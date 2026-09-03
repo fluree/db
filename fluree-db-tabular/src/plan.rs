@@ -251,8 +251,14 @@ pub struct PushdownCapabilities {
     pub keyset_max_rows: usize,
     /// Rendered statement size the provider will send.
     pub statement_max_bytes: usize,
-    /// String `=` compares bytes (not a case-folding collation).
+    /// String `=` against a literal or another column compares bytes (not a
+    /// case-folding collation), possibly because the renderer forces it.
     pub string_eq_is_binary: bool,
+    /// `DISTINCT`, `GROUP BY` and `COUNT(DISTINCT …)` over a string column
+    /// keep byte-distinct values apart. Separate from `string_eq_is_binary`
+    /// because a comparison can be forced binary where a grouping cannot
+    /// (MySQL's `ONLY_FULL_GROUP_BY` rejects `GROUP BY BINARY col`).
+    pub string_distinct_is_binary: bool,
     /// String `<` orders by code point (not a locale collation).
     pub string_order_is_codepoint: bool,
 }

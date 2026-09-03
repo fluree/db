@@ -177,11 +177,19 @@ pub fn render_duplicate_probe(
 ) -> String {
     let cols: Vec<String> = keys.iter().map(|k| dialect.quote_ident(k)).collect();
     let not_null: Vec<String> = cols.iter().map(|c| format!("{c} IS NOT NULL")).collect();
+    // Two keys are duplicates when their *bytes* agree, since that is what
+    // the template maps to one IRI. MySQL groups strings by collation, which
+    // would report `Ada` and `ada` as one key; `BINARY` groups bytes and is
+    // harmless on the other key types.
+    let group: Vec<String> = match dialect {
+        SqlDialect::Mysql => cols.iter().map(|c| format!("BINARY {c}")).collect(),
+        _ => cols,
+    };
     format!(
         "SELECT 1 FROM {} WHERE {} GROUP BY {} HAVING COUNT(*) > 1 LIMIT 1",
         source.render(dialect),
         not_null.join(" AND "),
-        cols.join(", ")
+        group.join(", ")
     )
 }
 
@@ -291,6 +299,18 @@ fn render_predicate(pred: &Predicate, ty: FieldType, dialect: SqlDialect) -> Opt
 /// *behind* an endpoint that need not be a bridge we configured. So a value
 /// carrying a backslash is declined, which costs a pushdown and nothing else —
 /// the in-engine FILTER enforces the predicate either way.
+/// A string literal for *comparison* with a column. On MySQL the default
+/// collation case-folds (and, on older defaults, pads), so the literal is
+/// marked `BINARY` to compare bytes the way the engine does; every other
+/// dialect here already compares bytes.
+pub(crate) fn binary_string(s: &str, dialect: SqlDialect) -> Option<String> {
+    let lit = sql_string(s, dialect)?;
+    Some(match dialect {
+        SqlDialect::Mysql => format!("BINARY {lit}"),
+        _ => lit,
+    })
+}
+
 pub(crate) fn sql_string(s: &str, dialect: SqlDialect) -> Option<String> {
     if dialect.backslash_may_escape() && s.contains('\\') {
         return None;
@@ -326,7 +346,7 @@ pub(crate) fn render_literal(lit: &Literal, ty: FieldType, dialect: SqlDialect) 
             matches!(ty, FieldType::Boolean).then(|| if *b { "TRUE" } else { "FALSE" }.to_string())
         }
         Literal::Int(i) => is_numeric(ty).then(|| i.to_string()),
-        Literal::Str(s) => matches!(ty, FieldType::String).then(|| sql_string(s, dialect))?,
+        Literal::Str(s) => matches!(ty, FieldType::String).then(|| binary_string(s, dialect))?,
         Literal::Date(days) => {
             if !matches!(ty, FieldType::Date) {
                 return None;
@@ -361,14 +381,24 @@ pub(crate) fn render_literal(lit: &Literal, ty: FieldType, dialect: SqlDialect) 
             }
             let dt = chrono::DateTime::from_timestamp_micros(*micros)?;
             let text = dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-            match (dialect.typed_literals(), *tz) {
-                (true, true) => Some(format!("TIMESTAMP '{text} UTC'")),
-                (true, false) => Some(format!("TIMESTAMP '{text}'")),
-                (false, _) => sql_string(&text, dialect),
+            // A zoned literal must carry its zone in a form the dialect
+            // honors: Postgres silently drops the zone from a plain
+            // `TIMESTAMP '…'` and reads the rest in the session's zone;
+            // MySQL takes a numeric offset but no zone name.
+            match (dialect, *tz) {
+                (SqlDialect::Trino, true) => Some(format!("TIMESTAMP '{text} UTC'")),
+                (SqlDialect::Postgres, true) => {
+                    Some(format!("TIMESTAMP WITH TIME ZONE '{text} UTC'"))
+                }
+                (SqlDialect::Mysql, true) => Some(format!("TIMESTAMP '{text}+00:00'")),
+                (SqlDialect::Trino | SqlDialect::Postgres | SqlDialect::Mysql, false) => {
+                    Some(format!("TIMESTAMP '{text}'"))
+                }
+                (SqlDialect::Sqlite, _) => sql_string(&text, dialect),
             }
         }
         Literal::TemplateKey(raw) => match ty {
-            FieldType::String => sql_string(raw, dialect),
+            FieldType::String => binary_string(raw, dialect),
             FieldType::Int32 | FieldType::Int64 => raw.parse::<i64>().ok().map(|i| i.to_string()),
             _ => None,
         },
@@ -464,7 +494,7 @@ mod tests {
                 &["id".to_string()],
                 SqlDialect::Mysql
             ),
-            "SELECT 1 FROM (SELECT id FROM t) AS `__fluree_q` WHERE `id` IS NOT NULL GROUP BY `id` HAVING COUNT(*) > 1 LIMIT 1"
+            "SELECT 1 FROM (SELECT id FROM t) AS `__fluree_q` WHERE `id` IS NOT NULL GROUP BY BINARY `id` HAVING COUNT(*) > 1 LIMIT 1"
         );
     }
 
@@ -631,7 +661,8 @@ mod tests {
     }
 
     /// Values with no backslash are unaffected on MySQL: quote doubling and
-    /// backtick identifier quoting still apply.
+    /// backtick identifier quoting still apply, and the literal is marked
+    /// `BINARY` so the default case-folding collation cannot widen the match.
     #[test]
     fn mysql_still_pushes_ordinary_string_literals() {
         let req = ScanRequest {
@@ -640,8 +671,73 @@ mod tests {
             predicates: vec![pred("name", CmpOp::Eq, Literal::Str("O'Brien".into()))],
         };
         let r = render_scan(&req, &schema(), SqlDialect::Mysql).unwrap();
-        assert_eq!(r.sql, "SELECT `name` FROM `t` WHERE `name` = 'O''Brien'");
+        assert_eq!(
+            r.sql,
+            "SELECT `name` FROM `t` WHERE `name` = BINARY 'O''Brien'"
+        );
         assert!(r.declined_predicates.is_empty());
+    }
+
+    /// A template key is compared the same way: bytes on MySQL.
+    #[test]
+    fn mysql_template_keys_compare_binary() {
+        let req = ScanRequest {
+            source: LogicalSource::Table("t".into()),
+            projection: vec!["name".into()],
+            predicates: vec![pred("name", CmpOp::Eq, Literal::TemplateKey("Ada".into()))],
+        };
+        let r = render_scan(&req, &schema(), SqlDialect::Mysql).unwrap();
+        assert_eq!(r.sql, "SELECT `name` FROM `t` WHERE `name` = BINARY 'Ada'");
+    }
+
+    /// The duplicate-key probe groups bytes on MySQL, so `Ada` and `ada`
+    /// (two IRIs) are not reported as one key.
+    #[test]
+    fn mysql_duplicate_probe_groups_binary() {
+        let sql = render_duplicate_probe(
+            &LogicalSource::Table("t".into()),
+            &["name".into()],
+            SqlDialect::Mysql,
+        );
+        assert_eq!(
+            sql,
+            "SELECT 1 FROM `t` WHERE `name` IS NOT NULL GROUP BY BINARY `name` HAVING COUNT(*) > 1 LIMIT 1"
+        );
+    }
+
+    /// A zoned timestamp literal carries its zone in the form each dialect
+    /// honors. Postgres reads a plain `TIMESTAMP '… UTC'` as a *naive* value
+    /// in the session's zone, and MySQL accepts an offset but not a name.
+    #[test]
+    fn zoned_timestamp_literal_per_dialect() {
+        let lit = Literal::Timestamp {
+            micros: 1_704_844_800_000_000, // 2024-01-10T00:00:00Z
+            tz: true,
+        };
+        let render = |d| render_literal(&lit, FieldType::TimestampTz, d).unwrap();
+        assert_eq!(
+            render(SqlDialect::Trino),
+            "TIMESTAMP '2024-01-10 00:00:00.000000 UTC'"
+        );
+        assert_eq!(
+            render(SqlDialect::Postgres),
+            "TIMESTAMP WITH TIME ZONE '2024-01-10 00:00:00.000000 UTC'"
+        );
+        assert_eq!(
+            render(SqlDialect::Mysql),
+            "TIMESTAMP '2024-01-10 00:00:00.000000+00:00'"
+        );
+        assert_eq!(render(SqlDialect::Sqlite), "'2024-01-10 00:00:00.000000'");
+        let naive = Literal::Timestamp {
+            micros: 1_704_844_800_000_000,
+            tz: false,
+        };
+        for d in [SqlDialect::Trino, SqlDialect::Postgres, SqlDialect::Mysql] {
+            assert_eq!(
+                render_literal(&naive, FieldType::Timestamp, d).unwrap(),
+                "TIMESTAMP '2024-01-10 00:00:00.000000'"
+            );
+        }
     }
 
     #[test]

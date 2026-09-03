@@ -228,6 +228,38 @@ pushable. In that statement:
   `SUM`/`AVG` over a column whose SQL type does not match its datatype, or
   an aggregate over an IRI template declines to the engine's grouping.
 
+**Where dialects differ**, the lane follows SPARQL's semantics (bytes, code
+points, instants) and declines rather than approximate:
+
+- String equality — a `FILTER`, an `IN` list, a key set, a constant subject
+  reversed into a string key column, or a join on string columns — compares
+  **bytes** on every dialect. Trino, SQLite and a deterministic Postgres
+  collation do so already; on `dialect: mysql` the renderer marks every
+  string literal and one side of every string join `BINARY`, since the
+  default collation there folds case. The duplicate-key probe at
+  registration groups `BINARY` for the same reason.
+- `SELECT DISTINCT`, `GROUP BY` and `COUNT(DISTINCT …)` over a string column
+  stay in the engine on MySQL: a grouping cannot be forced binary there
+  (`ONLY_FULL_GROUP_BY` rejects `GROUP BY BINARY col`), and a case-folding
+  collation would merge two distinct terms.
+- String `ORDER BY … LIMIT` (as a top-k) and `MIN`/`MAX` of strings are
+  pushed only on Trino and SQLite, which order by code point; Postgres and
+  MySQL order by a locale collation, so those run in the engine.
+- An `xsd:dateTime` literal against a `timestamp with time zone` column is
+  rendered as the zoned literal each dialect honors — `TIMESTAMP '… UTC'`
+  on Trino, `TIMESTAMP WITH TIME ZONE '… UTC'` on Postgres (a plain
+  `TIMESTAMP` literal there silently drops the zone and is read in the
+  session's zone), `TIMESTAMP '…+00:00'` on MySQL. A naive `timestamp`
+  column is taken as UTC when its term is built, on every dialect.
+- A decimal's lexical form follows the scale the endpoint reports for the
+  column (`decimal(10,2)` gives `99.50`); the bridge reports NUMERIC /
+  DECIMAL columns at the scale it was started with (`--decimal-scale`,
+  default 6), and SQLite's `NUMERIC` is a double.
+
+CI replays every lane case against SQLite, Postgres 16 and MySQL 8 behind
+the bridge, the two servers deliberately running five hours off UTC, and
+pins both the rows and which of these forms each statement took.
+
 Terms are always built in the engine from the returned columns, so
 datatypes come from the mapping, not from the SQL types. Shapes the lane
 cannot express exactly — variable predicates, several triples maps for one
@@ -315,7 +347,10 @@ moment. Consequently
   additionally pins the rule on the sessions it opens — `NO_BACKSLASH_ESCAPES`
   on MySQL, `standard_conforming_strings = on` on Postgres (already the
   default there, set explicitly so a server-, database- or role-level override
-  cannot change it). If you point a source at some other Trino-protocol
+  cannot change it). Its MySQL sessions also run with `time_zone = '+00:00'`
+  (the driver's default, pinned by a test), so a `TIMESTAMP` column reads back
+  as the instant it stores rather than the server's wall-clock time. If you
+  point a source at some other Trino-protocol
   endpoint, ensure the equivalent holds there.
 - Credentials can be indirected (`{"env_var": "TRINO_TOKEN"}` or
   `{"secret_ref": "…"}`) rather than stored inline — but only in a

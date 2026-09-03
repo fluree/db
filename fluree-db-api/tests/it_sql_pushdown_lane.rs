@@ -15,13 +15,13 @@ mod fake_sql;
 mod span_capture;
 
 use fake_sql::{FakeSql, Table};
-use fluree_db_api::{set_fast_paths_disabled, Fluree, FlureeBuilder, SqlCreateConfig};
+use fluree_db_api::{set_fast_paths_disabled, Fluree, FlureeBuilder, SqlCreateConfig, SqlDialect};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use wiremock::MockServer;
 
 /// The shop mapping over `shop.customers` / `shop.orders` (the fixture) or,
-/// for a live SQLite run, unqualified table names.
+/// for a live run, unqualified table names.
 fn shop_mapping(prefix: &str) -> String {
     SHOP_R2RML.replace("shop.", prefix)
 }
@@ -1075,43 +1075,465 @@ async fn tracked_queries_report_the_statements_sent() {
     assert!(response.sql.is_none(), "{:?}", response.sql);
 }
 
-/// Grouped cases whose SUM/AVG column is `decimal` in the mapping but text
-/// or double in SQLite, so the aggregate lane declines there.
-const SQLITE_DECLINES: &[&str] = &[
-    "GROUP BY a foreign-key object with COUNT and SUM",
-    "AVG pushes SUM and COUNT and divides in the engine",
-];
+// ---------------------------------------------------------------------------
+// Live differential: every case replayed against real databases
+// ---------------------------------------------------------------------------
+//
+// The fake endpoint pins the statements; only a database can confirm those
+// statements return the rows the per-scan lane returns *and* the rows the
+// fake pinned. Each backend below runs behind `fluree-sql-bridge`, seeded
+// through the bridge itself. The base tables carry exactly the fake's rows,
+// so the fake's expected rows hold here too; `words`, `tags` and `events`
+// carry the values on which dialects disagree (collation, zones) for the
+// dialect cases in `live_cases`. Gated on the backend's URL variable; CI's
+// bridge job sets all three.
 
-/// Every case replayed against a real database: SQLite behind
-/// `fluree-sql-bridge`, seeded through the bridge itself. The fake endpoint
-/// pins the statements; this pins that a database agrees with the per-scan
-/// lane on the rows. Gated on `FLUREE_SQL_BRIDGE_URL` (a bridge over an
-/// otherwise unused SQLite file); CI's bridge job sets it.
-#[tokio::test]
-async fn live_bridge_agrees_with_the_scan_lane() {
-    let Ok(url) = std::env::var("FLUREE_SQL_BRIDGE_URL") else {
-        eprintln!("FLUREE_SQL_BRIDGE_URL unset: live bridge differential skipped");
-        return;
-    };
-    let _lock = KILL_SWITCH.lock().await;
+/// A database behind the bridge, with the fixture in its own types.
+struct LiveBackend {
+    dialect: SqlDialect,
+    /// Environment variable carrying the bridge URL.
+    url_var: &'static str,
+    seed: &'static [&'static str],
+    /// Grouped cases the aggregate lane must decline here because a fixture
+    /// column reaches the bridge as a type it cannot fold exactly.
+    declines: &'static [&'static str],
+}
 
-    let mut cfg = fluree_db_sql::SqlGsConfig::new(url.clone());
-    cfg.dialect = fluree_db_api::SqlDialect::Sqlite;
-    let cfg = cfg.hydrate(None).await.expect("hydrate");
-    let auth = cfg.auth.create_provider_arc().expect("auth");
-    let client = fluree_db_sql::TrinoClient::new(&cfg, auth).expect("client");
-    for stmt in [
+const CUSTOMER_ROWS: &str =
+    "INSERT INTO customers VALUES (1, 'Ada', 'UK'), (2, 'Bo', NULL), (3, 'Cy', 'US')";
+/// `words` holds strings a case-folding collation equates (`Ada`/`ada`), a
+/// padding one equates (`Bo`/`Bo `), and one a locale sorts among the ASCII
+/// letters (`Émile`, which code-point order puts last).
+const WORD_ROWS: &str = "INSERT INTO words VALUES (1, 'Ada', 3), (2, 'ada', 3), (3, 'Bo', 2), (4, 'Bo ', 3), (5, 'Émile', 5)";
+/// `tags` is keyed by a string column, so its subjects are minted from
+/// values a collation would merge.
+const TAG_ROWS: &str = "INSERT INTO tags VALUES ('Ada', 1), ('ada', 2), ('Bo ', 3)";
+
+const SQLITE: LiveBackend = LiveBackend {
+    dialect: SqlDialect::Sqlite,
+    url_var: "FLUREE_SQL_BRIDGE_URL",
+    seed: &[
         "DROP TABLE IF EXISTS customers",
         "DROP TABLE IF EXISTS orders",
+        "DROP TABLE IF EXISTS words",
+        "DROP TABLE IF EXISTS tags",
+        "DROP TABLE IF EXISTS events",
         "CREATE TABLE customers (id INTEGER, name TEXT, country TEXT)",
         "CREATE TABLE orders (id INTEGER, customer_id INTEGER, total NUMERIC, placed DATE, shipped TIMESTAMP, updated TIMESTAMP)",
-        "INSERT INTO customers VALUES (1, 'Ada', 'UK'), (2, 'Bo', NULL), (3, 'Cy', 'US')",
+        "CREATE TABLE words (id INTEGER, word TEXT, len INTEGER)",
+        "CREATE TABLE tags (tag TEXT, n INTEGER)",
+        "CREATE TABLE events (id INTEGER, at_tz TIMESTAMP, at_local TIMESTAMP)",
+        CUSTOMER_ROWS,
         "INSERT INTO orders VALUES \
             (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00', '2024-01-06 09:30:00'), \
             (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00', '2024-02-02 18:00:00'), \
             (12, 2, 42.00, '2024-03-01', NULL, NULL), \
             (13, NULL, 7.00, NULL, NULL, NULL)",
-    ] {
+        WORD_ROWS,
+        TAG_ROWS,
+        "INSERT INTO events VALUES (1, '2024-01-10 03:00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00', '2024-01-09 21:00:00')",
+    ],
+    // SQLite's `NUMERIC` reaches the bridge as text or double, so a SUM/AVG
+    // over it declines (its datatype is decimal).
+    declines: &[
+        "GROUP BY a foreign-key object with COUNT and SUM",
+        "AVG pushes SUM and COUNT and divides in the engine",
+    ],
+};
+
+/// Zoned values are inserted with an explicit offset so the server's own
+/// zone (deliberately not UTC in CI) cannot leak into the fixture.
+const POSTGRES: LiveBackend = LiveBackend {
+    dialect: SqlDialect::Postgres,
+    url_var: "FLUREE_SQL_BRIDGE_POSTGRES_URL",
+    seed: &[
+        "DROP TABLE IF EXISTS customers",
+        "DROP TABLE IF EXISTS orders",
+        "DROP TABLE IF EXISTS words",
+        "DROP TABLE IF EXISTS tags",
+        "DROP TABLE IF EXISTS events",
+        "CREATE TABLE customers (id BIGINT, name TEXT, country TEXT)",
+        "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total NUMERIC(10,2), placed DATE, shipped TIMESTAMPTZ, updated TIMESTAMP)",
+        "CREATE TABLE words (id BIGINT, word TEXT, len INTEGER)",
+        "CREATE TABLE tags (tag TEXT, n INTEGER)",
+        "CREATE TABLE events (id BIGINT, at_tz TIMESTAMPTZ, at_local TIMESTAMP)",
+        CUSTOMER_ROWS,
+        "INSERT INTO orders VALUES \
+            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00'), \
+            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00'), \
+            (12, 2, 42.00, '2024-03-01', NULL, NULL), \
+            (13, NULL, 7.00, NULL, NULL, NULL)",
+        WORD_ROWS,
+        TAG_ROWS,
+        "INSERT INTO events VALUES (1, '2024-01-10 03:00:00+00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00+00:00', '2024-01-09 21:00:00')",
+    ],
+    declines: &[],
+};
+
+const MYSQL: LiveBackend = LiveBackend {
+    dialect: SqlDialect::Mysql,
+    url_var: "FLUREE_SQL_BRIDGE_MYSQL_URL",
+    seed: &[
+        "DROP TABLE IF EXISTS customers",
+        "DROP TABLE IF EXISTS orders",
+        "DROP TABLE IF EXISTS words",
+        "DROP TABLE IF EXISTS tags",
+        "DROP TABLE IF EXISTS events",
+        "CREATE TABLE customers (id BIGINT, name VARCHAR(64), country VARCHAR(64))",
+        "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total DECIMAL(10,2), placed DATE, shipped TIMESTAMP NULL, updated DATETIME)",
+        "CREATE TABLE words (id BIGINT, word VARCHAR(64), len INT)",
+        "CREATE TABLE tags (tag VARCHAR(64), n INT)",
+        "CREATE TABLE events (id BIGINT, at_tz TIMESTAMP NULL, at_local DATETIME)",
+        CUSTOMER_ROWS,
+        "INSERT INTO orders VALUES \
+            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00'), \
+            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00'), \
+            (12, 2, 42.00, '2024-03-01', NULL, NULL), \
+            (13, NULL, 7.00, NULL, NULL, NULL)",
+        WORD_ROWS,
+        TAG_ROWS,
+        "INSERT INTO events VALUES (1, '2024-01-10 03:00:00+00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00+00:00', '2024-01-09 21:00:00')",
+    ],
+    declines: &[],
+};
+
+/// Maps over the dialect tables, appended to the shop mapping for live runs.
+const LIVE_R2RML: &str = r#"
+    <http://example.org/mapping#Word>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "words" ] ;
+        rr:subjectMap [ rr:template "http://example.org/word/{id}" ; rr:class ex:Word ] ;
+        rr:predicateObjectMap [ rr:predicate ex:word ; rr:objectMap [ rr:column "word" ] ] ;
+        rr:predicateObjectMap [ rr:predicate ex:len ; rr:objectMap [ rr:column "len" ] ] .
+
+    <http://example.org/mapping#Tag>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "tags" ] ;
+        rr:subjectMap [ rr:template "http://example.org/tag/{tag}" ; rr:class ex:Tag ] ;
+        rr:predicateObjectMap [ rr:predicate ex:n ; rr:objectMap [ rr:column "n" ] ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:wordOf ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Word> ;
+                rr:joinCondition [ rr:child "tag" ; rr:parent "word" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Event>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "events" ] ;
+        rr:subjectMap [ rr:template "http://example.org/event/{id}" ; rr:class ex:Event ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:at ;
+            rr:objectMap [ rr:column "at_tz" ; rr:datatype xsd:dateTime ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:atLocal ;
+            rr:objectMap [ rr:column "at_local" ; rr:datatype xsd:dateTime ]
+        ] .
+"#;
+
+/// What the statements the lane sent must look like on one backend.
+enum Sent {
+    /// Some statement carries this fragment.
+    Contains(&'static str),
+    /// No statement carries this fragment (the shape ran in the engine).
+    Lacks(&'static str),
+    /// The lane sent nothing: the whole query ran through the per-scan lane.
+    Nothing,
+}
+
+/// A case whose answer depends on the database's string, time or numeric
+/// semantics. The lane must fire on every backend unless `sent` says
+/// `Nothing`; `sent` pins *how* per backend, and `rows` pins the SPARQL
+/// answer (bytes, code points, instants, lexical forms) on all of them.
+struct LiveCase {
+    name: &'static str,
+    sparql: &'static str,
+    rows: &'static [&'static str],
+    /// Backends the case runs on; empty = all.
+    only: &'static [SqlDialect],
+    sent: &'static [(SqlDialect, Sent)],
+}
+
+fn live_cases() -> Vec<LiveCase> {
+    use SqlDialect::{Mysql, Postgres, Sqlite};
+    vec![
+        LiveCase {
+            name: "string equality compares bytes",
+            sparql: "SELECT ?w FROM <shop-live:main> WHERE { ?x ex:word ?w FILTER(?w = \"ada\") }",
+            rows: &["w=ada"],
+            only: &[],
+            sent: &[(Mysql, Sent::Contains("= BINARY 'ada'"))],
+        },
+        LiveCase {
+            name: "string equality does not pad",
+            sparql: "SELECT ?w FROM <shop-live:main> WHERE { ?x ex:word ?w FILTER(?w = \"Bo\") }",
+            rows: &["w=Bo"],
+            only: &[],
+            sent: &[(Mysql, Sent::Contains("= BINARY 'Bo'"))],
+        },
+        LiveCase {
+            name: "IN list compares bytes",
+            sparql: "SELECT ?w FROM <shop-live:main> WHERE { ?x ex:word ?w FILTER(?w IN (\"ada\", \"Bo\")) }",
+            rows: &["w=Bo", "w=ada"],
+            only: &[],
+            sent: &[(Mysql, Sent::Contains("IN (BINARY 'ada', BINARY 'Bo')"))],
+        },
+        LiveCase {
+            name: "a constant subject on a string key compares bytes",
+            sparql: "SELECT ?n FROM <shop-live:main> WHERE { <http://example.org/tag/ada> ex:n ?n }",
+            rows: &["n=2"],
+            only: &[],
+            sent: &[(Mysql, Sent::Contains("= BINARY 'ada'"))],
+        },
+        LiveCase {
+            name: "a key set on a string key compares bytes",
+            sparql: "SELECT ?t ?n FROM <shop-live:main> WHERE { VALUES ?t { <http://example.org/tag/ada> <http://example.org/tag/Bo%20> } ?t ex:n ?n }",
+            rows: &[
+                "n=2 t=http://example.org/tag/ada",
+                "n=3 t=http://example.org/tag/Bo%20",
+            ],
+            only: &[],
+            sent: &[(Mysql, Sent::Contains("BINARY 'ada'"))],
+        },
+        LiveCase {
+            name: "a string join compares bytes",
+            sparql: "SELECT ?t ?l FROM <shop-live:main> WHERE { ?t ex:wordOf ?w . ?w ex:len ?l }",
+            rows: &[
+                "l=3 t=http://example.org/tag/Ada",
+                "l=3 t=http://example.org/tag/Bo%20",
+                "l=3 t=http://example.org/tag/ada",
+            ],
+            only: &[],
+            sent: &[(Mysql, Sent::Contains("= BINARY `t"))],
+        },
+        LiveCase {
+            name: "DISTINCT over strings runs in the engine where the database folds case",
+            sparql: "SELECT DISTINCT ?w FROM <shop-live:main> WHERE { ?x ex:word ?w }",
+            rows: &["w=Ada", "w=Bo", "w=Bo ", "w=ada", "w=Émile"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("SELECT DISTINCT")),
+                (Postgres, Sent::Contains("SELECT DISTINCT")),
+                (Mysql, Sent::Lacks("DISTINCT")),
+            ],
+        },
+        LiveCase {
+            name: "GROUP BY a string runs in the engine where the database folds case",
+            sparql: "SELECT ?w (COUNT(*) AS ?c) FROM <shop-live:main> WHERE { ?x ex:word ?w } GROUP BY ?w",
+            rows: &[
+                "c=1 w=Ada",
+                "c=1 w=Bo",
+                "c=1 w=Bo ",
+                "c=1 w=ada",
+                "c=1 w=Émile",
+            ],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("GROUP BY")),
+                (Postgres, Sent::Contains("GROUP BY")),
+                (Mysql, Sent::Nothing),
+            ],
+        },
+        LiveCase {
+            name: "COUNT DISTINCT of strings runs in the engine where the database folds case",
+            sparql: "SELECT (COUNT(DISTINCT ?w) AS ?c) FROM <shop-live:main> WHERE { ?x ex:word ?w }",
+            rows: &["c=5"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("COUNT(DISTINCT")),
+                (Postgres, Sent::Contains("COUNT(DISTINCT")),
+                (Mysql, Sent::Lacks("COUNT(DISTINCT")),
+            ],
+        },
+        LiveCase {
+            name: "string ORDER BY LIMIT pushes a top-k only under code-point order",
+            sparql: "SELECT ?w FROM <shop-live:main> WHERE { ?x ex:word ?w } ORDER BY ?w LIMIT 2",
+            rows: &["w=Ada", "w=Bo"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("ORDER BY")),
+                (Postgres, Sent::Lacks("ORDER BY")),
+                (Mysql, Sent::Lacks("ORDER BY")),
+            ],
+        },
+        LiveCase {
+            name: "string ORDER BY DESC LIMIT pushes a top-k only under code-point order",
+            sparql: "SELECT ?w FROM <shop-live:main> WHERE { ?x ex:word ?w } ORDER BY DESC(?w) LIMIT 2",
+            rows: &["w=ada", "w=Émile"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("ORDER BY")),
+                (Postgres, Sent::Lacks("ORDER BY")),
+                (Mysql, Sent::Lacks("ORDER BY")),
+            ],
+        },
+        LiveCase {
+            name: "MIN of strings runs in the engine where order is a collation",
+            sparql: "SELECT (MIN(?w) AS ?lo) FROM <shop-live:main> WHERE { ?x ex:word ?w }",
+            rows: &["lo=Ada"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("MIN(")),
+                (Postgres, Sent::Lacks("MIN(")),
+                (Mysql, Sent::Lacks("MIN(")),
+            ],
+        },
+        LiveCase {
+            name: "MAX of strings runs in the engine where order is a collation",
+            sparql: "SELECT (MAX(?w) AS ?hi) FROM <shop-live:main> WHERE { ?x ex:word ?w }",
+            rows: &["hi=Émile"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("MAX(")),
+                (Postgres, Sent::Lacks("MAX(")),
+                (Mysql, Sent::Lacks("MAX(")),
+            ],
+        },
+        // The servers run in a zone five hours behind UTC in CI. A literal
+        // that lost its zone would move by that much, which is why the
+        // fixture's instants sit within five hours of the boundary.
+        LiveCase {
+            name: "a zoned filter compares the instant whatever the server's zone",
+            sparql: "SELECT ?e FROM <shop-live:main> WHERE { ?e ex:at ?t FILTER(?t > \"2024-01-10T00:00:00Z\"^^xsd:dateTime) }",
+            rows: &["e=http://example.org/event/1"],
+            only: &[Postgres, Mysql],
+            sent: &[
+                (
+                    Postgres,
+                    Sent::Contains("> TIMESTAMP WITH TIME ZONE '2024-01-10 00:00:00.000000 UTC'"),
+                ),
+                (Mysql, Sent::Contains("> TIMESTAMP '2024-01-10 00:00:00.000000+00:00'")),
+            ],
+        },
+        LiveCase {
+            name: "a zoned value reads back as the instant stored",
+            sparql: "SELECT ?t FROM <shop-live:main> WHERE { <http://example.org/event/1> ex:at ?t }",
+            rows: &["t=2024-01-10T03:00:00Z"],
+            only: &[Postgres, Mysql],
+            sent: &[],
+        },
+        // The engine's xsd:dateTime carries no offset, so a naive timestamp
+        // is taken as UTC and renders with `Z`, on every backend.
+        LiveCase {
+            name: "a naive value reads back as UTC",
+            sparql: "SELECT ?t FROM <shop-live:main> WHERE { <http://example.org/event/1> ex:atLocal ?t }",
+            rows: &["t=2024-01-10T03:00:00Z"],
+            only: &[],
+            sent: &[],
+        },
+        // A decimal's lexical form follows the scale the endpoint reports for
+        // the column: the bridge reports NUMERIC/DECIMAL as `decimal(38, 6)`
+        // unless started with `--decimal-scale`, and SQLite's NUMERIC is a
+        // double. Same value everywhere; pinned so a change is deliberate.
+        LiveCase {
+            name: "a decimal value reads back at the reported scale",
+            sparql: "SELECT ?t FROM <shop-live:main> WHERE { <http://example.org/order/10> ex:total ?t }",
+            rows: &["t=99.500000"],
+            only: &[Postgres, Mysql],
+            sent: &[],
+        },
+        LiveCase {
+            name: "a decimal value reads back as a double on SQLite",
+            sparql: "SELECT ?t FROM <shop-live:main> WHERE { <http://example.org/order/10> ex:total ?t }",
+            rows: &["t=99.5"],
+            only: &[Sqlite],
+            sent: &[],
+        },
+        LiveCase {
+            name: "SUM and AVG of a decimal column fold in the database",
+            sparql: "SELECT (SUM(?t) AS ?s) (AVG(?t) AS ?a) FROM <shop-live:main> WHERE { ?o ex:total ?t }",
+            rows: &["a=38.375 s=153.500000"],
+            only: &[Postgres, Mysql],
+            sent: &[(Postgres, Sent::Contains("SUM(")), (Mysql, Sent::Contains("SUM("))],
+        },
+    ]
+}
+
+/// Rows with every plain decimal lexical reduced to its shortest form, so a
+/// fixture pinned against the fake's `decimal(10,2)` (`99.50`) compares by
+/// value with a backend that reports the column at another scale (`99.5` as
+/// a SQLite double, `99.500000` through the bridge's default scale).
+fn by_value(rows: &[String]) -> Vec<String> {
+    fn canon(v: &str) -> String {
+        let plain = v.strip_prefix('-').unwrap_or(v);
+        let (int, frac) = match plain.split_once('.') {
+            Some(parts) => parts,
+            None => return v.to_string(),
+        };
+        if int.is_empty()
+            || !int.bytes().all(|b| b.is_ascii_digit())
+            || !frac.bytes().all(|b| b.is_ascii_digit())
+        {
+            return v.to_string();
+        }
+        let frac = frac.trim_end_matches('0');
+        let sign = if v.starts_with('-') { "-" } else { "" };
+        if frac.is_empty() {
+            format!("{sign}{int}")
+        } else {
+            format!("{sign}{int}.{frac}")
+        }
+    }
+    let mut out: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            row.split(' ')
+                .map(|tok| match tok.split_once('=') {
+                    Some((var, val)) => format!("{var}={}", canon(val)),
+                    None => tok.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The lane's rows and the statements it sent for `sparql`.
+async fn lane_run(fluree: &Fluree, sparql: &str, name: &str) -> (Vec<String>, Vec<String>) {
+    set_fast_paths_disabled(false);
+    let tracked = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute_tracked()
+        .await
+        .unwrap_or_else(|e| panic!("{name}: lane query failed: {}\n{sparql}", e.error));
+    let sent = tracked
+        .sql
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.sql)
+        .collect();
+    (rows_of(&tracked.result), sent)
+}
+
+/// The per-scan lane's rows for `sparql`.
+async fn scan_run(fluree: &Fluree, sparql: &str) -> Vec<String> {
+    set_fast_paths_disabled(true);
+    let rows = rows_of(&query(fluree, sparql).await);
+    set_fast_paths_disabled(false);
+    rows
+}
+
+async fn live_differential(backend: &LiveBackend) {
+    let Ok(url) = std::env::var(backend.url_var) else {
+        eprintln!(
+            "{} unset: live {:?} differential skipped",
+            backend.url_var, backend.dialect
+        );
+        return;
+    };
+    let _lock = KILL_SWITCH.lock().await;
+
+    let mut cfg = fluree_db_sql::SqlGsConfig::new(url.clone());
+    cfg.dialect = backend.dialect;
+    let cfg = cfg.hydrate(None).await.expect("hydrate");
+    let auth = cfg.auth.create_provider_arc().expect("auth");
+    let client = fluree_db_sql::TrinoClient::new(&cfg, auth).expect("client");
+    for stmt in backend.seed {
         client
             .execute_collect(stmt)
             .await
@@ -1119,8 +1541,12 @@ async fn live_bridge_agrees_with_the_scan_lane() {
     }
 
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut source = SqlCreateConfig::new("shop-live", url, shop_mapping(""));
-    source.dialect = fluree_db_api::SqlDialect::Sqlite;
+    let mut source = SqlCreateConfig::new(
+        "shop-live",
+        url,
+        format!("{}{LIVE_R2RML}", shop_mapping("")),
+    );
+    source.dialect = backend.dialect;
     fluree
         .create_sql_graph_source(source)
         .await
@@ -1129,27 +1555,16 @@ async fn live_bridge_agrees_with_the_scan_lane() {
     let mut failures: Vec<String> = Vec::new();
     for c in cases().into_iter().chain(aggregate_cases()) {
         let sparql = format!("{PREFIX}{}", c.sparql).replace("shop-sql:main", "shop-live:main");
-        set_fast_paths_disabled(false);
-        let tracked = fluree
-            .query_from()
-            .sparql(&sparql)
-            .execute_tracked()
-            .await
-            .unwrap_or_else(|e| panic!("{}: lane query failed: {}\n{sparql}", c.name, e.error));
-        let lane_rows = rows_of(&tracked.result);
-        let sent = tracked.sql.unwrap_or_default();
-        // SQLite's `NUMERIC` reaches the bridge as text or double, so a
-        // SUM/AVG over it declines (its datatype is decimal); the rows must
-        // still agree, and the decline itself is pinned.
-        let declines_on_sqlite = SQLITE_DECLINES.contains(&c.name);
+        let (lane_rows, sent) = lane_run(&fluree, &sparql, c.name).await;
+        let declines = backend.declines.contains(&c.name);
         match (&c.routing, c.sql.is_empty()) {
-            (Routing::MustFire, false) if declines_on_sqlite && !sent.is_empty() => {
+            (Routing::MustFire, false) if declines && !sent.is_empty() => {
                 failures.push(format!(
-                    "{}: expected a decline on SQLite, sent {sent:?}",
-                    c.name
+                    "{}: expected a decline on {:?}, sent {sent:?}",
+                    c.name, backend.dialect
                 ));
             }
-            (Routing::MustFire, false) if !declines_on_sqlite && sent.is_empty() => {
+            (Routing::MustFire, false) if !declines && sent.is_empty() => {
                 failures.push(format!("{}: the lane sent no statement", c.name));
             }
             // A declined grouped shape may still run its block through the
@@ -1158,14 +1573,76 @@ async fn live_bridge_agrees_with_the_scan_lane() {
             (Routing::MustNotFire, _)
                 if sent
                     .iter()
-                    .any(|s| s.sql.contains("GROUP BY") || s.sql.contains("COUNT(")) =>
+                    .any(|s| s.contains("GROUP BY") || s.contains("COUNT(")) =>
             {
                 failures.push(format!("{}: a declined shape sent {sent:?}", c.name));
             }
             _ => {}
         }
-        set_fast_paths_disabled(true);
-        let scan_rows = rows_of(&query(&fluree, &sparql).await);
+        let pinned: Vec<String> = c.rows.iter().map(ToString::to_string).collect();
+        if by_value(&lane_rows) != by_value(&pinned) {
+            failures.push(format!(
+                "{}: lane rows {lane_rows:?} differ from the pinned rows {:?} [sent: {sent:?}]",
+                c.name, c.rows
+            ));
+        }
+        let scan_rows = scan_run(&fluree, &sparql).await;
+        if lane_rows != scan_rows {
+            failures.push(format!(
+                "{}: lane rows {lane_rows:?} differ from scan lane rows {scan_rows:?} [sent: {sent:?}]",
+                c.name
+            ));
+        }
+    }
+
+    for c in live_cases() {
+        if !c.only.is_empty() && !c.only.contains(&backend.dialect) {
+            continue;
+        }
+        let sparql = format!("{PREFIX}{}", c.sparql);
+        let (lane_rows, sent) = lane_run(&fluree, &sparql, c.name).await;
+        let expects_nothing = c
+            .sent
+            .iter()
+            .any(|(d, e)| *d == backend.dialect && matches!(e, Sent::Nothing));
+        if sent.is_empty() != expects_nothing {
+            failures.push(format!(
+                "{}: the lane sent {sent:?}, expected {}",
+                c.name,
+                if expects_nothing {
+                    "nothing"
+                } else {
+                    "a statement"
+                }
+            ));
+        }
+        for (dialect, expect) in c.sent {
+            if *dialect != backend.dialect {
+                continue;
+            }
+            match expect {
+                Sent::Contains(frag) if !sent.iter().any(|s| s.contains(frag)) => {
+                    failures.push(format!(
+                        "{}: no statement contains {frag:?}; sent {sent:?}",
+                        c.name
+                    ));
+                }
+                Sent::Lacks(frag) if sent.iter().any(|s| s.contains(frag)) => {
+                    failures.push(format!(
+                        "{}: a statement contains {frag:?}; sent {sent:?}",
+                        c.name
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if lane_rows != c.rows {
+            failures.push(format!(
+                "{}: lane rows {lane_rows:?} differ from the pinned rows {:?} [sent: {sent:?}]",
+                c.name, c.rows
+            ));
+        }
+        let scan_rows = scan_run(&fluree, &sparql).await;
         if lane_rows != scan_rows {
             failures.push(format!(
                 "{}: lane rows {lane_rows:?} differ from scan lane rows {scan_rows:?} [sent: {sent:?}]",
@@ -1174,7 +1651,44 @@ async fn live_bridge_agrees_with_the_scan_lane() {
         }
     }
     set_fast_paths_disabled(false);
-    assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
+    assert!(
+        failures.is_empty(),
+        "{:?}:\n{}",
+        backend.dialect,
+        failures.join("\n\n")
+    );
+}
+
+#[tokio::test]
+async fn live_bridge_sqlite_agrees_with_the_scan_lane() {
+    live_differential(&SQLITE).await;
+}
+
+#[tokio::test]
+async fn live_bridge_postgres_agrees_with_the_scan_lane() {
+    live_differential(&POSTGRES).await;
+}
+
+#[tokio::test]
+async fn live_bridge_mysql_agrees_with_the_scan_lane() {
+    live_differential(&MYSQL).await;
+}
+
+/// A skipped differential is not a passing one: CI must supply every backend.
+#[test]
+fn live_bridge_backends_are_configured_in_ci() {
+    if std::env::var("CI").is_err() {
+        eprintln!("SKIPPED: not CI");
+        return;
+    }
+    for b in [&SQLITE, &POSTGRES, &MYSQL] {
+        assert!(
+            std::env::var(b.url_var).is_ok_and(|v| !v.is_empty()),
+            "{} must be set in CI, or the {:?} differential passes by doing nothing",
+            b.url_var,
+            b.dialect
+        );
+    }
 }
 
 const DUP_R2RML: &str = r#"

@@ -330,26 +330,60 @@ async fn registration_survives_an_unreachable_endpoint() {
     assert!(err.to_string().contains("dead-sql:main"), "{err}");
 }
 
-/// Against a live `fluree-sql-bridge` (or Trino) serving a `people(id, name,
-/// score, born)` table — run with `FLUREE_SQL_BRIDGE_URL=http://127.0.0.1:8080`
-/// and, for a bridge, `FLUREE_SQL_BRIDGE_DIALECT=sqlite|postgres|mysql`;
-/// `FLUREE_SQL_BRIDGE_CATALOG` / `FLUREE_SQL_BRIDGE_SCHEMA` qualify the table.
-/// Skips (loudly) when unset, so CI without a bridge does not silently pass it.
+/// Against a live `fluree-sql-bridge` (or Trino) — run with
+/// `FLUREE_SQL_BRIDGE_URL=http://127.0.0.1:8080` and
+/// `FLUREE_SQL_BRIDGE_DIALECT=sqlite|postgres|mysql|trino` (default `sqlite`,
+/// which is what CI's bridge job supplies); `FLUREE_SQL_BRIDGE_CATALOG` /
+/// `FLUREE_SQL_BRIDGE_SCHEMA` qualify the table. Behind a bridge the test
+/// seeds its own `people(id, name, score, born)` table through the bridge; a
+/// Trino endpoint must already serve it. Skips (loudly) when unset, so CI
+/// without a bridge does not silently pass it.
 #[tokio::test]
 async fn live_bridge_round_trip() {
+    use fluree_db_api::SqlDialect;
     let Ok(endpoint) = std::env::var("FLUREE_SQL_BRIDGE_URL") else {
         eprintln!("SKIPPED live_bridge_round_trip: FLUREE_SQL_BRIDGE_URL not set");
         return;
     };
+    let dialect = match std::env::var("FLUREE_SQL_BRIDGE_DIALECT").as_deref() {
+        Ok("postgres") => SqlDialect::Postgres,
+        Ok("mysql") => SqlDialect::Mysql,
+        Ok("trino") => SqlDialect::Trino,
+        _ => SqlDialect::Sqlite,
+    };
+    let ddl = match dialect {
+        SqlDialect::Sqlite => {
+            Some("CREATE TABLE people (id INTEGER, name TEXT, score REAL, born DATE)")
+        }
+        SqlDialect::Postgres => {
+            Some("CREATE TABLE people (id BIGINT, name TEXT, score DOUBLE PRECISION, born DATE)")
+        }
+        SqlDialect::Mysql => {
+            Some("CREATE TABLE people (id BIGINT, name VARCHAR(64), score DOUBLE, born DATE)")
+        }
+        SqlDialect::Trino => None,
+    };
+    if let Some(ddl) = ddl {
+        let mut cfg = fluree_db_sql::SqlGsConfig::new(endpoint.clone());
+        cfg.dialect = dialect;
+        let cfg = cfg.hydrate(None).await.expect("hydrate");
+        let auth = cfg.auth.create_provider_arc().expect("auth");
+        let client = fluree_db_sql::TrinoClient::new(&cfg, auth).expect("client");
+        for stmt in [
+            "DROP TABLE IF EXISTS people",
+            ddl,
+            "INSERT INTO people VALUES (1, 'alice', 9.25, '1985-01-02'), (2, 'bob', NULL, NULL), (3, NULL, 7.5, '1990-05-06')",
+        ] {
+            client
+                .execute_collect(stmt)
+                .await
+                .unwrap_or_else(|e| panic!("seed failed: {e}\n{stmt}"));
+        }
+    }
     let mapping = PEOPLE_R2RML.replace("sales.people", "people");
     let fluree = FlureeBuilder::memory().build_memory();
     let mut config = SqlCreateConfig::new("live-sql", endpoint, mapping);
-    config.dialect = match std::env::var("FLUREE_SQL_BRIDGE_DIALECT").as_deref() {
-        Ok("sqlite") => fluree_db_api::SqlDialect::Sqlite,
-        Ok("postgres") => fluree_db_api::SqlDialect::Postgres,
-        Ok("mysql") => fluree_db_api::SqlDialect::Mysql,
-        _ => fluree_db_api::SqlDialect::Trino,
-    };
+    config.dialect = dialect;
     config.catalog = std::env::var("FLUREE_SQL_BRIDGE_CATALOG").ok();
     config.schema = std::env::var("FLUREE_SQL_BRIDGE_SCHEMA").ok();
     let created = fluree

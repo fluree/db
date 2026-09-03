@@ -135,12 +135,15 @@ jobs:
     # (NO_BACKSLASH_ESCAPES on MySQL) is only observable against a real server,
     # so both are supplied here. `server_backends_are_configured_in_ci` fails if
     # these ever stop being set, so a skipped test cannot read as a pass.
+    # Both servers run five hours behind UTC so that a zoned literal or value
+    # which silently lost its zone is off by five hours, not by nothing.
     services:
       mysql:
         image: mysql:8
         env:
           MYSQL_ROOT_PASSWORD: fluree
           MYSQL_DATABASE: bridge_test
+          TZ: America/New_York
         ports:
           - 3306:3306
         options: >-
@@ -153,6 +156,7 @@ jobs:
         env:
           POSTGRES_PASSWORD: fluree
           POSTGRES_DB: bridge_test
+          TZ: America/New_York
         ports:
           - 5432:5432
         options: >-
@@ -188,26 +192,33 @@ jobs:
 
       # The SQL pushdown lane's golden tests pin statements against a fake
       # endpoint; only a real database can confirm those statements return
-      # the rows the per-scan lane returns. The bridge is already built here,
-      # so run it over an empty SQLite file and replay every lane case through
-      # it. The test seeds its own tables and skips loudly when the URL is
-      # unset, so it cannot pass by not running.
-      - name: Start the bridge over SQLite
+      # the rows the per-scan lane returns and the rows the fake pinned. The
+      # bridge is already built here, so run one over each database (an empty
+      # SQLite file, and the two services) and replay every lane case through
+      # all three. The tests seed their own tables and skip loudly when a URL
+      # is unset; `live_bridge_backends_are_configured_in_ci` fails if any of
+      # the three is missing, so a skipped backend cannot read as a pass.
+      - name: Start a bridge over each database
         run: |
-          fluree-sql-bridge/target/debug/fluree-sql-bridge \
-            --database "sqlite://$RUNNER_TEMP/lane.db?mode=rwc" \
-            --listen 127.0.0.1:18080 &
-          for i in $(seq 1 60); do
-            curl -sf http://127.0.0.1:18080/v1/info >/dev/null && exit 0
-            sleep 1
+          bridge=fluree-sql-bridge/target/debug/fluree-sql-bridge
+          "$bridge" --database "sqlite://$RUNNER_TEMP/lane.db?mode=rwc" --listen 127.0.0.1:18080 &
+          "$bridge" --database "postgres://postgres:fluree@127.0.0.1:5432/bridge_test" --listen 127.0.0.1:18081 &
+          "$bridge" --database "mysql://root:fluree@127.0.0.1:3306/bridge_test" --listen 127.0.0.1:18082 &
+          for port in 18080 18081 18082; do
+            up=
+            for i in $(seq 1 60); do
+              if curl -sf "http://127.0.0.1:$port/v1/info" >/dev/null; then up=1; break; fi
+              sleep 1
+            done
+            if [ -z "$up" ]; then echo "bridge on $port did not come up" >&2; exit 1; fi
           done
-          echo "bridge did not come up" >&2
-          exit 1
 
-      - name: Pushdown lane differential against SQLite
+      - name: Pushdown lane differential against SQLite, Postgres and MySQL
         env:
           FLUREE_SQL_BRIDGE_URL: http://127.0.0.1:18080
-        run: cargo test -p fluree-db-api --features sql,native --test it_sql_pushdown_lane live_bridge
+          FLUREE_SQL_BRIDGE_POSTGRES_URL: http://127.0.0.1:18081
+          FLUREE_SQL_BRIDGE_MYSQL_URL: http://127.0.0.1:18082
+        run: cargo test -p fluree-db-api --features sql,native --test it_sql_pushdown_lane --test it_sql_graph_source live_bridge
 
   bench-paths:
     # Cost gate for bench-compare below, which is a ~30-minute job. GitHub's

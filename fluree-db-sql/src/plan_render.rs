@@ -22,7 +22,7 @@ use fluree_db_tabular::plan::{
 };
 use fluree_db_tabular::{BatchSchema, FieldType};
 
-use crate::dialect::{cmp_sql, is_numeric, render_literal, sql_string, SqlDialect};
+use crate::dialect::{cmp_sql, is_numeric, render_literal, SqlDialect};
 use crate::error::{Result, SqlError};
 
 struct Renderer<'a> {
@@ -382,7 +382,15 @@ impl Renderer<'_> {
                         left.alias, left.column, right.alias, right.column
                     )));
                 }
-                format!("{} = {}", self.col(left), self.col(right))
+                // MySQL joins strings under the column collation; `BINARY`
+                // on one side makes the comparison byte-wise, which is what
+                // the engine's IRI/literal join does.
+                let binary = if lt == FieldType::String && self.dialect == SqlDialect::Mysql {
+                    "BINARY "
+                } else {
+                    ""
+                };
+                format!("{} = {binary}{}", self.col(left), self.col(right))
             }
             Pred::IsNull(c) => format!("{} IS NULL", self.col(c)),
             Pred::IsNotNull(c) => format!("{} IS NOT NULL", self.col(c)),
@@ -404,17 +412,6 @@ impl Renderer<'_> {
     }
 
     fn literal(&self, lit: &Literal, ty: FieldType, col: &ColRef) -> Result<String> {
-        if let (Literal::Str(s), FieldType::String, SqlDialect::Mysql) = (lit, ty, self.dialect) {
-            // Byte comparison under MySQL's case-folding default collation.
-            return sql_string(s, self.dialect)
-                .map(|lit| format!("BINARY {lit}"))
-                .ok_or_else(|| {
-                    SqlError::Unsupported(format!(
-                        "string literal cannot be rendered safely for {}.{}",
-                        col.alias, col.column
-                    ))
-                });
-        }
         render_literal(lit, ty, self.dialect).ok_or_else(|| {
             SqlError::Unsupported(format!(
                 "literal {lit:?} cannot be compared with {}.{} ({ty:?})",
@@ -472,8 +469,14 @@ pub fn capabilities(dialect: SqlDialect) -> PushdownCapabilities {
         statement_max_bytes: STATEMENT_MAX_BYTES,
         // Byte equality: Trino compares code points; a deterministic Postgres
         // collation equates only identical strings; SQLite's default is BINARY;
-        // MySQL's default collation case-folds, which `BINARY` (above) undoes.
+        // MySQL's default collation case-folds, which the renderer undoes by
+        // marking every string literal and column-to-column comparison
+        // `BINARY` (see `render_literal` and `render_pred`).
         string_eq_is_binary: true,
+        // `GROUP BY` / `DISTINCT` cannot be forced binary on MySQL: with
+        // `ONLY_FULL_GROUP_BY` (the default) a projected column must appear in
+        // the `GROUP BY` as itself, so grouping folds case-variants together.
+        string_distinct_is_binary: !matches!(dialect, SqlDialect::Mysql),
         string_order_is_codepoint: matches!(dialect, SqlDialect::Trino | SqlDialect::Sqlite),
     }
 }
@@ -707,6 +710,43 @@ mod tests {
         assert_eq!(
             sql,
             "SELECT `c`.`id` AS `c0` FROM `customers` AS `c` WHERE `c`.`name` = BINARY 'Bob'"
+        );
+    }
+
+    /// A string join on MySQL compares bytes too, and an integer join is
+    /// left alone.
+    #[test]
+    fn mysql_string_join_is_binary() {
+        let mut schemas = schemas();
+        schemas.insert(
+            "t".to_string(),
+            schema(&[("tag", FieldType::String), ("owner", FieldType::Int64)]),
+        );
+        let plan = RelPlan {
+            root: RelNode::Join {
+                left: Box::new(access("t", "tags")),
+                right: Box::new(access("c", "customers")),
+                on: Pred::And(vec![
+                    Pred::ColEq {
+                        left: ColRef::new("t", "tag"),
+                        right: ColRef::new("c", "name"),
+                    },
+                    Pred::ColEq {
+                        left: ColRef::new("t", "owner"),
+                        right: ColRef::new("c", "id"),
+                    },
+                ]),
+            },
+            output: vec![out("c", "id", "c0")],
+            group_by: Vec::new(),
+            distinct: false,
+            order_by: vec![],
+            limit: None,
+        };
+        let sql = render_plan(&plan, &schemas, SqlDialect::Mysql).unwrap();
+        assert_eq!(
+            sql,
+            "SELECT `c`.`id` AS `c0` FROM `tags` AS `t` JOIN `customers` AS `c` ON `t`.`tag` = BINARY `c`.`name` AND `t`.`owner` = `c`.`id`"
         );
     }
 

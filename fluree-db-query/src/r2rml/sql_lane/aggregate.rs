@@ -204,7 +204,7 @@ fn lower_aggregate(
     for v in &plan.group_by {
         let (src, cols) = var_of(*v)?;
         for col in cols {
-            if field_type(col) == Some(FieldType::String) && !caps.string_eq_is_binary {
+            if field_type(col) == Some(FieldType::String) && !caps.string_distinct_is_binary {
                 return Err("string key under a collating dialect");
             }
             if !claimed.insert((col.alias.clone(), col.column.clone())) {
@@ -284,7 +284,8 @@ fn lower_aggregate(
                     let [col] = cols.as_slice() else {
                         return Err("COUNT DISTINCT over a template");
                     };
-                    if field_type(col) == Some(FieldType::String) && !caps.string_eq_is_binary {
+                    if field_type(col) == Some(FieldType::String) && !caps.string_distinct_is_binary
+                    {
                         return Err("COUNT DISTINCT of strings under a collating dialect");
                     }
                     col

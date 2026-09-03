@@ -401,10 +401,10 @@ impl<'a> Lowerer<'a> {
         // returns each distinct combination of those variables' columns
         // once, keeping the columns the in-memory join and the residual
         // filters read. Distinct column values are distinct terms only when
-        // string equality is byte equality (a case-folding collation would
-        // merge two IRIs or literals).
+        // the database keeps byte-distinct strings apart (a case-folding
+        // collation would merge two IRIs or literals).
         let distinct_vars: Option<HashSet<VarId>> = projection
-            .filter(|_| self.caps.string_eq_is_binary)
+            .filter(|_| self.caps.string_distinct_is_binary)
             .map(|proj| {
                 let mut keep: HashSet<VarId> = proj.iter().copied().collect();
                 keep.extend(child_vars.iter().copied());
