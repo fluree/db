@@ -41,9 +41,12 @@ fn cell(row: &SqliteRow, i: usize, trino: &str) -> Result<Value, String> {
     if raw.is_null() {
         return Ok(Value::Null);
     }
+    // Unchecked: SQLite stores each cell in its own storage class (a
+    // `NUMERIC` column holds `5.00` as an INTEGER and `99.50` as a REAL), so
+    // the declared type is a conversion target, not a guarantee.
     macro_rules! get {
         ($ty:ty) => {
-            row.try_get::<$ty, _>(i)
+            row.try_get_unchecked::<$ty, _>(i)
                 .map_err(|e| format!("column {i}: {e}"))?
         };
     }
