@@ -32,8 +32,9 @@ pub use fluree_db_tabular::plan;
 pub use fused_aggregate::{detect_fused_r2rml_aggregate, FusedR2rmlAggregateOperator};
 pub use operator::{R2rmlParentMemo, R2rmlScanOperator};
 pub use provider::{
-    ColumnBatchStream, NoOpR2rmlProvider, ObjectConstant, PushdownCapabilities, R2rmlProvider,
-    R2rmlTableProvider, RelPlan, ScanCmpOp, ScanFilter, ScanTopK, ScanValue, TableWatermark,
+    BatchSchema, ColumnBatchStream, NoOpR2rmlProvider, ObjectConstant, PushdownCapabilities,
+    R2rmlProvider, R2rmlTableProvider, RelPlan, RelSource, ScanCmpOp, ScanFilter, ScanTopK,
+    ScanValue, TableWatermark,
 };
 pub use rewrite::{
     convert_triple_to_r2rml, r2rml_unsupported_pattern_error, rewrite_patterns_for_r2rml,

@@ -17,7 +17,7 @@ use fluree_db_r2rml::materialize::{
 use fluree_db_tabular::plan::{Literal, OutputCol};
 use fluree_db_tabular::{BatchSchema, Column, ColumnBatch, FieldInfo};
 
-use super::lower::{literal_of, AccessInfo, KeyShape, Lowered, RdfClass, TermSource};
+use super::lower::{key_fits, literal_of, AccessInfo, KeyShape, Lowered, RdfClass, TermSource};
 use crate::binding::Binding;
 use crate::error::{QueryError, Result};
 use crate::r2rml::operator::LiteralEncoder;
@@ -197,13 +197,19 @@ pub(crate) fn seed_values(
     snapshot: Option<&LedgerSnapshot>,
 ) -> Option<Vec<Literal>> {
     match shape {
-        KeyShape::Template { template, cols } => {
+        KeyShape::Template {
+            template,
+            cols,
+            types,
+        } => {
             let iri = iri_of_binding(binding, snapshot)?;
             let keys = reverse_subject_template(template, &iri)?;
             cols.iter()
-                .map(|c| {
+                .zip(types)
+                .map(|(c, ty)| {
                     keys.iter()
                         .find(|(col, _)| col == &c.column)
+                        .filter(|(_, raw)| key_fits(*ty, raw))
                         .map(|(_, raw)| Literal::TemplateKey(raw.clone()))
                 })
                 .collect()

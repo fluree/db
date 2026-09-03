@@ -42,6 +42,7 @@ Tracking provides:
 - **fuel**: Total cost as a decimal value (rounded to 3 places)
 - **policy**: Policy evaluation statistics (`{policy-id: {executed: N, allowed: M}}`)
 - **policy_enforcement**: Whether policy governed the request at all (`{enforced, denies_all_data}`), present only when it did
+- **sql**: The statements the [SQL pushdown lane](../graph-sources/sql.md#the-pushdown-lane-one-statement-per-block) sent to SQL graph sources, in order, as `[{"source": "<graph source id>", "sql": "<statement>"}]`; absent when no block was pushed down
 
 `policy` and `policy_enforcement` are not only performance statistics — they
 are the authorization-visibility signal. Policy filtering is otherwise

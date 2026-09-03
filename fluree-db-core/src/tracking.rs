@@ -252,6 +252,8 @@ struct TrackerInner {
     // reasoning mode ran). Not gated by an option: a capped materialization
     // is a correctness signal, so any enabled tracker reports it.
     reasoning: RwLock<Option<ReasoningTally>>,
+    /// Statements the SQL pushdown lane sent to graph sources, in order.
+    statements: RwLock<Vec<PushedStatement>>,
 
     options: TrackingOptions,
 }
@@ -276,6 +278,7 @@ impl Tracker {
             policy_stats: RwLock::new(HashMap::new()),
             policy_enforcement: RwLock::new(None),
             reasoning: RwLock::new(None),
+            statements: RwLock::new(Vec::new()),
             options,
         })))
     }
@@ -439,6 +442,20 @@ impl Tracker {
         }
     }
 
+    /// Record a statement the SQL pushdown lane sent to `source`, so the
+    /// response reports what ran remotely.
+    pub fn record_statement(&self, source: &str, sql: &str) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if let Ok(mut slot) = inner.statements.write() {
+            slot.push(PushedStatement {
+                source: source.to_string(),
+                sql: sql.to_string(),
+            });
+        }
+    }
+
     /// Read fuel consumed so far, in micro-fuel, without finalizing.
     ///
     /// Lock-free: a single relaxed load of the fuel counter. Safe to call
@@ -482,6 +499,12 @@ impl Tracker {
             },
             policy_enforcement: inner.policy_enforcement.read().ok().and_then(|p| p.clone()),
             reasoning: inner.reasoning.read().ok().and_then(|r| r.clone()),
+            sql: inner
+                .statements
+                .read()
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.clone()),
         })
     }
 }
@@ -506,6 +529,18 @@ pub struct TrackingTally {
     /// Reasoning materialization outcome, when a reasoning mode ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningTally>,
+    /// Statements the SQL pushdown lane sent to graph sources, in the order
+    /// they ran. Absent when no block was pushed down.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql: Option<Vec<PushedStatement>>,
+}
+
+/// One statement the SQL pushdown lane sent to a graph source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushedStatement {
+    /// The graph source the statement ran against.
+    pub source: String,
+    pub sql: String,
 }
 
 /// Outcome of an OWL2-RL materialization, reported per request.

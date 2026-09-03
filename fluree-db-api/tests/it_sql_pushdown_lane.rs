@@ -20,6 +20,12 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 use wiremock::MockServer;
 
+/// The shop mapping over `shop.customers` / `shop.orders` (the fixture) or,
+/// for a live SQLite run, unqualified table names.
+fn shop_mapping(prefix: &str) -> String {
+    SHOP_R2RML.replace("shop.", prefix)
+}
+
 const SHOP_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
     @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
@@ -43,6 +49,14 @@ const SHOP_R2RML: &str = r#"
         rr:predicateObjectMap [
             rr:predicate ex:placed ;
             rr:objectMap [ rr:column "placed" ; rr:datatype xsd:date ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:shipped ;
+            rr:objectMap [ rr:column "shipped" ; rr:datatype xsd:dateTime ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:updated ;
+            rr:objectMap [ rr:column "updated" ; rr:datatype xsd:dateTime ]
         ] ;
         rr:predicateObjectMap [
             rr:predicate ex:customer ;
@@ -80,12 +94,44 @@ async fn shop() -> MockServer {
                 ("customer_id", "bigint"),
                 ("total", "decimal(10,2)"),
                 ("placed", "date"),
+                // A zoned and a naive timestamp: only the zoned one compares
+                // exactly with an xsd:dateTime literal in SQL.
+                ("shipped", "timestamp(6) with time zone"),
+                ("updated", "timestamp(6)"),
             ],
             vec![
-                vec![json!(10), json!(1), json!("99.50"), json!("2024-01-05")],
-                vec![json!(11), json!(1), json!("5.00"), json!("2024-02-01")],
-                vec![json!(12), json!(2), json!("42.00"), json!("2024-03-01")],
-                vec![json!(13), Value::Null, json!("7.00"), Value::Null],
+                vec![
+                    json!(10),
+                    json!(1),
+                    json!("99.50"),
+                    json!("2024-01-05"),
+                    json!("2024-01-06 09:30:00.000000 UTC"),
+                    json!("2024-01-06 09:30:00.000000"),
+                ],
+                vec![
+                    json!(11),
+                    json!(1),
+                    json!("5.00"),
+                    json!("2024-02-01"),
+                    json!("2024-02-02 18:00:00.000000 UTC"),
+                    json!("2024-02-02 18:00:00.000000"),
+                ],
+                vec![
+                    json!(12),
+                    json!(2),
+                    json!("42.00"),
+                    json!("2024-03-01"),
+                    Value::Null,
+                    Value::Null,
+                ],
+                vec![
+                    json!(13),
+                    Value::Null,
+                    json!("7.00"),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ],
             ],
         ))
         .mount()
@@ -96,7 +142,11 @@ async fn setup() -> (MockServer, Fluree) {
     let server = shop().await;
     let fluree = FlureeBuilder::memory().build_memory();
     fluree
-        .create_sql_graph_source(SqlCreateConfig::new("shop-sql", server.uri(), SHOP_R2RML))
+        .create_sql_graph_source(SqlCreateConfig::new(
+            "shop-sql",
+            server.uri(),
+            shop_mapping("shop."),
+        ))
         .await
         .expect("create sql source");
     (server, fluree)
@@ -173,6 +223,8 @@ struct Case {
     sql: Option<&'static str>,
     rows: &'static [&'static str],
     routing: Routing,
+    /// The decline reason the lowering must report, for `MustNotFire` shapes.
+    declined: Option<&'static str>,
 }
 
 const PREFIX: &str =
@@ -189,6 +241,7 @@ fn cases() -> Vec<Case> {
                 "o=http://example.org/order/12 t=42.00",
             ],
             routing: Routing::MustFire,
+            declined: None,
         },
         Case {
             name: "foreign-key join between two entities",
@@ -200,6 +253,7 @@ fn cases() -> Vec<Case> {
                 "n=Bo o=http://example.org/order/12",
             ],
             routing: Routing::MustFire,
+            declined: None,
         },
         Case {
             name: "foreign-key object alone joins the parent for its IRI",
@@ -211,6 +265,7 @@ fn cases() -> Vec<Case> {
                 "c=http://example.org/customer/2 o=http://example.org/order/12",
             ],
             routing: Routing::MustFire,
+            declined: None,
         },
         Case {
             name: "constant subject reverses through the template",
@@ -218,6 +273,7 @@ fn cases() -> Vec<Case> {
             sql: Some(r#"SELECT "t0"."total" AS "c0" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."id" = 10 AND "t0"."total" IS NOT NULL"#),
             rows: &["t=99.50"],
             routing: Routing::MustFire,
+            declined: None,
         },
         Case {
             name: "optional member of the same entity is a nullable column",
@@ -225,6 +281,7 @@ fn cases() -> Vec<Case> {
             sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t0"."country" AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
             rows: &["k= n=Bo", "k=UK n=Ada", "k=US n=Cy"],
             routing: Routing::MustFire,
+            declined: None,
         },
         Case {
             name: "optional entity hanging off a foreign key is a left join",
@@ -237,6 +294,7 @@ fn cases() -> Vec<Case> {
                 "n=Cy o=",
             ],
             routing: Routing::MustFire,
+            declined: None,
         },
         Case {
             name: "unpushable filter stays in the engine as a residual",
@@ -244,6 +302,7 @@ fn cases() -> Vec<Case> {
             sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
             rows: &["n=Ada"],
             routing: Routing::MustFire,
+            declined: None,
         },
         Case {
             name: "typed date filter pushes as a DATE literal",
@@ -251,6 +310,7 @@ fn cases() -> Vec<Case> {
             sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."placed" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL AND "t0"."placed" >= DATE '2024-02-01'"#),
             rows: &["o=http://example.org/order/11", "o=http://example.org/order/12"],
             routing: Routing::MustFire,
+            declined: None,
         },
         Case {
             name: "IN list pushes as a set",
@@ -258,6 +318,7 @@ fn cases() -> Vec<Case> {
             sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."name" IN ('Ada', 'Cy')"#),
             rows: &["n=Ada", "n=Cy"],
             routing: Routing::MustFire,
+            declined: None,
         },
         Case {
             name: "VALUES in the block is a static key set",
@@ -265,6 +326,7 @@ fn cases() -> Vec<Case> {
             sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" JOIN (VALUES (2)) AS "v0" ("k0") ON "v0"."k0" = "t0"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
             rows: &["n=Bo"],
             routing: Routing::MustFire,
+            declined: None,
         },
         Case {
             name: "LIMIT without ORDER BY pushes a LIMIT",
@@ -272,6 +334,100 @@ fn cases() -> Vec<Case> {
             sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL LIMIT 2"#),
             rows: &["o=http://example.org/order/10", "o=http://example.org/order/11"],
             routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "dateTime filter pushes as a zoned TIMESTAMP against a zoned column",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:shipped ?s FILTER(?s > \"2024-01-10T00:00:00Z\"^^xsd:dateTime) }",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."shipped" AT TIME ZONE 'UTC' AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."shipped" IS NOT NULL AND "t0"."shipped" > TIMESTAMP '2024-01-10 00:00:00.000000 UTC'"#),
+            rows: &["o=http://example.org/order/11"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "dateTime filter on a naive timestamp column stays in the engine",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:updated ?u FILTER(?u > \"2024-01-10T00:00:00Z\"^^xsd:dateTime) }",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."updated" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."updated" IS NOT NULL"#),
+            rows: &["o=http://example.org/order/11"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "ORDER BY DESC LIMIT pushes a top-k",
+            sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { ?o ex:total ?t } ORDER BY DESC(?t) LIMIT 2",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL ORDER BY "t0"."total" DESC LIMIT 2"#),
+            rows: &[
+                "o=http://example.org/order/10 t=99.50",
+                "o=http://example.org/order/12 t=42.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "OFFSET widens the pushed top-k",
+            sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { ?o ex:total ?t } ORDER BY DESC(?t) OFFSET 1 LIMIT 1",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL ORDER BY "t0"."total" DESC LIMIT 2"#),
+            rows: &["o=http://example.org/order/12 t=42.00"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a residual filter keeps LIMIT in the engine",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(STRLEN(?n) > 1) } LIMIT 1",
+            sql: Some(r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#),
+            rows: &["n=Ada"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "constant subject whose key cannot be the column's type is empty without a round trip",
+            sparql: "SELECT ?t FROM <shop-sql:main> WHERE { <http://example.org/order/abc> ex:total ?t }",
+            sql: None,
+            rows: &[],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "predicates of two triples maps on one subject are empty without a round trip",
+            sparql: "SELECT ?n ?t FROM <shop-sql:main> WHERE { ?x ex:name ?n . ?x ex:total ?t }",
+            sql: None,
+            rows: &[],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a variable shared by two value classes declines",
+            sparql: "SELECT ?c ?o FROM <shop-sql:main> WHERE { ?c ex:name ?v . ?o ex:total ?v }",
+            sql: None,
+            rows: &[],
+            routing: Routing::MustNotFire,
+            declined: Some("repeated variable joins two value classes"),
+        },
+        Case {
+            name: "an optional hanging off an optional entity declines",
+            sparql: "SELECT ?n ?t FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?o ex:customer ?c } OPTIONAL { ?o ex:total ?t } }",
+            sql: None,
+            rows: &["n=Ada t=5.00", "n=Ada t=99.50", "n=Bo t=42.00", "n=Cy t="],
+            routing: Routing::MustNotFire,
+            declined: Some("optional chained on an optional entity"),
+        },
+        Case {
+            name: "an inexact filter inside OPTIONAL declines",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k FILTER(STRLEN(?k) > 1) } }",
+            sql: None,
+            rows: &["k= n=Bo", "k=UK n=Ada", "k=US n=Cy"],
+            routing: Routing::MustNotFire,
+            declined: Some("filter inside a folded optional"),
+        },
+        Case {
+            name: "VALUES over an optional variable declines",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k } VALUES ?k { \"UK\" } }",
+            sql: None,
+            // An unbound ?k is compatible with the VALUES row, so Bo keeps it;
+            // a WHERE on the column would have dropped that row.
+            rows: &["k=UK n=Ada", "k=UK n=Bo"],
+            routing: Routing::MustNotFire,
+            declined: Some("VALUES over an optional variable"),
         },
         Case {
             name: "variable predicate is not admitted",
@@ -283,6 +439,7 @@ fn cases() -> Vec<Case> {
                 "p=http://www.w3.org/1999/02/22-rdf-syntax-ns#type v=http://example.org/Customer",
             ],
             routing: Routing::MustNotFire,
+            declined: None,
         },
         Case {
             name: "disconnected entities decline (no cartesian product)",
@@ -290,6 +447,7 @@ fn cases() -> Vec<Case> {
             sql: None,
             rows: &["n=Ada t=99.50", "n=Bo t=99.50", "n=Cy t=99.50"],
             routing: Routing::MustNotFire,
+            declined: Some("disconnected entities (cartesian product)"),
         },
     ]
 }
@@ -341,6 +499,14 @@ async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
                         "{}: `{SITE}` proceeded on a declined shape",
                         c.name
                     ));
+                }
+                if let Some(why) = c.declined {
+                    if !declined.iter().any(|d| d == why) {
+                        failures.push(format!(
+                            "{}: expected decline `{why}`, got {declined:?}",
+                            c.name
+                        ));
+                    }
                 }
             }
         }
@@ -537,6 +703,125 @@ async fn outer_bindings_become_a_key_set() {
     ";
     let rows = rows_of(&query(&fluree, sparql).await);
     assert_eq!(rows, vec!["n=Ada tier=gold", "n=Cy tier=silver"]);
+}
+
+/// A tracked query reports every statement the lane sent, in order, so a
+/// caller can see what ran remotely without reading the server log.
+#[tokio::test]
+async fn tracked_queries_report_the_statements_sent() {
+    let _lock = KILL_SWITCH.lock().await;
+    let (_server, fluree) = setup().await;
+    set_fast_paths_disabled(false);
+    let response = fluree
+        .query_from()
+        .sparql(&format!(
+            "{PREFIX}SELECT ?o ?n FROM <shop-sql:main> WHERE {{ ?o ex:customer ?c . ?c ex:name ?n }}"
+        ))
+        .execute_tracked()
+        .await
+        .unwrap_or_else(|e| panic!("tracked query failed: {}", e.error));
+    let sent: Vec<(String, String)> = response
+        .sql
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| (s.source, s.sql))
+        .collect();
+    assert_eq!(
+        sent,
+        vec![(
+            "shop-sql:main".to_string(),
+            r#"SELECT "t0"."id" AS "c0", "t1"."id" AS "c1", "t1"."name" AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL"#.to_string()
+        )]
+    );
+
+    // A query the lane never ran reports nothing.
+    let response = fluree
+        .query_from()
+        .sparql(&format!(
+            "{PREFIX}SELECT ?p ?v FROM <shop-sql:main> WHERE {{ <http://example.org/customer/1> ?p ?v }}"
+        ))
+        .execute_tracked()
+        .await
+        .unwrap_or_else(|e| panic!("tracked query failed: {}", e.error));
+    assert!(response.sql.is_none(), "{:?}", response.sql);
+}
+
+/// Every case replayed against a real database: SQLite behind
+/// `fluree-sql-bridge`, seeded through the bridge itself. The fake endpoint
+/// pins the statements; this pins that a database agrees with the per-scan
+/// lane on the rows. Gated on `FLUREE_SQL_BRIDGE_URL` (a bridge over an
+/// otherwise unused SQLite file); CI's bridge job sets it.
+#[tokio::test]
+async fn live_bridge_agrees_with_the_scan_lane() {
+    let Ok(url) = std::env::var("FLUREE_SQL_BRIDGE_URL") else {
+        eprintln!("FLUREE_SQL_BRIDGE_URL unset: live bridge differential skipped");
+        return;
+    };
+    let _lock = KILL_SWITCH.lock().await;
+
+    let mut cfg = fluree_db_sql::SqlGsConfig::new(url.clone());
+    cfg.dialect = fluree_db_api::SqlDialect::Sqlite;
+    let cfg = cfg.hydrate(None).await.expect("hydrate");
+    let auth = cfg.auth.create_provider_arc().expect("auth");
+    let client = fluree_db_sql::TrinoClient::new(&cfg, auth).expect("client");
+    for stmt in [
+        "DROP TABLE IF EXISTS customers",
+        "DROP TABLE IF EXISTS orders",
+        "CREATE TABLE customers (id INTEGER, name TEXT, country TEXT)",
+        "CREATE TABLE orders (id INTEGER, customer_id INTEGER, total NUMERIC, placed DATE, shipped TIMESTAMP, updated TIMESTAMP)",
+        "INSERT INTO customers VALUES (1, 'Ada', 'UK'), (2, 'Bo', NULL), (3, 'Cy', 'US')",
+        "INSERT INTO orders VALUES \
+            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00', '2024-01-06 09:30:00'), \
+            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00', '2024-02-02 18:00:00'), \
+            (12, 2, 42.00, '2024-03-01', NULL, NULL), \
+            (13, NULL, 7.00, NULL, NULL, NULL)",
+    ] {
+        client
+            .execute_collect(stmt)
+            .await
+            .unwrap_or_else(|e| panic!("seed failed: {e}\n{stmt}"));
+    }
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut source = SqlCreateConfig::new("shop-live", url, shop_mapping(""));
+    source.dialect = fluree_db_api::SqlDialect::Sqlite;
+    fluree
+        .create_sql_graph_source(source)
+        .await
+        .expect("create live sql source");
+
+    let mut failures: Vec<String> = Vec::new();
+    for c in cases() {
+        let sparql = format!("{PREFIX}{}", c.sparql).replace("shop-sql:main", "shop-live:main");
+        set_fast_paths_disabled(false);
+        let tracked = fluree
+            .query_from()
+            .sparql(&sparql)
+            .execute_tracked()
+            .await
+            .unwrap_or_else(|e| panic!("{}: lane query failed: {}\n{sparql}", c.name, e.error));
+        let lane_rows = rows_of(&tracked.result);
+        let sent = tracked.sql.unwrap_or_default();
+        match (&c.routing, c.sql) {
+            (Routing::MustFire, Some(_)) if sent.is_empty() => {
+                failures.push(format!("{}: the lane sent no statement", c.name));
+            }
+            (Routing::MustNotFire, _) if !sent.is_empty() => {
+                failures.push(format!("{}: a declined shape sent {sent:?}", c.name));
+            }
+            _ => {}
+        }
+        set_fast_paths_disabled(true);
+        let scan_rows = rows_of(&query(&fluree, &sparql).await);
+        if lane_rows != scan_rows {
+            failures.push(format!(
+                "{}: lane rows {lane_rows:?} differ from scan lane rows {scan_rows:?} [sent: {sent:?}]",
+                c.name
+            ));
+        }
+    }
+    set_fast_paths_disabled(false);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
 }
 
 const DUP_R2RML: &str = r#"

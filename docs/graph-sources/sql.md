@@ -191,9 +191,15 @@ pushable. In that statement:
   `LEFT JOIN`;
 - a `FILTER` is pushed only when it is exact — the column's RDF datatype
   (from `rr:datatype`; `xsd:string` when un-annotated), the literal's type
-  and the SQL type agree, and for strings the dialect compares bytes.
-  Anything else stays in the engine as a residual filter over the returned
-  rows;
+  and the **probed SQL type** agree, and for strings the dialect compares
+  bytes. A numeric literal against a text column the mapping reads as a
+  number, or an `xsd:dateTime` literal (always a UTC instant) against a
+  `timestamp` without a zone, is not exact and stays in the engine as a
+  residual filter over the returned rows; against a `timestamp with time
+  zone` column it pushes as a zoned `TIMESTAMP` literal;
+- a constant subject or object IRI is reversed through its template into
+  key predicates; a key that cannot be a value of its column (`order/abc`
+  over a `bigint`) makes the block empty without a round trip;
 - a `VALUES` block, and bindings the outer query already holds (a ledger
   pattern joined to the block), are sent as a `VALUES` key set so the
   source does the semi-join;
@@ -207,7 +213,10 @@ entity, disconnected entities (a Cartesian product), a filter inside an
 optional that is not exact, subject-targeted view policies — decline to the
 per-scan lane below, which is also the differential oracle in the test
 suite. `FLUREE_SQL_PUSHDOWN_LANE=0` disables the lane. The statement sent
-is logged at `info` as `SQL block pushdown`.
+is logged at `info` as `SQL block pushdown`, and a tracked query (`"meta":
+true`) returns every statement the lane ran under `sql` as
+`[{"source", "sql"}]` — see [Tracking and
+Fuel](../query/tracking-and-fuel.md#tracked-information).
 
 ### Subject keys must be unique
 

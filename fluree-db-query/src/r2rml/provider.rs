@@ -22,7 +22,8 @@ pub type ColumnBatchStream = Pin<Box<dyn Stream<Item = Result<ColumnBatch>> + Se
 // Re-export from fluree-db-r2rml for convenience
 pub use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 // The dialect-neutral plan a whole block lowers to (see `sql_lane`).
-pub use fluree_db_tabular::plan::{PushdownCapabilities, RelPlan};
+pub use fluree_db_tabular::plan::{PushdownCapabilities, RelPlan, RelSource};
+pub use fluree_db_tabular::BatchSchema;
 
 /// Comparison operator for a pushed-down scan filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,6 +334,18 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
         graph_source_id: &str,
     ) -> Result<Option<PushdownCapabilities>> {
         let _ = graph_source_id;
+        Ok(None)
+    }
+
+    /// The probed column schema of one relation of `graph_source_id`, for a
+    /// provider that can execute plans (it caches the probe). The lowering
+    /// asks only for relations a typed literal has to be compared against.
+    async fn source_schema(
+        &self,
+        graph_source_id: &str,
+        source: &RelSource,
+    ) -> Result<Option<Arc<BatchSchema>>> {
+        let _ = (graph_source_id, source);
         Ok(None)
     }
 

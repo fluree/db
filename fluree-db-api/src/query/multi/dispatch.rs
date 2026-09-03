@@ -162,7 +162,9 @@ pub(crate) struct AliasOutcome {
 pub(crate) enum AliasOutcomeKind {
     Success {
         data: JsonValue,
-        tally: Option<TrackingTally>,
+        /// Boxed: a tally is several optional maps and lists, far larger than
+        /// the other variants.
+        tally: Option<Box<TrackingTally>>,
     },
     Error {
         code: String,
@@ -653,7 +655,7 @@ fn success_or_size_error(output: SubqueryOutput, max_bytes: usize) -> AliasOutco
     } else {
         AliasOutcomeKind::Success {
             data: output.data,
-            tally: output.tally,
+            tally: output.tally.map(Box::new),
         }
     }
 }

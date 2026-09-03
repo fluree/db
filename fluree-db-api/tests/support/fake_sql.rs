@@ -539,7 +539,11 @@ fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
             .ok()
             .partial_cmp(&y.as_f64())
             .unwrap_or(Ordering::Equal),
-        (Value::String(x), Value::String(y)) => x.cmp(y),
+        // Decimals arrive as strings; order them as numbers when both parse.
+        (Value::String(x), Value::String(y)) => match (x.parse::<f64>(), y.parse::<f64>()) {
+            (Ok(a), Ok(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+            _ => x.cmp(y),
+        },
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Null, _) => Ordering::Less,

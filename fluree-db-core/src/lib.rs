@@ -213,8 +213,8 @@ pub use storage::{FileStorage, STORAGE_METHOD_FILE};
 pub use subject_id::{SubjectId, SubjectIdColumn, SubjectIdEncoding};
 pub use temporal::{Date, DateTime, Time};
 pub use tracking::{
-    FuelExceededError, PolicyEnforcement, PolicyStats, ReasoningTally, Tracker, TrackingOptions,
-    TrackingTally,
+    FuelExceededError, PolicyEnforcement, PolicyStats, PushedStatement, ReasoningTally, Tracker,
+    TrackingOptions, TrackingTally,
 };
 pub use value::{
     parse_decimal, parse_decimal_string, parse_double, parse_integer, parse_integer_string,

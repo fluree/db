@@ -1808,6 +1808,23 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         Ok(None)
     }
 
+    async fn source_schema(
+        &self,
+        graph_source_id: &str,
+        source: &fluree_db_query::r2rml::RelSource,
+    ) -> QueryResult<Option<Arc<fluree_db_query::r2rml::BatchSchema>>> {
+        #[cfg(feature = "sql")]
+        if let Some(sql) = self.sql_source(graph_source_id).await? {
+            let mapping = self.compiled_mapping(graph_source_id, None).await?;
+            return sql
+                .source_schema(&self.session, &mapping, source)
+                .await
+                .map(Some);
+        }
+        let _ = (graph_source_id, source);
+        Ok(None)
+    }
+
     async fn execute_plan(
         &self,
         graph_source_id: &str,

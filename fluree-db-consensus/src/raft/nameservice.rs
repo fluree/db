@@ -2456,6 +2456,7 @@ mod tests {
                 iterations: 3,
                 duration_ms: 17,
             }),
+            sql: None,
         }
     }
 
@@ -2534,6 +2535,7 @@ mod tests {
                 iterations: 1,
                 duration_ms: 5,
             }),
+            sql: None,
         };
         let receipt = AppliedReceipt::Transact(TransactApplied {
             commit_id: cid(2),
@@ -2811,6 +2813,7 @@ mod tests {
             }),
             policy_enforcement: None,
             reasoning: Some(original_reasoning),
+            sql: None,
         };
         let original_transact = TransactApplied {
             commit_id: cid(2),
@@ -2857,7 +2860,9 @@ mod tests {
             policy: rt_policy,
             policy_enforcement: rt_policy_enforcement,
             reasoning: rt_reasoning,
+            sql: rt_sql,
         } = rt_tally.expect("tally Some on round-trip");
+        assert_eq!(rt_sql, None);
         assert_eq!(rt_time, original_tally.time);
         assert_eq!(rt_fuel, original_tally.fuel);
         assert_eq!(rt_policy, original_tally.policy);

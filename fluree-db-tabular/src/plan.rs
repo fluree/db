@@ -102,7 +102,7 @@ impl Pred {
 }
 
 /// Where a relation's rows come from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RelSource {
     /// Dotted table name.
     Table(String),

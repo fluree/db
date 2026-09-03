@@ -111,6 +111,8 @@ impl From<RecordedTally> for TrackingTally {
             // mirror — adding a field would shift every postcard byte offset.
             policy_enforcement: None,
             reasoning: r.reasoning.map(Into::into),
+            // Likewise read-path only (SQL pushdown statements).
+            sql: None,
         }
     }
 }

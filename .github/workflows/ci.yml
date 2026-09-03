@@ -167,7 +167,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          workspaces: "fluree-sql-bridge -> target"
+          workspaces: |
+            fluree-sql-bridge -> target
+            . -> target
 
       - name: Format
         working-directory: fluree-sql-bridge
@@ -183,6 +185,29 @@ jobs:
           FLUREE_BRIDGE_MYSQL_URL: mysql://root:fluree@127.0.0.1:3306/bridge_test
           FLUREE_BRIDGE_POSTGRES_URL: postgres://postgres:fluree@127.0.0.1:5432/bridge_test
         run: cargo test
+
+      # The SQL pushdown lane's golden tests pin statements against a fake
+      # endpoint; only a real database can confirm those statements return
+      # the rows the per-scan lane returns. The bridge is already built here,
+      # so run it over an empty SQLite file and replay every lane case through
+      # it. The test seeds its own tables and skips loudly when the URL is
+      # unset, so it cannot pass by not running.
+      - name: Start the bridge over SQLite
+        run: |
+          fluree-sql-bridge/target/debug/fluree-sql-bridge \
+            --database "sqlite://$RUNNER_TEMP/lane.db?mode=rwc" \
+            --listen 127.0.0.1:18080 &
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:18080/v1/info >/dev/null && exit 0
+            sleep 1
+          done
+          echo "bridge did not come up" >&2
+          exit 1
+
+      - name: Pushdown lane differential against SQLite
+        env:
+          FLUREE_SQL_BRIDGE_URL: http://127.0.0.1:18080
+        run: cargo test -p fluree-db-api --features sql,native --test it_sql_pushdown_lane live_bridge
 
   bench-paths:
     # Cost gate for bench-compare below, which is a ~30-minute job. GitHub's

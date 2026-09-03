@@ -11,6 +11,7 @@
 //! the per-scan lane runs. There is no approximate translation.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot};
 use fluree_db_r2rml::mapping::{
@@ -21,7 +22,7 @@ use fluree_db_r2rml::RdfTerm;
 use fluree_db_tabular::plan::{
     CmpOp, ColRef, KeySet, Literal, OutputCol, Pred, PushdownCapabilities, RelNode, RelSource,
 };
-use fluree_db_tabular::FieldType;
+use fluree_db_tabular::{BatchSchema, FieldType};
 use fluree_vocab::{rdf, xsd, UnresolvedDatatypeConstraint};
 
 use crate::binding::Binding;
@@ -73,8 +74,14 @@ pub(crate) enum RdfClass {
 /// a filter can be expressed on.
 #[derive(Debug, Clone)]
 pub(crate) enum KeyShape {
-    /// An IRI rendered from `template` over `cols` (in placeholder order).
-    Template { template: String, cols: Vec<ColRef> },
+    /// An IRI rendered from `template` over `cols` (in placeholder order);
+    /// `types` are the probed column types, when known, so a reversed key
+    /// that cannot be a value of its column is recognized as matching nothing.
+    Template {
+        template: String,
+        cols: Vec<ColRef>,
+        types: Vec<Option<FieldType>>,
+    },
     /// A raw column value, as a literal of `class` (or an IRI when `Iri`).
     Column { col: ColRef, class: RdfClass },
 }
@@ -159,6 +166,8 @@ pub(crate) struct LowerInput<'a> {
     /// Variables bound by the outer query that this block shares.
     pub child_vars: &'a [VarId],
     pub policy: Option<PolicyVerdict<'a>>,
+    /// Probed schemas for the relations [`wanted_schemas`] named.
+    pub schemas: &'a HashMap<RelSource, Arc<BatchSchema>>,
 }
 
 /// Lower a block. `Ok(Err(Decline))` is a structural decline (the per-scan
@@ -172,6 +181,7 @@ pub(crate) fn lower_block(input: LowerInput<'_>) -> Result<Lowering<Option<Lower
         mapping: input.mapping,
         caps: input.caps,
         policy: input.policy,
+        schemas: input.schemas,
         next_alias: 0,
         accesses: Vec::new(),
         access_preds: HashMap::new(),
@@ -190,6 +200,7 @@ struct Lowerer<'a> {
     mapping: &'a CompiledR2rmlMapping,
     caps: &'a PushdownCapabilities,
     policy: Option<PolicyVerdict<'a>>,
+    schemas: &'a HashMap<RelSource, Arc<BatchSchema>>,
     next_alias: usize,
     accesses: Vec<AccessInfo>,
     /// Predicates local to one access (its `WHERE`, or `ON` when left-joined).
@@ -241,8 +252,10 @@ impl<'a> Lowerer<'a> {
             }
             let alias = self.new_access(tm);
             entity_alias.insert(idx, alias.clone());
-            if let Err(d) = self.bind_subject(&alias, tm, subject, false) {
-                return Ok(Err(d));
+            match self.bind_subject(&alias, tm, subject, false) {
+                Ok(Ok(())) => {}
+                Ok(Err(Empty)) => return Ok(Ok(None)),
+                Err(d) => return Ok(Err(d)),
             }
             for (pred, obj) in members {
                 if pred == rdf::TYPE {
@@ -357,7 +370,7 @@ impl<'a> Lowerer<'a> {
         for v in child_vars {
             if let Some(src) = self.vars.get(v) {
                 match &src.key {
-                    Some(shape) if !src.nullable => seeds.push(SeedSpec {
+                    Some(shape) if !src.nullable && self.seedable(shape) => seeds.push(SeedSpec {
                         var: *v,
                         shape: shape.clone(),
                     }),
@@ -419,9 +432,47 @@ impl<'a> Lowerer<'a> {
     }
 
     fn source_of(&self, tm: &TriplesMap) -> RelSource {
-        match tm.sql_query() {
-            Some(q) => RelSource::Query(q.to_string()),
-            None => RelSource::Table(tm.table_name().unwrap_or_default().to_string()),
+        source_of_tm(tm)
+    }
+
+    /// The probed type of a column, when the provider supplied its
+    /// relation's schema.
+    fn field_type(&self, col: &ColRef) -> Option<FieldType> {
+        self.schemas
+            .get(&self.rel_source(&col.alias))?
+            .field_by_name(&col.column)
+            .map(|f| f.field_type)
+    }
+
+    /// Whether an engine literal of `class` compares exactly against `col`:
+    /// the probed column type must carry the class natively (a numeric
+    /// literal against a text column the mapping *reads* as a number is the
+    /// engine's comparison, not the database's). A dateTime literal is a UTC
+    /// instant, exact only against a zoned column. An unprobed column is
+    /// trusted; the renderer then types the literal.
+    fn literal_exact(&self, col: &ColRef, class: &RdfClass) -> bool {
+        use FieldType as F;
+        let Some(ty) = self.field_type(col) else {
+            return *class != RdfClass::DateTime;
+        };
+        match class {
+            RdfClass::Numeric => matches!(
+                ty,
+                F::Int32 | F::Int64 | F::Float32 | F::Float64 | F::Decimal { .. }
+            ),
+            RdfClass::Str | RdfClass::LangStr(_) => ty == F::String,
+            RdfClass::Bool => ty == F::Boolean,
+            RdfClass::Date => ty == F::Date,
+            RdfClass::DateTime => ty == F::TimestampTz,
+            RdfClass::Iri | RdfClass::Other => true,
+        }
+    }
+
+    /// Whether outer values can be sent as a key set on this shape.
+    fn seedable(&self, shape: &KeyShape) -> bool {
+        match shape {
+            KeyShape::Template { .. } => true,
+            KeyShape::Column { col, class } => self.literal_exact(col, class),
         }
     }
 
@@ -466,13 +517,33 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// The key shape of a template over `cols`, declined when a column's
+    /// probed type has no template-key rendering.
+    fn template_shape(&self, template: &str, cols: Vec<ColRef>) -> Lowering<KeyShape> {
+        let types: Vec<Option<FieldType>> = cols.iter().map(|c| self.field_type(c)).collect();
+        if types.iter().any(|t| {
+            !matches!(
+                t,
+                None | Some(FieldType::String | FieldType::Int32 | FieldType::Int64)
+            )
+        }) {
+            return decline("template over a column type that cannot be keyed");
+        }
+        Ok(KeyShape::Template {
+            template: template.to_string(),
+            cols,
+            types,
+        })
+    }
+
+    /// `Ok(Err(Empty))`: a constant subject that no row of the table can mint.
     fn bind_subject(
         &mut self,
         alias: &str,
         tm: &TriplesMap,
         subject: &SubjRef,
         nullable: bool,
-    ) -> Lowering<()> {
+    ) -> Lowering<std::result::Result<(), Empty>> {
         let sm = &tm.subject_map;
         if sm.term_type == TermType::BlankNode {
             return decline("blank-node subject");
@@ -486,10 +557,7 @@ impl<'a> Lowerer<'a> {
             if cols.is_empty() {
                 return decline("subject template without placeholders");
             }
-            Some(KeyShape::Template {
-                template: template.clone(),
-                cols,
-            })
+            Some(self.template_shape(template, cols)?)
         } else if let Some(col) = &sm.column {
             Some(KeyShape::Column {
                 col: ColRef::new(alias, col),
@@ -506,37 +574,47 @@ impl<'a> Lowerer<'a> {
             }
         }
         match subject {
-            SubjRef::Var(v) => self.bind_var(
-                *v,
-                VarSource {
-                    term: TermSource::Subject {
-                        alias: alias.to_string(),
+            SubjRef::Var(v) => self
+                .bind_var(
+                    *v,
+                    VarSource {
+                        term: TermSource::Subject {
+                            alias: alias.to_string(),
+                        },
+                        key: shape,
+                        nullable,
                     },
-                    key: shape,
-                    nullable,
-                },
-            ),
+                )
+                .map(Ok),
             SubjRef::Iri(iri) => {
-                let Some(KeyShape::Template { template, cols }) = shape else {
+                let Some(KeyShape::Template {
+                    template,
+                    cols,
+                    types,
+                }) = shape
+                else {
                     return decline("constant subject on a non-template subject map");
                 };
                 let Some(keys) = reverse_subject_template(&template, iri) else {
                     return decline("constant subject does not reverse through the template");
                 };
                 for (col, raw) in keys {
-                    let Some(cref) = cols.iter().find(|c| c.column == col) else {
+                    let Some(idx) = cols.iter().position(|c| c.column == col) else {
                         return decline("reversed column not in template");
                     };
+                    if !key_fits(types[idx], &raw) {
+                        return Ok(Err(Empty));
+                    }
                     self.access_preds
                         .entry(alias.to_string())
                         .or_default()
                         .push(Pred::Cmp {
-                            col: cref.clone(),
+                            col: cols[idx].clone(),
                             op: CmpOp::Eq,
                             value: Literal::TemplateKey(raw),
                         });
                 }
-                Ok(())
+                Ok(Ok(()))
             }
         }
     }
@@ -572,10 +650,12 @@ impl<'a> Lowerer<'a> {
                 KeyShape::Template {
                     template: ta,
                     cols: ca,
+                    ..
                 },
                 KeyShape::Template {
                     template: tb,
                     cols: cb,
+                    ..
                 },
             ) => {
                 if ta != tb || ca.len() != cb.len() {
@@ -672,7 +752,7 @@ impl<'a> Lowerer<'a> {
                         let Some((lit, lclass)) = literal_of(val, dtc.as_ref()) else {
                             return decline("constant object literal not pushable");
                         };
-                        if !self.exact_eq(&class, &lclass) {
+                        if !self.exact_eq(&col, &class, &lclass) {
                             return decline("constant object type differs from the column");
                         }
                         self.access_preds
@@ -701,12 +781,11 @@ impl<'a> Lowerer<'a> {
                 let cols: Vec<ColRef> = columns.iter().map(|c| ColRef::new(alias, c)).collect();
                 match obj {
                     Obj::Var(v) => {
-                        let key = (*term_type == TermType::Iri && !cols.is_empty()).then(|| {
-                            KeyShape::Template {
-                                template: template.clone(),
-                                cols,
-                            }
-                        });
+                        let key = if *term_type == TermType::Iri && !cols.is_empty() {
+                            Some(self.template_shape(template, cols)?)
+                        } else {
+                            None
+                        };
                         self.bind_var(
                             *v,
                             VarSource {
@@ -718,10 +797,22 @@ impl<'a> Lowerer<'a> {
                         .map(|()| Ok(None))
                     }
                     Obj::Iri(iri) if *term_type == TermType::Iri => {
+                        let KeyShape::Template { types, .. } =
+                            self.template_shape(template, cols)?
+                        else {
+                            unreachable!("template_shape builds a template");
+                        };
                         let Some(keys) = reverse_subject_template(template, iri) else {
                             return decline("constant object does not reverse");
                         };
                         for (col, raw) in keys {
+                            let ty = columns
+                                .iter()
+                                .position(|c| c.as_str() == col)
+                                .and_then(|i| types[i]);
+                            if !key_fits(ty, &raw) {
+                                return Ok(Err(Empty));
+                            }
                             self.access_preds
                                 .entry(alias.to_string())
                                 .or_default()
@@ -814,7 +905,7 @@ impl<'a> Lowerer<'a> {
                             }
                         }
                         self.bind_subject(&palias, parent, &SubjRef::Var(*v), nullable)
-                            .map(|()| Ok(None))
+                            .map(|r| r.map(|()| None))
                     }
                     Obj::Iri(iri) => {
                         let palias = self.new_access(parent);
@@ -829,7 +920,7 @@ impl<'a> Lowerer<'a> {
                             ));
                         }
                         self.bind_subject(&palias, parent, &SubjRef::Iri(iri.clone()), false)
-                            .map(|()| Ok(None))
+                            .map(|r| r.map(|()| None))
                     }
                     Obj::Lit(..) => Ok(Err(Empty)),
                 }
@@ -925,7 +1016,9 @@ impl<'a> Lowerer<'a> {
         let edges_before = self.edges.len();
         let mut connected = false;
         let mut fk_edges: Vec<Pred> = Vec::new();
-        self.bind_subject(&alias, tm, subject, true)?;
+        if self.bind_subject(&alias, tm, subject, true)?.is_err() {
+            return decline("optional member cannot match");
+        }
         for (pred, obj) in members {
             if pred == rdf::TYPE {
                 continue;
@@ -1010,6 +1103,9 @@ impl<'a> Lowerer<'a> {
             };
             if src.nullable {
                 return decline("VALUES over an optional variable");
+            }
+            if !self.seedable(&shape) {
+                return decline("VALUES on a column its literals cannot seed exactly");
             }
             let n = match &shape {
                 KeyShape::Template { cols, .. } => cols.len(),
@@ -1103,7 +1199,7 @@ impl<'a> Lowerer<'a> {
                         return None;
                     };
                     let (lit, lclass) = literal_of(c, None)?;
-                    if !self.exact_eq(&class, &lclass) {
+                    if !self.exact_eq(&col, &class, &lclass) {
                         return None;
                     }
                     members.push(lit);
@@ -1139,7 +1235,7 @@ impl<'a> Lowerer<'a> {
                         }
                         let (l, cl) = self.literal_column(*a)?;
                         let (r, cr) = self.literal_column(*b)?;
-                        (cl == cr && self.exact_eq(&cl, &cr))
+                        (cl == cr && self.exact_eq(&l, &cl, &cr) && self.literal_exact(&r, &cr))
                             .then_some(Pred::ColEq { left: l, right: r })
                     }
                     (Expression::Var(v), Expression::Const(c))
@@ -1147,7 +1243,7 @@ impl<'a> Lowerer<'a> {
                         let reversed = matches!(&args[0], Expression::Const(_));
                         let (col, class) = self.literal_column(*v)?;
                         let (lit, lclass) = literal_of(c, None)?;
-                        if !self.exact_eq(&class, &lclass) {
+                        if !self.exact_eq(&col, &class, &lclass) {
                             return None;
                         }
                         if ordering
@@ -1188,10 +1284,10 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Whether a column of `col` class compared with a literal of `lit`
-    /// class evaluates identically in SPARQL and in the database.
-    fn exact_eq(&self, col: &RdfClass, lit: &RdfClass) -> bool {
-        match (col, lit) {
+    /// Whether `col`, of `class`, compared with a literal of `lit` class
+    /// evaluates identically in SPARQL and in the database.
+    fn exact_eq(&self, col: &ColRef, class: &RdfClass, lit: &RdfClass) -> bool {
+        let same = match (class, lit) {
             (RdfClass::Str, RdfClass::Str) => self.caps.string_eq_is_binary,
             (RdfClass::LangStr(a), RdfClass::LangStr(b)) => {
                 a.eq_ignore_ascii_case(b) && self.caps.string_eq_is_binary
@@ -1201,7 +1297,8 @@ impl<'a> Lowerer<'a> {
             | (RdfClass::Date, RdfClass::Date)
             | (RdfClass::DateTime, RdfClass::DateTime) => true,
             _ => false,
-        }
+        };
+        same && self.literal_exact(col, class)
     }
 
     fn place_pred(&mut self, pred: Pred) {
@@ -1549,10 +1646,15 @@ pub(crate) fn literal_of(
             let bd = bigdecimal::BigDecimal::parse_bytes(s.as_bytes(), 10)?;
             decimal_literal(&bd).map(|l| (l, RdfClass::Numeric))
         }
-        // A dateTime literal is always UTC-zoned after parsing, so it is exact
-        // only against a `timestamp with time zone` column — a property of
-        // the probed schema the lowering does not see. Left in the engine.
-        FlakeValue::DateTime(_) => None,
+        // A UTC instant; exact only against a zoned column, which the
+        // lowering checks against the probed schema (`literal_exact`).
+        FlakeValue::DateTime(dt) => Some((
+            Literal::Timestamp {
+                micros: dt.epoch_micros(),
+                tz: true,
+            },
+            RdfClass::DateTime,
+        )),
         _ => None,
     }
 }
@@ -1564,6 +1666,56 @@ fn decimal_literal(bd: &bigdecimal::BigDecimal) -> Option<Literal> {
         unscaled: unscaled_bi.to_i128()?,
         scale: i8::try_from(scale).ok()?,
     })
+}
+
+fn source_of_tm(tm: &TriplesMap) -> RelSource {
+    match tm.sql_query() {
+        Some(q) => RelSource::Query(q.to_string()),
+        None => RelSource::Table(tm.table_name().unwrap_or_default().to_string()),
+    }
+}
+
+/// The relations the block's predicates can reach, whose probed schemas the
+/// lowering wants up front so literals and template keys lower against known
+/// column types. The statement's own tables are probed again at execution
+/// from the same cache, so this adds no round trip for them.
+pub(crate) fn candidate_sources(
+    patterns: &[Pattern],
+    snapshot: &LedgerSnapshot,
+    mapping: &CompiledR2rmlMapping,
+) -> Vec<RelSource> {
+    let Ok(block) = parse_block(patterns, snapshot) else {
+        return Vec::new();
+    };
+    let preds: HashSet<&str> = block
+        .triples
+        .iter()
+        .chain(block.optionals.iter().flat_map(|(t, _)| t))
+        .map(|t| t.p.as_str())
+        .collect();
+    let mut out: Vec<RelSource> = Vec::new();
+    for tm in mapping.triples_maps.values() {
+        if preds
+            .iter()
+            .any(|p| *p == rdf::TYPE || pom_for(tm, p).is_some())
+        {
+            let src = source_of_tm(tm);
+            if !out.contains(&src) {
+                out.push(src);
+            }
+        }
+    }
+    out
+}
+
+/// Whether a reversed template key can be a value of a column of type `ty`
+/// (unknown types are trusted; the renderer types the literal).
+pub(crate) fn key_fits(ty: Option<FieldType>, raw: &str) -> bool {
+    match ty {
+        Some(FieldType::Int64) => raw.parse::<i64>().is_ok(),
+        Some(FieldType::Int32) => raw.parse::<i32>().is_ok(),
+        _ => true,
+    }
 }
 
 /// Structural admission at plan time: only shapes the lowering could accept.

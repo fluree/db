@@ -634,25 +634,7 @@ impl SqlSource {
         }
         let mut schemas: HashMap<String, Arc<BatchSchema>> = HashMap::new();
         for (alias, source) in plan.root.accesses() {
-            let (logical, table_name) = match source {
-                RelSource::Table(t) => (LogicalSource::Table(t.clone()), t.clone()),
-                RelSource::Query(q) => {
-                    let alias_name = mapping
-                        .triples_maps
-                        .values()
-                        .find(|tm| tm.sql_query() == Some(q.as_str()))
-                        .and_then(|tm| tm.table_name())
-                        .unwrap_or("rr:sqlQuery")
-                        .to_string();
-                    (LogicalSource::Query(q.clone()), alias_name)
-                }
-            };
-            let schema = self
-                .client
-                .schema(&logical)
-                .await
-                .map_err(|e| sql_query_error(&self.graph_source_id, &table_name, e))?;
-            self.record_watermark(session, &table_name);
+            let schema = self.source_schema(session, mapping, source).await?;
             schemas.insert(alias.to_string(), schema);
         }
         let caps = self.pushdown_capabilities();
@@ -677,6 +659,35 @@ impl SqlSource {
             .execute(sql.clone())
             .map(move |item| item.map_err(|e| sql_query_error(&gs, "<plan>", e)));
         Ok((sql, Box::pin(stream)))
+    }
+
+    /// The probed schema of one plan relation (cached per client).
+    pub(crate) async fn source_schema(
+        &self,
+        session: &IcebergCatalogSession,
+        mapping: &CompiledR2rmlMapping,
+        source: &RelSource,
+    ) -> QueryResult<Arc<BatchSchema>> {
+        let (logical, table_name) = match source {
+            RelSource::Table(t) => (LogicalSource::Table(t.clone()), t.clone()),
+            RelSource::Query(q) => {
+                let alias_name = mapping
+                    .triples_maps
+                    .values()
+                    .find(|tm| tm.sql_query() == Some(q.as_str()))
+                    .and_then(|tm| tm.table_name())
+                    .unwrap_or("rr:sqlQuery")
+                    .to_string();
+                (LogicalSource::Query(q.clone()), alias_name)
+            }
+        };
+        let schema = self
+            .client
+            .schema(&logical)
+            .await
+            .map_err(|e| sql_query_error(&self.graph_source_id, &table_name, e))?;
+        self.record_watermark(session, &table_name);
+        Ok(schema)
     }
 
     pub(crate) async fn row_count(

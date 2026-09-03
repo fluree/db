@@ -800,7 +800,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
 
         let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
             ClaimOutcome::AlreadyDone(receipt) => match *receipt {
-                OperationReceipt::Transaction(r) => return Ok(r),
+                OperationReceipt::Transaction(r) => return Ok(*r),
                 _ => return Err(SubmissionError::KeyCollision),
             },
             ClaimOutcome::Claimed(g) => g,
@@ -819,7 +819,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
                 commit_id: r.commit.commit_id.clone(),
                 t: r.commit.t,
                 tally: r.tally.clone(),
-                receipt: Some(Box::new(OperationReceipt::Transaction(r.clone()))),
+                receipt: Some(Box::new(OperationReceipt::Transaction(Box::new(r.clone())))),
             }))
         })
         .await;
@@ -1152,6 +1152,7 @@ mod tests {
                     policy: Some(policy),
                     policy_enforcement: None,
                     reasoning: None,
+                    sql: None,
                 }),
                 receipt: None,
             })),

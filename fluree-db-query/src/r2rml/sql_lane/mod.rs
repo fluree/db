@@ -16,7 +16,8 @@ mod terms;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use fluree_db_tabular::plan::{ColRef, KeySet, Literal, Pred, RelNode, RelPlan};
+use fluree_db_tabular::plan::{ColRef, KeySet, Literal, Pred, RelNode, RelPlan, RelSource};
+use fluree_db_tabular::BatchSchema;
 
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
@@ -162,6 +163,12 @@ impl SqlBlockOperator {
                     Some(v) => v.get(&(tm.iri.clone(), pred.to_string())).copied(),
                 })
             };
+        let mut schemas: HashMap<RelSource, Arc<BatchSchema>> = HashMap::new();
+        for src in lower::candidate_sources(&self.inner_patterns, ctx.active_snapshot, &mapping) {
+            if let Some(schema) = table_provider.source_schema(iri, &src).await? {
+                schemas.insert(src, schema);
+            }
+        }
         let lowered = lower_block(LowerInput {
             patterns: &self.inner_patterns,
             mapping: &mapping,
@@ -169,6 +176,7 @@ impl SqlBlockOperator {
             caps: &caps,
             child_vars,
             policy: verdicts.is_some().then_some(&mut verdict),
+            schemas: &schemas,
         })?;
         let lowered = match lowered {
             Err(Decline(why)) => {
@@ -226,6 +234,17 @@ impl Operator for SqlBlockOperator {
             (Some(c), _) | (None, Some(c)) => vec![crate::plan_node::PlanChild::child(c.as_ref())],
             _ => Vec::new(),
         }
+    }
+
+    fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        m.insert("graph".into(), self.graph_iri.to_string().into());
+        m.insert("lane".into(), "sql_block_pushdown".into());
+        m.insert(
+            "note".into(),
+            "resolved at open: falls back to GraphOperator unless the source is SQL and the block lowers".into(),
+        );
+        m
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
@@ -749,8 +768,8 @@ impl Operator for SqlBlockSource {
                     let table_provider = graph_ctx.r2rml_table_provider.ok_or_else(|| {
                         QueryError::InvalidQuery("R2RML table provider not configured".into())
                     })?;
-                    let (_sql, stream) =
-                        table_provider.execute_plan(&self.graph_iri, &plan).await?;
+                    let (sql, stream) = table_provider.execute_plan(&self.graph_iri, &plan).await?;
+                    graph_ctx.tracker.record_statement(&self.graph_iri, &sql);
                     inflight.stream = Some(stream);
                     self.inflight = Some(inflight);
                 }
