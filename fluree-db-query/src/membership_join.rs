@@ -224,9 +224,11 @@ impl MembershipJoinOperator {
         Ok(())
     }
 
-    /// Exact join fallback for a row that does NOT fully ground the
-    /// pattern: evaluate the triple seeded with the row and emit one
-    /// output row per match, with produced bindings filled in.
+    /// Exact join for a row the keep/drop drain cannot answer: one that
+    /// does NOT fully ground the pattern, or — once the drain declines
+    /// (`exact_only`: duplicate ground rows in the key set) — every row.
+    /// Evaluates the triple seeded with the row and emits one output row
+    /// per match, with produced bindings filled in.
     async fn per_row_join(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -369,7 +371,17 @@ impl Operator for MembershipJoinOperator {
     }
 
     fn estimated_rows(&self) -> Option<usize> {
-        // A filter: at most the child's cardinality (ground rows match ≤ once).
+        // Drain lane (keep/drop): a filter — at most the child's cardinality.
+        // Per-row-join fallback (`exact_only`, entered mid-execution when the
+        // drain finds duplicate ground rows): a bag join whose output can
+        // exceed the child's cardinality (the #1687 fixture emits 532 rows
+        // from 296 driving rows), making this an under-estimate. The regime
+        // isn't known yet when this is read (EXPLAIN `describe()` and lane
+        // gates run at plan/open time, before `build_key_set`), and every
+        // consumer treats a low value conservatively — a lane gate that reads
+        // it (`SubqueryOperator` materialize eligibility, the annotation-edge
+        // hash probe) declines its optimization and stays on the exact generic
+        // path — so the child estimate remains the honest upper-bound hint.
         self.child.estimated_rows()
     }
 }
