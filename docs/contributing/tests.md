@@ -111,10 +111,12 @@ instrumentation-assertion rule above.
 Because `autotests = false` means an unwired file silently never compiles and
 never runs — with `cargo test` still reporting success — both crates carry a
 `tests/harness_coverage.rs` that asserts every `tests/*.rs` is either declared
-as a `[[test]]` target or pulled into one via `#[path]`. It derives reachability
-from `Cargo.toml` outwards rather than from file names, so an undeclared
-`grp_*.rs` is flagged as an orphan itself instead of being assumed to be a
-target.
+as a `[[test]]` target or reachable from one through `#[path = "…"] mod x;` or
+plain `mod x;` lines. It derives reachability from `Cargo.toml` outwards rather
+than from file names, so an undeclared `grp_*.rs` is flagged as an orphan
+itself instead of being assumed to be a target. Only those two line-anchored
+forms are followed; a file included any other way is reported as an orphan
+rather than missed, and the fix is to wire it in with `#[path]`.
 
 The other two standalone rules — env mutation and instrumentation assertions —
 are **not** mechanically enforced. Detecting them means scanning Rust source for

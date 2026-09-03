@@ -1,12 +1,18 @@
 //! Reachability guard for crates that group their integration tests.
 //!
 //! A crate with `autotests = false` declares its `[[test]]` targets explicitly,
-//! so a `tests/*.rs` becomes a test binary only if it is named in a `[[test]]`
-//! block or pulled into a harness via `#[path]`. That buys far fewer link steps
+//! so a `tests/*.rs` is compiled only if it is named in a `[[test]]` block or
+//! pulled into a declared binary as a module. That buys far fewer link steps
 //! and costs one invariant the compiler does not check: a file that is neither
 //! declared nor pulled in is never compiled and never run, and `cargo test`
 //! still reports success, because from Cargo's point of view there is nothing
 //! to build.
+//!
+//! The guard follows exactly two module forms from the declared targets,
+//! transitively: `#[path = "<file>"] mod <name>;` and plain `mod <name>;`,
+//! each at the start of a line. A file included any other way — a `#[path]`
+//! built by a macro, say — compiles fine but is reported as an orphan, so the
+//! guard errs loud rather than silent; wire such a file in with `#[path]`.
 //!
 //! Call the assert from a test in each adopting crate, passing that crate's own
 //! manifest directory:
@@ -173,7 +179,8 @@ fn normalize(path: &Path) -> String {
 }
 
 /// Every top-level `tests/*.rs` must be declared as a `[[test]]` target or
-/// pulled into one via `#[path]`.
+/// reachable from one through `#[path = "..."] mod x;` or plain `mod x;`
+/// lines (see the crate docs for what is and is not recognised).
 ///
 /// Reachability is derived from `Cargo.toml` outwards, never from file names:
 /// an undeclared `tests/grp_foo.rs` is itself an orphan, and the files it
@@ -214,9 +221,12 @@ pub fn assert_every_test_file_is_reachable(manifest_dir: &str) {
     orphans.sort();
     assert!(
         orphans.is_empty(),
-        "unreachable under `autotests = false` — every tests/*.rs must be \
-         declared as a [[test]] target or pulled into one via `#[path = \
-         \"<file>\"] mod <name>;`. Orphaned: {orphans:?}"
+        "unreachable under `autotests = false`: no [[test]] target declares \
+         these files and none reaches them through a `#[path = \"<file>\"] \
+         mod <name>;` or plain `mod <name>;` line. Those two forms, at the \
+         start of a line, are the only ones the guard follows — a file pulled \
+         in some other way is a false orphan; wire it in with `#[path]` \
+         instead. Orphaned: {orphans:?}"
     );
 }
 
