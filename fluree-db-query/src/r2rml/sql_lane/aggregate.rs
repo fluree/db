@@ -6,9 +6,11 @@
 //! `AVG` is pushed as `SUM` + `COUNT` and divided in the engine (databases
 //! round a decimal average to the input scale), an empty `SUM` comes back
 //! `NULL` and is reported as `0`, and string keys or `MIN`/`MAX` are pushed
-//! only when the dialect compares bytes. HAVING, ORDER BY and LIMIT stay
-//! with the engine's own operators above; a top-k is offered to the
-//! statement when no HAVING could drop rows afterwards.
+//! only when the dialect compares bytes. A `HAVING` comparing `COUNT`,
+//! `SUM`, `MIN` or `MAX` outputs with constants goes with the statement;
+//! the engine's own HAVING, ORDER BY and LIMIT operators stay above, and a
+//! top-k is offered to the statement when no HAVING left in the engine
+//! could drop rows afterwards.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +18,7 @@ use std::sync::Arc;
 use bigdecimal::BigDecimal;
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_r2rml::mapping::ObjectMap;
-use fluree_db_tabular::plan::{ColRef, OrderKey, OutputCol, OutputExpr, RelPlan};
+use fluree_db_tabular::plan::{CmpOp, ColRef, OrderKey, OutputCol, OutputExpr, Pred, RelPlan};
 use fluree_db_tabular::{Column, ColumnBatch, FieldType};
 use fluree_vocab::xsd;
 use num_bigint::BigInt;
@@ -30,7 +32,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::ir::grouping::{AggregateFn, InputSemantics};
-use crate::ir::{GraphName, Pattern, Query};
+use crate::ir::{Expression, GraphName, Pattern, Query};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::sort::SortSpec;
 use crate::var_registry::VarId;
@@ -44,7 +46,9 @@ pub struct SqlAggregatePlan {
     inner_patterns: Vec<Pattern>,
     group_by: Vec<VarId>,
     aggregates: Vec<(VarId, AggregateFn)>,
-    /// The complete ORDER BY and k when a LIMIT above may be pushed.
+    having: Option<Expression>,
+    /// The complete ORDER BY and k when a LIMIT above may be pushed (only
+    /// with the HAVING, if any).
     topk: Option<(Vec<SortSpec>, usize)>,
 }
 
@@ -97,16 +101,17 @@ pub fn detect_sql_block_aggregate(query: &Query) -> Option<SqlAggregatePlan> {
         .copied()
         .chain(aggregates.iter().map(|(v, _)| *v))
         .collect();
+    // An aggregate a HAVING lifted out is an output the projection drops.
     if let Some(projected) = query.output.projected_vars() {
-        if projected.len() != outs.len() || projected.iter().any(|v| !outs.contains(v)) {
+        if projected.iter().any(|v| !outs.contains(v)) {
             return None;
         }
     }
     if query.ordering.iter().any(|s| !outs.contains(&s.var)) {
         return None;
     }
-    let topk = match (query.limit, grouping.having()) {
-        (Some(limit), None) if !query.ordering.is_empty() => Some((
+    let topk = match query.limit {
+        Some(limit) if !query.ordering.is_empty() => Some((
             query.ordering.clone(),
             limit.saturating_add(query.offset.unwrap_or(0)),
         )),
@@ -117,6 +122,7 @@ pub fn detect_sql_block_aggregate(query: &Query) -> Option<SqlAggregatePlan> {
         inner_patterns: patterns.clone(),
         group_by,
         aggregates,
+        having: grouping.having().cloned(),
         topk,
     })
 }
@@ -179,6 +185,7 @@ fn lower_aggregate(
     let mut grouped = group_plan(
         &plan.group_by,
         &plan.aggregates,
+        plan.having.as_ref(),
         plan.topk.as_ref(),
         lowered,
         &resolved.mapping,
@@ -201,9 +208,11 @@ fn lower_aggregate(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn group_plan(
     group_by: &[VarId],
     aggregates: &[(VarId, AggregateFn)],
+    having: Option<&Expression>,
     topk: Option<&(Vec<SortSpec>, usize)>,
     lowered: &Lowered,
     mapping: &fluree_db_r2rml::mapping::CompiledR2rmlMapping,
@@ -447,6 +456,16 @@ pub(super) fn group_plan(
         )
         .collect();
 
+    // The HAVING goes with the statement when every comparison in it is
+    // over an output the database evaluates as the engine does; otherwise
+    // the engine's HAVING keeps it, and no top-k can be pushed below it.
+    let having_pred = having.and_then(|h| lower_having(h, group_by, aggregates, &decodes));
+    let topk = if having.is_some() && having_pred.is_none() {
+        None
+    } else {
+        topk
+    };
+
     // A top-k over aggregate outputs and required scalar keys. The statement
     // answers exactly k groups, so the LIMIT goes only with the whole ORDER BY.
     let mut order_by = Vec::new();
@@ -488,6 +507,7 @@ pub(super) fn group_plan(
         },
         order_by,
         limit,
+        having: having_pred,
     };
     Ok(Grouped {
         plan,
@@ -496,6 +516,82 @@ pub(super) fn group_plan(
         extremes,
         decodes,
     })
+}
+
+/// The `HAVING` as a predicate over the grouped outputs: `AND`/`OR`/`NOT`
+/// of comparisons between an aggregate output and a numeric constant.
+/// `COUNT`s and `SUM`s of exact numbers compare as in the engine; an
+/// `AVG` (divided in the engine), a `MIN`/`MAX` (a term, not a number the
+/// database holds natively) or a key does not.
+fn lower_having(
+    expr: &Expression,
+    group_by: &[VarId],
+    aggregates: &[(VarId, AggregateFn)],
+    decodes: &[Decode],
+) -> Option<Pred> {
+    use crate::ir::expression::Function;
+    let Expression::Call { func, args } = expr else {
+        return None;
+    };
+    let cmp = |v: VarId, op: CmpOp, c: &FlakeValue| -> Option<Pred> {
+        let i = aggregates.iter().position(|(out, _)| *out == v)?;
+        let (value, RdfClass::Numeric) = super::lower::literal_of(c, None)? else {
+            return None;
+        };
+        let output = match &decodes[group_by.len() + i] {
+            Decode::Count { name } => name.clone(),
+            Decode::Numeric {
+                sum,
+                avg: false,
+                kind: NumKind::Integer | NumKind::Decimal,
+                ..
+            } => sum.clone(),
+            _ => return None,
+        };
+        Some(Pred::OutputCmp { output, op, value })
+    };
+    match func {
+        Function::And => {
+            let parts: Option<Vec<Pred>> = args
+                .iter()
+                .map(|a| lower_having(a, group_by, aggregates, decodes))
+                .collect();
+            Some(Pred::And(parts?))
+        }
+        Function::Or => {
+            let parts: Option<Vec<Pred>> = args
+                .iter()
+                .map(|a| lower_having(a, group_by, aggregates, decodes))
+                .collect();
+            Some(Pred::Or(parts?))
+        }
+        Function::Not => {
+            let [a] = args.as_slice() else {
+                return None;
+            };
+            Some(Pred::Not(Box::new(lower_having(
+                a, group_by, aggregates, decodes,
+            )?)))
+        }
+        Function::Eq | Function::Ne | Function::Lt | Function::Le | Function::Gt | Function::Ge => {
+            let (v, c, reversed) = match args.as_slice() {
+                [Expression::Var(v), Expression::Const(c)] => (*v, c, false),
+                [Expression::Const(c), Expression::Var(v)] => (*v, c, true),
+                _ => return None,
+            };
+            let op = match (func, reversed) {
+                (Function::Eq, _) => CmpOp::Eq,
+                (Function::Ne, _) => CmpOp::NotEq,
+                (Function::Lt, false) | (Function::Gt, true) => CmpOp::Lt,
+                (Function::Le, false) | (Function::Ge, true) => CmpOp::LtEq,
+                (Function::Gt, false) | (Function::Lt, true) => CmpOp::Gt,
+                (Function::Ge, false) | (Function::Le, true) => CmpOp::GtEq,
+                _ => return None,
+            };
+            cmp(v, op, c)
+        }
+        _ => None,
+    }
 }
 
 /// The grouped-query operator: one statement at open, rows decoded into

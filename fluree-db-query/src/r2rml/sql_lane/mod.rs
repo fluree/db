@@ -535,6 +535,7 @@ impl SqlBlockSource {
                 distinct: self.lowered(b).distinct,
                 order_by: Vec::new(),
                 limit: None,
+                having: None,
             })
             .collect();
         let mut order_by = Vec::new();
@@ -564,6 +565,7 @@ impl SqlBlockSource {
             distinct: false,
             order_by,
             limit,
+            having: None,
         }
     }
 
@@ -636,6 +638,7 @@ impl SqlBlockSource {
             distinct: lowered.distinct,
             order_by,
             limit,
+            having: None,
         }
     }
 
@@ -650,6 +653,7 @@ impl SqlBlockSource {
             distinct: lowered.distinct,
             order_by: Vec::new(),
             limit: None,
+            having: None,
         }
     }
 
@@ -678,6 +682,7 @@ impl SqlBlockSource {
             distinct: false,
             order_by: Vec::new(),
             limit: None,
+            having: None,
         };
         let (sql, mut stream) = table_provider
             .execute_plan(&self.graph_iri, &count_plan)

@@ -79,6 +79,10 @@ pub fn render_plan(
         sql.push_str(" GROUP BY ");
         sql.push_str(&keys.join(", "));
     }
+    if let Some(h) = &plan.having {
+        sql.push_str(" HAVING ");
+        sql.push_str(&r.render_having(h, &plan.output)?);
+    }
     if !plan.order_by.is_empty() {
         let keys: Vec<String> = plan
             .order_by
@@ -283,8 +287,45 @@ impl Renderer<'_> {
             })
     }
 
+    /// A `HAVING` predicate: comparisons over outputs render the output's
+    /// own expression, since Postgres and Trino do not resolve a select
+    /// alias there.
+    fn render_having(&self, pred: &Pred, outputs: &[OutputCol]) -> Result<String> {
+        Ok(match pred {
+            Pred::OutputCmp { output, op, value } => {
+                let o = outputs.iter().find(|o| &o.name == output).ok_or_else(|| {
+                    SqlError::Unsupported(format!("HAVING over unknown output '{output}'"))
+                })?;
+                format!(
+                    "{} {} {}",
+                    self.render_output_expr(o)?,
+                    cmp_sql(*op),
+                    self.expr_literal(value)?
+                )
+            }
+            Pred::And(ps) | Pred::Or(ps) => {
+                let sep = if matches!(pred, Pred::And(_)) {
+                    " AND "
+                } else {
+                    " OR "
+                };
+                let parts: Vec<String> = ps
+                    .iter()
+                    .map(|p| Ok(format!("({})", self.render_having(p, outputs)?)))
+                    .collect::<Result<_>>()?;
+                parts.join(sep)
+            }
+            Pred::Not(p) => format!("NOT ({})", self.render_having(p, outputs)?),
+            other => self.render_pred(other)?,
+        })
+    }
+
     fn render_output(&self, o: &OutputCol) -> Result<String> {
         let name = self.dialect.quote_ident(&o.name);
+        Ok(format!("{} AS {name}", self.render_output_expr(o)?))
+    }
+
+    fn render_output_expr(&self, o: &OutputCol) -> Result<String> {
         let zoned = |c: &ColRef, rendered: String| -> Result<String> {
             Ok(match (self.col_type(c)?, self.dialect) {
                 (FieldType::TimestampTz, SqlDialect::Trino) => {
@@ -308,7 +349,7 @@ impl Renderer<'_> {
             OutputExpr::Min(c) => zoned(c, format!("MIN({})", self.col(c)))?,
             OutputExpr::Max(c) => zoned(c, format!("MAX({})", self.col(c)))?,
         };
-        Ok(format!("{expr} AS {name}"))
+        Ok(expr)
     }
 
     /// A flat `a AND b AND c`: nested conjunctions are spliced in, and only a
@@ -563,6 +604,11 @@ impl Renderer<'_> {
                     other => self.expr_literal(other)?,
                 };
                 format!("{} {} {rhs}", self.render_expr(expr)?, cmp_sql(*op))
+            }
+            Pred::OutputCmp { .. } => {
+                return Err(SqlError::Unsupported(
+                    "an output comparison belongs in HAVING".into(),
+                ))
             }
             // Printable ASCII is the range every dialect's case mapping and
             // collation agree on; anything else goes back to the engine.
@@ -864,6 +910,7 @@ mod tests {
             distinct: false,
             order_by: vec![(OrderKey::Col(ColRef::new("o", "total")), false)],
             limit: Some(10),
+            having: None,
         };
         let sql = render_plan(&plan, &schemas(), SqlDialect::Trino).unwrap();
         assert_eq!(
@@ -912,6 +959,7 @@ mod tests {
             distinct: false,
             order_by: vec![(OrderKey::Output("c1".into()), false)],
             limit: Some(5),
+            having: None,
         };
         let sql = render_plan(&plan, &schemas(), SqlDialect::Trino).unwrap();
         assert_eq!(
@@ -939,6 +987,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         };
         let sql = render_plan(&plan, &schemas(), SqlDialect::Postgres).unwrap();
         assert_eq!(
@@ -966,6 +1015,7 @@ mod tests {
             distinct: true,
             order_by: vec![],
             limit: None,
+            having: None,
         }
     }
 
@@ -1003,6 +1053,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         };
         let sql = render_plan(&plan, &schemas(), SqlDialect::Mysql).unwrap();
         assert_eq!(
@@ -1029,6 +1080,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         };
         let pattern = format!("{}%", fluree_db_tabular::plan::like_escape("50%_!"));
         assert_eq!(
@@ -1074,6 +1126,7 @@ mod tests {
             distinct: false,
             order_by: vec![(OrderKey::Expr(times_two(col)), false)],
             limit: Some(2),
+            having: None,
         };
         assert_eq!(
             render_plan(&plan("id"), &schemas(), SqlDialect::Postgres).unwrap(),
@@ -1100,6 +1153,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         };
         let plan = RelPlan {
             root: RelNode::Join {
@@ -1118,6 +1172,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         };
         assert_eq!(
             render_plan(&plan, &schemas(), SqlDialect::Postgres).unwrap(),
@@ -1133,6 +1188,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         }
     }
 
@@ -1261,6 +1317,48 @@ mod tests {
         );
     }
 
+    /// HAVING repeats the output's expression rather than naming it.
+    #[test]
+    fn having_renders_the_aggregate_expression() {
+        let mut plan = plain(
+            access("o", "orders"),
+            vec![
+                out("o", "customer_id", "c0"),
+                OutputCol {
+                    expr: OutputExpr::CountRows,
+                    name: "c1".into(),
+                },
+                OutputCol {
+                    expr: OutputExpr::Sum {
+                        col: ColRef::new("o", "total"),
+                        distinct: false,
+                    },
+                    name: "c2".into(),
+                },
+            ],
+        );
+        plan.group_by = vec![ColRef::new("o", "customer_id")];
+        plan.having = Some(Pred::And(vec![
+            Pred::OutputCmp {
+                output: "c1".into(),
+                op: CmpOp::Gt,
+                value: Literal::Int(1),
+            },
+            Pred::OutputCmp {
+                output: "c2".into(),
+                op: CmpOp::GtEq,
+                value: Literal::Decimal {
+                    unscaled: 1000,
+                    scale: 1,
+                },
+            },
+        ]));
+        assert_eq!(
+            render_plan(&plan, &schemas(), SqlDialect::Postgres).unwrap(),
+            r#"SELECT "o"."customer_id" AS "c0", COUNT(*) AS "c1", SUM("o"."total") AS "c2" FROM "orders" AS "o" GROUP BY "o"."customer_id" HAVING (COUNT(*) > 1) AND (SUM("o"."total") >= 100.0)"#
+        );
+    }
+
     /// A string join on MySQL compares bytes too, and an integer join is
     /// left alone.
     #[test]
@@ -1290,6 +1388,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         };
         let sql = render_plan(&plan, &schemas, SqlDialect::Mysql).unwrap();
         assert_eq!(
@@ -1314,6 +1413,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         };
         assert!(matches!(
             render_plan(&plan, &schemas(), SqlDialect::Trino),
@@ -1337,6 +1437,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         };
         assert!(matches!(
             render_plan(&plan, &schemas(), SqlDialect::Trino),

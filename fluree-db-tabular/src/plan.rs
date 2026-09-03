@@ -144,6 +144,14 @@ pub enum Pred {
     },
     /// The string column holds a character outside printable ASCII.
     NonAscii(ColRef),
+    /// `output op value` over a named output of the plan, for `HAVING`:
+    /// rendered as the output's expression, since a dialect need not let a
+    /// `HAVING` name a select alias.
+    OutputCmp {
+        output: String,
+        op: CmpOp,
+        value: Literal,
+    },
     And(Vec<Pred>),
     Or(Vec<Pred>),
     Not(Box<Pred>),
@@ -342,6 +350,8 @@ pub struct RelPlan {
     /// `(key, ascending)`.
     pub order_by: Vec<(OrderKey, bool)>,
     pub limit: Option<u64>,
+    /// A `HAVING` over the grouped outputs.
+    pub having: Option<Pred>,
 }
 
 /// What a provider can execute, consulted by the lowering before it emits a

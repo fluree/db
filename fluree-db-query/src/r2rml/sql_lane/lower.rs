@@ -881,6 +881,7 @@ impl<'a> Lowerer<'a> {
                 distinct: false,
                 order_by: Vec::new(),
                 limit: None,
+                having: None,
             })
             .collect();
         let Some(first_tm) = first.accesses.first().map(|a| a.tm_iri.clone()) else {
@@ -1100,6 +1101,7 @@ impl<'a> Lowerer<'a> {
                 let grouped = match group_plan(
                     &group_by,
                     &aggregates,
+                    g.having(),
                     topk.as_ref(),
                     &lowered,
                     self.mapping,
@@ -1109,6 +1111,9 @@ impl<'a> Lowerer<'a> {
                     Ok(g) => g,
                     Err(why) => return Ok(Err(Decline(why))),
                 };
+                if g.having().is_some() && grouped.plan.having.is_none() {
+                    return Ok(Err(Decline("subquery HAVING not pushable")));
+                }
                 if topk.is_some() && grouped.plan.limit.is_none() {
                     return Ok(Err(Decline("subquery ORDER BY not pushable")));
                 }
@@ -1197,6 +1202,7 @@ impl<'a> Lowerer<'a> {
                     distinct: lowered.distinct,
                     order_by,
                     limit,
+                    having: None,
                 };
                 let mut sources = Vec::new();
                 for v in &sq.select {
@@ -3208,6 +3214,7 @@ fn collect_aliases(pred: &Pred, out: &mut HashSet<String>) {
         }
         Pred::And(ps) | Pred::Or(ps) => ps.iter().for_each(|p| collect_aliases(p, out)),
         Pred::Not(p) => collect_aliases(p, out),
+        Pred::OutputCmp { .. } => {}
     }
 }
 
@@ -3607,7 +3614,7 @@ fn subquery_is_admissible(sq: &SubqueryPattern, enclosing: &[Pattern]) -> bool {
         return false;
     }
     if let Some(g) = &sq.grouping {
-        if g.having().is_some() || g.aggregation().is_some_and(|a| !a.binds.is_empty()) {
+        if g.aggregation().is_some_and(|a| !a.binds.is_empty()) {
             return false;
         }
         let outs: Vec<VarId> = g

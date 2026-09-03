@@ -218,9 +218,10 @@ pushable. In that statement:
   enclosing one, `GROUP BY` with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` becomes
   the derived table's grouping (the engine decodes the aggregate outputs
   as the grouped lane does), `DISTINCT` and `ORDER BY … LIMIT` push inside
-  it. A sub-select with `HAVING`, `OFFSET`, a `BIND`, a nested sub-select,
-  a filter the statement cannot evaluate exactly, or one that hides an
-  inner variable the enclosing block also uses is not admitted. There is
+  it, as does a `HAVING` the grouped lane can push (below). A sub-select
+  with another `HAVING`, an `OFFSET`, a `BIND`, a nested sub-select, a
+  filter the statement cannot evaluate exactly, or one that hides an inner
+  variable the enclosing block also uses is not admitted. There is
   no other lane for a sub-select over a graph source (the engine's
   subquery operator has no native index to run against), so one the lane
   does not take still refuses the query, as it did before;
@@ -327,10 +328,14 @@ pushable. In that statement:
   `SUM` comes back `NULL` and is reported as `0`, aggregate results take the
   datatype of the mapping's `rr:datatype`, and string keys, `COUNT DISTINCT`
   of strings and `MIN`/`MAX` of strings are pushed only where the dialect
-  compares bytes. `HAVING`, `ORDER BY` and `LIMIT` run in the engine over
-  the grouped rows; an `ORDER BY` over aggregates and required group keys
-  with a `LIMIT` and no `HAVING` is pushed as a top-k, again only when every
-  key can be ordered on. Any residual filter, a
+  compares bytes. A `HAVING` made of `AND`/`OR`/`NOT` over comparisons of
+  a `COUNT`, or a `SUM` of integers or decimals, with a constant goes with
+  the statement (`HAVING (SUM("total") > 10) AND (COUNT("id") >= 1)`); one
+  over an `AVG` (divided in the engine), a `MIN`/`MAX` or a group key stays
+  in the engine. `ORDER BY` and `LIMIT` run in the engine over the grouped
+  rows; an `ORDER BY` over aggregates and required group keys with a
+  `LIMIT` is pushed as a top-k when no `HAVING` is left in the engine and
+  every key can be ordered on. Any residual filter, a
   `SUM`/`AVG` over a column whose SQL type does not match its datatype, or
   an aggregate over an IRI template declines to the engine's grouping.
 

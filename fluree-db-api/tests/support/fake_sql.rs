@@ -263,7 +263,7 @@ impl FakeSql {
 
         let mut where_text = None;
         let mut group_by: Option<Vec<Col>> = None;
-        let mut having_min_count: Option<usize> = None;
+        let mut having: Option<Having> = None;
         let mut order: Vec<(SortKey, bool)> = Vec::new();
         let mut limit = None;
         if let Some(r) = rest.strip_prefix("WHERE ") {
@@ -276,9 +276,9 @@ impl FakeSql {
             group_by = Some(split_top(g, ", ").into_iter().map(colref).collect());
             rest = tail;
         }
-        if let Some(r) = rest.strip_prefix("HAVING COUNT(*) > ") {
+        if let Some(r) = rest.strip_prefix("HAVING ") {
             let (h, tail) = cut_clause(r);
-            having_min_count = Some(h.trim().parse::<usize>().map_err(|e| e.to_string())? + 1);
+            having = Some(parse_having(h)?);
             rest = tail;
         }
         if let Some(r) = rest.strip_prefix("ORDER BY ") {
@@ -407,8 +407,17 @@ impl FakeSql {
                 // An implicit group over no rows still yields one row.
                 groups.push((Vec::new(), Vec::new()));
             }
-            let min = having_min_count.unwrap_or(0);
-            for (_, members) in groups.into_iter().filter(|(_, m)| m.len() >= min) {
+            let mut kept = Vec::new();
+            for (_, members) in groups {
+                let keep = match &having {
+                    Some(h) => h.eval(&members, &resolver, &rels)?,
+                    None => true,
+                };
+                if keep {
+                    kept.push(members);
+                }
+            }
+            for members in kept {
                 let mut row = Vec::with_capacity(items.len());
                 for item in &items {
                     let (ty, v) = item.expr.eval_group(&members, &resolver, &rels)?;
@@ -492,6 +501,81 @@ impl FakeSql {
 struct SelectItem {
     expr: SelectExpr,
     name: String,
+}
+
+/// A `HAVING`: comparisons of aggregate expressions with literals.
+enum Having {
+    Cmp(SelectExpr, String, Value),
+    And(Vec<Having>),
+    Or(Vec<Having>),
+    Not(Box<Having>),
+}
+
+impl Having {
+    fn eval(&self, members: &[Tuple], r: &Resolver<'_>, rels: &[Rel]) -> Result<bool, String> {
+        Ok(match self {
+            Having::Cmp(e, op, lit) => {
+                let (_, v) = e.eval_group(members, r, rels)?;
+                let o = cmp_values(&v, lit);
+                match op.as_str() {
+                    "=" => o.is_eq(),
+                    "<>" => o.is_ne(),
+                    "<" => o.is_lt(),
+                    "<=" => o.is_le(),
+                    ">" => o.is_gt(),
+                    ">=" => o.is_ge(),
+                    _ => false,
+                }
+            }
+            Having::And(hs) => {
+                for h in hs {
+                    if !h.eval(members, r, rels)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            Having::Or(hs) => {
+                for h in hs {
+                    if h.eval(members, r, rels)? {
+                        return Ok(true);
+                    }
+                }
+                false
+            }
+            Having::Not(h) => !h.eval(members, r, rels)?,
+        })
+    }
+}
+
+fn parse_having(text: &str) -> Result<Having, String> {
+    let text = strip_parens(text.trim());
+    let ands = split_top(text, " AND ");
+    if ands.len() > 1 {
+        return Ok(Having::And(
+            ands.into_iter()
+                .map(parse_having)
+                .collect::<Result<_, _>>()?,
+        ));
+    }
+    let ors = split_top(text, " OR ");
+    if ors.len() > 1 {
+        return Ok(Having::Or(
+            ors.into_iter()
+                .map(parse_having)
+                .collect::<Result<_, _>>()?,
+        ));
+    }
+    if let Some(inner) = text.strip_prefix("NOT ") {
+        return Ok(Having::Not(Box::new(parse_having(inner)?)));
+    }
+    for op in ["<>", "<=", ">=", "=", "<", ">"] {
+        if let Some((l, r)) = split_once_top(text, &format!(" {op} ")) {
+            let item = parse_select_item(l.trim())?;
+            return Ok(Having::Cmp(item.expr, op.to_string(), parse_literal(r)?));
+        }
+    }
+    Err(format!("unparsed HAVING: {text}"))
 }
 
 enum SelectExpr {

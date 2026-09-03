@@ -278,6 +278,7 @@ const LANE_ONLY_CASES: &[&str] = &[
     "a grouped sub-select sums in the database and finalizes in the engine",
     "a DISTINCT sub-select pushes as a distinct derived table",
     "a top-k sub-select orders and limits inside the derived table",
+    "a sub-select's HAVING pushes inside its derived table",
 ];
 
 /// The shop fixture as a native ledger (`shop-native:main`): the oracle for
@@ -962,6 +963,16 @@ fn cases() -> Vec<Case> {
         // like the grouped lane's; DISTINCT and ORDER BY … LIMIT push inside
         // it. HAVING, OFFSET, a nested sub-select and a hidden inner
         // variable the block reuses decline.
+        Case {
+            name: "a sub-select's HAVING pushes inside its derived table",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c (COUNT(?o) AS ?k) WHERE { ?o ex:customer ?c } GROUP BY ?c HAVING (COUNT(?o) > 1) } }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "d0"."c1" AS "c2" FROM "shop"."customers" AS "t0" JOIN (SELECT "t2"."id" AS "c0", COUNT("t1"."id") AS "c1" FROM "shop"."orders" AS "t1" JOIN "shop"."customers" AS "t2" ON "t1"."customer_id" = "t2"."id" WHERE "t1"."id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL AND "t2"."id" IS NOT NULL GROUP BY "t2"."id" HAVING COUNT("t1"."id") > 1) AS "d0" ON "t0"."id" = "d0"."c0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            rows: &[
+                "k=2 n=Ada",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
         Case {
             name: "a grouped sub-select joins its counts to the outer rows",
             sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c (COUNT(?o) AS ?k) WHERE { ?o ex:customer ?c } GROUP BY ?c } }",
@@ -1858,8 +1869,8 @@ async fn sub_selects_the_lane_cannot_take_still_refuse() {
     let (_server, fluree) = setup().await;
     let shapes = [
         (
-            "HAVING",
-            "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c (COUNT(?o) AS ?k) WHERE { ?o ex:customer ?c } GROUP BY ?c HAVING (COUNT(?o) > 1) } }",
+            "a HAVING over an AVG",
+            "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c (COUNT(?o) AS ?k) WHERE { ?o ex:customer ?c ; ex:total ?t } GROUP BY ?c HAVING (AVG(?t) > 1) } }",
         ),
         (
             "a hidden variable the block reuses",
@@ -2124,11 +2135,35 @@ fn aggregate_cases() -> Vec<Case> {
             routing: Routing::MustFire,
             declined: None,
         },
+        // A HAVING comparing COUNT or an exact SUM with a constant goes
+        // with the statement (the engine's HAVING still runs above it); a
+        // top-k may then follow it. One over an AVG, divided in the engine,
+        // stays there and keeps the LIMIT with it.
         Case {
-            name: "HAVING keeps LIMIT in the engine and filters the groups",
+            name: "HAVING filters the groups in the database",
             sparql: "SELECT ?c (COUNT(?o) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c } GROUP BY ?c HAVING (COUNT(?o) > 1) LIMIT 5",
-            sql: &[r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            sql: &[r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id" HAVING COUNT("t0"."id") > 1"#],
             rows: &["c=http://example.org/customer/1 n=2"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "HAVING over a SUM and a COUNT pushes with a top-k",
+            sparql: "SELECT ?c (SUM(?t) AS ?s) FROM <shop-sql:main> WHERE { ?o ex:customer ?c ; ex:total ?t } GROUP BY ?c HAVING (SUM(?t) > 10 && COUNT(?o) >= 1) ORDER BY DESC(?s) LIMIT 1",
+            sql: &[r#"SELECT "t1"."id" AS "c0", SUM("t0"."total") AS "c1", COUNT("t0"."total") AS "c2", COUNT("t0"."id") AS "c3" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id" HAVING (SUM("t0"."total") > 10) AND (COUNT("t0"."id") >= 1) ORDER BY "c1" DESC LIMIT 1"#],
+            rows: &[
+                "c=http://example.org/customer/1 s=104.50",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "HAVING over an AVG stays in the engine with the LIMIT",
+            sparql: "SELECT ?c (COUNT(?o) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c ; ex:total ?t } GROUP BY ?c HAVING (AVG(?t) > 30) ORDER BY DESC(?n) LIMIT 1",
+            sql: &[r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1", SUM("t0"."total") AS "c2", COUNT("t0"."total") AS "c3" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            rows: &[
+                "c=http://example.org/customer/1 n=2",
+            ],
             routing: Routing::MustFire,
             declined: None,
         },
