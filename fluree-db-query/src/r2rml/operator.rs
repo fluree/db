@@ -2836,7 +2836,14 @@ impl Operator for R2rmlScanOperator {
         // `row_budget`, do NOT forward to the child — an inner correlated scan must
         // still produce every row the join needs; only a topmost scan is eligible.
         // An ASC directive is admitted only when the sort column is REQUIRED (the
-        // provider re-checks nullability at scan time).
+        // provider re-checks nullability at scan time), and only under
+        // `FLUREE_R2RML_TOPK_ASC` (default on): off is byte-identical to the
+        // pre-item-8 DESC-only scan. The planner offers ASC unconditionally so
+        // the SQL pushdown lane, whose ORDER BY columns are required by
+        // construction, is not tied to this scan's switch.
+        if ascending && !crate::r2rml::topk_asc_enabled() {
+            return;
+        }
         if topk_pushdown_enabled() {
             self.topk = Some((sort_var, k, ascending));
         }

@@ -3728,6 +3728,11 @@ pub(crate) fn apply_solution_modifiers(
     }
 
     if can_project_distinct_before_sort {
+        let distinct_vars: Vec<VarId> = match select_vars {
+            Some(vars) => vars.to_vec(),
+            None => operator.schema().to_vec(),
+        };
+        operator.set_distinct(&distinct_vars);
         // PROJECT
         if let Some(vars) = select_vars {
             operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
@@ -3783,18 +3788,14 @@ pub(crate) fn apply_solution_modifiers(
             // honors either direction ONLY if the key resolves to a single scalar
             // scan column, else no-op. Pure optimization — this `SortOperator`
             // remains the authority for the exact (compound) order + LIMIT.
+            // Both directions are offered; the R2RML scan applies its own
+            // FLUREE_R2RML_TOPK_ASC gate in `set_topk`, the SQL pushdown lane
+            // orders only on required columns and takes either.
             if can_topk {
                 if let Some(primary) = ordering.first() {
                     use crate::sort::SortDirection;
-                    match primary.direction {
-                        SortDirection::Descending => operator.set_topk(primary.var, k, false),
-                        // Gated by FLUREE_R2RML_TOPK_ASC: OFF is byte-identical to
-                        // the pre-item-8 DESC-only behavior.
-                        SortDirection::Ascending if crate::r2rml::topk_asc_enabled() => {
-                            operator.set_topk(primary.var, k, true);
-                        }
-                        SortDirection::Ascending => {}
-                    }
+                    let ascending = matches!(primary.direction, SortDirection::Ascending);
+                    operator.set_topk(primary.var, k, ascending);
                 }
             }
             let mut sort_op = if can_topk {
@@ -3808,6 +3809,16 @@ pub(crate) fn apply_solution_modifiers(
                     .map(|d| d.required_sort_vars.as_slice()),
             );
             operator = Box::new(sort_op);
+        }
+
+        if distinct {
+            // Reaches a source only when nothing but row-preserving operators
+            // sit between (a Sort above swallows it).
+            let distinct_vars: Vec<VarId> = match select_vars {
+                Some(vars) if !vars.is_empty() => vars.to_vec(),
+                _ => operator.schema().to_vec(),
+            };
+            operator.set_distinct(&distinct_vars);
         }
 
         // PROJECT
