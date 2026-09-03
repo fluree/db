@@ -173,7 +173,7 @@ impl ServerError {
             ServerError::Api(ApiError::Internal(_)) => errors::INTERNAL,
             ServerError::Api(ApiError::Drop(_)) => errors::INTERNAL,
             ServerError::Api(ApiError::Json(_)) => errors::INTERNAL,
-            ServerError::Api(ApiError::Config(_)) => errors::CONFIG,
+            ServerError::Api(ApiError::Config(_) | ApiError::LedgerConfig(_)) => errors::CONFIG,
             ServerError::Api(ApiError::Format(_)) => errors::FORMAT,
 
             // Cross-ledger model dependency failure (502). The variant
@@ -255,6 +255,8 @@ impl ServerError {
             ServerError::Api(ApiError::CypherLower(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::CypherUpdateLower(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::Config(_)) => StatusCode::BAD_REQUEST,
+            // Operator data, not caller input. See `ApiError::LedgerConfig`.
+            ServerError::Api(ApiError::LedgerConfig(_)) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::Api(ApiError::Format(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::AwaitTNotReached { .. }) => StatusCode::REQUEST_TIMEOUT,
             ServerError::MissingLedger => StatusCode::BAD_REQUEST,

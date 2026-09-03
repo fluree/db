@@ -792,10 +792,15 @@ impl Fluree {
         // largest of them, contributing to the ~2 MB worker-stack overflow on a
         // plain `select *` query (fluree/db#1408). Boxing keeps their state on
         // the heap so this frame stays O(1).
+        // Report the error's own status. Query preparation completes the
+        // ledger's config defaults, so a fault in the config graph surfaces
+        // here; a blanket 400 would tell the caller their request was bad
+        // when nothing about the request is.
         let executable = Box::pin(self.build_executable_for_view(db, &parsed))
             .await
             .map_err(|e| {
-                crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+                let status = e.status_code();
+                crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
             })?;
 
         // Execute with tracking

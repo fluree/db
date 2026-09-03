@@ -190,3 +190,73 @@ async fn jsonld_config_reasoning_defaults_apply_on_ledger_route() {
         "config reasoning defaults should engage on the JSON-LD ledger route"
     );
 }
+
+// =============================================================================
+// A malformed config graph is the operator's fault, not the caller's
+// =============================================================================
+
+/// `f:rulesSource` with `f:atT` is parsed but not yet supported, so config
+/// resolution fails loudly rather than silently dropping a governance setting
+/// the operator believes is in force. Since query preparation is where config
+/// defaults are completed, that failure now reaches every query on the ledger.
+const BAD_RULES_SOURCE_TRIG: &str = r"
+@prefix f: <https://ns.flur.ee/db#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+GRAPH <urn:fluree:cfgdefaults:main#config> {
+    <urn:cfgdefaults:config> rdf:type f:LedgerConfig .
+    <urn:cfgdefaults:config> f:datalogDefaults <urn:cfgdefaults:datalog> .
+    <urn:cfgdefaults:datalog> f:datalogEnabled true .
+    <urn:cfgdefaults:datalog> f:rulesSource <urn:cfgdefaults:rules-ref> .
+    <urn:cfgdefaults:rules-ref> rdf:type f:GraphRef ;
+                                f:graphSource <urn:cfgdefaults:rules-src> .
+    <urn:cfgdefaults:rules-src> f:graphSelector f:defaultGraph .
+    <urn:cfgdefaults:rules-src> f:atT 1 .
+}
+";
+
+/// The caller sent a perfectly good query. Answering with 400 points them at
+/// their own request, which they cannot change to fix this; the fault is in
+/// the ledger's config graph and only an operator can clear it.
+#[tokio::test]
+async fn malformed_ledger_config_is_not_reported_as_a_client_error() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": LEDGER }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "create ledger");
+
+    upsert_trig(&app, SEED_TRIG).await;
+    upsert_trig(&app, BAD_RULES_SOURCE_TRIG).await;
+
+    let (status, json) = post(
+        &app,
+        "application/sparql-query",
+        ENTAILED_SELECT.to_string(),
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a fault in the ledger's config graph must not read as a bad request: {json}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "expected a server-side status for a malformed config graph: {json}"
+    );
+}

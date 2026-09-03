@@ -1051,17 +1051,17 @@ fn resolve_local_rules_source_g_id(
         return Ok(None);
     }
     if src.at_t.is_some() {
-        return Err(ApiError::config(
+        return Err(ApiError::ledger_config(
             "f:rulesSource with f:atT (temporal pinning) is not yet supported",
         ));
     }
     if src.trust_policy.is_some() {
-        return Err(ApiError::config(
+        return Err(ApiError::ledger_config(
             "f:rulesSource with f:trustPolicy is not yet supported",
         ));
     }
     if src.rollback_guard.is_some() {
-        return Err(ApiError::config(
+        return Err(ApiError::ledger_config(
             "f:rulesSource with f:rollbackGuard is not yet supported",
         ));
     }
@@ -1072,7 +1072,7 @@ fn resolve_local_rules_source_g_id(
     };
     match g_id {
         Some(id) => Ok(Some(id)),
-        None => Err(ApiError::config(format!(
+        None => Err(ApiError::ledger_config(format!(
             "f:rulesSource graph '{}' not found in this ledger's graph registry",
             src.graph_selector.as_deref().unwrap_or("<none>"),
         ))),
