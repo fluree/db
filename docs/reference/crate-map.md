@@ -20,11 +20,14 @@ fluree-db/
 ├── Query & Transaction
 │   ├── fluree-db-query/           # Query engine (JSON-LD Query)
 │   ├── fluree-db-sparql/          # SPARQL parser and lowering
+│   ├── fluree-db-cypher/          # openCypher parser and lowering
+│   ├── fluree-db-graphql/         # GraphQL schema derivation + lowering
 │   └── fluree-db-transact/        # Transaction processing
 │
 ├── Storage & Connection
 │   ├── fluree-db-connection/      # Storage backends and connection management
 │   ├── fluree-db-storage-aws/     # AWS storage (S3, S3 Express, DynamoDB)
+│   ├── fluree-db-storage-ipfs/    # IPFS storage backend (Kubo HTTP RPC)
 │   ├── fluree-db-nameservice/     # Nameservice implementations
 │   └── fluree-db-nameservice-sync/# Git-like remote sync for nameservice
 │
@@ -42,10 +45,14 @@ fluree-db/
 ├── Reasoning
 │   └── fluree-db-reasoner/        # OWL2-RL reasoning engine
 │
+├── Indexing (specialized)
+│   └── fluree-db-spatial/         # S2 cell-based spatial indexing
+│
 ├── Graph Sources
 │   ├── fluree-db-tabular/         # Tabular column batch types
 │   ├── fluree-db-iceberg/         # Apache Iceberg integration
-│   └── fluree-db-r2rml/           # R2RML mapping support
+│   ├── fluree-db-r2rml/           # R2RML mapping support
+│   └── fluree-db-sql/             # SQL graph sources (Trino-protocol HTTP)
 │
 ├── Search
 │   ├── fluree-search-protocol/    # Search service protocol types
@@ -63,7 +70,11 @@ fluree-db/
 └── Top-Level
     ├── fluree-db-api/             # Public API and high-level operations
     ├── fluree-db-bolt/            # Bolt protocol codec + session machine
-    └── fluree-db-server/          # HTTP server (binary)
+    ├── fluree-db-server/          # HTTP server (binary)
+    ├── fluree-db-cli/             # `fluree` command-line interface (binary)
+    ├── fluree-db-memory/          # Developer memory layer (facts as RDF)
+    ├── fluree-db-docs/            # Embedded, version-pinned documentation lookup
+    └── fluree-db-mcp/             # MCP service exposing selectable toolsets
 ```
 
 ## Foundation Crates
@@ -321,6 +332,20 @@ fluree-db/
 - fluree-db-novelty
 - fluree-sse
 
+### fluree-db-storage-ipfs
+
+**Purpose:** IPFS storage backend (Kubo HTTP RPC)
+
+**Responsibilities:**
+- Implement `ContentStore` against `/api/v0/block/*`
+- Map Fluree's `ContentId` (CIDv1, SHA2-256 multihash) onto IPFS blocks
+
+Behind the `ipfs` feature on `fluree-db-api`.
+
+**Dependencies:**
+- fluree-db-core
+- reqwest, cid, multihash
+
 ## Indexing Crates
 
 ### fluree-db-binary-index
@@ -368,6 +393,20 @@ fluree-db/
 - fluree-db-core
 - fluree-db-novelty
 - fluree-db-nameservice
+
+### fluree-db-spatial
+
+**Purpose:** S2 cell-based spatial indexing
+
+**Responsibilities:**
+- Index complex geometries (polygons, linestrings) via Google S2 cells
+- Content-addressed, chunked snapshots for CAS storage
+- Novelty overlay and `to_t` time-travel semantics, as the main index has
+- Embedded and remote deployment modes
+
+**Dependencies:**
+- fluree-db-core, fluree-db-novelty, fluree-db-ledger
+- fluree-db-nameservice, fluree-vocab
 
 ## Security & Validation Crates
 
@@ -421,6 +460,51 @@ fluree-db/
 - fluree-db-query
 - fluree-db-sparql (parsing `sh:select` constraint queries)
 - fluree-vocab
+
+### fluree-db-cypher
+
+**Purpose:** openCypher 9 parser and lowering
+
+**Responsibilities:**
+- Lex, parse, and validate openCypher 9 with LLM-friendly diagnostics
+- Lower reads into the shared `fluree-db-query` IR — the same engine that
+  executes SPARQL and JSON-LD queries
+- Map property-graph relationships-with-properties onto Fluree's
+  edge-annotation primitive
+
+Lowering is behind the default `lowering` feature; disabling it leaves a
+parse/validate-only crate for smaller Lambda/WASM builds.
+
+**Dependencies:**
+- fluree-db-query (optional, `lowering` feature)
+- fluree-db-core, fluree-vocab, fluree-graph-json-ld (same feature)
+- winnow
+
+See [Cypher](../query/cypher.md) for the supported surface. Cypher *writes*
+lower in `fluree-db-transact`, not here.
+
+### fluree-db-graphql
+
+**Purpose:** GraphQL schema derivation and query lowering
+
+**Responsibilities:**
+- Derive a GraphQL schema from ledger statistics, SHACL shapes, and a
+  `graphql:Schema` instance — three tiers, into one language-neutral model
+- Render that model as an executable `async-graphql` schema and as SDL
+- Lower a GraphQL document to a JSON-LD query (or, for a mutation, a
+  transaction) and reshape the result back
+- Emit SHACL from a derived schema (`--bootstrap`), the mapping run backwards
+
+Owns no engine of its own: everything it produces runs through the ordinary
+JSON-LD query and transaction paths, so policy, SHACL, and time travel apply
+unchanged. Ledger access lives on the `fluree-db-api` side of the seam — this
+crate takes plain IRIs, which is what makes it testable without a ledger.
+
+**Dependencies:**
+- fluree-db-core (value-type tags for the datatype mapping)
+- fluree-vocab
+- fluree-db-query (optional, `lowering` feature)
+- async-graphql (parse, validate, introspect, execute)
 
 ## Reasoning
 
@@ -476,6 +560,20 @@ fluree-db/
 - fluree-graph-turtle (optional)
 - fluree-db-tabular
 - fluree-vocab
+
+### fluree-db-sql
+
+**Purpose:** SQL graph sources — R2RML scans over a Trino-protocol HTTP endpoint
+
+**Responsibilities:**
+- Typed rendering of single-table scans (`SELECT … WHERE …`) against a probed schema
+- The statement/page protocol client (streaming, retry, cancel-on-drop)
+- Trino type names and JSON page values → column batches
+
+**Dependencies:**
+- fluree-db-tabular
+- fluree-db-iceberg (base: shared `ConfigValue` / auth / secret resolution)
+- reqwest
 
 ## Search Crates
 
@@ -747,6 +845,63 @@ fluree-db-nameservice, fluree-db-transact, fluree-db-ledger
 - fluree-db-bolt (optional)
 - axum
 
+### fluree-db-cli
+
+**Purpose:** `fluree` command-line interface (binary + library)
+
+**Responsibilities:**
+- Command handlers for every CLI verb (query, transact, index, branch, model, …)
+- Local-vs-remote mode resolution, `.fluree/` config and active-ledger context
+- Optionally routes through a running local server rather than opening storage
+
+Published as a library as well as a binary, so alternative front-ends (web UI,
+TUI) can reuse the command logic.
+
+**Dependencies:**
+- fluree-db-api, fluree-db-server (optional, `server` feature)
+- fluree-db-graphql, fluree-db-memory, fluree-db-docs, fluree-db-mcp
+- clap
+
+### fluree-db-memory
+
+**Purpose:** Developer memory layer
+
+**Responsibilities:**
+- Store facts, decisions and constraints as ordinary RDF triples in a ledger
+- Recall by keyword (BM25) and by structured query
+
+Backs `fluree memory` and the MCP `memory` toolset.
+
+**Dependencies:**
+- fluree-db-api, fluree-db-core, fluree-db-nameservice
+
+### fluree-db-docs
+
+**Purpose:** Embedded, version-pinned documentation lookup
+
+**Responsibilities:**
+- Embed the `docs/` mdBook into the binary at build time
+- Search / get / examples over heading-level sections
+
+Because the docs ship inside the binary, every result is version-exact by
+construction. Backs `fluree docs` and the MCP `docs` toolset.
+
+**Dependencies:**
+- (none internal; the docs tree is a build-time input)
+
+### fluree-db-mcp
+
+**Purpose:** Model Context Protocol service
+
+**Responsibilities:**
+- One configurable MCP surface exposing selectable toolsets, rather than one
+  server per feature
+- Served over stdio by `fluree mcp serve --toolsets …`
+
+**Dependencies:**
+- fluree-db-memory, fluree-db-docs
+- rmcp
+
 ## Dependency Layers
 
 ```text
@@ -826,6 +981,12 @@ cargo test
 ```bash
 cargo build --features native,vector
 ```
+
+## Crates not listed here
+
+The bench chassis — `fluree-bench-support`, `fluree-bench-alloc`,
+`fluree-bench-virtual` — are workspace members but build-time tooling rather
+than library crates. See [Contributing: Benches](../contributing/benches.md).
 
 ## Crate Versions
 

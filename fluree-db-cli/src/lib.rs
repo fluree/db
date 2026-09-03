@@ -471,6 +471,49 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             }
         }
 
+        #[cfg(feature = "graphql")]
+        Commands::Graphql {
+            args,
+            ledger,
+            expr,
+            file,
+            variables,
+            operation,
+            schema,
+            bootstrap,
+            explain,
+        } => {
+            let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
+            // A GraphQL document always starts with `{`, `query`, `mutation`,
+            // `fragment` or `...`; a ledger name never does.
+            let looks_like_document = |s: &String| {
+                let t = s.trim_start();
+                t.starts_with('{')
+                    || t.starts_with("query")
+                    || t.starts_with("mutation")
+                    || t.starts_with("fragment")
+            };
+            let (positional_ledger, positional_query) = match args.len() {
+                0 => (None, None),
+                1 if looks_like_document(&args[0]) => (None, Some(args[0].clone())),
+                1 => (Some(args[0].clone()), None),
+                _ => (Some(args[0].clone()), Some(args[1].clone())),
+            };
+            commands::graphql::run(
+                ledger.as_deref().or(positional_ledger.as_deref()),
+                positional_query.as_deref(),
+                expr.as_deref(),
+                file.as_ref(),
+                variables.as_deref(),
+                operation.as_deref(),
+                schema,
+                bootstrap,
+                explain,
+                &fluree_dir,
+            )
+            .await
+        }
+
         #[cfg(feature = "shacl")]
         Commands::Validate {
             target,
@@ -731,6 +774,42 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
         Commands::Memory { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             commands::memory::run(action, &fluree_dir).await
+        }
+
+        Commands::Sql { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            match action {
+                cli::SqlAction::Map(args) => {
+                    commands::sql::run_sql_map(*args, &fluree_dir, direct).await
+                }
+                cli::SqlAction::List { remote } => {
+                    commands::iceberg::run_iceberg_list(&fluree_dir, remote.as_deref(), direct)
+                        .await
+                }
+                cli::SqlAction::Info { name, remote } => {
+                    commands::iceberg::run_iceberg_info(
+                        &name,
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
+                }
+                cli::SqlAction::Drop {
+                    name,
+                    force,
+                    remote,
+                } => {
+                    commands::iceberg::run_iceberg_drop(
+                        &name,
+                        force,
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
+                }
+            }
         }
 
         Commands::Iceberg { action } => {

@@ -7,6 +7,8 @@ mod commits;
 mod context;
 mod events;
 mod export;
+#[cfg(feature = "graphql")]
+pub mod graphql;
 #[cfg(feature = "iceberg")]
 mod iceberg;
 mod iceberg_ssrf;
@@ -20,6 +22,8 @@ mod push;
 pub(crate) mod query;
 pub(crate) mod serving;
 mod show;
+#[cfg(feature = "sql")]
+mod sql;
 mod storage_proxy;
 mod stream_query;
 mod stubs;
@@ -117,6 +121,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/iceberg/materialize", post(iceberg::iceberg_materialize))
         .route("/iceberg/track", post(iceberg::iceberg_track))
         .route("/iceberg/untrack", post(iceberg::iceberg_untrack));
+
+    #[cfg(feature = "sql")]
+    let v1_admin_protected_writes = v1_admin_protected_writes.route("/sql/map", post(sql::sql_map));
 
     // Admin auth runs BEFORE leader-forward. Axum runs the
     // last-applied layer outermost, so `require_admin_token`
@@ -334,6 +341,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         "/validate/*ledger",
         get(validate::validate_ledger_tail).post(validate::validate_ledger_tail),
     );
+
+    // GraphQL over the schema derived from the ledger's own data. The SDL sits
+    // on its own path rather than a `/schema` suffix: the ledger tail is greedy
+    // and ledger names may contain `/`.
+    #[cfg(feature = "graphql")]
+    let v1 = v1
+        .route(
+            "/graphql/*ledger",
+            get(graphql::graphql_ledger_tail).post(graphql::graphql_ledger_tail),
+        )
+        .route(
+            "/graphql-schema/*ledger",
+            get(graphql::graphql_schema_ledger_tail),
+        );
 
     let mut router = Router::new()
         // Health check

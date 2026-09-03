@@ -531,6 +531,29 @@ impl IdStatsHook {
         }
     }
 
+    /// Discount duplicate statements collapsed by the import SPOT merge.
+    ///
+    /// Import worker hooks are fed per chunk, upstream of the cross-chunk
+    /// merge, so a statement duplicated across chunks was counted once per
+    /// copy; the merge reports the collapsed copies here. Only the exact
+    /// counters move — HLL sketches, `last_modified_t`, and historical
+    /// datatype tags are duplicate-insensitive and stay untouched. Worker
+    /// hooks never track class detail (rdf:type p_id unset), so class maps
+    /// need no correction; the set-view class stats come from the
+    /// `SpotClassStatsCollector` on the already-deduplicated merge output.
+    pub fn discount_import_duplicates(&mut self, g_id: GraphId, p_id: u32, o_type: u16, n: u64) {
+        let delta = n as i64;
+        self.flake_count = self.flake_count.saturating_sub(n as usize);
+        *self.graph_flakes.entry(g_id).or_insert(0) -= delta;
+        let hll = self
+            .properties
+            .entry(GraphPropertyKey { g_id, p_id })
+            .or_insert_with(IdPropertyHll::new);
+        hll.count -= delta;
+        let dt = otype_to_value_type_tag(fluree_db_core::o_type::OType::from_u16(o_type));
+        *hll.datatypes.entry(dt.as_u8()).or_insert(0) -= delta;
+    }
+
     /// Merge another hook into this one (for cross-commit accumulation).
     ///
     /// HLL: register-wise max. Counts: additive.
@@ -1004,6 +1027,36 @@ mod tests {
         let hll = &hook.properties()[&GraphPropertyKey { g_id: 0, p_id: 1 }];
         assert_eq!(hll.last_modified_t, 9);
         assert!(hll.values_hll.estimate() > 0, "value sketch observed");
+    }
+
+    /// Import-merge duplicate discounts move exactly the exact counters —
+    /// graph flakes, property count, per-datatype count — and leave the
+    /// monotone accumulators (HLL, last_modified_t, historical tags) alone.
+    #[test]
+    fn discount_import_duplicates_moves_exact_counters_only() {
+        use fluree_db_core::o_type::OType;
+
+        let mut hook = IdStatsHook::new();
+        // Two copies of the same fact counted by per-chunk worker hooks.
+        hook.on_record(&record(true, 1));
+        hook.on_record(&record(true, 1));
+        let hll_before = hook.properties()[&GraphPropertyKey { g_id: 0, p_id: 1 }]
+            .values_hll
+            .estimate();
+
+        // The merge collapsed one copy. record() uses ValueTypeTag::INTEGER,
+        // which OType::XSD_INTEGER maps back to.
+        hook.discount_import_duplicates(0, 1, OType::XSD_INTEGER.as_u16(), 1);
+
+        assert_eq!(property_count(&hook), 1);
+        assert_eq!(hook.graph_flakes_mut()[&0], 1);
+        let hll = &hook.properties()[&GraphPropertyKey { g_id: 0, p_id: 1 }];
+        assert_eq!(
+            hll.datatypes[&fluree_db_core::value_id::ValueTypeTag::INTEGER.as_u8()],
+            1
+        );
+        assert_eq!(hll.values_hll.estimate(), hll_before, "HLL untouched");
+        assert_eq!(hll.last_modified_t, 1);
     }
 
     /// The op-derived path is unchanged: ±1 regardless of any base.

@@ -33,8 +33,10 @@
 //! let db = GraphDb::from_ledger_state(&ledger);
 //! ```
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod admin;
 pub mod block_fetch;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
 mod commit_data;
 pub mod commit_transfer;
@@ -61,15 +63,20 @@ pub mod graph_query_builder;
 pub mod graph_snapshot;
 pub mod graph_source;
 pub mod graph_transact_builder;
+#[cfg(feature = "graphql")]
+pub mod graphql;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod import;
 pub mod import_source;
 mod indexer_attachment_provider;
+#[cfg(not(target_arch = "wasm32"))]
 mod indexer_fulltext_provider;
 mod inline_ontology;
 #[cfg(feature = "shacl")]
 mod inline_shapes;
 mod ledger;
 pub mod ledger_info;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod materialize;
 #[cfg(feature = "iceberg")]
 pub mod materialize_worker;
@@ -101,6 +108,8 @@ pub mod vector_worker;
 pub mod vended_credentials;
 pub mod verify;
 pub mod view;
+pub mod wasm_compat;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod wire;
 
 // Ledger caching and management
@@ -110,6 +119,7 @@ pub mod ledger_view;
 // Search service integration (embedded adapter, remote client)
 pub mod search;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use admin::{
     BranchDropReport,
     DropMode,
@@ -157,6 +167,7 @@ pub use graph_source::{
     FlureeIndexProvider, SnapshotSelection,
 };
 pub use graph_transact_builder::{GraphTransactBuilder, StagedGraph};
+#[cfg(not(target_arch = "wasm32"))]
 pub use import::{
     is_bulk_import_file, scan_directory_format, CreateBuilder, DirectoryFormat,
     EffectiveImportSettings, ImportBuilder, ImportConfig, ImportError, ImportPhase, ImportResult,
@@ -218,6 +229,14 @@ pub use graph_source::{
     ValidateR2rmlResponse,
 };
 
+#[cfg(feature = "sql")]
+pub use fluree_db_sql::{
+    validate_sql_endpoint, AuthConfig as SqlAuthConfig, ConfigValue as SqlConfigValue, SqlDialect,
+    SqlGsConfig, WireProtocol,
+};
+#[cfg(feature = "sql")]
+pub use graph_source::{SqlCreateConfig, SqlCreateResult};
+
 /// Secret-resolution injection point for `ConfigValue::SecretRef` in Iceberg
 /// graph-source auth. The host constructs a [`SecretResolver`] with the tenant
 /// captured and injects it via [`Fluree::with_secret_resolver`]; db stays
@@ -235,6 +254,7 @@ pub use fluree_db_iceberg::mor_guard::ALLOW_MOR_DELETES_ENV;
 #[cfg(feature = "iceberg")]
 pub use fluree_db_iceberg::DeleteConvention;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use bm25_worker::{
     Bm25MaintenanceWorker, Bm25WorkerConfig, Bm25WorkerHandle, Bm25WorkerState, Bm25WorkerStats,
 };
@@ -261,11 +281,14 @@ pub use graph_source::{
 pub use search::EmbeddedBm25SearchProvider;
 
 // Re-export indexer types for background indexing setup
+#[cfg(not(target_arch = "wasm32"))]
 pub use fluree_db_indexer::{
     current_index_request_correlation, with_index_request_correlation, BackgroundIndexerWorker,
     IndexCompletion, IndexOutcome, IndexPhase, IndexRequestCorrelation, IndexStatusSnapshot,
     IndexerConfig, IndexerHandle, SweepPlan, SweepResult,
 };
+#[cfg(target_arch = "wasm32")]
+pub use wasm_compat::{IndexerConfig, IndexerHandle};
 
 // Re-export commonly used types from child crates
 pub use fluree_db_connection::{ConnectionConfig, StorageType};
@@ -1058,6 +1081,9 @@ impl StorageMethod for AddressIdentifierResolverStorage {
 /// kept for backward compatibility.
 pub type FlureeClient = Fluree;
 
+// Callers live in the native-feature storage builders; the no-native shape
+// (wasm, or a native host building e.g. fluree-db-wasm's dep graph) has none.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 fn decode_encryption_key_base64(key_str: &str) -> Result<[u8; 32]> {
     use base64::Engine;
     let decoded = base64::engine::general_purpose::STANDARD
@@ -1217,8 +1243,8 @@ fn is_indexing_enabled(config: &ConnectionConfig) -> bool {
 }
 
 /// Build IndexerConfig from connection defaults, falling back to defaults.
-fn build_indexer_config(config: &ConnectionConfig) -> fluree_db_indexer::IndexerConfig {
-    let mut indexer_config = fluree_db_indexer::IndexerConfig::default();
+fn build_indexer_config(config: &ConnectionConfig) -> wasm_compat::IndexerConfig {
+    let mut indexer_config = wasm_compat::IndexerConfig::default();
 
     // Apply gc_max_old_indexes from config if present
     if let Some(max_old) = config
@@ -1413,7 +1439,9 @@ pub fn spawn_local_cache_event_listener(
     event_bus: Arc<fluree_db_nameservice::LedgerEventBus>,
     ledger_manager: Arc<LedgerManager>,
 ) {
-    tokio::spawn(async move {
+    // spawn_detached: tokio::spawn on native (as before); the browser event
+    // loop on wasm32, where builds run without an ambient tokio runtime.
+    crate::wasm_compat::spawn_detached(async move {
         let mut subscription = event_bus.subscribe(fluree_db_nameservice::SubscriptionScope::all());
         drop(event_bus);
 
@@ -2021,6 +2049,63 @@ impl FlureeBuilder {
             index_config,
         });
         self.indexer_config_user_set = true;
+        self
+    }
+
+    /// Set how often the background indexer re-sweeps for stalled ledgers.
+    ///
+    /// `Duration::ZERO` disables the re-sweep. The sweep the worker performs at
+    /// start-up always runs — see [`fluree_db_indexer::IndexerConfig::catchup_interval`].
+    ///
+    /// No-op unless background indexing is enabled, since it configures the
+    /// worker; call it after `with_indexing*`.
+    pub fn with_indexer_catchup_interval(mut self, interval: std::time::Duration) -> Self {
+        if let Some(cfg) = self.indexing_config.take() {
+            self.indexing_config = Some(IndexingBuilderConfig {
+                indexer_config: cfg.indexer_config.with_catchup_interval(interval),
+                index_config: cfg.index_config,
+            });
+        }
+        self
+    }
+
+    /// Declare that another worker owns catch-up for this nameservice, so the
+    /// background indexer this builder spawns must not sweep.
+    ///
+    /// Both sweeps are skipped — the start-up one and the periodic re-sweep.
+    /// Everything else about the worker is unchanged: post-commit triggers,
+    /// admin reindex, the max-novelty nudge, and maintenance holds all keep
+    /// working, because they route through `IndexerHandle` rather than the
+    /// sweeps.
+    ///
+    /// Raft is the case this exists for. Every node builds a `Fluree` through
+    /// this builder and so runs a node-scope worker, while the leader
+    /// additionally runs a leader-scope worker wired to the consensus event
+    /// bus. Catch-up belongs to the leader-scope one: it is the worker raft
+    /// starts and stops with leadership, and it is the only one whose publishes
+    /// land. `RaftNameService::publish_index` swallows the `ForwardToLeader`
+    /// that `client_write` returns on a non-leader, so a follower's build pays
+    /// its full cost, is told it succeeded, and advances no index head. Left
+    /// enabled here, the leader would sweep twice over independent `states`
+    /// maps — `trigger_if_idle` cannot see the other worker's claim, so the
+    /// same ledger is queued and built concurrently — and every follower would
+    /// begin building into that no-op.
+    ///
+    /// Prefer this over `without_indexing()` for that case. `without_indexing()`
+    /// leaves `IndexingMode::Disabled`, which also turns off `admin::reindex`
+    /// and `admin::trigger_index` (they answer `ApiError::IndexingDisabled`),
+    /// drops the `cancel` + `wait_for_idle` quiesce that ledger drop and branch
+    /// purge rely on, and silently no-ops the max-novelty nudge.
+    ///
+    /// No-op unless background indexing is enabled, since it configures the
+    /// worker; call it after `with_indexing*`.
+    pub fn without_indexer_catchup_sweeps(mut self) -> Self {
+        if let Some(cfg) = self.indexing_config.take() {
+            self.indexing_config = Some(IndexingBuilderConfig {
+                indexer_config: cfg.indexer_config.with_catchup_sweeps(false),
+                index_config: cfg.index_config,
+            });
+        }
         self
     }
 
@@ -2754,6 +2839,7 @@ impl FlureeBuilder {
     /// Spawn the background indexer worker if configured.
     ///
     /// Must be called within a tokio runtime context.
+    #[cfg(not(target_arch = "wasm32"))]
     fn start_background_indexing<N>(
         &self,
         backend: &StorageBackend,
@@ -2777,10 +2863,26 @@ impl FlureeBuilder {
         Arc::new(std::sync::OnceLock::new())
     }
 
+    /// wasm32: background indexing has no meaning in a browser peer — run in
+    /// the existing "external indexer" mode (`IndexingMode::Disabled`).
+    #[cfg(target_arch = "wasm32")]
+    fn start_background_indexing<N>(
+        &self,
+        _backend: &StorageBackend,
+        _nameservice: &N,
+        _cell: &indexer_attachment_provider::LedgerManagerCell,
+    ) -> tx::IndexingMode
+    where
+        N: NameServiceLookup + BranchLifecycle + fluree_db_nameservice::Publisher + Clone + 'static,
+    {
+        tx::IndexingMode::Disabled
+    }
+
     /// Spawn the background indexer with an already-`Arc`'d nameservice.
     ///
     /// Used by AWS paths where the nameservice is already type-erased behind
     /// an `Arc<dyn ReadWriteNameService>`.
+    #[cfg(not(target_arch = "wasm32"))]
     fn start_background_indexing_dyn(
         &self,
         backend: &StorageBackend,
@@ -3566,6 +3668,7 @@ impl Fluree {
     /// already attaches one of these automatically; external callers
     /// invoking `fluree_db_indexer::build_index_for_ledger` directly should
     /// attach their own by calling this method.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn fulltext_config_provider(&self) -> Arc<dyn fluree_db_indexer::FulltextConfigProvider> {
         Arc::new(
             crate::indexer_fulltext_provider::ApiFulltextConfigProvider {
@@ -3595,6 +3698,7 @@ impl Fluree {
     /// callers invoking `fluree_db_indexer::build_index_for_ledger`
     /// directly (e.g. the CLI's `index` command) need to attach
     /// theirs by calling this method.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn attachment_events_provider(
         &self,
     ) -> Option<Arc<dyn fluree_db_indexer::AttachmentEventsProvider>> {
@@ -3688,6 +3792,7 @@ impl Fluree {
     /// let view = fluree.db("mydb").await?;
     /// let qr = fluree.query(&view, "SELECT * WHERE { ?s ?p ?o } LIMIT 10").await?;
     /// ```
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn create(&self, ledger_id: &str) -> import::CreateBuilder<'_> {
         import::CreateBuilder::new(self, ledger_id.to_string())
     }
@@ -4686,6 +4791,11 @@ impl Fluree {
     /// Returns JoinHandle for graceful shutdown. Call `.abort()` on shutdown.
     /// Should be called once after building Fluree.
     /// Returns None if caching is not enabled.
+    ///
+    /// Native-only: spawns onto the ambient tokio runtime, which browser
+    /// builds do not have. A wasm embedder that wants idle eviction drives
+    /// it from its own scheduler instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn spawn_maintenance(&self) -> Option<tokio::task::JoinHandle<()>> {
         self.ledger_manager
             .as_ref()

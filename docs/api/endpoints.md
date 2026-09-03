@@ -1555,6 +1555,96 @@ curl -X POST http://localhost:8090/v1/fluree/explain/mydb \
   --data 'MATCH (n:Person {id: 7}) RETURN n'
 ```
 
+### POST/GET /graphql/{ledger...}
+
+Execute a GraphQL request against the schema derived from the ledger's own data.
+There is nothing to register first: any ledger with typed subjects has a schema.
+Requires the `graphql` build feature (on by default).
+
+**URL:**
+```
+POST /graphql/{ledger...}
+GET  /graphql/{ledger...}?query={urlencoded-graphql}
+```
+
+**Content types:**
+
+| Content-Type | Body |
+|--------------|------|
+| `application/json` | `{"query": "...", "variables": {...}, "operationName": "...", "extensions": {"explain": true}}` |
+| `application/graphql` | the document as the raw body |
+
+**Optional query parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query` | string | — | The document, for the `GET` form GraphiQL and browser clients use. |
+| `variables` | string | — | A URL-encoded JSON object (`GET` form). |
+| `operationName` | string | — | Which operation to run, when the document defines several. |
+| `explain` | boolean | `false` | Return `extensions.explain`: the Fluree query or transaction each root field lowered to. |
+
+Identity and policy travel in headers, as they do for SPARQL and Cypher — a
+GraphQL request has no body `opts` block. A class or property the caller's
+policy denies is absent from introspection, not present-but-empty.
+
+**Mutations** are routed to the write path automatically, decided from the
+document (GraphQL sends everything over `POST`, so the method says nothing about
+intent). They require write authority *and* a `graphql:Schema` in the ledger that
+enables them; see [GraphQL](../query/graphql.md#curated-schemas-and-mutations).
+
+**Status codes.** A GraphQL error is part of the response body, not a transport
+failure: the endpoint returns **200** with an `errors` array, because that is
+what every standard client reads. Only a malformed request envelope (no `query`)
+is a `400`.
+
+```bash
+# Query
+curl -X POST http://localhost:8090/v1/fluree/graphql/mydb \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ persons(limit: 10) { id name knows { id } } }"}'
+
+# The raw-document form
+curl -X POST http://localhost:8090/v1/fluree/graphql/mydb \
+  -H "Content-Type: application/graphql" \
+  --data '{ persons_count }'
+
+# With the lowered JSON-LD query attached
+curl -X POST 'http://localhost:8090/v1/fluree/graphql/mydb?explain=true' \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ persons { id } }"}'
+
+# A mutation (needs f:graphqlEnableMutations on the ledger's graphql:Schema)
+curl -X POST http://localhost:8090/v1/fluree/graphql/mydb \
+  -H "Content-Type: application/json" \
+  -d '{"query": "mutation { create_Person(input: {name: \"Alice\"}) { id } }"}'
+```
+
+### GET /graphql-schema/{ledger...}
+
+The derived schema as GraphQL SDL, including mutations when the ledger's
+`graphql:Schema` enables them.
+
+A separate path rather than a `/schema` suffix on the route above: the ledger
+segment is a greedy tail and ledger names may contain `/`.
+
+```bash
+curl http://localhost:8090/v1/fluree/graphql-schema/mydb
+```
+
+```graphql
+type Person {
+  id: ID!
+  name: [String!]
+  knows(where: PersonFilter, limit: Int, offset: Int, orderBy: PersonNestedOrder): [Person!]
+}
+
+type Query {
+  person(id: ID!): Person
+  persons(where: PersonFilter, limit: Int, offset: Int, orderBy: PersonOrder): [Person!]
+  persons_count(where: PersonFilter): Int!
+}
+```
+
 ### GET/POST /validate/{ledger...}
 
 Validate the current state of a ledger (or one of its named graphs) against SHACL shapes and return a **validation report** — the HTTP surface of `fluree validate`. Unlike transaction-time enforcement, this never rejects anything; it reports every result it finds. Requires the `shacl` build feature (on by default).
@@ -1663,7 +1753,7 @@ A flat array of ledgers and graph sources. Retracted entries are omitted.
   {"name": "mydb", "branch": "dev", "type": "Ledger", "t": 3},
   {"name": "docsearch", "branch": "main", "type": "BM25", "t": 5,
    "dependencies": ["mydb:main"]},
-  {"name": "warehouse", "branch": "main", "type": "Iceberg", "t": 0,
+  {"name": "orders-db", "branch": "main", "type": "Iceberg", "t": 0,
    "dependencies": ["mydb:main"]}
 ]
 ```
@@ -2572,7 +2662,7 @@ Returns simplified nameservice-only metadata:
 | `commitId` | string | No | Head commit CID (non-proxy mode) |
 | `commit_head_id` | string | No | Head commit CID (proxy mode) |
 
-> **Important:** The `t` field is required by the CLI for push/pull/clone operations. See [CLI-Server API Contract](../design/cli-server-contract.md) for details.
+> **Important:** The `t` field is required by the CLI for push/pull/clone operations — clone and pull read it as a remote-head preflight before requesting a pack. See [Implementing Server Support For Fluree CLI](../cli/server-integration.md#minimum-endpoints-by-cli-feature) for the per-command endpoint contract.
 
 **Optional query parameters:**
 
@@ -2954,6 +3044,73 @@ Two errors that are the caller's fault currently come back as `500` with `"@type
 By default the server does not sync on commit, so an index only advances when something calls this endpoint — run it from a maintenance job, using `fluree bm25 list --stale` to enumerate the indexes whose source has moved past their watermark. Starting the server with `--bm25-auto-sync` (env `FLUREE_BM25_AUTO_SYNC`, or `indexing.bm25_auto_sync` in the config file) instead keeps every index current automatically, syncing each one when its source ledger commits.
 
 See also the CLI equivalent: [fluree bm25 sync](../cli/bm25.md#fluree-bm25-sync).
+
+### POST {api_base_url}/sql/map
+
+Map tables behind a SQL endpoint as an R2RML graph source. The endpoint speaks the Trino client protocol (Trino, Starburst, PrestoDB, or a `fluree-sql-bridge` sidecar). Admin-protected — requires the admin Bearer token when an admin token is configured. Available only when the server is built with the `sql` feature (on by default). See [SQL graph sources](../graph-sources/sql.md).
+
+**URL:**
+```
+POST {api_base_url}/sql/map
+```
+
+**Request Body:**
+
+```json
+{
+  "name": "orders-db",
+  "endpoint": "https://trino.example.com:8443",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "r2rml_type": "text/turtle",
+  "branch": "main",
+  "dialect": "trino",
+  "protocol": "trino",
+  "catalog": "hive",
+  "schema": "sales",
+  "user": "fluree",
+  "auth_bearer": "…",
+  "session": { "query_max_run_time": "5m" }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Graph source name (required) |
+| `endpoint` | string | Statement endpoint base URL (required); `/v1/statement` is appended. Loopback/private hosts are allowed; the link-local/metadata range is refused. |
+| `r2rml` | string | Inline R2RML mapping (required). `rr:tableName` and `rr:sqlQuery` logical tables are both accepted. |
+| `r2rml_type` | string | Media type of `r2rml` (`text/turtle`, `application/ld+json`) |
+| `branch` | string | Branch name (default: `main`) |
+| `dialect` | string | `trino` (default), `postgres`, `mysql`, `sqlite` — the engine behind a bridge |
+| `protocol` | string | `trino` (default, `X-Trino-*` headers) or `presto` |
+| `catalog`, `schema` | string | Defaults for unqualified table names |
+| `user` | string | Protocol user header (default `fluree`) |
+| `auth_bearer` | string | Static bearer token |
+| `oauth2_token_url`, `oauth2_client_id`, `oauth2_client_secret`, `oauth2_scope`, `oauth2_audience` | string | OAuth2 client-credentials flow (refreshes); `oauth2_token_url` is guarded against internal hosts |
+| `session` | object | Session properties sent as `X-Trino-Session` |
+
+**Response:**
+
+```json
+{
+  "graph_source_id": "orders-db:main",
+  "endpoint": "https://trino.example.com:8443",
+  "connection_tested": true,
+  "mapping_source": "bafy…",
+  "triples_map_count": 3,
+  "table_count": 2,
+  "table_names": ["sales.customers", "sales.orders"],
+  "mapping_validated": true
+}
+```
+
+`connection_tested` reports whether `SELECT 1` succeeded against the endpoint; a failure does not block registration.
+
+**Status Codes:**
+- `201 Created` — graph source created
+- `400 Bad Request` — invalid body, unknown `dialect`/`protocol`, endpoint refused by the SSRF guard, or an invalid mapping
+- `401 Unauthorized` — admin token required
+
+---
 
 ### POST {api_base_url}/iceberg/materialize
 

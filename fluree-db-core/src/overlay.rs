@@ -133,6 +133,20 @@ pub trait OverlayProvider: Send + Sync {
         callback: &mut dyn FnMut(&Flake),
     );
 
+    /// Number of overlay flakes for `g_id`, unfiltered by `to_t`, when the
+    /// implementation can answer in O(segments) or better.
+    ///
+    /// Used as the denominator of selectivity heuristics (e.g. the bounded
+    /// overlay walk's fallback guard in `fluree-db-query`), so `None` (the
+    /// default) means "unknown — skip the heuristic": callers must never walk
+    /// the overlay to count. Because the count is `to_t`-unfiltered while a
+    /// bounded walk's matches are filtered, a time-travel query under-states
+    /// its match share — which only ever biases the guard toward staying
+    /// bounded, never toward a spurious fallback.
+    fn overlay_flake_count(&self, _g_id: GraphId) -> Option<usize> {
+        None
+    }
+
     /// Segment metadata for `g_id`, in segment (commit) order.
     ///
     /// Enables a per-segment translation cache (only newly-appended segments

@@ -4,11 +4,15 @@
 //! - `o_type` table for decode dispatch
 //! - `ColumnBatch` output
 
+#[cfg(target_arch = "wasm32")]
+use crate::wasm_compat::memmap2;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use fluree_db_core::ids::DatatypeDictId;
@@ -36,6 +40,7 @@ use super::artifact_cache::{fetch_cached_bytes, fetch_cached_bytes_cid};
 use super::leaflet_cache::LeafletCache;
 
 const HOT_REMOTE_LEAF_PROMOTION_TOUCHES: usize = 2;
+#[cfg(not(target_arch = "wasm32"))]
 const CAS_HELPER_RUNTIME_THREADS: usize = 2;
 
 // ============================================================================
@@ -80,6 +85,7 @@ pub(crate) fn cas_sync_timeout() -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn shared_cas_helper_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
     static RT: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
 
@@ -95,6 +101,7 @@ fn shared_cas_helper_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
     .map_err(|e| io::Error::other(e.clone()))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn run_on_shared_cas_helper_thread<T, Fut>(fut: Fut) -> io::Result<T>
 where
     T: Send + 'static,
@@ -131,6 +138,7 @@ where
 /// re-injects the fetch onto the outer runtime with no `block_in_place`; on a
 /// small (e.g. 2-worker) runtime every worker can then park in `recv` with no
 /// thread left to drive the reactor, so the fetch never completes — a hard wedge.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn run_sync_on_runtime<T, Fut>(fut: Fut) -> io::Result<T>
 where
     T: Send + 'static,
@@ -166,6 +174,33 @@ where
     }
 }
 
+/// wasm32: no threads and no `block_on` — a sync-context CAS fetch cannot be
+/// bridged. Every CAS-backed sync read path short-circuits *before* reaching
+/// this bridge: it serves already-resident bytes via
+/// `ContentStore::resolve_cached_bytes` and surfaces a typed
+/// [`super::need_fetch::NeedFetch`] miss (naming the wanted CID) for an async
+/// caller to fetch and retry. Reaching this stub therefore means a read path
+/// gained a bridge call without a wasm residency arm — keep it an error, not
+/// an `unreachable!`, so that bug degrades to a failed query. SEAM(wasm).
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+pub(crate) fn run_sync_on_runtime<T, Fut>(fut: Fut) -> io::Result<T>
+where
+    T: Send + 'static,
+    Fut: std::future::Future<Output = io::Result<T>> + Send + 'static,
+{
+    // Intentionally discard the future: there is no runtime to drive it on
+    // wasm32, and reaching this stub is itself the bug (a read path missing
+    // its residency arm). `drop` rather than `let _ =` so the discard is
+    // explicit and clippy's `let_underscore_future` does not read it as an
+    // accidental un-awaited future.
+    drop(fut);
+    Err(io::Error::other(
+        "sync CAS fetch bridge unavailable on wasm32; this read path is missing \
+         a residency-tier arm (expected resolve_cached_bytes + NeedFetch)",
+    ))
+}
+
 // ============================================================================
 // Per-graph V3 index data
 // ============================================================================
@@ -174,7 +209,7 @@ struct GraphIndex {
     orders: HashMap<RunSortOrder, Arc<BranchManifest>>,
     numbig: HashMap<u32, crate::arena::numbig::NumBigArena>,
     vectors: HashMap<u32, crate::arena::vector::LazyVectorArena>,
-    spatial: HashMap<u32, Arc<dyn fluree_db_spatial::SpatialIndexProvider>>,
+    spatial: HashMap<u32, Arc<dyn crate::wasm_compat::SpatialIndexProvider>>,
     /// Fulltext arenas keyed by `(p_id, lang_id)` — one arena per language
     /// on each property. `@fulltext`-datatype and configured-English content
     /// both resolve to the dict-assigned id for `"en"` and share a bucket.
@@ -206,6 +241,12 @@ static NEXT_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub enum SharedLeafBytes {
     Mmap(Arc<memmap2::Mmap>),
     Owned(Vec<u8>),
+    /// Zero-copy view of the content store's resident tier
+    /// (`resolve_cached_bytes`). Compiled only for residency-capable builds
+    /// (wasm32, or native with the `residency` feature) so default native
+    /// match sites and layout stay exactly as they were.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    Shared(Arc<[u8]>),
 }
 
 impl std::ops::Deref for SharedLeafBytes {
@@ -214,6 +255,8 @@ impl std::ops::Deref for SharedLeafBytes {
         match self {
             SharedLeafBytes::Mmap(mmap) => mmap,
             SharedLeafBytes::Owned(bytes) => bytes,
+            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+            SharedLeafBytes::Shared(bytes) => bytes,
         }
     }
 }
@@ -234,6 +277,17 @@ pub struct BinaryIndexStore {
     /// O(1) lookup: o_type value → index into o_type_table.
     o_type_index: HashMap<u16, usize>,
     cas: Option<Arc<dyn ContentStore>>,
+    /// Cached at construction: whether `cas` carries a sync residency tier.
+    ///
+    /// This is a fixed property of the store — `cas` is assigned once in each
+    /// constructor and never reassigned — but reading it went through
+    /// `dyn ContentStore::miss_register`, a vtable call, at six sites and up
+    /// to ~3 times per leaf open. Caching it also takes dyn dispatch out of
+    /// the `residency`-enabled build, which is the build the api benches
+    /// compile (see the dev-dependency note in `fluree-db-api/Cargo.toml`),
+    /// narrowing the gap between what is measured and what ships.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    residency_mode: bool,
     cache_dir: PathBuf,
     /// Shared disk artifact cache — kept alive here so the global `CACHE_REGISTRY`
     /// weak ref survives across calls, avoiding repeated dir scans on every write.
@@ -297,7 +351,7 @@ impl BinaryIndexStore {
         leaflet_cache: Option<Arc<LeafletCache>>,
     ) -> io::Result<Self> {
         tracing::debug!("BinaryIndexStore::load_from_root_v6 starting");
-        std::fs::create_dir_all(cache_dir)?;
+        fluree_db_core::disk_cache::ensure_cache_dir(cache_dir)?;
 
         // ── Dict loading ──────────────────────────────────────────────────────────────
         let dicts =
@@ -387,6 +441,8 @@ impl BinaryIndexStore {
             graph_indexes,
             o_type_table,
             o_type_index,
+            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+            residency_mode: cs.miss_register().is_some(),
             cas: Some(cs),
             cache_dir: cache_dir.to_path_buf(),
             disk_cache,
@@ -612,6 +668,50 @@ impl BinaryIndexStore {
     /// through this instead of [`Self::get_leaf_bytes_sync`], which copies
     /// the full file into a fresh `Vec` on every call.
     pub fn get_leaf_bytes_shared(&self, leaf_cid: &ContentId) -> io::Result<SharedLeafBytes> {
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            return self
+                .resident_leaf_bytes(leaf_cid, super::need_fetch::FetchKind::IndexLeaf)
+                .map(SharedLeafBytes::Shared);
+        }
+        self.get_leaf_bytes_shared_native(leaf_cid)
+    }
+
+    /// True when the content store carries a sync residency tier (it exposes
+    /// a miss register): sync reads are then served exclusively from
+    /// `resolve_cached_bytes` + `NeedFetch` misses, never the filesystem or
+    /// bridge tiers. Always true for browser stores; native stores opt in
+    /// (tests) by exposing a register.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    pub(crate) fn residency_mode(&self) -> bool {
+        self.residency_mode
+    }
+
+    /// The CAS content store backing this index, when one is configured.
+    /// Residency retry frames use it to drain the miss register and fetch
+    /// wants; see [`super::need_fetch::RetryBudget`].
+    pub fn content_store(&self) -> Option<&Arc<dyn ContentStore>> {
+        self.cas.as_ref()
+    }
+
+    /// Residency tier: serve `cid` from the content store's
+    /// `resolve_cached_bytes` or surface a typed [`super::need_fetch::NeedFetch`]
+    /// miss (recorded in the store's miss register) for an async caller to
+    /// fetch and retry. No I/O, no blocking.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    fn resident_leaf_bytes(
+        &self,
+        cid: &ContentId,
+        kind: super::need_fetch::FetchKind,
+    ) -> io::Result<Arc<[u8]>> {
+        let cs = self
+            .cas
+            .as_ref()
+            .ok_or_else(|| io::Error::other("no content store"))?;
+        super::need_fetch::resident_or_need_fetch(cs.as_ref(), cid, kind)
+    }
+
+    fn get_leaf_bytes_shared_native(&self, leaf_cid: &ContentId) -> io::Result<SharedLeafBytes> {
         if let Some(cs) = self.cas.as_ref() {
             let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
             let mut local = cs.resolve_local_path(leaf_cid);
@@ -645,6 +745,16 @@ impl BinaryIndexStore {
     }
 
     pub fn get_leaf_bytes_sync(&self, leaf_cid: &ContentId) -> io::Result<Vec<u8>> {
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            return self
+                .resident_leaf_bytes(leaf_cid, super::need_fetch::FetchKind::IndexLeaf)
+                .map(|bytes| bytes.to_vec());
+        }
+        self.get_leaf_bytes_sync_native(leaf_cid)
+    }
+
+    fn get_leaf_bytes_sync_native(&self, leaf_cid: &ContentId) -> io::Result<Vec<u8>> {
         let cs = self
             .cas
             .as_ref()
@@ -711,6 +821,45 @@ impl BinaryIndexStore {
     /// - Remote (S3/etc): returns `RangeReadLeafHandle` (header+dir only, lazy
     ///   column fetch via byte-range reads)
     pub fn open_leaf_handle(
+        &self,
+        leaf_cid: &ContentId,
+        sidecar_cid: Option<&ContentId>,
+        need_replay: bool,
+    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            return self.open_resident_leaf_handle(leaf_cid, sidecar_cid, need_replay);
+        }
+        self.open_leaf_handle_native(leaf_cid, sidecar_cid, need_replay)
+    }
+
+    /// Residency-mode leaf open: whole leaf (and sidecar when replaying)
+    /// must be resident; a miss surfaces as `NeedFetch` and is recorded in
+    /// the miss register. The local-path/mmap and range-read tiers are
+    /// bypassed — on wasm there is no filesystem, and the residency tier
+    /// holds full blobs.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    fn open_resident_leaf_handle(
+        &self,
+        leaf_cid: &ContentId,
+        sidecar_cid: Option<&ContentId>,
+        need_replay: bool,
+    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
+        use super::need_fetch::FetchKind;
+        let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
+        let bytes = self.resident_leaf_bytes(leaf_cid, FetchKind::IndexLeaf)?;
+        let sidecar = match (need_replay, sidecar_cid) {
+            (true, Some(sc_cid)) => {
+                Some(self.resident_leaf_bytes(sc_cid, FetchKind::HistorySidecar)?)
+            }
+            _ => None,
+        };
+        Ok(Box::new(super::leaf_access::SharedBlobLeafHandle::new(
+            bytes, sidecar, leaf_id,
+        )?))
+    }
+
+    fn open_leaf_handle_native(
         &self,
         leaf_cid: &ContentId,
         sidecar_cid: Option<&ContentId>,
@@ -912,6 +1061,12 @@ impl BinaryIndexStore {
             Some(cid) => cid,
             None => return Ok(None),
         };
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            return self
+                .resident_leaf_bytes(sc_cid, super::need_fetch::FetchKind::HistorySidecar)
+                .map(|bytes| Some(bytes.to_vec()));
+        }
         let bytes = self.get_leaf_bytes_sync(sc_cid)?;
         Ok(Some(bytes))
     }
@@ -941,40 +1096,30 @@ impl BinaryIndexStore {
             DecodeKind::Bool => Ok(FlakeValue::Boolean(o_key != 0)),
             DecodeKind::I64 => Ok(FlakeValue::Long(key.decode_i64())),
             DecodeKind::F64 => Ok(FlakeValue::Double(key.decode_f64())),
+            // The temporal types own their canonical form; building them from
+            // the key directly is what makes an indexed value identical to the
+            // same value parsed from a commit (see fluree_db_core::temporal).
             DecodeKind::Date => {
                 let days = key.decode_date();
-                let date = chrono::NaiveDate::from_num_days_from_ce_opt(days + 719_163).unwrap_or(
-                    chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch date is valid"),
-                );
-                let iso = date.format("%Y-%m-%d").to_string();
-                match fluree_db_core::temporal::Date::parse(&iso) {
-                    Ok(d) => Ok(FlakeValue::Date(Box::new(d))),
-                    Err(_) => Ok(FlakeValue::String(iso)),
-                }
+                Ok(fluree_db_core::temporal::Date::from_days_since_epoch(days)
+                    .map(|d| FlakeValue::Date(Box::new(d)))
+                    .unwrap_or_else(|| FlakeValue::String(format!("<date {days}>"))))
             }
             DecodeKind::Time => {
                 let micros = key.decode_time();
-                let secs = (micros / 1_000_000) as u32;
-                let frac_micros = (micros % 1_000_000) as u32;
-                let time =
-                    chrono::NaiveTime::from_num_seconds_from_midnight_opt(secs, frac_micros * 1000)
-                        .unwrap_or(
-                            chrono::NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is valid"),
-                        );
-                let iso = time.format("%H:%M:%S%.6f").to_string();
-                match fluree_db_core::temporal::Time::parse(&iso) {
-                    Ok(t) => Ok(FlakeValue::Time(Box::new(t))),
-                    Err(_) => Ok(FlakeValue::String(iso)),
-                }
+                Ok(
+                    fluree_db_core::temporal::Time::from_micros_since_midnight(micros)
+                        .map(|t| FlakeValue::Time(Box::new(t)))
+                        .unwrap_or_else(|| FlakeValue::String(format!("<time {micros}>"))),
+                )
             }
             DecodeKind::DateTime => {
-                let epoch_micros = key.decode_datetime();
-                let dt = chrono::DateTime::from_timestamp_micros(epoch_micros).unwrap_or_default();
-                let iso = dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string();
-                match fluree_db_core::temporal::DateTime::parse(&iso) {
-                    Ok(d) => Ok(FlakeValue::DateTime(Box::new(d))),
-                    Err(_) => Ok(FlakeValue::String(iso)),
-                }
+                let micros = key.decode_datetime();
+                Ok(
+                    fluree_db_core::temporal::DateTime::from_epoch_micros(micros)
+                        .map(|d| FlakeValue::DateTime(Box::new(d)))
+                        .unwrap_or_else(|| FlakeValue::String(format!("<dateTime {micros}>"))),
+                )
             }
             DecodeKind::GYear => Ok(FlakeValue::GYear(Box::new(
                 fluree_db_core::temporal::GYear::from_year(key.decode_g_year()),
@@ -1956,7 +2101,7 @@ impl BinaryIndexStore {
     /// Spatial provider map for query context configuration.
     pub fn spatial_provider_map(
         &self,
-    ) -> HashMap<String, Arc<dyn fluree_db_spatial::SpatialIndexProvider>> {
+    ) -> HashMap<String, Arc<dyn crate::wasm_compat::SpatialIndexProvider>> {
         let mut map = HashMap::new();
         for (g_id, gi) in &self.graph_indexes {
             for (p_id, provider) in &gi.spatial {
@@ -2754,7 +2899,7 @@ async fn build_dictionary_set(
 struct LoadedArenas {
     numbig: HashMap<u32, crate::arena::numbig::NumBigArena>,
     vectors: HashMap<u32, crate::arena::vector::LazyVectorArena>,
-    spatial: HashMap<u32, Arc<dyn fluree_db_spatial::SpatialIndexProvider>>,
+    spatial: HashMap<u32, Arc<dyn crate::wasm_compat::SpatialIndexProvider>>,
     /// Keyed by `(p_id, lang_id)` — one bucket per language on each property.
     fulltext: HashMap<(u32, u16), Arc<crate::arena::fulltext::FulltextArena>>,
 }
@@ -2819,7 +2964,11 @@ async fn load_per_graph_arenas(
         }
 
         // Spatial and fulltext arenas.
+        #[allow(unused_mut)]
         let mut spatial = HashMap::new();
+        // Spatial search is unsupported on wasm32 (s2 geometry stack is
+        // native-only); the provider map stays empty. SEAM(wasm).
+        #[cfg(not(target_arch = "wasm32"))]
         for sp_ref in &ga.spatial {
             let root_bytes =
                 fetch_cached_bytes(cs.as_ref(), &sp_ref.root_cid, cache_dir, "spr").await?;
@@ -2851,7 +3000,7 @@ async fn load_per_graph_arenas(
                         format!("spatial snapshot load: {e}"),
                     )
                 })?;
-            let provider: Arc<dyn fluree_db_spatial::SpatialIndexProvider> =
+            let provider: Arc<dyn crate::wasm_compat::SpatialIndexProvider> =
                 Arc::new(fluree_db_spatial::EmbeddedSpatialProvider::new(snapshot));
             spatial.insert(sp_ref.p_id, provider);
         }
@@ -2900,6 +3049,41 @@ impl ContentStoreRangeFetcher {
 
 impl super::leaf_access::RangeReadFetcher for ContentStoreRangeFetcher {
     fn fetch_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> io::Result<Vec<u8>> {
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.cs.miss_register().is_some() {
+            return self.fetch_range_resident(id, range);
+        }
+        self.fetch_range_native(id, range)
+    }
+}
+
+impl ContentStoreRangeFetcher {
+    /// Residency mode: whole blobs live in the residency tier; serve the
+    /// range as a subslice copy with the same EOF-truncation semantics as
+    /// the native positional read. A miss surfaces as `NeedFetch` for the
+    /// whole blob (recorded in the miss register).
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    fn fetch_range_resident(
+        &self,
+        id: &ContentId,
+        range: std::ops::Range<u64>,
+    ) -> io::Result<Vec<u8>> {
+        let bytes = super::need_fetch::resident_or_need_fetch(
+            self.cs.as_ref(),
+            id,
+            super::need_fetch::FetchKind::IndexLeaf,
+        )?;
+        let len = bytes.len() as u64;
+        let start = range.start.min(len) as usize;
+        let end = range.end.min(len) as usize;
+        Ok(bytes[start..end].to_vec())
+    }
+
+    fn fetch_range_native(
+        &self,
+        id: &ContentId,
+        range: std::ops::Range<u64>,
+    ) -> io::Result<Vec<u8>> {
         fn read_range_from_file(
             path: &Path,
             range: std::ops::Range<u64>,
@@ -3111,6 +3295,8 @@ pub(crate) mod tests {
             graph_indexes: HashMap::new(),
             o_type_table: Vec::new(),
             o_type_index: HashMap::new(),
+            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+            residency_mode: cs.miss_register().is_some(),
             cas: Some(cs),
             disk_cache: crate::read::artifact_cache::DiskArtifactCache::for_dir(&cache_dir),
             cache_dir,
@@ -3164,6 +3350,380 @@ pub(crate) mod tests {
                 .unwrap();
         }
         writer.finish().unwrap().remove(0).leaf_bytes
+    }
+
+    /// Same leaf as [`build_test_leaf_bytes`], keeping the routing keys so a
+    /// `BranchManifest` can be built around it.
+    fn build_test_leaf_info() -> crate::format::leaf::LeafInfo {
+        let mut writer = LeafWriter::new(RunSortOrder::Post, 100, 1000, 1);
+        writer.set_skip_history(true);
+        for i in 0..5u64 {
+            writer
+                .push_record(make_rec(i + 1, 1, OType::XSD_INTEGER.as_u16(), i * 10, 1))
+                .unwrap();
+        }
+        writer.finish().unwrap().remove(0)
+    }
+
+    /// Content store that fails exactly one CAS read — the `fail_on`-th
+    /// `get`/`get_range` call (1-based; 0 = never) — then recovers. Models a
+    /// transient remote failure (or a wasm residency miss) at an arbitrary
+    /// point in the read sequence.
+    #[derive(Debug, Clone)]
+    struct FailNthContentStore {
+        inner: MemoryContentStore,
+        calls: Arc<AtomicUsize>,
+        fail_on: usize,
+    }
+
+    impl FailNthContentStore {
+        fn new(fail_on: usize) -> Self {
+            Self {
+                inner: MemoryContentStore::new(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                fail_on,
+            }
+        }
+
+        fn cas_calls(&self) -> usize {
+            self.calls.load(AtomicOrdering::Relaxed)
+        }
+
+        fn check_injected_failure(&self) -> fluree_db_core::Result<()> {
+            let call_number = self.calls.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            if call_number == self.fail_on {
+                return Err(fluree_db_core::Error::Storage(format!(
+                    "injected transient failure at CAS call {call_number}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ContentStore for FailNthContentStore {
+        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+
+        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+            self.check_injected_failure()?;
+            self.inner.get(id).await
+        }
+
+        async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {
+            self.inner.put(kind, bytes).await
+        }
+
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await
+        }
+
+        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+
+        async fn get_range(
+            &self,
+            id: &ContentId,
+            range: std::ops::Range<u64>,
+        ) -> fluree_db_core::Result<Vec<u8>> {
+            self.check_injected_failure()?;
+            self.inner.get_range(id, range).await
+        }
+    }
+
+    /// Drive a full scan over the single test leaf through a store whose
+    /// `fail_on`-th CAS read fails once, retrying `next_batch` on error.
+    /// Returns (rows_seen, errors_seen, cas_calls).
+    fn scan_with_injected_failure(fail_on: usize) -> (u64, usize, usize) {
+        use crate::read::binary_cursor::BinaryCursor;
+        use crate::read::column_types::{BinaryFilter, ColumnProjection};
+
+        let store = FailNthContentStore::new(fail_on);
+        let info = build_test_leaf_info();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            let bytes = info.leaf_bytes.clone();
+            async move {
+                store
+                    .inner
+                    .put(ContentKind::IndexLeaf, &bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("seed leaf");
+
+        let cache_dir = temp_cache_dir();
+        let binary_store = Arc::new(empty_store(Arc::new(store.clone()), cache_dir.clone()));
+        let branch = Arc::new(crate::format::branch::BranchManifest {
+            leaves: vec![crate::format::branch::LeafEntry {
+                first_key: info.first_key,
+                last_key: info.last_key,
+                row_count: info.total_rows,
+                leaf_cid,
+                sidecar_cid: None,
+            }],
+        });
+
+        let mut cursor = BinaryCursor::scan_all(
+            binary_store,
+            RunSortOrder::Post,
+            branch,
+            BinaryFilter::default(),
+            ColumnProjection::all(),
+        );
+
+        let mut rows = 0u64;
+        let mut errors = 0usize;
+        loop {
+            match cursor.next_batch() {
+                Ok(Some(batch)) => rows += batch.row_count as u64,
+                Ok(None) => break,
+                Err(_) => {
+                    errors += 1;
+                    assert!(
+                        errors <= 8,
+                        "cursor did not recover after repeated retries (fail_on={fail_on})"
+                    );
+                }
+            }
+        }
+        let cas_calls = store.cas_calls();
+        let _ = std::fs::remove_dir_all(cache_dir);
+        (rows, errors, cas_calls)
+    }
+
+    /// A transient failure at ANY point in the leaf-read CAS sequence must
+    /// surface exactly one error and, on retry of `next_batch`, still deliver
+    /// every row — no silently skipped leaf (advance-before-open) or leaflet
+    /// (mid-leaf `?` with the leaf taken). This is the native pin for the
+    /// wasm NeedFetch fetch-and-retry contract at cursor granularity.
+    #[test]
+    fn cursor_retries_failed_cas_reads_without_losing_rows() {
+        // Baseline: no injected failure. Positively establish that the scan
+        // reads through CAS at all — otherwise the sweep below is vacuous.
+        let (rows, errors, total_calls) = scan_with_injected_failure(0);
+        assert_eq!(rows, 5, "baseline scan must see every row");
+        assert_eq!(errors, 0, "baseline scan must not error");
+        assert!(
+            total_calls >= 2,
+            "expected the remote scan to issue CAS reads (got {total_calls})"
+        );
+
+        // Sweep: fail each CAS call position once (header, directory, column
+        // loads, promotion refetch, ...) and require full recovery.
+        for fail_on in 1..=total_calls {
+            let (rows, errors, _) = scan_with_injected_failure(fail_on);
+            assert_eq!(
+                errors, 1,
+                "injected failure at CAS call {fail_on} must surface exactly once"
+            );
+            assert_eq!(
+                rows, 5,
+                "retry after failure at CAS call {fail_on} must not lose rows"
+            );
+        }
+    }
+
+    /// Residency mode, F1 multi-want: a scan's first leaf-open miss must
+    /// register the cursor's WHOLE remaining routed leaf set, so one retry
+    /// round fetches N leaves instead of learning one per round.
+    #[cfg(feature = "residency")]
+    #[test]
+    fn residency_miss_registers_remaining_routed_leaves() {
+        use crate::read::binary_cursor::BinaryCursor;
+        use crate::read::column_types::{BinaryFilter, ColumnProjection};
+        use crate::read::need_fetch::{tests::MissInjectingStore, FetchKind, NeedFetch};
+
+        let store = Arc::new(MissInjectingStore::new());
+
+        // Two single-leaflet leaves over disjoint POST key ranges.
+        let mut leaves = Vec::new();
+        for half in 0..2u64 {
+            let mut writer = LeafWriter::new(RunSortOrder::Post, 100, 1000, 1);
+            writer.set_skip_history(true);
+            for i in 0..5u64 {
+                let s_id = half * 100 + i + 1;
+                writer
+                    .push_record(make_rec(s_id, 1, OType::XSD_INTEGER.as_u16(), s_id * 10, 1))
+                    .unwrap();
+            }
+            leaves.push(writer.finish().unwrap().remove(0));
+        }
+        let mut entries = Vec::new();
+        for info in &leaves {
+            let cid = run_sync_on_runtime({
+                let store = Arc::clone(&store);
+                let bytes = info.leaf_bytes.clone();
+                async move {
+                    store
+                        .inner
+                        .put(ContentKind::IndexLeaf, &bytes)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .expect("seed leaf");
+            entries.push(crate::format::branch::LeafEntry {
+                first_key: info.first_key,
+                last_key: info.last_key,
+                row_count: info.total_rows,
+                leaf_cid: cid,
+                sidecar_cid: None,
+            });
+        }
+        let leaf_cids: Vec<ContentId> = entries.iter().map(|e| e.leaf_cid.clone()).collect();
+
+        let cache_dir = temp_cache_dir();
+        let cs: Arc<dyn ContentStore> = Arc::clone(&store) as Arc<dyn ContentStore>;
+        let binary_store = Arc::new(empty_store(cs, cache_dir.clone()));
+        assert!(
+            binary_store.residency_mode(),
+            "a register-bearing store must put the read path in residency mode"
+        );
+        let branch = Arc::new(crate::format::branch::BranchManifest { leaves: entries });
+
+        let mut cursor = BinaryCursor::scan_all(
+            Arc::clone(&binary_store),
+            RunSortOrder::Post,
+            branch,
+            BinaryFilter::default(),
+            ColumnProjection::all(),
+        );
+
+        // First call: leaf 0 is not resident — typed miss, and the register
+        // must carry BOTH routed leaves, not just the one that failed.
+        let err = cursor.next_batch().expect_err("cold scan must miss");
+        let nf = NeedFetch::from_io_error(&err).expect("typed NeedFetch");
+        assert_eq!(nf.cid, leaf_cids[0]);
+        assert_eq!(nf.kind, FetchKind::IndexLeaf);
+        let register = binary_store
+            .content_store()
+            .and_then(|cs| cs.miss_register())
+            .expect("residency store exposes a register");
+        let wants = register.drain();
+        let want_cids: Vec<&ContentId> = wants.iter().map(|w| &w.cid).collect();
+        assert!(
+            want_cids.contains(&&leaf_cids[0]) && want_cids.contains(&&leaf_cids[1]),
+            "one miss must register the scan's whole routed want set, got {want_cids:?}"
+        );
+
+        // Fetch the whole want set (fetch-pins contract), then the SAME
+        // cursor completes without further misses.
+        run_sync_on_runtime({
+            let store = Arc::clone(&store);
+            async move {
+                let cs: Arc<dyn ContentStore> = Arc::clone(&store) as Arc<dyn ContentStore>;
+                let outcome = crate::read::need_fetch::fetch_wants(cs.as_ref(), wants, 4).await;
+                if outcome.newly_resident == outcome.wanted {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!(
+                        "failures: {:?}",
+                        outcome.failures
+                    )))
+                }
+            }
+        })
+        .expect("fetch whole want set");
+
+        let mut rows = 0u64;
+        loop {
+            match cursor.next_batch() {
+                Ok(Some(batch)) => rows += batch.row_count as u64,
+                Ok(None) => break,
+                Err(e) => panic!("no misses after the want set was pinned: {e}"),
+            }
+        }
+        assert_eq!(rows, 10, "both leaves' rows after one fetch round");
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    /// One leaf-open miss on a large routed scan registers a BOUNDED
+    /// read-ahead window, not the whole remaining routed set. This is both the
+    /// LIMIT-overfetch fix (a scan that stops early never pulls the whole
+    /// predicate run) and the eviction-livelock fix (a retry round never
+    /// fetches more than a bounded window). PREFETCH_WINDOW in
+    /// binary_cursor.rs is 32; a 40-leaf scan must register exactly 32,
+    /// contiguous from the leaf that missed.
+    #[cfg(feature = "residency")]
+    #[test]
+    fn residency_miss_registers_a_bounded_window_not_the_whole_run() {
+        use crate::read::binary_cursor::BinaryCursor;
+        use crate::read::column_types::{BinaryFilter, ColumnProjection};
+        use crate::read::need_fetch::tests::MissInjectingStore;
+
+        const LEAVES: u64 = 40;
+        const EXPECTED_WINDOW: usize = 32;
+
+        let store = Arc::new(MissInjectingStore::new());
+        let mut entries = Vec::new();
+        for i in 0..LEAVES {
+            let mut writer = LeafWriter::new(RunSortOrder::Post, 100, 1000, 1);
+            writer.set_skip_history(true);
+            let s_id = i + 1;
+            writer
+                .push_record(make_rec(s_id, 1, OType::XSD_INTEGER.as_u16(), s_id * 10, 1))
+                .unwrap();
+            let info = writer.finish().unwrap().remove(0);
+            let cid = run_sync_on_runtime({
+                let store = Arc::clone(&store);
+                let bytes = info.leaf_bytes.clone();
+                async move {
+                    store
+                        .inner
+                        .put(ContentKind::IndexLeaf, &bytes)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .expect("seed leaf");
+            entries.push(crate::format::branch::LeafEntry {
+                first_key: info.first_key,
+                last_key: info.last_key,
+                row_count: info.total_rows,
+                leaf_cid: cid,
+                sidecar_cid: None,
+            });
+        }
+        let leaf_cids: Vec<ContentId> = entries.iter().map(|e| e.leaf_cid.clone()).collect();
+
+        let cache_dir = temp_cache_dir();
+        let cs: Arc<dyn ContentStore> = Arc::clone(&store) as Arc<dyn ContentStore>;
+        let binary_store = Arc::new(empty_store(cs, cache_dir.clone()));
+        let branch = Arc::new(crate::format::branch::BranchManifest { leaves: entries });
+        let mut cursor = BinaryCursor::scan_all(
+            Arc::clone(&binary_store),
+            RunSortOrder::Post,
+            branch,
+            BinaryFilter::default(),
+            ColumnProjection::all(),
+        );
+
+        // Cold scan: leaf 0 misses.
+        cursor.next_batch().expect_err("cold scan must miss");
+        let wants = binary_store
+            .content_store()
+            .and_then(|cs| cs.miss_register())
+            .expect("residency store exposes a register")
+            .drain();
+        assert_eq!(
+            wants.len(),
+            EXPECTED_WINDOW,
+            "one miss registers a bounded window, not all {LEAVES} routed leaves"
+        );
+        // Contiguous from the leaf that missed (leaf 0).
+        let want_cids: Vec<&ContentId> = wants.iter().map(|w| &w.cid).collect();
+        for (i, cid) in leaf_cids.iter().take(EXPECTED_WINDOW).enumerate() {
+            assert_eq!(want_cids[i], cid, "window leaf {i} out of order");
+        }
+        assert!(
+            !want_cids.contains(&&leaf_cids[EXPECTED_WINDOW]),
+            "leaf {EXPECTED_WINDOW} is past the window and must not be registered"
+        );
+        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]

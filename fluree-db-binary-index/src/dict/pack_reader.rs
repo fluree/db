@@ -9,6 +9,8 @@
 //!   immediately; defers remote packs to lazy fetch on first lookup.
 //! - **`from_memory`**: In-memory constructor for testing.
 
+#[cfg(target_arch = "wasm32")]
+use crate::wasm_compat::memmap2;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -138,7 +140,7 @@ impl ForwardPackReader {
     ) -> io::Result<Self> {
         // Pre-create cache directory once.
         if !refs.is_empty() {
-            std::fs::create_dir_all(cache_dir).map_err(|e| {
+            fluree_db_core::disk_cache::ensure_cache_dir(cache_dir).map_err(|e| {
                 io::Error::other(format!("create cache dir {}: {}", cache_dir.display(), e))
             })?;
         }
@@ -400,6 +402,23 @@ fn fetch_and_load(
     cache_path: &Path,
     ctx: &LoadContext,
 ) -> io::Result<LazyLoaded> {
+    // Residency-mode stores: serve the residency tier with shared zero-copy
+    // backing; a miss surfaces as `NeedFetch` (recorded in the miss
+    // register). The surrounding `OnceCell` makes a successful load
+    // one-time, exactly as on native. Checked before any filesystem probe.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    if ctx.cs.miss_register().is_some() {
+        let bytes = crate::read::need_fetch::resident_or_need_fetch(
+            ctx.cs.as_ref(),
+            pack_cid,
+            crate::read::need_fetch::FetchKind::ForwardPack,
+        )?;
+        let backing = LoadedBacking::InMemory(bytes);
+        let meta = parse_pack_meta(backing.bytes())?;
+        validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
+        return Ok(LazyLoaded { meta, backing });
+    }
+
     // Fast paths: check if something appeared since construction.
     if let Some(path) = ctx.cs.resolve_local_path(pack_cid) {
         let backing = load_pack_backing(&path)?;
