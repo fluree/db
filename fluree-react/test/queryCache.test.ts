@@ -989,4 +989,20 @@ describe("close", () => {
     // and, in a server process, the event loop with it.
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it("does not strand an uncollectable entry when the public handleFor is called directly on a closed cache", () => {
+    // `storeFor`/`observe`/`snapshotFor` all guard `closed` before minting
+    // anything, but `handleFor` is public and a caller can reach it directly
+    // (every test in this file does). Two calls for a NEW key after close
+    // must not return the same instance — same instance would mean the first
+    // call got inserted into `byKey`, where nothing can ever observe it
+    // (`observe` no-ops when closed) or janitor it (armed only pre-close) —
+    // i.e. a cache entry that lives forever.
+    const { cache } = setup();
+    cache.close();
+    const a = cache.handleFor(spec("new-key"));
+    const b = cache.handleFor(spec("new-key"));
+    expect(a).not.toBe(b);
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });

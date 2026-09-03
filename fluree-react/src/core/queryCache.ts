@@ -254,9 +254,19 @@ export class QueryCache {
     const existing = this.byKey.get(key);
     if (existing) return existing;
     const handle = new QueryHandle(this, spec, this.nextSubId++, gcTime);
+    // A closed cache mints nothing durable. `storeFor`/`observe`/`snapshotFor`
+    // all short-circuit before reaching here, so this branch is only hit by a
+    // caller that goes straight to the public `handleFor` on a closed cache.
+    // Tracking the handle in `byKey`/`bySubId` here would strand it forever:
+    // `observe` no-ops on a closed cache (so it can never gain an observer to
+    // later trigger `collect`) and the janitor below never arms — an
+    // uncollectable leak. Hand back a standalone handle instead: usable by
+    // the caller, but untracked, so there is nothing left for the cache to
+    // hold onto.
+    if (this.closed) return handle;
     this.byKey.set(key, handle);
     this.bySubId.set(handle.subId, handle);
-    if (!this.closed) handle.armJanitor();
+    handle.armJanitor();
     return handle;
   }
 

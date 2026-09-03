@@ -322,6 +322,44 @@ describe("cycle translation", () => {
     ]);
   });
 
+  it("replays a cycle that arrives for an engine id before its subscribe() reply resolves", async () => {
+    // The engine primes a subscription the moment it registers, so its cycle
+    // can reach the transport before the `subscribe()` reply that would
+    // populate `byEngineId` for it (see the class docstring's "auto-prime
+    // race" note). Losing this entry would leave the cache's `hasResult`
+    // false, turning the NEXT "unchanged" cycle into a spurious
+    // transport-contract error downstream.
+    const engine = new FakePeerEngine();
+    engine.holdRegistrations = true;
+    const { sink, transport } = setup(engine);
+    await flush();
+    const s = spec();
+    transport.subscribe(s);
+    await flush();
+    // The engine accepted the request but has not answered yet — exactly
+    // where the race window sits.
+    expect(engine.subscribes).toHaveLength(1);
+
+    engine.emitCycle(
+      cycle({ t: 3, changed: [{ subId: engine.subId(0), data: { v: 1 } }] }),
+    );
+    // Can't be resolved yet — not dropped, just not deliverable.
+    expect(sink.cycles).toHaveLength(0);
+
+    engine.releaseAll();
+    await flush();
+
+    // Delivered once the mapping lands, watermark included.
+    expect(sink.cycles).toHaveLength(1);
+    expect(sink.cycles[0]).toEqual({
+      ledger: LEDGER,
+      t: 3,
+      changed: [{ subId: s.subId, payload: { v: 1 } }],
+      unchanged: [],
+      errored: [],
+    });
+  });
+
   it("preserves the engine's error code and status when it has them", async () => {
     const { engine, sink, transport } = setup();
     await flush();

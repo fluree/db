@@ -21,6 +21,20 @@
  *   this package exists to prevent. The transport re-subscribes on `"ready"`
  *   and, when the engine goes `"terminal"`, errors every live subscription so
  *   the UI can say so.
+ * - **The auto-prime race.** The engine primes a subscription the moment it
+ *   registers, so its first cycle can reach `applyCycle` before the
+ *   `subscribe()` reply that would populate `byEngineId` for it — the reply
+ *   and the cycle are separate postMessages, and nothing guarantees the reply
+ *   wins. An unresolvable cycle entry is stashed (keyed by the raw engine id)
+ *   for as long as a registration is in flight and replayed the moment that
+ *   id's mapping lands, instead of being silently dropped — a drop here would
+ *   leave `hasResult` false in the cache and turn the NEXT "unchanged" cycle
+ *   into a spurious transport-contract error. The stash is cleared whenever
+ *   no registration is in flight, so it cannot accumulate entries for engine
+ *   ids this transport will never own (another consumer may share the peer),
+ *   and it is cleared again on a crash recycle, since a fresh worker restarts
+ *   its id counter and could otherwise reuse a stashed id for an unrelated
+ *   subscription.
  */
 
 import type {
@@ -73,6 +87,16 @@ interface Registration {
   cancelled: boolean;
 }
 
+/**
+ * A cycle entry that arrived for an engine id `byEngineId` doesn't know yet,
+ * stashed to replay once a registration resolves that id. See `register`'s
+ * `pendingRegistrations` bracket and `applyCycle`'s unresolved branch.
+ */
+type PendingCycleEntry =
+  | { kind: "changed"; data: unknown; t: number | undefined }
+  | { kind: "unchanged"; t: number | undefined }
+  | { kind: "errored"; error: PeerError; t: number | undefined };
+
 /** The format a query language produces natively. The engine has no format
  * parameter — a subscription's results are always its language's — so a
  * different `opts.format` cannot be honoured in peer mode and must fail
@@ -115,6 +139,15 @@ export class PeerTransport implements LiveTransport {
   private readonly subs = new Map<number, Registration>();
   /** Engine subId -> cache subId. */
   private readonly byEngineId = new Map<number, number>();
+  /** Count of `register()` calls currently between their `engine.subscribe()`
+   * call and its reply — i.e. engine ids that exist but aren't in
+   * `byEngineId` yet. Gates whether an unresolved cycle entry is worth
+   * stashing (see `pendingCycles`) instead of just dropped. */
+  private pendingRegistrations = 0;
+  /** Cycle entries for an engine id not yet in `byEngineId`, keyed by that
+   * raw engine id — only populated while `pendingRegistrations > 0`. See the
+   * class docstring's "auto-prime race" note. */
+  private readonly pendingCycles = new Map<number, PendingCycleEntry>();
   private detachCycle: (() => void) | undefined;
   private detachState: (() => void) | undefined;
 
@@ -157,8 +190,12 @@ export class PeerTransport implements LiveTransport {
       if (state === "recycling") {
         // Every engine id died with the worker. Drop the mapping outright:
         // a fresh worker restarts its id counter, so a stale entry could
-        // otherwise route another query's results to this subscription.
+        // otherwise route another query's results to this subscription. The
+        // same reasoning applies to any stashed pre-mapping cycle entries —
+        // the new worker can reissue an id a dead one used, so a stashed
+        // entry left standing could be replayed onto the wrong subscription.
         this.byEngineId.clear();
+        this.pendingCycles.clear();
         for (const reg of this.subs.values()) reg.sub = undefined;
         this.setConnection("reconnecting");
       } else if (state === "ready") {
@@ -284,6 +321,11 @@ export class PeerTransport implements LiveTransport {
   private async register(subId: number, reg: Registration): Promise<void> {
     const engine = this.engine;
     if (!engine || reg.cancelled) return;
+    // Brackets the window in which the engine has this registration's id but
+    // `byEngineId` does not — the auto-prime race the class docstring
+    // describes. `finally` clears the stash the moment no such window is
+    // open anywhere, so it never outlives the registrations that justified it.
+    this.pendingRegistrations++;
     try {
       const sub = await engine.subscribe(
         reg.spec.ledger,
@@ -298,6 +340,7 @@ export class PeerTransport implements LiveTransport {
       }
       reg.sub = sub;
       this.byEngineId.set(sub.subId, subId);
+      this.drainStash(sub.subId, subId, reg.spec.ledger);
     } catch (err) {
       if (this.closed || reg.cancelled) return;
       this.sink?.onCycle({
@@ -306,7 +349,38 @@ export class PeerTransport implements LiveTransport {
         unchanged: [],
         errored: [{ subId, error: toQueryError(err) }],
       });
+    } finally {
+      this.pendingRegistrations--;
+      if (this.pendingRegistrations === 0) this.pendingCycles.clear();
     }
+  }
+
+  /** Replay a cycle entry that arrived for `engineId` before its mapping did
+   * (see the class docstring's "auto-prime race" note), as its own
+   * one-subscription cycle. A no-op when nothing was stashed for it. */
+  private drainStash(engineId: number, subId: number, ledger: string): void {
+    const entry = this.pendingCycles.get(engineId);
+    if (!entry) return;
+    this.pendingCycles.delete(engineId);
+    const update: CycleUpdate = { ledger, changed: [], unchanged: [], errored: [] };
+    if (entry.kind === "changed") {
+      update.changed = [{ subId, payload: entry.data }];
+    } else if (entry.kind === "unchanged") {
+      update.unchanged = [subId];
+    } else {
+      update.errored = [{ subId, error: toQueryError(entry.error) }];
+    }
+    if (entry.t !== undefined) update.t = entry.t;
+    this.sink?.onCycle(update);
+  }
+
+  /** Stash a cycle entry `resolve()` couldn't place, but only while some
+   * registration is in flight — otherwise `engineId` belongs to a
+   * subscription this transport will never own (another consumer may share
+   * the peer) and stashing it would never be drained. */
+  private stashIfPending(engineId: number, entry: PendingCycleEntry): void {
+    if (this.pendingRegistrations === 0) return;
+    this.pendingCycles.set(engineId, entry);
   }
 
   unsubscribe(subId: number): void {
@@ -363,11 +437,19 @@ export class PeerTransport implements LiveTransport {
 
     for (const entry of cycle.changed) {
       const r = resolve(entry.subId);
-      if (r) bucketFor(r.ledger).changed.push({ subId: r.subId, payload: entry.data });
+      if (r) {
+        bucketFor(r.ledger).changed.push({ subId: r.subId, payload: entry.data });
+      } else {
+        this.stashIfPending(entry.subId, { kind: "changed", data: entry.data, t: cycle.t });
+      }
     }
     for (const engineId of cycle.unchanged) {
       const r = resolve(engineId);
-      if (r) bucketFor(r.ledger).unchanged.push(r.subId);
+      if (r) {
+        bucketFor(r.ledger).unchanged.push(r.subId);
+      } else {
+        this.stashIfPending(engineId, { kind: "unchanged", t: cycle.t });
+      }
     }
     for (const entry of cycle.errored) {
       const r = resolve(entry.subId);
@@ -376,6 +458,8 @@ export class PeerTransport implements LiveTransport {
           subId: r.subId,
           error: toQueryError(entry.error),
         });
+      } else {
+        this.stashIfPending(entry.subId, { kind: "errored", error: entry.error, t: cycle.t });
       }
     }
 
@@ -417,6 +501,7 @@ export class PeerTransport implements LiveTransport {
     this.detachState?.();
     this.subs.clear();
     this.byEngineId.clear();
+    this.pendingCycles.clear();
     this.setConnection("closed");
     // The engine may still be connecting; close it whenever it lands.
     if (this.engine) this.engine.close();
