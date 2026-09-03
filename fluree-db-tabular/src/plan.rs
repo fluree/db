@@ -55,6 +55,20 @@ pub enum Expr {
         left: Box<Expr>,
         right: Box<Expr>,
     },
+    /// String concatenation.
+    Concat(Vec<Expr>),
+    /// Length of a string in characters.
+    Strlen(Box<Expr>),
+    /// A substring from the 1-based `start`, `len` characters long (to the
+    /// end when `None`).
+    Substr {
+        expr: Box<Expr>,
+        start: u64,
+        len: Option<u64>,
+    },
+    /// The dialect's own case mapping: exact on ASCII, not beyond it.
+    Lower(Box<Expr>),
+    Upper(Box<Expr>),
 }
 
 impl Expr {
@@ -66,6 +80,10 @@ impl Expr {
             Expr::Arith { left, right, .. } => {
                 left.columns(out);
                 right.columns(out);
+            }
+            Expr::Concat(parts) => parts.iter().for_each(|p| p.columns(out)),
+            Expr::Strlen(e) | Expr::Substr { expr: e, .. } | Expr::Lower(e) | Expr::Upper(e) => {
+                e.columns(out);
             }
         }
     }
@@ -118,12 +136,14 @@ pub enum Pred {
         col: ColRef,
         pattern: String,
     },
-    /// `expr op value` for a computed numeric expression.
+    /// `expr op value` for a computed expression.
     ExprCmp {
         expr: Expr,
         op: CmpOp,
         value: Literal,
     },
+    /// The string column holds a character outside printable ASCII.
+    NonAscii(ColRef),
     And(Vec<Pred>),
     Or(Vec<Pred>),
     Not(Box<Pred>),

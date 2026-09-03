@@ -333,7 +333,7 @@ impl FakeSql {
             if !by_output {
                 let value = |t: &Tuple, k: &Key| match k {
                     Key::Cell(ri, ci) => cell(t, *ri, *ci),
-                    Key::Expr(e) => e.eval(t, &resolver).map_or(Value::Null, |n| json!(n)),
+                    Key::Expr(e) => e.eval(t, &resolver).unwrap_or(Value::Null),
                 };
                 tuples.sort_by(|a, b| {
                     keys.iter()
@@ -755,25 +755,55 @@ type Col = (Option<String>, String);
 enum Expr {
     Col(Col),
     Num(f64),
+    Str(String),
     Bin(char, Box<Expr>, Box<Expr>),
+    Concat(Vec<Expr>),
+    Length(Box<Expr>),
+    Substr(Box<Expr>, usize, Option<usize>),
+    Lower(Box<Expr>),
+    Upper(Box<Expr>),
 }
 
 impl Expr {
-    fn eval(&self, t: &Tuple, r: &Resolver<'_>) -> Option<f64> {
+    /// `None` is SQL NULL.
+    fn eval(&self, t: &Tuple, r: &Resolver<'_>) -> Option<Value> {
+        let text = |e: &Expr| -> Option<String> {
+            match e.eval(t, r)? {
+                Value::String(s) => Some(s),
+                other => Some(other.to_string()),
+            }
+        };
         match self {
             Expr::Col(c) => {
                 let (ri, ci) = r.resolve(c).ok()?;
-                number_of(&cell(t, ri, ci))
+                let v = cell(t, ri, ci);
+                (!v.is_null()).then_some(v)
             }
-            Expr::Num(n) => Some(*n),
+            Expr::Num(n) => Some(json!(n)),
+            Expr::Str(s) => Some(json!(s)),
             Expr::Bin(op, l, r2) => {
-                let (a, b) = (l.eval(t, r)?, r2.eval(t, r)?);
-                Some(match op {
+                let (a, b) = (number_of(&l.eval(t, r)?)?, number_of(&r2.eval(t, r)?)?);
+                Some(json!(match op {
                     '+' => a + b,
                     '-' => a - b,
                     _ => a * b,
-                })
+                }))
             }
+            Expr::Concat(parts) => {
+                let parts: Option<Vec<String>> = parts.iter().map(text).collect();
+                Some(json!(parts?.concat()))
+            }
+            Expr::Length(e) => Some(json!(text(e)?.chars().count())),
+            Expr::Substr(e, start, len) => {
+                let s = text(e)?;
+                let taken: String = match len {
+                    Some(n) => s.chars().skip(start - 1).take(*n).collect(),
+                    None => s.chars().skip(start - 1).collect(),
+                };
+                Some(json!(taken))
+            }
+            Expr::Lower(e) => Some(json!(text(e)?.to_lowercase())),
+            Expr::Upper(e) => Some(json!(text(e)?.to_uppercase())),
         }
     }
 }
@@ -793,6 +823,15 @@ fn parse_expr(text: &str) -> Result<Expr, String> {
     } else {
         text
     };
+    let parts = split_top(inner, " || ");
+    if parts.len() > 1 {
+        return Ok(Expr::Concat(
+            parts
+                .into_iter()
+                .map(parse_expr)
+                .collect::<Result<_, _>>()?,
+        ));
+    }
     for op in [" + ", " - ", " * "] {
         if let Some((l, r)) = split_once_top(inner, op) {
             return Ok(Expr::Bin(
@@ -802,12 +841,36 @@ fn parse_expr(text: &str) -> Result<Expr, String> {
             ));
         }
     }
+    for (name, unary) in [
+        ("LENGTH(", Expr::Length as fn(Box<Expr>) -> Expr),
+        ("LOWER(", Expr::Lower),
+        ("UPPER(", Expr::Upper),
+    ] {
+        if let Some(arg) = inner.strip_prefix(name).and_then(|r| r.strip_suffix(')')) {
+            return Ok(unary(Box::new(parse_expr(arg)?)));
+        }
+    }
+    if let Some(args) = inner
+        .strip_prefix("SUBSTR(")
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        let args = split_top(args, ", ");
+        let count = |i: usize| -> Result<usize, String> {
+            args[i].trim().parse::<usize>().map_err(|e| e.to_string())
+        };
+        return Ok(match args.len() {
+            2 => Expr::Substr(Box::new(parse_expr(args[0])?), count(1)?, None),
+            3 => Expr::Substr(Box::new(parse_expr(args[0])?), count(1)?, Some(count(2)?)),
+            _ => return Err(format!("SUBSTR arity in: {inner}")),
+        });
+    }
     if inner.starts_with('"') {
         return Ok(Expr::Col(colref(inner)));
     }
     match parse_literal(inner)? {
         v if number_of(&v).is_some() => Ok(Expr::Num(number_of(&v).unwrap())),
-        other => Err(format!("not a number in an expression: {other}")),
+        Value::String(s) => Ok(Expr::Str(s)),
+        other => Err(format!("not a value in an expression: {other}")),
     }
 }
 
@@ -822,6 +885,8 @@ enum Pred {
     Like(Col, String),
     Cmp(Col, String, Value),
     ExprCmp(Expr, String, Value),
+    /// `regexp_like(col, '^[ -~]*$')`: printable ASCII only.
+    AsciiOnly(Col),
     ColEq(Col, Col),
     In(Col, Vec<Value>),
     Not(Box<Pred>),
@@ -857,9 +922,15 @@ impl Pred {
                     _ => false,
                 }
             }
+            Pred::AsciiOnly(c) => get(c)
+                .and_then(|v| {
+                    v.as_str()
+                        .map(|s| s.chars().all(|ch| (' '..='~').contains(&ch)))
+                })
+                .unwrap_or(false),
             Pred::ExprCmp(e, op, lit) => {
                 let Some(v) = e.eval(t, r) else { return false };
-                let o = cmp_values(&json!(v), lit);
+                let o = cmp_values(&v, lit);
                 match op.as_str() {
                     "=" => o.is_eq(),
                     "<>" => o.is_ne(),
@@ -902,6 +973,12 @@ fn parse_pred(text: &str) -> Result<Pred, String> {
     if let Some(inner) = text.strip_prefix("NOT ") {
         return Ok(Pred::Not(Box::new(parse_pred(inner)?)));
     }
+    if let Some(c) = text
+        .strip_prefix("regexp_like(")
+        .and_then(|r| r.strip_suffix(", '^[ -~]*$')"))
+    {
+        return Ok(Pred::AsciiOnly(colref(c)));
+    }
     if let Some(c) = text.strip_suffix(" IS NOT NULL") {
         return Ok(Pred::IsNull(colref(c), false));
     }
@@ -930,7 +1007,7 @@ fn parse_pred(text: &str) -> Result<Pred, String> {
             if r.trim().starts_with('"') {
                 return Ok(Pred::ColEq(colref(l), colref(r)));
             }
-            if l.trim().starts_with('(') {
+            if l.trim().starts_with('(') || l.contains('(') {
                 return Ok(Pred::ExprCmp(
                     parse_expr(l)?,
                     op.to_string(),

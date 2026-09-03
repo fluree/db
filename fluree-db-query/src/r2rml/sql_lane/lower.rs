@@ -101,6 +101,13 @@ struct DerivedCols {
     columns: Vec<(String, String)>,
 }
 
+/// What a pushed expression yields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExprKind {
+    Num,
+    Str,
+}
+
 /// The RDF value class of a column or literal, for exact-comparison checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RdfClass {
@@ -345,8 +352,9 @@ struct Lowerer<'a> {
     vars: HashMap<VarId, VarSource>,
     var_order: Vec<VarId>,
     residuals: Vec<Expression>,
-    /// Numeric `BIND` expressions the statement can compute, by variable.
-    bind_exprs: HashMap<VarId, Expr>,
+    /// `BIND` expressions the statement can compute, by variable, with the
+    /// kind of value they yield.
+    bind_exprs: HashMap<VarId, (Expr, ExprKind)>,
     snapshot: &'a LedgerSnapshot,
     /// Derived tables (subqueries) by alias, joined like accesses.
     derived: HashMap<String, RelPlan>,
@@ -553,7 +561,7 @@ impl<'a> Lowerer<'a> {
         // Filters: exact ones into the plan; the rest stay in the engine,
         // with a widening predicate in the plan where one exists.
         for (v, e) in &binds {
-            if let Some(x) = self.lower_arith(e) {
+            if let Some(x) = self.lower_expr(e) {
                 self.bind_exprs.insert(*v, x);
             }
         }
@@ -725,19 +733,21 @@ impl<'a> Lowerer<'a> {
         }
 
         // An expression orders exactly when every column it reads is
-        // required: a NULL would order as the dialect's NULL, not as unbound.
+        // required (a NULL would order as the dialect's NULL, not as
+        // unbound) and, for a string, where the dialect orders code points.
         let order_exprs: HashMap<VarId, Expr> = self
             .bind_exprs
             .iter()
-            .filter(|(_, e)| {
+            .filter(|(_, (e, kind))| {
                 let mut cols = Vec::new();
                 e.columns(&mut cols);
-                cols.iter().all(|c| {
-                    self.required_columns
-                        .contains(&(c.alias.clone(), c.column.clone()))
-                })
+                (*kind == ExprKind::Num || self.caps.string_order_is_codepoint)
+                    && cols.iter().all(|c| {
+                        self.required_columns
+                            .contains(&(c.alias.clone(), c.column.clone()))
+                    })
             })
-            .map(|(v, e)| (*v, e.clone()))
+            .map(|(v, (e, _))| (*v, e.clone()))
             .collect();
         let limit_is_exact = self.residuals.is_empty() && all_shared_seeded;
         Ok(Ok(Some(Lowered {
@@ -2515,18 +2525,8 @@ impl<'a> Lowerer<'a> {
                             _ => return None,
                         };
                         let (lit, lclass) = literal_of(c, None)?;
-                        // A computed numeric value compares in the database
-                        // as it does in the engine (same promotion, no
-                        // division).
-                        if let Some(expr) = self.bind_exprs.get(v) {
-                            if lclass != RdfClass::Numeric {
-                                return None;
-                            }
-                            return Some(Pred::ExprCmp {
-                                expr: expr.clone(),
-                                op,
-                                value: lit,
-                            });
+                        if let Some((expr, kind)) = self.bind_exprs.get(v) {
+                            return self.expr_cmp(expr.clone(), *kind, op, lit, lclass, ordering);
                         }
                         let (col, class) = self.literal_column(*v)?;
                         if !self.exact_eq(&col, &class, &lclass) {
@@ -2544,11 +2544,54 @@ impl<'a> Lowerer<'a> {
                             value: lit,
                         })
                     }
+                    // A computed value against a literal, the expression
+                    // written out in the filter itself.
+                    (e, Expression::Const(c)) | (Expression::Const(c), e) => {
+                        let reversed = matches!(&args[0], Expression::Const(_));
+                        let op = match (func, reversed) {
+                            (Function::Eq, _) => CmpOp::Eq,
+                            (Function::Ne, _) => CmpOp::NotEq,
+                            (Function::Lt, false) | (Function::Gt, true) => CmpOp::Lt,
+                            (Function::Le, false) | (Function::Ge, true) => CmpOp::LtEq,
+                            (Function::Gt, false) | (Function::Lt, true) => CmpOp::Gt,
+                            (Function::Ge, false) | (Function::Le, true) => CmpOp::GtEq,
+                            _ => return None,
+                        };
+                        let (lit, lclass) = literal_of(c, None)?;
+                        let (expr, kind) = self.lower_expr(e)?;
+                        self.expr_cmp(expr, kind, op, lit, lclass, ordering)
+                    }
                     _ => None,
                 }
             }
             _ => None,
         }
+    }
+
+    /// `expr op lit` when the database evaluates it as the engine does: a
+    /// numeric value promotes the same way (no division), a string compares
+    /// (and orders) by code point.
+    fn expr_cmp(
+        &self,
+        expr: Expr,
+        kind: ExprKind,
+        op: CmpOp,
+        lit: Literal,
+        lclass: RdfClass,
+        ordering: bool,
+    ) -> Option<Pred> {
+        let exact = match (kind, &lclass) {
+            (ExprKind::Num, RdfClass::Numeric) => true,
+            (ExprKind::Str, RdfClass::Str) => {
+                self.caps.string_eq_is_binary && (!ordering || self.caps.string_order_is_codepoint)
+            }
+            _ => false,
+        };
+        exact.then_some(Pred::ExprCmp {
+            expr,
+            op,
+            value: lit,
+        })
     }
 
     /// A predicate every row `expr` keeps satisfies, for an `expr` the plan
@@ -2584,7 +2627,10 @@ impl<'a> Lowerer<'a> {
                 };
                 Some(Pred::Like { col, pattern })
             }
-            Function::Eq | Function::Lt | Function::Le | Function::Gt | Function::Ge => {
+            Function::Eq => self
+                .case_fold_superset(args)
+                .or_else(|| self.naive_timestamp_window(func, args)),
+            Function::Lt | Function::Le | Function::Gt | Function::Ge => {
                 self.naive_timestamp_window(func, args)
             }
             // `^literal` with no flags is a case-sensitive prefix.
@@ -2658,6 +2704,46 @@ impl<'a> Lowerer<'a> {
         })
     }
 
+    /// `LCASE(?v) = "lit"` / `UCASE(?v) = "lit"` over a plain string
+    /// column: every dialect's case mapping agrees with SPARQL's on
+    /// printable ASCII, so the folded comparison is exact for such values
+    /// and any other value is sent back for the engine to decide.
+    fn case_fold_superset(&self, args: &[Expression]) -> Option<Pred> {
+        let (call, c) = match args {
+            [call @ Expression::Call { .. }, Expression::Const(c)]
+            | [Expression::Const(c), call @ Expression::Call { .. }] => (call, c),
+            _ => return None,
+        };
+        let Expression::Call { func, args } = call else {
+            return None;
+        };
+        let [Expression::Var(v)] = args.as_slice() else {
+            return None;
+        };
+        let fold = match func {
+            Function::Lcase => Expr::Lower,
+            Function::Ucase => Expr::Upper,
+            _ => return None,
+        };
+        let (col, RdfClass::Str) = self.literal_column(*v)? else {
+            return None;
+        };
+        if !self.literal_exact(&col, &RdfClass::Str) || !self.caps.string_eq_is_binary {
+            return None;
+        }
+        let (lit @ Literal::Str(_), RdfClass::Str) = literal_of(c, None)? else {
+            return None;
+        };
+        Some(Pred::Or(vec![
+            Pred::ExprCmp {
+                expr: fold(Box::new(Expr::Col(col.clone()))),
+                op: CmpOp::Eq,
+                value: lit,
+            },
+            Pred::NonAscii(col),
+        ]))
+    }
+
     /// `(?v, "literal")` where `?v` is a physical string column.
     fn string_column_and_literal(&self, args: &[Expression]) -> Option<(ColRef, String)> {
         let [Expression::Var(v), Expression::Const(c)] = args else {
@@ -2679,42 +2765,116 @@ impl<'a> Lowerer<'a> {
     /// numeric columns the database holds natively, numeric constants and
     /// other such `BIND`s. Division is left out: SPARQL divides integers
     /// into a decimal, SQL into an integer. Overflow is the dialect's.
-    fn lower_arith(&self, expr: &Expression) -> Option<Expr> {
+    /// An expression the statement computes as the engine would, with the
+    /// kind of value it yields: arithmetic (no division) over exact numeric
+    /// columns and numeric constants; `CONCAT`, `STRLEN`, `SUBSTR` (from a
+    /// positive constant position) and `STR` over plain string columns and
+    /// constants. `None` where a step's SQL definition could differ.
+    fn lower_expr(&self, expr: &Expression) -> Option<(Expr, ExprKind)> {
         match expr {
             Expression::Var(v) => {
                 if let Some(e) = self.bind_exprs.get(v) {
                     return Some(e.clone());
                 }
                 let (col, class) = self.literal_column(*v)?;
-                if class != RdfClass::Numeric
-                    || !self.literal_exact(&col, &class)
-                    || self.field_type(&col) == Some(FieldType::Float32)
-                {
+                if !self.literal_exact(&col, &class) {
                     return None;
                 }
-                Some(Expr::Col(col))
+                match class {
+                    RdfClass::Numeric if self.field_type(&col) != Some(FieldType::Float32) => {
+                        Some((Expr::Col(col), ExprKind::Num))
+                    }
+                    RdfClass::Str => Some((Expr::Col(col), ExprKind::Str)),
+                    _ => None,
+                }
             }
             Expression::Const(c) => match literal_of(c, None)? {
                 (lit @ (Literal::Int(_) | Literal::Decimal { .. } | Literal::Double(_)), _) => {
-                    Some(Expr::Lit(lit))
+                    Some((Expr::Lit(lit), ExprKind::Num))
                 }
+                (lit @ Literal::Str(_), RdfClass::Str) => Some((Expr::Lit(lit), ExprKind::Str)),
                 _ => None,
             },
             Expression::Call { func, args } => {
-                let op = match func {
-                    Function::Add => ArithOp::Add,
-                    Function::Sub => ArithOp::Sub,
-                    Function::Mul => ArithOp::Mul,
-                    _ => return None,
+                let num = |e: &Expression| -> Option<Expr> {
+                    match self.lower_expr(e)? {
+                        (x, ExprKind::Num) => Some(x),
+                        _ => None,
+                    }
                 };
-                let [l, r] = args.as_slice() else {
-                    return None;
+                let str = |e: &Expression| -> Option<Expr> {
+                    match self.lower_expr(e)? {
+                        (x, ExprKind::Str) => Some(x),
+                        _ => None,
+                    }
                 };
-                Some(Expr::Arith {
-                    op,
-                    left: Box::new(self.lower_arith(l)?),
-                    right: Box::new(self.lower_arith(r)?),
-                })
+                let count = |e: &Expression| -> Option<u64> {
+                    match e {
+                        Expression::Const(c) => match literal_of(c, None)? {
+                            (Literal::Int(n), _) => u64::try_from(n).ok(),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                };
+                match func {
+                    Function::Add | Function::Sub | Function::Mul => {
+                        let op = match func {
+                            Function::Add => ArithOp::Add,
+                            Function::Sub => ArithOp::Sub,
+                            _ => ArithOp::Mul,
+                        };
+                        let [l, r] = args.as_slice() else {
+                            return None;
+                        };
+                        Some((
+                            Expr::Arith {
+                                op,
+                                left: Box::new(num(l)?),
+                                right: Box::new(num(r)?),
+                            },
+                            ExprKind::Num,
+                        ))
+                    }
+                    Function::Concat if !args.is_empty() => {
+                        let parts: Option<Vec<Expr>> = args.iter().map(str).collect();
+                        Some((Expr::Concat(parts?), ExprKind::Str))
+                    }
+                    Function::Strlen => {
+                        let [e] = args.as_slice() else {
+                            return None;
+                        };
+                        Some((Expr::Strlen(Box::new(str(e)?)), ExprKind::Num))
+                    }
+                    Function::Str => {
+                        let [e] = args.as_slice() else {
+                            return None;
+                        };
+                        Some((str(e)?, ExprKind::Str))
+                    }
+                    // Positions before the start or a negative length have
+                    // dialect-specific readings; SPARQL's are exact only
+                    // from position 1.
+                    Function::Substr => {
+                        let (e, start, len) = match args.as_slice() {
+                            [e, s] => (e, count(s)?, None),
+                            [e, s, n] => (e, count(s)?, Some(count(n)?)),
+                            _ => return None,
+                        };
+                        if start < 1 {
+                            return None;
+                        }
+                        Some((
+                            Expr::Substr {
+                                expr: Box::new(str(e)?),
+                                start,
+                                len,
+                            },
+                            ExprKind::Str,
+                        ))
+                    }
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -3033,7 +3193,8 @@ fn collect_aliases(pred: &Pred, out: &mut HashSet<String>) {
         Pred::Cmp { col, .. }
         | Pred::IsNull(col)
         | Pred::IsNotNull(col)
-        | Pred::Like { col, .. } => {
+        | Pred::Like { col, .. }
+        | Pred::NonAscii(col) => {
             out.insert(col.alias.clone());
         }
         Pred::ColEq { left, right } => {

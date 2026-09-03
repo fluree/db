@@ -276,12 +276,26 @@ pushable. In that statement:
   `BIND`s, a `FILTER` comparing it with a number pushes as the expression
   (`("total" * 2) > 50`) and an `ORDER BY … LIMIT` over it pushes as a
   top-k (`ORDER BY ("total" * 2) DESC LIMIT 2`); the bound value is still
-  built in the engine. Division stays in the engine (SPARQL divides
-  integers into a decimal, SQL into an integer), as does anything over a
-  string. The `BIND` must read only variables the block bound
+  built in the engine. `CONCAT`, `STRLEN`, `SUBSTR` from a positive
+  constant position, and `STR` over plain string columns and constants
+  push the same way (`("name" || '-' || "country") = 'Ada-UK'`,
+  `LENGTH("name") > 2`; `CHAR_LENGTH` and `CONCAT()` on `dialect: mysql`),
+  a string comparison where the dialect compares bytes and a string
+  ordering where it orders code points. A `FILTER` that writes the
+  expression out instead of binding it pushes too. Division stays in the
+  engine (SPARQL divides integers into a decimal, SQL into an integer), as
+  do language-tagged strings and `SUBSTR` from a computed or non-positive
+  position. The `BIND` must read only variables the block bound
   before it, and nothing the statement joins or filters on may read the
   bound variable; an `EXISTS` inside the expression, or a `BIND` inside an
   `OPTIONAL` or a `UNION` branch, leaves the block to the engine;
+- `LCASE(?v) = "…"` and `UCASE(?v) = "…"` over a plain string column widen
+  rather than push exactly: every dialect's case mapping agrees with
+  SPARQL's on printable ASCII and nowhere else for certain (SPARQL maps
+  `ß` to `SS` and a ligature to two letters; the databases do not), so the
+  statement keeps the rows whose folded value matches **or** that hold any
+  other character (`LOWER("name") = 'ada' OR "name" !~ '^[ -~]*$'`), and
+  the engine decides the rest;
 - `LIMIT`, and `ORDER BY … LIMIT` as a top-k, are pushed when no residual
   filter could drop rows afterwards. The top-k needs every `ORDER BY` key to
   be a typed, required column (either direction); a key the statement cannot

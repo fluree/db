@@ -495,7 +495,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "unpushable filter stays in the engine as a residual",
-            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(STRLEN(?n) > 2) }",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(REGEX(?n, \"a$\")) }",
             sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
             rows: &["n=Ada"],
             routing: Routing::MustFire,
@@ -630,7 +630,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "a residual filter keeps LIMIT in the engine",
-            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(STRLEN(?n) > 1) } LIMIT 1",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(REGEX(?n, \"[a-z]$\")) } LIMIT 1",
             sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
             rows: &["n=Ada"],
             routing: Routing::MustFire,
@@ -812,7 +812,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "a widened conjunction drops what it cannot widen and keeps the exact part",
-            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n ; ex:country ?k FILTER(STRSTARTS(?n, \"A\") && STRLEN(?k) = 2 && ?k = \"UK\") }",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n ; ex:country ?k FILTER(STRSTARTS(?n, \"A\") && REGEX(?k, \"K$\") && ?k = \"UK\") }",
             sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t0"."country" AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."country" IS NOT NULL AND "t0"."name" LIKE 'A%' ESCAPE '!' AND "t0"."country" = 'UK'"#],
             rows: &["n=Ada"],
             routing: Routing::MustFire,
@@ -1069,7 +1069,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "DISTINCT keeps the columns a residual filter reads",
-            sparql: "SELECT DISTINCT ?c FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?c ex:name ?n FILTER(STRLEN(?n) > 2) }",
+            sparql: "SELECT DISTINCT ?c FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?c ex:name ?n FILTER(REGEX(?n, \"a$\")) }",
             sql: &[r#"SELECT DISTINCT "t1"."id" AS "c0", "t1"."name" AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL"#],
             rows: &["c=http://example.org/customer/1"],
             routing: Routing::MustFire,
@@ -1144,6 +1144,70 @@ fn cases() -> Vec<Case> {
                 "o=http://example.org/order/10 v=99.50",
                 "o=http://example.org/order/12 v=2024-03-01",
                 "o=http://example.org/order/12 v=42.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        // String expressions push as the dialect's own functions where
+        // their definition is SPARQL's: CONCAT, STRLEN and SUBSTR from a
+        // positive position, over plain string columns; the bound value is
+        // still computed in the engine. LCASE/UCASE equality widens: the
+        // fold is exact on printable ASCII, other values come back.
+        Case {
+            name: "a CONCAT bind compares in the database",
+            sparql: "SELECT ?c ?x FROM <shop-sql:main> WHERE { ?c ex:name ?n ; ex:country ?k BIND(CONCAT(?n, \"-\", ?k) AS ?x) FILTER(?x = \"Ada-UK\") }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t0"."country" AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."country" IS NOT NULL AND ("t0"."name" || '-' || "t0"."country") = 'Ada-UK'"#],
+            rows: &[
+                "c=http://example.org/customer/1 x=Ada-UK",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "STRLEN and SUBSTR compare in the database without a BIND",
+            sparql: "SELECT ?c ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(STRLEN(?n) > 2 && SUBSTR(?n, 1, 1) = \"A\") }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND LENGTH("t0"."name") > 2 AND SUBSTR("t0"."name", 1, 1) = 'A'"#],
+            rows: &[
+                "c=http://example.org/customer/1 n=Ada",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a string bind orders and limits in the database",
+            sparql: "SELECT ?c ?x FROM <shop-sql:main> WHERE { ?c ex:name ?n ; ex:country ?k BIND(CONCAT(?k, ?n) AS ?x) } ORDER BY DESC(?x) LIMIT 1",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t0"."country" AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."country" IS NOT NULL ORDER BY ("t0"."country" || "t0"."name") DESC LIMIT 1"#],
+            rows: &[
+                "c=http://example.org/customer/3 x=USCy",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a CONCAT over a numeric column stays in the engine",
+            sparql: "SELECT ?o ?x FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(CONCAT(\"$\", ?t) AS ?x) FILTER(?x = \"$42.00\") }",
+            // CONCAT over a decimal is a type error in SPARQL: no row.
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            rows: &[],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "LCASE equality widens to the dialect's fold on ASCII",
+            sparql: "SELECT ?c ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(LCASE(?n) = \"ada\") }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND ((LOWER("t0"."name") = 'ada') OR (NOT regexp_like("t0"."name", '^[ -~]*$')))"#],
+            rows: &[
+                "c=http://example.org/customer/1 n=Ada",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "UCASE equality widens with the literal first",
+            sparql: "SELECT ?c ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(\"CY\" = UCASE(?n)) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND ((UPPER("t0"."name") = 'CY') OR (NOT regexp_like("t0"."name", '^[ -~]*$')))"#],
+            rows: &[
+                "c=http://example.org/customer/3 n=Cy",
             ],
             routing: Routing::MustFire,
             declined: None,
@@ -2078,7 +2142,7 @@ fn aggregate_cases() -> Vec<Case> {
         },
         Case {
             name: "a residual filter under an aggregate declines",
-            sparql: "SELECT (COUNT(*) AS ?n) FROM <shop-sql:main> WHERE { ?c ex:name ?x FILTER(STRLEN(?x) > 2) }",
+            sparql: "SELECT (COUNT(*) AS ?n) FROM <shop-sql:main> WHERE { ?c ex:name ?x FILTER(REGEX(?x, \"a$\")) }",
             sql: &[],
             rows: &["n=1"],
             routing: Routing::MustNotFire,

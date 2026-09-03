@@ -22,7 +22,7 @@ use fluree_db_tabular::plan::{
 };
 use fluree_db_tabular::{BatchSchema, FieldType};
 
-use crate::dialect::{cmp_sql, is_numeric, render_literal, sql_string, SqlDialect};
+use crate::dialect::{binary_string, cmp_sql, is_numeric, render_literal, sql_string, SqlDialect};
 use crate::error::{Result, SqlError};
 
 struct Renderer<'a> {
@@ -554,26 +554,42 @@ impl Renderer<'_> {
                 })?;
                 format!("{} LIKE {lit} ESCAPE '!'", self.col(col))
             }
-            Pred::ExprCmp { expr, op, value } => format!(
-                "{} {} {}",
-                self.render_expr(expr)?,
-                cmp_sql(*op),
-                self.expr_literal(value)?
-            ),
+            Pred::ExprCmp { expr, op, value } => {
+                let rhs = match value {
+                    // Compared, not computed with: bytes on MySQL too.
+                    Literal::Str(s) => binary_string(s, self.dialect).ok_or_else(|| {
+                        SqlError::Unsupported(format!("string {s:?} cannot be rendered"))
+                    })?,
+                    other => self.expr_literal(other)?,
+                };
+                format!("{} {} {rhs}", self.render_expr(expr)?, cmp_sql(*op))
+            }
+            // Printable ASCII is the range every dialect's case mapping and
+            // collation agree on; anything else goes back to the engine.
+            Pred::NonAscii(col) => {
+                let c = self.col(col);
+                match self.dialect {
+                    SqlDialect::Postgres => format!("{c} !~ '^[ -~]*$'"),
+                    SqlDialect::Mysql => format!("{c} NOT REGEXP '^[ -~]*$'"),
+                    SqlDialect::Sqlite => format!("{c} GLOB '*[^ -~]*'"),
+                    SqlDialect::Trino => format!("NOT regexp_like({c}, '^[ -~]*$')"),
+                }
+            }
             Pred::And(ps) => self.render_junction(ps, " AND ")?,
             Pred::Or(ps) => self.render_junction(ps, " OR ")?,
             Pred::Not(p) => format!("NOT ({})", self.render_pred(p)?),
         })
     }
 
-    /// A numeric expression, every operation parenthesized so precedence
-    /// is the plan's, not the dialect's.
+    /// An expression, every operation parenthesized so precedence is the
+    /// plan's, not the dialect's.
     fn render_expr(&self, expr: &Expr) -> Result<String> {
         Ok(match expr {
             Expr::Col(c) => {
-                if !is_numeric(self.col_type(c)?) {
+                let ty = self.col_type(c)?;
+                if !is_numeric(ty) && ty != FieldType::String {
                     return Err(SqlError::Unsupported(format!(
-                        "arithmetic over {}.{}, not a numeric column",
+                        "expression over {}.{}, neither numeric nor text",
                         c.alias, c.column
                     )));
                 }
@@ -581,6 +597,9 @@ impl Renderer<'_> {
             }
             Expr::Lit(l) => self.expr_literal(l)?,
             Expr::Arith { op, left, right } => {
+                for side in [left, right] {
+                    self.operand_is(side, is_numeric, "numeric")?;
+                }
                 let op = match op {
                     ArithOp::Add => "+",
                     ArithOp::Sub => "-",
@@ -592,11 +611,67 @@ impl Renderer<'_> {
                     self.render_expr(right)?
                 )
             }
+            Expr::Concat(parts) => {
+                for p in parts {
+                    self.operand_is(p, |t| t == FieldType::String, "text")?;
+                }
+                let parts: Vec<String> = parts
+                    .iter()
+                    .map(|p| self.render_expr(p))
+                    .collect::<Result<_>>()?;
+                // `||` is OR on MySQL unless the session says otherwise.
+                match self.dialect {
+                    SqlDialect::Mysql => format!("CONCAT({})", parts.join(", ")),
+                    _ => format!("({})", parts.join(" || ")),
+                }
+            }
+            Expr::Strlen(e) => {
+                self.operand_is(e, |t| t == FieldType::String, "text")?;
+                let f = match self.dialect {
+                    SqlDialect::Mysql => "CHAR_LENGTH",
+                    _ => "LENGTH",
+                };
+                format!("{f}({})", self.render_expr(e)?)
+            }
+            Expr::Substr { expr, start, len } => {
+                self.operand_is(expr, |t| t == FieldType::String, "text")?;
+                match len {
+                    Some(n) => format!("SUBSTR({}, {start}, {n})", self.render_expr(expr)?),
+                    None => format!("SUBSTR({}, {start})", self.render_expr(expr)?),
+                }
+            }
+            Expr::Lower(e) | Expr::Upper(e) => {
+                self.operand_is(e, |t| t == FieldType::String, "text")?;
+                let f = if matches!(expr, Expr::Lower(_)) {
+                    "LOWER"
+                } else {
+                    "UPPER"
+                };
+                format!("{f}({})", self.render_expr(e)?)
+            }
         })
     }
 
-    /// A numeric literal inside an expression, typed by its own kind.
+    /// A column operand of an operation must carry the operation's kind.
+    fn operand_is(&self, e: &Expr, ok: impl Fn(FieldType) -> bool, kind: &str) -> Result<()> {
+        if let Expr::Col(c) = e {
+            let ty = self.col_type(c)?;
+            if !ok(ty) {
+                return Err(SqlError::Unsupported(format!(
+                    "{kind} operation over {}.{} ({ty:?})",
+                    c.alias, c.column
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// A literal inside an expression, typed by its own kind.
     fn expr_literal(&self, lit: &Literal) -> Result<String> {
+        if let Literal::Str(s) = lit {
+            return sql_string(s, self.dialect)
+                .ok_or_else(|| SqlError::Unsupported(format!("string {s:?} cannot be rendered")));
+        }
         let ty = match lit {
             Literal::Int(_) => FieldType::Int64,
             Literal::Decimal { scale, .. } => FieldType::Decimal {
@@ -606,7 +681,7 @@ impl Renderer<'_> {
             Literal::Double(_) => FieldType::Float64,
             other => {
                 return Err(SqlError::Unsupported(format!(
-                    "literal {other:?} in an arithmetic expression"
+                    "literal {other:?} in an expression"
                 )))
             }
         };
@@ -1104,6 +1179,64 @@ mod tests {
         assert_eq!(
             render_plan(&plan, &schemas, SqlDialect::Mysql).unwrap(),
             r"SELECT `u0`.`c0` AS `c0`, `u0`.`c1` AS `c1`, `u0`.`c2` AS `c2` FROM (SELECT `c`.`id` AS `c0`, `c`.`name` AS `c1`, 0 AS `c2` FROM `customers` AS `c` WHERE `c`.`name` IS NOT NULL UNION ALL SELECT `c2`.`id` AS `c0`, `c2`.`name` AS `c1`, 1 AS `c2` FROM `customers` AS `c2` WHERE `c2`.`name` IS NOT NULL) AS `u0` WHERE `u0`.`c1` = BINARY 'Ada'"
+        );
+    }
+
+    /// String expressions take each dialect's own spelling; a compared
+    /// string is bytes on MySQL, a concatenated one is not.
+    #[test]
+    fn string_expressions_render_per_dialect() {
+        let name = || Box::new(Expr::Col(ColRef::new("c", "name")));
+        let plan = plain(
+            RelNode::Filter {
+                input: Box::new(access("c", "customers")),
+                pred: Pred::And(vec![
+                    Pred::ExprCmp {
+                        expr: Expr::Concat(vec![*name(), Expr::Lit(Literal::Str("-".into()))]),
+                        op: CmpOp::Eq,
+                        value: Literal::Str("Ada-".into()),
+                    },
+                    Pred::ExprCmp {
+                        expr: Expr::Strlen(name()),
+                        op: CmpOp::Gt,
+                        value: Literal::Int(2),
+                    },
+                    Pred::ExprCmp {
+                        expr: Expr::Substr {
+                            expr: name(),
+                            start: 1,
+                            len: Some(1),
+                        },
+                        op: CmpOp::Eq,
+                        value: Literal::Str("A".into()),
+                    },
+                    Pred::Or(vec![
+                        Pred::ExprCmp {
+                            expr: Expr::Lower(name()),
+                            op: CmpOp::Eq,
+                            value: Literal::Str("ada".into()),
+                        },
+                        Pred::NonAscii(ColRef::new("c", "name")),
+                    ]),
+                ]),
+            },
+            vec![out("c", "id", "c0")],
+        );
+        let sql = |d| render_plan(&plan, &schemas(), d).unwrap();
+        assert_eq!(
+            sql(SqlDialect::Postgres),
+            r#"SELECT "c"."id" AS "c0" FROM "customers" AS "c" WHERE ("c"."name" || '-') = 'Ada-' AND LENGTH("c"."name") > 2 AND SUBSTR("c"."name", 1, 1) = 'A' AND ((LOWER("c"."name") = 'ada') OR ("c"."name" !~ '^[ -~]*$'))"#
+        );
+        assert_eq!(
+            sql(SqlDialect::Mysql),
+            r"SELECT `c`.`id` AS `c0` FROM `customers` AS `c` WHERE CONCAT(`c`.`name`, '-') = BINARY 'Ada-' AND CHAR_LENGTH(`c`.`name`) > 2 AND SUBSTR(`c`.`name`, 1, 1) = BINARY 'A' AND ((LOWER(`c`.`name`) = BINARY 'ada') OR (`c`.`name` NOT REGEXP '^[ -~]*$'))"
+        );
+        assert_eq!(
+            sql(SqlDialect::Sqlite),
+            r#"SELECT "c"."id" AS "c0" FROM "customers" AS "c" WHERE ("c"."name" || '-') = 'Ada-' AND LENGTH("c"."name") > 2 AND SUBSTR("c"."name", 1, 1) = 'A' AND ((LOWER("c"."name") = 'ada') OR ("c"."name" GLOB '*[^ -~]*'))"#
+        );
+        assert!(
+            sql(SqlDialect::Trino).ends_with(r#"OR (NOT regexp_like("c"."name", '^[ -~]*$')))"#)
         );
     }
 
