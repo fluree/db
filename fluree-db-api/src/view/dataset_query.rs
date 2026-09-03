@@ -411,11 +411,15 @@ impl Fluree {
         })?;
 
         // Build executable
+        // Report the error's own status, as the single-view tracked path
+        // does: query preparation completes the ledger's config defaults, so
+        // a fault in the config graph surfaces here and is not the caller's.
         let executable = self
             .build_executable_for_dataset(dataset, &parsed)
             .await
             .map_err(|e| {
-                crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+                let status = e.status_code();
+                crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
             })?;
 
         // Execute with tracking
@@ -531,11 +535,15 @@ impl Fluree {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
         })?;
 
+        // Report the error's own status, as the single-view tracked path
+        // does: query preparation completes the ledger's config defaults, so
+        // a fault in the config graph surfaces here and is not the caller's.
         let executable = self
             .build_executable_for_dataset(dataset, &parsed)
             .await
             .map_err(|e| {
-                crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+                let status = e.status_code();
+                crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
             })?;
 
         let batches = self
