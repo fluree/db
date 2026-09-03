@@ -32,12 +32,7 @@ use serde_json::Value as JsonValue;
 fn residency_content_store(
     db: &GraphDb,
 ) -> Option<std::sync::Arc<dyn fluree_db_core::ContentStore>> {
-    let provider = db.snapshot.range_provider.as_ref()?;
-    let brp = provider
-        .as_any()
-        .downcast_ref::<fluree_db_query::BinaryRangeProvider>()?;
-    let cs = brp.store().content_store()?.clone();
-    cs.miss_register().is_some().then_some(cs)
+    crate::residency::content_store(&db.snapshot)
 }
 
 /// If the view was created from a graph source, wrap all top-level patterns

@@ -218,6 +218,13 @@ impl ServerError {
             ServerError::Api(ApiError::Drop(_)) => errors::INTERNAL,
             ServerError::Api(ApiError::Json(_)) => errors::INTERNAL,
             ServerError::Api(ApiError::Config(_)) => errors::CONFIG,
+            // A residency fetch failure is an upstream storage READ failure
+            // that happened to surface during formatting — not malformed
+            // data. It must not carry the FormatError @type, which callers
+            // read as "fix your query/data".
+            ServerError::Api(ApiError::Format(fluree_db_api::FormatError::ResidencyFetch(_))) => {
+                errors::STORAGE_READ
+            }
             ServerError::Api(ApiError::Format(_)) => errors::FORMAT,
 
             // Cross-ledger model dependency failure (502). The variant
@@ -323,6 +330,9 @@ impl ServerError {
             ServerError::Api(ApiError::CypherLower(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::CypherUpdateLower(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::Config(_)) => StatusCode::BAD_REQUEST,
+            ServerError::Api(ApiError::Format(fluree_db_api::FormatError::ResidencyFetch(_))) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             ServerError::Api(ApiError::Format(_)) => StatusCode::BAD_REQUEST,
             ServerError::Api(ApiError::AwaitTNotReached { .. }) => StatusCode::REQUEST_TIMEOUT,
             ServerError::MissingLedger => StatusCode::BAD_REQUEST,
@@ -625,6 +635,26 @@ mod tests {
             assert_eq!(se.status_code(), StatusCode::FORBIDDEN);
             assert_eq!(se.error_type(), errors::STORAGE_ACCESS_DENIED);
         }
+    }
+
+    /// A residency fetch failure surfaces DURING formatting, but it is an
+    /// upstream read failure: the request and the bindings are both fine,
+    /// the bytes could not be fetched. It must not be answered 400 with the
+    /// FormatError @type, which tells the caller to fix their query.
+    #[test]
+    fn a_residency_fetch_failure_is_not_a_format_error() {
+        let residency = ServerError::Api(ApiError::Format(
+            fluree_db_api::FormatError::ResidencyFetch("dict-leaf bagd…: connection reset".into()),
+        ));
+        assert_eq!(residency.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(residency.error_type(), errors::STORAGE_READ);
+
+        // A genuine formatting fault keeps the 400 + FormatError @type.
+        let malformed = ServerError::Api(ApiError::Format(
+            fluree_db_api::FormatError::InvalidBinding("not a binding".into()),
+        ));
+        assert_eq!(malformed.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(malformed.error_type(), errors::FORMAT);
     }
 
     #[test]

@@ -34,10 +34,14 @@
     "build": "node scripts/build.mjs",
     "build:ts": "tsc -p tsconfig.json",
     "smoke": "node scripts/smoke-browser.mjs",
-    "serve": "node scripts/serve.mjs"
+    "smoke:peer": "node scripts/smoke-peer-server.mjs",
+    "serve": "node scripts/serve.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "devDependencies": {
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
   },
   "engines": {
     "node": ">=20"

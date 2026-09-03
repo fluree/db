@@ -1857,7 +1857,16 @@ impl LedgerManager {
 /// Maximum number of commits to catch up incrementally before falling back to
 /// full reload. For gaps larger than this, the cost of N individual commit loads
 /// exceeds the cost of a single full reload.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_INCREMENTAL_COMMITS: i64 = 5;
+/// Browser peers: an SSE reconnect after a tab sleeps routinely wakes tens
+/// of commits behind, and a full re-open drops warm per-store state (the
+/// overlay-translation cache is store-id-keyed) that catch-up preserves.
+/// The parent-chain walk is one sequential fetch per commit, so the cap is
+/// where ~gap × RTT stops beating a re-open's concurrent artifact loads —
+/// past it, reload (which still fires the head-change signal) wins.
+#[cfg(target_arch = "wasm32")]
+const MAX_INCREMENTAL_COMMITS: i64 = 64;
 
 /// Decision from comparing cached state to nameservice record
 ///
@@ -2175,6 +2184,12 @@ impl LedgerManager {
 
                 commits.reverse(); // oldest → newest
 
+                #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                let translation_prefetch: Option<(
+                    Arc<fluree_db_binary_index::BinaryIndexStore>,
+                    Arc<fluree_db_core::dict_novelty::DictNovelty>,
+                )>;
+
                 // Apply commits under write lock (brief — all sync).
                 // Re-check state.t() under lock to guard against concurrent updates.
                 {
@@ -2233,6 +2248,16 @@ impl LedgerManager {
                     // (`apply_single_commit` mutates the dicts in place now that the
                     // provider no longer pins them.) Runs unconditionally — even
                     // after an apply error — so the provider is never left detached.
+                    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                    {
+                        translation_prefetch = provider_store.as_ref().map(|store| {
+                            (
+                                Arc::clone(store),
+                                Arc::clone(&write_guard.state().dict_novelty),
+                            )
+                        });
+                    }
+
                     if let Some(store) = provider_store {
                         let dn = Arc::clone(&write_guard.state().dict_novelty);
                         let runtime_small_dicts =
@@ -2263,6 +2288,19 @@ impl LedgerManager {
                             self.config.leaflet_cache.clone(),
                         )
                         .await?;
+                }
+
+                // Caught-up commits introduced new novelty entries whose
+                // overlay translation reverse-looks-up the persisted dict
+                // trees at query time: prewarm those leaves now (the same F8
+                // treatment the load and index-apply paths get), so a
+                // head-change → re-query is a pure hit instead of a retry
+                // round. Runs outside the write guard; when an index update
+                // swapped the store above, its apply-path prefetch already
+                // covered the new store and this is a resident no-op.
+                #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                if let Some((store, dict_novelty)) = translation_prefetch {
+                    prefetch_novelty_translation(&store, &dict_novelty).await;
                 }
 
                 Ok(NotifyResult::CommitsApplied { count: gap })

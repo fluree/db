@@ -2,7 +2,27 @@
 
 > Package name is a placeholder pending the npm org decision.
 
-Fluree in the browser: the graph database engine (`fluree-db-api`) compiled to WebAssembly and hosted in a dedicated Web Worker. This release ships **playground mode** — an in-memory Fluree you can create ledgers in, transact JSON-LD into, and query with SPARQL or JSON-LD, with no server. The **peer mode** (query a Fluree server's ledgers locally from CID-verified, cached index blocks) uses the same API surface via a second constructor and lands in a later release.
+Fluree in the browser: the graph database engine (`fluree-db-api`) compiled to WebAssembly and hosted in a dedicated Web Worker. Two modes share one API surface:
+
+- **Playground** (`playground()`): an in-memory Fluree you can create ledgers in, transact JSON-LD into, and query with SPARQL or JSON-LD — no server.
+- **Peer** (`connect(url, { getToken, ... })`): a read-only local engine over a remote Fluree server — heads resolve through the server's nameservice, index/commit blocks arrive CID-verified and cache in IndexedDB, queries execute locally, and SSE head tracking pushes ledger advances to `peer.on("headChange", …)`. Transacting through a peer rejects with a typed `unsupported`; commits are ordered by the origin server.
+
+```js
+import { connect } from "@fluree/db-wasm";
+
+const peer = await connect("https://data.example.com/v1/fluree", {
+  getToken: () => fetchTokenFromMyBackend(),   // fluree.storage.* scope
+  subscribe: ["books:main"],                   // SSE head tracking ([] = all visible)
+});
+const books = await peer.ledger("books:main");
+const rows = await books.query("SELECT ?s WHERE { ?s ?p ?o } LIMIT 10");
+const off = peer.on("headChange", ({ ledger, t }) => rerender(ledger, t));
+peer.close();
+```
+
+**Peer credentials:** `getToken` is the single source — the token is requested from the main thread over the worker's event channel at connect AND at every post-crash reconnect; it is never embedded in a replayable init message. There is no mid-session re-auth op on this package's surface: when a token expires, requests fail typed and you reconnect (`close()` + `connect()`) with a fresh token, which costs every subscription, snapshot, and the warm residency tier.
+
+The engine below this package can already do better — `fluree-db-browser`'s `BrowserPeer::set_token` swaps the bearer through a shared cell that every I/O surface reads, with no teardown, and it is natively tested. It is deliberately NOT exposed here yet, because wiring it needs a decision this package has not made: which side owns the token once both paths exist. Today `getToken` is asked on connect and re-asked on every recycle, so it is the single source of truth; a pushed `setToken` would be silently superseded by the next recycle's `getToken` unless the two are reconciled. Expect a `setToken` op once that is settled.
 
 ## Install & use
 
@@ -42,6 +62,9 @@ fluree.close();                             // terminates the worker; ledgers ar
 | | |
 |---|---|
 | `playground(options?)` → `Promise<Playground>` | Start an engine worker. `options.workerUrl`, `options.wasmUrl` override asset locations; `options.resultTransport` is `"transfer"` (default) or `"clone"`; `options.maxMemoryBytes` caps each query's memory budget (see below). |
+| `connect(url, options?)` → `Promise<Peer>` | Read-only peer over a remote server (`url` = versioned API base). Adds `options.getToken` (credential source — see above) and `options.subscribe` (SSE head tracking). In peer mode `maxMemoryBytes` is the ONE ceiling: it derives the whole browser-io budget split (residency tier, write-behind, fetch width) and the per-query budget (¼ of it). |
+| `Peer.ledger(id)` → `Promise<Ledger>`, `Peer.on("headChange", cb)` → unsubscriber, `Peer.version`, `.close()` | Same `Ledger` surface as the playground minus writes (transacts reject `unsupported`). Head-change callbacks fire after the engine absorbed the advance: the next `snapshot()` sees the new head; frozen snapshots never move. |
+| `Playground.subscribe(ledger, query, onUpdate)` / `Peer.subscribe(...)` → `Promise<LiveSubscription>` | Live query: `onUpdate` fires with the first result immediately (auto-prime) and again after every commit that CHANGES the result — unchanged results are hash-gated engine-side and cost no serialization or delivery. One batched engine cycle per head advance (peer: SSE-driven; playground: after each local transact); changed payloads cross the worker boundary as transferred buffers. `update` is `{ ledger, t, data }` or `{ ledger, t, error }` (per-cycle; keep-last-good is the caller's layer). Subscriptions do not survive a crash recycle — re-subscribe on `fatal`. `LiveSubscription.unsubscribe()` stops updates. |
 | `Playground.createLedger(id)` / `.ledger(id)` → `Promise<Ledger>` | `"demo"` normalizes to `"demo:main"`. `conflict` / `not_found` errors respectively. |
 | `Playground.version`, `.close()` | Engine version; terminate the worker. |
 | `Ledger.insert(data)` / `.upsert(data)` / `.update(doc)` / `.sparqlUpdate(text)` → `Promise<CommitReceipt>` | JSON-LD in (object or JSON text); `{ t, commit, flakes }` out. |
@@ -80,13 +103,29 @@ cd fluree-db-wasm/js && npm install
 node scripts/build.mjs            # → pkg/ (wasm + glue) and dist/ (TS output); prints sizes
 node scripts/serve.mjs            # http://127.0.0.1:8787/demo/
 node scripts/smoke-browser.mjs    # headless-Chrome end-to-end check (positive ran-marker)
+node scripts/smoke-peer-server.mjs  # the same, against a REAL fluree-db-server
 ```
+
+`smoke-peer-server.mjs` launches `fluree-server` itself (building it first if
+`target/{debug,release}/fluree-server` is absent, or set `FLUREE_SERVER_BIN`),
+mints a storage-proxy token, creates and populates a ledger over HTTP, then
+drives `connect()` in headless Chrome from a *different origin* through a
+recording reverse proxy — so it asserts the query's rows, the CAS objects the
+browser actually fetched, and the SSE live loop after an external commit.
 
 The Rust-level browser tests run with `wasm-pack test --headless --chrome ..` from the crate directory (needs a `chromedriver` matching your Chrome; set `CHROMEDRIVER=` to point at one).
 
 ### Build profile and size
 
-The `.wasm` builds with the workspace's `wasm-release` cargo profile (fat LTO, one codegen unit, stripped, `opt-level = "s"`) followed by `wasm-opt -Os`. `scripts/build.mjs` prints raw / gzip / brotli sizes and writes `pkg/size-report.json`; the current numbers are in the crate README. Playground and future peer mode share one binary; a feature-sliced slim build (no R2RML, reasoner, full-text, Cypher) is the lever if size ever matters more than surface.
+The `.wasm` builds with the workspace's `wasm-release` cargo profile (fat LTO, one codegen unit, stripped, `opt-level = "s"`) followed by `wasm-opt -Os`. `scripts/build.mjs` prints raw / gzip / brotli sizes and writes `pkg/size-report.json`; the current numbers are in the crate README. Playground and peer mode share one binary; a feature-sliced slim build (no R2RML, reasoner, full-text, Cypher) is the lever if size ever matters more than surface.
+
+### Peer-mode verification status (honest)
+
+Verified in CI's browser smoke without a server: the token event round-trip (init carries no credential; `getToken` answers the worker's request), peer init/close, and typed non-fatal failure against an unreachable remote. Verified natively in `fluree-db-browser`'s mock-driver suites: head resolution through the proxy nameservice, SSE head tracking → callback dispatch, block fetch/verify/cache.
+
+Verified in CI against a **real `fluree-db-server`** by `scripts/smoke-peer-server.mjs`: the server runs with the storage proxy on and the smoke's own did:key as its only trusted issuer (the production token path, not `--storage-proxy-insecure`); a ledger is created, given `f:serveBlocks true`, and populated over HTTP; the page is served from a different origin than the API, so the request really is cross-origin; `connect()` then opens the ledger, and the query's rows are asserted alongside the traffic that produced them — successful `GET /storage/objects/{cid}` fetches, head resolutions, an open SSE stream, and **zero** calls to `/query` (local compute, not query-shipping). An external HTTP commit then has to reach the page as an SSE head change, be absorbed by the engine, and show up both in a re-query and in a live subscription's update.
+
+Still not covered: token expiry/refresh against a live server, IndexedDB reuse across a page reload, ranged leaf reads, and anything on the public/anonymous tier (not implemented server-side).
 
 ### Result transport
 

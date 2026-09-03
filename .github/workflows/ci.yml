@@ -368,10 +368,22 @@ jobs:
   # restatement as the wasm32 job (an env RUSTFLAGS masks .cargo/config.toml).
   wasm-smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       RUSTFLAGS: --cfg getrandom_backend="wasm_js"
     steps:
+      # This job carries a wasm32 target dir AND a native one (the peer
+      # gate's server binary), which is what pushed it into the same disk
+      # pressure `clippy`, `test`, `testsuite-sparql` and `bench-compare`
+      # all clear first.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
@@ -411,6 +423,16 @@ jobs:
       - name: Browser I/O tests (headless Chrome)
         run: wasm-pack test --headless --chrome fluree-db-browser
 
+      # Lints the wasm-only targets, which nothing else sees: the workspace
+      # clippy job builds for the host, so wasm-gated code and
+      # `#[wasm_bindgen_test]` targets are never compiled there, and the
+      # wasm32 job runs `cargo check`, which does not lint. Scoped to these
+      # two crates deliberately — they hold all the wasm-only code, and a
+      # workspace-wide wasm clippy would not be cheap. This job has already
+      # compiled the wasm32 graph twice by now, so it reuses that.
+      - name: Clippy (wasm32-only targets)
+        run: cargo clippy -p fluree-db-browser -p fluree-db-wasm --target wasm32-unknown-unknown --all-targets -- -D warnings
+
       - name: Build npm package (wasm-release profile + wasm-opt + tsc)
         working-directory: fluree-db-wasm/js
         run: |
@@ -424,5 +446,134 @@ jobs:
         working-directory: fluree-db-wasm/js
         run: node scripts/smoke-browser.mjs --packed
 
+      # The Phase-A exit gate: the same package, but against a REAL
+      # fluree-db-server with the storage proxy on. Every other check in this
+      # job stops at a mock; this one proves CID-verified block fetches over
+      # HTTP, cross-origin CORS, and the SSE live loop closing after an
+      # external commit. Builds the server binary itself (debug) — the slow
+      # step, hence its own timeout budget.
+      - name: Build fluree-server (for the real-server peer gate)
+        # The job-level RUSTFLAGS carries the wasm getrandom backend cfg, which
+        # is invalid for a native target — clear it for this one native build.
+        # (`.cargo/config.toml` scopes that cfg to wasm32 already; only the env
+        # restatement leaks across targets.)
+        #
+        # Only the features the gate actually uses. The server's DEFAULT set
+        # is native+credential+iceberg+shacl+bolt, and `iceberg` drags in
+        # `fluree-db-iceberg/aws` — the whole AWS SDK plus Arrow/Parquet, 56
+        # crates this gate never touches (641 -> 473 unique dependencies).
+        # `credential` IS needed: the gate mints an Ed25519 did:key identity
+        # and a `fluree.storage.ledgers` JWS, and starts the server trusting
+        # exactly that issuer, so the storage proxy has to verify a signed
+        # token rather than run `--insecure`.
+        env:
+          RUSTFLAGS: ""
+        run: |
+          cargo build -p fluree-db-server --bin fluree-server \
+            --no-default-features --features native,credential
+
+      - name: Peer gate (browser peer ↔ real fluree-db-server)
+        working-directory: fluree-db-wasm/js
+        run: node scripts/smoke-peer-server.mjs
+
       - name: Size report
         run: cat fluree-db-wasm/js/pkg/size-report.json
+
+  # NOTE on the filter below: `fluree-db-wasm/js/` is in it because the
+  # react-sdk job genuinely compiles that tree — `test/protocolCompat.test.ts`
+  # imports `../../fluree-db-wasm/js/src/index.js` and `.../protocol.js` by
+  # relative path and tsconfig's `include` covers `test/**`, so Type-check
+  # compiles it, Test loads it, and Demo type-checks it again through
+  # `demo/tsconfig.json`. Without it a change to `connect()`'s signature or the
+  # protocol types merges green and the NEXT unrelated fluree-react PR goes red
+  # for someone else's change — the failure landing on the wrong author.
+  react-paths:
+    # Same reason bench-paths exists: GitHub's `paths:` filter is
+    # workflow-scoped and the rest of this workflow must run on every PR, so
+    # the filter lives in a job output instead. `@fluree/react` is a plain npm
+    # package and deliberately NOT a Cargo workspace member, so nothing it
+    # contains can affect a Rust job — and equally, no Rust change can affect
+    # it. ci.yml itself is in the list so a change to the job below runs it.
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.filter.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "not a pull_request — running react-sdk"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
+          echo "changed files:"; echo "$changed"
+          if echo "$changed" | grep -qE '^fluree-react/|^fluree-db-wasm/js/|^\.github/workflows/ci\.yml$'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "no fluree-react paths changed — skipping react-sdk"
+          fi
+
+  # `@fluree/react`: type-check, unit tests, and the package build. No Rust
+  # toolchain, no cargo cache — this job exists so the TypeScript SDK cannot
+  # rot, and so it never makes a Rust contributor's PR slower.
+  react-sdk:
+    needs: react-paths
+    if: needs.react-paths.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: fluree-react
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            fluree-react/package-lock.json
+            fluree-db-wasm/js/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Type-check
+        run: npx tsc -p tsconfig.json --noEmit
+
+      - name: Test
+        run: npx vitest run
+
+      # @fluree/db-wasm's own JS shell (index.ts/protocol.ts, the main-thread
+      # proxy) — unit-tested against a stubbed Worker, no wasm build needed.
+      # Lives in this job, not a new one, because the `react-paths` filter
+      # above already reruns this job for any fluree-db-wasm/js change (the
+      # coupling that comment explains).
+      - name: Shell tests (@fluree/db-wasm)
+        working-directory: fluree-db-wasm/js
+        run: |
+          npm ci
+          npm test
+
+      # Emits dist/ with `types: []`, so a src file that leaned on a vitest
+      # global (or any dev-only type) fails here rather than in a consumer's
+      # build.
+      - name: Build
+        run: npm run build
+
+      # The demo is the program's presentation artifact, so it must not be
+      # allowed to rot. Building it also puts the package through a real
+      # bundler, which the unit tests (which import `src/` directly) never do.
+      # Peer mode is code-split behind a dynamic import and stubbed when the
+      # wasm glue is absent, so this needs no wasm build.
+      - name: Demo (install, type-check, bundle)
+        working-directory: fluree-react/demo
+        run: |
+          npm ci
+          npm run build

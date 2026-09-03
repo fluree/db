@@ -16,6 +16,31 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
+/// SSE request headers, carrying a bearer `authorization` value.
+///
+/// A newtype purely so `Debug` redacts the token: `IoJob` derives `Debug`,
+/// and one `tracing::debug!(?job, …)` or `panic!("unexpected job {other:?}")`
+/// in the driver would otherwise write the user's bearer token to the browser
+/// console, where any extension or error-reporting SDK on the page can read
+/// it. The sibling `TransportRequest` (fluree-db-nameservice-sync) redacts for
+/// the same reason; this keeps `IoJob`'s derived `Debug` correct without a
+/// hand-written impl per variant.
+pub struct SseHeaders(pub Vec<(&'static str, String)>);
+
+impl std::fmt::Debug for SseHeaders {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(name, value)| {
+                if name.eq_ignore_ascii_case("authorization") {
+                    (*name, "[redacted]")
+                } else {
+                    (*name, value.as_str())
+                }
+            }))
+            .finish()
+    }
+}
+
 /// One unit of work for the driver.
 #[derive(Debug)]
 pub enum IoJob {
@@ -55,9 +80,14 @@ pub enum IoJob {
     /// dropping tells the driver to cancel the stream and abort the fetch.
     SseOpen {
         url: String,
-        headers: Vec<(&'static str, String)>,
+        headers: SseHeaders,
         ready: oneshot::Sender<Result<(), SseConnectError>>,
-        chunks: mpsc::UnboundedSender<Result<Bytes, String>>,
+        /// BOUNDED: a full channel pauses the driver's stream read (and so
+        /// the TCP read), backpressuring a server that streams SSE faster
+        /// than the consumer drains it, instead of buffering it without
+        /// limit. The consumer awaits `LedgerManager::notify` per event, so
+        /// this bound is what keeps a flood from growing memory unboundedly.
+        chunks: mpsc::Sender<Result<Bytes, String>>,
     },
     /// Reply after `duration`. The engine side has no timer of its own —
     /// JS owns the clock — so bounded waits (deferred-insert deadlines)
@@ -68,4 +98,29 @@ pub enum IoJob {
     },
     /// Stop the driver after draining what it already spawned.
     Shutdown,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bearer token must never reach a debug string. `IoJob` derives
+    /// `Debug`, so this is enforced by `SseHeaders`' own impl; one stray
+    /// `debug!(?job)`/`panic!("{job:?}")` in the driver would otherwise leak
+    /// the token to the browser console.
+    #[test]
+    fn sse_headers_debug_redacts_the_bearer_token() {
+        let headers = SseHeaders(vec![
+            ("accept", "text/event-stream".to_string()),
+            ("authorization", "Bearer super-secret-token".to_string()),
+        ]);
+        let rendered = format!("{headers:?}");
+        assert!(
+            !rendered.contains("super-secret-token"),
+            "token leaked: {rendered}"
+        );
+        assert!(rendered.contains("[redacted]"), "not redacted: {rendered}");
+        // Non-sensitive headers stay visible for debugging.
+        assert!(rendered.contains("text/event-stream"), "{rendered}");
+    }
 }

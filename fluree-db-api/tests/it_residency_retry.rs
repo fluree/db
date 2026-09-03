@@ -16,7 +16,11 @@
 //!    scan misses handled in-frame by the operator and one-shot paths
 //!    (fast paths, dir walks, policy sub-queries) by the entry loop;
 //! 3. ledger LOAD prefetches novelty's overlay-translation miss sources
-//!    (F8: reverse-dict leaves), so translation lookups are pure hits.
+//!    (F8: reverse-dict leaves), so translation lookups are pure hits;
+//! 4. FORMATTING — the second miss frame — recovers through its own loop.
+//!    Encoded bindings are materialized late, through dictionary leaves the
+//!    execution round often never touches, so a query that completed can
+//!    still miss while being formatted.
 //!
 //! Every test asserts a positive "miss fired" marker; recovery is never
 //! inferred from the absence of an error.
@@ -580,4 +584,268 @@ async fn novelty_ledger_prefetches_translation_and_completes() {
         "identical results including novelty rows"
     );
     assert!(storage.register.is_empty(), "wants drained");
+}
+
+// ============================================================================
+// 6. A5: a beyond-gap head change (sleeping tab) takes the reload fallback
+//    and still lands the manager at the record's watermarks — the engine
+//    half of the "queryable at t" signal (the browser head sink fires its
+//    callbacks unconditionally after notify, with the record's watermarks).
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn beyond_gap_head_change_reloads_at_record_watermarks() {
+    use fluree_db_api::{NotifyResult, NsNotify};
+    use fluree_db_nameservice::NameServiceLookup;
+
+    support::assert_index_defaults();
+    let (shared, ns, fluree_a) = build_indexed_fixture().await;
+
+    // Residency instance with the ledger CACHED in its manager (the state
+    // the SSE head sink notifies against).
+    let (fluree_b, storage) = residency_instance(&shared, &ns);
+    let _ = ledger_with_recovery(&fluree_b, &storage).await;
+    let handle = fluree_b
+        .ledger_cached(LEDGER)
+        .await
+        .expect("cache ledger in manager");
+    drop(handle);
+
+    // A sleeps-and-wakes gap: more commits than the incremental cap (5 on
+    // native), each insert being one commit.
+    const GAP: u64 = 8;
+    let mut ledger_a = fluree_a.ledger(LEDGER).await.expect("ledger A");
+    for i in 0..GAP {
+        let txn = json!({
+            "@context": { "ex": "http://example.org/ns/" },
+            "@graph": [{
+                "@id": format!("ex:wake{i}"),
+                "@type": "ex:Item",
+                "ex:name": format!("Wake {i}"),
+                "ex:level": 1
+            }]
+        });
+        ledger_a = fluree_a
+            .insert(ledger_a, &txn)
+            .await
+            .expect("commit")
+            .ledger;
+    }
+
+    let record = ns
+        .lookup(LEDGER)
+        .await
+        .expect("ns lookup")
+        .expect("record exists");
+    let expected_t = record.commit_t;
+
+    let mgr = fluree_b.ledger_manager().expect("manager");
+    let t_before = mgr
+        .current_t(LEDGER)
+        .await
+        .expect("ledger cached before the gap");
+    assert!(
+        expected_t - t_before > 5,
+        "fixture sanity: gap {} must exceed the native incremental cap",
+        expected_t - t_before
+    );
+    let result = mgr
+        .notify(NsNotify {
+            ledger_id: LEDGER.to_string(),
+            record: Some(record),
+        })
+        .await
+        .expect("notify");
+    assert_eq!(
+        result,
+        NotifyResult::Reloaded,
+        "beyond the incremental cap the fallback must be a full re-open"
+    );
+    assert_eq!(
+        mgr.current_t(LEDGER).await,
+        Some(expected_t),
+        "reloaded state must sit at the record's commit watermark"
+    );
+
+    // And the re-opened state answers queries (through the production loop)
+    // with every post-gap row present.
+    let query = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "select": "?name",
+        "where": [{ "@id": "?item", "ex:name": "?name" }]
+    });
+    let ledger_b = ledger_with_recovery(&fluree_b, &storage).await;
+    assert_eq!(ledger_b.t(), expected_t, "fresh load at the same watermark");
+    let db_b = GraphDb::from_ledger_state(&ledger_b);
+    let result = fluree_b
+        .query(&db_b, &query)
+        .await
+        .expect("production retry loop absorbs the cold re-open");
+    assert_eq!(
+        rows_of(&result, &ledger_b).len(),
+        (PEOPLE + GAP) as usize,
+        "all pre- and post-gap rows visible"
+    );
+}
+
+// ============================================================================
+// 7. A2: a within-gap head change takes incremental catch-up, runs the
+//    novelty translation prefetch (call-site wiring; the prefetcher itself
+//    is unit-pinned in fluree-db-binary-index), and the caught-up state
+//    serves the new rows through the production loop.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn catch_up_applies_commits_and_prefetches_translation() {
+    use fluree_db_api::{NotifyResult, NsNotify};
+    use fluree_db_nameservice::NameServiceLookup;
+
+    support::assert_index_defaults();
+    let (shared, ns, fluree_a) = build_indexed_fixture().await;
+
+    let (fluree_b, storage) = residency_instance(&shared, &ns);
+    let _ = ledger_with_recovery(&fluree_b, &storage).await;
+    let _ = fluree_b
+        .ledger_cached(LEDGER)
+        .await
+        .expect("cache ledger in manager");
+
+    // Two commits — within the incremental cap — introducing new subjects
+    // and strings (novelty translation work).
+    let mut ledger_a = fluree_a.ledger(LEDGER).await.expect("ledger A");
+    for i in 0..2u64 {
+        let txn = json!({
+            "@context": { "ex": "http://example.org/ns/" },
+            "@graph": [{
+                "@id": format!("ex:live{i}"),
+                "@type": "ex:Item",
+                "ex:name": format!("Live {i}"),
+                "ex:level": 2
+            }]
+        });
+        ledger_a = fluree_a
+            .insert(ledger_a, &txn)
+            .await
+            .expect("commit")
+            .ledger;
+    }
+
+    let record = ns
+        .lookup(LEDGER)
+        .await
+        .expect("ns lookup")
+        .expect("record exists");
+    let expected_t = record.commit_t;
+
+    let mgr = fluree_b.ledger_manager().expect("manager");
+    let result = mgr
+        .notify(NsNotify {
+            ledger_id: LEDGER.to_string(),
+            record: Some(record),
+        })
+        .await
+        .expect("notify");
+    assert_eq!(
+        result,
+        NotifyResult::CommitsApplied { count: 2 },
+        "within the cap the head change must catch up incrementally"
+    );
+    assert_eq!(mgr.current_t(LEDGER).await, Some(expected_t));
+
+    // The caught-up state serves persisted + novelty rows through the
+    // production loop, with the register drained afterwards. (On this
+    // fixture scale the translation prefetch is a resident no-op — the
+    // strong prefetcher pin is `residency_prefetch_covers_novelty_reverse_lookups`
+    // in fluree-db-binary-index; this test pins the catch-up call-site
+    // wiring and the end-to-end result.)
+    let query = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "select": "?name",
+        "where": [{ "@id": "?item", "ex:name": "?name" }]
+    });
+    let ledger_b = ledger_with_recovery(&fluree_b, &storage).await;
+    assert_eq!(ledger_b.t(), expected_t);
+    let db_b = GraphDb::from_ledger_state(&ledger_b);
+    let result = fluree_b
+        .query(&db_b, &query)
+        .await
+        .expect("production retry loop");
+    assert_eq!(
+        rows_of(&result, &ledger_b).len(),
+        (PEOPLE + 2) as usize,
+        "persisted + caught-up novelty rows visible"
+    );
+    assert!(storage.register.is_empty(), "wants drained");
+}
+
+// ============================================================================
+// 8. FORMATTING is the SECOND residency frame, with a retry loop of its own.
+//    Execution emits `Binding::Encoded*` for late materialization; those ids
+//    are resolved to IRIs and literals only during formatting, through
+//    dictionary and forward-pack leaves the execution round often never
+//    touches. So a peer whose query round succeeded can still take its first
+//    miss here — which is what `format::format_results_async`'s loop exists
+//    for. Every other test in this file formats through the SYNC `to_jsonld`
+//    (`rows_of`), so none of them can reach it.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn formatting_completes_through_its_own_residency_loop() {
+    support::assert_index_defaults();
+    let (shared, ns, fluree_a) = build_indexed_fixture().await;
+
+    // Selecting the subject IRI, not just the literal, is what forces
+    // materialization through a dictionary leaf during formatting.
+    let query = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "select": ["?item", "?name"],
+        "where": [{ "@id": "?item", "ex:name": "?name" }]
+    });
+
+    let ledger_a = fluree_a.ledger(LEDGER).await.expect("ledger A");
+    let db_a = GraphDb::from_ledger_state(&ledger_a);
+    let expected = rows_of(
+        &fluree_a.query(&db_a, &query).await.expect("query A"),
+        &ledger_a,
+    );
+    assert_eq!(expected.len(), PEOPLE as usize, "fixture sanity");
+
+    // (a) The loop is load-bearing, not decorative: on a cold residency
+    //     instance the production query round succeeds and the SYNC formatter
+    //     — the one every other test here uses — still fails, not resident.
+    let (fluree_c, storage_c) = residency_instance(&shared, &ns);
+    let ledger_c = ledger_with_recovery(&fluree_c, &storage_c).await;
+    let db_c = GraphDb::from_ledger_state(&ledger_c);
+    let result_c = fluree_c.query(&db_c, &query).await.expect("query C");
+    let sync_err = result_c
+        .to_jsonld(&ledger_c.snapshot)
+        .expect_err("formatting must miss where execution did not")
+        .to_string();
+    assert!(
+        sync_err.contains("not resident"),
+        "the formatting-time failure must be a residency miss: {sync_err}"
+    );
+
+    // (b) The async formatter absorbs it, on a FRESH instance so nothing (a)
+    //     made resident can carry over.
+    let (fluree_b, storage_b) = residency_instance(&shared, &ns);
+    let ledger_b = ledger_with_recovery(&fluree_b, &storage_b).await;
+    let db_b = GraphDb::from_ledger_state(&ledger_b);
+    let result_b = fluree_b.query(&db_b, &query).await.expect("query B");
+    let misses_before = storage_b.miss_count();
+
+    let formatted = result_b
+        .to_jsonld_async(db_b.as_graph_db_ref())
+        .await
+        .expect("the formatting retry loop must absorb every residency miss");
+
+    assert!(
+        storage_b.miss_count() > misses_before,
+        "the miss must fire DURING formatting (positive marker), not before it"
+    );
+    assert!(
+        storage_b.register.is_empty(),
+        "every want recorded while formatting must have been drained"
+    );
+    assert_eq!(normalize_rows(&formatted), expected, "identical results");
 }

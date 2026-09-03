@@ -179,10 +179,27 @@ async fn open_db(name: &str) -> Result<IdbDatabase, JsValue> {
             }
         });
     open_req.set_onupgradeneeded(Some(on_upgrade.as_ref().unchecked_ref()));
+    // `blocked` is a third outcome alongside success and error: another
+    // connection is holding the database open across a version change, so
+    // this request waits — possibly forever, if that connection never
+    // closes. It is not fatal (the open still completes if the other side
+    // goes away), but it is invisible otherwise, and an open that never
+    // returns used to strand the whole driver. The driver no longer waits
+    // on this before serving jobs; log it so the condition is at least
+    // diagnosable when persistence silently never arrives.
+    let on_blocked = Closure::<dyn FnMut(Event)>::new(move |_: Event| {
+        tracing::warn!(
+            "IndexedDB open is blocked by another open connection; \
+             the block cache will not attach until that connection closes"
+        );
+    });
+    open_req.set_onblocked(Some(on_blocked.as_ref().unchecked_ref()));
     let base: &IdbRequest = &open_req;
     let result = request(base.clone()).await;
     open_req.set_onupgradeneeded(None);
+    open_req.set_onblocked(None);
     drop(on_upgrade);
+    drop(on_blocked);
     result?
         .dyn_into::<IdbDatabase>()
         .map_err(|_| JsValue::from_str("open did not yield a database"))
@@ -284,9 +301,7 @@ async fn scan_meta(db: &IdbDatabase) -> Result<Vec<(String, u64, f64)>, JsValue>
 }
 
 fn spawn_flusher(cache: Weak<IdbCache>, interval: Duration) {
-    let ms = u32::try_from(interval.as_millis())
-        .unwrap_or(u32::MAX)
-        .max(1_000);
+    let ms = crate::config::timer_millis(interval).max(1_000);
     spawn_local(async move {
         loop {
             TimeoutFuture::new(ms).await;

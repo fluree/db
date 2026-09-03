@@ -429,6 +429,25 @@ impl Tracker {
         self.current_micro_fuel().map(micro_to_fuel)
     }
 
+    /// Roll the fuel counter back to a snapshot taken earlier with
+    /// [`current_micro_fuel`](Self::current_micro_fuel).
+    ///
+    /// For retry frames — the residency drain/fetch/re-run loops — whose
+    /// round re-runs a *pure* function and discards the failed round's work:
+    /// without the rollback, N rounds charge N× the fuel of one round, and a
+    /// query near its budget can fail `FuelExceeded` merely for having missed
+    /// residency N times. Caller invariants: `snapshot` must be a value this
+    /// counter actually held, and the caller must be the counter's sole fuel
+    /// writer for the rolled-back span (the store would silently erase a
+    /// concurrent `consume_fuel`). No-op when fuel tracking is disabled.
+    pub fn restore_micro_fuel(&self, snapshot: u64) {
+        if let Some(inner) = &self.0 {
+            if inner.options.track_fuel {
+                inner.fuel_total.store(snapshot, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Finalize tracking into a serializable tally.
     pub fn tally(&self) -> Option<TrackingTally> {
         let inner = self.0.as_ref()?;
@@ -517,6 +536,41 @@ mod tests {
         let t = fuel_tracker(None);
         t.consume_fuel(QUERY_FLOOR_MICRO_FUEL).unwrap();
         assert_eq!(t.tally().unwrap().fuel, Some(1.0));
+    }
+
+    #[test]
+    fn restore_micro_fuel_rolls_back_a_discarded_round() {
+        // The residency retry frames re-run a PURE round and discard the
+        // failed attempt's work; restoring to a snapshot makes N rounds
+        // charge like one, so a near-budget query cannot fail FuelExceeded
+        // merely for having missed residency N times.
+        let t = fuel_tracker(Some(100));
+        t.consume_fuel(40).unwrap();
+        let snapshot = t.current_micro_fuel().unwrap();
+
+        // A failed round charges 50; without the rollback the next (final)
+        // round's 50 would blow the 100 budget at 140.
+        t.consume_fuel(50).unwrap();
+        t.restore_micro_fuel(snapshot);
+        assert_eq!(t.current_micro_fuel(), Some(40));
+
+        // The successful round's charge stands, inside budget.
+        t.consume_fuel(50).unwrap();
+        assert_eq!(t.current_micro_fuel(), Some(90));
+    }
+
+    #[test]
+    fn restore_micro_fuel_is_inert_when_fuel_tracking_is_off() {
+        let disabled = Tracker::disabled();
+        disabled.restore_micro_fuel(0); // must not panic
+        assert_eq!(disabled.current_micro_fuel(), None);
+
+        let no_fuel = Tracker::new(TrackingOptions {
+            track_policy: true,
+            ..Default::default()
+        });
+        no_fuel.restore_micro_fuel(7);
+        assert_eq!(no_fuel.current_micro_fuel(), None);
     }
 
     #[test]

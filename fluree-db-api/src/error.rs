@@ -641,8 +641,11 @@ impl ApiError {
             | ApiError::CypherUpdateLower(_)
             | ApiError::Turtle(_)
             | ApiError::Json(_)
-            | ApiError::Batch(_)
-            | ApiError::Format(_) => 400,
+            | ApiError::Batch(_) => 400,
+            // A residency fetch failure is an upstream READ failure, not a
+            // bad request: the same request can succeed on retry.
+            ApiError::Format(crate::format::FormatError::ResidencyFetch(_)) => 503,
+            ApiError::Format(_) => 400,
             ApiError::Transact(
                 fluree_db_transact::TransactError::CommitConflict { .. }
                 | fluree_db_transact::TransactError::CommitIdMismatch { .. }
@@ -831,5 +834,22 @@ mod tests {
             .target_tally()
             .is_none());
         assert!(ApiError::Internal("boom".into()).target_tally().is_none());
+    }
+
+    /// A residency fetch failure arrives wrapped in `Format` because that
+    /// is the frame it surfaced in, but it is an upstream read failure that
+    /// a retry can fix — not a 400 telling the caller their request is bad.
+    #[test]
+    fn residency_fetch_failures_are_not_client_errors() {
+        assert_eq!(
+            ApiError::Format(crate::format::FormatError::ResidencyFetch("gone".into()))
+                .status_code(),
+            503
+        );
+        assert_eq!(
+            ApiError::Format(crate::format::FormatError::InvalidBinding("bad".into()))
+                .status_code(),
+            400
+        );
     }
 }

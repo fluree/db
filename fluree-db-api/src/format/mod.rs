@@ -214,6 +214,16 @@ pub enum FormatError {
     /// Fuel limit exceeded during formatting (expansion)
     #[error(transparent)]
     FuelExceeded(#[from] FuelExceededError),
+
+    /// A residency FETCH failed while recovering a formatting-time miss
+    /// (wasm32 / the `residency` feature). Distinct from
+    /// [`InvalidBinding`](Self::InvalidBinding) on purpose: the bindings are
+    /// fine and the request is fine — the bytes needed to materialize them
+    /// could not be retrieved. Folding it into `InvalidBinding` made the
+    /// shell's mapping read a network failure as "your data is malformed"
+    /// and answer 400 to something a retry can fix.
+    #[error("Residency fetch failed: {0}")]
+    ResidencyFetch(String),
 }
 
 /// Result type for formatting operations
@@ -512,6 +522,68 @@ pub async fn format_results_async(
     policy: Option<&fluree_db_policy::PolicyContext>,
     tracker: Option<&Tracker>,
 ) -> Result<JsonValue> {
+    // Residency mode (wasm32 / the `residency` feature): formatting is the
+    // SECOND frame that can take a residency miss. Execution emits
+    // `Binding::Encoded*` for late materialization, and those ids are only
+    // resolved to IRIs and literals here — through forward packs the
+    // execution round often never touched. So a query whose execution
+    // succeeded still needs the drain/fetch/re-run loop around formatting,
+    // or the first peer query dies with "content not resident: forward-pack
+    // … (fetch and retry)". Formatting is a pure function of resident state,
+    // so re-running it is always safe; the in-flight guard pins what earlier
+    // rounds made resident, which is what makes progress monotone.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    if let Some(cs) = crate::residency::content_store(db.snapshot) {
+        let _guard = cs.query_guard();
+        let mut budget = fluree_db_binary_index::read::need_fetch::RetryBudget::default();
+        // Formatting is pure and a failed round's work is discarded, so N
+        // retry rounds must charge the fuel of ONE round, not N — otherwise a
+        // query near its budget fails `FuelExceeded` merely for missing
+        // residency N times, and on a peer, misses are the NORMAL first-query
+        // path. Snapshot once, roll back before each retry; the successful
+        // round's charge stands. Sound here because execution has already
+        // finished — this frame is the tracker's sole fuel writer.
+        let fuel_snapshot = tracker.and_then(Tracker::current_micro_fuel);
+        loop {
+            match format_results_async_inner(result, context, db, config, policy, tracker).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    let retried = budget
+                        .after_error(
+                            cs.as_ref(),
+                            fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
+                        )
+                        .await
+                        .map_err(|re| FormatError::ResidencyFetch(re.to_string()))?;
+                    if retried {
+                        if let (Some(t), Some(snap)) = (tracker, fuel_snapshot) {
+                            t.restore_micro_fuel(snap);
+                        }
+                        tracing::debug!(
+                            rounds = budget.rounds(),
+                            fetched_total = budget.fetched_total(),
+                            "formatting residency retry round"
+                        );
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+    format_results_async_inner(result, context, db, config, policy, tracker).await
+}
+
+/// The formatting body. Called directly off residency targets, and once per
+/// retry round on them — see [`format_results_async`].
+async fn format_results_async_inner(
+    result: &QueryResult,
+    context: &ParsedContext,
+    db: GraphDbRef<'_>,
+    config: &FormatterConfig,
+    policy: Option<&fluree_db_policy::PolicyContext>,
+    tracker: Option<&Tracker>,
+) -> Result<JsonValue> {
     // Delimited-text formats produce bytes/String, not JsonValue. Reject early.
     if matches!(config.format, OutputFormat::Tsv | OutputFormat::Csv) {
         return Err(FormatError::InvalidBinding(format!(
@@ -628,6 +700,26 @@ pub async fn format_results_async_dataset(
             return Err(FormatError::InvalidBinding(
                 "Hydration only supports JSON-LD and TypedJson output formats".to_string(),
             ));
+        }
+        // SEAM (#1775): this branch calls hydration directly and is NOT
+        // wrapped in the residency drain/fetch/re-run loop that
+        // `format_results_async` puts around single-ledger formatting, so on
+        // a residency-backed target a mid-hydration miss would be
+        // unrecoverable. The browser peer is single-ledger today, so no
+        // residency store reaches here — but that invariant is now ENFORCED
+        // (typed refusal below), not narrated. The real fix — hoisting the
+        // loop into a helper both paths call, with per-graph store routing —
+        // is tracked in #1775.
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        for graph in dataset.graphs() {
+            if crate::residency::content_store(&graph.snapshot).is_some() {
+                return Err(FormatError::InvalidBinding(
+                    "dataset hydration on a residency-backed (browser peer) target is not \
+                     supported yet: a formatting miss here would be unrecoverable. \
+                     Tracked in https://github.com/fluree/db/issues/1775"
+                        .to_string(),
+                ));
+            }
         }
         let v = hydration::format_async_dataset(result, dataset, context, config, tracker).await?;
         return if result.output.is_select_one() {
