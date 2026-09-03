@@ -2,6 +2,8 @@
 mod cypher_http_integration;
 #[path = "graph_source_format_gating.rs"]
 mod graph_source_format_gating;
+#[path = "ledger_route_config_defaults.rs"]
+mod ledger_route_config_defaults;
 #[path = "multi_ledger_query_dispatch.rs"]
 mod multi_ledger_query_dispatch;
 #[path = "multi_query_auth_integration.rs"]

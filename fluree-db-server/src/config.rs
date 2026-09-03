@@ -426,6 +426,24 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_REINDEX_MAX_BYTES")]
     pub reindex_max_bytes: Option<usize>,
 
+    /// How often to re-sweep for ledgers whose indexing has stalled (seconds)
+    ///
+    /// A safety net for a ledger that falls behind and then stops receiving the
+    /// commits that would trigger it. Only ledgers that are behind AND whose
+    /// commit_t has not moved since the previous sweep are queued, so a healthy
+    /// deployment pays one nameservice listing per interval and nothing else.
+    /// `0` disables the re-sweep; the sweep performed at start-up always runs.
+    ///
+    /// Both sweeps queue on "behind" alone. `NsRecord` carries no novelty byte
+    /// count, so neither can re-apply --reindex-min-bytes: a ledger the soft
+    /// threshold deliberately left unindexed is built anyway once a sweep
+    /// reaches it. On a deployment with many small, mostly-idle ledgers that
+    /// means an index build per behind ledger on every process start, and one
+    /// more per ledger that goes idle while behind. Builds are serialized per
+    /// worker, so the cost is throughput rather than a stampede.
+    #[arg(long, env = "FLUREE_INDEXER_CATCHUP_INTERVAL_SECS", default_value_t = server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS)]
+    pub indexer_catchup_interval_secs: u64,
+
     /// Global cache budget in MB (default: tiered fraction of system RAM — 30% if <4GB, 40% if 4-8GB, 50% if ≥8GB)
     ///
     /// This controls the shared API-level cache budget used for decoded index artifacts.
@@ -460,6 +478,14 @@ pub struct ServerConfig {
     /// Maximum time to wait for HTTP read-after-write min-t freshness checks.
     #[arg(long, env = "FLUREE_QUERY_MIN_T_TIMEOUT_MS", default_value_t = server_defaults::DEFAULT_QUERY_MIN_T_TIMEOUT_MS)]
     pub query_min_t_timeout_ms: u64,
+
+    /// Nesting depth a GraphQL document may reach (0 disables the limit).
+    #[arg(long, env = "FLUREE_GRAPHQL_MAX_DEPTH", default_value_t = server_defaults::DEFAULT_GRAPHQL_MAX_DEPTH)]
+    pub graphql_max_depth: usize,
+
+    /// Fields one GraphQL document may select (0 disables the limit).
+    #[arg(long, env = "FLUREE_GRAPHQL_MAX_COMPLEXITY", default_value_t = server_defaults::DEFAULT_GRAPHQL_MAX_COMPLEXITY)]
+    pub graphql_max_complexity: usize,
 
     /// Heartbeat interval (ms) for the streaming query endpoint. Keep-alive
     /// records flush at this cadence during stalls; set below the fronting
@@ -830,10 +856,13 @@ impl Default for ServerConfig {
             bm25_auto_sync: server_defaults::DEFAULT_BM25_AUTO_SYNC,
             reindex_min_bytes: server_defaults::DEFAULT_REINDEX_MIN_BYTES,
             reindex_max_bytes: None,
+            indexer_catchup_interval_secs: server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS,
             cache_max_mb: None,
             disk_cache_max_mb: None,
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
             query_timeout_ms: server_defaults::DEFAULT_QUERY_TIMEOUT_MS,
+            graphql_max_depth: server_defaults::DEFAULT_GRAPHQL_MAX_DEPTH,
+            graphql_max_complexity: server_defaults::DEFAULT_GRAPHQL_MAX_COMPLEXITY,
             query_min_t_timeout_ms: server_defaults::DEFAULT_QUERY_MIN_T_TIMEOUT_MS,
             stream_heartbeat_ms: server_defaults::DEFAULT_STREAM_HEARTBEAT_MS,
             query_refresh_enabled: server_defaults::DEFAULT_QUERY_REFRESH_ENABLED,

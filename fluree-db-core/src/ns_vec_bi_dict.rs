@@ -214,6 +214,19 @@ impl NsVecBiDict {
     }
 
     /// Total entries across all namespaces.
+    /// Iterate every novel `(ns_code, suffix)` entry (persisted-watermark
+    /// entries are never stored here). Order: per-namespace insertion order,
+    /// overflow namespace last.
+    pub fn iter_entries(&self) -> impl Iterator<Item = (u16, &str)> {
+        let per_ns = self
+            .entries
+            .iter()
+            .enumerate()
+            .flat_map(|(ns, sufs)| sufs.iter().map(move |s| (ns as u16, &**s)));
+        let overflow = self.overflow_entries.iter().map(|s| (NS_OVERFLOW, &**s));
+        per_ns.chain(overflow)
+    }
+
     pub fn len(&self) -> usize {
         self.reverse.len()
     }

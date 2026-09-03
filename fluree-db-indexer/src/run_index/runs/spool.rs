@@ -1594,6 +1594,9 @@ pub struct SortedCommitInfo {
     /// (18 bytes each) for every `rdf:type` assertion. Used after Phase B vocab merge
     /// to build the global subject→class bitset table.
     pub types_map_path: Option<PathBuf>,
+    /// Duplicate statements collapsed by the within-chunk dedup (step 4b).
+    /// `record_count` is the post-dedup count.
+    pub duplicates_removed: u64,
 }
 
 /// Sort, remap, and write a sorted commit file from buffered parse output.
@@ -1659,17 +1662,34 @@ pub fn sort_remap_and_write_sorted_commit(
             Ok((subject_remap, subject_count, string_remap, string_count))
         })?;
 
-    // A.2 step 2b: Write per-chunk language vocab file.
-    // Language tags are chunk-local (assigned in parse order). We persist
-    // them as a LanguageTagDict so that Phase B can build a unified dict
-    // with per-chunk remap tables for the SPOT merge.
+    // A.2 step 2b: Reassign chunk-local language IDs (parse order) to the
+    // lexical order of the normalized tag, rewriting each record's lang_id,
+    // and write the per-chunk vocab in that order. The unified dict built in
+    // Phase B is lexical too (`build_lang_remap_from_vocabs`), which makes
+    // every local→global lang remap monotone. That monotonicity is what keeps
+    // remapped record streams SPOT-sorted through the k-way merges: lang_id
+    // is the payload of the langString `o_type`, so a non-monotone remap
+    // would reorder equal-tag records mid-stream and break both leaf ordering
+    // and adjacent-identity deduplication.
     if let Some((lang_map, lang_vocab_path)) = languages {
         let mut lang_dict = crate::run_index::resolve::global_dict::LanguageTagDict::new();
-        // Insert tags in ID order (1, 2, ...) to preserve the chunk-local mapping.
-        let mut entries: Vec<(&String, &u16)> = lang_map.iter().collect();
-        entries.sort_by_key(|(_, &id)| id);
-        for (tag, _) in entries {
-            lang_dict.get_or_insert(Some(tag));
+        if !lang_map.is_empty() {
+            let mut entries: Vec<(String, u16)> = lang_map
+                .iter()
+                .map(|(tag, &id)| (fluree_db_core::normalize_lang_tag(tag).into_owned(), id))
+                .collect();
+            entries.sort();
+            let max_old_id = entries.iter().map(|&(_, id)| id).max().unwrap_or(0);
+            let mut old_to_lex = vec![0u16; max_old_id as usize + 1];
+            for (tag, old_id) in &entries {
+                // Raw tags that normalize identically collapse to one dict id.
+                old_to_lex[*old_id as usize] = lang_dict.get_or_insert(Some(tag));
+            }
+            for record in &mut records {
+                if record.lang_id != 0 {
+                    record.lang_id = old_to_lex[record.lang_id as usize];
+                }
+            }
         }
         let lang_bytes = super::run_file::serialize_lang_dict(&lang_dict);
         std::fs::write(lang_vocab_path, &lang_bytes)?;
@@ -1707,6 +1727,28 @@ pub fn sort_remap_and_write_sorted_commit(
     // A.2 step 4: Sort records by the V2-native graph-prefixed SPOT key without
     // materializing a second full-size record buffer.
     records.sort_unstable_by(|a, b| cmp_run_record_as_v2_g_spot(a, b, otype_registry));
+
+    // A.2 step 4b: Collapse duplicate statements within the chunk. An RDF
+    // graph is a set of triples, but input files can repeat identical lines;
+    // the sorted commit feeds the index (the set view), while the commit-v2
+    // blob written during parse keeps the raw ops. All records in a chunk
+    // carry one commit `t` and imports write only asserts; the guard keeps
+    // any record violating that expectation rather than collapsing it.
+    let pre_dedup_len = records.len();
+    records.dedup_by(|a, b| {
+        a.t == b.t
+            && a.op == 1
+            && b.op == 1
+            && cmp_run_record_as_v2_g_spot(a, b, otype_registry) == std::cmp::Ordering::Equal
+    });
+    let duplicates_removed = (pre_dedup_len - records.len()) as u64;
+    if duplicates_removed > 0 {
+        tracing::info!(
+            chunk_idx,
+            duplicates_removed,
+            "collapsed duplicate statements in chunk"
+        );
+    }
 
     // A.3: Stream the V2-native sorted commit artifact to disk.
     let mut writer = SortedCommitWriterV2::new(commit_path, chunk_idx)?;
@@ -1748,6 +1790,7 @@ pub fn sort_remap_and_write_sorted_commit(
         subject_count,
         string_count,
         types_map_path,
+        duplicates_removed,
     })
 }
 
@@ -2362,6 +2405,123 @@ mod tests {
         // Verify SPOT order: records must be sorted by s_id ascending
         assert!(read[0].s_id.as_u64() <= read[1].s_id.as_u64());
         assert!(read[1].s_id.as_u64() <= read[2].s_id.as_u64());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sorted_commit_collapses_duplicate_records() {
+        use crate::run_index::resolve::chunk_dict::{ChunkStringDict, ChunkSubjectDict};
+
+        let dir = std::env::temp_dir().join("fluree_test_sorted_commit_dedup");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut subj_dict = ChunkSubjectDict::new();
+        subj_dict.get_or_insert(5, b"Alice");
+        let mut str_dict = ChunkStringDict::new();
+        str_dict.get_or_insert(b"hello");
+
+        // The same statement twice (a duplicated input line) plus one distinct.
+        let records = vec![
+            make_record(0, 10, ObjKind::LEX_ID, ObjKey::encode_u32_id(0).as_u64(), 1),
+            make_record(0, 10, ObjKind::LEX_ID, ObjKey::encode_u32_id(0).as_u64(), 1),
+            make_record(0, 20, ObjKind::NUM_INT, ObjKey::encode_i64(7).as_u64(), 1),
+        ];
+        let registry = OTypeRegistry::builtin_only();
+
+        let info = sort_remap_and_write_sorted_commit(
+            records,
+            subj_dict,
+            str_dict,
+            &dir.join("subjects.voc"),
+            &dir.join("strings.voc"),
+            &dir.join("commit_0.fsv2"),
+            0,
+            None,
+            None,
+            &registry,
+        )
+        .unwrap();
+
+        assert_eq!(info.duplicates_removed, 1);
+        assert_eq!(info.record_count, 2);
+        let reader = SortedCommitReaderV2::open(dir.join("commit_0.fsv2"), 2).unwrap();
+        let read: Vec<RunRecordV2> = reader.map(|r| r.unwrap()).collect();
+        assert_eq!(read.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sorted_commit_lang_ids_reassigned_lexically() {
+        use crate::run_index::resolve::chunk_dict::{ChunkStringDict, ChunkSubjectDict};
+
+        let dir = std::env::temp_dir().join("fluree_test_sorted_commit_lang");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut subj_dict = ChunkSubjectDict::new();
+        subj_dict.get_or_insert(5, b"Alice");
+        subj_dict.get_or_insert(5, b"Bob");
+        let mut str_dict = ChunkStringDict::new();
+        str_dict.get_or_insert(b"hello");
+
+        // Parse order assigns "fr" before "de"; lexical order is the reverse.
+        let mut lang_map = rustc_hash::FxHashMap::default();
+        lang_map.insert("fr".to_string(), 1u16);
+        lang_map.insert("de".to_string(), 2u16);
+
+        let lang_record = |s_id: u64, lang_id: u16| {
+            let mut r = make_record(
+                s_id,
+                10,
+                ObjKind::LEX_ID,
+                ObjKey::encode_u32_id(0).as_u64(),
+                1,
+            );
+            r.dt = DatatypeDictId::LANG_STRING.as_u16();
+            r.lang_id = lang_id;
+            r
+        };
+        // Same subject/pred/string in both languages: distinct facts that must
+        // survive dedup, ordered by the lexical lang ids.
+        let records = vec![lang_record(0, 1), lang_record(0, 2)];
+        let registry = OTypeRegistry::builtin_only();
+
+        let lang_vocab = dir.join("languages.voc");
+        let info = sort_remap_and_write_sorted_commit(
+            records,
+            subj_dict,
+            str_dict,
+            &dir.join("subjects.voc"),
+            &dir.join("strings.voc"),
+            &dir.join("commit_0.fsv2"),
+            0,
+            Some((&lang_map, &lang_vocab)),
+            None,
+            &registry,
+        )
+        .unwrap();
+
+        assert_eq!(info.duplicates_removed, 0);
+        assert_eq!(info.record_count, 2);
+
+        // Vocab is written in lexical order: de=1, fr=2.
+        let dict = crate::run_index::runs::run_file::deserialize_lang_dict(
+            &std::fs::read(&lang_vocab).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(dict.resolve(1), Some("de"));
+        assert_eq!(dict.resolve(2), Some("fr"));
+
+        // Records were rewritten to the lexical ids: the de record (now id 1)
+        // sorts before the fr record (now id 2) within the same (s, p).
+        let reader = SortedCommitReaderV2::open(dir.join("commit_0.fsv2"), 2).unwrap();
+        let read: Vec<RunRecordV2> = reader.map(|r| r.unwrap()).collect();
+        use fluree_db_core::o_type::OType;
+        assert_eq!(read[0].o_type, OType::lang_string(1).as_u16());
+        assert_eq!(read[1].o_type, OType::lang_string(2).as_u16());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

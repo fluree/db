@@ -549,6 +549,12 @@ async fn validate_ledger_reports_cross_ledger_shape_violations() {
         "report must flag the missing ex:name (results: {:?})",
         report.results
     );
+    // The cross-ledger path pins the data ledger's t, not the model's.
+    let data_handle = fluree
+        .ledger_cached(data_id)
+        .await
+        .expect("data ledger handle");
+    assert_eq!(report.t, data_handle.t().await);
     assert!(
         report
             .results

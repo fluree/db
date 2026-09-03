@@ -15,6 +15,8 @@ pub mod drop;
 pub mod export;
 pub mod graph;
 pub mod graph_sync;
+#[cfg(feature = "graphql")]
+pub mod graphql;
 pub mod history;
 pub mod iceberg;
 pub mod index;
@@ -39,6 +41,7 @@ pub mod remote;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod show;
+pub mod sql;
 pub mod sweep;
 pub mod sync;
 pub mod token;

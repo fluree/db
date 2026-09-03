@@ -135,12 +135,6 @@ fn split_alias(alias: &str) -> (String, String) {
     }
 }
 
-fn vector_index_id(alias: &str) -> (String, String) {
-    let (name, branch) = split_alias(alias);
-    let index = format!("{name}-vectors");
-    (format!("{index}:{branch}"), index)
-}
-
 fn text_index_id(alias: &str) -> (String, String) {
     let (name, branch) = split_alias(alias);
     let index = format!("{name}-text");
@@ -794,7 +788,7 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                 "⟳".dimmed(),
                 indexed.index_t
             );
-            ensure_indexes(f, &alias, dimensions).await?;
+            ensure_indexes(f, &alias).await?;
         } else if totals.skipped > 0 {
             sync_indexes_if_present(f, &alias).await?;
         }
@@ -963,7 +957,11 @@ async fn query_rows(fluree: &Fluree, alias: &str, query: &Value) -> CliResult<Ve
     Ok(json.as_array().cloned().unwrap_or_default())
 }
 
-async fn ensure_indexes(fluree: &Fluree, alias: &str, dimensions: Option<usize>) -> CliResult<()> {
+/// The BM25 index over the chunk text. There is deliberately no HNSW index:
+/// embedded indexes need usearch, which the CLI does not link. Embeddings are
+/// ledger data, so the vector lane scores them exactly with `cosineSimilarity`
+/// and a `fluree server` built with `vector` can index the same property.
+async fn ensure_indexes(fluree: &Fluree, alias: &str) -> CliResult<()> {
     let (text_id, text_name) = text_index_id(alias);
     if graph_source_present(fluree, &text_id).await? {
         let r = fluree.sync_bm25_index(&text_id).await?;
@@ -991,54 +989,6 @@ async fn ensure_indexes(fluree: &Fluree, alias: &str, dimensions: Option<usize>)
         );
     }
 
-    let (vec_id, vec_name) = vector_index_id(alias);
-    let mut present = graph_source_present(fluree, &vec_id).await?;
-    // An index built for another embedding model has the wrong width:
-    // vectors of a new size cannot be synced into it, so it is rebuilt.
-    if let (true, Some(dims)) = (present, dimensions) {
-        if let Some(existing) = index_dimensions(fluree, &vec_id).await? {
-            if existing != dims {
-                fluree.drop_vector_index(&vec_id).await?;
-                println!(
-                    "  {} vector index {vec_id}: rebuilt, embeddings changed from {existing} to {dims} dims",
-                    "×".yellow()
-                );
-                present = false;
-            }
-        }
-    }
-    if present {
-        let r = fluree.sync_vector_index(&vec_id).await?;
-        println!(
-            "  {} vector index {vec_id}: +{} −{} vector(s)",
-            "⟳".dimmed(),
-            r.upserted,
-            r.removed
-        );
-    } else if let Some(dims) = dimensions {
-        let query = json!({
-            "@context": { "doc": vocab::DOC_NS },
-            "where": [{ "@id": "?c", "@type": vocab::CHUNK }],
-            "select": { "?c": ["@id", vocab::EMBEDDING] }
-        });
-        let config = fluree_db_api::VectorCreateConfig::new(
-            &vec_name,
-            alias,
-            query,
-            vocab::embedding_iri(),
-            dims,
-        )
-        .with_branch(split_alias(alias).1)
-        .with_metric(fluree_db_query::vector::DistanceMetric::Cosine);
-        let r = fluree.create_vector_index(config).await?;
-        println!(
-            "  {} vector index {}: {} vector(s), {} dims",
-            "+".green(),
-            r.graph_source_id,
-            r.vector_count,
-            r.dimensions
-        );
-    }
     Ok(())
 }
 
@@ -1049,23 +999,19 @@ async fn sync_indexes_if_present(fluree: &Fluree, alias: &str) -> CliResult<()> 
     if graph_source_present(fluree, &text_id).await? {
         fluree.sync_bm25_index(&text_id).await?;
     }
-    let (vec_id, _) = vector_index_id(alias);
-    if graph_source_present(fluree, &vec_id).await? {
-        fluree.sync_vector_index(&vec_id).await?;
-    }
     Ok(())
 }
 
-/// The width a vector index was built for, from its published config.
-async fn index_dimensions(fluree: &Fluree, id: &str) -> CliResult<Option<usize>> {
-    let Some(record) = fluree.nameservice().lookup_graph_source(id).await? else {
-        return Ok(None);
-    };
-    let config: Value = serde_json::from_str(&record.config).unwrap_or(Value::Null);
-    Ok(config
-        .get("dimensions")
-        .and_then(Value::as_u64)
-        .map(|d| d as usize))
+/// Whether any chunk in the ledger carries an embedding — what the vector
+/// lane needs, in place of the index it used to look for.
+async fn has_embeddings(fluree: &Fluree, alias: &str) -> CliResult<bool> {
+    let query = json!({
+        "@context": { "doc": vocab::DOC_NS },
+        "where": [{ "@id": "?c", vocab::EMBEDDING: "?v" }],
+        "select": ["?c"],
+        "limit": 1
+    });
+    Ok(!query_rows(fluree, alias, &query).await?.is_empty())
 }
 
 async fn graph_source_present(fluree: &Fluree, id: &str) -> CliResult<bool> {
@@ -1084,9 +1030,10 @@ async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
     let alias = context::resolve_ledger(args.ledger.as_deref(), dirs)?;
     let fluree = build_fluree(dirs)?;
 
-    let (vec_id, _) = vector_index_id(&alias);
     let (text_id, _) = text_index_id(&alias);
-    let has_vectors = graph_source_present(&fluree, &vec_id).await?;
+    // The vector lane needs embeddings on the chunks, not an index: it
+    // scores them directly.
+    let has_vectors = has_embeddings(&fluree, &alias).await?;
     let has_text = graph_source_present(&fluree, &text_id).await?;
     // Whether the query could be embedded is known without the network: a
     // slot, or an account that would fill one. The account is only asked
@@ -1112,9 +1059,9 @@ async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
         )));
     }
     if wants_vectors && !has_vectors {
-        return Err(CliError::NotFound(format!(
-            "no vector index {vec_id}; run `fluree doc ingest` with an embedding endpoint configured (or use --mode text)"
-        )));
+        return Err(CliError::NotFound(
+            "no chunk in this ledger carries an embedding; run `fluree doc ingest` with an embedding endpoint configured (or use --mode text)".to_string()
+        ));
     }
     if wants_text && !has_text {
         return Err(CliError::NotFound(format!(
@@ -1155,25 +1102,38 @@ async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
             .await?
             .pop()
             .ok_or_else(|| CliError::Input("embedding endpoint returned no vector".into()))?;
-        let pattern = json!({
-            "f:graphSource": vec_id,
-            "f:queryVector": vector,
-            "f:searchLimit": per_method,
-            "f:searchResult": { "f:resultId": "?c", "f:resultScore": "?score" }
-        });
-        search_hits(&fluree, &alias, pattern).await
+        // Flatrank: score every chunk's embedding, order, and cut with
+        // LIMIT. Cosine lands in 0..1, the same scale the fuser calibrates
+        // against.
+        search_hits(
+            &fluree,
+            &alias,
+            vec![
+                json!({ "@id": "?c", vocab::EMBEDDING: "?vec" }),
+                json!(["bind", "?score", ["cosineSimilarity", "?vec", "?q"]]),
+            ],
+            Some(vector),
+            per_method,
+        )
+        .await
     };
     let text_lane = async {
         if !wants_text {
             return Ok::<Vec<Hit>, CliError>(Vec::new());
         }
-        let pattern = json!({
-            "f:graphSource": text_id,
-            "f:searchText": args.query,
-            "f:searchLimit": per_method,
-            "f:searchResult": { "f:resultId": "?c", "f:resultScore": "?score" }
-        });
-        search_hits(&fluree, &alias, pattern).await
+        search_hits(
+            &fluree,
+            &alias,
+            vec![json!({
+                "f:graphSource": text_id,
+                "f:searchText": args.query,
+                "f:searchLimit": per_method,
+                "f:searchResult": { "f:resultId": "?c", "f:resultScore": "?score" }
+            })],
+            None,
+            per_method,
+        )
+        .await
     };
     let (vector_hits, text_hits) = tokio::try_join!(vector_lane, text_lane)?;
     let hits = match mode {
@@ -1246,18 +1206,35 @@ struct Hit {
 
 /// Run one index search pattern and join each hit to its chunk, in score
 /// order.
-async fn search_hits(fluree: &Fluree, alias: &str, pattern: Value) -> CliResult<Vec<Hit>> {
-    let query = json!({
+/// `head` binds `?c` and `?score`; `query_vector` supplies `?q` for the
+/// flatrank lane, whose cutoff is a plain LIMIT rather than an index's
+/// `f:searchLimit`.
+async fn search_hits(
+    fluree: &Fluree,
+    alias: &str,
+    head: Vec<Value>,
+    query_vector: Option<Vec<f32>>,
+    limit: usize,
+) -> CliResult<Vec<Hit>> {
+    let mut where_clauses = head;
+    where_clauses.extend([
+        json!({ "@id": "?c", vocab::TEXT: "?text", vocab::SOURCE_DOCUMENT: "?d" }),
+        json!(["optional", { "@id": "?c", vocab::HEADER_PATH: "?path" }]),
+        json!(["optional", { "@id": "?d", vocab::RELATIVE_PATH: "?file" }]),
+    ]);
+    let mut query = json!({
         "@context": { "doc": vocab::DOC_NS, "f": vocab::FLUREE_NS },
-        "where": [
-            pattern,
-            { "@id": "?c", vocab::TEXT: "?text", vocab::SOURCE_DOCUMENT: "?d" },
-            ["optional", { "@id": "?c", vocab::HEADER_PATH: "?path" }],
-            ["optional", { "@id": "?d", vocab::RELATIVE_PATH: "?file" }]
-        ],
+        "where": where_clauses,
         "select": ["?score", "?c", "?d", "?file", "?path", "?text"],
-        "orderBy": [["desc", "?score"]]
+        "orderBy": [["desc", "?score"]],
+        "limit": limit
     });
+    if let Some(vector) = query_vector {
+        query["values"] = json!([
+            ["?q"],
+            [{ "@value": vector, "@type": format!("{}embeddingVector", vocab::FLUREE_NS) }]
+        ]);
+    }
     let rows = query_rows(fluree, alias, &query).await?;
     Ok(rows
         .iter()

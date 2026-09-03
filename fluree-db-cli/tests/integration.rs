@@ -3076,7 +3076,9 @@ ex:alice a ex:User ; schema:name "Alice" .
         .args(["validate", "data.ttl", "--shacl", "shapes.ttl"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Conforms: true"));
+        .stdout(predicate::str::contains("Conforms: true"))
+        // t=2: the loader's staging-SHACL-disable commit precedes the data commit.
+        .stdout(predicate::str::contains("checked at t=2"));
 }
 
 #[test]
@@ -4154,4 +4156,190 @@ fn doc_ingest_tolerates_a_failed_chunk_and_retries_it_next_run() {
         .success()
         .stdout(predicate::str::contains("1 chunk(s) not extracted"));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// A stub OpenAI-compatible `/embeddings` endpoint. Each input string becomes
+/// a 3-dim vector counting two marker words, so similarity is predictable and
+/// the assertions below are about ranking, not about a model.
+///
+/// The third dimension is a small constant: a document mentioning neither
+/// marker would otherwise embed as the zero vector, whose cosine is undefined.
+fn spawn_stub_embeddings() -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Read headers, then exactly Content-Length bytes of body.
+            let body = loop {
+                let n = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break None,
+                    Ok(n) => n,
+                };
+                buf.extend_from_slice(&chunk[..n]);
+                let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..split]).to_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if buf.len() >= split + 4 + len {
+                    break Some(buf[split + 4..split + 4 + len].to_vec());
+                }
+            };
+            let Some(body) = body else { continue };
+            let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let inputs: Vec<String> = req["input"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().unwrap_or_default().to_lowercase())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let data: Vec<serde_json::Value> = inputs
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let count = |w: &str| text.matches(w).count() as f64;
+                    serde_json::json!({
+                        "object": "embedding",
+                        "index": i,
+                        "embedding": [count("expense"), count("kubernetes"), 0.1],
+                    })
+                })
+                .collect();
+            let payload =
+                serde_json::json!({ "object": "list", "data": data, "model": "stub" }).to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            let _ = stream.flush();
+        }
+    });
+    format!("http://127.0.0.1:{}/v1", addr.port())
+}
+
+/// `doc search --mode vector` with no HNSW index: the CLI links no ANN
+/// library, so it scores every chunk exactly with `cosineSimilarity`
+/// (flatrank) and cuts with LIMIT. Pins that the ranking is real — the
+/// document that matches the query outranks the one that does not.
+#[test]
+fn doc_search_vector_uses_flatrank_without_an_index() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let url = spawn_stub_embeddings();
+
+    let docs = tmp.path().join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(
+        docs.join("expenses.md"),
+        "# Expense policy\n\nAn expense over fifty dollars needs a receipt. File each expense in the portal within thirty days of the expense being incurred.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        docs.join("clusters.md"),
+        "# Cluster runbook\n\nEach kubernetes node is drained before an upgrade. Restart the kubernetes scheduler only after the kubernetes control plane reports healthy.\n",
+    )
+    .unwrap();
+
+    let with_model = |tmp: &TempDir| {
+        let mut cmd = fluree_cmd(tmp);
+        cmd.env("FLUREE_DOC_EMBEDDING_URL", &url)
+            .env("FLUREE_DOC_EMBEDDING_MODEL", "stub");
+        cmd
+    };
+
+    // Ingest embeds each chunk through the stub. No vector index is created:
+    // the CLI has no usearch.
+    with_model(&tmp)
+        .args(["doc", "ingest", "docs", "-l", "handbook"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "2 ingested, 0 unchanged, 0 failed",
+        ))
+        .stdout(predicate::str::contains("full-text index"))
+        .stdout(predicate::str::contains("vector index").not());
+
+    // The embeddings are ledger data regardless, so flatrank has something to
+    // score.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "handbook",
+            "-e",
+            r#"{"@context":{"doc":"https://ns.flur.ee/doc#"},
+                "where":[{"@id":"?c","doc:embedding":"?v"}],
+                "select":["(count ?c)"]}"#,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2"));
+
+    let out = with_model(&tmp)
+        .args([
+            "doc",
+            "search",
+            "expense receipts",
+            "-l",
+            "handbook",
+            "--mode",
+            "vector",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+
+    let expenses = out.find("expenses.md");
+    let clusters = out.find("clusters.md");
+    assert!(
+        expenses.is_some(),
+        "vector search returned no hit for the matching document:\n{out}"
+    );
+    assert!(
+        expenses < clusters || clusters.is_none(),
+        "expected expenses.md to outrank clusters.md:\n{out}"
+    );
+
+    // The opposite query must invert the ranking — otherwise the assertion
+    // above would also pass on an unscored, arbitrarily ordered scan.
+    let out = with_model(&tmp)
+        .args([
+            "doc",
+            "search",
+            "kubernetes upgrade",
+            "-l",
+            "handbook",
+            "--mode",
+            "vector",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    let expenses = out.find("expenses.md");
+    let clusters = out.find("clusters.md");
+    assert!(
+        clusters.is_some(),
+        "vector search returned no hit for the matching document:\n{out}"
+    );
+    assert!(
+        clusters < expenses || expenses.is_none(),
+        "expected clusters.md to outrank expenses.md:\n{out}"
+    );
 }

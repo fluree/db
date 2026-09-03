@@ -332,6 +332,7 @@ async fn run_iceberg_map_remote(
         );
     }
 
+    print_model_warnings(&model_warnings_of(&result));
     Ok(())
 }
 
@@ -343,7 +344,7 @@ async fn run_iceberg_map_remote(
 /// `text/turtle` (the resolver's default), case-insensitively. Returns `None`
 /// only when the path has no extension at all, leaving the server to apply the
 /// same default. An explicit `--r2rml-type` still overrides this at the call site.
-fn infer_mapping_media_type(path: &std::path::Path) -> Option<String> {
+pub(crate) fn infer_mapping_media_type(path: &std::path::Path) -> Option<String> {
     use fluree_db_r2rml::loader::MappingFormat;
     // No extension means no signal to infer from — defer to the server default.
     path.extension()?;
@@ -356,6 +357,26 @@ fn infer_mapping_media_type(path: &std::path::Path) -> Option<String> {
 }
 
 /// Convert CLI args to a JSON body for the server endpoint.
+/// Print registration warnings about the `--model` reference (one per line).
+pub(crate) fn print_model_warnings(warnings: &[String]) {
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
+}
+
+/// The `model_warnings` of a server map response, if any.
+pub(crate) fn model_warnings_of(result: &serde_json::Value) -> Vec<String> {
+    result
+        .get("model_warnings")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|w| w.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     let mut body = serde_json::json!({
         "name": args.name,
@@ -391,6 +412,12 @@ fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     }
     if let Some(ref v) = args.branch {
         obj.insert("branch".into(), v.clone().into());
+    }
+    if let Some(ref v) = args.model {
+        obj.insert("model".into(), v.clone().into());
+    }
+    if let Some(v) = args.default_allow {
+        obj.insert("default_allow".into(), v.into());
     }
     if let Some(ref v) = args.auth_bearer {
         obj.insert("auth_bearer".into(), v.clone().into());
@@ -579,6 +606,7 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
             result.graph_source_id
         );
         println!("  Table:       {}", result.table_identifier);
+        print_model_warnings(&result.model_warnings);
         println!("  Catalog:     {}", result.catalog_uri);
         println!("  R2RML:       {}", result.mapping_source);
         println!("  TriplesMaps: {}", result.triples_map_count);
@@ -610,6 +638,7 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
             result.graph_source_id
         );
         println!("  Table:       {}", result.table_identifier);
+        print_model_warnings(&result.model_warnings);
         println!("  Catalog:     {}", result.catalog_uri);
         println!(
             "  Connection:  {}",
@@ -674,6 +703,12 @@ fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::Icebe
     if let Some(ref branch) = args.branch {
         config = config.with_branch(branch);
     }
+    if let Some(ref model) = args.model {
+        config = config.with_model(model);
+    }
+    if let Some(allow) = args.default_allow {
+        config = config.with_default_allow(allow);
+    }
     if let Some(ref token) = args.auth_bearer {
         config = config.with_auth_bearer(token);
     }
@@ -712,7 +747,7 @@ fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::Icebe
 
 /// Format the `Tables:` summary as `N (name1, name2, …)`, or just `N` when no
 /// table names are available (e.g. an unvalidated address-based mapping).
-fn format_table_summary(count: usize, names: &[String]) -> String {
+pub(crate) fn format_table_summary(count: usize, names: &[String]) -> String {
     if names.is_empty() {
         count.to_string()
     } else {
@@ -720,16 +755,19 @@ fn format_table_summary(count: usize, names: &[String]) -> String {
     }
 }
 
+/// Mapped (R2RML-backed) graph sources: Iceberg, R2RML and SQL. `fluree sql`
+/// and `fluree iceberg` share list/info/drop over this family.
 fn is_iceberg_family_source_type(st: &fluree_db_nameservice::GraphSourceType) -> bool {
     matches!(
         st,
         fluree_db_nameservice::GraphSourceType::Iceberg
             | fluree_db_nameservice::GraphSourceType::R2rml
+            | fluree_db_nameservice::GraphSourceType::Sql
     )
 }
 
 fn is_iceberg_family_type_str(s: &str) -> bool {
-    matches!(s, "Iceberg" | "R2RML")
+    matches!(s, "Iceberg" | "R2RML" | "SQL")
 }
 
 #[cfg(test)]
@@ -747,6 +785,8 @@ mod tests {
             r2rml: None,
             r2rml_type: None,
             branch: None,
+            model: None,
+            default_allow: None,
             auth_bearer: None,
             oauth2_token_url: None,
             oauth2_client_id: None,
@@ -759,6 +799,17 @@ mod tests {
             s3_endpoint: None,
             s3_path_style: false,
         }
+    }
+
+    #[test]
+    fn args_to_json_carries_model_ledger() {
+        let mut args = base_rest_args();
+        assert!(args_to_json(&args).unwrap().get("model").is_none());
+        args.model = Some("governance:main".to_string());
+        assert_eq!(args_to_json(&args).unwrap()["model"], "governance:main");
+        assert!(args_to_json(&args).unwrap().get("default_allow").is_none());
+        args.default_allow = Some(true);
+        assert_eq!(args_to_json(&args).unwrap()["default_allow"], true);
     }
 
     #[test]

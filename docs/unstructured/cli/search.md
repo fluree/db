@@ -17,14 +17,14 @@ fluree doc search <QUERY> [-l <LEDGER>] [-n <N>] [--mode auto|hybrid|vector|text
 
 ## Modes
 
-Two indexes are built by `ingest`: BM25 over the chunks' text, always, and HNSW over their embeddings when an embedding slot was configured. `search` can use either or both.
+`ingest` builds one index — BM25 over the chunks' text — and, when an embedding slot was configured, stores an embedding on every chunk. `search` can rank by either, or fuse both.
 
 | Mode | What runs | Best for |
 |---|---|---|
 | `text` | BM25 over the full-text index. No model call. | Exact terms, identifiers, part numbers, names; a ledger built without embeddings. |
-| `vector` | The query is embedded with the embedding slot and the HNSW index is searched by cosine distance. | Paraphrase: a question worded nothing like the passage that answers it. |
-| `hybrid` | Both, each asked for three times the limit, then fused on calibrated scores (below). | The default when both indexes exist. Agreement between meaning and words outranks either alone, and a strong hit only one method finds still surfaces above a weak agreed one. |
-| `auto` | `hybrid` when both indexes exist and the query can be embedded; otherwise `vector` or `text`, whichever the ledger has. | Not thinking about it. |
+| `vector` | The query is embedded with the embedding slot, then every chunk's embedding is scored by cosine similarity — an exact scan, no index. See [vector search](../concepts/vector-search.md) for where that stops being the right shape. | Paraphrase: a question worded nothing like the passage that answers it. |
+| `hybrid` | Both, each asked for three times the limit, then fused on calibrated scores (below). | The default when the chunks carry embeddings. Agreement between meaning and words outranks either alone, and a strong hit only one method finds still surfaces above a weak agreed one. |
+| `auto` | `hybrid` when the chunks carry embeddings, the full-text index exists and the query can be embedded; otherwise `vector` or `text`, whichever the ledger supports. | Not thinking about it. |
 
 ### How hybrid scores
 
@@ -48,7 +48,7 @@ $ fluree doc search "paramount lien on Reserve Bank assets" -l fed -n 2
 (2 result(s), hybrid, 1913 ms)
 ```
 
-This query names the answer's words but not its meaning: vector search alone had the right chunk tenth, BM25 had it first with a solid score, and fused it leads by a wide margin. In `vector` and `text` modes the score shown is the method's own.
+This query names the answer's words but not its meaning: the vector lane alone had the right chunk tenth, BM25 had it first with a solid score, and fused it leads by a wide margin. In `vector` and `text` modes the score shown is the method's own.
 
 ## Output
 

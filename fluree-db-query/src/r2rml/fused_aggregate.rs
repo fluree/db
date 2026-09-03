@@ -1642,7 +1642,14 @@ impl Operator for FusedR2rmlAggregateOperator {
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        self.resolved = self.resolve_at_open(ctx).await?;
+        // A view policy filters rows in the scan operator (`r2rml::policy`);
+        // folding straight from column batches would bypass it, so the fused
+        // path declines and the fallback pipeline enforces it.
+        self.resolved = if ctx.allow_unfiltered() {
+            self.resolve_at_open(ctx).await?
+        } else {
+            None
+        };
         if self.resolved.is_none() {
             tracing::debug!("fused R2RML aggregate: gates failed, using fallback pipeline");
             self.use_fallback = true;

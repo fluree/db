@@ -10,7 +10,9 @@ Turn a folder of documents into a searchable graph, and search it.
 - a **document node** recording the file, its content hash, the parser revision and the embedding model;
 - with `--entities` and `--model`, **mentions** of known entities under their own IRIs, **relations** the text states (reified with evidence and verdict, and as edges when the ontology admits them), and any **new entities** the language model found.
 
-It then creates or syncs a BM25 full-text index and, when embeddings were produced, an HNSW vector index over the chunks. `fluree doc search` queries those indexes and joins each hit back to its chunk text, section path and source file.
+It then creates or syncs a BM25 full-text index over the chunks. `fluree doc search` joins each hit back to its chunk text, section path and source file.
+
+There is no vector index: `--mode vector` scores every chunk's `doc:embedding` exactly with `cosineSimilarity`, so no ANN library is linked into the CLI and nothing has to be built, synced or rebuilt. An approximate HNSW index for corpora past the point where a scan is cheap is a `fluree server` capability.
 
 Everything runs in-process against local storage: the ledger written is always a local one, and Fluree AI, when connected, supplies models only. Parsing is deterministic and makes no network connection unless a model endpoint is configured.
 
@@ -45,7 +47,7 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--base-iri <IRI>` | Prefix documents are minted under (default `urn:fluree:doc:`). The path relative to the ingested directory is appended, so a document keeps its IRI across runs. |
 | `--no-embed` | Skip embeddings even when `[doc.embedding]` is configured. |
 | `--no-escalate` | Never call a vision model, whatever `[doc.vlm]` says. |
-| `--no-index` | Skip indexing after the run: the ledger's own binary index, and the vector and full-text indexes. |
+| `--no-index` | Skip indexing after the run: the ledger's own binary index, and the full-text index. |
 | `--no-cache` | Neither read nor write the parse and reading caches. |
 | `--force` | Re-ingest documents the ledger already holds with the same content, parser and embedding model. |
 | `--min-chars <N>` | Emit a chunk once its buffer reaches this many characters (default `1500`). |
@@ -75,7 +77,7 @@ For each document, in path order:
 5. **Extract**, when `--entities` or `--model` is given. Each chunk is scanned for every label of every known entity (longest whole-word match, case-folded, plus Snowball stems), and each match becomes a mention under the entity's IRI. With `--model`, the language model is then asked about the chunk with the ontology as its system prompt and the entities found as known names. Its entities are resolved to known IRIs where a label matches and minted otherwise; an entity whose excerpt is not in the chunk is dropped; a new entity typed outside the ontology is kept flagged `doc:offModel` (or dropped with `--drop-off-model`); each relation's predicate is judged against the ontology as `valid`, `repaired` (an unambiguous label, local name or class-to-property fix) or `rejected`, and written reified with that verdict, a relation whose object names no entity carrying it as a literal. In `direct` mode an admitted relation with an entity object is also written as an edge. Answers are cached per chunk and asked for several chunks at once; a chunk whose call fails keeps its gazetteer mentions, and the document is not stamped as extracted so the next run retries it.
 6. **Retract the previous extraction** of the same document IRI, if any, then insert the structure graph, the chunks, the document node and the extraction as one commit. The earlier extraction remains queryable at its commit. Entity nodes are shared across documents and not retracted; an edge the earlier extraction asserted is dropped only when no remaining relation supports it.
 
-After the documents, the ledger's binary index is brought up to the new head, so later invocations read it rather than replaying the commits just written (a CLI process never runs the background indexer that a server would). Then the full-text index `<ledger>-text` is created or synced, and the vector index `<ledger>-vectors` likewise when embeddings were produced. A vector index built for a different embedding width, because the embedding model changed, is dropped and rebuilt rather than synced.
+After the documents, the ledger's binary index is brought up to the new head, so later invocations read it rather than replaying the commits just written (a CLI process never runs the background indexer that a server would). Then the full-text index `<ledger>-text` is created or synced. Embeddings need no index step — they are committed with the chunks and scored at search time.
 
 ### Examples
 
@@ -113,7 +115,6 @@ ingest 3 document(s) → contracts
   = sow/q3.pdf  unchanged
   ⟳ ledger index contracts: t=2
   + full-text index contracts-text:main: 142 chunk(s), 1631 terms
-  + vector index contracts-vectors:main: 142 vector(s), 768 dims
 
 done: 2 ingested, 1 unchanged, 0 failed — 142 chunks, 41 pages, 0 crop(s) read, 0 parse(s) from cache, 9.4s
 ```
@@ -132,7 +133,7 @@ fluree doc search <QUERY> [-l <LEDGER>] [-n <N>] [--mode auto|hybrid|vector|text
 |--------|-------------|
 | `-l, --ledger <LEDGER>` | Ledger to search (default: the active ledger). |
 | `-n, --limit <N>` | Results to return (default `10`). |
-| `--mode <MODE>` | `text` runs BM25 over the full-text index; `vector` embeds the query with `[doc.embedding]` and searches the HNSW index; `hybrid` runs both, each for three times the limit, and fuses them on calibrated scores: the cosine as it is, BM25 as `s / (s + 10)`, averaged over both methods with a missing method counting 0; `auto` (default) picks `hybrid` when both indexes exist and the query can be embedded, else whichever index there is. |
+| `--mode <MODE>` | `text` runs BM25 over the full-text index; `vector` embeds the query with `[doc.embedding]` and ranks every chunk by cosine similarity; `hybrid` runs both, each for three times the limit, and fuses them on calibrated scores: the cosine as it is, BM25 as `s / (s + 10)`, averaged over both methods with a missing method counting 0; `auto` (default) picks `hybrid` when the chunks carry embeddings, the full-text index exists and the query can be embedded, else whichever of the two is available. |
 | `--json` | Print the hits as JSON objects: `score`, `chunk`, `document`, `file`, `path`, `text`, and `ranks` (`vector 0.53 #10 · text 11.1 #1`) for a fused hit. |
 
 ### Example

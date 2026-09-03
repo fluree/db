@@ -20,7 +20,7 @@ ingest 3 document(s) → contracts
 done: 3 ingested, 0 unchanged, 0 failed — 169 chunks, 53 pages, 0 crop(s) read, 0 parse(s) from cache, 6.1s
 ```
 
-The ledger was created, each document landed as one commit, and a full-text index was built over the chunks. Two lines say what is not configured yet: no vision model, so scanned pages would stay unread, and no embedding model, so there is no vector index.
+The ledger was created, each document landed as one commit, and a full-text index was built over the chunks. Two lines say what is not configured yet: no vision model, so scanned pages would stay unread, and no embedding model, so there is nothing to search by meaning.
 
 ## 2. Search it
 
@@ -51,7 +51,7 @@ fluree config set doc.embedding.model nomic-embed-text
 fluree doc ingest ./contracts -l contracts
 ```
 
-The documents are re-ingested — the embedding model changed, so they are no longer "unchanged" — and a vector index is built. `fluree doc search` now runs both indexes and fuses them (`--mode hybrid`, the default once both exist); `--mode vector` and `--mode text` give you one or the other.
+The documents are re-ingested — the embedding model changed, so they are no longer "unchanged" — and each chunk now carries an embedding. `fluree doc search` now runs both methods and fuses them (`--mode hybrid`, the default once chunks carry embeddings); `--mode vector` and `--mode text` give you one or the other.
 
 Or skip model configuration entirely by [connecting a Fluree AI account](fluree-ai.md).
 
