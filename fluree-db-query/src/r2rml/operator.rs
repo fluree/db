@@ -38,6 +38,7 @@ use crate::filter::filter_batch;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::R2rmlPattern;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::r2rml::policy::R2rmlPolicyGate;
 use crate::r2rml::ColumnBatchStream;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -437,6 +438,9 @@ pub struct R2rmlScanOperator {
     /// unchanged — but now the LIMIT budget and the filter live in one operator,
     /// so a `FILTER + LIMIT` scan can stop after enough *matching* rows.
     consumed_filter: Option<PreparedBoolExpression>,
+    /// View-policy gate, built at open when a non-root policy is active. `None`
+    /// = unfiltered scan (see `r2rml::policy`).
+    policy_gate: Option<R2rmlPolicyGate>,
     /// State
     state: OperatorState,
 }
@@ -514,6 +518,7 @@ impl R2rmlScanOperator {
             emitted: 0,
             topk: None,
             consumed_filter,
+            policy_gate: None,
             state: OperatorState::Created,
         }
     }
@@ -626,6 +631,12 @@ impl R2rmlScanOperator {
         // SOUNDNESS (heap feed): decline when a residual filter the operator
         // enforces after the scan is present — the heap would see pre-filter rows.
         if topk_residual_filter_present(&self.pattern) {
+            return None;
+        }
+        // The view-policy gate is a residual filter too: it drops rows AFTER the
+        // scan emits, so a denied row can set the k-th bound and prune files whose
+        // VISIBLE rows belong in the true top-k.
+        if self.policy_gate.is_some() {
             return None;
         }
         let pred_iri = if Some(sort_var) == self.pattern.object_var {
@@ -759,24 +770,37 @@ impl R2rmlScanOperator {
         parent_lookups: &HashMap<LookupCacheKey, Arc<ParentLookup>>,
         ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
         ctx: &ExecutionContext<'_>,
-    ) -> Result<Vec<Vec<(VarId, Binding)>>> {
+    ) -> Result<MaterializedRows> {
         use rayon::prelude::*;
         let encoder = LiteralEncoder::build(triples_map, ctx.active_snapshot);
         let pattern = &self.pattern;
-        let per_batch: Vec<Vec<Vec<(VarId, Binding)>>> = batches
+        let derive_row_classes = self
+            .policy_gate
+            .as_ref()
+            .is_some_and(|g| g.needs_row_classes(triples_map));
+        let per_batch: Vec<MaterializedRows> = batches
             .par_iter()
             .map(|batch| {
-                materialize_batch(
+                materialize_batch_rows(
                     pattern,
                     triples_map,
                     batch,
                     parent_lookups,
                     ref_shortcuts,
                     &encoder,
+                    derive_row_classes,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(per_batch.into_iter().flatten().collect())
+        let mut rows = Vec::new();
+        let mut classes = derive_row_classes.then(Vec::new);
+        for m in per_batch {
+            rows.extend(m.rows);
+            if let (Some(all), Some(part)) = (classes.as_mut(), m.classes) {
+                all.extend(part);
+            }
+        }
+        Ok(MaterializedRows { rows, classes })
     }
 
     /// Index the buffered child rows by their join-key values, so the streamed
@@ -939,6 +963,27 @@ impl R2rmlScanOperator {
                 .collect()
         };
 
+        // View policy: a map whose required predicates are all hidden from the
+        // identity can produce no row — skip its table scan entirely.
+        let triples_maps: Vec<&TriplesMap> = match self.policy_gate.as_mut() {
+            Some(gate) => {
+                let mut kept = Vec::with_capacity(triples_maps.len());
+                for tm in triples_maps {
+                    if gate.tm_can_yield(ctx, &self.pattern, tm).await? {
+                        kept.push(tm);
+                    } else {
+                        tracing::debug!(
+                            graph_source = %self.pattern.graph_source_id,
+                            triples_map = %tm.iri,
+                            "R2RML scan: TriplesMap skipped, its required predicates are hidden by view policy"
+                        );
+                    }
+                }
+                kept
+            }
+            None => triples_maps,
+        };
+
         if triples_maps.is_empty() {
             return Ok(None);
         }
@@ -1036,6 +1081,19 @@ impl R2rmlScanOperator {
                 cols.sort();
                 cols.dedup();
                 cols
+            };
+
+            // View policy with column-derived rdf:type: project the type columns
+            // too so each row's classes can be materialized for class policies.
+            let projection: Vec<String> = match self.policy_gate.as_ref() {
+                Some(gate) if gate.needs_row_classes(triples_map) => {
+                    let mut cols = projection;
+                    cols.extend(R2rmlPolicyGate::row_class_columns(triples_map));
+                    cols.sort();
+                    cols.dedup();
+                    cols
+                }
+                _ => projection,
             };
 
             // Scan the table, pushing resolved FILTER predicates for file pruning
@@ -1454,13 +1512,24 @@ impl R2rmlScanOperator {
                     progress.tms[i].tm_iri
                 ))
             })?;
-            let produced = self.materialize_window(
+            let MaterializedRows {
+                rows: produced,
+                classes: row_classes,
+            } = self.materialize_window(
                 triples_map,
                 &window,
                 &progress.tms[i].parent_lookups,
                 &progress.tms[i].ref_shortcuts,
                 ctx,
             )?;
+            // View policy: drop rows whose read triples the identity cannot see.
+            let produced = match self.policy_gate.as_mut() {
+                Some(gate) => {
+                    gate.filter_rows(ctx, &self.pattern, triples_map, produced, row_classes)
+                        .await?
+                }
+                None => produced,
+            };
 
             // F-AUD-3 site A1: account the materialized window against the query
             // memory budget so a wide non-aggregate crawl (the previously-blind scan
@@ -2221,6 +2290,16 @@ fn row_passes_star_constraints(
 /// Materialize one column batch into produced variable assignments (subject +
 /// object vars) — the per-batch unit of the parallel scan. Mirrors the previous
 /// per-row logic (star cross product, subject-only, single-object).
+/// Produced rows of one column batch, optionally paired with each row's
+/// column-derived classes (see [`R2rmlPolicyGate::needs_row_classes`]).
+struct MaterializedRows {
+    rows: Vec<Vec<(VarId, Binding)>>,
+    /// Parallel to `rows` when requested.
+    classes: Option<Vec<Vec<String>>>,
+}
+
+/// Test/convenience form of [`materialize_batch_rows`] without row classes.
+#[cfg(test)]
 fn materialize_batch(
     pattern: &R2rmlPattern,
     triples_map: &TriplesMap,
@@ -2229,6 +2308,28 @@ fn materialize_batch(
     ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
     encoder: &LiteralEncoder,
 ) -> Result<Vec<Vec<(VarId, Binding)>>> {
+    materialize_batch_rows(
+        pattern,
+        triples_map,
+        iceberg_batch,
+        parent_lookups,
+        ref_shortcuts,
+        encoder,
+        false,
+    )
+    .map(|m| m.rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_batch_rows(
+    pattern: &R2rmlPattern,
+    triples_map: &TriplesMap,
+    iceberg_batch: &ColumnBatch,
+    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
+    ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
+    encoder: &LiteralEncoder,
+    derive_row_classes: bool,
+) -> Result<MaterializedRows> {
     // Precompute each decimal constant's canonical string once (not per row), so
     // the per-row match can skip the `BigDecimal` parse on an exact lexical hit.
     let object_constant_canon: Option<String> = pattern
@@ -2242,197 +2343,152 @@ fn materialize_batch(
         .collect();
 
     let mut produced: Vec<Vec<(VarId, Binding)>> = Vec::new();
+    let mut row_classes: Option<Vec<Vec<String>>> = derive_row_classes.then(Vec::new);
     for table_row_idx in 0..iceberg_batch.num_rows {
-        let subject_term = match materialize_subject_from_batch(
-            &triples_map.subject_map,
+        let before = produced.len();
+        materialize_row(
+            pattern,
+            triples_map,
             iceberg_batch,
             table_row_idx,
-        )? {
-            Some(t) => t,
-            None => continue,
-        };
-
-        // Bound-subject filter (`<store/5> <pred> ?o`): keep only rows whose
-        // subject IRI equals the constant. This is the pattern's semantics,
-        // enforced regardless of any scan pushdown.
-        if let Some(want) = pattern.subject_constant.as_deref() {
-            if !subject_term_matches_iri(&subject_term, want) {
-                continue;
-            }
-        }
-        let subject_binding = encoder.encode(&subject_term);
-
-        // A fixed-predicate same-subject star (extra star_bindings and/or folded
-        // const-object star_constraints). A variable-predicate WILDCARD is excluded
-        // here even when it carries folded star_constraints (W4-1b): it must reach
-        // the wildcard POM loop below to bind ?p/?o, so its star_constraints are
-        // applied as a subject-level existence pre-check there — this fixed-predicate
-        // path never binds a predicate var and would emit a subject-only row.
-        if pattern.predicate_var.is_none()
-            && (!pattern.star_bindings.is_empty() || !pattern.star_constraints.is_empty())
-        {
-            let mut members: Vec<(VarId, &str)> = Vec::new();
-            if let (Some(ov), Some(pf)) = (pattern.object_var, pattern.predicate_filter.as_deref())
-            {
-                members.push((ov, pf));
-            }
-            for (pred, var) in &pattern.star_bindings {
-                members.push((*var, pred.as_str()));
-            }
-
-            let mut binding_lists: Vec<(VarId, Vec<Binding>)> = Vec::with_capacity(members.len());
-            let mut row_ok = true;
-            for (var, pred) in &members {
-                let mut vals: Vec<Binding> = Vec::new();
-                for pom in triples_map
-                    .predicate_object_maps
-                    .iter()
-                    .filter(|p| p.predicate_map.as_constant() == Some(*pred))
-                {
-                    if let Some(t) = materialize_pom_object(
-                        pom,
-                        iceberg_batch,
-                        table_row_idx,
-                        parent_lookups,
-                        ref_shortcuts,
-                    )? {
-                        vals.push(encoder.encode(&t));
-                    }
-                }
-                if vals.is_empty() {
-                    row_ok = false;
-                    break;
-                }
-                binding_lists.push((*var, vals));
-            }
-
-            // Fused constant-object constraints: the row survives only when each
-            // predicate produces at least one object equal to its constant. This
-            // is an existence filter (produces no var), enforced by the operator.
-            if row_ok
-                && !row_passes_star_constraints(
-                    pattern,
+            parent_lookups,
+            ref_shortcuts,
+            encoder,
+            object_constant_canon.as_deref(),
+            &star_constraint_canon,
+            &mut produced,
+        )?;
+        if let Some(rc) = row_classes.as_mut() {
+            if produced.len() > before {
+                let classes = derived_row_classes(
                     triples_map,
                     iceberg_batch,
                     table_row_idx,
                     parent_lookups,
                     ref_shortcuts,
-                    &star_constraint_canon,
-                )?
-            {
-                row_ok = false;
+                )?;
+                rc.extend(std::iter::repeat_n(classes, produced.len() - before));
             }
-            if !row_ok {
-                continue;
-            }
+        }
+    }
+    Ok(MaterializedRows {
+        rows: produced,
+        classes: row_classes,
+    })
+}
 
-            // Seed row: the subject binding, or empty for a constant subject.
-            // The cross-product below clones this row per extra object, so a clone
-            // (not a move) of the subject binding is required here.
-            let seed = match pattern.subject_var {
-                Some(sv) => vec![(sv, subject_binding.clone())],
-                None => Vec::new(),
-            };
-            let mut rows: Vec<Vec<(VarId, Binding)>> = vec![seed];
-            for (var, vals) in &binding_lists {
-                if vals.len() == 1 {
-                    for r in &mut rows {
-                        r.push((*var, vals[0].clone()));
-                    }
-                } else {
-                    let mut next = Vec::with_capacity(rows.len() * vals.len());
-                    for r in &rows {
-                        for v in vals {
-                            let mut nr = r.clone();
-                            nr.push((*var, v.clone()));
-                            next.push(nr);
-                        }
-                    }
-                    rows = next;
-                }
-            }
-            produced.extend(rows);
+/// A row's column-derived classes: every IRI a non-constant `rdf:type` object
+/// map materializes for it (constant classes are static per map and handled by
+/// the policy gate directly).
+fn derived_row_classes(
+    triples_map: &TriplesMap,
+    iceberg_batch: &ColumnBatch,
+    table_row_idx: usize,
+    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
+    ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
+) -> Result<Vec<String>> {
+    let mut classes = Vec::new();
+    for pom in &triples_map.predicate_object_maps {
+        if pom.predicate_map.as_constant() != Some(fluree_vocab::rdf::TYPE)
+            || matches!(pom.object_map, ObjectMap::Constant { .. })
+        {
             continue;
         }
+        if let Some(RdfTerm::Iri(iri)) = materialize_pom_object(
+            pom,
+            iceberg_batch,
+            table_row_idx,
+            parent_lookups,
+            ref_shortcuts,
+        )? {
+            classes.push(iri);
+        }
+    }
+    Ok(classes)
+}
 
-        let Some(obj_var) = pattern.object_var else {
-            // Constant-object (`?s <pred> "value"`): keep the subject only when
-            // this predicate has an object equal to the required constant. The
-            // equality is the pattern's semantics, enforced here regardless of
-            // scan pushdown; the pushed ScanFilter is only an optimization. Exactly
-            // one row per surviving subject, so the subject binding is moved (not
-            // cloned) into it.
-            if let Some(required) = &pattern.object_constant {
-                let mut matched = false;
-                for pom in triples_map.predicate_object_maps.iter().filter(|pom| {
-                    pattern
-                        .predicate_filter
-                        .as_deref()
-                        .is_some_and(|pf| pom.predicate_map.as_constant() == Some(pf))
-                }) {
-                    if let Some(t) = materialize_pom_object(
-                        pom,
-                        iceberg_batch,
-                        table_row_idx,
-                        parent_lookups,
-                        ref_shortcuts,
-                    )? {
-                        let numeric = object_column_is_numeric(pom, iceberg_batch);
-                        if rdf_term_eq_object_constant_cached(
-                            &t,
-                            required,
-                            numeric,
-                            object_constant_canon.as_deref(),
-                        ) {
-                            matched = true;
-                            break;
-                        }
-                    }
-                }
-                if matched {
-                    produced.push(match pattern.subject_var {
-                        Some(sv) => vec![(sv, subject_binding)],
-                        None => Vec::new(),
-                    });
-                }
-                continue;
-            }
-            // Pure subject-only pattern. A plain `?s a ex:Class` scan (constrained
-            // by `class_filter`) emits the subject alone. A projected `?s a ?type`
-            // scan (`type_var`) instead emits one row per class the map declares,
-            // binding `?type` to that class IRI — the same subjects a bound-class
-            // scan visits, with the class projected rather than filtered. A map
-            // that declares no class produces no row for a `type_var` pattern (its
-            // subjects have no rdf:type triple).
-            match pattern.type_var {
-                Some(tv) => {
-                    for class_iri in triples_map.classes() {
-                        let mut row = Vec::with_capacity(2);
-                        if let Some(sv) = pattern.subject_var {
-                            row.push((sv, subject_binding.clone()));
-                        }
-                        row.push((tv, Binding::iri(class_iri.as_str())));
-                        produced.push(row);
-                    }
-                }
-                None => {
-                    produced.push(match pattern.subject_var {
-                        Some(sv) => vec![(sv, subject_binding)],
-                        None => Vec::new(),
-                    });
-                }
-            }
-            continue;
-        };
+/// Materialize one table row of `triples_map` into produced assignments,
+/// appending to `produced`. Split out of the batch loop so callers can attribute
+/// the rows a table row produced (e.g. to pair them with that row's classes).
+#[allow(clippy::too_many_arguments)]
+fn materialize_row(
+    pattern: &R2rmlPattern,
+    triples_map: &TriplesMap,
+    iceberg_batch: &ColumnBatch,
+    table_row_idx: usize,
+    parent_lookups: &HashMap<(String, Vec<String>), Arc<ParentLookup>>,
+    ref_shortcuts: &HashMap<LookupCacheKey, RefShortcut>,
+    encoder: &LiteralEncoder,
+    object_constant_canon: Option<&str>,
+    star_constraint_canon: &[Option<String>],
+    produced: &mut Vec<Vec<(VarId, Binding)>>,
+) -> Result<()> {
+    let subject_term = match materialize_subject_from_batch(
+        &triples_map.subject_map,
+        iceberg_batch,
+        table_row_idx,
+    )? {
+        Some(t) => t,
+        None => return Ok(()),
+    };
 
-        // W4-1b: a folded crawl wildcard carries const-object members as
-        // `star_constraints`. Apply them as a SUBJECT existence pre-check before
-        // emitting any (p,o) row: keep this subject's wildcard rows only when every
-        // constraint predicate yields its constant — the same existence filter the
-        // standalone joined key scan enforced. Empty (a no-op) for a plain wildcard;
-        // a fixed-predicate star with constraints took the star branch above, so only
-        // a folded wildcard reaches here with a non-empty set.
-        if !pattern.star_constraints.is_empty()
+    // Bound-subject filter (`<store/5> <pred> ?o`): keep only rows whose
+    // subject IRI equals the constant. This is the pattern's semantics,
+    // enforced regardless of any scan pushdown.
+    if let Some(want) = pattern.subject_constant.as_deref() {
+        if !subject_term_matches_iri(&subject_term, want) {
+            return Ok(());
+        }
+    }
+    let subject_binding = encoder.encode(&subject_term);
+
+    // A fixed-predicate same-subject star (extra star_bindings and/or folded
+    // const-object star_constraints). A variable-predicate WILDCARD is excluded
+    // here even when it carries folded star_constraints (W4-1b): it must reach
+    // the wildcard POM loop below to bind ?p/?o, so its star_constraints are
+    // applied as a subject-level existence pre-check there — this fixed-predicate
+    // path never binds a predicate var and would emit a subject-only row.
+    if pattern.predicate_var.is_none()
+        && (!pattern.star_bindings.is_empty() || !pattern.star_constraints.is_empty())
+    {
+        let mut members: Vec<(VarId, &str)> = Vec::new();
+        if let (Some(ov), Some(pf)) = (pattern.object_var, pattern.predicate_filter.as_deref()) {
+            members.push((ov, pf));
+        }
+        for (pred, var) in &pattern.star_bindings {
+            members.push((*var, pred.as_str()));
+        }
+
+        let mut binding_lists: Vec<(VarId, Vec<Binding>)> = Vec::with_capacity(members.len());
+        let mut row_ok = true;
+        for (var, pred) in &members {
+            let mut vals: Vec<Binding> = Vec::new();
+            for pom in triples_map
+                .predicate_object_maps
+                .iter()
+                .filter(|p| p.predicate_map.as_constant() == Some(*pred))
+            {
+                if let Some(t) = materialize_pom_object(
+                    pom,
+                    iceberg_batch,
+                    table_row_idx,
+                    parent_lookups,
+                    ref_shortcuts,
+                )? {
+                    vals.push(encoder.encode(&t));
+                }
+            }
+            if vals.is_empty() {
+                row_ok = false;
+                break;
+            }
+            binding_lists.push((*var, vals));
+        }
+
+        // Fused constant-object constraints: the row survives only when each
+        // predicate produces at least one object equal to its constant. This
+        // is an existence filter (produces no var), enforced by the operator.
+        if row_ok
             && !row_passes_star_constraints(
                 pattern,
                 triples_map,
@@ -2440,114 +2496,236 @@ fn materialize_batch(
                 table_row_idx,
                 parent_lookups,
                 ref_shortcuts,
-                &star_constraint_canon,
+                star_constraint_canon,
             )?
         {
-            continue;
+            row_ok = false;
+        }
+        if !row_ok {
+            return Ok(());
         }
 
-        for pom in triples_map.predicate_object_maps.iter().filter(|pom| {
-            pattern
-                .predicate_filter
-                .as_deref()
-                .is_none_or(|pf| pom.predicate_map.as_constant() == Some(pf))
-        }) {
-            if let Some(t) = materialize_pom_object(
-                pom,
-                iceberg_batch,
-                table_row_idx,
-                parent_lookups,
-                ref_shortcuts,
-            )? {
-                let object_binding = encoder.encode(&t);
-                // Build the (subject?, predicate?, object) prefix once. Capacity
-                // accounts for the extra type slot (a fused browse crawl also
-                // projects `?type`) so no push reallocates on this hottest scan
-                // path.
-                let cap = if pattern.type_var.is_some() { 4 } else { 3 };
-                let mut base = Vec::with_capacity(cap);
-                if let Some(sv) = pattern.subject_var {
-                    base.push((sv, subject_binding.clone()));
+        // Seed row: the subject binding, or empty for a constant subject.
+        // The cross-product below clones this row per extra object, so a clone
+        // (not a move) of the subject binding is required here.
+        let seed = match pattern.subject_var {
+            Some(sv) => vec![(sv, subject_binding.clone())],
+            None => Vec::new(),
+        };
+        let mut rows: Vec<Vec<(VarId, Binding)>> = vec![seed];
+        for (var, vals) in &binding_lists {
+            if vals.len() == 1 {
+                for r in &mut rows {
+                    r.push((*var, vals[0].clone()));
                 }
-                // Variable-predicate wildcard (`?s ?p ?o` / `<iri> ?p ?o`): bind
-                // `?p` to this POM's predicate IRI. A templated/column (non-
-                // constant) predicate — rare but representable — is materialized
-                // from the row; when it expands to nothing (NULL column) the
-                // triple does not exist for this row, so the POM is SKIPPED
-                // rather than emitting a solution with a bound object and an
-                // unbound predicate.
-                if let Some(pv) = pattern.predicate_var {
-                    match pom.predicate_map.as_constant() {
-                        Some(pred_iri) => base.push((pv, Binding::iri(pred_iri))),
-                        None => match materialize_predicate_from_batch(
-                            &pom.predicate_map,
-                            iceberg_batch,
-                            table_row_idx,
-                        )? {
-                            Some(pred_iri) => base.push((pv, Binding::iri(pred_iri))),
-                            None => continue,
-                        },
+            } else {
+                let mut next = Vec::with_capacity(rows.len() * vals.len());
+                for r in &rows {
+                    for v in vals {
+                        let mut nr = r.clone();
+                        nr.push((*var, v.clone()));
+                        next.push(nr);
                     }
                 }
-                base.push((obj_var, object_binding));
-                // When the pattern ALSO projects a type-var (a browse crawl fused
-                // its `?s a ?type` into this wildcard), emit each `(predicate,
-                // object)` row once per declared class — the per-`(p,o)` × class
-                // cartesian, identical to the two-scan `wildcard ⋈ type-var` inner
-                // join. Without a type-var the behavior is byte-identical to before.
-                match pattern.type_var {
-                    None => produced.push(base),
-                    Some(tv) => {
-                        let classes = triples_map.classes();
-                        match classes.len() {
-                            // A classless scanned map keeps its `(p,o)` triple with
-                            // `?type` unbound — never drop the wildcard binding.
-                            // (Unreachable while fused, since `class_filter` prunes
-                            // to classed maps; kept for two-scan parity and the
-                            // future non-`["*"]` crawl shapes.)
-                            0 => produced.push(base),
-                            // Common case: exactly one class — bind it, no clone.
-                            1 => {
-                                base.push((tv, Binding::iri(classes[0].as_str())));
-                                produced.push(base);
-                            }
-                            // Multi-class: clone the `(p,o)` prefix once per class.
-                            _ => {
-                                for class_iri in classes {
-                                    let mut row = base.clone();
-                                    row.push((tv, Binding::iri(class_iri.as_str())));
-                                    produced.push(row);
-                                }
+                rows = next;
+            }
+        }
+        produced.extend(rows);
+        return Ok(());
+    }
+
+    let Some(obj_var) = pattern.object_var else {
+        // Constant-object (`?s <pred> "value"`): keep the subject only when
+        // this predicate has an object equal to the required constant. The
+        // equality is the pattern's semantics, enforced here regardless of
+        // scan pushdown; the pushed ScanFilter is only an optimization. Exactly
+        // one row per surviving subject, so the subject binding is moved (not
+        // cloned) into it.
+        if let Some(required) = &pattern.object_constant {
+            let mut matched = false;
+            for pom in triples_map.predicate_object_maps.iter().filter(|pom| {
+                pattern
+                    .predicate_filter
+                    .as_deref()
+                    .is_some_and(|pf| pom.predicate_map.as_constant() == Some(pf))
+            }) {
+                if let Some(t) = materialize_pom_object(
+                    pom,
+                    iceberg_batch,
+                    table_row_idx,
+                    parent_lookups,
+                    ref_shortcuts,
+                )? {
+                    let numeric = object_column_is_numeric(pom, iceberg_batch);
+                    if rdf_term_eq_object_constant_cached(
+                        &t,
+                        required,
+                        numeric,
+                        object_constant_canon,
+                    ) {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if matched {
+                produced.push(match pattern.subject_var {
+                    Some(sv) => vec![(sv, subject_binding)],
+                    None => Vec::new(),
+                });
+            }
+            return Ok(());
+        }
+        // Pure subject-only pattern. A plain `?s a ex:Class` scan (constrained
+        // by `class_filter`) emits the subject alone. A projected `?s a ?type`
+        // scan (`type_var`) instead emits one row per class the map declares,
+        // binding `?type` to that class IRI — the same subjects a bound-class
+        // scan visits, with the class projected rather than filtered. A map
+        // that declares no class produces no row for a `type_var` pattern (its
+        // subjects have no rdf:type triple).
+        match pattern.type_var {
+            Some(tv) => {
+                for class_iri in triples_map.classes() {
+                    let mut row = Vec::with_capacity(2);
+                    if let Some(sv) = pattern.subject_var {
+                        row.push((sv, subject_binding.clone()));
+                    }
+                    row.push((tv, Binding::iri(class_iri.as_str())));
+                    produced.push(row);
+                }
+            }
+            None => {
+                produced.push(match pattern.subject_var {
+                    Some(sv) => vec![(sv, subject_binding)],
+                    None => Vec::new(),
+                });
+            }
+        }
+        return Ok(());
+    };
+
+    // W4-1b: a folded crawl wildcard carries const-object members as
+    // `star_constraints`. Apply them as a SUBJECT existence pre-check before
+    // emitting any (p,o) row: keep this subject's wildcard rows only when every
+    // constraint predicate yields its constant — the same existence filter the
+    // standalone joined key scan enforced. Empty (a no-op) for a plain wildcard;
+    // a fixed-predicate star with constraints took the star branch above, so only
+    // a folded wildcard reaches here with a non-empty set.
+    if !pattern.star_constraints.is_empty()
+        && !row_passes_star_constraints(
+            pattern,
+            triples_map,
+            iceberg_batch,
+            table_row_idx,
+            parent_lookups,
+            ref_shortcuts,
+            star_constraint_canon,
+        )?
+    {
+        return Ok(());
+    }
+
+    for pom in triples_map.predicate_object_maps.iter().filter(|pom| {
+        pattern
+            .predicate_filter
+            .as_deref()
+            .is_none_or(|pf| pom.predicate_map.as_constant() == Some(pf))
+    }) {
+        if let Some(t) = materialize_pom_object(
+            pom,
+            iceberg_batch,
+            table_row_idx,
+            parent_lookups,
+            ref_shortcuts,
+        )? {
+            let object_binding = encoder.encode(&t);
+            // Build the (subject?, predicate?, object) prefix once. Capacity
+            // accounts for the extra type slot (a fused browse crawl also
+            // projects `?type`) so no push reallocates on this hottest scan
+            // path.
+            let cap = if pattern.type_var.is_some() { 4 } else { 3 };
+            let mut base = Vec::with_capacity(cap);
+            if let Some(sv) = pattern.subject_var {
+                base.push((sv, subject_binding.clone()));
+            }
+            // Variable-predicate wildcard (`?s ?p ?o` / `<iri> ?p ?o`): bind
+            // `?p` to this POM's predicate IRI. A templated/column (non-
+            // constant) predicate — rare but representable — is materialized
+            // from the row; when it expands to nothing (NULL column) the
+            // triple does not exist for this row, so the POM is SKIPPED
+            // rather than emitting a solution with a bound object and an
+            // unbound predicate.
+            if let Some(pv) = pattern.predicate_var {
+                match pom.predicate_map.as_constant() {
+                    Some(pred_iri) => base.push((pv, Binding::iri(pred_iri))),
+                    None => match materialize_predicate_from_batch(
+                        &pom.predicate_map,
+                        iceberg_batch,
+                        table_row_idx,
+                    )? {
+                        Some(pred_iri) => base.push((pv, Binding::iri(pred_iri))),
+                        None => continue,
+                    },
+                }
+            }
+            base.push((obj_var, object_binding));
+            // When the pattern ALSO projects a type-var (a browse crawl fused
+            // its `?s a ?type` into this wildcard), emit each `(predicate,
+            // object)` row once per declared class — the per-`(p,o)` × class
+            // cartesian, identical to the two-scan `wildcard ⋈ type-var` inner
+            // join. Without a type-var the behavior is byte-identical to before.
+            match pattern.type_var {
+                None => produced.push(base),
+                Some(tv) => {
+                    let classes = triples_map.classes();
+                    match classes.len() {
+                        // A classless scanned map keeps its `(p,o)` triple with
+                        // `?type` unbound — never drop the wildcard binding.
+                        // (Unreachable while fused, since `class_filter` prunes
+                        // to classed maps; kept for two-scan parity and the
+                        // future non-`["*"]` crawl shapes.)
+                        0 => produced.push(base),
+                        // Common case: exactly one class — bind it, no clone.
+                        1 => {
+                            base.push((tv, Binding::iri(classes[0].as_str())));
+                            produced.push(base);
+                        }
+                        // Multi-class: clone the `(p,o)` prefix once per class.
+                        _ => {
+                            for class_iri in classes {
+                                let mut row = base.clone();
+                                row.push((tv, Binding::iri(class_iri.as_str())));
+                                produced.push(row);
                             }
                         }
                     }
                 }
             }
         }
+    }
 
-        // A TRUE-wildcard scan (`?s ?p ?o` / `<iri> ?p ?o`: variable predicate,
-        // no predicate filter) must ALSO emit each subject's `rr:class`-derived
-        // `rdf:type` triple — the POM loop above materializes only the data
-        // predicates, while a native wildcard returns the type triple too
-        // (without this, the subject inspector shows no `@type` on a virtual
-        // dataset). Excluded when a type-var is projected (a fused browse crawl
-        // already carries the class on every row — no double emission) and when
-        // a predicate filter pins `?p` to one data predicate.
-        if pattern.predicate_filter.is_none() && pattern.type_var.is_none() {
-            if let Some(pv) = pattern.predicate_var {
-                for class_iri in triples_map.classes() {
-                    let mut row = Vec::with_capacity(3);
-                    if let Some(sv) = pattern.subject_var {
-                        row.push((sv, subject_binding.clone()));
-                    }
-                    row.push((pv, Binding::iri(fluree_vocab::rdf::TYPE)));
-                    row.push((obj_var, Binding::iri(class_iri.as_str())));
-                    produced.push(row);
+    // A TRUE-wildcard scan (`?s ?p ?o` / `<iri> ?p ?o`: variable predicate,
+    // no predicate filter) must ALSO emit each subject's `rr:class`-derived
+    // `rdf:type` triple — the POM loop above materializes only the data
+    // predicates, while a native wildcard returns the type triple too
+    // (without this, the subject inspector shows no `@type` on a virtual
+    // dataset). Excluded when a type-var is projected (a fused browse crawl
+    // already carries the class on every row — no double emission) and when
+    // a predicate filter pins `?p` to one data predicate.
+    if pattern.predicate_filter.is_none() && pattern.type_var.is_none() {
+        if let Some(pv) = pattern.predicate_var {
+            for class_iri in triples_map.classes() {
+                let mut row = Vec::with_capacity(3);
+                if let Some(sv) = pattern.subject_var {
+                    row.push((sv, subject_binding.clone()));
                 }
+                row.push((pv, Binding::iri(fluree_vocab::rdf::TYPE)));
+                row.push((obj_var, Binding::iri(class_iri.as_str())));
+                produced.push(row);
             }
         }
     }
-    Ok(produced)
+    Ok(())
 }
 
 /// Build a parent lookup table for RefObjectMap joins.
@@ -2686,6 +2864,7 @@ impl Operator for R2rmlScanOperator {
             .compiled_mapping(&self.pattern.graph_source_id, as_of_t)
             .await?;
 
+        self.policy_gate = R2rmlPolicyGate::build(ctx, &mapping, &self.pattern.graph_source_id);
         self.mapping = Some(mapping);
         self.state = OperatorState::Open;
 
@@ -2806,6 +2985,7 @@ impl Operator for R2rmlScanOperator {
     fn close(&mut self) {
         self.child.close();
         self.mapping = None;
+        self.policy_gate = None;
         self.pending.clear();
         self.progress = None;
         self.scan_cache.clear();

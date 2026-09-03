@@ -3158,6 +3158,17 @@ pub struct SqlMapArgs {
     /// Session property (repeatable): --session query_max_run_time=5m
     #[arg(long = "session", value_name = "KEY=VALUE")]
     pub session: Vec<String>,
+
+    /// Model ledger (name:branch) governing this source: its default graph
+    /// supplies the view policies (`fluree model access enable <model> ...`)
+    /// and the class/property hierarchy they entail over.
+    #[arg(long, value_name = "LEDGER")]
+    pub model: Option<String>,
+
+    /// Fallback for governed requests that match no policy: `true` keeps the
+    /// source readable under authentication without a model (unset: deny).
+    #[arg(long, value_name = "BOOL")]
+    pub default_allow: Option<bool>,
 }
 
 /// Arguments for mapping an Iceberg table as a graph source.
@@ -3213,6 +3224,17 @@ pub struct IcebergMapArgs {
     /// Branch name (defaults to "main")
     #[arg(long)]
     pub branch: Option<String>,
+
+    /// Model ledger (name:branch) governing this source: its default graph
+    /// supplies the view policies (`fluree model access enable <model> ...`)
+    /// and the class/property hierarchy they entail over.
+    #[arg(long, value_name = "LEDGER")]
+    pub model: Option<String>,
+
+    /// Fallback for governed requests that match no policy: `true` keeps the
+    /// source readable under authentication without a model (unset: deny).
+    #[arg(long, value_name = "BOOL")]
+    pub default_allow: Option<bool>,
 
     /// Bearer token for REST catalog authentication
     #[arg(long)]

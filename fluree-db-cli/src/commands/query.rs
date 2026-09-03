@@ -2032,6 +2032,7 @@ mod tests {
         let deny_all = PolicyEnforcement {
             enforced: true,
             denies_all_data: true,
+            unevaluable_policies: Vec::new(),
         };
         assert_eq!(
             format_tally_suffix(None, None, Some(&empty), Some(&deny_all), POLICY_ONLY),
@@ -2041,6 +2042,7 @@ mod tests {
         let some_grants = PolicyEnforcement {
             enforced: true,
             denies_all_data: false,
+            unevaluable_policies: Vec::new(),
         };
         assert_eq!(
             format_tally_suffix(None, None, Some(&empty), Some(&some_grants), POLICY_ONLY),

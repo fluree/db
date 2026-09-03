@@ -234,6 +234,25 @@ under a cross-ledger `f:policySource`:
   owner. Keep identity/user records in the default graph, or bind
   `?$identity` explicitly via `opts.policy_values`.
 
+### Virtual graph sources (Iceberg / SQL)
+
+A graph source registered with `--model <ledger>` is a data ledger D with no
+data of its own: the model ledger's default graph is both its
+`f:policySource` and its `f:schemaSource`, and the contract above applies
+with two adjustments, because D has nowhere to hold identity records:
+
+- An identity-carrying request with no policy class looks the identity's
+  `f:policyClass` up **in M** instead of failing closed. An identity M does
+  not know selects no rules, and `default-allow` governs.
+- Schema axioms from M are interned even for namespaces D has never
+  registered (a virtual D registers none), so `f:onClass` /
+  `f:onProperty` expand through M's hierarchy. On a native D the same
+  axioms are inert, since D holds no data under those namespaces.
+
+`?$identity` stays unbound (D has no subject node for it), which only
+matters for `f:query` rules — and those cannot run against a virtual source
+anyway. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy).
+
 One merge subtlety: an identity counts as a request policy input,
 so under the default `f:overrideControl` (`f:OverrideAll`) the
 request's options take precedence and the config's
@@ -584,7 +603,7 @@ closed when configured:
 | `f:atT` (temporal pinning of M)            | Request fails with `UnsupportedFeature { feature: "f:atT", phase: "Phase 3" }`. |
 | `f:trustPolicy` (commit-signer allowlist)  | Request fails with `UnsupportedFeature`. |
 | `f:rollbackGuard` (freshness constraints)  | Request fails with `UnsupportedFeature`. |
-| `opts.identity` + cross-ledger `f:policySource` **with no policy class anywhere** | Request fails with a config error. The identity is bind-only under cross-ledger (see [Identity binding](#identity-binding-under-cross-ledger-policy)) and can't select rules, so a policy class must be named on the request or in D's config. With a class available, identity-carrying requests work normally. |
+| `opts.identity` + cross-ledger `f:policySource` **with no policy class anywhere** | Request fails with a config error. The identity is bind-only under cross-ledger (see [Identity binding](#identity-binding-under-cross-ledger-policy)) and can't select rules, so a policy class must be named on the request or in D's config. With a class available, identity-carrying requests work normally. Exception: a [virtual graph source](#virtual-graph-sources-iceberg--sql) looks the identity's classes up in M. |
 | `f:policySource` with `f:graphSelector` naming M's `#config` or `#txn-meta` | Request fails with `ReservedGraphSelected` before any storage read on M. |
 | Transitive `owl:imports` across model ledgers (`f:schemaSource` recursion) | Not yet honored. Imports inside M's schema graph are projected but the resolver doesn't follow them across ledger boundaries. |
 

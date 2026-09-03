@@ -39,6 +39,14 @@ fluree iceberg map execution-log \
   --table-location s3://bucket/warehouse/logs/execution_log \
   --r2rml mappings/execution_log.ttl
 
+# Governed by a model ledger holding its policies and class hierarchy
+# (see "Access policy" below)
+fluree iceberg map execution-log \
+  --mode direct \
+  --table-location s3://bucket/warehouse/logs/execution_log \
+  --r2rml mappings/execution_log.ttl \
+  --model governance:main
+
 # Google Cloud Storage — see "Google Cloud Storage (GCS)" below
 fluree iceberg map orders \
   --mode direct \
@@ -93,7 +101,7 @@ curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
   }'
 ```
 
-R2RML can be omitted to auto-generate a direct mapping. AWS credentials for `direct` mode are read from the server's environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
+R2RML can be omitted to auto-generate a direct mapping. An optional `"model": "governance:main"` names the model ledger that governs the source (see [Access policy](#access-policy)). AWS credentials for `direct` mode are read from the server's environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
 
 ### Rust API
 
@@ -141,7 +149,7 @@ fluree.create_r2rml_graph_source(config).await?;
 
 Iceberg graph sources are persisted as an `IcebergGsConfig` JSON document in the nameservice record’s `config` field.
 
-Note the nesting: the graph source is “Iceberg” (this page), and `catalog.type` selects the **catalog mode** (`rest` vs `direct`) used to discover Iceberg metadata.
+Note the nesting: the graph source is “Iceberg” (this page), and `catalog.type` selects the **catalog mode** (`rest` vs `direct`) used to discover Iceberg metadata. Optional top-level fields not shown below: `mapping` (the stored R2RML address and media type), `delete` and `order_by` (materialization conventions), and `model` (the governing model ledger, see [Access policy](#access-policy)).
 
 **REST catalog config:**
 
@@ -506,7 +514,8 @@ This is the way to give each partition its **own** ledger for per-partition
 access isolation: Fluree's read policy is graph-blind, so separate access regimes
 are separate ledgers (isolated by the per-ledger read gate) rather than named
 graphs. Within each per-partition ledger, `rr:graphMap` named-graph routing still
-applies independently.
+applies independently. Row- and column-level policy on the live source itself is
+covered under [Access policy](#access-policy).
 
 ### Multiple sources into one target (additive)
 
@@ -868,6 +877,85 @@ Before a twin is announced, a memory-bounded parity gate re-checks it against th
 - **`full`** — a whole-twin triple diff (the twin streamed in a single linear pass over the binary index), external-sorted and diffed under a bounded working set.
 
 A failed gate drops the twin so nothing unverified stays announced. See the [`fluree materialize`](../cli/materialize.md) reference for the full flow, the machine-safety posture, and `--tmp-dir`.
+
+## Access policy
+
+Fluree's view policy applies to an Iceberg source the same way it applies to a
+native ledger, with one difference in what a policy can express. A request that
+carries policy inputs (`identity`, `policy-class`, an inline `policy`, or
+`default-allow`) is enforced inside the R2RML scan: subject classes come from
+the mapping (`rr:class`, plus any column-derived `rdf:type`), targets are
+matched on the row's IRIs, and a triples map whose required predicates are all
+hidden is skipped before its table is read. In the common case a decision is
+made once per `(triples map, predicate)`, so enforcement is cheaper than the
+per-flake filter a native scan pays.
+
+Supported, with native parity (the test suite checks each shape against a
+native twin of the same data):
+
+- `f:onProperty`, `f:onClass`, `f:onSubject`, and untargeted policies with a
+  static `f:allow`, including `f:required` gates and `default-allow`.
+- `f:onClass` / `f:onProperty` expansion through `rdfs:subClassOf` /
+  `rdfs:subPropertyOf`, when the source references a model ledger (below).
+- Every pattern shape the scan produces: fixed predicates, same-subject stars,
+  constant objects, class scans, projected `rdf:type`, wildcards (`?s ?p ?o`),
+  aggregates, and `GRAPH` blocks in a dataset query.
+
+Not supported: **`f:query`** policies. A virtual source has no graph to run the
+policy query against, so a targeted `f:query` evaluates as "no rows" and
+denies its targets — it never falls open. Relationship gates that join the
+requesting identity to the row (`fluree model access … --connected`) fall in
+this category. Write verbs do not apply; the source is read-only.
+
+### Where policies live: the model ledger
+
+A virtual source has no ledger of its own, so its stored policies, the
+identities' `f:policyClass` assignments, and the class hierarchy are held in a
+**model ledger** the source references at registration:
+
+```bash
+fluree create governance
+fluree model class define governance --class https://example.org/Person --subclass-of https://example.org/Agent
+fluree model access enable governance --profile read --class https://example.org/Agent
+fluree iceberg map orders --mode direct --table-location s3://… --r2rml orders.ttl \
+  --model governance:main
+```
+
+The reference (`model` in the HTTP body and stored config, `--model` on the
+CLI) makes the model ledger's default graph the source's `f:policySource` and
+`f:schemaSource`, resolved through the same cross-ledger mechanism a native
+ledger's config uses. Rule selection follows the cross-ledger contract: an
+explicit `policy-class` on the request (or token) selects rules; a bare
+`identity` is looked up in the model ledger for its `f:policyClass`; an
+anonymous request carrying `default-allow` applies the baseline
+`f:AccessPolicy` rules. A request with no policy inputs is unrestricted, as
+for a native ledger. Inline `opts.policy` works with or without a model.
+
+The model is validated when the source is registered: it must be an existing
+native ledger (not a graph source), so a mistyped name fails at `map` time
+rather than as a 502 on every governed query. Registration also reports every
+policy in the model that uses `f:query` — in the CLI output, and as
+`model_warnings` in the HTTP response — since the source will deny their
+targets.
+
+### Sources without a model under authentication
+
+On a server with data auth enabled every request carries an identity, which is
+a policy input, so a source with **no** model and no matching policy resolves
+to nothing: `default-allow` is fail-closed when unset. To keep such a source
+readable without attaching a model, register it with `--default-allow true`
+(`default_allow` in the HTTP body and stored config). It plays the same role as
+a native ledger's `f:defaultAllow` config: it fills a request that left
+`default-allow` unset, and an explicit request value still wins.
+
+### Seeing what policy did
+
+With `"meta": {"policy": true}` (or the `fluree-meta` header) the tracked
+response's `policy_enforcement` carries `unevaluable_policies`: the ids of
+`f:query` policies the source could not evaluate and therefore denied. That is
+how to tell a fail-closed policy from an empty table. The server also logs a
+warning the first time each such policy is met, and a debug line for every
+triples map a scan skipped because its predicates were hidden.
 
 ## Limitations
 

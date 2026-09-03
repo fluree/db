@@ -67,6 +67,8 @@ fluree sql map <NAME> --endpoint <URL> --r2rml <PATH> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--branch <BRANCH>` | Branch name (defaults to `main`) |
+| `--model <LEDGER>` | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must exist. See [Access policy](../graph-sources/iceberg.md#access-policy) |
+| `--default-allow <BOOL>` | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny) |
 | `--remote <NAME>` | Execute against a remote server |
 
 ### Examples

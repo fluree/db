@@ -147,6 +147,11 @@ Iceberg graph sources require an [R2RML mapping](r2rml.md) that defines how tabl
 
 See [Iceberg / Parquet](iceberg.md) for full configuration details and examples.
 
+View policy is enforced on Iceberg and SQL sources for static targeting
+(`f:onProperty`, `f:onClass`, `f:onSubject`, defaults); `f:query` policies fail
+closed. Stored policies and the class hierarchy come from a model ledger named
+at registration (`--model`). See [Access policy](iceberg.md#access-policy).
+
 **Query:**
 ```json
 {

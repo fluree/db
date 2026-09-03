@@ -121,7 +121,7 @@ mod lazy_storage;
 pub(crate) mod crawl;
 
 #[cfg(feature = "iceberg")]
-mod r2rml;
+pub(crate) mod r2rml;
 
 #[cfg(feature = "iceberg")]
 mod iceberg_catalog;
