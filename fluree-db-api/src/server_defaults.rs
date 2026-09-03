@@ -44,8 +44,14 @@ pub const DEFAULT_INDEXING_ENABLED: bool = true;
 /// `fluree-db-api` depends on the indexer unconditionally, and the server already
 /// sources its other clap defaults from this module, so routing it here keeps one
 /// definition and one import path.
+///
+/// Routed through [`crate::wasm_compat`] rather than naming
+/// `fluree_db_indexer::` directly: `fluree-db-api` takes the indexer as a
+/// `cfg(not(target_arch = "wasm32"))` dependency, so a direct reference here
+/// compiles natively and fails the wasm32 build with the same E0433 this
+/// constant exists to avoid one layer up.
 pub const DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS: u64 =
-    fluree_db_indexer::DEFAULT_CATCHUP_INTERVAL_SECS;
+    crate::wasm_compat::DEFAULT_CATCHUP_INTERVAL_SECS;
 // 100 bytes — effectively reindex after every commit (any commit's novelty
 // exceeds this), so the persisted index tracks the head with minimal lag.
 pub const DEFAULT_REINDEX_MIN_BYTES: usize = 100;
