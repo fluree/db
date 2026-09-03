@@ -433,6 +433,14 @@ pub struct ServerConfig {
     /// commit_t has not moved since the previous sweep are queued, so a healthy
     /// deployment pays one nameservice listing per interval and nothing else.
     /// `0` disables the re-sweep; the sweep performed at start-up always runs.
+    ///
+    /// Both sweeps queue on "behind" alone. `NsRecord` carries no novelty byte
+    /// count, so neither can re-apply --reindex-min-bytes: a ledger the soft
+    /// threshold deliberately left unindexed is built anyway once a sweep
+    /// reaches it. On a deployment with many small, mostly-idle ledgers that
+    /// means an index build per behind ledger on every process start, and one
+    /// more per ledger that goes idle while behind. Builds are serialized per
+    /// worker, so the cost is throughput rather than a stampede.
     #[arg(long, env = "FLUREE_INDEXER_CATCHUP_INTERVAL_SECS", default_value_t = server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS)]
     pub indexer_catchup_interval_secs: u64,
 
