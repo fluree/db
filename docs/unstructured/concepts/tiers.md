@@ -11,7 +11,7 @@ What each tier reads, on the [public benchmark](../README.md#how-well-does-it-re
 
 ## Local only
 
-Nothing configured beyond a Fluree project. Parsing is deterministic and the command makes no network connection. You get the structure graph, chunks and full-text search.
+Nothing configured beyond a Fluree project. Parsing is deterministic and the command makes no network connection. You get the structure graph, chunks and full-text search, and, with `--entities`, every mention of the entities you already have, under their own IRIs: the [gazetteer scan](entities-and-relations.md) needs no model either.
 
 What you do not get: vector search, because nothing produced embeddings; and scanned pages or pixel-only regions, because nothing can read them. Such pages are reported as unread rather than silently dropped. The deterministic engine alone still places third of seventeen on the public benchmark, and most documents in that corpus never needed more.
 
@@ -23,7 +23,7 @@ Three slots, each an OpenAI-compatible endpoint you point at anything: Ollama, v
 |---|---|---|
 | `embedding` | one vector per chunk; enables vector search | — |
 | `vlm` | reading crops of pages and regions the parser could not | `llm` |
-| `llm` | entity and relation extraction (in progress) | — |
+| `llm` | entity and relation extraction against `--model` | — |
 
 This is the most setup and the fewest features, and it is fully yours: no account, and no data leaves the machine unless a slot points at a hosted API. See [Local models](../guides/local-models.md).
 

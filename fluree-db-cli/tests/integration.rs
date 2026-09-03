@@ -3719,6 +3719,7 @@ fn doc_ingest_markdown_then_search_then_skip_unchanged() {
         .stdout(predicate::str::contains(
             "1 ingested, 0 unchanged, 0 failed",
         ))
+        .stdout(predicate::str::contains("ledger index handbook: t=1"))
         .stdout(predicate::str::contains(
             "full-text index handbook-text:main",
         ));
@@ -3822,6 +3823,339 @@ fn doc_search_without_index_explains() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("no full-text index"));
+    // Hybrid without an embedding endpoint says which half it cannot run.
+    fluree_cmd(&tmp)
+        .args([
+            "doc", "search", "anything", "-l", "empty", "--mode", "hybrid",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "hybrid search needs `[doc.embedding]`",
+        ));
+}
+
+/// A one-thread chat-completions server answering every request with the
+/// same JSON, fenced the way models fence it however they are asked not
+/// to. Returns its base URL and the count of requests it served.
+fn stub_llm(answer: serde_json::Value) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    stub_llm_with_status(answer, 200)
+}
+
+fn stub_llm_with_status(
+    answer: serde_json::Value,
+    status: u16,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served = calls.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let mut content_length = 0usize;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            reader.read_exact(&mut body).ok();
+            served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let content = format!("```json\n{answer}\n```");
+            let reply = serde_json::json!({
+                "choices": [{ "message": { "role": "assistant", "content": content } }]
+            })
+            .to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+        }
+    });
+    (url, calls)
+}
+
+fn write_extraction_fixtures(tmp: &TempDir) {
+    let ont = tmp.path().join("ont");
+    std::fs::create_dir_all(&ont).unwrap();
+    std::fs::write(
+        ont.join("model.ttl"),
+        r#"@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix schema: <https://schema.org/> .
+schema:Person a rdfs:Class ; rdfs:label "Person" .
+schema:Organization a rdfs:Class ; rdfs:label "Organization" .
+schema:worksFor a rdf:Property ; rdfs:label "works for" ;
+    schema:domainIncludes schema:Person ; schema:rangeIncludes schema:Organization .
+schema:jobTitle a rdf:Property ; rdfs:label "job title" ;
+    schema:domainIncludes schema:Person ; schema:rangeIncludes schema:Text .
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ont.join("entities.ttl"),
+        r#"@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix schema: <https://schema.org/> .
+<https://example.org/org/acme> a schema:Organization ;
+    skos:prefLabel "Acme Corporation" ; skos:altLabel "Acme" .
+"#,
+    )
+    .unwrap();
+    let docs = tmp.path().join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(
+        docs.join("memo.md"),
+        "# Staffing memo\n\nJane Doe joined Acme as Chief Technology Officer in March.\n\nJane Doe will present the roadmap to the Acme board.\n",
+    )
+    .unwrap();
+}
+
+const EXTRACTION_CONTEXT: &str = r#""@context":{"doc":"https://ns.flur.ee/doc#","nif":"http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#","rdf":"http://www.w3.org/1999/02/22-rdf-syntax-ns#","schema":"https://schema.org/"}"#;
+
+#[test]
+fn doc_ingest_extracts_entities_and_relations_grounded_on_model_and_gazetteer() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, calls) = stub_llm(serde_json::json!({
+        "entities": [
+            { "name": "Jane Doe", "type": "schema:Person", "nerLabel": "PERSON",
+              "context": "Jane Doe joined Acme as Chief Technology Officer",
+              "attributes": { "schema:jobTitle": "Chief Technology Officer" } },
+            // The model's spelling of a gazetteer entity: must land on its IRI.
+            { "name": "ACME", "type": "schema:Organization", "context": "joined Acme as" },
+            // Not in the text: dropped as a hallucination.
+            { "name": "Phantom LLC", "type": "schema:Organization", "context": "Phantom LLC was never here" }
+        ],
+        "relations": [
+            // A label instead of the IRI: repaired to schema:worksFor.
+            { "subjectName": "Jane Doe", "predicate": "works for", "objectName": "Acme",
+              "objectIsLiteral": false, "context": "Jane Doe joined Acme as Chief Technology Officer in March." },
+            // Not a model property: kept as evidence, never an edge.
+            { "subjectName": "Jane Doe", "predicate": "schema:knows", "objectName": "Acme",
+              "objectIsLiteral": false, "context": "Jane Doe will present the roadmap to the Acme board." }
+        ]
+    }));
+
+    let ingest = |ledger: &str, extra: &[&str]| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_DOC_LLM_URL", &url)
+            .env("FLUREE_DOC_LLM_MODEL", "stub")
+            .args([
+                "doc",
+                "ingest",
+                "docs",
+                "-l",
+                ledger,
+                "--model",
+                "ont/model.ttl",
+                "--entities",
+                "ont/entities.ttl",
+            ])
+            .args(extra);
+        cmd
+    };
+
+    ingest("memos", &[])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "model      ont/model.ttl (2 classes, 2 properties)",
+        ))
+        .stderr(predicate::str::contains("gazetteer  1 entity"))
+        .stdout(predicate::str::contains(
+            "3 mention(s) of 2 entities (1 new), 2 relation(s) (1 rejected)",
+        ))
+        .stdout(predicate::str::contains(
+            "1 dropped (1 hallucinated, 0 off-model)",
+        ))
+        .stderr(predicate::str::contains(
+            "off-model entities: kept, flagged",
+        ));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Gazetteer mentions carry the source IRI; the model's "ACME" did too.
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", &format!(
+            r#"{{{EXTRACTION_CONTEXT},"where":[{{"@id":"?m","@type":"doc:Mention","nif:entity":"?e","nif:anchorOf":"?a","doc:extractedBy":"?by","doc:sourceElement":"?el"}}],"select":["?e","?a","?by","?el"],"orderBy":"?a"}}"#
+        )])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""https://example.org/org/acme""#).count(2))
+        .stdout(predicate::str::contains(r#""gazetteer""#).count(2))
+        .stdout(predicate::str::contains(r#""Jane Doe""#).count(1))
+        .stdout(predicate::str::contains("urn:fluree:doc:memo.md/element/"));
+
+    // The new entity is minted once, typed by the model, with its attribute.
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", &format!(
+            r#"{{{EXTRACTION_CONTEXT},"where":[{{"@id":"?e","@type":"doc:Entity","schema:name":"?n","schema:jobTitle":"?j","schema:worksFor":"?o"}}],"select":["?e","?n","?j","?o"]}}"#
+        )])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("urn:fluree:doc:entity/"))
+        .stdout(predicate::str::contains("Chief Technology Officer"))
+        .stdout(predicate::str::contains("https://example.org/org/acme"))
+        .stderr(predicate::str::contains("(1 rows"));
+
+    // Both relations are reified with a verdict; only the repaired one is an edge.
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", &format!(
+            r#"{{{EXTRACTION_CONTEXT},"where":[{{"@id":"?r","@type":"doc:Relation","rdf:predicate":"?p","doc:verdict":"?v","doc:asserted":"?a","doc:excerpt":"?x"}}],"select":["?p","?v","?a"],"orderBy":"?v"}}"#
+        )])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""schema:knows",
+    "rejected",
+    false"#))
+        .stdout(predicate::str::contains(r#""schema:worksFor",
+    "repaired",
+    true"#));
+
+    // Same inputs, same model, same gazetteer: nothing to do and no model call.
+    ingest("memos", &[])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("memo.md  unchanged"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // The same ask into a fresh ledger is answered from the extraction cache.
+    ingest("memos2", &[])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 chunk(s) from cache"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // A re-ingest that no longer asserts edges takes the orphaned edge away
+    // with the relation that supported it. The ledger now knows Jane Doe
+    // itself, so the known-entities block, and with it the ask, changed.
+    ingest("memos", &["--relations", "reified", "--force"])
+        .assert()
+        .success();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", &format!(
+            r#"{{{EXTRACTION_CONTEXT},"where":[{{"@id":"?s","schema:worksFor":"?o"}}],"select":["?s","?o"]}}"#
+        )])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(0 rows"));
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", &format!(
+            r#"{{{EXTRACTION_CONTEXT},"where":[{{"@id":"?m","@type":"doc:Mention"}}],"select":["?m"]}}"#
+        )])
+        .assert()
+        .success()
+        // The earlier mentions were retracted; Jane is now known from the
+        // ledger itself, so both her spans are gazetteer hits.
+        .stderr(predicate::str::contains("(4 rows"));
+}
+
+#[test]
+fn doc_ingest_entities_alone_scan_without_a_model_and_model_needs_an_llm() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--entities",
+            "ont/entities.ttl#schema:Organization",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("gazetteer scan only"))
+        .stdout(predicate::str::contains("2 mention(s) of 1 entity (0 new)"));
+
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--model needs a language model"));
+
+    fluree_cmd(&tmp)
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--entities",
+            "nowhere",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nowhere: no such ledger"));
+}
+
+#[test]
+fn doc_ingest_tolerates_a_failed_chunk_and_retries_it_next_run() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    // A model that always fails: the gazetteer half still lands, the
+    // document is written, and it is not stamped as extracted.
+    let (url, calls) = stub_llm_with_status(serde_json::json!({}), 400);
+    let ingest = || {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_DOC_LLM_URL", &url)
+            .env("FLUREE_DOC_LLM_MODEL", "stub")
+            .args([
+                "doc",
+                "ingest",
+                "docs",
+                "-l",
+                "memos",
+                "--model",
+                "ont/model.ttl",
+                "--entities",
+                "ont/entities.ttl",
+            ]);
+        cmd
+    };
+    ingest()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "2 mention(s) of 1 entity (0 new), 1 chunk(s) not extracted",
+        ))
+        .stdout(predicate::str::contains(
+            "extraction incomplete, will be retried next run",
+        ))
+        .stdout(predicate::str::contains(
+            "1 ingested, 0 unchanged, 0 failed",
+        ))
+        .stdout(predicate::str::contains("1 chunk(s) failed"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // Not "unchanged": the chunk is asked about again.
+    ingest()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 chunk(s) not extracted"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
 /// A stub OpenAI-compatible `/embeddings` endpoint. Each input string becomes

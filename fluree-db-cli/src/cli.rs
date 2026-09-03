@@ -3380,6 +3380,7 @@ mod tests {
 }
 
 /// `fluree doc` — documents in, a graph-RAG ledger out.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum DocAction {
     /// Parse documents into a ledger: DoCO structure graph, retrieval chunks,
@@ -3430,7 +3431,8 @@ pub struct DocIngestArgs {
     #[arg(long)]
     pub no_escalate: bool,
 
-    /// Skip building or syncing the vector and full-text indexes
+    /// Skip indexing after the run: the ledger's own index, and the vector
+    /// and full-text indexes
     #[arg(long)]
     pub no_index: bool,
 
@@ -3444,16 +3446,67 @@ pub struct DocIngestArgs {
     pub force: bool,
 
     /// Emit a chunk once its buffer reaches this many characters
-    #[arg(long, default_value_t = 800, value_name = "N")]
+    #[arg(long, default_value_t = 1500, value_name = "N")]
     pub min_chars: usize,
 
     /// Split a single element longer than this many characters
-    #[arg(long, default_value_t = 2000, value_name = "N")]
+    #[arg(long, default_value_t = 4000, value_name = "N")]
     pub max_chars: usize,
 
     /// Most crops one document may send to the vision model
     #[arg(long, default_value_t = 70, value_name = "N")]
     pub max_crops: usize,
+
+    /// Ontology the language model extracts against: a ledger, or a
+    /// `.ttl` / `.jsonld` file. Needs `[doc.llm]` (or a Fluree AI account)
+    #[arg(long, value_name = "LEDGER|FILE")]
+    pub model: Option<String>,
+
+    /// Known entities to find by their labels (`skos:prefLabel`, `skos:altLabel`,
+    /// `skos:hiddenLabel`, `rdfs:label`, `schema:name`): a ledger or a
+    /// `.ttl` / `.jsonld` file, optionally scoped to one class with `#Class`.
+    /// Repeatable. A mention keeps the entity's own IRI
+    #[arg(long, value_name = "LEDGER|FILE[#CLASS]", action = clap::ArgAction::Append)]
+    pub entities: Vec<String>,
+
+    /// What becomes of the relations the language model reports: `direct`
+    /// writes an edge for every predicate the model admits, `reified` keeps
+    /// them as review nodes only, `off` extracts entities alone
+    #[arg(long, value_enum, default_value_t = DocRelationMode::Direct)]
+    pub relations: DocRelationMode,
+
+    /// A file of project priorities placed in the extraction prompt
+    /// (config: `doc.extraction.guidance`)
+    #[arg(long, value_name = "FILE")]
+    pub guidance: Option<PathBuf>,
+
+    /// A file replacing the extraction system prompt; keeps the `{model}`
+    /// and `{guidance}` slots (config: `doc.extraction.system_prompt`)
+    #[arg(long, value_name = "FILE")]
+    pub system_prompt: Option<PathBuf>,
+
+    /// A file replacing the extraction user prompt; keeps the `{existing}`
+    /// and `{document}` slots (config: `doc.extraction.user_prompt`)
+    #[arg(long, value_name = "FILE")]
+    pub user_prompt: Option<PathBuf>,
+
+    /// Chunks sent to the language model at once (config:
+    /// `doc.extraction.concurrency`, default 4)
+    #[arg(long, value_name = "N")]
+    pub concurrency: Option<usize>,
+
+    /// Drop new entities whose class is not in the ontology instead of
+    /// keeping them flagged `doc:offModel` (config: `doc.extraction.drop_off_model`)
+    #[arg(long)]
+    pub drop_off_model: bool,
+
+    /// Language of the documents, for stemming in the entity scan
+    #[arg(long, default_value = "en", value_name = "CODE")]
+    pub lang: String,
+
+    /// Skip entity and relation extraction even when `--model` or `--entities` is given
+    #[arg(long)]
+    pub no_extract: bool,
 
     /// Parse, chunk and embed, then report what would be written — write nothing
     #[arg(long)]
@@ -3462,6 +3515,13 @@ pub struct DocIngestArgs {
     /// Also write each document's transaction as `<relative-path>.jsonld` here
     #[arg(long, value_name = "DIR")]
     pub out_dir: Option<PathBuf>,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocRelationMode {
+    Direct,
+    Reified,
+    Off,
 }
 
 #[derive(Args, Debug)]
@@ -3479,8 +3539,9 @@ pub struct DocSearchArgs {
     pub limit: usize,
 
     /// `vector` embeds the query with `[doc.embedding]` and searches the HNSW
-    /// index; `text` runs BM25; `auto` picks vector when an embedding endpoint
-    /// is configured
+    /// index; `text` runs BM25; `hybrid` runs both and fuses them by
+    /// reciprocal rank; `auto` picks hybrid when both indexes exist and the
+    /// query can be embedded, else whichever there is
     #[arg(long, value_enum, default_value_t = DocSearchMode::Auto)]
     pub mode: DocSearchMode,
 
@@ -3494,4 +3555,5 @@ pub enum DocSearchMode {
     Auto,
     Vector,
     Text,
+    Hybrid,
 }

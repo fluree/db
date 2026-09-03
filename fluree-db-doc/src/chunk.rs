@@ -19,6 +19,18 @@ pub struct Chunk {
     pub text: String,
     /// `@id` of every element that contributed text, in walk order.
     pub source_ids: Vec<String>,
+    /// Where each element's text sits in `text`, so a mention found at a
+    /// character offset can be traced back to the element on the page.
+    pub spans: Vec<ChunkSpan>,
+}
+
+/// One element's contribution to a chunk, as character offsets into
+/// `Chunk::text`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkSpan {
+    pub source_id: String,
+    pub begin: usize,
+    pub end: usize,
 }
 
 impl Chunk {
@@ -34,6 +46,14 @@ impl Chunk {
     pub fn header_path_string(&self) -> String {
         self.header_path.join(" / ")
     }
+
+    /// The element whose text covers character offset `at`.
+    pub fn element_at(&self, at: usize) -> Option<&str> {
+        self.spans
+            .iter()
+            .find(|s| s.begin <= at && at < s.end)
+            .map(|s| s.source_id.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -47,8 +67,8 @@ pub struct ChunkConfig {
 impl Default for ChunkConfig {
     fn default() -> Self {
         Self {
-            min_chars: 800,
-            max_chars: 2000,
+            min_chars: 1500,
+            max_chars: 4000,
         }
     }
 }
@@ -94,7 +114,10 @@ struct WalkState {
     /// The header path when the buffer's first text arrived: a chunk is
     /// labelled by where it starts, not by where the walk was when it filled.
     buffer_headers: Vec<String>,
+    /// Characters in `buffer`; its byte length is what the size limits use.
+    buffer_chars: usize,
     pending_ids: Vec<String>,
+    pending_spans: Vec<ChunkSpan>,
     chunks: Vec<Chunk>,
 }
 
@@ -105,7 +128,9 @@ impl WalkState {
             headers: Vec::new(),
             buffer: String::new(),
             buffer_headers: Vec::new(),
+            buffer_chars: 0,
             pending_ids: Vec::new(),
+            pending_spans: Vec::new(),
             chunks: Vec::new(),
         }
     }
@@ -123,8 +148,16 @@ impl WalkState {
                 self.buffer_headers = self.headers.iter().map(|(_, t)| t.clone()).collect();
             } else {
                 self.buffer.push_str("\n\n");
+                self.buffer_chars += 2;
             }
+            let begin = self.buffer_chars;
             self.buffer.push_str(piece);
+            self.buffer_chars += piece.chars().count();
+            self.pending_spans.push(ChunkSpan {
+                source_id: source_id.to_string(),
+                begin,
+                end: self.buffer_chars,
+            });
             if i == 0 {
                 self.pending_ids.push(source_id.to_string());
             }
@@ -147,10 +180,12 @@ impl WalkState {
         if self.buffer.is_empty() {
             return;
         }
+        self.buffer_chars = 0;
         self.chunks.push(Chunk {
             header_path: std::mem::take(&mut self.buffer_headers),
             text: std::mem::take(&mut self.buffer),
             source_ids: std::mem::take(&mut self.pending_ids),
+            spans: std::mem::take(&mut self.pending_spans),
         });
     }
 }
@@ -339,6 +374,13 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "Hello world.\n\nSecond.");
         assert_eq!(chunks[0].source_ids, vec!["p1", "p2"]);
+        assert_eq!(chunks[0].element_at(0), Some("p1"));
+        assert_eq!(
+            chunks[0].element_at(12),
+            None,
+            "the separator belongs to no element"
+        );
+        assert_eq!(chunks[0].element_at(14), Some("p2"));
         assert!(chunks[0].header_path.is_empty());
     }
 

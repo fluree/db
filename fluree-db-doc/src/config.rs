@@ -108,6 +108,30 @@ impl ModelEndpoint {
     }
 }
 
+/// How extraction is asked and what is kept, per project, so every run
+/// over a corpus makes the same ask. Paths are relative to the project.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ExtractionConfig {
+    /// A file of project priorities, rendered into the system prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
+    /// A file replacing the whole system prompt template; keeps the
+    /// `{model}` and `{guidance}` slots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// A file replacing the whole user prompt template; keeps the
+    /// `{existing}` and `{document}` slots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_prompt: Option<String>,
+    /// Chunks asked about at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<usize>,
+    /// Drop new entities whose class is not in the ontology instead of
+    /// keeping them flagged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop_off_model: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DocConfig {
     /// A configured CLI remote (a Fluree AI stack) whose URL and stored
@@ -121,6 +145,8 @@ pub struct DocConfig {
     pub llm: Option<ModelEndpoint>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vlm: Option<ModelEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction: Option<ExtractionConfig>,
 }
 
 impl DocConfig {
@@ -227,6 +253,7 @@ mod tests {
             embedding: None,
             llm: Some(llm.clone()),
             vlm: None,
+            extraction: None,
         };
         assert_eq!(cfg.crop_reader(), Some(&llm));
     }
@@ -244,6 +271,7 @@ mod tests {
             }),
             llm: None,
             vlm: None,
+            extraction: None,
         }
         .fill_from_gateway("https://stack/v1", "tok");
         let emb = cfg.embedding.unwrap();

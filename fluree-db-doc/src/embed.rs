@@ -6,7 +6,7 @@ use std::time::Duration;
 
 /// Inputs per request. Ollama and OpenAI both take far more, but a modest
 /// batch keeps a single failure cheap to retry.
-const BATCH: usize = 32;
+const BATCH: usize = 64;
 const ATTEMPTS: u32 = 4;
 
 #[derive(Debug, Clone)]

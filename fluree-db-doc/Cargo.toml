@@ -30,6 +30,12 @@ base64 = "0.22"
 thiserror.workspace = true
 tracing.workspace = true
 walkdir.workspace = true
+# Gazetteer scanning: longest whole-word match over every label, plus
+# Snowball stems so "cities" finds "City".
+aho-corasick = "1.1"
+rust-stemmers = "1.2"
+# Downscaling crops that would not fit the gateway's request ceiling.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 tokio = { workspace = true, features = ["time"] }
 
 [lints]

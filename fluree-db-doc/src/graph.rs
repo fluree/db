@@ -21,6 +21,18 @@ pub struct DocumentMeta {
     pub parser_revision: String,
     /// RFC 3339 timestamp of this ingest.
     pub ingested_at: String,
+    /// `min/max` characters the chunker was run with.
+    pub chunking: String,
+}
+
+/// What extraction did to a document, for its node.
+#[derive(Debug, Clone, Default)]
+pub struct ExtractionStamp {
+    pub fingerprint: String,
+    pub model: Option<String>,
+    pub mentions: usize,
+    pub entities: usize,
+    pub relations: usize,
 }
 
 pub fn chunk_iri(doc_iri: &str, index: usize) -> String {
@@ -32,6 +44,7 @@ pub fn document_node(
     meta: &DocumentMeta,
     chunk_count: usize,
     embedding: Option<(&str, usize)>,
+    extraction: Option<&ExtractionStamp>,
 ) -> Value {
     let mut node = json!({
         "@id": meta.doc_iri,
@@ -45,11 +58,21 @@ pub fn document_node(
         vocab::ESCALATED_CROPS: meta.escalated_crops,
         vocab::PARSER_REVISION: meta.parser_revision,
         vocab::CHUNK_COUNT: chunk_count,
+        vocab::CHUNKING: meta.chunking,
         vocab::INGESTED_AT: { "@value": meta.ingested_at, "@type": "xsd:dateTime" },
     });
     if let Some((model, dims)) = embedding {
         node[vocab::EMBEDDING_MODEL] = json!(model);
         node[vocab::EMBEDDING_DIMENSIONS] = json!(dims);
+    }
+    if let Some(x) = extraction {
+        node[vocab::EXTRACTION_FINGERPRINT] = json!(x.fingerprint);
+        if let Some(model) = &x.model {
+            node[vocab::EXTRACTION_MODEL] = json!(model);
+        }
+        node[vocab::MENTION_COUNT] = json!(x.mentions);
+        node[vocab::ENTITY_COUNT] = json!(x.entities);
+        node[vocab::RELATION_COUNT] = json!(x.relations);
     }
     node
 }
@@ -81,9 +104,14 @@ pub fn chunk_nodes(doc_iri: &str, chunks: &[Chunk], embeddings: Option<&[Vec<f32
         .collect()
 }
 
-/// The structure graph, the document node and the chunks as one JSON-LD
-/// transaction under the shared context.
-pub fn transaction(doco_json: &str, document: Value, chunks: Vec<Value>) -> Result<Value> {
+/// The structure graph, the document node, the chunks and whatever
+/// extraction added, as one JSON-LD transaction under the shared context.
+pub fn transaction(
+    doco_json: &str,
+    document: Value,
+    chunks: Vec<Value>,
+    extra: Vec<Value>,
+) -> Result<Value> {
     let doco: Value = serde_json::from_str(doco_json)
         .map_err(|e| DocError::Parse(format!("doco graph is not JSON: {e}")))?;
     let mut graph = match doco.get("@graph") {
@@ -92,6 +120,7 @@ pub fn transaction(doco_json: &str, document: Value, chunks: Vec<Value>) -> Resu
     };
     graph.push(document);
     graph.extend(chunks);
+    graph.extend(extra);
     Ok(json!({
         "@context": vocab::context(),
         "@graph": graph,
@@ -117,18 +146,94 @@ pub fn retract_update(doc_iri: &str) -> String {
 }
 
 /// What an earlier ingest of this document recorded — content hash, parser
-/// revision and embedding model — so an unchanged document can be skipped.
-/// Rows are `[sha256, parserRevision, embeddingModel | null]`.
+/// revision, embedding model, extraction fingerprint and chunking — so an
+/// unchanged document can be skipped. Rows are `[sha256, parserRevision,
+/// embeddingModel | null, extractionFingerprint | null, chunking | null]`.
 pub fn exists_query(doc_iri: &str) -> Value {
     json!({
         "@context": { "doc": vocab::DOC_NS },
         "where": [
             { "@id": doc_iri, vocab::SHA256: "?sha", vocab::PARSER_REVISION: "?rev" },
-            ["optional", { "@id": doc_iri, vocab::EMBEDDING_MODEL: "?model" }]
+            ["optional", { "@id": doc_iri, vocab::EMBEDDING_MODEL: "?model" }],
+            ["optional", { "@id": doc_iri, vocab::EXTRACTION_FINGERPRINT: "?extraction" }],
+            ["optional", { "@id": doc_iri, vocab::CHUNKING: "?chunking" }]
         ],
-        "select": ["?sha", "?rev", "?model"],
+        "select": ["?sha", "?rev", "?model", "?extraction", "?chunking"],
         "limit": 1
     })
+}
+
+/// The edges a previous extraction of this document wrote directly: rows
+/// `[subject, predicate, object]` of its asserted relations. After the
+/// retraction, each is kept only while some other relation still supports
+/// it — see [`relation_support_query`] and [`delete_triple_update`].
+pub fn asserted_triples_query(doc_iri: &str) -> Value {
+    json!({
+        "@context": { "doc": vocab::DOC_NS, "rdf": vocab::RDF_NS, "doc:sourceDocument": { "@type": "@id" } },
+        "where": [{
+            "@id": "?r",
+            "@type": vocab::RELATION,
+            vocab::SOURCE_DOCUMENT: doc_iri,
+            vocab::ASSERTED: true,
+            "rdf:subject": "?s",
+            "rdf:predicate": "?p",
+            "rdf:object": "?o"
+        }],
+        "select": ["?s", "?p", "?o"]
+    })
+}
+
+/// Any remaining asserted relation stating this exact edge.
+pub fn relation_support_query(subject: &str, predicate: &str, object: &str) -> Value {
+    json!({
+        "@context": {
+            "doc": vocab::DOC_NS,
+            "rdf": vocab::RDF_NS,
+            "rdf:subject": { "@type": "@id" },
+            "rdf:predicate": { "@type": "@id" },
+            "rdf:object": { "@type": "@id" }
+        },
+        "where": [{
+            "@id": "?r",
+            "@type": vocab::RELATION,
+            vocab::ASSERTED: true,
+            "rdf:subject": subject,
+            "rdf:predicate": predicate,
+            "rdf:object": object
+        }],
+        "select": ["?r"],
+        "limit": 1
+    })
+}
+
+/// Whether an IRI can be written inside `<…>` in a SPARQL update without
+/// escaping — the RFC 3987 IRIREF exclusions.
+///
+/// Minted IRIs are hex and document IRIs are percent-encoded, but gazetteer
+/// and model IRIs come from operator-supplied files (`--entities`,
+/// `--model`). One carrying `>` would close the brackets and splice extra
+/// triples into a `DELETE DATA` on the target ledger.
+pub fn sparql_iri_safe(iri: &str) -> bool {
+    !iri.is_empty()
+        && !iri.chars().any(|c| {
+            c <= '\u{20}' || matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')
+        })
+}
+
+/// One update retracting every edge given, all full IRIs.
+///
+/// A triple naming an unsafe IRI is skipped rather than escaped: the IRI is
+/// already stored that way, so rewriting it would delete nothing and hide
+/// that it happened. `None` when nothing is left to retract. Callers should
+/// filter with [`sparql_iri_safe`] first so they can report what they
+/// skipped; this is the backstop.
+pub fn delete_triples_update(triples: &[(String, String, String)]) -> Option<String> {
+    let body: Vec<String> = triples
+        .iter()
+        .filter(|(s, p, o)| sparql_iri_safe(s) && sparql_iri_safe(p) && sparql_iri_safe(o))
+        .map(|(s, p, o)| format!("<{s}> <{p}> <{o}> ."))
+        .collect();
+    (!body.is_empty()).then(|| format!("DELETE DATA {{ {} }}", body.join(" ")))
 }
 
 #[cfg(test)]
@@ -141,6 +246,7 @@ mod tests {
             header_path: vec!["A".into(), "B".into()],
             text: "body".into(),
             source_ids: vec!["urn:x/element/1".into()],
+            spans: Vec::new(),
         }];
         let emb = vec![vec![0.5f32, 0.25]];
         let nodes = chunk_nodes("urn:x", &chunks, Some(&emb));
@@ -153,14 +259,61 @@ mod tests {
     #[test]
     fn transaction_merges_graphs() {
         let doco = r#"{"@context":{},"@graph":[{"@id":"e0","@type":"doco:Document"}]}"#;
-        let tx = transaction(doco, json!({"@id":"d"}), vec![json!({"@id":"c0"})]).unwrap();
+        let tx = transaction(
+            doco,
+            json!({"@id":"d"}),
+            vec![json!({"@id":"c0"})],
+            vec![json!({"@id":"m0"})],
+        )
+        .unwrap();
         let ids: Vec<&str> = tx["@graph"]
             .as_array()
             .unwrap()
             .iter()
             .map(|n| n["@id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, vec!["e0", "d", "c0"]);
+        assert_eq!(ids, vec!["e0", "d", "c0", "m0"]);
         assert_eq!(tx["@context"]["doc"], vocab::DOC_NS);
+    }
+
+    #[test]
+    fn delete_triples_update_refuses_an_iri_that_escapes_its_brackets() {
+        let safe = (
+            "urn:fluree:doc:a".to_string(),
+            "https://ex.org/knows".to_string(),
+            "urn:fluree:doc:b".to_string(),
+        );
+        let update = delete_triples_update(std::slice::from_ref(&safe)).expect("one safe triple");
+        assert!(update.contains("<urn:fluree:doc:a> <https://ex.org/knows> <urn:fluree:doc:b> ."));
+
+        // An operator-supplied gazetteer IRI closing the bracket would
+        // otherwise splice a second triple into the DELETE DATA.
+        let injected = (
+            "https://ex.org/x> <https://ex.org/p> <https://ex.org/o> . <urn:victim".to_string(),
+            "https://ex.org/knows".to_string(),
+            "urn:fluree:doc:b".to_string(),
+        );
+        assert!(!sparql_iri_safe(&injected.0));
+        assert_eq!(delete_triples_update(std::slice::from_ref(&injected)), None);
+
+        // A safe triple alongside an unsafe one still retracts.
+        let update = delete_triples_update(&[injected, safe]).expect("the safe triple survives");
+        assert!(!update.contains("urn:victim"));
+        assert_eq!(
+            update.matches(" .").count(),
+            1,
+            "exactly one triple: {update}"
+        );
+    }
+
+    #[test]
+    fn sparql_iri_safe_rejects_the_iriref_exclusions() {
+        assert!(sparql_iri_safe("https://ex.org/a_b-c~1"));
+        assert!(sparql_iri_safe("urn:fluree:doc:folder/file.pdf/chunk/0"));
+        for bad in [
+            "", "a b", "a>b", "a<b", "a\"b", "a{b", "a}b", "a|b", "a^b", "a`b", "a\\b", "a\nb",
+        ] {
+            assert!(!sparql_iri_safe(bad), "should reject {bad:?}");
+        }
     }
 }
