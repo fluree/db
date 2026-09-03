@@ -161,6 +161,12 @@ impl LlmClient {
         // The system prompt travels as a system-role message with string
         // content, not as `instructions`: the Fluree AI gateway forwards the
         // former and drops the latter, and OpenAI accepts both.
+        //
+        // Keep it this way even after the gateway learns to honor
+        // `instructions`. Both shapes are then served, while switching back
+        // silently breaks every client pointed at a proxy that has not been
+        // updated — and the failure is a prompt-less call that still returns
+        // 200, with null subjects and objects in every relation.
         let mut input = Vec::new();
         if let Some(system) = req.system {
             input.push(serde_json::json!({ "role": "system", "content": system }));
