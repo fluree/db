@@ -374,6 +374,38 @@ fn cases() -> Vec<Case> {
             declined: None,
         },
         Case {
+            name: "a compound ORDER BY on required columns pushes a multi-key top-k",
+            sparql: "SELECT ?o ?p ?t FROM <shop-sql:main> WHERE { ?o ex:total ?t ; ex:placed ?p } ORDER BY DESC(?p) ?t LIMIT 2",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", "t0"."placed" AS "c2" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."placed" IS NOT NULL ORDER BY "t0"."placed" DESC, "t0"."total" ASC LIMIT 2"#],
+            rows: &[
+                "o=http://example.org/order/11 p=2024-02-01 t=5.00",
+                "o=http://example.org/order/12 p=2024-03-01 t=42.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a secondary ORDER BY key on the subject keeps LIMIT in the engine",
+            sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { ?o ex:total ?t } ORDER BY DESC(?t) ?o LIMIT 2",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            rows: &[
+                "o=http://example.org/order/10 t=99.50",
+                "o=http://example.org/order/12 t=42.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            // Ada has two orders: a LIMIT pushed with only the primary key
+            // would let the database pick either of them.
+            name: "a secondary ORDER BY key the statement cannot order on keeps LIMIT in the engine",
+            sparql: "SELECT ?o ?n FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?c ex:name ?n } ORDER BY ?n DESC(?o) LIMIT 1",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t1"."id" AS "c1", "t1"."name" AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL"#],
+            rows: &["n=Ada o=http://example.org/order/11"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
             name: "a residual filter keeps LIMIT in the engine",
             sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(STRLEN(?n) > 1) } LIMIT 1",
             sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
@@ -861,6 +893,23 @@ fn aggregate_cases() -> Vec<Case> {
             name: "ORDER BY an aggregate with LIMIT pushes a top-k on the output",
             sparql: "SELECT ?c (COUNT(?o) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c } GROUP BY ?c ORDER BY DESC(?n) LIMIT 1",
             sql: &[r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id" ORDER BY "c1" DESC LIMIT 1"#],
+            rows: &["c=http://example.org/customer/1 n=2"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            // Every total is its own group, so the counts all tie.
+            name: "a compound ORDER BY over an aggregate and a group key pushes a multi-key top-k",
+            sparql: "SELECT ?t (COUNT(?o) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:total ?t } GROUP BY ?t ORDER BY ?n ?t LIMIT 1",
+            sql: &[r#"SELECT "t0"."total" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL GROUP BY "t0"."total" ORDER BY "c1" ASC, "t0"."total" ASC LIMIT 1"#],
+            rows: &["n=1 t=5.00"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a secondary ORDER BY key over a template subject keeps LIMIT in the engine",
+            sparql: "SELECT ?c (COUNT(?o) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c } GROUP BY ?c ORDER BY DESC(?n) ?c LIMIT 1",
+            sql: &[r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
             rows: &["c=http://example.org/customer/1 n=2"],
             routing: Routing::MustFire,
             declined: None,

@@ -32,6 +32,7 @@ use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcom
 use crate::ir::grouping::{AggregateFn, InputSemantics};
 use crate::ir::{GraphName, Pattern, Query};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::sort::SortSpec;
 use crate::var_registry::VarId;
 
 /// Routing stamp site for `MustFire` / `MustNotFire` tests.
@@ -43,8 +44,8 @@ pub struct SqlAggregatePlan {
     inner_patterns: Vec<Pattern>,
     group_by: Vec<VarId>,
     aggregates: Vec<(VarId, AggregateFn)>,
-    /// `(sort var, k, ascending)` when a LIMIT above may be pushed.
-    topk: Option<(VarId, usize, bool)>,
+    /// The complete ORDER BY and k when a LIMIT above may be pushed.
+    topk: Option<(Vec<SortSpec>, usize)>,
 }
 
 /// Structural admission: the fused aggregate's shape (a sole `GRAPH <iri>`
@@ -104,11 +105,10 @@ pub fn detect_sql_block_aggregate(query: &Query) -> Option<SqlAggregatePlan> {
     if query.ordering.iter().any(|s| !outs.contains(&s.var)) {
         return None;
     }
-    let topk = match (query.limit, query.ordering.first(), grouping.having()) {
-        (Some(limit), Some(primary), None) => Some((
-            primary.var,
+    let topk = match (query.limit, grouping.having()) {
+        (Some(limit), None) if !query.ordering.is_empty() => Some((
+            query.ordering.clone(),
             limit.saturating_add(query.offset.unwrap_or(0)),
-            matches!(primary.direction, crate::sort::SortDirection::Ascending),
         )),
         _ => None,
     };
@@ -381,31 +381,33 @@ fn lower_aggregate(
         )
         .collect();
 
-    // A top-k on an aggregate output or a required scalar key.
+    // A top-k over aggregate outputs and required scalar keys. The statement
+    // answers exactly k groups, so the LIMIT goes only with the whole ORDER BY.
     let mut order_by = Vec::new();
     let mut limit = None;
-    if let Some((var, k, asc)) = plan.topk {
-        let key = if let Some(i) = plan.group_by.iter().position(|v| *v == var) {
-            match lowered.order_columns.get(&var) {
-                Some((col, _)) => Some(OrderKey::Col(col.clone())),
-                None => {
-                    let _ = i;
-                    None
-                }
-            }
-        } else {
-            let idx = plan.aggregates.iter().position(|(v, _)| *v == var);
-            idx.and_then(|i| match &decodes[plan.group_by.len() + i] {
-                Decode::Count { name } => Some(OrderKey::Output(name.clone())),
-                Decode::Numeric {
-                    sum, avg: false, ..
-                } => Some(OrderKey::Output(sum.clone())),
-                _ => None,
+    if let Some((ordering, k)) = &plan.topk {
+        let keys: Option<Vec<(OrderKey, bool)>> = ordering
+            .iter()
+            .map(|s| {
+                let key = if plan.group_by.contains(&s.var) {
+                    let (col, _) = lowered.order_columns.get(&s.var)?;
+                    OrderKey::Col(col.clone())
+                } else {
+                    let i = plan.aggregates.iter().position(|(v, _)| *v == s.var)?;
+                    match &decodes[plan.group_by.len() + i] {
+                        Decode::Count { name } => OrderKey::Output(name.clone()),
+                        Decode::Numeric {
+                            sum, avg: false, ..
+                        } => OrderKey::Output(sum.clone()),
+                        _ => return None,
+                    }
+                };
+                Some((key, s.ascending()))
             })
-        };
-        if let Some(key) = key {
-            order_by.push((key, asc));
-            limit = Some(k as u64);
+            .collect();
+        if let Some(keys) = keys {
+            order_by = keys;
+            limit = Some(*k as u64);
         }
     }
 

@@ -9,7 +9,7 @@
 //! `IS [NOT] NULL`, comparisons, `IN`, `NOT (…)` and `OR`; `GROUP BY` with
 //! `HAVING COUNT(*) > n` (the uniqueness probe) or with `COUNT`, `SUM`,
 //! `MIN`, `MAX` select items (`DISTINCT` inside them too); `SELECT DISTINCT`;
-//! `ORDER BY` on one column or output name; `LIMIT`. Anything else answers
+//! `ORDER BY` on columns and output names; `LIMIT`. Anything else answers
 //! with a Trino error naming the statement, so a test fails loudly with the
 //! SQL it sent.
 
@@ -224,7 +224,7 @@ impl FakeSql {
         let mut where_text = None;
         let mut group_by: Option<Vec<Col>> = None;
         let mut having_min_count: Option<usize> = None;
-        let mut order = None;
+        let mut order: Vec<(Col, bool)> = Vec::new();
         let mut limit = None;
         if let Some(r) = rest.strip_prefix("WHERE ") {
             let (w, tail) = cut_clause(r);
@@ -243,8 +243,10 @@ impl FakeSql {
         }
         if let Some(r) = rest.strip_prefix("ORDER BY ") {
             let (o, tail) = cut_clause(r);
-            let (c, dir) = o.rsplit_once(' ').ok_or("ORDER BY without direction")?;
-            order = Some((colref(c), dir == "ASC"));
+            for key in split_top(o, ", ") {
+                let (c, dir) = key.rsplit_once(' ').ok_or("ORDER BY without direction")?;
+                order.push((colref(c), dir == "ASC"));
+            }
             rest = tail;
         }
         if let Some(r) = rest.strip_prefix("LIMIT ") {
@@ -261,23 +263,40 @@ impl FakeSql {
             tuples.retain(|t| pred.eval(t, &resolver));
         }
 
-        // Ordering on a join column happens before grouping/projection;
-        // ordering on an output name happens after.
-        let mut order_output: Option<(String, bool)> = None;
-        if let Some((col, asc)) = &order {
-            match resolver.resolve(col) {
-                Ok((ri, ci)) => {
-                    tuples.sort_by(|a, b| {
-                        let o = cmp_values(&cell(a, ri, ci), &cell(b, ri, ci));
-                        if *asc {
-                            o
-                        } else {
-                            o.reverse()
-                        }
-                    });
-                }
-                Err(_) if col.0.is_none() => order_output = Some((col.1.clone(), *asc)),
-                Err(e) => return Err(e),
+        // Ordering on join columns alone happens before grouping/projection;
+        // a key list naming an output happens after, over the projection.
+        let mut order_output: Vec<(Col, bool)> = Vec::new();
+        if !order.is_empty() {
+            let resolved: Vec<_> = order
+                .iter()
+                .map(|(c, asc)| (c, resolver.resolve(c), *asc))
+                .collect();
+            if let Some((_, Err(e), _)) = resolved
+                .iter()
+                .find(|(c, r, _)| c.0.is_some() && r.is_err())
+            {
+                return Err(e.clone());
+            }
+            if resolved.iter().all(|(_, r, _)| r.is_ok()) {
+                let keys: Vec<((usize, usize), bool)> = resolved
+                    .into_iter()
+                    .map(|(_, r, asc)| (r.unwrap(), asc))
+                    .collect();
+                tuples.sort_by(|a, b| {
+                    keys.iter()
+                        .map(|((ri, ci), asc)| {
+                            let o = cmp_values(&cell(a, *ri, *ci), &cell(b, *ri, *ci));
+                            if *asc {
+                                o
+                            } else {
+                                o.reverse()
+                            }
+                        })
+                        .find(|o| o.is_ne())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            } else {
+                order_output = order.clone();
             }
         }
 
@@ -371,18 +390,36 @@ impl FakeSql {
                 }
             });
         }
-        if let Some((name, asc)) = order_output {
-            let idx = out_cols
+        if !order_output.is_empty() {
+            let keys: Vec<(usize, bool)> = order_output
                 .iter()
-                .position(|(n, _)| *n == name)
-                .ok_or_else(|| format!("ORDER BY unknown output {name}"))?;
+                .map(|(c, asc)| {
+                    let by_name =
+                        c.0.is_none()
+                            .then(|| out_cols.iter().position(|(n, _)| *n == c.1))
+                            .flatten();
+                    let idx = by_name
+                        .or_else(|| {
+                            items
+                                .iter()
+                                .position(|i| matches!(&i.expr, SelectExpr::Col(k) if k == c))
+                        })
+                        .ok_or_else(|| format!("ORDER BY unknown output {}", c.1))?;
+                    Ok((idx, *asc))
+                })
+                .collect::<Result<_, String>>()?;
             data.sort_by(|a, b| {
-                let o = cmp_values(&a[idx], &b[idx]);
-                if asc {
-                    o
-                } else {
-                    o.reverse()
-                }
+                keys.iter()
+                    .map(|(idx, asc)| {
+                        let o = cmp_values(&a[*idx], &b[*idx]);
+                        if *asc {
+                            o
+                        } else {
+                            o.reverse()
+                        }
+                    })
+                    .find(|o| o.is_ne())
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
         }
         if let Some(n) = limit {

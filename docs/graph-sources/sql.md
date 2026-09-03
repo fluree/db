@@ -203,9 +203,11 @@ pushable. In that statement:
 - a `VALUES` block, and bindings the outer query already holds (a ledger
   pattern joined to the block), are sent as a `VALUES` key set so the
   source does the semi-join;
-- `LIMIT` and a single-column `ORDER BY`, in either direction, on a typed,
-  required column are pushed when no residual filter could drop rows
-  afterwards;
+- `LIMIT`, and `ORDER BY … LIMIT` as a top-k, are pushed when no residual
+  filter could drop rows afterwards. The top-k needs every `ORDER BY` key to
+  be a typed, required column (either direction); a key the statement cannot
+  order on, a subject IRI say, keeps the whole `LIMIT` in the engine, because
+  k rows ordered by a prefix of the keys can be the wrong k among ties;
 - a `SELECT DISTINCT` directly over the block is `SELECT DISTINCT` over the
   columns of the projected variables (plus what the join and any residual
   filter read), where the dialect's string equality is byte equality; the
@@ -223,8 +225,9 @@ pushable. In that statement:
   datatype of the mapping's `rr:datatype`, and string keys, `COUNT DISTINCT`
   of strings and `MIN`/`MAX` of strings are pushed only where the dialect
   compares bytes. `HAVING`, `ORDER BY` and `LIMIT` run in the engine over
-  the grouped rows; an `ORDER BY` on an aggregate with a `LIMIT` and no
-  `HAVING` is offered to the statement as a top-k. Any residual filter, a
+  the grouped rows; an `ORDER BY` over aggregates and required group keys
+  with a `LIMIT` and no `HAVING` is pushed as a top-k, again only when every
+  key can be ordered on. Any residual filter, a
   `SUM`/`AVG` over a column whose SQL type does not match its datatype, or
   an aggregate over an IRI template declines to the engine's grouping.
 

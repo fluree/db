@@ -3778,25 +3778,15 @@ pub(crate) fn apply_solution_modifiers(
                 (Some(limit), None) => limit,
                 _ => 0,
             };
-            // PR-5 / item 8 (F-AUD-6): offer the primary sort key + k to the
-            // row-preserving scan below, so a single-column `ORDER BY <scan col>
-            // LIMIT k` over an R2RML scan can read only the files that can hold the
-            // top-k. DESC is offered for any scalar column; ASC is offered too but
-            // the scan honors it ONLY when the column is REQUIRED (non-nullable) —
-            // SPARQL orders unbound values FIRST under ASC, so a nullable column
-            // could hide an unread top-k row (the provider re-checks). The scan
-            // honors either direction ONLY if the key resolves to a single scalar
-            // scan column, else no-op. Pure optimization — this `SortOperator`
-            // remains the authority for the exact (compound) order + LIMIT.
-            // Both directions are offered; the R2RML scan applies its own
-            // FLUREE_R2RML_TOPK_ASC gate in `set_topk`, the SQL pushdown lane
-            // orders only on required columns and takes either.
+            // PR-5 / item 8 (F-AUD-6): offer the ORDER BY + k to the
+            // row-preserving source below. The R2RML scan uses the primary key
+            // to read only the files that can hold the top-k (a superset under
+            // ties; this `SortOperator` remains the authority for the exact
+            // compound order + LIMIT), and applies its own FLUREE_R2RML_TOPK_ASC
+            // gate in `set_topk`. The SQL pushdown lane answers exactly k rows,
+            // so it pushes the LIMIT only when it can order on every key.
             if can_topk {
-                if let Some(primary) = ordering.first() {
-                    use crate::sort::SortDirection;
-                    let ascending = matches!(primary.direction, SortDirection::Ascending);
-                    operator.set_topk(primary.var, k, ascending);
-                }
+                operator.set_topk(ordering, k);
             }
             let mut sort_op = if can_topk {
                 SortOperator::new_topk(operator, ordering.to_vec(), k)
@@ -3891,8 +3881,13 @@ mod tests {
                 Ok(None)
             }
             fn close(&mut self) {}
-            fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
-                *self.recorded.lock().unwrap() = Some((sort_var, k, ascending));
+            fn set_topk(&mut self, ordering: &[crate::sort::SortSpec], k: usize) {
+                let primary = &ordering[0];
+                *self.recorded.lock().unwrap() = Some((
+                    primary.var,
+                    k,
+                    matches!(primary.direction, crate::sort::SortDirection::Ascending),
+                ));
             }
         }
 
@@ -3951,8 +3946,13 @@ mod tests {
                 Ok(None)
             }
             fn close(&mut self) {}
-            fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
-                *self.recorded.lock().unwrap() = Some((sort_var, k, ascending));
+            fn set_topk(&mut self, ordering: &[crate::sort::SortSpec], k: usize) {
+                let primary = &ordering[0];
+                *self.recorded.lock().unwrap() = Some((
+                    primary.var,
+                    k,
+                    matches!(primary.direction, crate::sort::SortDirection::Ascending),
+                ));
             }
         }
 

@@ -59,10 +59,10 @@ impl Operator for ProjectOperator {
         self.child.set_row_budget(budget);
     }
 
-    fn set_topk(&mut self, sort_var: crate::var_registry::VarId, k: usize, ascending: bool) {
+    fn set_topk(&mut self, ordering: &[crate::sort::SortSpec], k: usize) {
         // Projection is row- and order-preserving, so a top-k directive passes
         // straight through to the scan below (mirrors `set_row_budget`).
-        self.child.set_topk(sort_var, k, ascending);
+        self.child.set_topk(ordering, k);
     }
 
     fn set_distinct(&mut self, vars: &[crate::var_registry::VarId]) {

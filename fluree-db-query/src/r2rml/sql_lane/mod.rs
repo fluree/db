@@ -37,6 +37,7 @@ use crate::ir::{GraphName, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::policy::R2rmlPolicyGate;
 use crate::r2rml::{ColumnBatchStream, PushdownCapabilities};
+use crate::sort::SortSpec;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
@@ -69,7 +70,7 @@ pub struct SqlBlockOperator {
     schema: Arc<[VarId]>,
     state: OperatorState,
     row_budget: Option<usize>,
-    topk: Option<(VarId, usize, bool)>,
+    topk: Option<(Vec<SortSpec>, usize)>,
     /// The variables a `DISTINCT` directly above reads.
     distinct: Option<Vec<VarId>>,
     /// After open: the source, or the fallback.
@@ -115,8 +116,8 @@ impl SqlBlockOperator {
         if let Some(b) = self.row_budget {
             op.set_row_budget(b);
         }
-        if let Some((v, k, asc)) = self.topk {
-            op.set_topk(v, k, asc);
+        if let Some((ordering, k)) = &self.topk {
+            op.set_topk(ordering, *k);
         }
         Box::new(op)
     }
@@ -275,8 +276,8 @@ impl Operator for SqlBlockOperator {
         self.row_budget = Some(budget);
     }
 
-    fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
-        self.topk = Some((sort_var, k, ascending));
+    fn set_topk(&mut self, ordering: &[SortSpec], k: usize) {
+        self.topk = Some((ordering.to_vec(), k));
     }
 
     fn set_distinct(&mut self, vars: &[VarId]) {
@@ -324,7 +325,7 @@ impl Operator for SqlBlockOperator {
                     Arc::clone(&self.schema),
                     resolved,
                     self.row_budget,
-                    self.topk,
+                    self.topk.clone(),
                 ))
             }
         };
@@ -398,7 +399,7 @@ struct SqlBlockSource {
     schema: Arc<[VarId]>,
     resolved: Resolved,
     row_budget: Option<usize>,
-    topk: Option<(VarId, usize, bool)>,
+    topk: Option<(Vec<SortSpec>, usize)>,
     state: OperatorState,
     /// Rows waiting to be batched, tagged with the branch that produced
     /// them so the branch's residual filters run over a homogeneous batch.
@@ -415,7 +416,7 @@ impl SqlBlockSource {
         schema: Arc<[VarId]>,
         resolved: Resolved,
         row_budget: Option<usize>,
-        topk: Option<(VarId, usize, bool)>,
+        topk: Option<(Vec<SortSpec>, usize)>,
     ) -> Self {
         let out_pos = schema.iter().enumerate().map(|(i, v)| (*v, i)).collect();
         Self {
@@ -465,11 +466,21 @@ impl SqlBlockSource {
         let mut order_by = Vec::new();
         let mut limit = None;
         if lowered.limit_is_exact {
-            match self.topk {
-                Some((var, k, asc)) => {
-                    if let Some((col, _)) = lowered.order_columns.get(&var) {
-                        order_by.push((OrderKey::Col(col.clone()), asc));
-                        limit = Some(k as u64);
+            match &self.topk {
+                // The statement answers exactly k rows, so the LIMIT goes only
+                // with the whole ORDER BY: a prefix of the keys would pick a
+                // different k among ties on the primary key.
+                Some((ordering, k)) => {
+                    let keys: Option<Vec<(OrderKey, bool)>> = ordering
+                        .iter()
+                        .map(|s| {
+                            let (col, _) = lowered.order_columns.get(&s.var)?;
+                            Some((OrderKey::Col(col.clone()), s.ascending()))
+                        })
+                        .collect();
+                    if let Some(keys) = keys {
+                        order_by = keys;
+                        limit = Some(*k as u64);
                     }
                 }
                 None => {

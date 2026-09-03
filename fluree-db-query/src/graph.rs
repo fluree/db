@@ -51,6 +51,7 @@ use crate::r2rml::{
     r2rml_unsupported_pattern_error, rewrite_patterns_for_r2rml, unsupported_subscope_error,
 };
 use crate::seed::{BatchSeedOperator, SeedOperator};
+use crate::sort::SortSpec;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -111,7 +112,7 @@ pub struct GraphOperator {
     /// top-k row from partition p is among p's k largest, so the global top-k is a
     /// subset of the union of the per-partition results (the authoritative sort
     /// above re-selects the exact k).
-    topk: Option<(VarId, usize, bool)>,
+    topk: Option<(Vec<SortSpec>, usize)>,
     /// Plan-time decision: seed the enumerated graph variable into the inner
     /// subplan. True only when the inner patterns bind the graph var in EVERY
     /// solution (required top-level triple / property path / slice-free
@@ -355,8 +356,8 @@ impl GraphOperator {
         if let Some(budget) = self.row_budget {
             inner.set_row_budget(budget);
         }
-        if let Some((sort_var, k, ascending)) = self.topk {
-            inner.set_topk(sort_var, k, ascending);
+        if let Some((ordering, k)) = &self.topk {
+            inner.set_topk(ordering, *k);
         }
         // Rebuild-boundary memory accounting (D1): this correlated inner subplan is
         // rebuilt per parent row/batch and is genuinely dropped at the end of this
@@ -548,8 +549,8 @@ impl GraphOperator {
         if let Some(budget) = self.row_budget {
             inner.set_row_budget(budget);
         }
-        if let Some((sort_var, k, ascending)) = self.topk {
-            inner.set_topk(sort_var, k, ascending);
+        if let Some((ordering, k)) = &self.topk {
+            inner.set_topk(ordering, *k);
         }
         // Rebuild-boundary memory accounting (D1): this correlated inner subplan is
         // rebuilt per parent row/batch and is genuinely dropped at the end of this
@@ -672,11 +673,11 @@ impl Operator for GraphOperator {
         self.row_budget = Some(budget);
     }
 
-    fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
+    fn set_topk(&mut self, ordering: &[SortSpec], k: usize) {
         // Record the top-k directive; threaded into the per-parent inner subplan
         // (like `row_budget`). NOT forwarded to `self.child` (the parent seed is
         // not the scan). Per-partition top-k is sound (see the field doc).
-        self.topk = Some((sort_var, k, ascending));
+        self.topk = Some((ordering.to_vec(), k));
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {

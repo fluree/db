@@ -38,6 +38,7 @@ use crate::ir::triple::TriplePattern;
 use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::inline::{extend_schema, InlineOperator};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::sort::SortSpec;
 use crate::temporal_mode::TemporalMode;
 use crate::var_registry::VarId;
 
@@ -318,7 +319,7 @@ pub struct DatasetOperator {
     /// T1.3: an `ORDER BY … LIMIT` top-k directive, applied per member like
     /// `row_budget`. Per-member top-k is sound — the outer sort merges the members'
     /// partial top-k into the global one.
-    topk: Option<(VarId, usize, bool)>,
+    topk: Option<(Vec<SortSpec>, usize)>,
 }
 
 impl DatasetOperator {
@@ -347,8 +348,8 @@ impl DatasetOperator {
         if let Some(budget) = self.row_budget {
             member.set_row_budget(budget);
         }
-        if let Some((sort_var, k, ascending)) = self.topk {
-            member.set_topk(sort_var, k, ascending);
+        if let Some((ordering, k)) = &self.topk {
+            member.set_topk(ordering, *k);
         }
     }
 
@@ -509,13 +510,13 @@ impl Operator for DatasetOperator {
         }
     }
 
-    fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
+    fn set_topk(&mut self, ordering: &[SortSpec], k: usize) {
         // T1.3: record ORDER BY … LIMIT top-k; applied per member like the row
         // budget. Per-member top-k is sound — the outer sort merges the members'
         // partial top-k into the global one (same reasoning as `GraphOperator`'s
         // per-partition top-k). Switch-gated.
         if crate::r2rml::dataset_budget_enabled() {
-            self.topk = Some((sort_var, k, ascending));
+            self.topk = Some((ordering.to_vec(), k));
         }
     }
 
@@ -860,8 +861,13 @@ mod tests {
         fn set_row_budget(&mut self, budget: usize) {
             *self.budget.lock().unwrap() = Some(budget);
         }
-        fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
-            *self.topk.lock().unwrap() = Some((sort_var, k, ascending));
+        fn set_topk(&mut self, ordering: &[SortSpec], k: usize) {
+            let primary = &ordering[0];
+            *self.topk.lock().unwrap() = Some((
+                primary.var,
+                k,
+                matches!(primary.direction, crate::sort::SortDirection::Ascending),
+            ));
         }
     }
 
@@ -931,7 +937,7 @@ mod tests {
     #[tokio::test]
     async fn dataset_forwards_topk_to_member() {
         let (mut op, (_budget, topk)) = recorder_dataset();
-        op.set_topk(VarId(3), 5, false);
+        op.set_topk(&[SortSpec::desc(VarId(3))], 5);
         open_and_drain(&mut op).await;
         assert_eq!(*topk.lock().unwrap(), Some((VarId(3), 5, false)));
     }

@@ -8,6 +8,7 @@ pub mod inline;
 use crate::binding::Batch;
 use crate::context::ExecutionContext;
 use crate::error::Result;
+use crate::sort::SortSpec;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -100,17 +101,17 @@ pub trait Operator: Send + Sync {
     /// never inside fused per-row/per-group loops (hot-loop purity).
     fn set_row_budget(&mut self, _budget: usize) {}
 
-    /// Offer a scan-side top-k directive (PR-5; ASC added in item 8, F-AUD-6): a
-    /// single-column `ORDER BY <sort_var> LIMIT k` sits directly above a
-    /// row-preserving operator chain down to a single R2RML scan. `ascending` is
-    /// the sort direction (`false` = DESC). Default no-op; only the R2RML scan
-    /// honors it (and only when `sort_var` resolves to a scalar scan column — for
-    /// ASC, also a required/non-nullable column). Order-preserving pass-through
-    /// operators forward it to their child so it reaches the scan. It is a pure
-    /// optimization — a scan may then read only the files that can hold the top-k —
-    /// and never changes results (the `Sort` above is authoritative). Set
-    /// **before** `open()`.
-    fn set_topk(&mut self, _sort_var: VarId, _k: usize, _ascending: bool) {}
+    /// Offer a source-side top-k directive: `ORDER BY <ordering> LIMIT k` (`k`
+    /// = LIMIT + OFFSET) sits directly above a row-preserving operator chain
+    /// down to a single source. `ordering` is the complete ORDER BY. Default
+    /// no-op. The R2RML scan reads the primary key alone and skips only the
+    /// files that cannot hold the top-k, which stays a superset under ties, so
+    /// the `Sort` above remains authoritative (for ASC it also requires a
+    /// non-nullable column, since SPARQL orders unbound first). A source that
+    /// answers *exactly* k rows (the SQL pushdown lane) must order on every
+    /// key or leave the LIMIT to the engine. Order-preserving pass-through
+    /// operators forward it to their child. Set **before** `open()`.
+    fn set_topk(&mut self, _ordering: &[SortSpec], _k: usize) {}
 
     /// Tell a source that a `DISTINCT` over exactly `vars` sits directly above
     /// it (through row-preserving operators only), so it may return each

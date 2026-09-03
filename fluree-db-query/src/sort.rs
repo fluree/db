@@ -161,6 +161,11 @@ impl SortSpec {
         }
     }
 
+    /// `true` for an ascending key.
+    pub fn ascending(&self) -> bool {
+        matches!(self.direction, SortDirection::Ascending)
+    }
+
     /// Create a descending sort specification
     pub fn desc(var: VarId) -> Self {
         Self {
