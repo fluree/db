@@ -2044,6 +2044,43 @@ impl FlureeBuilder {
         self
     }
 
+    /// Override index garbage-collection retention. `None` leaves a setting at its
+    /// default; order relative to [`Self::with_indexing_thresholds`] does not
+    /// matter, since each preserves the other's half of the config.
+    ///
+    /// `hard_max_old_indexes` is the one that actually bounds disk.
+    /// `max_old_indexes` and `min_time_mins` are ANDed, so under a fast publish
+    /// rate the age guard always wins and the count target bounds nothing:
+    /// retention becomes "however many versions fit inside the guard", which is
+    /// unbounded in bytes because it scales with publish rate and index size.
+    pub fn with_gc_settings(
+        mut self,
+        max_old_indexes: Option<u32>,
+        min_time_mins: Option<u32>,
+        hard_max_old_indexes: Option<u32>,
+    ) -> Self {
+        let existing = self.indexing_config.take();
+        let index_config = existing
+            .as_ref()
+            .map(|c| c.index_config.clone())
+            .unwrap_or_else(server_defaults::default_index_config);
+        let mut indexer_config = existing.map(|c| c.indexer_config).unwrap_or_default();
+        if let Some(v) = max_old_indexes {
+            indexer_config.gc_max_old_indexes = v;
+        }
+        if let Some(v) = min_time_mins {
+            indexer_config.gc_min_time_mins = v;
+        }
+        if hard_max_old_indexes.is_some() {
+            indexer_config.gc_hard_max_old_indexes = hard_max_old_indexes;
+        }
+        self.indexing_config = Some(IndexingBuilderConfig {
+            indexer_config,
+            index_config,
+        });
+        self
+    }
+
     /// Set novelty backpressure thresholds without enabling background indexing.
     ///
     /// Use this for short-lived processes (CLI, one-shot scripts) that need
