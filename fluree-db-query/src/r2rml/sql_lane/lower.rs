@@ -31,6 +31,7 @@ use crate::error::Result;
 use crate::ir::expression::Function;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Pattern};
+use crate::r2rml::policy::{derived_type_map, static_classes, Verdict};
 use crate::var_registry::VarId;
 
 /// Why the lane declined; logged at debug so a `MustNotFire` test can name it.
@@ -173,9 +174,9 @@ struct Block {
     binds: Vec<(VarId, Expression)>,
 }
 
-/// Per-`(triples map, predicate)` view-policy verdict: `Some(true)` allowed,
-/// `Some(false)` denied, `None` not decidable statically (the lane declines).
-pub(crate) type PolicyVerdict<'a> = &'a mut dyn FnMut(&TriplesMap, &str) -> Result<Option<bool>>;
+/// Per-`(triples map, predicate)` view-policy verdict; `None` when not
+/// decidable before the rows are read (the lane declines).
+pub(crate) type PolicyVerdict<'a> = &'a mut dyn FnMut(&TriplesMap, &str) -> Result<Option<Verdict>>;
 
 pub(crate) struct LowerInput<'a> {
     pub patterns: &'a [Pattern],
@@ -334,13 +335,6 @@ impl<'a> Lowerer<'a> {
             };
             let mut accesses: Vec<(String, &'a TriplesMap)> = Vec::new();
             for (tm, member_idxs) in parts {
-                for i in &member_idxs {
-                    match self.allowed(tm, &members[*i].0)? {
-                        Some(true) => {}
-                        Some(false) => return Ok(Ok(None)),
-                        None => return Ok(Err(Decline("policy not static"))),
-                    }
-                }
                 let alias = match accesses.iter().find(|(_, a)| same_row(a, tm)) {
                     Some((alias, _)) => alias.clone(),
                     None => {
@@ -354,9 +348,39 @@ impl<'a> Lowerer<'a> {
                         alias
                     }
                 };
+                for i in &member_idxs {
+                    match self.allowed(tm, &members[*i].0)? {
+                        Some(Verdict::Allow) => {}
+                        Some(Verdict::Deny) => return Ok(Ok(None)),
+                        Some(Verdict::ByClass { classes, otherwise }) => {
+                            match self.policy_pred(&alias, tm, &classes, otherwise) {
+                                Ok(Ok(Some(pred))) => self.place_pred(pred),
+                                Ok(Ok(None)) => {}
+                                Ok(Err(Empty)) => return Ok(Ok(None)),
+                                Err(d) => return Ok(Err(d)),
+                            }
+                        }
+                        None => return Ok(Err(Decline("policy not static"))),
+                    }
+                }
                 for i in member_idxs {
                     let (pred, obj) = &members[i];
                     if pred == rdf::TYPE {
+                        // A class the map derives from a column is a value
+                        // of that column.
+                        let Obj::Iri(class) = obj else { continue };
+                        if static_classes(tm).iter().any(|c| c == class) {
+                            continue;
+                        }
+                        match self.class_value(&alias, tm, class) {
+                            Ok(Some((col, value))) => self.place_pred(Pred::Cmp {
+                                col,
+                                op: CmpOp::Eq,
+                                value,
+                            }),
+                            Ok(None) => return Ok(Ok(None)),
+                            Err(d) => return Ok(Err(d)),
+                        }
                         continue;
                     }
                     match self.bind_member(&alias, tm, pred, obj, &required_subjects, false) {
@@ -558,11 +582,112 @@ impl<'a> Lowerer<'a> {
         })))
     }
 
-    fn allowed(&mut self, tm: &TriplesMap, pred: &str) -> Result<Option<bool>> {
+    fn allowed(&mut self, tm: &TriplesMap, pred: &str) -> Result<Option<Verdict>> {
         match self.policy.as_mut() {
             Some(verdict) => verdict(tm, pred),
-            None => Ok(Some(true)),
+            None => Ok(Some(Verdict::Allow)),
         }
+    }
+
+    /// The column of `tm`'s derived `rdf:type` and the value that yields
+    /// `class` from it: `None` when no value can (the IRI is outside the
+    /// template), a decline when the template cannot be reversed or the
+    /// column's type cannot be keyed.
+    fn class_value(
+        &self,
+        alias: &str,
+        tm: &TriplesMap,
+        class: &str,
+    ) -> Lowering<Option<(ColRef, Literal)>> {
+        let Some(om) = derived_type_map(tm) else {
+            return decline("column-derived rdf:type with a class constraint");
+        };
+        let (column, raw) = match om {
+            ObjectMap::Column {
+                column, term_type, ..
+            } => {
+                if *term_type != TermType::Iri {
+                    return Ok(None);
+                }
+                (column.clone(), class.to_string())
+            }
+            ObjectMap::Template {
+                template,
+                term_type,
+                ..
+            } => {
+                if *term_type != TermType::Iri {
+                    return Ok(None);
+                }
+                let prefix = template.split('{').next().unwrap_or_default();
+                if !class.starts_with(prefix) {
+                    return Ok(None);
+                }
+                match reverse_subject_template(template, class).as_deref() {
+                    Some([(column, value)]) => (column.clone(), value.clone()),
+                    _ => return decline("rdf:type template cannot be reversed"),
+                }
+            }
+            _ => return decline("column-derived rdf:type with a class constraint"),
+        };
+        let col = ColRef::new(alias, &column);
+        match self.field_type(&col) {
+            None | Some(FieldType::String) => {}
+            Some(FieldType::Int32 | FieldType::Int64) => {
+                if raw.parse::<i64>().is_err() {
+                    return Ok(None);
+                }
+            }
+            _ => return decline("rdf:type column type cannot be keyed"),
+        }
+        Ok(Some((col, Literal::TemplateKey(raw))))
+    }
+
+    /// A [`Verdict::ByClass`] as a predicate on the class column of `tm`'s
+    /// access `alias`: rows of a denied class drop out (a row without a
+    /// class keeps `otherwise`), or only rows of an allowed class stay.
+    /// `Empty` when no row can pass.
+    fn policy_pred(
+        &self,
+        alias: &str,
+        tm: &TriplesMap,
+        classes: &[(String, bool)],
+        otherwise: bool,
+    ) -> Lowering<std::result::Result<Option<Pred>, Empty>> {
+        let mut col = None;
+        let (mut allowed, mut denied) = (Vec::new(), Vec::new());
+        for (class, ok) in classes {
+            let Some((c, value)) = self.class_value(alias, tm, class)? else {
+                continue; // no row of this map carries the class
+            };
+            col = Some(c);
+            if *ok { &mut allowed } else { &mut denied }.push(value);
+        }
+        let Some(col) = col else {
+            return Ok(if otherwise { Ok(None) } else { Err(Empty) });
+        };
+        Ok(Ok(Some(if otherwise {
+            if denied.is_empty() {
+                return Ok(Ok(None));
+            }
+            Pred::Or(vec![
+                Pred::IsNull(col.clone()),
+                Pred::Not(Box::new(Pred::Cmp {
+                    col,
+                    op: CmpOp::In,
+                    value: Literal::Set(denied),
+                })),
+            ])
+        } else {
+            if allowed.is_empty() {
+                return Ok(Err(Empty));
+            }
+            Pred::Cmp {
+                col,
+                op: CmpOp::In,
+                value: Literal::Set(allowed),
+            }
+        })))
     }
 
     fn new_access(&mut self, tm: &TriplesMap) -> String {
@@ -660,25 +785,25 @@ impl<'a> Lowerer<'a> {
                     Obj::Iri(c) => c,
                     _ => return decline("rdf:type object is not an IRI"),
                 };
-                if self
-                    .mapping
-                    .triples_maps
-                    .values()
-                    .any(|tm| !super::super::policy::derived_type_columns(tm).is_empty())
-                {
-                    return decline("column-derived rdf:type with a class constraint");
+                // A map deriving `rdf:type` from a column provides the class
+                // when the column can hold its value; a derivation the lane
+                // cannot key (several maps, a multi-column template) could
+                // provide any class, so it declines.
+                let mut found: Vec<&'a TriplesMap> = Vec::new();
+                for tm in &candidates {
+                    let derived = !super::super::policy::derived_type_columns(tm).is_empty();
+                    if static_classes(tm).iter().any(|c| c == class) {
+                        found.push(tm);
+                    } else if derived {
+                        if derived_type_map(tm).is_none() {
+                            return decline("column-derived rdf:type with a class constraint");
+                        }
+                        if self.class_value("t", tm, class)?.is_some() {
+                            found.push(tm);
+                        }
+                    }
                 }
-                providers.push(
-                    candidates
-                        .iter()
-                        .copied()
-                        .filter(|tm| {
-                            super::super::policy::static_classes(tm)
-                                .iter()
-                                .any(|c| c == class)
-                        })
-                        .collect(),
-                );
+                providers.push(found);
             } else {
                 providers.push(
                     candidates
@@ -1209,9 +1334,11 @@ impl<'a> Lowerer<'a> {
                     .allowed(tm, pred)
                     .map_err(|_| Decline("policy error"))?
                 {
-                    Some(true) => {}
-                    Some(false) => continue, // hidden: the variable stays unbound
-                    None => return decline("policy not static"),
+                    Some(Verdict::Allow) => {}
+                    Some(Verdict::Deny) => continue, // hidden: the variable stays unbound
+                    // Hidden per row: the column would have to be nulled
+                    // by a predicate, which no statement here expresses.
+                    Some(Verdict::ByClass { .. }) | None => return decline("policy not static"),
                 }
                 match self.bind_member(&alias, tm, pred, obj, required_subjects, true) {
                     Ok(Ok(None)) => {}
@@ -1233,9 +1360,9 @@ impl<'a> Lowerer<'a> {
                 .allowed(tm, pred)
                 .map_err(|_| Decline("policy error"))?
             {
-                Some(true) => {}
-                Some(false) => return Ok(()),
-                None => return decline("policy not static"),
+                Some(Verdict::Allow) => {}
+                Some(Verdict::Deny) => return Ok(()),
+                Some(Verdict::ByClass { .. }) | None => return decline("policy not static"),
             }
         }
         let alias = self.new_access(tm);

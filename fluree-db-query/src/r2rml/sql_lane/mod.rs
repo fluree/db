@@ -35,7 +35,7 @@ use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcom
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::{GraphName, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
-use crate::r2rml::policy::R2rmlPolicyGate;
+use crate::r2rml::policy::{R2rmlPolicyGate, Verdict};
 use crate::r2rml::{ColumnBatchStream, PushdownCapabilities};
 use crate::sort::SortSpec;
 use crate::temporal_mode::PlanningContext;
@@ -207,10 +207,10 @@ pub(super) async fn resolve_block(
         },
     };
     let mut verdict =
-        |tm: &fluree_db_r2rml::mapping::TriplesMap, pred: &str| -> Result<Option<bool>> {
+        |tm: &fluree_db_r2rml::mapping::TriplesMap, pred: &str| -> Result<Option<Verdict>> {
             Ok(match &verdicts {
-                None => Some(true),
-                Some(v) => v.get(&(tm.iri.clone(), pred.to_string())).copied(),
+                None => Some(Verdict::Allow),
+                Some(v) => v.get(&(tm.iri.clone(), pred.to_string())).cloned(),
             })
         };
     let mut schemas: HashMap<RelSource, Arc<BatchSchema>> = HashMap::new();

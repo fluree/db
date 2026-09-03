@@ -227,7 +227,11 @@ pushable. In that statement:
   `UNION` expanding to more than eight branch combinations declines;
 - a constant subject or object IRI is reversed through its template into
   key predicates; a key that cannot be a value of its column (`order/abc`
-  over a `bigint`) makes the block empty without a round trip;
+  over a `bigint`) makes the block empty without a round trip. A class a
+  map derives from a column (`?p a <…/kind/staff>`) is reversed the same
+  way into a predicate on that column, and a class the template cannot
+  produce empties the block. (The per-scan lane cannot answer a
+  column-derived class constraint yet, so that shape has no fallback);
 - a `VALUES` block, and bindings the outer query already holds (a ledger
   pattern joined to the block), are sent as a `VALUES` key set so the
   source does the semi-join. Once the outer side has grown past one key
@@ -412,7 +416,15 @@ moment. Consequently
   expansion and stored policies through a `--model` ledger; `f:query` fails
   closed). See [Access policy](iceberg.md#access-policy). The pushdown lane
   prunes the mapping before it builds its statement, so a hidden column is
-  never selected; the per-scan lane enforces after the rows come back.
+  never selected; the per-scan lane enforces after the rows come back. An
+  `f:onClass` policy over a map that derives `rdf:type` from one column
+  (`rr:template "…/kind/{kind}"` or an `rr:column` IRI map) is decided per
+  targeted class and pushed as a predicate on that column: rows of a denied
+  class drop out (`"kind" IS NULL OR NOT ("kind" IN ('staff'))`, a row
+  without a class keeping the default), or only rows of an allowed class stay
+  (`"kind" IN ('guest')`). A subject-targeted policy, a map deriving classes
+  from several columns or maps, and a policy on an `OPTIONAL` member of such
+  a map still leave the block to the per-scan lane.
 
 ## Running the bridge
 

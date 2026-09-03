@@ -74,6 +74,27 @@ fn vp_mapping(prefix: &str) -> String {
     VP_R2RML.replace("shop.", prefix)
 }
 
+fn typed_mapping(prefix: &str) -> String {
+    TYPED_R2RML.replace("shop.", prefix)
+}
+
+/// `rdf:type` derived from a column (one class per person), no `rr:class`.
+const TYPED_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.people" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate rdf:type ;
+            rr:objectMap [ rr:template "http://example.org/kind/{kind}" ; rr:termType rr:IRI ]
+        ] ;
+        rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+"#;
+
 const VP_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
     @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
@@ -142,6 +163,16 @@ async fn shop() -> MockServer {
             vec![
                 vec![json!(1), json!("ada@example.org")],
                 vec![json!(3), json!("cy@example.org")],
+            ],
+        ))
+        .table(Table::new(
+            "shop.people",
+            &[("id", "bigint"), ("kind", "varchar"), ("name", "varchar")],
+            vec![
+                vec![json!(1), json!("staff"), json!("Ada")],
+                vec![json!(2), json!("guest"), json!("Bo")],
+                vec![json!(3), json!("staff"), json!("Cy")],
+                vec![json!(4), Value::Null, json!("Di")],
             ],
         ))
         .table(Table::new(
@@ -214,6 +245,14 @@ async fn setup() -> (MockServer, Fluree) {
         ))
         .await
         .expect("create partitioned sql source");
+    fluree
+        .create_sql_graph_source(SqlCreateConfig::new(
+            "shop-typed",
+            server.uri(),
+            typed_mapping("shop."),
+        ))
+        .await
+        .expect("create typed sql source");
     (server, fluree)
 }
 
@@ -1134,6 +1173,161 @@ async fn outer_bindings_become_a_key_set() {
     assert_eq!(rows, vec!["n=Ada tier=gold", "n=Cy tier=silver"]);
 }
 
+/// A class a map derives from a column is a value of that column: the
+/// constraint is a predicate on it, and a class the template cannot
+/// produce empties the block without a round trip. Lane-only: the per-scan
+/// lane matches a constant class against `rr:class` alone and answers this
+/// shape with no rows (tracked separately), so it is no oracle here.
+#[tokio::test]
+async fn a_column_derived_class_constrains_the_column() {
+    let _lock = KILL_SWITCH.lock().await;
+    let (server, fluree) = setup().await;
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(
+        &query(
+            &fluree,
+            &format!("{PREFIX}SELECT ?n ?p FROM <shop-typed:main> WHERE {{ ?p a <http://example.org/kind/staff> ; ex:name ?n }}"),
+        )
+        .await,
+    );
+    assert_eq!(
+        rows,
+        vec![
+            "n=Ada p=http://example.org/person/1",
+            "n=Cy p=http://example.org/person/3"
+        ]
+    );
+    assert_eq!(
+        block_statements(&server).await[before..],
+        [r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."people" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."kind" = 'staff' AND "t0"."name" IS NOT NULL"#.to_string()]
+    );
+
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(
+        &query(
+            &fluree,
+            &format!(
+                "{PREFIX}SELECT ?n FROM <shop-typed:main> WHERE {{ ?p a ex:Nobody ; ex:name ?n }}"
+            ),
+        )
+        .await,
+    );
+    assert!(rows.is_empty(), "{rows:?}");
+    assert_eq!(
+        block_statements(&server).await.len(),
+        before,
+        "no round trip"
+    );
+}
+
+/// A class policy over a map deriving `rdf:type` from a column is decided
+/// per targeted class and pushed as a predicate on that column, where the
+/// lane used to decline the whole block. The per-scan lane, enforcing per
+/// row, is the oracle.
+#[tokio::test]
+async fn class_policy_on_a_derived_type_pushes_a_predicate() {
+    let _lock = KILL_SWITCH.lock().await;
+    let (server, fluree) = setup().await;
+    let context = json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"});
+    let on_class = |allow: bool, class: &str| {
+        json!([{
+            "@id": "http://example.org/p", "@type": "f:AccessPolicy", "f:action": "f:view",
+            "f:allow": allow, "f:onClass": [{"@id": class}]
+        }])
+    };
+    let run = |policy: Value, default_allow: bool, r#where: Value, oracle: bool| {
+        let fluree = &fluree;
+        let context = context.clone();
+        async move {
+            let q = json!({
+                "@context": context,
+                "from": "shop-typed:main",
+                "opts": {"policy": policy, "default-allow": default_allow},
+                "select": ["?n"],
+                "where": r#where,
+            });
+            let lane = fluree
+                .query_from()
+                .jsonld(&q)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("policy query failed: {e}"));
+            if oracle {
+                set_fast_paths_disabled(true);
+                let scan = fluree
+                    .query_from()
+                    .jsonld(&q)
+                    .execute_formatted()
+                    .await
+                    .unwrap_or_else(|e| panic!("policy query failed: {e}"));
+                set_fast_paths_disabled(false);
+                assert_eq!(lane, scan, "scan lane disagrees");
+            }
+            lane
+        }
+    };
+    let names = json!({"@id": "?p", "ex:name": "?n"});
+
+    // Denied class: its rows drop out, rows without a class keep the default.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        on_class(false, "http://example.org/kind/staff"),
+        true,
+        names.clone(),
+        true,
+    )
+    .await;
+    assert_eq!(rows, json!([["Bo"], ["Di"]]), "{rows}");
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert_eq!(
+        sent,
+        vec![r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."people" AS "t0" WHERE "t0"."id" IS NOT NULL AND (("t0"."kind" IS NULL) OR (NOT ("t0"."kind" IN ('staff')))) AND "t0"."name" IS NOT NULL"#.to_string()]
+    );
+
+    // Allowed class under a deny default: only its rows stay.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        on_class(true, "http://example.org/kind/guest"),
+        false,
+        names.clone(),
+        true,
+    )
+    .await;
+    assert_eq!(rows, json!([["Bo"]]), "{rows}");
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert_eq!(
+        sent,
+        vec![r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."people" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."kind" IN ('guest') AND "t0"."name" IS NOT NULL"#.to_string()]
+    );
+
+    // A denied class the block also asks for: nothing can pass, decided in
+    // the statement (lane-only: the per-scan lane cannot answer a derived
+    // class constraint, see `a_column_derived_class_constrains_the_column`).
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        on_class(false, "http://example.org/kind/staff"),
+        true,
+        json!({"@id": "?p", "@type": "http://example.org/kind/staff", "ex:name": "?n"}),
+        false,
+    )
+    .await;
+    assert_eq!(rows, json!([]), "{rows}");
+    assert_eq!(block_statements(&server).await.len(), before + 1);
+
+    // A class no policy names leaves the verdict static: no predicate.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        on_class(false, "http://example.org/Customer"),
+        true,
+        names,
+        true,
+    )
+    .await;
+    assert_eq!(rows, json!([["Ada"], ["Bo"], ["Cy"], ["Di"]]), "{rows}");
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert!(!sent[0].contains("kind"), "{}", sent[0]);
+}
+
 /// Outer bindings above the provider's key-set row cap go out as several
 /// statements; a `VALUES` or `IN` list inside the block above the cap is
 /// not pushed at all (the block still runs on the lane, the list in the
@@ -1609,6 +1803,7 @@ const CUSTOMER_ROWS: &str =
 /// letters (`Émile`, which code-point order puts last).
 const PROFILE_ROWS: &str =
     "INSERT INTO profiles VALUES (1, 'ada@example.org'), (3, 'cy@example.org')";
+const PEOPLE_ROWS: &str = "INSERT INTO people VALUES (1, 'staff', 'Ada'), (2, 'guest', 'Bo'), (3, 'staff', 'Cy'), (4, NULL, 'Di')";
 const WORD_ROWS: &str = "INSERT INTO words VALUES (1, 'Ada', 3), (2, 'ada', 3), (3, 'Bo', 2), (4, 'Bo ', 3), (5, 'Émile', 5)";
 /// `tags` is keyed by a string column, so its subjects are minted from
 /// values a collation would merge.
@@ -1624,14 +1819,17 @@ const SQLITE: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS tags",
         "DROP TABLE IF EXISTS events",
         "DROP TABLE IF EXISTS profiles",
+        "DROP TABLE IF EXISTS people",
         "CREATE TABLE customers (id INTEGER, name TEXT, country TEXT)",
         "CREATE TABLE profiles (id INTEGER, email TEXT)",
+        "CREATE TABLE people (id INTEGER, kind TEXT, name TEXT)",
         "CREATE TABLE orders (id INTEGER, customer_id INTEGER, total NUMERIC, placed DATE, shipped TIMESTAMP, updated TIMESTAMP)",
         "CREATE TABLE words (id INTEGER, word TEXT, len INTEGER)",
         "CREATE TABLE tags (tag TEXT, n INTEGER)",
         "CREATE TABLE events (id INTEGER, at_tz TIMESTAMP, at_local TIMESTAMP)",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
+        PEOPLE_ROWS,
         "INSERT INTO orders VALUES \
             (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00', '2024-01-06 09:30:00'), \
             (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00', '2024-02-02 18:00:00'), \
@@ -1661,14 +1859,17 @@ const POSTGRES: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS tags",
         "DROP TABLE IF EXISTS events",
         "DROP TABLE IF EXISTS profiles",
+        "DROP TABLE IF EXISTS people",
         "CREATE TABLE customers (id BIGINT, name TEXT, country TEXT)",
         "CREATE TABLE profiles (id BIGINT, email TEXT)",
+        "CREATE TABLE people (id BIGINT, kind TEXT, name TEXT)",
         "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total NUMERIC(10,2), placed DATE, shipped TIMESTAMPTZ, updated TIMESTAMP)",
         "CREATE TABLE words (id BIGINT, word TEXT, len INTEGER)",
         "CREATE TABLE tags (tag TEXT, n INTEGER)",
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMPTZ, at_local TIMESTAMP)",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
+        PEOPLE_ROWS,
         "INSERT INTO orders VALUES \
             (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00'), \
             (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00'), \
@@ -1691,14 +1892,17 @@ const MYSQL: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS tags",
         "DROP TABLE IF EXISTS events",
         "DROP TABLE IF EXISTS profiles",
+        "DROP TABLE IF EXISTS people",
         "CREATE TABLE customers (id BIGINT, name VARCHAR(64), country VARCHAR(64))",
         "CREATE TABLE profiles (id BIGINT, email VARCHAR(64))",
+        "CREATE TABLE people (id BIGINT, kind VARCHAR(64), name VARCHAR(64))",
         "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total DECIMAL(10,2), placed DATE, shipped TIMESTAMP NULL, updated DATETIME)",
         "CREATE TABLE words (id BIGINT, word VARCHAR(64), len INT)",
         "CREATE TABLE tags (tag VARCHAR(64), n INT)",
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMP NULL, at_local DATETIME)",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
+        PEOPLE_ROWS,
         "INSERT INTO orders VALUES \
             (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00'), \
             (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00'), \
@@ -1769,6 +1973,10 @@ struct LiveCase {
     only: &'static [SqlDialect],
     sent: &'static [(SqlDialect, Sent)],
 }
+
+/// Live cases the per-scan lane cannot answer (it has no column-derived
+/// classes), so their rows are pinned without the oracle.
+const LANE_ONLY_LIVE: &[&str] = &["a column-derived class constrains the column"];
 
 fn live_cases() -> Vec<LiveCase> {
     use SqlDialect::{Mysql, Postgres, Sqlite};
@@ -1940,6 +2148,17 @@ fn live_cases() -> Vec<LiveCase> {
         // A filter on a naive column pushes a ±14h window rendered naive, so
         // the server's zone never enters; SQLite's text timestamps get
         // whole-day bounds, which order right with either time separator.
+        LiveCase {
+            name: "a column-derived class constrains the column",
+            sparql: "SELECT ?n FROM <shop-typed-live:main> WHERE { ?p a <http://example.org/kind/staff> ; ex:name ?n }",
+            rows: &["n=Ada", "n=Cy"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("\"kind\" = 'staff'")),
+                (Postgres, Sent::Contains("\"kind\" = 'staff'")),
+                (Mysql, Sent::Contains("`kind` = BINARY 'staff'")),
+            ],
+        },
         LiveCase {
             name: "a filter on a naive column pushes a window and the engine keeps the exact rows",
             sparql: "SELECT ?e FROM <shop-live:main> WHERE { ?e ex:atLocal ?t FILTER(?t > \"2024-01-10T00:00:00Z\"^^xsd:dateTime) }",
@@ -2148,18 +2367,25 @@ async fn live_differential(backend: &LiveBackend) {
         .create_sql_graph_source(source)
         .await
         .expect("create live sql source");
-    let mut partitioned = SqlCreateConfig::new("shop-vp-live", url, vp_mapping(""));
+    let mut partitioned = SqlCreateConfig::new("shop-vp-live", url.clone(), vp_mapping(""));
     partitioned.dialect = backend.dialect;
     fluree
         .create_sql_graph_source(partitioned)
         .await
         .expect("create live partitioned sql source");
+    let mut typed = SqlCreateConfig::new("shop-typed-live", url, typed_mapping(""));
+    typed.dialect = backend.dialect;
+    fluree
+        .create_sql_graph_source(typed)
+        .await
+        .expect("create live typed sql source");
 
     let mut failures: Vec<String> = Vec::new();
     for c in cases().into_iter().chain(aggregate_cases()) {
         let sparql = format!("{PREFIX}{}", c.sparql)
             .replace("shop-sql:main", "shop-live:main")
-            .replace("shop-vp:main", "shop-vp-live:main");
+            .replace("shop-vp:main", "shop-vp-live:main")
+            .replace("shop-typed:main", "shop-typed-live:main");
         let (lane_rows, sent) = lane_run(&fluree, &sparql, c.name).await;
         let declines = backend.declines.contains(&c.name);
         match (&c.routing, c.sql.is_empty()) {
@@ -2246,6 +2472,9 @@ async fn live_differential(backend: &LiveBackend) {
                 "{}: lane rows {lane_rows:?} differ from the pinned rows {:?} [sent: {sent:?}]",
                 c.name, c.rows
             ));
+        }
+        if LANE_ONLY_LIVE.contains(&c.name) {
+            continue;
         }
         let scan_rows = scan_run(&fluree, &sparql).await;
         if lane_rows != scan_rows {
