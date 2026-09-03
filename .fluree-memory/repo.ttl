@@ -2426,6 +2426,33 @@ mem:constraint-01m1m5ar785b6stsnntn8q7eq1 a mem:Constraint ;
     mem:createdAt "2026-09-03T17:33:40.968413+00:00"^^xsd:dateTime ;
     mem:rationale "The bridge accepts bodies up to 2 MB; the lane's promise is that a decline costs only performance, never a failed query." .
 
+mem:constraint-01m1mc97h8yzpgmgbgcdf8k61k a mem:Constraint ;
+    mem:content "A dateTime filter on a timestamp column with no zone may only push a naive ±14h window (UTC-12..UTC+14 bounds the offset) with the exact filter kept in the engine; on SQLite the bounds must be whole-day date strings, because text timestamps with a 'T' separator sort above ' ' within a day and a time-of-day bound would drop rows." ;
+    mem:tag "r2rml" ;
+    mem:tag "sql-pushdown" ;
+    mem:tag "sqlite" ;
+    mem:tag "timestamp" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-query/src/r2rml/sql_lane/lower.rs" ;
+    mem:artifactRef "fluree-db-sql/src/dialect.rs" ;
+    mem:branch "feature/sql-pushdown-lane-m1" ;
+    mem:createdAt "2026-09-03T19:35:11.144202+00:00"^^xsd:dateTime ;
+    mem:rationale "The engine reads a naive column as UTC; a widening window is sound for any writer zone, a tighter one is not. Verified live on SQLite, Postgres and MySQL." .
+
+mem:decision-01m1mc9g44ynan6vh8w0c4tmd2 a mem:Decision ;
+    mem:content "The SQL pushdown lane fetches a block whole and hash-joins in memory only when the outer side has passed one key set (2000 rows) and a COUNT(*) probe says the block has at most 100k rows and no more than 4 rows per outer row seen so far; otherwise every outer batch stays a seeded key-set statement." ;
+    mem:tag "join" ;
+    mem:tag "performance" ;
+    mem:tag "r2rml" ;
+    mem:tag "sql-pushdown" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/r2rml/sql_lane/mod.rs" ;
+    mem:branch "feature/sql-pushdown-lane-m1" ;
+    mem:createdAt "2026-09-03T19:35:19.940607+00:00"^^xsd:dateTime ;
+    mem:rationale "Measured on the 1M-row Postgres shop: a seeded key costs ~7.6µs, a fetched row ~1.4µs. Caching 100k customers for a 5k VALUES lost (83 vs 38ms); for 50k it won (177 vs 380ms). The unbounded COUNT costs ~15ms on 1M rows (#1784)." ;
+    mem:alternatives "always cache below an absolute cap (lost on small outers); LIMIT-probe fetch (transfers up to the cap in the losing case)" .
+
 mem:fact-01m1m5ammqn2g4r89jkrqnc1yf a mem:Fact ;
     mem:content "Vertically partitioned R2RML mappings (members of one entity split across triples maps sharing the subject template) were silently empty on BOTH lanes: the per-scan star loop fused members no single map covered (F10), and the SQL lane's single-map resolution found no candidate. Both fixed 2026-09-03: the rewrite refuses to fuse an uncovered star (separate scans joined on subject) and the SQL lane resolves one access per distinct table joined on key columns. Residual: a predicate two maps both mint answers once per map on the scan lane (duplicates), so the SQL lane declines that ambiguous shape rather than pick a multiplicity." ;
     mem:tag "f10" ;
@@ -2438,6 +2465,20 @@ mem:fact-01m1m5ammqn2g4r89jkrqnc1yf a mem:Fact ;
     mem:artifactRef "fluree-db-query/src/r2rml/sql_lane/lower.rs" ;
     mem:branch "feature/sql-pushdown-lane-m1" ;
     mem:createdAt "2026-09-03T17:33:37.303298+00:00"^^xsd:dateTime .
+
+mem:fact-01m1mc9r2y0h50byff01dcat6s a mem:Fact ;
+    mem:content "The per-scan R2RML lane has no column-derived rdf:type support in queries: a constant class matches tm.classes() (rr:class) only and ?s a ?t emits rr:class only, so a class constraint on a map with rr:template/rr:column rdf:type answers no rows silently (#1780). The SQL pushdown lane answers it (kind = 'staff'), so that shape cannot use the scan lane as its differential oracle. The policy gate, by contrast, does derive row classes." ;
+    mem:tag "iceberg" ;
+    mem:tag "oracle" ;
+    mem:tag "r2rml" ;
+    mem:tag "rdf-type" ;
+    mem:tag "sql-pushdown" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/r2rml/operator.rs" ;
+    mem:artifactRef "fluree-db-query/src/r2rml/policy.rs" ;
+    mem:artifactRef "fluree-db-query/src/r2rml/rewrite.rs" ;
+    mem:branch "feature/sql-pushdown-lane-m1" ;
+    mem:createdAt "2026-09-03T19:35:28.094496+00:00"^^xsd:dateTime .
 
 mem:fact-01kxtrxpq07vr4vbgybyk3e0p8 a mem:Fact ;
     mem:content "KB UNWIND OOM class: value-only Cypher rel binding lowers to OPTIONAL{EdgeAnnotation}; on reified ledgers without annotation_index (bulk import AND full reindex both write annotation_index: None) the chain ran per row driving from f:reifiesPredicate ≈25ms/row, matching field 35s-LIMIT-20/OOM. Fix: AnnotationValueOptionalBuilder — 3 set-wise f:reifies* planned scans hash-indexed ONCE per query run (Mutex-cached across required batches) + per-row lookups. Verified at customer scale: 54.6k rows 35s→1.1s, no OOM. Also: hash-join lane admits single-source DefaultGraphSource; arena probe takes per-row var predicate; reifies* structural selectivities in estimator. Non-annotated scale was already ~0.4s." ;
