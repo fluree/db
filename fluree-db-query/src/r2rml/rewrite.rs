@@ -373,12 +373,11 @@ pub fn rewrite_patterns_for_r2rml(
     // `class_filter`, which constrains TriplesMap resolution to the class and
     // removes the separate class operator's correlated re-scan.
     //
-    // Fusing is unconditional, which assumes some single TriplesMap covers all
-    // members: required members split across template-sharing maps yield zero
-    // star rows (materialization is per-map — no cross-map member join), where
-    // a per-member plan would subject-join them. Recorded as F10 in
-    // `04-findings-register.md`; the fix is to refuse to fuse when no map
-    // covers every member.
+    // Fusing assumes some single TriplesMap covers all members (materialization
+    // is per map, with no cross-map member join), so a star no map covers —
+    // required members split across template-sharing maps, F10 in
+    // `04-findings-register.md` — keeps its members as separate scans the
+    // engine joins on the subject.
     // W4-1b: const-object members whose subject has a co-located crawl wildcard are
     // folded onto that wildcard as star_constraints AFTER the class-fusion loop
     // below, so W4-1's pushdown prunes the crawl scan instead of reading the whole
@@ -430,6 +429,27 @@ pub fn rewrite_patterns_for_r2rml(
                 result_patterns.push(Pattern::R2rml(m));
             }
             continue;
+        }
+
+        if let Some(m) = mapping {
+            let preds: Vec<&str> = var_members
+                .iter()
+                .chain(&const_members)
+                .filter_map(|p| p.predicate_filter.as_deref())
+                .collect();
+            let covered = m.triples_maps.values().any(|tm| {
+                preds.iter().all(|pred| {
+                    tm.predicate_object_maps
+                        .iter()
+                        .any(|pom| pom.predicate_map.as_constant() == Some(pred))
+                })
+            });
+            if !covered {
+                for m in var_members.into_iter().chain(const_members) {
+                    result_patterns.push(Pattern::R2rml(m));
+                }
+                continue;
+            }
         }
 
         let star_constraints: Vec<(String, ObjectConstant)> = const_members
@@ -1967,6 +1987,66 @@ mod tests {
             base.class_prune_hint, None,
             "overlapping subject templates ⇒ pruning unsound ⇒ hint refused"
         );
+    }
+
+    // F10: members split across maps sharing the subject template. No single
+    // map covers the star, so fusing would materialize no row; the members stay
+    // separate scans the engine joins on the subject.
+    #[test]
+    fn star_no_map_covers_is_not_fused() {
+        const COUNTRY: &str = "http://example.org/country";
+        let names = TriplesMap::new("#Names", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(PRED, "name"));
+        let countries = TriplesMap::new("#Countries", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(COUNTRY, "country"));
+        let mapping = CompiledR2rmlMapping::new(vec![names, countries]);
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let star = |pred: &str, obj: u16| {
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(pred.into()),
+                Term::Var(VarId(obj)),
+            ))
+        };
+        let rewrite = |patterns: &[Pattern]| -> Vec<R2rmlPattern> {
+            rewrite_patterns_for_r2rml(patterns, "gs:main", &snapshot, Some(&mapping), false, false)
+                .patterns
+                .into_iter()
+                .filter_map(|p| match p {
+                    Pattern::R2rml(rp) => Some(rp),
+                    _ => None,
+                })
+                .collect()
+        };
+        let split = rewrite(&[star(PRED, 1), star(COUNTRY, 2)]);
+        assert_eq!(split.len(), 2, "one scan per map, joined on the subject");
+        assert!(split.iter().all(|p| p.star_bindings.is_empty()));
+
+        // A star one map does cover still fuses.
+        let names2 = TriplesMap::new("#Names", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(PRED, "name"))
+            .with_predicate_object(pom(COUNTRY, "country"));
+        let mapping = CompiledR2rmlMapping::new(vec![names2]);
+        let fused: Vec<R2rmlPattern> = rewrite_patterns_for_r2rml(
+            &[star(PRED, 1), star(COUNTRY, 2)],
+            "gs:main",
+            &snapshot,
+            Some(&mapping),
+            false,
+            false,
+        )
+        .patterns
+        .into_iter()
+        .filter_map(|p| match p {
+            Pattern::R2rml(rp) => Some(rp),
+            _ => None,
+        })
+        .collect();
+        assert_eq!(fused.len(), 1, "one map covers both members");
+        assert_eq!(fused[0].star_bindings.len(), 1);
     }
 
     // ---- PR-F20: RefObjectMap-target resolution prune (invariants A + B) ----

@@ -206,6 +206,12 @@ pushable. In that statement:
   widened are simply dropped from the pushed predicate. A widened filter is
   a residual, so a `LIMIT` above it stays in the engine and a grouped query
   over it declines;
+- an entity whose members come from **several triples maps sharing its
+  subject** (a vertically partitioned mapping: one map per column group, or
+  per table, over the same `rr:template`) is one access per distinct table,
+  joined on the subject's key columns; maps over the same table and subject
+  share a single access. Every member must have exactly one providing map
+  when no map provides them all, or the block is left to the engine;
 - a constant subject or object IRI is reversed through its template into
   key predicates; a key that cannot be a value of its column (`order/abc`
   over a `bigint`) makes the block empty without a round trip;

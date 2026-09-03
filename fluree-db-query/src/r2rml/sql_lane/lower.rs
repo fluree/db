@@ -50,9 +50,12 @@ pub(crate) enum TermSource {
     Subject {
         alias: String,
     },
-    /// Object map `pom` of the triples map behind `alias`.
+    /// Object map `pom` of triples map `tm_iri`, read from the row of
+    /// `alias` (a map sharing the access's table and subject, when not the
+    /// access's own).
     Object {
         alias: String,
+        tm_iri: String,
         pom: usize,
     },
     Constant(RdfTerm),
@@ -317,60 +320,81 @@ impl<'a> Lowerer<'a> {
                 SubjRef::Iri(_) => None,
             })
             .collect();
-        let mut entity_alias: HashMap<usize, String> = HashMap::new();
+        // An entity whose members split across triples maps sharing its
+        // subject (vertical partitioning) is one access per distinct row
+        // source, joined on the subject's key columns; maps over the same
+        // table and subject share one access.
+        let mut entity_accesses: HashMap<usize, Vec<(String, &'a TriplesMap)>> = HashMap::new();
         let mut pending_refs: Vec<RefEdge> = Vec::new();
         for (idx, (subject, members)) in entities.iter().enumerate() {
-            let tm = match self.resolve_tm(members, None) {
-                Ok(Ok(tm)) => tm,
+            let parts = match self.resolve_parts(members, None) {
+                Ok(Ok(parts)) => parts,
                 Ok(Err(Empty)) => return Ok(Ok(None)),
                 Err(d) => return Ok(Err(d)),
             };
-            for (pred, _) in members {
-                match self.allowed(tm, pred)? {
-                    Some(true) => {}
-                    Some(false) => return Ok(Ok(None)),
-                    None => return Ok(Err(Decline("policy not static"))),
+            let mut accesses: Vec<(String, &'a TriplesMap)> = Vec::new();
+            for (tm, member_idxs) in parts {
+                for i in &member_idxs {
+                    match self.allowed(tm, &members[*i].0)? {
+                        Some(true) => {}
+                        Some(false) => return Ok(Ok(None)),
+                        None => return Ok(Err(Decline("policy not static"))),
+                    }
+                }
+                let alias = match accesses.iter().find(|(_, a)| same_row(a, tm)) {
+                    Some((alias, _)) => alias.clone(),
+                    None => {
+                        let alias = self.new_access(tm);
+                        match self.bind_subject(&alias, tm, subject, false) {
+                            Ok(Ok(())) => {}
+                            Ok(Err(Empty)) => return Ok(Ok(None)),
+                            Err(d) => return Ok(Err(d)),
+                        }
+                        accesses.push((alias.clone(), tm));
+                        alias
+                    }
+                };
+                for i in member_idxs {
+                    let (pred, obj) = &members[i];
+                    if pred == rdf::TYPE {
+                        continue;
+                    }
+                    match self.bind_member(&alias, tm, pred, obj, &required_subjects, false) {
+                        Ok(Ok(Some(edge))) => pending_refs.push(edge),
+                        Ok(Ok(None)) => {}
+                        Ok(Err(Empty)) => return Ok(Ok(None)),
+                        Err(d) => return Ok(Err(d)),
+                    }
                 }
             }
-            let alias = self.new_access(tm);
-            entity_alias.insert(idx, alias.clone());
-            match self.bind_subject(&alias, tm, subject, false) {
-                Ok(Ok(())) => {}
-                Ok(Err(Empty)) => return Ok(Ok(None)),
-                Err(d) => return Ok(Err(d)),
-            }
-            for (pred, obj) in members {
-                if pred == rdf::TYPE {
-                    continue;
-                }
-                match self.bind_member(&alias, tm, pred, obj, &required_subjects, false) {
-                    Ok(Ok(Some(edge))) => pending_refs.push(edge),
-                    Ok(Ok(None)) => {}
-                    Ok(Err(Empty)) => return Ok(Ok(None)),
-                    Err(d) => return Ok(Err(d)),
-                }
-            }
+            entity_accesses.insert(idx, accesses);
         }
         // Deferred foreign-key edges to entities that got their alias later.
         for (child_alias, conds, parent_tm_iri, var) in pending_refs {
             let target = entities
                 .iter()
                 .position(|(s, _)| matches!(s, SubjRef::Var(v) if *v == var))
-                .and_then(|i| entity_alias.get(&i).cloned());
-            let Some(parent_alias) = target else {
+                .and_then(|i| entity_accesses.get(&i));
+            let Some(accesses) = target else {
                 return Ok(Err(Decline("ref target entity missing")));
             };
-            let parent_tm = self
-                .accesses
-                .iter()
-                .find(|a| a.alias == parent_alias)
-                .map(|a| a.tm_iri.clone())
-                .unwrap_or_default();
-            if parent_tm != parent_tm_iri {
-                // The object's triples map is not the one the FK points at:
-                // no row of the child can join a row of that entity.
-                return Ok(Ok(None));
-            }
+            let Some(parent) = self.mapping.get(&parent_tm_iri) else {
+                return Ok(Err(Decline("ref object map parent missing")));
+            };
+            // The parent columns are on the parent map's table: join the
+            // entity's access over that table and subject, which need not
+            // be the parent map itself.
+            let parent_alias = match accesses.iter().find(|(_, tm)| same_row(tm, parent)) {
+                Some((alias, _)) => alias.clone(),
+                None if accesses.iter().any(|(_, tm)| same_subject(tm, parent)) => {
+                    return Ok(Err(Decline(
+                        "ref object map parent on a table the entity does not access",
+                    )));
+                }
+                // Another subject: no row of the child can join a row of
+                // that entity.
+                None => return Ok(Ok(None)),
+            };
             for (child_col, parent_col) in conds {
                 self.edges.push((
                     child_alias.clone(),
@@ -599,16 +623,37 @@ impl<'a> Lowerer<'a> {
     }
 
     /// The single triples map every member of an entity resolves to.
+    /// The one triples map providing every member, for an entity that
+    /// must be a single access.
     fn resolve_tm(
         &self,
         members: &[(String, Obj)],
         only: Option<&'a TriplesMap>,
     ) -> Lowering<std::result::Result<&'a TriplesMap, Empty>> {
+        match self.resolve_parts(members, only)? {
+            Ok(parts) => match parts.as_slice() {
+                [(tm, _)] => Ok(Ok(tm)),
+                _ => decline("optional entity spans several triples maps"),
+            },
+            Err(Empty) => Ok(Err(Empty)),
+        }
+    }
+
+    /// The triples maps an entity's members come from, each with the
+    /// members (by index) it provides: one map providing everything, or a
+    /// vertical partition where every member has exactly one provider and
+    /// the providers mint the same subject.
+    fn resolve_parts(
+        &self,
+        members: &[(String, Obj)],
+        only: Option<&'a TriplesMap>,
+    ) -> Lowering<std::result::Result<Vec<Part<'a>>, Empty>> {
         let mut candidates: Vec<&'a TriplesMap> = match only {
             Some(tm) => vec![tm],
             None => self.mapping.triples_maps.values().collect(),
         };
         candidates.sort_by(|a, b| a.iri.cmp(&b.iri));
+        let mut providers: Vec<Vec<&'a TriplesMap>> = Vec::with_capacity(members.len());
         for (pred, obj) in members {
             if pred == rdf::TYPE {
                 let class = match obj {
@@ -623,20 +668,82 @@ impl<'a> Lowerer<'a> {
                 {
                     return decline("column-derived rdf:type with a class constraint");
                 }
-                candidates.retain(|tm| {
-                    super::super::policy::static_classes(tm)
+                providers.push(
+                    candidates
                         .iter()
-                        .any(|c| c == class)
-                });
+                        .copied()
+                        .filter(|tm| {
+                            super::super::policy::static_classes(tm)
+                                .iter()
+                                .any(|c| c == class)
+                        })
+                        .collect(),
+                );
             } else {
-                candidates.retain(|tm| pom_for(tm, pred).is_some());
+                providers.push(
+                    candidates
+                        .iter()
+                        .copied()
+                        .filter(|tm| pom_for(tm, pred).is_some())
+                        .collect(),
+                );
             }
         }
-        match candidates.len() {
-            0 => Ok(Err(Empty)),
-            1 => Ok(Ok(candidates[0])),
-            _ => decline("entity spans several triples maps"),
+        let whole: Vec<&'a TriplesMap> = candidates
+            .iter()
+            .copied()
+            .filter(|tm| providers.iter().all(|p| p.iter().any(|c| c.iri == tm.iri)))
+            .collect();
+        match whole.as_slice() {
+            [tm] => return Ok(Ok(vec![(tm, (0..members.len()).collect())])),
+            [] => {}
+            _ => return decline("entity spans several triples maps"),
         }
+        let mut parts: Vec<Part<'a>> = Vec::new();
+        let mut classes: Vec<usize> = Vec::new();
+        for (i, p) in providers.iter().enumerate() {
+            if members[i].0 == rdf::TYPE {
+                classes.push(i);
+                continue;
+            }
+            match p.as_slice() {
+                [] => return Ok(Err(Empty)),
+                [tm] => match parts.iter_mut().find(|(t, _)| t.iri == tm.iri) {
+                    Some((_, idxs)) => idxs.push(i),
+                    None => parts.push((tm, vec![i])),
+                },
+                _ => return decline("predicate provided by several triples maps"),
+            }
+        }
+        // A class comes with any part's map that declares it; otherwise it
+        // is a part of its own (a type-only access on the shared subject).
+        for i in classes {
+            let p = &providers[i];
+            if let Some((_, idxs)) = parts
+                .iter_mut()
+                .find(|(t, _)| p.iter().any(|c| c.iri == t.iri))
+            {
+                idxs.push(i);
+                continue;
+            }
+            match p.as_slice() {
+                [] => return Ok(Err(Empty)),
+                [tm] => parts.push((tm, vec![i])),
+                _ => return decline("class declared by several triples maps"),
+            }
+        }
+        if parts.iter().any(|(tm, _)| {
+            let sm = &tm.subject_map;
+            sm.template.is_none() && sm.column.is_none()
+        }) {
+            return decline("entity spans triples maps with a constant subject");
+        }
+        // Different subjects never name one entity (the lane joins by key
+        // columns, never by rendered IRI): no row can carry every member.
+        if parts.iter().any(|(tm, _)| !same_subject(parts[0].0, tm)) {
+            return Ok(Err(Empty));
+        }
+        Ok(Ok(parts))
     }
 
     /// The key shape of a template over `cols`, declined when a column's
@@ -831,6 +938,7 @@ impl<'a> Lowerer<'a> {
         let om = &tm.predicate_object_maps[pom_idx].object_map;
         let term = TermSource::Object {
             alias: alias.to_string(),
+            tm_iri: tm.iri.clone(),
             pom: pom_idx,
         };
         match om {
@@ -1627,8 +1735,9 @@ impl<'a> Lowerer<'a> {
                 })
                 .unwrap_or_default()
             }
-            TermSource::Object { alias, pom } => self
-                .tm_of(alias)
+            TermSource::Object { alias, tm_iri, pom } => self
+                .mapping
+                .get(tm_iri)
                 .map(|tm| {
                     object_columns(&tm.predicate_object_maps[*pom].object_map)
                         .into_iter()
@@ -1647,6 +1756,24 @@ impl<'a> Lowerer<'a> {
             .map(|a| a.tm_iri.as_str())?;
         self.mapping.get(iri)
     }
+}
+
+/// A triples map and the entity members (by index) it provides.
+type Part<'a> = (&'a TriplesMap, Vec<usize>);
+
+/// Whether two triples maps mint their subject the same way from the same
+/// columns, so a row of each with equal key columns is one entity.
+fn same_subject(a: &TriplesMap, b: &TriplesMap) -> bool {
+    let (sa, sb) = (&a.subject_map, &b.subject_map);
+    (sa.template.is_some() || sa.column.is_some())
+        && sa.template == sb.template
+        && sa.template_columns == sb.template_columns
+        && sa.column == sb.column
+}
+
+/// Whether two triples maps read the same row: one relation, one subject.
+fn same_row(a: &TriplesMap, b: &TriplesMap) -> bool {
+    same_subject(a, b) && source_of_tm(a) == source_of_tm(b)
 }
 
 fn collect_aliases(pred: &Pred, out: &mut HashSet<String>) {

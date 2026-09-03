@@ -176,10 +176,9 @@ fn lower_aggregate(
             .map(|f| f.field_type)
     };
     let object_map = |term: &TermSource| -> Option<ObjectMap> {
-        let TermSource::Object { alias, pom } = term else {
+        let TermSource::Object { tm_iri, pom, .. } = term else {
             return None;
         };
-        let tm_iri = &lowered.accesses.iter().find(|a| a.alias == *alias)?.tm_iri;
         let tm = resolved.mapping.get(tm_iri)?;
         Some(tm.predicate_object_maps.get(*pom)?.object_map.clone())
     };
@@ -232,7 +231,7 @@ fn lower_aggregate(
                 let [col] = cols.as_slice() else {
                     return Err("MIN/MAX over a template");
                 };
-                let TermSource::Object { pom, .. } = &src.term else {
+                let TermSource::Object { tm_iri, pom, .. } = &src.term else {
                     return Err("MIN/MAX over a subject");
                 };
                 let orderable = match &src.key {
@@ -260,7 +259,7 @@ fn lower_aggregate(
                     name: n.clone(),
                 });
                 let alias = format!("{}.{n}", col.alias);
-                let tm_iri = lowered
+                let access_tm = lowered
                     .accesses
                     .iter()
                     .find(|a| a.alias == col.alias)
@@ -268,12 +267,19 @@ fn lower_aggregate(
                     .ok_or("MIN/MAX column without an access")?;
                 extremes.push(AccessInfo {
                     alias: alias.clone(),
-                    tm_iri,
+                    tm_iri: access_tm,
                     columns: vec![col.column.clone()],
                     output_names: Some(vec![n]),
                 });
                 let idx = terms.len();
-                terms.push((*out, TermSource::Object { alias, pom: *pom }));
+                terms.push((
+                    *out,
+                    TermSource::Object {
+                        alias,
+                        tm_iri: tm_iri.clone(),
+                        pom: *pom,
+                    },
+                ));
                 Decode::Term { idx }
             }
             AggregateFn::CountAll => {

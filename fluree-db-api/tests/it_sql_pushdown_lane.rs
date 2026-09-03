@@ -67,6 +67,55 @@ const SHOP_R2RML: &str = r#"
         ] .
 "#;
 
+/// The customer entity split across three triples maps sharing its subject
+/// template: two over `customers` (vertical partitioning by column) and one
+/// over `profiles` (by table). `ex:label` is on both `customers` maps.
+fn vp_mapping(prefix: &str) -> String {
+    VP_R2RML.replace("shop.", prefix)
+}
+
+const VP_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Customer>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.customers" ] ;
+        rr:subjectMap [ rr:template "http://example.org/customer/{id}" ; rr:class ex:Customer ] ;
+        rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+        rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "name" ] ] .
+
+    <http://example.org/mapping#CustomerCountry>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.customers" ] ;
+        rr:subjectMap [ rr:template "http://example.org/customer/{id}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:country ; rr:objectMap [ rr:column "country" ] ] ;
+        rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "name" ] ] .
+
+    <http://example.org/mapping#CustomerProfile>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.profiles" ] ;
+        rr:subjectMap [ rr:template "http://example.org/customer/{id}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:email ; rr:objectMap [ rr:column "email" ] ] .
+
+    <http://example.org/mapping#Order>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.orders" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{id}" ; rr:class ex:Order ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:total ;
+            rr:objectMap [ rr:column "total" ; rr:datatype xsd:decimal ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:customer ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Customer> ;
+                rr:joinCondition [ rr:child "customer_id" ; rr:parent "id" ]
+            ]
+        ] .
+"#;
+
 const SITE: &str = "sql_block_pushdown";
 
 /// The global kill switch is process-wide; tests that flip it take this.
@@ -85,6 +134,14 @@ async fn shop() -> MockServer {
                 vec![json!(1), json!("Ada"), json!("UK")],
                 vec![json!(2), json!("Bo"), Value::Null],
                 vec![json!(3), json!("Cy"), json!("US")],
+            ],
+        ))
+        .table(Table::new(
+            "shop.profiles",
+            &[("id", "bigint"), ("email", "varchar")],
+            vec![
+                vec![json!(1), json!("ada@example.org")],
+                vec![json!(3), json!("cy@example.org")],
             ],
         ))
         .table(Table::new(
@@ -149,6 +206,14 @@ async fn setup() -> (MockServer, Fluree) {
         ))
         .await
         .expect("create sql source");
+    fluree
+        .create_sql_graph_source(SqlCreateConfig::new(
+            "shop-vp",
+            server.uri(),
+            vp_mapping("shop."),
+        ))
+        .await
+        .expect("create partitioned sql source");
     (server, fluree)
 }
 
@@ -584,6 +649,52 @@ fn cases() -> Vec<Case> {
             rows: &["k=UK n=Ada", "k=US n=Cy"],
             routing: Routing::MustFire,
             declined: None,
+        },
+        Case {
+            name: "members split across two maps over one table share one access",
+            sparql: "SELECT ?n ?k FROM <shop-vp:main> WHERE { ?c ex:name ?n ; ex:country ?k }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t0"."country" AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."country" IS NOT NULL"#],
+            rows: &["k=UK n=Ada", "k=US n=Cy"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a class from one map and a member from another share one access",
+            sparql: "SELECT ?k FROM <shop-vp:main> WHERE { ?c a ex:Customer ; ex:country ?k }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."country" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."country" IS NOT NULL"#],
+            rows: &["k=UK", "k=US"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "members split across two tables join on the subject's key",
+            sparql: "SELECT ?n ?e FROM <shop-vp:main> WHERE { ?c ex:name ?n ; ex:email ?e }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t1"."email" AS "c2" FROM "shop"."customers" AS "t0" JOIN "shop"."profiles" AS "t1" ON "t0"."id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL"#],
+            rows: &["e=ada@example.org n=Ada", "e=cy@example.org n=Cy"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a foreign key joins a partitioned entity on its shared subject",
+            sparql: "SELECT ?o ?k FROM <shop-vp:main> WHERE { ?o ex:customer ?c . ?c ex:country ?k }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t1"."id" AS "c1", "t1"."country" AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."country" IS NOT NULL"#],
+            rows: &["k=UK o=http://example.org/order/10", "k=UK o=http://example.org/order/11"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a predicate two maps provide, with no map providing the entity, declines",
+            sparql: "SELECT ?l ?e FROM <shop-vp:main> WHERE { ?c ex:label ?l ; ex:email ?e }",
+            sql: &[],
+            // The per-scan lane answers once per map minting the triple.
+            rows: &[
+                "e=ada@example.org l=Ada",
+                "e=ada@example.org l=Ada",
+                "e=cy@example.org l=Cy",
+                "e=cy@example.org l=Cy",
+            ],
+            routing: Routing::MustNotFire,
+            declined: Some("predicate provided by several triples maps"),
         },
         Case {
             name: "a variable shared by two value classes declines",
@@ -1358,6 +1469,8 @@ const CUSTOMER_ROWS: &str =
 /// `words` holds strings a case-folding collation equates (`Ada`/`ada`), a
 /// padding one equates (`Bo`/`Bo `), and one a locale sorts among the ASCII
 /// letters (`Émile`, which code-point order puts last).
+const PROFILE_ROWS: &str =
+    "INSERT INTO profiles VALUES (1, 'ada@example.org'), (3, 'cy@example.org')";
 const WORD_ROWS: &str = "INSERT INTO words VALUES (1, 'Ada', 3), (2, 'ada', 3), (3, 'Bo', 2), (4, 'Bo ', 3), (5, 'Émile', 5)";
 /// `tags` is keyed by a string column, so its subjects are minted from
 /// values a collation would merge.
@@ -1372,12 +1485,15 @@ const SQLITE: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS words",
         "DROP TABLE IF EXISTS tags",
         "DROP TABLE IF EXISTS events",
+        "DROP TABLE IF EXISTS profiles",
         "CREATE TABLE customers (id INTEGER, name TEXT, country TEXT)",
+        "CREATE TABLE profiles (id INTEGER, email TEXT)",
         "CREATE TABLE orders (id INTEGER, customer_id INTEGER, total NUMERIC, placed DATE, shipped TIMESTAMP, updated TIMESTAMP)",
         "CREATE TABLE words (id INTEGER, word TEXT, len INTEGER)",
         "CREATE TABLE tags (tag TEXT, n INTEGER)",
         "CREATE TABLE events (id INTEGER, at_tz TIMESTAMP, at_local TIMESTAMP)",
         CUSTOMER_ROWS,
+        PROFILE_ROWS,
         "INSERT INTO orders VALUES \
             (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00', '2024-01-06 09:30:00'), \
             (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00', '2024-02-02 18:00:00'), \
@@ -1406,12 +1522,15 @@ const POSTGRES: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS words",
         "DROP TABLE IF EXISTS tags",
         "DROP TABLE IF EXISTS events",
+        "DROP TABLE IF EXISTS profiles",
         "CREATE TABLE customers (id BIGINT, name TEXT, country TEXT)",
+        "CREATE TABLE profiles (id BIGINT, email TEXT)",
         "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total NUMERIC(10,2), placed DATE, shipped TIMESTAMPTZ, updated TIMESTAMP)",
         "CREATE TABLE words (id BIGINT, word TEXT, len INTEGER)",
         "CREATE TABLE tags (tag TEXT, n INTEGER)",
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMPTZ, at_local TIMESTAMP)",
         CUSTOMER_ROWS,
+        PROFILE_ROWS,
         "INSERT INTO orders VALUES \
             (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00'), \
             (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00'), \
@@ -1433,12 +1552,15 @@ const MYSQL: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS words",
         "DROP TABLE IF EXISTS tags",
         "DROP TABLE IF EXISTS events",
+        "DROP TABLE IF EXISTS profiles",
         "CREATE TABLE customers (id BIGINT, name VARCHAR(64), country VARCHAR(64))",
+        "CREATE TABLE profiles (id BIGINT, email VARCHAR(64))",
         "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total DECIMAL(10,2), placed DATE, shipped TIMESTAMP NULL, updated DATETIME)",
         "CREATE TABLE words (id BIGINT, word VARCHAR(64), len INT)",
         "CREATE TABLE tags (tag VARCHAR(64), n INT)",
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMP NULL, at_local DATETIME)",
         CUSTOMER_ROWS,
+        PROFILE_ROWS,
         "INSERT INTO orders VALUES \
             (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00'), \
             (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00'), \
@@ -1855,7 +1977,7 @@ async fn live_differential(backend: &LiveBackend) {
     let fluree = FlureeBuilder::memory().build_memory();
     let mut source = SqlCreateConfig::new(
         "shop-live",
-        url,
+        url.clone(),
         format!("{}{LIVE_R2RML}", shop_mapping("")),
     );
     source.dialect = backend.dialect;
@@ -1863,10 +1985,18 @@ async fn live_differential(backend: &LiveBackend) {
         .create_sql_graph_source(source)
         .await
         .expect("create live sql source");
+    let mut partitioned = SqlCreateConfig::new("shop-vp-live", url, vp_mapping(""));
+    partitioned.dialect = backend.dialect;
+    fluree
+        .create_sql_graph_source(partitioned)
+        .await
+        .expect("create live partitioned sql source");
 
     let mut failures: Vec<String> = Vec::new();
     for c in cases().into_iter().chain(aggregate_cases()) {
-        let sparql = format!("{PREFIX}{}", c.sparql).replace("shop-sql:main", "shop-live:main");
+        let sparql = format!("{PREFIX}{}", c.sparql)
+            .replace("shop-sql:main", "shop-live:main")
+            .replace("shop-vp:main", "shop-vp-live:main");
         let (lane_rows, sent) = lane_run(&fluree, &sparql, c.name).await;
         let declines = backend.declines.contains(&c.name);
         match (&c.routing, c.sql.is_empty()) {

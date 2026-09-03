@@ -25,8 +25,7 @@ use crate::var_registry::VarId;
 
 struct AliasTerms {
     alias: String,
-    tm: TriplesMap,
-    encoder: LiteralEncoder,
+    tm_iri: String,
     columns: Vec<String>,
     /// Index of each column in the statement's output, by `columns` position.
     output_idx: Vec<usize>,
@@ -34,6 +33,8 @@ struct AliasTerms {
 
 pub(crate) struct Materializer {
     aliases: Vec<AliasTerms>,
+    /// Every triples map a term reads through, with its literal encoder.
+    maps: HashMap<String, (TriplesMap, LiteralEncoder)>,
     terms: Vec<(VarId, TermSource)>,
 }
 
@@ -43,6 +44,19 @@ impl Materializer {
         mapping: &CompiledR2rmlMapping,
         snapshot: &LedgerSnapshot,
     ) -> Result<Self> {
+        let mut maps: HashMap<String, (TriplesMap, LiteralEncoder)> = HashMap::new();
+        let mut map_of = |tm_iri: &str| -> Result<()> {
+            if !maps.contains_key(tm_iri) {
+                let tm = mapping.get(tm_iri).cloned().ok_or_else(|| {
+                    QueryError::Internal(format!(
+                        "triples map '{tm_iri}' vanished from the mapping"
+                    ))
+                })?;
+                let encoder = LiteralEncoder::build(&tm, snapshot);
+                maps.insert(tm_iri.to_string(), (tm, encoder));
+            }
+            Ok(())
+        };
         let mut aliases = Vec::with_capacity(lowered.accesses.len());
         for AccessInfo {
             alias,
@@ -51,9 +65,7 @@ impl Materializer {
             output_names,
         } in &lowered.accesses
         {
-            let tm = mapping.get(tm_iri).cloned().ok_or_else(|| {
-                QueryError::Internal(format!("triples map '{tm_iri}' vanished from the mapping"))
-            })?;
+            map_of(tm_iri)?;
             let position = |c: &String, i: usize| match output_names {
                 Some(names) => {
                     let name = names.get(i)?;
@@ -74,17 +86,21 @@ impl Materializer {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let encoder = LiteralEncoder::build(&tm, snapshot);
             aliases.push(AliasTerms {
                 alias: alias.clone(),
-                tm,
-                encoder,
+                tm_iri: tm_iri.clone(),
                 columns: columns.clone(),
                 output_idx,
             });
         }
+        for (_, term) in &lowered.terms {
+            if let TermSource::Object { tm_iri, .. } = term {
+                map_of(tm_iri)?;
+            }
+        }
         Ok(Self {
             aliases,
+            maps,
             terms: lowered.terms.clone(),
         })
     }
@@ -148,25 +164,28 @@ impl Materializer {
                 TermSource::Constant(t) => {
                     // Any encoder will do for a constant: datatype Sids resolve
                     // the same way for every triples map.
-                    self.aliases
-                        .first()
-                        .map(|a| a.encoder.encode(t))
+                    self.maps
+                        .values()
+                        .next()
+                        .map(|(_, e)| e.encode(t))
                         .unwrap_or(Binding::Unbound)
                 }
                 TermSource::Subject { alias } => {
                     let a = self.alias(alias)?;
+                    let (tm, encoder) = self.map(&a.tm_iri)?;
                     let batch = &batches[alias];
-                    match materialize_subject_from_batch(&a.tm.subject_map, batch, row_idx) {
-                        Ok(Some(t)) => a.encoder.encode(&t),
+                    match materialize_subject_from_batch(&tm.subject_map, batch, row_idx) {
+                        Ok(Some(t)) => encoder.encode(&t),
                         _ => Binding::Unbound,
                     }
                 }
-                TermSource::Object { alias, pom } => {
-                    let a = self.alias(alias)?;
+                TermSource::Object { alias, tm_iri, pom } => {
+                    self.alias(alias)?;
+                    let (tm, encoder) = self.map(tm_iri)?;
                     let batch = &batches[alias];
-                    let om = &a.tm.predicate_object_maps[*pom].object_map;
+                    let om = &tm.predicate_object_maps[*pom].object_map;
                     match materialize_object_from_batch(om, batch, row_idx) {
-                        Ok(Some(t)) => a.encoder.encode(&t),
+                        Ok(Some(t)) => encoder.encode(&t),
                         _ => Binding::Unbound,
                     }
                 }
@@ -174,6 +193,12 @@ impl Materializer {
             out.push((*var, binding));
         }
         Ok(out)
+    }
+
+    fn map(&self, tm_iri: &str) -> Result<&(TriplesMap, LiteralEncoder)> {
+        self.maps
+            .get(tm_iri)
+            .ok_or_else(|| QueryError::Internal(format!("unknown triples map '{tm_iri}'")))
     }
 
     fn alias(&self, alias: &str) -> Result<&AliasTerms> {
