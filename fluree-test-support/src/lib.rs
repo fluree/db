@@ -319,6 +319,56 @@ path = "benches/not_a_test.rs"
         assert!(declared_test_paths("[package]\nname = \"x\"\n").is_empty());
     }
 
+    /// The manifest shapes the line-scanning predecessor got wrong, or never
+    /// pinned, now handled by a real TOML parser. One row per shape.
+    #[test]
+    fn declared_targets_survive_every_manifest_shape() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            (
+                "a comment on the [[test]] header",
+                "[[test]] # standalone: mutates env\nname = \"a\"\npath = \"tests/a.rs\"\n",
+                &["tests/a.rs"],
+            ),
+            (
+                "single-quoted values",
+                "[[test]]\nname = 'a'\npath = 'tests/a.rs'\n",
+                &["tests/a.rs"],
+            ),
+            (
+                "an inline table instead of an array-of-tables header",
+                "test = [{ name = \"a\", path = \"tests/a.rs\" }, { name = \"b\" }]\n",
+                &["tests/a.rs", "tests/b.rs"],
+            ),
+            (
+                "non-canonical spacing around `=`",
+                "[[test]]\nname=\"a\"\npath  =  \"tests/a.rs\"\n",
+                &["tests/a.rs"],
+            ),
+            (
+                "keys after `path` do not spill the target into the next block",
+                "[[test]]\nname = \"gated\"\npath = \"tests/gated.rs\"\n\
+                 required-features = [\"f\"]\n\n\
+                 [[test]]\nname = \"next\"\npath = \"tests/next.rs\"\n",
+                &["tests/gated.rs", "tests/next.rs"],
+            ),
+            (
+                "keys before `path`",
+                "[[test]]\nrequired-features = [\"f\"]\nname = \"a\"\npath = \"tests/a.rs\"\n",
+                &["tests/a.rs"],
+            ),
+            (
+                "a [[test]] block among other sections",
+                "[package]\nname = \"x\"\n\n[[bin]]\nname = \"x\"\n\n\
+                 [[test]]\nname = \"a\"\n\n[[bench]]\nname = \"b\"\n\n[lints]\nworkspace = true\n",
+                &["tests/a.rs"],
+            ),
+        ];
+        for (shape, manifest, expected) in cases {
+            let expected: HashSet<String> = expected.iter().map(ToString::to_string).collect();
+            assert_eq!(declared_test_paths(manifest), expected, "{shape}");
+        }
+    }
+
     #[test]
     fn a_declared_path_is_normalised() {
         let declared = declared_test_paths(
