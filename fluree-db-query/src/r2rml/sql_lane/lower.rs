@@ -100,6 +100,9 @@ pub(crate) struct AccessInfo {
     pub tm_iri: String,
     /// Columns returned for this alias, original names.
     pub columns: Vec<String>,
+    /// Statement outputs feeding `columns`, when they are not the columns
+    /// themselves: an aggregate's extreme stands in for the column it reads.
+    pub output_names: Option<Vec<String>>,
 }
 
 /// A block variable the engine can seed from bindings it already holds.
@@ -450,6 +453,7 @@ impl<'a> Lowerer<'a> {
                 alias: a.alias.clone(),
                 tm_iri: a.tm_iri.clone(),
                 columns: per_alias.remove(&a.alias).unwrap_or_default(),
+                output_names: None,
             })
             .collect();
 
@@ -523,6 +527,7 @@ impl<'a> Lowerer<'a> {
             alias: alias.clone(),
             tm_iri: tm.iri.clone(),
             columns: Vec::new(),
+            output_names: None,
         });
         alias
     }

@@ -48,25 +48,30 @@ impl Materializer {
             alias,
             tm_iri,
             columns,
+            output_names,
         } in &lowered.accesses
         {
             let tm = mapping.get(tm_iri).cloned().ok_or_else(|| {
                 QueryError::Internal(format!("triples map '{tm_iri}' vanished from the mapping"))
             })?;
+            let position = |c: &String, i: usize| match output_names {
+                Some(names) => {
+                    let name = names.get(i)?;
+                    lowered.outputs.iter().position(|o| &o.name == name)
+                }
+                None => lowered.outputs.iter().position(|o| {
+                    o.expr
+                        .col()
+                        .is_some_and(|k| &k.alias == alias && &k.column == c)
+                }),
+            };
             let output_idx = columns
                 .iter()
-                .map(|c| {
-                    lowered
-                        .outputs
-                        .iter()
-                        .position(|o| {
-                            o.expr
-                                .col()
-                                .is_some_and(|k| &k.alias == alias && &k.column == c)
-                        })
-                        .ok_or_else(|| {
-                            QueryError::Internal(format!("column {alias}.{c} not projected"))
-                        })
+                .enumerate()
+                .map(|(i, c)| {
+                    position(c, i).ok_or_else(|| {
+                        QueryError::Internal(format!("column {alias}.{c} not projected"))
+                    })
                 })
                 .collect::<Result<Vec<_>>>()?;
             let encoder = LiteralEncoder::build(&tm, snapshot);

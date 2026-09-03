@@ -21,7 +21,7 @@ use fluree_db_tabular::{Column, ColumnBatch, FieldType};
 use fluree_vocab::xsd;
 use num_bigint::BigInt;
 
-use super::lower::{source_of_tm, KeyShape, Lowered, RdfClass, TermSource};
+use super::lower::{source_of_tm, AccessInfo, KeyShape, Lowered, RdfClass, TermSource};
 use super::terms::Materializer;
 use super::{resolve_block, Resolved};
 use crate::aggregate::NumericAcc;
@@ -222,15 +222,18 @@ fn lower_aggregate(
         terms.push((*v, src.term.clone()));
     }
 
-    // MIN / MAX first: their outputs stand in for the column when the term
-    // is materialized, so they must be the first match for it.
-    let mut later: Vec<(usize, &AggregateFn)> = Vec::new();
+    // Each extreme reads its column through its own materialization alias,
+    // so MIN and MAX of one column, or of a key, are distinct outputs.
+    let mut extremes: Vec<AccessInfo> = Vec::new();
     for (pos, (out, f)) in plan.aggregates.iter().enumerate() {
-        match f {
+        agg_decodes[pos] = Some(match f {
             AggregateFn::Min(v) | AggregateFn::Max(v) => {
                 let (src, cols) = var_of(*v)?;
                 let [col] = cols.as_slice() else {
                     return Err("MIN/MAX over a template");
+                };
+                let TermSource::Object { pom, .. } = &src.term else {
+                    return Err("MIN/MAX over a subject");
                 };
                 let orderable = match &src.key {
                     Some(KeyShape::Column { class, .. }) => match class {
@@ -246,29 +249,33 @@ fn lower_aggregate(
                 if !orderable {
                     return Err("MIN/MAX over a value the database orders differently");
                 }
-                if !claimed.insert((col.alias.clone(), col.column.clone())) {
-                    return Err("MIN/MAX column also a key or another extreme");
-                }
-                access_columns
-                    .entry(col.alias.clone())
-                    .or_default()
-                    .push(col.column.clone());
                 let n = name(&outputs);
                 let expr = if matches!(f, AggregateFn::Min(_)) {
                     OutputExpr::Min(col.clone())
                 } else {
                     OutputExpr::Max(col.clone())
                 };
-                outputs.push(OutputCol { expr, name: n });
-                agg_decodes[pos] = Some(Decode::Term { idx: terms.len() });
-                terms.push((*out, src.term.clone()));
+                outputs.push(OutputCol {
+                    expr,
+                    name: n.clone(),
+                });
+                let alias = format!("{}.{n}", col.alias);
+                let tm_iri = lowered
+                    .accesses
+                    .iter()
+                    .find(|a| a.alias == col.alias)
+                    .map(|a| a.tm_iri.clone())
+                    .ok_or("MIN/MAX column without an access")?;
+                extremes.push(AccessInfo {
+                    alias: alias.clone(),
+                    tm_iri,
+                    columns: vec![col.column.clone()],
+                    output_names: Some(vec![n]),
+                });
+                let idx = terms.len();
+                terms.push((*out, TermSource::Object { alias, pom: *pom }));
+                Decode::Term { idx }
             }
-            _ => later.push((pos, f)),
-        }
-    }
-
-    for (pos, f) in later {
-        agg_decodes[pos] = Some(match f {
             AggregateFn::CountAll => {
                 let n = name(&outputs);
                 outputs.push(OutputCol {
@@ -365,7 +372,6 @@ fn lower_aggregate(
                     avg: matches!(f, AggregateFn::Avg(..)),
                 }
             }
-            AggregateFn::Min(_) | AggregateFn::Max(_) => unreachable!("handled above"),
             _ => return Err("unsupported aggregate"),
         });
     }
@@ -429,6 +435,7 @@ fn lower_aggregate(
     for a in &mut for_terms.accesses {
         a.columns = access_columns.remove(&a.alias).unwrap_or_default();
     }
+    for_terms.accesses.extend(extremes);
     let materializer =
         Materializer::new(&for_terms, &resolved.mapping, snapshot).map_err(|_| "materializer")?;
     Ok(AggLowered {

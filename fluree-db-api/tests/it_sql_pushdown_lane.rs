@@ -874,6 +874,25 @@ fn aggregate_cases() -> Vec<Case> {
             declined: None,
         },
         Case {
+            name: "MIN and MAX of the same variable are two outputs of one column",
+            sparql: "SELECT (MIN(?t) AS ?lo) (MAX(?t) AS ?hi) FROM <shop-sql:main> WHERE { ?o ex:total ?t }",
+            sql: &[r#"SELECT MIN("t0"."total") AS "c0", MAX("t0"."total") AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            rows: &["hi=99.50 lo=5.00"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "MIN and MAX of the same variable per group",
+            sparql: "SELECT ?c (MIN(?t) AS ?lo) (MAX(?t) AS ?hi) FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?o ex:total ?t } GROUP BY ?c",
+            sql: &[r#"SELECT "t1"."id" AS "c0", MIN("t0"."total") AS "c1", MAX("t0"."total") AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            rows: &[
+                "c=http://example.org/customer/1 hi=99.50 lo=5.00",
+                "c=http://example.org/customer/2 hi=42.00 lo=42.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
             name: "COUNT DISTINCT of a foreign-key object",
             sparql: "SELECT (COUNT(DISTINCT ?c) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c }",
             sql: &[r#"SELECT COUNT(DISTINCT "t1"."id") AS "c0" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL"#],
@@ -1496,6 +1515,25 @@ fn live_cases() -> Vec<LiveCase> {
             rows: &["a=38.375 s=153.500000"],
             only: &[Postgres, Mysql],
             sent: &[(Postgres, Sent::Contains("SUM(")), (Mysql, Sent::Contains("SUM("))],
+        },
+        LiveCase {
+            name: "MIN and MAX of one decimal column fold in the database",
+            sparql: "SELECT (MIN(?t) AS ?lo) (MAX(?t) AS ?hi) FROM <shop-live:main> WHERE { ?o ex:total ?t }",
+            rows: &["hi=99.500000 lo=5.000000"],
+            only: &[Postgres, Mysql],
+            sent: &[
+                (Postgres, Sent::Contains("MIN(")),
+                (Postgres, Sent::Contains("MAX(")),
+                (Mysql, Sent::Contains("MIN(")),
+                (Mysql, Sent::Contains("MAX(")),
+            ],
+        },
+        LiveCase {
+            name: "MIN and MAX of one decimal column fold in the database on SQLite",
+            sparql: "SELECT (MIN(?t) AS ?lo) (MAX(?t) AS ?hi) FROM <shop-live:main> WHERE { ?o ex:total ?t }",
+            rows: &["hi=99.5 lo=5"],
+            only: &[Sqlite],
+            sent: &[(Sqlite, Sent::Contains("MIN(")), (Sqlite, Sent::Contains("MAX("))],
         },
     ]
 }
