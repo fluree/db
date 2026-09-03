@@ -96,6 +96,22 @@ pub fn eval_str<R: RowAccess>(
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
     check_arity(args, 1, "STR")?;
+    // A stored xsd:float narrows to f32 on the way into `ComparableValue`
+    // (the numeric lanes are single-precision), but its lexical form belongs
+    // to the stored f64: the serializer prints `canonical_xsd_double` of it,
+    // and STR() must agree per-term (#1695's float sibling). For the
+    // bare-variable shape — the only one whose argument IS a stored term —
+    // read the f64 straight from the binding. No widening artifact can
+    // arise: this f64 was parsed from the lexical, never widened from an
+    // f32. (A float value computed inside the expression is a genuine f32
+    // and keeps `canonical_xsd_float` via `into_string_value`.)
+    if let Expression::Var(var_id) = &args[0] {
+        if let Some(d) = crate::eval::stored_float_f64(row, *var_id, ctx) {
+            return Ok(Some(ComparableValue::String(Arc::from(
+                fluree_graph_ir::canonical_xsd_double(d),
+            ))));
+        }
+    }
     let val = args[0].eval_to_comparable(row, ctx)?;
     Ok(val.and_then(|v| match &v {
         ComparableValue::Sid(..) => {
