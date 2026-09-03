@@ -44,8 +44,14 @@ mod it_graphql;
 #[path = "it_graphql_curated.rs"]
 mod it_graphql_curated;
 #[cfg(feature = "graphql")]
+#[path = "it_graphql_limits.rs"]
+mod it_graphql_limits;
+#[cfg(feature = "graphql")]
 #[path = "it_graphql_mutations.rs"]
 mod it_graphql_mutations;
+#[cfg(feature = "graphql")]
+#[path = "it_graphql_policy.rs"]
+mod it_graphql_policy;
 #[cfg(feature = "graphql")]
 #[path = "it_graphql_polish.rs"]
 mod it_graphql_polish;

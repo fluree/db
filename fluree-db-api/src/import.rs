@@ -43,6 +43,71 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::Instrument;
 
+/// Publish the import's commit head by fast-forwarding the ref directly.
+///
+/// Bulk import is a one-shot admin flow: nothing is staged on the
+/// per-branch transaction queue, so `publish_commit` — whose contract on
+/// queue-backed nameservices (the raft data plane) is "apply the staged
+/// queue front" — fails there with "per-branch queue is empty". A
+/// ref-level fast-forward carries the exact strictly-newer semantics the
+/// file/S3 nameservices give `publish_commit`, and every nameservice
+/// implements it via `RefPublisher`, so the bulk importer works under
+/// all data planes without touching the transactor's queue contract.
+///
+/// Import runs against a fresh ledger and publishes serially, so the one
+/// benign conflict is the final publish restating the last checkpoint's
+/// exact `(t, commit_id)`. Any other conflict is surfaced as an error:
+/// a head at a different `t`/id means a foreign writer got ahead of the
+/// import, and a head still behind `t` means the CAS retry budget ran
+/// out under contention.
+async fn publish_import_commit_head(
+    nameservice: &dyn crate::NameServicePublisher,
+    alias: &str,
+    t: i64,
+    commit_id: &ContentId,
+) -> std::result::Result<(), ImportError> {
+    use fluree_db_nameservice::{CasResult, RefValue};
+
+    let new_ref = RefValue {
+        id: Some(commit_id.clone()),
+        t,
+    };
+    match nameservice
+        .fast_forward_commit(alias, &new_ref, 5)
+        .await
+        .map_err(|e| ImportError::Storage(e.to_string()))?
+    {
+        CasResult::Updated => Ok(()),
+        CasResult::Conflict { actual }
+            if actual
+                .as_ref()
+                .is_some_and(|a| a.t == t && a.id.as_ref() == Some(commit_id)) =>
+        {
+            Ok(())
+        }
+        CasResult::Conflict { actual } => Err(ImportError::Storage(match actual.as_ref() {
+            // `fast_forward_commit` returns the same `Conflict` shape when
+            // its retry budget runs out while the fast-forward is still
+            // valid — the head never reached `t`, so this is contention,
+            // not divergence.
+            None => format!(
+                "import commit-head publish for {alias} gave up after contended CAS \
+                 attempts: head is still unborn, wanted t={t}"
+            ),
+            Some(a) if a.t < t => format!(
+                "import commit-head publish for {alias} gave up after contended CAS \
+                 attempts: head is at t={}, wanted t={t}",
+                a.t
+            ),
+            Some(a) => format!(
+                "import commit-head publish for {alias} found a diverged head: \
+                 head is t={} id={:?}, wanted t={t} id={commit_id}",
+                a.t, a.id
+            ),
+        })),
+    }
+}
+
 const IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS: u128 = 50;
 const LOCAL_RECHUNK_EVENT_CHANNEL_CAPACITY: usize = 2;
 
@@ -595,6 +660,12 @@ pub struct ImportResult {
     /// Tracking tally (fuel, time) when a tracker was supplied via
     /// `ImportBuilder::tracker(...)`. `None` when tracking was disabled.
     pub tally: Option<TrackingTally>,
+    /// Duplicate input statements collapsed out of the index. `flake_count`
+    /// reports the raw commit operations (the commit blobs keep every op),
+    /// so when this is non-zero the indexed triple count is
+    /// `flake_count - duplicates_removed`. 0 when `build_index == false`
+    /// (no index, nothing collapsed).
+    pub duplicates_removed: u64,
 }
 
 /// Lightweight summary of the imported dataset for CLI display.
@@ -3796,6 +3867,7 @@ where
     let index_t;
     let summary;
     let mut has_annotations = false;
+    let mut duplicates_removed = 0u64;
 
     if config.build_index {
         let build_input = IndexBuildInput {
@@ -3845,6 +3917,7 @@ where
         index_t = index_result.index_t;
         summary = index_result.summary;
         has_annotations = index_result.has_annotations;
+        duplicates_removed = index_result.duplicates_removed;
     } else {
         root_id = None;
         index_t = 0;
@@ -3870,6 +3943,7 @@ where
         summary,
         has_annotations,
         tally: config.tracker.tally(),
+        duplicates_removed,
     })
 }
 
@@ -4180,10 +4254,13 @@ where
                 if env.config.publish_every > 0
                     && (next_expected + 1).is_multiple_of(env.config.publish_every)
                 {
-                    env.nameservice
-                        .publish_commit(env.alias, result.t, &result.commit_id)
-                        .await
-                        .map_err(|e| ImportError::Storage(e.to_string()))?;
+                    publish_import_commit_head(
+                        env.nameservice,
+                        env.alias,
+                        result.t,
+                        &result.commit_id,
+                    )
+                    .await?;
                     tracing::info!(
                         t = result.t,
                         chunk = next_expected + 1,
@@ -5050,10 +5127,7 @@ where
                 elapsed_secs: run_start.elapsed().as_secs_f64(),
             });
             if config.publish_every > 0 && (idx + 1).is_multiple_of(config.publish_every) {
-                nameservice
-                    .publish_commit(alias, result.t, &result.commit_id)
-                    .await
-                    .map_err(|e| ImportError::Storage(e.to_string()))?;
+                publish_import_commit_head(nameservice, alias, result.t, &result.commit_id).await?;
             }
         }
 
@@ -5312,10 +5386,8 @@ where
                     elapsed_secs: run_start.elapsed().as_secs_f64(),
                 });
                 if config.publish_every > 0 && (i + 1).is_multiple_of(config.publish_every) {
-                    nameservice
-                        .publish_commit(alias, result.t, &result.commit_id)
-                        .await
-                        .map_err(|e| ImportError::Storage(e.to_string()))?;
+                    publish_import_commit_head(nameservice, alias, result.t, &result.commit_id)
+                        .await?;
                 }
             }
         }
@@ -5327,10 +5399,7 @@ where
         .clone()
         .ok_or_else(|| ImportError::Storage("no commit head after import".to_string()))?;
 
-    nameservice
-        .publish_commit(alias, state.t, &commit_head_id)
-        .await
-        .map_err(|e| ImportError::Storage(e.to_string()))?;
+    publish_import_commit_head(nameservice, alias, state.t, &commit_head_id).await?;
     tracing::info!(t = state.t, "published final commit head");
 
     // ---- Spawn txn-meta "meta chunk" build in background ----
@@ -6059,6 +6128,9 @@ struct IndexUploadResult {
     /// `reindex` pass (the bulk-import root currently writes
     /// `annotation_index: None` even when annotations are present).
     has_annotations: bool,
+    /// Duplicate input statements collapsed out of the index (chunk-level
+    /// dedup + cross-chunk merge dedup). The commit blobs keep the raw ops.
+    duplicates_removed: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6151,6 +6223,10 @@ where
         let v3_run_budget = config.effective_run_budget_mb() * 1024 * 1024;
         let v3_worker_count = config.effective_heavy_workers();
         let v3_sorted_commit_infos = input.sorted_commit_infos;
+        let chunk_duplicates_removed: u64 = v3_sorted_commit_infos
+            .iter()
+            .map(|info| info.duplicates_removed)
+            .sum();
         let v3_lang_remaps: Vec<Vec<u16>> = lang_remaps.clone();
         let v3_remap_counter = remap_counter.clone();
         let v3_build_counter = build_counter.clone();
@@ -6360,6 +6436,7 @@ where
                 let mut total_remapped = g0_result.total_remapped;
                 let mut remap_elapsed = g0_result.remap_elapsed;
                 let mut build_elapsed = g0_result.build_elapsed;
+                let mut duplicates_removed = g0_result.duplicates_removed;
 
                 // g1 (txn-meta) is a system graph; its per-class SPOT stats are
                 // intentionally not merged into the user-facing class stats.
@@ -6368,6 +6445,7 @@ where
                     total_remapped += g1.total_remapped;
                     remap_elapsed += g1.remap_elapsed;
                     build_elapsed += g1.build_elapsed;
+                    duplicates_removed += g1.duplicates_removed;
 
                     for (order, g1_order) in g1.order_results {
                         if let Some((_, existing)) =
@@ -6387,6 +6465,7 @@ where
                     total_remapped += ng.total_remapped;
                     remap_elapsed += ng.remap_elapsed;
                     build_elapsed += ng.build_elapsed;
+                    duplicates_removed += ng.duplicates_removed;
 
                     for (order, ng_order) in ng.order_results {
                         if let Some((_, existing)) =
@@ -6406,6 +6485,7 @@ where
                     total_remapped,
                     remap_elapsed,
                     build_elapsed,
+                    duplicates_removed,
                 };
 
                 tracing::info!(
@@ -6421,8 +6501,12 @@ where
             },
         );
 
-        let remap_total_flakes = input.cumulative_flakes;
-        let build_total_flakes = input.cumulative_flakes * 4;
+        // Chunk-level dedup already shrank the sorted commits the remap and
+        // build phases consume; cross-chunk merge dedup self-corrects because
+        // the pumps advance progress by consumed (pre-collapse) records.
+        let deduped_flakes = input.cumulative_flakes - chunk_duplicates_removed;
+        let remap_total_flakes = deduped_flakes;
+        let build_total_flakes = deduped_flakes * 4;
 
         let emit_index_progress =
             |stage: u8, current_stage: &mut u8, stage_start: &mut std::time::Instant| {
@@ -6867,6 +6951,7 @@ where
             index_t: input.final_t,
             summary,
             has_annotations: import_has_annotations,
+            duplicates_removed: chunk_duplicates_removed + v3_result.duplicates_removed,
         })
     }
 }
@@ -7608,5 +7693,74 @@ mod resource_model_tests {
         assert_eq!(parallel[0].0, 0);
         assert_eq!(parallel[1].0, 1);
         assert_eq!(parallel[2].0, 2);
+    }
+}
+
+#[cfg(test)]
+mod publish_import_commit_head_tests {
+    use super::*;
+    use fluree_db_nameservice::memory::MemoryNameService;
+    use fluree_db_nameservice::{LedgerLifecycle, RefKind, RefLookup};
+
+    fn cid(label: &str) -> ContentId {
+        ContentId::new(ContentKind::Commit, label.as_bytes())
+    }
+
+    /// The publish shapes the import pipeline produces — creation on a
+    /// freshly-initialized ledger, a checkpoint fast-forwarding past the
+    /// importer's own head, and the final publish restating the last
+    /// checkpoint's exact `(t, commit_id)` — plus the two conflicts it
+    /// never produces (equal `t` under a different id, lower `t`), which
+    /// must fail loudly instead of reporting success over a foreign head.
+    #[tokio::test]
+    async fn creates_advances_tolerates_exact_republish_rejects_divergence() {
+        let ns = MemoryNameService::new();
+        let alias = "importdb:main";
+
+        // The importer initializes the ledger before its first publish.
+        ns.init(alias).await.expect("init");
+
+        publish_import_commit_head(&ns, alias, 1, &cid("t1"))
+            .await
+            .expect("initial publish creates the head");
+        let head = ns
+            .get_ref(alias, RefKind::CommitHead)
+            .await
+            .expect("get_ref")
+            .expect("head exists");
+        assert_eq!(head.t, 1);
+        assert_eq!(head.id, Some(cid("t1")));
+
+        publish_import_commit_head(&ns, alias, 5, &cid("t5"))
+            .await
+            .expect("checkpoint fast-forwards");
+
+        publish_import_commit_head(&ns, alias, 5, &cid("t5"))
+            .await
+            .expect("republish of the exact head is a no-op success");
+
+        let err = publish_import_commit_head(&ns, alias, 5, &cid("other"))
+            .await
+            .expect_err("equal t under a different id is a divergence");
+        assert!(
+            err.to_string().contains("diverged"),
+            "unexpected error: {err}"
+        );
+
+        let err = publish_import_commit_head(&ns, alias, 3, &cid("t3"))
+            .await
+            .expect_err("a head past the published t is a divergence");
+        assert!(
+            err.to_string().contains("diverged"),
+            "unexpected error: {err}"
+        );
+
+        let head = ns
+            .get_ref(alias, RefKind::CommitHead)
+            .await
+            .expect("get_ref")
+            .expect("head exists");
+        assert_eq!(head.t, 5, "failed publishes leave the head alone");
+        assert_eq!(head.id, Some(cid("t5")));
     }
 }

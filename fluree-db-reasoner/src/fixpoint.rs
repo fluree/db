@@ -3,7 +3,11 @@
 //! This module implements the main reasoning loop that iteratively applies
 //! OWL2-RL rules until a fixpoint is reached or budget is exhausted.
 
-use std::time::Instant;
+// `clock::Instant` aliases `web_time` on wasm32 and `std::time` on native.
+// `std::time::Instant::now()` TRAPS (unreachable) on wasm32 rather than
+// erroring, and this fixpoint runs on the OWL2-RL reasoning query path, which
+// is reachable ungated from wasm.
+use fluree_db_core::clock::Instant;
 
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::flake::Flake;

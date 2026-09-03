@@ -12,6 +12,11 @@
 //! guessed — a mistyped comparison would fail the whole statement in Trino
 //! ("Cannot apply operator: bigint = varchar"), and the in-engine FILTER stays
 //! the authority either way, so a dropped push only costs I/O.
+//!
+//! The same valve carries the escaping rule: string literals are rendered with
+//! standard-SQL quote doubling, and a value that a dialect might read as
+//! carrying escapes is declined rather than escaped for a server mode we cannot
+//! observe. See [`sql_string`].
 
 use fluree_db_tabular::{BatchSchema, FieldType};
 use serde::{Deserialize, Serialize};
@@ -64,6 +69,17 @@ impl SqlDialect {
     /// Whether typed literal prefixes (`DATE '…'`, `TIMESTAMP '…'`) are valid.
     fn typed_literals(self) -> bool {
         !matches!(self, SqlDialect::Sqlite)
+    }
+
+    /// Whether the server may treat `\\` as live inside a string literal.
+    ///
+    /// Trino, SQLite and Postgres (with `standard_conforming_strings`, on by
+    /// default since 9.1) leave backslash inert, so doubling `'` is the whole
+    /// escaping rule. MySQL under its default `sql_mode` does not: there a
+    /// trailing `\\` escapes the closing quote and the rest of the value parses
+    /// as SQL.
+    fn backslash_may_escape(self) -> bool {
+        matches!(self, SqlDialect::Mysql)
     }
 }
 
@@ -284,7 +300,19 @@ fn render_predicate(pred: &Predicate, ty: FieldType, dialect: SqlDialect) -> Opt
     }
 }
 
-fn sql_string(s: &str) -> String {
+/// Render `s` as a string literal, or decline when no rendering is safe.
+///
+/// Doubling `'` is the standard-SQL rule and is sufficient wherever backslash
+/// is inert. On MySQL it is not (see [`SqlDialect::backslash_may_escape`]), and
+/// escaping instead of declining would be wrong in both directions: the engine
+/// cannot observe the endpoint's `sql_mode`, and `dialect` names the database
+/// *behind* an endpoint that need not be a bridge we configured. So a value
+/// carrying a backslash is declined, which costs a pushdown and nothing else —
+/// the in-engine FILTER enforces the predicate either way.
+fn sql_string(s: &str, dialect: SqlDialect) -> Option<String> {
+    if dialect.backslash_may_escape() && s.contains('\\') {
+        return None;
+    }
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
@@ -294,7 +322,7 @@ fn sql_string(s: &str) -> String {
         out.push(c);
     }
     out.push('\'');
-    out
+    Some(out)
 }
 
 fn is_numeric(ty: FieldType) -> bool {
@@ -316,18 +344,18 @@ fn render_literal(lit: &Literal, ty: FieldType, dialect: SqlDialect) -> Option<S
             matches!(ty, FieldType::Boolean).then(|| if *b { "TRUE" } else { "FALSE" }.to_string())
         }
         Literal::Int(i) => is_numeric(ty).then(|| i.to_string()),
-        Literal::Str(s) => matches!(ty, FieldType::String).then(|| sql_string(s)),
+        Literal::Str(s) => matches!(ty, FieldType::String).then(|| sql_string(s, dialect))?,
         Literal::Date(days) => {
             if !matches!(ty, FieldType::Date) {
                 return None;
             }
             let date = chrono::DateTime::from_timestamp(i64::from(*days) * 86_400, 0)?.date_naive();
             let text = date.format("%Y-%m-%d").to_string();
-            Some(if dialect.typed_literals() {
-                format!("DATE '{text}'")
+            if dialect.typed_literals() {
+                Some(format!("DATE '{text}'"))
             } else {
-                sql_string(&text)
-            })
+                sql_string(&text, dialect)
+            }
         }
         Literal::Double(d) => {
             if !d.is_finite() || !is_numeric(ty) {
@@ -351,14 +379,14 @@ fn render_literal(lit: &Literal, ty: FieldType, dialect: SqlDialect) -> Option<S
             }
             let dt = chrono::DateTime::from_timestamp_micros(*micros)?;
             let text = dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
-            Some(match (dialect.typed_literals(), *tz) {
-                (true, true) => format!("TIMESTAMP '{text} UTC'"),
-                (true, false) => format!("TIMESTAMP '{text}'"),
-                (false, _) => sql_string(&text),
-            })
+            match (dialect.typed_literals(), *tz) {
+                (true, true) => Some(format!("TIMESTAMP '{text} UTC'")),
+                (true, false) => Some(format!("TIMESTAMP '{text}'")),
+                (false, _) => sql_string(&text, dialect),
+            }
         }
         Literal::TemplateKey(raw) => match ty {
-            FieldType::String => Some(sql_string(raw)),
+            FieldType::String => sql_string(raw, dialect),
             FieldType::Int32 | FieldType::Int64 => raw.parse::<i64>().ok().map(|i| i.to_string()),
             _ => None,
         },
@@ -431,7 +459,10 @@ mod tests {
         );
         assert_eq!(SqlDialect::Trino.quote_ident(r#"we"ird"#), r#""we""ird""#);
         assert_eq!(SqlDialect::Mysql.quote_table("db.t"), "`db`.`t`");
-        assert_eq!(sql_string("O'Brien"), "'O''Brien'");
+        assert_eq!(
+            sql_string("O'Brien", SqlDialect::Trino).unwrap(),
+            "'O''Brien'"
+        );
     }
 
     #[test]
@@ -542,6 +573,72 @@ mod tests {
         assert!(r
             .sql
             .starts_with(r#"SELECT "id", "name", "born", "score", "price", "at" AT TIME ZONE"#));
+    }
+
+    /// A backslash is inert on Trino/Postgres/SQLite and live on MySQL under
+    /// its default `sql_mode`, where quote-doubling alone would let the value
+    /// close its own literal. Rendering must decline there, and only there.
+    #[test]
+    fn mysql_declines_string_literals_carrying_a_backslash() {
+        // `a\' UNION SELECT …` — the shape that escapes its closing quote when
+        // the server reads `\'` as an escaped quote rather than as two chars.
+        let hostile = r"a\' UNION SELECT price FROM other -- ";
+        let req = |lit: Literal| ScanRequest {
+            source: LogicalSource::Table("t".into()),
+            projection: vec!["name".into()],
+            predicates: vec![pred("name", CmpOp::Eq, lit)],
+        };
+
+        for lit in [
+            Literal::Str(hostile.into()),
+            Literal::TemplateKey(hostile.into()),
+            // A lone trailing backslash is the minimal case, and ordinary data.
+            Literal::Str(r"c:\".into()),
+        ] {
+            let r = render_scan(&req(lit.clone()), &schema(), SqlDialect::Mysql).unwrap();
+            assert!(
+                !r.sql.contains("WHERE"),
+                "MySQL must decline `{lit:?}`, rendered: {}",
+                r.sql
+            );
+            assert_eq!(r.declined_predicates.len(), 1, "{lit:?}");
+
+            // Every other dialect leaves backslash inert, so the push stands.
+            for dialect in [SqlDialect::Trino, SqlDialect::Postgres, SqlDialect::Sqlite] {
+                let r = render_scan(&req(lit.clone()), &schema(), dialect).unwrap();
+                assert!(
+                    r.declined_predicates.is_empty(),
+                    "{dialect:?} should push `{lit:?}`"
+                );
+            }
+        }
+
+        // The escaping that is applied stays standard: `'` doubles, `\` is
+        // passed through as the single character it is.
+        let r = render_scan(
+            &req(Literal::Str(hostile.into())),
+            &schema(),
+            SqlDialect::Trino,
+        )
+        .unwrap();
+        assert_eq!(
+            r.sql,
+            r#"SELECT "name" FROM "t" WHERE "name" = 'a\'' UNION SELECT price FROM other -- '"#
+        );
+    }
+
+    /// Values with no backslash are unaffected on MySQL: quote doubling and
+    /// backtick identifier quoting still apply.
+    #[test]
+    fn mysql_still_pushes_ordinary_string_literals() {
+        let req = ScanRequest {
+            source: LogicalSource::Table("t".into()),
+            projection: vec!["name".into()],
+            predicates: vec![pred("name", CmpOp::Eq, Literal::Str("O'Brien".into()))],
+        };
+        let r = render_scan(&req, &schema(), SqlDialect::Mysql).unwrap();
+        assert_eq!(r.sql, "SELECT `name` FROM `t` WHERE `name` = 'O''Brien'");
+        assert!(r.declined_predicates.is_empty());
     }
 
     #[test]

@@ -81,8 +81,11 @@ pub struct IndexBuildConfig {
     pub leaf_target_rows: usize,
     /// Zstd compression level.
     pub zstd_level: i32,
-    /// Skip deduplication (safe for fresh bulk import).
-    pub skip_dedup: bool,
+    /// Import fast path: inputs are asserts of distinct facts, except for
+    /// duplicate input statements, which collapse adjacently in the merge
+    /// (earliest `t` wins) with no lifecycle resolution and no history.
+    /// `false` = rebuild path: full event-log transition resolution.
+    pub import_unique_asserts: bool,
     /// Skip history sidecar production (safe for append-only import).
     pub skip_history: bool,
     /// Graph ID for all records. Required because V2 run files (FRN2) do
@@ -217,16 +220,23 @@ pub fn build_index(config: &IndexBuildConfig) -> Result<IndexBuildResult, IndexB
 
     let mut total_rows: u64 = 0;
     let mut progress_batch: u64 = 0;
+    let mut import_duplicates_dropped: u64 = 0;
 
     // Scratch: one identity's full event log, reused across identities.
     let mut events: Vec<(RunRecordV2, u8)> = Vec::new();
 
     loop {
-        if config.skip_dedup {
-            // Import path: no dedup, no history.
-            let Some((record, op)) = merge.next_record()? else {
+        if config.import_unique_asserts {
+            // Import path: collapse duplicate input statements (earliest t
+            // wins), no history. The SPOT merge already tallied the collapsed
+            // copies for stats correction; here they only advance progress,
+            // whose denominators count pre-dedup records.
+            let dropped_before = import_duplicates_dropped;
+            let Some((record, op)) = merge.next_unique_assert(&mut import_duplicates_dropped)?
+            else {
                 break;
             };
+            progress_batch += import_duplicates_dropped - dropped_before;
             if op == 0 {
                 continue;
             }
@@ -526,7 +536,7 @@ pub fn discover_run_files_v2(dir: &Path) -> io::Result<Vec<PathBuf>> {
 ///    order too, so the emitted sequence is identical; induction extends
 ///    this to any cascade depth.
 /// 3. Downstream consumers are pure functions of the emitted sequence: the
-///    import path (`skip_dedup`) consumes `next_record` directly, and the
+///    import path (`import_unique_asserts`) consumes `next_record` directly, and the
 ///    rebuild path's `next_deduped_with_history` resolves winners from the
 ///    same sequence. Intermediate passes preserve rather than resolve — op
 ///    bytes are carried verbatim (version-2 output whenever any input
@@ -637,7 +647,7 @@ pub struct BuildAllConfig {
     pub leaflet_target_rows: usize,
     pub leaf_target_rows: usize,
     pub zstd_level: i32,
-    pub skip_dedup: bool,
+    pub import_unique_asserts: bool,
     pub skip_history: bool,
     /// Graph ID — builds are graph-scoped (run files don't carry g_id).
     pub g_id: u16,
@@ -711,7 +721,7 @@ pub fn build_all_indexes(
             leaflet_target_rows: config.leaflet_target_rows,
             leaf_target_rows: config.leaf_target_rows,
             zstd_level: config.zstd_level,
-            skip_dedup: config.skip_dedup,
+            import_unique_asserts: config.import_unique_asserts,
             skip_history: config.skip_history,
             g_id: config.g_id,
             // Import progress reflects all order builds, not just one
@@ -881,7 +891,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 1000,
             zstd_level: 1,
-            skip_dedup: true,
+            import_unique_asserts: true,
             skip_history: true,
             g_id: 0,
             progress: None,
@@ -933,7 +943,7 @@ mod tests {
     /// A cascaded merge (fan_in_cap 3 forces two passes over 9 runs) must be
     /// byte-identical to the flat merge: leaf/sidecar/branch CIDs are
     /// content-addressed, so CID equality is byte equality. Import path
-    /// (skip_dedup, no ops).
+    /// (import_unique_asserts, no ops).
     #[test]
     fn cascade_matches_flat_merge_no_op() {
         use fluree_db_binary_index::format::run_record_v2::cmp_v2_spot;
@@ -976,7 +986,7 @@ mod tests {
                 leaflet_target_rows: 64,
                 leaf_target_rows: 256,
                 zstd_level: 1,
-                skip_dedup: true,
+                import_unique_asserts: true,
                 skip_history: true,
                 g_id: 0,
                 progress: None,
@@ -1045,7 +1055,7 @@ mod tests {
                 leaflet_target_rows: 64,
                 leaf_target_rows: 256,
                 zstd_level: 1,
-                skip_dedup: false,
+                import_unique_asserts: false,
                 skip_history: false,
                 g_id: 0,
                 progress: None,
@@ -1118,7 +1128,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 1000,
             zstd_level: 1,
-            skip_dedup: false,
+            import_unique_asserts: false,
             skip_history: false,
             g_id: 0,
             progress: None,
@@ -1181,7 +1191,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 1000,
             zstd_level: 1,
-            skip_dedup: false,
+            import_unique_asserts: false,
             skip_history: false,
             g_id: 0,
             progress: None,
@@ -1234,7 +1244,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 1000,
             zstd_level: 1,
-            skip_dedup: false,
+            import_unique_asserts: false,
             skip_history: false,
             g_id: 0,
             progress: None,
@@ -1294,7 +1304,7 @@ mod tests {
             leaflet_target_rows: 100,
             leaf_target_rows: 1000,
             zstd_level: 1,
-            skip_dedup: true,
+            import_unique_asserts: true,
             skip_history: true,
             g_id: 0,
             progress: None,

@@ -19,10 +19,11 @@
 //! - Transactions serialize via `lock_for_write()` (hold lock for stage+commit)
 //! - Manager lock is released during I/O (no blocking other ledgers)
 
+use fluree_db_core::clock::Instant;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use std::path::PathBuf;
 
@@ -162,8 +163,9 @@ struct ConfigCacheEntry {
 /// All paths that touch both locks (snapshot, apply_index_v2, reload)
 /// follow this order to prevent deadlock and ensure coherence.
 ///
-/// `config_cache` is independent of `state` (guarded by its own lock, never
-/// held across the `state` lock), so it participates in no ordering constraint.
+/// `config_cache` has its own lock and is never held while acquiring `state`;
+/// `reload`'s swap takes it briefly *while holding* `state`, so the one
+/// permitted order is `state` → `config_cache`, never the reverse.
 struct LedgerHandleInner {
     /// Guards all access to the ledger state. A `RwLock` so concurrent reads
     /// (every query takes a brief shared `read()` to clone a cheap, Arc-backed
@@ -233,6 +235,24 @@ impl LedgerHandle {
         let mut entry = self.inner.config_cache.write().await;
         entry.key = Some(key);
         entry.config = config;
+    }
+
+    /// Drop the resolved-config entry so the next read re-resolves.
+    ///
+    /// Needed by out-of-band state swaps (`LedgerManager::reload`): the marker
+    /// only protects against staleness it can *see* advance. A reader that
+    /// raced the unwind gap of a detached commit (see `DetachedCacheSlot`)
+    /// can have resolved config against the empty placeholder and cached it
+    /// under `config_write_t = 0` — and a reloaded state whose config graph
+    /// was last written at or below `index_t` legitimately carries marker `0`
+    /// too, so that entry would *hit*, silently serving "no config" for a
+    /// configured ledger until the next config write. Clearing at the swap
+    /// point closes it (all but a resolve still in flight across the swap,
+    /// whose put can land after this clear — reaching even that needs a panic
+    /// plus two racing windows).
+    pub(crate) async fn config_cache_clear(&self) {
+        let mut entry = self.inner.config_cache.write().await;
+        *entry = ConfigCacheEntry::default();
     }
 
     /// Set the read-side tier width (`0`/`1` disables read-triggered compaction).
@@ -405,8 +425,11 @@ impl LedgerHandle {
     /// Apply a v2 binary index root to this handle.
     ///
     /// All I/O (root read, BinaryIndexStore load) happens outside any lock.
-    /// The state lock is held for the brief atomic swap of both `state` and
-    /// `binary_store`, ensuring coherence between `db.range_provider` and
+    /// The state lock is held while the snapshot is applied — novelty trim
+    /// and runtime-dict reseed scale with accumulated novelty, so this is
+    /// not a constant-time swap; see the `index_install_wait` /
+    /// `index_install_lock` spans — and both `state` and `binary_store` are
+    /// swapped under it, ensuring coherence between `db.range_provider` and
     /// `binary_store` (lock ordering: state → binary_store).
     ///
     /// `cs` MUST be branch-aware for branched ledgers (built via
@@ -420,6 +443,25 @@ impl LedgerHandle {
         cache_dir: &std::path::Path,
         leaflet_cache: Option<Arc<LeafletCache>>,
     ) -> Result<()> {
+        use tracing::Instrument as _;
+        let span = tracing::debug_span!(
+            "index_install",
+            ledger_id = %self.id(),
+            index_t = tracing::field::Empty,
+        );
+        self.apply_index_v2_inner(index_id, cs, cache_dir, leaflet_cache)
+            .instrument(span)
+            .await
+    }
+
+    async fn apply_index_v2_inner(
+        &self,
+        index_id: &ContentId,
+        cs: Arc<dyn ContentStore>,
+        cache_dir: &std::path::Path,
+        leaflet_cache: Option<Arc<LeafletCache>>,
+    ) -> Result<()> {
+        use tracing::Instrument as _;
         let bytes = cs
             .get(index_id)
             .await
@@ -453,14 +495,31 @@ impl LedgerHandle {
             had_annotation_arena: root.had_annotation_arena,
             has_list_meta: root.has_list_meta,
         };
+        tracing::Span::current().record("index_t", meta.t);
         let db = LedgerSnapshot::new_meta(meta)
             .map_err(|e| ApiError::internal(format!("graph registry from root: {e}")))?;
 
-        // Brief lock: apply snapshot (trims novelty, rebuilds dict_novelty),
+        // Exclusive lock: apply snapshot (trims novelty, rebuilds dict_novelty),
         // then wire up range_provider with the correct dict_novelty.
         // Lock ordering: state → binary_store (same as snapshot()).
-        {
-            let mut state = self.inner.state.write().await;
+        //
+        // Wait and hold are bracketed by separate spans so each aggregates
+        // independently: a long `index_install_wait` is contention on the
+        // state lock (points at backpressure or install batching), while a
+        // long `index_install_lock` is the guarded work itself — the two
+        // novelty walks inside (apply_loaded_db, reseed_runtime_small_dicts)
+        // scale with accumulated novelty, so this is not a constant-time
+        // swap. No event fires inside the lock: under a default `fmt`
+        // subscriber, span lifecycle is in-memory bookkeeping rather than a
+        // formatted write to a shared writer.
+        let state_guard = self
+            .inner
+            .state
+            .write()
+            .instrument(tracing::debug_span!("index_install_wait"))
+            .await;
+        let install = async move {
+            let mut state = state_guard;
 
             // apply_loaded_db: validates, trims novelty, rebuilds dict_novelty
             state
@@ -496,7 +555,11 @@ impl LedgerHandle {
             let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
             state.binary_store = Some(TypeErasedStore(te_store));
             *self.inner.binary_store.write().await = Some(arc_store);
-        }
+            Ok::<(), ApiError>(())
+        };
+        install
+            .instrument(tracing::debug_span!("index_install_lock"))
+            .await?;
 
         Ok(())
     }
@@ -731,10 +794,26 @@ impl Default for LedgerManagerConfig {
         Self {
             idle_ttl: Duration::from_secs(30 * 60),
             sweep_interval: Duration::from_secs(60),
-            cache_dir: std::env::temp_dir().join("fluree_binary_cache"),
+            cache_dir: default_cache_dir(),
             leaflet_cache: None,
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn default_cache_dir() -> PathBuf {
+    std::env::temp_dir().join("fluree_binary_cache")
+}
+
+/// wasm32 has no filesystem and `std::env::temp_dir()` PANICS there ("no
+/// filesystem on this platform") — and this default runs inside
+/// `FlureeBuilder::memory()`, before any build method. The synthetic path is
+/// never touched at runtime: the disk cache opens with a zero write budget
+/// (`fs::create_dir_all` fails → writes disabled) and reads map
+/// `Unsupported` to a cache miss.
+#[cfg(target_arch = "wasm32")]
+fn default_cache_dir() -> PathBuf {
+    PathBuf::from("/fluree-cache")
 }
 
 // ============================================================================
@@ -1561,6 +1640,15 @@ impl LedgerManager {
                             let mut bs_guard = handle.inner.binary_store.write().await;
                             write_guard.replace(new_state);
                             *bs_guard = new_binary_store;
+                            // Out-of-band swap: any resolved-config entry may
+                            // have been cached against a state this swap just
+                            // replaced — including a detached-commit
+                            // placeholder whose marker (0) a reloaded state
+                            // can legitimately share. See `config_cache_clear`.
+                            // Taking the config lock while holding `state` is
+                            // safe: no path acquires `state` while holding the
+                            // config lock.
+                            handle.config_cache_clear().await;
                         } else {
                             // A concurrent commit advanced the in-memory state
                             // past the reloaded storage HEAD (a txn took the

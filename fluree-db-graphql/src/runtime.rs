@@ -24,6 +24,7 @@ use async_graphql::dynamic::{
 use async_graphql::Value as GqlValue;
 
 use crate::error::{Error, Result};
+use crate::limits::Limits;
 use crate::mutate::{self, MutationField, MutationKind};
 use crate::schema::model::{
     Direction, Field, FieldType, ObjectType, RootField, RootKind, Scalar, SchemaModel,
@@ -84,7 +85,16 @@ pub trait RootExecutor: Send + Sync + 'static {
 ///
 /// `mutations` are the write fields to expose; empty means a read-only schema,
 /// which is every tier below 3 and any tier-3 schema that did not opt in.
-pub fn build_schema(model: &SchemaModel, mutations: &[MutationField]) -> Result<Schema> {
+///
+/// `limits` bound what a document may ask of the schema. async-graphql defaults
+/// both depth and complexity to unlimited, and a derived schema is cyclic
+/// wherever one class references another, so leaving them off would let the
+/// caller choose the recursion depth.
+pub fn build_schema(
+    model: &SchemaModel,
+    mutations: &[MutationField],
+    limits: &Limits,
+) -> Result<Schema> {
     let mutation_type = (!mutations.is_empty()).then_some("Mutation");
     let mut builder = Schema::build("Query", mutation_type, None);
 
@@ -162,6 +172,13 @@ pub fn build_schema(model: &SchemaModel, mutations: &[MutationField]) -> Result<
             mutation = mutation.field(build_mutation_field(field));
         }
         builder = builder.register(mutation);
+    }
+
+    if limits.max_depth != usize::MAX {
+        builder = builder.limit_depth(limits.max_depth);
+    }
+    if limits.max_complexity != usize::MAX {
+        builder = builder.limit_complexity(limits.max_complexity);
     }
 
     builder

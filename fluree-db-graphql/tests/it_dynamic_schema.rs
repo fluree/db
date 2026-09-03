@@ -1,5 +1,4 @@
-//! Phase 0 spike: prove async-graphql's `dynamic` API supports the design in
-//! `GRAPHQL.md` — a schema built at runtime from a [`SchemaModel`], one root
+//! The dynamic schema — built at runtime from a [`SchemaModel`], one root
 //! resolver that receives the entire selection subtree, and generic pass-through
 //! resolvers for everything nested.
 //!
@@ -15,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use async_graphql::{Request, Variables};
 use fluree_db_graphql::error::Result as GqlResult;
+use fluree_db_graphql::limits::Limits;
 use fluree_db_graphql::runtime::{build_schema, ExecutorData, RootExecutor, RootRequest};
 use fluree_db_graphql::schema::model::{
     Direction, EnumType, Field, FieldType, InterfaceType, ObjectType, Provenance, RootField,
@@ -248,9 +248,10 @@ async fn run(
     let model = fixture_model();
     // The schema is executor-agnostic — that is what lets one registration be
     // cached and shared — so the executor rides on the request instead.
-    let schema = build_schema(&model, &[]).expect("schema builds");
+    let schema = build_schema(&model, &[], &Limits::default()).expect("schema builds");
     let doc = async_graphql::parser::parse_query(query).expect("document parses");
-    let op = selection::extract(&doc, None, &variables).expect("selection extracts");
+    let op =
+        selection::extract(&doc, None, &variables, &Limits::default()).expect("selection extracts");
     schema
         .execute(
             Request::new(query)
@@ -649,7 +650,8 @@ fn cyclic_fragments_are_rejected_by_extraction() {
         fragment A on Person { id ...B }
         fragment B on Person { ...A }";
     let doc = async_graphql::parser::parse_query(query).unwrap();
-    let err = selection::extract(&doc, None, &Variables::default()).unwrap_err();
+    let err =
+        selection::extract(&doc, None, &Variables::default(), &Limits::default()).unwrap_err();
     assert!(err.to_string().contains("cyclic"), "{err}");
 }
 
@@ -657,6 +659,7 @@ fn cyclic_fragments_are_rejected_by_extraction() {
 fn unknown_variable_is_reported() {
     let query = "query { persons(limit: $nope) { id } }";
     let doc = async_graphql::parser::parse_query(query).unwrap();
-    let err = selection::extract(&doc, None, &Variables::default()).unwrap_err();
+    let err =
+        selection::extract(&doc, None, &Variables::default(), &Limits::default()).unwrap_err();
     assert!(err.to_string().contains("$nope"), "{err}");
 }

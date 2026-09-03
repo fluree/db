@@ -7,6 +7,16 @@ use tokio::sync::mpsc;
 use crate::backend::{flush, Backend, ColumnMeta, RowChunk, Session, CHUNK_ROWS};
 use crate::render::{self, trino};
 
+/// Keep Postgres on the standard-SQL string rule this bridge's clients assume.
+///
+/// `standard_conforming_strings` has defaulted to `on` since 9.1, which is why
+/// Postgres is not exposed the way MySQL is (see `mysql.rs`). But it is still a
+/// settable GUC: a server, database or role with it `off` would process
+/// backslash escapes inside ordinary literals, and a value ending in one could
+/// escape its own closing quote. Setting it per session costs nothing and
+/// removes the dependency on how the server happens to be configured.
+const ENFORCE_STANDARD_STRING_LITERALS: &str = "SET standard_conforming_strings = on";
+
 pub struct Postgres {
     pool: PgPool,
     decimal_scale: i64,
@@ -20,6 +30,12 @@ impl Postgres {
     ) -> Result<Self, String> {
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    conn.execute(ENFORCE_STANDARD_STRING_LITERALS).await?;
+                    Ok(())
+                })
+            })
             .connect(url)
             .await
             .map_err(|e| format!("connect postgres: {e}"))?;

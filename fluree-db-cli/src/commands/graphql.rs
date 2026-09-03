@@ -72,18 +72,39 @@ pub async fn run(
         variables,
         operation_name: operation.map(str::to_string),
         explain,
+        // The server's defaults, not `unlimited`: a document that works here
+        // should be one the endpoint will also accept.
+        limits: fluree_db_api::graphql::Limits::default(),
     };
     // A mutation needs the ledger itself, not a read view — decided from the
-    // document, since there is no other signal.
-    let response = if fluree_db_api::graphql::is_mutation(&request) {
-        let ledger = fluree.ledger(&ledger_id).await?;
-        let default_context = fluree.get_default_context(&ledger_id).await?;
-        let (response, _committed) = fluree
-            .graphql_transact(ledger, default_context, &request)
-            .await?;
-        response
-    } else {
-        fluree.graphql(&view, &request).await?
+    // document, since there is no other signal. Parsed once and reused by
+    // whichever path runs.
+    let response = match fluree_db_api::graphql::PreparedRequest::new(&request) {
+        // A refused document is already a GraphQL error envelope, and the
+        // `errors` check below is what turns it into an exit code.
+        Err(envelope) => envelope,
+        Ok(prepared) if prepared.writes() => {
+            let ledger = fluree.ledger(&ledger_id).await?;
+            let default_context = fluree.get_default_context(&ledger_id).await?;
+            let (response, _committed) = fluree
+                .graphql_transact_with_options(
+                    ledger,
+                    default_context,
+                    prepared,
+                    fluree_db_api::QueryExecutionOptions::default(),
+                )
+                .await?;
+            response
+        }
+        Ok(prepared) => {
+            fluree
+                .graphql_with_options(
+                    &view,
+                    prepared,
+                    fluree_db_api::QueryExecutionOptions::default(),
+                )
+                .await?
+        }
     };
     println!(
         "{}",

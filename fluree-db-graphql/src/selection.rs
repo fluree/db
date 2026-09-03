@@ -18,6 +18,31 @@ use async_graphql::parser::types::{
 use async_graphql::{Name, Positioned, Value, Variables};
 
 use crate::error::{Error, Result};
+use crate::limits::Limits;
+
+/// How far into the selection tree the walk currently is.
+///
+/// Only a field descends: an inline fragment or a spread is flattened into the
+/// level that holds it, so counting them would refuse a document that selects
+/// nothing deeper than a permitted one.
+#[derive(Debug, Clone, Copy)]
+struct Depth {
+    current: usize,
+    max: usize,
+}
+
+impl Depth {
+    fn descend(self) -> Result<Self> {
+        let current = self.current + 1;
+        if current > self.max {
+            return Err(Error::Parse(format!(
+                "selection nests deeper than the {} levels this endpoint allows",
+                self.max
+            )));
+        }
+        Ok(Self { current, ..self })
+    }
+}
 
 /// One selected field, with its sub-selection.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,17 +83,24 @@ pub fn extract(
     doc: &ExecutableDocument,
     operation_name: Option<&str>,
     variables: &Variables,
+    limits: &Limits,
 ) -> Result<Operation> {
     let (name, op) = pick_operation(doc, operation_name)?;
-    let defaults = variable_defaults(&op.node);
+    let ctx = Ctx {
+        fragments: &doc.fragments,
+        variables,
+        defaults: variable_defaults(&op.node),
+    };
     let mut out = Vec::new();
     walk(
         &op.node.selection_set.node,
         None,
-        &doc.fragments,
-        variables,
-        &defaults,
+        &ctx,
         &mut Vec::new(),
+        Depth {
+            current: 0,
+            max: limits.max_depth,
+        },
         &mut out,
     )?;
     Ok(Operation {
@@ -115,6 +147,13 @@ fn variable_defaults(op: &OperationDefinition) -> HashMap<Name, Value> {
         .collect()
 }
 
+/// What the walk carries unchanged from the document it started on.
+struct Ctx<'a> {
+    fragments: &'a HashMap<Name, Positioned<FragmentDefinition>>,
+    variables: &'a Variables,
+    defaults: HashMap<Name, Value>,
+}
+
 /// Flatten fragments into `out` while carrying the innermost type condition down.
 ///
 /// `seen_fragments` guards against a cyclic fragment spread. Cyclic spreads are a
@@ -123,10 +162,9 @@ fn variable_defaults(op: &OperationDefinition) -> HashMap<Name, Value> {
 fn walk(
     set: &SelectionSet,
     type_condition: Option<&str>,
-    fragments: &HashMap<Name, Positioned<FragmentDefinition>>,
-    variables: &Variables,
-    defaults: &HashMap<Name, Value>,
+    ctx: &Ctx<'_>,
     seen_fragments: &mut Vec<Name>,
+    depth: Depth,
     out: &mut Vec<Selection>,
 ) -> Result<()> {
     for item in &set.items {
@@ -136,9 +174,9 @@ fn walk(
                 let mut arguments = Vec::with_capacity(f.arguments.len());
                 for (n, v) in &f.arguments {
                     let resolved = v.node.clone().into_const_with(|var| {
-                        variables
+                        ctx.variables
                             .get(&var)
-                            .or_else(|| defaults.get(&var))
+                            .or_else(|| ctx.defaults.get(&var))
                             .cloned()
                             .ok_or_else(|| {
                                 Error::Parse(format!("variable `${var}` is not defined"))
@@ -150,10 +188,9 @@ fn walk(
                 walk(
                     &f.selection_set.node,
                     None,
-                    fragments,
-                    variables,
-                    defaults,
+                    ctx,
                     seen_fragments,
+                    depth.descend()?,
                     &mut children,
                 )?;
                 out.push(Selection {
@@ -174,16 +211,15 @@ fn walk(
                 walk(
                     &frag.node.selection_set.node,
                     cond,
-                    fragments,
-                    variables,
-                    defaults,
+                    ctx,
                     seen_fragments,
+                    depth,
                     out,
                 )?;
             }
             AstSelection::FragmentSpread(spread) => {
                 let fname = &spread.node.fragment_name.node;
-                let Some(frag) = fragments.get(fname) else {
+                let Some(frag) = ctx.fragments.get(fname) else {
                     return Err(Error::Parse(format!("unknown fragment `{fname}`")));
                 };
                 if seen_fragments.contains(fname) {
@@ -193,10 +229,9 @@ fn walk(
                 let result = walk(
                     &frag.node.selection_set.node,
                     Some(frag.node.type_condition.node.on.node.as_str()),
-                    fragments,
-                    variables,
-                    defaults,
+                    ctx,
                     seen_fragments,
+                    depth,
                     out,
                 );
                 seen_fragments.pop();

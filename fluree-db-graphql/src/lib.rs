@@ -20,9 +20,11 @@
 //! ([`lower::reshape`]). [`schema::bootstrap`] runs the mapping backwards, emitting
 //! SHACL from a derived schema as a starting point for tier 2.
 //!
-//! See `GRAPHQL.md` at the repo root for the full mapping specification.
+//! See `docs/query/graphql.md` for the reference and `docs/cli/graphql.md`
+//! for the full SHACL and curation mapping tables.
 
 pub mod error;
+pub mod limits;
 pub mod lower;
 pub mod mutate;
 pub mod naming;

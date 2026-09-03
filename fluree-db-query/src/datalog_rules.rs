@@ -15,6 +15,7 @@
 //! ```
 
 use crate::reasoning::ReasoningOverlay;
+use fluree_db_core::clock::Instant;
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::flake::Flake;
 use fluree_db_core::overlay::OverlayProvider;
@@ -30,7 +31,6 @@ use fluree_vocab::namespaces::FLUREE_DB;
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::error::{QueryError, Result};
 
@@ -1972,6 +1972,10 @@ impl OverlayProvider for OverlayRef<'_> {
 
     fn epoch(&self) -> u64 {
         self.0.epoch()
+    }
+
+    fn overlay_flake_count(&self, g_id: fluree_db_core::GraphId) -> Option<usize> {
+        self.0.overlay_flake_count(g_id)
     }
 
     fn for_each_overlay_flake(

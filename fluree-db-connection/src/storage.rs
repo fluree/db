@@ -27,14 +27,17 @@ pub fn validate_storage_config(config: &StorageConfig) -> Result<Option<&str>> {
         StorageType::File => {
             #[cfg(not(all(feature = "native", not(target_arch = "wasm32"))))]
             {
-                return Err(ConnectionError::unsupported_component(
+                Err(ConnectionError::unsupported_component(
                     "https://ns.flur.ee/system#filePath (native feature disabled)",
-                ));
+                ))
             }
-            let path = config.path.as_ref().ok_or_else(|| {
-                ConnectionError::invalid_config("File storage requires 'path' to be specified")
-            })?;
-            Ok(Some(path.as_ref()))
+            #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+            {
+                let path = config.path.as_ref().ok_or_else(|| {
+                    ConnectionError::invalid_config("File storage requires 'path' to be specified")
+                })?;
+                Ok(Some(path.as_ref()))
+            }
         }
         StorageType::S3(_) => Err(ConnectionError::unsupported_component(
             "https://ns.flur.ee/system#s3Bucket",

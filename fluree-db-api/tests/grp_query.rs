@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_bounded_overlay_translation.rs"]
+mod it_bounded_overlay_translation;
 #[path = "it_differential_fastpath.rs"]
 mod it_differential_fastpath;
 #[path = "it_nested_select_modifiers.rs"]

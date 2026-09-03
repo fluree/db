@@ -9,7 +9,7 @@ repository.workspace = true
 
 [features]
 default = ["native"]
-native = ["fluree-db-nameservice/native", "fluree-db-core/native", "fluree-db-query/native", "dep:sysinfo"]
+native = ["fluree-db-nameservice/native", "fluree-db-core/native", "fluree-db-query/native", "fluree-db-connection/native", "dep:sysinfo"]
 # Enable AWS-backed storage support (S3, storage-backed nameservice,
 # vended-credential minting).
 aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws", "dep:aws-sdk-sts"]
@@ -53,19 +53,16 @@ fluree-db-core = { path = "../fluree-db-core" }
 parking_lot = "0.12"
 lru = { workspace = true }
 fluree-db-crypto = { path = "../fluree-db-crypto", features = ["nameservice"] }
-fluree-db-connection = { path = "../fluree-db-connection" }
+fluree-db-connection = { path = "../fluree-db-connection", default-features = false }
 fluree-db-policy = { path = "../fluree-db-policy" }
 fluree-db-query = { path = "../fluree-db-query" }
 fluree-db-ledger = { path = "../fluree-db-ledger" }
 fluree-db-novelty = { path = "../fluree-db-novelty" }
 fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false }
-fluree-db-transact = { path = "../fluree-db-transact", features = ["import"] }
-fluree-db-indexer = { path = "../fluree-db-indexer" }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 fluree-db-sparql = { path = "../fluree-db-sparql" }
 fluree-db-cypher = { path = "../fluree-db-cypher" }
 fluree-db-graphql = { path = "../fluree-db-graphql", optional = true }
-fluree-db-spatial = { path = "../fluree-db-spatial" }
 fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
 fluree-db-sql = { path = "../fluree-db-sql", optional = true }
@@ -88,14 +85,13 @@ bytes = "1.4"
 chrono.workspace = true
 futures.workspace = true
 indexmap.workspace = true
-moka.workspace = true
+# moka is native-only: its eviction clock aborts on wasm32 (see fluree-db-core::wasm_cache)
 rustc-hash = "2"
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # SHA-256 of the R2RML mapping for the materialize twin's completion stamp.
 sha2.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 # Used for fast xxh3_128 hashing in streaming dictionary merge.
 xxhash-rust.workspace = true
@@ -121,7 +117,6 @@ aws-sdk-sts = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 
 # Platform directory resolution (XDG on Linux, Application Support on macOS)
-dirs = "5"
 
 # System memory detection for import memory budget auto-sizing (native only)
 sysinfo = { workspace = true, optional = true }
@@ -150,6 +145,15 @@ fluree-bench-alloc = { path = "../fluree-bench-alloc" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 wiremock = { workspace = true }
+# Residency-mode read arms for the wasm read-path recovery tests
+# (it_residency_retry): dev-only feature unification — production native
+# builds keep the feature off and compile the pre-residency read path.
+fluree-db-query = { path = "../fluree-db-query", features = ["residency"] }
+fluree-db-binary-index = { path = "../fluree-db-binary-index", features = ["residency"] }
+
+[[test]]
+name = "it_residency_retry"
+path = "tests/it_residency_retry.rs"
 
 [[test]]
 name = "grp_graphsource"
@@ -236,6 +240,20 @@ path = "tests/grp_reasoning.rs"
 name = "grp_transact"
 path = "tests/grp_transact.rs"
 
+# Own binary: installs a process-global tracing subscriber and asserts on every
+# `fluree::cow_probe` event the process emits, so it must not share a process
+# with other tests that commit.
+[[test]]
+name = "it_cached_handle_cow"
+path = "tests/it_cached_handle_cow.rs"
+required-features = ["native"]
+
+# Own binary for the same reason (process-global `fluree::cow_probe` capture),
+# covering the branch-op (merge / revert) commit flows.
+[[test]]
+name = "it_branch_op_cow"
+path = "tests/it_branch_op_cow.rs"
+
 # Own binary: toggles the process-global fast-path kill switch AND asserts
 # fast-path routing, so it must not share a process with either.
 [[test]]
@@ -251,6 +269,21 @@ path = "tests/it_fastpath_1652_regression.rs"
 [[test]]
 name = "it_datetime_component_presence"
 path = "tests/it_datetime_component_presence.rs"
+
+[[test]]
+name = "it_timezone_accessors"
+path = "tests/it_timezone_accessors.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_temporal_lane_stability"
+path = "tests/it_temporal_lane_stability.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_temporal_arithmetic"
+path = "tests/it_temporal_arithmetic.rs"
+required-features = ["native"]
 
 # Own binary: asserts fast-path routing via process-scoped tracing capture.
 [[test]]
@@ -536,3 +569,18 @@ required-features = ["native"]
 name = "it_fast_stats_1391_regression"
 path = "tests/it_fast_stats_1391_regression.rs"
 required-features = ["native"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+moka = { workspace = true }
+fluree-db-transact = { path = "../fluree-db-transact", features = ["import"] }
+fluree-db-indexer = { path = "../fluree-db-indexer" }
+fluree-db-spatial = { path = "../fluree-db-spatial" }
+tokio = { workspace = true }
+# Platform directory resolution (XDG on Linux, Application Support on macOS)
+dirs = "5"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+fluree-db-transact = { path = "../fluree-db-transact" }
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time", "io-util"] }
+# Executor for `wasm_compat::spawn_detached` (browser event loop).
+wasm-bindgen-futures = "0.4"

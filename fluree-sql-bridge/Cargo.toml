@@ -12,6 +12,34 @@ publish = false
 # has its own Cargo.lock.
 [workspace]
 
+# Mirrors `[workspace.lints.clippy]` in the repo root, which this package cannot
+# inherit across the workspace boundary. The root is the source of truth; keep
+# the two in step.
+[workspace.lints.clippy]
+bool_to_int_with_if = "deny"
+comparison_chain = "deny"
+elidable_lifetime_names = "deny"
+explicit_into_iter_loop = "deny"
+explicit_iter_loop = "deny"
+ignored_unit_patterns = "deny"
+inconsistent_struct_constructor = "deny"
+manual_assert = "deny"
+manual_is_variant_and = "deny"
+manual_midpoint = "deny"
+manual_string_new = "deny"
+needless_raw_string_hashes = "deny"
+option_as_ref_cloned = "deny"
+range_plus_one = "deny"
+redundant_closure_for_method_calls = "deny"
+redundant_else = "deny"
+ref_binding_to_reference = "deny"
+semicolon_if_nothing_returned = "deny"
+unnecessary_literal_bound = "deny"
+unnecessary_semicolon = "deny"
+unnested_or_patterns = "deny"
+unreadable_literal = "deny"
+uninlined_format_args = "deny"
+
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
@@ -45,3 +73,6 @@ tower = { version = "0.5", features = ["util"] }
 [profile.release]
 strip = true
 lto = "thin"
+
+[lints]
+workspace = true

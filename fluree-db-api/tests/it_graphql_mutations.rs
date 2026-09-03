@@ -190,6 +190,20 @@ async fn create_mints_an_iri_and_returns_the_new_object() {
         id.starts_with("ex:"),
         "minted under the declared base: {id}"
     );
+    // 128 bits, not 64. Each writer in a cluster seeds independently, so
+    // uniqueness is birthday-bound, and a collision is silent: `create_` lowers
+    // to an Insert, which would merge onto whatever already holds the IRI. A
+    // minted IRI is permanent, so the width cannot be widened later.
+    let local = id.strip_prefix("ex:").expect("prefixed id");
+    assert_eq!(
+        local.len(),
+        32,
+        "minted local name must be 128 bits of hex: {id}"
+    );
+    assert!(
+        local.chars().all(|c| c.is_ascii_hexdigit()),
+        "minted local name must be hex: {id}"
+    );
 
     // It is really in the ledger, readable by an ordinary query.
     let data = fluree

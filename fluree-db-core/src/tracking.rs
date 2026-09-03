@@ -7,12 +7,13 @@
 //! micro-fuel. Use the helper methods (`limit_fuel`, `used_fuel`) for
 //! user-facing decimal representations.
 
+use crate::clock::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 
 /// Conversion factor between fuel and micro-fuel.

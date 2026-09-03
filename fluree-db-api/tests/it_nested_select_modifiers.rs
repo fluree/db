@@ -201,3 +201,57 @@ async fn malformed_nested_selections_are_rejected() {
         assert!(err.contains(expected), "for {spec}: {err}");
     }
 }
+
+/// Ordering by a large integer end to end.
+///
+/// The exactness itself is pinned by `compare_sort_values`'s own unit tests:
+/// whether two values that share an `f64` tie is invisible here, because the
+/// hydration happens to produce them in ascending order already. What this
+/// covers is that big integers survive the nested `orderBy` path at all.
+#[tokio::test]
+async fn nested_order_by_handles_large_integers() {
+    const BASE: i64 = 1 << 53;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "nested-order-bigint:main");
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": context(),
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "@type": "ex:Person",
+                        "ex:knows": [
+                            { "@id": "ex:x" }, { "@id": "ex:y" }, { "@id": "ex:z" }
+                        ]
+                    },
+                    { "@id": "ex:x", "ex:serial": BASE },
+                    { "@id": "ex:y", "ex:serial": BASE + 1 },
+                    { "@id": "ex:z", "ex:serial": BASE + 2 }
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let subject = alice(
+        &fluree,
+        &ledger,
+        json!({
+            "select": ["@id", "ex:serial"],
+            "orderBy": ["ex:serial"]
+        }),
+    )
+    .await;
+
+    let serials: Vec<i64> = subject["ex:knows"]
+        .as_array()
+        .expect("friends")
+        .iter()
+        .map(|f| f["ex:serial"].as_i64().expect("serial"))
+        .collect();
+    assert_eq!(serials, vec![BASE, BASE + 1, BASE + 2]);
+}
