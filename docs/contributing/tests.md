@@ -86,10 +86,13 @@ binary. No new `[[test]]` entry is needed unless you are creating a new group.
 - Feature-gated suites (`credential`, `iceberg`, `aws-testcontainers`, `vector`)
   — declared with `required-features`.
 - Tests that mutate **process-global env vars** (e.g. `FLUREE_*` toggles). A
-  grouped binary runs its tests as threads in one process under plain
-  `cargo test`, so env mutation must stay in a dedicated binary to remain
-  isolated. (Under `cargo nextest`, every test already runs in its own process,
-  so this only matters for bare `cargo test`.)
+  binary runs its tests as threads in one process under plain `cargo test`, so
+  a mutating test must be **alone in its binary**: moving a whole file out of a
+  group is not enough, because the mutation still leaks to every sibling test
+  in that file. `it_sync_graph_scan_backstop` holds one test for exactly this
+  reason; the rest of the graph-sync suite stays in `grp_ledger`. (Under
+  `cargo nextest`, every test already runs in its own process, so this only
+  matters for bare `cargo test`.)
 - Tests whose **assertions are about instrumentation** — presence/absence of
   tracing events captured via a thread-local `span_capture` subscriber (e.g.
   `it_cyclic_bgp_probe`, `it_minmax_fast_path_fired`,

@@ -13,6 +13,16 @@
 //! makes the mutation safe — nextest's process-per-test isolation is not
 //! enough on its own, because it does not apply to `cargo test`.
 //!
+//! The leak is scheduling-dependent and needs load to show: with this test
+//! back in `grp_ledger`, a plain `cargo test --test grp_ledger` usually stays
+//! green because the siblings miss the window. Reproduce it with
+//!
+//! ```text
+//! cargo test -p fluree-db-api --test grp_ledger -- it_sync_graph --test-threads=16
+//! ```
+//!
+//! which fails several of the fifteen `it_sync_graph` tests on every run.
+//!
 //! See docs/contributing/tests.md, "Kept standalone".
 
 #![cfg(feature = "native")]
