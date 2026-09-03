@@ -1088,18 +1088,27 @@ impl BackgroundIndexerWorker {
         // The same task then re-sweeps on a timer, for the residual the start-up
         // sweep cannot cover: a ledger that falls behind later and stops
         // receiving the commits that would trigger it.
-        let _sweep_guard = {
+        //
+        // Both sweeps are skipped when this worker does not own catch-up for
+        // its nameservice — see `IndexerConfig::catchup_sweeps_enabled`. A
+        // process can run two workers against one nameservice (raft does), and
+        // because they hold independent `states` maps, `trigger_if_idle` cannot
+        // see the other's claim: both would queue and build the same ledger.
+        let _sweep_guard = if self.config.catchup_sweeps_enabled {
             let trigger = self.subscriber_trigger.clone();
             let nameservice = Arc::clone(&self.nameservice);
             let interval = self.config.catchup_interval;
-            AbortOnDrop(tokio::spawn(async move {
+            Some(AbortOnDrop(tokio::spawn(async move {
                 catch_up_sweep(&trigger, nameservice.as_ref()).await;
                 if interval.is_zero() {
                     debug!("indexer catch-up re-sweep disabled");
                     return;
                 }
                 run_catchup_sweeps(trigger, nameservice, interval).await;
-            }))
+            })))
+        } else {
+            debug!("indexer catch-up sweeps disabled; another worker owns catch-up");
+            None
         };
 
         // Guard ensures aborting the outer `run` task also aborts
@@ -3402,6 +3411,57 @@ mod tests {
         .expect("subscriber should trigger handle within 2s");
 
         sub_task.abort();
+    }
+
+    /// A worker that does not own catch-up must not sweep — neither at start-up
+    /// nor on the timer. Raft is why: every node runs a node-scope worker built
+    /// by the api layer, and the leader runs a second, bus-wired one. Two
+    /// sweeping workers hold independent `states` maps, so `trigger_if_idle`
+    /// cannot see the other's claim and the same ledger is queued and built
+    /// twice; on followers, sweeping means initiating builds that publish
+    /// through a nameservice which under raft proposes to the state machine,
+    /// where indexing is leader-only by design.
+    ///
+    /// The handle must still work: this turns off automatic catch-up, not the
+    /// indexer. Admin reindex, post-commit triggers and the max-novelty nudge
+    /// all route through `IndexerHandle` and are unaffected.
+    #[tokio::test]
+    async fn a_worker_that_does_not_own_catchup_never_sweeps() {
+        let backend = StorageBackend::Managed(Arc::new(MemoryStorage::new()));
+        let ns = Arc::new(MemoryNameService::new());
+        let ns_dyn: Arc<dyn IndexingNameService> = Arc::clone(&ns) as _;
+
+        // Behind before the worker starts: a sweeping worker would find this.
+        ns.create_ledger("behind:main").unwrap();
+        ns.publish_commit("behind:main", 7, &test_commit_cid(7))
+            .await
+            .unwrap();
+
+        let config = IndexerConfig::default()
+            .with_catchup_sweeps(false)
+            // Short enough that a periodic sweep would have fired many times
+            // over inside the window this test waits.
+            .with_catchup_interval(Duration::from_millis(10));
+        let (worker, handle) = BackgroundIndexerWorker::new(backend, Arc::clone(&ns_dyn), config);
+        let worker_task = tokio::spawn(worker.run());
+
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            !handle.is_pending("behind:main").await,
+            "a worker that does not own catch-up must not queue a behind ledger"
+        );
+
+        // The handle is still live: an explicit request is honoured.
+        assert!(
+            handle.trigger_if_idle("behind:main", 7).await,
+            "disabling the sweeps must not disable the indexer itself"
+        );
+
+        worker_task.abort();
     }
 
     #[tokio::test]

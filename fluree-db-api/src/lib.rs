@@ -2069,6 +2069,44 @@ impl FlureeBuilder {
         self
     }
 
+    /// Declare that another worker owns catch-up for this nameservice, so the
+    /// background indexer this builder spawns must not sweep.
+    ///
+    /// Both sweeps are skipped — the start-up one and the periodic re-sweep.
+    /// Everything else about the worker is unchanged: post-commit triggers,
+    /// admin reindex, the max-novelty nudge, and maintenance holds all keep
+    /// working, because they route through `IndexerHandle` rather than the
+    /// sweeps.
+    ///
+    /// Raft is the case this exists for. Every node builds a `Fluree` through
+    /// this builder and so runs a node-scope worker, while the leader
+    /// additionally runs a leader-scope worker wired to the consensus event
+    /// bus. Catch-up belongs to the leader-scope one: it is the worker raft
+    /// starts and stops with leadership, and indexing under raft is leader-only
+    /// because publishing an index result proposes to the state machine. Left
+    /// enabled here, the leader would sweep twice over independent `states`
+    /// maps — `trigger_if_idle` cannot see the other worker's claim, so the
+    /// same ledger is queued and built concurrently — and every follower would
+    /// begin initiating builds of its own.
+    ///
+    /// Prefer this over `without_indexing()` for that case. `without_indexing()`
+    /// leaves `IndexingMode::Disabled`, which also turns off `admin::reindex`
+    /// and `admin::trigger_index` (they answer `ApiError::IndexingDisabled`),
+    /// drops the `cancel` + `wait_for_idle` quiesce that ledger drop and branch
+    /// purge rely on, and silently no-ops the max-novelty nudge.
+    ///
+    /// No-op unless background indexing is enabled, since it configures the
+    /// worker; call it after `with_indexing*`.
+    pub fn without_indexer_catchup_sweeps(mut self) -> Self {
+        if let Some(cfg) = self.indexing_config.take() {
+            self.indexing_config = Some(IndexingBuilderConfig {
+                indexer_config: cfg.indexer_config.with_catchup_sweeps(false),
+                index_config: cfg.index_config,
+            });
+        }
+        self
+    }
+
     /// Set novelty backpressure thresholds without enabling background indexing.
     ///
     /// Use this for short-lived processes (CLI, one-shot scripts) that need

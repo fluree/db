@@ -761,7 +761,22 @@ impl FlureeServerBuilder {
                 let backend = state_inner.fluree.backend().clone();
                 let bm25_auto_sync = state_inner.config.bm25_auto_sync;
                 let bm25_fluree = Arc::clone(&state_inner.fluree);
-                let indexer_config = fluree_db_indexer::IndexerConfig::default();
+                // The leader-scope worker is the one that sweeps under raft
+                // (the node-scope worker every node builds through
+                // `build_direct_fluree` has its sweeps delegated here), so the
+                // operator's catch-up interval has to reach THIS config or the
+                // flag governs nothing in a raft deployment — including `0`,
+                // which is the documented off switch.
+                //
+                // The rest of `IndexerConfig` is still defaulted here, which is
+                // pre-existing: `data_dir`, `run_budget_bytes`, the GC knobs and
+                // the fulltext / attachment / warm-cache providers that
+                // `build_direct_fluree` assembles for the node-scope worker do
+                // not reach the leader-scope one.
+                let indexer_config = fluree_db_indexer::IndexerConfig::default()
+                    .with_catchup_interval(std::time::Duration::from_secs(
+                        state_inner.config.indexer_catchup_interval_secs,
+                    ));
                 let event_bus = Arc::clone(&integration.event_bus);
                 let leader_tasks = move || {
                     let nameservice: std::sync::Arc<
