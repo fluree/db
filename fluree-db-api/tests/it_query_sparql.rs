@@ -6683,3 +6683,87 @@ async fn sparql_count_distinct_chain_fan_in() {
     let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(j, json!([[2]]), "2 distinct ?x values: {j}");
 }
+
+// =============================================================================
+// Range pushdown must be total-or-nothing
+// =============================================================================
+
+/// Six `ex:price` rows: a=497.26 b=0.005 c=12.5 d=0.01 (doubles), e=7 (integer),
+/// f=0.5 (decimal). A conjoined FILTER that mixes a pushable bound with an
+/// `xsd:decimal` bound used to push the representable half and drop the rest.
+async fn seed_prices(fluree: &MemoryFluree, ledger_id: &str) -> MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": [
+            {"@id": "ex:a", "ex:price": {"@value": "4.972607E2", "@type": "xsd:double"}},
+            {"@id": "ex:b", "ex:price": {"@value": "0.005", "@type": "xsd:double"}},
+            {"@id": "ex:c", "ex:price": {"@value": "12.5", "@type": "xsd:double"}},
+            {"@id": "ex:d", "ex:price": {"@value": "1.0E-2", "@type": "xsd:double"}},
+            {"@id": "ex:e", "ex:price": 7},
+            {"@id": "ex:f", "ex:price": {"@value": "0.5", "@type": "xsd:decimal"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap().ledger
+}
+
+async fn price_subjects(fluree: &MemoryFluree, ledger: &MemoryLedger, filter: &str) -> Vec<String> {
+    let query = format!(
+        r"
+        PREFIX ex: <http://example.org/>
+        SELECT ?s WHERE {{ ?s ex:price ?v . FILTER({filter}) }}
+        "
+    );
+    let result = support::query_sparql(fluree, ledger, &query)
+        .await
+        .unwrap_or_else(|e| panic!("FILTER({filter}): {e}"));
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let mut subjects: Vec<String> = jsonld
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            row.as_array().expect("row")[0]
+                .as_str()
+                .expect("subject")
+                .trim_start_matches("ex:")
+                .to_string()
+        })
+        .collect();
+    subjects.sort();
+    subjects
+}
+
+#[tokio::test]
+async fn sparql_range_filter_with_decimal_bound_keeps_every_conjunct() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_prices(&fluree, "prices:main").await;
+
+    let cases: &[(&str, &[&str])] = &[
+        // Baselines: a lone bound and same-type pairs already worked.
+        ("?v < 0.01", &["b"]),
+        ("?v >= 0.0 && ?v < 0.01", &["b"]),
+        ("?v >= 0 && ?v < 1", &["b", "d", "f"]),
+        // Mixed pushable + decimal bound, either order and either side.
+        ("?v >= 0 && ?v < 0.01", &["b"]),
+        ("?v < 0.01 && ?v >= 0", &["b"]),
+        ("?v >= 0e0 && ?v < 0.01", &["b"]),
+        ("?v >= 1 && ?v <= 12.5", &["c", "e"]),
+        ("?v >= 0.5 && ?v < 20", &["c", "e", "f"]),
+        ("?v >= 0 && ?v < 1.0", &["b", "d", "f"]),
+        ("(?v >= 0) && (?v < 20.5)", &["b", "c", "d", "e", "f"]),
+        ("?v >= 0 && ?v < 20.5 && ?v != 7", &["b", "c", "d", "f"]),
+    ];
+    for (filter, expected) in cases {
+        let expected: Vec<String> = expected.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            price_subjects(&fluree, &ledger, filter).await,
+            expected,
+            "FILTER({filter})"
+        );
+    }
+}

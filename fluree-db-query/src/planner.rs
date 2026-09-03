@@ -535,7 +535,12 @@ fn compare_range_values(a: &RangeValue, b: &RangeValue) -> std::cmp::Ordering {
 
 /// Extract range constraints from a pushdown-safe filter expression
 ///
-/// Returns `None` if the filter is not range-safe (contains OR, NOT, functions, etc.).
+/// Returns `None` if the filter is not range-safe (contains OR, NOT, functions, etc.),
+/// or if any part of it compares against a constant that has no `RangeValue`
+/// representation (e.g. `xsd:decimal`, boolean). The result is total-or-nothing:
+/// callers treat `Some` as "the pushed bounds are equivalent to the whole filter"
+/// and drop the filter, so a partial extraction would silently discard the
+/// conjuncts it could not represent.
 /// Returns `Some(vec)` with extracted constraints for each variable.
 ///
 /// # Supported patterns
@@ -597,13 +602,15 @@ pub fn extract_range_constraints(expr: &Expression) -> Option<Vec<RangeConstrain
                 let mut all_constraints: HashMap<VarId, RangeConstraint> = HashMap::new();
 
                 for e in args {
-                    if let Some(constraints) = extract_range_constraints(e) {
-                        for constraint in constraints {
-                            all_constraints
-                                .entry(constraint.var)
-                                .and_modify(|existing| existing.merge(&constraint))
-                                .or_insert(constraint);
-                        }
+                    // Every conjunct must extract. A conjunct that yields no
+                    // constraint (e.g. `?v < 0.01` with a decimal literal) would
+                    // otherwise be dropped from the filter it was part of.
+                    let constraints = extract_range_constraints(e)?;
+                    for constraint in constraints {
+                        all_constraints
+                            .entry(constraint.var)
+                            .and_modify(|existing| existing.merge(&constraint))
+                            .or_insert(constraint);
                     }
                 }
 
@@ -3159,6 +3166,79 @@ mod tests {
         let vars: Vec<_> = constraints.iter().map(|c| c.var).collect();
         assert!(vars.contains(&VarId(0)));
         assert!(vars.contains(&VarId(1)));
+    }
+
+    #[test]
+    fn test_extract_range_and_rejects_unrepresentable_conjunct() {
+        use std::str::FromStr;
+        // ?v >= 0 AND ?v < 0.01 — `0.01` is xsd:decimal, which has no RangeValue.
+        // The whole AND must fail to extract; a partial `>= 0` would replace the
+        // filter and silently drop the upper bound.
+        let decimal = |s: &str| {
+            Expression::Const(FlakeValue::Decimal(Box::new(
+                bigdecimal::BigDecimal::from_str(s).unwrap(),
+            )))
+        };
+        let lower = Expression::ge(
+            Expression::Var(VarId(0)),
+            Expression::Const(FlakeValue::Long(0)),
+        );
+        let upper = Expression::lt(Expression::Var(VarId(0)), decimal("0.01"));
+
+        assert!(
+            extract_range_constraints(&Expression::and(vec![lower.clone(), upper.clone()]))
+                .is_none()
+        );
+        // Order irrelevant.
+        assert!(
+            extract_range_constraints(&Expression::and(vec![upper.clone(), lower.clone()]))
+                .is_none()
+        );
+        // Nested AND is not a loophole.
+        assert!(extract_range_constraints(&Expression::and(vec![
+            Expression::and(vec![lower.clone(), upper]),
+            Expression::lt(
+                Expression::Var(VarId(0)),
+                Expression::Const(FlakeValue::Long(100)),
+            ),
+        ]))
+        .is_none());
+        // Other unrepresentable constants behave the same.
+        assert!(extract_range_constraints(&Expression::and(vec![
+            lower,
+            Expression::lt(
+                Expression::Var(VarId(0)),
+                Expression::Const(FlakeValue::Boolean(true)),
+            ),
+        ]))
+        .is_none());
+    }
+
+    #[test]
+    fn test_pushdown_does_not_consume_filter_with_unrepresentable_conjunct() {
+        use std::str::FromStr;
+        // The consumer-side check: a FILTER whose AND could only partially
+        // extract must be neither narrowed nor marked consumed.
+        let filter = Expression::and(vec![
+            Expression::ge(
+                Expression::Var(VarId(0)),
+                Expression::Const(FlakeValue::Long(0)),
+            ),
+            Expression::lt(
+                Expression::Var(VarId(0)),
+                Expression::Const(FlakeValue::Decimal(Box::new(
+                    bigdecimal::BigDecimal::from_str("0.01").unwrap(),
+                ))),
+            ),
+        ]);
+        assert!(extract_object_bounds_for_var(&filter, VarId(0)).is_none());
+
+        let triple =
+            TriplePattern::new(Ref::Var(VarId(1)), Ref::Var(VarId(2)), Term::Var(VarId(0)));
+        let (bounds, consumed) =
+            crate::execute::pushdown::extract_bounds_from_filters(&[triple], &[filter]);
+        assert!(bounds.is_empty());
+        assert!(consumed.is_empty());
     }
 
     #[test]
