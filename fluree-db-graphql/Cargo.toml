@@ -1,0 +1,38 @@
+[package]
+name = "fluree-db-graphql"
+description = "GraphQL schema derivation and query lowering for Fluree DB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["lowering"]
+# Lowering to the fluree-db-query IR. Disable for builds that only need schema
+# derivation + SDL (e.g. tooling that renders a schema without an engine).
+lowering = ["dep:fluree-db-query"]
+
+[dependencies]
+# Schema derivation reads `ValueTypeTag` and the XSD/RDF vocabulary, so these two
+# are unconditional; only the query IR is feature-gated.
+fluree-db-core = { path = "../fluree-db-core" }
+fluree-vocab = { path = "../fluree-vocab" }
+fluree-db-query = { path = "../fluree-db-query", optional = true }
+
+# GraphQL runtime: parse, validate, introspect, execute.
+# `dynamic-schema` is the only feature we need; the default set also pulls
+# `tempfile` (multipart uploads) and `graphiql` (an askama-templated HTML page),
+# neither of which this crate serves.
+async-graphql = { workspace = true }
+
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

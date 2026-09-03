@@ -16,14 +16,14 @@ use crate::rewrite_owl_ql::Ontology;
 use crate::schema_bundle::SchemaBundleOverlay;
 use crate::stats_cache::cached_stats_view_for_db;
 use crate::var_registry::VarRegistry;
+use fluree_db_binary_index::wasm_compat::SpatialIndexProvider;
 use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_core::clock::Instant;
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::{GraphDbRef, GraphId, LedgerSnapshot, QueryCancellation, Tracker};
 use fluree_db_reasoner::DerivedFactsOverlay;
-use fluree_db_spatial::SpatialIndexProvider;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 use tracing::Instrument;
 
 use super::operator_tree::build_operator_tree;

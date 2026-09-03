@@ -32,7 +32,7 @@ Rules of thumb:
   different identities see different rows of the same ledger.
 - **Heavy or frequent analytical consumers you trust with the full ledger →
   peer mode.** Your server stops paying query compute; with S3-backed
-  storage and [vended credentials](#optional-vended-s3-credentials) it stops
+  storage and [vended credentials](#5-optional-vended-s3-credentials) it stops
   paying bandwidth too.
 - **Offline or air-gapped consumers → replication** ([clone](../cli/clone.md),
   [pull](../cli/pull.md)).

@@ -12,6 +12,7 @@ members = [
     "fluree-db-query",
     "fluree-db-sparql",
     "fluree-db-cypher",
+    "fluree-db-graphql",
     "fluree-db-nameservice",
     "fluree-db-novelty",
     "fluree-db-ledger",
@@ -29,11 +30,13 @@ members = [
     "fluree-db-iceberg",
     "fluree-db-tabular",
     "fluree-db-r2rml",
+    "fluree-db-sql",
     "fluree-db-server",
     "fluree-db-bolt",
     "fluree-db-peer",
     "fluree-sse",
     "fluree-db-nameservice-sync",
+    "fluree-db-browser",
     "fluree-search-protocol",
     "fluree-search-service",
     "fluree-search-httpd",
@@ -47,8 +50,9 @@ members = [
     "fluree-test-support",
     "fluree-db-consensus",
     "fluree-raft-core",
+    "fluree-db-wasm",
 ]
-exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load"]
+exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load", "fluree-sql-bridge"]
 
 [workspace.package]
 version = "4.1.6"
@@ -68,6 +72,12 @@ thiserror = "1.0"
 # Used by fluree-db-novelty's current-state fact index.
 imbl = "3"
 winnow = "0.7"
+
+# GraphQL runtime (fluree-db-graphql): parse/validate/introspect/execute over a
+# schema built at runtime from ledger metadata. `default-features = false` drops
+# the multipart-upload (`tempfile`) and bundled GraphiQL (`askama`) features; the
+# `dynamic-schema` API is all this repo uses.
+async-graphql = { version = "7.2", default-features = false, features = ["dynamic-schema"] }
 indexmap = { version = "2", features = ["serde"] }
 
 # For content addressing and hashing
@@ -116,7 +126,11 @@ aws-smithy-http-client = { version = "1.1.12", default-features = false }
 hyper-rustls = { version = "0.24", default-features = false, features = ["http1", "native-tokio", "tls12"] }
 once_cell = "1.19"
 smallvec = "1.13"
-chrono = { version = "0.4", features = ["serde"] }
+# wasmbind only activates chrono's wasm32 cfg branch (js-sys/wasm-bindgen are
+# target-gated optional deps inside chrono); the native build is unchanged —
+# verified via cargo tree before/after. On wasm32-unknown-unknown it makes
+# Utc::now() read Date.now() instead of aborting in SystemTime::now().
+chrono = { version = "0.4", features = ["serde", "wasmbind"] }
 rand = "0.8"
 
 # System info for memory detection (cache sizing)
@@ -244,3 +258,12 @@ split-debuginfo = "unpacked"
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
+
+# Browser artifact profile (`fluree-db-wasm`, `--target wasm32-unknown-unknown`).
+# Inert for every native build: profiles only apply when selected with
+# `--profile wasm-release`. Inherits release's fat LTO / strip / single
+# codegen unit; overrides opt-level because the shipped .wasm is download-
+# size-bound (see fluree-db-wasm/README.md for the measured level trade-off).
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"

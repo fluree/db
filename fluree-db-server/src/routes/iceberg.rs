@@ -77,6 +77,12 @@ pub struct IcebergMapRequest {
     pub delete_values: Vec<Option<String>>,
     /// Ordering column for latest-by-key materialization (e.g. `event_timestamp`).
     pub order_by: Option<String>,
+    /// Model ledger (`name:branch`) whose default graph supplies the source's
+    /// view policies and class/property hierarchy.
+    pub model: Option<String>,
+    /// `default-allow` for governed requests that match no policy (`true`
+    /// keeps the source readable under authentication without a model).
+    pub default_allow: Option<bool>,
 }
 
 fn default_mode() -> String {
@@ -100,6 +106,10 @@ pub struct IcebergMapResponse {
     pub table_names: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mapping_validated: Option<bool>,
+    /// Warnings about the `model` reference (policies a virtual source cannot
+    /// evaluate).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_warnings: Vec<String>,
 }
 
 /// Map an Iceberg table as a graph source
@@ -165,6 +175,7 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
                 .map_err(ServerError::Api)?;
 
             IcebergMapResponse {
+                model_warnings: result.model_warnings,
                 graph_source_id: result.graph_source_id,
                 table_identifier: result.table_identifier,
                 catalog_uri: result.catalog_uri,
@@ -183,6 +194,7 @@ async fn iceberg_map_local(state: Arc<AppState>, request: Request) -> Result<imp
                 .map_err(ServerError::Api)?;
 
             IcebergMapResponse {
+                model_warnings: result.model_warnings,
                 graph_source_id: result.graph_source_id,
                 table_identifier: result.table_identifier,
                 catalog_uri: result.catalog_uri,
@@ -693,6 +705,12 @@ fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::Iceber
     }
     if let Some(ref order_by) = req.order_by {
         config = config.with_order_by(order_by);
+    }
+    if let Some(ref model) = req.model {
+        config = config.with_model(model);
+    }
+    if let Some(allow) = req.default_allow {
+        config = config.with_default_allow(allow);
     }
 
     Ok(config)
@@ -1320,6 +1338,8 @@ mod tests {
             table_identifier: "ns.tbl".to_string(),
             delete_convention: None,
             order_by: None,
+            model: None,
+            default_allow: None,
         };
         assert!(create.is_rest());
         let gs = create.to_iceberg_gs_config();

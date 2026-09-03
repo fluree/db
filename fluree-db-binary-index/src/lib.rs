@@ -8,6 +8,7 @@
 pub mod analyzer;
 pub mod error;
 pub mod types;
+pub mod wasm_compat;
 
 pub mod annotation_arena;
 pub mod arena;
@@ -26,12 +27,13 @@ pub use read::column_types::{BinaryFilter, ColumnBatch, ColumnData, ColumnProjec
 pub use read::leaflet_cache::{
     CachedOverlaySegment, LeafletCache, LeafletCacheKey, V3BatchCacheKey,
 };
+pub use read::need_fetch::{resident_or_need_fetch, FetchKind, NeedFetch};
 pub use read::replay::{batch_has_rows_above_t, replay_leaflet, replay_leaflet_at_t};
 
 // ── Format types ────────────────────────────────────────────────────────────
 pub use format::branch::{BranchManifest, LeafEntry};
 pub use format::expanded_cas::{
-    collect_root_cas_ids_expanded, collect_root_cas_ids_expanded_tolerant,
+    collect_root_cas_ids_expanded, collect_root_cas_ids_expanded_tolerant, ChainCasIds,
 };
 pub use format::index_root::IndexRoot;
 pub use format::run_record::{cmp_for_order, cmp_psot, cmp_spot, RunRecord, RunSortOrder};

@@ -771,6 +771,7 @@ impl GraphDb {
             // no permissive default denies every non-schema flake up front, in
             // `evaluate::allow_view_flake`, before any policy runs.
             denies_all_data: wrapper.view().restrictions.is_empty() && !wrapper.default_allow(),
+            unevaluable_policies: Vec::new(),
         })
     }
 }

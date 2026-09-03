@@ -109,9 +109,11 @@ fn coerce_boolean() {
 fn coerce_date() {
     assert_eq!(coerce(serde_json::json!("1980-10-5Z"), xsd::DATE), None);
     assert_eq!(coerce(serde_json::json!("1980-10-5"), xsd::DATE), None);
+    // Asserted `"2022-01-05Z"` round-tripped until timezone designators
+    // stopped being retained: a date carries none, so `Z` is dropped.
     assert_eq!(
         coerce(serde_json::json!("2022-01-05Z"), xsd::DATE),
-        Some(serde_json::json!("2022-01-05Z"))
+        Some(serde_json::json!("2022-01-05"))
     );
     assert_eq!(coerce(serde_json::json!("foo"), xsd::DATE), None);
 }
@@ -132,12 +134,14 @@ fn coerce_datetime() {
         coerce(serde_json::json!("1980-10-5T11:23:00Z"), xsd::DATE_TIME),
         None
     );
+    // Asserted the `-06:00` lexical round-tripped until offsets stopped being
+    // retained: a dateTime is a UTC instant and renders as one.
     assert_eq!(
         coerce(
             serde_json::json!("1980-10-05T11:23:00-06:00"),
             xsd::DATE_TIME
         ),
-        Some(serde_json::json!("1980-10-05T11:23:00-06:00"))
+        Some(serde_json::json!("1980-10-05T17:23:00Z"))
     );
     assert_eq!(coerce(serde_json::json!("foo"), xsd::DATE_TIME), None);
 }

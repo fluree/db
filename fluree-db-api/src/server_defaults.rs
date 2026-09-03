@@ -16,6 +16,13 @@ pub const DEFAULT_CORS_ENABLED: bool = true;
 pub const DEFAULT_BODY_LIMIT: usize = 52_428_800; // 50 MB
 pub const DEFAULT_QUERY_TIMEOUT_MS: u64 = 15 * 60 * 1000; // 15 minutes
 pub const DEFAULT_QUERY_MIN_T_TIMEOUT_MS: u64 = 5_000; // 5 seconds
+/// Nesting depth a GraphQL document may reach. A derived schema is cyclic
+/// wherever one class references another, so without a ceiling the caller
+/// chooses the recursion depth.
+pub const DEFAULT_GRAPHQL_MAX_DEPTH: usize = 15;
+/// Field budget for one GraphQL document, which bounds alias fan-out: each
+/// root field resolves as its own query, concurrently.
+pub const DEFAULT_GRAPHQL_MAX_COMPLEXITY: usize = 1000;
 /// Interval between keep-alive heartbeats on the streaming query endpoint.
 /// Default 15s — comfortably under common proxy idle timeouts (CloudFront/ALB
 /// ~60s). Tune down for stricter proxies.
@@ -26,6 +33,25 @@ pub const DEFAULT_QUERY_REFRESH_TTL_MS: u64 = 1000;
 // ── Indexing ────────────────────────────────────────────────────────
 
 pub const DEFAULT_INDEXING_ENABLED: bool = true;
+
+/// Re-exported from `fluree-db-indexer` so the server can reference it under
+/// DEFAULT features.
+///
+/// `fluree-db-server` takes `fluree-db-indexer` as an OPTIONAL dependency, gated
+/// behind the `raft` feature, which the default feature set does not enable. So
+/// naming `fluree_db_indexer::` directly in `fluree-db-server/src/config.rs`
+/// compiles under `--all-features` and fails the default build with E0433.
+/// `fluree-db-api` depends on the indexer unconditionally, and the server already
+/// sources its other clap defaults from this module, so routing it here keeps one
+/// definition and one import path.
+///
+/// Routed through [`crate::wasm_compat`] rather than naming
+/// `fluree_db_indexer::` directly: `fluree-db-api` takes the indexer as a
+/// `cfg(not(target_arch = "wasm32"))` dependency, so a direct reference here
+/// compiles natively and fails the wasm32 build with the same E0433 this
+/// constant exists to avoid one layer up.
+pub const DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS: u64 =
+    crate::wasm_compat::DEFAULT_CATCHUP_INTERVAL_SECS;
 // 100 bytes — effectively reindex after every commit (any commit's novelty
 // exceeds this), so the persisted index tracks the head with minimal lag.
 pub const DEFAULT_REINDEX_MIN_BYTES: usize = 100;
@@ -241,6 +267,7 @@ impl FlureeDir {
     /// `dirs::config_local_dir()/fluree` and data goes to
     /// `dirs::data_local_dir()/fluree` (XDG-split on Linux; unified on
     /// macOS and Windows where both resolve to the same directory).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn global() -> Option<Self> {
         if let Ok(p) = std::env::var("FLUREE_HOME") {
             return Some(Self::unified(PathBuf::from(p)));
@@ -248,6 +275,12 @@ impl FlureeDir {
         let config = dirs::config_local_dir().map(|d| d.join("fluree"))?;
         let data = dirs::data_local_dir().map(|d| d.join("fluree"))?;
         Some(Self::split(config, data))
+    }
+
+    /// wasm32: no home directory or platform config dirs.
+    #[cfg(target_arch = "wasm32")]
+    pub fn global() -> Option<Self> {
+        None
     }
 }
 
@@ -395,6 +428,8 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
 # body_limit = {body_limit}              # 50 MB
 # query_timeout_ms = {query_timeout_ms}  # 15 minutes; set 0 to disable
 # query_min_t_timeout_ms = {query_min_t_timeout_ms}  # read-after-write min-t wait cap
+# graphql_max_depth = {graphql_max_depth}                 # GraphQL nesting depth; 0 disables the limit
+# graphql_max_complexity = {graphql_max_complexity}         # GraphQL fields per document; 0 disables the limit
 # cache_max_mb = 4096                    # global cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
 
 # [server.query_refresh]
@@ -479,6 +514,8 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
         body_limit = DEFAULT_BODY_LIMIT,
         query_timeout_ms = DEFAULT_QUERY_TIMEOUT_MS,
         query_min_t_timeout_ms = DEFAULT_QUERY_MIN_T_TIMEOUT_MS,
+        graphql_max_depth = DEFAULT_GRAPHQL_MAX_DEPTH,
+        graphql_max_complexity = DEFAULT_GRAPHQL_MAX_COMPLEXITY,
         query_refresh_enabled = DEFAULT_QUERY_REFRESH_ENABLED,
         query_refresh_ttl_ms = DEFAULT_QUERY_REFRESH_TTL_MS,
         indexing_enabled = DEFAULT_INDEXING_ENABLED,
@@ -519,6 +556,8 @@ pub fn generate_jsonld_config_template(storage_path_override: Option<&str>) -> S
             "body_limit": DEFAULT_BODY_LIMIT,
             "query_timeout_ms": DEFAULT_QUERY_TIMEOUT_MS,
             "query_min_t_timeout_ms": DEFAULT_QUERY_MIN_T_TIMEOUT_MS,
+            "graphql_max_depth": DEFAULT_GRAPHQL_MAX_DEPTH,
+            "graphql_max_complexity": DEFAULT_GRAPHQL_MAX_COMPLEXITY,
             "query_refresh": {
                 "enabled": DEFAULT_QUERY_REFRESH_ENABLED,
                 "ttl_ms": DEFAULT_QUERY_REFRESH_TTL_MS

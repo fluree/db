@@ -4218,8 +4218,14 @@ async fn sparql_timezone_returns_day_time_duration() {
 }
 
 #[tokio::test]
-async fn sparql_timezone_positive_offset() {
-    // TIMEZONE for +05:30 → "PT5H30M"
+async fn sparql_timezone_normalizes_source_offset_to_utc() {
+    // ex:beer's value is written "2024-01-20T14:00:00+05:30", and this asserted
+    // "PT5H30M" until 2026-08-29. Fluree normalizes temporals to UTC and does
+    // not persist the source offset, so that answer was only reachable while
+    // the value sat in novelty — after a reindex the identical query returned
+    // "PT0S". TIMEZONE now reports UTC on both lanes rather than changing under
+    // a background reindex with no write behind it. See it_timezone_accessors
+    // and the register entry in testsuite-sparql/tests/registers/mod.rs.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_builtin_fn_data(&fluree, "fn:timezone-pos").await;
 
@@ -4239,7 +4245,7 @@ async fn sparql_timezone_positive_offset() {
     let bindings = normalize_sparql_bindings(&sparql_json);
     assert_eq!(bindings.len(), 1);
     let tz = &bindings[0]["tz"];
-    assert_eq!(tz["value"].as_str().unwrap(), "PT5H30M");
+    assert_eq!(tz["value"].as_str().unwrap(), "PT0S");
 }
 
 #[tokio::test]
@@ -4701,6 +4707,212 @@ async fn sparql_double_canonical_lexical_form_across_formats() {
         jsonld[0][0].is_number(),
         "JSON-LD double must stay a JSON number: {jsonld}"
     );
+}
+
+/// Issue #1695: `STR()` on an `xsd:double` must return the same W3C canonical
+/// lexical form the serializer emits for the very same term — the companion
+/// of `sparql_double_canonical_lexical_form_across_formats`, which pins the
+/// serializer side but never exercises expression evaluation. Each row
+/// asserts `STR(?d) == serialized ?d` (self-anchoring: the two paths cannot
+/// drift apart again) plus the expected canonical spelling.
+///
+/// The `xsd:string()` cast is pinned alongside precisely because it must NOT
+/// always follow: SPARQL §17.5 defers casting to XPath, whose double→string
+/// rule is plain decimal notation for absolute values in `[1e-6, 1e6)` — W3C
+/// `cast-string` requires `xsd:string("1E0"^^xsd:double)` to be `"1"` — and
+/// the canonical (scientific) lexical form outside that range, on BOTH sides
+/// (`1.0E-7` and `1.0E30` alike, never `0.0000001` or a 31-digit integer).
+/// This test states both answers so neither function drifts into the other.
+#[tokio::test]
+async fn sparql_str_double_matches_serializer_canonical_form() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "canon:str-double");
+
+    // Representative doubles: the issue's repro (1E0), an integral value,
+    // a large exponent, a small exponent, a negative, and the specials.
+    // Columns: id, stored lexical, canonical (STR + serializer), cast form.
+    let cases = [
+        ("ex:d1", "1E0", "1.0E0", "1"),
+        ("ex:d2", "5.0", "5.0E0", "5"),
+        // 1e6 sits just OUTSIDE the XPath decimal-notation range (the upper
+        // bound is exclusive), so cast and canonical agree here.
+        ("ex:d3", "1.0E6", "1.0E6", "1.0E6"),
+        ("ex:d4", "0.001", "1.0E-3", "0.001"),
+        ("ex:d5", "-12.5", "-1.25E1", "-12.5"),
+        // Outside the XPath range on either side the cast is the canonical
+        // scientific form too — the range rule is two-sided.
+        ("ex:d9", "1.0E-7", "1.0E-7", "1.0E-7"),
+        ("ex:d10", "1.0E30", "1.0E30", "1.0E30"),
+        // Specials share one spelling across both renderings — and neither is
+        // Rust's `Display` ("inf"), which is a lexical form of nothing.
+        ("ex:d6", "NaN", "NaN", "NaN"),
+        ("ex:d7", "INF", "INF", "INF"),
+        ("ex:d8", "-INF", "-INF", "-INF"),
+    ];
+    let graph: Vec<serde_json::Value> = cases
+        .iter()
+        .map(|(id, lex, _, _)| {
+            json!({"@id": id, "ex:score": {"@value": lex, "@type": "xsd:double"}})
+        })
+        .collect();
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": graph
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.expect("seed").ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?s ?d (STR(?d) AS ?lex) (xsd:string(?d) AS ?cast)
+        WHERE { ?s ex:score ?d }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("STR(double) query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(bindings.len(), cases.len(), "{sparql_json}");
+
+    for row in bindings {
+        let subject = row["s"]["value"].as_str().expect("subject IRI");
+        let serialized = row["d"]["value"].as_str().expect("serialized double");
+        let str_lex = row["lex"]["value"].as_str().expect("STR result");
+        let cast_lex = row["cast"]["value"].as_str().expect("xsd:string result");
+        // The core pin: expression evaluation agrees with the serializer on
+        // the SAME term in the SAME result set.
+        assert_eq!(
+            str_lex, serialized,
+            "STR(?d) diverges from the serializer for {subject}: {sparql_json}"
+        );
+        // And the shared form is the W3C canonical one.
+        let (_, _, canonical, cast) = cases
+            .iter()
+            .find(|(id, _, _, _)| subject.ends_with(&id[3..]))
+            .expect("known subject");
+        assert_eq!(serialized, *canonical, "{subject}: {sparql_json}");
+        // The cast keeps its own XPath-mandated rendering (W3C cast-string).
+        assert_eq!(
+            cast_lex, *cast,
+            "xsd:string(?d) must follow the XPath cast rule for {subject}: {sparql_json}"
+        );
+    }
+}
+
+/// Issue #1695 (float sibling): a stored `xsd:float` is carried as a
+/// full-precision f64 (ingest never narrows) and the serializer prints THAT
+/// value; expression evaluation narrows the same binding to an f32. `STR()`
+/// must side with the serializer — it reads the stored f64 off the binding
+/// (`stored_float_f64`) rather than spelling the f32 truncation. The
+/// f32-inexact rows are the ones that catch it: for `3.14159265358979` the
+/// truncated spelling would be `3.1415927E0`.
+#[tokio::test]
+async fn sparql_str_float_matches_serializer_canonical_form() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "canon:str-float");
+
+    let cases = [
+        ("ex:f1", "1E0", "1.0E0"),
+        ("ex:f2", "33.33", "3.333E1"),
+        ("ex:f3", "-0.5", "-5.0E-1"),
+        // f32-INEXACT: the stored f64 keeps more precision than an f32 can
+        // hold, so serializer-vs-STR() agreement is only possible if STR()
+        // reads the stored f64. (These rows go red if STR() ever routes
+        // through the f32 materialization again.)
+        ("ex:f4", "3.14159265358979", "3.14159265358979E0"),
+        ("ex:f5", "1.23456789012345E-5", "1.23456789012345E-5"),
+    ];
+    let graph: Vec<serde_json::Value> = cases
+        .iter()
+        .map(|(id, lex, _)| json!({"@id": id, "ex:reading": {"@value": lex, "@type": "xsd:float"}}))
+        .collect();
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": graph
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.expect("seed").ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?s ?f (STR(?f) AS ?lex)
+        WHERE { ?s ex:reading ?f }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("STR(float) query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(bindings.len(), cases.len(), "{sparql_json}");
+
+    for row in bindings {
+        let subject = row["s"]["value"].as_str().expect("subject IRI");
+        let serialized = row["f"]["value"].as_str().expect("serialized float");
+        let str_lex = row["lex"]["value"].as_str().expect("STR result");
+        assert_eq!(
+            str_lex, serialized,
+            "STR(?f) diverges from the serializer for {subject}: {sparql_json}"
+        );
+        let expected = cases
+            .iter()
+            .find(|(id, _, _)| subject.ends_with(&id[3..]))
+            .map(|(_, _, canonical)| *canonical)
+            .expect("known subject");
+        assert_eq!(serialized, expected, "{subject}: {sparql_json}");
+    }
+}
+
+/// Issue #1695 (aggregate sibling): GROUP_CONCAT's lenient numeric coercion
+/// stringifies a double through the same seam, and must use the same
+/// canonical form the serializer would give the value.
+#[tokio::test]
+async fn sparql_group_concat_double_canonical_form() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "canon:gc-double");
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@id": "ex:s",
+        "ex:score": [
+            {"@value": "1E0", "@type": "xsd:double"},
+            {"@value": "1.0E6", "@type": "xsd:double"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.expect("seed").ledger;
+
+    let query = r#"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT (GROUP_CONCAT(?d; separator="|") AS ?all)
+        WHERE { ex:s ex:score ?d }
+    "#;
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("GROUP_CONCAT(double) query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let all = sparql_json["results"]["bindings"][0]["all"]["value"]
+        .as_str()
+        .expect("group_concat result");
+    let mut parts: Vec<&str> = all.split('|').collect();
+    parts.sort_unstable();
+    assert_eq!(parts, vec!["1.0E0", "1.0E6"], "{sparql_json}");
 }
 
 #[tokio::test]

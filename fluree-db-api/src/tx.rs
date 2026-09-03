@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config_resolver;
+use crate::wasm_compat::IndexerHandle;
 use crate::{ApiError, Result};
 use crate::{TrackedErrorResponse, Tracker, TrackingOptions, TrackingTally};
 use fluree_db_core::ledger_config::LedgerConfig;
@@ -15,7 +16,6 @@ use fluree_db_core::{
     range_with_overlay, ContentId, ContentKind, FlakeValue, GraphId, IndexType, RangeMatch,
     RangeOptions, RangeTest, Sid,
 };
-use fluree_db_indexer::IndexerHandle;
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_novelty::TxnMetaEntry;
 #[cfg(feature = "shacl")]
@@ -2294,6 +2294,56 @@ impl crate::Fluree {
         .await
     }
 
+    /// Ask the indexer for a build after a write was rejected at max novelty.
+    ///
+    /// This is the one condition the post-commit triggers cannot cover, because
+    /// there is no commit: `at_max_novelty` gates on the ledger's accumulated
+    /// novelty rather than on the size of the incoming transaction, so a ledger
+    /// loaded with a backlog past `reindex_max_bytes` rejects every write. No
+    /// commit means no trigger, and only a completed index build drains novelty
+    /// — the one thing that can unblock the ledger is gated behind the one thing
+    /// the ledger blocks.
+    ///
+    /// Fire and forget. **Never wait here.** Only the indexer can drain novelty,
+    /// and a caller that holds the ledger while waiting starves the build it is
+    /// waiting for; `graph_source::r2rml_materialize` documents the production
+    /// deadlock that caused. `trigger_if_idle` registers no waiter and yields to
+    /// anything already in flight, so this is naturally rate-limited to once per
+    /// idle window however fast the rejections arrive.
+    ///
+    /// Deliberately not fired for `NoveltyWouldExceed`: that rejection is
+    /// already self-healing, because callers halve the batch and retry.
+    ///
+    /// Call this from every seam that can surface `NoveltyAtMax` to a client.
+    /// `at_max_novelty` is checked in four places in `fluree-db-transact`
+    /// (`stage`, `stage_graph_mgmt`, `stage_flakes`, and commit entry), which
+    /// reach the api layer through five write families: owned-state
+    /// insert/upsert/transact, the guarded view path (HTTP transact and SPARQL
+    /// UPDATE), credential transact, `stage_turtle_insert` (Turtle/TriG, via
+    /// `TxBuilder`), and commit replication (`commit_transfer`). Missing one
+    /// does not break correctness — the catch-up sweeps still recover the
+    /// ledger — but it costs that family the O(1) recovery and leaves it wedged
+    /// for up to two sweep intervals.
+    pub(crate) async fn request_index_after_novelty_rejection(
+        &self,
+        ledger_id: &str,
+        base_t: i64,
+        err: &fluree_db_transact::TransactError,
+    ) {
+        if !matches!(err, fluree_db_transact::TransactError::NoveltyAtMax) {
+            return;
+        }
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            if handle.trigger_if_idle(ledger_id, base_t).await {
+                tracing::info!(
+                    ledger_id = %ledger_id,
+                    base_t,
+                    "novelty at max: requested an index build so the retry has headroom"
+                );
+            }
+        }
+    }
+
     /// Stage a transaction with optional TriG metadata, named graphs, external tracker,
     /// and policy context.
     ///
@@ -2461,10 +2511,13 @@ impl crate::Fluree {
         // across all subsystems. `ledger_id_owned` keeps a string
         // alive past the `ledger` move into `stage_with_config_shacl`.
         let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
+        // Captured before `ledger` moves into staging, so a max-novelty
+        // rejection can name the t the indexer should build to.
+        let base_t = ledger.t();
         let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
 
         #[cfg(feature = "shacl")]
-        let (view, ns_registry) = stage_with_config_shacl(
+        let staged = stage_with_config_shacl(
             ledger,
             txn,
             ns_registry,
@@ -2472,9 +2525,17 @@ impl crate::Fluree {
             &mut resolve_ctx,
             txn_json.get("@context"),
         )
-        .await?;
+        .await;
         #[cfg(not(feature = "shacl"))]
-        let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
+        let staged = stage_txn(ledger, txn, ns_registry, options).await;
+        let (view, ns_registry) = match staged {
+            Ok(staged) => staged,
+            Err(e) => {
+                self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
+                    .await;
+                return Err(e.into());
+            }
+        };
 
         // Enforce uniqueness constraints (independent of shacl feature)
         enforce_unique_after_staging(
@@ -2592,10 +2653,13 @@ impl crate::Fluree {
         // Single per-tx ResolveCtx; see comment on the matching
         // block above for the consistency rationale.
         let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
+        // Captured before `ledger` moves into staging, so a max-novelty
+        // rejection can name the t the indexer should build to.
+        let base_t = ledger.t();
         let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
 
         #[cfg(feature = "shacl")]
-        let (view, ns_registry) = stage_with_config_shacl(
+        let staged = stage_with_config_shacl(
             ledger,
             txn,
             ns_registry,
@@ -2605,9 +2669,17 @@ impl crate::Fluree {
             // context to compact violation messages against.
             None,
         )
-        .await?;
+        .await;
         #[cfg(not(feature = "shacl"))]
-        let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
+        let staged = stage_txn(ledger, txn, ns_registry, options).await;
+        let (view, ns_registry) = match staged {
+            Ok(staged) => staged,
+            Err(e) => {
+                self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
+                    .await;
+                return Err(e.into());
+            }
+        };
 
         // Enforce uniqueness constraints (independent of shacl feature)
         enforce_unique_after_staging(
@@ -2810,10 +2882,13 @@ impl crate::Fluree {
         // Single per-tx ResolveCtx; see comment on the matching
         // block above for the consistency rationale.
         let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
+        // Captured before `ledger` moves into staging; see the matching block
+        // above.
+        let base_t = ledger.t();
         let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
 
         #[cfg(feature = "shacl")]
-        let (view, ns_registry) = stage_with_config_shacl(
+        let staged = stage_with_config_shacl(
             ledger,
             txn,
             ns_registry,
@@ -2828,12 +2903,23 @@ impl crate::Fluree {
             // reported `ex:alex`.
             input.txn_json.get("@context"),
         )
-        .await
-        .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
+        .await;
         #[cfg(not(feature = "shacl"))]
-        let (view, ns_registry) = stage_txn(ledger, txn, ns_registry, options)
-            .await
-            .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), tracker.tally()))?;
+        let staged = stage_txn(ledger, txn, ns_registry, options).await;
+        let (view, ns_registry) = match staged {
+            Ok(staged) => staged,
+            Err(e) => {
+                self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
+                    .await;
+                // The 400 is preserved as-is: correcting the status for novelty
+                // backpressure is a separate concern from noticing it.
+                return Err(TrackedErrorResponse::new(
+                    400,
+                    e.to_string(),
+                    tracker.tally(),
+                ));
+            }
+        };
 
         // Enforce uniqueness constraints (independent of shacl feature)
         enforce_unique_after_staging(
@@ -3404,6 +3490,10 @@ impl crate::Fluree {
 
         let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
         let new_t = ledger.t() + 1;
+        // Captured before `ledger` moves into `stage_flakes`, so a max-novelty
+        // rejection can name the ledger and the t the indexer should build to.
+        let ledger_id_owned: String = ledger.snapshot.ledger_id.to_string();
+        let base_t = ledger.t();
         let txn_id = generate_txn_id();
 
         // Parse Turtle directly to flakes
@@ -3459,7 +3549,14 @@ impl crate::Fluree {
         if let Some(policy) = policy {
             options = options.with_policy(policy);
         }
-        let view = stage_flakes(ledger, flakes, options).await?;
+        let view = match stage_flakes(ledger, flakes, options).await {
+            Ok(view) => view,
+            Err(e) => {
+                self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
+                    .await;
+                return Err(e.into());
+            }
+        };
 
         // Apply SHACL policy to the staged view. Plain Turtle has no named-graph
         // metadata (that's TriG), so we pass `None` for graph_delta/graph_sids —
@@ -3892,6 +3989,139 @@ fn _ensure_error_used(e: ApiError) -> ApiError {
 mod tests {
     use super::*;
     use fluree_db_transact::{RawObject, RawTerm, RawTriple};
+
+    /// A write rejected at max novelty must ask the indexer for a build. It is
+    /// the one condition no post-commit trigger can cover, because there is no
+    /// commit — and only a completed build drains novelty, so without this the
+    /// ledger stays wedged until a restart or a manual reindex.
+    ///
+    /// The catch-up sweep cannot be what queues this: the ledger is never
+    /// created, so `all_records()` never reports it.
+    #[tokio::test]
+    async fn a_max_novelty_rejection_asks_the_indexer_for_a_build() {
+        let fluree = crate::FlureeBuilder::memory()
+            .with_indexing_thresholds(1_000, 2_000)
+            .build_client()
+            .await
+            .expect("memory client");
+
+        let pending = |id: &'static str| {
+            let mode = fluree.indexing_mode.clone();
+            async move {
+                match &mode {
+                    IndexingMode::Background(handle) => handle.is_pending(id).await,
+                    IndexingMode::Disabled => panic!("this test needs a background indexer"),
+                }
+            }
+        };
+
+        assert!(
+            !pending("wedged:main").await,
+            "nothing has asked for a build yet"
+        );
+
+        // `NoveltyWouldExceed` must be left alone. That rejection is already
+        // self-healing — callers halve the batch and retry — so nudging on it
+        // would fire on every split.
+        fluree
+            .request_index_after_novelty_rejection(
+                "wedged:main",
+                42,
+                &fluree_db_transact::TransactError::NoveltyWouldExceed {
+                    current_bytes: 1_500,
+                    delta_bytes: 900,
+                    max_bytes: 2_000,
+                },
+            )
+            .await;
+        assert!(
+            !pending("wedged:main").await,
+            "a would-exceed rejection is self-healing; only at-max should ask for a build"
+        );
+
+        fluree
+            .request_index_after_novelty_rejection(
+                "wedged:main",
+                42,
+                &fluree_db_transact::TransactError::NoveltyAtMax,
+            )
+            .await;
+        assert!(
+            pending("wedged:main").await,
+            "a max-novelty rejection must ask the indexer for a build; without it \
+             the write that is blocked never asks for the thing that unblocks it"
+        );
+    }
+
+    /// The Turtle/TriG write family must ask for a build too.
+    ///
+    /// `stage_turtle_insert` reaches `at_max_novelty` through `stage_flakes`
+    /// rather than through `stage`, so it sits outside the three seams the
+    /// JSON-LD paths use. A deployment ingesting Turtle wedges exactly the same
+    /// way and, without this, gets only the sweeps — recovery in up to two
+    /// sweep intervals instead of immediately.
+    ///
+    /// `reindex_max_bytes: 0` makes the gate fire on any ledger (`novelty.size
+    /// >= 0`), which pins the seam without having to accumulate real novelty.
+    #[tokio::test]
+    async fn a_turtle_insert_rejected_at_max_novelty_asks_for_a_build() {
+        let mut fluree = crate::FlureeBuilder::memory()
+            .build_client()
+            .await
+            .expect("memory client");
+        let ledger = fluree
+            .create_ledger("turtle:main")
+            .await
+            .expect("create ledger");
+
+        // The worker is built for its handle and deliberately never spawned, so
+        // nothing drains the queue underneath the assertion below. Which
+        // nameservice it holds is therefore immaterial.
+        let ns: std::sync::Arc<dyn fluree_db_nameservice::IndexingNameService> =
+            std::sync::Arc::new(fluree_db_nameservice::memory::MemoryNameService::new());
+        let (_worker, handle) = fluree_db_indexer::BackgroundIndexerWorker::new(
+            fluree.backend().clone(),
+            ns,
+            fluree_db_indexer::IndexerConfig::default(),
+        );
+        fluree.set_indexing_mode(IndexingMode::Background(handle.clone()));
+
+        assert!(
+            !handle.is_pending("turtle:main").await,
+            "nothing has asked for a build yet"
+        );
+
+        let wedged = IndexConfig {
+            reindex_min_bytes: 0,
+            reindex_max_bytes: 0,
+        };
+        // `StageResult` is not `Debug`, so match rather than `expect_err`.
+        let Err(err) = fluree
+            .stage_turtle_insert(
+                ledger,
+                "@prefix ex: <http://example.org/> . ex:a ex:b \"c\" .",
+                Some(&wedged),
+                None,
+                None,
+            )
+            .await
+        else {
+            panic!("a ledger at max novelty must reject the write");
+        };
+        assert!(
+            matches!(
+                err,
+                ApiError::Transact(fluree_db_transact::TransactError::NoveltyAtMax)
+            ),
+            "expected NoveltyAtMax, got {err:?}"
+        );
+
+        assert!(
+            handle.is_pending("turtle:main").await,
+            "a Turtle write rejected at max novelty must ask the indexer for a build; \
+             without it this write family never asks for the thing that unblocks it"
+        );
+    }
 
     /// TriG named-graph blocks (upsert/insert-turtle path): a stable
     /// `_:fdb-...` id must resolve to the stored node's Sid, while ordinary

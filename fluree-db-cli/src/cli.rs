@@ -925,6 +925,64 @@ pub enum Commands {
     ///   fluree validate mydb --shacl proposed-shapes.ttl
     ///   fluree validate data.ttl --shacl shapes.ttl
     ///   fluree validate data.jsonld --format jsonld
+    /// Query a ledger through GraphQL
+    ///
+    /// The schema is derived from the ledger's own data — every class becomes a
+    /// type and every observed property a field — so there is nothing to
+    /// register. The ledger's default context decides the names.
+    ///
+    /// Examples:
+    ///   fluree graphql --schema mydb
+    ///   fluree graphql mydb '{ persons { id name } }'
+    ///   fluree graphql mydb -f query.graphql --variables '{"n": 10}'
+    #[cfg(feature = "graphql")]
+    Graphql {
+        /// Optional ledger name and/or inline GraphQL document.
+        ///
+        /// With 0 args: the active ledger; provide the document via -e, -f, or
+        /// stdin. With 1 arg: a document if it looks like one, otherwise a
+        /// ledger name. With 2 args: ledger name then document.
+        #[arg(num_args = 0..=2)]
+        args: Vec<String>,
+
+        /// Ledger name (defaults to the active ledger)
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
+
+        /// Inline GraphQL document
+        #[arg(short = 'e', long = "expr")]
+        expr: Option<String>,
+
+        /// Read the document from a file
+        #[arg(short = 'f', long = "file")]
+        file: Option<PathBuf>,
+
+        /// Query variables, as a JSON object
+        #[arg(long)]
+        variables: Option<String>,
+
+        /// Operation to run, when the document defines several
+        #[arg(long)]
+        operation: Option<String>,
+
+        /// Print the derived schema as SDL instead of running a query
+        #[arg(long)]
+        schema: bool,
+
+        /// Print SHACL shapes derived from the schema, as a starting point for
+        /// refining it. Nothing is written: edit the output, then apply it with
+        /// `fluree insert`. Shapes activate SHACL validation for their class,
+        /// so applying them is a decision to make deliberately.
+        #[arg(long, conflicts_with = "schema")]
+        bootstrap: bool,
+
+        /// Include `extensions.explain`: the Fluree query or transaction each
+        /// root field lowered to, and which tier the schema came from. Reports
+        /// what ran — it is not a dry run, and a mutation still writes.
+        #[arg(long)]
+        explain: bool,
+    },
+
     #[cfg(feature = "shacl")]
     Validate {
         /// Ledger name (with optional :branch) or an RDF data file
@@ -1288,6 +1346,12 @@ pub enum Commands {
     Iceberg {
         #[command(subcommand)]
         action: IcebergAction,
+    },
+
+    /// Manage SQL graph sources (R2RML over a Trino-protocol endpoint)
+    Sql {
+        #[command(subcommand)]
+        action: SqlAction,
     },
 
     /// Materialize a native twin ledger from a virtual (R2RML-over-Iceberg)
@@ -2975,6 +3039,138 @@ pub enum IcebergAction {
     },
 }
 
+#[derive(Debug, Clone, Subcommand)]
+pub enum SqlAction {
+    /// Map tables behind a SQL endpoint as an R2RML graph source
+    ///
+    /// The endpoint speaks the Trino client protocol: Trino, Starburst,
+    /// PrestoDB, or a `fluree-sql-bridge` sidecar in front of Postgres,
+    /// MySQL or SQLite.
+    ///
+    /// Examples:
+    ///   fluree sql map orders-db --endpoint https://trino.example.com:8443 --r2rml mappings/orders.ttl --auth-bearer $TOKEN
+    ///   fluree sql map crm --endpoint http://localhost:8080 --catalog pg --schema public --r2rml crm.ttl
+    Map(Box<SqlMapArgs>),
+
+    /// List mapped graph sources (SQL, Iceberg and R2RML)
+    List {
+        /// List graph sources on a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show details for a mapped graph source
+    Info {
+        /// Graph source name
+        name: String,
+
+        /// Query a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Drop a mapped graph source
+    Drop {
+        /// Graph source name
+        name: String,
+
+        /// Required flag to confirm deletion
+        #[arg(long)]
+        force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+/// Arguments for mapping a SQL endpoint as a graph source.
+#[derive(Debug, Clone, clap::Args)]
+pub struct SqlMapArgs {
+    /// Graph source name (e.g., "orders-db")
+    pub name: String,
+
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    /// Statement endpoint base URL (e.g., "https://trino.example.com:8443")
+    #[arg(long)]
+    pub endpoint: String,
+
+    /// R2RML mapping file. Each rr:tableName names a table reachable through
+    /// the endpoint; rr:sqlQuery is also accepted.
+    #[arg(long)]
+    pub r2rml: PathBuf,
+
+    /// R2RML mapping media type (e.g., "text/turtle"); inferred from extension if omitted
+    #[arg(long)]
+    pub r2rml_type: Option<String>,
+
+    /// Branch name (defaults to "main")
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// SQL rendering dialect: trino (default), postgres, mysql, sqlite
+    #[arg(long)]
+    pub dialect: Option<String>,
+
+    /// Header family: trino (default) or presto
+    #[arg(long)]
+    pub protocol: Option<String>,
+
+    /// Default catalog for unqualified table names
+    #[arg(long)]
+    pub catalog: Option<String>,
+
+    /// Default schema for unqualified table names
+    #[arg(long)]
+    pub schema: Option<String>,
+
+    /// Protocol user (X-Trino-User); defaults to "fluree"
+    #[arg(long)]
+    pub user: Option<String>,
+
+    /// Bearer token for endpoint authentication
+    #[arg(long)]
+    pub auth_bearer: Option<String>,
+
+    /// OAuth2 token URL for client credentials auth
+    #[arg(long)]
+    pub oauth2_token_url: Option<String>,
+
+    /// OAuth2 client ID
+    #[arg(long)]
+    pub oauth2_client_id: Option<String>,
+
+    /// OAuth2 client secret
+    #[arg(long)]
+    pub oauth2_client_secret: Option<String>,
+
+    /// OAuth2 scope
+    #[arg(long)]
+    pub oauth2_scope: Option<String>,
+
+    /// OAuth2 audience
+    #[arg(long)]
+    pub oauth2_audience: Option<String>,
+
+    /// Session property (repeatable): --session query_max_run_time=5m
+    #[arg(long = "session", value_name = "KEY=VALUE")]
+    pub session: Vec<String>,
+
+    /// Model ledger (name:branch) governing this source: its default graph
+    /// supplies the view policies (`fluree model access enable <model> ...`)
+    /// and the class/property hierarchy they entail over.
+    #[arg(long, value_name = "LEDGER")]
+    pub model: Option<String>,
+
+    /// Fallback for governed requests that match no policy: `true` keeps the
+    /// source readable under authentication without a model (unset: deny).
+    #[arg(long, value_name = "BOOL")]
+    pub default_allow: Option<bool>,
+}
+
 /// Arguments for mapping an Iceberg table as a graph source.
 #[derive(Debug, Clone, clap::Args)]
 pub struct IcebergMapArgs {
@@ -3028,6 +3224,17 @@ pub struct IcebergMapArgs {
     /// Branch name (defaults to "main")
     #[arg(long)]
     pub branch: Option<String>,
+
+    /// Model ledger (name:branch) governing this source: its default graph
+    /// supplies the view policies (`fluree model access enable <model> ...`)
+    /// and the class/property hierarchy they entail over.
+    #[arg(long, value_name = "LEDGER")]
+    pub model: Option<String>,
+
+    /// Fallback for governed requests that match no policy: `true` keeps the
+    /// source readable under authentication without a model (unset: deny).
+    #[arg(long, value_name = "BOOL")]
+    pub default_allow: Option<bool>,
 
     /// Bearer token for REST catalog authentication
     #[arg(long)]

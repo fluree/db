@@ -95,7 +95,7 @@ fn count_distinct_object_with_exists_subject_post(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
 
         let dir = handle.dir();
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {

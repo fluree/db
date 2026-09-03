@@ -26,6 +26,12 @@ pub enum Durability {
     PageCache,
 }
 
+// The env/sync helpers are consumed only by the native `FileStorage` (gated
+// on `native` + non-wasm); the enum itself is part of the portable config API.
+#[cfg_attr(
+    not(all(feature = "native", not(target_arch = "wasm32"))),
+    allow(dead_code)
+)]
 impl Durability {
     /// Environment variable selecting the default for new `FileStorage`.
     pub const ENV_VAR: &'static str = "FLUREE_STORAGE_FSYNC";
@@ -97,6 +103,7 @@ impl Durability {
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod file;
 mod memory;
+pub mod residency;
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use file::{FileStorage, STORAGE_METHOD_FILE};
@@ -204,6 +211,32 @@ pub trait StorageRead: Debug + Send + Sync {
     /// is already locally accessible.
     fn resolve_local_path(&self, address: &str) -> Option<PathBuf> {
         let _ = address;
+        None
+    }
+
+    /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
+    ///
+    /// Mirror of [`ContentStore::resolve_cached_bytes`] for address-keyed
+    /// backends: `StorageContentStore` forwards the CID straight through
+    /// (no address formatting on the lookup), so a `StorageRead` implementor
+    /// with a resident tier — e.g. a browser fetch-backed storage that
+    /// caches by CID — is consulted by the sync read path. Implementations
+    /// must not perform I/O or block; the default returns `None`.
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
+        let _ = id;
+        None
+    }
+
+    /// The store's residency miss register, if it participates in the sync
+    /// residency tier. Mirror of [`ContentStore::miss_register`]; see it for
+    /// the participation contract.
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        None
+    }
+
+    /// Begin an in-flight window on the store's residency tier. Mirror of
+    /// [`ContentStore::query_guard`].
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
         None
     }
 
@@ -420,6 +453,18 @@ impl StorageRead for Arc<dyn Storage> {
     fn resolve_local_path(&self, address: &str) -> Option<PathBuf> {
         self.as_ref().resolve_local_path(address)
     }
+
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
+        self.as_ref().resolve_cached_bytes(id)
+    }
+
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        self.as_ref().miss_register()
+    }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        self.as_ref().query_guard()
+    }
 }
 
 #[async_trait]
@@ -498,6 +543,47 @@ pub trait ContentStore: Debug + Send + Sync {
         None
     }
 
+    /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
+    ///
+    /// This is the sync residency tier for targets without a sync→async
+    /// bridge (`wasm32`): the binary-index read path consults it instead of
+    /// filesystem probes or a bridged CAS fetch, and surfaces a typed
+    /// `NeedFetch` miss when it returns `None` so an async caller can fetch
+    /// and retry. Implementations must not perform I/O or block — a hit is
+    /// an O(1) map lookup returning a shared `Arc` clone (zero copy); on a
+    /// backend with no resident tier the default returns `None`.
+    ///
+    /// Content is immutable (CID-addressed), so implementations may pin and
+    /// serve entries indefinitely without invalidation.
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        let _ = id;
+        None
+    }
+
+    /// The store's residency miss register, if it participates in the sync
+    /// residency tier.
+    ///
+    /// Returning `Some` is the participation signal: the sync read path then
+    /// serves reads *exclusively* from [`Self::resolve_cached_bytes`] —
+    /// never the filesystem or a bridged fetch — and records every miss into
+    /// this register for an async retry frame to drain (see
+    /// [`residency::MissRegister`]). A participating store must uphold the
+    /// **fetch-pins contract**: bytes returned by [`Self::get`] become (and
+    /// stay) resident, so a drained want that was fetched successfully is
+    /// guaranteed to hit on the re-run.
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        None
+    }
+
+    /// Begin an in-flight window on the store's residency tier, if it has
+    /// one. See [`residency::InFlightGuard`]: while the returned guard is
+    /// alive the tier must not evict resident bytes, so a retry loop's
+    /// rounds observe a monotone resident set. Stores without a residency
+    /// tier return `None` (the default).
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        None
+    }
+
     /// Signal that this content is no longer needed and may be reclaimed.
     ///
     /// Implementations should make a best effort to free the underlying
@@ -552,6 +638,18 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
         self.as_ref().resolve_local_path(id)
+    }
+
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        self.as_ref().resolve_cached_bytes(id)
+    }
+
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        self.as_ref().miss_register()
+    }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        self.as_ref().query_guard()
     }
 
     async fn release(&self, id: &ContentId) -> Result<()> {
@@ -747,13 +845,41 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         // layout: on a ledger predating the `@shared` dict move or the
         // `.fir6` rename, the only copy sits at a legacy address, and
         // releasing just the canonical one silently reclaims nothing.
+        let mut deleted = Ok(());
         for address in candidate_addresses(&self.method, &self.ledger_id, id) {
             match self.storage.delete(&address).await {
                 Ok(()) | Err(crate::error::Error::NotFound(_)) => {}
-                Err(e) => return Err(e),
+                Err(e) => {
+                    deleted = Err(e);
+                    break;
+                }
             }
         }
-        Ok(())
+
+        // After the deletes, never before: evicting first leaves a window
+        // where a concurrent reader repopulates the entry from storage that
+        // still holds the blob. Runs even when a delete failed — the blob may
+        // be partly gone by then, and a needless eviction only costs a refetch.
+        // Off-native there is no disk cache to hold a stale entry.
+        #[cfg(feature = "native")]
+        crate::disk_cache::evict_cached_cid(id);
+
+        deleted
+    }
+
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        // CID-keyed straight through — no address formatting on the lookup.
+        // A resident tier indexes by CID regardless of which (current or
+        // legacy) address the bytes were fetched from.
+        self.storage.resolve_cached_bytes(id)
+    }
+
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        self.storage.miss_register()
+    }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        self.storage.query_guard()
     }
 
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
@@ -1071,6 +1197,33 @@ impl ContentStore for BranchedContentStore {
         self.branch_store
             .resolve_local_path(id)
             .or_else(|| self.parents.iter().find_map(|p| p.resolve_local_path(id)))
+    }
+
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        self.branch_store
+            .resolve_cached_bytes(id)
+            .or_else(|| self.parents.iter().find_map(|p| p.resolve_cached_bytes(id)))
+    }
+
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        self.branch_store
+            .miss_register()
+            .or_else(|| self.parents.iter().find_map(|p| p.miss_register()))
+    }
+
+    fn query_guard(&self) -> Option<residency::InFlightGuard> {
+        // Guard the whole ancestry chain: reads fall back through parents.
+        let mut guards: Vec<residency::InFlightGuard> = self
+            .branch_store
+            .query_guard()
+            .into_iter()
+            .chain(self.parents.iter().filter_map(ContentStore::query_guard))
+            .collect();
+        match guards.len() {
+            0 => None,
+            1 => Some(guards.remove(0)),
+            _ => Some(residency::InFlightGuard::join(guards)),
+        }
     }
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
@@ -1422,6 +1575,39 @@ mod tests {
     use crate::storage::memory::MemoryStorage;
 
     const LEDGER: &str = "mydb:main";
+
+    /// Releasing a blob must take its cached copy with it. A cache entry that
+    /// outlives its blob reads back as a live object, so a caller deciding
+    /// what storage holds — the index-chain walk, which ends at a root storage
+    /// no longer has — would not see the ending.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn releasing_a_blob_evicts_its_cached_copy() {
+        let storage = MemoryStorage::new();
+        let store = content_store_for(storage.clone(), LEDGER);
+        let bytes = b"root bytes";
+        let id = store.put(ContentKind::IndexRoot, bytes).await.unwrap();
+
+        let cache_dir = std::env::temp_dir().join(format!(
+            "fluree-release-evicts-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        crate::disk_cache::fetch_cached_bytes_cid(&store, &id, &cache_dir)
+            .await
+            .unwrap();
+        let cached = cache_dir.join(id.to_string());
+        assert!(cached.exists(), "the fetch should have populated the cache");
+
+        store.release(&id).await.unwrap();
+
+        assert!(
+            !cached.exists(),
+            "a released blob is still readable from the disk cache"
+        );
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
 
     /// `candidate_addresses` exists so that callers deciding a blob is
     /// unreferenced see every address `ContentStore::get` would resolve it to.

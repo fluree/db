@@ -3055,3 +3055,744 @@ async fn test_object_endpoint_pins_graph_source_kinds_unserved() {
         "GraphSourceMapping must 404 until #1539"
     );
 }
+
+/// The per-ledger SSE subscription form, over HTTP.
+///
+/// `GET /v1/fluree/events?ledger=<alias>` is what every peer opens — the
+/// native peer builds it in `peer/subscription.rs`, the browser peer in
+/// `fluree-db-browser`'s `events_url`, and the module docs advertise
+/// `?ledger=a&ledger=b`. It nevertheless answered **400** for any value,
+/// because `axum::extract::Query` deserializes with `serde_urlencoded`,
+/// which cannot build a `Vec` from repeated keys. Every unit test built an
+/// `EventsQuery` in process, so nothing caught it; only `?all=true`
+/// (a plain bool) ever worked, which is what the peer test configs use.
+#[tokio::test]
+async fn test_events_accepts_per_ledger_subscription_over_http() {
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state);
+
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "sse:main" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    // The body is an endless stream; only the response head is asserted (a
+    // rejected query string never gets that far).
+    for uri in [
+        "/v1/fluree/events?ledger=sse:main",
+        "/v1/fluree/events?ledger=sse%3Amain",
+        "/v1/fluree/events?ledger=sse%3Amain&ledger=other%3Amain",
+        "/v1/fluree/events?ledger=sse%3Amain&graph-source=gs%3Amain",
+        "/v1/fluree/events?all=true",
+        "/v1/fluree/events",
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("Accept", "text/event-stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET {uri}");
+        assert!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .starts_with("text/event-stream"),
+            "GET {uri} must open an SSE stream"
+        );
+    }
+}
+// =============================================================================
+// Browser-Readiness Header Tests (CORS, immutable caching, conditional GET)
+// =============================================================================
+
+/// Like `tx_server_state`, but with the CORS layer enabled so the
+/// browser-facing header behavior is exercised.
+async fn tx_server_state_with_cors() -> (TempDir, Arc<AppState>) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: true,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        server_role: ServerRole::Transaction,
+        storage_proxy_enabled: true,
+        storage_proxy_insecure_accept_any_issuer: true,
+        ..Default::default()
+    };
+
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    (tmp, state)
+}
+
+fn header_str<'a>(resp: &'a http::Response<Body>, name: &str) -> &'a str {
+    resp.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+}
+
+/// CAS objects are immutable, so the object endpoint must serve them with an
+/// `ETag` (the CID) and a forever/immutable `Cache-Control` — on both full
+/// (200) and ranged (206) responses — and answer a matching `If-None-Match`
+/// with 304 without touching storage.
+#[tokio::test]
+async fn test_object_endpoint_immutable_caching_and_conditional_get() {
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+
+    let secret = [0u8; 32];
+    let signing_key = SigningKey::from_bytes(&secret);
+    let token = create_storage_proxy_token(&signing_key, true);
+
+    let create_body = serde_json::json!({ "ledger": "cachehdrs:test" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let admin_storage = state
+        .fluree
+        .backend()
+        .admin_storage_cloned()
+        .expect("test backend has managed storage");
+    let payload = b"hll sketch bytes".as_slice();
+    let id = ContentId::new(ContentKind::StatsSketch, payload);
+    admin_storage
+        .content_write_bytes(ContentKind::StatsSketch, "cachehdrs:test", payload)
+        .await
+        .expect("seed artifact");
+
+    let uri = format!("/v1/fluree/storage/objects/{id}?ledger=cachehdrs:test");
+    let expected_etag = format!("\"{id}\"");
+
+    // Full 200: ETag + immutable Cache-Control.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header_str(&resp, "etag"), expected_etag);
+    assert_eq!(
+        header_str(&resp, "cache-control"),
+        "private, max-age=31536000, immutable"
+    );
+    assert_eq!(
+        header_str(&resp, "vary"),
+        "Authorization",
+        "an immutable, never-revalidated body authorized by a bearer token must \
+         key its cache entry on that token, or the next principal on this \
+         browser profile is served it without the server seeing their token"
+    );
+
+    // Ranged 206: same caching headers ride along.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Range", "bytes=0-3")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(header_str(&resp, "etag"), expected_etag);
+    assert_eq!(
+        header_str(&resp, "cache-control"),
+        "private, max-age=31536000, immutable"
+    );
+    assert_eq!(
+        header_str(&resp, "vary"),
+        "Authorization",
+        "an immutable, never-revalidated body authorized by a bearer token must \
+         key its cache entry on that token, or the next principal on this \
+         browser profile is served it without the server seeing their token"
+    );
+    assert_eq!(header_str(&resp, "content-range"), "bytes 0-3/16");
+
+    // Conditional revalidation: matching If-None-Match → 304, empty body,
+    // caching headers still present.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("If-None-Match", &expected_etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(header_str(&resp, "etag"), expected_etag);
+    assert_eq!(
+        header_str(&resp, "vary"),
+        "Authorization",
+        "the 304 refreshes the cached entry, so it must carry the same cache key"
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(body.is_empty(), "304 must carry no body");
+
+    // Weak-comparison and list forms also revalidate; `*` deliberately does
+    // not (the object route answers before consulting storage).
+    for candidate in [
+        format!("W/{expected_etag}"),
+        format!("\"other\", {expected_etag}"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(&uri)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header("If-None-Match", &candidate)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_MODIFIED,
+            "If-None-Match {candidate:?} must revalidate"
+        );
+    }
+
+    // Non-matching validator → full 200.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("If-None-Match", "\"stale\"")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // No-leak parity: an out-of-scope conditional request still 404s (a 304
+    // must not become an existence oracle).
+    let scoped = create_storage_proxy_token_scoped(&signing_key, &["other:ledger"]);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .header("Authorization", format!("Bearer {scoped}"))
+                .header("If-None-Match", &expected_etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Create a JWS token scoped to specific ledgers (fluree.storage.ledgers).
+fn create_storage_proxy_token_scoped(signing_key: &SigningKey, ledgers: &[&str]) -> String {
+    let pubkey = signing_key.verifying_key().to_bytes();
+    let pubkey_b64 = URL_SAFE_NO_PAD.encode(pubkey);
+    let header = serde_json::json!({
+        "alg": "EdDSA",
+        "jwk": { "kty": "OKP", "crv": "Ed25519", "x": pubkey_b64 }
+    });
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let payload = serde_json::json!({
+        "iss": did_from_pubkey(&pubkey),
+        "exp": now + 3600,
+        "iat": now,
+        "fluree.storage.all": false,
+        "fluree.storage.ledgers": ledgers
+    });
+    let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string().as_bytes());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let signature = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+    format!("{header_b64}.{payload_b64}.{sig_b64}")
+}
+
+/// The nameservice record serves a content-digest `ETag` with
+/// `Cache-Control: private, no-cache`, answers a matching `If-None-Match`
+/// with 304, and the ETag changes when the head advances (making SSE-less
+/// head polling a cheap 304 loop). The `*` form of `If-None-Match` is
+/// deliberately not honored (see `if_none_match_matches` in
+/// `routes/storage_proxy.rs`) — pinned below as a 200.
+#[tokio::test]
+async fn test_ns_record_etag_and_conditional_get() {
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+
+    let secret = [0u8; 32];
+    let signing_key = SigningKey::from_bytes(&secret);
+    let token = create_storage_proxy_token(&signing_key, true);
+
+    let create_body = serde_json::json!({ "ledger": "nsetag:test" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let uri = "/v1/fluree/storage/ns/nsetag:test";
+
+    // 200 carries the watermark ETag + no-cache, and the body still parses.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag = header_str(&resp, "etag").to_string();
+    assert!(
+        etag.len() > 2 && etag.starts_with('"') && etag.ends_with('"'),
+        "NS record must carry a quoted ETag, got {etag:?}"
+    );
+    assert_eq!(header_str(&resp, "cache-control"), "private, no-cache");
+    let (_, record) = json_body(resp).await;
+    assert!(
+        record["commit_t"].is_i64(),
+        "body still parses as the record"
+    );
+
+    // Replaying the validator revalidates: 304, empty body, ETag echoed.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("If-None-Match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(header_str(&resp, "etag"), etag);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(body.is_empty(), "304 must carry no body");
+
+    // Advance the head; the stale validator now yields a full 200 with a
+    // NEW ETag (monotonic watermarks).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/update")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "ledger": "nsetag:test",
+                        "@context": { "ex": "http://example.org/ns/" },
+                        "insert": { "@id": "ex:a", "ex:name": "A" }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("If-None-Match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "stale validator after head advance must return the full record"
+    );
+    let new_etag = header_str(&resp, "etag").to_string();
+    assert_ne!(new_etag, etag, "ETag must change when the head advances");
+
+    // `If-None-Match: *` is deliberately not honored (the route answers
+    // before consulting storage, so `*`'s "any current representation"
+    // semantics cannot be evaluated) — it must serve the full 200, never 304.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("If-None-Match", "*")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the `*` If-None-Match form is documented as not honored"
+    );
+    assert_eq!(header_str(&resp, "etag"), new_etag);
+}
+
+/// Browser contract for the CORS layer: preflights must explicitly allow
+/// `authorization` (the Fetch spec excludes it from the `*` wildcard, so the
+/// old blanket allow-list silently broke bearer-token browser clients),
+/// response metadata must be exposed to page JavaScript, and the
+/// 404-no-existence-leak responses must still carry CORS headers so a browser
+/// client can even *read* the 404.
+#[tokio::test]
+async fn test_cors_preflight_and_404_no_leak_keep_cors_headers() {
+    let (_tmp, state) = tx_server_state_with_cors().await;
+    let app = build_router(state.clone());
+
+    // Preflight for a bearer-token object fetch.
+    let some_cid = ContentId::new(ContentKind::Commit, b"cors probe");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri(format!(
+                    "/v1/fluree/storage/objects/{some_cid}?ledger=any:main"
+                ))
+                .header("Origin", "https://app.example.com")
+                .header("Access-Control-Request-Method", "GET")
+                .header("Access-Control-Request-Headers", "authorization, range")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "preflight must succeed");
+    assert_eq!(header_str(&resp, "access-control-allow-origin"), "*");
+    let allow_headers = header_str(&resp, "access-control-allow-headers").to_lowercase();
+    assert!(
+        allow_headers.contains("authorization"),
+        "authorization must be explicitly allowed (wildcard does not cover it), got: {allow_headers}"
+    );
+    assert!(
+        allow_headers.contains("range"),
+        "range must be allowed for ranged CAS reads, got: {allow_headers}"
+    );
+    assert!(
+        !header_str(&resp, "access-control-max-age").is_empty(),
+        "preflight results must be cacheable"
+    );
+
+    // SSE preflight: last-event-id must be allowed for reconnects.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/v1/fluree/events?ledger=any:main")
+                .header("Origin", "https://app.example.com")
+                .header("Access-Control-Request-Method", "GET")
+                .header("Access-Control-Request-Headers", "last-event-id")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(header_str(&resp, "access-control-allow-headers")
+        .to_lowercase()
+        .contains("last-event-id"));
+
+    // Actual (non-preflight) response: metadata headers are exposed to JS.
+    let secret = [0u8; 32];
+    let signing_key = SigningKey::from_bytes(&secret);
+    let token = create_storage_proxy_token(&signing_key, true);
+    let create_body = serde_json::json!({ "ledger": "corsdata:test" });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/storage/ns/corsdata:test")
+                .header("Origin", "https://app.example.com")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header_str(&resp, "access-control-allow-origin"), "*");
+    let exposed = header_str(&resp, "access-control-expose-headers").to_lowercase();
+    for name in [
+        "etag",
+        "content-range",
+        "x-fluree-content-kind",
+        "x-fdb-time",
+    ] {
+        assert!(
+            exposed.contains(name),
+            "{name} must be exposed to browser JS, got: {exposed}"
+        );
+    }
+
+    // 404-no-leak (out-of-scope token) still carries CORS headers — without
+    // them a browser client sees an opaque network error instead of the 404.
+    let scoped = create_storage_proxy_token_scoped(&signing_key, &["other:ledger"]);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/storage/ns/corsdata:test")
+                .header("Origin", "https://app.example.com")
+                .header("Authorization", format!("Bearer {scoped}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        header_str(&resp, "access-control-allow-origin"),
+        "*",
+        "no-leak 404s must still be CORS-readable"
+    );
+}
+
+/// The allow-list mirrors the preflight: every documented client-facing
+/// request header — the `fluree-*` policy/tracking headers,
+/// `Idempotency-Key`, and the `If-None-Match` this branch teaches clients
+/// to send — must survive preflight, not just `authorization`.
+#[tokio::test]
+async fn test_cors_preflight_mirrors_every_requested_header() {
+    let (_tmp, state) = tx_server_state_with_cors().await;
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/v1/fluree/query")
+                .header("Origin", "https://app.example.com")
+                .header("Access-Control-Request-Method", "POST")
+                .header(
+                    "Access-Control-Request-Headers",
+                    "authorization, fluree-identity, fluree-track-fuel, idempotency-key, if-none-match, content-type",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "preflight must succeed");
+    let allowed = header_str(&resp, "access-control-allow-headers").to_lowercase();
+    for name in [
+        "authorization",
+        "fluree-identity",
+        "fluree-track-fuel",
+        "idempotency-key",
+        "if-none-match",
+        "content-type",
+    ] {
+        assert!(
+            allowed.contains(name),
+            "{name} must be allowed at preflight, got: {allowed}"
+        );
+    }
+}
+
+/// The NS ETag identifies the whole representation, not just the
+/// watermarks: creating a child branch changes the parent's `branches`
+/// count without a commit, and the previously-valid validator must then
+/// yield a full 200 with a new ETag — otherwise a revalidating browser is
+/// served a stale record indefinitely.
+#[tokio::test]
+async fn test_ns_record_etag_changes_without_a_commit() {
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+
+    let secret = [0u8; 32];
+    let signing_key = SigningKey::from_bytes(&secret);
+    let token = create_storage_proxy_token(&signing_key, true);
+
+    for (uri, body) in [
+        (
+            "/v1/fluree/create",
+            serde_json::json!({ "ledger": "nsbranch:main" }).to_string(),
+        ),
+        (
+            "/v1/fluree/update",
+            serde_json::json!({
+                "ledger": "nsbranch:main",
+                "@context": { "ex": "http://example.org/ns/" },
+                "insert": { "@id": "ex:a", "ex:name": "A" }
+            })
+            .to_string(),
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "{uri} must succeed, got {}",
+            resp.status()
+        );
+    }
+
+    let ns_uri = "/v1/fluree/storage/ns/nsbranch:main";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(ns_uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag = header_str(&resp, "etag").to_string();
+    let (_, before) = json_body(resp).await;
+
+    // Create a child branch: no commit on the parent, but its `branches`
+    // count moves.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "nsbranch", "branch": "child" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "branch create must succeed, got {}",
+        resp.status()
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(ns_uri)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("If-None-Match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "stale validator must not revalidate after the record changed"
+    );
+    let new_etag = header_str(&resp, "etag").to_string();
+    assert_ne!(new_etag, etag, "ETag must change with the representation");
+    let (_, after) = json_body(resp).await;
+    assert_eq!(before["commit_t"], after["commit_t"], "no commit happened");
+    assert_ne!(before["branches"], after["branches"], "branch count moved");
+}

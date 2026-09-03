@@ -766,6 +766,42 @@ for the W3C report), and exposed in Rust as `fluree_db_api::validate` —
 with per-result constraint-component IRIs, severities, and messages, plus
 `to_jsonld()` / `to_turtle()` serializers.
 
+## Annotation properties
+
+Three SHACL properties describe a shape without constraining anything.
+Validation never reads them; they exist for tools that render or generate from
+your shapes — notably [GraphQL](../query/graphql.md), whose schema takes its
+field names, documentation and field order from them.
+
+| Property | On | Effect |
+|----------|----|--------|
+| `sh:name` | node or property shape | A human-readable name |
+| `sh:description` | node or property shape | Human-readable documentation |
+| `sh:order` | property shape | Where the property sorts among its siblings, ascending |
+| `sh:defaultValue` | property shape | A value a consumer *may* present when none is stored |
+
+```json
+{
+  "@id": "ex:PersonShape",
+  "@type": "sh:NodeShape",
+  "sh:targetClass": { "@id": "ex:Person" },
+  "sh:description": "A person we know about.",
+  "sh:property": [{
+    "sh:path": { "@id": "ex:name" },
+    "sh:datatype": { "@id": "xsd:string" },
+    "sh:name": "full name",
+    "sh:description": "The person's full name.",
+    "sh:order": 1
+  }]
+}
+```
+
+**`sh:defaultValue` is never materialized.** Fluree carries it for consumers to
+read, but does not write the triple, and validation does not treat the property
+as present because a default exists. A default is a statement about
+presentation, not about what the graph holds — inventing the fact would make
+`sh:minCount 1` self-satisfying and put data in your ledger nobody asserted.
+
 ## Not yet supported
 
 - SPARQL-based constraint *components* (`sh:ConstraintComponent`,
@@ -798,3 +834,4 @@ Because shapes live as regular RDF in your ledger:
 - [Setting Groups — SHACL](../ledger-config/setting-groups.md#shacl-defaults) — Configuration reference for `f:shaclDefaults`
 - [Override Control](../ledger-config/override-control.md) — Per-graph / query-time override rules
 - [Writing Config Data](../ledger-config/writing-config.md) — How to transact into the config graph
+- [GraphQL](../query/graphql.md) — shapes drive the derived GraphQL schema
