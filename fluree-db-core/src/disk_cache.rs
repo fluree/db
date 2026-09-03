@@ -379,6 +379,15 @@ impl DiskArtifactCache {
         }
     }
 
+    /// Remove entries, oldest first by mtime, until the directory holds no
+    /// more than `target_bytes`.
+    ///
+    /// Reads never touch mtime ([`try_read_cached_bytes`] is a plain
+    /// `fs::read`), so this is write order, not access order: the entries
+    /// that go first are the ones resident longest, however often they are
+    /// read. A bulk writer sharing the directory with the read path — the
+    /// index sweep walks and caches every root in a chain — can push out hot
+    /// leaves once the budget is reached.
     fn evict_until(&self, target_bytes: u64) -> io::Result<()> {
         let mut entries = scan_cache_entries(&self.root)?;
         let mut current = entries
@@ -642,6 +651,13 @@ pub fn best_effort_cache_bytes_to_path(cache_dir: &Path, target: &Path, bytes: &
 ///   that process's entry behind,
 /// - a crash between the delete and this call leaves the entry behind, where
 ///   it survives restarts and goes only when the cache exceeds its budget,
+/// - it is reached through [`ContentStore::release`], and not every delete
+///   goes that way: the index sweep reclaims orphans by address, through
+///   [`crate::storage::Storage::delete`], because its plan comes from a
+///   storage listing and has no CID to evict by. Those entries stay behind
+///   the same way a crash leaves them. The sweep can afford that because an
+///   orphan is, by construction, a blob no index chain reaches, so no walk
+///   reads its entry afterwards,
 /// - a fetch already in flight for `id` writes its result when it completes,
 ///   which can be after this call. Eviction removes an entry; it cannot
 ///   cancel the read that is about to replace it.

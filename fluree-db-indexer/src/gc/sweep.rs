@@ -100,6 +100,13 @@ pub struct SweepResult {
 /// a crash between a release and its cache eviction, or a release by another
 /// process — so a cached chain can run past where storage ends it. The walk
 /// stops there anyway; see [`chain_cas_ids`].
+///
+/// The sweep is also a bulk writer of that cache: every root in the chain is
+/// written on its first read, and with no `data_dir` configured the directory
+/// is the one the read path uses for leaves. The cache evicts by write order
+/// rather than access order, so a long chain that fills the budget evicts the
+/// longest-resident leaves first, which are the hot ones. Query latency that
+/// dips after a sweep on a full cache is that, not a fault in the sweep.
 pub async fn plan_sweep<S>(
     storage: &S,
     ledger_name: &str,
@@ -157,6 +164,12 @@ where
     // A backlog is the whole reason a sweep runs, so the delete count is the
     // operation's dominant cost and every one of them is a storage round trip
     // taken while the ledger is held out of indexing.
+    //
+    // These are address deletes, not releases: the plan comes from a storage
+    // listing and carries no CID, so nothing here evicts a cached copy. An
+    // orphan is a blob no index chain reaches, so no later walk reads the
+    // entry it leaves behind; `evict_cached_cid`'s doc lists this among the
+    // states the cache does not clear.
     let outcomes: Vec<(String, Option<String>)> =
         futures::stream::iter(plan.orphans.iter().cloned())
             .map(|address| async move {
