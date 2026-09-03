@@ -508,11 +508,15 @@ impl PolicyContext {
         // f:query) grants. Every targeted entry is tried before the decision
         // so the outcome cannot depend on restriction order; a targeted
         // f:query that fails still blocks fall-through to Default policies.
-        let (targeted, defaults): (Vec<_>, Vec<_>) = filtered_entries
-            .into_iter()
-            .partition(|e| policy_set.restrictions[e.idx].target_mode != TargetMode::Default);
+        let targets = |e: &FlakePolicyEntry| {
+            policy_set.restrictions[e.idx].target_mode != TargetMode::Default
+        };
         let mut targeted_query_failed = false;
-        for entry in targeted.iter().chain(&defaults) {
+        for entry in filtered_entries
+            .iter()
+            .filter(|e| targets(e))
+            .chain(filtered_entries.iter().filter(|e| !targets(e)))
+        {
             let restriction = &policy_set.restrictions[entry.idx];
             let is_targeted = restriction.target_mode != TargetMode::Default;
             if !is_targeted && targeted_query_failed {
@@ -762,12 +766,15 @@ impl PolicyContext {
         // f:query) grants. Every targeted entry is tried before the decision
         // so the outcome cannot depend on restriction order; a targeted
         // f:query that fails still blocks fall-through to Default policies.
-        let (targeted, defaults): (Vec<&FlakePolicyEntry>, Vec<&FlakePolicyEntry>) =
-            filtered_entries
-                .iter()
-                .partition(|e| policy_set.restrictions[e.idx].target_mode != TargetMode::Default);
+        let targets = |e: &FlakePolicyEntry| {
+            policy_set.restrictions[e.idx].target_mode != TargetMode::Default
+        };
         let mut failed_targeted: Vec<&'a PolicyRestriction> = Vec::new();
-        for entry in targeted.into_iter().chain(defaults) {
+        for entry in filtered_entries
+            .iter()
+            .filter(|e| targets(e))
+            .chain(filtered_entries.iter().filter(|e| !targets(e)))
+        {
             let restriction = &policy_set.restrictions[entry.idx];
             let is_targeted = restriction.target_mode != TargetMode::Default;
             if !is_targeted && !failed_targeted.is_empty() {
