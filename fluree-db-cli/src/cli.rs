@@ -3224,7 +3224,8 @@ pub struct DocIngestArgs {
     #[arg(long)]
     pub no_escalate: bool,
 
-    /// Skip building or syncing the vector and full-text indexes
+    /// Skip indexing after the run: the ledger's own index, and the vector
+    /// and full-text indexes
     #[arg(long)]
     pub no_index: bool,
 

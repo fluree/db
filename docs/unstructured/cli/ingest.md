@@ -20,7 +20,7 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--base-iri <IRI>` | Prefix documents are minted under (default `urn:fluree:doc:`). The path relative to the ingested directory is appended, so a document keeps its IRI across runs. |
 | `--no-embed` | Skip embeddings even when an embedding slot is configured. |
 | `--no-escalate` | Never call a vision model, whatever is configured. |
-| `--no-index` | Skip building or syncing the vector and full-text indexes. |
+| `--no-index` | Skip indexing after the run: the ledger's own index, and the vector and full-text indexes. |
 | `--no-cache` | Neither read nor write the parse and reading caches. |
 | `--force` | Re-ingest documents the ledger already holds with the same content, parser and embedding model. |
 | `--min-chars <N>` | Emit a chunk once its buffer reaches this many characters (default `1500`). |
@@ -50,7 +50,7 @@ For each document, in path order:
 5. **Extract**, when asked: scan each chunk for the `--entities` labels, then ask the `llm` slot about the chunk with the ontology and the entities found, and gate what comes back. See [Entities and relations](../concepts/entities-and-relations.md).
 6. **Retract** the previous extraction of the same document IRI, if any, then **insert** structure, chunks, document node, mentions, relations and new entities as one commit.
 
-Then the full-text index `<ledger>-text` is created or synced, and the vector index `<ledger>-vectors` likewise when embeddings were produced; an index built for a different vector width is rebuilt.
+Then the ledger's own index is brought up to the new head, so later commands read it instead of replaying the commits just written; then the full-text index `<ledger>-text` is created or synced, and the vector index `<ledger>-vectors` likewise when embeddings were produced; an index built for a different vector width is rebuilt.
 
 ## Output
 
@@ -64,6 +64,7 @@ ingest 3 document(s) → contracts
   ✓ msa-2024.pdf  parsed: 41p, 512 elements, 138 chunks, 2 crop(s) read, embedded  t=1
   ✓ nda.docx  parsed: 19 elements, 4 chunks, embedded  t=2
   = sow/q3.pdf  unchanged
+  ⟳ ledger index contracts: t=2
   + full-text index contracts-text:main: 142 chunk(s), 1631 terms
   + vector index contracts-vectors:main: 142 vector(s), 1536 dims
 

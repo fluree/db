@@ -3717,6 +3717,7 @@ fn doc_ingest_markdown_then_search_then_skip_unchanged() {
         .stdout(predicate::str::contains(
             "1 ingested, 0 unchanged, 0 failed",
         ))
+        .stdout(predicate::str::contains("ledger index handbook: t=1"))
         .stdout(predicate::str::contains(
             "full-text index handbook-text:main",
         ));

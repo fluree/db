@@ -785,6 +785,15 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
 
     if let (Some(f), false) = (&fluree, args.no_index) {
         if totals.ingested > 0 {
+            // A CLI process never runs the background indexer, so what was
+            // just committed would otherwise be replayed into novelty by
+            // every later invocation, search included.
+            let indexed = crate::commands::index::index_ledger(f, &ledger_id).await?;
+            println!(
+                "  {} ledger index {alias}: t={}",
+                "⟳".dimmed(),
+                indexed.index_t
+            );
             ensure_indexes(f, &alias, dimensions).await?;
         } else if totals.skipped > 0 {
             sync_indexes_if_present(f, &alias).await?;

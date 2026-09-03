@@ -45,7 +45,7 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--base-iri <IRI>` | Prefix documents are minted under (default `urn:fluree:doc:`). The path relative to the ingested directory is appended, so a document keeps its IRI across runs. |
 | `--no-embed` | Skip embeddings even when `[doc.embedding]` is configured. |
 | `--no-escalate` | Never call a vision model, whatever `[doc.vlm]` says. |
-| `--no-index` | Skip building or syncing the vector and full-text indexes. |
+| `--no-index` | Skip indexing after the run: the ledger's own binary index, and the vector and full-text indexes. |
 | `--no-cache` | Neither read nor write the parse and reading caches. |
 | `--force` | Re-ingest documents the ledger already holds with the same content, parser and embedding model. |
 | `--min-chars <N>` | Emit a chunk once its buffer reaches this many characters (default `1500`). |
@@ -75,7 +75,7 @@ For each document, in path order:
 5. **Extract**, when `--entities` or `--model` is given. Each chunk is scanned for every label of every known entity (longest whole-word match, case-folded, plus Snowball stems), and each match becomes a mention under the entity's IRI. With `--model`, the language model is then asked about the chunk with the ontology as its system prompt and the entities found as known names. Its entities are resolved to known IRIs where a label matches and minted otherwise; an entity whose excerpt is not in the chunk is dropped; a new entity typed outside the ontology is kept flagged `doc:offModel` (or dropped with `--drop-off-model`); each relation's predicate is judged against the ontology as `valid`, `repaired` (an unambiguous label, local name or class-to-property fix) or `rejected`, and written reified with that verdict, a relation whose object names no entity carrying it as a literal. In `direct` mode an admitted relation with an entity object is also written as an edge. Answers are cached per chunk and asked for several chunks at once; a chunk whose call fails keeps its gazetteer mentions, and the document is not stamped as extracted so the next run retries it.
 6. **Retract the previous extraction** of the same document IRI, if any, then insert the structure graph, the chunks, the document node and the extraction as one commit. The earlier extraction remains queryable at its commit. Entity nodes are shared across documents and not retracted; an edge the earlier extraction asserted is dropped only when no remaining relation supports it.
 
-After the documents, the full-text index `<ledger>-text` is created or synced, and the vector index `<ledger>-vectors` likewise when embeddings were produced. A vector index built for a different embedding width, because the embedding model changed, is dropped and rebuilt rather than synced.
+After the documents, the ledger's binary index is brought up to the new head, so later invocations read it rather than replaying the commits just written (a CLI process never runs the background indexer that a server would). Then the full-text index `<ledger>-text` is created or synced, and the vector index `<ledger>-vectors` likewise when embeddings were produced. A vector index built for a different embedding width, because the embedding model changed, is dropped and rebuilt rather than synced.
 
 ### Examples
 
@@ -111,6 +111,7 @@ ingest 3 document(s) → contracts
   ✓ msa-2024.pdf  parsed: 41p, 512 elements, 138 chunks, embedded  t=1
   ✓ nda.docx  parsed: 19 elements, 4 chunks, embedded  t=2
   = sow/q3.pdf  unchanged
+  ⟳ ledger index contracts: t=2
   + full-text index contracts-text:main: 142 chunk(s), 1631 terms
   + vector index contracts-vectors:main: 142 vector(s), 768 dims
 

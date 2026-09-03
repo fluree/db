@@ -22,4 +22,4 @@ Under `.fluree/cache/doc/`, keyed so that a re-run pays only for what actually c
 
 ## Indexes follow
 
-After the documents, the full-text index is created or synced incrementally, and the vector index likewise. Switching embedding models changes the vector width; an index built for the old width is dropped and rebuilt rather than synced.
+After the documents, the ledger's own binary index is brought up to the new head. A CLI process never runs the background indexer a server would, and without this every later invocation, `doc search` included, would replay the commits just written into memory before answering: on a 66-page statement that was two seconds per command against a few milliseconds indexed. Then the full-text index is created or synced incrementally, and the vector index likewise. Switching embedding models changes the vector width; an index built for the old width is dropped and rebuilt rather than synced.
