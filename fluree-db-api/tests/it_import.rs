@@ -2849,3 +2849,252 @@ ex:bob a ex:User ;
             .collect::<Vec<_>>()
     );
 }
+
+// ============================================================================
+// Duplicate-statement deduplication (#1651)
+// ============================================================================
+
+/// SPARQL `COUNT(*)` over all default-graph triples.
+async fn count_all_triples(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+) -> u64 {
+    let qr = support::query_sparql(fluree, ledger, "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }")
+        .await
+        .expect("count query");
+    let json = qr.to_sparql_json(&ledger.snapshot).expect("format");
+    json["results"]["bindings"][0]["c"]["value"]
+        .as_str()
+        .expect("count value")
+        .parse()
+        .expect("count number")
+}
+
+// The issue #1651 minimal repro: an RDF graph is a set of triples, so a
+// 6-line file with every line duplicated holds 3 facts, blank-node lines
+// included (labeled blank nodes are document-scoped). All copies land in one
+// chunk, so this pins the chunk-sort dedup lane.
+#[tokio::test]
+async fn import_deduplicates_repeated_statements() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let nt = r#"<http://ex.org/pub1> <http://ex.org/hasId> _:id1 .
+_:id1 <http://ex.org/scheme> <http://ex.org/doi> .
+<http://ex.org/pub1> <http://ex.org/hasId> _:id1 .
+_:id1 <http://ex.org/scheme> <http://ex.org/doi> .
+<http://ex.org/pub2> <http://ex.org/title> "Hello" .
+<http://ex.org/pub2> <http://ex.org/title> "Hello" .
+"#;
+    let path = write_data(data_dir.path(), "dupe.nt", nt);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/import-dedup:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+
+    assert_eq!(result.duplicates_removed, 3, "three duplicated lines");
+    // flake_count reports raw commit ops — the commit chain keeps every op.
+    assert_eq!(result.flake_count, 6);
+
+    let ledger = fluree.ledger("test/import-dedup:main").await.expect("load");
+    assert_eq!(count_all_triples(&fluree, &ledger).await, 3);
+}
+
+// Copies of the same statement split across import chunks meet only in the
+// k-way SPOT/secondary merges — the chunk-sort dedup cannot see them. Pins
+// the merge lane (`next_unique_assert`) plus the stats discount: per-property
+// counts must describe the set view, not the op log.
+#[tokio::test]
+async fn import_deduplicates_repeated_statements_across_chunks() {
+    use std::fmt::Write as _;
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let mut ttl = String::new();
+    ttl.push_str("@prefix ex: <http://example.org/> .\n");
+    ttl.push_str("@prefix schema: <http://schema.org/> .\n\n");
+    ttl.push_str("_:dupbn schema:name \"bn-dup\" .\n");
+    ttl.push_str("ex:dup schema:jobTitle \"iri-dup\" .\n");
+    for i in 0..12_000 {
+        let _ = writeln!(
+            ttl,
+            "ex:filler{i} schema:description \"padding that pushes the trailing duplicates into a later import chunk\" ."
+        );
+    }
+    ttl.push_str("_:dupbn schema:name \"bn-dup\" .\n");
+    ttl.push_str("ex:dup schema:jobTitle \"iri-dup\" .\n");
+    assert!(ttl.len() > 1024 * 1024, "fixture must exceed one chunk");
+    let path = write_ttl(data_dir.path(), "big-dupes.ttl", &ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/import-dedup-chunks:main")
+        .import(&path)
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .collect_id_stats(true)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("chunked import");
+    assert!(
+        result.t > 1,
+        "test is vacuous unless the file was split: {} chunk(s)",
+        result.t
+    );
+    assert_eq!(
+        result.duplicates_removed, 2,
+        "one bnode + one IRI duplicate"
+    );
+
+    let ledger = fluree
+        .ledger("test/import-dedup-chunks:main")
+        .await
+        .expect("load");
+
+    // One row per fact, duplicate-free.
+    assert_eq!(count_all_triples(&fluree, &ledger).await, 12_002);
+
+    // Per-property stats describe the set view: exactly one jobTitle fact,
+    // even though the op log holds two (merge-dedup discount applied).
+    assert_eq!(
+        property_count(&ledger.snapshot, "http://schema.org/jobTitle"),
+        Some(1),
+        "stats must discount the merge-collapsed duplicate"
+    );
+    assert_eq!(
+        property_count(&ledger.snapshot, "http://schema.org/name"),
+        Some(1)
+    );
+}
+
+// Near misses must all survive: statements differing only in language tag,
+// only in datatype, or plain-vs-tagged are distinct RDF facts.
+#[tokio::test]
+async fn import_preserves_near_miss_statements() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let ttl = r#"
+@prefix ex: <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+ex:pub ex:title "Hello"@en .
+ex:pub ex:title "Hello"@de .
+ex:pub ex:title "Hello" .
+ex:n ex:v "5" .
+ex:n ex:v 5 .
+ex:n ex:v "5"^^xsd:byte .
+"#;
+    let path = write_ttl(data_dir.path(), "near-miss.ttl", ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/import-near-miss:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+
+    assert_eq!(result.duplicates_removed, 0, "no line is a duplicate fact");
+
+    let ledger = fluree
+        .ledger("test/import-near-miss:main")
+        .await
+        .expect("load");
+    assert_eq!(count_all_triples(&fluree, &ledger).await, 6);
+}
+
+// Adversarial language-tag introduction order across chunks. Chunk 2 parses
+// "de" before "en" while chunk 1 established "en" first; a first-seen global
+// lang dictionary makes chunk 2's local→global remap non-monotone, which
+// un-sorts its remapped stream within (subject, predicate) — the two @en
+// copies then never sit adjacent in the merge and the duplicate survives.
+// Lexical assignment on both sides (chunk sort + unified dict) keeps every
+// remap monotone; this pins that.
+#[tokio::test]
+async fn import_deduplicates_lang_tagged_across_chunks_adversarial_order() {
+    use std::fmt::Write as _;
+
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let mut ttl = String::new();
+    ttl.push_str("@prefix ex: <http://example.org/> .\n");
+    ttl.push_str("@prefix schema: <http://schema.org/> .\n\n");
+    ttl.push_str("ex:l schema:name \"shared\"@en .\n");
+    for i in 0..12_000 {
+        let _ = writeln!(
+            ttl,
+            "ex:filler{i} schema:description \"padding that pushes the trailing statements into a later import chunk\" ."
+        );
+    }
+    // Same subject and predicate: the lang id is the deciding sort component,
+    // and "de" enters this chunk's dictionary first.
+    ttl.push_str("ex:l schema:name \"anders\"@de .\n");
+    ttl.push_str("ex:l schema:name \"shared\"@en .\n");
+    assert!(ttl.len() > 1024 * 1024, "fixture must exceed one chunk");
+    let path = write_ttl(data_dir.path(), "lang-dupes.ttl", &ttl);
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+
+    let result = fluree
+        .create("test/import-dedup-lang:main")
+        .import(&path)
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("chunked import");
+    assert!(
+        result.t > 1,
+        "test is vacuous unless the file was split: {} chunk(s)",
+        result.t
+    );
+    assert_eq!(result.duplicates_removed, 1, "the repeated @en statement");
+
+    let ledger = fluree
+        .ledger("test/import-dedup-lang:main")
+        .await
+        .expect("load");
+
+    let qr = support::query_sparql(
+        &fluree,
+        &ledger,
+        "SELECT ?o WHERE { <http://example.org/l> <http://schema.org/name> ?o }",
+    )
+    .await
+    .expect("name query");
+    let json = qr.to_sparql_json(&ledger.snapshot).expect("format");
+    let bindings = json["results"]["bindings"].as_array().expect("bindings");
+    assert_eq!(
+        bindings.len(),
+        2,
+        "one @en fact (deduped) plus the @de fact: {bindings:?}"
+    );
+}

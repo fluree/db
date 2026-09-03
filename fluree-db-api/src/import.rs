@@ -660,6 +660,12 @@ pub struct ImportResult {
     /// Tracking tally (fuel, time) when a tracker was supplied via
     /// `ImportBuilder::tracker(...)`. `None` when tracking was disabled.
     pub tally: Option<TrackingTally>,
+    /// Duplicate input statements collapsed out of the index. `flake_count`
+    /// reports the raw commit operations (the commit blobs keep every op),
+    /// so when this is non-zero the indexed triple count is
+    /// `flake_count - duplicates_removed`. 0 when `build_index == false`
+    /// (no index, nothing collapsed).
+    pub duplicates_removed: u64,
 }
 
 /// Lightweight summary of the imported dataset for CLI display.
@@ -3861,6 +3867,7 @@ where
     let index_t;
     let summary;
     let mut has_annotations = false;
+    let mut duplicates_removed = 0u64;
 
     if config.build_index {
         let build_input = IndexBuildInput {
@@ -3910,6 +3917,7 @@ where
         index_t = index_result.index_t;
         summary = index_result.summary;
         has_annotations = index_result.has_annotations;
+        duplicates_removed = index_result.duplicates_removed;
     } else {
         root_id = None;
         index_t = 0;
@@ -3935,6 +3943,7 @@ where
         summary,
         has_annotations,
         tally: config.tracker.tally(),
+        duplicates_removed,
     })
 }
 
@@ -6119,6 +6128,9 @@ struct IndexUploadResult {
     /// `reindex` pass (the bulk-import root currently writes
     /// `annotation_index: None` even when annotations are present).
     has_annotations: bool,
+    /// Duplicate input statements collapsed out of the index (chunk-level
+    /// dedup + cross-chunk merge dedup). The commit blobs keep the raw ops.
+    duplicates_removed: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6211,6 +6223,10 @@ where
         let v3_run_budget = config.effective_run_budget_mb() * 1024 * 1024;
         let v3_worker_count = config.effective_heavy_workers();
         let v3_sorted_commit_infos = input.sorted_commit_infos;
+        let chunk_duplicates_removed: u64 = v3_sorted_commit_infos
+            .iter()
+            .map(|info| info.duplicates_removed)
+            .sum();
         let v3_lang_remaps: Vec<Vec<u16>> = lang_remaps.clone();
         let v3_remap_counter = remap_counter.clone();
         let v3_build_counter = build_counter.clone();
@@ -6420,6 +6436,7 @@ where
                 let mut total_remapped = g0_result.total_remapped;
                 let mut remap_elapsed = g0_result.remap_elapsed;
                 let mut build_elapsed = g0_result.build_elapsed;
+                let mut duplicates_removed = g0_result.duplicates_removed;
 
                 // g1 (txn-meta) is a system graph; its per-class SPOT stats are
                 // intentionally not merged into the user-facing class stats.
@@ -6428,6 +6445,7 @@ where
                     total_remapped += g1.total_remapped;
                     remap_elapsed += g1.remap_elapsed;
                     build_elapsed += g1.build_elapsed;
+                    duplicates_removed += g1.duplicates_removed;
 
                     for (order, g1_order) in g1.order_results {
                         if let Some((_, existing)) =
@@ -6447,6 +6465,7 @@ where
                     total_remapped += ng.total_remapped;
                     remap_elapsed += ng.remap_elapsed;
                     build_elapsed += ng.build_elapsed;
+                    duplicates_removed += ng.duplicates_removed;
 
                     for (order, ng_order) in ng.order_results {
                         if let Some((_, existing)) =
@@ -6466,6 +6485,7 @@ where
                     total_remapped,
                     remap_elapsed,
                     build_elapsed,
+                    duplicates_removed,
                 };
 
                 tracing::info!(
@@ -6481,8 +6501,12 @@ where
             },
         );
 
-        let remap_total_flakes = input.cumulative_flakes;
-        let build_total_flakes = input.cumulative_flakes * 4;
+        // Chunk-level dedup already shrank the sorted commits the remap and
+        // build phases consume; cross-chunk merge dedup self-corrects because
+        // the pumps advance progress by consumed (pre-collapse) records.
+        let deduped_flakes = input.cumulative_flakes - chunk_duplicates_removed;
+        let remap_total_flakes = deduped_flakes;
+        let build_total_flakes = deduped_flakes * 4;
 
         let emit_index_progress =
             |stage: u8, current_stage: &mut u8, stage_start: &mut std::time::Instant| {
@@ -6927,6 +6951,7 @@ where
             index_t: input.final_t,
             summary,
             has_annotations: import_has_annotations,
+            duplicates_removed: chunk_duplicates_removed + v3_result.duplicates_removed,
         })
     }
 }
