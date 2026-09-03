@@ -356,6 +356,14 @@ WHERE {
 }
 ```
 
+**Expression errors leave the variable unbound.** Per SPARQL 1.1 §18.5, when a
+`BIND` expression raises a *value* error — arithmetic on operands that have no
+operator between them, an out-of-range comparison — the row is kept and the
+target variable is simply not bound. The query does not fail and no diagnostic
+is emitted, so an unexpectedly empty column is worth reading as "this expression
+had no answer for this row", not necessarily as missing data. Use `BOUND(?var)`
+to distinguish the two.
+
 ### VALUES
 
 Provide initial bindings:
@@ -594,6 +602,127 @@ the graphs listed.
 - `HOURS(?time)` - Hours
 - `MINUTES(?time)` - Minutes
 - `SECONDS(?time)` - Seconds
+- `TZ(?dateTime)` - Timezone as a plain string. **Always `"Z"`** — see below.
+- `TIMEZONE(?dateTime)` - Timezone as an `xsd:dayTimeDuration`. **Always `"PT0S"`.**
+
+> **Timezones are normalized, not preserved.** Fluree stores temporal values as
+> UTC instants and does not keep the offset the literal was written with, so
+> `"2010-12-21T15:38:02-08:00"` and `"2010-12-21T23:38:02Z"` are the same stored
+> value. `TZ` and `TIMEZONE` therefore report UTC for everything rather than the
+> source offset, which SPARQL 1.1 §17.4.5.8-9 would expect.
+>
+> This is deliberate: the offset is only recoverable before a value is indexed,
+> so reporting it would mean the same query returned a different answer once a
+> background reindex ran — with no write in between. A constant answer is the
+> only one that does not change underneath you.
+>
+> Ordering, comparison and range queries are unaffected; they use the normalized
+> instant. If you need a wall-clock offset, store it as its own property.
+
+### Date/Time Arithmetic
+
+Subtracting one temporal value from another yields the elapsed time as an
+`xsd:dayTimeDuration`:
+
+```sparql
+SELECT ?event ?elapsed WHERE {
+  ?event ex:start ?start ;
+         ex:end   ?end .
+  BIND(?end - ?start AS ?elapsed)     # e.g. "P1DT2H30M"^^xsd:dayTimeDuration
+}
+```
+
+Defined for three operand pairs, matching the XPath operators of the same names:
+
+**Differences** — subtracting two values of the same kind gives the elapsed time:
+
+| Expression | XPath operator | Result |
+| --- | --- | --- |
+| `?dateTime - ?dateTime` | `op:subtract-dateTimes` | `xsd:dayTimeDuration` |
+| `?date - ?date` | `op:subtract-dates` | `xsd:dayTimeDuration` |
+| `?time - ?time` | `op:subtract-times` | `xsd:dayTimeDuration` |
+
+**Shifts** — adding or subtracting a duration gives back the left operand's kind:
+
+| Expression | Result |
+| --- | --- |
+| `?dateTime ± ?dayTimeDuration` | `xsd:dateTime` |
+| `?dateTime ± ?yearMonthDuration` | `xsd:dateTime` |
+| `?date ± ?dayTimeDuration` | `xsd:date` |
+| `?date ± ?yearMonthDuration` | `xsd:date` |
+| `?time ± ?dayTimeDuration` | `xsd:time` |
+| `?dayTimeDuration ± ?dayTimeDuration` | `xsd:dayTimeDuration` |
+| `?yearMonthDuration ± ?yearMonthDuration` | `xsd:yearMonthDuration` |
+
+```sparql
+BIND(?start + "P1M"^^xsd:yearMonthDuration AS ?renewal)
+BIND(?deadline - "PT48H"^^xsd:dayTimeDuration AS ?reminder)
+```
+
+Shifting is calendar-aware, with three behaviours worth knowing:
+
+- **Month arithmetic clamps to the end of the month.** `2026-01-31 + P1M` is
+  `2026-02-28`, not March 3rd — and `2028-01-31 + P1M` is `2028-02-29`, since
+  2028 is a leap year.
+- **`xsd:time` wraps within the day**, having no date to carry into:
+  `23:00:00Z + PT2H` is `01:00:00Z`.
+- **`xsd:date ± dayTimeDuration` keeps only the date part**, so a sub-day
+  duration moves nothing: `2026-01-01 + PT5H` is still `2026-01-01`.
+
+The two duration families never mix — `?dayTimeDuration + ?yearMonthDuration` is
+a type error, because months have no fixed length. So is `?time ± ?yearMonthDuration`,
+since a time carries no months. Computed values render in the canonical form of
+their kind: a `dateTime` in UTC with a `Z`, a `date` or `time` with no timezone
+designator.
+
+
+**Semantics:**
+
+- **Signed.** `?end - ?start` is negative when the end precedes the start, e.g.
+  `-P1D`. It is an elapsed difference, not an absolute magnitude.
+- **`xsd:dateTime` is an instant.** A dateTime is UTC from the moment it is
+  parsed, so `"2026-01-01T13:00:00+03:00" - "2026-01-01T10:00:00Z"` is `PT0S` —
+  the same instant written two ways — not the three hours the wall-clock
+  readings differ by. A lexical form with no timezone is read as UTC.
+- **`xsd:date` and `xsd:time` carry no offset** (deviation, see below). Fluree
+  does not support timezone offsets: on a `date` or `time` the designator is
+  validated and discarded, not applied, so `"2026-01-01+05:00"` *is*
+  `"2026-01-01"` and `"17:00:00-06:00"` *is* `"17:00:00"`. Arithmetic therefore
+  subtracts calendar dates and wall clocks: `"2026-01-01+05:00" - "2026-01-01Z"`
+  is `PT0S` rather than the `-PT5H` XPath gives. Full statement under
+  [Timezone offsets are not supported](../reference/compatibility.md). Store an
+  offset you need to keep as its own property.
+- **Subtraction only.** `+`, `*`, `/` and `%` are not defined over temporal
+  operands, and neither are mixed pairs such as `?dateTime - ?date`. These are
+  type errors, which inside `BIND` means the variable is left **unbound** rather
+  than raising — see [Expression errors](#bind).
+
+> **Beyond the standard.** SPARQL 1.1 maps `-` only over numeric operands, and
+> the SPARQL 1.2 draft does not extend it either — a conformant processor is
+> free to answer a type error here. Fluree follows
+> [SEP-0002](https://github.com/w3c/sparql-dev/blob/main/SEP/SEP-0002/sep-0002.md),
+> the community proposal that specifies these operators, and matches its XPath
+> semantics wherever an offset is not in play — that is, for every
+> `xsd:dateTime` operand, and for `xsd:date`/`xsd:time` operands written without
+> one. Where an `xsd:date` or `xsd:time` is written with an offset, the bullet
+> above applies and the answers differ; XPath's own `op:subtract-times` example
+> (`"17:00:00-06:00" - "08:00:00+09:00"` = `P1D`) is one such case, and Fluree
+> answers `PT9H`. Queries relying on any of this are not portable to processors
+> that implement only the published spec.
+
+Also supported from SEP-0002: ordering and equality over `xsd:date`,
+`xsd:time`, `xsd:dayTimeDuration` and `xsd:yearMonthDuration` (`<`, `>`, `=`),
+and the `YEAR`/`MONTH`/`DAY` and `HOURS`/`MINUTES`/`SECONDS` accessors over
+`xsd:date` and `xsd:time`.
+
+`ADJUST()` is **not supported and not planned**. SEP-0002 adds it (SPARQL 1.1
+and the 1.2 draft define no such function), but its whole purpose is to set or
+change a value's timezone offset — the one property Fluree deliberately does not
+keep. A result whose only distinguishing feature is an offset would be discarded
+on write and reported as `Z` on read, so supporting it would suggest offsets are
+preserved when they are not. Calling it is a parse error. To render an instant
+in a particular zone, do it in the application, or store the offset as its own
+property.
 
 ### Type Conversion
 

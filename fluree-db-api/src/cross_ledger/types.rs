@@ -234,11 +234,14 @@ impl SchemaArtifactWire {
     /// Translate to a Sid-form `SchemaBundleFlakes` against the
     /// data ledger's snapshot.
     ///
-    /// Each triple's IRIs are encoded via `snapshot.encode_iri_strict`.
-    /// Triples whose subject, predicate, or object IRI has no
-    /// registered namespace on D are dropped — D has no instance
-    /// data under those IRIs so the missing axiom can't fire on data
-    /// D doesn't have. The downstream whitelist check in
+    /// Each triple's IRIs are encoded via `snapshot.encode_iri`, which
+    /// falls back to the EMPTY namespace for an IRI D has never
+    /// registered. On a native D such a Sid matches no instance data,
+    /// so the axiom is inert; on a virtual (graph-source) D — a genesis
+    /// snapshot whose data lives outside its namespace table — it is
+    /// exactly the encoding the policy targets and the R2RML policy
+    /// gate use, so `f:onClass` expansion sees the model's hierarchy.
+    /// The downstream whitelist check in
     /// `SchemaBundleFlakes::from_collected_schema_triples` is the
     /// canonical filter; if a future cross-ledger producer emits
     /// non-whitelist triples they'll drop there.
@@ -262,9 +265,9 @@ impl SchemaArtifactWire {
                 continue;
             };
             let (Some(s_sid), Some(p_sid), Some(o_sid)) = (
-                snapshot.encode_iri_strict(&t.s),
-                snapshot.encode_iri_strict(&t.p),
-                snapshot.encode_iri_strict(o_iri),
+                snapshot.encode_iri(&t.s),
+                snapshot.encode_iri(&t.p),
+                snapshot.encode_iri(o_iri),
             ) else {
                 continue;
             };

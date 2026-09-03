@@ -15,6 +15,9 @@ fluree-db-r2rml = { path = "../fluree-db-r2rml" }
 fluree-db-reasoner = { path = "../fluree-db-reasoner" }
 fluree-search-protocol = { path = "../fluree-search-protocol" }
 fluree-vocab = { path = "../fluree-vocab" }
+# Canonical XSD lexical forms (xsd:double / xsd:float) — the same routines the
+# result serializers use, so STR()/casts can never drift from output formats.
+fluree-graph-ir = { path = "../fluree-graph-ir" }
 fluree-graph-json-ld = { path = "../fluree-graph-json-ld" }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 futures = { workspace = true }

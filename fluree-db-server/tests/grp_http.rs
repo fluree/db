@@ -2,6 +2,11 @@
 mod admin_auth_layering;
 #[path = "cross_ledger_http_integration.rs"]
 mod cross_ledger_http_integration;
+// GraphQL is behind a feature flag (async-graphql is a heavy dependency), so
+// this module only compiles when it is on.
+#[cfg(feature = "graphql")]
+#[path = "graphql_http_integration.rs"]
+mod graphql_http_integration;
 #[path = "harness_coverage.rs"]
 mod harness_coverage;
 #[path = "iceberg_track_durability.rs"]

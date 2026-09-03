@@ -17,6 +17,10 @@ aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws", "dep:aws-sdk-sts
 # Arrow columnar reader is the single graph-source read path (native predicate
 # pushdown: row-group skipping + exact row filtering).
 iceberg = ["dep:fluree-db-iceberg", "fluree-db-iceberg/aws"]
+# SQL graph sources (R2RML over a Trino-protocol endpoint). Stacks on `iceberg`
+# because the graph-source provider dispatch lives there; the crate itself adds
+# only an HTTP client, no database drivers.
+sql = ["iceberg", "dep:fluree-db-sql"]
 # Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers)
 aws-testcontainers = [
   "dep:fluree-db-storage-aws",
@@ -30,16 +34,24 @@ aws-testcontainers = [
 credential = ["dep:fluree-db-credential"]
 # SHACL validation (requires fluree-db-transact + fluree-db-shacl)
 shacl = ["dep:fluree-db-shacl", "fluree-db-transact/shacl"]
+# GraphQL endpoint (schema derived from ledger metadata; pulls in async-graphql)
+# Tier 2 reads SHACL shapes, so `shacl` comes with it.
+graphql = ["dep:fluree-db-graphql", "shacl"]
 # Temporary benchmark examples (opt-in so `cargo test` stays fast)
 benchmarks = []
 # Remote search client (HTTP client for remote search service)
 search-remote-client = ["dep:reqwest"]
 # Embedded vector search (HNSW-based approximate nearest neighbor)
 vector = ["fluree-db-query/vector"]
+# Store-driven sync residency mode (wasm32 has it unconditionally): compiles
+# the query-entry retry loop, the load-time novelty prefetch, and the read
+# arms beneath them, engaged at runtime only by miss-register-bearing stores.
+# Native production builds keep this off and compile the pre-residency paths.
+residency = ["fluree-db-query/residency", "fluree-db-binary-index/residency"]
 # IPFS-backed storage (via Kubo HTTP RPC)
 ipfs = ["dep:fluree-db-storage-ipfs"]
 # Convenience bundle (excludes vector, aws, and test-only features)
-full = ["native", "credential", "iceberg", "shacl", "ipfs"]
+full = ["native", "credential", "iceberg", "sql", "shacl", "ipfs", "graphql"]
 
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
@@ -55,8 +67,10 @@ fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = 
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 fluree-db-sparql = { path = "../fluree-db-sparql" }
 fluree-db-cypher = { path = "../fluree-db-cypher" }
+fluree-db-graphql = { path = "../fluree-db-graphql", optional = true }
 fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
+fluree-db-sql = { path = "../fluree-db-sql", optional = true }
 fluree-db-tabular = { path = "../fluree-db-tabular" }
 fluree-db-storage-aws = { path = "../fluree-db-storage-aws", optional = true }
 fluree-db-storage-ipfs = { path = "../fluree-db-storage-ipfs", optional = true }
@@ -135,6 +149,7 @@ fluree-bench-support = { path = "../fluree-bench-support" }
 fluree-bench-alloc = { path = "../fluree-bench-alloc" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
+wiremock = { workspace = true }
 # Residency-mode read arms for the wasm read-path recovery tests
 # (it_residency_retry): dev-only feature unification — production native
 # builds keep the feature off and compile the pre-residency read path.
@@ -144,6 +159,7 @@ fluree-db-binary-index = { path = "../fluree-db-binary-index", features = ["resi
 [[test]]
 name = "it_residency_retry"
 path = "tests/it_residency_retry.rs"
+required-features = ["residency"]
 
 [[test]]
 name = "grp_graphsource"
@@ -169,12 +185,26 @@ name = "it_iceberg_local_fs"
 path = "tests/it_iceberg_local_fs.rs"
 required-features = ["iceberg", "native"]
 
+# View-policy enforcement on R2RML / Iceberg graph sources, checked against a
+# native twin of the same fixture as the oracle.
+[[test]]
+name = "it_iceberg_policy"
+path = "tests/it_iceberg_policy.rs"
+required-features = ["iceberg", "native"]
+
 # Standalone for the same reason: catalog-less WAREHOUSE-ROOT resolution through
 # every Direct entry point, against the committed fixture's parent directory.
 [[test]]
 name = "it_iceberg_warehouse_root"
 path = "tests/it_iceberg_warehouse_root.rs"
 required-features = ["iceberg", "native"]
+
+# End-to-end over a SQL graph source against a fake Trino-protocol endpoint
+# (wiremock), through registration, the R2RML query path and pushdown.
+[[test]]
+name = "it_sql_graph_source"
+path = "tests/it_sql_graph_source.rs"
+required-features = ["sql", "native"]
 
 [[test]]
 name = "grp_index"
@@ -246,6 +276,21 @@ path = "tests/it_fastpath_1652_regression.rs"
 name = "it_datetime_component_presence"
 path = "tests/it_datetime_component_presence.rs"
 
+[[test]]
+name = "it_timezone_accessors"
+path = "tests/it_timezone_accessors.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_temporal_lane_stability"
+path = "tests/it_temporal_lane_stability.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_temporal_arithmetic"
+path = "tests/it_temporal_arithmetic.rs"
+required-features = ["native"]
+
 # Own binary: asserts fast-path routing via process-scoped tracing capture.
 [[test]]
 name = "it_exists_semijoin_correlation"
@@ -310,6 +355,10 @@ path = "tests/it_multi_graph_property_path.rs"
 [[test]]
 name = "it_cypher_seq_writes"
 path = "tests/it_cypher_seq_writes.rs"
+
+[[test]]
+name = "it_cypher_probe_reasoning"
+path = "tests/it_cypher_probe_reasoning.rs"
 
 [[test]]
 name = "it_query_cypher"
@@ -420,6 +469,11 @@ name = "fulltext_query"
 harness = false
 
 [[bench]]
+name = "graphql_schema"
+harness = false
+required-features = ["graphql"]
+
+[[bench]]
 name = "insert_formats"
 harness = false
 
@@ -517,6 +571,13 @@ required-features = ["native"]
 [[test]]
 name = "it_literal_identity"
 path = "tests/it_literal_identity.rs"
+required-features = ["native"]
+
+# Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
+# switch AND asserts membership-join routing via span capture.
+[[test]]
+name = "it_membership_join_list_rows"
+path = "tests/it_membership_join_list_rows.rs"
 required-features = ["native"]
 
 # Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill

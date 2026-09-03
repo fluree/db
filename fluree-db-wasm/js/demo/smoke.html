@@ -1,0 +1,118 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>fluree-db-wasm smoke</title>
+<pre id="out">running…</pre>
+<script type="module">
+  // Drives the shipped package end to end and publishes a machine-readable
+  // verdict on window.__smoke (awaited by scripts/smoke-browser.mjs).
+  // Phase 1: create → insert → query → ask. Phase 2: deliberate crash, then
+  // recycle semantics (H-4/H-5): pre-crash snapshot handles must reject typed
+  // instead of aliasing the fresh engine's snapshots.
+  import { playground } from "../dist/index.js";
+
+  const out = document.getElementById("out");
+  const data = {
+    "@context": { ex: "http://example.org/ns/" },
+    "@graph": [
+      { "@id": "ex:alice", "@type": "ex:Person", "ex:name": "Alice", "ex:age": 34,
+        "ex:knows": { "@id": "ex:bob" } },
+      { "@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob", "ex:age": 29 },
+    ],
+  };
+  const sparql = `PREFIX ex: <http://example.org/ns/>
+    SELECT ?name WHERE { ?p a ex:Person ; ex:name ?name } ORDER BY ?name`;
+  const askKnows = "PREFIX ex: <http://example.org/ns/> ASK { ex:alice ex:knows ex:bob }";
+
+  window.__smoke = (async () => {
+    const timings = {};
+    try {
+      // — Phase 1: the happy path —
+      let t0 = performance.now();
+      const pg = await playground();
+      timings.init = Math.round(performance.now() - t0);
+
+      const ledger = await pg.createLedger("smoke");
+      t0 = performance.now();
+      const receipt = await ledger.insert(data);
+      timings.insert = Math.round(performance.now() - t0);
+
+      t0 = performance.now();
+      const res = await ledger.query(sparql);
+      timings.query = Math.round(performance.now() - t0);
+      const names = res.results.bindings.map((b) => b.name.value);
+
+      const ask = await ledger.query(askKnows);
+      const info = await ledger.info();
+
+      // — Phase 2: crash + recycle semantics —
+      const preCrash = await ledger.snapshot();
+
+      let crashCode = null;
+      let crashFatal = null;
+      try {
+        await pg._debugCrash();
+      } catch (e) {
+        crashCode = e.code;
+        crashFatal = e.fatal;
+      }
+
+      // The proxy respawns with backoff; poll until the fresh engine answers.
+      let post = null;
+      let recycleAttempts = 0;
+      for (let i = 0; i < 40 && !post; i++) {
+        recycleAttempts++;
+        try {
+          post = await pg.createLedger("post-crash");
+        } catch {
+          await new Promise((r) => setTimeout(r, 250));
+        }
+      }
+      if (!post) throw new Error("engine never came back after the deliberate crash");
+      await post.insert({
+        "@context": { ex: "http://example.org/ns/" },
+        "@id": "ex:zed", "@type": "ex:Person", "ex:name": "Zed",
+      });
+      // Fresh engine mints small handle numbers again — the aliasing H-4 guards.
+      const postSnap = await post.snapshot();
+
+      // Stale pre-crash snapshot must reject typed, never answer.
+      let staleCode = null;
+      try {
+        await preCrash.query(askKnows);
+      } catch (e) {
+        staleCode = e.code;
+      }
+      // Releasing the stale snapshot must be a no-op for the fresh engine…
+      await preCrash.release();
+      // …so the fresh snapshot still answers afterwards.
+      const postRows = await postSnap.query(
+        'PREFIX ex: <http://example.org/ns/> ASK { ex:zed ex:name "Zed" }');
+      const postAlive = postRows.boolean === true;
+
+      pg.close();
+
+      const report = {
+        status: "pass",
+        version: pg.version,
+        transport: "transfer",
+        rows: names.length,
+        names,
+        ask: ask.boolean,
+        t: info.t,
+        receiptT: receipt.t,
+        crashCode,
+        crashFatal,
+        staleCode,
+        postAlive,
+        recycleAttempts,
+        timings,
+      };
+      out.textContent = JSON.stringify(report, null, 2);
+      return report;
+    } catch (err) {
+      const report = { status: "fail", error: String(err?.stack ?? err), timings };
+      out.textContent = JSON.stringify(report, null, 2);
+      return report;
+    }
+  })();
+</script>

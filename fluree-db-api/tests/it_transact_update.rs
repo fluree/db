@@ -583,17 +583,18 @@ async fn update_where_bind_datetime_functions() {
         (seconds - 22.435).abs() < 0.001,
         "expected ~22.435, got {seconds}"
     );
-    let mut tz_values: Vec<&str> = result
-        .get("ex:tz")
-        .and_then(|v| v.as_array())
-        .expect("tz array")
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
-    tz_values.sort();
-    // TZ() returns the literal timezone string from the input.
-    // For "...Z" input, TZ returns "Z" (not "+00:00").
-    assert_eq!(tz_values, vec!["-05:00", "Z"]);
+    // `?tz1` and `?tz2` are TZ() over a "...Z" value and a "...-05:00" value.
+    // This asserted ["-05:00", "Z"] until 2026-08-29; TZ now reports UTC for
+    // every temporal rather than the source offset (see it_timezone_accessors
+    // for why), so both arms produce "Z" and the two writes collapse to the one
+    // distinct object value. Deduplication to a scalar is the ordinary
+    // multi-value JSON-LD rendering, not a quirk of this change.
+    let tz = result.get("ex:tz").expect("tz");
+    let tz_values: Vec<&str> = match tz {
+        serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_str()).collect(),
+        other => other.as_str().into_iter().collect(),
+    };
+    assert_eq!(tz_values, vec!["Z"], "TZ reports UTC for every temporal");
     assert_eq!(result.get("ex:comp="), Some(&json!(false)));
     assert_eq!(result.get("ex:comp<"), Some(&json!(true)));
     assert_eq!(result.get("ex:comp<="), Some(&json!(true)));

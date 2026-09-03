@@ -121,7 +121,7 @@ mod lazy_storage;
 pub(crate) mod crawl;
 
 #[cfg(feature = "iceberg")]
-mod r2rml;
+pub(crate) mod r2rml;
 
 #[cfg(feature = "iceberg")]
 mod iceberg_catalog;
@@ -140,6 +140,12 @@ mod ephemeral;
 
 #[cfg(feature = "iceberg")]
 mod r2rml_materialize;
+
+#[cfg(feature = "sql")]
+mod sql;
+
+#[cfg(feature = "sql")]
+pub use sql::{SqlCreateConfig, SqlCreateResult};
 
 // Re-export configuration types
 pub use config::Bm25CreateConfig;
@@ -168,7 +174,7 @@ pub use iceberg_sample::{sample_column_values, sample_iceberg_rows};
 #[cfg(feature = "iceberg")]
 pub(crate) use iceberg_catalog::table_schema_from_metadata;
 #[cfg(feature = "iceberg")]
-pub(crate) use r2rml::rest_client_cache_key;
+pub(crate) use r2rml::{mapping_source_of, rest_client_cache_key};
 
 #[cfg(feature = "iceberg")]
 pub use iceberg_generate::{
