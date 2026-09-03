@@ -125,6 +125,29 @@ For each setting group independently:
 | `enabled: true`, OverrideAll | `enabled: false` | **disabled** | Per-graph disables for its graph |
 | `mode: warn`, OverrideAll | `mode: reject` | **reject** | Per-graph overrides |
 
+Transactions can also request a validation mode for themselves via
+`opts.validationMode` (`"warn"` / `"reject"`). Gating is **asymmetric**:
+strengthening (`warn` → `reject`) is always honored, while softening
+(`reject` → `warn`) is granted only when the SHACL group's
+`f:overrideControl` permits it for the request's verified identity. A denied
+softening request keeps the configured posture (with a server-side warning
+log); it does not fail the transaction. The request can never toggle
+`f:shaclEnabled`.
+
+| Config mode | Override control | Request (identity) | Effective | Why |
+|-------------|------------------|--------------------|-----------|-----|
+| `reject` | OverrideAll | `warn` (any) | **warn** | Softening allowed |
+| `reject` | OverrideNone | `warn` (any) | **reject** | Softening denied |
+| `reject` | IdentityRestricted({remediator}) | `warn` (remediator) | **warn** | Identity authorized |
+| `reject` | IdentityRestricted({remediator}) | `warn` (other/none) | **reject** | Not authorized |
+| `warn` | OverrideNone | `reject` (any) | **reject** | Strengthening is always free |
+
+The identity checked is the auth-layer-verified one (bearer / credential
+DID), not the user-settable `opts.identity`. Typical use: a remediation
+agent whose corrective writes transiently violate shapes gets per-write
+softening — under `IdentityRestricted`, only that agent — without flipping
+the graph's standing posture for every other writer.
+
 ### Transact (`f:transactDefaults`)
 
 Transact defaults use **additive** merge semantics, unlike other groups. However, the general override control rule still applies: if the ledger-wide `f:overrideControl` is `f:OverrideNone`, per-graph transact defaults are blocked entirely.

@@ -26,6 +26,12 @@ pub enum Durability {
     PageCache,
 }
 
+// The env/sync helpers are consumed only by the native `FileStorage` (gated
+// on `native` + non-wasm); the enum itself is part of the portable config API.
+#[cfg_attr(
+    not(all(feature = "native", not(target_arch = "wasm32"))),
+    allow(dead_code)
+)]
 impl Durability {
     /// Environment variable selecting the default for new `FileStorage`.
     pub const ENV_VAR: &'static str = "FLUREE_STORAGE_FSYNC";
@@ -97,6 +103,7 @@ impl Durability {
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod file;
 mod memory;
+pub mod residency;
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use file::{FileStorage, STORAGE_METHOD_FILE};
@@ -207,11 +214,54 @@ pub trait StorageRead: Debug + Send + Sync {
         None
     }
 
+    /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
+    ///
+    /// Mirror of [`ContentStore::resolve_cached_bytes`] for address-keyed
+    /// backends: `StorageContentStore` forwards the CID straight through
+    /// (no address formatting on the lookup), so a `StorageRead` implementor
+    /// with a resident tier — e.g. a browser fetch-backed storage that
+    /// caches by CID — is consulted by the sync read path. Implementations
+    /// must not perform I/O or block; the default returns `None`.
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
+        let _ = id;
+        None
+    }
+
+    /// The store's residency miss register, if it participates in the sync
+    /// residency tier. Mirror of [`ContentStore::miss_register`]; see it for
+    /// the participation contract.
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        None
+    }
+
     /// Read a byte range from the object at the given address.
     ///
     /// The range is `[start, end)` in bytes. Returns the bytes within
     /// the range, which may be shorter than requested if the object is
     /// smaller than `range.end`.
+    ///
+    /// **Clamping is the contract, not an implementation detail.** An
+    /// implementation must size its result from the object, never from the
+    /// width of the range: `mid..u64::MAX` is the established spelling of
+    /// "read to the end" against this trait, so a `range.end` past the object
+    /// is normal input rather than an error. A `range.start` at or past the
+    /// end of the object returns `Ok(vec![])`, the same answer an empty range
+    /// gives — absence of bytes is not an error here, and callers distinguish
+    /// "no bytes" from "no object" by the `NotFound` error, not by this.
+    ///
+    /// Two known divergences, named so this paragraph stays authoritative
+    /// rather than optimistic — a contract doc that names one exception as if
+    /// it were the only one is how a backend drifts out from under it:
+    ///
+    /// - `S3Storage` returns 416 rather than an empty vec for a start past
+    ///   the end. That predates this doc and is tracked in #1712; the
+    ///   clamping half of the contract holds on every backend.
+    /// - A **zero-length object** reads as `NotFound` from `FileStorage` —
+    ///   the #1599 debris guard treats an empty blob as absent on every read
+    ///   surface, this one included — where `MemoryStorage` and this default
+    ///   implementation return `Ok(vec![])`. Deliberate, and callers relying
+    ///   on the guard want exactly that answer, but it is a divergence in
+    ///   this method's observable behavior all the same.
     ///
     /// The default implementation fetches the full object and slices.
     /// StorageBackends that support native range reads (S3, HTTP) should override
@@ -397,6 +447,14 @@ impl StorageRead for Arc<dyn Storage> {
     fn resolve_local_path(&self, address: &str) -> Option<PathBuf> {
         self.as_ref().resolve_local_path(address)
     }
+
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
+        self.as_ref().resolve_cached_bytes(id)
+    }
+
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        self.as_ref().miss_register()
+    }
 }
 
 #[async_trait]
@@ -475,6 +533,38 @@ pub trait ContentStore: Debug + Send + Sync {
         None
     }
 
+    /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
+    ///
+    /// This is the sync residency tier for targets without a sync→async
+    /// bridge (`wasm32`): the binary-index read path consults it instead of
+    /// filesystem probes or a bridged CAS fetch, and surfaces a typed
+    /// `NeedFetch` miss when it returns `None` so an async caller can fetch
+    /// and retry. Implementations must not perform I/O or block — a hit is
+    /// an O(1) map lookup returning a shared `Arc` clone (zero copy); on a
+    /// backend with no resident tier the default returns `None`.
+    ///
+    /// Content is immutable (CID-addressed), so implementations may pin and
+    /// serve entries indefinitely without invalidation.
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        let _ = id;
+        None
+    }
+
+    /// The store's residency miss register, if it participates in the sync
+    /// residency tier.
+    ///
+    /// Returning `Some` is the participation signal: the sync read path then
+    /// serves reads *exclusively* from [`Self::resolve_cached_bytes`] —
+    /// never the filesystem or a bridged fetch — and records every miss into
+    /// this register for an async retry frame to drain (see
+    /// [`residency::MissRegister`]). A participating store must uphold the
+    /// **fetch-pins contract**: bytes returned by [`Self::get`] become (and
+    /// stay) resident, so a drained want that was fetched successfully is
+    /// guaranteed to hit on the re-run.
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        None
+    }
+
     /// Signal that this content is no longer needed and may be reclaimed.
     ///
     /// Implementations should make a best effort to free the underlying
@@ -529,6 +619,14 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
         self.as_ref().resolve_local_path(id)
+    }
+
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        self.as_ref().resolve_cached_bytes(id)
+    }
+
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        self.as_ref().miss_register()
     }
 
     async fn release(&self, id: &ContentId) -> Result<()> {
@@ -669,11 +767,15 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 
     async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
         let address = self.cid_to_address(id)?;
-        match self.storage.read_bytes(&address).await {
+        // Keep the primary miss's message rather than discarding it: it carries
+        // the resolved path, and — for a zero-length blob — the reason the
+        // backend called it absent. Rebuilding a bare `not_found(address)` here
+        // throws both away, and this is the error a caller actually sees.
+        let primary = match self.storage.read_bytes(&address).await {
             Ok(bytes) => return Ok(bytes),
-            Err(crate::error::Error::NotFound(_)) => {}
+            Err(crate::error::Error::NotFound(reason)) => reason,
             Err(e) => return Err(e),
-        }
+        };
         // Fallback: dicts moved from per-branch to @shared namespace
         if let Some(legacy) = self.legacy_dict_address(id) {
             return self.storage.read_bytes(&legacy).await;
@@ -682,7 +784,7 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         if let Some(legacy) = self.legacy_index_root_address(id) {
             return self.storage.read_bytes(&legacy).await;
         }
-        Err(crate::error::Error::not_found(address))
+        Err(crate::error::Error::not_found(primary))
     }
 
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> Result<ContentId> {
@@ -729,6 +831,17 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         Ok(())
     }
 
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        // CID-keyed straight through — no address formatting on the lookup.
+        // A resident tier indexes by CID regardless of which (current or
+        // legacy) address the bytes were fetched from.
+        self.storage.resolve_cached_bytes(id)
+    }
+
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        self.storage.miss_register()
+    }
+
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
         let address = self.cid_to_address(id).ok()?;
         if let Some(path) = self.storage.resolve_local_path(&address) {
@@ -747,11 +860,12 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
         let address = self.cid_to_address(id)?;
-        match self.storage.read_byte_range(&address, range.clone()).await {
+        // Same reason-preservation as `get` above.
+        let primary = match self.storage.read_byte_range(&address, range.clone()).await {
             Ok(bytes) => return Ok(bytes),
-            Err(crate::error::Error::NotFound(_)) => {}
+            Err(crate::error::Error::NotFound(reason)) => reason,
             Err(e) => return Err(e),
-        }
+        };
         // Fallback: dicts moved from per-branch to @shared namespace
         if let Some(legacy) = self.legacy_dict_address(id) {
             match self.storage.read_byte_range(&legacy, range.clone()).await {
@@ -764,7 +878,7 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         if let Some(legacy) = self.legacy_index_root_address(id) {
             return self.storage.read_byte_range(&legacy, range).await;
         }
-        Err(crate::error::Error::not_found(address))
+        Err(crate::error::Error::not_found(primary))
     }
 }
 
@@ -1043,6 +1157,18 @@ impl ContentStore for BranchedContentStore {
         self.branch_store
             .resolve_local_path(id)
             .or_else(|| self.parents.iter().find_map(|p| p.resolve_local_path(id)))
+    }
+
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        self.branch_store
+            .resolve_cached_bytes(id)
+            .or_else(|| self.parents.iter().find_map(|p| p.resolve_cached_bytes(id)))
+    }
+
+    fn miss_register(&self) -> Option<&residency::MissRegister> {
+        self.branch_store
+            .miss_register()
+            .or_else(|| self.parents.iter().find_map(|p| p.miss_register()))
     }
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {

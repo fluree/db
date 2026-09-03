@@ -385,6 +385,64 @@ in place: nameservice head refs and ledger config.
 Configuration details: [Connection config (JSON-LD)](../reference/connection-config-jsonld.md#durability)
 and [Configuration](configuration.md).
 
+### Staging files left by a crash
+
+Because writes stage alongside the destination, a process killed between
+staging the bytes and moving them into place leaves the staged copy behind,
+named `<file>.<pid>.<token>.<seq>.tmp`. These are never served — listings skip
+them, so they can't be read back as content — but they are a full copy of the
+object being written, and a crash loop produces one per attempt.
+
+Starting a file-backed Fluree instance — opening a connection, or building an
+API client — reclaims them. The sweep is a deliberate startup action, taken
+explicitly by those startup paths: merely constructing a storage handle (as a
+test or an inspection tool might, on a directory it does not own) never
+deletes anything. The sweep is also deliberately timid, because the directory
+it walks is shared — by other instances in a multi-instance deployment, and by
+other subsystems even in a single process:
+
+- Only files named the way this backend's own staging writer names them are
+  considered at all. `.tmp` is a suffix, not a namespace — the indexer, the
+  disk cache, the nameservice and the Raft log all stage under it, and the
+  nameservice writes into this same tree. Anything whose name doesn't parse as
+  ours is ignored outright, whatever its age.
+- A staging file carrying **this process's token** is never removed, at any
+  age. In flight and already-leaked look identical from a directory entry.
+  Staging files written by a pre-token build (v4.1.5/v4.1.6) carry a pid where
+  the token now sits, so this rule cannot recognize them as anyone's — for
+  those, the 24-hour rule below is the only protection. The deployment where
+  that matters is a rolling upgrade, with an old-format process still staging
+  into the shared tree.
+- A staging file **modified within the last 24 hours** is never removed. A
+  staging write is a single write of one in-memory buffer, so a day is far past
+  any real one.
+- Anything the sweep can't classify — an unparseable name, an entry it can't
+  stat, an mtime in the future — is kept.
+
+What this does *not* do is coordinate with other processes. It is an age
+heuristic, not a lease: it compares another host's clock against this one's,
+and a foreign staging write that somehow stayed open for over a day would be
+unlinked. Even then nothing is corrupted — on POSIX the writer keeps its open
+descriptor, so only its final rename fails and the write reports an error.
+
+The walk runs at most once per directory per process, and is handed to a
+background thread when one is available, so startup never waits on it.
+
+It is also bounded, at 100,000 directory entries by default — a walk bounded in
+entries is not bounded in wall-clock on a network mount, where every directory
+read is a round trip. **Exhausting that budget is not a deferral.** The walk
+restarts from the top each time with no cursor and never removes content files,
+so if the first 100,000 entries it encounters are content, every subsequent
+start re-walks those same entries and the orphans beyond them are never
+reached. That case logs at `warn`; if you see it, raise
+`FLUREE_STORAGE_TMP_SWEEP_BUDGET` past the number of files under the directory.
+That variable only ever *sizes* the walk — an unparseable value, or `0`, keeps
+the 100,000 default rather than meaning "don't walk". Turning the sweep off is
+the other variable's job.
+
+Set `FLUREE_STORAGE_TMP_SWEEP=0` to skip the sweep entirely — worth doing if
+you want a crash's leftovers preserved for a post-mortem.
+
 ## AWS Storage Details
 
 ### S3 Structure

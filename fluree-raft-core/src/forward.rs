@@ -1,17 +1,18 @@
 //! Follower-forwarding middleware for leader-only client requests.
 //!
-//! Only the Raft leader can accept [`Committer`](crate::Committer)
-//! writes (the state machine's `AdvanceRef` proposal has to
-//! originate there). When a client load balancer happens to land on
-//! a follower for `POST /api/transact` (or any other leader-only
-//! route), the follower transparently HTTP-forwards the request to
-//! the leader and relays the leader's response back. From the
-//! client's perspective it's a single round-trip; the extra hop
-//! lives entirely inside the cluster (VPC-internal, fast).
+//! Only the leader can propose, so any route that ends in a proposal
+//! is leader-only. When a client load balancer lands on a follower for
+//! one of those routes, the follower transparently HTTP-forwards the
+//! request to the leader and relays the response back. From the
+//! client's perspective it is a single round-trip; the extra hop stays
+//! inside the cluster.
 //!
 //! This module gives you the primitives:
 //!
-//! - [`LeaderForwarder`]: per-node state — the Raft handle, this
+//! - [`LeaderView`]: what the routing decision actually needs — who
+//!   leads, and the membership addresses. Implemented for
+//!   `openraft::Raft<C>`, so production wiring is a no-op.
+//! - [`LeaderForwarder`]: per-node state — a [`LeaderView`], this
 //!   node's id, and a pooled `reqwest::Client`.
 //! - [`forward_to_leader`]: an axum middleware that intercepts a
 //!   request, checks leadership, and either calls `next.run(...)`
@@ -21,18 +22,20 @@
 //!
 //! # Resolving the leader's client URL
 //!
-//! [`ClusterNode`](crate::raft::ClusterNode) — the type config's
+//! [`ClusterNode`] — the type config's
 //! `Node` — carries both `raft_addr` (the inter-node RPC URL) and
 //! `client_addr` (the client-facing URL). The membership openraft
 //! replicates therefore already contains every voter's and
 //! learner's client URL; the forwarder reads it from the current
 //! membership snapshot on each request, so a peer added at runtime
-//! via [`super::admin::RaftAdmin::add_learner`] is immediately
+//! via [`crate::admin::RaftAdmin::add_learner`] is immediately
 //! reachable for forwarding on every other node — no restart.
 
+use crate::config::FlureeRaftConfig;
 use crate::http::is_hop_by_hop;
-use crate::raft::network::NetworkConfig;
-use crate::raft::{ClusterNode, NodeId, TypeConfig};
+use crate::network::{RaftHttpClient, RaftTransportConfig};
+use crate::node::{ClusterNode, NodeId};
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::{OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -74,32 +77,82 @@ const MAX_FORWARD_HOPS: u32 = 2;
 // State
 // ============================================================================
 
+/// What [`LeaderForwarder`] needs to know about the cluster.
+///
+/// Implemented for `openraft::Raft<C>`, which is what every group uses
+/// in production. It exists as a trait so forwarding can be exercised
+/// without standing up a Raft instance — the decision logic (leader
+/// resolution, the SSRF guard, loopback detection) is the part most
+/// worth testing, and it has nothing to do with consensus.
+#[async_trait]
+pub trait LeaderView: Send + Sync + 'static {
+    /// Currently-known leader id. `None` during an election.
+    async fn current_leader(&self) -> Option<NodeId>;
+
+    /// Every known member with its address pair, from the local
+    /// membership snapshot.
+    fn membership_nodes(&self) -> Vec<(NodeId, ClusterNode)>;
+}
+
+#[async_trait]
+impl<C: FlureeRaftConfig> LeaderView for Raft<C> {
+    async fn current_leader(&self) -> Option<NodeId> {
+        Raft::current_leader(self).await
+    }
+
+    fn membership_nodes(&self) -> Vec<(NodeId, ClusterNode)> {
+        self.metrics()
+            .borrow()
+            .membership_config
+            .nodes()
+            .map(|(id, node)| (*id, node.clone()))
+            .collect()
+    }
+}
+
 /// Per-node forwarding state, mounted as axum middleware state.
-#[derive(Clone)]
-pub struct LeaderForwarder {
-    raft: Arc<Raft<TypeConfig>>,
+pub struct LeaderForwarder<L: LeaderView> {
+    raft: Arc<L>,
     id: NodeId,
     client: reqwest::Client,
     /// Upper bound on the request body buffered before relaying —
     /// a follower shouldn't be coerced into allocating arbitrary
     /// memory by a hostile caller. Bodies beyond the cap are
     /// refused with 413 Payload Too Large before any relay. See
-    /// [`NetworkConfig::forward_max_body_bytes`] for how to size it.
+    /// [`RaftTransportConfig::forward_max_body_bytes`] for how to size it.
     max_body_bytes: usize,
 }
 
-impl LeaderForwarder {
-    pub fn new(raft: Arc<Raft<TypeConfig>>, id: NodeId, client: reqwest::Client) -> Self {
+// Hand-written: `#[derive(Clone)]` would demand `L: Clone`, but `L` is
+// only ever held behind an `Arc`.
+impl<L: LeaderView> Clone for LeaderForwarder<L> {
+    fn clone(&self) -> Self {
+        Self {
+            raft: Arc::clone(&self.raft),
+            id: self.id,
+            client: self.client.clone(),
+            max_body_bytes: self.max_body_bytes,
+        }
+    }
+}
+
+impl<L: LeaderView> LeaderForwarder<L> {
+    /// Takes a [`RaftHttpClient`] rather than a bare `reqwest::Client`:
+    /// this is the path that dials a membership-supplied URL, so the
+    /// no-redirects guarantee is load-bearing here. See
+    /// [`is_valid_leader_url`] for what the guard does and does not
+    /// cover.
+    pub fn new(raft: Arc<L>, id: NodeId, client: RaftHttpClient) -> Self {
         Self {
             raft,
             id,
-            client,
-            max_body_bytes: NetworkConfig::default().forward_max_body_bytes,
+            client: client.inner().clone(),
+            max_body_bytes: RaftTransportConfig::default().forward_max_body_bytes,
         }
     }
 
     /// Cap the request body buffered before relaying (see
-    /// [`NetworkConfig::forward_max_body_bytes`]).
+    /// [`RaftTransportConfig::forward_max_body_bytes`]).
     pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
         self.max_body_bytes = max_body_bytes;
         self
@@ -123,14 +176,7 @@ impl LeaderForwarder {
         if leader_id == self.id {
             return ForwardDecision::Local;
         }
-        let nodes: Vec<(NodeId, ClusterNode)> = self
-            .raft
-            .metrics()
-            .borrow()
-            .membership_config
-            .nodes()
-            .map(|(id, node)| (*id, node.clone()))
-            .collect();
+        let nodes: Vec<(NodeId, ClusterNode)> = self.raft.membership_nodes();
         let allow_loopback = nodes
             .iter()
             .find(|(id, _)| *id == self.id)
@@ -182,7 +228,12 @@ impl LeaderForwarder {
 /// a literal SSRF address into the membership record; an active
 /// adversary controlling DNS for cluster hostnames is out of scope
 /// of this check and needs to be addressed at a different layer.
-pub(crate) fn is_valid_leader_url(url: &str, allow_loopback: bool) -> bool {
+///
+/// Public because applications that relay to the leader over their own
+/// RPCs (rather than through [`forward_to_leader`]) need the same guard
+/// on the same membership-sourced URLs; a second, drifting copy of this
+/// check is exactly what should not happen.
+pub fn is_valid_leader_url(url: &str, allow_loopback: bool) -> bool {
     match url_host(url) {
         Some(host) => !is_ssrf_host(&host, allow_loopback),
         None => false,
@@ -192,7 +243,7 @@ pub(crate) fn is_valid_leader_url(url: &str, allow_loopback: bool) -> bool {
 /// True iff this node's own reported `client_addr` is on loopback
 /// (or the literal `"localhost"`). The forwarder uses this to opt
 /// into accepting loopback peer URLs — see [`is_valid_leader_url`].
-pub(crate) fn self_addr_is_loopback(url: &str) -> bool {
+pub fn self_addr_is_loopback(url: &str) -> bool {
     url_host(url).is_some_and(|h| is_loopback_host(&h))
 }
 
@@ -260,6 +311,7 @@ fn is_ssrf_host(host: &str, allow_loopback: bool) -> bool {
     }
 }
 
+#[derive(Debug)]
 enum ForwardDecision {
     /// This node is the leader — process locally.
     Local,
@@ -280,8 +332,9 @@ enum ForwardDecision {
 
 /// Axum middleware: if this node is the leader, fall through to the
 /// inner handler; otherwise forward the request to the leader's
-/// client port and return its response verbatim. Mount it as a
-/// layer over the leader-only routes (transact, branch admin, etc.).
+/// client port and return its response verbatim. Mount it as a layer
+/// over the routes that end in a proposal — leave read-only routes off
+/// it, since any node can serve those from its local state.
 ///
 /// Example:
 /// ```ignore
@@ -290,11 +343,11 @@ enum ForwardDecision {
 ///
 /// let forwarder = Arc::new(LeaderForwarder::new(raft, id, client));
 /// let app = Router::new()
-///     .route("/api/transact", axum::routing::post(transact_handler))
+///     .route("/write", axum::routing::post(write_handler))
 ///     .layer(middleware::from_fn_with_state(forwarder, forward_to_leader));
 /// ```
-pub async fn forward_to_leader(
-    State(forwarder): State<Arc<LeaderForwarder>>,
+pub async fn forward_to_leader<L: LeaderView>(
+    State(forwarder): State<Arc<LeaderForwarder<L>>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -525,12 +578,125 @@ fn status_from_reqwest(s: reqwest::StatusCode) -> StatusCode {
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests cover the header-scrubbing + status-mapping
-    //! helpers. The end-to-end leader-forward flow (membership
-    //! lookup → outbound HTTP → response relay) needs a live Raft
+    //! Unit tests cover the routing decision (via a stub
+    //! [`LeaderView`]) plus the header-scrubbing and status-mapping
+    //! helpers. Only the outbound HTTP relay itself still needs a live
     //! cluster; that's exercised in the multi-node integration test.
 
     use super::*;
+
+    /// A [`LeaderView`] with no Raft behind it.
+    struct StubView {
+        leader: Option<NodeId>,
+        nodes: Vec<(NodeId, ClusterNode)>,
+    }
+
+    #[async_trait]
+    impl LeaderView for StubView {
+        async fn current_leader(&self) -> Option<NodeId> {
+            self.leader
+        }
+        fn membership_nodes(&self) -> Vec<(NodeId, ClusterNode)> {
+            self.nodes.clone()
+        }
+    }
+
+    /// `self_id` is node 1 throughout; `nodes` lists `(id, client_addr)`.
+    fn forwarder(leader: Option<NodeId>, nodes: &[(NodeId, &str)]) -> LeaderForwarder<StubView> {
+        let view = StubView {
+            leader,
+            nodes: nodes
+                .iter()
+                .map(|(id, addr)| (*id, ClusterNode::new(format!("{addr}/raft"), *addr)))
+                .collect(),
+        };
+        LeaderForwarder::new(
+            Arc::new(view),
+            1,
+            crate::network::build_client(&crate::network::HttpClientConfig::default())
+                .expect("client builds"),
+        )
+    }
+
+    #[tokio::test]
+    async fn no_leader_during_election() {
+        let f = forwarder(None, &[(1, "http://10.0.0.1:8080")]);
+        assert!(matches!(f.decide().await, ForwardDecision::NoLeader));
+    }
+
+    #[tokio::test]
+    async fn self_is_leader_runs_locally() {
+        let f = forwarder(Some(1), &[(1, "http://10.0.0.1:8080")]);
+        assert!(matches!(f.decide().await, ForwardDecision::Local));
+    }
+
+    #[tokio::test]
+    async fn forwards_to_the_leader_client_addr() {
+        let f = forwarder(
+            Some(2),
+            &[(1, "http://10.0.0.1:8080"), (2, "http://10.0.0.2:8080")],
+        );
+        match f.decide().await {
+            ForwardDecision::Forward(url) => assert_eq!(url, "http://10.0.0.2:8080"),
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    /// A leader id with no membership entry is a stale snapshot, not a
+    /// reason to guess an address.
+    #[tokio::test]
+    async fn leader_missing_from_membership_is_unknown() {
+        let f = forwarder(Some(9), &[(1, "http://10.0.0.1:8080")]);
+        assert!(matches!(
+            f.decide().await,
+            ForwardDecision::UnknownLeader(9)
+        ));
+    }
+
+    /// The SSRF guard: when this node is on a routable address, a
+    /// loopback peer URL is refused rather than dialed.
+    #[tokio::test]
+    async fn loopback_leader_rejected_when_self_is_routable() {
+        let f = forwarder(
+            Some(2),
+            &[(1, "http://10.0.0.1:8080"), (2, "http://127.0.0.1:8080")],
+        );
+        assert!(matches!(
+            f.decide().await,
+            ForwardDecision::UnknownLeader(2)
+        ));
+    }
+
+    /// ...but a single-host dev/test cluster, where this node is itself
+    /// on loopback, still forwards.
+    #[tokio::test]
+    async fn loopback_leader_allowed_when_self_is_loopback() {
+        let f = forwarder(
+            Some(2),
+            &[(1, "http://127.0.0.1:8080"), (2, "http://127.0.0.1:8081")],
+        );
+        match f.decide().await {
+            ForwardDecision::Forward(url) => assert_eq!(url, "http://127.0.0.1:8081"),
+            other => panic!("expected Forward, got {other:?}"),
+        }
+    }
+
+    /// Link-local (cloud instance-metadata) is refused even on a
+    /// loopback-permissive node — it is never a valid client target.
+    #[tokio::test]
+    async fn link_local_leader_always_rejected() {
+        let f = forwarder(
+            Some(2),
+            &[
+                (1, "http://127.0.0.1:8080"),
+                (2, "http://169.254.169.254:80"),
+            ],
+        );
+        assert!(matches!(
+            f.decide().await,
+            ForwardDecision::UnknownLeader(2)
+        ));
+    }
 
     #[test]
     fn hop_by_hop_headers_are_dropped() {
@@ -753,4 +919,120 @@ mod tests {
         h.insert(FORWARD_HOPS_HEADER, "-1".parse().unwrap());
         assert_eq!(incoming_hop_count(&h), 0);
     }
+}
+
+// ─── Follower-side propose ───────────────────────────────────────────────
+
+/// Why [`propose_via_leader`] could not land a command.
+#[derive(Debug, thiserror::Error)]
+pub enum ProposeError {
+    /// No leader is known — mid-election, or the group has no quorum.
+    #[error("no leader known for this group; retry once one is elected")]
+    NoLeader,
+    /// The membership-recorded leader address failed [`is_valid_leader_url`].
+    #[error("leader address rejected: {0}")]
+    BadLeaderAddress(String),
+    /// The relay could not reach the leader, or the leader refused.
+    #[error("propose relay failed: {0}")]
+    Relay(String),
+    /// The local or relayed apply failed with an application error.
+    #[error("{0}")]
+    Apply(String),
+}
+
+/// Propose `cmd` to this group from ANY node: a plain `client_write` when
+/// this node leads, an HTTP relay of the JSON-encoded command to the
+/// leader's network router (`{raft_addr}/propose`) when it does not. One
+/// retry after a relayed "leadership moved" answer, with a fresh leader
+/// lookup in between.
+///
+/// The wire is JSON in both directions — commands are constrained to
+/// postcard-safe shapes by the log, but RESPONSES never ride the log and
+/// may carry `serde_json::Value` state postcard cannot decode.
+///
+/// The relay dials a membership-supplied URL, so it uses a no-redirect
+/// client and [`is_valid_leader_url`] — the same SSRF posture as the
+/// request-forwarding middleware above.
+pub async fn propose_via_leader<C>(raft: &Raft<C>, cmd: C::D) -> Result<C::R, ProposeError>
+where
+    C: crate::config::FlureeRaftConfig,
+    C::D: Clone + serde::Serialize,
+{
+    let mut last_relay_error: Option<ProposeError> = None;
+    for _attempt in 0..2 {
+        match raft.client_write(cmd.clone()).await {
+            Ok(resp) => return Ok(resp.data),
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ForwardToLeader(fwd),
+            )) => {
+                let Some(node) = fwd.leader_node else {
+                    return Err(ProposeError::NoLeader);
+                };
+                match relay_propose::<C>(&node.raft_addr, &cmd).await {
+                    Ok(data) => return Ok(data),
+                    Err(e @ ProposeError::Relay(_)) => {
+                        // Leadership may have moved mid-relay; loop for
+                        // one fresh lookup.
+                        last_relay_error = Some(e);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ChangeMembershipError(e),
+            )) => return Err(ProposeError::Apply(format!("membership error: {e}"))),
+            Err(openraft::error::RaftError::Fatal(f)) => {
+                return Err(ProposeError::Apply(format!("raft fatal: {f}")))
+            }
+        }
+    }
+    Err(last_relay_error.unwrap_or(ProposeError::NoLeader))
+}
+
+async fn relay_propose<C>(leader_raft_addr: &str, cmd: &C::D) -> Result<C::R, ProposeError>
+where
+    C: crate::config::FlureeRaftConfig,
+    C::D: serde::Serialize,
+{
+    if !is_valid_leader_url(leader_raft_addr, true) {
+        return Err(ProposeError::BadLeaderAddress(leader_raft_addr.to_string()));
+    }
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            // Membership-supplied URL: never follow a redirect off it.
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("propose relay client builds")
+    });
+    let url = format!("{}/propose", leader_raft_addr.trim_end_matches('/'));
+    let body = serde_json::to_vec(cmd)
+        .map_err(|e| ProposeError::Apply(format!("command encode error: {e}")))?;
+    let resp = client
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| ProposeError::Relay(format!("POST {url}: {e}")))?;
+    let status = resp.status();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| ProposeError::Relay(format!("read {url}: {e}")))?;
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return Err(ProposeError::Relay(format!(
+            "leader at {url} stepped down mid-relay"
+        )));
+    }
+    if !status.is_success() {
+        return Err(ProposeError::Apply(format!(
+            "{url} answered {status}: {}",
+            String::from_utf8_lossy(&bytes)
+        )));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| ProposeError::Apply(format!("response decode error: {e}")))
 }

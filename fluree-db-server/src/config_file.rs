@@ -63,6 +63,8 @@ pub struct ServerFileConfig {
     pub body_limit: Option<usize>,
     pub query_timeout_ms: Option<u64>,
     pub query_min_t_timeout_ms: Option<u64>,
+    pub graphql_max_depth: Option<usize>,
+    pub graphql_max_complexity: Option<usize>,
     pub cache_max_mb: Option<usize>,
     pub disk_cache_max_mb: Option<usize>,
 
@@ -429,6 +431,8 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "body_limit",
     "query_timeout_ms",
     "query_min_t_timeout_ms",
+    "graphql_max_depth",
+    "graphql_max_complexity",
     "query_refresh_enabled",
     "query_refresh_ttl_ms",
     "cache_max_mb",
@@ -549,6 +553,16 @@ pub fn apply_to_server_config(
     if is_default("query_min_t_timeout_ms") {
         if let Some(v) = file.query_min_t_timeout_ms {
             config.query_min_t_timeout_ms = v;
+        }
+    }
+    if is_default("graphql_max_depth") {
+        if let Some(v) = file.graphql_max_depth {
+            config.graphql_max_depth = v;
+        }
+    }
+    if is_default("graphql_max_complexity") {
+        if let Some(v) = file.graphql_max_complexity {
+            config.graphql_max_complexity = v;
         }
     }
     if is_default("cache_max_mb") {

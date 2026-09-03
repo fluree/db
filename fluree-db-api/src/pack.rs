@@ -489,10 +489,20 @@ async fn stream_pack_inner(
                 // Send txn blob after its referencing commit (causal order), deduped.
                 if let Some(ref txn_cid) = env.txn {
                     if txn_cids_sent.insert(txn_cid.clone()) {
-                        let txn_bytes = content_store
-                            .get(txn_cid)
-                            .await
-                            .map_err(|e| format!("failed to read txn blob {txn_cid}: {e}"))?;
+                        let txn_bytes = match content_store.get(txn_cid).await {
+                            Ok(bytes) => bytes,
+                            Err(fluree_db_core::Error::NotFound(_)) => {
+                                tracing::warn!(
+                                    commit = %commit_cid,
+                                    %txn_cid,
+                                    "commit references a txn blob that is missing from storage; packing without it"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                return Err(format!("failed to read txn blob {txn_cid}: {e}"));
+                            }
+                        };
 
                         let mut txn_buf = Vec::with_capacity(txn_bytes.len() + 64);
                         encode_data_frame(txn_cid, &txn_bytes, &mut txn_buf);

@@ -22,9 +22,10 @@
 use crate::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
-    GraphSourceType, IndexPublisher, LedgerLifecycle, NameServiceError, NameServiceLookup,
-    NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind, RefLookup,
-    RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher, StatusValue,
+    GraphSourceType, IndexPublisher, LedgerHeads, LedgerLifecycle, NameServiceError,
+    NameServiceLookup, NameServicePublisher, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind,
+    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher,
+    StatusValue,
 };
 use async_trait::async_trait;
 use fluree_db_core::ContentId;
@@ -185,6 +186,13 @@ impl NameServiceLookup for CompositeNameService {
                 .map(|r| mount.localize_record(r))
                 .collect()),
             None => self.local.list_branches(ledger_name).await,
+        }
+    }
+
+    async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
+        match self.mount_for(ledger_id) {
+            Some((mount, remote)) => mount.lookup.heads(remote).await,
+            None => self.local.heads(ledger_id).await,
         }
     }
 }

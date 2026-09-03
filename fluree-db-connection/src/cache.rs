@@ -9,6 +9,8 @@
 //! - `4 – 8 GB`  → 40%
 //! - `≥ 8 GB`    → 35%
 
+// Used only by the native-feature memory-detection path below.
+#[cfg(feature = "native")]
 use tracing::info;
 
 /// Default cache size in MB when memory detection is unavailable (WASM/JS)

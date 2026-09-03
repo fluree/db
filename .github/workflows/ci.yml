@@ -125,6 +125,65 @@ jobs:
         timeout-minutes: 45
         run: cargo test
 
+  sql-bridge:
+    # fluree-sql-bridge is a standalone workspace (it links sqlx + three
+    # database drivers, none of which belong in the fluree binary), so the
+    # workspace gates above never reach it.
+    runs-on: ubuntu-latest
+    # SQLite exercises the protocol in-process, but it is the one backend whose
+    # string literals cannot misbehave. The escaping rule the bridge enforces
+    # (NO_BACKSLASH_ESCAPES on MySQL) is only observable against a real server,
+    # so both are supplied here. `server_backends_are_configured_in_ci` fails if
+    # these ever stop being set, so a skipped test cannot read as a pass.
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: fluree
+          MYSQL_DATABASE: bridge_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pfluree"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: fluree
+          POSTGRES_DB: bridge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd=pg_isready
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: "fluree-sql-bridge -> target"
+
+      - name: Format
+        working-directory: fluree-sql-bridge
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: fluree-sql-bridge
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test (SQLite, MySQL and Postgres backed protocol tests)
+        working-directory: fluree-sql-bridge
+        env:
+          FLUREE_BRIDGE_MYSQL_URL: mysql://root:fluree@127.0.0.1:3306/bridge_test
+          FLUREE_BRIDGE_POSTGRES_URL: postgres://postgres:fluree@127.0.0.1:5432/bridge_test
+        run: cargo test
+
   bench-paths:
     # Cost gate for bench-compare below, which is a ~30-minute job. GitHub's
     # `paths:` filter is workflow-scoped and the rest of this workflow must run
@@ -240,3 +299,62 @@ jobs:
           cargo run -p fluree-bench-support --bin bench-baseline -- \
             compare --baseline bench-baselines/guardrails-pre.json \
             --allow-host-mismatch
+
+  # Keeps the wasm32-unknown-unknown build honest: the whole engine stack must
+  # keep compiling for the browser target (fluree-db-api pulls every wasm-path
+  # crate), and the parse layer must keep compiling with NO default features
+  # (the parse-only Lambda/WASM consumer contract). Runs on the same pinned
+  # toolchain as the native jobs. Job-level RUSTFLAGS: the workflow-global
+  # mold linker flag doesn't apply to wasm, and setting RUSTFLAGS here would
+  # otherwise mask the target-scoped `getrandom_backend` cfg from
+  # .cargo/config.toml — so the cfg is restated explicitly.
+  wasm32:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # -D warnings: `cargo check` exits 0 on warnings, so without this the
+      # branch's zero-warning wasm build could rot silently (registry deps
+      # stay cap-linted, so only workspace code is gated).
+      RUSTFLAGS: -D warnings --cfg getrandom_backend="wasm_js"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+            wasm-probe -> target
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      # clippy, not check: `cargo check` cannot see clippy-only lints, and
+      # nothing else runs clippy against the wasm32 target. Two of those lints
+      # (a dropped un-awaited future in the CAS bridge stub, a needless return
+      # in a wasm-cfg storage arm) sat red under this exact command while the
+      # check-only gate reported green. clippy lints every workspace member in
+      # the -p closure, so this covers the engine crates behind fluree-db-api,
+      # not just the umbrella.
+      # No --all-targets: it drags in fluree-db-api's dev-dependencies, whose
+      # tokio `net`/mio does not build for wasm32 (unrelated to our code). The
+      # lib-level pass is what matters here anyway — clippy lints every
+      # workspace member in the -p closure at lib level, which is how the two
+      # latent lints this gate exists for (in fluree-db-binary-index and
+      # fluree-db-connection) surfaced.
+      - name: Lint engine stack (wasm32 clippy)
+        run: cargo clippy --target wasm32-unknown-unknown -p fluree-db-api --no-default-features
+
+      - name: Lint parse layer, no default features (wasm32 clippy)
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features -p fluree-vocab -p fluree-graph-ir -p fluree-graph-turtle -p fluree-graph-json-ld -p fluree-db-sparql
+
+      # Compiling is not running: wasm32-unknown-unknown panics at RUNTIME on
+      # Instant::now / SystemTime::now, thread spawns, and moka construction,
+      # none of which the check above can see. The probe drives the real
+      # memory-ledger create -> insert -> SPARQL query path under Node and
+      # exits 0 only on the future's own Ok (see wasm-probe/README.md).
+      - name: Runtime smoke (wasm32 under Node)
+        run: node wasm-probe/run-node.mjs

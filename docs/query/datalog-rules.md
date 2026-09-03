@@ -89,6 +89,49 @@ ledger — see the reasoning budget under [Fixpoint evaluation](#fixpoint-evalua
 ]
 ```
 
+Filters can also compare against an **IRI**, which is how you constrain a
+variable-position predicate or an entity-valued object:
+
+```json
+"where": [
+  {"@id": "?s", "ex:sameAs": {"@id": "?other"}},
+  {"@id": "?other", "?prop": "?val"},
+  ["filter", "(!= ?prop ex:ssn)"]
+]
+```
+
+How a filter operand is classified:
+
+| Operand | Read as |
+|---------|---------|
+| `?name` | Variable |
+| `62`, `1.5`, `true` | Number / boolean literal |
+| `ex:ssn`, `http://example.org/ssn` | **IRI** — expanded via the rule's `@context` and resolved against the ledger |
+| `"senior"`, `"John Smith"` | String literal (quote it — quoted operands may contain spaces) |
+| `senior` | **Rejected** — a bare unquoted token is ambiguous; quote it for a string, prefix it for an IRI |
+
+Three rules worth knowing:
+
+- **IRI comparison is namespace-aware.** `(= ?p ex:knows)` matches `ex:knows`
+  and not `foaf:knows`. Only `=` and `!=` are defined for IRIs; ordering
+  operators against an IRI are rejected.
+- **A bare name is rejected, not guessed.** `(= ?p knows)` is a parse error
+  naming the operand: write `"knows"` (quoted) to compare against the string,
+  or `ex:knows` to compare against the IRI. A bare token cannot be safely read
+  as a string, because against an IRI-bound variable a string comparison fails
+  invisibly in both directions — `=` derives nothing, and `!=` keeps every row,
+  so an exclusion filter derives exactly the facts it was written to exclude.
+  (Before Fluree resolved IRIs in filters, the bare form was the only one that
+  appeared to work — but it matched namespace-blindly, so `ex:knows`,
+  `foaf:knows` and any other `knows` were treated as equal. A rule still using
+  the bare form is now rejected and skipped with a logged error naming the
+  operand and both rewrites.)
+- **An unresolvable IRI operand is an error, not a fallback.** If a filter
+  names a prefix the rule's `@context` does not define, or a namespace the
+  ledger has never seen, the rule is rejected and skipped with a logged error
+  rather than quietly comparing the operand as a string. Quote the operand if
+  you did mean a literal.
+
 ### Insert clause
 
 The `insert` clause defines what facts to produce for each set of matching
@@ -105,6 +148,24 @@ variable bindings.
 - Use `{"@id": "?var"}` for IRI/entity values; use `"?var"` directly for
   literal values.
 - Multiple triples can be generated from a single insert pattern.
+- **Every variable used in `insert` must also appear in `where`.** A variable
+  the `where` clause never binds cannot produce a fact. Each insert pattern is
+  checked independently: a pattern that references an unbound variable is
+  **skipped with a logged warning naming the variable**, while the rule's other
+  insert patterns keep deriving — so one typo'd head in a multi-head rule does
+  not silence the rest. Only a rule in which **no** insert pattern can ever
+  produce a fact is rejected outright at parse time (with the same
+  variable-naming error), rather than running and deriving nothing. A
+  `where`/`insert` typo is the usual cause:
+
+  ```json
+  "where":  {"@id": "?s", "ex:relType": {"@id": "?relation"}},
+  "insert": {"@id": "?s", "?rel": {"@id": "?s"}}
+  ```
+
+  `?rel` is never bound — the `where` clause binds `?relation`.
+- Every node in an `insert` pattern needs an `@id`. An anonymous node has no
+  subject to derive facts about, and is reported the same way.
 
 ## Providing rules
 
@@ -381,21 +442,40 @@ Filters use S-expression syntax within the `where` array:
 
 ### Available operators
 
+A JSON-LD rule filter is a single comparison between two operands:
+
 | Category | Operators |
 |----------|-----------|
-| Comparison | `=`, `!=`, `<`, `>`, `<=`, `>=` |
-| Logical | `and`, `or`, `not` |
-| Arithmetic | `+`, `-`, `*`, `/` |
-| String | `str`, `strlen`, `contains`, `strstarts`, `strends` |
-| Type checking | `isIRI`, `isBlank`, `isLiteral`, `bound` |
+| Comparison | `=`, `!=` (also `not=`), `<`, `>`, `<=`, `>=` |
+
+Logical combinators (`and` / `or` / `not`), arithmetic, and string or
+type-checking functions are **not** available in JSON-LD rule filters — an
+unrecognized operator is a parse error and the rule is skipped. Use several
+`["filter", ...]` entries in the `where` array to require more than one
+condition; they are combined with AND. For richer expressions, write the rule
+in SPARQL (see [SPARQL rules](#sparql-rules)), where `FILTER(… && …)` and
+`FILTER(!(…))` are supported.
+
+Ordering operators (`<`, `<=`, `>`, `>=`) are defined for numbers and strings
+only; using one against an IRI operand is rejected.
 
 ### Examples
 
 ```json
 ["filter", "(> ?age 21)"]
-["filter", "(and (>= ?age 18) (< ?age 65))"]
-["filter", "(contains ?name \"Smith\")"]
 ["filter", "(!= ?person ?other)"]
+["filter", "(!= ?prop ex:ssn)"]
+["filter", "(= ?name \"John Smith\")"]
+```
+
+Two conditions, ANDed:
+
+```json
+"where": [
+  {"@id": "?person", "ex:age": "?age"},
+  ["filter", "(>= ?age 18)"],
+  ["filter", "(< ?age 65)"]
+]
 ```
 
 ## Performance considerations

@@ -332,6 +332,16 @@ impl<'a> HashJoinPlanner<'a> {
         self.stats
     }
 
+    /// The driving-set size snapshot taken by the latest [`before_step`](Self::before_step)
+    /// — the estimated rows entering the probe being built. Shared with the
+    /// membership-join gate in `build_scan_or_join`, whose left operator often
+    /// reports no estimate of its own (`DatasetOperator` and the nested loop
+    /// above it both return `None`), which that gate would otherwise read as
+    /// "unbounded" and drain a whole predicate extension for a handful of rows.
+    pub(crate) fn step_est(&self) -> Option<f64> {
+        self.step_est
+    }
+
     pub(crate) fn new(stats: Option<&'a StatsView>) -> Self {
         Self {
             stats,

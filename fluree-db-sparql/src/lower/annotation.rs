@@ -145,7 +145,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 Ok((r.into(), None))
             }
             other if with_constraint => self.lower_object_with_constraint(other),
-            other => Ok((self.lower_object(other)?, None)),
+            other => self.lower_object_with_term_constraint(other),
         }
     }
 
