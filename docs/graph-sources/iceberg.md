@@ -206,7 +206,7 @@ disk. Ideal for local development and test datasets.
 }
 ```
 
-**Enabling local tables**
+### Enabling local tables
 
 `FLUREE_ICEBERG_LOCAL_ROOTS` is a colon-separated list of absolute directories,
 in the style of `PATH`:

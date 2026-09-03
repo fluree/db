@@ -662,7 +662,7 @@ checksum = "8bf7cc16383c4b8d58b9905a8509f02926ce3058053c056376248d958c9df1e8"
 
 [[package]]
 name = "fluree-db-api"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "async-trait",
  "base64",
@@ -709,13 +709,14 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "wasm-bindgen-futures",
  "xxhash-rust",
  "zstd",
 ]
 
 [[package]]
 name = "fluree-db-binary-index"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "bigdecimal 0.4.10",
  "chrono",
@@ -723,7 +724,6 @@ dependencies = [
  "fluree-db-core",
  "fluree-db-spatial",
  "fluree-vocab",
- "fs2",
  "futures",
  "hex",
  "memmap2",
@@ -741,13 +741,14 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "uuid",
  "xxhash-rust",
  "zstd",
 ]
 
 [[package]]
 name = "fluree-db-connection"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -761,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-core"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -773,15 +774,19 @@ dependencies = [
  "fluree-vocab",
  "fs2",
  "futures",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
  "hashbrown 0.16.1",
  "hex",
  "libc",
+ "lru",
  "moka",
  "multihash",
  "num-bigint",
  "num-traits",
  "once_cell",
  "parking_lot",
+ "rand 0.8.5",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -790,13 +795,15 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "uuid",
+ "web-time",
  "xxhash-rust",
  "zstd",
 ]
 
 [[package]]
 name = "fluree-db-credential"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "base64",
  "bs58",
@@ -809,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-crypto"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -825,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-cypher"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "fluree-db-core",
  "fluree-db-query",
@@ -840,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-indexer"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -875,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-ledger"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -891,7 +898,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-nameservice"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -907,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-novelty"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -925,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-policy"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "fluree-db-core",
  "fluree-vocab",
@@ -937,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-query"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -956,10 +963,10 @@ dependencies = [
  "futures",
  "geo",
  "geo-types",
+ "getrandom 0.2.17",
  "hashbrown 0.16.1",
  "lru",
  "md-5",
- "memmap2",
  "moka",
  "num-bigint",
  "num-traits",
@@ -976,7 +983,6 @@ dependencies = [
  "sha1",
  "sha2",
  "thiserror 1.0.69",
- "tokio",
  "tracing",
  "uuid",
  "wkt",
@@ -986,7 +992,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-r2rml"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "async-trait",
  "fluree-db-tabular",
@@ -1002,7 +1008,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-reasoner"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -1018,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-sparql"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "bigdecimal 0.4.10",
  "fluree-db-core",
@@ -1035,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-spatial"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "async-trait",
  "crc32fast",
@@ -1055,7 +1061,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
- "tokio",
  "tracing",
  "wkt",
  "zstd",
@@ -1063,14 +1068,14 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-tabular"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "fluree-db-transact"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -1109,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-format"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "fluree-graph-ir",
  "serde",
@@ -1119,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-ir"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "fluree-vocab",
  "serde",
@@ -1129,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-json-ld"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
@@ -1141,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-turtle"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
@@ -1154,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-search-protocol"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -1163,7 +1168,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-vocab"
-version = "4.1.5"
+version = "4.1.6"
 
 [[package]]
 name = "foldhash"
@@ -1332,8 +1337,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1343,9 +1350,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2404,7 +2413,7 @@ dependencies = [
 
 [[package]]
 name = "testsuite-sparql"
-version = "4.1.5"
+version = "4.1.6"
 dependencies = [
  "anyhow",
  "fluree-db-api",
@@ -2630,6 +2639,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-bindgen-futures"
+version = "0.4.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70a6e77fd0ae8029c9ea0063f87c46fde723e7d887703d74ad2616d792e51e6f"
+dependencies = [
+ "cfg-if",
+ "futures-util",
+ "js-sys",
+ "once_cell",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "wasm-bindgen-macro"
 version = "0.2.108"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2693,6 +2716,16 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
+]
+
+[[package]]
+name = "web-sys"
+version = "0.3.85"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "312e32e551d92129218ea9a2452120f4aabc03529ef03e4d0d82fb2780608598"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]

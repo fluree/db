@@ -24,7 +24,7 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_spatial::SpatialIndexProvider;
+use fluree_db_binary_index::wasm_compat::SpatialIndexProvider;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

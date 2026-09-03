@@ -113,6 +113,49 @@ pub const SPARQL11_EXISTS: &[&str] = &[
 pub const SPARQL11_FUNCTIONS: &[&str] = &[
     // fully green: concat02 (CONCAT type-errors on a non-string argument) and
     // strlang03-rdf11 (case-insensitive language-tag comparison) — PR-X2
+    //
+    // Timezone offsets are not supported. Deliberate, and not a burn-down
+    // item — see rule 2 of "Managing the Skip List".
+    //
+    // Every temporal value is canonicalized the moment it is parsed
+    // (fluree-db-core/src/temporal.rs): an xsd:dateTime becomes a UTC instant
+    // (the offset is applied) and an xsd:date/xsd:time drops its designator
+    // (the offset is discarded, not applied). The source offset is retained
+    // nowhere — not in novelty, not in the commit log, not in the index. So
+    // TZ is always "Z", TIMEZONE always "PT0S", and HOURS reads the UTC hour:
+    // hours-01 expects 15 for "…T15:38:02-08:00" and gets 23.
+    //
+    // Why one representation, rather than keeping the offset while it is
+    // available: the parsed value used to keep it in novelty and lose it once
+    // indexed, so every consumer that read it — these accessors, but also
+    // comparison, equality, hashing, arithmetic and rendering — answered one
+    // thing before a background reindex and another after. The same query
+    // over unchanged data returning a different result, with no write behind
+    // it and no way for a caller to predict which they would get.
+    //
+    // These three tests passed until 2026-08-29 only because this harness
+    // loads into a fresh in-memory ledger and never reindexes, so it exercised
+    // the novelty lane exclusively. On an indexed ledger — the steady state of
+    // any real deployment — they already failed. Registering them records a
+    // choice that was, in practice, already made.
+    //
+    // Storing the offset would fix it, but it does not fit: an `ObjKey` is a
+    // u64 and holds 59 bits of microsecond-range instant, leaving no room for
+    // the 11 bits an offset needs. The alternatives are an arena handle (which
+    // would destroy the inline key ordering that dateTime range pushdown
+    // depends on) or a sidecar — real cost for an accessor whose value the
+    // caller can supply themselves by rendering in whichever zone they want.
+    //
+    // Spec: https://www.w3.org/TR/sparql11-query/#func-hours    (§17.4.5.5)
+    //       https://www.w3.org/TR/sparql11-query/#func-timezone (§17.4.5.8)
+    //       https://www.w3.org/TR/sparql11-query/#func-tz       (§17.4.5.9)
+    // Behaviour + rationale: docs/reference/compatibility.md
+    // Cross-lane pin: fluree-db-api/tests/it_timezone_accessors.rs,
+    //                 fluree-db-api/tests/it_temporal_lane_stability.rs
+    // NEEDS: second reviewer per "Managing the Skip List" rule 4.
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#hours",
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#timezone",
+    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#tz",
 ];
 
 pub const SPARQL11_GROUPING: &[&str] = &[];
@@ -139,6 +182,15 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // (PR-W1-OPT). filter-nested-2 (nested-group FILTER scope) and join-scope-1
     // (sub-SELECT merge of an OPTIONAL-produced correlation var) are fixed
     // (PR-W1 Families A/B).
+    //
+    // nested-opt-1/2 are about WHERE the right operand is evaluated, not how it
+    // merges: §18.2.4 evaluates it independently and unifies afterwards, while
+    // every OptionalBuilder here seeds it from the required row. nested-opt-1
+    // wants `{ :x3 :q ?w . OPTIONAL { :x2 :p ?v } }` to bind ?v=2 on its own and
+    // so match nothing against ?v=1 (1 solution); correlating substitutes ?v=1,
+    // the inner OPTIONAL finds nothing and passes ?w=3/4 through, and we answer
+    // 2. #1713's unbound-merge fix does not move either one — verified, output
+    // byte-identical before and after.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-combo-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-2",
@@ -153,20 +205,11 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-4",
-    // quotes-3/4: D5b scan-path — pattern-object datatype drop (ninth-audit
-    // reclassified these here from serialization); deferred with the scan-path
-    // carve-out (open-eq-02 / eq-graph / dawg-lang-3) — PR-X2.
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#quotes-3",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#quotes-4",
     // dawg-bev-1..6: greened by the datatype-aware, fallible bare-variable EBV
     // (numeric-zero/empty-string falsy; ill-typed/lang/IRI/unbound → type error
     // excluding the row) — D-EBV, PR-X2
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-9",
-    // dawg-lang-3: pattern-object language tag dropped on the scan path
-    // (`?x :p "string"@EN` matches every lexical "string" regardless of @lang)
-    // — D5b scan-path family, PR-X2 (owned with open-eq-02 / quotes-3/4)
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-builtin/manifest#dawg-lang-3",
     // dawg-langMatches-4: `!langMatches(lang(?v),"*")` where ?v is an IRI —
     // LANG of a non-literal must raise a type error that excludes the row (the
     // negation of an error is an error), not evaluate to "" — PR-X2 follow-up
@@ -187,26 +230,31 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // instant handling; needs temporal value semantics beyond the filter lattice
     // — PR-X2 (temporal, deferred).
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-dateTime",
-    // eq-graph-1/2/4: NOT filter equality — each is a bare BGP `{ ?x :p <const> }`
-    // (no GRAPH keyword, no FILTER), so the constant OBJECT is matched on the scan
-    // path, which ignores the exact term (`:p 1` also matches "01"/1.0e0). Same
-    // D5b scan-path class as open-eq-02; the earlier "GRAPH-var / pr-g1" note was
-    // a misnomer — PR-X2 (scan-path carve-out, deferred).
+    // eq-graph-1/2: bare BGP `{ ?x :p <const> }` with a NUMERIC constant — the
+    // scan path deliberately matches `:p 1` against "01"/1.0e0 (bare numerics
+    // stay lenient across numeric subtypes). String constants (quotes-3/4,
+    // open-eq-02, eq-graph-4) carry their exact term since string literals
+    // lower with a datatype/language constraint.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/expr-equals/manifest#eq-graph-4",
     // expr-ops {add,subtract,multiply,divide}-numbers-cast + unplus-2/unminus-2:
     // greened by D4 numeric promotion (xsd:float first-class, double∘decimal→
     // double) — PR-X2
-    // date-1: xsd:date `=` — Fluree drops the timezone, so "2006-08-23" ≡
-    // "2006-08-23Z" ≡ "2006-08-23+00:00"; needs temporal value semantics — PR-X2
-    // (temporal, deferred).
+    // date-1..4: timezone offsets are not supported — the same decision as
+    // functions#tz/#timezone/#hours in SPARQL11_FUNCTIONS above, see the
+    // rationale there and docs/reference/compatibility.md. Not deferred.
+    //   date-1: `=` — the designator is discarded on an xsd:date, so
+    //           "2006-08-23" ≡ "2006-08-23Z" ≡ "2006-08-23+00:00".
+    //   date-2/3/4: the expected results echo the lexical as written
+    //           ("2001-01-01Z", "2006-08-23+00:00", "…T09:00:00+01:00");
+    //           Fluree returns the canonical form ("2001-01-01",
+    //           "2006-08-23", "…T08:00:00Z"). date-2/3/4 passed until
+    //           2026-09-02 only because this harness never reindexes.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-1",
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-2",
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-3",
+    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#date-4",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-01",
-    // open-eq-02: D5b scan-path — the BGP object `"a"^^t:type1` matches
-    // `"a"^^t:type2`; a deliberately-disabled per-flake scan datatype constraint,
-    // deferred to protect the bench budget (spec-sanctioned carve-out) — PR-X2.
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-02",
     // open-eq-04 greened (D5 datatype-aware `=`/`!=`). open-eq-05/06 need BOTH the
     // scan-path EncodedLit datatype-carry (bench-sensitive, D5b class) AND typed-
     // literal *constants* to carry their datatype (lower_typed_literal drops it).
@@ -260,7 +308,6 @@ pub const SPARQL11_CSV_TSV: &[&str] = &[];
 pub const SPARQL11_ENTAILMENT: &[&str] = &[
     // result mismatch (45)
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#bind07",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#lang",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#paper-sparqldl-Q1",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#paper-sparqldl-Q1-rdfs",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#paper-sparqldl-Q2",
@@ -274,7 +321,6 @@ pub const SPARQL11_ENTAILMENT: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#parent7",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#parent8",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#parent9",
-    "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#plainLit",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#rdf01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#rdfs01",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/entailment/manifest#rdfs02",

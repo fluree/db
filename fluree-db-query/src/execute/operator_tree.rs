@@ -764,6 +764,12 @@ fn detect_predicate_group_by_object_count_topk(
 /// Detect `GROUP BY ?o` top-k where WHERE is a same-subject star join:
 /// `?s <p_group> ?o . ?s <p_filter1> ?x1 . ...`
 ///
+/// The filter object vars must be pairwise distinct, as written: the operator
+/// folds them as a product of per-subject counts, which is the join
+/// multiplicity only when they range independently. Sharing one makes the
+/// filters a join on it, whose multiplicity is their value intersection —
+/// not expressible in the fold, so the shape declines.
+///
 /// Supports subject aggregates: MIN(?s), MAX(?s), SAMPLE(?s) in addition to COUNT.
 #[allow(clippy::type_complexity)]
 fn detect_group_by_object_star_topk(
@@ -811,6 +817,7 @@ fn detect_group_by_object_star_topk(
     let mut subj_var: Option<VarId> = None;
     let mut group_tp: Option<&TriplePattern> = None;
     let mut filter_preds: Vec<Ref> = Vec::new();
+    let mut filter_obj_vars: Vec<VarId> = Vec::new();
     for p in &query.patterns {
         let Pattern::Triple(tp) = p else {
             return None;
@@ -827,6 +834,16 @@ fn detect_group_by_object_star_topk(
             }
             group_tp = Some(tp);
         } else {
+            // Filter object vars must be pairwise distinct. The operator folds
+            // filters as a product of per-subject counts, which is the join
+            // multiplicity only when they range independently; two filters
+            // sharing an object var join on it, and the true multiplicity is
+            // the size of their value intersection. Distinct vars over the
+            // same predicate stay eligible — that product is correct.
+            if filter_obj_vars.contains(&ov) {
+                return None;
+            }
+            filter_obj_vars.push(ov);
             filter_preds.push(pred);
         }
     }
@@ -2300,6 +2317,63 @@ fn build_operator_tree_folds(
     build_operator_tree_inner(query, stats, true, planning)
 }
 
+/// Whether the query's output form cannot observe WHERE-output row
+/// multiplicity, and so licenses the same WHERE-level dedup a
+/// `SELECT DISTINCT` does.
+///
+/// `QueryOutput::restriction()` returns `None` for every non-`Select` output,
+/// so without this the license reads false for all of them and a fan-out join
+/// under a CONSTRUCT or an ASK builds its full cartesian product for a
+/// consumer that provably cannot tell the difference. Two output forms
+/// qualify, each on its own argument:
+///
+/// **CONSTRUCT/DESCRIBE** — the result is an RDF **graph**, not a solution
+/// bag: several solutions instantiating the template to the same `(s, p, o)`
+/// contribute one triple (SPARQL 1.1 §16.2). Every output path enforces that
+/// or refuses the query outright — the JSON-LD serializer and RDF/XML both
+/// call `Graph::canonicalize()` (`format/construct.rs`, `format/rdf_xml.rs`),
+/// streaming JSON excludes CONSTRUCT from its eligibility check, and TSV/CSV,
+/// SPARQL-Results XML and the streaming endpoint all reject it. So duplicate
+/// solutions are erased before anyone can see them, and materializing them is
+/// pure cost. (`every_output_format_collapses_or_rejects_construct` in
+/// `it_query_construct.rs` is the gate that keeps this enumeration honest: a
+/// new `OutputFormat` variant fails compilation there until it is classified,
+/// and the classification is asserted behaviorally, not taken on faith.)
+///
+/// Two CONSTRUCT shapes are excluded, and both exclusions are load-bearing:
+///
+/// * **A template blank node.** `bnode_vars` variables are minted fresh per
+///   *solution* and shared only within a row (see [`ConstructTemplate`]), so
+///   distinct solutions produce distinct triples and collapsing them changes
+///   the graph. Empty for every JSON-LD/FQL construct and every DESCRIBE, so
+///   this keeps the license for the whole non-SPARQL graph surface.
+/// * **A slice.** `LIMIT`/`OFFSET` cut the solution sequence *before* the
+///   template is instantiated, so collapsing rows first changes which
+///   solutions survive and therefore which triples get built.
+///
+/// **ASK** — the result is a boolean: every formatter either reads
+/// solution-sequence *emptiness* and nothing else (`format_ask`,
+/// `sparql_xml::format`) or rejects ASK outright (TSV/CSV, the streaming
+/// endpoint), so N duplicate rows and 1 row are indistinguishable. `LIMIT`
+/// does not weaken this — a limit of any value preserves emptiness (`LIMIT 0`
+/// is empty on both sides of the dedup) — and the license must tolerate it,
+/// because both surfaces already plan ASK with `LIMIT 1` (`lower_ask` in
+/// `fluree-db-sparql`, the `"ask"` branch of the JSON-LD parser). `OFFSET`
+/// does weaken it — it counts rows off the front, so `OFFSET 5` over six
+/// duplicates is non-empty while its deduped form is empty — and is excluded.
+/// Neither surface can currently attach an offset to an ASK (SPARQL lowering
+/// discards the modifier, the JSON-LD `"ask"` branch never parses options),
+/// so the guard exists for programmatically built IR.
+fn result_is_multiplicity_blind(query: &Query) -> bool {
+    match &query.output {
+        QueryOutput::Construct(template) => {
+            template.bnode_vars.is_empty() && query.limit.is_none() && query.offset.is_none()
+        }
+        QueryOutput::Ask => query.offset.is_none(),
+        QueryOutput::Select { .. } => false,
+    }
+}
+
 fn build_operator_tree_inner(
     query: &Query,
     stats: Option<Arc<StatsView>>,
@@ -3042,6 +3116,27 @@ fn build_operator_tree_inner(
     let mut needed_where_vars: HashSet<VarId> = HashSet::new();
     if let Some(req) = required_where_vars {
         needed_where_vars.extend(req.iter().copied());
+    } else if matches!(query.output, QueryOutput::Ask)
+        && query.grouping.is_none()
+        && query.ordering.is_empty()
+        && query.order_binds.is_empty()
+        && query.post_values.is_none()
+        && result_is_multiplicity_blind(query)
+    {
+        // A licensed, modifier-free ASK reads nothing but solution-sequence
+        // emptiness, so no variable is "needed after WHERE" — the same
+        // empty-set a constant-template CONSTRUCT gets via
+        // `compute_variable_deps`. `referenced_vars()` still reports `None`
+        // for ASK (its conservative all-vars answer stays right for every
+        // other consumer of variable deps); this narrows only the WHERE
+        // planner's needed set, which `compute_where_var_stats` treats as the
+        // protected set. With it empty, `property_join_needed_vars` can demote
+        // an unread fan-out object var to an existence-only constraint — join
+        // and FILTER variables stay protected through `var_counts` (their
+        // reference count exceeds one). Any solution modifier that could read
+        // a variable (grouping, ordering, post-VALUES) or observe multiplicity
+        // (OFFSET, via the license check) falls through to the conservative
+        // all-vars default.
     } else {
         let mut counts: HashMap<VarId, usize> = HashMap::new();
         let mut vars: HashSet<VarId> = HashSet::new();
@@ -3070,7 +3165,10 @@ fn build_operator_tree_inner(
     // aggregate check alone is vacuously true. An outer SELECT DISTINCT does
     // NOT license dedup — it dedups result rows *after* aggregation, so a
     // plain COUNT under it still observes pre-aggregation multiplicity.
-    // Without grouping, SELECT DISTINCT is exactly the license.
+    // Without grouping, SELECT DISTINCT is the license for a SELECT — and
+    // CONSTRUCT/DESCRIBE and ASK each carry their own, because their results
+    // (an RDF graph; a boolean) are not solution bags. See
+    // `result_is_multiplicity_blind`.
     let where_dedup_safe = match query.grouping.as_ref() {
         Some(g) => {
             let aggregates_ok = g
@@ -3089,7 +3187,7 @@ fn build_operator_tree_inner(
             });
             aggregates_ok && no_raw_passthrough
         }
-        None => query.output.is_distinct(),
+        None => query.output.is_distinct() || result_is_multiplicity_blind(query),
     };
 
     let mut operator = build_where_operators_with_needed(
@@ -3162,6 +3260,17 @@ pub(crate) fn apply_solution_modifiers(
     variable_deps: Option<&VariableDeps>,
     planning: &PlanningContext,
 ) -> Result<BoxedOperator> {
+    // The partitioned hint promises the child stream arrives grouped by the
+    // GROUP BY key (comparator-adjacent), which only current-mode scans
+    // honor. A history plan's scan emits the *event stream* in collection
+    // order — persisted sidecar + base rows first, then novelty appended
+    // (`BinaryHistoryScanOperator::collect_history_flakes`) — so one key's
+    // rows are not adjacent once any part of the range is index-served, and
+    // the adjacency-based streaming lane would emit one group per key *run*
+    // (e.g. `GROUP BY ?s COUNT(*)` splitting every subject into per-source
+    // groups of 1). Demote here, next to the consumer, so no caller can
+    // reintroduce the unsound combination.
+    let partitioned = partitioned && !planning.is_history();
     // Flatten the grouping phase's data for consumption below. The variant
     // distinction has already done its structural work at the IR boundary; the
     // tail treats both variants uniformly. Cloning is cheap — both vectors are
@@ -3855,6 +3964,180 @@ mod tests {
             include_system_facts: false,
             cypher_vocab: None,
         }
+    }
+
+    // --- CONSTRUCT's and ASK's WHERE-dedup license (#1700 follow-up) ---------
+
+    /// `CONSTRUCT { ?s <flag> "y" } WHERE { … }` with the given template
+    /// blank-node vars and slice.
+    fn construct_query(
+        bnode_vars: HashSet<VarId>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Query {
+        use crate::ir::ConstructTemplate;
+        let template_tp = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(100, "flag")),
+            Term::Var(VarId(1)),
+        );
+        let mut q = make_simple_query(Vec::new(), Vec::new());
+        q.output = QueryOutput::Construct(ConstructTemplate::with_bnode_vars(
+            vec![template_tp],
+            bnode_vars,
+        ));
+        q.limit = limit;
+        q.offset = offset;
+        q
+    }
+
+    /// A blank-free, unsliced CONSTRUCT result is an RDF graph whose serializers
+    /// canonicalize, so duplicate solutions are unobservable and the WHERE stage
+    /// may collapse them. Without this the license reads false for every
+    /// CONSTRUCT (`restriction()` is `None` for non-`Select` outputs) and a
+    /// fan-out join builds its full cartesian product only to have it
+    /// canonicalized back down. To be precise about what that buys: losing this
+    /// license makes the #1700 correctness fix ~6.2x more expensive for
+    /// blank-free CONSTRUCT (0.1464s on the pre-fix planner → 0.9026s at 120k
+    /// pairs, byte-identical output); with it, CONSTRUCT stays flat vs the
+    /// pre-fix planner (0.1380s). It recovers cost the fix would otherwise
+    /// introduce — it is not a speedup over what shipped before.
+    #[test]
+    fn construct_licenses_where_dedup_when_blank_free_and_unsliced() {
+        assert!(result_is_multiplicity_blind(&construct_query(
+            HashSet::new(),
+            None,
+            None
+        )));
+    }
+
+    /// A template blank node is minted fresh per *solution*, so distinct
+    /// solutions yield distinct triples and collapsing them changes the graph.
+    #[test]
+    fn construct_declines_where_dedup_with_a_template_blank_node() {
+        let bnodes: HashSet<VarId> = [VarId(1)].into_iter().collect();
+        assert!(!result_is_multiplicity_blind(&construct_query(
+            bnodes, None, None
+        )));
+    }
+
+    /// `LIMIT`/`OFFSET` slice the solution sequence *before* the template is
+    /// instantiated, so collapsing rows first changes which solutions survive
+    /// and therefore which triples get built.
+    #[test]
+    fn construct_declines_where_dedup_when_sliced() {
+        assert!(!result_is_multiplicity_blind(&construct_query(
+            HashSet::new(),
+            Some(10),
+            None
+        )));
+        assert!(!result_is_multiplicity_blind(&construct_query(
+            HashSet::new(),
+            None,
+            Some(10)
+        )));
+    }
+
+    /// The license never reaches a SELECT: a plain SELECT keeps `is_distinct()`
+    /// as its only license, so this cannot leak into the bag-semantics surface
+    /// that #1700 was about.
+    #[test]
+    fn select_never_gets_the_output_form_license() {
+        let q = make_simple_query(vec![VarId(0)], Vec::new());
+        assert!(!result_is_multiplicity_blind(&q));
+    }
+
+    /// An `ASK` query with the given slice. Both real surfaces lower ASK with
+    /// `LIMIT 1` and no offset (`lower_ask` in `fluree-db-sparql`; the JSON-LD
+    /// parser's `"ask"` branch), so `Some(1)/None` below is the shape the
+    /// planner actually sees.
+    fn ask_query(limit: Option<usize>, offset: Option<usize>) -> Query {
+        let mut q = make_simple_query(Vec::new(), Vec::new());
+        q.output = QueryOutput::Ask;
+        q.limit = limit;
+        q.offset = offset;
+        q
+    }
+
+    /// ASK is a boolean read off solution-sequence emptiness, so no formatter
+    /// can observe row multiplicity and the license holds — including under the
+    /// `LIMIT 1` both surfaces always attach, since a limit of any value
+    /// preserves emptiness.
+    #[test]
+    fn ask_licenses_where_dedup_including_under_its_own_limit() {
+        assert!(result_is_multiplicity_blind(&ask_query(None, None)));
+        assert!(result_is_multiplicity_blind(&ask_query(Some(1), None)));
+        assert!(result_is_multiplicity_blind(&ask_query(Some(0), None)));
+    }
+
+    /// `OFFSET` counts rows off the front of the sequence, so it is the one
+    /// modifier through which an ASK *can* observe multiplicity: `OFFSET 5`
+    /// over six duplicate rows is non-empty, its deduped form is empty. No
+    /// surface currently lowers an ASK with an offset; the guard is for
+    /// programmatically built IR.
+    #[test]
+    fn ask_declines_where_dedup_with_an_offset() {
+        assert!(!result_is_multiplicity_blind(&ask_query(None, Some(5))));
+        assert!(!result_is_multiplicity_blind(&ask_query(Some(1), Some(5))));
+    }
+
+    /// End-to-end through `build_operator_tree`: an ASK over the #1700 fan-out
+    /// star must get the pruned, existence-only plan — the object var stays out
+    /// of the WHERE schema. This pins the wiring (`where_dedup_safe` →
+    /// `property_join_needed_vars`), not just the predicate above; revert the
+    /// `Ask` arm of `result_is_multiplicity_blind` and this fails with the
+    /// object var back in the schema.
+    #[test]
+    fn ask_over_a_fanout_star_plans_the_existence_only_join() {
+        let mut q = ask_query(Some(1), None);
+        q.patterns = vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+                Term::Iri(Arc::from("http://ex/C")),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from("http://ex/tag")),
+                Term::Var(VarId(1)),
+            )),
+        ];
+        let planning = crate::temporal_mode::PlanningContext::current();
+        let op = build_operator_tree(&q, None, &planning).expect("plan ASK fan-out star");
+        assert_eq!(
+            op.schema(),
+            &[VarId(0)],
+            "ASK licenses WHERE-level dedup, so the fan-out object var must be \
+             demoted to an existence-only constraint; schema was {:?}",
+            op.schema()
+        );
+    }
+
+    /// The offset guard, through the same wiring: an offset makes the ASK
+    /// multiplicity-observable, so the object var must survive.
+    #[test]
+    fn ask_with_offset_keeps_the_fanout_object_var() {
+        let mut q = ask_query(Some(1), Some(5));
+        q.patterns = vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
+                Term::Iri(Arc::from("http://ex/C")),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(Arc::from("http://ex/tag")),
+                Term::Var(VarId(1)),
+            )),
+        ];
+        let planning = crate::temporal_mode::PlanningContext::current();
+        let op = build_operator_tree(&q, None, &planning).expect("plan ASK with offset");
+        assert!(
+            op.schema().contains(&VarId(1)),
+            "an ASK with an OFFSET can observe row multiplicity, so the object \
+             var must stay; schema was {:?}",
+            op.schema()
+        );
     }
 
     #[test]

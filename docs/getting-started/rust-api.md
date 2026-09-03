@@ -139,8 +139,16 @@ use fluree_db_api::{FlureeBuilder, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // LocalStack/MinIO: endpoint is required
+    // LocalStack: an endpoint override is enough.
     let fluree = FlureeBuilder::s3("my-bucket", "http://localhost:4566")
+        .build_client()
+        .await?;
+
+    // MinIO also needs path-style addressing: without it the SDK emits
+    // `http://my-bucket.minio:9000/key`, which a plain MinIO (no wildcard
+    // bucket-subdomain DNS) rejects.
+    let _minio = FlureeBuilder::s3("my-bucket", "http://minio:9000")
+        .s3_force_path_style(true)
         .build_client()
         .await?;
 

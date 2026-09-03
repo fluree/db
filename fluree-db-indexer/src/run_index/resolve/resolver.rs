@@ -1126,6 +1126,9 @@ pub struct SharedResolverState {
     /// for every `rdfs:subClassOf` / `rdfs:subPropertyOf` user-data op so rebuild
     /// can populate `IndexSchema` in the FIR6 root.
     pub schema_hook: Option<crate::stats::SchemaExtractor>,
+    /// Sticky: any resolved user-data op carried a list index (`@list`
+    /// value). Feeds `IndexRoot.has_list_meta` at root assembly.
+    pub saw_list_meta: bool,
 }
 
 impl SharedResolverState {
@@ -1172,6 +1175,7 @@ impl SharedResolverState {
             fulltext_hook: None,
             fulltext_hook_config: crate::fulltext_hook::FulltextHookConfig::default(),
             schema_hook: None,
+            saw_list_meta: false,
         }
     }
 
@@ -1299,6 +1303,7 @@ impl SharedResolverState {
             fulltext_hook: None,
             fulltext_hook_config: crate::fulltext_hook::FulltextHookConfig::default(),
             schema_hook: None,
+            saw_list_meta: false,
         })
     }
 
@@ -1532,6 +1537,7 @@ impl SharedResolverState {
         let dt_id = dt_id as u16;
 
         // 5. List index — needed by vector fact-identity lookup before object encode.
+        self.saw_list_meta |= op.i.is_some();
         let i = match op.i {
             Some(idx) if idx >= 0 => idx as u32,
             Some(idx) => {

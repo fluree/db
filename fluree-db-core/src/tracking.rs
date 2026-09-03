@@ -7,12 +7,13 @@
 //! micro-fuel. Use the helper methods (`limit_fuel`, `used_fuel`) for
 //! user-facing decimal representations.
 
+use crate::clock::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 
 /// Conversion factor between fuel and micro-fuel.
@@ -72,7 +73,11 @@ pub mod schedule {
     /// Per row/flake materialized from in-memory state: `db.range` flakes,
     /// overlay/novelty rows, and history rows. The same 1 µf-per-unit rate also
     /// applies to staged flakes during transactions and bulk imports, where it
-    /// is charged as a raw count (`flakes.len()`) at those call sites.
+    /// is charged as a raw count (`flakes.len()`) at those call sites, and to
+    /// rows handled by the fused join lanes (`PropertyJoinOperator` scan/probe
+    /// drains, `ValuesOperator` join input), charged per batch/chunk at the
+    /// existing cancellation boundaries — never per iteration inside the merge
+    /// loops (hot-loop purity).
     pub const PER_ROW_MICRO_FUEL: u64 = 1;
 
     /// Transaction/commit baseline, charged once per `stage` and once per

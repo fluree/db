@@ -29,14 +29,10 @@ use std::collections::HashMap;
 
 /// Future type for policy query evaluation.
 ///
-/// Uses conditional compilation to handle Send bounds:
-/// - Native targets require Send for multi-threaded runtimes
-/// - WASM targets don't support Send (single-threaded)
-#[cfg(not(target_arch = "wasm32"))]
+/// `Send` on every target: the engine's operator futures are uniformly
+/// `Send`-bounded, and single-threaded wasm32 implementors satisfy
+/// `Send + Sync` trivially (no `Rc`/JS handles in engine state).
 pub type PolicyQueryFut<'a> = Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>;
-
-#[cfg(target_arch = "wasm32")]
-pub type PolicyQueryFut<'a> = Pin<Box<dyn Future<Output = Result<bool>> + 'a>>;
 
 /// Async trait for evaluating policy queries
 ///
@@ -66,11 +62,6 @@ pub type PolicyQueryFut<'a> = Pin<Box<dyn Future<Output = Result<bool>> + 'a>>;
 /// inject the bindings as a VALUES clause, execute with root context (no policy
 /// filtering to avoid recursion), and return `true` if any results are found.
 ///
-/// # Platform Support
-///
-/// On native targets, the trait requires `Send + Sync` for multi-threaded runtimes.
-/// On WASM, these bounds are removed since WASM is single-threaded.
-#[cfg(not(target_arch = "wasm32"))]
 pub trait PolicyQueryExecutor: Send + Sync {
     /// Evaluate a policy query with the given variable bindings
     ///
@@ -84,16 +75,6 @@ pub trait PolicyQueryExecutor: Send + Sync {
     /// * `Ok(true)` - Query returned at least one result (allow)
     /// * `Ok(false)` - Query returned no results (continue to next policy)
     /// * `Err(_)` - Query execution failed
-    fn evaluate_policy_query<'a>(
-        &'a self,
-        query: &'a PolicyQuery,
-        bindings: &'a HashMap<String, FlakeValue>,
-    ) -> PolicyQueryFut<'a>;
-}
-
-/// WASM version without Send + Sync bounds (single-threaded environment)
-#[cfg(target_arch = "wasm32")]
-pub trait PolicyQueryExecutor {
     fn evaluate_policy_query<'a>(
         &'a self,
         query: &'a PolicyQuery,

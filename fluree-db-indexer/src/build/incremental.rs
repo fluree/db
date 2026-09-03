@@ -1272,6 +1272,7 @@ pub async fn incremental_index(
 
     let new_pred_sids = build_predicate_sids(&novelty.shared, &new_ns_codes);
     root_builder.set_predicate_sids(new_pred_sids);
+    root_builder.note_list_meta(novelty.shared.saw_list_meta);
 
     let new_graph_iris: Vec<String> = (0..novelty.shared.graphs.len())
         .filter_map(|id| {
@@ -2167,7 +2168,6 @@ pub async fn incremental_index(
         let mut base_ndv_floor: std::collections::HashMap<stats::GraphPropertyKey, (u64, u64)> =
             std::collections::HashMap::new();
         if let Some(graphs) = base_root.stats.as_ref().and_then(|s| s.graphs.as_ref()) {
-            let seed_from_base_stats = prior_properties.is_empty();
             for g in graphs {
                 for prop in &g.properties {
                     let key = stats::GraphPropertyKey {
@@ -2175,26 +2175,51 @@ pub async fn incremental_index(
                         p_id: prop.p_id,
                     };
                     base_ndv_floor.insert(key.clone(), (prop.ndv_values, prop.ndv_subjects));
-                    if seed_from_base_stats {
+                    // Per-key fallback: a blob entry (with real HLL registers)
+                    // wins; a key the blob lacks is seeded from the base
+                    // root's persisted per-graph stats.
+                    let entry = prior_properties.entry(key).or_insert_with(|| {
                         let datatypes = prop
                             .datatypes
                             .iter()
                             .map(|&(tag, c)| (tag, c as i64))
                             .collect();
-                        prior_properties.insert(
-                            key,
-                            stats::IdPropertyHll::from_sketches(
-                                prop.count as i64,
-                                crate::hll::HllSketch256::new(),
-                                crate::hll::HllSketch256::new(),
-                                prop.last_modified_t,
-                                datatypes,
-                            ),
-                        );
-                    }
+                        stats::IdPropertyHll::from_sketches(
+                            prop.count as i64,
+                            crate::hll::HllSketch256::new(),
+                            crate::hll::HllSketch256::new(),
+                            prop.last_modified_t,
+                            datatypes,
+                        )
+                    });
+                    // Historical accumulation (monotone across publishes): the
+                    // base's persisted historical set, plus the base's exact
+                    // current-state tags — the latter is what makes adoption
+                    // sound when the base predates the historical wire tail.
+                    entry.seed_historical_tags(
+                        prop.historical_datatypes
+                            .iter()
+                            .copied()
+                            .chain(prop.datatypes.iter().map(|&(tag, _)| tag)),
+                    );
                 }
             }
         }
+
+        // Historical accumulation boundary (`IndexStats::historical_since_t`).
+        // With per-graph base stats in hand, the seeding above covers state at
+        // the base publish exactly, and the novelty walk observes every tag in
+        // the window `(base_t, index_t]` — a tag visible at any `t` in that
+        // window was either visible at `base_t` (seeded) or asserted in the
+        // window (walked). So a base that carries a boundary passes it
+        // forward, and a base that predates the tail adopts at its own `t`.
+        // Without per-graph base stats there is nothing sound to seed from and
+        // no boundary is claimed.
+        let historical_since_t: Option<i64> = base_root
+            .stats
+            .as_ref()
+            .filter(|s| s.graphs.is_some())
+            .map(|s| s.historical_since_t.unwrap_or(base_root.index_t));
 
         // Seed hook with prior properties.
         let rdf_type_p_id = novelty
@@ -3633,6 +3658,7 @@ pub async fn incremental_index(
                 properties: Some(properties),
                 classes: root_classes,
                 graphs: Some(final_graphs),
+                historical_since_t,
             }
         };
 

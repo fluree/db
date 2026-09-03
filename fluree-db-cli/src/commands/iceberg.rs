@@ -343,7 +343,7 @@ async fn run_iceberg_map_remote(
 /// `text/turtle` (the resolver's default), case-insensitively. Returns `None`
 /// only when the path has no extension at all, leaving the server to apply the
 /// same default. An explicit `--r2rml-type` still overrides this at the call site.
-fn infer_mapping_media_type(path: &std::path::Path) -> Option<String> {
+pub(crate) fn infer_mapping_media_type(path: &std::path::Path) -> Option<String> {
     use fluree_db_r2rml::loader::MappingFormat;
     // No extension means no signal to infer from — defer to the server default.
     path.extension()?;
@@ -712,7 +712,7 @@ fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::Icebe
 
 /// Format the `Tables:` summary as `N (name1, name2, …)`, or just `N` when no
 /// table names are available (e.g. an unvalidated address-based mapping).
-fn format_table_summary(count: usize, names: &[String]) -> String {
+pub(crate) fn format_table_summary(count: usize, names: &[String]) -> String {
     if names.is_empty() {
         count.to_string()
     } else {
@@ -720,16 +720,19 @@ fn format_table_summary(count: usize, names: &[String]) -> String {
     }
 }
 
+/// Mapped (R2RML-backed) graph sources: Iceberg, R2RML and SQL. `fluree sql`
+/// and `fluree iceberg` share list/info/drop over this family.
 fn is_iceberg_family_source_type(st: &fluree_db_nameservice::GraphSourceType) -> bool {
     matches!(
         st,
         fluree_db_nameservice::GraphSourceType::Iceberg
             | fluree_db_nameservice::GraphSourceType::R2rml
+            | fluree_db_nameservice::GraphSourceType::Sql
     )
 }
 
 fn is_iceberg_family_type_str(s: &str) -> bool {
-    matches!(s, "Iceberg" | "R2RML")
+    matches!(s, "Iceberg" | "R2RML" | "SQL")
 }
 
 #[cfg(test)]

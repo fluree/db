@@ -122,6 +122,7 @@ fn decode_graph_property(data: &[u8], pos: &mut usize) -> io::Result<GraphProper
     let ndv_subjects = read_u64(data, pos)?;
     let last_modified_t = read_i64(data, pos)?;
     let datatypes = decode_datatypes(data, pos)?;
+    let observed_datatypes = PropertyStatEntry::tags_of(&datatypes);
 
     Ok(GraphPropertyStatEntry {
         p_id,
@@ -130,7 +131,112 @@ fn decode_graph_property(data: &[u8], pos: &mut usize) -> io::Result<GraphProper
         ndv_subjects,
         last_modified_t,
         datatypes,
+        observed_datatypes,
+        historical_datatypes: Vec::new(),
     })
+}
+
+/// One graph's rows in the tail: `(g_id, [(p_id, tags)])`.
+type GraphTagSets = Vec<(u16, Vec<(u32, Vec<u8>)>)>;
+
+/// The historical tail section appended after the classes section.
+///
+/// This is the reader-only mirror of the format owned by
+/// `fluree-db-binary-index/src/format/stats_wire.rs` — see the encoder there
+/// for the wire layout and the evolution rules that make the tail safe for
+/// readers on both sides of the change.
+struct HistoricalTail {
+    since_t: i64,
+    agg: Vec<((u16, String), Vec<u8>)>,
+    graphs: GraphTagSets,
+}
+
+/// Wire tag identifying the v1 historical tail.
+const HISTORICAL_TAIL_TAG: u8 = 1;
+
+fn read_tag_set(data: &[u8], pos: &mut usize) -> io::Result<Vec<u8>> {
+    let n = read_u8(data, pos)? as usize;
+    ensure_len(data, *pos, n, "historical tag set")?;
+    let tags = data[*pos..*pos + n].to_vec();
+    *pos += n;
+    Ok(tags)
+}
+
+/// Decode the optional historical tail. `None` when the section is absent
+/// (an old blob, exactly `pos == data.len()`) or carries an unknown future
+/// tag — in which case the remainder is consumed, which is safe because the
+/// root length-prefixes the whole stats section.
+fn decode_historical_tail(data: &[u8], pos: &mut usize) -> io::Result<Option<HistoricalTail>> {
+    if *pos >= data.len() {
+        return Ok(None);
+    }
+    let tag = read_u8(data, pos)?;
+    if tag != HISTORICAL_TAIL_TAG {
+        *pos = data.len();
+        return Ok(None);
+    }
+    let since_t = read_i64(data, pos)?;
+    let agg_count = read_u32(data, pos)? as usize;
+    let mut agg = Vec::with_capacity(agg_count);
+    for _ in 0..agg_count {
+        let (sid, new_pos) = read_sid_tuple(data, *pos)?;
+        *pos = new_pos;
+        let tags = read_tag_set(data, pos)?;
+        agg.push((sid, tags));
+    }
+    let graph_count = read_u16(data, pos)? as usize;
+    let mut graphs = Vec::with_capacity(graph_count);
+    for _ in 0..graph_count {
+        let g_id = read_u16(data, pos)?;
+        let prop_count = read_u32(data, pos)? as usize;
+        let mut props = Vec::with_capacity(prop_count);
+        for _ in 0..prop_count {
+            let p_id = read_u32(data, pos)?;
+            let tags = read_tag_set(data, pos)?;
+            props.push((p_id, tags));
+        }
+        graphs.push((g_id, props));
+    }
+    Ok(Some(HistoricalTail {
+        since_t,
+        agg,
+        graphs,
+    }))
+}
+
+/// Attach a decoded historical tail to the stats: set the boundary and fill
+/// the per-entry `historical_datatypes` sets. Entries the tail does not name
+/// keep their empty (unknown) set, which fails closed.
+fn apply_historical_tail(stats: &mut IndexStats, tail: Option<HistoricalTail>) {
+    let Some(tail) = tail else { return };
+    stats.historical_since_t = Some(tail.since_t);
+    if let Some(props) = stats.properties.as_mut() {
+        let mut by_sid: std::collections::HashMap<(u16, String), Vec<u8>> =
+            tail.agg.into_iter().collect();
+        for entry in &mut *props {
+            if let Some(tags) = by_sid.remove(&entry.sid) {
+                entry.historical_datatypes = tags;
+            }
+        }
+    }
+    if let Some(graphs) = stats.graphs.as_mut() {
+        let mut by_key: std::collections::HashMap<(u16, u32), Vec<u8>> = tail
+            .graphs
+            .into_iter()
+            .flat_map(|(g_id, props)| {
+                props
+                    .into_iter()
+                    .map(move |(p_id, tags)| ((g_id, p_id), tags))
+            })
+            .collect();
+        for graph in &mut *graphs {
+            for prop in &mut graph.properties {
+                if let Some(tags) = by_key.remove(&(graph.g_id, prop.p_id)) {
+                    prop.historical_datatypes = tags;
+                }
+            }
+        }
+    }
 }
 
 /// Decode the per-property payload within a class section: datatypes, langs, ref_classes.
@@ -268,6 +374,7 @@ pub fn decode_stats(data: &[u8]) -> io::Result<(IndexStats, usize)> {
         let ndv_subjects = read_u64(data, &mut pos)?;
         let last_modified_t = read_i64(data, &mut pos)?;
         let datatypes = decode_datatypes(data, &mut pos)?;
+        let observed_datatypes = PropertyStatEntry::tags_of(&datatypes);
         agg_props.push(PropertyStatEntry {
             sid,
             count,
@@ -275,6 +382,8 @@ pub fn decode_stats(data: &[u8]) -> io::Result<(IndexStats, usize)> {
             ndv_subjects,
             last_modified_t,
             datatypes,
+            observed_datatypes,
+            historical_datatypes: Vec::new(),
         });
     }
 
@@ -298,7 +407,9 @@ pub fn decode_stats(data: &[u8]) -> io::Result<(IndexStats, usize)> {
         });
     }
 
-    let stats = IndexStats {
+    let tail = decode_historical_tail(data, &mut pos)?;
+
+    let mut stats = IndexStats {
         flakes,
         size,
         properties: if agg_props.is_empty() {
@@ -316,7 +427,9 @@ pub fn decode_stats(data: &[u8]) -> io::Result<(IndexStats, usize)> {
         } else {
             Some(graphs)
         },
+        historical_since_t: None,
     };
+    apply_historical_tail(&mut stats, tail);
 
     Ok((stats, pos))
 }

@@ -187,9 +187,9 @@ fn create_sync_connection(config: ConnectionConfig) -> Result<ConnectionHandle> 
         StorageType::File => {
             #[cfg(not(all(feature = "native", not(target_arch = "wasm32"))))]
             {
-                return Err(ConnectionError::unsupported_component(
+                Err(ConnectionError::unsupported_component(
                     "https://ns.flur.ee/system#filePath (native feature disabled)",
-                ));
+                ))
             }
             #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
             {
@@ -199,6 +199,11 @@ fn create_sync_connection(config: ConnectionConfig) -> Result<ConnectionHandle> 
                     })?;
                 let storage = FileStorage::new(path.as_ref())
                     .with_durability(Durability::resolve(config.index_storage.durability));
+                // Opening a connection is startup, and startup is the layer
+                // that knows it: reclaiming staging files a crash left behind
+                // is an explicit action here, not a side effect of holding a
+                // storage handle.
+                storage.sweep_orphaned_staging();
                 Ok(ConnectionHandle::File { config, storage })
             }
         }
@@ -223,9 +228,9 @@ async fn create_async_connection(config: ConnectionConfig) -> Result<ConnectionH
         StorageType::File => {
             #[cfg(not(all(feature = "native", not(target_arch = "wasm32"))))]
             {
-                return Err(ConnectionError::unsupported_component(
+                Err(ConnectionError::unsupported_component(
                     "https://ns.flur.ee/system#filePath (native feature disabled)",
-                ));
+                ))
             }
             #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
             {
@@ -235,6 +240,11 @@ async fn create_async_connection(config: ConnectionConfig) -> Result<ConnectionH
                     })?;
                 let storage = FileStorage::new(path.as_ref())
                     .with_durability(Durability::resolve(config.index_storage.durability));
+                // Opening a connection is startup, and startup is the layer
+                // that knows it: reclaiming staging files a crash left behind
+                // is an explicit action here, not a side effect of holding a
+                // storage handle.
+                storage.sweep_orphaned_staging();
                 Ok(ConnectionHandle::File { config, storage })
             }
         }
@@ -392,6 +402,12 @@ mod tests {
         );
     }
 
+    // The hardcoded shared path below is safe *only because* constructing a
+    // `FileStorage` touches nothing on disk — the staging sweep is an
+    // explicit startup call (`sweep_orphaned_staging`), taken by
+    // `create_sync_connection` / `create_async_connection`, not by `new`.
+    // When it hung off the constructor, running this test unlinked stale
+    // `.tmp` files an operator had under /tmp/test.
     #[test]
     #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
     fn test_connection_handle_file() {
@@ -400,5 +416,34 @@ mod tests {
             storage: FileStorage::new("/tmp/test"),
         };
         assert!(format!("{handle:?}").contains("FileStorage"));
+    }
+
+    /// The sweep moved out of `FileStorage::new` and into the startup layer,
+    /// so the startup layer has to be seen taking it: opening a file
+    /// connection reclaims what a crash left behind. Sync creation runs
+    /// outside a runtime, so the walk is inline and finished by the time the
+    /// handle exists — no polling.
+    #[test]
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    fn file_connection_startup_sweeps_orphaned_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        // A stale orphan in the current staging format, bearing another
+        // process's token, aged well past the 24h threshold.
+        let orphan = dir.path().join("leaf.json.4242.0123456789abcdef.0.tmp");
+        std::fs::write(&orphan, b"half a leaf").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600))
+            .unwrap();
+
+        let _handle =
+            create_sync_connection(ConnectionConfig::file(dir.path().to_str().unwrap())).unwrap();
+
+        assert!(
+            !orphan.exists(),
+            "opening a file connection did not sweep a stale staging orphan"
+        );
     }
 }

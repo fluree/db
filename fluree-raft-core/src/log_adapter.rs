@@ -2,40 +2,46 @@
 //!
 //! Wraps an `Arc<S: RaftStorage>` so the openraft engine can drive
 //! our backend-agnostic log storage. Conversions between our owned
-//! types ([`super::storage::LogId`], [`super::storage::Vote`],
-//! [`super::storage::LogState`], [`super::storage::LogEntry`]) and
-//! openraft's parametric versions live here too — this is the only
-//! place openraft's type system leaks beyond the `raft` feature.
+//! types ([`crate::storage::LogId`], [`crate::storage::Vote`],
+//! [`crate::storage::LogState`], [`crate::storage::LogEntry`]) and
+//! openraft's parametric versions live here too.
 //!
-//! The log entry payload — an [`openraft::Entry<TypeConfig>`] — is
-//! serialized via postcard to bytes for storage in [`LogEntry`] and
-//! deserialized back on read. Round-tripping costs one allocation
-//! per entry; entries are small so this isn't on a hot path.
+//! Generic over `C: FlureeRaftConfig`, so one implementation serves
+//! every group in the process. Only the pieces that mention `C` in a
+//! signature are parameterized: the log-id and vote converters stay
+//! concrete, because `NodeId` is pinned to `u64` by the profile.
+//!
+//! The log entry payload — an [`openraft::Entry<C>`] — is serialized
+//! via postcard to bytes for storage in [`OurLogEntry`] and deserialized
+//! back on read. Round-tripping costs one allocation per entry;
+//! entries are small so this isn't on a hot path.
 
-use crate::raft::storage::{
+use crate::config::FlureeRaftConfig;
+use crate::node::NodeId;
+use crate::storage::{
     LogEntry as OurLogEntry, LogId as OurLogId, LogState as OurLogState, RaftLogStore, RaftStorage,
     Vote as OurVote,
 };
-use crate::raft::{NodeId, TypeConfig};
 use openraft::storage::{LogFlushed, RaftLogReader, RaftLogStorage};
 use openraft::{
     AnyError, CommittedLeaderId, Entry, ErrorSubject, ErrorVerb, LeaderId, LogId, LogState,
     StorageError, StorageIOError, Vote,
 };
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
 // === Conversions ===
 
-pub(crate) fn to_openraft_log_id(id: OurLogId) -> LogId<NodeId> {
+pub fn to_openraft_log_id(id: OurLogId) -> LogId<NodeId> {
     LogId {
         leader_id: CommittedLeaderId::new(id.term, 0),
         index: id.index,
     }
 }
 
-pub(crate) fn from_openraft_log_id(id: LogId<NodeId>) -> OurLogId {
+pub fn from_openraft_log_id(id: LogId<NodeId>) -> OurLogId {
     OurLogId {
         term: id.leader_id.term,
         index: id.index,
@@ -62,7 +68,7 @@ fn from_openraft_vote(v: &Vote<NodeId>) -> Option<OurVote> {
     })
 }
 
-fn to_openraft_log_state(s: OurLogState) -> LogState<TypeConfig> {
+fn to_openraft_log_state<C: FlureeRaftConfig>(s: OurLogState) -> LogState<C> {
     let last_purged = s.last_purged.map(to_openraft_log_id);
     let last_log = s.last_log.map(to_openraft_log_id).or(last_purged);
     LogState {
@@ -97,11 +103,11 @@ fn vote_err<S: ToString>(verb: ErrorVerb, source: S) -> StorageError<NodeId> {
 
 // === Entry (de)serialization ===
 
-fn serialize_entry(entry: &Entry<TypeConfig>) -> Result<Vec<u8>, postcard::Error> {
+fn serialize_entry<C: FlureeRaftConfig>(entry: &Entry<C>) -> Result<Vec<u8>, postcard::Error> {
     postcard::to_allocvec(entry)
 }
 
-fn deserialize_entry(bytes: &[u8]) -> Result<Entry<TypeConfig>, postcard::Error> {
+fn deserialize_entry<C: FlureeRaftConfig>(bytes: &[u8]) -> Result<Entry<C>, postcard::Error> {
     postcard::from_bytes(bytes)
 }
 
@@ -129,19 +135,26 @@ fn resolve_range<RB: RangeBounds<u64>>(range: &RB) -> std::ops::Range<u64> {
 ///
 /// Clone-friendly so it can satisfy both the `RaftLogStorage` trait
 /// and serve as its own `LogReader` via [`RaftLogStorage::get_log_reader`].
-pub struct LogAdapter<S>
+pub struct LogAdapter<C, S>
 where
+    C: FlureeRaftConfig,
     S: RaftStorage,
 {
     storage: Arc<S>,
+    /// `C` appears only in the trait impls, never in a field.
+    _config: PhantomData<C>,
 }
 
-impl<S> LogAdapter<S>
+impl<C, S> LogAdapter<C, S>
 where
+    C: FlureeRaftConfig,
     S: RaftStorage,
 {
     pub fn new(storage: Arc<S>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            _config: PhantomData,
+        }
     }
 
     fn log(&self) -> &S::LogStore {
@@ -149,25 +162,30 @@ where
     }
 }
 
-impl<S> Clone for LogAdapter<S>
+// Hand-written rather than derived: `#[derive(Clone)]` would demand
+// `C: Clone` even though `C` is only ever a `PhantomData` tag.
+impl<C, S> Clone for LogAdapter<C, S>
 where
+    C: FlureeRaftConfig,
     S: RaftStorage,
 {
     fn clone(&self) -> Self {
         Self {
             storage: Arc::clone(&self.storage),
+            _config: PhantomData,
         }
     }
 }
 
-impl<S> RaftLogReader<TypeConfig> for LogAdapter<S>
+impl<C, S> RaftLogReader<C> for LogAdapter<C, S>
 where
+    C: FlureeRaftConfig,
     S: RaftStorage,
 {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send>(
         &mut self,
         range: RB,
-    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
+    ) -> Result<Vec<Entry<C>>, StorageError<NodeId>> {
         let range = resolve_range(&range);
         let raw = self.log().read_range(range).await.map_err(read_log_err)?;
         let mut entries = Vec::with_capacity(raw.len());
@@ -178,13 +196,14 @@ where
     }
 }
 
-impl<S> RaftLogStorage<TypeConfig> for LogAdapter<S>
+impl<C, S> RaftLogStorage<C> for LogAdapter<C, S>
 where
+    C: FlureeRaftConfig,
     S: RaftStorage,
 {
     type LogReader = Self;
 
-    async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
+    async fn get_log_state(&mut self) -> Result<LogState<C>, StorageError<NodeId>> {
         let state = self.log().log_state().await.map_err(read_log_err)?;
         Ok(to_openraft_log_state(state))
     }
@@ -233,10 +252,10 @@ where
     async fn append<I>(
         &mut self,
         entries: I,
-        callback: LogFlushed<TypeConfig>,
+        callback: LogFlushed<C>,
     ) -> Result<(), StorageError<NodeId>>
     where
-        I: IntoIterator<Item = Entry<TypeConfig>> + Send,
+        I: IntoIterator<Item = Entry<C>> + Send,
         I::IntoIter: Send,
     {
         let mut ours = Vec::new();
@@ -276,7 +295,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::storage::memory::MemoryRaftStorage;
+    use crate::node::ClusterNode;
+    use crate::storage::memory::MemoryRaftStorage;
+    use std::io::Cursor;
+
+    openraft::declare_raft_types!(
+        /// Minimal conforming config; the adapter never inspects `D`/`R`.
+        pub TestConfig:
+            D = String,
+            R = String,
+            NodeId = NodeId,
+            Node = ClusterNode,
+            Entry = openraft::Entry<TestConfig>,
+            SnapshotData = Cursor<Vec<u8>>,
+            AsyncRuntime = openraft::TokioRuntime,
+    );
 
     #[test]
     fn log_id_round_trip() {
@@ -319,7 +352,7 @@ mod tests {
             last_purged: Some(OurLogId::new(1, 5)),
             last_log: None,
         };
-        let openraft = to_openraft_log_state(ours);
+        let openraft = to_openraft_log_state::<TestConfig>(ours);
         let purged = openraft.last_purged_log_id.unwrap();
         assert_eq!(purged.leader_id.term, 1);
         assert_eq!(purged.index, 5);
@@ -342,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn adapter_round_trips_an_empty_log_state() {
         let storage = Arc::new(MemoryRaftStorage::new());
-        let mut adapter = LogAdapter::new(storage);
+        let mut adapter = LogAdapter::<TestConfig, _>::new(storage);
         let state = adapter.get_log_state().await.unwrap();
         assert!(state.last_log_id.is_none());
         assert!(state.last_purged_log_id.is_none());

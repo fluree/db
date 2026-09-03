@@ -420,7 +420,7 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_REINDEX_MIN_BYTES", default_value_t = server_defaults::DEFAULT_REINDEX_MIN_BYTES)]
     pub reindex_min_bytes: usize,
 
-    /// Novelty size (bytes) that blocks new commits until reindexing completes (hard threshold)
+    /// Novelty size (bytes) at which new transactions are rejected (503 `err:db/NoveltyAtMax`, retryable) until reindexing completes (hard threshold)
     ///
     /// Default: 20% of system RAM (256 MB fallback). Set explicitly to override.
     #[arg(long, env = "FLUREE_REINDEX_MAX_BYTES")]
@@ -470,6 +470,14 @@ pub struct ServerConfig {
     /// Maximum time to wait for HTTP read-after-write min-t freshness checks.
     #[arg(long, env = "FLUREE_QUERY_MIN_T_TIMEOUT_MS", default_value_t = server_defaults::DEFAULT_QUERY_MIN_T_TIMEOUT_MS)]
     pub query_min_t_timeout_ms: u64,
+
+    /// Nesting depth a GraphQL document may reach (0 disables the limit).
+    #[arg(long, env = "FLUREE_GRAPHQL_MAX_DEPTH", default_value_t = server_defaults::DEFAULT_GRAPHQL_MAX_DEPTH)]
+    pub graphql_max_depth: usize,
+
+    /// Fields one GraphQL document may select (0 disables the limit).
+    #[arg(long, env = "FLUREE_GRAPHQL_MAX_COMPLEXITY", default_value_t = server_defaults::DEFAULT_GRAPHQL_MAX_COMPLEXITY)]
+    pub graphql_max_complexity: usize,
 
     /// Heartbeat interval (ms) for the streaming query endpoint. Keep-alive
     /// records flush at this cadence during stalls; set below the fronting
@@ -845,6 +853,8 @@ impl Default for ServerConfig {
             disk_cache_max_mb: None,
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
             query_timeout_ms: server_defaults::DEFAULT_QUERY_TIMEOUT_MS,
+            graphql_max_depth: server_defaults::DEFAULT_GRAPHQL_MAX_DEPTH,
+            graphql_max_complexity: server_defaults::DEFAULT_GRAPHQL_MAX_COMPLEXITY,
             query_min_t_timeout_ms: server_defaults::DEFAULT_QUERY_MIN_T_TIMEOUT_MS,
             stream_heartbeat_ms: server_defaults::DEFAULT_STREAM_HEARTBEAT_MS,
             query_refresh_enabled: server_defaults::DEFAULT_QUERY_REFRESH_ENABLED,

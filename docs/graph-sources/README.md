@@ -31,6 +31,14 @@ Relational database mapping:
 - Join optimization
 - Supported databases (PostgreSQL, MySQL, etc.)
 
+### [SQL endpoints](sql.md)
+
+Relational databases and warehouses through a Trino-protocol endpoint:
+- Trino / Starburst / PrestoDB, or the `fluree-sql-bridge` sidecar
+- R2RML mappings with `rr:tableName` and `rr:sqlQuery`
+- Typed filter pushdown and exact `COUNT`
+- No database drivers in the Fluree binary
+
 ### [BM25 Graph Source](bm25.md)
 
 Full-text search as graph source:
@@ -232,6 +240,19 @@ See [Iceberg / Parquet](iceberg.md).
 ```
 
 See [R2RML](r2rml.md).
+
+### SQL Endpoints
+
+**Purpose:** Query relational databases and warehouses as RDF, live
+
+**Backend:** Any Trino-protocol endpoint — Trino/Starburst in front of Postgres, MySQL, SQL Server, Oracle, Snowflake, BigQuery, …, or the `fluree-sql-bridge` sidecar for a single database
+
+**Use Cases:**
+- Virtual graph over an operational database, no copy
+- One SPARQL query spanning a ledger and a warehouse table
+- Lambda deployments (every scan is a stateless HTTP request)
+
+See [SQL endpoints](sql.md).
 
 ## Architecture
 
