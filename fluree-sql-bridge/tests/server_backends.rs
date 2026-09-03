@@ -342,6 +342,37 @@ async fn probe_types(router: &axum::Router) -> Vec<String> {
         .collect()
 }
 
+/// The session settings the escaping rule depends on, asserted directly.
+///
+/// For MySQL this is the whole fix: a default server does *not* set
+/// `NO_BACKSLASH_ESCAPES`, so dropping the pool's `after_connect` makes this
+/// fail. For Postgres it is weaker — `standard_conforming_strings` is already
+/// `on` by default, so this passes with or without the session `SET`, and only
+/// a server configured with it `off` would tell the two apart. It is asserted
+/// anyway so the setting cannot be dropped without a visible reason.
+#[tokio::test]
+async fn sessions_use_standard_sql_string_literals() {
+    if let Some(url) = backend_url("FLUREE_BRIDGE_MYSQL_URL") {
+        let found = rows(&router_for(&url).await, "SELECT @@sql_mode")
+            .await
+            .unwrap();
+        let mode = found[0][0].as_str().unwrap();
+        assert!(
+            mode.contains("NO_BACKSLASH_ESCAPES"),
+            "MySQL sessions must disable backslash escapes, got: {mode}"
+        );
+    }
+    if let Some(url) = backend_url("FLUREE_BRIDGE_POSTGRES_URL") {
+        let found = rows(
+            &router_for(&url).await,
+            "SELECT current_setting('standard_conforming_strings')",
+        )
+        .await
+        .unwrap();
+        assert_eq!(found[0][0].as_str(), Some("on"));
+    }
+}
+
 /// A skipped test is not a passing one. CI must supply both backends.
 #[test]
 fn server_backends_are_configured_in_ci() {

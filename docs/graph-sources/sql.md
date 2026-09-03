@@ -233,9 +233,11 @@ moment. Consequently
   Postgres and SQLite. MySQL's default `sql_mode` treats a backslash as live
   inside a literal, so on `dialect: mysql` a value containing one is **not
   pushed down** at all; the in-engine `FILTER` applies it instead. The bridge
-  additionally sets `NO_BACKSLASH_ESCAPES` on every MySQL session it opens.
-  If you point a `mysql` source at some other Trino-protocol endpoint, set the
-  equivalent there.
+  additionally pins the rule on the sessions it opens — `NO_BACKSLASH_ESCAPES`
+  on MySQL, `standard_conforming_strings = on` on Postgres (already the
+  default there, set explicitly so a server-, database- or role-level override
+  cannot change it). If you point a source at some other Trino-protocol
+  endpoint, ensure the equivalent holds there.
 - Credentials can be indirected (`{"env_var": "TRINO_TOKEN"}` or
   `{"secret_ref": "…"}`) rather than stored inline — but only in a
   graph-source record whose config JSON is authored directly. Both
