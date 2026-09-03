@@ -4218,8 +4218,14 @@ async fn sparql_timezone_returns_day_time_duration() {
 }
 
 #[tokio::test]
-async fn sparql_timezone_positive_offset() {
-    // TIMEZONE for +05:30 → "PT5H30M"
+async fn sparql_timezone_normalizes_source_offset_to_utc() {
+    // ex:beer's value is written "2024-01-20T14:00:00+05:30", and this asserted
+    // "PT5H30M" until 2026-08-29. Fluree normalizes temporals to UTC and does
+    // not persist the source offset, so that answer was only reachable while
+    // the value sat in novelty — after a reindex the identical query returned
+    // "PT0S". TIMEZONE now reports UTC on both lanes rather than changing under
+    // a background reindex with no write behind it. See it_timezone_accessors
+    // and the register entry in testsuite-sparql/tests/registers/mod.rs.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_builtin_fn_data(&fluree, "fn:timezone-pos").await;
 
@@ -4239,7 +4245,7 @@ async fn sparql_timezone_positive_offset() {
     let bindings = normalize_sparql_bindings(&sparql_json);
     assert_eq!(bindings.len(), 1);
     let tz = &bindings[0]["tz"];
-    assert_eq!(tz["value"].as_str().unwrap(), "PT5H30M");
+    assert_eq!(tz["value"].as_str().unwrap(), "PT0S");
 }
 
 #[tokio::test]

@@ -404,13 +404,24 @@ fn render_value(
 
 /// A fresh local name for a minted subject.
 ///
-/// A process-lifetime counter supplies uniqueness; hashing it under a
-/// per-process random seed keeps the minted IRIs from reading as a visible
-/// sequence. Uniqueness is the property relied on — knowing another subject's
-/// IRI grants nothing on its own, since reads are governed by policy.
+/// A process-lifetime counter supplies the uniqueness; hashing it under
+/// per-process random seeds keeps the minted IRIs from reading as a visible
+/// sequence. Knowing another subject's IRI grants nothing on its own, since
+/// reads are governed by policy — so unguessability is a nicety and uniqueness
+/// is the property actually relied on.
+///
+/// **128 bits, not 64.** Each writer in a clustered deployment seeds
+/// independently, so uniqueness across the cluster is birthday-bound: at 64
+/// bits that is ~2³² mints, and the failure is silent — `create_<T>` lowers to
+/// an `Insert`, so a collision merges the new subject's facts onto whatever
+/// already holds that IRI rather than erroring. Two independent seeds put the
+/// bound at ~2⁶⁴ instead, which is UUIDv4's. A minted IRI is permanent, so this
+/// is a width that has to be right the first time.
 ///
 /// Deliberately no clock: `SystemTime::now()` *panics* on
-/// `wasm32-unknown-unknown`, and it would compile fine on the way there.
+/// `wasm32-unknown-unknown`, and it would compile fine on the way there. That
+/// rules out a ULID or a UUIDv7; the seeds come from `RandomState`, which is
+/// the same source the previous 64-bit form already relied on.
 fn new_id() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
@@ -418,9 +429,14 @@ fn new_id() -> String {
     use std::sync::OnceLock;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    static SEED: OnceLock<RandomState> = OnceLock::new();
+    static SEEDS: OnceLock<(RandomState, RandomState)> = OnceLock::new();
 
-    let mut hasher = SEED.get_or_init(RandomState::new).build_hasher();
-    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
-    format!("{:016x}", hasher.finish())
+    let (high, low) = SEEDS.get_or_init(|| (RandomState::new(), RandomState::new()));
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let half = |seed: &RandomState| {
+        let mut hasher = seed.build_hasher();
+        hasher.write_u64(n);
+        hasher.finish()
+    };
+    format!("{:016x}{:016x}", half(high), half(low))
 }

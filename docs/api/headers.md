@@ -438,9 +438,9 @@ If a request exceeds size limits:
 **Response:**
 ```json
 {
-  "error": "Request body exceeds maximum size of 10485760 bytes",
+  "error": "request body exceeds the configured limit",
   "status": 413,
-  "@type": "err:http/PayloadTooLarge"
+  "@type": "err:db/PayloadTooLarge"
 }
 ```
 

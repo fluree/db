@@ -5,6 +5,7 @@
 
 use async_graphql::Variables;
 use fluree_db_core::ValueTypeTag;
+use fluree_db_graphql::limits::Limits;
 use fluree_db_graphql::lower::shape::{FieldSource, RootShape};
 use fluree_db_graphql::lower::{self, Lowered};
 use fluree_db_graphql::naming::Namer;
@@ -75,7 +76,8 @@ fn lower_with_vars(
     variables: Variables,
 ) -> Lowered {
     let doc = async_graphql::parser::parse_query(document).expect("document parses");
-    let op = selection::extract(&doc, None, &variables).expect("selection extracts");
+    let op =
+        selection::extract(&doc, None, &variables, &Limits::default()).expect("selection extracts");
     let selection = op
         .selections
         .iter()
@@ -91,7 +93,8 @@ fn lower_with_vars(
 
 fn lower_err(model: &SchemaModel, document: &str, root_field: &str) -> String {
     let doc = async_graphql::parser::parse_query(document).expect("document parses");
-    let op = selection::extract(&doc, None, &Variables::default()).expect("extracts");
+    let op = selection::extract(&doc, None, &Variables::default(), &Limits::default())
+        .expect("extracts");
     let selection = op
         .selections
         .iter()

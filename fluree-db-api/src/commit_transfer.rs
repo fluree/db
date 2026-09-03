@@ -1713,6 +1713,14 @@ impl Fluree {
                 // already written are harmless content-addressed orphans (a
                 // retry rewrites identical bytes; GC reclaims them otherwise).
                 // `drop_ledger` takes the bare name, so strip the branch suffix.
+                // (admin::drop_ledger is native-only; on wasm32 the orphaned
+                // name is left for the server/external admin to reap.)
+                #[cfg(target_arch = "wasm32")]
+                error!(
+                    ledger = %new_ledger_id,
+                    "restore rollback (drop_ledger) unavailable on wasm32"
+                );
+                #[cfg(not(target_arch = "wasm32"))]
                 match fluree_db_core::ledger_id::split_ledger_id(new_ledger_id) {
                     Ok((name, _branch)) => {
                         if let Err(drop_err) = self.drop_ledger(&name, crate::DropMode::Soft).await

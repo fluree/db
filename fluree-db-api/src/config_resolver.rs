@@ -269,8 +269,8 @@ fn matches_graph_target(target: &str, graph_iri: Option<&str>) -> bool {
 /// this as "only the `@fulltext` datatype path contributes entries."
 pub fn configured_fulltext_properties_for_indexer(
     config: &LedgerConfig,
-) -> Vec<fluree_db_indexer::ConfiguredFulltextProperty> {
-    use fluree_db_indexer::{ConfiguredFulltextProperty, ConfiguredFulltextScope};
+) -> Vec<crate::wasm_compat::ConfiguredFulltextProperty> {
+    use crate::wasm_compat::{ConfiguredFulltextProperty, ConfiguredFulltextScope};
 
     let mut out: Vec<ConfiguredFulltextProperty> = Vec::new();
 

@@ -339,11 +339,26 @@ fn compare_sort_values(lhs: Option<&JsonValue>, rhs: Option<&JsonValue>) -> std:
             other => other,
         }
     }
-    match (sortable(first(lhs)), sortable(first(rhs))) {
-        (JsonValue::Number(a), JsonValue::Number(b)) => a
-            .as_f64()
+    // Integers compare exactly. `as_f64` alone misorders `xsd:long` past 2⁵³,
+    // where distinct values share a float — 2⁵³ and 2⁵³+1 would tie, and the
+    // sort would then order them by whichever the input happened to hold first.
+    fn numbers(a: &serde_json::Number, b: &serde_json::Number) -> Ordering {
+        if let (Some(a), Some(b)) = (a.as_i64(), b.as_i64()) {
+            return a.cmp(&b);
+        }
+        if let (Some(a), Some(b)) = (a.as_u64(), b.as_u64()) {
+            return a.cmp(&b);
+        }
+        // Anything left is a float, or a negative against a `u64` past
+        // `i64::MAX`. Both are safe through `f64`: precision loss can collapse
+        // neighbours, never flip a sign.
+        a.as_f64()
             .partial_cmp(&b.as_f64())
-            .unwrap_or(Ordering::Equal),
+            .unwrap_or(Ordering::Equal)
+    }
+
+    match (sortable(first(lhs)), sortable(first(rhs))) {
+        (JsonValue::Number(a), JsonValue::Number(b)) => numbers(a, b),
         (JsonValue::String(a), JsonValue::String(b)) => a.cmp(b),
         (JsonValue::Bool(a), JsonValue::Bool(b)) => a.cmp(b),
         _ => Ordering::Equal,
@@ -2682,6 +2697,69 @@ impl<'a> HydrationFormatter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Past 2⁵³ floats step by two, so consecutive `xsd:long` values share one
+    /// `f64`. Comparing through `as_f64` made them tie, and a stable sort then
+    /// left them in whatever order the hydration happened to produce — which is
+    /// why this is pinned here rather than end to end, where the arrival order
+    /// masks it.
+    #[test]
+    fn large_integers_compare_exactly_not_through_f64() {
+        const BASE: i64 = 1 << 53;
+        let n = |v: i64| JsonValue::Number(v.into());
+
+        #[allow(clippy::cast_precision_loss)]
+        {
+            assert_eq!((BASE + 1) as f64, BASE as f64, "premise: they share a f64");
+        }
+
+        assert_eq!(
+            compare_sort_values(Some(&n(BASE)), Some(&n(BASE + 1))),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_sort_values(Some(&n(BASE + 1)), Some(&n(BASE))),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_sort_values(Some(&n(BASE)), Some(&n(BASE))),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    /// A negative against a `u64` past `i64::MAX` matches neither integer
+    /// branch and falls through to `f64`, which is safe here: rounding can
+    /// collapse neighbouring values, never flip a sign.
+    #[test]
+    fn mixed_width_integers_compare_by_value() {
+        let big = JsonValue::Number(serde_json::Number::from(u64::MAX));
+        let small = JsonValue::Number(serde_json::Number::from(-1i64));
+        assert_eq!(
+            compare_sort_values(Some(&small), Some(&big)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_sort_values(Some(&big), Some(&small)),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    /// Floats still work, and an int/float mix falls through to the float path
+    /// rather than comparing as equal.
+    #[test]
+    fn floats_still_compare() {
+        let a = JsonValue::Number(serde_json::Number::from_f64(1.5).unwrap());
+        let b = JsonValue::Number(serde_json::Number::from_f64(2.5).unwrap());
+        let one = JsonValue::Number(1i64.into());
+        assert_eq!(
+            compare_sort_values(Some(&a), Some(&b)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_sort_values(Some(&one), Some(&a)),
+            std::cmp::Ordering::Less
+        );
+    }
 
     #[test]
     fn test_cache_key_different_depths() {

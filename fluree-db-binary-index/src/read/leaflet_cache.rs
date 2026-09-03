@@ -27,11 +27,37 @@
 
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::read::types::OverlayOp;
+#[cfg(target_arch = "wasm32")]
+use crate::wasm_compat::memmap2;
 use fluree_db_core::subject_id::SubjectIdColumn;
 use fluree_db_core::{Flake, ListIndex, Sid, StatsView};
+// moka's eviction clock reads std::time::Instant at cache construction, which
+// aborts on wasm32-unknown-unknown; shadow-import core's clock-free LRU
+// stand-in there (same API subset, exact-LRU instead of TinyLFU).
+#[cfg(target_arch = "wasm32")]
+use fluree_db_core::wasm_cache::Cache;
+#[cfg(not(target_arch = "wasm32"))]
 use moka::sync::Cache;
 use std::io;
 use std::sync::Arc;
+
+/// Convert a shared loader error back into `io::Error`, preserving a typed
+/// `NeedFetch` payload when one is present.
+///
+/// Loader closures run inside the cache's `try_get_with`, which shares the
+/// error as `Arc<io::Error>`; a plain `to_string()` re-wrap severs the typed
+/// residency miss. Residency invariant: read paths should resolve residency
+/// BEFORE entering a loader closure where possible (the dict-leaf path
+/// does); this rewrap is the backstop for paths that cannot — e.g.
+/// `open_leaf_dir`'s header fetch runs inside the dir-load closure. The
+/// store-level miss register is unaffected either way: the miss was
+/// recorded inside the closure before the error propagated.
+fn arc_io_error(arc_err: std::sync::Arc<io::Error>) -> io::Error {
+    if let Some(nf) = fluree_db_core::storage::residency::NeedFetch::from_io_error(&arc_err) {
+        return nf.clone().into_io_error();
+    }
+    io::Error::new(arc_err.kind(), arc_err.to_string())
+}
 
 // ============================================================================
 // Sparse column types (for lang_id and list-index)
@@ -427,11 +453,18 @@ impl std::fmt::Debug for LeafletCache {
 /// Callers MUST peek the cache first (non-blocking `get`) and only enter this
 /// region on a miss, so plain cache hits never pay the conversion cost (every
 /// scan flows through these methods).
+#[cfg(not(target_arch = "wasm32"))]
 fn in_blocking_region<T>(f: impl FnOnce() -> T) -> T {
     match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
         _ => f(),
     }
+}
+
+/// wasm32 is single-threaded: there is no worker to convert, run inline.
+#[cfg(target_arch = "wasm32")]
+fn in_blocking_region<T>(f: impl FnOnce() -> T) -> T {
+    f()
 }
 
 macro_rules! region_cache_methods {
@@ -561,7 +594,7 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::DictLeaf(bytes)) => Ok(bytes),
             Ok(_) => unreachable!("DictLeaf key always maps to DictLeaf entry"),
-            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }
 
@@ -613,7 +646,7 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::LeafMmap(mmap)) => Ok(mmap),
             Ok(_) => unreachable!("LeafMmap key always maps to LeafMmap entry"),
-            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }
 
@@ -642,7 +675,7 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::LeafDir(dir)) => Ok(dir),
             Ok(_) => unreachable!("LeafDir key always maps to LeafDir entry"),
-            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }
 
@@ -760,7 +793,7 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::VectorShard(shard)) => Ok(shard),
             Ok(_) => unreachable!("VectorShard key always maps to VectorShard entry"),
-            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }
 
@@ -870,7 +903,7 @@ impl LeafletCache {
         match result {
             Ok(CachedEntry::V3Batch(batch)) => Ok(batch),
             Ok(_) => unreachable!("V3Batch key always maps to V3Batch entry"),
-            Err(arc_err) => Err(io::Error::new(arc_err.kind(), arc_err.to_string())),
+            Err(arc_err) => Err(arc_io_error(arc_err)),
         }
     }
 
