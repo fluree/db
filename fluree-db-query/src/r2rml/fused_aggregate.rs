@@ -720,32 +720,105 @@ fn accumulate_exact_row(
             Some(Some(v)) => add(sum, count, *v as i128),
             _ => true,
         },
+        // The declared datatype is exact but the physical column is not: a
+        // double (SQLite `NUMERIC` behind the bridge) or text (a CSV-shaped
+        // table). The generic path converts each value, so the fold must too —
+        // skipping the row would report a sum of 0 over a count of 0.
+        Column::Float64(values) => match values.get(row) {
+            Some(Some(v)) => match BigDecimal::try_from(*v) {
+                Ok(d) => add_exact(d, sum, scale, count),
+                Err(_) => true,
+            },
+            _ => true,
+        },
+        Column::Float32(values) => match values.get(row) {
+            Some(Some(v)) => match BigDecimal::try_from(f64::from(*v)) {
+                Ok(d) => add_exact(d, sum, scale, count),
+                Err(_) => true,
+            },
+            _ => true,
+        },
+        Column::String(values) => match values.get(row) {
+            Some(Some(text)) => match text.trim().parse::<BigDecimal>() {
+                Ok(d) => add_exact(d, sum, scale, count),
+                Err(_) => true,
+            },
+            _ => true,
+        },
         _ => true,
+    }
+}
+
+/// Add a decimal to the exact i128 accumulator, widening the running scale
+/// to the value's own (so `"99.50"` keeps rendering with two places). `false`
+/// when the sum leaves i128 (the caller re-runs on BigDecimal).
+fn add_exact(d: BigDecimal, sum: &mut i128, scale: &mut i64, count: &mut u64) -> bool {
+    let (digits, exp) = d.as_bigint_and_exponent();
+    let (digits, exp) = if exp < 0 {
+        (digits * BigInt::from(10).pow((-exp) as u32), 0)
+    } else {
+        (digits, exp)
+    };
+    let Some(mut digits) = digits.to_i128() else {
+        return false;
+    };
+    if exp > *scale {
+        let Some(rescaled) = u32::try_from(exp - *scale)
+            .ok()
+            .and_then(|e| 10i128.checked_pow(e))
+            .and_then(|f| sum.checked_mul(f))
+        else {
+            return false;
+        };
+        *sum = rescaled;
+        *scale = exp;
+    } else if exp < *scale {
+        let Some(d) = u32::try_from(*scale - exp)
+            .ok()
+            .and_then(|e| 10i128.checked_pow(e))
+            .and_then(|f| digits.checked_mul(f))
+        else {
+            return false;
+        };
+        digits = d;
+    }
+    match sum.checked_add(digits) {
+        Some(s) => {
+            *sum = s;
+            *count += 1;
+            true
+        }
+        None => false,
     }
 }
 
 /// Add one row's floating value to the accumulator. NaN is dropped (neither
 /// summed nor counted), mirroring the standard aggregate pipeline's numeric
-/// coercion, so a NaN value can't poison SUM/AVG or inflate the count.
+/// coercion, so a NaN value can't poison SUM/AVG or inflate the count. A
+/// physical exact or text column under a double datatype converts, as the
+/// generic path does.
 fn accumulate_double_row(col: &Column, row: usize, sum: &mut f64, count: &mut u64) {
-    match col {
-        Column::Float64(values) => {
-            if let Some(Some(v)) = values.get(row) {
-                if !v.is_nan() {
-                    *sum += *v;
-                    *count += 1;
-                }
-            }
+    let v: Option<f64> = match col {
+        Column::Float64(values) => values.get(row).copied().flatten(),
+        Column::Float32(values) => values.get(row).copied().flatten().map(f64::from),
+        Column::Int64(values) => values.get(row).copied().flatten().map(|i| i as f64),
+        Column::Int32(values) => values.get(row).copied().flatten().map(f64::from),
+        Column::Decimal { values, scale, .. } => values
+            .get(row)
+            .copied()
+            .flatten()
+            .map(|u| u as f64 / 10f64.powi(i32::from(*scale))),
+        Column::String(values) => values
+            .get(row)
+            .and_then(|o| o.as_deref())
+            .and_then(|t| t.trim().parse::<f64>().ok()),
+        _ => None,
+    };
+    if let Some(v) = v {
+        if !v.is_nan() {
+            *sum += v;
+            *count += 1;
         }
-        Column::Float32(values) => {
-            if let Some(Some(v)) = values.get(row) {
-                if !v.is_nan() {
-                    *sum += *v as f64;
-                    *count += 1;
-                }
-            }
-        }
-        _ => {}
     }
 }
 
@@ -7205,6 +7278,50 @@ mod tests {
         accumulate_double_row(&col32, 1, &mut sum, &mut count);
         assert_eq!(count, 1);
         assert_eq!(sum, 2.0);
+    }
+
+    #[test]
+    fn text_typed_numeric_columns_fold_like_the_generic_path() {
+        // A `NUMERIC` column a SQLite bridge reports as varchar: the generic
+        // path parses each value, so the fold must sum the text (it used to
+        // skip such rows and report 0 with a count of 0).
+        let col = Column::String(vec![
+            Some("99.50".into()),
+            None,
+            Some("5".into()),
+            Some("2.125".into()),
+        ]);
+        let (mut sum, mut scale, mut count) = (0i128, 0i64, 0u64);
+        for row in 0..4 {
+            assert!(accumulate_exact_row(
+                &col, row, &mut sum, &mut scale, &mut count
+            ));
+        }
+        assert_eq!(count, 3);
+        assert_eq!(
+            (sum, scale),
+            (106_625, 3),
+            "99.50 + 5 + 2.125 at the widest scale"
+        );
+
+        // A physical double under an exact datatype (SQLite NUMERIC behind
+        // the bridge) converts too.
+        let dbl = Column::Float64(vec![Some(99.5), None, Some(5.0)]);
+        let (mut sum, mut scale, mut count) = (0i128, 0i64, 0u64);
+        for row in 0..3 {
+            assert!(accumulate_exact_row(
+                &dbl, row, &mut sum, &mut scale, &mut count
+            ));
+        }
+        assert_eq!(count, 2);
+        assert_eq!((sum, scale), (1045, 1));
+
+        let (mut dsum, mut dcount) = (0.0f64, 0u64);
+        for row in 0..4 {
+            accumulate_double_row(&col, row, &mut dsum, &mut dcount);
+        }
+        assert_eq!(dcount, 3);
+        assert_eq!(dsum, 106.625);
     }
 
     #[test]
