@@ -411,6 +411,7 @@ impl Fluree {
             ns_registry,
             txn_meta,
             graph_delta,
+            sync_graph: _,
         } = outcome.stage_result;
 
         let commit_opts = fluree_db_transact::CommitOpts::default()
@@ -431,6 +432,8 @@ impl Fluree {
                     ),
                     t: base.t(),
                     flake_count: 0,
+                    assert_count: 0,
+                    retract_count: 0,
                 },
                 base,
             )

@@ -127,6 +127,9 @@ Implementation: `NamespaceRegistry::from_db` and `NamespaceRegistry::sid_for_iri
   can be exhausted by a few hundred thousand subjects, and per-transaction work that keys off
   namespace codes degrades. The streaming preflight above only covers **bulk import** — ordinary
   transactions get no such detection, so this is a data-modelling concern for write workloads.
-  Prefer moving the high-cardinality part into the *suffix* (`urn:example:record:<id>-rev-<hash>`)
-  or setting `HostPlusN(n)` on the ledger.
+  The remedy is to move the high-cardinality part into the *suffix*
+  (`urn:example:record:<id>-rev-<hash>`), so the whole family shares one prefix. There is no
+  user-facing knob for the split mode — `HostPlusN(n)` is selected only by the bulk-import preflight
+  above (`fluree-db-api/src/import.rs`), and the mode is immutable once the ledger's genesis commit
+  is written, so it cannot be changed on an existing ledger.
 

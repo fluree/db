@@ -299,7 +299,7 @@ impl Fluree {
 
         // #1473: parse SPARQL once. The AST is reused for FROM-clause resolution
         // and IR lowering below, instead of re-lexing the string 2–3×.
-        let parse_start = std::time::Instant::now();
+        let parse_start = fluree_db_core::clock::Instant::now();
         let mut sparql_ast = match input {
             QueryInput::Sparql(sparql) => Some(parse_and_validate_sparql(sparql)?),
             QueryInput::JsonLd(_) => None,
@@ -356,12 +356,12 @@ impl Fluree {
         guard_graph_source_patterns(db, &parsed, QuerySyntax::of(&input))?;
 
         // 2. Build executable with optional reasoning override
-        let plan_start = std::time::Instant::now();
+        let plan_start = fluree_db_core::clock::Instant::now();
         let executable = self.build_executable_for_view(db, &parsed).await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
         // 4. Execute
-        let exec_start = std::time::Instant::now();
+        let exec_start = fluree_db_core::clock::Instant::now();
         let batches = self
             .execute_view_internal(db, &vars, &executable, &tracker, &options)
             .await?;
@@ -407,7 +407,7 @@ impl Fluree {
         cypher: &str,
         params: Option<&fluree_db_cypher::ParamMap>,
     ) -> Result<QueryResult> {
-        let parse_start = std::time::Instant::now();
+        let parse_start = fluree_db_core::clock::Instant::now();
         let (vars, mut parsed) = parse_cypher_to_ir(
             cypher,
             &db.snapshot,
@@ -515,13 +515,13 @@ impl Fluree {
         parsed: fluree_db_query::ir::Query,
         parse_ms: f64,
     ) -> Result<QueryResult> {
-        let plan_start = std::time::Instant::now();
+        let plan_start = fluree_db_core::clock::Instant::now();
         let executable = self.build_executable_for_view(db, &parsed).await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
         let tracker = Tracker::disabled();
         let options = QueryExecutionOptions::default();
-        let exec_start = std::time::Instant::now();
+        let exec_start = fluree_db_core::clock::Instant::now();
         let batches = self
             .execute_view_internal(db, &vars, &executable, &tracker, &options)
             .await?;

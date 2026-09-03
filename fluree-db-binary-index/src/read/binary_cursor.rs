@@ -191,8 +191,11 @@ impl BinaryCursor {
     /// key range: ops outside the window cost an O(overlay) merge walk per
     /// cursor and defeat leaflet pre-skips.
     pub fn set_overlay_ops_window(&mut self, ops: Arc<[OverlayOp]>, start: usize, end: usize) {
+        debug_assert!(start <= end && end <= ops.len());
         debug_assert!(
-            ops.windows(2).all(|w| w[0].fact_key() != w[1].fact_key()),
+            ops[start..end]
+                .windows(2)
+                .all(|w| w[0].fact_key() != w[1].fact_key()),
             "overlay ops contain duplicate fact keys — caller must resolve \
              assert/retract lifecycles via resolve_overlay_ops() before set_overlay_ops()"
         );
@@ -216,7 +219,6 @@ impl BinaryCursor {
              in the cursor projection; got {:?}",
             self.projection
         );
-        debug_assert!(start <= end && end <= ops.len());
         self.overlay_ops = ops;
         self.overlay_pos = start;
         self.overlay_end = end;
@@ -299,6 +301,54 @@ impl BinaryCursor {
         self.leaf_overlay_end = self.overlay_pos + (end_offset - start_offset);
     }
 
+    /// After a leaf-open failure in residency mode, record a bounded
+    /// read-ahead window of routed leaves (and sidecars, when replaying) that
+    /// are not yet resident into the store's miss register, so the retry
+    /// frame fetches them in one concurrent round (see
+    /// [`crate::read::need_fetch::RetryBudget`]).
+    ///
+    /// The window is bounded rather than "the whole remaining routed set" for
+    /// two reasons. Correctness: a resident tier with a byte budget evicts,
+    /// and registering every remaining leaf made each retry round re-fetch a
+    /// tail the tier had just evicted — `newly_resident > 0` every round while
+    /// the cursor never advanced, a livelock the round cap alone stopped
+    /// (thousands of wasted fetches first). Cost: a `LIMIT`-shaped scan that
+    /// reads one leaf and stops should not pull the whole predicate run over
+    /// the network first — the consumer stops calling `next_batch`, so only
+    /// the first window is ever fetched. `RetryBudget::after_error` closes the
+    /// residual pathological case (a tier smaller than one window) by gating
+    /// progress on the blocking object, so this bound is a read-ahead/latency
+    /// knob, not the termination guarantee.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    fn register_remaining_wants(&self, from_leaf_idx: usize) {
+        use crate::read::need_fetch::FetchKind;
+        // Read-ahead width: enough to amortize round latency at the fetch
+        // concurrency (`DEFAULT_FETCH_WIDTH` = 8), bounded so one miss never
+        // fetches an unbounded routed run.
+        const PREFETCH_WINDOW: usize = 32;
+        let Some(cs) = self.store.content_store() else {
+            return;
+        };
+        let Some(register) = cs.miss_register() else {
+            return;
+        };
+        let window_end = from_leaf_idx
+            .saturating_add(PREFETCH_WINDOW)
+            .min(self.leaf_range.end);
+        for entry in &self.branch.leaves[from_leaf_idx..window_end] {
+            if cs.resolve_cached_bytes(&entry.leaf_cid).is_none() {
+                register.record(&entry.leaf_cid, FetchKind::IndexLeaf);
+            }
+            if self.need_replay() {
+                if let Some(sc_cid) = &entry.sidecar_cid {
+                    if cs.resolve_cached_bytes(sc_cid).is_none() {
+                        register.record(sc_cid, FetchKind::HistorySidecar);
+                    }
+                }
+            }
+        }
+    }
+
     /// Advance to the next non-empty leaflet and return its `ColumnBatch`.
     ///
     /// Returns `None` when all leaflets in all leaves are exhausted
@@ -378,65 +428,82 @@ impl BinaryCursor {
                         continue;
                     }
 
-                    // Load columns via LeafHandle (cached when LeafletCache is available).
-                    let mut batch = if entry.row_count > 0 {
-                        let leaflet_idx = self.current_leaflet_idx - 1;
-                        let decode_set = self.leaflet_decode_set(has_ov);
-                        if let Some(cache) = self.store.leaflet_cache() {
-                            load_columns_cached_via_handle(
-                                leaf.handle.as_ref(),
-                                cache,
-                                super::column_loader::LeafletDecodeSpec {
-                                    leaf_id: leaf.handle.leaf_id(),
-                                    leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
-                                        std::io::Error::other(format!(
-                                            "leaflet index {leaflet_idx} exceeds u32::MAX"
-                                        ))
-                                    })?,
-                                    order: self.order,
-                                    decode_set,
-                                },
-                            )?
+                    // The leaflet's fallible reads (column load + history
+                    // sidecar), isolated so a failure rewinds: the leaflet
+                    // index steps back and the leaf is restored, leaving the
+                    // cursor re-enterable — the next `next_batch` call retries
+                    // this same leaflet (transient I/O, wasm NeedFetch miss)
+                    // instead of dropping it and the rest of the leaf.
+                    let load_result = (|| -> io::Result<ColumnBatch> {
+                        // Load columns via LeafHandle (cached when LeafletCache is available).
+                        let mut batch = if entry.row_count > 0 {
+                            let leaflet_idx = self.current_leaflet_idx - 1;
+                            let decode_set = self.leaflet_decode_set(has_ov);
+                            if let Some(cache) = self.store.leaflet_cache() {
+                                load_columns_cached_via_handle(
+                                    leaf.handle.as_ref(),
+                                    cache,
+                                    super::column_loader::LeafletDecodeSpec {
+                                        leaf_id: leaf.handle.leaf_id(),
+                                        leaflet_idx: u32::try_from(leaflet_idx).map_err(|_| {
+                                            std::io::Error::other(format!(
+                                                "leaflet index {leaflet_idx} exceeds u32::MAX"
+                                            ))
+                                        })?,
+                                        order: self.order,
+                                        decode_set,
+                                    },
+                                )?
+                            } else {
+                                let proj = ColumnProjection {
+                                    output: decode_set,
+                                    internal: ColumnSet::EMPTY,
+                                };
+                                leaf.handle.load_columns(leaflet_idx, &proj, self.order)?
+                            }
                         } else {
-                            let proj = ColumnProjection {
-                                output: decode_set,
-                                internal: ColumnSet::EMPTY,
-                            };
-                            leaf.handle.load_columns(leaflet_idx, &proj, self.order)?
-                        }
-                    } else {
-                        ColumnBatch::empty()
-                    };
+                            ColumnBatch::empty()
+                        };
 
-                    // Time-travel replay: if to_t < index_t, reconstruct leaflet state
-                    // at to_t using the history sidecar.
-                    if self.need_replay() {
-                        // Quick-skip: if this leaflet's history doesn't extend past to_t,
-                        // and no base rows have t > to_t, replay is unnecessary.
-                        let to_t_u32 = u32::try_from(self.to_t).unwrap_or(u32::MAX);
-                        let needs_leaflet_replay = entry.history_max_t > to_t_u32
-                            || batch_has_rows_above_t(&batch, to_t_u32);
+                        // Time-travel replay: if to_t < index_t, reconstruct leaflet state
+                        // at to_t using the history sidecar.
+                        if self.need_replay() {
+                            // Quick-skip: if this leaflet's history doesn't extend past to_t,
+                            // and no base rows have t > to_t, replay is unnecessary.
+                            let to_t_u32 = u32::try_from(self.to_t).unwrap_or(u32::MAX);
+                            let needs_leaflet_replay = entry.history_max_t > to_t_u32
+                                || batch_has_rows_above_t(&batch, to_t_u32);
 
-                        if needs_leaflet_replay && entry.history_len > 0 {
-                            let history = leaf
-                                .handle
-                                .load_sidecar_segment(self.current_leaflet_idx - 1)?;
-                            if !history.is_empty() {
+                            if needs_leaflet_replay && entry.history_len > 0 {
+                                let history = leaf
+                                    .handle
+                                    .load_sidecar_segment(self.current_leaflet_idx - 1)?;
+                                if !history.is_empty() {
+                                    if let Some(replayed) =
+                                        replay_leaflet(&batch, &history, self.to_t, self.order)
+                                    {
+                                        batch = replayed;
+                                    }
+                                }
+                            } else if needs_leaflet_replay {
+                                // No sidecar but base rows have t > to_t: filter them out.
                                 if let Some(replayed) =
-                                    replay_leaflet(&batch, &history, self.to_t, self.order)
+                                    replay_leaflet(&batch, &[], self.to_t, self.order)
                                 {
                                     batch = replayed;
                                 }
                             }
-                        } else if needs_leaflet_replay {
-                            // No sidecar but base rows have t > to_t: filter them out.
-                            if let Some(replayed) =
-                                replay_leaflet(&batch, &[], self.to_t, self.order)
-                            {
-                                batch = replayed;
-                            }
                         }
-                    }
+                        Ok(batch)
+                    })();
+                    let batch = match load_result {
+                        Ok(batch) => batch,
+                        Err(err) => {
+                            self.current_leaflet_idx -= 1;
+                            self.current_leaf = Some(leaf);
+                            return Err(err);
+                        }
+                    };
 
                     // Apply row-level filter.
                     let batch = if self.filter.is_empty() || batch.is_empty() {
@@ -498,17 +565,35 @@ impl BinaryCursor {
             let leaf_idx = self.current_leaf_idx;
             let leaf_cid = self.branch.leaves[leaf_idx].leaf_cid.clone();
             let sidecar_cid = self.branch.leaves[leaf_idx].sidecar_cid.clone();
+
+            // Open leaf via LeafHandle (auto-selects local vs range-read path).
+            // Fallible — must run BEFORE any cursor-state advance (leaf index,
+            // overlay slicing) so a failed open (transient I/O, wasm NeedFetch
+            // miss) leaves the cursor re-enterable: the next `next_batch` call
+            // retries this same leaf instead of silently skipping it.
+            let handle = match self.store.open_leaf_handle(
+                &leaf_cid,
+                sidecar_cid.as_ref(),
+                self.need_replay(),
+            ) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    // A residency miss on this leaf means the next routed
+                    // leaves are likely missing too: record a bounded
+                    // read-ahead window so one retry round fetches several
+                    // objects instead of one per round (bound explained on
+                    // `register_remaining_wants`).
+                    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                    self.register_remaining_wants(leaf_idx);
+                    return Err(err);
+                }
+            };
             self.current_leaf_idx += 1;
 
             // Slice overlay ops for this leaf (binary search on branch keys).
             if self.has_any_overlay() {
                 self.slice_overlay_for_leaf(leaf_idx);
             }
-
-            // Open leaf via LeafHandle (auto-selects local vs range-read path).
-            let handle =
-                self.store
-                    .open_leaf_handle(&leaf_cid, sidecar_cid.as_ref(), self.need_replay())?;
 
             // Range seek: skip directory entries wholly before `range_min`
             // instead of walking them one by one. Safe only when no replay
@@ -708,7 +793,7 @@ impl BinaryCursor {
         let mut out_o_i: Vec<u32> = Vec::new();
         let mut out_t: Vec<u32> = Vec::new();
 
-        while self.overlay_pos < self.overlay_ops.len() {
+        while self.overlay_pos < self.overlay_end {
             let ov = &self.overlay_ops[self.overlay_pos];
             self.overlay_pos += 1;
 
@@ -1066,6 +1151,55 @@ mod tests {
 
         let (start, end) = compute_overlay_window(&ops, &leaf_key, None, RunSortOrder::Spot, true);
         assert_eq!((start, end), (0, 0));
+    }
+
+    /// `emit_overlay_only` must stop at `overlay_end`, not at
+    /// `overlay_ops.len()`: the window is the cursor's share of an `Arc`
+    /// slice held in common with every other cursor over the same overlay.
+    /// Today's callers all narrow via `overlay_window_for_range`, whose
+    /// out-of-window ops are filtered anyway, so the tail was cost rather
+    /// than wrong rows — O(overlay) per novelty-only point lookup. Nothing
+    /// below the api tests pins the window itself.
+    #[test]
+    fn overlay_only_emits_exactly_the_window() {
+        use crate::format::branch::BranchManifest;
+        use crate::read::binary_index_store::tests::{empty_store, temp_cache_dir};
+        use crate::read::column_types::{BinaryFilter, ColumnProjection};
+        use fluree_db_core::{ContentStore, MemoryContentStore};
+
+        let cs: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+        let store = Arc::new(empty_store(cs, temp_cache_dir()));
+        // No leaves: `next_batch` goes straight to the overlay-only path.
+        let branch = Arc::new(BranchManifest { leaves: Vec::new() });
+        let ops: Arc<[OverlayOp]> = vec![
+            make_op(1, 1),
+            make_op(2, 1),
+            make_op(3, 1),
+            make_op(4, 1),
+            make_op(5, 1),
+        ]
+        .into();
+
+        let mut cursor = BinaryCursor::scan_all(
+            store,
+            RunSortOrder::Spot,
+            branch,
+            BinaryFilter::default(),
+            ColumnProjection::all(),
+        );
+        cursor.set_overlay_ops_window(Arc::clone(&ops), 1, 3);
+
+        let batch = cursor.next_batch().unwrap().expect("overlay-only batch");
+        assert_eq!(batch.row_count, 2, "window is [1, 3), not the whole slice");
+        let ColumnData::Block(s_ids) = &batch.s_id else {
+            panic!("expected materialized s_id block");
+        };
+        assert_eq!(
+            &s_ids[..],
+            &[2, 3],
+            "the window's ops, not a prefix of the slice"
+        );
+        assert!(cursor.next_batch().unwrap().is_none(), "cursor exhausted");
     }
 
     /// An OPST batch in sort order (o_type, o_key, ...): a filter binding

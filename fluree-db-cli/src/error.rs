@@ -6,6 +6,11 @@ use std::process;
 pub const EXIT_SUCCESS: i32 = 0;
 pub const EXIT_ERROR: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
+/// `fluree verify`: provenance-only problems — state and every replication
+/// path are intact, so a gate that only cares about replication may proceed.
+pub const EXIT_VERIFY_PROVENANCE: i32 = 3;
+/// `fluree verify`: the commit chain or index root is broken.
+pub const EXIT_VERIFY_CHAIN: i32 = 4;
 
 /// Unified error type for CLI operations.
 pub enum CliError {

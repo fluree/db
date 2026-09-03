@@ -1,6 +1,6 @@
 [package]
 name = "testsuite-sparql"
-version = "4.1.5"
+version = "4.1.6"
 edition = "2021"
 publish = false
 
@@ -27,3 +27,12 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 [[bin]]
 name = "run-w3c-test"
 path = "src/bin/run_w3c_test.rs"
+
+# Mirrors the root workspace's [profile.dev]. This package sits in the root
+# `exclude` list and declares its own [workspace] above, so it does not inherit
+# that profile: without this line its binaries carry packed DWARF and duplicate
+# the fluree dependency tree's debug info into each one. CI builds this suite in
+# a separate cache workspace ("testsuite-sparql -> target"), so it is a second
+# build tree that would otherwise miss the saving entirely.
+[profile.dev]
+split-debuginfo = "unpacked"

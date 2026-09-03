@@ -470,7 +470,7 @@ pub enum ApiError {
 
     /// Indexer crate errors
     #[error("Indexer error: {0}")]
-    Indexer(#[from] fluree_db_indexer::IndexerError),
+    Indexer(#[from] crate::wasm_compat::IndexerError),
 
     /// Builder validation errors (one or more problems with builder configuration)
     #[error("{0}")]
@@ -622,7 +622,7 @@ impl ApiError {
             ApiError::NoveltyDeferred { .. } => 503,
             ApiError::IndexingDisabled => 400, // Bad Request
             ApiError::Indexer(e) => {
-                use fluree_db_indexer::IndexerError;
+                use crate::wasm_compat::IndexerError;
                 match e {
                     IndexerError::LedgerNotFound(_) => 404,
                     IndexerError::NoCommits => 400,
@@ -667,6 +667,29 @@ impl ApiError {
                 | fluree_db_transact::TransactError::PublishLostRace { .. }
                 | fluree_db_transact::TransactError::NamespaceConflict(_),
             ) => 409,
+            // 413: the transaction's own delta meets or exceeds
+            // `reindex_max_bytes` (the commit check is `current + delta >=
+            // max`, so with drained novelty this still fails) — no amount of
+            // indexer draining can ever admit it. A 503 here would tell the
+            // client to retry a request that can never work; 413 says the
+            // payload itself is the problem. MUST precede the drainable
+            // novelty arm below.
+            ApiError::Transact(fluree_db_transact::TransactError::NoveltyWouldExceed {
+                delta_bytes,
+                max_bytes,
+                ..
+            }) if delta_bytes >= max_bytes => 413,
+            // 503 + retryable: novelty backpressure, the same class as
+            // `NoveltyDeferred` above. `NoveltyAtMax` (novelty already at
+            // `reindex_max_bytes`) and drainable `NoveltyWouldExceed` (this
+            // delta would cross it, but fits once novelty drains) are cleared
+            // by the indexer, not by changing the request — a 400 tells
+            // retrying clients the write is permanently invalid and to drop
+            // it.
+            ApiError::Transact(
+                fluree_db_transact::TransactError::NoveltyAtMax
+                | fluree_db_transact::TransactError::NoveltyWouldExceed { .. },
+            ) => 503,
             // Other transaction errors are usually validation failures
             ApiError::Transact(_) => 400,
             // Cross-ledger model dependency could not be resolved /

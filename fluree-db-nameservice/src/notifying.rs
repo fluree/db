@@ -12,10 +12,10 @@ use fluree_db_core::ContentId;
 use crate::{
     event_bus::LedgerEventBus, AdminPublisher, BranchLifecycle, CasResult, CommitPublisher,
     ConfigCasResult, ConfigLookup, ConfigPublisher, ConfigValue, GraphSourceLookup,
-    GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerLifecycle,
-    NameServiceEvent, NameServiceLookup, NsLookupResult, NsRecord, NsRecordSnapshot, RefKind,
-    RefLookup, RefPublisher, RefValue, Result, StatusCasResult, StatusLookup, StatusPublisher,
-    StatusValue, Subscription, SubscriptionScope,
+    GraphSourcePublisher, GraphSourceRecord, GraphSourceType, IndexPublisher, LedgerHeads,
+    LedgerLifecycle, NameServiceEvent, NameServiceLookup, NsLookupResult, NsRecord,
+    NsRecordSnapshot, RefKind, RefLookup, RefPublisher, RefValue, Result, StatusCasResult,
+    StatusLookup, StatusPublisher, StatusValue, Subscription, SubscriptionScope,
 };
 
 /// Decorator that wraps a nameservice and emits events on a [`LedgerEventBus`]
@@ -80,6 +80,10 @@ where
 
     async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
         self.inner.list_branches(ledger_name).await
+    }
+
+    async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
+        self.inner.heads(ledger_id).await
     }
 }
 

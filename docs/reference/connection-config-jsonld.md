@@ -171,6 +171,7 @@ Supported fields (parsed and **applied** by Rust):
 - `s3Bucket`
 - `s3Prefix`
 - `s3Endpoint` (optional; recommended **only** for LocalStack/MinIO/custom endpoints)
+- `s3ForcePathStyle` (optional; `true` for MinIO-class endpoints without bucket-subdomain DNS)
 - `s3ReadTimeoutMs`, `s3WriteTimeoutMs`, `s3ListTimeoutMs`
   - Rust applies a single **operation timeout** of `max(read, write, list)`
 - `s3MaxRetries`, `s3RetryBaseDelayMs`, `s3RetryMaxDelayMs`
@@ -189,7 +190,7 @@ Supported fields (parsed and **applied** by Rust):
 }
 ```
 
-#### LocalStack / MinIO (custom endpoint)
+#### LocalStack (custom endpoint)
 
 ```json
 {
@@ -200,6 +201,26 @@ Supported fields (parsed and **applied** by Rust):
   "s3Prefix": "fluree/"
 }
 ```
+
+#### MinIO (custom endpoint + path-style)
+
+```json
+{
+  "@id": "s3",
+  "@type": "Storage",
+  "s3Bucket": "fluree",
+  "s3Endpoint": "http://minio:9000",
+  "s3ForcePathStyle": true
+}
+```
+
+`s3ForcePathStyle` addresses the bucket in the URL path
+(`http://minio:9000/fluree/key`) instead of as a virtual host
+(`http://fluree.minio:9000/key`). An endpoint override alone is not enough: the
+SDK still emits virtual-hosted URLs, and a plain MinIO — anything without
+wildcard DNS for bucket subdomains in front of it — rejects them. LocalStack
+resolves both forms. Leave it unset for real AWS. The builder equivalent is
+`FlureeBuilder::s3(bucket, endpoint).s3_force_path_style(true)`.
 
 #### S3 Express One Zone
 
@@ -223,7 +244,8 @@ endpoints; for Express buckets, use `FlureeBuilder::from_json_ld()` with a confi
 Guidance:
 - **Standard S3 in AWS**: omit `s3Endpoint` (let the SDK pick defaults)
 - **Express One Zone**: omit `s3Endpoint`
-- **LocalStack/MinIO/custom**: set `s3Endpoint`
+- **LocalStack/custom**: set `s3Endpoint`
+- **MinIO**: set `s3Endpoint` and `s3ForcePathStyle: true`
 
 For serverless index-storage tradeoffs, including Standard S3 vs S3 Express One
 Zone benchmark ranges, see

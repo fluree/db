@@ -12,6 +12,8 @@ fluree mcp init --ide claude-code            # or cursor / vscode / windsurf / z
 
 This wires `fluree mcp serve` with the `docs` toolset (ranked search over this documentation, version-exact) and the `memory` toolset (persistent project memory). Use `--toolsets docs` to skip memory. Without MCP, the same corpus is available as plain commands: `fluree docs search`, `fluree docs get`, `fluree docs examples`, `fluree docs tree`.
 
+The `fluree-cli` plugin in [fluree/claude-plugins](https://github.com/fluree/claude-plugins) registers the docs MCP server (`--toolsets docs` — no memory toolset; run `fluree mcp init` yourself if you want that too) and adds skills for driving the CLI, which defer to this page rather than restating it. The same marketplace carries `fluree-companion` for stack-first workflows — connecting to a Fluree AI stack, authenticating against it, and working through the stack's own surfaces.
+
 ## Probe, don't assume
 
 The CLI's surface varies by version and by compiled features — and an agent's trained knowledge of it is always stale. Before composing a nontrivial invocation:
@@ -36,6 +38,7 @@ Support is per-command, not global:
 - **`fluree auth login` needs the human.** It prints a device code and opens the stack's `/activate` page — the *user* approves it in their browser while the CLI polls. Run the command, then tell the user to approve; continue only after `fluree auth status` shows a configured token. There are no environment-variable credentials.
 - **Scripting a token:** `fluree auth token` prints exactly the access token (for `.env` files, `curl`). `fluree config list` masks credentials as `[redacted]`; `--reveal` prints them raw and its output must never be pasted into logs, commits, or chat.
 - `.fluree/` contains the remote config **including live access and refresh tokens** — it must be gitignored in any project where an agent runs `fluree init`.
+- **The stack documents itself, separately from this corpus.** A Fluree AI stack serves an unauthenticated markdown index at `https://<stack>/api/docs`, with each page at `/api/docs/{category}/{slug}`. Those pages describe the stack — its UI, its HTTP surface, its provisioning; this corpus describes the binary. A task that spans both needs both.
 
 ## Destructive operations — confirm with the user first
 

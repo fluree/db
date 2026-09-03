@@ -193,7 +193,7 @@ impl UnresolvedTriplePattern {
             p,
             o,
             dtc: Some(UnresolvedDatatypeConstraint::LangTag(Arc::from(
-                lang.as_ref(),
+                fluree_db_core::normalize_lang_tag(lang.as_ref()).as_ref(),
             ))),
         }
     }

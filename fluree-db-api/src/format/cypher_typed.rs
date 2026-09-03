@@ -337,7 +337,7 @@ async fn binding_cell_owned(
 fn date_cell(d: &fluree_db_core::temporal::Date) -> CypherTemporal {
     CypherTemporal::Date {
         days: d.days_since_epoch() as i64,
-        iso: d.original().to_string(),
+        iso: d.canonical(),
     }
 }
 
@@ -346,8 +346,9 @@ fn datetime_cell(dt: &fluree_db_core::temporal::DateTime) -> CypherTemporal {
     CypherTemporal::DateTime {
         epoch_seconds: micros.div_euclid(1_000_000),
         nanos: (micros.rem_euclid(1_000_000) * 1_000) as u32,
-        tz_offset_seconds: dt.tz_offset().map(|o| o.local_minus_utc()),
-        iso: dt.original().to_string(),
+        // Every dateTime is a UTC instant (see fluree_db_core::temporal).
+        tz_offset_seconds: Some(0),
+        iso: dt.canonical(),
     }
 }
 
@@ -356,8 +357,9 @@ fn time_cell(t: &fluree_db_core::temporal::Time) -> CypherTemporal {
     let nanos = (whole_minutes_secs + t.seconds()) * 1_000_000_000.0;
     CypherTemporal::Time {
         nanos_since_midnight: nanos.round() as i64,
-        tz_offset_seconds: t.tz_offset().map(|o| o.local_minus_utc()),
-        iso: t.original().to_string(),
+        // A time carries no offset (see fluree_db_core::temporal).
+        tz_offset_seconds: None,
+        iso: t.canonical(),
     }
 }
 
@@ -456,6 +458,8 @@ struct NodeHydrator<'a> {
 }
 
 /// Concurrent subject fetches in flight during [`NodeHydrator::prefetch`].
+/// Native only — the wasm32 fallback lane runs its point reads inline.
+#[cfg(not(target_arch = "wasm32"))]
 const PREFETCH_CONCURRENCY: usize = 16;
 
 impl<'a> NodeHydrator<'a> {
@@ -523,7 +527,7 @@ impl<'a> NodeHydrator<'a> {
             .map_err(|e| FormatError::InvalidBinding(format!("policy class lookup failed: {e}")))?;
         let tracker = fluree_db_core::Tracker::disabled();
         enforcer
-            .filter_flakes_for_graph(db.snapshot, db.overlay, db.t, &tracker, flakes)
+            .filter_flakes_for_graph(db.snapshot, db.g_id, db.overlay, db.t, &tracker, flakes)
             .await
             .map_err(|e| FormatError::InvalidBinding(format!("policy filtering failed: {e}")))
     }
@@ -820,42 +824,72 @@ impl<'a> NodeHydrator<'a> {
             return Ok(());
         }
 
-        let workers = std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(4)
-            .min(PREFETCH_CONCURRENCY)
-            .min(sids.len());
-        let chunk_size = sids.len().div_ceil(workers);
-        let mut handles = Vec::with_capacity(workers);
-        for chunk in sids.chunks(chunk_size) {
-            let chunk = chunk.to_vec();
-            let view = self.view.clone();
-            handles.push(tokio::spawn(async move {
-                let db = view.as_graph_db_ref();
-                let mut out = Vec::with_capacity(chunk.len());
-                for sid in chunk {
-                    let flakes = db
-                        .range_with_opts(
-                            IndexType::Spot,
-                            RangeTest::Eq,
-                            RangeMatch::subject(sid.clone()),
-                            RangeOptions::default(),
-                        )
-                        .await
-                        .map_err(|e| {
-                            FormatError::InvalidBinding(format!("node property fetch failed: {e}"))
-                        })?;
-                    out.push((sid, flakes));
-                }
-                Ok::<_, FormatError>(out)
-            }));
-        }
-        let mut fetched: Vec<(Sid, Vec<fluree_db_core::Flake>)> = Vec::new();
-        for handle in handles {
-            fetched.extend(handle.await.map_err(|e| {
-                FormatError::InvalidBinding(format!("node property fetch task failed: {e}"))
-            })??);
-        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let fetched: Vec<(Sid, Vec<fluree_db_core::Flake>)> = {
+            let workers = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(4)
+                .min(PREFETCH_CONCURRENCY)
+                .min(sids.len());
+            let chunk_size = sids.len().div_ceil(workers);
+            let mut handles = Vec::with_capacity(workers);
+            for chunk in sids.chunks(chunk_size) {
+                let chunk = chunk.to_vec();
+                let view = self.view.clone();
+                handles.push(tokio::spawn(async move {
+                    let db = view.as_graph_db_ref();
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for sid in chunk {
+                        let flakes = db
+                            .range_with_opts(
+                                IndexType::Spot,
+                                RangeTest::Eq,
+                                RangeMatch::subject(sid.clone()),
+                                RangeOptions::default(),
+                            )
+                            .await
+                            .map_err(|e| {
+                                FormatError::InvalidBinding(format!(
+                                    "node property fetch failed: {e}"
+                                ))
+                            })?;
+                        out.push((sid, flakes));
+                    }
+                    Ok::<_, FormatError>(out)
+                }));
+            }
+            let mut fetched: Vec<(Sid, Vec<fluree_db_core::Flake>)> = Vec::new();
+            for handle in handles {
+                fetched.extend(handle.await.map_err(|e| {
+                    FormatError::InvalidBinding(format!("node property fetch task failed: {e}"))
+                })??);
+            }
+            fetched
+        };
+
+        // wasm32 is single-threaded and runs without an ambient tokio runtime
+        // (`tokio::spawn` would panic): the chunked fan-out buys nothing
+        // there, so run the same point reads inline.
+        #[cfg(target_arch = "wasm32")]
+        let fetched: Vec<(Sid, Vec<fluree_db_core::Flake>)> = {
+            let db = self.view.as_graph_db_ref();
+            let mut fetched = Vec::with_capacity(sids.len());
+            for sid in sids {
+                let flakes = db
+                    .range_with_opts(
+                        IndexType::Spot,
+                        RangeTest::Eq,
+                        RangeMatch::subject(sid.clone()),
+                        RangeOptions::default(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        FormatError::InvalidBinding(format!("node property fetch failed: {e}"))
+                    })?;
+                fetched.push((sid, flakes));
+            }
+            fetched
+        };
         if self.enforcer.is_none() {
             for (sid, flakes) in fetched {
                 self.flake_cache.insert(sid, Arc::new(flakes));

@@ -14,25 +14,29 @@ The design splits the work: the Raft log replicates **decisions** (branch head m
 
 ## Component map
 
-The Raft consensus crate (`fluree-db-consensus/src/raft/`) is structured as a set of cooperating components:
+The Raft consensus crate (`fluree-db-consensus/src/raft/`) is structured as a set of cooperating components. The application-agnostic pieces — durable log/snapshot storage, node identity, rendezvous ownership — have been extracted to `fluree-raft-core` so other replicated groups can reuse them; paths below say which crate a component lives in when it is not `fluree-db-consensus`:
 
 | Component                  | Lives where                                              | Job                                                                                                         |
 | -------------------------- | -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | `Command`, `Response`      | `state_machine.rs`                                       | The log entry types. ~20 variants spanning transaction flow, ledger lifecycle, and metadata.                |
 | `NameServiceState`         | `state_machine.rs`                                       | The replicated in-memory state: branch heads, ledger registry, per-branch queues, idempotency cache.        |
-| `StateMachineAdapter`      | `state_machine_adapter.rs`                               | openraft's `RaftStateMachine` impl. Applies entries, takes/installs snapshots, resolves waiters.            |
-| `LogStore`, `SnapshotStore`| `log_adapter.rs`, `storage/{fs,memory}.rs`               | openraft's `RaftLogStorage`/`RaftLogReader`/`RaftSnapshotBuilder`. Local-disk persistence.                                          |
-| `HttpRaftNetworkFactory`   | `network.rs`                                             | Inter-node RPC (`/raft/vote`, `/raft/append-entries`, `/raft/install-snapshot`) over HTTP.                  |
-| `RaftAdmin` / `/cluster/*` | `admin.rs`                                               | Operator-facing membership endpoints (`initialize`, `add-learner`, `change-membership`, `status`).         |
-| Follower-forward middleware| `forward.rs`                                             | Axum middleware that proxies leader-only client requests to the current leader.                            |
+| `NameServiceApp`           | `app.rs`                                                 | The pure reduction: routes a `Command` through `state_machine::apply`, mirrors membership, owns the snapshot codec. |
+| `NameServiceObserver`      | `app.rs`                                                 | The effects: event bus, waiter resolution, staged receipts, releases, ledger-cache watermark. Captured under the state lock, published after it drops. |
+| `StateMachineAdapter`      | `state_machine_adapter.rs`                               | The two above composed with `fluree_raft_core::state_machine::StateMachineAdapter`, which owns last-applied, membership, and snapshot persistence. |
+| `RaftIntegration`          | `integration.rs`                                         | One-call consensus assembly: storage, adapters, `Raft`, `RaftNameService`, routers, channels. Host-agnostic — moved here from the server binary, which it never depended on. |
+| `EmbeddedRaftNode`         | `embedded.rs`                                            | Wires a `Fluree` engine to a `RaftIntegration`: the committer, worker supervisor, leader watcher, release task, and their shutdown order. What an embedding process calls instead of re-deriving `FlureeServerBuilder::build`. |
+| `LogStore`, `SnapshotStore`| `fluree-raft-core` `log_adapter.rs`, `storage/{fs,memory}.rs` | openraft's `RaftLogStorage`/`RaftLogReader`/`RaftSnapshotBuilder`. Local-disk persistence. The backends are openraft-free — they store opaque `Vec<u8>` payloads. |
+| `HttpRaftNetworkFactory`   | `fluree-raft-core` `network.rs`                          | Inter-node RPC (`/raft/vote`, `/raft/append-entries`, `/raft/install-snapshot`) over HTTP. Generic over the type config; `network.rs` here keeps only the nameservice-specific `NetworkConfig` fields. |
+| `RaftAdmin` / `/cluster/*` | `fluree-raft-core` `admin.rs`                            | Operator-facing membership endpoints (`initialize`, `add-learner`, `change-membership`, `status`).         |
+| Follower-forward middleware| `fluree-raft-core` `forward.rs`                          | Axum middleware that proxies leader-only client requests to the current leader. Generic over a `LeaderView` source. |
 | `QueuedTransactor`         | `queued_transactor.rs`                                   | Client-side proposer. Builds envelopes, writes to CAS, proposes `EnqueueCommand`, awaits the typed receipt. |
-| `commit_worker::Worker`             | `commit_worker.rs`                                       | Leader-only. Drains per-branch queues, stages work, proposes `ApplyHead`.                                  |
+| `commit_worker::Worker`             | `commit_worker.rs`                                       | Node-scoped, one per branch this node owns under rendezvous. Drains the queue, stages work, writes the blob to CAS, publishes `ApplyHead` — locally if leader, via `apply_staged_commit` if not. |
 | `EvictionScheduler`        | `eviction_scheduler.rs`                                  | Leader-only. Periodically proposes `EvictIdempotency` to age out the cache.                                |
 | `RaftNameService`          | `nameservice.rs`                                         | The replicated `NameService` impl. Reads observe `NameServiceState`; writes propose log entries.            |
-| `WaiterMap`                | `waiter.rs`                                              | Per-process oneshot registry keyed by `queue_id`. Bridges propose and apply.                                |
+| `WaiterMap`                | `waiter.rs`                                              | Per-process registry of *local interest*. Armed by `request_cid` before proposing, bound to a `queue_id` when this node applies the enqueue. Only local proposals are tracked, so a follower's map stays empty. |
 | `StagedReceiptMap`         | `staged_receipt.rs`                                      | Per-process map carrying typed apply receipts (flake counts, tally, conflict resolution) from worker to transactor on the same node. |
 
-Three of these (`commit_worker::Worker`, `EvictionScheduler`, follower-forward middleware) are gated on leadership: the integration's leader watcher spawns / stops them in response to `current_leader()` changes.
+Three of these (`EvictionScheduler`, `LivenessMonitor`, the background indexer) are gated on leadership: the leader watcher spawns / stops them in response to `current_leader()` changes. `commit_worker::Worker` is deliberately **not**: the worker supervisor runs on every node and owns whichever branches rendezvous-hash to it, so the blob-writing half of a commit is spread across the cluster rather than serialized through the leader. The follower-forward middleware runs everywhere and simply does nothing on the leader.
 
 ## Submission flow in detail
 
@@ -46,32 +50,39 @@ Client → POST /api/transact
    └─ this node is follower → HTTP forward to leader's client_addr
         ↓
 [QueuedTransactor on leader]
-   1. write QueuedRequest envelope to CAS  → envelope_cid
-   2. register oneshot waiter on WaiterMap → rx
-   3. propose Command::EnqueueCommand { envelope_cid, body_hash, kind, idempotency_key? }
+   1. write QueuedRequest envelope to CAS  → request_cid
+   2. arm interest on WaiterMap keyed by request_cid → ticket
+      (before proposing: the queue_id does not exist yet, and arming
+       first is what lets a fast worker's ApplyHead find a waiter)
+   3. propose Command::EnqueueCommand { request_cid, body_hash, kind, idempotency_key? }
         ↓
 [Raft consensus]
    4. leader appends to log, replicates to quorum
    5. on quorum, state machine applies on every node:
         - state.queues[branch].push_back(QueueEntry { queue_id, envelope_cid, ... })
-        - leader records waiter assignment
+        - each node binds any locally-armed interest for request_cid to
+          queue_id; a follower has none, so this is a no-op there
         ↓
-[commit_worker::Worker on leader]
+[commit_worker::Worker on the node that OWNS branch — rendezvous, often a follower]
    6. polls state.queues[branch].front()
    7. fetches envelope from CAS, stages via `Fluree` API
-   8. writes commit blob to CAS → head_cid
+   8. writes commit blob to CAS → head_cid   (the bytes never enter the log)
    9. stashes AppliedReceipt in StagedReceiptMap[queue_id]
-  10. propose Command::ApplyHead { branch, queue_id, head_cid, ... }
+  10. publish ApplyHead { branch, queue_id, head_cid, ... }:
+        leader   → propose locally
+        follower → POST /raft/apply_staged_commit to the leader (CID only)
         ↓
 [Raft consensus]
   11. leader appends, replicates to quorum
   12. on quorum, state machine applies on every node:
         - state.refs[branch].head = head_cid
         - state.queues[branch].pop_front()
-        - leader: take StagedReceiptMap[queue_id] → resolve WaiterMap[queue_id] with receipt
+        - take StagedReceiptMap[queue_id] → resolve WaiterMap[queue_id]
+          with the receipt. No local waiter (every follower) → dropped,
+          not buffered
         ↓
 [QueuedTransactor on leader]
-  13. rx returns receipt → return to client
+  13. ticket.wait() returns the receipt → return to client
         ↓
 [follower-forward middleware (if forwarded)]
   14. relay response verbatim to client
@@ -138,13 +149,27 @@ Snapshot ids are validated against a path-traversal guard before any disk path i
 
 Inter-node RPC is plain HTTP over `reqwest`, with:
 
-- `connect_timeout`: 250 ms (default)
+Per-request settings live on `fluree_raft_core::network::RaftTransportConfig`:
+
 - `rpc_timeout` (vote, append): 500 ms (default)
 - `snapshot_timeout`: 30 s (default)
-- Redirects disabled (SSRF guard against 302s to internal addresses).
-- Per-route body size limits: vote 1 MiB, append-entries 64 MiB, install-snapshot 1 GiB.
+- Per-route body size limits: vote 1 MiB, append-entries 64 MiB, install-snapshot 1 GiB
+- `forward_max_body_bytes`: 64 MiB — what a follower buffers before relaying
 
-These are exposed on `NetworkConfig` and can be overridden at integration time, though the server binary doesn't currently expose tuning knobs for them.
+Client settings live on `HttpClientConfig`, separately, because they are baked
+into the shared `reqwest::Client` and cannot vary per request or per group:
+
+- `connect_timeout`: 250 ms (default)
+- `pool_idle_timeout`: 90 s (default)
+- Redirects disabled (SSRF guard against 302s to internal addresses). The
+  `RaftHttpClient` newtype carries that guarantee in its type, so an injected
+  client cannot quietly reinstate them.
+
+The nameservice's own `NetworkConfig` embeds both as `transport` and
+`http_client`, and adds the fields only it needs (`cross_node_propose_timeout`,
+the staged-commit and queue-poison body caps). All are overridable at
+integration time, though the server binary doesn't currently expose tuning
+knobs for them.
 
 Why plain HTTP rather than gRPC or a custom protocol? Two reasons:
 

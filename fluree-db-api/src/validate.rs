@@ -51,6 +51,18 @@ pub struct ValidateOptions {
     /// When the shapes source is not [`ShapesSource::Attached`], also union
     /// in the ledger's attached shapes instead of replacing them.
     pub include_attached: bool,
+    /// Micro-fuel ceiling for the whole validation pass. `None` / `Some(0)`
+    /// = unbounded.
+    ///
+    /// Matters because of `sh:sparql`: every other SHACL constraint can only
+    /// read what is reachable from the focus node, but a `sh:sparql` body may
+    /// walk anywhere in the graph, once per focus node. Fuel is what makes
+    /// that reading bounded.
+    pub max_fuel: Option<u64>,
+    /// Request-scoped cooperative cancellation: the deadline, and the carrier
+    /// for the per-query memory ceiling (which is installed only when a
+    /// cancellation is present). Server callers should always pass one.
+    pub cancellation: Option<fluree_db_core::QueryCancellation>,
 }
 
 impl Default for ValidateOptions {
@@ -59,6 +71,8 @@ impl Default for ValidateOptions {
             graph: None,
             shapes: ShapesSource::Attached,
             include_attached: false,
+            max_fuel: None,
+            cancellation: None,
         }
     }
 }
@@ -330,6 +344,11 @@ fn compact_sh(iri: &str) -> String {
 impl crate::Fluree {
     /// Validate the current state of a ledger against SHACL shapes and
     /// return a resolved validation report. See [`ValidateOptions`].
+    ///
+    /// This is the entry point that supports a cross-ledger `f:shapesSource`
+    /// (`f:ledger` set): the model ledger's shapes are resolved through the
+    /// governance cache (one nameservice head lookup when M is unchanged)
+    /// and validated against exactly like the transaction path.
     pub async fn validate_ledger(
         &self,
         ledger_id: &str,
@@ -337,7 +356,51 @@ impl crate::Fluree {
     ) -> Result<ValidateReport> {
         let handle = self.ledger_cached(ledger_id).await?;
         let view = handle.snapshot().await;
-        validate_view(&view, ledger_id, options).await
+
+        let use_attached =
+            matches!(options.shapes, ShapesSource::Attached) || options.include_attached;
+        let (config, cross) = if use_attached {
+            let config = resolve_config_for_validate(&view).await;
+            let is_cross_ledger = config
+                .as_ref()
+                .and_then(|c| c.shacl.as_ref())
+                .and_then(|s| s.shapes_source.as_ref())
+                .is_some_and(|s| s.ledger.is_some());
+            let cross = if is_cross_ledger {
+                let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(ledger_id, self);
+                crate::tx::open_cross_ledger_shapes_model(config.as_ref(), &mut resolve_ctx)
+                    .await
+                    .map_err(ApiError::from)?
+            } else {
+                None
+            };
+            (config, cross)
+        } else {
+            (None, None)
+        };
+
+        validate_view_inner(&view, ledger_id, options, config, cross).await
+    }
+}
+
+/// Resolve the ledger config for validation. Mirrors the transaction path's
+/// degrade semantics: a broken config graph read falls back to defaults
+/// (default-graph shapes) rather than failing validation.
+async fn resolve_config_for_validate(
+    view: &LedgerView,
+) -> Option<fluree_db_core::ledger_config::LedgerConfig> {
+    match crate::config_resolver::resolve_ledger_config(
+        view.snapshot.as_ref(),
+        view.novelty.as_ref(),
+        view.t,
+    )
+    .await
+    {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::debug!(error = %e, "Config graph read failed during validate — using defaults");
+            None
+        }
     }
 }
 
@@ -345,10 +408,45 @@ impl crate::Fluree {
 ///
 /// Runs over the query-visible composition (snapshot + novelty overlay) of
 /// `view`, scoped to the data graph selected by `options.graph`.
+///
+/// This view-scoped entry point has no connection handle, so a cross-ledger
+/// `f:shapesSource` cannot be resolved here and returns an error — use
+/// [`crate::Fluree::validate_ledger`] for ledgers configured that way.
 pub async fn validate_view(
     view: &LedgerView,
     ledger_id: &str,
     options: &ValidateOptions,
+) -> Result<ValidateReport> {
+    let use_attached = matches!(options.shapes, ShapesSource::Attached) || options.include_attached;
+    let config = if use_attached {
+        resolve_config_for_validate(view).await
+    } else {
+        None
+    };
+    validate_view_inner(view, ledger_id, options, config, None).await
+}
+
+/// Fuel tracker for one validation pass. `None` / `Some(0)` = unbounded,
+/// matching `tracker_for_limits` on the query and transact paths.
+fn validate_tracker(max_fuel: Option<u64>) -> fluree_db_core::tracking::Tracker {
+    use fluree_db_core::tracking::{Tracker, TrackingOptions};
+    match max_fuel.filter(|limit| *limit > 0) {
+        Some(limit) => Tracker::new(TrackingOptions {
+            track_time: false,
+            track_fuel: true,
+            track_policy: false,
+            max_fuel: Some(limit),
+        }),
+        None => Tracker::disabled(),
+    }
+}
+
+async fn validate_view_inner(
+    view: &LedgerView,
+    ledger_id: &str,
+    options: &ValidateOptions,
+    config: Option<fluree_db_core::ledger_config::LedgerConfig>,
+    cross: Option<crate::tx::CrossLedgerShapesModel>,
 ) -> Result<ValidateReport> {
     let snapshot = view.snapshot.as_ref();
     let novelty = view.novelty.as_ref();
@@ -367,28 +465,65 @@ pub async fn validate_view(
     #[allow(unused_assignments)]
     let mut inline_overlay = None;
     let mut inline_membership: Option<fluree_db_shacl::CrossLedgerMembership<'_>> = None;
+    #[allow(unused_assignments)]
+    let mut cross_overlay = None;
+    let mut cross_membership: Option<fluree_db_shacl::CrossLedgerMembership<'_>> = None;
 
     let mut shape_dbs: Vec<GraphDbRef<'_>> = Vec::new();
     let mut membership: Vec<GraphId> = Vec::new();
 
     let use_attached = matches!(options.shapes, ShapesSource::Attached) || options.include_attached;
     if use_attached {
-        // Mirror the transaction path: a broken config graph read degrades to
-        // defaults (default-graph shapes) rather than failing validation.
-        let config = match crate::config_resolver::resolve_ledger_config(snapshot, novelty, to_t)
-            .await
-        {
-            Ok(config) => config,
-            Err(e) => {
-                tracing::debug!(error = %e, "Config graph read failed during validate — using defaults");
-                None
+        if let Some(model) = cross.as_ref() {
+            // Cross-ledger `f:shapesSource`: compile from M's wire artifact,
+            // translated against D's committed namespace registry (validate
+            // has no in-flight transaction, so the snapshot registry is
+            // complete). Mirrors the transaction path's shape source; D's
+            // own default-graph shapes compose via the bundle overlay's
+            // novelty base exactly as they do at staging time.
+            let wire = model.wire().ok_or_else(|| {
+                ApiError::from(TransactError::Parse(
+                    "cross-ledger shapes resolution returned a non-shapes artifact".into(),
+                ))
+            })?;
+            let registry = NamespaceRegistry::from_db(snapshot);
+            let bundle = wire
+                .translate_to_schema_bundle_flakes(&registry)
+                .map_err(|e| {
+                    ApiError::from(TransactError::Parse(format!(
+                        "cross-ledger shapes wire translation failed: {e}"
+                    )))
+                })?;
+            cross_overlay = Some(fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
+                novelty, bundle,
+            ));
+            shape_dbs.push(GraphDbRef::new(
+                snapshot,
+                0u16,
+                cross_overlay.as_ref().expect("just set above"),
+                to_t,
+            ));
+            membership.push(0);
+            // `sh:class` value-sets living alongside M's shapes: probe M's
+            // shapes graph after a local membership miss, translating D-term
+            // Sids through the snapshot namespace map.
+            cross_membership = Some(fluree_db_shacl::CrossLedgerMembership {
+                model_db: GraphDbRef::new(
+                    &model.model_db.snapshot,
+                    model.model_g_id,
+                    model.model_db.overlay.as_ref(),
+                    model.model_db.t,
+                ),
+                data_ns_map: snapshot.namespaces(),
+                same_term_space: false,
+            });
+        } else {
+            let shapes_g_ids = crate::tx::resolve_shapes_source_g_ids(config.as_ref(), snapshot)?;
+            for g_id in &shapes_g_ids {
+                shape_dbs.push(GraphDbRef::new(snapshot, *g_id, novelty, to_t));
             }
-        };
-        let shapes_g_ids = crate::tx::resolve_shapes_source_g_ids(config.as_ref(), snapshot)?;
-        for g_id in &shapes_g_ids {
-            shape_dbs.push(GraphDbRef::new(snapshot, *g_id, novelty, to_t));
+            membership.extend(shapes_g_ids);
         }
-        membership.extend(shapes_g_ids);
     }
 
     match &options.shapes {
@@ -471,11 +606,14 @@ pub async fn validate_view(
         shapes,
         hierarchy.as_ref(),
     );
-    let engine = match hierarchy {
+    let mut engine = match hierarchy {
         Some(h) => ShaclEngine::new_with_hierarchy(cache, h),
         None => ShaclEngine::new(cache),
     }
     .with_membership_graphs(membership);
+    if let Some(cancellation) = options.cancellation.clone() {
+        engine = engine.with_cancellation(cancellation);
+    }
 
     let shape_count = engine.shape_count();
     if engine.is_empty() {
@@ -486,9 +624,19 @@ pub async fn validate_view(
         });
     }
 
-    let data_db = GraphDbRef::new(snapshot, data_g_id, novelty, to_t);
+    // Fuel bounds how much the pass may READ. `sh:sparql` runs one query per
+    // focus node whose body is not limited to the focus node's neighbourhood,
+    // so without a tracker a single request can walk the whole ledger
+    // repeatedly. `with_tracker` is a no-op on a disabled tracker, so the
+    // unbounded default costs nothing.
+    let tracker = validate_tracker(options.max_fuel);
+    let data_db = GraphDbRef::new(snapshot, data_g_id, novelty, to_t).with_tracker(&tracker);
+    // The engine takes one external membership source. Inline shapes carry
+    // their own value-set facts (same term space), so an explicit inline
+    // document keeps precedence; the cross-ledger probe serves the attached
+    // cross-ledger shapes otherwise.
     let raw = engine
-        .validate_all_with_membership(data_db, inline_membership)
+        .validate_all_with_membership(data_db, inline_membership.or(cross_membership))
         .await
         .map_err(TransactError::from)?;
 

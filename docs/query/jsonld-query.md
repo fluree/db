@@ -1115,6 +1115,20 @@ Arithmetic operators accept two or more arguments. With multiple arguments, they
 - `(- ?x)` - Unary negation (single argument)
 - `(abs ?x)` - Absolute value
 
+`(- ?a ?b)` also subtracts two temporal values of the same kind — two
+`xsd:dateTime`s, two `xsd:date`s or two `xsd:time`s — yielding the elapsed time
+as an `xsd:dayTimeDuration`:
+
+```json
+["bind", "?elapsed", "(- ?end ?start)"]
+```
+
+The result is signed, and subtraction is the only operator defined over two
+temporal operands (shifting by a duration is the other form). This is an extension beyond the SPARQL
+standard; see [Date/Time Arithmetic](sparql.md#datetime-arithmetic) for the full
+semantics and portability caveat, which apply identically here — both query
+surfaces lower to the same expression IR.
+
 ### List Value Functions
 
 Operate on list values — those produced by `range`, `list`, or [`collect`](#aggregation-functions). Usable anywhere expressions are (`bind`, `filter`, `select`), and the list-producing ones drive [`unwind`](#unwind-patterns).

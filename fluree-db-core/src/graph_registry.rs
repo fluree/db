@@ -56,6 +56,53 @@ pub fn txn_meta_graph_iri(ledger_id: &str) -> String {
     format!("urn:fluree:{ledger_id}#txn-meta")
 }
 
+/// Validate that `value` is an absolute IRI acceptable as a graph target.
+///
+/// A minimal check, not a full RFC 3987 parser: no whitespace / C0 / DEL /
+/// RFC 3987-excluded characters (`<`, `>`, `"`, `{`, `}`, `|`, `\\`, `^`,
+/// `` ` ``), and a `<scheme>:<rest>` head per RFC 3986 §3.1. Returns the
+/// error message a caller surfaces as a bad request.
+pub fn validate_absolute_graph_iri(value: &str) -> std::result::Result<(), String> {
+    if value.is_empty() {
+        return Err("graph IRI is required and cannot be empty".to_string());
+    }
+    if value.chars().any(|c| {
+        matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`')
+            || c.is_whitespace()
+            || c <= '\u{20}'
+            || c == '\u{7F}'
+    }) {
+        return Err(format!(
+            "Invalid graph IRI '{value}': contains whitespace, a control character, \
+             or a character not allowed in an IRI \
+             (one of `<`, `>`, `\"`, `{{`, `}}`, `|`, `\\`, `^`, `` ` ``)"
+        ));
+    }
+    let (scheme, rest) = value.split_once(':').ok_or_else(|| {
+        format!("Invalid graph IRI '{value}': missing scheme (expected an absolute IRI like 'urn:...' or 'http://...')")
+    })?;
+    let mut sc = scheme.chars();
+    let first = sc
+        .next()
+        .ok_or_else(|| format!("Invalid graph IRI '{value}': scheme is empty"))?;
+    if !first.is_ascii_alphabetic() {
+        return Err(format!(
+            "Invalid graph IRI '{value}': scheme must start with an ASCII letter"
+        ));
+    }
+    if !sc.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+        return Err(format!(
+            "Invalid graph IRI '{value}': scheme may only contain letters, digits, '+', '-', '.'"
+        ));
+    }
+    if rest.is_empty() {
+        return Err(format!(
+            "Invalid graph IRI '{value}': nothing follows the scheme"
+        ));
+    }
+    Ok(())
+}
+
 /// Construct the ledger-scoped config graph IRI from a ledger ID.
 ///
 /// Each ledger has its own config graph. The IRI follows the pattern

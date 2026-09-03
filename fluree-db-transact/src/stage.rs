@@ -690,6 +690,40 @@ pub async fn stage(
             }
         }
 
+        // Graph-sync target: resolve the g_id + graph Sid now, before the
+        // generator takes `ns_registry` mutably. An unregistered target is a
+        // first population — nothing to retract (`None` scan). Reserved
+        // system graphs are refused the same way CLEAR refuses them.
+        let sync_scan: Option<(GraphId, Sid)> = match &txn.sync_graph {
+            Some(iri) => {
+                // Guard the target by shape, independent of registration:
+                // every entry point (builder, consensus applier, HTTP) meets
+                // this check, so a malformed IRI can't be registered as a
+                // graph and the ledger's own system-graph IRIs are refused
+                // even on a ledger whose registry never seeded them.
+                fluree_db_core::graph_registry::validate_absolute_graph_iri(iri)
+                    .map_err(|msg| TransactError::Parse(format!("sync target: {msg}")))?;
+                let ledger_id = ledger.snapshot.ledger_id.as_ref();
+                if *iri == fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id)
+                    || *iri == fluree_db_core::graph_registry::config_graph_iri(ledger_id)
+                {
+                    return Err(TransactError::ReservedGraphTarget {
+                        graph_iri: iri.clone(),
+                    });
+                }
+                match ledger.snapshot.graph_registry.graph_id_for_iri(iri) {
+                    Some(g_id) if g_id < FIRST_USER_GRAPH_ID => {
+                        return Err(TransactError::ReservedGraphTarget {
+                            graph_iri: iri.clone(),
+                        });
+                    }
+                    Some(g_id) => Some((g_id, ns_registry.sid_for_iri(iri))),
+                    None => None,
+                }
+            }
+            None => None,
+        };
+
         let mut generator = FlakeGenerator::new(new_t, &mut ns_registry, txn_id)
             .with_graph_sids(graph_sids.clone());
 
@@ -752,6 +786,44 @@ pub async fn stage(
                 "upsert deletions generated"
             );
             acc.push_retractions(upsert_retractions);
+        }
+
+        // Graph-sync wave: push every currently-asserted flake of the target
+        // graph as a retraction (see [`Txn::sync_graph`]). The accumulator
+        // nets retract+assert of the same fact to nothing, so what survives
+        // `finalize()` is exactly `current − payload` retractions plus
+        // `payload − current` assertions — the delta. Scanned flakes carry
+        // correct `m` from storage, so (like the upsert wave) no hydration
+        // is needed.
+        //
+        // Policy model follows CLEAR (roadmap O4): the scan is not
+        // view-policy filtered — sync is an authoritative whole-graph
+        // replacement, and a view-filtered scan would leave rows the caller
+        // cannot see in place, breaking "the graph now equals the payload".
+        // Modify-policy is still enforced on the resulting flakes below.
+        //
+        // Scale note: like CLEAR/COPY/MOVE, this materializes the whole
+        // graph's flakes at staging time; backpressure is the pre-check
+        // above plus `NoveltyWouldExceed` sizing at commit (which sees only
+        // the surviving delta). Chunked staging for whole-graph ops is the
+        // same known follow-up flagged on `scan_graph_flakes`.
+        if let Some((sync_g_id, sync_graph_sid)) = &sync_scan {
+            // The scan attributes every flake to the graph Sid, matching the
+            // payload's assertions — both sides must agree on `flake.g` for
+            // the accumulator's unchanged-fact cancellation to fire.
+            let mut sync_retractions =
+                scan_graph_flakes(&ledger, *sync_g_id, Some(sync_graph_sid), options.tracker)
+                    .await?;
+            for f in &mut sync_retractions {
+                f.op = false;
+                f.t = new_t;
+            }
+            tracing::debug!(
+                graph_id = sync_g_id,
+                scanned = sync_retractions.len(),
+                "graph-sync retractions generated"
+            );
+            acc.push_retractions(sync_retractions);
         }
 
         let retraction_count = stream_stats.retraction_count;
@@ -1052,8 +1124,41 @@ fn flake_content(f: &Flake) -> FlakeContent {
     )
 }
 
+/// Default for [`whole_graph_scan_limit`]: ~2 GB peak at the accumulator's
+/// two-copies-per-fact profile. Any graph that worked before the limit
+/// existed still works — whole-graph verbs errored outright on
+/// index-resident graphs, and novelty-resident graphs are already bounded
+/// well below this by `reindex_max_bytes`.
+const DEFAULT_MAX_GRAPH_SCAN_FLAKES: usize = 10_000_000;
+
+/// Memory backstop for whole-graph scans (graph sync, CLEAR, DROP, COPY,
+/// MOVE): staging materializes the target graph's currently-asserted
+/// flakes, so peak memory scales with the graph, not the delta — an
+/// identical resync of a huge graph is the worst case, and no other guard
+/// sees it (`NoveltyWouldExceed` measures only the surviving delta, after
+/// materialization). `FLUREE_MAX_GRAPH_SCAN_FLAKES` overrides; `0`
+/// disables. Read per call — once per graph-management op, never per
+/// flake — so tests and embedders can change it at runtime.
+fn whole_graph_scan_limit() -> Option<usize> {
+    match std::env::var("FLUREE_MAX_GRAPH_SCAN_FLAKES") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(DEFAULT_MAX_GRAPH_SCAN_FLAKES),
+        },
+        Err(_) => Some(DEFAULT_MAX_GRAPH_SCAN_FLAKES),
+    }
+}
+
 /// Scan every currently-asserted flake in graph `g_id` (merged snapshot +
-/// novelty view as of the ledger's current `t`).
+/// novelty view as of the ledger's current `t`), attributed to `g_sid`.
+///
+/// Every flake comes back with `g = g_sid` (`None` for the default graph).
+/// The range provider materializes index-resident rows with `g: None`
+/// regardless of graph — only novelty-resident flakes carry it — and every
+/// caller here routes by `flake.g` (`resolve_flake_graph_id`, where `None`
+/// is the default graph). Without the stamp, retracting an indexed named
+/// graph silently retracted phantoms from the default graph instead.
 ///
 /// Scale note: a whole-graph operation (`CLEAR ALL`, a large COPY/MOVE)
 /// materializes every scanned flake into a `Vec` and re-stages it, and
@@ -1075,17 +1180,38 @@ fn flake_content(f: &Flake) -> FlakeContent {
 async fn scan_graph_flakes(
     ledger: &LedgerState,
     g_id: GraphId,
+    g_sid: Option<&Sid>,
     tracker: Option<&Tracker>,
 ) -> Result<Vec<Flake>> {
     let db_ref = match tracker {
         Some(t) => ledger.as_graph_db_ref(g_id).with_tracker(t),
         None => ledger.as_graph_db_ref(g_id),
     };
-    // Unbounded SPOT scan (empty match, `>= min`) returns the whole graph.
-    db_ref
-        .range(IndexType::Spot, RangeTest::Ge, RangeMatch::new())
+    // `Eq` with an empty match is the whole-graph scan on both range paths:
+    // the V3 provider treats "nothing bound" as a full-index cursor and
+    // rejects every other `RangeTest`, and the genesis (overlay-only) path
+    // matches an empty `Eq` against every flake. `Ge` only ever worked on
+    // the genesis path, where non-`Eq` tests pass through unfiltered.
+    // `flake_limit` stops the provider's drain loop mid-scan, so the
+    // backstop bounds what is materialized, not just what is returned.
+    let limit = whole_graph_scan_limit();
+    let opts = fluree_db_core::RangeOptions {
+        flake_limit: limit.map(|l| l.saturating_add(1)),
+        ..Default::default()
+    };
+    let mut flakes = db_ref
+        .range_with_opts(IndexType::Spot, RangeTest::Eq, RangeMatch::new(), opts)
         .await
-        .map_err(|e| TransactError::FlakeGeneration(format!("graph scan failed: {e}")))
+        .map_err(|e| TransactError::FlakeGeneration(format!("graph scan failed: {e}")))?;
+    if let Some(l) = limit {
+        if flakes.len() > l {
+            return Err(TransactError::WholeGraphScanTooLarge { limit: l });
+        }
+    }
+    for f in &mut flakes {
+        f.g = g_sid.cloned();
+    }
+    Ok(flakes)
 }
 
 /// Resolve the ledger `GraphId` and graph `Sid` for a named graph IRI, if it
@@ -1198,10 +1324,12 @@ async fn stage_graph_mgmt(
                 }
 
                 for (g_id, sid) in targets {
-                    if let Some(sid) = sid {
-                        graph_sids.insert(g_id, sid);
+                    if let Some(sid) = &sid {
+                        graph_sids.insert(g_id, sid.clone());
                     }
-                    for mut f in scan_graph_flakes(&ledger, g_id, options.tracker).await? {
+                    for mut f in
+                        scan_graph_flakes(&ledger, g_id, sid.as_ref(), options.tracker).await?
+                    {
                         f.op = false;
                         f.t = new_t;
                         flakes.push(f);
@@ -1238,7 +1366,7 @@ async fn stage_graph_mgmt(
                 // `from == to` is a spec no-op for ADD/COPY/MOVE.
                 if from != to {
                     // Resolve the source (existing only) and destination.
-                    let (src_g_id, _src_sid): (Option<GraphId>, Option<Sid>) = match from {
+                    let (src_g_id, src_sid): (Option<GraphId>, Option<Sid>) = match from {
                         GraphSel::Default => (Some(0), None),
                         GraphSel::Graph(iri) => {
                             match resolve_named_graph(&ledger, &mut ns_registry, iri) {
@@ -1310,12 +1438,15 @@ async fn stage_graph_mgmt(
                     }
 
                     let src_flakes = match src_g_id {
-                        Some(g) => scan_graph_flakes(&ledger, g, options.tracker).await?,
+                        Some(g) => {
+                            scan_graph_flakes(&ledger, g, src_sid.as_ref(), options.tracker).await?
+                        }
                         None => Vec::new(),
                     };
 
                     let dest_flakes =
-                        scan_graph_flakes(&ledger, dest_g_id, options.tracker).await?;
+                        scan_graph_flakes(&ledger, dest_g_id, dest_sid.as_ref(), options.tracker)
+                            .await?;
 
                     let dest_contents: HashSet<FlakeContent> =
                         dest_flakes.iter().map(flake_content).collect();
@@ -1617,17 +1748,20 @@ async fn hydrate_list_index_meta_for_retractions(
 ) -> Result<()> {
     use std::collections::BTreeMap;
 
-    // Group candidates by (graph, subject, predicate): one range lookup per
-    // group, not one per retraction. Every `range_with_overlay` call pays a
-    // full overlay translation of the graph's novelty (walk + translate +
-    // sort), so per-flake lookups make filtered-DELETE staging
-    // O(matched_triples × novelty log novelty) — observed as a >900s livelock
-    // for ~21k matched triples on a novelty-heavy ledger. Grouped, the cost
-    // scales with distinct (subject, predicate) pairs instead.
+    // Nothing to copy when neither the indexed base nor novelty holds a
+    // single `@list` position. `Some(false)` is an exact observation by the
+    // indexer; `None` (legacy root, bulk import) must fall through.
+    if ledger.snapshot.has_list_meta == Some(false) && !ledger.novelty.has_list_meta {
+        return Ok(());
+    }
+
+    // Group candidates by (graph, subject, predicate).
     let mut groups: HashMap<(GraphId, Sid, Sid), Vec<usize>> = HashMap::new();
     for (idx, flake) in retractions.iter().enumerate() {
-        // Only retractions with no metadata are candidates.
-        if flake.op || flake.m.is_some() {
+        // Only retractions lacking a list position are candidates. A
+        // language-tagged binding already carries `m = { lang, i: None }`
+        // and still needs its position filled in.
+        if flake.op || flake.m.as_ref().is_some_and(|m| m.i.is_some()) {
             continue;
         }
         let g_id = resolve_flake_graph_id(flake, reverse_graph)?;
@@ -1636,32 +1770,70 @@ async fn hydrate_list_index_meta_for_retractions(
             .or_default()
             .push(idx);
     }
+    if groups.is_empty() {
+        return Ok(());
+    }
+
+    let to_t = ledger.t();
+
+    // Novelty side: ONE SPOT walk per touched graph, keeping every op on a
+    // requested (subject, predicate) pair. `range_with_overlay` per group
+    // would instead translate (or walk) the graph's entire overlay once per
+    // group — O(groups × novelty), observed as a multi-minute-to-never
+    // filtered DELETE once both are in the tens of thousands.
+    let mut wanted: HashMap<GraphId, HashSet<(&Sid, &Sid)>> = HashMap::new();
+    for (g_id, s, p) in groups.keys() {
+        wanted.entry(*g_id).or_default().insert((s, p));
+    }
+    let mut overlay_by_key: HashMap<(GraphId, Sid, Sid), Vec<Flake>> = HashMap::new();
+    for (g_id, pairs) in &wanted {
+        ledger.novelty.for_each_overlay_flake(
+            *g_id,
+            IndexType::Spot,
+            None,
+            None,
+            true,
+            to_t,
+            &mut |f| {
+                if f.t <= to_t && pairs.contains(&(&f.s, &f.p)) {
+                    overlay_by_key
+                        .entry((*g_id, f.s.clone(), f.p.clone()))
+                        .or_default()
+                        .push(f.clone());
+                }
+            },
+        );
+    }
 
     for ((g_id, s, p), members) in groups {
-        // Find currently asserted flakes for this (subject, predicate)
-        // (db + novelty overlay) and copy list index meta where present.
+        // Base side: subject + predicate bound against the persisted index
+        // only (`NoOverlay`) — a leaf seek, no overlay translation.
         let rm = fluree_db_core::RangeMatch::new()
-            .with_subject(s)
-            .with_predicate(p);
-
-        let found = fluree_db_core::range_with_overlay(
+            .with_subject(s.clone())
+            .with_predicate(p.clone());
+        let mut found = fluree_db_core::range_with_overlay(
             &ledger.snapshot,
             g_id,
-            ledger.novelty.as_ref(),
-            fluree_db_core::IndexType::Spot,
+            &fluree_db_core::NoOverlay,
+            IndexType::Spot,
             fluree_db_core::RangeTest::Eq,
             rm,
-            fluree_db_core::RangeOptions::new().with_to_t(ledger.t()),
+            fluree_db_core::RangeOptions::new().with_to_t(to_t),
         )
         .await?;
+        if let Some(ops) = overlay_by_key.remove(&(g_id, s, p)) {
+            found.extend(ops);
+        }
+        // Same lifecycle rule `range_with_overlay` applies to its merged
+        // result: newest op per fact key wins, retractions drop out.
+        let found = fluree_db_core::range::resolve_current_flakes(found, IndexType::Spot);
 
         // Index asserted list-carrying metas per object value, in index
         // order. Every matching retraction copies the FIRST dt-compatible
-        // meta — mirroring the per-flake lookup's `.find()` this replaces:
-        // identical duplicates then collapse in the accumulator, so a value
-        // asserted at N list positions loses exactly one entry per distinct
-        // WHERE binding (pinned by the `object-probe-list-retract` case in
-        // `it_join_batched_overlay.rs`).
+        // meta: identical duplicates then collapse in the accumulator, so a
+        // value asserted at N list positions loses exactly one entry per
+        // distinct WHERE binding (pinned by the `object-probe-list-retract`
+        // case in `it_join_batched_overlay.rs`).
         let mut metas: BTreeMap<FlakeValue, Vec<(Sid, fluree_db_core::FlakeMeta)>> =
             BTreeMap::new();
         for f in found {
@@ -1677,13 +1849,17 @@ async fn hydrate_list_index_meta_for_retractions(
 
         for idx in members {
             let flake = &mut retractions[idx];
-            if let Some(candidates) = metas.get(&flake.o) {
-                if let Some((_, m)) = candidates
-                    .iter()
-                    .find(|(dt, _)| fluree_db_core::dt_compatible(&flake.dt, dt))
-                {
-                    flake.m = Some(m.clone());
-                }
+            let Some(candidates) = metas.get(&flake.o) else {
+                continue;
+            };
+            // Same lexical value under different language tags are distinct
+            // facts: the candidate must match the retraction's tag (absent
+            // on both for plain literals) as well as its datatype.
+            let lang = flake.m.as_ref().and_then(|m| m.lang.as_deref());
+            if let Some((_, m)) = candidates.iter().find(|(dt, m)| {
+                fluree_db_core::dt_compatible(&flake.dt, dt) && m.lang.as_deref() == lang
+            }) {
+                flake.m = Some(m.clone());
             }
         }
     }
@@ -2584,9 +2760,9 @@ fn lower_where_patterns(
 
 /// Generate a unique transaction ID for blank node skolemization
 pub fn generate_txn_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use fluree_db_core::clock::SystemTime;
     let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+        .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     format!("{now:x}")
@@ -2766,10 +2942,18 @@ async fn generate_upsert_deletions(
     // system RAM when indexing lags — which is why it runs at most once per
     // graph, and only on demand. It is authoritative in Sid space, needing
     // no dictionary translation.
-    // A snapshot with no range provider at all has no base index (genesis, or
-    // nothing indexed yet), so novelty is the only place a subject can exist
-    // and the presence check below is authoritative on its own.
-    let base_index_absent = ledger.snapshot.range_provider.is_none();
+    // Genesis, or nothing indexed yet: novelty is the only place a subject can
+    // exist, so the presence check below is authoritative on its own.
+    //
+    // The `t == 0` conjunct mirrors `fluree_db_core::range`, which treats a
+    // missing range provider as an empty index only at genesis and errors
+    // otherwise ("binary-only db has no range_provider attached"). A binary
+    // store that fails to load is non-fatal in the ledger manager, which leaves
+    // an indexed ledger (`t > 0`) with no provider attached; subjects there DO
+    // have base rows we cannot see, so absence must stay undecidable and the
+    // per-predicate query must run — that path surfaces the load failure
+    // instead of silently skipping every retraction.
+    let base_index_absent = ledger.snapshot.range_provider.is_none() && ledger.snapshot.t == 0;
     let can_decide_absence = binary_store.is_some() || base_index_absent;
 
     let mut per_g_subjects: HashMap<u16, HashSet<&Sid>> = HashMap::new();
@@ -2789,8 +2973,10 @@ async fn generate_upsert_deletions(
     // per-predicate query surfaces the real failure.
     let subject_in_base = |subject: &Sid| -> bool {
         let Some(store) = binary_store.as_deref() else {
-            // Nothing to consult: absent iff there is no base index at all.
-            return !base_index_absent;
+            // Only reachable under `base_index_absent` (the caller gates on
+            // `can_decide_absence`): there is no base index, so no subject has
+            // rows in one. Novelty presence decides.
+            return false;
         };
         if matches!(
             store.find_subject_id_by_parts(subject.namespace_code, &subject.name),
@@ -2798,11 +2984,16 @@ async fn generate_upsert_deletions(
         ) {
             return true;
         }
-        // Resolve the subject IRI so the store's full-IRI fallback can run. The
-        // snapshot is consulted first; when it cannot decode the namespace code
-        // the store's own namespace table is tried. A code that NEITHER knows
-        // was minted after the base index was written, so the subject provably
-        // has no rows in it — report absent rather than failing open.
+        // Resolve the subject IRI so the store's full-IRI lookup can run.
+        //
+        // A namespace code the pre-transaction snapshot cannot decode was
+        // minted by this transaction, so it provably names no base-index row —
+        // report absent rather than failing open. The store's own namespace
+        // table is no help as a fallback: it is a subset of the snapshot's (the
+        // index root is a materialized cache at `index_t`, and
+        // `ns_helpers::sync_store_and_snapshot_ns` reconciles its codes back
+        // into the snapshot on load), so it can never decode a code the
+        // snapshot could not.
         //
         // Reporting "present" here instead defeats the skip for every IRI shape
         // that mints a namespace per subject — `MostGranular` splits
@@ -2810,11 +3001,7 @@ async fn generate_upsert_deletions(
         // per-(subject, predicate) degraded scan. Novelty presence is still
         // checked by the caller, so a subject that exists only in unindexed
         // commits is never wrongly skipped.
-        match ledger
-            .snapshot
-            .decode_sid(subject)
-            .or_else(|| store.sid_to_iri(subject))
-        {
+        match ledger.snapshot.decode_sid(subject) {
             Some(iri) => !matches!(store.find_subject_id(&iri), Ok(None)),
             None => false,
         }
@@ -3079,12 +3266,16 @@ pub async fn stage_with_shacl(
     // `enabled_graphs` means "validate every graph with staged flakes" —
     // this legacy path doesn't consult per-graph config.
     let report =
-        validate_staged_nodes(&view, &engine, Some(&graph_sids), tracker, None, None).await?;
+        validate_staged_nodes(&view, &engine, Some(&graph_sids), tracker, None, None, None).await?;
 
     // Reject on violations only — spec-level `conforms` is also false for
     // warnings/infos, which must not block a commit.
     if report.violation_count() > 0 {
-        return Err(TransactError::ShaclViolation(format_shacl_report(&report)));
+        return Err(TransactError::ShaclViolation(format_shacl_report(
+            &report,
+            &base.snapshot,
+            &ns_registry,
+        )));
     }
 
     Ok((view, ns_registry))
@@ -3148,6 +3339,7 @@ pub async fn validate_view_with_shacl(
     per_graph_policy: Option<&HashMap<GraphId, ShaclGraphPolicy>>,
     membership_g_ids: &[GraphId],
     cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
+    sparql_iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
 ) -> Result<ShaclValidationOutcome> {
     // Fast path: if there are no SHACL shapes, elide validation entirely.
     if shacl_cache.is_empty() {
@@ -3171,6 +3363,7 @@ pub async fn validate_view_with_shacl(
         tracker,
         enabled_graphs.as_ref(),
         cross_ledger,
+        sparql_iri_encoder,
     )
     .await?;
 
@@ -3221,6 +3414,7 @@ async fn validate_staged_nodes(
     tracker: Option<&fluree_db_core::Tracker>,
     enabled_graphs: Option<&HashSet<GraphId>>,
     cross_ledger: Option<fluree_db_shacl::CrossLedgerMembership<'_>>,
+    sparql_iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
 ) -> Result<ValidationReport> {
     use fluree_vocab::namespaces::RDF;
     use fluree_vocab::rdf_names;
@@ -3329,7 +3523,7 @@ async fn validate_staged_nodes(
             // SubjectsOf/ObjectsOf handling there for why hints can't be
             // reliably built from staged flakes alone.
             let report = engine
-                .validate_node(db, subject, &node_types, cross_ledger)
+                .validate_node(db, subject, &node_types, cross_ledger, sparql_iri_encoder)
                 .await?;
             // Tag each result with the graph it was validated under so the
             // caller can route warn vs reject per-graph (see
@@ -3353,38 +3547,38 @@ async fn validate_staged_nodes(
     })
 }
 
-/// Format a SHACL validation report as a human-readable string
+/// Format a SHACL validation report as a human-readable string.
+///
+/// Supplies the resolution the shared layout cannot do for itself: Sids decode
+/// against the snapshot's namespaces, falling back to `ns_registry` for
+/// prefixes this transaction registered — a property the transaction itself
+/// introduced is absent from the snapshot until it commits.
+///
+/// Reports full IRIs, unlike the api layer's caller: this crate cannot see the
+/// transaction's JSON-LD context, so there are no author-supplied prefixes to
+/// compact against.
 #[cfg(feature = "shacl")]
-fn format_shacl_report(report: &ValidationReport) -> String {
-    use std::fmt::Write;
+fn format_shacl_report(
+    report: &ValidationReport,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    ns_registry: &NamespaceRegistry,
+) -> String {
+    let violations = fluree_db_shacl::violations_of(&report.results);
 
-    let mut output = String::new();
-    writeln!(
-        &mut output,
-        "SHACL validation failed with {} violation(s):",
-        report.violation_count()
+    fluree_db_shacl::format_violations(
+        &violations,
+        |sid| {
+            snapshot
+                .decode_sid(sid)
+                .or_else(|| {
+                    ns_registry
+                        .get_prefix(sid.namespace_code)
+                        .map(|prefix| format!("{prefix}{}", sid.name))
+                })
+                .unwrap_or_else(|| fluree_db_shacl::unresolved_sid(sid))
+        },
+        str::to_string,
     )
-    .ok();
-
-    for (i, result) in report
-        .results
-        .iter()
-        .filter(|r| r.severity == fluree_db_shacl::Severity::Violation)
-        .enumerate()
-    {
-        writeln!(&mut output, "  {}. {}", i + 1, result.message).ok();
-        writeln!(&mut output, "     Focus node: {}", result.focus_node).ok();
-        if let Some(path) = &result.result_path {
-            writeln!(
-                &mut output,
-                "     Path: {}{}",
-                path.namespace_code, path.name
-            )
-            .ok();
-        }
-    }
-
-    output
 }
 
 #[cfg(test)]
