@@ -352,14 +352,12 @@ impl<'a> Lowerer<'a> {
                     match self.allowed(tm, &members[*i].0)? {
                         Some(Verdict::Allow) => {}
                         Some(Verdict::Deny) => return Ok(Ok(None)),
-                        Some(Verdict::ByClass { classes, otherwise }) => {
-                            match self.policy_pred(&alias, tm, &classes, otherwise) {
-                                Ok(Ok(Some(pred))) => self.place_pred(pred),
-                                Ok(Ok(None)) => {}
-                                Ok(Err(Empty)) => return Ok(Ok(None)),
-                                Err(d) => return Ok(Err(d)),
-                            }
-                        }
+                        Some(verdict) => match self.verdict_pred(&alias, tm, &verdict) {
+                            Ok(Ok(Some(pred))) => self.place_pred(pred),
+                            Ok(Ok(None)) => {}
+                            Ok(Err(Empty)) => return Ok(Ok(None)),
+                            Err(d) => return Ok(Err(d)),
+                        },
                         None => return Ok(Err(Decline("policy not static"))),
                     }
                 }
@@ -687,6 +685,110 @@ impl<'a> Lowerer<'a> {
                 op: CmpOp::In,
                 value: Literal::Set(allowed),
             }
+        })))
+    }
+
+    /// The alias the next [`Self::new_access`] mints.
+    fn next_alias_name(&self) -> String {
+        format!("t{}", self.next_alias)
+    }
+
+    /// A row-dependent verdict as a predicate on `tm`'s access `alias`;
+    /// `Empty` when no row can pass.
+    fn verdict_pred(
+        &self,
+        alias: &str,
+        tm: &TriplesMap,
+        verdict: &Verdict,
+    ) -> Lowering<std::result::Result<Option<Pred>, Empty>> {
+        match verdict {
+            Verdict::Allow => Ok(Ok(None)),
+            Verdict::Deny => Ok(Err(Empty)),
+            Verdict::ByClass { classes, otherwise } => {
+                self.policy_pred(alias, tm, classes, *otherwise)
+            }
+            Verdict::BySubject {
+                subjects,
+                otherwise,
+            } => self.subject_pred(alias, tm, subjects, *otherwise),
+        }
+    }
+
+    /// A [`Verdict::BySubject`] as a predicate on the subject key columns:
+    /// each targeted subject reverses through the subject template (or is
+    /// the column's value) into a key; a subject the map cannot mint has no
+    /// row and is dropped. A constant subject decides the whole map.
+    fn subject_pred(
+        &self,
+        alias: &str,
+        tm: &TriplesMap,
+        subjects: &[(String, bool)],
+        otherwise: bool,
+    ) -> Lowering<std::result::Result<Option<Pred>, Empty>> {
+        let sm = &tm.subject_map;
+        if let Some(constant) = &sm.constant {
+            let verdict = subjects
+                .iter()
+                .find(|(s, _)| s == constant)
+                .map_or(otherwise, |(_, ok)| *ok);
+            return Ok(if verdict { Ok(None) } else { Err(Empty) });
+        }
+        let (mut allowed, mut denied) = (Vec::new(), Vec::new());
+        for (subject, ok) in subjects {
+            let key = if let Some(template) = &sm.template {
+                let prefix = template.split('{').next().unwrap_or_default();
+                if !subject.starts_with(prefix) {
+                    continue;
+                }
+                let Some(keys) = reverse_subject_template(template, subject) else {
+                    return decline("subject template cannot be reversed");
+                };
+                let mut parts = Vec::with_capacity(keys.len());
+                let mut fits = true;
+                for (column, raw) in keys {
+                    let col = ColRef::new(alias, &column);
+                    if !key_fits(self.field_type(&col), &raw) {
+                        fits = false;
+                        break;
+                    }
+                    parts.push(Pred::Cmp {
+                        col,
+                        op: CmpOp::Eq,
+                        value: Literal::TemplateKey(raw),
+                    });
+                }
+                if !fits {
+                    continue;
+                }
+                match parts.len() {
+                    1 => parts.pop().unwrap(),
+                    _ => Pred::And(parts),
+                }
+            } else if let Some(column) = &sm.column {
+                let col = ColRef::new(alias, column);
+                if !matches!(self.field_type(&col), None | Some(FieldType::String)) {
+                    return decline("subject column type cannot be keyed");
+                }
+                Pred::Cmp {
+                    col,
+                    op: CmpOp::Eq,
+                    value: Literal::TemplateKey(subject.clone()),
+                }
+            } else {
+                return decline("subject policy on a blank-node subject map");
+            };
+            if *ok { &mut allowed } else { &mut denied }.push(key);
+        }
+        Ok(Ok(Some(if otherwise {
+            if denied.is_empty() {
+                return Ok(Ok(None));
+            }
+            Pred::Not(Box::new(any_of(denied)))
+        } else {
+            if allowed.is_empty() {
+                return Ok(Err(Empty));
+            }
+            any_of(allowed)
         })))
     }
 
@@ -1338,7 +1440,9 @@ impl<'a> Lowerer<'a> {
                     Some(Verdict::Deny) => continue, // hidden: the variable stays unbound
                     // Hidden per row: the column would have to be nulled
                     // by a predicate, which no statement here expresses.
-                    Some(Verdict::ByClass { .. }) | None => return decline("policy not static"),
+                    Some(Verdict::ByClass { .. } | Verdict::BySubject { .. }) | None => {
+                        return decline("policy not static")
+                    }
                 }
                 match self.bind_member(&alias, tm, pred, obj, required_subjects, true) {
                     Ok(Ok(None)) => {}
@@ -1355,6 +1459,11 @@ impl<'a> Lowerer<'a> {
             Ok(tm) => tm,
             Err(Empty) => return Ok(()), // nothing to join: its vars stay unbound
         };
+        // A row-dependent verdict joins as a condition: a row it hides
+        // simply does not join, and the variables stay unbound. Its
+        // predicates name the access this entity is about to get.
+        let alias = self.next_alias_name();
+        let mut policy_on: Vec<Pred> = Vec::new();
         for (pred, _) in members {
             match self
                 .allowed(tm, pred)
@@ -1362,11 +1471,17 @@ impl<'a> Lowerer<'a> {
             {
                 Some(Verdict::Allow) => {}
                 Some(Verdict::Deny) => return Ok(()),
-                Some(Verdict::ByClass { .. }) | None => return decline("policy not static"),
+                Some(verdict) => match self.verdict_pred(&alias, tm, &verdict)? {
+                    Ok(Some(p)) => policy_on.push(p),
+                    Ok(None) => {}
+                    Err(Empty) => return Ok(()),
+                },
+                None => return decline("policy not static"),
             }
         }
+        debug_assert_eq!(alias, self.next_alias_name());
         let alias = self.new_access(tm);
-        let mut on: Vec<Pred> = Vec::new();
+        let mut on: Vec<Pred> = policy_on;
         for c in tm.subject_columns() {
             on.push(Pred::IsNotNull(ColRef::new(&alias, c)));
         }
@@ -2187,6 +2302,39 @@ fn decimal_literal(bd: &bigdecimal::BigDecimal) -> Option<Literal> {
         unscaled: unscaled_bi.to_i128()?,
         scale: i8::try_from(scale).ok()?,
     })
+}
+
+/// A disjunction of key predicates; equalities on one column fold into an
+/// `IN` list.
+fn any_of(mut keys: Vec<Pred>) -> Pred {
+    if keys.len() == 1 {
+        return keys.pop().unwrap();
+    }
+    let single = keys
+        .iter()
+        .all(|k| matches!(k, Pred::Cmp { op: CmpOp::Eq, .. }));
+    let same_col = keys
+        .windows(2)
+        .all(|w| matches!((&w[0], &w[1]), (Pred::Cmp { col: a, .. }, Pred::Cmp { col: b, .. }) if a == b));
+    if single && same_col {
+        let col = match &keys[0] {
+            Pred::Cmp { col, .. } => col.clone(),
+            _ => unreachable!(),
+        };
+        let values = keys
+            .into_iter()
+            .map(|k| match k {
+                Pred::Cmp { value, .. } => value,
+                _ => unreachable!(),
+            })
+            .collect();
+        return Pred::Cmp {
+            col,
+            op: CmpOp::In,
+            value: Literal::Set(values),
+        };
+    }
+    Pred::Or(keys)
 }
 
 /// The widest offset a zone can put between a naive timestamp and the

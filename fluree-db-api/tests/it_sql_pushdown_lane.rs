@@ -1088,8 +1088,10 @@ async fn static_policy_prunes_the_statement() {
         "{rows}"
     );
 
-    // Subject targeting is not static: the lane declines, the scan lane hides
-    // the one subject.
+    // A subject-targeted policy is a key predicate (see
+    // `subject_policy_pushes_a_key_predicate`); a policy on both a subject
+    // and a class the map derives per row is not static: the lane declines
+    // and the scan lane decides per row.
     let before = block_statements(&server).await.len();
     let before_events = store.find_events("fast-path outcome").len();
     let rows = run(
@@ -1102,14 +1104,172 @@ async fn static_policy_prunes_the_statement() {
     )
     .await;
     assert_eq!(rows, json!([["Bo"], ["Cy"]]), "{rows}");
-    assert_eq!(
-        block_statements(&server).await.len(),
-        before,
-        "declined: no block statement"
-    );
+    assert_eq!(block_statements(&server).await.len(), before + 1);
     let proceeded = proceeded_sites(&store, before_events);
-    assert!(!proceeded.iter().any(|s| s == SITE), "{proceeded:?}");
+    assert!(proceeded.iter().any(|s| s == SITE), "{proceeded:?}");
     drop(tracing_guard);
+}
+
+/// A subject-targeted view policy is decided per targeted subject and
+/// pushed as a predicate on the subject key columns, where the lane used to
+/// decline; a subject the map cannot mint adds nothing, and on an optional
+/// entity the predicate joins as a condition so hidden rows leave the
+/// variables unbound. The per-scan lane, deciding per row, is the oracle.
+#[tokio::test]
+async fn subject_policy_pushes_a_key_predicate() {
+    let _lock = KILL_SWITCH.lock().await;
+    let (server, fluree) = setup().await;
+    let context = json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"});
+    let on_subjects = |allow: bool, subjects: &[&str]| {
+        json!([{
+            "@id": "http://example.org/p", "@type": "f:AccessPolicy", "f:action": "f:view",
+            "f:allow": allow,
+            "f:onSubject": subjects.iter().map(|s| json!({"@id": s})).collect::<Vec<_>>()
+        }])
+    };
+    let run = |from: &str, policy: Value, default_allow: bool, r#where: Value, select: Value| {
+        let fluree = &fluree;
+        let context = context.clone();
+        let from = from.to_string();
+        async move {
+            let q = json!({
+                "@context": context,
+                "from": from,
+                "opts": {"policy": policy, "default-allow": default_allow},
+                "select": select,
+                "where": r#where,
+            });
+            let lane = fluree
+                .query_from()
+                .jsonld(&q)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("policy query failed: {e}"));
+            set_fast_paths_disabled(true);
+            let scan = fluree
+                .query_from()
+                .jsonld(&q)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("policy query failed: {e}"));
+            set_fast_paths_disabled(false);
+            assert_eq!(lane, scan, "scan lane disagrees");
+            lane
+        }
+    };
+    let names = json!({"@id": "?c", "ex:name": "?n"});
+    let name = json!(["?n"]);
+
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        "shop-sql:main",
+        on_subjects(false, &["http://example.org/customer/1"]),
+        true,
+        names.clone(),
+        name.clone(),
+    )
+    .await;
+    assert_eq!(rows, json!([["Bo"], ["Cy"]]), "{rows}");
+    assert_eq!(
+        block_statements(&server).await[before..],
+        [r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND NOT ("t0"."id" = 1) AND "t0"."name" IS NOT NULL"#.to_string()]
+    );
+
+    // Allowed subjects under a deny default: only their rows stay.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        "shop-sql:main",
+        on_subjects(
+            true,
+            &[
+                "http://example.org/customer/2",
+                "http://example.org/customer/3",
+            ],
+        ),
+        false,
+        names.clone(),
+        name.clone(),
+    )
+    .await;
+    assert_eq!(rows, json!([["Bo"], ["Cy"]]), "{rows}");
+    assert_eq!(
+        block_statements(&server).await[before..],
+        [r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."id" IN (2, 3) AND "t0"."name" IS NOT NULL"#.to_string()]
+    );
+
+    // A subject outside the template names no row of this map.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        "shop-sql:main",
+        on_subjects(false, &["http://example.org/order/10"]),
+        true,
+        names.clone(),
+        name.clone(),
+    )
+    .await;
+    assert_eq!(rows, json!([["Ada"], ["Bo"], ["Cy"]]), "{rows}");
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert!(!sent[0].contains(" IN "), "{}", sent[0]);
+
+    // On an optional entity the predicate is a join condition: the hidden
+    // order does not join, and Ada keeps her other order.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        "shop-sql:main",
+        on_subjects(false, &["http://example.org/order/10"]),
+        true,
+        json!([
+            {"@id": "?c", "ex:name": "?n"},
+            ["optional", {"@id": "?o", "ex:customer": "?c"}]
+        ]),
+        json!(["?n", "?o"]),
+    )
+    .await;
+    let orders: Vec<String> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{}:{}",
+                r[0].as_str().unwrap(),
+                r[1].as_str().unwrap_or("-")
+            )
+        })
+        .collect();
+    assert_eq!(
+        orders
+            .iter()
+            .map(|s| s.rsplit('/').next().unwrap_or(s))
+            .collect::<Vec<_>>(),
+        vec!["11", "12", "Cy:-"],
+        "{rows}"
+    );
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert!(
+        sent[0].contains(r#"LEFT JOIN "shop"."orders" AS "t1" ON NOT ("t1"."id" = 10) AND"#),
+        "{}",
+        sent[0]
+    );
+
+    // A subject policy beside a class policy over a column-derived type is
+    // decided per row: the lane declines.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        "shop-typed:main",
+        json!([
+            {"@id": "http://example.org/p1", "@type": "f:AccessPolicy", "f:action": "f:view",
+             "f:allow": false, "f:onSubject": [{"@id": "http://example.org/person/1"}]},
+            {"@id": "http://example.org/p2", "@type": "f:AccessPolicy", "f:action": "f:view",
+             "f:allow": false, "f:onClass": [{"@id": "http://example.org/kind/guest"}]}
+        ]),
+        true,
+        json!({"@id": "?p", "ex:name": "?n"}),
+        name,
+    )
+    .await;
+    assert_eq!(rows, json!([["Cy"], ["Di"]]), "{rows}");
+    assert_eq!(block_statements(&server).await.len(), before, "declined");
 }
 
 /// Bindings the outer query already holds are sent into the statement as a

@@ -422,9 +422,16 @@ moment. Consequently
   targeted class and pushed as a predicate on that column: rows of a denied
   class drop out (`"kind" IS NULL OR NOT ("kind" IN ('staff'))`, a row
   without a class keeping the default), or only rows of an allowed class stay
-  (`"kind" IN ('guest')`). A subject-targeted policy, a map deriving classes
-  from several columns or maps, and a policy on an `OPTIONAL` member of such
-  a map still leave the block to the per-scan lane.
+  (`"kind" IN ('guest')`). An `f:onSubject` policy is decided per targeted
+  subject the same way and pushed on the subject key columns, each subject
+  reversed through the subject template (`NOT ("id" IN (1, 9))`, or
+  `"id" IN (2, 3)` under a deny default); a subject the template cannot
+  mint adds nothing. On an optional entity either predicate joins as a
+  condition, so a hidden row leaves the optional variables unbound. A
+  subject policy beside a class policy over a column-derived type, a map
+  deriving classes from several columns or maps, and a policy on an
+  `OPTIONAL` member of the entity it hides still leave the block to the
+  per-scan lane.
 
 ## Running the bridge
 
