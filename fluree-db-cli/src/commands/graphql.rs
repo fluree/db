@@ -72,6 +72,9 @@ pub async fn run(
         variables,
         operation_name: operation.map(str::to_string),
         explain,
+        // The server's defaults, not `unlimited`: a document that works here
+        // should be one the endpoint will also accept.
+        limits: fluree_db_api::graphql::Limits::default(),
     };
     // A mutation needs the ledger itself, not a read view — decided from the
     // document, since there is no other signal.

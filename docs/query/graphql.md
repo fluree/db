@@ -167,6 +167,28 @@ standard client reads. Only a malformed request envelope is a 4xx.
 Codes: `GRAPHQL_PARSE_FAILED`, `SCHEMA_ERROR`, `UNSUPPORTED_QUERY`,
 `EXECUTION_ERROR`, `EMPTY_SCHEMA`.
 
+## Limits
+
+The endpoint runs inside the server's ordinary query timeout and
+client-disconnect cancellation, and all of one document's root fields share a
+single handle — they resolve concurrently, so cancelling one has to cancel all
+of them.
+
+Two limits bound the document itself, because a derived schema is cyclic
+wherever one class references another and so the caller, not the schema, picks
+the nesting depth:
+
+| Limit | Default | Setting |
+| --- | --- | --- |
+| Nesting depth | 15 | `graphql_max_depth` |
+| Fields per document | 1000 | `graphql_max_complexity` |
+
+Depth counts field levels — `{ persons { knows { name } } }` is 3 — and
+fragments do not add a level. The field budget spans every alias and fragment,
+which is what bounds an aliased fan-out. Exceeding either is a `200` with
+`errors` and nothing executed. See
+[Configuration](../operations/configuration.md#graphql-document-limits).
+
 ## Not yet supported
 
 - `where` on a nested field — filtering a nested level means evaluating a

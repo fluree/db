@@ -506,3 +506,92 @@ async fn explain_is_returned_when_asked_for() {
     let json: Value = serde_json::from_str(&body).unwrap();
     assert!(json.get("extensions").is_none(), "{body}");
 }
+
+// ── Resource bounds ──────────────────────────────────────────────────────────
+
+/// A server with tight GraphQL limits, over the storage `seeded` just wrote.
+///
+/// Rebuilding state rather than seeding through the limited server: the seed
+/// itself is a transaction, and a depth limit low enough to be interesting
+/// would refuse the queries the fixture makes.
+async fn seeded_with_limits(
+    ledger: &str,
+    max_depth: usize,
+    max_complexity: usize,
+) -> (TempDir, Arc<AppState>) {
+    let (tmp, _) = seeded(ledger).await;
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        graphql_max_depth: max_depth,
+        graphql_max_complexity: max_complexity,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState"));
+    (tmp, state)
+}
+
+#[tokio::test]
+async fn a_document_past_the_configured_depth_is_refused() {
+    let (_tmp, state) = seeded_with_limits("gqlhttp-depth", 3, 1000).await;
+
+    let deep = "{ persons { knows { knows { knows { id } } } } }";
+    let (status, body) = send(&state, post_json("gqlhttp-depth", json!({ "query": deep }))).await;
+
+    // A GraphQL error is a 200 with `errors`, like every other refusal here.
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json.get("errors").is_some(),
+        "a document past graphql_max_depth must be refused: {body}"
+    );
+}
+
+#[tokio::test]
+async fn an_alias_fan_out_past_the_configured_complexity_is_refused() {
+    let (_tmp, state) = seeded_with_limits("gqlhttp-complexity", 15, 20).await;
+
+    let document = format!(
+        "{{ {} }}",
+        (0..50)
+            .map(|i| format!("a{i}: persons {{ id name }}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let (status, body) = send(
+        &state,
+        post_json("gqlhttp-complexity", json!({ "query": document })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json.get("errors").is_some(),
+        "a 50-alias document must not run under a 20-field budget: {body}"
+    );
+    assert!(
+        json["data"].get("a0").is_none(),
+        "the document must be refused before any field resolves: {body}"
+    );
+}
+
+/// The limits are a ceiling, not a filter: an ordinary document is unaffected.
+#[tokio::test]
+async fn the_default_limits_do_not_touch_an_ordinary_document() {
+    let (_tmp, state) = seeded("gqlhttp-limits-ok").await;
+    let (status, body) = send(
+        &state,
+        post_json(
+            "gqlhttp-limits-ok",
+            json!({ "query": "{ persons { id name knows { id name } } }" }),
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert!(json.get("errors").is_none(), "{body}");
+}

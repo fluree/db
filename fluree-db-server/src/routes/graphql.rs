@@ -12,6 +12,8 @@ use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::graphql::GraphQlRequest;
+use fluree_db_api::graphql::Limits;
+use fluree_db_api::QueryExecutionOptions;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tracing::Instrument;
@@ -58,26 +60,43 @@ pub async fn graphql_ledger_tail(
         None,
     );
 
-    async move {
-        authorize_read(&state, &ledger, &bearer, &credential)?;
-        let request = parse_request(&params, &credential)?;
+    // One document resolves its root fields concurrently, so all of a request's
+    // queries share the cancellation handle this installs: a timeout or a
+    // client disconnect cancels the whole fan-out, not one field of it.
+    let timeout_ms = state.config.query_timeout_ms;
+    let limits = graphql_limits(&state);
+    crate::query_control::run_query_task(timeout_ms, move || {
+        async move {
+            authorize_read(&state, &ledger, &bearer, &credential)?;
+            let request = parse_request(&params, &credential, limits)?;
+            let options = crate::query_control::current_query_execution_options(timeout_ms);
 
-        // A GraphQL error is part of the response body, not a transport failure:
-        // the spec has clients read `errors`, and returning 4xx for an unknown
-        // field would break every standard client.
-        let response = if fluree_db_api::graphql::is_mutation(&request) {
-            execute_mutation(&state, &ledger, &headers, &bearer, &credential, &request).await?
-        } else {
-            let view = policy_view(&state, &ledger, &headers, &bearer, &credential).await?;
-            state
-                .fluree
-                .graphql(&view, &request)
-                .await
-                .map_err(ServerError::Api)?
-        };
-        Ok(Json(response).into_response())
-    }
-    .instrument(span)
+            // A GraphQL error is part of the response body, not a transport failure:
+            // the spec has clients read `errors`, and returning 4xx for an unknown
+            // field would break every standard client.
+            let response = if fluree_db_api::graphql::is_mutation(&request) {
+                execute_mutation(
+                    &state,
+                    &ledger,
+                    &headers,
+                    &bearer,
+                    &credential,
+                    &request,
+                    options,
+                )
+                .await?
+            } else {
+                let view = policy_view(&state, &ledger, &headers, &bearer, &credential).await?;
+                state
+                    .fluree
+                    .graphql_with_options(&view, &request, options)
+                    .await
+                    .map_err(ServerError::Api)?
+            };
+            Ok(Json(response).into_response())
+        }
+        .instrument(span)
+    })
     .await
 }
 
@@ -132,6 +151,7 @@ async fn execute_mutation(
     bearer: &MaybeDataBearer,
     credential: &MaybeCredential,
     request: &GraphQlRequest,
+    options: QueryExecutionOptions,
 ) -> Result<JsonValue> {
     // Writing needs write authority, which reading does not imply.
     if let Some(p) = bearer.0.as_ref() {
@@ -155,10 +175,26 @@ async fn execute_mutation(
         .map_err(ServerError::Api)?;
     let (response, _committed) = state
         .fluree
-        .graphql_transact(loaded, context, request)
+        .graphql_transact_with_options(loaded, context, request, options)
         .await
         .map_err(ServerError::Api)?;
     Ok(response)
+}
+
+/// The configured document bounds. `0` on either knob means "no ceiling",
+/// matching how `query_timeout_ms = 0` disables the timeout.
+fn graphql_limits(state: &AppState) -> Limits {
+    let unlimited = Limits::unlimited();
+    Limits {
+        max_depth: match state.config.graphql_max_depth {
+            0 => unlimited.max_depth,
+            n => n,
+        },
+        max_complexity: match state.config.graphql_max_complexity {
+            0 => unlimited.max_complexity,
+            n => n,
+        },
+    }
 }
 
 fn authorize_read(
@@ -227,7 +263,11 @@ async fn policy_view(
     }
 }
 
-fn parse_request(params: &GraphQlParams, credential: &MaybeCredential) -> Result<GraphQlRequest> {
+fn parse_request(
+    params: &GraphQlParams,
+    credential: &MaybeCredential,
+    limits: Limits,
+) -> Result<GraphQlRequest> {
     // A `?query=` parameter wins: that is a GET, which has no body.
     if let Some(query) = &params.query {
         let variables = match &params.variables {
@@ -241,6 +281,7 @@ fn parse_request(params: &GraphQlParams, credential: &MaybeCredential) -> Result
             variables,
             operation_name: params.operation_name.clone(),
             explain: params.explain.unwrap_or(false),
+            limits,
         });
     }
 
@@ -250,6 +291,7 @@ fn parse_request(params: &GraphQlParams, credential: &MaybeCredential) -> Result
     let Ok(JsonValue::Object(envelope)) = serde_json::from_str::<JsonValue>(&body) else {
         let mut request = GraphQlRequest::new(body);
         request.explain = params.explain.unwrap_or(false);
+        request.limits = limits;
         return Ok(request);
     };
     let query = envelope
@@ -271,5 +313,6 @@ fn parse_request(params: &GraphQlParams, credential: &MaybeCredential) -> Result
                 .and_then(|e| e.get("explain"))
                 .and_then(JsonValue::as_bool)
                 .unwrap_or(false),
+        limits,
     })
 }

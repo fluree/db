@@ -18,5 +18,7 @@ pub fn sdl_with_mutations(
     model: &SchemaModel,
     mutations: &[crate::mutate::MutationField],
 ) -> Result<String> {
-    Ok(build_schema(model, mutations)?.sdl())
+    // Limits do not appear in SDL and this schema is never executed, so the
+    // defaults stand in for whatever the endpoint is configured with.
+    Ok(build_schema(model, mutations, &crate::limits::Limits::default())?.sdl())
 }

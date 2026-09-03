@@ -23,6 +23,7 @@
 //! See `GRAPHQL.md` at the repo root for the full mapping specification.
 
 pub mod error;
+pub mod limits;
 pub mod lower;
 pub mod mutate;
 pub mod naming;

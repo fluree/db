@@ -39,6 +39,8 @@ storage_path = "/var/lib/fluree"
 log_level = "info"
 query_timeout_ms = 900000  # 15 minutes; set to 0 to disable
 query_min_t_timeout_ms = 5000
+graphql_max_depth = 15         # GraphQL nesting depth; 0 disables
+graphql_max_complexity = 1000  # GraphQL fields per document; 0 disables
 # cache_max_mb = 4096  # global in-memory cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
 # disk_cache_max_mb = 20480  # global on-disk cache budget (MB), shared across object storage + Iceberg; default: auto-detect; 0 disables
 # iceberg_local_roots = "/data/warehouse:/srv/lake"  # allow catalog-less Iceberg tables under these dirs; default: unset (local-filesystem tables disabled)
@@ -359,6 +361,36 @@ operators can stop at the next checkpoint.
 `query_min_t_timeout_ms` caps HTTP read-after-write waits from `Fluree-Min-T`, `opts.min-t`, and numeric `@t` snapshot pins. It remains enforced even when `query_timeout_ms = 0`.
 
 `stream_heartbeat_ms` is the keep-alive cadence for the [streaming query endpoint](../api/streaming-query.md) (`/stream/query`). Records flush at this interval during stalls so a long-running query survives a fronting proxy's idle timeout; set it below that timeout (e.g. under CloudFront/ALB's ~60s). `0` disables heartbeats.
+
+The [GraphQL endpoint](../query/graphql.md) runs inside the same timeout and
+cancellation scope, and one document's root fields share a single handle — so a
+timeout or a client disconnect stops all of them, not whichever field checks
+next.
+
+### GraphQL Document Limits
+
+A GraphQL schema derived from a ledger is cyclic wherever one class references
+another, so nesting depth is chosen by the caller rather than by the schema.
+Root fields also resolve concurrently, which means aliases multiply whatever one
+field costs. Two limits bound a document; both apply only to the GraphQL
+surface.
+
+| Flag                        | Env Var                          | Default |
+| --------------------------- | -------------------------------- | ------- |
+| `--graphql-max-depth`       | `FLUREE_GRAPHQL_MAX_DEPTH`       | `15`    |
+| `--graphql-max-complexity`  | `FLUREE_GRAPHQL_MAX_COMPLEXITY`  | `1000`  |
+
+`graphql_max_depth` counts field levels the way GraphQL tooling does: the root
+field is level 1 and a leaf is a level of its own, so
+`{ persons { knows { name } } }` is depth 3. Fragments and inline fragments are
+flattened into the level that holds them and do not count. `graphql_max_complexity`
+is a budget of fields per document, across every alias and fragment, which is
+what bounds alias fan-out.
+
+Both are checked before execution: a document past either limit comes back as a
+`200` with an `errors` array — the GraphQL spec's shape for a refusal — having
+run nothing. Set either to `0` to disable that limit, the same way
+`query_timeout_ms = 0` disables the timeout.
 
 ### Query-Time Refresh
 

@@ -120,6 +120,40 @@ Two things the spike settled that constrain the rest of the design:
   resolver uses it for `FieldValue::with_type`. Nested pass-throughs *borrow* out of the root's owned
   JSON (async-graphql keeps a parent `FieldValue` alive across its children), so only leaf values copy.
 
+### Resource bounds
+
+Every other read surface is bounded by the server's query timeout and its
+client-disconnect cancellation, both installed by `run_query_task` and carried
+in a `QueryExecutionOptions` the route builds. GraphQL has to join that scope
+rather than invent its own, and two properties make it awkward:
+
+- **The handle has to be shared across a whole request.** async-graphql resolves
+  root fields concurrently, so one document is N queries. `LedgerExecutor` holds
+  the options and hands the same clone to every `query_with_options` — one
+  timeout, one disconnect, all N cancelled together. A per-field handle would
+  bound each query and still let the fan-out run unbounded in aggregate.
+- **The document's own cost is bounded separately.** A timeout limits how long
+  one query runs; it does not limit how many a document launches, and it does
+  nothing about recursion that happens before execution. A derived schema is
+  cyclic wherever one class references another, so depth is the caller's choice.
+
+Hence two limits, in `limits.rs`, defaulting to depth 15 and 1000 fields and
+configurable as `graphql_max_depth` / `graphql_max_complexity`:
+
+- **Depth is checked twice.** `Schema::build` gets `limit_depth`, but
+  `parse_query` and `selection::extract` run *before* `schema.execute()` — a
+  schema-level limit alone would let a deep document recurse through the
+  extraction walk first. `selection::walk` therefore carries its own counter.
+  It counts the way async-graphql's `DepthCalculate` does (a field is a level, a
+  fragment is not), so the two agree on which documents are refusable.
+- **Complexity is checked by the schema.** It bounds total fields across aliases
+  and fragments, which is what caps the fan-out. The pre-execution walk does not
+  duplicate it: the parse it would protect is already bounded by the body limit.
+
+The limits are baked into the registered schema, which is cached per ledger
+version — so they are part of `RegisteredKey`. Without that the first request
+through would fix the ceiling for every later one.
+
 ## Mapping specification
 
 ### Types
@@ -509,6 +543,10 @@ Each of these was reached and deliberately left, not overlooked.
 - **Dataset / multi-graph queries**: tier 1 unions per-graph class stats; a `graph:` root argument
   is a follow-up.
 - **Subscriptions and federation** — see Non-goals.
+- **Fuel accounting.** The lowered query carries no `opts.maxFuel`, so
+  `tracker_for_limits` runs it untracked; the timeout is the only ceiling on a
+  single query's cost. Exposing a fuel budget on the GraphQL surface would give
+  a second, work-proportional bound.
 
 Two open questions from the original plan, now answered:
 

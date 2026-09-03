@@ -39,7 +39,9 @@ use fluree_db_query::policy::QueryPolicyEnforcer;
 use serde_json::{json, Value as JsonValue};
 
 use crate::error::ApiError;
-use crate::{Fluree, GraphDb, LedgerState, Result};
+use crate::{Fluree, GraphDb, LedgerState, QueryExecutionOptions, Result};
+
+pub use fluree_db_graphql::limits::{Limits, DEFAULT_MAX_COMPLEXITY, DEFAULT_MAX_DEPTH};
 
 /// A GraphQL request in the usual HTTP envelope.
 #[derive(Debug, Clone, Default)]
@@ -54,6 +56,12 @@ pub struct GraphQlRequest {
     /// because silently not writing when the caller asked to see the plan would
     /// be the more surprising behaviour.
     pub explain: bool,
+    /// What this document is allowed to ask for.
+    ///
+    /// Set by whoever runs the endpoint, never by the client: unlike the fields
+    /// above, nothing in the HTTP envelope maps here. A server reads it from
+    /// configuration; an embedder running its own documents can widen it.
+    pub limits: Limits,
 }
 
 impl GraphQlRequest {
@@ -63,7 +71,14 @@ impl GraphQlRequest {
             variables: None,
             operation_name: None,
             explain: false,
+            limits: Limits::default(),
         }
+    }
+
+    /// Set the resource bounds this document must respect.
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
     }
 
     pub fn with_variables(mut self, variables: JsonValue) -> Self {
@@ -842,6 +857,12 @@ struct LedgerExecutor {
     /// What each root field lowered to, collected when `explain` was asked for.
     /// `None` costs nothing on the ordinary path.
     explain: Option<parking_lot::Mutex<Vec<JsonValue>>>,
+    /// Cancellation and timeout controls for every query this request runs.
+    ///
+    /// GraphQL resolves root fields concurrently, so one document can launch
+    /// many queries; they share one handle so a timeout or a client disconnect
+    /// cancels all of them, not whichever happens to check next.
+    options: QueryExecutionOptions,
 }
 
 impl LedgerExecutor {
@@ -883,7 +904,7 @@ impl RootExecutor for LedgerExecutor {
         );
         let result = self
             .fluree
-            .query(&self.db, &lowered.query)
+            .query_with_options(&self.db, &lowered.query, self.options.clone())
             .await
             .map_err(|e| GqlError::Execution(e.to_string()))?;
         let rows = result
@@ -1001,7 +1022,7 @@ impl LedgerExecutor {
 
         let result = self
             .fluree
-            .query(view, &lowered.query)
+            .query_with_options(view, &lowered.query, self.options.clone())
             .await
             .map_err(|e| GqlError::Execution(e.to_string()))?;
         let rows = result
@@ -1074,7 +1095,24 @@ impl Fluree {
     /// response body, not a transport failure. Only errors that prevent a
     /// response at all — an unschematisable ledger — come back as `Err`.
     pub async fn graphql(&self, db: &GraphDb, request: &GraphQlRequest) -> Result<JsonValue> {
-        self.run_graphql(db, request, None).await
+        self.graphql_with_options(db, request, QueryExecutionOptions::default())
+            .await
+    }
+
+    /// Execute a GraphQL request with explicit execution controls.
+    ///
+    /// One document can resolve many root fields concurrently, so the options —
+    /// and in particular the cancellation handle — are shared across every query
+    /// the request runs. Without this a server has no way to bound a GraphQL
+    /// read: the cancellation handle it installs for every other read surface
+    /// cannot reach the queries this lowers to.
+    pub async fn graphql_with_options(
+        &self,
+        db: &GraphDb,
+        request: &GraphQlRequest,
+        options: QueryExecutionOptions,
+    ) -> Result<JsonValue> {
+        self.run_graphql(db, request, None, options).await
     }
 
     /// Execute a GraphQL request that may write.
@@ -1097,9 +1135,30 @@ impl Fluree {
         default_context: Option<JsonValue>,
         request: &GraphQlRequest,
     ) -> Result<(JsonValue, LedgerState)> {
+        self.graphql_transact_with_options(
+            ledger,
+            default_context,
+            request,
+            QueryExecutionOptions::default(),
+        )
+        .await
+    }
+
+    /// [`Fluree::graphql_transact`] with explicit execution controls.
+    ///
+    /// The options bound the *reads* — the read-back after each commit, and any
+    /// query fields in the same document. A write is not cancellable once the
+    /// transaction is handed to the write path.
+    pub async fn graphql_transact_with_options(
+        &self,
+        ledger: LedgerState,
+        default_context: Option<JsonValue>,
+        request: &GraphQlRequest,
+        options: QueryExecutionOptions,
+    ) -> Result<(JsonValue, LedgerState)> {
         let db = GraphDb::from_ledger_state(&ledger).with_default_context(default_context);
         let slot = parking_lot::Mutex::new(Some(ledger));
-        let envelope = self.run_graphql(&db, request, Some(&slot)).await?;
+        let envelope = self.run_graphql(&db, request, Some(&slot), options).await?;
         let ledger = slot.lock().take().ok_or_else(|| {
             ApiError::Internal("the ledger state was consumed by a failed mutation".to_string())
         })?;
@@ -1111,6 +1170,7 @@ impl Fluree {
         db: &GraphDb,
         request: &GraphQlRequest,
         ledger: Option<&parking_lot::Mutex<Option<LedgerState>>>,
+        options: QueryExecutionOptions,
     ) -> Result<JsonValue> {
         let derived = derive_schema(db).await;
         if derived.model.query_fields.is_empty() {
@@ -1133,12 +1193,13 @@ impl Fluree {
             schema: Arc::clone(&derived),
             ledger: ledger.map(|slot| parking_lot::Mutex::new(slot.lock().take())),
             explain: request.explain.then(|| parking_lot::Mutex::new(Vec::new())),
+            options,
         });
         // Registering the schema costs thousands of allocations — 2.5 ms for a
         // hundred-class ledger — so it is cached beside the model rather than
         // rebuilt per request. The resolvers read the per-request executor from
         // the request's data, which is what lets one registration be shared.
-        let schema = registered_schema(db, &derived, &mutations)?;
+        let schema = registered_schema(db, &derived, &mutations, &request.limits)?;
 
         // The selection tree is extracted from the parsed document, not from the
         // resolver context, because async-graphql's resolver-facing selection API
@@ -1153,11 +1214,15 @@ impl Fluree {
             Ok(doc) => doc,
             Err(e) => return Ok(error_envelope(&e.to_string(), "GRAPHQL_PARSE_FAILED")),
         };
-        let operation =
-            match selection::extract(&doc, request.operation_name.as_deref(), &variables) {
-                Ok(op) => op,
-                Err(e) => return Ok(error_envelope(&e.to_string(), e.code())),
-            };
+        let operation = match selection::extract(
+            &doc,
+            request.operation_name.as_deref(),
+            &variables,
+            &request.limits,
+        ) {
+            Ok(op) => op,
+            Err(e) => return Ok(error_envelope(&e.to_string(), e.code())),
+        };
 
         let mut req = async_graphql::Request::new(&request.query)
             .variables(variables)
@@ -1218,27 +1283,33 @@ fn registered_schema(
     db: &GraphDb,
     derived: &DerivedSchema,
     mutations: &[fluree_db_graphql::mutate::MutationField],
+    limits: &Limits,
 ) -> Result<async_graphql::dynamic::Schema> {
     let key = cache_key(db).map(|schema| RegisteredKey {
         schema,
         mutations: !mutations.is_empty(),
+        limits: *limits,
     });
     if let Some(key) = &key {
         if let Some(hit) = registered_cache().lock().get(key) {
             return Ok(hit.clone());
         }
     }
-    let schema = build_schema(&derived.model, mutations).map_err(to_api_error)?;
+    let schema = build_schema(&derived.model, mutations, limits).map_err(to_api_error)?;
     if let Some(key) = key {
         registered_cache().lock().put(key, schema.clone());
     }
     Ok(schema)
 }
 
+/// The limits are part of the key: they are baked into the registered schema,
+/// so a request configured with tighter bounds must not be served one built
+/// with looser ones.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RegisteredKey {
     schema: SchemaCacheKey,
     mutations: bool,
+    limits: Limits,
 }
 
 type RegisteredCache =
