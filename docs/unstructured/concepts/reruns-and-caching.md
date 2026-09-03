@@ -21,4 +21,4 @@ Under `.fluree/cache/doc/`, keyed so that a re-run pays only for what actually c
 
 ## Indexes follow
 
-After the documents, the full-text index is created or synced incrementally, and the vector index likewise. Switching embedding models changes the vector width; an index built for the old width is dropped and rebuilt rather than synced.
+After the documents, the full-text index is created or synced incrementally. There is no vector index to keep in step: embeddings live on the chunks, so switching embedding models re-embeds the documents and search picks up the new vectors on the next query.

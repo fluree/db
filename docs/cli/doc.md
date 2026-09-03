@@ -9,7 +9,9 @@ Turn a folder of documents into a searchable graph, and search it.
 - an **embedding** per chunk, when an embedding endpoint is configured;
 - a **document node** recording the file, its content hash, the parser revision and the embedding model.
 
-It then creates or syncs a BM25 full-text index and, when embeddings were produced, an HNSW vector index over the chunks. `fluree doc search` queries those indexes and joins each hit back to its chunk text, section path and source file.
+It then creates or syncs a BM25 full-text index over the chunks. `fluree doc search` joins each hit back to its chunk text, section path and source file.
+
+There is no vector index: `--mode vector` scores every chunk's `doc:embedding` exactly with `cosineSimilarity`, so no ANN library is linked into the CLI and nothing has to be built, synced or rebuilt. An approximate HNSW index for corpora past the point where a scan is cheap is a `fluree server` capability.
 
 Everything runs in-process against local storage: the ledger written is always a local one, and Fluree AI, when connected, supplies models only. Parsing is deterministic and makes no network connection unless a model endpoint is configured.
 
@@ -44,7 +46,7 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--base-iri <IRI>` | Prefix documents are minted under (default `urn:fluree:doc:`). The path relative to the ingested directory is appended, so a document keeps its IRI across runs. |
 | `--no-embed` | Skip embeddings even when `[doc.embedding]` is configured. |
 | `--no-escalate` | Never call a vision model, whatever `[doc.vlm]` says. |
-| `--no-index` | Skip building or syncing the vector and full-text indexes. |
+| `--no-index` | Skip building or syncing the full-text index. |
 | `--no-cache` | Neither read nor write the parse and reading caches. |
 | `--force` | Re-ingest documents the ledger already holds with the same content, parser and embedding model. |
 | `--min-chars <N>` | Emit a chunk once its buffer reaches this many characters (default `800`). |
@@ -63,7 +65,7 @@ For each document, in path order:
 4. **Embed** each chunk's text, prefixed with its section path, against `[doc.embedding]`.
 5. **Retract the previous extraction** of the same document IRI, if any, then insert the structure graph, the chunks and the document node as one commit. The earlier extraction remains queryable at its commit.
 
-After the documents, the full-text index `<ledger>-text` is created or synced, and the vector index `<ledger>-vectors` likewise when embeddings were produced. A vector index built for a different embedding width, because the embedding model changed, is dropped and rebuilt rather than synced.
+After the documents, the full-text index `<ledger>-text` is created or synced. Embeddings need no index step — they are committed with the chunks and scanned at search time.
 
 ### Examples
 
@@ -92,7 +94,6 @@ ingest 3 document(s) → contracts
   ✓ nda.docx  parsed: 19 elements, 4 chunks, embedded  t=2
   = sow/q3.pdf  unchanged
   + full-text index contracts-text:main: 142 chunk(s), 1631 terms
-  + vector index contracts-vectors:main: 142 vector(s), 768 dims
 
 done: 2 ingested, 1 unchanged, 0 failed — 142 chunks, 41 pages, 0 crop(s) read, 0 parse(s) from cache, 9.4s
 ```
@@ -111,7 +112,7 @@ fluree doc search <QUERY> [-l <LEDGER>] [-n <N>] [--mode auto|vector|text] [--js
 |--------|-------------|
 | `-l, --ledger <LEDGER>` | Ledger to search (default: the active ledger). |
 | `-n, --limit <N>` | Results to return (default `10`). |
-| `--mode <MODE>` | `vector` embeds the query with `[doc.embedding]` and searches the HNSW index; `text` runs BM25; `auto` (default) picks `vector` when an embedding endpoint is configured. |
+| `--mode <MODE>` | `vector` embeds the query with `[doc.embedding]` and ranks every chunk by cosine similarity; `text` runs BM25; `auto` (default) picks `vector` when an embedding endpoint is configured. |
 | `--json` | Print the rows as JSON: `[score, chunk, document, file, section path, text]`. |
 
 ### Example

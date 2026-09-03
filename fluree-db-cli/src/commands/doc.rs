@@ -3,13 +3,15 @@
 //!
 //! `ingest` runs in-process against local storage: parse (cached), chunk,
 //! embed, retract the document's previous extraction, insert structure plus
-//! chunks as one commit, then create or sync the vector and full-text graph
-//! sources over the ledger. The HNSW index has no HTTP creation endpoint,
-//! so there is no server route for this command yet.
+//! chunks as one commit, then create or sync the full-text graph source over
+//! the ledger.
 //!
-//! `search` embeds the query with the same endpoint and joins the index hit
-//! back to the chunk's text, section path and source document, so a result
-//! is a citation and not just a score.
+//! `search` embeds the query with the same endpoint and joins the hit back to
+//! the chunk's text, section path and source document, so a result is a
+//! citation and not just a score. `--mode vector` scores every chunk with
+//! `cosineSimilarity` (flatrank): exact, and no ANN library is linked into
+//! the CLI to do it. An approximate HNSW index over the same embeddings is a
+//! `fluree server` capability, built with its `vector` feature.
 
 use crate::cli::{DocAction, DocIngestArgs, DocSearchArgs, DocSearchMode};
 use crate::context::{self, build_fluree};
@@ -109,12 +111,6 @@ fn split_alias(alias: &str) -> (String, String) {
         Some((n, b)) => (n.to_string(), b.to_string()),
         None => (alias.to_string(), "main".to_string()),
     }
-}
-
-fn vector_index_id(alias: &str) -> (String, String) {
-    let (name, branch) = split_alias(alias);
-    let index = format!("{name}-vectors");
-    (format!("{index}:{branch}"), index)
 }
 
 fn text_index_id(alias: &str) -> (String, String) {
@@ -347,7 +343,7 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
 
     if let (Some(f), false) = (&fluree, args.no_index) {
         if totals.ingested > 0 {
-            ensure_indexes(f, &alias, dimensions).await?;
+            ensure_indexes(f, &alias).await?;
         } else if totals.skipped > 0 {
             sync_indexes_if_present(f, &alias).await?;
         }
@@ -447,7 +443,12 @@ async fn query_rows(fluree: &Fluree, alias: &str, query: &Value) -> CliResult<Ve
     Ok(json.as_array().cloned().unwrap_or_default())
 }
 
-async fn ensure_indexes(fluree: &Fluree, alias: &str, dimensions: Option<usize>) -> CliResult<()> {
+/// The BM25 index over the chunk text. There is deliberately no HNSW index
+/// here: embedded indexes need usearch, which the CLI does not link (see
+/// `Cargo.toml`). Embeddings are ledger data, so `doc search` scores them
+/// exactly with flatrank, and a `fluree server` built with `vector` can
+/// build a real HNSW index over the same property.
+async fn ensure_indexes(fluree: &Fluree, alias: &str) -> CliResult<()> {
     let (text_id, text_name) = text_index_id(alias);
     if graph_source_present(fluree, &text_id).await? {
         let r = fluree.sync_bm25_index(&text_id).await?;
@@ -474,55 +475,6 @@ async fn ensure_indexes(fluree: &Fluree, alias: &str, dimensions: Option<usize>)
             r.term_count
         );
     }
-
-    let (vec_id, vec_name) = vector_index_id(alias);
-    let mut present = graph_source_present(fluree, &vec_id).await?;
-    // An index built for another embedding model has the wrong width:
-    // vectors of a new size cannot be synced into it, so it is rebuilt.
-    if let (true, Some(dims)) = (present, dimensions) {
-        if let Some(existing) = index_dimensions(fluree, &vec_id).await? {
-            if existing != dims {
-                fluree.drop_vector_index(&vec_id).await?;
-                println!(
-                    "  {} vector index {vec_id}: rebuilt, embeddings changed from {existing} to {dims} dims",
-                    "×".yellow()
-                );
-                present = false;
-            }
-        }
-    }
-    if present {
-        let r = fluree.sync_vector_index(&vec_id).await?;
-        println!(
-            "  {} vector index {vec_id}: +{} −{} vector(s)",
-            "⟳".dimmed(),
-            r.upserted,
-            r.removed
-        );
-    } else if let Some(dims) = dimensions {
-        let query = json!({
-            "@context": { "doc": vocab::DOC_NS },
-            "where": [{ "@id": "?c", "@type": vocab::CHUNK }],
-            "select": { "?c": ["@id", vocab::EMBEDDING] }
-        });
-        let config = fluree_db_api::VectorCreateConfig::new(
-            &vec_name,
-            alias,
-            query,
-            vocab::embedding_iri(),
-            dims,
-        )
-        .with_branch(split_alias(alias).1)
-        .with_metric(fluree_db_query::vector::DistanceMetric::Cosine);
-        let r = fluree.create_vector_index(config).await?;
-        println!(
-            "  {} vector index {}: {} vector(s), {} dims",
-            "+".green(),
-            r.graph_source_id,
-            r.vector_count,
-            r.dimensions
-        );
-    }
     Ok(())
 }
 
@@ -533,23 +485,7 @@ async fn sync_indexes_if_present(fluree: &Fluree, alias: &str) -> CliResult<()> 
     if graph_source_present(fluree, &text_id).await? {
         fluree.sync_bm25_index(&text_id).await?;
     }
-    let (vec_id, _) = vector_index_id(alias);
-    if graph_source_present(fluree, &vec_id).await? {
-        fluree.sync_vector_index(&vec_id).await?;
-    }
     Ok(())
-}
-
-/// The width a vector index was built for, from its published config.
-async fn index_dimensions(fluree: &Fluree, id: &str) -> CliResult<Option<usize>> {
-    let Some(record) = fluree.nameservice().lookup_graph_source(id).await? else {
-        return Ok(None);
-    };
-    let config: Value = serde_json::from_str(&record.config).unwrap_or(Value::Null);
-    Ok(config
-        .get("dimensions")
-        .and_then(Value::as_u64)
-        .map(|d| d as usize))
 }
 
 async fn graph_source_present(fluree: &Fluree, id: &str) -> CliResult<bool> {
@@ -575,6 +511,12 @@ async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
         m => m,
     };
 
+    // Vector search in the CLI is flatrank: `cosineSimilarity` over every
+    // chunk embedding, scored by the engine and cut by LIMIT. Exact, and the
+    // CLI links no ANN library to do it. An HNSW index is an accelerator for
+    // corpora past the point where a full scan is cheap, and it lives in
+    // `fluree server` (built with `vector`), not here.
+    let mut flat_vector = None;
     let search_pattern = match mode {
         DocSearchMode::Vector => {
             let Some(endpoint) = &config.embedding else {
@@ -582,24 +524,14 @@ async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
                     "vector search needs `[doc.embedding]` configured (or use --mode text)".into(),
                 ));
             };
-            let (vec_id, _) = vector_index_id(&alias);
-            if !graph_source_present(&fluree, &vec_id).await? {
-                return Err(CliError::NotFound(format!(
-                    "no vector index {vec_id}; run `fluree doc ingest` with an embedding endpoint configured"
-                )));
-            }
             let client = EmbeddingClient::new(endpoint.clone())?;
             let vector = client
                 .embed(std::slice::from_ref(&args.query))
                 .await?
                 .pop()
                 .ok_or_else(|| CliError::Input("embedding endpoint returned no vector".into()))?;
-            json!({
-                "f:graphSource": vec_id,
-                "f:queryVector": vector,
-                "f:searchLimit": args.limit,
-                "f:searchResult": { "f:resultId": "?c", "f:resultScore": "?score" }
-            })
+            flat_vector = Some(vector);
+            json!({ "@id": "?c", vocab::EMBEDDING: "?vec" })
         }
         DocSearchMode::Text | DocSearchMode::Auto => {
             let (text_id, _) = text_index_id(&alias);
@@ -617,7 +549,7 @@ async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
         }
     };
 
-    let query = json!({
+    let mut query = json!({
         "@context": { "doc": vocab::DOC_NS, "f": vocab::FLUREE_NS },
         "where": [
             search_pattern,
@@ -628,6 +560,20 @@ async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
         "select": ["?score", "?c", "?d", "?file", "?path", "?text"],
         "orderBy": [["desc", "?score"]]
     });
+    // Flatrank scores in the query itself, so the cutoff is a plain LIMIT
+    // rather than the index's `f:searchLimit`.
+    if let Some(vector) = flat_vector {
+        let where_clauses = query["where"].as_array_mut().expect("where is an array");
+        where_clauses.insert(
+            1,
+            json!(["bind", "?score", ["cosineSimilarity", "?vec", "?q"]]),
+        );
+        query["values"] = json!([
+            ["?q"],
+            [{ "@value": vector, "@type": format!("{}embeddingVector", vocab::FLUREE_NS) }]
+        ]);
+        query["limit"] = json!(args.limit);
+    }
 
     let started = Instant::now();
     let rows = query_rows(&fluree, &alias, &query).await?;

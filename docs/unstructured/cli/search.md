@@ -12,7 +12,7 @@ fluree doc search <QUERY> [-l <LEDGER>] [-n <N>] [--mode auto|vector|text] [--js
 |---|---|
 | `-l, --ledger <LEDGER>` | Ledger to search (default: the active ledger). |
 | `-n, --limit <N>` | Results to return (default `10`). |
-| `--mode <MODE>` | `vector` embeds the query with the embedding slot and searches the HNSW index; `text` runs BM25; `auto` (default) picks `vector` when an embedding slot is configured. |
+| `--mode <MODE>` | `vector` embeds the query with the embedding slot and scores every chunk by cosine similarity; `text` runs BM25; `auto` (default) picks `vector` when an embedding slot is configured. |
 | `--json` | Print the rows as JSON: `[score, chunk, document, file, section path, text]`. |
 
 ## Output

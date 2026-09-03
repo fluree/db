@@ -37,4 +37,6 @@ Documents are minted as `<base-iri><relative path>`, default `urn:fluree:doc:` p
 
 ## The indexes
 
-Over the chunks, two graph sources: a BM25 full-text index named `<ledger>-text`, and, when embeddings were produced, an HNSW vector index named `<ledger>-vectors`. They are Fluree graph sources like any other and can be queried directly with `f:searchText` and `f:queryVector` patterns; `fluree doc search` is a convenience over them.
+Over the chunks, one graph source: a BM25 full-text index named `<ledger>-text`. It is a Fluree graph source like any other and can be queried directly with an `f:searchText` pattern; `fluree doc search --mode text` is a convenience over it.
+
+There is no vector index. Similarity runs over the `doc:embedding` values themselves — see [vector search](vector-search.md).

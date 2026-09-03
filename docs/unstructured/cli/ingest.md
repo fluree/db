@@ -1,6 +1,6 @@
 # fluree doc ingest
 
-Parse documents into a ledger: structure graph, retrieval chunks, embeddings, and the vector and full-text indexes over them.
+Parse documents into a ledger: structure graph, retrieval chunks, embeddings, and the full-text index over them.
 
 ```bash
 fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
@@ -20,7 +20,7 @@ fluree doc ingest <PATH>... [-l <LEDGER>] [OPTIONS]
 | `--base-iri <IRI>` | Prefix documents are minted under (default `urn:fluree:doc:`). The path relative to the ingested directory is appended, so a document keeps its IRI across runs. |
 | `--no-embed` | Skip embeddings even when an embedding slot is configured. |
 | `--no-escalate` | Never call a vision model, whatever is configured. |
-| `--no-index` | Skip building or syncing the vector and full-text indexes. |
+| `--no-index` | Skip building or syncing the full-text index. |
 | `--no-cache` | Neither read nor write the parse and reading caches. |
 | `--force` | Re-ingest documents the ledger already holds with the same content, parser and embedding model. |
 | `--min-chars <N>` | Emit a chunk once its buffer reaches this many characters (default `800`). |
@@ -39,7 +39,9 @@ For each document, in path order:
 4. **Embed** each chunk, prefixed with its section path, against the embedding slot.
 5. **Retract** the previous extraction of the same document IRI, if any, then **insert** structure, chunks and document node as one commit.
 
-Then the full-text index `<ledger>-text` is created or synced, and the vector index `<ledger>-vectors` likewise when embeddings were produced; an index built for a different vector width is rebuilt.
+Then the full-text index `<ledger>-text` is created or synced.
+
+No vector index is built. Embeddings are ledger data, and `fluree doc search --mode vector` scores them exactly with `cosineSimilarity` — a full scan, which is what a folder of documents wants. An approximate HNSW index for corpora past that point is a `fluree server` capability, not a CLI one; see [vector search](../concepts/vector-search.md).
 
 ## Output
 
@@ -54,7 +56,6 @@ ingest 3 document(s) → contracts
   ✓ nda.docx  parsed: 19 elements, 4 chunks, embedded  t=2
   = sow/q3.pdf  unchanged
   + full-text index contracts-text:main: 142 chunk(s), 1631 terms
-  + vector index contracts-vectors:main: 142 vector(s), 1536 dims
 
 done: 2 ingested, 1 unchanged, 0 failed — 142 chunks, 41 pages, 2 crop(s) read, 0 parse(s) from cache, 14.2s
 ```

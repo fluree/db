@@ -38,4 +38,6 @@ Set only `llm`; `vlm` falls back to it. One multimodal model then reads crops an
 
 ## Choosing an embedding size
 
-The vector index is built for the width the model returns. Models that accept a `dimensions` parameter can be pinned with `dimensions = 768` in the slot. Changing model or width later is fine: unchanged documents are re-embedded because the model changed, and the index is rebuilt for the new width.
+Embeddings are stored at whatever width the model returns. Models that accept a `dimensions` parameter can be pinned with `dimensions = 768` in the slot — smaller vectors are cheaper to store and to scan. Changing model or width later is fine: the documents are re-embedded because the model changed, and search reads the new vectors.
+
+A query is only comparable to chunks embedded by the same model, so a corpus part-way through a model switch mixes widths. Re-ingest the whole folder after a change rather than a subset.

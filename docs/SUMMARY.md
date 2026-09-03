@@ -228,6 +228,7 @@
     - [What gets built](unstructured/concepts/what-gets-built.md)
     - [Tiers](unstructured/concepts/tiers.md)
     - [Models and calls](unstructured/concepts/models-and-calls.md)
+    - [Vector search](unstructured/concepts/vector-search.md)
     - [Re-runs and caching](unstructured/concepts/reruns-and-caching.md)
   - [Guides](unstructured/guides/README.md)
     - [Local models](unstructured/guides/local-models.md)

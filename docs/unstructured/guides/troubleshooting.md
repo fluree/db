@@ -10,4 +10,4 @@
 | `NoEmbeddingProvider` from the gateway | The stack has neither an OpenAI-type provider key nor a proxy connection serving embeddings. Configure one in the stack's settings, or point `doc.embedding` at an endpoint of your own. |
 | `[doc] section: …` at startup | The `[doc]` table in `config.toml` is malformed. A present but broken section is an error rather than a silent fallback, because running without the model you configured would look like success. |
 | `an image has no text layer; configure [doc.vlm]` | A PNG or JPEG can only be read by a vision model. |
-| `Vector index … does not support time-travel queries` | `--at` on a vector search asks for a state older than the index. The vector index is head-only; full-text and plain queries time-travel. |
+| A vector search feels slow on a large corpus | `--mode vector` scores every chunk exactly. That is fast for a folder of documents and linear past it; `--mode text` stays indexed at any size, and an approximate index is a [server capability](../concepts/vector-search.md). |
