@@ -40,6 +40,13 @@ impl OverlayProvider for CompositeOverlay {
         self.overlays.iter().all(|o| o.is_effectively_empty())
     }
 
+    fn overlay_flake_count(&self, g_id: GraphId) -> Option<usize> {
+        // Unknown for any component ⇒ unknown for the composite.
+        self.overlays
+            .iter()
+            .try_fold(0usize, |acc, o| Some(acc + o.overlay_flake_count(g_id)?))
+    }
+
     fn for_each_overlay_flake(
         &self,
         g_id: GraphId,

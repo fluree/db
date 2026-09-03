@@ -46,7 +46,8 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Write `bytes` to `path` atomically: stage in a uniquely-named temp file in
@@ -696,7 +697,24 @@ impl LazyVectorArena {
     // ========================================================================
 
     /// Load shard through the global cache (point lookups, small batches).
+    ///
+    /// Residency-mode stores parse the shard from the resident tier — no
+    /// filesystem, no sync→async bridge; a miss surfaces as `NeedFetch`
+    /// (recorded in the miss register).
     fn load_shard_cached(&self, shard_idx: usize) -> io::Result<Arc<VectorShard>> {
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            let source = self.get_source(shard_idx)?;
+            let bytes = self.resident_shard_bytes(source, shard_idx)?;
+            let shard = self
+                .cache
+                .try_get_or_load_vector_shard(source.cid_hash, || {
+                    let parsed = read_vector_shard_from_bytes(&bytes)?;
+                    Ok(Arc::new(parsed))
+                })?;
+            self.validate_shard_dims(&shard, shard_idx)?;
+            return Ok(shard);
+        }
         let source = self.get_source(shard_idx)?;
         self.ensure_on_disk(source, shard_idx)?;
         let path = source.path.clone();
@@ -714,12 +732,51 @@ impl LazyVectorArena {
     /// Load shard WITHOUT inserting into the global cache.
     /// For streaming scans — avoids evicting BM25/dict/R1/R2 entries.
     fn load_shard_transient(&self, shard_idx: usize) -> io::Result<Arc<VectorShard>> {
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            let source = self.get_source(shard_idx)?;
+            let bytes = self.resident_shard_bytes(source, shard_idx)?;
+            let shard = Arc::new(read_vector_shard_from_bytes(&bytes)?);
+            self.validate_shard_dims(&shard, shard_idx)?;
+            return Ok(shard);
+        }
         let source = self.get_source(shard_idx)?;
         self.ensure_on_disk(source, shard_idx)?;
         let bytes = std::fs::read(&source.path)?;
         let shard = Arc::new(read_vector_shard_from_bytes(&bytes)?);
         self.validate_shard_dims(&shard, shard_idx)?;
         Ok(shard)
+    }
+
+    /// True when the content store carries a sync residency tier.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    fn residency_mode(&self) -> bool {
+        self.cas
+            .as_ref()
+            .is_some_and(|cs| cs.miss_register().is_some())
+    }
+
+    /// Resolve a shard's bytes from the residency tier or report the miss
+    /// (recording it in the store's miss register) with the shard's CID.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    fn resident_shard_bytes(&self, source: &ShardSource, idx: usize) -> io::Result<Arc<[u8]>> {
+        let cas = self.cas.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("vector shard {idx} not resident and no CAS configured"),
+            )
+        })?;
+        let cid = source.cid.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("vector shard {idx} not resident and no CID for remote fetch"),
+            )
+        })?;
+        crate::read::need_fetch::resident_or_need_fetch(
+            cas.as_ref(),
+            cid,
+            crate::read::need_fetch::FetchKind::VectorShard,
+        )
     }
 
     fn get_source(&self, shard_idx: usize) -> io::Result<&ShardSource> {

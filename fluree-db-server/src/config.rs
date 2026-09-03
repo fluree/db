@@ -420,7 +420,7 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_REINDEX_MIN_BYTES", default_value_t = server_defaults::DEFAULT_REINDEX_MIN_BYTES)]
     pub reindex_min_bytes: usize,
 
-    /// Novelty size (bytes) that blocks new commits until reindexing completes (hard threshold)
+    /// Novelty size (bytes) at which new transactions are rejected (503 `err:db/NoveltyAtMax`, retryable) until reindexing completes (hard threshold)
     ///
     /// Default: 20% of system RAM (256 MB fallback). Set explicitly to override.
     #[arg(long, env = "FLUREE_REINDEX_MAX_BYTES")]

@@ -4848,6 +4848,35 @@ mod tests {
     }
 
     #[test]
+    fn cas_ref_commit_initial_creation_with_expected_unborn_ref_value() {
+        // The shape `RefPublisher::fast_forward_commit` actually produces
+        // for creation: `get_ref` reports a registered-but-unborn branch as
+        // `Some(RefValue { id: None, t: 0 })` (never `None`), so the CAS
+        // arrives with that as `expected` rather than `expected = None`.
+        // This is the bulk importer's first publish under raft.
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 0);
+        let resp = apply(
+            &mut state,
+            cas_ref_cmd(
+                "test/db",
+                "main",
+                RefKind::CommitHead,
+                Some(RefValue { id: None, t: 0 }),
+                RefValue {
+                    id: Some(cid(1)),
+                    t: 1,
+                },
+            ),
+            1,
+        );
+        assert_eq!(resp, Response::RefCasUpdated);
+        let entry = state.refs.get(&RefKey::new("test/db", "main")).unwrap();
+        assert_eq!(entry.head, cid(1));
+        assert_eq!(entry.t, 1);
+    }
+
+    #[test]
     fn cas_ref_commit_conflict_when_expected_doesnt_match() {
         let mut state = NameServiceState::new();
         create_ledger_with_genesis(&mut state, "test/db");

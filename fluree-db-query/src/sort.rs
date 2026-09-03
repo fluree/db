@@ -12,12 +12,12 @@ use crate::operator::{
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryGraphView;
+use fluree_db_core::clock::Instant;
 use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{DatatypeConstraint, DatatypeDictId, FlakeValue, Sid};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
-use std::time::Instant;
 use tracing::Instrument;
 
 /// Keep sort diagnostics cheap by only surfacing non-trivial blocking sorts at

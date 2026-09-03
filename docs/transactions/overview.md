@@ -381,6 +381,12 @@ Committed data is durable:
 - Replicated (if configured)
 - Immutable
 
+A transaction that has started committing runs to completion even if the
+client disconnects mid-request: the server finishes the write and the data
+is committed, the client just never sees the receipt. A client that times
+out or drops the connection should therefore re-query (or retry
+idempotently) rather than assume the write was lost.
+
 ## Error Handling
 
 ### Validation Errors
