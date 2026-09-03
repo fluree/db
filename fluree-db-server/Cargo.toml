@@ -23,7 +23,7 @@ name = "fluree_db_server"
 path = "src/lib.rs"
 
 [features]
-default = ["native", "credential", "iceberg", "shacl", "bolt", "graphql"]
+default = ["native", "credential", "iceberg", "sql", "shacl", "bolt", "graphql"]
 native = ["fluree-db-api/native"]
 # AWS S3 storage + DynamoDB nameservice (via connection JSON-LD config)
 aws = ["fluree-db-api/aws"]
@@ -38,6 +38,8 @@ graphql = ["fluree-db-api/graphql"]
 oidc = ["fluree-db-credential/oidc", "dep:jsonwebtoken"]
 # Iceberg / R2RML graph source support
 iceberg = ["fluree-db-api/iceberg"]
+# SQL graph sources (R2RML over a Trino-protocol endpoint)
+sql = ["iceberg", "fluree-db-api/sql"]
 # Use mimalloc as the global allocator. Better multicore allocation throughput
 # for the allocation-heavy query/materialization paths (e.g. R2RML/Iceberg
 # scans). Opt-in: enable in release packaging after a soak.

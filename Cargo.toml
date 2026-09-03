@@ -30,6 +30,7 @@ members = [
     "fluree-db-iceberg",
     "fluree-db-tabular",
     "fluree-db-r2rml",
+    "fluree-db-sql",
     "fluree-db-server",
     "fluree-db-bolt",
     "fluree-db-peer",
@@ -48,7 +49,7 @@ members = [
     "fluree-db-consensus",
     "fluree-raft-core",
 ]
-exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load"]
+exclude = ["testsuite-sparql", "testsuite-shacl", "scripts/local/load", "fluree-sql-bridge"]
 
 [workspace.package]
 version = "4.1.6"

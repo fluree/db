@@ -2650,6 +2650,7 @@ dependencies = [
  "fluree-db-shacl",
  "fluree-db-sparql",
  "fluree-db-spatial",
+ "fluree-db-sql",
  "fluree-db-storage-aws",
  "fluree-db-storage-ipfs",
  "fluree-db-tabular",
@@ -2686,6 +2687,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wasm-bindgen-futures",
+ "wiremock",
  "xxhash-rust",
  "zstd",
 ]
@@ -3411,6 +3413,26 @@ dependencies = [
  "tracing",
  "wkt",
  "zstd",
+]
+
+[[package]]
+name = "fluree-db-sql"
+version = "4.1.6"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "fluree-db-iceberg",
+ "fluree-db-tabular",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]

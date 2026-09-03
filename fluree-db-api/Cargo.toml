@@ -17,6 +17,10 @@ aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws", "dep:aws-sdk-sts
 # Arrow columnar reader is the single graph-source read path (native predicate
 # pushdown: row-group skipping + exact row filtering).
 iceberg = ["dep:fluree-db-iceberg", "fluree-db-iceberg/aws"]
+# SQL graph sources (R2RML over a Trino-protocol endpoint). Stacks on `iceberg`
+# because the graph-source provider dispatch lives there; the crate itself adds
+# only an HTTP client, no database drivers.
+sql = ["iceberg", "dep:fluree-db-sql"]
 # Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers)
 aws-testcontainers = [
   "dep:fluree-db-storage-aws",
@@ -42,7 +46,7 @@ vector = ["fluree-db-query/vector"]
 # IPFS-backed storage (via Kubo HTTP RPC)
 ipfs = ["dep:fluree-db-storage-ipfs"]
 # Convenience bundle (excludes vector, aws, and test-only features)
-full = ["native", "credential", "iceberg", "shacl", "ipfs", "graphql"]
+full = ["native", "credential", "iceberg", "sql", "shacl", "ipfs", "graphql"]
 
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
@@ -61,6 +65,7 @@ fluree-db-cypher = { path = "../fluree-db-cypher" }
 fluree-db-graphql = { path = "../fluree-db-graphql", optional = true }
 fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
+fluree-db-sql = { path = "../fluree-db-sql", optional = true }
 fluree-db-tabular = { path = "../fluree-db-tabular" }
 fluree-db-storage-aws = { path = "../fluree-db-storage-aws", optional = true }
 fluree-db-storage-ipfs = { path = "../fluree-db-storage-ipfs", optional = true }
@@ -139,6 +144,7 @@ fluree-bench-support = { path = "../fluree-bench-support" }
 fluree-bench-alloc = { path = "../fluree-bench-alloc" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
+wiremock = { workspace = true }
 # Residency-mode read arms for the wasm read-path recovery tests
 # (it_residency_retry): dev-only feature unification — production native
 # builds keep the feature off and compile the pre-residency read path.
@@ -179,6 +185,13 @@ required-features = ["iceberg", "native"]
 name = "it_iceberg_warehouse_root"
 path = "tests/it_iceberg_warehouse_root.rs"
 required-features = ["iceberg", "native"]
+
+# End-to-end over a SQL graph source against a fake Trino-protocol endpoint
+# (wiremock), through registration, the R2RML query path and pushdown.
+[[test]]
+name = "it_sql_graph_source"
+path = "tests/it_sql_graph_source.rs"
+required-features = ["sql", "native"]
 
 [[test]]
 name = "grp_index"

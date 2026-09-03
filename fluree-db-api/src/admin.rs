@@ -1524,11 +1524,9 @@ impl crate::Fluree {
         #[cfg(feature = "iceberg")]
         if matches!(mode, DropMode::Hard) {
             if let Some(ref record) = record {
-                // Try to delete the CAS-stored mapping blob
-                if let Ok(iceberg_config) =
-                    fluree_db_iceberg::IcebergGsConfig::from_json(&record.config)
+                // Try to delete the CAS-stored mapping blob (Iceberg, R2RML or SQL record)
                 {
-                    if let Some(mapping) = &iceberg_config.mapping {
+                    if let Some(mapping) = &crate::graph_source::mapping_source_of(record) {
                         if let Ok(cid) = mapping.source.parse::<fluree_db_core::ContentId>() {
                             // Resolve CID to storage path and delete
                             let path = fluree_db_core::content_path(

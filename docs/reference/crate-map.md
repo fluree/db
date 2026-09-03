@@ -51,7 +51,8 @@ fluree-db/
 ├── Graph Sources
 │   ├── fluree-db-tabular/         # Tabular column batch types
 │   ├── fluree-db-iceberg/         # Apache Iceberg integration
-│   └── fluree-db-r2rml/           # R2RML mapping support
+│   ├── fluree-db-r2rml/           # R2RML mapping support
+│   └── fluree-db-sql/             # SQL graph sources (Trino-protocol HTTP)
 │
 ├── Search
 │   ├── fluree-search-protocol/    # Search service protocol types
@@ -559,6 +560,20 @@ crate takes plain IRIs, which is what makes it testable without a ledger.
 - fluree-graph-turtle (optional)
 - fluree-db-tabular
 - fluree-vocab
+
+### fluree-db-sql
+
+**Purpose:** SQL graph sources — R2RML scans over a Trino-protocol HTTP endpoint
+
+**Responsibilities:**
+- Typed rendering of single-table scans (`SELECT … WHERE …`) against a probed schema
+- The statement/page protocol client (streaming, retry, cancel-on-drop)
+- Trino type names and JSON page values → column batches
+
+**Dependencies:**
+- fluree-db-tabular
+- fluree-db-iceberg (base: shared `ConfigValue` / auth / secret resolution)
+- reqwest
 
 ## Search Crates
 

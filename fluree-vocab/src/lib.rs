@@ -2116,6 +2116,9 @@ pub mod ns_types {
 
     /// `https://ns.flur.ee/db#R2rmlMapping` - R2RML relational mapping
     pub const R2RML_MAPPING: &str = "https://ns.flur.ee/db#R2rmlMapping";
+
+    /// `https://ns.flur.ee/db#SqlMapping` - R2RML mapping over a SQL endpoint
+    pub const SQL_MAPPING: &str = "https://ns.flur.ee/db#SqlMapping";
 }
 
 /// Graph source nameservice field local names (under `https://ns.flur.ee/db#`)

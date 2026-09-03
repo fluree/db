@@ -776,6 +776,42 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             commands::memory::run(action, &fluree_dir).await
         }
 
+        Commands::Sql { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            match action {
+                cli::SqlAction::Map(args) => {
+                    commands::sql::run_sql_map(*args, &fluree_dir, direct).await
+                }
+                cli::SqlAction::List { remote } => {
+                    commands::iceberg::run_iceberg_list(&fluree_dir, remote.as_deref(), direct)
+                        .await
+                }
+                cli::SqlAction::Info { name, remote } => {
+                    commands::iceberg::run_iceberg_info(
+                        &name,
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
+                }
+                cli::SqlAction::Drop {
+                    name,
+                    force,
+                    remote,
+                } => {
+                    commands::iceberg::run_iceberg_drop(
+                        &name,
+                        force,
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
+                }
+            }
+        }
+
         Commands::Iceberg { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             match action {

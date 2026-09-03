@@ -50,6 +50,7 @@
   - [mcp](cli/mcp.md)
   - [docs](cli/docs.md)
   - [iceberg](cli/iceberg.md)
+  - [sql](cli/sql.md)
   - [bm25](cli/bm25.md)
   - [materialize](cli/materialize.md)
   - [completions](cli/completions.md)
@@ -174,6 +175,7 @@
   - [Overview](graph-sources/overview.md)
   - [Iceberg / Parquet](graph-sources/iceberg.md)
   - [R2RML](graph-sources/r2rml.md)
+  - [SQL endpoints (Trino / bridge)](graph-sources/sql.md)
   - [BM25 graph source](graph-sources/bm25.md)
 
 - [Fluree for AI and agents](ai/README.md)
