@@ -916,3 +916,220 @@ async fn source_default_allow_keeps_model_less_source_readable() {
         .unwrap();
     assert_eq!(closed.as_array().map_or(0, Vec::len), 0, "{closed}");
 }
+
+/// The graph-scoped builder (`fluree.graph(id).query()`, which the server's
+/// proxy-mode query route uses) must enforce a governed source's model, not
+/// just the `from`-driven builder.
+///
+/// Nothing downstream of `GraphQueryBuilder` wraps policy, so attaching the
+/// model's `resolved_config` alone left the source readable.
+#[tokio::test]
+async fn graph_scoped_builder_enforces_governed_source() {
+    let fluree = setup().await;
+    const MODEL: &str = "governance-gsb:main";
+    const GOVERNED: &str = "local-governed-gsb:main";
+
+    let ledger = fluree.create_ledger(MODEL).await.expect("model ledger");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "f": "https://ns.flur.ee/db#",
+                    "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+                },
+                "@graph": [
+                    { "@id": "ex:Person", "@type": "rdfs:Class" },
+                    { "@id": "ex:hidePeople", "@type": "f:AccessPolicy",
+                      "f:action": { "@id": "f:view" },
+                      "f:onClass": [{ "@id": "ex:Person" }], "f:allow": false }
+                ]
+            }),
+        )
+        .await
+        .expect("seed model ledger");
+
+    let cfg = R2rmlCreateConfig::new_direct("local-governed-gsb", table_location(), PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle")
+        .with_model(MODEL);
+    fluree
+        .create_r2rml_graph_source(cfg)
+        .await
+        .expect("governed source");
+
+    let (sel, wh) = name_query();
+    let governed = json!({
+        "@context": context(),
+        "opts": { "default-allow": true },
+        "select": sel.clone(),
+        "where": wh.clone(),
+    });
+    let rows = |v: &Value| v.as_array().map_or(0, Vec::len);
+
+    let via_graph = fluree
+        .graph(GOVERNED)
+        .query()
+        .jsonld(&governed)
+        .execute_formatted()
+        .await
+        .expect("graph-scoped query");
+    assert_eq!(
+        rows(&via_graph),
+        0,
+        "the model's deny must apply through the graph-scoped builder: {via_graph}"
+    );
+
+    // Parity with the `from`-driven builder, which already enforced it.
+    let mut from_q = governed.clone();
+    from_q["from"] = json!(GOVERNED);
+    let via_from = fluree
+        .query_from()
+        .jsonld(&from_q)
+        .execute_formatted()
+        .await
+        .expect("from-driven query");
+    assert_eq!(rows(&via_from), 0, "{via_from}");
+
+    // Control: with no policy input on the request the source stays readable,
+    // so the assertion above cannot pass by denying everything unconditionally.
+    let open = json!({ "@context": context(), "select": sel, "where": wh });
+    let via_graph_open = fluree
+        .graph(GOVERNED)
+        .query()
+        .jsonld(&open)
+        .execute_formatted()
+        .await
+        .expect("ungoverned query");
+    assert_eq!(rows(&via_graph_open), 5, "{via_graph_open}");
+}
+
+/// `ORDER BY … LIMIT k` must not push a scan-side top-k under a view policy.
+///
+/// The fixture spans two data files — alice/bob/carol (score 77.25..91.5) and
+/// dave/erin (64..99.9) — so a DESC top-k reads the dave/erin file first and
+/// takes its k-th bound from rows the policy has NOT yet removed. With erin
+/// denied and `k = 1` the bound rides at erin's 99.9, the alice file prunes
+/// away, and the query answers dave (64) instead of alice (91.5).
+///
+/// Selects only `?s`: the fixture's scores differ from the native twin's, but
+/// the rank order is identical, so the top-k subject set must match.
+#[tokio::test]
+async fn topk_limit_is_declined_under_view_policy() {
+    let fluree = setup().await;
+    let policies = vec![deny(
+        "ex:hide-top",
+        on_subject("http://example.org/person/5"),
+    )];
+    let select = json!(["?s"]);
+    let r#where = json!({ "@id": "?s", "ex:score": "?score" });
+
+    let run_topk = |from: &'static str, policies: Vec<Value>, k: usize| {
+        let fluree = &fluree;
+        let (select, r#where) = (select.clone(), r#where.clone());
+        async move {
+            let q = json!({
+                "@context": context(),
+                "from": from,
+                "opts": { "policy": policies, "default-allow": true },
+                "select": select,
+                "where": r#where,
+                "orderBy": "(desc ?score)",
+                "limit": k,
+            });
+            fluree
+                .query_from()
+                .jsonld(&q)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("query against {from} failed: {e}"))
+                .to_string()
+                .replace("\"ex:", "\"http://example.org/")
+        }
+    };
+
+    // k = 1 is the shape that prunes: the denied row alone fills the heap.
+    for k in [1usize, 2, 3] {
+        let native = run_topk(NATIVE, policies.clone(), k).await;
+        let virt = run_topk(GS, policies.clone(), k).await;
+        assert_eq!(
+            virt, native,
+            "top-{k} under an f:onSubject deny must match the native twin"
+        );
+    }
+
+    // Control: with no policy the scan-side top-k still runs and still answers
+    // with the true top scorer, so the guard above cannot pass vacuously by
+    // having disabled the pushdown outright.
+    assert_eq!(
+        run_topk(GS, Vec::new(), 1).await,
+        "[[\"http://example.org/person/5\"]]",
+        "unpoliced top-1 must still be the highest scorer"
+    );
+}
+
+/// A graph source's system graphs (`#txn-meta`) are genuinely empty, and the
+/// view is deliberately not tagged as the virtual source. The model's
+/// `resolved_config` must not ride along either: `wrap_policy` would take the
+/// cross-ledger path with `virtual_source = false` and reject an identity that
+/// carries no explicit `f:policyClass`, turning an empty result into an error.
+#[tokio::test]
+async fn txn_meta_on_a_governed_source_is_empty_not_an_error() {
+    let fluree = setup().await;
+    const MODEL: &str = "governance-tm:main";
+
+    let ledger = fluree.create_ledger(MODEL).await.expect("model ledger");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+                "@graph": [{
+                    "@id": "ex:hidePeople", "@type": "f:AccessPolicy",
+                    "f:action": { "@id": "f:view" },
+                    "f:onClass": [{ "@id": "ex:Person" }], "f:allow": false
+                }]
+            }),
+        )
+        .await
+        .expect("seed model ledger");
+
+    let cfg = R2rmlCreateConfig::new_direct("local-gov-tm", table_location(), PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle")
+        .with_model(MODEL);
+    fluree
+        .create_r2rml_graph_source(cfg)
+        .await
+        .expect("governed source");
+
+    let (sel, wh) = name_query();
+    // An identity with no explicit policy-class: the shape the cross-ledger
+    // resolver rejects outright.
+    let q = |from: &str| {
+        json!({
+            "@context": context(),
+            "from": from,
+            "opts": { "identity": "http://example.org/users/someone", "default-allow": false },
+            "select": sel.clone(),
+            "where": wh.clone(),
+        })
+    };
+
+    let meta = fluree
+        .query_from()
+        .jsonld(&q("local-gov-tm:main#txn-meta"))
+        .execute_formatted()
+        .await
+        .expect("#txn-meta on a governed source must not error");
+    assert_eq!(meta.as_array().map_or(1, Vec::len), 0, "{meta}");
+
+    // The default graph still resolves the model and denies, so the assertion
+    // above is not passing because governance was dropped everywhere.
+    let default_graph = fluree
+        .query_from()
+        .jsonld(&q("local-gov-tm:main"))
+        .execute_formatted()
+        .await
+        .expect("default graph query");
+    assert_eq!(default_graph.as_array().map_or(1, Vec::len), 0);
+}

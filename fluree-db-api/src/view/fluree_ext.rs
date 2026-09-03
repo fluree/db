@@ -729,13 +729,17 @@ impl Fluree {
         let state =
             fluree_db_ledger::LedgerState::new(snapshot, fluree_db_novelty::Novelty::new(0));
         let mut db = GraphDb::from_ledger_state(&state);
-        db.resolved_config = Self::graph_source_model_config(&record);
 
         match graph_ref {
             GraphRef::Default => {
                 // The virtual default graph: tag the view so query execution
                 // auto-wraps patterns in `GRAPH <gs_id> { ... }` and the configured
                 // provider (Iceberg / R2RML / BM25 / vector) resolves them.
+                // `resolved_config` rides with the tag — both say "this view IS
+                // the virtual source" — and `wrap_policy` reads the tag to decide
+                // that the model, not this empty genesis snapshot, holds the
+                // identity's `f:policyClass`.
+                db.resolved_config = Self::graph_source_model_config(&record);
                 db.graph_source_id = Some(gs_id.into());
                 Ok(Some(db))
             }

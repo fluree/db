@@ -633,6 +633,12 @@ impl R2rmlScanOperator {
         if topk_residual_filter_present(&self.pattern) {
             return None;
         }
+        // The view-policy gate is a residual filter too: it drops rows AFTER the
+        // scan emits, so a denied row can set the k-th bound and prune files whose
+        // VISIBLE rows belong in the true top-k.
+        if self.policy_gate.is_some() {
+            return None;
+        }
         let pred_iri = if Some(sort_var) == self.pattern.object_var {
             self.pattern.predicate_filter.as_deref()
         } else {
