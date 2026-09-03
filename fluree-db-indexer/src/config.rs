@@ -204,6 +204,33 @@ pub struct IndexerConfig {
     /// Default: 300 s.
     pub catchup_interval: Duration,
 
+    /// Whether this worker owns catch-up for its nameservice.
+    ///
+    /// Both sweeps — the one [`BackgroundIndexerWorker::run`] performs at
+    /// start-up and the periodic re-sweep — are skipped when this is `false`.
+    /// Post-commit triggers, `trigger_if_idle`, and every `IndexerHandle`
+    /// operation (admin reindex, cancel, maintenance holds) keep working, so a
+    /// non-sweeping worker is still a fully functional indexer for work that is
+    /// asked for explicitly.
+    ///
+    /// This exists because a process can run more than one worker against the
+    /// same nameservice, and catch-up must have exactly one owner. Raft is that
+    /// case: every node runs a node-scope worker built by the api layer, and the
+    /// leader additionally runs a leader-scope worker wired to the event bus.
+    /// If both swept, the leader would queue and build each behind ledger twice
+    /// — the two workers hold independent `states` maps, so `trigger_if_idle`
+    /// cannot see the other's claim — and followers would start initiating
+    /// builds that publish through a nameservice which, under raft, proposes to
+    /// the state machine. Indexing is leader-only by design.
+    ///
+    /// Distinct from `catchup_interval == ZERO`, deliberately. That is an
+    /// operator tuning knob and leaves the start-up sweep alone, because the
+    /// start-up sweep is the deadlock fix. This is a statement about deployment
+    /// topology — who owns catch-up — and turns off both.
+    ///
+    /// Default: `true`.
+    pub catchup_sweeps_enabled: bool,
+
     /// Memory budget (bytes) for the run-sort buffer during index building.
     ///
     /// This total is split evenly across all sort orders (SPOT, PSOT, POST, OPST).
@@ -427,6 +454,7 @@ impl Default for IndexerConfig {
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
             catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
+            catchup_sweeps_enabled: true,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -464,6 +492,7 @@ impl IndexerConfig {
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
             catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
+            catchup_sweeps_enabled: true,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -494,6 +523,7 @@ impl IndexerConfig {
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
             catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
+            catchup_sweeps_enabled: true,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -524,6 +554,7 @@ impl IndexerConfig {
             gc_max_old_indexes: DEFAULT_MAX_OLD_INDEXES,
             gc_min_time_mins: DEFAULT_MIN_TIME_GARBAGE_MINS,
             catchup_interval: Duration::from_secs(DEFAULT_CATCHUP_INTERVAL_SECS),
+            catchup_sweeps_enabled: true,
             run_budget_bytes: DEFAULT_RUN_BUDGET_BYTES,
             data_dir: None,
             incremental_enabled: true,
@@ -595,6 +626,15 @@ impl IndexerConfig {
     /// runs regardless. See [`IndexerConfig::catchup_interval`].
     pub fn with_catchup_interval(mut self, interval: Duration) -> Self {
         self.catchup_interval = interval;
+        self
+    }
+
+    /// Builder method to set whether this worker owns catch-up sweeps.
+    ///
+    /// See [`IndexerConfig::catchup_sweeps_enabled`]. Pass `false` for a worker
+    /// that shares a nameservice with another worker that already sweeps.
+    pub fn with_catchup_sweeps(mut self, enabled: bool) -> Self {
+        self.catchup_sweeps_enabled = enabled;
         self
     }
 
