@@ -78,20 +78,41 @@ async fn resolve_config(dirs: &FlureeDir) -> CliResult<DocConfig> {
             "doc.remote '{remote_name}': no such remote\n  hint: fluree remote add {remote_name} <url>"
         )));
     };
-    // A cheap authenticated call: on an expired login the client refreshes,
-    // and the refreshed token is what the model slots must carry.
-    client.list_ledgers().await.map_err(|e| {
-        CliError::Remote(format!(
-            "doc.remote '{remote_name}': {e}\n  hint: fluree auth login --remote {remote_name}"
-        ))
-    })?;
-    context::persist_refreshed_tokens(&client, &remote_name, &remote_dirs).await;
+    // The model slots carry the token themselves, so it must be valid up
+    // front. A stored login with time left is used as is; one about to
+    // expire is refreshed by a cheap authenticated call, which the client
+    // does on its own.
+    let fresh = client
+        .current_token()
+        .is_some_and(|t| token_seconds_left(&t).is_some_and(|left| left > 60));
+    if !fresh {
+        client.list_ledgers().await.map_err(|e| {
+            CliError::Remote(format!(
+                "doc.remote '{remote_name}': {e}\n  hint: fluree auth login --remote {remote_name}"
+            ))
+        })?;
+        context::persist_refreshed_tokens(&client, &remote_name, &remote_dirs).await;
+    }
     let token = client.current_token().ok_or_else(|| {
         CliError::Config(format!(
             "doc.remote '{remote_name}' has no stored login\n  hint: fluree auth login --remote {remote_name}"
         ))
     })?;
     Ok(config.fill_from_gateway(&gateway_base(client.base_url()), &token))
+}
+
+/// Seconds until a JWT's `exp`, read without verifying it: this decides
+/// only whether to bother the server for a refresh. `None` for anything
+/// that is not a JWT with a numeric `exp`.
+fn token_seconds_left(token: &str) -> Option<i64> {
+    use base64::Engine;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: Value = serde_json::from_slice(&bytes).ok()?;
+    let exp = claims.get("exp")?.as_i64()?;
+    Some(exp - chrono::Utc::now().timestamp())
 }
 
 /// `https://stack/v1/fluree` (the CLI-compat base a remote is registered
@@ -1052,14 +1073,18 @@ async fn graph_source_present(fluree: &Fluree, id: &str) -> CliResult<bool> {
 
 async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
     let alias = context::resolve_ledger(args.ledger.as_deref(), dirs)?;
-    let config = resolve_config(dirs).await?;
     let fluree = build_fluree(dirs)?;
 
     let (vec_id, _) = vector_index_id(&alias);
     let (text_id, _) = text_index_id(&alias);
     let has_vectors = graph_source_present(&fluree, &vec_id).await?;
     let has_text = graph_source_present(&fluree, &text_id).await?;
-    let can_embed = config.embedding.is_some();
+    // Whether the query could be embedded is known without the network: a
+    // slot, or an account that would fill one. The account is only asked
+    // for its token when a vector lane actually runs, so a text search
+    // never waits on it.
+    let local = crate::config::read_doc_config(dirs.config_dir())?.with_env();
+    let can_embed = local.embedding.is_some() || local.remote.is_some();
 
     // Everything available, unless told otherwise: both indexes fused when
     // the query can be embedded, else whichever one there is.
@@ -1087,6 +1112,17 @@ async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
             "no full-text index {text_id}; run `fluree doc ingest` first"
         )));
     }
+    let config = if wants_vectors {
+        resolve_config(dirs).await?
+    } else {
+        local
+    };
+    if wants_vectors && config.embedding.is_none() {
+        return Err(CliError::Config(format!(
+            "{} search needs `[doc.embedding]` configured to embed the query (or use --mode text)",
+            mode_label(mode)
+        )));
+    }
 
     let started = Instant::now();
     // Each method is asked for more than the final count, so a hit that
@@ -1097,7 +1133,12 @@ async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
     } else {
         args.limit
     };
-    let vector_hits = if wants_vectors {
+    // The two lanes are independent, and hybrid should cost the slower
+    // one, not their sum.
+    let vector_lane = async {
+        if !wants_vectors {
+            return Ok::<Vec<Hit>, CliError>(Vec::new());
+        }
         let endpoint = config.embedding.as_ref().expect("checked above");
         let client = EmbeddingClient::new(endpoint.clone())?;
         let vector = client
@@ -1111,21 +1152,21 @@ async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
             "f:searchLimit": per_method,
             "f:searchResult": { "f:resultId": "?c", "f:resultScore": "?score" }
         });
-        search_hits(&fluree, &alias, pattern).await?
-    } else {
-        Vec::new()
+        search_hits(&fluree, &alias, pattern).await
     };
-    let text_hits = if wants_text {
+    let text_lane = async {
+        if !wants_text {
+            return Ok::<Vec<Hit>, CliError>(Vec::new());
+        }
         let pattern = json!({
             "f:graphSource": text_id,
             "f:searchText": args.query,
             "f:searchLimit": per_method,
             "f:searchResult": { "f:resultId": "?c", "f:resultScore": "?score" }
         });
-        search_hits(&fluree, &alias, pattern).await?
-    } else {
-        Vec::new()
+        search_hits(&fluree, &alias, pattern).await
     };
+    let (vector_hits, text_hits) = tokio::try_join!(vector_lane, text_lane)?;
     let hits = match mode {
         DocSearchMode::Hybrid => fuse_hits(vector_hits, text_hits, args.limit),
         DocSearchMode::Vector => vector_hits,
