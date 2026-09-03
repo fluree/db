@@ -193,19 +193,26 @@ pushable. In that statement:
   (from `rr:datatype`; `xsd:string` when un-annotated), the literal's type
   and the **probed SQL type** agree, and for strings the dialect compares
   bytes. A numeric literal against a text column the mapping reads as a
-  number, or an `xsd:dateTime` literal (always a UTC instant) against a
-  `timestamp` without a zone, is not exact and stays in the engine as a
-  residual filter over the returned rows; against a `timestamp with time
-  zone` column it pushes as a zoned `TIMESTAMP` literal;
+  number is not exact and stays in the engine as a residual filter over the
+  returned rows; an `xsd:dateTime` literal (always a UTC instant) against a
+  `timestamp with time zone` column pushes as a zoned `TIMESTAMP` literal;
 - a filter the statement can only approximate is still pushed as a
   **widening** predicate, with the exact filter kept in the engine over the
   rows that come back: `STRSTARTS`, `STRENDS` and `CONTAINS` of a constant
   against a string column, and a `REGEX` anchored on a literal prefix with
   no flags, push a `LIKE` (a collation can only match more strings than a
-  byte prefix, never fewer). Inside a conjunction the parts that cannot be
-  widened are simply dropped from the pushed predicate. A widened filter is
-  a residual, so a `LIMIT` above it stays in the engine and a grouped query
-  over it declines;
+  byte prefix, never fewer). An `xsd:dateTime` literal compared (`=`, `<`,
+  `<=`, `>`, `>=`) with a `timestamp` column that has **no zone** pushes a
+  window of ±14 hours around the literal, rendered as a naive `TIMESTAMP`
+  so the database converts nothing: whatever zone the column was written
+  in, its values lie within that span of the instant they denote (UTC-12 to
+  UTC+14), so the window keeps every row the exact comparison can and the
+  engine, which reads the column as UTC, applies the exact one. On SQLite,
+  where a timestamp is text, the bounds are whole days (`>= '2024-01-09'`),
+  which order correctly with either time separator. Inside a conjunction
+  the parts that cannot be widened are simply dropped from the pushed
+  predicate. A widened filter is a residual, so a `LIMIT` above it stays in
+  the engine and a grouped query over it declines;
 - an entity whose members come from **several triples maps sharing its
   subject** (a vertically partitioned mapping: one map per column group, or
   per table, over the same `rr:template`) is one access per distinct table,
@@ -281,7 +288,8 @@ points, instants) and declines rather than approximate:
   on Trino, `TIMESTAMP WITH TIME ZONE '… UTC'` on Postgres (a plain
   `TIMESTAMP` literal there silently drops the zone and is read in the
   session's zone), `TIMESTAMP '…+00:00'` on MySQL. A naive `timestamp`
-  column is taken as UTC when its term is built, on every dialect.
+  column is taken as UTC when its term is built, on every dialect, and a
+  filter against it pushes the ±14h widening window described above.
 - A decimal's lexical form follows the scale the endpoint reports for the
   column (`decimal(10,2)` gives `99.50`); the bridge reports NUMERIC /
   DECIMAL columns at the scale it was started with (`--decimal-scale`,

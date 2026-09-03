@@ -279,4 +279,8 @@ pub struct PushdownCapabilities {
     pub string_distinct_is_binary: bool,
     /// String `<` orders by code point (not a locale collation).
     pub string_order_is_codepoint: bool,
+    /// A `timestamp` without a zone is stored as text (SQLite), ordered by
+    /// its characters. The date prefix orders correctly whatever the time
+    /// separator; a comparison at time-of-day granularity does not.
+    pub timestamp_is_text: bool,
 }

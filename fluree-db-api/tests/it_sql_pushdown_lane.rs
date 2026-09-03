@@ -411,11 +411,39 @@ fn cases() -> Vec<Case> {
             routing: Routing::MustFire,
             declined: None,
         },
+        // A naive column's values sit within 14h of the instant they denote
+        // (UTC-12 to UTC+14), so a window that wide around the literal is
+        // pushed as a naive TIMESTAMP and the exact comparison stays a
+        // residual.
         Case {
-            name: "dateTime filter on a naive timestamp column stays in the engine",
+            name: "dateTime filter on a naive timestamp column pushes a widened window",
             sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:updated ?u FILTER(?u > \"2024-01-10T00:00:00Z\"^^xsd:dateTime) }",
-            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."updated" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."updated" IS NOT NULL"#],
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."updated" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."updated" IS NOT NULL AND "t0"."updated" >= TIMESTAMP '2024-01-09 10:00:00.000000'"#],
             rows: &["o=http://example.org/order/11"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "dateTime equality on a naive timestamp column pushes both bounds",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:updated ?u FILTER(?u = \"2024-02-02T18:00:00Z\"^^xsd:dateTime) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."updated" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."updated" IS NOT NULL AND "t0"."updated" >= TIMESTAMP '2024-02-02 04:00:00.000000' AND "t0"."updated" <= TIMESTAMP '2024-02-03 08:00:00.000000'"#],
+            rows: &["o=http://example.org/order/11"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "dateTime upper bound on a naive timestamp column keeps the LIMIT in the engine",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:updated ?u FILTER(\"2024-01-10T00:00:00Z\"^^xsd:dateTime > ?u) } LIMIT 1",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."updated" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."updated" IS NOT NULL AND "t0"."updated" <= TIMESTAMP '2024-01-10 14:00:00.000000'"#],
+            rows: &["o=http://example.org/order/10"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "dateTime inequality on a naive timestamp column stays in the engine",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:updated ?u FILTER(?u != \"2024-01-10T00:00:00Z\"^^xsd:dateTime) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."updated" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."updated" IS NOT NULL"#],
+            rows: &["o=http://example.org/order/10", "o=http://example.org/order/11"],
             routing: Routing::MustFire,
             declined: None,
         },
@@ -1871,6 +1899,31 @@ fn live_cases() -> Vec<LiveCase> {
             rows: &["t=2024-01-10T03:00:00Z"],
             only: &[],
             sent: &[],
+        },
+        // A filter on a naive column pushes a ±14h window rendered naive, so
+        // the server's zone never enters; SQLite's text timestamps get
+        // whole-day bounds, which order right with either time separator.
+        LiveCase {
+            name: "a filter on a naive column pushes a window and the engine keeps the exact rows",
+            sparql: "SELECT ?e FROM <shop-live:main> WHERE { ?e ex:atLocal ?t FILTER(?t > \"2024-01-10T00:00:00Z\"^^xsd:dateTime) }",
+            rows: &["e=http://example.org/event/1"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("\"at_local\" >= '2024-01-09'")),
+                (Postgres, Sent::Contains("\"at_local\" >= TIMESTAMP '2024-01-09 10:00:00.000000'")),
+                (Mysql, Sent::Contains("`at_local` >= TIMESTAMP '2024-01-09 10:00:00.000000'")),
+            ],
+        },
+        LiveCase {
+            name: "equality on a naive column pushes both bounds of the window",
+            sparql: "SELECT ?e FROM <shop-live:main> WHERE { ?e ex:atLocal ?t FILTER(?t = \"2024-01-09T21:00:00Z\"^^xsd:dateTime) }",
+            rows: &["e=http://example.org/event/2"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("\"at_local\" < '2024-01-11'")),
+                (Postgres, Sent::Contains("\"at_local\" <= TIMESTAMP '2024-01-10 11:00:00.000000'")),
+                (Mysql, Sent::Contains("`at_local` <= TIMESTAMP '2024-01-10 11:00:00.000000'")),
+            ],
         },
         // A decimal's lexical form follows the scale the endpoint reports for
         // the column: the bridge reports NUMERIC/DECIMAL as `decimal(38, 6)`

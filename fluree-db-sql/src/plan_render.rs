@@ -491,6 +491,7 @@ pub fn capabilities(dialect: SqlDialect) -> PushdownCapabilities {
         // the `GROUP BY` as itself, so grouping folds case-variants together.
         string_distinct_is_binary: !matches!(dialect, SqlDialect::Mysql),
         string_order_is_codepoint: matches!(dialect, SqlDialect::Trino | SqlDialect::Sqlite),
+        timestamp_is_text: matches!(dialect, SqlDialect::Sqlite),
     }
 }
 
