@@ -269,7 +269,10 @@ where
 /// released, since the cached copy outlives the blob. Expanding such a root
 /// fails — its manifests were released with it — and that failure is read as
 /// the end of the chain rather than an error, because storage no longer holds
-/// the root and an uncached walk would have stopped there too.
+/// the root and an uncached walk would have stopped there too. The head is
+/// the exception: a chain that ends before its first root has no live set,
+/// and the plan refuses rather than orphan the branch, as an uncached walk
+/// does when it cannot read the head.
 ///
 /// The set that results is a superset of the uncached walk's, not a match: a
 /// root contributes its direct refs before any manifest is read, so the
@@ -289,6 +292,7 @@ where
 {
     let mut chain_ids = ChainCasIds::new();
     let mut walk = PrevIndexChainWalk::new(store, head, artifact_cache_dir);
+    let mut expanded_any = false;
 
     // One root at a time: only the CIDs outlive each step, so a long chain
     // costs its distinct refs rather than every decoded root at once.
@@ -300,7 +304,16 @@ where
             // than gone, and a live set short of them would classify live
             // artifacts as orphans. If existence cannot be established either,
             // treat the root as present and refuse.
-            if !store.has(&entry.root_id).await.unwrap_or(true) {
+            //
+            // The head is never an ending, for the same reason
+            // `PrevIndexChainWalk::end_of_chain_or_error` refuses it: a chain
+            // that ends before its first root leaves the live set holding
+            // only the head's direct refs, and every retained root and
+            // manifest behind it would be planned as an orphan. `add_root`
+            // has already added those direct refs by the time it fails, so
+            // the accumulator is not empty here, which is why the test is a
+            // flag and not `chain_ids.is_empty()`.
+            if expanded_any && !store.has(&entry.root_id).await.unwrap_or(true) {
                 tracing::debug!(
                     root_id = %entry.root_id,
                     t = entry.t,
@@ -319,6 +332,7 @@ where
         if let Some(garbage_id) = entry.garbage_id {
             chain_ids.insert(garbage_id);
         }
+        expanded_any = true;
     }
 
     Ok(chain_ids.into_ids())
@@ -608,6 +622,51 @@ mod tests {
                 "a manifest a live root routes through must stay live"
             );
         }
+    }
+
+    /// The same state at the head: its blob and manifest are gone but its
+    /// cached copy survives. Ending the chain there would leave the live set
+    /// holding only the head's direct refs and plan every retained root and
+    /// manifest as an orphan, so the plan must refuse — as it does without
+    /// the cache, pinned by `an_unreadable_head_aborts_the_plan`.
+    #[tokio::test]
+    async fn a_released_head_aborts_the_plan_even_when_its_cache_entry_survives() {
+        let storage = MemoryStorage::new();
+        let dict = dict_cid(b"live-dict");
+        let (_, dict_addr) = cid_and_addr_for(
+            MAIN,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"live-dict",
+        );
+        storage.write_bytes(&dict_addr, b"dict").await.unwrap();
+
+        let chain = write_named_graph_chain(&storage, MAIN, 3, &dict).await;
+        let head = chain.last().map(|(cid, _)| cid);
+        let branches = heads(&[(MAIN, head)]);
+        let cache_dir = empty_cache_dir("released-head");
+
+        plan_sweep(&storage, NAME, &branches, Some(&cache_dir))
+            .await
+            .unwrap();
+        assert_cache_populated(&cache_dir);
+
+        // Release the head and the manifest it routes through, leaving the
+        // cache entry behind. Nothing in-process does this under a normal
+        // configuration; it is the shape a lifecycle rule, an operator
+        // cleanup, or a partial restore leaves.
+        let (head_root, head_manifest_addr) = chain.last().unwrap();
+        let head_addr = candidate_addresses("memory", MAIN, head_root)[0].clone();
+        storage.delete(&head_addr).await.unwrap();
+        storage.delete(head_manifest_addr).await.unwrap();
+
+        let result = plan_sweep(&storage, NAME, &branches, Some(&cache_dir)).await;
+
+        assert!(
+            result.is_err(),
+            "a released head must abort the plan rather than orphan every retained root"
+        );
     }
 
     /// A root published with no `prev_index` severs the chain, and everything
