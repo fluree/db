@@ -1094,6 +1094,20 @@ impl BackgroundIndexerWorker {
         // process can run two workers against one nameservice (raft does), and
         // because they hold independent `states` maps, `trigger_if_idle` cannot
         // see the other's claim: both would queue and build the same ledger.
+        //
+        // Subscribe BEFORE spawning the sweep, not inside the subscriber task.
+        // The sweep and the subscription used to be sequential statements in
+        // one task, which is what made "events arriving during the sweep are
+        // buffered, not lost" true. They are separate tasks now, so leaving the
+        // `subscribe()` inside the subscriber would let a commit published
+        // between the sweep's `all_records()` and the subscriber's first poll
+        // reach neither. Taking the receiver here restores the ordering: the
+        // broadcast buffers from this point on, whatever order the tasks run in.
+        let subscription = self
+            .event_bus
+            .as_ref()
+            .map(|bus| bus.subscribe(SubscriptionScope::All));
+
         let _sweep_guard = if self.config.catchup_sweeps_enabled {
             let trigger = self.subscriber_trigger.clone();
             let nameservice = Arc::clone(&self.nameservice);
@@ -1114,7 +1128,7 @@ impl BackgroundIndexerWorker {
         // Guard ensures aborting the outer `run` task also aborts
         // the subscriber — its broadcast receiver doesn't otherwise
         // observe cancellation.
-        let _subscriber_guard = self.event_bus.clone().map(|bus| {
+        let _subscriber_guard = subscription.map(|subscription| {
             // Hand the subscriber the trigger surface, not the full
             // `IndexerHandle`. The subscriber keeps a `watch::Sender`
             // alive (so trigger() can wake the worker), but it does
@@ -1124,7 +1138,7 @@ impl BackgroundIndexerWorker {
             let trigger = self.subscriber_trigger.clone();
             let nameservice = Arc::clone(&self.nameservice);
             AbortOnDrop(tokio::spawn(async move {
-                run_event_subscriber(bus, trigger, nameservice).await;
+                run_event_subscriber(subscription, trigger, nameservice).await;
             }))
         });
 
@@ -1902,6 +1916,7 @@ async fn catch_up_sweep(handle: &TriggerHandle, nameservice: &dyn IndexingNameSe
     let behind = records
         .into_iter()
         .filter(|r| !r.retracted && r.has_novelty());
+    let mut queued = 0usize;
     for record in behind {
         debug!(
             ledger_id = %record.ledger_id,
@@ -1910,6 +1925,14 @@ async fn catch_up_sweep(handle: &TriggerHandle, nameservice: &dyn IndexingNameSe
             "Catch-up: triggering indexer"
         );
         let _ = handle.trigger(record.ledger_id, record.commit_t).await;
+        queued += 1;
+    }
+    // Logged as a total because the count is the operator-visible cost. The
+    // predicate is "behind", which `reindex_min_bytes` cannot narrow (an
+    // `NsRecord` carries no novelty byte count), so on a deployment with many
+    // small idle ledgers this is one index build per ledger listed here.
+    if queued > 0 {
+        info!(queued, "Catch-up sweep queued behind ledgers for indexing");
     }
 }
 
@@ -1936,23 +1959,21 @@ async fn catch_up_sweep(handle: &TriggerHandle, nameservice: &dyn IndexingNameSe
 /// converges: afterwards `index_t == commit_t`, `has_novelty()` is false, and it
 /// is not swept again until it falls behind.
 fn stalled_ledgers(records: &[NsRecord], last_seen: &HashMap<String, i64>) -> Vec<(String, i64)> {
-    let mut stalled: Vec<(String, i64)> = records
+    // Carry the gap through the sort rather than looking it up per comparison:
+    // a comparator that scans `records` makes the sort O(S log S * R).
+    let mut stalled: Vec<(String, i64, i64)> = records
         .iter()
         .filter(|r| !r.retracted && r.has_novelty())
         .filter(|r| last_seen.get(&r.ledger_id) == Some(&r.commit_t))
-        .map(|r| (r.ledger_id.clone(), r.commit_t))
+        .map(|r| (r.ledger_id.clone(), r.commit_t, r.commit_t - r.index_t))
         .collect();
     // Most-behind first: on a deployment that starts with a backlog, the ledger
     // blocking writes should be queued ahead of one merely lagging by a commit.
-    let gap = |id: &str| {
-        records
-            .iter()
-            .find(|r| r.ledger_id == id)
-            .map(|r| r.commit_t - r.index_t)
-            .unwrap_or(0)
-    };
-    stalled.sort_by(|a, b| gap(&b.0).cmp(&gap(&a.0)).then_with(|| a.0.cmp(&b.0)));
+    stalled.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
     stalled
+        .into_iter()
+        .map(|(id, commit_t, _gap)| (id, commit_t))
+        .collect()
 }
 
 /// Re-sweep for stalled ledgers on a timer, forever.
@@ -2002,18 +2023,20 @@ async fn run_catchup_sweeps(
     }
 }
 
-/// Translate [`NameServiceEvent::LedgerCommitPublished`] from `bus`
-/// into [`IndexerHandle::trigger`] calls. A catch-up sweep runs on
-/// `Lagged`; the startup sweep belongs to
+/// Translate [`NameServiceEvent::LedgerCommitPublished`] from
+/// `subscription` into [`IndexerHandle::trigger`] calls. A catch-up
+/// sweep runs on `Lagged`; the startup sweep belongs to
 /// [`BackgroundIndexerWorker::run`], which performs it whether or not
 /// a bus was wired. Returns when the bus closes.
+///
+/// Takes an already-created [`Subscription`](fluree_db_nameservice::Subscription)
+/// rather than the bus: `run` subscribes synchronously so events are buffered
+/// from before the start-up sweep begins, whatever order the two tasks run in.
 async fn run_event_subscriber(
-    bus: Arc<LedgerEventBus>,
+    mut subscription: fluree_db_nameservice::Subscription,
     handle: TriggerHandle,
     nameservice: Arc<dyn IndexingNameService>,
 ) {
-    let mut subscription = bus.subscribe(SubscriptionScope::All);
-
     loop {
         match subscription.receiver.recv().await {
             Ok(NameServiceEvent::LedgerCommitPublished {
@@ -3380,21 +3403,17 @@ mod tests {
             BackgroundIndexerWorker::new(backend, Arc::clone(&ns), IndexerConfig::default());
 
         let bus = Arc::new(LedgerEventBus::new(16));
+        // Subscribing here rather than inside the task is what `run` does, and
+        // it is what makes this test deterministic: the receiver exists before
+        // `notify`, so the event is buffered no matter when the task is polled.
+        let subscription = bus.subscribe(SubscriptionScope::All);
         let sub_task = tokio::spawn({
-            let bus = Arc::clone(&bus);
             let handle = handle.clone();
             let ns = Arc::clone(&ns);
             async move {
-                run_event_subscriber(bus, handle.trigger.clone(), ns).await;
+                run_event_subscriber(subscription, handle.trigger.clone(), ns).await;
             }
         });
-
-        // Ensure the subscriber has called subscribe() before we emit.
-        // The catch-up sweep runs after subscribe, so once it completes
-        // the receiver is ready — yield a few times to let it land.
-        for _ in 0..5 {
-            tokio::task::yield_now().await;
-        }
 
         bus.notify(NameServiceEvent::LedgerCommitPublished {
             ledger_id: "test:main".into(),

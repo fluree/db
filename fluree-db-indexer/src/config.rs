@@ -199,7 +199,17 @@ pub struct IndexerConfig {
     ///
     /// `Duration::ZERO` disables the periodic re-sweep. It does **not** disable
     /// the sweep [`BackgroundIndexerWorker::run`] performs at start-up — that
-    /// one is a deadlock fix, not a tuning knob.
+    /// one is a deadlock fix, not a tuning knob. To turn both off, see
+    /// [`catchup_sweeps_enabled`](Self::catchup_sweeps_enabled).
+    ///
+    /// Neither sweep can honour `reindex_min_bytes`: `NsRecord` carries no
+    /// novelty byte count, so "behind" is the only predicate available and a
+    /// ledger the soft threshold deliberately left unindexed is built anyway
+    /// once a sweep reaches it. The post-commit trigger does gate on
+    /// `should_reindex`, so this is the one path that bypasses the operator's
+    /// batching — an index build per behind ledger on every process start, plus
+    /// one per ledger that goes idle while behind. Builds are serialized per
+    /// worker, so the cost is throughput rather than a stampede.
     ///
     /// Default: 300 s.
     pub catchup_interval: Duration,
