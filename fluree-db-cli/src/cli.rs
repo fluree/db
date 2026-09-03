@@ -1342,6 +1342,12 @@ pub enum Commands {
         action: DocsAction,
     },
 
+    /// Turn a folder of documents into a searchable graph: structure, chunks, embeddings
+    Doc {
+        #[command(subcommand)]
+        action: DocAction,
+    },
+
     /// Manage Apache Iceberg table connections
     Iceberg {
         #[command(subcommand)]
@@ -3371,4 +3377,121 @@ mod tests {
             Some(&serde_json::Value::Bool(true))
         );
     }
+}
+
+/// `fluree doc` — documents in, a graph-RAG ledger out.
+#[derive(Subcommand, Debug)]
+pub enum DocAction {
+    /// Parse documents into a ledger: DoCO structure graph, retrieval chunks,
+    /// embeddings, and the vector + full-text indexes over them
+    ///
+    /// Reads PDF, Markdown, HTML, DOCX, PPTX and images. Parsing is
+    /// deterministic and local; with `[doc.vlm]` (or `[doc.llm]`) configured,
+    /// pages the parser could not read are escalated to that vision model.
+    /// With `[doc.embedding]` configured every chunk is embedded. Parses and
+    /// model readings are cached under `.fluree/cache/doc/`, so a re-run only
+    /// pays for what changed.
+    ///
+    /// Examples:
+    ///   fluree doc ingest ./contracts --ledger contracts
+    ///   fluree doc ingest report.pdf notes/ -l docs --no-escalate
+    ///   fluree config set doc.embedding.url http://localhost:11434/v1
+    ///   fluree config set doc.embedding.model nomic-embed-text
+    Ingest(DocIngestArgs),
+
+    /// Search a ledger's chunks by meaning (vector) or by words (full-text)
+    ///
+    /// Examples:
+    ///   fluree doc search "termination notice period" -l contracts
+    ///   fluree doc search "LM358B supply voltage" --mode text -n 5
+    Search(DocSearchArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DocIngestArgs {
+    /// Files or directories to ingest
+    #[arg(required = true, value_name = "PATH")]
+    pub paths: Vec<PathBuf>,
+
+    /// Target ledger (default: the active ledger). Created when missing.
+    #[arg(short = 'l', long, value_name = "LEDGER")]
+    pub ledger: Option<String>,
+
+    /// IRI prefix documents are minted under; the path relative to the
+    /// ingested directory is appended, so a document keeps its IRI across runs
+    #[arg(long, default_value = "urn:fluree:doc:", value_name = "IRI")]
+    pub base_iri: String,
+
+    /// Skip embeddings even when `[doc.embedding]` is configured
+    #[arg(long)]
+    pub no_embed: bool,
+
+    /// Never call a vision model, whatever `[doc.vlm]` says
+    #[arg(long)]
+    pub no_escalate: bool,
+
+    /// Skip building or syncing the vector and full-text indexes
+    #[arg(long)]
+    pub no_index: bool,
+
+    /// Neither read nor write the parse and reading caches
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Re-ingest documents already in the ledger with the same content,
+    /// parser and embedding model
+    #[arg(long)]
+    pub force: bool,
+
+    /// Emit a chunk once its buffer reaches this many characters
+    #[arg(long, default_value_t = 800, value_name = "N")]
+    pub min_chars: usize,
+
+    /// Split a single element longer than this many characters
+    #[arg(long, default_value_t = 2000, value_name = "N")]
+    pub max_chars: usize,
+
+    /// Most crops one document may send to the vision model
+    #[arg(long, default_value_t = 70, value_name = "N")]
+    pub max_crops: usize,
+
+    /// Parse, chunk and embed, then report what would be written — write nothing
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Also write each document's transaction as `<relative-path>.jsonld` here
+    #[arg(long, value_name = "DIR")]
+    pub out_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct DocSearchArgs {
+    /// What to look for
+    #[arg(required = true, value_name = "QUERY")]
+    pub query: String,
+
+    /// Ledger to search (default: the active ledger)
+    #[arg(short = 'l', long, value_name = "LEDGER")]
+    pub ledger: Option<String>,
+
+    /// Results to return
+    #[arg(short = 'n', long, default_value_t = 10, value_name = "N")]
+    pub limit: usize,
+
+    /// `vector` embeds the query with `[doc.embedding]` and searches the HNSW
+    /// index; `text` runs BM25; `auto` picks vector when an embedding endpoint
+    /// is configured
+    #[arg(long, value_enum, default_value_t = DocSearchMode::Auto)]
+    pub mode: DocSearchMode,
+
+    /// Print the raw query result as JSON instead of a summary
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocSearchMode {
+    Auto,
+    Vector,
+    Text,
 }

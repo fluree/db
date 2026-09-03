@@ -1,0 +1,36 @@
+[package]
+name = "fluree-db-doc"
+description = "Document ingestion for Fluree: parse a folder of documents into a DoCO structure graph with retrieval chunks and embeddings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The parsing engine. `render` is what rasterises the crops a VLM reads.
+fluree-doc-model.workspace = true
+fluree-doc-pdf = { workspace = true, features = ["render"] }
+fluree-doc-markdown.workspace = true
+fluree-doc-docx.workspace = true
+fluree-doc-html.workspace = true
+fluree-doc-pptx.workspace = true
+hayro-syntax.workspace = true
+
+# Model endpoints (OpenAI-compatible). Embeddings are async (reqwest); crop
+# reading runs inside the synchronous parse and uses ureq, a plain blocking
+# client with no runtime of its own — reqwest's blocking client owns one and
+# panics when dropped inside a tokio context.
+reqwest = { workspace = true }
+ureq = { version = "3", features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64 = "0.22"
+thiserror.workspace = true
+tracing.workspace = true
+walkdir.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[lints]
+workspace = true

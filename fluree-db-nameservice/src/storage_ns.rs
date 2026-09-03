@@ -1268,13 +1268,11 @@ where
             let kind_type_str = kind_type_str.clone();
             let source_type_str = source_type_str.clone();
 
-            // For graph source config, we always update (config changes are allowed)
-            // Only preserve retracted status if already set
-            let status = existing
-                .as_ref()
-                .map(|f| f.status.clone())
-                .filter(|s| s == "retracted")
-                .unwrap_or_else(|| "ready".to_string());
+            // Publishing config creates or reconfigures, so the record is
+            // active — a retraction from an earlier drop does not survive
+            // it (see `FileNameService::publish_graph_source`).
+            let _ = &existing;
+            let status = "ready".to_string();
 
             Some(GraphSourceNsFileV2 {
                 context: ns_context(),
