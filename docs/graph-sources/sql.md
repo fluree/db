@@ -247,7 +247,14 @@ pushable. In that statement:
 - a `BIND` in the block keeps the block on one statement: the statement
   returns the columns the expression reads and the engine computes the
   value per row, before any residual filter (so a `FILTER` over the bound
-  variable is fine). The `BIND` must read only variables the block bound
+  variable is fine). When the expression is `+`, `-` and `*` over numeric
+  columns the database holds natively, numeric constants and other such
+  `BIND`s, a `FILTER` comparing it with a number pushes as the expression
+  (`("total" * 2) > 50`) and an `ORDER BY … LIMIT` over it pushes as a
+  top-k (`ORDER BY ("total" * 2) DESC LIMIT 2`); the bound value is still
+  built in the engine. Division stays in the engine (SPARQL divides
+  integers into a decimal, SQL into an integer), as does anything over a
+  string. The `BIND` must read only variables the block bound
   before it, and nothing the statement joins or filters on may read the
   bound variable; an `EXISTS` inside the expression, or a `BIND` inside an
   `OPTIONAL` or a `UNION` branch, leaves the block to the engine;

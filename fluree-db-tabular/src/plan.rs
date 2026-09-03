@@ -38,6 +38,40 @@ pub enum Literal {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+/// A scalar expression over columns and literals: what a `BIND` computes,
+/// when a filter or an ordering over it is pushed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Col(ColRef),
+    Lit(Literal),
+    Arith {
+        op: ArithOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+}
+
+impl Expr {
+    /// Every column the expression reads.
+    pub fn columns<'a>(&'a self, out: &mut Vec<&'a ColRef>) {
+        match self {
+            Expr::Col(c) => out.push(c),
+            Expr::Lit(_) => {}
+            Expr::Arith { left, right, .. } => {
+                left.columns(out);
+                right.columns(out);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmpOp {
     Eq,
     NotEq,
@@ -83,6 +117,12 @@ pub enum Pred {
     Like {
         col: ColRef,
         pattern: String,
+    },
+    /// `expr op value` for a computed numeric expression.
+    ExprCmp {
+        expr: Expr,
+        op: CmpOp,
+        value: Literal,
     },
     And(Vec<Pred>),
     Or(Vec<Pred>),
@@ -240,10 +280,11 @@ impl OutputCol {
 
 /// An `ORDER BY` key: a column of the join, or one of the plan's outputs by
 /// name (the only way to order by an aggregate).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum OrderKey {
     Col(ColRef),
     Output(String),
+    Expr(Expr),
 }
 
 /// A complete pushed-down block: a join tree, a projection, and the

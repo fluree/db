@@ -20,8 +20,8 @@ use fluree_db_r2rml::mapping::{
 use fluree_db_r2rml::materialize::reverse_subject_template;
 use fluree_db_r2rml::RdfTerm;
 use fluree_db_tabular::plan::{
-    like_escape, CmpOp, ColRef, KeySet, Literal, OutputCol, Pred, PushdownCapabilities, RelNode,
-    RelSource,
+    like_escape, ArithOp, CmpOp, ColRef, Expr, KeySet, Literal, OutputCol, Pred,
+    PushdownCapabilities, RelNode, RelSource,
 };
 use fluree_db_tabular::{BatchSchema, FieldType};
 use fluree_vocab::{rdf, xsd, UnresolvedDatatypeConstraint};
@@ -136,6 +136,8 @@ pub(crate) struct Lowered {
     pub var_columns: HashMap<VarId, Vec<ColRef>>,
     /// Required (non-nullable) literal columns a `ORDER BY` may be pushed on.
     pub order_columns: HashMap<VarId, (ColRef, RdfClass)>,
+    /// `BIND` variables whose numeric expression the statement can order by.
+    pub order_exprs: HashMap<VarId, Expr>,
     /// A `LIMIT` on the statement is a superset of the block's result only
     /// when no residual filter drops rows afterwards and every variable
     /// shared with the outer query is seeded into the statement.
@@ -224,6 +226,7 @@ pub(crate) fn lower_block(input: LowerInput<'_>) -> Result<Lowering<Vec<Lowered>
             vars: HashMap::new(),
             var_order: Vec::new(),
             residuals: Vec::new(),
+            bind_exprs: HashMap::new(),
             required_columns: HashSet::new(),
             static_keysets: Vec::new(),
         };
@@ -287,6 +290,8 @@ struct Lowerer<'a> {
     vars: HashMap<VarId, VarSource>,
     var_order: Vec<VarId>,
     residuals: Vec<Expression>,
+    /// Numeric `BIND` expressions the statement can compute, by variable.
+    bind_exprs: HashMap<VarId, Expr>,
     /// `(alias, column)` pairs that are `IS NOT NULL`.
     required_columns: HashSet<(String, String)>,
     static_keysets: Vec<(KeySet, Vec<Pred>)>,
@@ -446,6 +451,11 @@ impl<'a> Lowerer<'a> {
 
         // Filters: exact ones into the plan; the rest stay in the engine,
         // with a widening predicate in the plan where one exists.
+        for (v, e) in &binds {
+            if let Some(x) = self.lower_arith(e) {
+                self.bind_exprs.insert(*v, x);
+            }
+        }
         for f in &block.filters {
             match self.lower_filter(f) {
                 Some(pred) => self.place_pred(pred),
@@ -562,6 +572,21 @@ impl<'a> Lowerer<'a> {
             }
         }
 
+        // An expression orders exactly when every column it reads is
+        // required: a NULL would order as the dialect's NULL, not as unbound.
+        let order_exprs: HashMap<VarId, Expr> = self
+            .bind_exprs
+            .iter()
+            .filter(|(_, e)| {
+                let mut cols = Vec::new();
+                e.columns(&mut cols);
+                cols.iter().all(|c| {
+                    self.required_columns
+                        .contains(&(c.alias.clone(), c.column.clone()))
+                })
+            })
+            .map(|(v, e)| (*v, e.clone()))
+            .collect();
         let limit_is_exact = self.residuals.is_empty() && all_shared_seeded;
         Ok(Ok(Some(Lowered {
             root,
@@ -575,6 +600,7 @@ impl<'a> Lowerer<'a> {
             vars: self.vars.clone(),
             var_columns,
             order_columns,
+            order_exprs,
             limit_is_exact,
             distinct: distinct_vars.is_some(),
         })))
@@ -1720,17 +1746,6 @@ impl<'a> Lowerer<'a> {
                     (Expression::Var(v), Expression::Const(c))
                     | (Expression::Const(c), Expression::Var(v)) => {
                         let reversed = matches!(&args[0], Expression::Const(_));
-                        let (col, class) = self.literal_column(*v)?;
-                        let (lit, lclass) = literal_of(c, None)?;
-                        if !self.exact_eq(&col, &class, &lclass) {
-                            return None;
-                        }
-                        if ordering
-                            && class == RdfClass::Str
-                            && !self.caps.string_order_is_codepoint
-                        {
-                            return None;
-                        }
                         let op = match (func, reversed) {
                             (Function::Eq, _) => CmpOp::Eq,
                             (Function::Ne, _) => CmpOp::NotEq,
@@ -1740,6 +1755,30 @@ impl<'a> Lowerer<'a> {
                             (Function::Ge, false) | (Function::Le, true) => CmpOp::GtEq,
                             _ => return None,
                         };
+                        let (lit, lclass) = literal_of(c, None)?;
+                        // A computed numeric value compares in the database
+                        // as it does in the engine (same promotion, no
+                        // division).
+                        if let Some(expr) = self.bind_exprs.get(v) {
+                            if lclass != RdfClass::Numeric {
+                                return None;
+                            }
+                            return Some(Pred::ExprCmp {
+                                expr: expr.clone(),
+                                op,
+                                value: lit,
+                            });
+                        }
+                        let (col, class) = self.literal_column(*v)?;
+                        if !self.exact_eq(&col, &class, &lclass) {
+                            return None;
+                        }
+                        if ordering
+                            && class == RdfClass::Str
+                            && !self.caps.string_order_is_codepoint
+                        {
+                            return None;
+                        }
                         Some(Pred::Cmp {
                             col,
                             op,
@@ -1873,6 +1912,51 @@ impl<'a> Lowerer<'a> {
         }
         match literal_of(c, None)? {
             (Literal::Str(s), RdfClass::Str) => Some((col, s)),
+            _ => None,
+        }
+    }
+
+    /// `expr` as a statement expression, when it is `+`, `-` and `*` over
+    /// numeric columns the database holds natively, numeric constants and
+    /// other such `BIND`s. Division is left out: SPARQL divides integers
+    /// into a decimal, SQL into an integer. Overflow is the dialect's.
+    fn lower_arith(&self, expr: &Expression) -> Option<Expr> {
+        match expr {
+            Expression::Var(v) => {
+                if let Some(e) = self.bind_exprs.get(v) {
+                    return Some(e.clone());
+                }
+                let (col, class) = self.literal_column(*v)?;
+                if class != RdfClass::Numeric
+                    || !self.literal_exact(&col, &class)
+                    || self.field_type(&col) == Some(FieldType::Float32)
+                {
+                    return None;
+                }
+                Some(Expr::Col(col))
+            }
+            Expression::Const(c) => match literal_of(c, None)? {
+                (lit @ (Literal::Int(_) | Literal::Decimal { .. } | Literal::Double(_)), _) => {
+                    Some(Expr::Lit(lit))
+                }
+                _ => None,
+            },
+            Expression::Call { func, args } => {
+                let op = match func {
+                    Function::Add => ArithOp::Add,
+                    Function::Sub => ArithOp::Sub,
+                    Function::Mul => ArithOp::Mul,
+                    _ => return None,
+                };
+                let [l, r] = args.as_slice() else {
+                    return None;
+                };
+                Some(Expr::Arith {
+                    op,
+                    left: Box::new(self.lower_arith(l)?),
+                    right: Box::new(self.lower_arith(r)?),
+                })
+            }
             _ => None,
         }
     }
@@ -2100,6 +2184,11 @@ fn collect_aliases(pred: &Pred, out: &mut HashSet<String>) {
         Pred::ColEq { left, right } => {
             out.insert(left.alias.clone());
             out.insert(right.alias.clone());
+        }
+        Pred::ExprCmp { expr, .. } => {
+            let mut cols = Vec::new();
+            expr.columns(&mut cols);
+            out.extend(cols.into_iter().map(|c| c.alias.clone()));
         }
         Pred::And(ps) | Pred::Or(ps) => ps.iter().for_each(|p| collect_aliases(p, out)),
         Pred::Not(p) => collect_aliases(p, out),

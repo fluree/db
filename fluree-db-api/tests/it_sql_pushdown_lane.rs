@@ -574,11 +574,40 @@ fn cases() -> Vec<Case> {
             routing: Routing::MustFire,
             declined: None,
         },
+        // A numeric BIND of `+`, `-`, `*` over native numeric columns is an
+        // expression the statement can compute: a filter over it pushes
+        // exactly, a top-k orders by it, and the engine still builds the
+        // bound value itself. Division stays in the engine (SPARQL divides
+        // integers into a decimal, SQL into an integer).
         Case {
-            name: "a filter over a BIND variable stays in the engine after the BIND",
+            name: "a filter over a numeric BIND pushes the expression",
             sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) FILTER(?d > 50) }",
-            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND ("t0"."total" * 2) > 50"#],
             rows: &["o=http://example.org/order/10", "o=http://example.org/order/12"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a nested BIND expression pushes with the plan's precedence",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(?t * 2 + 1 AS ?d) FILTER(100 < ?d) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND (("t0"."total" * 2) + 1) > 100"#],
+            rows: &["o=http://example.org/order/10"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a top-k over a numeric BIND orders by the expression",
+            sparql: "SELECT ?o ?d FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) } ORDER BY DESC(?d) LIMIT 2",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL ORDER BY ("t0"."total" * 2) DESC LIMIT 2"#],
+            rows: &["d=199.00 o=http://example.org/order/10", "d=84.00 o=http://example.org/order/12"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a filter over a BIND that divides stays in the engine",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(?t / 2 AS ?h) FILTER(?h > 40) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            rows: &["o=http://example.org/order/10"],
             routing: Routing::MustFire,
             declined: None,
         },
@@ -2366,22 +2395,35 @@ fn live_cases() -> Vec<LiveCase> {
             only: &[Postgres, Mysql],
             sent: &[(Postgres, Sent::Contains("SUM(")), (Mysql, Sent::Contains("SUM("))],
         },
+        // The filter over the BIND pushes as an expression; the bound value
+        // itself is still the engine's (its lexical follows the column).
         LiveCase {
-            name: "a BIND and a filter over it run in the engine",
+            name: "a filter over a BIND pushes the expression and the engine binds the value",
             sparql: "SELECT ?o ?d FROM <shop-live:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) FILTER(?d > 50) }",
             rows: &[
                 "d=199.000000 o=http://example.org/order/10",
                 "d=84.000000 o=http://example.org/order/12",
             ],
             only: &[Postgres, Mysql],
-            sent: &[(Postgres, Sent::Lacks("* 2")), (Mysql, Sent::Lacks("* 2"))],
+            sent: &[(Postgres, Sent::Contains("* 2) > 50")), (Mysql, Sent::Contains("* 2) > 50"))],
         },
         LiveCase {
-            name: "a BIND and a filter over it run in the engine on SQLite",
+            name: "a filter over a BIND pushes the expression on SQLite",
             sparql: "SELECT ?o ?d FROM <shop-live:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) FILTER(?d > 50) }",
             rows: &["d=199.0 o=http://example.org/order/10", "d=84 o=http://example.org/order/12"],
             only: &[Sqlite],
-            sent: &[(Sqlite, Sent::Lacks("* 2"))],
+            sent: &[(Sqlite, Sent::Contains("* 2) > 50"))],
+        },
+        LiveCase {
+            name: "a top-k over a BIND orders by the expression",
+            sparql: "SELECT ?o FROM <shop-live:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) } ORDER BY DESC(?d) LIMIT 1",
+            rows: &["o=http://example.org/order/10"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("ORDER BY (\"t0\".\"total\" * 2) DESC LIMIT 1")),
+                (Postgres, Sent::Contains("ORDER BY (\"t0\".\"total\" * 2) DESC LIMIT 1")),
+                (Mysql, Sent::Contains("ORDER BY (`t0`.`total` * 2) DESC LIMIT 1")),
+            ],
         },
         LiveCase {
             name: "STRSTARTS widens to a LIKE the engine narrows back",

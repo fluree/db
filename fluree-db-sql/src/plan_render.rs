@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use fluree_db_tabular::plan::{
-    ColRef, KeySet, Literal, OrderKey, OutputCol, OutputExpr, Pred, PushdownCapabilities, RelNode,
-    RelPlan, RelSource,
+    ArithOp, ColRef, Expr, KeySet, Literal, OrderKey, OutputCol, OutputExpr, Pred,
+    PushdownCapabilities, RelNode, RelPlan, RelSource,
 };
 use fluree_db_tabular::{BatchSchema, FieldType};
 
@@ -83,10 +83,11 @@ pub fn render_plan(
                 let key = match k {
                     OrderKey::Col(c) => r.col(c),
                     OrderKey::Output(name) => dialect.quote_ident(name),
+                    OrderKey::Expr(e) => r.render_expr(e)?,
                 };
-                format!("{key} {}", if *asc { "ASC" } else { "DESC" })
+                Ok(format!("{key} {}", if *asc { "ASC" } else { "DESC" }))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         sql.push_str(" ORDER BY ");
         sql.push_str(&keys.join(", "));
     }
@@ -407,9 +408,64 @@ impl Renderer<'_> {
                 })?;
                 format!("{} LIKE {lit} ESCAPE '!'", self.col(col))
             }
+            Pred::ExprCmp { expr, op, value } => format!(
+                "{} {} {}",
+                self.render_expr(expr)?,
+                cmp_sql(*op),
+                self.expr_literal(value)?
+            ),
             Pred::And(ps) => self.render_junction(ps, " AND ")?,
             Pred::Or(ps) => self.render_junction(ps, " OR ")?,
             Pred::Not(p) => format!("NOT ({})", self.render_pred(p)?),
+        })
+    }
+
+    /// A numeric expression, every operation parenthesized so precedence
+    /// is the plan's, not the dialect's.
+    fn render_expr(&self, expr: &Expr) -> Result<String> {
+        Ok(match expr {
+            Expr::Col(c) => {
+                if !is_numeric(self.col_type(c)?) {
+                    return Err(SqlError::Unsupported(format!(
+                        "arithmetic over {}.{}, not a numeric column",
+                        c.alias, c.column
+                    )));
+                }
+                self.col(c)
+            }
+            Expr::Lit(l) => self.expr_literal(l)?,
+            Expr::Arith { op, left, right } => {
+                let op = match op {
+                    ArithOp::Add => "+",
+                    ArithOp::Sub => "-",
+                    ArithOp::Mul => "*",
+                };
+                format!(
+                    "({} {op} {})",
+                    self.render_expr(left)?,
+                    self.render_expr(right)?
+                )
+            }
+        })
+    }
+
+    /// A numeric literal inside an expression, typed by its own kind.
+    fn expr_literal(&self, lit: &Literal) -> Result<String> {
+        let ty = match lit {
+            Literal::Int(_) => FieldType::Int64,
+            Literal::Decimal { scale, .. } => FieldType::Decimal {
+                precision: 38,
+                scale: (*scale).max(0),
+            },
+            Literal::Double(_) => FieldType::Float64,
+            other => {
+                return Err(SqlError::Unsupported(format!(
+                    "literal {other:?} in an arithmetic expression"
+                )))
+            }
+        };
+        render_literal(lit, ty, self.dialect).ok_or_else(|| {
+            SqlError::Unsupported(format!("literal {lit:?} cannot be rendered as {ty:?}"))
         })
     }
 
@@ -757,6 +813,45 @@ mod tests {
         );
         assert!(render_plan(&like("name", r"c:\%"), &schemas(), SqlDialect::Mysql).is_err());
         assert!(render_plan(&like("id", "1%"), &schemas(), SqlDialect::Postgres).is_err());
+    }
+
+    /// An expression is parenthesized at every operation, its literals
+    /// typed by their own kind, and it orders a top-k; a string column in
+    /// arithmetic is refused.
+    #[test]
+    fn expressions_render_parenthesized() {
+        let times_two = |col: &str| Expr::Arith {
+            op: ArithOp::Mul,
+            left: Box::new(Expr::Col(ColRef::new("c", col))),
+            right: Box::new(Expr::Lit(Literal::Int(2))),
+        };
+        let plan = |col: &str| RelPlan {
+            root: RelNode::Filter {
+                input: Box::new(access("c", "customers")),
+                pred: Pred::ExprCmp {
+                    expr: Expr::Arith {
+                        op: ArithOp::Add,
+                        left: Box::new(times_two(col)),
+                        right: Box::new(Expr::Lit(Literal::Decimal {
+                            unscaled: 15,
+                            scale: 1,
+                        })),
+                    },
+                    op: CmpOp::Gt,
+                    value: Literal::Double(100.0),
+                },
+            },
+            output: vec![out("c", "id", "c0")],
+            group_by: Vec::new(),
+            distinct: false,
+            order_by: vec![(OrderKey::Expr(times_two(col)), false)],
+            limit: Some(2),
+        };
+        assert_eq!(
+            render_plan(&plan("id"), &schemas(), SqlDialect::Postgres).unwrap(),
+            r#"SELECT "c"."id" AS "c0" FROM "customers" AS "c" WHERE (("c"."id" * 2) + 1.5) > 1E2 ORDER BY ("c"."id" * 2) DESC LIMIT 2"#
+        );
+        assert!(render_plan(&plan("name"), &schemas(), SqlDialect::Postgres).is_err());
     }
 
     /// A string join on MySQL compares bytes too, and an integer join is

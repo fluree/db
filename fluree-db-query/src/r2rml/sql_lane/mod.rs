@@ -528,8 +528,11 @@ impl SqlBlockSource {
                     let keys: Option<Vec<(OrderKey, bool)>> = ordering
                         .iter()
                         .map(|s| {
-                            let (col, _) = lowered.order_columns.get(&s.var)?;
-                            Some((OrderKey::Col(col.clone()), s.ascending()))
+                            let key = match lowered.order_columns.get(&s.var) {
+                                Some((col, _)) => OrderKey::Col(col.clone()),
+                                None => OrderKey::Expr(lowered.order_exprs.get(&s.var)?.clone()),
+                            };
+                            Some((key, s.ascending()))
                         })
                         .collect();
                     if let Some(keys) = keys {
