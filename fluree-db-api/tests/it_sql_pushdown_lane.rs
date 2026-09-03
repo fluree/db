@@ -253,7 +253,85 @@ async fn setup() -> (MockServer, Fluree) {
         ))
         .await
         .expect("create typed sql source");
+    seed_native_twin(&fluree).await;
     (server, fluree)
+}
+
+/// Cases the per-scan lane cannot run (a graph source has no native index
+/// for the engine's subquery operator), checked against the native twin
+/// of the shop fixture instead.
+const LANE_ONLY_CASES: &[&str] = &[
+    "a grouped sub-select joins its counts to the outer rows",
+    "a grouped sub-select sums in the database and finalizes in the engine",
+    "a DISTINCT sub-select pushes as a distinct derived table",
+    "a top-k sub-select orders and limits inside the derived table",
+];
+
+/// The shop fixture as a native ledger (`shop-native:main`): the oracle for
+/// shapes the per-scan lane cannot answer.
+async fn seed_native_twin(fluree: &Fluree) {
+    let ledger = fluree
+        .create_ledger("shop-native:main")
+        .await
+        .expect("native twin ledger");
+    let ex = "http://example.org/";
+    let customer = |id: u32, name: &str, country: Option<&str>| {
+        let mut c = json!({
+            "@id": format!("{ex}customer/{id}"),
+            "@type": format!("{ex}Customer"),
+            format!("{ex}name"): name,
+        });
+        if let Some(k) = country {
+            c[format!("{ex}country")] = json!(k);
+        }
+        c
+    };
+    let order = |id: u32,
+                 customer: Option<u32>,
+                 total: &str,
+                 placed: Option<&str>,
+                 at: Option<&str>| {
+        let mut o = json!({
+            "@id": format!("{ex}order/{id}"),
+            "@type": format!("{ex}Order"),
+            format!("{ex}total"): {"@value": total, "@type": "http://www.w3.org/2001/XMLSchema#decimal"},
+        });
+        if let Some(c) = customer {
+            o[format!("{ex}customer")] = json!({"@id": format!("{ex}customer/{c}")});
+        }
+        if let Some(p) = placed {
+            o[format!("{ex}placed")] =
+                json!({"@value": p, "@type": "http://www.w3.org/2001/XMLSchema#date"});
+        }
+        if let Some(t) = at {
+            for pred in ["shipped", "updated"] {
+                o[format!("{ex}{pred}")] =
+                    json!({"@value": t, "@type": "http://www.w3.org/2001/XMLSchema#dateTime"});
+            }
+        }
+        o
+    };
+    let graph = json!({"@graph": [
+        customer(1, "Ada", Some("UK")),
+        customer(2, "Bo", None),
+        customer(3, "Cy", Some("US")),
+        order(10, Some(1), "99.50", Some("2024-01-05"), Some("2024-01-06T09:30:00Z")),
+        order(11, Some(1), "5.00", Some("2024-02-01"), Some("2024-02-02T18:00:00Z")),
+        order(12, Some(2), "42.00", Some("2024-03-01"), None),
+        order(13, None, "7.00", None, None),
+    ]});
+    fluree
+        .insert(ledger, &graph)
+        .await
+        .expect("seed native twin");
+}
+
+/// A case's rows from the native twin, comparable by value with the lane's.
+async fn native_rows(fluree: &Fluree, sparql: &str) -> Vec<String> {
+    let sparql = sparql
+        .replace("shop-sql:main", "shop-native:main")
+        .replace("shop-live:main", "shop-native:main");
+    by_value(&rows_of(&query(fluree, &sparql).await))
 }
 
 /// SPARQL JSON results as sorted rows of `var=value` pairs (variables in
@@ -792,6 +870,43 @@ fn cases() -> Vec<Case> {
             routing: Routing::MustNotFire,
             declined: Some("predicate provided by several triples maps"),
         },
+        // A sub-select is a derived table joined on its projected keys: a
+        // grouped one carries its aggregates as outputs the engine decodes
+        // like the grouped lane's; DISTINCT and ORDER BY … LIMIT push inside
+        // it. HAVING, OFFSET, a nested sub-select and a hidden inner
+        // variable the block reuses decline.
+        Case {
+            name: "a grouped sub-select joins its counts to the outer rows",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c (COUNT(?o) AS ?k) WHERE { ?o ex:customer ?c } GROUP BY ?c } }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "d0"."c1" AS "c2" FROM "shop"."customers" AS "t0" JOIN (SELECT "t2"."id" AS "c0", COUNT("t1"."id") AS "c1" FROM "shop"."orders" AS "t1" JOIN "shop"."customers" AS "t2" ON "t1"."customer_id" = "t2"."id" WHERE "t1"."id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL AND "t2"."id" IS NOT NULL GROUP BY "t2"."id") AS "d0" ON "t0"."id" = "d0"."c0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            rows: &["k=1 n=Bo", "k=2 n=Ada"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a grouped sub-select sums in the database and finalizes in the engine",
+            sparql: "SELECT ?n ?s FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c (SUM(?t) AS ?s) WHERE { ?o ex:customer ?c ; ex:total ?t } GROUP BY ?c } }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "d0"."c1" AS "c2", "d0"."c2" AS "c3" FROM "shop"."customers" AS "t0" JOIN (SELECT "t2"."id" AS "c0", SUM("t1"."total") AS "c1", COUNT("t1"."total") AS "c2" FROM "shop"."orders" AS "t1" JOIN "shop"."customers" AS "t2" ON "t1"."customer_id" = "t2"."id" WHERE "t1"."id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL AND "t1"."total" IS NOT NULL AND "t2"."id" IS NOT NULL GROUP BY "t2"."id") AS "d0" ON "t0"."id" = "d0"."c0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            rows: &["n=Ada s=104.50", "n=Bo s=42.00"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a DISTINCT sub-select pushes as a distinct derived table",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { { SELECT DISTINCT ?c WHERE { ?o ex:customer ?c } } ?c ex:name ?n }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" JOIN (SELECT DISTINCT "t2"."id" AS "c0" FROM "shop"."orders" AS "t1" JOIN "shop"."customers" AS "t2" ON "t1"."customer_id" = "t2"."id" WHERE "t1"."id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL AND "t2"."id" IS NOT NULL) AS "d0" ON "t0"."id" = "d0"."c0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            rows: &["n=Ada", "n=Bo"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a top-k sub-select orders and limits inside the derived table",
+            sparql: "SELECT ?o ?p FROM <shop-sql:main> WHERE { { SELECT ?o WHERE { ?o ex:total ?t } ORDER BY DESC(?t) LIMIT 2 } ?o ex:placed ?p }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."placed" AS "c1" FROM "shop"."orders" AS "t0" JOIN (SELECT "t1"."id" AS "c0" FROM "shop"."orders" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."total" IS NOT NULL ORDER BY "t1"."total" DESC LIMIT 2) AS "d0" ON "t0"."id" = "d0"."c0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL"#],
+            rows: &["o=http://example.org/order/10 p=2024-01-05", "o=http://example.org/order/12 p=2024-03-01"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
         Case {
             name: "UNION branch combinations above the cap decline",
             sparql: "SELECT ?a ?b ?c ?d FROM <shop-sql:main> WHERE { { <http://example.org/order/13> ex:total ?a } UNION { <http://example.org/order/13> ex:placed ?a } { <http://example.org/order/13> ex:total ?b } UNION { <http://example.org/order/13> ex:placed ?b } { <http://example.org/order/13> ex:total ?c } UNION { <http://example.org/order/13> ex:placed ?c } { <http://example.org/order/13> ex:total ?d } UNION { <http://example.org/order/13> ex:placed ?d } }",
@@ -966,7 +1081,23 @@ async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
         let before_events = store.find_events("fast-path outcome").len();
         let before_declines = store.find_events("sql pushdown declined").len();
         let before_stmts = block_statements(&server).await.len();
-        let rows = rows_of(&query(&fluree, &format!("{PREFIX}{}", c.sparql)).await);
+        let sparql = format!("{PREFIX}{}", c.sparql);
+        let rows = match fluree.query_from().sparql(&sparql).execute_tracked().await {
+            Ok(t) => rows_of(&t.result),
+            Err(e) => {
+                let declines: Vec<String> = store.find_events("sql pushdown declined")
+                    [before_declines..]
+                    .iter()
+                    .map(|ev| format!("{ev:?}"))
+                    .collect();
+                failures.push(format!(
+                    "{}: query failed: {}\n  declines: {declines:?}",
+                    c.name, e.error
+                ));
+                lane_rows.push(Vec::new());
+                continue;
+            }
+        };
         let proceeded = proceeded_sites(&store, before_events);
         let declined: Vec<String> = store.find_events("sql pushdown declined")[before_declines..]
             .iter()
@@ -1021,9 +1152,21 @@ async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
     }
     drop(tracing_guard);
 
-    set_fast_paths_disabled(true);
     for (i, c) in cases.iter().enumerate() {
-        let rows = rows_of(&query(&fluree, &format!("{PREFIX}{}", c.sparql)).await);
+        let sparql = format!("{PREFIX}{}", c.sparql);
+        if LANE_ONLY_CASES.contains(&c.name) {
+            let native = native_rows(&fluree, &sparql).await;
+            if native != by_value(&lane_rows[i]) {
+                failures.push(format!(
+                    "{}: native twin rows {native:?} differ from lane rows {:?}",
+                    c.name, lane_rows[i]
+                ));
+            }
+            continue;
+        }
+        set_fast_paths_disabled(true);
+        let rows = rows_of(&query(&fluree, &sparql).await);
+        set_fast_paths_disabled(false);
         if rows != lane_rows[i] {
             failures.push(format!(
                 "{}: scan lane rows {rows:?} differ from lane rows {:?}",
@@ -1031,7 +1174,6 @@ async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
             ));
         }
     }
-    set_fast_paths_disabled(false);
 
     assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
 }
@@ -1515,6 +1657,48 @@ async fn class_policy_on_a_derived_type_pushes_a_predicate() {
     assert_eq!(rows, json!([["Ada"], ["Bo"], ["Cy"], ["Di"]]), "{rows}");
     let sent = block_statements(&server).await[before..].to_vec();
     assert!(!sent[0].contains("kind"), "{}", sent[0]);
+}
+
+/// A sub-select the lane cannot take has no other lane: a graph source has
+/// no native index for the engine's subquery operator, so the query refuses
+/// as it did before the lane took any sub-select at all. Never a silent
+/// empty answer.
+#[tokio::test]
+async fn sub_selects_the_lane_cannot_take_still_refuse() {
+    let _lock = KILL_SWITCH.lock().await;
+    let (_server, fluree) = setup().await;
+    let shapes = [
+        (
+            "HAVING",
+            "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c (COUNT(?o) AS ?k) WHERE { ?o ex:customer ?c } GROUP BY ?c HAVING (COUNT(?o) > 1) } }",
+        ),
+        (
+            "a hidden variable the block reuses",
+            "SELECT ?n ?t FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c WHERE { ?o ex:customer ?c } } ?o ex:total ?t }",
+        ),
+        (
+            "OFFSET",
+            "SELECT ?o ?p FROM <shop-sql:main> WHERE { { SELECT ?o WHERE { ?o ex:total ?t } ORDER BY DESC(?t) LIMIT 2 OFFSET 1 } ?o ex:placed ?p }",
+        ),
+        (
+            "a nested sub-select",
+            "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c WHERE { { SELECT ?c WHERE { ?o ex:customer ?c } } } } }",
+        ),
+    ];
+    for (what, sparql) in shapes {
+        let err = fluree
+            .query_from()
+            .sparql(&format!("{PREFIX}{sparql}"))
+            .execute_tracked()
+            .await
+            .err()
+            .map(|e| e.error.to_string())
+            .unwrap_or_else(|| panic!("{what}: expected a refusal"));
+        assert!(
+            err.contains("cannot be evaluated over a virtual dataset") && err.contains("subquery"),
+            "{what}: {err}"
+        );
+    }
 }
 
 /// Outer bindings above the provider's key-set row cap go out as several
@@ -2033,6 +2217,7 @@ const SQLITE: LiveBackend = LiveBackend {
     declines: &[
         "GROUP BY a foreign-key object with COUNT and SUM",
         "AVG pushes SUM and COUNT and divides in the engine",
+        "a grouped sub-select sums in the database and finalizes in the engine",
     ],
 };
 
@@ -2581,6 +2766,7 @@ async fn live_differential(backend: &LiveBackend) {
         .create_sql_graph_source(typed)
         .await
         .expect("create live typed sql source");
+    seed_native_twin(&fluree).await;
 
     let mut failures: Vec<String> = Vec::new();
     for c in cases().into_iter().chain(aggregate_cases()) {
@@ -2588,8 +2774,13 @@ async fn live_differential(backend: &LiveBackend) {
             .replace("shop-sql:main", "shop-live:main")
             .replace("shop-vp:main", "shop-vp-live:main")
             .replace("shop-typed:main", "shop-typed-live:main");
-        let (lane_rows, sent) = lane_run(&fluree, &sparql, c.name).await;
         let declines = backend.declines.contains(&c.name);
+        // A sub-select the lane declines has no other lane here: the query
+        // refuses (pinned in `sub_selects_the_lane_cannot_take_still_refuse`).
+        if declines && LANE_ONLY_CASES.contains(&c.name) {
+            continue;
+        }
+        let (lane_rows, sent) = lane_run(&fluree, &sparql, c.name).await;
         match (&c.routing, c.sql.is_empty()) {
             (Routing::MustFire, false) if declines && !sent.is_empty() => {
                 failures.push(format!(
@@ -2618,6 +2809,16 @@ async fn live_differential(backend: &LiveBackend) {
                 "{}: lane rows {lane_rows:?} differ from the pinned rows {:?} [sent: {sent:?}]",
                 c.name, c.rows
             ));
+        }
+        if LANE_ONLY_CASES.contains(&c.name) {
+            let native = native_rows(&fluree, &sparql).await;
+            if native != by_value(&lane_rows) {
+                failures.push(format!(
+                    "{}: native twin rows {native:?} differ from lane rows {lane_rows:?}",
+                    c.name
+                ));
+            }
+            continue;
         }
         let scan_rows = scan_run(&fluree, &sparql).await;
         if lane_rows != scan_rows {

@@ -187,6 +187,12 @@ pub enum RelNode {
         source: RelSource,
     },
     KeySet(KeySet),
+    /// A nested plan as a derived table: `(SELECT …) AS alias`, its outputs
+    /// the columns of `alias`.
+    Derived {
+        alias: String,
+        plan: Box<RelPlan>,
+    },
     Filter {
         input: Box<RelNode>,
         pred: Pred,
@@ -215,6 +221,7 @@ impl RelNode {
         match self {
             RelNode::Access { alias, source } => out.push((alias, source)),
             RelNode::KeySet(_) => {}
+            RelNode::Derived { plan, .. } => plan.root.collect_accesses(out),
             RelNode::Filter { input, .. } => input.collect_accesses(out),
             RelNode::Join { left, right, .. } | RelNode::LeftJoin { left, right, .. } => {
                 left.collect_accesses(out);

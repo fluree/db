@@ -213,6 +213,17 @@ pushable. In that statement:
   the parts that cannot be widened are simply dropped from the pushed
   predicate. A widened filter is a residual, so a `LIMIT` above it stays in
   the engine and a grouped query over it declines;
+- a **sub-`SELECT`** inside the block is a derived table joined on its
+  projected variables' key columns: its own block is lowered like the
+  enclosing one, `GROUP BY` with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` becomes
+  the derived table's grouping (the engine decodes the aggregate outputs
+  as the grouped lane does), `DISTINCT` and `ORDER BY … LIMIT` push inside
+  it. A sub-select with `HAVING`, `OFFSET`, a `BIND`, a nested sub-select,
+  a filter the statement cannot evaluate exactly, or one that hides an
+  inner variable the enclosing block also uses is not admitted. There is
+  no other lane for a sub-select over a graph source (the engine's
+  subquery operator has no native index to run against), so one the lane
+  does not take still refuses the query, as it did before;
 - an entity whose members come from **several triples maps sharing its
   subject** (a vertically partitioned mapping: one map per column group, or
   per table, over the same `rr:template`) is one access per distinct table,

@@ -20,8 +20,8 @@ use fluree_db_r2rml::mapping::{
 use fluree_db_r2rml::materialize::reverse_subject_template;
 use fluree_db_r2rml::RdfTerm;
 use fluree_db_tabular::plan::{
-    like_escape, ArithOp, CmpOp, ColRef, Expr, KeySet, Literal, OutputCol, Pred,
-    PushdownCapabilities, RelNode, RelSource,
+    like_escape, ArithOp, CmpOp, ColRef, Expr, KeySet, Literal, OrderKey, OutputCol, Pred,
+    PushdownCapabilities, RelNode, RelPlan, RelSource,
 };
 use fluree_db_tabular::{BatchSchema, FieldType};
 use fluree_vocab::{rdf, xsd, UnresolvedDatatypeConstraint};
@@ -29,10 +29,13 @@ use fluree_vocab::{rdf, xsd, UnresolvedDatatypeConstraint};
 use crate::binding::Binding;
 use crate::error::Result;
 use crate::ir::expression::Function;
+use crate::ir::grouping::AggregateFn;
 use crate::ir::triple::{Ref, Term, TriplePattern};
-use crate::ir::{Expression, Pattern};
+use crate::ir::{Expression, Pattern, SubqueryPattern};
 use crate::r2rml::policy::{derived_type_map, static_classes, Verdict};
 use crate::var_registry::VarId;
+
+use super::aggregate::{group_plan, Decode, NumKind};
 
 /// Why the lane declined; logged at debug so a `MustNotFire` test can name it.
 #[derive(Debug)]
@@ -60,6 +63,35 @@ pub(crate) enum TermSource {
         pom: usize,
     },
     Constant(RdfTerm),
+    /// An aggregate a subquery computed, read from the derived table's
+    /// outputs under `alias`.
+    Aggregate {
+        alias: String,
+        kind: AggTerm,
+    },
+}
+
+/// How a derived table's aggregate output becomes a binding.
+#[derive(Debug, Clone)]
+pub(crate) enum AggTerm {
+    Count {
+        column: String,
+    },
+    Numeric {
+        sum: String,
+        count: String,
+        kind: NumKind,
+        avg: bool,
+    },
+}
+
+/// A term alias that reads a derived table: the mapping columns it needs,
+/// each with the derived output holding it.
+#[derive(Debug, Clone)]
+struct DerivedCols {
+    derived: String,
+    tm_iri: String,
+    columns: Vec<(String, String)>,
 }
 
 /// The RDF value class of a column or literal, for exact-comparison checks.
@@ -174,6 +206,7 @@ struct Block {
     optionals: Vec<(Vec<Tp>, Vec<Expression>)>,
     values: Vec<(Vec<VarId>, Vec<Vec<Binding>>)>,
     binds: Vec<(VarId, Expression)>,
+    subqueries: Vec<SubqueryPattern>,
 }
 
 /// Per-`(triples map, predicate)` view-policy verdict; `None` when not
@@ -227,10 +260,18 @@ pub(crate) fn lower_block(input: LowerInput<'_>) -> Result<Lowering<Vec<Lowered>
             var_order: Vec::new(),
             residuals: Vec::new(),
             bind_exprs: HashMap::new(),
+            snapshot: input.snapshot,
+            derived: HashMap::new(),
+            derived_terms: HashMap::new(),
             required_columns: HashSet::new(),
             static_keysets: Vec::new(),
         };
-        let lowered = lw.lower(block, input.child_vars, input.projection)?;
+        let lowered = lw.lower(
+            block,
+            input.child_vars,
+            input.projection,
+            input.projection.is_some(),
+        )?;
         policy = lw.policy.take();
         match lowered {
             Ok(Some(l)) => out.push(l),
@@ -292,6 +333,11 @@ struct Lowerer<'a> {
     residuals: Vec<Expression>,
     /// Numeric `BIND` expressions the statement can compute, by variable.
     bind_exprs: HashMap<VarId, Expr>,
+    snapshot: &'a LedgerSnapshot,
+    /// Derived tables (subqueries) by alias, joined like accesses.
+    derived: HashMap<String, RelPlan>,
+    /// Term aliases reading a derived table.
+    derived_terms: HashMap<String, DerivedCols>,
     /// `(alias, column)` pairs that are `IS NOT NULL`.
     required_columns: HashSet<(String, String)>,
     static_keysets: Vec<(KeySet, Vec<Pred>)>,
@@ -310,6 +356,7 @@ impl<'a> Lowerer<'a> {
         mut block: Block,
         child_vars: &[VarId],
         projection: Option<&[VarId]>,
+        distinct: bool,
     ) -> Result<Lowering<Option<Lowered>>> {
         // A BIND is computed in the engine after the statement, so it cannot
         // be a join key with the outer query.
@@ -449,6 +496,16 @@ impl<'a> Lowerer<'a> {
             }
         }
 
+        // Sub-selects: each a derived table joined on its projected
+        // variables' key columns.
+        for sq in &block.subqueries {
+            match self.lower_subquery(sq)? {
+                Ok(Ok(())) => {}
+                Ok(Err(Empty)) => return Ok(Ok(None)),
+                Err(d) => return Ok(Err(d)),
+            }
+        }
+
         // Filters: exact ones into the plan; the rest stay in the engine,
         // with a widening predicate in the plan where one exists.
         for (v, e) in &binds {
@@ -473,25 +530,24 @@ impl<'a> Lowerer<'a> {
             Err(d) => return Ok(Err(d)),
         };
 
-        // A DISTINCT above reads only `projection`; the statement then
-        // returns each distinct combination of those variables' columns
-        // once, keeping the columns the in-memory join and the residual
-        // filters read. Distinct column values are distinct terms only when
-        // the database keeps byte-distinct strings apart (a case-folding
-        // collation would merge two IRIs or literals).
-        let distinct_vars: Option<HashSet<VarId>> = projection
-            .filter(|_| self.caps.string_distinct_is_binary)
-            .map(|proj| {
-                let mut keep: HashSet<VarId> = proj.iter().copied().collect();
-                keep.extend(child_vars.iter().copied());
-                for f in &self.residuals {
-                    keep.extend(f.referenced_vars());
-                }
-                for (_, e) in &binds {
-                    keep.extend(e.referenced_vars());
-                }
-                keep
-            });
+        // A projection above reads only `projection`: the statement then
+        // returns those variables' columns, keeping the columns the
+        // in-memory join and the residual filters read. Under a DISTINCT
+        // each distinct combination comes back once, which is distinct
+        // terms only when no string column is among them or the database
+        // keeps byte-distinct strings apart (a case-folding collation would
+        // merge two IRIs or literals).
+        let distinct_vars: Option<HashSet<VarId>> = projection.map(|proj| {
+            let mut keep: HashSet<VarId> = proj.iter().copied().collect();
+            keep.extend(child_vars.iter().copied());
+            for f in &self.residuals {
+                keep.extend(f.referenced_vars());
+            }
+            for (_, e) in &binds {
+                keep.extend(e.referenced_vars());
+            }
+            keep
+        });
         let projected: Vec<VarId> = self
             .var_order
             .iter()
@@ -522,16 +578,57 @@ impl<'a> Lowerer<'a> {
         if outputs.is_empty() {
             return Ok(Err(Decline("no columns to project")));
         }
-        let accesses: Vec<AccessInfo> = self
+        let distinct_exact = self.caps.string_distinct_is_binary
+            || outputs.iter().all(|o| {
+                o.expr
+                    .col()
+                    .is_some_and(|c| !matches!(self.field_type(c), None | Some(FieldType::String)))
+            });
+        let mut accesses: Vec<AccessInfo> = self
             .accesses
             .iter()
             .map(|a| AccessInfo {
                 alias: a.alias.clone(),
                 tm_iri: a.tm_iri.clone(),
-                columns: per_alias.remove(&a.alias).unwrap_or_default(),
+                // A derived table's columns are read through its term
+                // aliases below, never through the table itself.
+                columns: if self.derived.contains_key(&a.alias) {
+                    per_alias.remove(&a.alias);
+                    Vec::new()
+                } else {
+                    per_alias.remove(&a.alias).unwrap_or_default()
+                },
                 output_names: None,
             })
             .collect();
+        // Term aliases over derived tables: mapping column names, fed by
+        // the outputs that project the derived columns.
+        let mut derived_aliases: Vec<&String> = self.derived_terms.keys().collect();
+        derived_aliases.sort();
+        for alias in derived_aliases {
+            let dc = &self.derived_terms[alias];
+            let mut columns = Vec::new();
+            let mut names = Vec::new();
+            for (mapping_col, out) in &dc.columns {
+                let projected = outputs.iter().find(|o| {
+                    o.expr
+                        .col()
+                        .is_some_and(|c| c.alias == dc.derived && &c.column == out)
+                });
+                if let Some(o) = projected {
+                    columns.push(mapping_col.clone());
+                    names.push(o.name.clone());
+                }
+            }
+            if !columns.is_empty() {
+                accesses.push(AccessInfo {
+                    alias: alias.clone(),
+                    tm_iri: dc.tm_iri.clone(),
+                    columns,
+                    output_names: Some(names),
+                });
+            }
+        }
 
         let terms: Vec<(VarId, TermSource)> = projected
             .iter()
@@ -602,8 +699,316 @@ impl<'a> Lowerer<'a> {
             order_columns,
             order_exprs,
             limit_is_exact,
-            distinct: distinct_vars.is_some(),
+            distinct: distinct && distinct_vars.is_some() && distinct_exact,
         })))
+    }
+
+    /// A sub-select as a derived table: its block is lowered on its own
+    /// (sharing the alias counter and the policy), grouped when it groups,
+    /// and each projected variable is bound on the derived table's columns:
+    /// a key variable keeps its key shape over the derived outputs, so a
+    /// shared variable joins on them; an aggregate decodes from its output.
+    fn lower_subquery(
+        &mut self,
+        sq: &SubqueryPattern,
+    ) -> Result<Lowering<std::result::Result<(), Empty>>> {
+        let block = match parse_block(&sq.patterns, self.snapshot) {
+            Ok(b) => b,
+            Err(d) => return Ok(Err(d)),
+        };
+        let mut inner = Lowerer {
+            mapping: self.mapping,
+            caps: self.caps,
+            policy: self.policy.take(),
+            schemas: self.schemas,
+            next_alias: self.next_alias,
+            accesses: Vec::new(),
+            access_preds: HashMap::new(),
+            edges: Vec::new(),
+            left_joins: Vec::new(),
+            vars: HashMap::new(),
+            var_order: Vec::new(),
+            residuals: Vec::new(),
+            bind_exprs: HashMap::new(),
+            snapshot: self.snapshot,
+            derived: HashMap::new(),
+            derived_terms: HashMap::new(),
+            required_columns: HashSet::new(),
+            static_keysets: Vec::new(),
+        };
+        // The inner statement keeps what the projection and the grouping
+        // read: the keys, and every aggregate's input.
+        let mut keep: Vec<VarId> = sq.select.clone();
+        if let Some(g) = &sq.grouping {
+            keep.extend(g.group_by_vars());
+            for a in g.aggregates() {
+                match &a.function {
+                    AggregateFn::Count(v)
+                    | AggregateFn::CountDistinct(v)
+                    | AggregateFn::Sum(v, _)
+                    | AggregateFn::Avg(v, _)
+                    | AggregateFn::Min(v)
+                    | AggregateFn::Max(v) => keep.push(*v),
+                    _ => {}
+                }
+            }
+        }
+        let lowered = inner.lower(block, &[], Some(&keep), sq.distinct)?;
+        self.policy = inner.policy.take();
+        self.next_alias = inner.next_alias;
+        let lowered = match lowered {
+            Ok(Some(l)) => l,
+            Ok(None) => return Ok(Ok(Err(Empty))),
+            Err(d) => return Ok(Err(d)),
+        };
+        if !lowered.residual_filters.is_empty() {
+            return Ok(Err(Decline("subquery with a residual filter")));
+        }
+        if !lowered.binds.is_empty() {
+            return Ok(Err(Decline("BIND inside a subquery")));
+        }
+        if sq.distinct && !lowered.distinct {
+            return Ok(Err(Decline("subquery DISTINCT not pushable")));
+        }
+        let alias = format!("d{}", self.derived.len());
+        let Some(first_tm) = lowered.accesses.first().map(|a| a.tm_iri.clone()) else {
+            return Ok(Err(Decline("subquery without an access")));
+        };
+        let topk = sq.limit.map(|k| {
+            (
+                sq.ordering.clone(),
+                k.saturating_add(sq.offset.unwrap_or(0)),
+            )
+        });
+
+        // The derived plan, and each projected variable's term and columns
+        // over the inner aliases (an aggregate's under the empty alias).
+        let (plan, sources): (RelPlan, Vec<(VarId, TermSource, Vec<ColRef>)>) = match &sq.grouping {
+            Some(g) => {
+                let group_by: Vec<VarId> = g.group_by_vars().collect();
+                let aggregates: Vec<(VarId, AggregateFn)> = g
+                    .aggregates()
+                    .map(|a| (a.output_var, a.function.clone()))
+                    .collect();
+                let grouped = match group_plan(
+                    &group_by,
+                    &aggregates,
+                    topk.as_ref(),
+                    &lowered,
+                    self.mapping,
+                    self.caps,
+                    self.schemas,
+                ) {
+                    Ok(g) => g,
+                    Err(why) => return Ok(Err(Decline(why))),
+                };
+                if topk.is_some() && grouped.plan.limit.is_none() {
+                    return Ok(Err(Decline("subquery ORDER BY not pushable")));
+                }
+                let mut sources = Vec::new();
+                let outs = group_by.iter().chain(aggregates.iter().map(|(v, _)| v));
+                for (i, v) in outs.enumerate() {
+                    if !sq.select.contains(v) {
+                        continue;
+                    }
+                    let (term, cols) = match &grouped.decodes[i] {
+                        Decode::Term { idx } => {
+                            let (_, term) = &grouped.terms[*idx];
+                            let cols = match term {
+                                TermSource::Object { alias: a, .. }
+                                | TermSource::Subject { alias: a } => {
+                                    match grouped.extremes.iter().find(|e| &e.alias == a) {
+                                        // An extreme: its one column, under
+                                        // the output carrying it.
+                                        Some(e) => vec![ColRef::new(a, &e.columns[0])],
+                                        None => {
+                                            lowered.var_columns.get(v).cloned().unwrap_or_default()
+                                        }
+                                    }
+                                }
+                                _ => Vec::new(),
+                            };
+                            (term.clone(), cols)
+                        }
+                        Decode::Count { name } => (
+                            TermSource::Aggregate {
+                                alias: format!("{alias}#{name}"),
+                                kind: AggTerm::Count {
+                                    column: name.clone(),
+                                },
+                            },
+                            vec![ColRef::new("", name)],
+                        ),
+                        Decode::Numeric {
+                            sum,
+                            count,
+                            kind,
+                            avg,
+                        } => (
+                            TermSource::Aggregate {
+                                alias: format!("{alias}#{sum}"),
+                                kind: AggTerm::Numeric {
+                                    sum: sum.clone(),
+                                    count: count.clone(),
+                                    kind: *kind,
+                                    avg: *avg,
+                                },
+                            },
+                            vec![ColRef::new("", sum), ColRef::new("", count)],
+                        ),
+                    };
+                    sources.push((*v, term, cols));
+                }
+                (grouped.plan, sources)
+            }
+            None => {
+                let mut order_by = Vec::new();
+                let mut limit = None;
+                if let Some((ordering, k)) = &topk {
+                    let keys: Option<Vec<(OrderKey, bool)>> = ordering
+                        .iter()
+                        .map(|s| {
+                            let key = match lowered.order_columns.get(&s.var) {
+                                Some((col, _)) => OrderKey::Col(col.clone()),
+                                None => OrderKey::Expr(lowered.order_exprs.get(&s.var)?.clone()),
+                            };
+                            Some((key, s.ascending()))
+                        })
+                        .collect();
+                    match keys {
+                        Some(keys) => {
+                            order_by = keys;
+                            limit = Some(*k as u64);
+                        }
+                        None => return Ok(Err(Decline("subquery ORDER BY not pushable"))),
+                    }
+                }
+                let plan = RelPlan {
+                    root: lowered.root.clone(),
+                    output: lowered.outputs.clone(),
+                    group_by: Vec::new(),
+                    distinct: lowered.distinct,
+                    order_by,
+                    limit,
+                };
+                let mut sources = Vec::new();
+                for v in &sq.select {
+                    let Some(src) = lowered.vars.get(v) else {
+                        return Ok(Err(Decline("subquery projects an unbound variable")));
+                    };
+                    let cols = lowered.var_columns.get(v).cloned().unwrap_or_default();
+                    sources.push((*v, src.term.clone(), cols));
+                }
+                (plan, sources)
+            }
+        };
+
+        // The derived output holding an inner column (an aggregate output
+        // is its own).
+        let out_of = |col: &ColRef| -> Option<String> {
+            if col.alias.is_empty() {
+                return Some(col.column.clone());
+            }
+            plan.output
+                .iter()
+                .find(|o| o.expr.col().is_some_and(|c| c == col))
+                .map(|o| o.name.clone())
+        };
+        let mut binds: Vec<(VarId, VarSource)> = Vec::new();
+        for (v, term, cols) in sources {
+            let (term_alias, tm_iri) = match &term {
+                TermSource::Subject { alias: a } | TermSource::Object { alias: a, .. } => {
+                    let Some(tm) = access_tm(&lowered, a) else {
+                        return Ok(Err(Decline("subquery term without an access")));
+                    };
+                    (format!("{alias}/{a}"), tm)
+                }
+                TermSource::Aggregate { alias: a, .. } => (a.clone(), first_tm.clone()),
+                TermSource::Constant(_) => {
+                    binds.push((
+                        v,
+                        VarSource {
+                            term,
+                            key: None,
+                            nullable: false,
+                        },
+                    ));
+                    continue;
+                }
+            };
+            let mut derived_cols = Vec::with_capacity(cols.len());
+            for col in &cols {
+                let Some(out) = out_of(col) else {
+                    return Ok(Err(Decline("subquery column not projected")));
+                };
+                derived_cols.push((col.column.clone(), out));
+            }
+            let entry = self
+                .derived_terms
+                .entry(term_alias.clone())
+                .or_insert_with(|| DerivedCols {
+                    derived: alias.clone(),
+                    tm_iri,
+                    columns: Vec::new(),
+                });
+            for c in derived_cols {
+                if !entry.columns.contains(&c) {
+                    entry.columns.push(c);
+                }
+            }
+            let term = match term {
+                TermSource::Subject { .. } => TermSource::Subject { alias: term_alias },
+                TermSource::Object { tm_iri, pom, .. } => TermSource::Object {
+                    alias: term_alias,
+                    tm_iri,
+                    pom,
+                },
+                other => other,
+            };
+            // The key keeps its shape, over the derived outputs.
+            let mut key = None;
+            if let Some(k) = lowered.vars.get(&v).and_then(|s| s.key.clone()) {
+                let remap = |c: &ColRef| out_of(c).map(|o| ColRef::new(&alias, &o));
+                key = match k {
+                    KeyShape::Template {
+                        template,
+                        cols: kc,
+                        types,
+                    } => {
+                        let cols: Option<Vec<ColRef>> = kc.iter().map(remap).collect();
+                        cols.map(|cols| KeyShape::Template {
+                            template,
+                            cols,
+                            types,
+                        })
+                    }
+                    KeyShape::Column { col, class } => {
+                        remap(&col).map(|col| KeyShape::Column { col, class })
+                    }
+                };
+            }
+            binds.push((
+                v,
+                VarSource {
+                    term,
+                    key,
+                    nullable: false,
+                },
+            ));
+        }
+        self.accesses.push(AccessInfo {
+            alias: alias.clone(),
+            tm_iri: first_tm,
+            columns: Vec::new(),
+            output_names: None,
+        });
+        self.derived.insert(alias, plan);
+        for (v, src) in binds {
+            if let Err(d) = self.bind_var(v, src) {
+                return Ok(Err(d));
+            }
+        }
+        Ok(Ok(Ok(())))
     }
 
     fn allowed(&mut self, tm: &TriplesMap, pred: &str) -> Result<Option<Verdict>> {
@@ -2097,9 +2502,15 @@ impl<'a> Lowerer<'a> {
     }
 
     fn leaf(&mut self, alias: &str) -> RelNode {
-        let node = RelNode::Access {
-            alias: alias.to_string(),
-            source: self.rel_source(alias),
+        let node = match self.derived.get(alias) {
+            Some(plan) => RelNode::Derived {
+                alias: alias.to_string(),
+                plan: Box::new(plan.clone()),
+            },
+            None => RelNode::Access {
+                alias: alias.to_string(),
+                source: self.rel_source(alias),
+            },
         };
         match self.access_preds.remove(alias).and_then(Pred::and) {
             Some(pred) => RelNode::Filter {
@@ -2111,8 +2522,21 @@ impl<'a> Lowerer<'a> {
     }
 
     fn term_columns(&self, term: &TermSource) -> Vec<ColRef> {
+        let alias = match term {
+            TermSource::Subject { alias }
+            | TermSource::Object { alias, .. }
+            | TermSource::Aggregate { alias, .. } => Some(alias),
+            TermSource::Constant(_) => None,
+        };
+        if let Some(dc) = alias.and_then(|a| self.derived_terms.get(a)) {
+            return dc
+                .columns
+                .iter()
+                .map(|(_, out)| ColRef::new(&dc.derived, out))
+                .collect();
+        }
         match term {
-            TermSource::Constant(_) => Vec::new(),
+            TermSource::Constant(_) | TermSource::Aggregate { .. } => Vec::new(),
             TermSource::Subject { alias } => {
                 let tm = self.tm_of(alias);
                 tm.map(|tm| {
@@ -2234,10 +2658,12 @@ fn parse_block(patterns: &[Pattern], snapshot: &LedgerSnapshot) -> Lowering<Bloc
         optionals: Vec::new(),
         values: Vec::new(),
         binds: Vec::new(),
+        subqueries: Vec::new(),
     };
     for p in patterns {
         match p {
             Pattern::Triple(tp) => block.triples.push(parse_triple(tp, snapshot)?),
+            Pattern::Subquery(sq) => block.subqueries.push(sq.clone()),
             Pattern::Filter(e) => block.filters.push(e.clone()),
             Pattern::Optional(inner) => {
                 let mut triples = Vec::new();
@@ -2393,6 +2819,17 @@ fn decimal_literal(bd: &bigdecimal::BigDecimal) -> Option<Literal> {
     })
 }
 
+/// The triples map behind an inner term alias, an extreme's (`t1.c3`)
+/// included.
+fn access_tm(lowered: &Lowered, alias: &str) -> Option<String> {
+    let base = alias.split('.').next().unwrap_or(alias);
+    lowered
+        .accesses
+        .iter()
+        .find(|a| a.alias == alias || a.alias == base)
+        .map(|a| a.tm_iri.clone())
+}
+
 /// A disjunction of key predicates; equalities on one column fold into an
 /// `IN` list.
 fn any_of(mut keys: Vec<Pred>) -> Pred {
@@ -2476,6 +2913,14 @@ pub(crate) fn candidate_sources(
             }
         }
     }
+    // A sub-select's tables are typed the same way.
+    for sq in blocks.iter().flat_map(|b| &b.subqueries) {
+        for src in candidate_sources(&sq.patterns, snapshot, mapping) {
+            if !out.contains(&src) {
+                out.push(src);
+            }
+        }
+    }
     out
 }
 
@@ -2530,6 +2975,11 @@ pub(crate) fn block_is_admissible(patterns: &[Pattern]) -> bool {
                     return false;
                 }
             }
+            Pattern::Subquery(sq) => {
+                if !subquery_is_admissible(sq, patterns) {
+                    return false;
+                }
+            }
             // Every branch is a block of its own; a branch without triples
             // would leave a combination with nothing to access.
             Pattern::Union(branches) => {
@@ -2543,6 +2993,53 @@ pub(crate) fn block_is_admissible(patterns: &[Pattern]) -> bool {
         in_scope.extend(p.produced_vars());
     }
     has_triple
+}
+
+/// A sub-select the lane embeds as a derived table: evaluated once (SPARQL's
+/// sub-`SELECT`, or a subquery without a `LIMIT` per-row seeding could
+/// change), its own block admissible with no nested subquery, grouped
+/// without `HAVING` or aggregate `BIND`s, and hiding no variable the
+/// enclosing block uses (a non-projected inner variable is invisible
+/// outside in SPARQL, which the join must not reconnect).
+fn subquery_is_admissible(sq: &SubqueryPattern, enclosing: &[Pattern]) -> bool {
+    if !sq.pinned_vars.is_empty()
+        || !sq.order_binds.is_empty()
+        || sq.offset.is_some()
+        || (!sq.uncorrelated && sq.limit.is_some())
+        || sq
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Subquery(_)))
+        || !block_is_admissible(&sq.patterns)
+    {
+        return false;
+    }
+    if let Some(g) = &sq.grouping {
+        if g.having().is_some() || g.aggregation().is_some_and(|a| !a.binds.is_empty()) {
+            return false;
+        }
+        let outs: Vec<VarId> = g
+            .group_by_vars()
+            .chain(g.aggregates().map(|a| a.output_var))
+            .collect();
+        if sq.select.iter().any(|v| !outs.contains(v)) {
+            return false;
+        }
+    }
+    let inner: HashSet<VarId> = sq
+        .patterns
+        .iter()
+        .flat_map(Pattern::referenced_vars)
+        .chain(sq.patterns.iter().flat_map(Pattern::produced_vars))
+        .collect();
+    let outside: HashSet<VarId> = enclosing
+        .iter()
+        .filter(|p| !matches!(p, Pattern::Subquery(s) if std::ptr::eq(s, sq)))
+        .flat_map(|p| p.referenced_vars().into_iter().chain(p.produced_vars()))
+        .collect();
+    !inner
+        .iter()
+        .any(|v| !sq.select.contains(v) && outside.contains(v))
 }
 
 fn triple_is_admissible(tp: &TriplePattern) -> bool {

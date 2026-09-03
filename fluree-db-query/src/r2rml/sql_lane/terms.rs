@@ -189,6 +189,10 @@ impl Materializer {
                         _ => Binding::Unbound,
                     }
                 }
+                TermSource::Aggregate { alias, kind } => {
+                    self.alias(alias)?;
+                    super::aggregate::decode_aggregate(&batches[alias], kind, row_idx)?
+                }
             };
             out.push((*var, binding));
         }

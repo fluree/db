@@ -122,7 +122,7 @@ pub fn detect_sql_block_aggregate(query: &Query) -> Option<SqlAggregatePlan> {
 }
 
 /// How one output of the grouped statement becomes a binding.
-enum Decode {
+pub(super) enum Decode {
     /// A key or a `MIN`/`MAX`: the `idx`-th term the materializer builds.
     Term { idx: usize },
     /// `COUNT`: the named integer output.
@@ -136,8 +136,8 @@ enum Decode {
     },
 }
 
-#[derive(Clone, Copy)]
-enum NumKind {
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NumKind {
     Integer,
     Decimal,
     Double,
@@ -148,6 +148,21 @@ struct AggLowered {
     materializer: Materializer,
     /// Aligned with the operator's schema (keys, then aggregate outputs).
     decodes: Vec<Decode>,
+}
+
+/// A grouped plan over a lowered block: keys, aggregate outputs, the terms
+/// and accesses that decode them, and a top-k. What [`lower_aggregate`]
+/// runs as a statement and a subquery embeds as a derived table.
+pub(super) struct Grouped {
+    pub plan: RelPlan,
+    /// Aligned with `decodes`' `Term` indices.
+    pub terms: Vec<(VarId, TermSource)>,
+    /// Mapping columns each access must carry, by alias.
+    pub access_columns: HashMap<String, Vec<String>>,
+    /// Per-extreme materialization aliases (see `MIN`/`MAX` below).
+    pub extremes: Vec<AccessInfo>,
+    /// Keys, then aggregates, in `group_by` / `aggregates` order.
+    pub decodes: Vec<Decode>,
 }
 
 /// The grouped statement for a lowered block, or `None` (a reason) when the
@@ -161,16 +176,48 @@ fn lower_aggregate(
     if !lowered.residual_filters.is_empty() {
         return Err("residual filter under an aggregate");
     }
-    let caps = &resolved.caps;
+    let mut grouped = group_plan(
+        &plan.group_by,
+        &plan.aggregates,
+        plan.topk.as_ref(),
+        lowered,
+        &resolved.mapping,
+        &resolved.caps,
+        &resolved.schemas,
+    )?;
+    let mut for_terms = lowered.clone();
+    for_terms.outputs = grouped.plan.output.clone();
+    for_terms.terms = grouped.terms;
+    for a in &mut for_terms.accesses {
+        a.columns = grouped.access_columns.remove(&a.alias).unwrap_or_default();
+    }
+    for_terms.accesses.extend(grouped.extremes);
+    let materializer =
+        Materializer::new(&for_terms, &resolved.mapping, snapshot).map_err(|_| "materializer")?;
+    Ok(AggLowered {
+        plan: grouped.plan,
+        materializer,
+        decodes: grouped.decodes,
+    })
+}
+
+pub(super) fn group_plan(
+    group_by: &[VarId],
+    aggregates: &[(VarId, AggregateFn)],
+    topk: Option<&(Vec<SortSpec>, usize)>,
+    lowered: &Lowered,
+    mapping: &fluree_db_r2rml::mapping::CompiledR2rmlMapping,
+    caps: &fluree_db_tabular::plan::PushdownCapabilities,
+    schemas: &HashMap<fluree_db_tabular::plan::RelSource, Arc<fluree_db_tabular::BatchSchema>>,
+) -> std::result::Result<Grouped, &'static str> {
     let field_type = |col: &ColRef| -> Option<FieldType> {
         let tm_iri = lowered
             .accesses
             .iter()
             .find(|a| a.alias == col.alias)
             .map(|a| a.tm_iri.as_str())?;
-        let tm = resolved.mapping.get(tm_iri)?;
-        resolved
-            .schemas
+        let tm = mapping.get(tm_iri)?;
+        schemas
             .get(&source_of_tm(tm))?
             .field_by_name(&col.column)
             .map(|f| f.field_type)
@@ -179,7 +226,7 @@ fn lower_aggregate(
         let TermSource::Object { tm_iri, pom, .. } = term else {
             return None;
         };
-        let tm = resolved.mapping.get(tm_iri)?;
+        let tm = mapping.get(tm_iri)?;
         Some(tm.predicate_object_maps.get(*pom)?.object_map.clone())
     };
     let var_of =
@@ -191,16 +238,16 @@ fn lower_aggregate(
         };
 
     let mut outputs: Vec<OutputCol> = Vec::new();
-    let mut group_by: Vec<ColRef> = Vec::new();
+    let mut group_cols: Vec<ColRef> = Vec::new();
     let mut key_decodes: Vec<Decode> = Vec::new();
-    let mut agg_decodes: Vec<Option<Decode>> = (0..plan.aggregates.len()).map(|_| None).collect();
+    let mut agg_decodes: Vec<Option<Decode>> = (0..aggregates.len()).map(|_| None).collect();
     let mut terms: Vec<(VarId, TermSource)> = Vec::new();
     let mut access_columns: HashMap<String, Vec<String>> = HashMap::new();
     let mut claimed: std::collections::HashSet<(String, String)> = Default::default();
     let name = |outputs: &Vec<OutputCol>| format!("c{}", outputs.len());
 
     // Keys: every column the key's term reads, grouped and projected.
-    for v in &plan.group_by {
+    for v in group_by {
         let (src, cols) = var_of(*v)?;
         for col in cols {
             if field_type(col) == Some(FieldType::String) && !caps.string_distinct_is_binary {
@@ -213,7 +260,7 @@ fn lower_aggregate(
                 .entry(col.alias.clone())
                 .or_default()
                 .push(col.column.clone());
-            group_by.push(col.clone());
+            group_cols.push(col.clone());
             let n = name(&outputs);
             outputs.push(OutputCol::column(col.clone(), n));
         }
@@ -224,7 +271,7 @@ fn lower_aggregate(
     // Each extreme reads its column through its own materialization alias,
     // so MIN and MAX of one column, or of a key, are distinct outputs.
     let mut extremes: Vec<AccessInfo> = Vec::new();
-    for (pos, (out, f)) in plan.aggregates.iter().enumerate() {
+    for (pos, (out, f)) in aggregates.iter().enumerate() {
         agg_decodes[pos] = Some(match f {
             AggregateFn::Min(v) | AggregateFn::Max(v) => {
                 let (src, cols) = var_of(*v)?;
@@ -397,16 +444,16 @@ fn lower_aggregate(
     // answers exactly k groups, so the LIMIT goes only with the whole ORDER BY.
     let mut order_by = Vec::new();
     let mut limit = None;
-    if let Some((ordering, k)) = &plan.topk {
+    if let Some((ordering, k)) = topk {
         let keys: Option<Vec<(OrderKey, bool)>> = ordering
             .iter()
             .map(|s| {
-                let key = if plan.group_by.contains(&s.var) {
+                let key = if group_by.contains(&s.var) {
                     let (col, _) = lowered.order_columns.get(&s.var)?;
                     OrderKey::Col(col.clone())
                 } else {
-                    let i = plan.aggregates.iter().position(|(v, _)| *v == s.var)?;
-                    match &decodes[plan.group_by.len() + i] {
+                    let i = aggregates.iter().position(|(v, _)| *v == s.var)?;
+                    match &decodes[group_by.len() + i] {
                         Decode::Count { name } => OrderKey::Output(name.clone()),
                         Decode::Numeric {
                             sum, avg: false, ..
@@ -423,30 +470,23 @@ fn lower_aggregate(
         }
     }
 
-    let rel = RelPlan {
+    let plan = RelPlan {
         root: lowered.root.clone(),
         output: outputs,
-        distinct: plan.aggregates.is_empty(),
-        group_by: if plan.aggregates.is_empty() {
+        distinct: aggregates.is_empty(),
+        group_by: if aggregates.is_empty() {
             Vec::new()
         } else {
-            group_by
+            group_cols
         },
         order_by,
         limit,
     };
-    let mut for_terms = lowered.clone();
-    for_terms.outputs = rel.output.clone();
-    for_terms.terms = terms;
-    for a in &mut for_terms.accesses {
-        a.columns = access_columns.remove(&a.alias).unwrap_or_default();
-    }
-    for_terms.accesses.extend(extremes);
-    let materializer =
-        Materializer::new(&for_terms, &resolved.mapping, snapshot).map_err(|_| "materializer")?;
-    Ok(AggLowered {
-        plan: rel,
-        materializer,
+    Ok(Grouped {
+        plan,
+        terms,
+        access_columns,
+        extremes,
         decodes,
     })
 }
@@ -630,7 +670,7 @@ impl GroupedSource {
                         .map(|(_, b)| b.clone())
                         .unwrap_or(Binding::Unbound),
                     Decode::Count { name } => Binding::lit(
-                        FlakeValue::Long(int_at(&by_name, name, i)?),
+                        FlakeValue::Long(int_at(column(&by_name, name)?, name, i)?),
                         Sid::xsd_integer(),
                     ),
                     Decode::Numeric {
@@ -639,13 +679,14 @@ impl GroupedSource {
                         kind,
                         avg,
                     } => {
-                        let count = int_at(&by_name, count, i)? as u64;
+                        let count = int_at(column(&by_name, count)?, count, i)? as u64;
                         let acc = match kind {
-                            NumKind::Double => {
-                                NumericAcc::from_double_total(double_at(&by_name, sum, i)?, count)
-                            }
+                            NumKind::Double => NumericAcc::from_double_total(
+                                double_at(column(&by_name, sum)?, sum, i)?,
+                                count,
+                            ),
                             NumKind::Integer | NumKind::Decimal => NumericAcc::from_exact_total(
-                                exact_at(&by_name, sum, i)?,
+                                exact_at(column(&by_name, sum)?, sum, i)?,
                                 count,
                                 matches!(kind, NumKind::Decimal),
                             ),
@@ -691,14 +732,54 @@ impl GroupedSource {
     }
 }
 
+/// An aggregate output of a derived table, read from the batch holding it.
+pub(super) fn decode_aggregate(
+    batch: &ColumnBatch,
+    kind: &super::lower::AggTerm,
+    i: usize,
+) -> Result<Binding> {
+    let col = |name: &str| {
+        batch.column_by_name(name).ok_or_else(|| {
+            QueryError::Internal(format!("derived table lacks aggregate output '{name}'"))
+        })
+    };
+    Ok(match kind {
+        super::lower::AggTerm::Count { column } => Binding::lit(
+            FlakeValue::Long(int_at(col(column)?, column, i)?),
+            Sid::xsd_integer(),
+        ),
+        super::lower::AggTerm::Numeric {
+            sum,
+            count,
+            kind,
+            avg,
+        } => {
+            let n = int_at(col(count)?, count, i)? as u64;
+            let acc = match kind {
+                NumKind::Double => NumericAcc::from_double_total(double_at(col(sum)?, sum, i)?, n),
+                NumKind::Integer | NumKind::Decimal => NumericAcc::from_exact_total(
+                    exact_at(col(sum)?, sum, i)?,
+                    n,
+                    matches!(kind, NumKind::Decimal),
+                ),
+            };
+            if *avg {
+                acc.finalize_avg()
+            } else {
+                acc.finalize_sum()
+            }
+        }
+    })
+}
+
 fn column<'a>(by_name: &'a HashMap<String, Column>, name: &str) -> Result<&'a Column> {
     by_name
         .get(name)
         .ok_or_else(|| QueryError::Internal(format!("grouped statement lacks output '{name}'")))
 }
 
-fn int_at(by_name: &HashMap<String, Column>, name: &str, i: usize) -> Result<i64> {
-    Ok(match column(by_name, name)? {
+fn int_at(col: &Column, name: &str, i: usize) -> Result<i64> {
+    Ok(match col {
         Column::Int64(v) => v.get(i).copied().flatten().unwrap_or(0),
         Column::Int32(v) => v.get(i).copied().flatten().map(i64::from).unwrap_or(0),
         Column::Decimal { values, scale, .. } if *scale == 0 => values
@@ -716,8 +797,8 @@ fn int_at(by_name: &HashMap<String, Column>, name: &str, i: usize) -> Result<i64
     })
 }
 
-fn double_at(by_name: &HashMap<String, Column>, name: &str, i: usize) -> Result<f64> {
-    Ok(match column(by_name, name)? {
+fn double_at(col: &Column, name: &str, i: usize) -> Result<f64> {
+    Ok(match col {
         Column::Float64(v) => v.get(i).copied().flatten().unwrap_or(0.0),
         Column::Float32(v) => v.get(i).copied().flatten().map(f64::from).unwrap_or(0.0),
         Column::Int64(v) => v.get(i).copied().flatten().unwrap_or(0) as f64,
@@ -736,8 +817,8 @@ fn double_at(by_name: &HashMap<String, Column>, name: &str, i: usize) -> Result<
     })
 }
 
-fn exact_at(by_name: &HashMap<String, Column>, name: &str, i: usize) -> Result<BigDecimal> {
-    Ok(match column(by_name, name)? {
+fn exact_at(col: &Column, name: &str, i: usize) -> Result<BigDecimal> {
+    Ok(match col {
         Column::Decimal { values, scale, .. } => values
             .get(i)
             .copied()

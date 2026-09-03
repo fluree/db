@@ -29,6 +29,8 @@ struct Renderer<'a> {
     dialect: SqlDialect,
     schemas: &'a HashMap<String, Arc<BatchSchema>>,
     keysets: HashMap<String, Vec<(String, Option<FieldType>)>>,
+    /// Column types of every derived table, by alias.
+    derived: HashMap<String, Vec<(String, FieldType)>>,
     from: String,
     where_preds: Vec<Pred>,
 }
@@ -44,11 +46,13 @@ pub fn render_plan(
         dialect,
         schemas,
         keysets: HashMap::new(),
+        derived: HashMap::new(),
         from: String::new(),
         where_preds: Vec::new(),
     };
     r.collect_keysets(&plan.root);
     r.infer_keyset_types(&plan.root)?;
+    r.collect_derived(&plan.root)?;
     r.render_from(&plan.root)?;
 
     let mut sql = String::from("SELECT ");
@@ -103,11 +107,54 @@ impl Renderer<'_> {
             RelNode::KeySet(k) => {
                 self.keysets.insert(k.alias.clone(), k.columns.clone());
             }
-            RelNode::Access { .. } => {}
+            // A derived table's key sets are its own statement's.
+            RelNode::Access { .. } | RelNode::Derived { .. } => {}
             RelNode::Filter { input, .. } => self.collect_keysets(input),
             RelNode::Join { left, right, .. } | RelNode::LeftJoin { left, right, .. } => {
                 self.collect_keysets(left);
                 self.collect_keysets(right);
+            }
+        }
+    }
+
+    /// Type every derived table's columns from its own plan, so an outer
+    /// predicate or join over them renders like one over a table column.
+    fn collect_derived(&mut self, node: &RelNode) -> Result<()> {
+        match node {
+            RelNode::Derived { alias, plan } => {
+                let mut inner = Renderer {
+                    dialect: self.dialect,
+                    schemas: self.schemas,
+                    keysets: HashMap::new(),
+                    derived: HashMap::new(),
+                    from: String::new(),
+                    where_preds: Vec::new(),
+                };
+                inner.collect_keysets(&plan.root);
+                inner.infer_keyset_types(&plan.root)?;
+                inner.collect_derived(&plan.root)?;
+                let mut cols = Vec::with_capacity(plan.output.len());
+                for o in &plan.output {
+                    let ty = match &o.expr {
+                        OutputExpr::Col(c) | OutputExpr::Min(c) | OutputExpr::Max(c) => {
+                            inner.col_type(c)?
+                        }
+                        OutputExpr::CountRows | OutputExpr::Count { .. } => FieldType::Int64,
+                        OutputExpr::Sum { .. } => FieldType::Decimal {
+                            precision: 38,
+                            scale: 6,
+                        },
+                    };
+                    cols.push((o.name.clone(), ty));
+                }
+                self.derived.insert(alias.clone(), cols);
+                Ok(())
+            }
+            RelNode::Access { .. } | RelNode::KeySet(_) => Ok(()),
+            RelNode::Filter { input, .. } => self.collect_derived(input),
+            RelNode::Join { left, right, .. } | RelNode::LeftJoin { left, right, .. } => {
+                self.collect_derived(left)?;
+                self.collect_derived(right)
             }
         }
     }
@@ -157,6 +204,18 @@ impl Renderer<'_> {
                 .ok_or_else(|| {
                     SqlError::Unsupported(format!(
                         "key set '{}' has no column '{}'",
+                        c.alias, c.column
+                    ))
+                });
+        }
+        if let Some(cols) = self.derived.get(&c.alias) {
+            return cols
+                .iter()
+                .find(|(n, _)| n == &c.column)
+                .map(|(_, t)| *t)
+                .ok_or_else(|| {
+                    SqlError::Unsupported(format!(
+                        "derived table '{}' has no column '{}'",
                         c.alias, c.column
                     ))
                 });
@@ -234,6 +293,14 @@ impl Renderer<'_> {
                 Ok((self.render_source(alias, source), Vec::new()))
             }
             RelNode::KeySet(k) => Ok((self.render_keyset(k)?, Vec::new())),
+            RelNode::Derived { alias, plan } => Ok((
+                format!(
+                    "({}) AS {}",
+                    render_plan(plan, self.schemas, self.dialect)?,
+                    self.dialect.quote_ident(alias)
+                ),
+                Vec::new(),
+            )),
             RelNode::Filter { input, pred } => {
                 let (item, mut preds) = self.render_leaf(input)?;
                 preds.push(pred.clone());
@@ -254,7 +321,10 @@ impl Renderer<'_> {
                 self.where_preds.push(pred.clone());
                 Ok(())
             }
-            RelNode::Access { .. } | RelNode::KeySet(_) | RelNode::Filter { .. } => {
+            RelNode::Access { .. }
+            | RelNode::KeySet(_)
+            | RelNode::Derived { .. }
+            | RelNode::Filter { .. } => {
                 let (item, preds) = self.render_leaf(node)?;
                 self.from = item;
                 self.where_preds.extend(preds);
@@ -500,7 +570,7 @@ fn collect_col_eqs(node: &RelNode, out: &mut Vec<(ColRef, ColRef)>) {
         }
     }
     match node {
-        RelNode::Access { .. } | RelNode::KeySet(_) => {}
+        RelNode::Access { .. } | RelNode::KeySet(_) | RelNode::Derived { .. } => {}
         RelNode::Filter { input, pred } => {
             from_pred(pred, out);
             collect_col_eqs(input, out);
@@ -852,6 +922,49 @@ mod tests {
             r#"SELECT "c"."id" AS "c0" FROM "customers" AS "c" WHERE (("c"."id" * 2) + 1.5) > 1E2 ORDER BY ("c"."id" * 2) DESC LIMIT 2"#
         );
         assert!(render_plan(&plan("name"), &schemas(), SqlDialect::Postgres).is_err());
+    }
+
+    /// A derived table renders as its own statement in parentheses, its
+    /// outputs typed from that statement so an outer join over them renders
+    /// like one over a table column.
+    #[test]
+    fn derived_table_renders_nested() {
+        let inner = RelPlan {
+            root: access("o", "orders"),
+            output: vec![
+                out("o", "customer_id", "c0"),
+                OutputCol {
+                    expr: OutputExpr::CountRows,
+                    name: "c1".into(),
+                },
+            ],
+            group_by: vec![ColRef::new("o", "customer_id")],
+            distinct: false,
+            order_by: vec![],
+            limit: None,
+        };
+        let plan = RelPlan {
+            root: RelNode::Join {
+                left: Box::new(access("c", "customers")),
+                right: Box::new(RelNode::Derived {
+                    alias: "d0".into(),
+                    plan: Box::new(inner),
+                }),
+                on: Pred::ColEq {
+                    left: ColRef::new("c", "id"),
+                    right: ColRef::new("d0", "c0"),
+                },
+            },
+            output: vec![out("c", "name", "c0"), out("d0", "c1", "c1")],
+            group_by: Vec::new(),
+            distinct: false,
+            order_by: vec![],
+            limit: None,
+        };
+        assert_eq!(
+            render_plan(&plan, &schemas(), SqlDialect::Postgres).unwrap(),
+            r#"SELECT "c"."name" AS "c0", "d0"."c1" AS "c1" FROM "customers" AS "c" JOIN (SELECT "o"."customer_id" AS "c0", COUNT(*) AS "c1" FROM "orders" AS "o" GROUP BY "o"."customer_id") AS "d0" ON "c"."id" = "d0"."c0""#
+        );
     }
 
     /// A string join on MySQL compares bytes too, and an integer join is

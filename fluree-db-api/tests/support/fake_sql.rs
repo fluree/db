@@ -135,6 +135,28 @@ impl FakeSql {
                 after[cend + 1..].trim_start(),
             ));
         }
+        // A nested statement the lane built, unless it is a registered
+        // `rr:sqlQuery` (resolved as a table below).
+        if s.starts_with("(SELECT ")
+            && matching_paren(s).is_some_and(|end| self.table_for_source(&s[..=end]).is_none())
+        {
+            let end = matching_paren(s).ok_or("unbalanced derived table")?;
+            let (columns, rows) = self.eval(&s[1..end])?;
+            let after = s[end + 1..].trim_start();
+            let after = after
+                .strip_prefix("AS ")
+                .ok_or("derived table without alias")?;
+            let sp = after.find(' ').unwrap_or(after.len());
+            let alias = after[..sp].replace('"', "");
+            return Ok((
+                Rel {
+                    alias,
+                    columns,
+                    rows,
+                },
+                after[sp..].trim_start(),
+            ));
+        }
         let (item, rest) = if s.starts_with('(') {
             let end = matching_paren(s).ok_or("unbalanced derived table")?;
             (&s[..=end], s[end + 1..].trim_start())
