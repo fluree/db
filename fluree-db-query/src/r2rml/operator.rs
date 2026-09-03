@@ -1867,9 +1867,11 @@ impl LiteralEncoder {
                         .get(dt_iri.as_ref())
                         .cloned()
                         .unwrap_or_else(|| self.xsd_string.clone());
-                    // Coerce numeric XSD literals from string to typed FlakeValue
-                    // (arithmetic reads the value, not the datatype Sid);
-                    // non-numeric datatypes keep their string form.
+                    // Coerce numeric and temporal XSD literals from string to
+                    // the typed FlakeValue: arithmetic reads the value, and
+                    // `=` is a type error between a string-backed literal and
+                    // a dateTime (ordering coerces, equality does not). Other
+                    // datatypes keep their string form.
                     let val = match fluree_db_core::coerce_value(
                         FlakeValue::String(value.clone()),
                         dt_iri.as_ref(),
@@ -1878,7 +1880,10 @@ impl LiteralEncoder {
                             c @ (FlakeValue::Long(_)
                             | FlakeValue::Double(_)
                             | FlakeValue::BigInt(_)
-                            | FlakeValue::Decimal(_)),
+                            | FlakeValue::Decimal(_)
+                            | FlakeValue::DateTime(_)
+                            | FlakeValue::Date(_)
+                            | FlakeValue::Time(_)),
                         ) => c,
                         _ => FlakeValue::String(value.clone()),
                     };
