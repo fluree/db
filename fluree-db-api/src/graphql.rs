@@ -97,31 +97,65 @@ impl GraphQlRequest {
     }
 }
 
-/// Whether a request's operation writes.
+/// A request whose document has been parsed, once.
 ///
-/// Decided from the document, not the HTTP method: GraphQL sends everything
-/// over `POST`, so the method says nothing about intent. An unparseable
-/// document reads as a query, so the parse error surfaces from the read path
-/// where it is the only thing wrong.
-pub fn is_mutation(request: &GraphQlRequest) -> bool {
-    use fluree_db_graphql::async_graphql::parser::types::OperationType;
-    // Refuse an over-nested document without parsing it: the parser overflows
-    // the stack before its own recursion counter fires, and an abort is not
-    // something the caller can catch. Reads as a query so the read path reports
-    // it, like any other unparseable document.
-    if fluree_db_graphql::limits::guard_nesting(&request.query).is_err() {
-        return false;
+/// A caller has to know whether the operation writes *before* it can execute
+/// it — a mutation needs a `LedgerState`, a read needs a policy view — and
+/// answering that means parsing. Parsing again to execute would be the third
+/// time over the same string: once to classify, once to extract the selection
+/// tree, and once more inside async-graphql. So the document is parsed here and
+/// handed on, to `selection::extract` and then to the executor by way of
+/// `Request::set_parsed_query`.
+pub struct PreparedRequest<'a> {
+    request: &'a GraphQlRequest,
+    doc: async_graphql::parser::types::ExecutableDocument,
+    writes: bool,
+}
+
+impl<'a> PreparedRequest<'a> {
+    /// Parse and classify a request.
+    ///
+    /// `Err` is a finished GraphQL error envelope rather than an error type: a
+    /// document this rejects is refused the way every other GraphQL failure is,
+    /// as a `200` with `errors`, so the caller returns it as-is.
+    pub fn new(request: &'a GraphQlRequest) -> std::result::Result<Self, JsonValue> {
+        use async_graphql::parser::types::OperationType;
+
+        // Before `parse_query`, not after: pest descends the grammar
+        // recursively with no limit of its own, so a deeply nested document
+        // overflows the stack and aborts the process before async-graphql's own
+        // recursion counter is ever consulted. An abort is not catchable.
+        if let Err(e) = fluree_db_graphql::limits::guard_nesting(&request.query) {
+            return Err(error_envelope(&e.to_string(), e.code()));
+        }
+        let doc = async_graphql::parser::parse_query(&request.query)
+            .map_err(|e| error_envelope(&e.to_string(), "GRAPHQL_PARSE_FAILED"))?;
+
+        // Decided from the document, not the HTTP method: GraphQL sends
+        // everything over `POST`, so the method says nothing about intent.
+        let writes = doc.operations.iter().any(|(name, op)| {
+            op.node.ty == OperationType::Mutation
+                && request
+                    .operation_name
+                    .as_deref()
+                    .is_none_or(|wanted| name.is_none_or(|n| n == wanted))
+        });
+        Ok(Self {
+            request,
+            doc,
+            writes,
+        })
     }
-    let Ok(doc) = fluree_db_graphql::async_graphql::parser::parse_query(&request.query) else {
-        return false;
-    };
-    doc.operations.iter().any(|(name, op)| {
-        op.node.ty == OperationType::Mutation
-            && request
-                .operation_name
-                .as_deref()
-                .is_none_or(|wanted| name.is_none_or(|n| n == wanted))
-    })
+
+    /// Whether this request's operation writes.
+    pub fn writes(&self) -> bool {
+        self.writes
+    }
+
+    /// The request this was prepared from.
+    pub fn request(&self) -> &'a GraphQlRequest {
+        self.request
+    }
 }
 
 // =============================================================================
@@ -1102,8 +1136,13 @@ impl Fluree {
     /// response body, not a transport failure. Only errors that prevent a
     /// response at all — an unschematisable ledger — come back as `Err`.
     pub async fn graphql(&self, db: &GraphDb, request: &GraphQlRequest) -> Result<JsonValue> {
-        self.graphql_with_options(db, request, QueryExecutionOptions::default())
-            .await
+        match PreparedRequest::new(request) {
+            Ok(prepared) => {
+                self.graphql_with_options(db, prepared, QueryExecutionOptions::default())
+                    .await
+            }
+            Err(envelope) => Ok(envelope),
+        }
     }
 
     /// Execute a GraphQL request with explicit execution controls.
@@ -1116,10 +1155,10 @@ impl Fluree {
     pub async fn graphql_with_options(
         &self,
         db: &GraphDb,
-        request: &GraphQlRequest,
+        prepared: PreparedRequest<'_>,
         options: QueryExecutionOptions,
     ) -> Result<JsonValue> {
-        self.run_graphql(db, request, None, options).await
+        self.run_graphql(db, prepared, None, options).await
     }
 
     /// Execute a GraphQL request that may write.
@@ -1142,13 +1181,18 @@ impl Fluree {
         default_context: Option<JsonValue>,
         request: &GraphQlRequest,
     ) -> Result<(JsonValue, LedgerState)> {
-        self.graphql_transact_with_options(
-            ledger,
-            default_context,
-            request,
-            QueryExecutionOptions::default(),
-        )
-        .await
+        match PreparedRequest::new(request) {
+            Ok(prepared) => {
+                self.graphql_transact_with_options(
+                    ledger,
+                    default_context,
+                    prepared,
+                    QueryExecutionOptions::default(),
+                )
+                .await
+            }
+            Err(envelope) => Ok((envelope, ledger)),
+        }
     }
 
     /// [`Fluree::graphql_transact`] with explicit execution controls.
@@ -1160,12 +1204,14 @@ impl Fluree {
         &self,
         ledger: LedgerState,
         default_context: Option<JsonValue>,
-        request: &GraphQlRequest,
+        prepared: PreparedRequest<'_>,
         options: QueryExecutionOptions,
     ) -> Result<(JsonValue, LedgerState)> {
         let db = GraphDb::from_ledger_state(&ledger).with_default_context(default_context);
         let slot = parking_lot::Mutex::new(Some(ledger));
-        let envelope = self.run_graphql(&db, request, Some(&slot), options).await?;
+        let envelope = self
+            .run_graphql(&db, prepared, Some(&slot), options)
+            .await?;
         let ledger = slot.lock().take().ok_or_else(|| {
             ApiError::Internal("the ledger state was consumed by a failed mutation".to_string())
         })?;
@@ -1175,10 +1221,11 @@ impl Fluree {
     async fn run_graphql(
         &self,
         db: &GraphDb,
-        request: &GraphQlRequest,
+        prepared: PreparedRequest<'_>,
         ledger: Option<&parking_lot::Mutex<Option<LedgerState>>>,
         options: QueryExecutionOptions,
     ) -> Result<JsonValue> {
+        let PreparedRequest { request, doc, .. } = prepared;
         let derived = derive_schema(db).await;
         if derived.model.query_fields.is_empty() {
             return Ok(error_envelope(
@@ -1217,16 +1264,6 @@ impl Fluree {
             .map_or_else(async_graphql::Variables::default, |v| {
                 async_graphql::Variables::from_json(v)
             });
-        // Before `parse_query`, not after: pest descends the grammar recursively
-        // with no limit of its own, so a deeply nested document overflows the
-        // stack and aborts the process before any counter is consulted.
-        if let Err(e) = fluree_db_graphql::limits::guard_nesting(&request.query) {
-            return Ok(error_envelope(&e.to_string(), e.code()));
-        }
-        let doc = match async_graphql::parser::parse_query(&request.query) {
-            Ok(doc) => doc,
-            Err(e) => return Ok(error_envelope(&e.to_string(), "GRAPHQL_PARSE_FAILED")),
-        };
         let operation = match selection::extract(
             &doc,
             request.operation_name.as_deref(),
@@ -1244,6 +1281,10 @@ impl Fluree {
         if let Some(name) = &request.operation_name {
             req = req.operation_name(name);
         }
+        // Hand over the document already parsed. `execute` uses it as-is and
+        // validation — the depth and complexity limits included — still runs on
+        // it, so this saves the parse without weakening anything.
+        req.set_parsed_query(doc);
         let mut response = to_envelope(schema.execute(req).await);
         // Hand the (possibly advanced) ledger back to the caller's slot.
         if let (Some(caller), Some(mine)) = (ledger, executor.ledger.as_ref()) {

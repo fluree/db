@@ -11,8 +11,8 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use fluree_db_api::graphql::GraphQlRequest;
 use fluree_db_api::graphql::Limits;
+use fluree_db_api::graphql::{GraphQlRequest, PreparedRequest};
 use fluree_db_api::QueryExecutionOptions;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -71,17 +71,25 @@ pub async fn graphql_ledger_tail(
             let request = parse_request(&params, &credential, limits)?;
             let options = crate::query_control::current_query_execution_options(timeout_ms);
 
+            // Parsed once, here: the document decides which path to take, and
+            // whichever one runs reuses this parse rather than repeating it.
+            let prepared = match PreparedRequest::new(&request) {
+                Ok(prepared) => prepared,
+                // A refused document is already a GraphQL error envelope.
+                Err(envelope) => return Ok(Json(envelope).into_response()),
+            };
+
             // A GraphQL error is part of the response body, not a transport failure:
             // the spec has clients read `errors`, and returning 4xx for an unknown
             // field would break every standard client.
-            let response = if fluree_db_api::graphql::is_mutation(&request) {
+            let response = if prepared.writes() {
                 execute_mutation(
                     &state,
                     &ledger,
                     &headers,
                     &bearer,
                     &credential,
-                    &request,
+                    prepared,
                     options,
                 )
                 .await?
@@ -89,7 +97,7 @@ pub async fn graphql_ledger_tail(
                 let view = policy_view(&state, &ledger, &headers, &bearer, &credential).await?;
                 state
                     .fluree
-                    .graphql_with_options(&view, &request, options)
+                    .graphql_with_options(&view, prepared, options)
                     .await
                     .map_err(ServerError::Api)?
             };
@@ -150,7 +158,7 @@ async fn execute_mutation(
     headers: &FlureeHeaders,
     bearer: &MaybeDataBearer,
     credential: &MaybeCredential,
-    request: &GraphQlRequest,
+    prepared: PreparedRequest<'_>,
     options: QueryExecutionOptions,
 ) -> Result<JsonValue> {
     // Writing needs write authority, which reading does not imply.
@@ -175,7 +183,7 @@ async fn execute_mutation(
         .map_err(ServerError::Api)?;
     let (response, _committed) = state
         .fluree
-        .graphql_transact_with_options(loaded, context, request, options)
+        .graphql_transact_with_options(loaded, context, prepared, options)
         .await
         .map_err(ServerError::Api)?;
     Ok(response)

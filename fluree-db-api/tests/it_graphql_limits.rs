@@ -7,7 +7,7 @@
 //! request runs) and the document limits.
 
 use crate::support::{genesis_ledger, MemoryFluree};
-use fluree_db_api::graphql::{GraphQlRequest, Limits};
+use fluree_db_api::graphql::{GraphQlRequest, Limits, PreparedRequest};
 use fluree_db_api::{FlureeBuilder, GraphDb, LedgerState, QueryExecutionOptions};
 use fluree_db_core::{QueryCancellation, QueryCancellationReason};
 use serde_json::{json, Value as JsonValue};
@@ -89,12 +89,10 @@ async fn a_cancelled_handle_stops_a_graphql_read() {
     cancellation.cancel_with(QueryCancellationReason::Timeout);
     let options = QueryExecutionOptions::new().with_cancellation(cancellation);
 
+    let request = GraphQlRequest::new("{ persons { id name } }");
+    let prepared = PreparedRequest::new(&request).expect("document prepares");
     let response = fluree
-        .graphql_with_options(
-            &view(&ledger),
-            &GraphQlRequest::new("{ persons { id name } }"),
-            options,
-        )
+        .graphql_with_options(&view(&ledger), prepared, options)
         .await
         .expect("graphql request");
 
@@ -116,9 +114,10 @@ async fn cancellation_covers_every_aliased_root_field() {
     cancellation.cancel_with(QueryCancellationReason::ClientDisconnected);
     let options = QueryExecutionOptions::new().with_cancellation(cancellation);
 
-    let document = "{ a: persons { id } b: persons { id } c: persons { id } }";
+    let request = GraphQlRequest::new("{ a: persons { id } b: persons { id } c: persons { id } }");
+    let prepared = PreparedRequest::new(&request).expect("document prepares");
     let response = fluree
-        .graphql_with_options(&view(&ledger), &GraphQlRequest::new(document), options)
+        .graphql_with_options(&view(&ledger), prepared, options)
         .await
         .expect("graphql request");
 
@@ -142,17 +141,83 @@ async fn an_uncancelled_handle_answers_normally() {
     let ledger = seed(&fluree, "gql-cancel-clean:main").await;
 
     let options = QueryExecutionOptions::new().with_cancellation(QueryCancellation::new());
+    let request = GraphQlRequest::new("{ persons { id name } }");
+    let prepared = PreparedRequest::new(&request).expect("document prepares");
     let response = fluree
-        .graphql_with_options(
-            &view(&ledger),
-            &GraphQlRequest::new("{ persons { id name } }"),
-            options,
-        )
+        .graphql_with_options(&view(&ledger), prepared, options)
         .await
         .expect("graphql request");
 
     assert!(response.get("errors").is_none(), "{response}");
     assert_eq!(response["data"]["persons"].as_array().unwrap().len(), 2);
+}
+
+/// The document handed to the executor is the one that was prepared.
+///
+/// Executing by `operationName` out of a multi-operation document is the check
+/// that survives: the parsed document is passed straight to async-graphql via
+/// `set_parsed_query`, so if that hand-off were wrong the named operation would
+/// not be the one that runs. (That there is exactly *one* parse is a
+/// performance property, not a behavioural one — the same string parsed twice
+/// behaves identically — so no test can pin it; the benchmark is what would
+/// notice a regression.)
+#[tokio::test]
+async fn the_prepared_document_is_what_executes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed(&fluree, "gql-single-parse:main").await;
+
+    let document = "query A { persons { id } } query B { persons { name } }";
+    let request = GraphQlRequest::new(document).with_operation_name("B");
+    let prepared = PreparedRequest::new(&request).expect("document prepares");
+    assert!(!prepared.writes());
+
+    let response = fluree
+        .graphql_with_options(&view(&ledger), prepared, QueryExecutionOptions::new())
+        .await
+        .expect("graphql request");
+    assert!(response.get("errors").is_none(), "{response}");
+
+    // B selects `name`, A selects `id`. Getting A's shape back would mean the
+    // executor ran something other than the prepared operation.
+    let first = &response["data"]["persons"][0];
+    assert!(
+        first.get("name").is_some(),
+        "ran the wrong operation: {response}"
+    );
+    assert!(
+        first.get("id").is_none(),
+        "ran the wrong operation: {response}"
+    );
+}
+
+/// The mutation half of the same contract: `writes` has to follow the named
+/// operation, not merely notice a `mutation` keyword somewhere in the document.
+#[tokio::test]
+async fn writes_follows_the_named_operation() {
+    let document = "query A { persons { id } } mutation B { create_Person(input: {}) { id } }";
+
+    let as_query = GraphQlRequest::new(document).with_operation_name("A");
+    assert!(!PreparedRequest::new(&as_query).expect("prepares").writes());
+
+    let as_mutation = GraphQlRequest::new(document).with_operation_name("B");
+    assert!(PreparedRequest::new(&as_mutation)
+        .expect("prepares")
+        .writes());
+}
+
+/// An unparseable document is refused as a GraphQL envelope, not an `Err`: the
+/// spec has clients read `errors`, and this is the shape the route returns.
+#[tokio::test]
+async fn an_unparseable_document_is_refused_as_an_envelope() {
+    let request = GraphQlRequest::new("{ persons { id ");
+    let Err(envelope) = PreparedRequest::new(&request) else {
+        panic!("an unterminated document must not parse");
+    };
+    assert_eq!(
+        envelope["errors"][0]["extensions"]["code"], "GRAPHQL_PARSE_FAILED",
+        "{envelope}"
+    );
+    assert!(envelope["data"].is_null(), "{envelope}");
 }
 
 // ── Document limits (#2) ─────────────────────────────────────────────────────
@@ -359,11 +424,12 @@ async fn a_document_deep_enough_to_overflow_the_parser_is_refused_unparsed() {
         "expected a pre-parse refusal, got: {response}"
     );
 
-    // The route asks `is_mutation` first, which parses too — it must not be the
-    // hole the guard leaves open.
+    // The route prepares the document before choosing a path, and that is the
+    // only parse — so the guard has to refuse it there rather than downstream.
+    let request = GraphQlRequest::new(document);
     assert!(
-        !fluree_db_api::graphql::is_mutation(&GraphQlRequest::new(document)),
-        "is_mutation parsed a document the guard refuses"
+        PreparedRequest::new(&request).is_err(),
+        "preparing parsed a document the guard refuses"
     );
 }
 
