@@ -193,6 +193,14 @@ pub enum RelNode {
         alias: String,
         plan: Box<RelPlan>,
     },
+    /// A `UNION ALL` of statements as a derived table: `(SELECT … UNION ALL
+    /// SELECT …) AS alias`. Every branch projects the same number of
+    /// columns, of the same types position by position; the first branch's
+    /// output names name the columns of `alias`.
+    UnionAll {
+        alias: String,
+        branches: Vec<RelPlan>,
+    },
     Filter {
         input: Box<RelNode>,
         pred: Pred,
@@ -222,6 +230,9 @@ impl RelNode {
             RelNode::Access { alias, source } => out.push((alias, source)),
             RelNode::KeySet(_) => {}
             RelNode::Derived { plan, .. } => plan.root.collect_accesses(out),
+            RelNode::UnionAll { branches, .. } => {
+                branches.iter().for_each(|b| b.root.collect_accesses(out));
+            }
             RelNode::Filter { input, .. } => input.collect_accesses(out),
             RelNode::Join { left, right, .. } | RelNode::LeftJoin { left, right, .. } => {
                 left.collect_accesses(out);
@@ -236,6 +247,8 @@ impl RelNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputExpr {
     Col(ColRef),
+    /// An integer literal: a `UNION ALL` branch tag.
+    Tag(i64),
     /// `COUNT(*)`.
     CountRows,
     /// `COUNT([DISTINCT] col)`: non-null values.
@@ -260,7 +273,7 @@ impl OutputExpr {
             | OutputExpr::Sum { col: c, .. }
             | OutputExpr::Min(c)
             | OutputExpr::Max(c) => Some(c),
-            OutputExpr::CountRows => None,
+            OutputExpr::CountRows | OutputExpr::Tag(_) => None,
         }
     }
 

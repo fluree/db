@@ -228,8 +228,21 @@ pushable. In that statement:
   subject** (a vertically partitioned mapping: one map per column group, or
   per table, over the same `rr:template`) is one access per distinct table,
   joined on the subject's key columns; maps over the same table and subject
-  share a single access. Every member must have exactly one providing map
-  when no map provides them all, or the block is left to the engine;
+  share a single access;
+- an entity with **several resolutions** — a predicate two maps mint, on
+  the same subject or on different ones (`?s ex:name ?n` where people and
+  companies both have names) — is one derived table: every resolution
+  (one choice of providing map per member, the chosen maps minting the same
+  subject) is lowered on its own and the branches are `UNION ALL`ed under
+  shared columns, each row tagged with its branch so its terms decode
+  through that branch's maps. The rest of the block joins the union once.
+  Like the per-scan lane, a triple two maps mint comes back once per map.
+  Filters and a top-k on a union variable push on the union's columns; a
+  variable keeps its key shape (so it can be seeded or joined) only where
+  every branch agrees on it. The branches must bind their columns with the
+  same database types, an entity with more than eight resolutions, a
+  foreign key into a union entity, an aggregate over one, and a union
+  inside a sub-select decline;
 - the statement has limits the lane respects: outer bindings above the
   provider's key-set cap (2000 rows, or half the statement budget) go out
   as several statements, one per chunk; a `VALUES` block or an `IN` list
@@ -332,10 +345,12 @@ pins both the rows and which of these forms each statement took.
 
 Terms are always built in the engine from the returned columns, so
 datatypes come from the mapping, not from the SQL types. Shapes the lane
-cannot express exactly — variable predicates, several triples maps for one
-entity, disconnected entities (a Cartesian product), a filter inside an
-optional that is not exact, subject-targeted view policies — decline to the
-per-scan lane below, which is also the differential oracle in the test
+cannot express exactly — variable predicates, an entity with more
+resolutions than the union cap or with branches of differing column types,
+disconnected entities (a Cartesian product), a filter inside an optional
+that is not exact, a view policy targeting both subjects and a
+column-derived class — decline to the per-scan lane below, which is also
+the differential oracle in the test
 suite. `FLUREE_SQL_PUSHDOWN_LANE=0` disables the lane. The statement sent
 is logged at `info` as `SQL block pushdown`, and a tracked query (`"meta":
 true`) returns every statement the lane ran under `sql` as

@@ -210,6 +210,13 @@ pub(super) fn group_plan(
     caps: &fluree_db_tabular::plan::PushdownCapabilities,
     schemas: &HashMap<fluree_db_tabular::plan::RelSource, Arc<fluree_db_tabular::BatchSchema>>,
 ) -> std::result::Result<Grouped, &'static str> {
+    if lowered
+        .terms
+        .iter()
+        .any(|(_, t)| matches!(t, TermSource::Union { .. }))
+    {
+        return Err("aggregate over a union entity");
+    }
     let field_type = |col: &ColRef| -> Option<FieldType> {
         let tm_iri = lowered
             .accesses

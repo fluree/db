@@ -20,8 +20,8 @@ use fluree_db_r2rml::mapping::{
 use fluree_db_r2rml::materialize::reverse_subject_template;
 use fluree_db_r2rml::RdfTerm;
 use fluree_db_tabular::plan::{
-    like_escape, ArithOp, CmpOp, ColRef, Expr, KeySet, Literal, OrderKey, OutputCol, Pred,
-    PushdownCapabilities, RelNode, RelPlan, RelSource,
+    like_escape, ArithOp, CmpOp, ColRef, Expr, KeySet, Literal, OrderKey, OutputCol, OutputExpr,
+    Pred, PushdownCapabilities, RelNode, RelPlan, RelSource,
 };
 use fluree_db_tabular::{BatchSchema, FieldType};
 use fluree_vocab::{rdf, xsd, UnresolvedDatatypeConstraint};
@@ -68,6 +68,13 @@ pub(crate) enum TermSource {
     Aggregate {
         alias: String,
         kind: AggTerm,
+    },
+    /// A variable of a union entity: the branch named by the `tag` column
+    /// of `alias` (the union's derived table) decodes it.
+    Union {
+        alias: String,
+        tag: String,
+        branches: Vec<TermSource>,
     },
 }
 
@@ -231,6 +238,10 @@ pub(crate) struct LowerInput<'a> {
 /// The most `UNION` branch combinations one block expands into.
 const MAX_UNION_BLOCKS: usize = 8;
 
+/// The most resolutions (choices of a providing triples map per member) one
+/// entity unions.
+const MAX_MAP_ALTERNATIVES: usize = 8;
+
 /// Lower a block: one lowering per `UNION` branch combination, each its own
 /// statement. `Ok(Err(Decline))` is a structural decline (the per-scan lane
 /// runs); an empty `Ok(Ok(_))` means the block provably yields no rows.
@@ -265,6 +276,9 @@ pub(crate) fn lower_block(input: LowerInput<'_>) -> Result<Lowering<Vec<Lowered>
             derived_terms: HashMap::new(),
             required_columns: HashSet::new(),
             static_keysets: Vec::new(),
+            unions: HashMap::new(),
+            forced: None,
+            derived_types: HashMap::new(),
         };
         let lowered = lw.lower(
             block,
@@ -341,6 +355,19 @@ struct Lowerer<'a> {
     /// `(alias, column)` pairs that are `IS NOT NULL`.
     required_columns: HashSet<(String, String)>,
     static_keysets: Vec<(KeySet, Vec<Pred>)>,
+    /// Union entities by alias, joined like accesses.
+    unions: HashMap<String, UnionInfo>,
+    /// The one resolution a union branch's lowering takes for its entity.
+    forced: Option<Vec<Part<'a>>>,
+    /// Column types of derived and union outputs, by alias then column.
+    derived_types: HashMap<String, HashMap<String, FieldType>>,
+}
+
+/// A union entity's derived table: one plan per resolution, each output
+/// row tagged with its branch under `tag`.
+struct UnionInfo {
+    branches: Vec<RelPlan>,
+    tag: String,
 }
 
 /// A required entity that resolves to no triples map: the block is empty.
@@ -378,12 +405,27 @@ impl<'a> Lowerer<'a> {
         // source, joined on the subject's key columns; maps over the same
         // table and subject share one access.
         let mut entity_accesses: HashMap<usize, Vec<(String, &'a TriplesMap)>> = HashMap::new();
+        let mut union_entities: HashSet<usize> = HashSet::new();
         let mut pending_refs: Vec<RefEdge> = Vec::new();
         for (idx, (subject, members)) in entities.iter().enumerate() {
-            let parts = match self.resolve_parts(members, None) {
-                Ok(Ok(parts)) => parts,
-                Ok(Err(Empty)) => return Ok(Ok(None)),
+            let mut alternatives = match self.resolve_alternatives(members, None) {
+                Ok(a) => a,
                 Err(d) => return Ok(Err(d)),
+            };
+            let parts = match alternatives.len() {
+                0 => return Ok(Ok(None)),
+                1 => alternatives.pop().expect("one resolution"),
+                // Several resolutions: their union, as one derived table.
+                _ => {
+                    match self.lower_union_entity(subject, members, alternatives)? {
+                        Ok(Ok(())) => {}
+                        Ok(Err(Empty)) => return Ok(Ok(None)),
+                        Err(d) => return Ok(Err(d)),
+                    }
+                    union_entities.insert(idx);
+                    entity_accesses.insert(idx, Vec::new());
+                    continue;
+                }
             };
             let mut accesses: Vec<(String, &'a TriplesMap)> = Vec::new();
             for (tm, member_idxs) in parts {
@@ -447,9 +489,11 @@ impl<'a> Lowerer<'a> {
         for (child_alias, conds, parent_tm_iri, var) in pending_refs {
             let target = entities
                 .iter()
-                .position(|(s, _)| matches!(s, SubjRef::Var(v) if *v == var))
-                .and_then(|i| entity_accesses.get(&i));
-            let Some(accesses) = target else {
+                .position(|(s, _)| matches!(s, SubjRef::Var(v) if *v == var));
+            if target.is_some_and(|i| union_entities.contains(&i)) {
+                return Ok(Err(Decline("ref object map into a union entity")));
+            }
+            let Some(accesses) = target.and_then(|i| entity_accesses.get(&i)) else {
                 return Ok(Err(Decline("ref target entity missing")));
             };
             let Some(parent) = self.mapping.get(&parent_tm_iri) else {
@@ -578,12 +622,17 @@ impl<'a> Lowerer<'a> {
         if outputs.is_empty() {
             return Ok(Err(Decline("no columns to project")));
         }
-        let distinct_exact = self.caps.string_distinct_is_binary
+        // A union's rows carry their branch tag, which is not part of the
+        // solution: the engine keeps its own DISTINCT over them.
+        let distinct_exact = (self.caps.string_distinct_is_binary
             || outputs.iter().all(|o| {
                 o.expr
                     .col()
                     .is_some_and(|c| !matches!(self.field_type(c), None | Some(FieldType::String)))
-            });
+            }))
+            && !projected
+                .iter()
+                .any(|v| matches!(self.vars[v].term, TermSource::Union { .. }));
         let mut accesses: Vec<AccessInfo> = self
             .accesses
             .iter()
@@ -591,10 +640,16 @@ impl<'a> Lowerer<'a> {
                 alias: a.alias.clone(),
                 tm_iri: a.tm_iri.clone(),
                 // A derived table's columns are read through its term
-                // aliases below, never through the table itself.
+                // aliases below, never through the table itself; a union's
+                // own column is its tag.
                 columns: if self.derived.contains_key(&a.alias) {
                     per_alias.remove(&a.alias);
                     Vec::new()
+                } else if let Some(u) = self.unions.get(&a.alias) {
+                    per_alias
+                        .remove(&a.alias)
+                        .map(|cols| cols.into_iter().filter(|c| c == &u.tag).collect())
+                        .unwrap_or_default()
                 } else {
                     per_alias.remove(&a.alias).unwrap_or_default()
                 },
@@ -703,6 +758,262 @@ impl<'a> Lowerer<'a> {
         })))
     }
 
+    /// An entity with several resolutions, as one derived table: each
+    /// resolution is lowered on its own (its accesses, joins, policy and
+    /// class predicates inside), the branches are `UNION ALL`ed under
+    /// shared output columns plus a tag naming the branch, and every
+    /// variable is bound once on those columns, decoded per branch. The
+    /// branches must bind the same variables on columns of the same probed
+    /// types; a key keeps its shape only where every branch agrees on it.
+    fn lower_union_entity(
+        &mut self,
+        subject: &SubjRef,
+        members: &[(String, Obj)],
+        alternatives: Vec<Vec<Part<'a>>>,
+    ) -> Result<Lowering<std::result::Result<(), Empty>>> {
+        let triples: Vec<Tp> = members
+            .iter()
+            .map(|(p, o)| Tp {
+                s: subject.clone(),
+                p: p.clone(),
+                o: o.clone(),
+            })
+            .collect();
+        let mut branches: Vec<(Lowered, HashSet<(String, String)>)> = Vec::new();
+        for alt in alternatives {
+            let mut inner = self.nested();
+            inner.forced = Some(alt);
+            let block = Block {
+                triples: triples.clone(),
+                filters: Vec::new(),
+                optionals: Vec::new(),
+                values: Vec::new(),
+                binds: Vec::new(),
+                subqueries: Vec::new(),
+            };
+            let lowered = inner.lower(block, &[], None, false)?;
+            let required = std::mem::take(&mut inner.required_columns);
+            self.rejoin(inner);
+            match lowered {
+                Ok(Some(l)) => branches.push((l, required)),
+                // A branch no row can satisfy contributes nothing.
+                Ok(None) => {}
+                Err(d) => return Ok(Err(d)),
+            }
+        }
+        let Some((first, _)) = branches.first() else {
+            return Ok(Ok(Err(Empty)));
+        };
+        let vars: Vec<VarId> = first.block_vars.clone();
+        if branches.iter().any(|(l, _)| {
+            l.block_vars.len() != vars.len() || l.block_vars.iter().any(|v| !vars.contains(v))
+        }) {
+            return Ok(Err(Decline("union branches bind different variables")));
+        }
+        // Output slots: each variable's columns in order, one slot per
+        // column of the first branch (a column two variables share takes
+        // one), the other branches' columns alongside.
+        let mut slots: Vec<Vec<ColRef>> = Vec::new();
+        for v in &vars {
+            let n = first.var_columns.get(v).map_or(0, Vec::len);
+            for j in 0..n {
+                let per_branch: Option<Vec<ColRef>> = branches
+                    .iter()
+                    .map(|(l, _)| l.var_columns.get(v).and_then(|c| c.get(j)).cloned())
+                    .collect();
+                let Some(per_branch) = per_branch else {
+                    return Ok(Err(Decline(
+                        "union branches bind a variable on different column counts",
+                    )));
+                };
+                match slots.iter().position(|s| s[0] == per_branch[0]) {
+                    Some(k) if slots[k] != per_branch => {
+                        return Ok(Err(Decline("union branches disagree on a shared column")));
+                    }
+                    Some(_) => {}
+                    None => slots.push(per_branch),
+                }
+            }
+        }
+        let mut types: Vec<FieldType> = Vec::with_capacity(slots.len());
+        for slot in &slots {
+            let mut ty = None;
+            for (i, col) in slot.iter().enumerate() {
+                let Some(t) = self.branch_field_type(&branches[i].0, col) else {
+                    return Ok(Err(Decline("union branch column of unknown type")));
+                };
+                if *ty.get_or_insert(t) != t {
+                    return Ok(Err(Decline("union branch column types differ")));
+                }
+            }
+            types.push(ty.expect("a slot has a column per branch"));
+        }
+        let alias = format!("u{}", self.unions.len());
+        let tag = format!("c{}", slots.len());
+        let slot_name = |k: usize| format!("c{k}");
+        let slot_of = |col: &ColRef, branch: usize| slots.iter().position(|s| &s[branch] == col);
+
+        let plans: Vec<RelPlan> = branches
+            .iter()
+            .enumerate()
+            .map(|(i, (l, _))| RelPlan {
+                root: l.root.clone(),
+                output: slots
+                    .iter()
+                    .enumerate()
+                    .map(|(k, s)| OutputCol::column(s[i].clone(), slot_name(k)))
+                    .chain(std::iter::once(OutputCol {
+                        expr: OutputExpr::Tag(i as i64),
+                        name: tag.clone(),
+                    }))
+                    .collect(),
+                group_by: Vec::new(),
+                distinct: false,
+                order_by: Vec::new(),
+                limit: None,
+            })
+            .collect();
+        let Some(first_tm) = first.accesses.first().map(|a| a.tm_iri.clone()) else {
+            return Ok(Err(Decline("union branch without an access")));
+        };
+        self.accesses.push(AccessInfo {
+            alias: alias.clone(),
+            tm_iri: first_tm,
+            columns: Vec::new(),
+            output_names: None,
+        });
+        let mut col_types: HashMap<String, FieldType> = types
+            .iter()
+            .enumerate()
+            .map(|(k, t)| (slot_name(k), *t))
+            .collect();
+        col_types.insert(tag.clone(), FieldType::Int64);
+        self.derived_types.insert(alias.clone(), col_types);
+        // A slot every branch requires is required of the union.
+        for (k, slot) in slots.iter().enumerate() {
+            if slot
+                .iter()
+                .enumerate()
+                .all(|(i, c)| branches[i].1.contains(&(c.alias.clone(), c.column.clone())))
+            {
+                self.required_columns.insert((alias.clone(), slot_name(k)));
+            }
+        }
+        // Each branch's inner aliases read the union's slots.
+        for (i, (l, _)) in branches.iter().enumerate() {
+            for (k, slot) in slots.iter().enumerate() {
+                let col = &slot[i];
+                let Some(tm_iri) = access_tm(l, &col.alias) else {
+                    return Ok(Err(Decline("union branch column without an access")));
+                };
+                let entry = self
+                    .derived_terms
+                    .entry(format!("{alias}/{}", col.alias))
+                    .or_insert_with(|| DerivedCols {
+                        derived: alias.clone(),
+                        tm_iri,
+                        columns: Vec::new(),
+                    });
+                let pair = (col.column.clone(), slot_name(k));
+                if !entry.columns.contains(&pair) {
+                    entry.columns.push(pair);
+                }
+            }
+        }
+        let retarget = |term: &TermSource| -> TermSource {
+            match term {
+                TermSource::Subject { alias: a } => TermSource::Subject {
+                    alias: format!("{alias}/{a}"),
+                },
+                TermSource::Object {
+                    alias: a,
+                    tm_iri,
+                    pom,
+                } => TermSource::Object {
+                    alias: format!("{alias}/{a}"),
+                    tm_iri: tm_iri.clone(),
+                    pom: *pom,
+                },
+                other => other.clone(),
+            }
+        };
+        for v in &vars {
+            let sources: Vec<&VarSource> = branches.iter().map(|(l, _)| &l.vars[v]).collect();
+            if sources.iter().any(|s| {
+                matches!(
+                    s.term,
+                    TermSource::Aggregate { .. } | TermSource::Union { .. }
+                )
+            }) {
+                return Ok(Err(Decline("union branch variable without a plain term")));
+            }
+            let term = TermSource::Union {
+                alias: alias.clone(),
+                tag: tag.clone(),
+                branches: sources.iter().map(|s| retarget(&s.term)).collect(),
+            };
+            // The key's shape survives when every branch has the same one,
+            // column for column over the slots.
+            let remapped = |branch: usize, cols: &[ColRef]| -> Option<Vec<usize>> {
+                cols.iter().map(|c| slot_of(c, branch)).collect()
+            };
+            let key = match &sources[0].key {
+                Some(KeyShape::Template { template, cols, .. }) => {
+                    let ks = remapped(0, cols);
+                    let uniform = sources.iter().enumerate().skip(1).all(|(i, s)| {
+                        matches!(&s.key, Some(KeyShape::Template { template: t, cols: c, .. })
+                            if t == template && remapped(i, c) == ks)
+                    });
+                    match (uniform, ks) {
+                        (true, Some(ks)) => Some(KeyShape::Template {
+                            template: template.clone(),
+                            cols: ks
+                                .iter()
+                                .map(|k| ColRef::new(&alias, slot_name(*k)))
+                                .collect(),
+                            types: ks.iter().map(|k| Some(types[*k])).collect(),
+                        }),
+                        _ => None,
+                    }
+                }
+                Some(KeyShape::Column { col, class }) => {
+                    let k = slot_of(col, 0);
+                    let uniform = sources.iter().enumerate().skip(1).all(|(i, s)| {
+                        matches!(&s.key, Some(KeyShape::Column { col: c, class: cl })
+                            if cl == class && slot_of(c, i) == k)
+                    });
+                    match (uniform, k) {
+                        (true, Some(k)) => Some(KeyShape::Column {
+                            col: ColRef::new(&alias, slot_name(k)),
+                            class: class.clone(),
+                        }),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            let nullable = sources.iter().any(|s| s.nullable);
+            if let Err(d) = self.bind_var(
+                *v,
+                VarSource {
+                    term,
+                    key,
+                    nullable,
+                },
+            ) {
+                return Ok(Err(d));
+            }
+        }
+        self.unions.insert(
+            alias,
+            UnionInfo {
+                branches: plans,
+                tag,
+            },
+        );
+        Ok(Ok(Ok(())))
+    }
+
     /// A sub-select as a derived table: its block is lowered on its own
     /// (sharing the alias counter and the policy), grouped when it groups,
     /// and each projected variable is bound on the derived table's columns:
@@ -716,26 +1027,7 @@ impl<'a> Lowerer<'a> {
             Ok(b) => b,
             Err(d) => return Ok(Err(d)),
         };
-        let mut inner = Lowerer {
-            mapping: self.mapping,
-            caps: self.caps,
-            policy: self.policy.take(),
-            schemas: self.schemas,
-            next_alias: self.next_alias,
-            accesses: Vec::new(),
-            access_preds: HashMap::new(),
-            edges: Vec::new(),
-            left_joins: Vec::new(),
-            vars: HashMap::new(),
-            var_order: Vec::new(),
-            residuals: Vec::new(),
-            bind_exprs: HashMap::new(),
-            snapshot: self.snapshot,
-            derived: HashMap::new(),
-            derived_terms: HashMap::new(),
-            required_columns: HashSet::new(),
-            static_keysets: Vec::new(),
-        };
+        let mut inner = self.nested();
         // The inner statement keeps what the projection and the grouping
         // read: the keys, and every aggregate's input.
         let mut keep: Vec<VarId> = sq.select.clone();
@@ -754,13 +1046,18 @@ impl<'a> Lowerer<'a> {
             }
         }
         let lowered = inner.lower(block, &[], Some(&keep), sq.distinct)?;
-        self.policy = inner.policy.take();
-        self.next_alias = inner.next_alias;
         let lowered = match lowered {
             Ok(Some(l)) => l,
-            Ok(None) => return Ok(Ok(Err(Empty))),
-            Err(d) => return Ok(Err(d)),
+            Ok(None) => {
+                self.rejoin(inner);
+                return Ok(Ok(Err(Empty)));
+            }
+            Err(d) => {
+                self.rejoin(inner);
+                return Ok(Err(d));
+            }
         };
+        self.rejoin(inner);
         if !lowered.residual_filters.is_empty() {
             return Ok(Err(Decline("subquery with a residual filter")));
         }
@@ -935,6 +1232,9 @@ impl<'a> Lowerer<'a> {
                     ));
                     continue;
                 }
+                TermSource::Union { .. } => {
+                    return Ok(Err(Decline("subquery over a union entity")));
+                }
             };
             let mut derived_cols = Vec::with_capacity(cols.len());
             for col in &cols {
@@ -1002,6 +1302,19 @@ impl<'a> Lowerer<'a> {
             columns: Vec::new(),
             output_names: None,
         });
+        // The outputs' types, so a filter or seed over them is checked like
+        // one over the columns they carry.
+        let types: HashMap<String, FieldType> = plan
+            .output
+            .iter()
+            .filter_map(|o| match &o.expr {
+                OutputExpr::Col(c) | OutputExpr::Min(c) | OutputExpr::Max(c) => self
+                    .branch_field_type(&lowered, c)
+                    .map(|t| (o.name.clone(), t)),
+                _ => None,
+            })
+            .collect();
+        self.derived_types.insert(alias.clone(), types);
         self.derived.insert(alias, plan);
         for (v, src) in binds {
             if let Err(d) = self.bind_var(v, src) {
@@ -1223,6 +1536,39 @@ impl<'a> Lowerer<'a> {
         })))
     }
 
+    /// A lowerer for a nested statement, sharing the alias counter and the
+    /// policy; `rejoin` hands both back.
+    fn nested(&mut self) -> Lowerer<'a> {
+        Lowerer {
+            mapping: self.mapping,
+            caps: self.caps,
+            policy: self.policy.take(),
+            schemas: self.schemas,
+            next_alias: self.next_alias,
+            accesses: Vec::new(),
+            access_preds: HashMap::new(),
+            edges: Vec::new(),
+            left_joins: Vec::new(),
+            vars: HashMap::new(),
+            var_order: Vec::new(),
+            residuals: Vec::new(),
+            bind_exprs: HashMap::new(),
+            snapshot: self.snapshot,
+            derived: HashMap::new(),
+            derived_terms: HashMap::new(),
+            required_columns: HashSet::new(),
+            static_keysets: Vec::new(),
+            unions: HashMap::new(),
+            forced: None,
+            derived_types: HashMap::new(),
+        }
+    }
+
+    fn rejoin(&mut self, mut inner: Lowerer<'a>) {
+        self.policy = inner.policy.take();
+        self.next_alias = inner.next_alias;
+    }
+
     fn new_access(&mut self, tm: &TriplesMap) -> String {
         let alias = format!("t{}", self.next_alias);
         self.next_alias += 1;
@@ -1242,8 +1588,24 @@ impl<'a> Lowerer<'a> {
     /// The probed type of a column, when the provider supplied its
     /// relation's schema.
     fn field_type(&self, col: &ColRef) -> Option<FieldType> {
+        if let Some(ty) = self
+            .derived_types
+            .get(&col.alias)
+            .and_then(|cols| cols.get(&col.column))
+        {
+            return Some(*ty);
+        }
         self.schemas
             .get(&self.rel_source(&col.alias))?
+            .field_by_name(&col.column)
+            .map(|f| f.field_type)
+    }
+
+    /// The probed type of a column of a nested lowering's table access.
+    fn branch_field_type(&self, lowered: &Lowered, col: &ColRef) -> Option<FieldType> {
+        let tm = self.mapping.get(&access_tm(lowered, &col.alias)?)?;
+        self.schemas
+            .get(&source_of_tm(tm))?
             .field_by_name(&col.column)
             .map(|f| f.field_type)
     }
@@ -1280,11 +1642,10 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// The single triples map every member of an entity resolves to.
     /// The one triples map providing every member, for an entity that
     /// must be a single access.
     fn resolve_tm(
-        &self,
+        &mut self,
         members: &[(String, Obj)],
         only: Option<&'a TriplesMap>,
     ) -> Lowering<std::result::Result<&'a TriplesMap, Empty>> {
@@ -1297,15 +1658,34 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// The triples maps an entity's members come from, each with the
-    /// members (by index) it provides: one map providing everything, or a
-    /// vertical partition where every member has exactly one provider and
-    /// the providers mint the same subject.
+    /// The one resolution of an entity that must have exactly one.
     fn resolve_parts(
-        &self,
+        &mut self,
         members: &[(String, Obj)],
         only: Option<&'a TriplesMap>,
     ) -> Lowering<std::result::Result<Vec<Part<'a>>, Empty>> {
+        let mut alternatives = self.resolve_alternatives(members, only)?;
+        match alternatives.len() {
+            0 => Ok(Err(Empty)),
+            1 => Ok(Ok(alternatives.pop().expect("one resolution"))),
+            _ => decline("optional entity spans several triples maps"),
+        }
+    }
+
+    /// Every resolution of an entity's members into triples maps, each a
+    /// list of parts (a map with the members it provides): one choice of a
+    /// providing map per member, the chosen maps minting the same subject.
+    /// A class member follows a chosen part declaring it, and is a part of
+    /// its own (a type-only access on the shared subject) only when none
+    /// does. Empty when no member has a provider.
+    fn resolve_alternatives(
+        &mut self,
+        members: &[(String, Obj)],
+        only: Option<&'a TriplesMap>,
+    ) -> Lowering<Vec<Vec<Part<'a>>>> {
+        if let Some(forced) = self.forced.take() {
+            return Ok(vec![forced]);
+        }
         let mut candidates: Vec<&'a TriplesMap> = match only {
             Some(tm) => vec![tm],
             None => self.mapping.triples_maps.values().collect(),
@@ -1347,61 +1727,35 @@ impl<'a> Lowerer<'a> {
                 );
             }
         }
-        let whole: Vec<&'a TriplesMap> = candidates
-            .iter()
-            .copied()
-            .filter(|tm| providers.iter().all(|p| p.iter().any(|c| c.iri == tm.iri)))
-            .collect();
-        match whole.as_slice() {
-            [tm] => return Ok(Ok(vec![(tm, (0..members.len()).collect())])),
-            [] => {}
-            _ => return decline("entity spans several triples maps"),
+        if providers.iter().any(Vec::is_empty) {
+            return Ok(Vec::new());
         }
-        let mut parts: Vec<Part<'a>> = Vec::new();
-        let mut classes: Vec<usize> = Vec::new();
-        for (i, p) in providers.iter().enumerate() {
-            if members[i].0 == rdf::TYPE {
-                classes.push(i);
-                continue;
-            }
-            match p.as_slice() {
-                [] => return Ok(Err(Empty)),
-                [tm] => match parts.iter_mut().find(|(t, _)| t.iri == tm.iri) {
-                    Some((_, idxs)) => idxs.push(i),
-                    None => parts.push((tm, vec![i])),
-                },
-                _ => return decline("predicate provided by several triples maps"),
+        let mut combos: usize = 1;
+        for p in &providers {
+            combos = combos.saturating_mul(p.len());
+            if combos > MAX_MAP_ALTERNATIVES {
+                return decline("too many triples-map combinations");
             }
         }
-        // A class comes with any part's map that declares it; otherwise it
-        // is a part of its own (a type-only access on the shared subject).
-        for i in classes {
-            let p = &providers[i];
-            if let Some((_, idxs)) = parts
-                .iter_mut()
-                .find(|(t, _)| p.iter().any(|c| c.iri == t.iri))
-            {
-                idxs.push(i);
-                continue;
+        let mut out: Vec<Vec<Part<'a>>> = Vec::new();
+        let mut choice = vec![0usize; members.len()];
+        loop {
+            if let Some(parts) = parts_of(members, &providers, &choice)? {
+                out.push(parts);
             }
-            match p.as_slice() {
-                [] => return Ok(Err(Empty)),
-                [tm] => parts.push((tm, vec![i])),
-                _ => return decline("class declared by several triples maps"),
+            let mut i = 0;
+            loop {
+                if i == members.len() {
+                    return Ok(out);
+                }
+                choice[i] += 1;
+                if choice[i] < providers[i].len() {
+                    break;
+                }
+                choice[i] = 0;
+                i += 1;
             }
         }
-        if parts.iter().any(|(tm, _)| {
-            let sm = &tm.subject_map;
-            sm.template.is_none() && sm.column.is_none()
-        }) {
-            return decline("entity spans triples maps with a constant subject");
-        }
-        // Different subjects never name one entity (the lane joins by key
-        // columns, never by rendered IRI): no row can carry every member.
-        if parts.iter().any(|(tm, _)| !same_subject(parts[0].0, tm)) {
-            return Ok(Err(Empty));
-        }
-        Ok(Ok(parts))
     }
 
     /// The key shape of a template over `cols`, declined when a column's
@@ -2502,15 +2856,21 @@ impl<'a> Lowerer<'a> {
     }
 
     fn leaf(&mut self, alias: &str) -> RelNode {
-        let node = match self.derived.get(alias) {
-            Some(plan) => RelNode::Derived {
+        let node = if let Some(plan) = self.derived.get(alias) {
+            RelNode::Derived {
                 alias: alias.to_string(),
                 plan: Box::new(plan.clone()),
-            },
-            None => RelNode::Access {
+            }
+        } else if let Some(u) = self.unions.get(alias) {
+            RelNode::UnionAll {
+                alias: alias.to_string(),
+                branches: u.branches.clone(),
+            }
+        } else {
+            RelNode::Access {
                 alias: alias.to_string(),
                 source: self.rel_source(alias),
-            },
+            }
         };
         match self.access_preds.remove(alias).and_then(Pred::and) {
             Some(pred) => RelNode::Filter {
@@ -2527,6 +2887,20 @@ impl<'a> Lowerer<'a> {
             | TermSource::Object { alias, .. }
             | TermSource::Aggregate { alias, .. } => Some(alias),
             TermSource::Constant(_) => None,
+            // The tag, then whatever any branch's term reads.
+            TermSource::Union {
+                alias,
+                tag,
+                branches,
+            } => {
+                let mut cols = vec![ColRef::new(alias, tag)];
+                for c in branches.iter().flat_map(|b| self.term_columns(b)) {
+                    if !cols.contains(&c) {
+                        cols.push(c);
+                    }
+                }
+                return cols;
+            }
         };
         if let Some(dc) = alias.and_then(|a| self.derived_terms.get(a)) {
             return dc
@@ -2536,7 +2910,9 @@ impl<'a> Lowerer<'a> {
                 .collect();
         }
         match term {
-            TermSource::Constant(_) | TermSource::Aggregate { .. } => Vec::new(),
+            TermSource::Constant(_) | TermSource::Aggregate { .. } | TermSource::Union { .. } => {
+                Vec::new()
+            }
             TermSource::Subject { alias } => {
                 let tm = self.tm_of(alias);
                 tm.map(|tm| {
@@ -2581,6 +2957,61 @@ pub(crate) fn literal_len(l: &Literal) -> usize {
 
 /// A triples map and the entity members (by index) it provides.
 type Part<'a> = (&'a TriplesMap, Vec<usize>);
+
+/// The parts of one choice of providers (`choice[i]` indexes
+/// `providers[i]`): `None` when the choice is not a resolution of its own
+/// (a class choice a chosen part already covers, or parts minting
+/// different subjects, which no row can carry together).
+fn parts_of<'a>(
+    members: &[(String, Obj)],
+    providers: &[Vec<&'a TriplesMap>],
+    choice: &[usize],
+) -> Lowering<Option<Vec<Part<'a>>>> {
+    let mut parts: Vec<Part<'a>> = Vec::new();
+    for (i, (pred, _)) in members.iter().enumerate() {
+        if pred == rdf::TYPE {
+            continue;
+        }
+        let tm = providers[i][choice[i]];
+        match parts.iter_mut().find(|(t, _)| t.iri == tm.iri) {
+            Some((_, idxs)) => idxs.push(i),
+            None => parts.push((tm, vec![i])),
+        }
+    }
+    for (i, (pred, _)) in members.iter().enumerate() {
+        if pred != rdf::TYPE {
+            continue;
+        }
+        let chosen = providers[i][choice[i]];
+        let declaring = parts
+            .iter_mut()
+            .find(|(t, _)| providers[i].iter().any(|c| c.iri == t.iri));
+        match declaring {
+            Some((t, idxs)) => {
+                if t.iri != chosen.iri {
+                    return Ok(None);
+                }
+                idxs.push(i);
+            }
+            None => parts.push((chosen, vec![i])),
+        }
+    }
+    if parts.iter().any(|(tm, _)| {
+        let sm = &tm.subject_map;
+        sm.template.is_none() && sm.column.is_none()
+    }) {
+        return decline("entity spans triples maps with a constant subject");
+    }
+    // Different subjects never name one entity (the lane joins by key
+    // columns, never by rendered IRI).
+    if parts.iter().any(|(tm, _)| !same_subject(parts[0].0, tm)) {
+        return Ok(None);
+    }
+    for (_, idxs) in &mut parts {
+        idxs.sort_unstable();
+    }
+    Ok(Some(parts))
+}
 
 /// Whether two triples maps mint their subject the same way from the same
 /// columns, so a row of each with equal key columns is one entity.

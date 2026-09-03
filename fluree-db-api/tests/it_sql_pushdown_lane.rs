@@ -105,7 +105,20 @@ const VP_R2RML: &str = r#"
         rr:logicalTable [ rr:tableName "shop.customers" ] ;
         rr:subjectMap [ rr:template "http://example.org/customer/{id}" ; rr:class ex:Customer ] ;
         rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
-        rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "name" ] ] .
+        rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "name" ] ] ;
+        rr:predicateObjectMap [ rr:predicate ex:code ; rr:objectMap [ rr:column "country" ] ] .
+
+    # Another subject minting `ex:label`, and `ex:code` from a column of
+    # another type than the customers' one.
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.people" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ; rr:class ex:Person ] ;
+        rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "name" ] ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:code ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:integer ]
+        ] .
 
     <http://example.org/mapping#CustomerCountry>
         a rr:TriplesMap ;
@@ -856,19 +869,96 @@ fn cases() -> Vec<Case> {
             routing: Routing::MustFire,
             declined: None,
         },
+        // An entity several resolutions provide (a predicate two maps
+        // mint, on the same subject or on different ones) is one derived
+        // table: the resolutions `UNION ALL`ed, each row tagged with its
+        // branch so its terms decode through that branch's maps. Like the
+        // per-scan lane, a triple two maps mint comes back once per map.
         Case {
-            name: "a predicate two maps provide, with no map providing the entity, declines",
+            name: "a predicate two maps provide unions the resolutions at the node",
             sparql: "SELECT ?l ?e FROM <shop-vp:main> WHERE { ?c ex:label ?l ; ex:email ?e }",
-            sql: &[],
-            // The per-scan lane answers once per map minting the triple.
+            sql: &[r#"SELECT "u0"."c3" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2", "u0"."c2" AS "c3" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t1"."email" AS "c2", 0 AS "c3" FROM "shop"."customers" AS "t0" JOIN "shop"."profiles" AS "t1" ON "t0"."id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", "t3"."email" AS "c2", 1 AS "c3" FROM "shop"."customers" AS "t2" JOIN "shop"."profiles" AS "t3" ON "t2"."id" = "t3"."id" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL AND "t3"."id" IS NOT NULL AND "t3"."email" IS NOT NULL) AS "u0""#],
             rows: &[
                 "e=ada@example.org l=Ada",
                 "e=ada@example.org l=Ada",
                 "e=cy@example.org l=Cy",
                 "e=cy@example.org l=Cy",
             ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "maps with different subjects providing a predicate union their accesses",
+            sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l }",
+            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", 1 AS "c2" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0""#],
+            // The subject has no key over the union (two templates), so it
+            // decodes per branch; the object is one string column.
+            rows: &[
+                "l=Ada s=http://example.org/customer/1",
+                "l=Ada s=http://example.org/customer/1",
+                "l=Ada s=http://example.org/person/1",
+                "l=Bo s=http://example.org/customer/2",
+                "l=Bo s=http://example.org/customer/2",
+                "l=Bo s=http://example.org/person/2",
+                "l=Cy s=http://example.org/customer/3",
+                "l=Cy s=http://example.org/customer/3",
+                "l=Cy s=http://example.org/person/3",
+                "l=Di s=http://example.org/person/4",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a filter on a union variable pushes on the union's column",
+            sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l FILTER(?l = \"Ada\") }",
+            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", 1 AS "c2" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" WHERE "u0"."c1" = 'Ada'"#],
+            rows: &[
+                "l=Ada s=http://example.org/customer/1",
+                "l=Ada s=http://example.org/customer/1",
+                "l=Ada s=http://example.org/person/1",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a top-k on a union variable pushes its LIMIT",
+            sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l } ORDER BY DESC(?l) LIMIT 1",
+            // Every branch requires the column, so the union's is required
+            // and orders exactly.
+            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", 1 AS "c2" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" ORDER BY "u0"."c1" DESC LIMIT 1"#],
+            rows: &["l=Di s=http://example.org/person/4"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a foreign key into a union entity declines",
+            sparql: "SELECT ?o ?l FROM <shop-vp:main> WHERE { ?o ex:customer ?c . ?c ex:label ?l }",
+            sql: &[],
+            rows: &[
+                "l=Ada o=http://example.org/order/10",
+                "l=Ada o=http://example.org/order/10",
+                "l=Ada o=http://example.org/order/11",
+                "l=Ada o=http://example.org/order/11",
+                "l=Bo o=http://example.org/order/12",
+                "l=Bo o=http://example.org/order/12",
+            ],
             routing: Routing::MustNotFire,
-            declined: Some("predicate provided by several triples maps"),
+            declined: Some("ref object map into a union entity"),
+        },
+        Case {
+            name: "union branches whose column types differ decline",
+            sparql: "SELECT ?s ?v FROM <shop-vp:main> WHERE { ?s ex:code ?v }",
+            sql: &[],
+            rows: &[
+                "s=http://example.org/customer/1 v=UK",
+                "s=http://example.org/customer/3 v=US",
+                "s=http://example.org/person/1 v=1",
+                "s=http://example.org/person/2 v=2",
+                "s=http://example.org/person/3 v=3",
+                "s=http://example.org/person/4 v=4",
+            ],
+            routing: Routing::MustNotFire,
+            declined: Some("union branch column types differ"),
         },
         // A sub-select is a derived table joined on its projected keys: a
         // grouped one carries its aggregates as outputs the engine decodes

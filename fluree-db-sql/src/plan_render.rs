@@ -108,7 +108,7 @@ impl Renderer<'_> {
                 self.keysets.insert(k.alias.clone(), k.columns.clone());
             }
             // A derived table's key sets are its own statement's.
-            RelNode::Access { .. } | RelNode::Derived { .. } => {}
+            RelNode::Access { .. } | RelNode::Derived { .. } | RelNode::UnionAll { .. } => {}
             RelNode::Filter { input, .. } => self.collect_keysets(input),
             RelNode::Join { left, right, .. } | RelNode::LeftJoin { left, right, .. } => {
                 self.collect_keysets(left);
@@ -122,30 +122,27 @@ impl Renderer<'_> {
     fn collect_derived(&mut self, node: &RelNode) -> Result<()> {
         match node {
             RelNode::Derived { alias, plan } => {
-                let mut inner = Renderer {
-                    dialect: self.dialect,
-                    schemas: self.schemas,
-                    keysets: HashMap::new(),
-                    derived: HashMap::new(),
-                    from: String::new(),
-                    where_preds: Vec::new(),
+                let cols = self.output_types(plan)?;
+                self.derived.insert(alias.clone(), cols);
+                Ok(())
+            }
+            // The union's columns are the first branch's; every other
+            // branch must line up with it, or the database would coerce
+            // (or refuse) the union.
+            RelNode::UnionAll { alias, branches } => {
+                let Some(first) = branches.first() else {
+                    return Err(SqlError::Unsupported("UNION ALL without branches".into()));
                 };
-                inner.collect_keysets(&plan.root);
-                inner.infer_keyset_types(&plan.root)?;
-                inner.collect_derived(&plan.root)?;
-                let mut cols = Vec::with_capacity(plan.output.len());
-                for o in &plan.output {
-                    let ty = match &o.expr {
-                        OutputExpr::Col(c) | OutputExpr::Min(c) | OutputExpr::Max(c) => {
-                            inner.col_type(c)?
-                        }
-                        OutputExpr::CountRows | OutputExpr::Count { .. } => FieldType::Int64,
-                        OutputExpr::Sum { .. } => FieldType::Decimal {
-                            precision: 38,
-                            scale: 6,
-                        },
-                    };
-                    cols.push((o.name.clone(), ty));
+                let cols = self.output_types(first)?;
+                for b in &branches[1..] {
+                    let other = self.output_types(b)?;
+                    if other.len() != cols.len()
+                        || other.iter().zip(&cols).any(|((_, x), (_, y))| x != y)
+                    {
+                        return Err(SqlError::Unsupported(
+                            "UNION ALL branch column types differ".into(),
+                        ));
+                    }
                 }
                 self.derived.insert(alias.clone(), cols);
                 Ok(())
@@ -157,6 +154,38 @@ impl Renderer<'_> {
                 self.collect_derived(right)
             }
         }
+    }
+
+    /// The output column types of a nested plan, from a renderer of its own.
+    fn output_types(&self, plan: &RelPlan) -> Result<Vec<(String, FieldType)>> {
+        let mut inner = Renderer {
+            dialect: self.dialect,
+            schemas: self.schemas,
+            keysets: HashMap::new(),
+            derived: HashMap::new(),
+            from: String::new(),
+            where_preds: Vec::new(),
+        };
+        inner.collect_keysets(&plan.root);
+        inner.infer_keyset_types(&plan.root)?;
+        inner.collect_derived(&plan.root)?;
+        let mut cols = Vec::with_capacity(plan.output.len());
+        for o in &plan.output {
+            let ty = match &o.expr {
+                OutputExpr::Col(c) | OutputExpr::Min(c) | OutputExpr::Max(c) => {
+                    inner.col_type(c)?
+                }
+                OutputExpr::Tag(_) | OutputExpr::CountRows | OutputExpr::Count { .. } => {
+                    FieldType::Int64
+                }
+                OutputExpr::Sum { .. } => FieldType::Decimal {
+                    precision: 38,
+                    scale: 6,
+                },
+            };
+            cols.push((o.name.clone(), ty));
+        }
+        Ok(cols)
     }
 
     /// Give every untyped key-set column the type of the table column it is
@@ -247,6 +276,7 @@ impl Renderer<'_> {
         let distinct = |d: bool| if d { "DISTINCT " } else { "" };
         let expr = match &o.expr {
             OutputExpr::Col(c) => zoned(c, self.col(c))?,
+            OutputExpr::Tag(n) => n.to_string(),
             OutputExpr::CountRows => "COUNT(*)".to_string(),
             OutputExpr::Count { col, distinct: d } => {
                 format!("COUNT({}{})", distinct(*d), self.col(col))
@@ -301,6 +331,30 @@ impl Renderer<'_> {
                 ),
                 Vec::new(),
             )),
+            // Branches go bare: SQLite rejects a parenthesized compound
+            // member, so a branch cannot carry its own ORDER BY or LIMIT.
+            RelNode::UnionAll { alias, branches } => {
+                if branches
+                    .iter()
+                    .any(|b| !b.order_by.is_empty() || b.limit.is_some())
+                {
+                    return Err(SqlError::Unsupported(
+                        "UNION ALL branch with ORDER BY or LIMIT is not rendered".into(),
+                    ));
+                }
+                let rendered: Vec<String> = branches
+                    .iter()
+                    .map(|b| render_plan(b, self.schemas, self.dialect))
+                    .collect::<Result<_>>()?;
+                Ok((
+                    format!(
+                        "({}) AS {}",
+                        rendered.join(" UNION ALL "),
+                        self.dialect.quote_ident(alias)
+                    ),
+                    Vec::new(),
+                ))
+            }
             RelNode::Filter { input, pred } => {
                 let (item, mut preds) = self.render_leaf(input)?;
                 preds.push(pred.clone());
@@ -324,6 +378,7 @@ impl Renderer<'_> {
             RelNode::Access { .. }
             | RelNode::KeySet(_)
             | RelNode::Derived { .. }
+            | RelNode::UnionAll { .. }
             | RelNode::Filter { .. } => {
                 let (item, preds) = self.render_leaf(node)?;
                 self.from = item;
@@ -570,7 +625,10 @@ fn collect_col_eqs(node: &RelNode, out: &mut Vec<(ColRef, ColRef)>) {
         }
     }
     match node {
-        RelNode::Access { .. } | RelNode::KeySet(_) | RelNode::Derived { .. } => {}
+        RelNode::Access { .. }
+        | RelNode::KeySet(_)
+        | RelNode::Derived { .. }
+        | RelNode::UnionAll { .. } => {}
         RelNode::Filter { input, pred } => {
             from_pred(pred, out);
             collect_col_eqs(input, out);
@@ -964,6 +1022,84 @@ mod tests {
         assert_eq!(
             render_plan(&plan, &schemas(), SqlDialect::Postgres).unwrap(),
             r#"SELECT "c"."name" AS "c0", "d0"."c1" AS "c1" FROM "customers" AS "c" JOIN (SELECT "o"."customer_id" AS "c0", COUNT(*) AS "c1" FROM "orders" AS "o" GROUP BY "o"."customer_id") AS "d0" ON "c"."id" = "d0"."c0""#
+        );
+    }
+
+    fn plain(root: RelNode, output: Vec<OutputCol>) -> RelPlan {
+        RelPlan {
+            root,
+            output,
+            group_by: Vec::new(),
+            distinct: false,
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    /// A union is a derived table of bare branches, each tagged; a filter
+    /// over its columns types like one over the first branch's.
+    #[test]
+    fn union_all_renders_as_a_tagged_derived_table() {
+        let branch = |alias: &str, tag: i64| {
+            plain(
+                RelNode::Filter {
+                    input: Box::new(access(alias, "customers")),
+                    pred: Pred::IsNotNull(ColRef::new(alias, "name")),
+                },
+                vec![
+                    out(alias, "id", "c0"),
+                    out(alias, "name", "c1"),
+                    OutputCol {
+                        expr: OutputExpr::Tag(tag),
+                        name: "c2".into(),
+                    },
+                ],
+            )
+        };
+        let mut schemas = schemas();
+        schemas.insert("c2".to_string(), schemas["c"].clone());
+        let plan = plain(
+            RelNode::Filter {
+                input: Box::new(RelNode::UnionAll {
+                    alias: "u0".into(),
+                    branches: vec![branch("c", 0), branch("c2", 1)],
+                }),
+                pred: Pred::Cmp {
+                    col: ColRef::new("u0", "c1"),
+                    op: CmpOp::Eq,
+                    value: Literal::Str("Ada".into()),
+                },
+            },
+            vec![
+                out("u0", "c0", "c0"),
+                out("u0", "c1", "c1"),
+                out("u0", "c2", "c2"),
+            ],
+        );
+        assert_eq!(
+            render_plan(&plan, &schemas, SqlDialect::Mysql).unwrap(),
+            r"SELECT `u0`.`c0` AS `c0`, `u0`.`c1` AS `c1`, `u0`.`c2` AS `c2` FROM (SELECT `c`.`id` AS `c0`, `c`.`name` AS `c1`, 0 AS `c2` FROM `customers` AS `c` WHERE `c`.`name` IS NOT NULL UNION ALL SELECT `c2`.`id` AS `c0`, `c2`.`name` AS `c1`, 1 AS `c2` FROM `customers` AS `c2` WHERE `c2`.`name` IS NOT NULL) AS `u0` WHERE `u0`.`c1` = BINARY 'Ada'"
+        );
+    }
+
+    /// Branches whose columns differ in type are refused, not coerced.
+    #[test]
+    fn union_all_branches_must_align() {
+        let plan = plain(
+            RelNode::UnionAll {
+                alias: "u0".into(),
+                branches: vec![
+                    plain(access("c", "customers"), vec![out("c", "name", "c0")]),
+                    plain(access("o", "orders"), vec![out("o", "total", "c0")]),
+                ],
+            },
+            vec![out("u0", "c0", "c0")],
+        );
+        let err = render_plan(&plan, &schemas(), SqlDialect::Postgres).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("UNION ALL branch column types differ"),
+            "{err}"
         );
     }
 

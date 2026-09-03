@@ -141,7 +141,17 @@ impl FakeSql {
             && matching_paren(s).is_some_and(|end| self.table_for_source(&s[..=end]).is_none())
         {
             let end = matching_paren(s).ok_or("unbalanced derived table")?;
-            let (columns, rows) = self.eval(&s[1..end])?;
+            // A `UNION ALL` of statements: the first branch's columns, every
+            // branch's rows.
+            let mut branches = split_top(&s[1..end], " UNION ALL ").into_iter();
+            let (columns, mut rows) = self.eval(branches.next().ok_or("empty derived table")?)?;
+            for b in branches {
+                let (cols, more) = self.eval(b)?;
+                if cols.len() != columns.len() {
+                    return Err("UNION ALL branches project different column counts".into());
+                }
+                rows.extend(more);
+            }
             let after = s[end + 1..].trim_start();
             let after = after
                 .strip_prefix("AS ")
@@ -478,6 +488,8 @@ struct SelectItem {
 
 enum SelectExpr {
     One,
+    /// An integer literal.
+    Const(i64),
     Col(Col),
     CountRows,
     Count(Col, bool),
@@ -488,7 +500,10 @@ enum SelectExpr {
 
 impl SelectExpr {
     fn is_aggregate(&self) -> bool {
-        !matches!(self, SelectExpr::One | SelectExpr::Col(_))
+        !matches!(
+            self,
+            SelectExpr::One | SelectExpr::Const(_) | SelectExpr::Col(_)
+        )
     }
 
     fn col_type(&self, resolver: &Resolver<'_>, rels: &[Rel]) -> Result<String, String> {
@@ -507,7 +522,10 @@ impl SelectExpr {
 
     fn type_hint(&self, resolver: &Resolver<'_>, rels: &[Rel]) -> String {
         match self {
-            SelectExpr::One | SelectExpr::CountRows | SelectExpr::Count(..) => "bigint".into(),
+            SelectExpr::One
+            | SelectExpr::Const(_)
+            | SelectExpr::CountRows
+            | SelectExpr::Count(..) => "bigint".into(),
             SelectExpr::Sum(c, _) => sum_type(&self.col_type(resolver, rels).unwrap_or_default())
                 .unwrap_or_else(|| format!("unsummable {}", c.1)),
             _ => self.col_type(resolver, rels).unwrap_or_default(),
@@ -517,6 +535,7 @@ impl SelectExpr {
     fn eval_row(&self, t: &Tuple, resolver: &Resolver<'_>) -> Result<Value, String> {
         match self {
             SelectExpr::One => Ok(json!(1)),
+            SelectExpr::Const(n) => Ok(json!(n)),
             SelectExpr::Col(c) => {
                 let (ri, ci) = resolver.resolve(c)?;
                 Ok(cell(t, ri, ci))
@@ -549,6 +568,7 @@ impl SelectExpr {
         };
         Ok(match self {
             SelectExpr::One => ("bigint".into(), json!(1)),
+            SelectExpr::Const(n) => ("bigint".into(), json!(n)),
             SelectExpr::Col(c) => {
                 let (ri, ci) = resolver.resolve(c)?;
                 (
@@ -649,6 +669,8 @@ fn parse_select_item(item: &str) -> Result<SelectItem, String> {
         SelectExpr::Min(colref(inner))
     } else if let Some(inner) = expr.strip_prefix("MAX(").and_then(|r| r.strip_suffix(')')) {
         SelectExpr::Max(colref(inner))
+    } else if let Ok(n) = expr.parse::<i64>() {
+        SelectExpr::Const(n)
     } else {
         SelectExpr::Col(colref(expr))
     };
