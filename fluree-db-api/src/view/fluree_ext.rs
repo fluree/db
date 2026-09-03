@@ -651,6 +651,11 @@ impl Fluree {
     /// surface only as a 502 on every governed query). Policies in it that use
     /// `f:query` are reported: a virtual source cannot evaluate them, so they
     /// deny their targets.
+    ///
+    /// Only graph-source registration calls this, and both entry points are
+    /// feature-gated, so the method is gated the same way — a wasm32
+    /// `--no-default-features` build would otherwise lint it as dead.
+    #[cfg(any(feature = "iceberg", feature = "sql"))]
     pub(crate) async fn validate_source_model(&self, model: Option<&str>) -> Result<Vec<String>> {
         let Some(model) = model else {
             return Ok(Vec::new());
