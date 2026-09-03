@@ -3820,6 +3820,16 @@ fn doc_search_without_index_explains() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("no full-text index"));
+    // Hybrid without an embedding endpoint says which half it cannot run.
+    fluree_cmd(&tmp)
+        .args([
+            "doc", "search", "anything", "-l", "empty", "--mode", "hybrid",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "hybrid search needs `[doc.embedding]`",
+        ));
 }
 
 /// A one-thread chat-completions server answering every request with the

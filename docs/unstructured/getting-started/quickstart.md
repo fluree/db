@@ -51,7 +51,7 @@ fluree config set doc.embedding.model nomic-embed-text
 fluree doc ingest ./contracts -l contracts
 ```
 
-The documents are re-ingested — the embedding model changed, so they are no longer "unchanged" — and a vector index is built. `fluree doc search` now searches by meaning, and `--mode text` still gives you words.
+The documents are re-ingested — the embedding model changed, so they are no longer "unchanged" — and a vector index is built. `fluree doc search` now runs both indexes and fuses them (`--mode hybrid`, the default once both exist); `--mode vector` and `--mode text` give you one or the other.
 
 Or skip model configuration entirely by [connecting a Fluree AI account](fluree-ai.md).
 

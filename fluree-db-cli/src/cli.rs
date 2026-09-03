@@ -3331,8 +3331,9 @@ pub struct DocSearchArgs {
     pub limit: usize,
 
     /// `vector` embeds the query with `[doc.embedding]` and searches the HNSW
-    /// index; `text` runs BM25; `auto` picks vector when an embedding endpoint
-    /// is configured
+    /// index; `text` runs BM25; `hybrid` runs both and fuses them by
+    /// reciprocal rank; `auto` picks hybrid when both indexes exist and the
+    /// query can be embedded, else whichever there is
     #[arg(long, value_enum, default_value_t = DocSearchMode::Auto)]
     pub mode: DocSearchMode,
 
@@ -3346,4 +3347,5 @@ pub enum DocSearchMode {
     Auto,
     Vector,
     Text,
+    Hybrid,
 }

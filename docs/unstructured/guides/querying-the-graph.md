@@ -89,7 +89,7 @@ The indexes are graph sources. A vector search takes a query vector — the same
 }
 ```
 
-Replace the first pattern with `{"f:graphSource": "contracts-text:main", "f:searchText": "termination notice", …}` for BM25. Run both and merge in your application for hybrid retrieval, or add filters on `doc:sourceDocument`, `doc:headerPath` or anything else in the graph.
+Replace the first pattern with `{"f:graphSource": "contracts-text:main", "f:searchText": "termination notice", …}` for BM25. `fluree doc search --mode hybrid` runs both and fuses them by reciprocal rank; by hand you can do the same and add filters on `doc:sourceDocument`, `doc:headerPath`, the entities a chunk mentions (`?m nif:referenceContext ?c ; nif:entity <…>`) or anything else in the graph, which the command does not do.
 
 ## Time travel and branches
 

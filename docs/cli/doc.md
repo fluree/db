@@ -122,7 +122,7 @@ done: 2 ingested, 1 unchanged, 0 failed — 142 chunks, 41 pages, 0 crop(s) read
 ### Usage
 
 ```bash
-fluree doc search <QUERY> [-l <LEDGER>] [-n <N>] [--mode auto|vector|text] [--json]
+fluree doc search <QUERY> [-l <LEDGER>] [-n <N>] [--mode auto|hybrid|vector|text] [--json]
 ```
 
 ### Options
@@ -131,8 +131,8 @@ fluree doc search <QUERY> [-l <LEDGER>] [-n <N>] [--mode auto|vector|text] [--js
 |--------|-------------|
 | `-l, --ledger <LEDGER>` | Ledger to search (default: the active ledger). |
 | `-n, --limit <N>` | Results to return (default `10`). |
-| `--mode <MODE>` | `vector` embeds the query with `[doc.embedding]` and searches the HNSW index; `text` runs BM25; `auto` (default) picks `vector` when an embedding endpoint is configured. |
-| `--json` | Print the rows as JSON: `[score, chunk, document, file, section path, text]`. |
+| `--mode <MODE>` | `text` runs BM25 over the full-text index; `vector` embeds the query with `[doc.embedding]` and searches the HNSW index; `hybrid` runs both, each for three times the limit, and fuses them on calibrated scores: the cosine as it is, BM25 as `s / (s + 10)`, averaged over both methods with a missing method counting 0; `auto` (default) picks `hybrid` when both indexes exist and the query can be embedded, else whichever index there is. |
+| `--json` | Print the hits as JSON objects: `score`, `chunk`, `document`, `file`, `path`, `text`, and `ranks` (`vector 0.53 #10 · text 11.1 #1`) for a fused hit. |
 
 ### Example
 
@@ -148,6 +148,12 @@ fluree doc search "termination notice period" -l contracts -n 3
     This Agreement terminates two years after the Effective Date unless…
     urn:fluree:doc:nda.docx/chunk/2
 (2 result(s), vector, 41 ms)
+```
+
+A fused hit shows each method's own score and rank, which is also the diagnostic for when one method fails: a query that names the answer's terms but not its meaning can rank tenth by vector and first by text, and lands first fused. The scales differ, a cosine of 0.9 being very high while BM25 reaches 35 and 3 is weak, which is why fusion calibrates before it averages.
+
+```
+ 1. 0.527  fin_fed_stmts.pdf  … / l. Federal Reserve Notes  vector 0.53 #10 · text 11.1 #1
 ```
 
 The chunk IRI is a real node: follow `doc:sourceElement` to the paragraphs and cells it was built from, and from those `nif:beginIndex`, `doc:pageIndex` and `doc:bbox` locate the passage on the page.

@@ -1055,58 +1055,152 @@ async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
     let config = resolve_config(dirs).await?;
     let fluree = build_fluree(dirs)?;
 
+    let (vec_id, _) = vector_index_id(&alias);
+    let (text_id, _) = text_index_id(&alias);
+    let has_vectors = graph_source_present(&fluree, &vec_id).await?;
+    let has_text = graph_source_present(&fluree, &text_id).await?;
+    let can_embed = config.embedding.is_some();
+
+    // Everything available, unless told otherwise: both indexes fused when
+    // the query can be embedded, else whichever one there is.
     let mode = match args.mode {
-        DocSearchMode::Auto if config.embedding.is_some() => DocSearchMode::Vector,
+        DocSearchMode::Auto if can_embed && has_vectors && has_text => DocSearchMode::Hybrid,
+        DocSearchMode::Auto if can_embed && has_vectors => DocSearchMode::Vector,
         DocSearchMode::Auto => DocSearchMode::Text,
         m => m,
     };
+    let wants_vectors = matches!(mode, DocSearchMode::Vector | DocSearchMode::Hybrid);
+    let wants_text = matches!(mode, DocSearchMode::Text | DocSearchMode::Hybrid);
+    if wants_vectors && !can_embed {
+        return Err(CliError::Config(format!(
+            "{} search needs `[doc.embedding]` configured to embed the query (or use --mode text)",
+            mode_label(mode)
+        )));
+    }
+    if wants_vectors && !has_vectors {
+        return Err(CliError::NotFound(format!(
+            "no vector index {vec_id}; run `fluree doc ingest` with an embedding endpoint configured (or use --mode text)"
+        )));
+    }
+    if wants_text && !has_text {
+        return Err(CliError::NotFound(format!(
+            "no full-text index {text_id}; run `fluree doc ingest` first"
+        )));
+    }
 
-    let search_pattern = match mode {
-        DocSearchMode::Vector => {
-            let Some(endpoint) = &config.embedding else {
-                return Err(CliError::Config(
-                    "vector search needs `[doc.embedding]` configured (or use --mode text)".into(),
-                ));
-            };
-            let (vec_id, _) = vector_index_id(&alias);
-            if !graph_source_present(&fluree, &vec_id).await? {
-                return Err(CliError::NotFound(format!(
-                    "no vector index {vec_id}; run `fluree doc ingest` with an embedding endpoint configured"
-                )));
-            }
-            let client = EmbeddingClient::new(endpoint.clone())?;
-            let vector = client
-                .embed(std::slice::from_ref(&args.query))
-                .await?
-                .pop()
-                .ok_or_else(|| CliError::Input("embedding endpoint returned no vector".into()))?;
-            json!({
-                "f:graphSource": vec_id,
-                "f:queryVector": vector,
-                "f:searchLimit": args.limit,
-                "f:searchResult": { "f:resultId": "?c", "f:resultScore": "?score" }
-            })
-        }
-        DocSearchMode::Text | DocSearchMode::Auto => {
-            let (text_id, _) = text_index_id(&alias);
-            if !graph_source_present(&fluree, &text_id).await? {
-                return Err(CliError::NotFound(format!(
-                    "no full-text index {text_id}; run `fluree doc ingest` first"
-                )));
-            }
-            json!({
-                "f:graphSource": text_id,
-                "f:searchText": args.query,
-                "f:searchLimit": args.limit,
-                "f:searchResult": { "f:resultId": "?c", "f:resultScore": "?score" }
-            })
-        }
+    let started = Instant::now();
+    // Each method is asked for more than the final count, so a hit that
+    // one method ranks low and the other high still has a chance to fuse
+    // upward.
+    let per_method = if mode == DocSearchMode::Hybrid {
+        args.limit * 3
+    } else {
+        args.limit
+    };
+    let vector_hits = if wants_vectors {
+        let endpoint = config.embedding.as_ref().expect("checked above");
+        let client = EmbeddingClient::new(endpoint.clone())?;
+        let vector = client
+            .embed(std::slice::from_ref(&args.query))
+            .await?
+            .pop()
+            .ok_or_else(|| CliError::Input("embedding endpoint returned no vector".into()))?;
+        let pattern = json!({
+            "f:graphSource": vec_id,
+            "f:queryVector": vector,
+            "f:searchLimit": per_method,
+            "f:searchResult": { "f:resultId": "?c", "f:resultScore": "?score" }
+        });
+        search_hits(&fluree, &alias, pattern).await?
+    } else {
+        Vec::new()
+    };
+    let text_hits = if wants_text {
+        let pattern = json!({
+            "f:graphSource": text_id,
+            "f:searchText": args.query,
+            "f:searchLimit": per_method,
+            "f:searchResult": { "f:resultId": "?c", "f:resultScore": "?score" }
+        });
+        search_hits(&fluree, &alias, pattern).await?
+    } else {
+        Vec::new()
+    };
+    let hits = match mode {
+        DocSearchMode::Hybrid => fuse_hits(vector_hits, text_hits, args.limit),
+        DocSearchMode::Vector => vector_hits,
+        _ => text_hits,
     };
 
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&hits)?);
+        return Ok(());
+    }
+    let label = mode_label(mode);
+    if hits.is_empty() {
+        println!(
+            "no matches ({label}, {:.0} ms)",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        return Ok(());
+    }
+    for (rank, hit) in hits.iter().enumerate() {
+        println!(
+            "{} {}  {}{}{}",
+            format!("{:>2}.", rank + 1).bold(),
+            format!("{:.3}", hit.score).dimmed(),
+            hit.file.cyan(),
+            if hit.path.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", hit.path.dimmed())
+            },
+            if hit.ranks.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", hit.ranks.dimmed())
+            }
+        );
+        println!("    {}", snippet(&hit.text, 240));
+        println!("    {}", hit.chunk.dimmed());
+    }
+    eprintln!(
+        "({} result(s), {label}, {:.0} ms)",
+        hits.len(),
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
+fn mode_label(mode: DocSearchMode) -> &'static str {
+    match mode {
+        DocSearchMode::Vector => "vector",
+        DocSearchMode::Hybrid => "hybrid",
+        _ => "text",
+    }
+}
+
+/// One search hit, with the chunk it names joined to its file and section.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+struct Hit {
+    score: f64,
+    chunk: String,
+    document: String,
+    file: String,
+    path: String,
+    text: String,
+    /// Where each method ranked it, for a fused result: `vector #1 · text #4`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    ranks: String,
+}
+
+/// Run one index search pattern and join each hit to its chunk, in score
+/// order.
+async fn search_hits(fluree: &Fluree, alias: &str, pattern: Value) -> CliResult<Vec<Hit>> {
     let query = json!({
         "@context": { "doc": vocab::DOC_NS, "f": vocab::FLUREE_NS },
         "where": [
-            search_pattern,
+            pattern,
             { "@id": "?c", vocab::TEXT: "?text", vocab::SOURCE_DOCUMENT: "?d" },
             ["optional", { "@id": "?c", vocab::HEADER_PATH: "?path" }],
             ["optional", { "@id": "?d", vocab::RELATIVE_PATH: "?file" }]
@@ -1114,53 +1208,105 @@ async fn run_search(args: DocSearchArgs, dirs: &FlureeDir) -> CliResult<()> {
         "select": ["?score", "?c", "?d", "?file", "?path", "?text"],
         "orderBy": [["desc", "?score"]]
     });
+    let rows = query_rows(fluree, alias, &query).await?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let row = row.as_array()?;
+            let text = |i: usize| row.get(i).and_then(Value::as_str).unwrap_or("").to_string();
+            let document = text(2);
+            Some(Hit {
+                score: row.first().and_then(Value::as_f64).unwrap_or(0.0),
+                chunk: text(1),
+                file: if row.get(3).and_then(Value::as_str).is_some() {
+                    text(3)
+                } else {
+                    document.clone()
+                },
+                document,
+                path: text(4),
+                text: text(5),
+                ranks: String::new(),
+            })
+        })
+        .collect())
+}
 
-    let started = Instant::now();
-    let rows = query_rows(&fluree, &alias, &query).await?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
-        return Ok(());
-    }
+/// The two methods score on different scales: a cosine similarity sits in
+/// 0..1 and 0.9 is very high, while a BM25 weight is a sum of term weights
+/// that grows with the query and the corpus, where 3 is weak and 35 is
+/// strong. Fusion by rank alone would credit a weak first place as much as
+/// a strong one, so each score is first put on a common 0..1 confidence:
+/// cosine as it is, BM25 as `s / (s + 10)`, which reads 3 as 0.23, 10 as
+/// 0.5, 24 as 0.71 and 35 as 0.78. A chunk's fused score is the mean of
+/// its confidences over both methods, a method that did not find it
+/// counting as 0, so agreement wins and a strong single-method hit still
+/// surfaces above a weak agreed one.
+const TEXT_HALF_CONFIDENCE: f64 = 10.0;
 
-    let mode_label = match mode {
-        DocSearchMode::Vector => "vector",
-        _ => "text",
-    };
-    if rows.is_empty() {
-        println!(
-            "no matches ({mode_label}, {:.0} ms)",
-            started.elapsed().as_secs_f64() * 1000.0
-        );
-        return Ok(());
+fn text_confidence(bm25: f64) -> f64 {
+    let s = bm25.max(0.0);
+    s / (s + TEXT_HALF_CONFIDENCE)
+}
+
+fn vector_confidence(cosine: f64) -> f64 {
+    cosine.clamp(0.0, 1.0)
+}
+
+fn fuse_hits(vector: Vec<Hit>, text: Vec<Hit>, limit: usize) -> Vec<Hit> {
+    struct Fused {
+        hit: Hit,
+        vector: Option<(usize, f64)>,
+        text: Option<(usize, f64)>,
     }
-    for (rank, row) in rows.iter().enumerate() {
-        let Some(row) = row.as_array() else { continue };
-        let score = row.first().and_then(Value::as_f64).unwrap_or(0.0);
-        let chunk = row.get(1).and_then(Value::as_str).unwrap_or("");
-        let doc = row.get(2).and_then(Value::as_str).unwrap_or("");
-        let file = row.get(3).and_then(Value::as_str).unwrap_or(doc);
-        let path = row.get(4).and_then(Value::as_str).unwrap_or("");
-        let text = row.get(5).and_then(Value::as_str).unwrap_or("");
-        println!(
-            "{} {}  {}{}",
-            format!("{:>2}.", rank + 1).bold(),
-            format!("{score:.3}").dimmed(),
-            file.cyan(),
-            if path.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", path.dimmed())
+    let mut fused: Vec<Fused> = Vec::new();
+    for (list, from_vector) in [(vector, true), (text, false)] {
+        for (i, hit) in list.into_iter().enumerate() {
+            let placed = (i + 1, hit.score);
+            match fused.iter_mut().find(|f| f.hit.chunk == hit.chunk) {
+                Some(f) => {
+                    if from_vector {
+                        f.vector = Some(placed);
+                    } else {
+                        f.text = Some(placed);
+                    }
+                }
+                None => fused.push(Fused {
+                    hit,
+                    vector: from_vector.then_some(placed),
+                    text: (!from_vector).then_some(placed),
+                }),
             }
-        );
-        println!("    {}", snippet(text, 240));
-        println!("    {}", chunk.dimmed());
+        }
     }
-    eprintln!(
-        "({} result(s), {mode_label}, {:.0} ms)",
-        rows.len(),
-        started.elapsed().as_secs_f64() * 1000.0
-    );
-    Ok(())
+    let score = |f: &Fused| {
+        let v = f.vector.map_or(0.0, |(_, s)| vector_confidence(s));
+        let t = f.text.map_or(0.0, |(_, s)| text_confidence(s));
+        f64::midpoint(v, t)
+    };
+    fused.sort_by(|a, b| {
+        score(b)
+            .partial_cmp(&score(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    fused
+        .into_iter()
+        .take(limit)
+        .map(|f| {
+            let fused_score = score(&f);
+            let mut hit = f.hit;
+            hit.score = fused_score;
+            hit.ranks = [
+                f.vector.map(|(r, s)| format!("vector {s:.2} #{r}")),
+                f.text.map(|(r, s)| format!("text {s:.1} #{r}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+            hit
+        })
+        .collect()
 }
 
 fn snippet(text: &str, max: usize) -> String {
@@ -1170,4 +1316,41 @@ fn snippet(text: &str, max: usize) -> String {
     }
     let cut: String = flat.chars().take(max).collect();
     format!("{}…", cut.trim_end())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(chunk: &str, score: f64) -> Hit {
+        Hit {
+            score,
+            chunk: chunk.into(),
+            document: "d".into(),
+            file: "f".into(),
+            path: String::new(),
+            text: String::new(),
+            ranks: String::new(),
+        }
+    }
+
+    #[test]
+    fn fusion_weighs_calibrated_scores_not_ranks() {
+        // Vector ranks a (0.9), b (0.6), c (0.5); text ranks c (35), a (3),
+        // d (24). `c` is first for text with a strong score and third for
+        // vector; `a` is first for vector and second for text but its text
+        // score is weak; `d` is a strong text-only hit, `b` a middling
+        // vector-only one.
+        let vector = vec![hit("a", 0.9), hit("b", 0.6), hit("c", 0.5)];
+        let text = vec![hit("c", 35.0), hit("a", 3.0), hit("d", 24.0)];
+        let fused = fuse_hits(vector, text, 4);
+        let order: Vec<&str> = fused.iter().map(|h| h.chunk.as_str()).collect();
+        assert_eq!(order, vec!["c", "a", "d", "b"]);
+        assert!((fused[0].score - f64::midpoint(0.5, 35.0 / 45.0)).abs() < 1e-12);
+        assert_eq!(fused[0].ranks, "vector 0.50 #3 · text 35.0 #1");
+        assert_eq!(fused[2].ranks, "text 24.0 #3");
+        // A weak BM25 first place is not worth a strong cosine.
+        assert!(text_confidence(3.0) < vector_confidence(0.6));
+        assert!(text_confidence(35.0) > 0.75);
+    }
 }
