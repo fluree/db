@@ -30,6 +30,9 @@ aws-testcontainers = [
 credential = ["dep:fluree-db-credential"]
 # SHACL validation (requires fluree-db-transact + fluree-db-shacl)
 shacl = ["dep:fluree-db-shacl", "fluree-db-transact/shacl"]
+# GraphQL endpoint (schema derived from ledger metadata; pulls in async-graphql)
+# Tier 2 reads SHACL shapes, so `shacl` comes with it.
+graphql = ["dep:fluree-db-graphql", "shacl"]
 # Temporary benchmark examples (opt-in so `cargo test` stays fast)
 benchmarks = []
 # Remote search client (HTTP client for remote search service)
@@ -39,7 +42,7 @@ vector = ["fluree-db-query/vector"]
 # IPFS-backed storage (via Kubo HTTP RPC)
 ipfs = ["dep:fluree-db-storage-ipfs"]
 # Convenience bundle (excludes vector, aws, and test-only features)
-full = ["native", "credential", "iceberg", "shacl", "ipfs"]
+full = ["native", "credential", "iceberg", "shacl", "ipfs", "graphql"]
 
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
@@ -55,6 +58,7 @@ fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = 
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 fluree-db-sparql = { path = "../fluree-db-sparql" }
 fluree-db-cypher = { path = "../fluree-db-cypher" }
+fluree-db-graphql = { path = "../fluree-db-graphql", optional = true }
 fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
 fluree-db-tabular = { path = "../fluree-db-tabular" }
@@ -433,6 +437,11 @@ harness = false
 [[bench]]
 name = "fulltext_query"
 harness = false
+
+[[bench]]
+name = "graphql_schema"
+harness = false
+required-features = ["graphql"]
 
 [[bench]]
 name = "insert_formats"

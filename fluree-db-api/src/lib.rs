@@ -63,6 +63,8 @@ pub mod graph_query_builder;
 pub mod graph_snapshot;
 pub mod graph_source;
 pub mod graph_transact_builder;
+#[cfg(feature = "graphql")]
+pub mod graphql;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod import;
 pub mod import_source;

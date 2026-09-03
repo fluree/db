@@ -1555,6 +1555,96 @@ curl -X POST http://localhost:8090/v1/fluree/explain/mydb \
   --data 'MATCH (n:Person {id: 7}) RETURN n'
 ```
 
+### POST/GET /graphql/{ledger...}
+
+Execute a GraphQL request against the schema derived from the ledger's own data.
+There is nothing to register first: any ledger with typed subjects has a schema.
+Requires the `graphql` build feature (on by default).
+
+**URL:**
+```
+POST /graphql/{ledger...}
+GET  /graphql/{ledger...}?query={urlencoded-graphql}
+```
+
+**Content types:**
+
+| Content-Type | Body |
+|--------------|------|
+| `application/json` | `{"query": "...", "variables": {...}, "operationName": "...", "extensions": {"explain": true}}` |
+| `application/graphql` | the document as the raw body |
+
+**Optional query parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `query` | string | — | The document, for the `GET` form GraphiQL and browser clients use. |
+| `variables` | string | — | A URL-encoded JSON object (`GET` form). |
+| `operationName` | string | — | Which operation to run, when the document defines several. |
+| `explain` | boolean | `false` | Return `extensions.explain`: the Fluree query or transaction each root field lowered to. |
+
+Identity and policy travel in headers, as they do for SPARQL and Cypher — a
+GraphQL request has no body `opts` block. A class or property the caller's
+policy denies is absent from introspection, not present-but-empty.
+
+**Mutations** are routed to the write path automatically, decided from the
+document (GraphQL sends everything over `POST`, so the method says nothing about
+intent). They require write authority *and* a `graphql:Schema` in the ledger that
+enables them; see [GraphQL](../query/graphql.md#curated-schemas-and-mutations).
+
+**Status codes.** A GraphQL error is part of the response body, not a transport
+failure: the endpoint returns **200** with an `errors` array, because that is
+what every standard client reads. Only a malformed request envelope (no `query`)
+is a `400`.
+
+```bash
+# Query
+curl -X POST http://localhost:8090/v1/fluree/graphql/mydb \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ persons(limit: 10) { id name knows { id } } }"}'
+
+# The raw-document form
+curl -X POST http://localhost:8090/v1/fluree/graphql/mydb \
+  -H "Content-Type: application/graphql" \
+  --data '{ persons_count }'
+
+# With the lowered JSON-LD query attached
+curl -X POST 'http://localhost:8090/v1/fluree/graphql/mydb?explain=true' \
+  -H "Content-Type: application/json" \
+  -d '{"query": "{ persons { id } }"}'
+
+# A mutation (needs f:graphqlEnableMutations on the ledger's graphql:Schema)
+curl -X POST http://localhost:8090/v1/fluree/graphql/mydb \
+  -H "Content-Type: application/json" \
+  -d '{"query": "mutation { create_Person(input: {name: \"Alice\"}) { id } }"}'
+```
+
+### GET /graphql-schema/{ledger...}
+
+The derived schema as GraphQL SDL, including mutations when the ledger's
+`graphql:Schema` enables them.
+
+A separate path rather than a `/schema` suffix on the route above: the ledger
+segment is a greedy tail and ledger names may contain `/`.
+
+```bash
+curl http://localhost:8090/v1/fluree/graphql-schema/mydb
+```
+
+```graphql
+type Person {
+  id: ID!
+  name: [String!]
+  knows(where: PersonFilter, limit: Int, offset: Int, orderBy: PersonNestedOrder): [Person!]
+}
+
+type Query {
+  person(id: ID!): Person
+  persons(where: PersonFilter, limit: Int, offset: Int, orderBy: PersonOrder): [Person!]
+  persons_count(where: PersonFilter): Int!
+}
+```
+
 ### GET/POST /validate/{ledger...}
 
 Validate the current state of a ledger (or one of its named graphs) against SHACL shapes and return a **validation report** — the HTTP surface of `fluree validate`. Unlike transaction-time enforcement, this never rejects anything; it reports every result it finds. Requires the `shacl` build feature (on by default).
@@ -2569,7 +2659,7 @@ Returns simplified nameservice-only metadata:
 | `commitId` | string | No | Head commit CID (non-proxy mode) |
 | `commit_head_id` | string | No | Head commit CID (proxy mode) |
 
-> **Important:** The `t` field is required by the CLI for push/pull/clone operations. See [CLI-Server API Contract](../design/cli-server-contract.md) for details.
+> **Important:** The `t` field is required by the CLI for push/pull/clone operations — clone and pull read it as a remote-head preflight before requesting a pack. See [Implementing Server Support For Fluree CLI](../cli/server-integration.md#minimum-endpoints-by-cli-feature) for the per-command endpoint contract.
 
 **Optional query parameters:**
 
