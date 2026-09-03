@@ -67,6 +67,17 @@ impl R2rmlPolicyGate {
         if ctx.allow_unfiltered() {
             return None;
         }
+        // Reaching here with no enforcer would be a contradiction: `allow_unfiltered`
+        // said filtering is required. It cannot happen today — that predicate is
+        // false either because this context's own enforcer is non-root, or because
+        // `ctx.dataset` has a policy, and `with_graph_ref` supplies the graph's
+        // enforcer and clears `dataset` before a scan opens. Asserted rather than
+        // silently scanning unfiltered, so a future path that opens a scan on a
+        // dataset-level context fails in CI instead of leaking.
+        debug_assert!(
+            ctx.policy_enforcer.is_some(),
+            "R2RML scan on {graph_source_id}: filtering required but no enforcer in scope"
+        );
         let enforcer = ctx.policy_enforcer.as_ref()?;
         let base = enforcer.policy();
         let snapshot = ctx.active_snapshot;
@@ -286,7 +297,10 @@ fn report_unevaluable_policies(
     use fluree_db_policy::PolicyValue;
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
-    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    // Keyed by (graph source, policy) because the message names both: two
+    // sources governed by the same model, or sharing an inline policy id, would
+    // otherwise log only whichever scanned first.
+    static WARNED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
 
     for r in &view.restrictions {
         if !matches!(r.value, PolicyValue::Query(_)) {
@@ -296,7 +310,7 @@ fn report_unevaluable_policies(
         let first = WARNED
             .get_or_init(|| Mutex::new(HashSet::new()))
             .lock()
-            .map(|mut set| set.insert(r.id.clone()))
+            .map(|mut set| set.insert((graph_source_id.to_string(), r.id.clone())))
             .unwrap_or(true);
         if first {
             tracing::warn!(
@@ -332,7 +346,10 @@ fn required_predicates(pattern: &R2rmlPattern, tm: &TriplesMap) -> Vec<String> {
     if pattern.class_filter.is_some() || pattern.type_var.is_some() {
         preds.push(rdf::TYPE.to_string());
     }
-    if preds.is_empty() && pattern.predicate_var.is_none() && !tm.classes().is_empty() {
+    // `static_classes`, not `tm.classes()`: a map that mints its type through a
+    // constant `rdf:type` predicate-object map asserts a class just as `rr:class`
+    // does, and the gate's `tm_classes` already keys on the wider set.
+    if preds.is_empty() && pattern.predicate_var.is_none() && !static_classes(tm).is_empty() {
         preds.push(rdf::TYPE.to_string());
     }
     preds.sort();
