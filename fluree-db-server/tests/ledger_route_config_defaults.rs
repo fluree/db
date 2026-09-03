@@ -292,7 +292,13 @@ const DATASET_SELECT: &str = r"PREFIX ex: <http://example.org/>
 SELECT ?v FROM NAMED <http://example.org/g1> WHERE { GRAPH ?g { ?s ex:childName ?v } }";
 
 /// Untracked: the error reaches the HTTP layer as an `ApiError` and takes the
-/// server's own status mapping.
+/// server's own status *and* code mapping.
+///
+/// The code is asserted here and only here. The status names who can fix the
+/// fault; the code names what the fault is, and it must still say "config"
+/// even though the status moved off 400. The tracked tests cannot make this
+/// claim: `TrackedErrorResponse` carries a status and a message but no error
+/// kind, so the tracked path always reports `err:system/InternalError`.
 #[tokio::test]
 async fn malformed_ledger_config_is_not_reported_as_a_client_error() {
     let (_tmp, app) = app_with_config(BAD_RULES_SOURCE_TRIG).await;
@@ -305,6 +311,11 @@ async fn malformed_ledger_config_is_not_reported_as_a_client_error() {
     .await;
 
     assert_operator_fault(status, &json);
+    assert_eq!(
+        json["@type"],
+        serde_json::json!("err:system/ConfigError"),
+        "a config-graph fault must keep the config error code: {json}"
+    );
 }
 
 /// Tracked, single view: the error is built into a `TrackedErrorResponse` by
