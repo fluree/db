@@ -3077,7 +3077,8 @@ ex:alice a ex:User ; schema:name "Alice" .
         .assert()
         .success()
         .stdout(predicate::str::contains("Conforms: true"))
-        .stdout(predicate::str::contains("checked at t="));
+        // t=2: the loader's staging-SHACL-disable commit precedes the data commit.
+        .stdout(predicate::str::contains("checked at t=2"));
 }
 
 #[test]

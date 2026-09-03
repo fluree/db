@@ -96,8 +96,8 @@ are omitted rather than misrepresented), `sh:resultSeverity`,
 `sh:sourceShape`, `sh:sourceConstraintComponent`, `sh:resultMessage`, and
 `sh:value`. The validated `t` rides on the report node as `f:t`
 (`f` = `https://ns.flur.ee/db#`), since `sh:ValidationReport` has no slot
-for a ledger time. In file mode `t` is the ephemeral ledger's commit (always
-`1`).
+for a ledger time. In file mode `t` is the ephemeral ledger's head: `2`, since
+the loader commits the staging-SHACL-disable config before your data.
 
 If the shapes source produces no shapes, the report is vacuously conforming
 and a warning is printed to stderr.
