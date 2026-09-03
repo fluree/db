@@ -28,6 +28,7 @@ pub mod address;
 pub mod address_path;
 pub mod annotation_index;
 pub mod cancellation;
+pub mod clock;
 pub mod coerce;
 pub mod commit;
 pub mod comparator;
@@ -40,7 +41,9 @@ pub mod db;
 pub mod dict_novelty;
 /// Shared LRU disk cache for content-addressed blobs (index artifacts, Iceberg
 /// data files), with a single global byte budget. Native (filesystem) only.
-#[cfg(feature = "native")]
+/// Also compiled on wasm32 (std::fs stubs): every read misses, writes are
+/// best-effort no-ops, so CAS consumers fall through to pure fetch. SEAM(wasm).
+#[cfg(any(feature = "native", target_arch = "wasm32"))]
 pub mod disk_cache;
 pub mod edge;
 pub mod error;
@@ -81,6 +84,10 @@ pub mod tracking;
 pub mod value;
 pub mod value_id;
 pub mod vec_bi_dict;
+// moka stand-in for wasm32 (clock-free LRU); compiled on native only for its
+// unit tests. See module docs.
+#[cfg(any(target_arch = "wasm32", test))]
+pub mod wasm_cache;
 
 // Re-export main types
 pub use address::{

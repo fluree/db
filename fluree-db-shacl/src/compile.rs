@@ -69,6 +69,16 @@ pub struct PropertyShape {
     pub severity: Severity,
     /// Human-readable name
     pub name: Option<String>,
+    /// `sh:description` — human-readable documentation for this property.
+    /// Annotation only: validation never reads it.
+    pub description: Option<String>,
+    /// `sh:order` — the position a consumer should render this property in,
+    /// ascending. Annotation only.
+    pub order: Option<f64>,
+    /// `sh:defaultValue` — advisory only. Fluree never materializes it: a
+    /// default is a statement about presentation, not about what the graph
+    /// holds, and inventing the triple would make validation self-fulfilling.
+    pub default_value: Option<FlakeValue>,
     /// Human-readable message for violations
     pub message: Option<String>,
     /// `sh:sparql` constraints declared on this property shape
@@ -92,6 +102,9 @@ pub struct CompiledShape {
     pub severity: Severity,
     /// Human-readable name
     pub name: Option<String>,
+    /// `sh:description` — human-readable documentation for this shape.
+    /// Annotation only: validation never reads it.
+    pub description: Option<String>,
     /// Human-readable message for violations
     pub message: Option<String>,
     /// Whether this shape is deactivated (sh:deactivated true)
@@ -174,6 +187,7 @@ struct ShapeData {
     xone_shapes: Vec<Sid>,
     severity: Severity,
     name: Option<String>,
+    description: Option<String>,
     message: Option<String>,
     deactivated: bool,
 }
@@ -188,6 +202,11 @@ struct PropertyShapeData {
     constraints: Vec<Constraint>,
     severity: Severity,
     name: Option<String>,
+    description: Option<String>,
+    /// sh:order — the position a consumer should render this property in.
+    order: Option<f64>,
+    /// sh:defaultValue — advisory; validation never applies it.
+    default_value: Option<FlakeValue>,
     message: Option<String>,
     /// sh:flags for pattern constraint (combined during finalize)
     pattern_flags: Option<String>,
@@ -312,6 +331,9 @@ impl ShapeCompiler {
             predicates::SEVERITY,
             predicates::MESSAGE,
             predicates::NAME,
+            predicates::DESCRIPTION,
+            predicates::ORDER,
+            predicates::DEFAULT_VALUE,
             // SPARQL-based constraints
             predicates::SPARQL,
             predicates::SELECT,
@@ -1057,6 +1079,38 @@ impl ShapeCompiler {
                     }
                 }
             }
+            // Annotation properties. They constrain nothing — validation never
+            // reads them — but they are what a schema generator has to work
+            // with, so they are compiled rather than dropped.
+            name if name == predicates::DESCRIPTION => {
+                if let FlakeValue::String(d) = &flake.o {
+                    if let Some(ps) = self.property_shapes.get_mut(&flake.s) {
+                        ps.description = Some(d.clone());
+                    } else if let Some(ns) = self.shapes.get_mut(&flake.s) {
+                        ns.description = Some(d.clone());
+                    }
+                }
+            }
+            name if name == predicates::ORDER => {
+                // `sh:order` is a decimal in the spec; accept any numeric form
+                // and keep it as f64 so mixed integer/decimal orders compare.
+                let order = match &flake.o {
+                    FlakeValue::Long(n) => Some(*n as f64),
+                    FlakeValue::Double(n) => Some(*n),
+                    FlakeValue::Decimal(d) => d.to_string().parse::<f64>().ok(),
+                    _ => None,
+                };
+                if let Some(order) = order {
+                    if let Some(ps) = self.property_shapes.get_mut(&flake.s) {
+                        ps.order = Some(order);
+                    }
+                }
+            }
+            name if name == predicates::DEFAULT_VALUE => {
+                if let Some(ps) = self.property_shapes.get_mut(&flake.s) {
+                    ps.default_value = Some(flake.o.clone());
+                }
+            }
 
             // SPARQL-based constraints (sh:sparql → sh:SPARQLConstraint node).
             // Raw data is collected by subject here; whether a subject is a
@@ -1189,6 +1243,9 @@ impl ShapeCompiler {
                             value_structural_constraints,
                             severity: ps_data.severity,
                             name: ps_data.name.clone(),
+                            description: ps_data.description.clone(),
+                            order: ps_data.order,
+                            default_value: ps_data.default_value.clone(),
                             message: ps_data.message.clone(),
                             sparql_constraints: built_sparql
                                 .get(ps_id)
@@ -1262,12 +1319,14 @@ impl ShapeCompiler {
             let mut node_constraints = data.node_constraints.clone();
             let mut message = data.message.clone();
             let mut name = data.name.clone();
+            let mut description = data.description.clone();
             let mut severity = data.severity;
             if let Some(own_ps) = ps_map.get(id) {
                 if own_ps.path.is_none() {
                     node_constraints.extend(build_constraints_from_ps_data(own_ps));
                     message = message.or_else(|| own_ps.message.clone());
                     name = name.or_else(|| own_ps.name.clone());
+                    description = description.or_else(|| own_ps.description.clone());
                     // sh:severity routes to the path-less entry too (the
                     // metadata arms prefer the property-shape map).
                     if severity == Severity::Violation {
@@ -1293,6 +1352,7 @@ impl ShapeCompiler {
                 structural_constraints,
                 severity,
                 name,
+                description,
                 message,
                 deactivated: data.deactivated,
                 sparql_constraints,

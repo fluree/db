@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+autotests = false
 
 [package.metadata.dist]
 dist = false
@@ -22,7 +23,7 @@ name = "fluree_db_server"
 path = "src/lib.rs"
 
 [features]
-default = ["native", "credential", "iceberg", "shacl", "bolt"]
+default = ["native", "credential", "iceberg", "shacl", "bolt", "graphql"]
 native = ["fluree-db-api/native"]
 # AWS S3 storage + DynamoDB nameservice (via connection JSON-LD config)
 aws = ["fluree-db-api/aws"]
@@ -31,6 +32,8 @@ aws = ["fluree-db-api/aws"]
 credential = ["fluree-db-api/credential"]
 # SHACL constraint validation at transaction time
 shacl = ["fluree-db-api/shacl"]
+# GraphQL endpoints over the schema derived from each ledger's data
+graphql = ["fluree-db-api/graphql"]
 # Enable OIDC JWT verification via JWKS (RS256 tokens from external IdPs)
 oidc = ["fluree-db-credential/oidc", "dep:jsonwebtoken"]
 # Iceberg / R2RML graph source support
@@ -182,3 +185,58 @@ fluree-db-novelty = { path = "../fluree-db-novelty" }
 
 [lints]
 workspace = true
+
+# Integration tests are grouped into grp_* harnesses so the crate links a
+# handful of test binaries instead of one per tests/*.rs file. `autotests =
+# false` above is what stops each file from also becoming its own binary;
+# the test files themselves are unchanged, pulled in via #[path]/mod.
+#
+# `raft` is the only non-default feature here (default = native, credential,
+# iceberg, shacl, bolt), so grp_raft is the only harness that compiles to an
+# empty binary on a default build. The rest group by domain, not by feature.
+#
+# tests/harness_coverage.rs (in grp_http) fails if any tests/*.rs is neither
+# pulled into a harness nor declared below — without it, `autotests = false`
+# would let a new integration file silently never run.
+
+[[test]]
+name = "grp_http"
+path = "tests/grp_http.rs"
+
+[[test]]
+name = "grp_query"
+path = "tests/grp_query.rs"
+
+[[test]]
+name = "grp_proxy"
+path = "tests/grp_proxy.rs"
+
+[[test]]
+name = "grp_policy"
+path = "tests/grp_policy.rs"
+
+[[test]]
+name = "grp_search"
+path = "tests/grp_search.rs"
+
+[[test]]
+name = "grp_raft"
+path = "tests/grp_raft.rs"
+
+[[test]]
+name = "grp_bolt"
+path = "tests/grp_bolt.rs"
+
+# Standalone: their assertions are about instrumentation. Both install a
+# tracing subscriber and assert on the events captured through it. Tracing's
+# callsite-interest cache is process-global while the capture is thread-local,
+# so those assertions are only reliable when the test is alone in its process
+# under bare `cargo test`. Same rule fluree-db-api follows — see
+# docs/contributing/tests.md.
+[[test]]
+name = "telemetry_test"
+path = "tests/telemetry_test.rs"
+
+[[test]]
+name = "multi_query_tracing_integration"
+path = "tests/multi_query_tracing_integration.rs"

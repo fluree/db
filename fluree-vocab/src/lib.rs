@@ -835,6 +835,63 @@ pub mod jsonld_names {
     pub const CONTEXT: &str = "context";
 }
 
+/// GraphQL-over-SHACL vocabulary.
+///
+/// `http://datashapes.org/graphql#` is the de-facto shared vocabulary for
+/// projecting SHACL shapes as a GraphQL schema — TopBraid EDG and GraphDB 11
+/// both read it, so shapes authored for either port here unchanged. Terms
+/// Fluree needs that the shared vocabulary does not define live under
+/// [`fluree::DB`] instead of being invented in someone else's namespace.
+pub mod graphql {
+    /// The `graphql:` namespace IRI.
+    pub const NS: &str = "http://datashapes.org/graphql#";
+
+    /// `graphql:Schema` — a named, curated selection of shapes to expose.
+    /// Its presence is what selects tier 3.
+    pub const SCHEMA: &str = "http://datashapes.org/graphql#Schema";
+
+    /// `graphql:publicShape` — exposed as a type *and* as root query fields.
+    pub const PUBLIC_SHAPE: &str = "http://datashapes.org/graphql#publicShape";
+
+    /// `graphql:protectedShape` — exposed as a type, reachable only by
+    /// following a reference; no root query fields of its own.
+    pub const PROTECTED_SHAPE: &str = "http://datashapes.org/graphql#protectedShape";
+
+    /// `graphql:privateShape` — not exposed. References to it degrade to the
+    /// `Node` placeholder rather than naming a type the caller cannot query.
+    pub const PRIVATE_SHAPE: &str = "http://datashapes.org/graphql#privateShape";
+
+    /// `graphql:name` — the GraphQL name for a schema, type, or field,
+    /// overriding both the derived name and `sh:name`.
+    pub const NAME: &str = "http://datashapes.org/graphql#name";
+
+    /// `graphql:isInterface` — the shape's class is abstract: it becomes an
+    /// interface, and the classes below it implement it.
+    pub const IS_INTERFACE: &str = "http://datashapes.org/graphql#isInterface";
+
+    /// `graphql:isIDField` — the property carries the object's identity.
+    pub const IS_ID_FIELD: &str = "http://datashapes.org/graphql#isIDField";
+
+    // ── Fluree extensions ────────────────────────────────────────────────
+    // Under Fluree's own namespace: the shared vocabulary defines no
+    // equivalent, and minting terms in a namespace we do not own would make
+    // shapes that only Fluree can read look like portable ones.
+
+    /// `f:graphqlPluralName` — the root list/count field name, overriding
+    /// the naive pluralisation.
+    pub const PLURAL_NAME: &str = "https://ns.flur.ee/db#graphqlPluralName";
+
+    /// `f:graphqlEnableMutations` — opt in to `create_`/`update_`/`delete_`
+    /// root fields for this schema. Off unless stated: a derived schema
+    /// should never become a write surface by accident.
+    pub const ENABLE_MUTATIONS: &str = "https://ns.flur.ee/db#graphqlEnableMutations";
+
+    /// `f:graphqlIriBase` — the namespace new subjects are minted under.
+    /// Required for mutations that create nodes: there is no safe default,
+    /// since a wrong guess writes IRIs that cannot be un-minted.
+    pub const IRI_BASE: &str = "https://ns.flur.ee/db#graphqlIriBase";
+}
+
 /// SHACL vocabulary constants
 pub mod shacl {
     /// SHACL namespace IRI
@@ -1103,6 +1160,12 @@ pub mod shacl {
 
     /// sh:description IRI
     pub const DESCRIPTION: &str = "http://www.w3.org/ns/shacl#description";
+
+    /// sh:order IRI
+    pub const ORDER: &str = "http://www.w3.org/ns/shacl#order";
+
+    /// sh:defaultValue IRI
+    pub const DEFAULT_VALUE: &str = "http://www.w3.org/ns/shacl#defaultValue";
 
     // ========================================================================
     // Validation Report
@@ -1538,6 +1601,12 @@ pub mod shacl_names {
 
     /// sh:description local name
     pub const DESCRIPTION: &str = "description";
+
+    /// sh:order local name
+    pub const ORDER: &str = "order";
+
+    /// sh:defaultValue local name
+    pub const DEFAULT_VALUE: &str = "defaultValue";
 
     // ========================================================================
     // Validation Report

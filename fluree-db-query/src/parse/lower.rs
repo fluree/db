@@ -1485,6 +1485,7 @@ fn lower_forward_item<E: IriEncoder>(
         UnresolvedForwardItem::Property {
             predicate,
             sub_spec,
+            modifiers,
         } => {
             let sid = encoder
                 .encode_iri(predicate)
@@ -1493,12 +1494,44 @@ fn lower_forward_item<E: IriEncoder>(
                 .as_ref()
                 .map(|nested| lower_level_boxed(nested, encoder))
                 .transpose()?;
+            let lowered_modifiers = modifiers
+                .as_ref()
+                .map(|m| lower_nested_modifiers(m, encoder))
+                .transpose()?;
             Ok(ForwardItem::Property {
                 predicate: sid,
                 sub_spec: lowered_sub,
+                modifiers: lowered_modifiers,
             })
         }
     }
+}
+
+/// Encode the sort predicates of a level's per-value modifiers.
+fn lower_nested_modifiers<E: IriEncoder>(
+    modifiers: &crate::parse::ast::UnresolvedNestedModifiers,
+    encoder: &E,
+) -> Result<Box<crate::ir::projection::NestedModifiers>> {
+    let mut order = Vec::with_capacity(modifiers.order.len());
+    for key in &modifiers.order {
+        let predicate = match &key.predicate {
+            Some(iri) => Some(
+                encoder
+                    .encode_iri(iri)
+                    .ok_or_else(|| ParseError::UnknownNamespace(iri.clone()))?,
+            ),
+            None => None,
+        };
+        order.push(crate::ir::projection::NestedOrderKey {
+            predicate,
+            descending: key.descending,
+        });
+    }
+    Ok(Box::new(crate::ir::projection::NestedModifiers {
+        order,
+        offset: modifiers.offset,
+        limit: modifiers.limit,
+    }))
 }
 
 /// Lower a reverse map (`predicate IRI -> Option<nested level>`).

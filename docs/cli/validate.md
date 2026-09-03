@@ -25,7 +25,7 @@ fluree validate mydb --shacl-graph http://example.org/graphs/shapes
 
 **File mode** validates an RDF file with no ledger at all: the data loads
 into an ephemeral in-memory ledger, the report prints, and nothing persists.
-This is the recommended pre-flight for [bulk import](import.md), which
+This is the recommended pre-flight for [bulk import](create.md#description), which
 deliberately never runs SHACL:
 
 ```bash
@@ -104,4 +104,4 @@ and a warning is printed to stderr.
 
 - [Cookbook: SHACL validation](../guides/cookbook-shacl.md) — shape authoring
   and transaction-time enforcement
-- [import](import.md) — bulk import (SHACL-exempt by design; validate first)
+- [create](create.md#description) — bulk import via `--from` (SHACL-exempt by design; validate first)

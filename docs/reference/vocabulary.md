@@ -451,6 +451,39 @@ Fluree encodes namespace IRIs as integer codes for compact storage. These are in
 
 ---
 
+## GraphQL schema vocabulary
+
+GraphQL projection reads the de-facto shared vocabulary at
+`http://datashapes.org/graphql#` — the one TopBraid EDG and GraphDB 11 both
+understand, so shapes authored for either port here unchanged. Terms Fluree
+needs that it does not define live under `f:` rather than being invented in a
+namespace we do not own.
+
+Declare the prefix as usual:
+
+```json
+{ "@context": { "graphql": "http://datashapes.org/graphql#", "f": "https://ns.flur.ee/db#" } }
+```
+
+| Predicate | Subject | Meaning |
+|-----------|---------|---------|
+| `graphql:Schema` | (class) | A curated selection of shapes to expose. Its presence selects tier 3. |
+| `graphql:publicShape` | schema | Expose the shape's class as a type **and** as root query fields. |
+| `graphql:protectedShape` | schema | Expose it as a type, reachable only by following a reference. |
+| `graphql:privateShape` | schema | Do not expose it. References to it come back as `Node` — the IRI without a type. |
+| `graphql:name` | schema, node shape, property shape | The GraphQL name. Beats `sh:name`. |
+| `graphql:isInterface` | node shape | The class is abstract: an `interface`, implemented by the classes beneath it in the RDFS hierarchy. |
+| `f:graphqlPluralName` | node shape | The root list/count field name, overriding the naive pluralisation. |
+| `f:graphqlEnableMutations` | schema | Opt in to `create_`/`update_`/`delete_`. Off unless stated. |
+| `f:graphqlIriBase` | schema | The namespace `create_` mints new subjects under. Required to mint; there is no default. |
+
+A class not listed by any of the three exposure predicates is absent from the
+schema — that is what makes a curated schema a contract rather than a mirror.
+
+See [GraphQL](../query/graphql.md) for the full mapping.
+
+---
+
 ## Standard W3C namespaces
 
 Fluree also recognizes these standard W3C namespaces:
@@ -462,5 +495,9 @@ Fluree also recognizes these standard W3C namespaces:
 | `xsd:` | `http://www.w3.org/2001/XMLSchema#` | `xsd:string`, `xsd:int`, `xsd:dateTime` |
 | `owl:` | `http://www.w3.org/2002/07/owl#` | `owl:sameAs`, `owl:inverseOf` |
 | `sh:` | `http://www.w3.org/ns/shacl#` | `sh:path`, `sh:datatype`, `sh:minCount` |
+
+One further namespace is read but not W3C: `http://datashapes.org/graphql#`,
+the shared GraphQL-over-SHACL vocabulary — see
+[GraphQL schema vocabulary](#graphql-schema-vocabulary) above.
 
 See [IRIs, namespaces, and JSON-LD @context](../concepts/iri-and-context.md) for details on prefix declarations and IRI resolution.

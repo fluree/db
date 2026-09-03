@@ -9,7 +9,7 @@ repository.workspace = true
 
 [features]
 default = ["native"]
-native = ["fluree-db-nameservice/native", "fluree-db-core/native", "fluree-db-query/native", "dep:sysinfo"]
+native = ["fluree-db-nameservice/native", "fluree-db-core/native", "fluree-db-query/native", "fluree-db-connection/native", "dep:sysinfo"]
 # Enable AWS-backed storage support (S3, storage-backed nameservice,
 # vended-credential minting).
 aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws", "dep:aws-sdk-sts"]
@@ -30,6 +30,9 @@ aws-testcontainers = [
 credential = ["dep:fluree-db-credential"]
 # SHACL validation (requires fluree-db-transact + fluree-db-shacl)
 shacl = ["dep:fluree-db-shacl", "fluree-db-transact/shacl"]
+# GraphQL endpoint (schema derived from ledger metadata; pulls in async-graphql)
+# Tier 2 reads SHACL shapes, so `shacl` comes with it.
+graphql = ["dep:fluree-db-graphql", "shacl"]
 # Temporary benchmark examples (opt-in so `cargo test` stays fast)
 benchmarks = []
 # Remote search client (HTTP client for remote search service)
@@ -39,25 +42,23 @@ vector = ["fluree-db-query/vector"]
 # IPFS-backed storage (via Kubo HTTP RPC)
 ipfs = ["dep:fluree-db-storage-ipfs"]
 # Convenience bundle (excludes vector, aws, and test-only features)
-full = ["native", "credential", "iceberg", "shacl", "ipfs"]
+full = ["native", "credential", "iceberg", "shacl", "ipfs", "graphql"]
 
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
 parking_lot = "0.12"
 lru = { workspace = true }
 fluree-db-crypto = { path = "../fluree-db-crypto", features = ["nameservice"] }
-fluree-db-connection = { path = "../fluree-db-connection" }
+fluree-db-connection = { path = "../fluree-db-connection", default-features = false }
 fluree-db-policy = { path = "../fluree-db-policy" }
 fluree-db-query = { path = "../fluree-db-query" }
 fluree-db-ledger = { path = "../fluree-db-ledger" }
 fluree-db-novelty = { path = "../fluree-db-novelty" }
 fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false }
-fluree-db-transact = { path = "../fluree-db-transact", features = ["import"] }
-fluree-db-indexer = { path = "../fluree-db-indexer" }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 fluree-db-sparql = { path = "../fluree-db-sparql" }
 fluree-db-cypher = { path = "../fluree-db-cypher" }
-fluree-db-spatial = { path = "../fluree-db-spatial" }
+fluree-db-graphql = { path = "../fluree-db-graphql", optional = true }
 fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
 fluree-db-tabular = { path = "../fluree-db-tabular" }
@@ -79,14 +80,13 @@ bytes = "1.4"
 chrono.workspace = true
 futures.workspace = true
 indexmap.workspace = true
-moka.workspace = true
+# moka is native-only: its eviction clock aborts on wasm32 (see fluree-db-core::wasm_cache)
 rustc-hash = "2"
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # SHA-256 of the R2RML mapping for the materialize twin's completion stamp.
 sha2.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 # Used for fast xxh3_128 hashing in streaming dictionary merge.
 xxhash-rust.workspace = true
@@ -112,7 +112,6 @@ aws-sdk-sts = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 
 # Platform directory resolution (XDG on Linux, Application Support on macOS)
-dirs = "5"
 
 # System memory detection for import memory budget auto-sizing (native only)
 sysinfo = { workspace = true, optional = true }
@@ -140,6 +139,15 @@ fluree-bench-support = { path = "../fluree-bench-support" }
 fluree-bench-alloc = { path = "../fluree-bench-alloc" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
+# Residency-mode read arms for the wasm read-path recovery tests
+# (it_residency_retry): dev-only feature unification — production native
+# builds keep the feature off and compile the pre-residency read path.
+fluree-db-query = { path = "../fluree-db-query", features = ["residency"] }
+fluree-db-binary-index = { path = "../fluree-db-binary-index", features = ["residency"] }
+
+[[test]]
+name = "it_residency_retry"
+path = "tests/it_residency_retry.rs"
 
 [[test]]
 name = "grp_graphsource"
@@ -241,6 +249,21 @@ path = "tests/it_fastpath_1652_regression.rs"
 [[test]]
 name = "it_datetime_component_presence"
 path = "tests/it_datetime_component_presence.rs"
+
+[[test]]
+name = "it_timezone_accessors"
+path = "tests/it_timezone_accessors.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_temporal_lane_stability"
+path = "tests/it_temporal_lane_stability.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_temporal_arithmetic"
+path = "tests/it_temporal_arithmetic.rs"
+required-features = ["native"]
 
 # Own binary: asserts fast-path routing via process-scoped tracing capture.
 [[test]]
@@ -416,6 +439,11 @@ name = "fulltext_query"
 harness = false
 
 [[bench]]
+name = "graphql_schema"
+harness = false
+required-features = ["graphql"]
+
+[[bench]]
 name = "insert_formats"
 harness = false
 
@@ -521,3 +549,18 @@ required-features = ["native"]
 name = "it_fast_stats_1391_regression"
 path = "tests/it_fast_stats_1391_regression.rs"
 required-features = ["native"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+moka = { workspace = true }
+fluree-db-transact = { path = "../fluree-db-transact", features = ["import"] }
+fluree-db-indexer = { path = "../fluree-db-indexer" }
+fluree-db-spatial = { path = "../fluree-db-spatial" }
+tokio = { workspace = true }
+# Platform directory resolution (XDG on Linux, Application Support on macOS)
+dirs = "5"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+fluree-db-transact = { path = "../fluree-db-transact" }
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time", "io-util"] }
+# Executor for `wasm_compat::spawn_detached` (browser event loop).
+wasm-bindgen-futures = "0.4"

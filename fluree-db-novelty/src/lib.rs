@@ -977,7 +977,7 @@ impl Novelty {
         );
         let _guard = span.enter();
 
-        let started = std::time::Instant::now();
+        let started = fluree_db_core::clock::Instant::now();
 
         // ---- Phase 1: partition incoming flakes by graph ----
         let mut per_graph: HashMap<GraphId, Vec<Flake>> = HashMap::new();
@@ -1484,6 +1484,15 @@ impl OverlayProvider for Novelty {
             }
             _ => {}
         }
+    }
+
+    fn overlay_flake_count(&self, g_id: GraphId) -> Option<usize> {
+        Some(
+            self.graphs
+                .get(g_id as usize)
+                .and_then(Option::as_ref)
+                .map_or(0, |segs| segs.iter().map(|s| s.flakes.len()).sum()),
+        )
     }
 
     fn overlay_segments(&self, g_id: GraphId) -> Vec<fluree_db_core::OverlaySegmentMeta> {

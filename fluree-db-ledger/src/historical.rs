@@ -471,6 +471,12 @@ impl OverlayProvider for HistoricalLedgerView {
         self.overlay.as_ref().map(|n| n.epoch).unwrap_or(0)
     }
 
+    fn overlay_flake_count(&self, g_id: GraphId) -> Option<usize> {
+        self.overlay
+            .as_ref()
+            .map_or(Some(0), |n| n.overlay_flake_count(g_id))
+    }
+
     fn for_each_overlay_flake(
         &self,
         g_id: GraphId,

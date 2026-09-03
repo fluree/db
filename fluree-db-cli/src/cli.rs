@@ -925,6 +925,64 @@ pub enum Commands {
     ///   fluree validate mydb --shacl proposed-shapes.ttl
     ///   fluree validate data.ttl --shacl shapes.ttl
     ///   fluree validate data.jsonld --format jsonld
+    /// Query a ledger through GraphQL
+    ///
+    /// The schema is derived from the ledger's own data — every class becomes a
+    /// type and every observed property a field — so there is nothing to
+    /// register. The ledger's default context decides the names.
+    ///
+    /// Examples:
+    ///   fluree graphql --schema mydb
+    ///   fluree graphql mydb '{ persons { id name } }'
+    ///   fluree graphql mydb -f query.graphql --variables '{"n": 10}'
+    #[cfg(feature = "graphql")]
+    Graphql {
+        /// Optional ledger name and/or inline GraphQL document.
+        ///
+        /// With 0 args: the active ledger; provide the document via -e, -f, or
+        /// stdin. With 1 arg: a document if it looks like one, otherwise a
+        /// ledger name. With 2 args: ledger name then document.
+        #[arg(num_args = 0..=2)]
+        args: Vec<String>,
+
+        /// Ledger name (defaults to the active ledger)
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
+
+        /// Inline GraphQL document
+        #[arg(short = 'e', long = "expr")]
+        expr: Option<String>,
+
+        /// Read the document from a file
+        #[arg(short = 'f', long = "file")]
+        file: Option<PathBuf>,
+
+        /// Query variables, as a JSON object
+        #[arg(long)]
+        variables: Option<String>,
+
+        /// Operation to run, when the document defines several
+        #[arg(long)]
+        operation: Option<String>,
+
+        /// Print the derived schema as SDL instead of running a query
+        #[arg(long)]
+        schema: bool,
+
+        /// Print SHACL shapes derived from the schema, as a starting point for
+        /// refining it. Nothing is written: edit the output, then apply it with
+        /// `fluree insert`. Shapes activate SHACL validation for their class,
+        /// so applying them is a decision to make deliberately.
+        #[arg(long, conflicts_with = "schema")]
+        bootstrap: bool,
+
+        /// Include `extensions.explain`: the Fluree query or transaction each
+        /// root field lowered to, and which tier the schema came from. Reports
+        /// what ran — it is not a dry run, and a mutation still writes.
+        #[arg(long)]
+        explain: bool,
+    },
+
     #[cfg(feature = "shacl")]
     Validate {
         /// Ledger name (with optional :branch) or an RDF data file

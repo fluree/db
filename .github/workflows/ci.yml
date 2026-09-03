@@ -240,3 +240,62 @@ jobs:
           cargo run -p fluree-bench-support --bin bench-baseline -- \
             compare --baseline bench-baselines/guardrails-pre.json \
             --allow-host-mismatch
+
+  # Keeps the wasm32-unknown-unknown build honest: the whole engine stack must
+  # keep compiling for the browser target (fluree-db-api pulls every wasm-path
+  # crate), and the parse layer must keep compiling with NO default features
+  # (the parse-only Lambda/WASM consumer contract). Runs on the same pinned
+  # toolchain as the native jobs. Job-level RUSTFLAGS: the workflow-global
+  # mold linker flag doesn't apply to wasm, and setting RUSTFLAGS here would
+  # otherwise mask the target-scoped `getrandom_backend` cfg from
+  # .cargo/config.toml — so the cfg is restated explicitly.
+  wasm32:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # -D warnings: `cargo check` exits 0 on warnings, so without this the
+      # branch's zero-warning wasm build could rot silently (registry deps
+      # stay cap-linted, so only workspace code is gated).
+      RUSTFLAGS: -D warnings --cfg getrandom_backend="wasm_js"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+            wasm-probe -> target
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+
+      # clippy, not check: `cargo check` cannot see clippy-only lints, and
+      # nothing else runs clippy against the wasm32 target. Two of those lints
+      # (a dropped un-awaited future in the CAS bridge stub, a needless return
+      # in a wasm-cfg storage arm) sat red under this exact command while the
+      # check-only gate reported green. clippy lints every workspace member in
+      # the -p closure, so this covers the engine crates behind fluree-db-api,
+      # not just the umbrella.
+      # No --all-targets: it drags in fluree-db-api's dev-dependencies, whose
+      # tokio `net`/mio does not build for wasm32 (unrelated to our code). The
+      # lib-level pass is what matters here anyway — clippy lints every
+      # workspace member in the -p closure at lib level, which is how the two
+      # latent lints this gate exists for (in fluree-db-binary-index and
+      # fluree-db-connection) surfaced.
+      - name: Lint engine stack (wasm32 clippy)
+        run: cargo clippy --target wasm32-unknown-unknown -p fluree-db-api --no-default-features
+
+      - name: Lint parse layer, no default features (wasm32 clippy)
+        run: cargo clippy --target wasm32-unknown-unknown --no-default-features -p fluree-vocab -p fluree-graph-ir -p fluree-graph-turtle -p fluree-graph-json-ld -p fluree-db-sparql
+
+      # Compiling is not running: wasm32-unknown-unknown panics at RUNTIME on
+      # Instant::now / SystemTime::now, thread spawns, and moka construction,
+      # none of which the check above can see. The probe drives the real
+      # memory-ledger create -> insert -> SPARQL query path under Node and
+      # exits 0 only on the future's own Ok (see wasm-probe/README.md).
+      - name: Runtime smoke (wasm32 under Node)
+        run: node wasm-probe/run-node.mjs
