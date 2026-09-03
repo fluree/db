@@ -130,6 +130,73 @@ async fn pages_stream_in_order_with_trino_typed_columns() {
     assert_eq!(status, StatusCode::GONE);
 }
 
+/// Run one statement and drain its pages: the reported column types and the rows.
+async fn run(router: &axum::Router, sql: &str) -> (Vec<String>, Vec<Value>) {
+    let (status, first) = call(router, post(sql, None)).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let types = first["columns"]
+        .as_array()
+        .map(|cols| {
+            cols.iter()
+                .map(|c| c["type"].as_str().unwrap().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut next = first["nextUri"].as_str().unwrap().to_string();
+    let mut rows: Vec<Value> = Vec::new();
+    loop {
+        let (status, page) = call(router, get(&next, None)).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert!(page["error"].is_null(), "{page}");
+        rows.extend(page["data"].as_array().cloned().unwrap_or_default());
+        match page["nextUri"].as_str() {
+            Some(n) => next = n.to_string(),
+            None => break,
+        }
+    }
+    (types, rows)
+}
+
+/// SQLite stores each cell in its own storage class: a `NUMERIC` column holds
+/// `5.00` as an INTEGER and `99.50` as a REAL, and the driver cannot parse
+/// `NUMERIC` or `DECIMAL(10,2)` as a declared type, so left to itself it
+/// reports the first row's storage class. The column's *declared* type must
+/// win — `double`, with every cell converted to it — whatever the first row
+/// holds, including NULL; an expression column keeps the driver's inference.
+#[tokio::test]
+async fn numeric_columns_are_typed_by_declaration_not_first_row() {
+    let (router, _dir) = app(None, 10).await;
+    for stmt in [
+        "CREATE TABLE amounts (n NUMERIC, d DECIMAL(10,2), label VARCHAR(20), flag BOOL)",
+        "INSERT INTO amounts VALUES (5.00, 5.00, 'five', 1), (99.50, 99.50, 'ninety-nine and a half', 0), (7, 7, NULL, NULL)",
+        "CREATE TABLE late (v NUMERIC)",
+        "INSERT INTO late VALUES (NULL), (2.5)",
+    ] {
+        run(&router, stmt).await;
+    }
+
+    let (types, rows) = run(&router, "SELECT n, d, label, flag FROM amounts ORDER BY n").await;
+    assert_eq!(types, ["double", "double", "varchar", "boolean"]);
+    assert_eq!(
+        rows,
+        vec![
+            json!([5.0, 5.0, "five", true]),
+            json!([7.0, 7.0, Value::Null, Value::Null]),
+            json!([99.5, 99.5, "ninety-nine and a half", false]),
+        ]
+    );
+
+    // A NULL first row would otherwise leave the column untyped (varchar).
+    let (types, rows) = run(&router, "SELECT v FROM late").await;
+    assert_eq!(types, ["double"]);
+    assert_eq!(rows, vec![json!([Value::Null]), json!([2.5])]);
+
+    // An expression has no declared type: the driver's inference stands.
+    let (types, rows) = run(&router, "SELECT SUM(n), COUNT(*) FROM amounts").await;
+    assert_eq!(types, ["double", "bigint"]);
+    assert_eq!(rows, vec![json!([111.5, 3])]);
+}
+
 #[tokio::test]
 async fn probe_with_no_rows_still_reports_columns_and_count_is_a_scalar() {
     let (router, _dir) = app(None, 100).await;

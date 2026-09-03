@@ -65,6 +65,9 @@ sqlx = { version = "0.8", default-features = false, features = [
 ] }
 bigdecimal = "0.4"
 chrono = "0.4"
+# Same crate sqlx's `sqlite` feature links; used only to read declared column
+# types (`sqlite3_column_decltype`), which sqlx does not expose.
+libsqlite3-sys = "0.30"
 
 [dev-dependencies]
 tempfile = "3"

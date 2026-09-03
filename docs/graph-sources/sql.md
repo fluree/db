@@ -273,6 +273,15 @@ The bridge holds the connection pool; Fluree holds nothing. It answers
 `POST /v1/statement` with the same paged JSON Trino returns, reporting column
 types in Trino's names, so everything on this page applies unchanged.
 
+Over SQLite, a table column is typed by its **declared** type under SQLite's
+own affinity rules (`NUMERIC`, `DECIMAL(10,2)` and any other numeric-affinity
+name report as `double`; `INT…` as `bigint`; `…CHAR`, `…TEXT`, `…CLOB` as
+`varchar`), and every cell is converted to that type. SQLite stores each cell
+in its own storage class, so a `NUMERIC` column can hold `5.00` as an integer
+next to `99.50` as a real; typing by declaration keeps both as `5.0` and
+`99.5` rather than letting the first row decide. An expression column
+(`SUM(total)`) has no declared type and takes the driver's inference.
+
 ## Comparison with Iceberg sources
 
 | | Iceberg source | SQL source |
