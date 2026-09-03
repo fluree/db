@@ -1117,7 +1117,11 @@ pub fn build_indexes_from_commits(
             "class membership built for ref-target stats"
         );
     }
-    let (spot_result, spot_class_stats, merge_duplicates) = build_spot_index_from_commits(
+    let SpotBuild {
+        result: spot_result,
+        class_stats: spot_class_stats,
+        merge_duplicates,
+    } = build_spot_index_from_commits(
         commits,
         config,
         spot_rdf_type_p_id,
@@ -1343,18 +1347,21 @@ pub fn build_indexes_from_commits(
     ))
 }
 
-#[allow(clippy::type_complexity)]
+struct SpotBuild {
+    result: IndexBuildResult,
+    class_stats: Option<SpotClassStats>,
+    /// Cross-chunk duplicate copies the SPOT merge collapsed, keyed
+    /// `(p_id, o_type)` so the id-stats hook can discount them.
+    merge_duplicates: FxHashMap<(u32, u16), u64>,
+}
+
 fn build_spot_index_from_commits(
     commits: &[CommitInput],
     config: &BuildConfig,
     rdf_type_p_id: Option<u32>,
     class_membership: Option<ClassMembership>,
     fd_plan: &FdPlan,
-) -> io::Result<(
-    IndexBuildResult,
-    Option<SpotClassStats>,
-    FxHashMap<(u32, u16), u64>,
-)> {
+) -> io::Result<SpotBuild> {
     let g_id = config.g_id;
     let index_dir = &config.index_dir;
     let leaflet_target_rows = config.leaflet_target_rows;
@@ -1371,16 +1378,16 @@ fn build_spot_index_from_commits(
     log_index_memory("spot_build:start");
 
     if commits.is_empty() {
-        return Ok((
-            IndexBuildResult {
+        return Ok(SpotBuild {
+            result: IndexBuildResult {
                 graphs: Vec::new(),
                 total_rows: 0,
                 index_dir: index_dir.to_path_buf(),
                 elapsed: t0.elapsed(),
             },
-            None,
-            FxHashMap::default(),
-        ));
+            class_stats: None,
+            merge_duplicates: FxHashMap::default(),
+        });
     }
 
     let order = RunSortOrder::Spot;
@@ -1493,16 +1500,16 @@ fn build_spot_index_from_commits(
         "direct SPOT build complete"
     );
     log_index_memory("spot_build:complete_before_stats_finish");
-    Ok((
-        IndexBuildResult {
+    Ok(SpotBuild {
+        result: IndexBuildResult {
             graphs: vec![result],
             total_rows,
             index_dir: index_dir.to_path_buf(),
             elapsed: t0.elapsed(),
         },
-        class_stats_collector.map(SpotClassStatsCollector::finish),
+        class_stats: class_stats_collector.map(SpotClassStatsCollector::finish),
         merge_duplicates,
-    ))
+    })
 }
 
 /// Unwrap an [`IndexBuildError`] into an `io::Error` **preserving the
@@ -1952,7 +1959,7 @@ mod tests {
             std::fs::create_dir_all(&config.run_dir).unwrap();
             build_spot_index_from_commits(&commits, &config, None, None, plan)
                 .unwrap()
-                .0
+                .result
         };
 
         let unlimited = plan_fd_usage(FdBudget::unlimited(), 1, IMPORT_CONCURRENT_ORDERS);
@@ -2095,12 +2102,12 @@ mod tests {
             ..unlimited
         };
 
-        let (flat_result, flat_stats, _) = build("statflat", &unlimited);
-        let (hier_result, hier_stats, _) = build("stathier", &constrained);
-        let flat_stats = flat_stats.expect("flat stats");
-        let hier_stats = hier_stats.expect("hier stats");
+        let flat = build("statflat", &unlimited);
+        let hier = build("stathier", &constrained);
+        let flat_stats = flat.class_stats.expect("flat stats");
+        let hier_stats = hier.class_stats.expect("hier stats");
 
-        assert_eq!(flat_result.total_rows, hier_result.total_rows);
+        assert_eq!(flat.result.total_rows, hier.result.total_rows);
 
         // Non-vacuous: counts exist, keyed under the named graph, and ref
         // targets resolved through the membership.
