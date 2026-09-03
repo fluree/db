@@ -536,6 +536,14 @@ pub async fn format_results_async(
     if let Some(cs) = crate::residency::content_store(db.snapshot) {
         let _guard = cs.query_guard();
         let mut budget = fluree_db_binary_index::read::need_fetch::RetryBudget::default();
+        // Formatting is pure and a failed round's work is discarded, so N
+        // retry rounds must charge the fuel of ONE round, not N — otherwise a
+        // query near its budget fails `FuelExceeded` merely for missing
+        // residency N times, and on a peer, misses are the NORMAL first-query
+        // path. Snapshot once, roll back before each retry; the successful
+        // round's charge stands. Sound here because execution has already
+        // finished — this frame is the tracker's sole fuel writer.
+        let fuel_snapshot = tracker.and_then(Tracker::current_micro_fuel);
         loop {
             match format_results_async_inner(result, context, db, config, policy, tracker).await {
                 Ok(v) => return Ok(v),
@@ -548,6 +556,9 @@ pub async fn format_results_async(
                         .await
                         .map_err(|re| FormatError::ResidencyFetch(re.to_string()))?;
                     if retried {
+                        if let (Some(t), Some(snap)) = (tracker, fuel_snapshot) {
+                            t.restore_micro_fuel(snap);
+                        }
                         tracing::debug!(
                             rounds = budget.rounds(),
                             fetched_total = budget.fetched_total(),
@@ -690,13 +701,26 @@ pub async fn format_results_async_dataset(
                 "Hydration only supports JSON-LD and TypedJson output formats".to_string(),
             ));
         }
-        // SEAM: this branch calls hydration directly and is NOT wrapped in the
-        // residency drain/fetch/re-run loop that `format_results_async` puts
-        // around single-ledger formatting. Harmless for v1 — the browser peer
-        // is single-ledger, so no residency store reaches here — but a
-        // multi-ledger peer would take an unrecoverable formatting miss on
-        // this path. Wrap it (or hoist the loop into a shared helper) before
-        // datasets go to a residency target.
+        // SEAM (#1775): this branch calls hydration directly and is NOT
+        // wrapped in the residency drain/fetch/re-run loop that
+        // `format_results_async` puts around single-ledger formatting, so on
+        // a residency-backed target a mid-hydration miss would be
+        // unrecoverable. The browser peer is single-ledger today, so no
+        // residency store reaches here — but that invariant is now ENFORCED
+        // (typed refusal below), not narrated. The real fix — hoisting the
+        // loop into a helper both paths call, with per-graph store routing —
+        // is tracked in #1775.
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        for graph in dataset.graphs() {
+            if crate::residency::content_store(&graph.snapshot).is_some() {
+                return Err(FormatError::InvalidBinding(
+                    "dataset hydration on a residency-backed (browser peer) target is not \
+                     supported yet: a formatting miss here would be unrecoverable. \
+                     Tracked in https://github.com/fluree/db/issues/1775"
+                        .to_string(),
+                ));
+            }
+        }
         let v = hydration::format_async_dataset(result, dataset, context, config, tracker).await?;
         return if result.output.is_select_one() {
             match v {

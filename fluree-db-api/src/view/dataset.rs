@@ -154,6 +154,14 @@ impl DataSetDb {
     }
 
     /// Get the "primary" graph view, mutably.
+    /// Every graph view in the dataset: default graphs first, then named
+    /// graphs in registration order.
+    pub fn graphs(&self) -> impl Iterator<Item = &GraphDb> {
+        self.default
+            .iter()
+            .chain(self.named_order.iter().filter_map(|n| self.named.get(n)))
+    }
+
     pub fn primary_mut(&mut self) -> Option<&mut GraphDb> {
         if let Some(v) = self.default.first_mut() {
             return Some(v);
