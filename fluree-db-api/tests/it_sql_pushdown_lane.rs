@@ -725,6 +725,16 @@ fn cases() -> Vec<Case> {
             declined: None,
         },
         Case {
+            // `\w` is a class, not the literal `\w`: a prefix ending in a
+            // backslash is no prefix at all.
+            name: "a REGEX whose anchored literal holds a backslash stays a plain residual",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(REGEX(?n, \"^A\\\\w\")) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            rows: &["n=Ada"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
             name: "a REGEX with flags or metacharacters stays a plain residual",
             sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(REGEX(?n, \"^b\", \"i\") || REGEX(?n, \"^C.\")) }",
             sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],

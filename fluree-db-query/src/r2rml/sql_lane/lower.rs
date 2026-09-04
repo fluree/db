@@ -1732,7 +1732,7 @@ impl<'a> Lowerer<'a> {
                 }
                 let (col, pattern) = self.string_column_and_literal(args)?;
                 let prefix = pattern.strip_prefix('^')?;
-                if prefix.is_empty() || prefix.chars().any(|c| r".^$*+?()[]{}|".contains(c)) {
+                if prefix.is_empty() || prefix.chars().any(|c| r".^$*+?()[]{}|\".contains(c)) {
                     return None;
                 }
                 Some(Pred::Like {
