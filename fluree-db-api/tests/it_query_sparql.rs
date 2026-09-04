@@ -6983,6 +6983,19 @@ const RANGE_FILTER_CASES: &[(&str, &str, &[&str])] = &[
     ("ex:price", "?v > 0.5 && ?v > 0e0", &["a", "c", "e"]),
     // Contradictory across types: empty, not "everything".
     ("ex:price", "?v > 1.5 && ?v < 1", &[]),
+    // A conjunct with no RangeValue at all (xsd:integer past i64) must keep the
+    // whole filter rather than push the representable half. Both directions, so
+    // a lane that drops every row cannot pass the `[]` case by accident.
+    (
+        "ex:price",
+        "?v >= 0 && ?v > \"100000000000000000000\"^^xsd:integer",
+        &[],
+    ),
+    (
+        "ex:price",
+        "?v >= 0 && ?v < \"100000000000000000000\"^^xsd:integer",
+        &["a", "b", "c", "d", "e", "f"],
+    ),
     // Temporal: same-side pair keeps the tighter bound.
     (
         "ex:shipped",
