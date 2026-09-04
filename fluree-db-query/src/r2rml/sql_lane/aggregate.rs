@@ -398,7 +398,28 @@ fn lower_aggregate(
                         Decode::Count { name } => OrderKey::Output(name.clone()),
                         Decode::Numeric {
                             sum, avg: false, ..
-                        } => OrderKey::Output(sum.clone()),
+                        } => {
+                            // The database applies `ORDER BY … LIMIT` before the
+                            // engine maps a NULL sum to SPARQL's empty-sum
+                            // identity of 0, and every dialect sorts NULL at one
+                            // end (NULLS LAST on ASC for Postgres and Trino,
+                            // NULLS FIRST for MySQL and SQLite), so a group whose
+                            // summed column is NULL throughout ranks at an
+                            // extreme instead of among the zeroes and the wrong k
+                            // groups come back. A required member carries an
+                            // IS NOT NULL, so only a nullable one can sum to
+                            // NULL; that ordering stays in the engine.
+                            let nullable = match &plan.aggregates[i].1 {
+                                AggregateFn::Sum(v, _) => {
+                                    lowered.vars.get(v).is_none_or(|src| src.nullable)
+                                }
+                                _ => true,
+                            };
+                            if nullable {
+                                return None;
+                            }
+                            OrderKey::Output(sum.clone())
+                        }
                         _ => return None,
                     }
                 };

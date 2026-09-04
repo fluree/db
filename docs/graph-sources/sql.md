@@ -186,9 +186,14 @@ columns of an identical IRI template — never on a rendered IRI string — and
 every required column is `IS NOT NULL`, which is also what makes `LIMIT`
 pushable. In that statement:
 
-- an `OPTIONAL` member of the same entity is a nullable column of the same
-  access (no join); an optional entity hanging off a foreign key is a
-  `LEFT JOIN`;
+- a **single** `OPTIONAL` member of the same entity, with a variable object, is
+  a nullable column of the same access (no join); an optional entity hanging
+  off a foreign key is a `LEFT JOIN`. Several members on that entity stay in
+  the engine, because SPARQL binds an `OPTIONAL` group as a unit — if one of
+  its triples is absent for a row, every variable the group binds is unbound,
+  where independent nullable columns would bind the ones that are present. A
+  constant object stays in the engine too: its equality would filter the
+  required rows rather than the optional ones;
 - a `FILTER` is pushed only when it is exact — the column's RDF datatype
   (from `rr:datatype`; `xsd:string` when un-annotated), the literal's type
   and the **probed SQL type** agree, and for strings the dialect compares

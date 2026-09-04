@@ -59,10 +59,30 @@ const SHOP_R2RML: &str = r#"
             rr:objectMap [ rr:column "updated" ; rr:datatype xsd:dateTime ]
         ] ;
         rr:predicateObjectMap [
+            rr:predicate ex:discount ;
+            rr:objectMap [ rr:column "discount" ; rr:datatype xsd:decimal ]
+        ] ;
+        rr:predicateObjectMap [
             rr:predicate ex:customer ;
             rr:objectMap [
                 rr:parentTriplesMap <http://example.org/mapping#Customer> ;
                 rr:joinCondition [ rr:child "customer_id" ; rr:parent "id" ]
+            ]
+        ] .
+
+    # The legacy shape: the foreign key is text where the parent key is a
+    # bigint, so the database cannot compare them and the lane must decline
+    # rather than let the renderer refuse after the fallback decision is past.
+    <http://example.org/mapping#Note>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.notes" ] ;
+        rr:subjectMap [ rr:template "http://example.org/note/{id}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:body ; rr:objectMap [ rr:column "body" ] ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:aboutOrder ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Order> ;
+                rr:joinCondition [ rr:child "order_ref" ; rr:parent "id" ]
             ]
         ] .
 "#;
@@ -98,6 +118,9 @@ async fn shop() -> MockServer {
                 // exactly with an xsd:dateTime literal in SQL.
                 ("shipped", "timestamp(6) with time zone"),
                 ("updated", "timestamp(6)"),
+                // Nullable numeric: a group whose rows are all NULL here sums
+                // to SPARQL's identity 0, which SQL cannot order as 0.
+                ("discount", "decimal(10,2)"),
             ],
             vec![
                 vec![
@@ -107,6 +130,7 @@ async fn shop() -> MockServer {
                     json!("2024-01-05"),
                     json!("2024-01-06 09:30:00.000000 UTC"),
                     json!("2024-01-06 09:30:00.000000"),
+                    Value::Null,
                 ],
                 vec![
                     json!(11),
@@ -115,6 +139,7 @@ async fn shop() -> MockServer {
                     json!("2024-02-01"),
                     json!("2024-02-02 18:00:00.000000 UTC"),
                     json!("2024-02-02 18:00:00.000000"),
+                    Value::Null,
                 ],
                 vec![
                     json!(12),
@@ -123,6 +148,7 @@ async fn shop() -> MockServer {
                     json!("2024-03-01"),
                     Value::Null,
                     Value::Null,
+                    json!("-5.00"),
                 ],
                 vec![
                     json!(13),
@@ -131,7 +157,20 @@ async fn shop() -> MockServer {
                     Value::Null,
                     Value::Null,
                     Value::Null,
+                    Value::Null,
                 ],
+            ],
+        ))
+        .table(Table::new(
+            "shop.notes",
+            &[
+                ("id", "bigint"),
+                ("order_ref", "varchar"),
+                ("body", "varchar"),
+            ],
+            vec![
+                vec![json!(1), json!("10"), json!("gift wrap")],
+                vec![json!(2), json!("12"), json!("call first")],
             ],
         ))
         .mount()
@@ -436,6 +475,53 @@ fn cases() -> Vec<Case> {
             rows: &[],
             routing: Routing::MustNotFire,
             declined: Some("repeated variable joins two value classes"),
+        },
+        Case {
+            // SPARQL's LeftJoin binds the group as a unit: order 12 has
+            // `placed` but no `shipped`, so BOTH ?p and ?s are unbound. Folded
+            // into two nullable columns of the required access they would be
+            // independently NULL, binding ?p and leaving ?s unbound.
+            name: "an optional with several members on the same entity declines",
+            sparql: "SELECT ?o ?p ?s FROM <shop-sql:main> WHERE { ?o ex:total ?t OPTIONAL { ?o ex:placed ?p . ?o ex:shipped ?s } }",
+            sql: &[],
+            rows: &[
+                "o=http://example.org/order/10 p=2024-01-05 s=2024-01-06T09:30:00Z",
+                "o=http://example.org/order/11 p=2024-02-01 s=2024-02-02T18:00:00Z",
+                "o=http://example.org/order/12 p= s=",
+                "o=http://example.org/order/13 p= s=",
+            ],
+            routing: Routing::MustNotFire,
+            declined: Some("several members in a folded optional"),
+        },
+        Case {
+            // The constant's equality would land in the WHERE of the REQUIRED
+            // access, so the OPTIONAL would filter the rows it must leave
+            // alone: one order back instead of every order.
+            name: "a constant object inside a folded optional declines",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t OPTIONAL { ?o ex:placed \"2024-01-05\"^^xsd:date } }",
+            sql: &[],
+            rows: &[
+                "o=http://example.org/order/10",
+                "o=http://example.org/order/11",
+                "o=http://example.org/order/12",
+                "o=http://example.org/order/13",
+            ],
+            routing: Routing::MustNotFire,
+            declined: Some("constant object in a folded optional"),
+        },
+        Case {
+            // varchar FK against a bigint key. The renderer refuses this pair,
+            // but only after `open` committed to the lane, so the query used to
+            // hard-fail where the per-scan lane answers it.
+            name: "a join between two column classes declines instead of failing to render",
+            sparql: "SELECT ?b ?o FROM <shop-sql:main> WHERE { ?n ex:body ?b . ?n ex:aboutOrder ?o }",
+            sql: &[],
+            rows: &[
+                "b=call first o=http://example.org/order/12",
+                "b=gift wrap o=http://example.org/order/10",
+            ],
+            routing: Routing::MustNotFire,
+            declined: Some("join between two column classes"),
         },
         Case {
             name: "an optional hanging off an optional entity declines",
@@ -886,6 +972,20 @@ fn aggregate_cases() -> Vec<Case> {
             sparql: "SELECT ?k FROM <shop-sql:main> WHERE { ?c ex:country ?k } GROUP BY ?k",
             sql: &[r#"SELECT DISTINCT "t0"."country" AS "c0" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."country" IS NOT NULL"#],
             rows: &["k=UK", "k=US"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            // The database applies ORDER BY … LIMIT before the engine maps a
+            // NULL sum to SPARQL's empty-sum identity of 0. Customer 1's orders
+            // have no discount at all, so its sum is 0 and must sort ahead of
+            // customer 2's -5.00 — but SQL has only NULL to order, and puts it
+            // at one end. The grouped statement still pushes; the top-k does
+            // not, and the engine picks k after decoding.
+            name: "a top-k over SUM of a nullable variable keeps the ordering in the engine",
+            sparql: "SELECT ?c (SUM(?d) AS ?s) FROM <shop-sql:main> WHERE { ?o ex:customer ?c OPTIONAL { ?o ex:discount ?d } } GROUP BY ?c ORDER BY ?s LIMIT 1",
+            sql: &[r#"SELECT "t1"."id" AS "c0", SUM("t0"."discount") AS "c1", COUNT("t0"."discount") AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            rows: &["c=http://example.org/customer/2 s=-5.00"],
             routing: Routing::MustFire,
             declined: None,
         },
