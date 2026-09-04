@@ -1958,3 +1958,224 @@ async fn duplicate_subject_keys_are_detected_and_refused() {
         ]
     );
 }
+
+/// A JSON-LD twin for the shapes whose routing depends on how the *parser*
+/// groups a block.
+///
+/// The lane keys on `Pattern::Graph { name: GraphName::Iri(..) }`, which both
+/// query surfaces lower to (`parse/lower.rs` for JSON-LD), so every admission
+/// and decline in this file is reachable from JSON-LD as well — yet every case
+/// above is written in SPARQL. That matters most for the folded-OPTIONAL rules,
+/// which count the members of the optional group: `["optional", {a}, {b}]` is
+/// one conjunctive OPTIONAL and a single node object may itself carry two
+/// predicates, so the two surfaces could plausibly present the same query to
+/// the lowering as a different number of members — and a group that folds where
+/// it should decline gives the wrong answer, not a slower one.
+///
+/// Each twin asserts the routing stamp, that the rows equal what the same query
+/// returns through SPARQL, and that they equal what the per-scan lane returns
+/// for the JSON-LD query itself. The last is the one that is an oracle: if a
+/// decline regressed, both surfaces would fold and be wrong the same way, so
+/// surface-to-surface agreement alone would still pass.
+struct Twin {
+    name: &'static str,
+    /// The SPARQL spelling, the oracle for the rows.
+    sparql: &'static str,
+    /// The JSON-LD `where`, run with the same `from`.
+    jsonld_where: Value,
+    select: &'static [&'static str],
+    routing: Routing,
+}
+
+fn twins() -> Vec<Twin> {
+    vec![
+        Twin {
+            name: "star with a filter fires on both surfaces",
+            sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { ?o ex:total ?t FILTER(?t > 40) }",
+            jsonld_where: json!([
+                {"@id": "?o", "ex:total": "?t"},
+                ["filter", "(> ?t 40)"]
+            ]),
+            select: &["?o", "?t"],
+            routing: Routing::MustFire,
+        },
+        Twin {
+            // The control for the two declines below: one member still folds.
+            name: "a single-member optional folds on both surfaces",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k } }",
+            jsonld_where: json!([
+                {"@id": "?c", "ex:name": "?n"},
+                ["optional", {"@id": "?c", "ex:country": "?k"}]
+            ]),
+            select: &["?n", "?k"],
+            routing: Routing::MustFire,
+        },
+        Twin {
+            // Two node objects on the same subject inside one OPTIONAL.
+            name: "a several-member optional declines on both surfaces",
+            sparql: "SELECT ?o ?p ?s FROM <shop-sql:main> WHERE { ?o ex:total ?t OPTIONAL { ?o ex:placed ?p . ?o ex:shipped ?s } }",
+            jsonld_where: json!([
+                {"@id": "?o", "ex:total": "?t"},
+                ["optional",
+                    {"@id": "?o", "ex:placed": "?p"},
+                    {"@id": "?o", "ex:shipped": "?s"}]
+            ]),
+            select: &["?o", "?p", "?s"],
+            routing: Routing::MustNotFire,
+        },
+        Twin {
+            // The same group written as ONE node object carrying two
+            // predicates — the spelling with no SPARQL counterpart, and the
+            // one most likely to reach the lowering shaped differently.
+            name: "one optional node object with two predicates declines",
+            sparql: "SELECT ?o ?p ?s FROM <shop-sql:main> WHERE { ?o ex:total ?t OPTIONAL { ?o ex:placed ?p . ?o ex:shipped ?s } }",
+            jsonld_where: json!([
+                {"@id": "?o", "ex:total": "?t"},
+                ["optional", {"@id": "?o", "ex:placed": "?p", "ex:shipped": "?s"}]
+            ]),
+            select: &["?o", "?p", "?s"],
+            routing: Routing::MustNotFire,
+        },
+        Twin {
+            name: "a constant object inside an optional declines on both surfaces",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t OPTIONAL { ?o ex:placed \"2024-01-05\"^^xsd:date } }",
+            jsonld_where: json!([
+                {"@id": "?o", "ex:total": "?t"},
+                ["optional", {"@id": "?o", "ex:placed": {"@value": "2024-01-05", "@type": "xsd:date"}}]
+            ]),
+            select: &["?o"],
+            routing: Routing::MustNotFire,
+        },
+        Twin {
+            name: "an explicit graph block fires",
+            sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { ?o ex:total ?t }",
+            jsonld_where: json!([
+                ["graph", "shop-sql:main", {"@id": "?o", "ex:total": "?t"}]
+            ]),
+            select: &["?o", "?t"],
+            routing: Routing::MustFire,
+        },
+    ]
+}
+
+/// JSON-LD select rows rendered like [`rows_of`], so the two surfaces compare.
+fn jsonld_rows_of(v: &Value, select: &[&str]) -> Vec<String> {
+    let mut order: Vec<(usize, String)> = select
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i, s.trim_start_matches('?').to_string()))
+        .collect();
+    order.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut out: Vec<String> = v
+        .as_array()
+        .unwrap_or_else(|| panic!("not JSON-LD select results: {v}"))
+        .iter()
+        .map(|row| {
+            order
+                .iter()
+                .map(|(i, var)| {
+                    let cell = &row[*i];
+                    let val = match cell {
+                        Value::Null => String::new(),
+                        Value::String(s) => s.clone(),
+                        Value::Object(o) => o
+                            .get("@value")
+                            .map(|x| match x {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                            .unwrap_or_default(),
+                        other => other.to_string(),
+                    };
+                    format!("{var}={val}")
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn jsonld_blocks_route_like_their_sparql_twins() {
+    assert!(
+        std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_none(),
+        "unset FLUREE_DISABLE_QUERY_FAST_PATHS: this pins nothing otherwise"
+    );
+    let _lock = KILL_SWITCH.lock().await;
+    let (_server, fluree) = setup().await;
+    let twins = twins();
+
+    let (store, tracing_guard) = span_capture::init_test_tracing();
+    set_fast_paths_disabled(false);
+    let mut failures: Vec<String> = Vec::new();
+    let mut lane_rows: Vec<(Value, Vec<String>)> = Vec::new();
+    for t in &twins {
+        let q = json!({
+            "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+            "from": "shop-sql:main",
+            "select": t.select,
+            "where": t.jsonld_where,
+        });
+        let before_events = store.find_events("fast-path outcome").len();
+        let out = fluree
+            .query_from()
+            .jsonld(&q)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{}: json-ld query failed: {e}", t.name));
+        let proceeded = proceeded_sites(&store, before_events);
+        let rows = jsonld_rows_of(&out, t.select);
+
+        match t.routing {
+            Routing::MustFire => {
+                if !proceeded.iter().any(|s| s == SITE) {
+                    failures.push(format!(
+                        "{}: expected `{SITE}` to proceed on JSON-LD [proceeded: {proceeded:?}]",
+                        t.name
+                    ));
+                }
+            }
+            Routing::MustNotFire => {
+                if proceeded.iter().any(|s| s == SITE) {
+                    failures.push(format!(
+                        "{}: `{SITE}` proceeded on JSON-LD for a shape SPARQL declines",
+                        t.name
+                    ));
+                }
+            }
+        }
+
+        let sparql_rows = rows_of(&query(&fluree, &format!("{PREFIX}{}", t.sparql)).await);
+        if rows != sparql_rows {
+            failures.push(format!(
+                "{}: json-ld rows {rows:?} differ from sparql rows {sparql_rows:?}",
+                t.name
+            ));
+        }
+        lane_rows.push((q, rows));
+    }
+    drop(tracing_guard);
+
+    // The oracle: the same JSON-LD queries with the lane off.
+    set_fast_paths_disabled(true);
+    for (t, (q, lane)) in twins.iter().zip(&lane_rows) {
+        let out = fluree
+            .query_from()
+            .jsonld(q)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{}: scan-lane json-ld query failed: {e}", t.name));
+        let scan = jsonld_rows_of(&out, t.select);
+        if &scan != lane {
+            failures.push(format!(
+                "{}: scan lane rows {scan:?} differ from lane rows {lane:?}",
+                t.name
+            ));
+        }
+    }
+    set_fast_paths_disabled(false);
+
+    assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
+}
