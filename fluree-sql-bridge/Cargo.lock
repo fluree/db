@@ -480,6 +480,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "libsqlite3-sys",
  "serde",
  "serde_json",
  "sqlx",

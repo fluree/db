@@ -605,8 +605,9 @@ impl Acc {
 
     /// Fold a single row's value into this accumulator. `col` is the fold's
     /// pre-resolved column for this batch (`None` for `COUNT(*)`). Returns
-    /// `false` if an exact i128 sum would overflow (the caller re-runs on the
-    /// BigDecimal pipeline); all other folds always return `true`.
+    /// `false` when the row cannot be folded exactly — an i128 sum that would
+    /// overflow, or a value with no exact reading — and the caller re-runs on
+    /// the BigDecimal pipeline; all other folds always return `true`.
     fn update_row(&mut self, fold: &Fold, col: Option<&Column>, row: usize) -> bool {
         match (self, fold) {
             (Acc::Count(n), Fold::CountRows) => {
@@ -686,7 +687,10 @@ impl Acc {
 }
 
 /// Add one row's exact (decimal/integer) value to the accumulator. Returns
-/// `false` if the i128 sum would overflow (the caller falls back to BigDecimal).
+/// `false` when the row has no exact reading — the i128 sum would overflow, or
+/// the cell does not parse as a decimal — and the caller falls back to the
+/// BigDecimal pipeline, which computes the row or poisons the group as the
+/// generic lane would. A null cell is a legitimate drop and returns `true`.
 fn accumulate_exact_row(
     col: &Column,
     row: usize,
@@ -720,32 +724,121 @@ fn accumulate_exact_row(
             Some(Some(v)) => add(sum, count, *v as i128),
             _ => true,
         },
+        // The declared datatype is exact but the physical column is not: a
+        // double (SQLite `NUMERIC` behind the bridge) or text (a CSV-shaped
+        // table). The generic path converts each value, so the fold must too —
+        // skipping the row would report a sum of 0 over a count of 0.
+        //
+        // Floats convert through their `to_string()` lexical, which is what the
+        // generic path materializes (`column_to_string`) and then parses.
+        // `BigDecimal::try_from(f64)` would take the exact binary expansion
+        // instead: `19.99f64` has scale 48, whose rescale leaves i128 and bails
+        // the fold on the first money-shaped row, while `19.99f32` fits at
+        // scale 19 and sums to `24.9899997711181640625` where the generic lane
+        // gives `24.99`. One lexical, one answer.
+        Column::Float64(values) => match values.get(row) {
+            Some(Some(v)) => accumulate_lexical(&v.to_string(), sum, scale, count),
+            _ => true,
+        },
+        Column::Float32(values) => match values.get(row) {
+            Some(Some(v)) => accumulate_lexical(&v.to_string(), sum, scale, count),
+            _ => true,
+        },
+        Column::String(values) => match values.get(row) {
+            Some(Some(text)) => accumulate_lexical(text, sum, scale, count),
+            _ => true,
+        },
         _ => true,
+    }
+}
+
+/// Fold one value's lexical form into the exact accumulator. An unparseable
+/// lexical (`"abc"`, and `"NaN"`/`"inf"` from a float column) returns `false`
+/// to escalate: the generic lane materializes it under the exact datatype,
+/// `binding_to_numeric` fails, and `agg_sum`/`agg_avg` poison the group to
+/// unbound (SPARQL §18.5.1, agg-err-01). Silently omitting the row here would
+/// report a sum over the parseable subset instead.
+fn accumulate_lexical(text: &str, sum: &mut i128, scale: &mut i64, count: &mut u64) -> bool {
+    match text.trim().parse::<BigDecimal>() {
+        Ok(d) => add_exact(d, sum, scale, count),
+        Err(_) => false,
+    }
+}
+
+/// Add a decimal to the exact i128 accumulator, widening the running scale
+/// to the value's own (so `"99.50"` keeps rendering with two places). `false`
+/// when the sum leaves i128 (the caller re-runs on BigDecimal).
+///
+/// A rescale of `sum`/`scale` may land before a later bail: that is fine and
+/// not a two-phase check waiting to happen — the rescaled pair denotes the same
+/// value, and on `false` the caller discards the accumulator wholesale.
+fn add_exact(d: BigDecimal, sum: &mut i128, scale: &mut i64, count: &mut u64) -> bool {
+    let (digits, exp) = d.as_bigint_and_exponent();
+    let (digits, exp) = if exp < 0 {
+        (digits * BigInt::from(10).pow((-exp) as u32), 0)
+    } else {
+        (digits, exp)
+    };
+    let Some(mut digits) = digits.to_i128() else {
+        return false;
+    };
+    if exp > *scale {
+        let Some(rescaled) = u32::try_from(exp - *scale)
+            .ok()
+            .and_then(|e| 10i128.checked_pow(e))
+            .and_then(|f| sum.checked_mul(f))
+        else {
+            return false;
+        };
+        *sum = rescaled;
+        *scale = exp;
+    } else if exp < *scale {
+        let Some(d) = u32::try_from(*scale - exp)
+            .ok()
+            .and_then(|e| 10i128.checked_pow(e))
+            .and_then(|f| digits.checked_mul(f))
+        else {
+            return false;
+        };
+        digits = d;
+    }
+    match sum.checked_add(digits) {
+        Some(s) => {
+            *sum = s;
+            *count += 1;
+            true
+        }
+        None => false,
     }
 }
 
 /// Add one row's floating value to the accumulator. NaN is dropped (neither
 /// summed nor counted), mirroring the standard aggregate pipeline's numeric
-/// coercion, so a NaN value can't poison SUM/AVG or inflate the count.
+/// coercion, so a NaN value can't poison SUM/AVG or inflate the count. A
+/// physical exact or text column under a double datatype converts, as the
+/// generic path does.
 fn accumulate_double_row(col: &Column, row: usize, sum: &mut f64, count: &mut u64) {
-    match col {
-        Column::Float64(values) => {
-            if let Some(Some(v)) = values.get(row) {
-                if !v.is_nan() {
-                    *sum += *v;
-                    *count += 1;
-                }
-            }
+    let v: Option<f64> = match col {
+        Column::Float64(values) => values.get(row).copied().flatten(),
+        Column::Float32(values) => values.get(row).copied().flatten().map(f64::from),
+        Column::Int64(values) => values.get(row).copied().flatten().map(|i| i as f64),
+        Column::Int32(values) => values.get(row).copied().flatten().map(f64::from),
+        Column::Decimal { values, scale, .. } => values
+            .get(row)
+            .copied()
+            .flatten()
+            .map(|u| u as f64 / 10f64.powi(i32::from(*scale))),
+        Column::String(values) => values
+            .get(row)
+            .and_then(|o| o.as_deref())
+            .and_then(|t| t.trim().parse::<f64>().ok()),
+        _ => None,
+    };
+    if let Some(v) = v {
+        if !v.is_nan() {
+            *sum += v;
+            *count += 1;
         }
-        Column::Float32(values) => {
-            if let Some(Some(v)) = values.get(row) {
-                if !v.is_nan() {
-                    *sum += *v as f64;
-                    *count += 1;
-                }
-            }
-        }
-        _ => {}
     }
 }
 
@@ -7205,6 +7298,111 @@ mod tests {
         accumulate_double_row(&col32, 1, &mut sum, &mut count);
         assert_eq!(count, 1);
         assert_eq!(sum, 2.0);
+    }
+
+    #[test]
+    fn text_typed_numeric_columns_fold_like_the_generic_path() {
+        // A `NUMERIC` column a SQLite bridge reports as varchar: the generic
+        // path parses each value, so the fold must sum the text (it used to
+        // skip such rows and report 0 with a count of 0).
+        let col = Column::String(vec![
+            Some("99.50".into()),
+            None,
+            Some("5".into()),
+            Some("2.125".into()),
+        ]);
+        let (mut sum, mut scale, mut count) = (0i128, 0i64, 0u64);
+        for row in 0..4 {
+            assert!(accumulate_exact_row(
+                &col, row, &mut sum, &mut scale, &mut count
+            ));
+        }
+        assert_eq!(count, 3);
+        assert_eq!(
+            (sum, scale),
+            (106_625, 3),
+            "99.50 + 5 + 2.125 at the widest scale"
+        );
+
+        // A physical double under an exact datatype (SQLite NUMERIC behind
+        // the bridge) converts too.
+        let dbl = Column::Float64(vec![Some(99.5), None, Some(5.0)]);
+        let (mut sum, mut scale, mut count) = (0i128, 0i64, 0u64);
+        for row in 0..3 {
+            assert!(accumulate_exact_row(
+                &dbl, row, &mut sum, &mut scale, &mut count
+            ));
+        }
+        assert_eq!(count, 2);
+        assert_eq!((sum, scale), (1045, 1));
+
+        let (mut dsum, mut dcount) = (0.0f64, 0u64);
+        for row in 0..4 {
+            accumulate_double_row(&col, row, &mut dsum, &mut dcount);
+        }
+        assert_eq!(dcount, 3);
+        assert_eq!(dsum, 106.625);
+    }
+
+    #[test]
+    fn float_columns_fold_on_the_generic_lane_lexical() {
+        // Money-shaped doubles are not dyadic, so their exact binary expansion
+        // runs to scale 48 (f64) / 19 (f32). Folding that expansion would bail
+        // the f64 fast path on the first row and make the f32 one disagree with
+        // the generic lane; both must fold the `to_string()` lexical the
+        // generic lane materializes and parses.
+        let dbl = Column::Float64(vec![Some(19.99), None, Some(5.0)]);
+        let (mut sum, mut scale, mut count) = (0i128, 0i64, 0u64);
+        for row in 0..3 {
+            assert!(
+                accumulate_exact_row(&dbl, row, &mut sum, &mut scale, &mut count),
+                "a non-dyadic double must fold, not escalate"
+            );
+        }
+        assert_eq!(count, 2);
+        assert_eq!((sum, scale), (2499, 2), "19.99 + 5 at the widest scale");
+
+        let flt = Column::Float32(vec![Some(19.99f32), Some(5.0f32)]);
+        let (mut sum, mut scale, mut count) = (0i128, 0i64, 0u64);
+        for row in 0..2 {
+            assert!(accumulate_exact_row(
+                &flt, row, &mut sum, &mut scale, &mut count
+            ));
+        }
+        assert_eq!(count, 2);
+        assert_eq!(
+            (sum, scale),
+            (2499, 2),
+            "f32 must give the generic lane's 24.99, not 24.9899997711181640625"
+        );
+    }
+
+    #[test]
+    fn unconvertible_exact_cells_escalate_rather_than_omit() {
+        // The generic lane materializes these under the exact datatype,
+        // `binding_to_numeric` fails, and SUM/AVG poison the group to unbound
+        // (SPARQL 18.5.1, agg-err-01). The fold cannot silently sum the rest:
+        // `false` hands the query to the exact pipeline, which poisons.
+        for col in [
+            Column::String(vec![Some("abc".into())]),
+            Column::Float64(vec![Some(f64::NAN)]),
+            Column::Float64(vec![Some(f64::INFINITY)]),
+            Column::Float32(vec![Some(f32::NAN)]),
+        ] {
+            let (mut sum, mut scale, mut count) = (0i128, 0i64, 0u64);
+            assert!(
+                !accumulate_exact_row(&col, 0, &mut sum, &mut scale, &mut count),
+                "an unconvertible cell must escalate, not be omitted"
+            );
+        }
+
+        // A null is still a legitimate drop, not an escalation.
+        let nulls = Column::String(vec![None]);
+        let (mut sum, mut scale, mut count) = (0i128, 0i64, 0u64);
+        assert!(accumulate_exact_row(
+            &nulls, 0, &mut sum, &mut scale, &mut count
+        ));
+        assert_eq!(count, 0);
     }
 
     #[test]
