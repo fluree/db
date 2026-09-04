@@ -78,8 +78,8 @@ impl IdPropertyHll {
     /// HLL: register-wise max. Counts: additive. last_modified_t: max.
     pub fn merge_from(&mut self, other: &IdPropertyHll) {
         self.count += other.count;
-        self.values_hll.merge_inplace(&other.values_hll);
-        self.subjects_hll.merge_inplace(&other.subjects_hll);
+        self.values_hll.merge(&other.values_hll);
+        self.subjects_hll.merge(&other.subjects_hll);
         self.last_modified_t = self.last_modified_t.max(other.last_modified_t);
         for (&dt, &delta) in &other.datatypes {
             *self.datatypes.entry(dt).or_insert(0) += delta;

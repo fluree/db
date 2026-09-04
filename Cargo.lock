@@ -2797,6 +2797,7 @@ dependencies = [
  "fluree-db-sparql",
  "fluree-db-spatial",
  "fluree-db-sql",
+ "fluree-db-stats",
  "fluree-db-storage-aws",
  "fluree-db-storage-ipfs",
  "fluree-db-tabular",
@@ -3220,6 +3221,7 @@ dependencies = [
  "fluree-db-nameservice",
  "fluree-db-novelty",
  "fluree-db-spatial",
+ "fluree-db-stats",
  "fluree-vocab",
  "futures",
  "hex",
@@ -3636,6 +3638,18 @@ dependencies = [
  "tokio",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "fluree-db-stats"
+version = "4.1.6"
+dependencies = [
+ "fluree-db-tabular",
+ "hex",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "xxhash-rust",
 ]
 
 [[package]]
