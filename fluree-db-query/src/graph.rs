@@ -142,22 +142,28 @@ impl GraphOperator {
         let parent_schema: std::collections::HashSet<VarId> =
             child.schema().iter().copied().collect();
 
-        let mut inner_vars: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+        // Collected in pattern order, not through a set: the output schema is
+        // part of this operator's contract, and a parent that resolved column
+        // positions against the schema declared at plan time (see
+        // `r2rml::sql_lane::SqlBlockOperator`) needs the batches to match it. A
+        // `HashSet` here seeds a fresh `RandomState` per construction, so with
+        // two or more new variables the order differed run to run.
+        let mut new_vars: Vec<VarId> = Vec::new();
+        let push_new = |v: VarId, out: &mut Vec<VarId>| {
+            if !parent_schema.contains(&v) && !out.contains(&v) {
+                out.push(v);
+            }
+        };
         for p in &inner_patterns {
-            inner_vars.extend(p.produced_vars());
+            for v in p.produced_vars() {
+                push_new(v, &mut new_vars);
+            }
         }
 
         // If graph_name is a variable, it may be bound by this operator
         if let GraphName::Var(var) = &graph_name {
-            inner_vars.insert(*var);
+            push_new(*var, &mut new_vars);
         }
-
-        // New vars are inner vars not in parent schema
-        let new_vars: Vec<VarId> = inner_vars
-            .iter()
-            .copied()
-            .filter(|v| !parent_schema.contains(v))
-            .collect();
 
         // Output schema = parent schema + new vars
         let mut schema_vec: Vec<VarId> = child.schema().to_vec();
@@ -975,6 +981,82 @@ mod tests {
         assert!(op.schema().contains(&VarId(0)));
         assert!(op.schema().contains(&VarId(1)));
         assert!(op.schema().contains(&VarId(2))); // Graph variable
+    }
+
+    /// The output schema is part of this operator's contract: `SqlBlockOperator`
+    /// declares the same schema at plan time and hands its parent column
+    /// positions resolved against it, so a mismatch is an error there rather
+    /// than something to permute around. Deriving `new_vars` from a `HashSet`
+    /// made the order differ run to run once a block bound two or more new
+    /// variables — the existing schema tests use `contains`, so they could not
+    /// see it. Assert the exact order, and repeatedly: a fresh `RandomState`
+    /// per construction means one sample proves nothing.
+    #[test]
+    fn new_vars_follow_pattern_order_not_set_order() {
+        let inner = |s: VarId, p: &str, o: VarId| {
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Sid(Sid::new(100, p)),
+                Term::Var(o),
+            ))
+        };
+
+        for _ in 0..64 {
+            let child: BoxedOperator = Box::new(TestChildOperator {
+                schema: Arc::from(vec![VarId(0)].into_boxed_slice()),
+            });
+            // Five new variables: 1/5! chance of matching by luck per run.
+            let patterns = vec![
+                inner(VarId(0), "a", VarId(4)),
+                inner(VarId(0), "b", VarId(2)),
+                inner(VarId(0), "c", VarId(5)),
+                inner(VarId(0), "d", VarId(1)),
+                // A repeat must not re-add VarId(2), and VarId(0) is already
+                // in the parent schema.
+                inner(VarId(0), "e", VarId(2)),
+                inner(VarId(0), "f", VarId(3)),
+            ];
+            let op = GraphOperator::new(
+                child,
+                GraphName::Iri(Arc::from("http://example.org/g")),
+                patterns,
+                crate::temporal_mode::PlanningContext::current(),
+            );
+            assert_eq!(
+                op.schema(),
+                &[VarId(0), VarId(4), VarId(2), VarId(5), VarId(1), VarId(3)],
+                "parent schema then inner-produced vars in pattern order"
+            );
+        }
+    }
+
+    /// The graph variable is appended after the pattern-produced vars, and only
+    /// when the patterns did not already bind it.
+    #[test]
+    fn graph_var_is_appended_deterministically() {
+        for _ in 0..32 {
+            let child: BoxedOperator = Box::new(TestChildOperator {
+                schema: Arc::from(vec![VarId(0)].into_boxed_slice()),
+            });
+            let op = GraphOperator::new(
+                child,
+                GraphName::Var(VarId(9)),
+                vec![
+                    Pattern::Triple(TriplePattern::new(
+                        Ref::Var(VarId(0)),
+                        Ref::Sid(Sid::new(100, "name")),
+                        Term::Var(VarId(2)),
+                    )),
+                    Pattern::Triple(TriplePattern::new(
+                        Ref::Var(VarId(0)),
+                        Ref::Sid(Sid::new(100, "age")),
+                        Term::Var(VarId(1)),
+                    )),
+                ],
+                crate::temporal_mode::PlanningContext::current(),
+            );
+            assert_eq!(op.schema(), &[VarId(0), VarId(2), VarId(1), VarId(9)]);
+        }
     }
 
     #[test]

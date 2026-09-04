@@ -553,6 +553,12 @@ impl Operator for SqlAggregateOperator {
         if batch.schema() == self.schema.as_ref() {
             return Ok(Some(batch));
         }
+        // Unlike `SqlBlockOperator`, this permute is real rather than an
+        // ordering accident: the fallback is a fused or generic aggregate tree
+        // whose schema follows the query's projection, while this operator
+        // declares `group_by` then `aggregates`. It stays a copy, and is bounded
+        // by the number of groups (each batch here is already aggregated), not
+        // by the row stream.
         let mut columns: Vec<Vec<Binding>> = Vec::with_capacity(self.schema.len());
         for var in self.schema.iter() {
             columns.push(match batch.column(*var) {

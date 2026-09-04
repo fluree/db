@@ -342,22 +342,19 @@ impl Operator for SqlBlockOperator {
         let Some(batch) = chain.next_batch(ctx).await? else {
             return Ok(None);
         };
-        if batch.schema() == self.schema.as_ref() {
-            return Ok(Some(batch));
+        if batch.schema() != self.schema.as_ref() {
+            // Both the lane and the fallback `GraphOperator` declare their
+            // schema in pattern order, so this cannot differ. Permuting here
+            // instead would rebuild every batch of every declined block — the
+            // common path on a native ledger, where `admits` is shape-only — and
+            // the fallback has to be free for the wrap to be acceptable there.
+            return Err(QueryError::Internal(format!(
+                "sql lane fallback changed the block's schema: declared {:?}, got {:?}",
+                self.schema.as_ref(),
+                batch.schema()
+            )));
         }
-        // The fallback `GraphOperator` orders its output from a set, so one
-        // built at open can differ from the schema declared at plan time,
-        // which parents resolved column positions against. Permute into it.
-        let mut columns: Vec<Vec<Binding>> = Vec::with_capacity(self.schema.len());
-        for var in self.schema.iter() {
-            columns.push(match batch.column(*var) {
-                Some(col) => col.to_vec(),
-                None => vec![Binding::Unbound; batch.len()],
-            });
-        }
-        Batch::new(Arc::clone(&self.schema), columns)
-            .map(Some)
-            .map_err(|e| QueryError::Internal(e.to_string()))
+        Ok(Some(batch))
     }
 
     fn close(&mut self) {
