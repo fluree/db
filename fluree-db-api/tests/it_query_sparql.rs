@@ -6981,6 +6981,17 @@ const RANGE_FILTER_CASES: &[(&str, &str, &[&str])] = &[
     ("ex:price", "?v < 5 && ?v < 0.01", &["b"]),
     ("ex:price", "?v < 0.01 && ?v < 5", &["b"]),
     ("ex:price", "?v > 0.5 && ?v > 0e0", &["a", "c", "e"]),
+    ("ex:price", "?v >= 0 && ?v > 100000000000000000000", &[]),
+    (
+        "ex:price",
+        "?v >= 0 && ?v < 100000000000000000000",
+        &["a", "b", "c", "d", "e", "f"],
+    ),
+    (
+        "ex:price",
+        "?v > -100000000000000000000",
+        &["a", "b", "c", "d", "e", "f"],
+    ),
     // Contradictory across types: empty, not "everything".
     ("ex:price", "?v > 1.5 && ?v < 1", &[]),
     // A conjunct with no RangeValue at all (xsd:integer past i64) must keep the
