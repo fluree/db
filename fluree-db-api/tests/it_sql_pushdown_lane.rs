@@ -1469,9 +1469,9 @@ async fn class_policy_on_a_derived_type_pushes_a_predicate() {
 }
 
 /// Outer bindings above the provider's key-set row cap go out as several
-/// statements; a `VALUES` or `IN` list inside the block above the cap is
-/// not pushed at all (the block still runs on the lane, the list in the
-/// engine), since the block's own key set is not chunked.
+/// statements. Inside the block, the key set is not chunked: an `IN` list
+/// above the cap stays a residual on the lane, and a `VALUES` block above it
+/// declines the block to the engine.
 #[tokio::test]
 async fn key_sets_above_the_cap_chunk_or_stay_in_the_engine() {
     let _lock = KILL_SWITCH.lock().await;
