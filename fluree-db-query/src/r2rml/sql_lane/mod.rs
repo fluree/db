@@ -141,6 +141,9 @@ const BLOCK_CACHE_MAX_BYTES: usize = 64 << 20;
 /// wrong call on the side that only costs what it costs today.
 const CACHE_ROWS_PER_OUTER_ROW: usize = 4;
 
+/// Alias of the bounded fetch the size probe counts.
+const PROBE_ALIAS: &str = "p";
+
 fn block_cache_max_rows() -> usize {
     std::env::var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS")
         .ok()
@@ -776,9 +779,16 @@ impl SqlBlockSource {
             QueryError::InvalidQuery("R2RML table provider not configured".into())
         })?;
         use futures::StreamExt;
-        let lowered = self.lowered(branch);
+        // Counted through the fetch statement bounded at the cap plus one:
+        // the answer past the cap is only "too large", so the probe never
+        // scans further than a fetch would.
+        let mut probe = self.plan_for_cache(branch);
+        probe.limit = Some(max_rows as u64 + 1);
         let count_plan = RelPlan {
-            root: lowered.root.clone(),
+            root: RelNode::Derived {
+                alias: PROBE_ALIAS.into(),
+                plan: Box::new(probe),
+            },
             output: vec![OutputCol {
                 expr: OutputExpr::CountRows,
                 name: "n".into(),

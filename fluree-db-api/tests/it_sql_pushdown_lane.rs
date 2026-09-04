@@ -2116,7 +2116,7 @@ async fn key_sets_above_the_cap_chunk_or_stay_in_the_engine() {
     );
     assert_eq!(
         sent[0],
-        r#"SELECT COUNT(*) AS "n" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#
+        r#"SELECT COUNT(*) AS "n" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL LIMIT 100001) AS "p""#
     );
     assert_eq!(
         sent[1],
@@ -2139,7 +2139,12 @@ async fn key_sets_above_the_cap_chunk_or_stay_in_the_engine() {
         3,
         "a COUNT(*) probe, then 2000 + 1 keys: {sent:?}"
     );
-    assert!(sent[0].starts_with("SELECT COUNT(*)"), "{}", sent[0]);
+    // The probe is bounded at the cap plus one: it never scans past the cap.
+    assert!(
+        sent[0].starts_with("SELECT COUNT(*)") && sent[0].contains("LIMIT 3) AS \"p\""),
+        "{}",
+        sent[0]
+    );
     assert!(sent[1].contains("(2000)") && !sent[1].contains("(2001)"));
     assert!(sent[2].contains("(VALUES (2001)) AS \"k\""), "{}", sent[2]);
 
