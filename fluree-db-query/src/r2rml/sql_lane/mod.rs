@@ -128,6 +128,11 @@ pub(crate) fn sql_pushdown_lane_enabled() -> bool {
 /// `FLUREE_SQL_PUSHDOWN_CACHE_ROWS` overrides; `0` keeps every batch seeded.
 const BLOCK_CACHE_MAX_ROWS: usize = 100_000;
 
+/// Bytes a cached block may hold, estimated from its materialized rows: the
+/// row cap alone leaves wide text columns unbounded. The join index adds a
+/// copy of every key on top. `FLUREE_SQL_PUSHDOWN_CACHE_BYTES` overrides.
+const BLOCK_CACHE_MAX_BYTES: usize = 64 << 20;
+
 /// Block rows per outer row above which seeding stays cheaper than fetching
 /// the block whole. On the 1M-row Postgres probe a seeded key costs ~7.6µs
 /// and a fetched row ~1.4µs, so the break-even is near five; four keeps the
@@ -139,6 +144,31 @@ fn block_cache_max_rows() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(BLOCK_CACHE_MAX_ROWS)
+}
+
+fn block_cache_max_bytes() -> usize {
+    std::env::var("FLUREE_SQL_PUSHDOWN_CACHE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BLOCK_CACHE_MAX_BYTES)
+}
+
+/// A row's footprint in the block cache: the bindings plus the heap their
+/// strings own. Encoded and numeric bindings own nothing.
+fn row_bytes(row: &[(VarId, Binding)]) -> usize {
+    row.iter()
+        .map(|(_, b)| {
+            let heap = match b {
+                Binding::Iri(s) | Binding::IriMatch { iri: s, .. } => s.len(),
+                Binding::Lit {
+                    val: fluree_db_core::FlakeValue::String(s),
+                    ..
+                } => s.len(),
+                _ => 0,
+            };
+            std::mem::size_of::<(VarId, Binding)>() + heap
+        })
+        .sum()
 }
 
 /// Whether the planner should route this GRAPH block through the lane.
@@ -339,6 +369,7 @@ pub(super) async fn resolve_block(
         mapping,
         schemas,
         cache_max_rows: block_cache_max_rows(),
+        cache_max_bytes: block_cache_max_bytes(),
     }))
 }
 
@@ -360,6 +391,8 @@ pub(super) struct Resolved {
     pub schemas: HashMap<RelSource, Arc<BatchSchema>>,
     /// See [`BLOCK_CACHE_MAX_ROWS`].
     pub cache_max_rows: usize,
+    /// See [`BLOCK_CACHE_MAX_BYTES`].
+    pub cache_max_bytes: usize,
 }
 
 #[async_trait::async_trait]
@@ -666,13 +699,29 @@ impl SqlBlockSource {
             order_by: Vec::new(),
             limit: None,
         };
-        let (sql, mut stream) = table_provider
+        // The count is an optimization: a provider that cannot run it, or a
+        // transient failure, leaves the branch seeded rather than failing a
+        // query the seeded path answers.
+        let (sql, mut stream) = match table_provider
             .execute_plan(&self.graph_iri, &count_plan)
-            .await?;
+            .await
+        {
+            Ok(started) => started,
+            Err(e) => {
+                tracing::debug!(branch, error = %e, "sql pushdown: block count failed, staying seeded");
+                return Ok(BlockCache::Seeded);
+            }
+        };
         ctx.tracker.record_statement(&self.graph_iri, &sql);
         let mut count: Option<i64> = None;
         while let Some(page) = stream.next().await {
-            let page = page?;
+            let page = match page {
+                Ok(page) => page,
+                Err(e) => {
+                    tracing::debug!(branch, error = %e, "sql pushdown: block count failed, staying seeded");
+                    return Ok(BlockCache::Seeded);
+                }
+            };
             count = match page.columns.first() {
                 Some(Column::Int64(v)) => v.first().copied().flatten(),
                 Some(Column::Int32(v)) => v.first().copied().flatten().map(i64::from),
@@ -718,25 +767,51 @@ impl SqlBlockSource {
         ctx: &ExecutionContext<'_>,
     ) -> Result<BlockCache> {
         let max_rows = self.resolved.cache_max_rows;
+        let max_bytes = self.resolved.cache_max_bytes;
         let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
             QueryError::InvalidQuery("R2RML table provider not configured".into())
         })?;
         use futures::StreamExt;
         let lowered = self.lowered(branch);
         let plan = self.plan_for_cache(branch);
-        let (sql, mut stream) = table_provider.execute_plan(&self.graph_iri, &plan).await?;
+        let (sql, mut stream) = match table_provider.execute_plan(&self.graph_iri, &plan).await {
+            Ok(started) => started,
+            Err(e) => {
+                tracing::debug!(branch, error = %e, "sql pushdown: block fetch failed, staying seeded");
+                return Ok(BlockCache::Seeded);
+            }
+        };
         ctx.tracker.record_statement(&self.graph_iri, &sql);
         let b = &self.resolved.branches[branch];
         let mut rows: Vec<Vec<(VarId, Binding)>> = Vec::with_capacity(count);
+        let mut bytes = 0usize;
         while let Some(page) = stream.next().await {
             ctx.checkpoint()?;
-            let batches = b.materializer.split_page(page?, &b.lowered.outputs)?;
+            let page = match page {
+                Ok(page) => page,
+                Err(e) => {
+                    tracing::debug!(branch, error = %e, "sql pushdown: block fetch failed, staying seeded");
+                    return Ok(BlockCache::Seeded);
+                }
+            };
+            let batches = b.materializer.split_page(page, &b.lowered.outputs)?;
             let num_rows = batches.values().next().map(|b| b.num_rows).unwrap_or(0);
             for i in 0..num_rows {
-                rows.push(b.materializer.row(&batches, i)?);
+                let row = b.materializer.row(&batches, i)?;
+                bytes += row_bytes(&row);
+                rows.push(row);
             }
             if rows.len() > max_rows {
                 tracing::debug!(branch, max_rows, "sql pushdown: block outgrew its count");
+                return Ok(BlockCache::Seeded);
+            }
+            if bytes > max_bytes {
+                tracing::debug!(
+                    branch,
+                    bytes,
+                    max_bytes,
+                    "sql pushdown: block outgrew the cache budget"
+                );
                 return Ok(BlockCache::Seeded);
             }
         }
