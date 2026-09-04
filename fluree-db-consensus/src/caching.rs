@@ -1153,6 +1153,7 @@ mod tests {
                     policy_enforcement: None,
                     reasoning: None,
                     sql: None,
+                    sql_elided: None,
                 }),
                 receipt: None,
             })),

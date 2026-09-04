@@ -108,6 +108,14 @@ pub struct SqlGsConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub duplicate_subject_tables: Vec<String>,
 
+    /// Tables whose uniqueness probe could not run (a timeout, or a dialect
+    /// that refused it). Kept apart from `duplicate_subject_tables` because
+    /// "not known to be unique" is not "known to be duplicated" and the two
+    /// need different advice. The lane refuses a statement over them for the
+    /// same reason it refuses a flagged one: it may not answer approximately.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unverified_subject_tables: Vec<String>,
+
     /// Accept duplicate subject keys: the probe still warns, queries proceed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_duplicate_subjects: bool,
@@ -129,6 +137,7 @@ impl SqlGsConfig {
             model: None,
             default_allow: None,
             duplicate_subject_tables: Vec::new(),
+            unverified_subject_tables: Vec::new(),
             allow_duplicate_subjects: false,
         }
     }

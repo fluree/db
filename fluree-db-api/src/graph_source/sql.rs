@@ -212,15 +212,30 @@ fn duplicate_probe_keys(mapping: &CompiledR2rmlMapping) -> Vec<(String, Vec<Stri
     out
 }
 
-/// Probe every table's subject keys for duplicates. Returns the flagged
-/// tables and human-readable warnings (a duplicate, or a probe that could not
-/// run — the latter never blocks registration).
+/// Probe every table's subject keys for duplicates.
+///
+/// Returns the tables found non-unique, the tables whose probe could not run,
+/// and human-readable warnings. A probe that errors used to warn and leave the
+/// table unflagged, so the lane then ran statements over a table whose
+/// uniqueness was unknown — the one thing the lane's contract does not allow.
+/// Those tables come back separately: the lane refuses them too, with advice
+/// that says which case it is.
+///
+/// Skipped entirely when the source is registered with
+/// `allow_duplicate_subjects`: nothing consumes the verdict, and the probe is
+/// a full-table aggregate whose only ceiling is the request timeout, which on
+/// a large table is enough to fail a registration outright.
 async fn probe_duplicate_subjects(
     client: &TrinoClient,
     mapping: &CompiledR2rmlMapping,
-) -> (Vec<String>, Vec<String>) {
+    allow_duplicate_subjects: bool,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut flagged = Vec::new();
+    let mut unverified = Vec::new();
     let mut warnings = Vec::new();
+    if allow_duplicate_subjects {
+        return (flagged, unverified, warnings);
+    }
     for (table, keys) in duplicate_probe_keys(mapping) {
         let source = match mapping.sql_query_for_table(&table) {
             Some(sql) => LogicalSource::Query(sql.to_string()),
@@ -237,12 +252,17 @@ async fn probe_duplicate_subjects(
                     flagged.push(table);
                 }
             }
-            Err(e) => warnings.push(format!(
-                "table '{table}': could not probe subject key uniqueness: {e}"
-            )),
+            Err(e) => {
+                warnings.push(format!(
+                    "table '{table}': could not probe subject key uniqueness: {e}; the pushdown \
+                     lane refuses statements over it until a `check` succeeds (register with \
+                     allow_duplicate_subjects to proceed anyway)"
+                ));
+                unverified.push(table);
+            }
         }
     }
-    (flagged, warnings)
+    (flagged, unverified, warnings)
 }
 
 impl crate::Fluree {
@@ -321,8 +341,14 @@ impl crate::Fluree {
             Ok(client) => match client.execute_collect("SELECT 1").await {
                 Ok(_) => {
                     if let Some(mapping) = &compiled_for_probe {
-                        let (flagged, warnings) = probe_duplicate_subjects(&client, mapping).await;
+                        let (flagged, unverified, warnings) = probe_duplicate_subjects(
+                            &client,
+                            mapping,
+                            gs_config.allow_duplicate_subjects,
+                        )
+                        .await;
                         gs_config.duplicate_subject_tables = flagged;
+                        gs_config.unverified_subject_tables = unverified;
                         mapping_warnings = warnings;
                     }
                     true
@@ -422,8 +448,10 @@ impl crate::Fluree {
         let client = build_sql_client(&config, self.secret_resolver())
             .await
             .map_err(|e| crate::ApiError::Config(e.to_string()))?;
-        let (flagged, mapping_warnings) = probe_duplicate_subjects(&client, &compiled).await;
+        let (flagged, unverified, mapping_warnings) =
+            probe_duplicate_subjects(&client, &compiled, config.allow_duplicate_subjects).await;
         config.duplicate_subject_tables = flagged.clone();
+        config.unverified_subject_tables = unverified;
         let (name, branch) = graph_source_id
             .rsplit_once(':')
             .unwrap_or((graph_source_id, "main"));
@@ -610,25 +638,54 @@ impl SqlSource {
         plan: &RelPlan,
     ) -> QueryResult<(String, ColumnBatchStream)> {
         if !self.config.allow_duplicate_subjects {
-            let touched: Vec<&str> = plan
-                .root
-                .accesses()
-                .iter()
-                .filter_map(|(_, src)| match src {
-                    RelSource::Table(t) => self
-                        .config
-                        .duplicate_subject_tables
-                        .iter()
-                        .any(|d| d == t)
-                        .then_some(t.as_str()),
-                    RelSource::Query(_) => None,
-                })
-                .collect();
+            // A flagged name is whatever the probe saw, which for an
+            // `rr:sqlQuery`-backed map is the synthetic alias, never the query
+            // text the plan carries. Matching only `RelSource::Table` therefore
+            // let every query-backed map through: flagged at registration,
+            // warned about, then run on the lane anyway with the very row
+            // multiplicities the check exists to refuse. Resolve each flagged
+            // name to the source the plan would use and compare both variants.
+            let as_sources = |names: &[String]| -> Vec<RelSource> {
+                names
+                    .iter()
+                    .map(|t| match mapping.sql_query_for_table(t) {
+                        Some(sql) => RelSource::Query(sql.to_string()),
+                        None => RelSource::Table(t.clone()),
+                    })
+                    .collect()
+            };
+            let touching = |names: &[String]| -> Vec<String> {
+                let sources = as_sources(names);
+                plan.root
+                    .accesses()
+                    .iter()
+                    .filter(|(_, src)| sources.contains(src))
+                    .map(|(_, src)| match src {
+                        RelSource::Table(t) => t.clone(),
+                        RelSource::Query(_) => "<rr:sqlQuery>".to_string(),
+                    })
+                    .collect()
+            };
+            let touched = touching(&self.config.duplicate_subject_tables);
             if !touched.is_empty() {
                 return Err(QueryError::InvalidQuery(format!(
-                    "SQL graph source '{}': table(s) {} have non-unique subject keys, so a                      statement over them would return wrong row multiplicities; fix the mapping                      (map from a view with distinct keys), or re-register with                      allow_duplicate_subjects to accept duplicate rows",
+                    "SQL graph source '{}': table(s) {} have non-unique subject keys, so a \
+                     statement over them would return wrong row multiplicities; fix the mapping \
+                     (map from a view with distinct keys), or re-register with \
+                     allow_duplicate_subjects to accept duplicate rows",
                     self.graph_source_id,
                     touched.join(", ")
+                )));
+            }
+            let unverified = touching(&self.config.unverified_subject_tables);
+            if !unverified.is_empty() {
+                return Err(QueryError::InvalidQuery(format!(
+                    "SQL graph source '{}': subject key uniqueness for table(s) {} could not be \
+                     probed, so a statement over them may return wrong row multiplicities; run \
+                     `fluree sql check` once the endpoint can answer the probe, or re-register \
+                     with allow_duplicate_subjects to proceed without it",
+                    self.graph_source_id,
+                    unverified.join(", ")
                 )));
             }
         }

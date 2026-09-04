@@ -252,8 +252,12 @@ struct TrackerInner {
     // reasoning mode ran). Not gated by an option: a capped materialization
     // is a correctness signal, so any enabled tracker reports it.
     reasoning: RwLock<Option<ReasoningTally>>,
-    /// Statements the SQL pushdown lane sent to graph sources, in order.
+    /// Statements the SQL pushdown lane sent to graph sources, in order,
+    /// capped at [`STATEMENT_REPORT_CAP`].
     statements: RwLock<Vec<PushedStatement>>,
+    /// Statements sent past the cap, so a truncated report says so rather
+    /// than reading as the whole story.
+    statements_elided: AtomicU64,
 
     options: TrackingOptions,
 }
@@ -279,6 +283,7 @@ impl Tracker {
             policy_enforcement: RwLock::new(None),
             reasoning: RwLock::new(None),
             statements: RwLock::new(Vec::new()),
+            statements_elided: AtomicU64::new(0),
             options,
         })))
     }
@@ -448,7 +453,16 @@ impl Tracker {
         let Some(inner) = &self.0 else {
             return;
         };
+        // Bounded: outer bindings chunk at 2,000 rows and a statement may run
+        // to `statement_max_bytes` (1 MiB), so an unbounded tally over a large
+        // seed set retains tens of MiB and echoes all of it in the response.
+        // The first `STATEMENT_REPORT_CAP` are what a reader needs to see the
+        // shape; the rest are counted, never silently dropped.
         if let Ok(mut slot) = inner.statements.write() {
+            if slot.len() >= STATEMENT_REPORT_CAP {
+                inner.statements_elided.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             slot.push(PushedStatement {
                 source: source.to_string(),
                 sql: sql.to_string(),
@@ -505,6 +519,10 @@ impl Tracker {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .map(|s| s.clone()),
+            sql_elided: match inner.statements_elided.load(Ordering::Relaxed) {
+                0 => None,
+                n => Some(n),
+            },
         })
     }
 }
@@ -533,7 +551,15 @@ pub struct TrackingTally {
     /// they ran. Absent when no block was pushed down.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql: Option<Vec<PushedStatement>>,
+    /// Statements sent beyond the reported cap. Present only when `sql` is a
+    /// prefix rather than the whole list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_elided: Option<u64>,
 }
+
+/// How many pushed statements a tracked response lists before it starts
+/// counting instead.
+pub const STATEMENT_REPORT_CAP: usize = 64;
 
 /// One statement the SQL pushdown lane sent to a graph source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

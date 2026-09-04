@@ -162,6 +162,9 @@ pub struct TrackedQueryResponse {
     /// Statements the SQL pushdown lane sent to graph sources, in order.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql: Option<Vec<fluree_db_core::PushedStatement>>,
+    /// Statements sent beyond the reported cap, when `sql` is a prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_elided: Option<u64>,
 }
 
 impl TrackedQueryResponse {
@@ -175,6 +178,7 @@ impl TrackedQueryResponse {
                 policy_enforcement,
                 reasoning,
                 sql,
+                sql_elided,
             }) => Self {
                 status: 200,
                 result,
@@ -184,6 +188,7 @@ impl TrackedQueryResponse {
                 policy_enforcement,
                 reasoning,
                 sql,
+                sql_elided,
             },
             None => Self {
                 status: 200,
@@ -194,6 +199,7 @@ impl TrackedQueryResponse {
                 policy_enforcement: None,
                 reasoning: None,
                 sql: None,
+                sql_elided: None,
             },
         }
     }
