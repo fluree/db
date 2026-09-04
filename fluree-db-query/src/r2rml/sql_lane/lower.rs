@@ -743,8 +743,9 @@ impl<'a> Lowerer<'a> {
     /// the probed column type must carry the class natively (a numeric
     /// literal against a text column the mapping *reads* as a number is the
     /// engine's comparison, not the database's). A dateTime literal is a UTC
-    /// instant, exact only against a zoned column. An unprobed column is
-    /// trusted; the renderer then types the literal.
+    /// instant; a zoneless column is read as UTC, so it is exact there too,
+    /// except where the database keeps it as text in an unknown format. An
+    /// unprobed column is trusted; the renderer then types the literal.
     fn literal_exact(&self, col: &ColRef, class: &RdfClass) -> bool {
         use FieldType as F;
         let Some(ty) = self.field_type(col) else {
@@ -758,7 +759,9 @@ impl<'a> Lowerer<'a> {
             RdfClass::Str | RdfClass::LangStr(_) => ty == F::String,
             RdfClass::Bool => ty == F::Boolean,
             RdfClass::Date => ty == F::Date,
-            RdfClass::DateTime => ty == F::TimestampTz,
+            RdfClass::DateTime => {
+                ty == F::TimestampTz || (ty == F::Timestamp && !self.caps.timestamp_is_text)
+            }
             RdfClass::Iri | RdfClass::Other => true,
         }
     }
@@ -1747,7 +1750,7 @@ impl<'a> Lowerer<'a> {
                 Some(Pred::Like { col, pattern })
             }
             Function::Eq | Function::Lt | Function::Le | Function::Gt | Function::Ge => {
-                self.naive_timestamp_window(func, args)
+                self.text_timestamp_day_bounds(func, args)
             }
             // `^literal` with no flags is a case-sensitive prefix.
             Function::Regex => {
@@ -1768,13 +1771,16 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// An `xsd:dateTime` literal (a UTC instant) compared with a `timestamp`
-    /// column that carries no zone: the column's values sit within
-    /// [`NAIVE_ZONE_SPAN`] of the instant they denote whatever zone they were
-    /// written in, so a window that wide around the literal keeps every row
-    /// the exact comparison can. Rendered naive, so the database converts
-    /// nothing. Where timestamps are text the bounds are whole days.
-    fn naive_timestamp_window(&self, func: &Function, args: &[Expression]) -> Option<Pred> {
+    /// An `xsd:dateTime` literal compared with a timestamp the database
+    /// keeps as text (SQLite), in whatever format its writer used: the day
+    /// of the literal bounds the comparison, `'2024-01-10'` sorting below
+    /// every timestamp of that day with either time separator, and the
+    /// engine applies the exact one. The column is read as UTC, like every
+    /// zoneless timestamp, so the literal's own day is the bound.
+    fn text_timestamp_day_bounds(&self, func: &Function, args: &[Expression]) -> Option<Pred> {
+        if !self.caps.timestamp_is_text {
+            return None;
+        }
         let (var, lit, reversed) = match args {
             [Expression::Var(v), Expression::Const(c)] => (*v, c, false),
             [Expression::Const(c), Expression::Var(v)] => (*v, c, true),
@@ -1789,24 +1795,9 @@ impl<'a> Lowerer<'a> {
         let (Literal::Timestamp { micros, tz: true }, _) = literal_of(lit, None)? else {
             return None;
         };
-        let lo = micros.checked_sub(NAIVE_ZONE_SPAN)?;
-        let hi = micros.checked_add(NAIVE_ZONE_SPAN)?;
-        // Text bounds are the day of the low end and the day after the high
-        // end, so the upper comparison is strict.
-        let bound = |micros: i64, upper: bool| -> Option<Literal> {
-            if self.caps.timestamp_is_text {
-                let day = micros.div_euclid(MICROS_PER_DAY) + i64::from(upper);
-                Some(Literal::Date(i32::try_from(day).ok()?))
-            } else {
-                Some(Literal::Timestamp { micros, tz: false })
-            }
-        };
-        let (lo, hi) = (bound(lo, false)?, bound(hi, true)?);
-        let hi_op = if self.caps.timestamp_is_text {
-            CmpOp::Lt
-        } else {
-            CmpOp::LtEq
-        };
+        let day = micros.div_euclid(MICROS_PER_DAY);
+        let bound = |day: i64| Some(Literal::Date(i32::try_from(day).ok()?));
+        let (lo, hi) = (bound(day)?, bound(day + 1)?);
         let cmp = |op, value| Pred::Cmp {
             col: col.clone(),
             op,
@@ -1814,8 +1805,8 @@ impl<'a> Lowerer<'a> {
         };
         let below = matches!(func, Function::Lt | Function::Le) != reversed;
         Some(match func {
-            Function::Eq => Pred::And(vec![cmp(CmpOp::GtEq, lo), cmp(hi_op, hi)]),
-            _ if below => cmp(hi_op, hi),
+            Function::Eq => Pred::And(vec![cmp(CmpOp::GtEq, lo), cmp(CmpOp::Lt, hi)]),
+            _ if below => cmp(CmpOp::Lt, hi),
             _ => cmp(CmpOp::GtEq, lo),
         })
     }
@@ -2319,7 +2310,6 @@ fn decimal_literal(bd: &bigdecimal::BigDecimal) -> Option<Literal> {
 
 /// The widest offset a zone can put between a naive timestamp and the
 /// instant it denotes (UTC-12 to UTC+14), as micros.
-const NAIVE_ZONE_SPAN: i64 = 14 * 3_600 * 1_000_000;
 const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
 
 pub(crate) fn source_of_tm(tm: &TriplesMap) -> RelSource {

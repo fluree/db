@@ -206,15 +206,14 @@ pushable. In that statement:
   rows that come back: `STRSTARTS`, `STRENDS` and `CONTAINS` of a constant
   against a string column, and a `REGEX` anchored on a literal prefix with
   no flags, push a `LIKE` (a collation can only match more strings than a
-  byte prefix, never fewer). An `xsd:dateTime` literal compared (`=`, `<`,
-  `<=`, `>`, `>=`) with a `timestamp` column that has **no zone** pushes a
-  window of ±14 hours around the literal, rendered as a naive `TIMESTAMP`
-  so the database converts nothing: whatever zone the column was written
-  in, its values lie within that span of the instant they denote (UTC-12 to
-  UTC+14), so the window keeps every row the exact comparison can and the
-  engine, which reads the column as UTC, applies the exact one. On SQLite,
-  where a timestamp is text, the bounds are whole days (`>= '2024-01-09'`),
-  which order correctly with either time separator. Inside a conjunction
+  byte prefix, never fewer). An `xsd:dateTime` literal
+  compared with a `timestamp` column that has **no zone** pushes exactly,
+  rendered as a naive `TIMESTAMP` literal: the lane reads a zoneless column
+  as UTC when it builds the term, and the comparison follows the same
+  contract. On SQLite, where a timestamp is text in whatever format its
+  writer used, the comparison widens to whole-day bounds (`>= '2024-01-10'`),
+  which order correctly with either time separator, and the engine applies
+  the exact one. Inside a conjunction
   the parts that cannot be widened are simply dropped from the pushed
   predicate. A widened filter is a residual, so a `LIMIT` above it stays in
   the engine and a grouped query over it declines;
@@ -307,7 +306,9 @@ points, instants) and declines rather than approximate:
   `TIMESTAMP` literal there silently drops the zone and is read in the
   session's zone), `TIMESTAMP '…+00:00'` on MySQL. A naive `timestamp`
   column is taken as UTC when its term is built, on every dialect, and a
-  filter against it pushes the ±14h widening window described above.
+  filter against it pushes the literal rendered naive
+  (`TIMESTAMP '2024-01-10 00:00:00.000000'`) under the same contract;
+  SQLite's text timestamps take the day bounds described above.
 - A decimal's lexical form follows the scale the endpoint reports for the
   column (`decimal(10,2)` gives `99.50`); the bridge reports NUMERIC /
   DECIMAL columns at the scale it was started with (`--decimal-scale`,
@@ -364,7 +365,7 @@ rules then apply as for any source.
 | `varchar`, `char`, `json`, `uuid`, … | String | `xsd:string` |
 | `varbinary` | Bytes | `xsd:base64Binary` |
 | `date` | Date | `xsd:date` |
-| `timestamp(p)` | Timestamp | `xsd:dateTime` |
+| `timestamp(p)` | Timestamp | `xsd:dateTime` (read as UTC) |
 | `timestamp(p) with time zone` | TimestampTz | `xsd:dateTime` (UTC) |
 | `array`, `map`, `row` | String (Trino's JSON rendering) | `xsd:string` |
 
