@@ -201,8 +201,11 @@ pub fn assert_every_test_file_is_reachable(manifest_dir: &str) {
     let declared = declared_test_paths(&manifest);
     let reachable = reachable_from_declared_targets(root, &declared);
 
-    // Only top-level files become test binaries; subdirectories such as
-    // tests/support are pulled in by path and are not enumerated here.
+    // Only top-level files can become test binaries, so only they are
+    // enumerated. Files in subdirectories such as tests/support/ are modules
+    // of whichever binary pulls them in — via `#[path = "support/mod.rs"]`
+    // from a harness, or a bare `mod support;` from a standalone crate root —
+    // and cannot be orphaned in the sense this guard checks.
     let entries = match fs::read_dir(&tests_dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
