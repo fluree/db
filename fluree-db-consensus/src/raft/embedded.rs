@@ -79,6 +79,14 @@ pub struct EmbeddedRaftConfig {
     /// See [`LeaderTaskFactory`]. Defaults to none, which means
     /// **nothing indexes**.
     pub extra_leader_tasks: Option<LeaderTaskFactory>,
+    /// Per-attempt waiter timeout and attempt count for queued
+    /// submissions (`None` = the transactor's defaults, 8 s × 3). The
+    /// default is sized for leader transitions on a cluster; a
+    /// single-node host whose per-branch queue can run tens of seconds
+    /// deep (bulk publishes, sequential upsert chunks) wants a longer
+    /// wait, or a submission still queued gets reported stranded and
+    /// then commits anyway.
+    pub submit_wait: Option<(Duration, usize)>,
 }
 
 impl EmbeddedRaftConfig {
@@ -88,7 +96,15 @@ impl EmbeddedRaftConfig {
             index_config: fluree.default_index_config(),
             liveness: LivenessConfig::default(),
             extra_leader_tasks: None,
+            submit_wait: None,
         }
+    }
+
+    /// Override the queued transactor's per-attempt wait and attempt
+    /// count — see [`Self::submit_wait`].
+    pub fn with_submit_wait(mut self, timeout: Duration, max_retries: usize) -> Self {
+        self.submit_wait = Some((timeout, max_retries));
+        self
     }
 
     pub fn with_liveness(mut self, liveness: LivenessConfig) -> Self {
@@ -142,12 +158,17 @@ impl EmbeddedRaftNode {
         // through `EnqueueCommand` plus the per-process waiter and
         // staged-receipt maps; `CachingCommitter` on top dedupes keyed
         // retries before the queue propose.
-        let queued = QueuedTransactor::new(
+        let mut queued = QueuedTransactor::new(
             Arc::clone(&integration.raft),
             Arc::clone(&fluree),
             Arc::clone(&integration.waiter_map),
             integration.shared_state.clone(),
         );
+        if let Some((timeout, max_retries)) = config.submit_wait {
+            queued = queued
+                .with_wait_timeout(timeout)
+                .with_max_retries(max_retries);
+        }
         let committer: Arc<dyn SubmittingCommitter> = Arc::new(CachingCommitter::wrapping(queued));
 
         let release_task = integration
