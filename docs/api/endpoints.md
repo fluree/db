@@ -3091,6 +3091,7 @@ POST {api_base_url}/sql/map
 | `session` | object | Session properties sent as `X-Trino-Session` |
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
+| `allow_duplicate_subjects` | bool | Accept subject keys the registration probe finds non-unique; without it the pushdown lane refuses statements over the flagged tables. See [Subject keys must be unique](../graph-sources/sql.md#subject-keys-must-be-unique). |
 
 **Response:**
 
@@ -3103,11 +3104,12 @@ POST {api_base_url}/sql/map
   "triples_map_count": 3,
   "table_count": 2,
   "table_names": ["sales.customers", "sales.orders"],
-  "mapping_validated": true
+  "mapping_validated": true,
+  "mapping_warnings": ["table 'sales.order_lines': subject key (order_id) is not unique; …"]
 }
 ```
 
-`connection_tested` reports whether `SELECT 1` succeeded against the endpoint; a failure does not block registration.
+`connection_tested` reports whether `SELECT 1` succeeded against the endpoint; a failure does not block registration. `mapping_warnings` (omitted when empty) lists the findings of the subject-key uniqueness probe.
 
 **Status Codes:**
 - `201 Created` — graph source created

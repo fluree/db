@@ -146,6 +146,40 @@ impl R2rmlPolicyGate {
     /// statically (a column/template/ref `rdf:type` object map) that a class
     /// policy would need — the scan must then project those columns and
     /// materialize each row's classes.
+    /// Every `(triples map, predicate)` verdict the mapping can need, decided
+    /// up front for a lane that plans the whole block before reading a row.
+    /// `None` when a verdict depends on the row (subject-targeted policies,
+    /// or a class policy over a column-derived `rdf:type`).
+    pub(crate) async fn static_verdicts(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        mapping: &CompiledR2rmlMapping,
+    ) -> Result<Option<HashMap<(String, String), bool>>> {
+        if self.per_subject {
+            return Ok(None);
+        }
+        let mut out = HashMap::new();
+        for tm in mapping.triples_maps.values() {
+            if self.needs_row_classes(tm) {
+                return Ok(None);
+            }
+            let mut preds: Vec<String> = tm
+                .predicate_object_maps
+                .iter()
+                .filter_map(|pom| match &pom.predicate_map {
+                    fluree_db_r2rml::mapping::PredicateMap::Constant(p) => Some(p.clone()),
+                    _ => None,
+                })
+                .collect();
+            preds.push(rdf::TYPE.to_string());
+            for pred in preds {
+                let allowed = self.allows(ctx, tm, None, &pred, &[]).await?;
+                out.insert((tm.iri.clone(), pred), allowed);
+            }
+        }
+        Ok(Some(out))
+    }
+
     pub(crate) fn needs_row_classes(&self, tm: &TriplesMap) -> bool {
         self.has_class_policies && !derived_type_columns(tm).is_empty()
     }
@@ -434,7 +468,7 @@ pub(crate) fn static_classes(tm: &TriplesMap) -> Vec<String> {
 }
 
 /// Columns feeding a non-constant `rdf:type` object map of `tm`.
-fn derived_type_columns(tm: &TriplesMap) -> Vec<String> {
+pub(crate) fn derived_type_columns(tm: &TriplesMap) -> Vec<String> {
     let mut cols: Vec<String> = Vec::new();
     for pom in &tm.predicate_object_maps {
         if pom.predicate_map.as_constant() != Some(rdf::TYPE) {

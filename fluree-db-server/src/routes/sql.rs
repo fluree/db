@@ -55,6 +55,9 @@ pub struct SqlMapRequest {
     pub model: Option<String>,
     /// `default-allow` for governed requests that match no policy.
     pub default_allow: Option<bool>,
+    /// Accept subject keys the registration probe finds non-unique.
+    #[serde(default)]
+    pub allow_duplicate_subjects: Option<bool>,
 }
 
 /// Response for `POST /v1/fluree/sql/map`
@@ -72,6 +75,8 @@ pub struct SqlMapResponse {
     /// evaluate).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mapping_warnings: Vec<String>,
 }
 
 /// Map a SQL endpoint as a graph source
@@ -130,6 +135,7 @@ async fn sql_map_local(state: Arc<AppState>, request: Request) -> Result<impl In
             StatusCode::CREATED,
             Json(SqlMapResponse {
                 model_warnings: result.model_warnings,
+                mapping_warnings: result.mapping_warnings,
                 graph_source_id: result.graph_source_id,
                 endpoint: result.endpoint,
                 connection_tested: result.connection_tested,
@@ -157,6 +163,7 @@ fn build_sql_config(req: &SqlMapRequest) -> Result<fluree_db_api::SqlCreateConfi
     config.session = req.session.clone();
     config.model = req.model.clone();
     config.default_allow = req.default_allow;
+    config.allow_duplicate_subjects = req.allow_duplicate_subjects.unwrap_or(false);
 
     if let Some(d) = &req.dialect {
         config.dialect = match d.to_lowercase().as_str() {

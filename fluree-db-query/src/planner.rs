@@ -1018,6 +1018,34 @@ pub fn estimate_pattern(
             row_count: s2p.limit.map_or(DEFAULT_SEARCH_LIMIT, |l| l as f64),
         },
 
+        // An IRI-named graph keeps this ledger's statistics: `properties` is the
+        // cross-graph aggregate, so for the ledger's own named graphs it is the
+        // same information the default graph is estimated from, and dropping it
+        // would rank every inner triple at the unknown-scan default and reorder
+        // native plans that mix default-graph triples with a `GRAPH <g>` block.
+        //
+        // The one verdict that does not carry over is "empty". The name may
+        // instead be another ledger or a graph source, whose contents these
+        // statistics say nothing about, and a predicate that is merely absent
+        // *here* would rank the block as empty, place it first, and never let
+        // bound outer values seed it. So an estimate that claims the block is
+        // empty is demoted to the statless one, which reads as unknown. The cost
+        // is that a native named graph whose predicate is genuinely absent
+        // ledger-wide is no longer short-circuited into first place; that shape
+        // returns nothing either way.
+        Pattern::Graph {
+            name: crate::ir::GraphName::Iri(_),
+            patterns,
+        } => {
+            let with_stats = estimate_branch_cardinality(patterns, stats);
+            PatternEstimate::Source {
+                row_count: if with_stats > HIGHLY_SELECTIVE {
+                    with_stats
+                } else {
+                    estimate_branch_cardinality(patterns, None)
+                },
+            }
+        }
         Pattern::Graph { patterns, .. } => PatternEstimate::Source {
             row_count: estimate_branch_cardinality(patterns, stats),
         },
@@ -2475,6 +2503,100 @@ mod tests {
         assert_eq!(
             estimate_triple_row_count(&missing, &HashSet::new(), Some(&unknown_stats)),
             DEFAULT_PROPERTY_SCAN_SELECTIVITY
+        );
+    }
+
+    fn stats_with(entries: &[(&str, u64, u64)]) -> StatsView {
+        let mut stats = StatsView::default();
+        for (name, count, ndv) in entries {
+            stats.properties.insert(
+                Sid::new(100, *name),
+                PropertyStatData {
+                    count: *count,
+                    ndv_values: *ndv,
+                    ndv_subjects: *ndv,
+                },
+            );
+        }
+        stats
+    }
+
+    /// A `GRAPH <iri>` block naming one of this ledger's own named graphs must
+    /// keep the ledger's statistics: `properties` is the cross-graph aggregate,
+    /// so the predicates inside it are the same ones the default graph is
+    /// estimated from. Estimating the block statelessly rated every inner triple
+    /// at the unknown-scan default and moved it behind the selective triple,
+    /// which in single-db mode re-runs the named graph once per parent row.
+    #[test]
+    fn iri_named_graph_block_keeps_ledger_statistics() {
+        let stats = stats_with(&[("name", 200_000, 200_000), ("email", 50, 50)]);
+        let s = VarId(0);
+
+        let block = vec![Pattern::Triple(make_pattern(s, "email", VarId(2)))];
+        assert_eq!(
+            estimate_pattern(
+                &Pattern::Graph {
+                    name: GraphName::Iri(Arc::from("http://example.org/g")),
+                    patterns: block.clone(),
+                },
+                &HashSet::new(),
+                Some(&stats),
+            ),
+            PatternEstimate::Source { row_count: 50.0 },
+            "the block must be estimated from the ledger's own stats, not the              unknown-scan default"
+        );
+
+        let ordered = reorder_patterns(
+            &[
+                Pattern::Triple(make_pattern(s, "name", VarId(1))),
+                Pattern::Graph {
+                    name: GraphName::Iri(Arc::from("http://example.org/g")),
+                    patterns: block,
+                },
+            ],
+            Some(&stats),
+            &HashSet::new(),
+        );
+        assert!(
+            matches!(&ordered[0], Pattern::Graph { .. }),
+            "the 50-row block must drive the 200k-row triple: {ordered:?}"
+        );
+    }
+
+    /// The one verdict the ledger's statistics cannot carry into a named graph is
+    /// "empty": the name may be another ledger or a graph source, and a predicate
+    /// absent *here* says nothing about what is there. Ranking such a block empty
+    /// placed it first and left bound outer values with nothing to seed. It reads
+    /// as unknown instead.
+    #[test]
+    fn absent_predicate_in_an_iri_named_graph_reads_as_unknown_not_empty() {
+        let stats = stats_with(&[("name", 200_000, 200_000)]);
+
+        let absent = Pattern::Graph {
+            name: GraphName::Iri(Arc::from("http://example.org/remote")),
+            patterns: vec![Pattern::Triple(make_pattern(
+                VarId(0),
+                "elsewhere",
+                VarId(1),
+            ))],
+        };
+        assert_eq!(
+            estimate_pattern(&absent, &HashSet::new(), Some(&stats)),
+            PatternEstimate::Source {
+                row_count: DEFAULT_PROPERTY_SCAN_SELECTIVITY
+            },
+            "a predicate absent from this ledger must not rank a foreign graph empty"
+        );
+
+        // A bare triple on the same predicate still reads as empty — this
+        // demotion is scoped to the named-graph arm.
+        assert_eq!(
+            estimate_triple_row_count(
+                &make_pattern(VarId(0), "elsewhere", VarId(1)),
+                &HashSet::new(),
+                Some(&stats)
+            ),
+            0.0
         );
     }
 

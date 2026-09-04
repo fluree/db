@@ -12,6 +12,7 @@
 
 pub mod batch;
 pub mod error;
+pub mod plan;
 
 pub use batch::{BatchSchema, Column, ColumnBatch, FieldInfo, FieldType};
 pub use error::{Result, TabularError};

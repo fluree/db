@@ -2716,12 +2716,26 @@ pub fn build_where_operators_seeded_with_needed(
             } => {
                 // GRAPH pattern - scope inner patterns to a named graph
                 let child = require_child(operator, "GRAPH pattern")?;
-                operator = Some(Box::new(crate::graph::GraphOperator::new(
-                    child,
-                    name.clone(),
-                    inner_patterns.clone(),
-                    *planning,
-                )));
+                operator = Some(match name {
+                    crate::ir::GraphName::Iri(iri)
+                        if crate::r2rml::sql_lane::admits(name, inner_patterns) =>
+                    {
+                        // A block a SQL-backed source could run as one
+                        // statement; decides at open, falls back to GRAPH.
+                        Box::new(crate::r2rml::SqlBlockOperator::new(
+                            child,
+                            Arc::clone(iri),
+                            inner_patterns.clone(),
+                            *planning,
+                        ))
+                    }
+                    _ => Box::new(crate::graph::GraphOperator::new(
+                        child,
+                        name.clone(),
+                        inner_patterns.clone(),
+                        *planning,
+                    )),
+                });
                 i += 1;
             }
 

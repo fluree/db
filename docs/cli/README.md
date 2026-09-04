@@ -75,7 +75,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`reindex`](reindex.md) | Full reindex from commit history |
 | [`sweep`](sweep.md) | Reclaim index artifacts no index chain references |
 | [`iceberg`](iceberg.md) | Map and manage Iceberg tables as graph sources (map, list, info, drop) |
-| [`sql`](sql.md) | Map and manage SQL tables as graph sources through a Trino-protocol endpoint (map, list, info, drop) |
+| [`sql`](sql.md) | Map and manage SQL tables as graph sources through a Trino-protocol endpoint (map, check, list, info, drop) |
 | [`materialize`](materialize.md) | Build a native ledger twin from a virtual (Iceberg/R2RML) graph source |
 | [`bm25`](bm25.md) | Manage BM25 full-text search indexes (create, list, sync, drop) |
 | [`doc`](doc.md) | Ingest a folder of documents into a searchable graph (structure, chunks, embeddings, indexes) and search it |

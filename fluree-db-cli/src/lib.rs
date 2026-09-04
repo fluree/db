@@ -782,6 +782,9 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 cli::SqlAction::Map(args) => {
                     commands::sql::run_sql_map(*args, &fluree_dir, direct).await
                 }
+                cli::SqlAction::Check { name } => {
+                    commands::sql::run_sql_check(&name, &fluree_dir).await
+                }
                 cli::SqlAction::List { remote } => {
                     commands::iceberg::run_iceberg_list(&fluree_dir, remote.as_deref(), direct)
                         .await

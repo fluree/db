@@ -26,17 +26,21 @@ mod operator;
 pub(crate) mod policy;
 mod provider;
 mod rewrite;
+pub mod sql_lane;
 
+pub use fluree_db_tabular::plan;
 pub use fused_aggregate::{detect_fused_r2rml_aggregate, FusedR2rmlAggregateOperator};
 pub use operator::{R2rmlParentMemo, R2rmlScanOperator};
 pub use provider::{
-    ColumnBatchStream, NoOpR2rmlProvider, ObjectConstant, R2rmlProvider, R2rmlTableProvider,
-    ScanCmpOp, ScanFilter, ScanTopK, ScanValue, TableWatermark,
+    BatchSchema, ColumnBatchStream, NoOpR2rmlProvider, ObjectConstant, PushdownCapabilities,
+    R2rmlProvider, R2rmlTableProvider, RelPlan, RelSource, ScanCmpOp, ScanFilter, ScanTopK,
+    ScanValue, TableWatermark,
 };
 pub use rewrite::{
     convert_triple_to_r2rml, r2rml_unsupported_pattern_error, rewrite_patterns_for_r2rml,
     unsupported_outside_graph_scopes, unsupported_subscope_error, R2rmlRewriteResult,
 };
+pub use sql_lane::{SqlBlockOperator, SQL_BLOCK_PUSHDOWN_SITE};
 
 /// Read an on/off environment switch that defaults to **on**. Only `0`, `false`,
 /// `off`, or `no` (trimmed, case-insensitive) disable it — the single falsy

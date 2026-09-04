@@ -2830,13 +2830,28 @@ impl Operator for R2rmlScanOperator {
         }
     }
 
-    fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
+    fn set_topk(&mut self, ordering: &[crate::sort::SortSpec], k: usize) {
         // Record the top-k directive; it is resolved to a scan column against the
         // mapping at scan time and honored only for the main table scan. Like
         // `row_budget`, do NOT forward to the child — an inner correlated scan must
         // still produce every row the join needs; only a topmost scan is eligible.
+        // Only the primary key matters here: the scan skips files that cannot
+        // hold the top-k by that key, a superset under ties, so a compound
+        // ORDER BY is the sort's business.
         // An ASC directive is admitted only when the sort column is REQUIRED (the
-        // provider re-checks nullability at scan time).
+        // provider re-checks nullability at scan time), and only under
+        // `FLUREE_R2RML_TOPK_ASC` (default on): off is byte-identical to the
+        // pre-item-8 DESC-only scan. The planner offers ASC unconditionally so
+        // the SQL pushdown lane, whose ORDER BY columns are required by
+        // construction, is not tied to this scan's switch.
+        let Some(primary) = ordering.first() else {
+            return;
+        };
+        let sort_var = primary.var;
+        let ascending = matches!(primary.direction, crate::sort::SortDirection::Ascending);
+        if ascending && !crate::r2rml::topk_asc_enabled() {
+            return;
+        }
         if topk_pushdown_enabled() {
             self.topk = Some((sort_var, k, ascending));
         }

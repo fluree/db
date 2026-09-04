@@ -176,11 +176,128 @@ against the endpoint, so cardinality on a large table costs an aggregate scan,
 where an Iceberg source answers from metadata. Most engines optimize
 `COUNT(*)`, but plan for it if a query shape asks for cardinality repeatedly.
 
-**Not pushed:** `ORDER BY … LIMIT`. A NULL in a key or required column would
-consume `LIMIT` slots for rows the mapping drops, so the engine's own sort
-runs over the full scan. Joins between triples maps on the same source are
-also performed in the engine (a whole-query SQL rewrite in the Ontop style is
-a possible later optimization, not a v1 requirement).
+### The pushdown lane: one statement per block
+
+A `GRAPH <source> { … }` block (and the whole `WHERE` clause of a query run
+against the source) is compiled to **one SQL statement** when its shape
+allows: triple patterns grouped by subject are one table access each, joins
+between them are on the mapping's `rr:joinCondition` columns or on the
+columns of an identical IRI template — never on a rendered IRI string — and
+every required column is `IS NOT NULL`, which is also what makes `LIMIT`
+pushable. In that statement:
+
+- a **single** `OPTIONAL` member of the same entity, with a variable object, is
+  a nullable column of the same access (no join); an optional entity hanging
+  off a foreign key is a `LEFT JOIN`. Several members on that entity stay in
+  the engine, because SPARQL binds an `OPTIONAL` group as a unit — if one of
+  its triples is absent for a row, every variable the group binds is unbound,
+  where independent nullable columns would bind the ones that are present. A
+  constant object stays in the engine too: its equality would filter the
+  required rows rather than the optional ones;
+- a `FILTER` is pushed only when it is exact — the column's RDF datatype
+  (from `rr:datatype`; `xsd:string` when un-annotated), the literal's type
+  and the **probed SQL type** agree, and for strings the dialect compares
+  bytes. A numeric literal against a text column the mapping reads as a
+  number, or an `xsd:dateTime` literal (always a UTC instant) against a
+  `timestamp` without a zone, is not exact and stays in the engine as a
+  residual filter over the returned rows; against a `timestamp with time
+  zone` column it pushes as a zoned `TIMESTAMP` literal;
+- a constant subject or object IRI is reversed through its template into
+  key predicates; a key that cannot be a value of its column (`order/abc`
+  over a `bigint`) makes the block empty without a round trip;
+- a `VALUES` block, and bindings the outer query already holds (a ledger
+  pattern joined to the block), are sent as a `VALUES` key set so the
+  source does the semi-join;
+- `LIMIT`, and `ORDER BY … LIMIT` as a top-k, are pushed when no residual
+  filter could drop rows afterwards. The top-k needs every `ORDER BY` key to
+  be a typed, required column (either direction); a key the statement cannot
+  order on, a subject IRI say, keeps the whole `LIMIT` in the engine, because
+  k rows ordered by a prefix of the keys can be the wrong k among ties;
+- a `SELECT DISTINCT` directly over the block is `SELECT DISTINCT` over the
+  columns of the projected variables (plus what the join and any residual
+  filter read), where the dialect's string equality is byte equality; the
+  engine still deduplicates the returned terms;
+- a `UNION` runs **one statement per branch combination**, each branch
+  joined with the rest of the block and carrying its own residual filters,
+  so the branches may bind a variable from columns of different types; a
+  branch that can yield nothing sends nothing;
+- a grouped query over the block (`GROUP BY` with `COUNT`, `COUNT DISTINCT`,
+  `SUM`, `AVG`, `MIN`, `MAX`; or `GROUP BY` alone, which is `SELECT
+  DISTINCT`) is **one grouped statement**, with SPARQL's semantics patched
+  where SQL differs: `AVG` is pushed as `SUM` and `COUNT` and divided in the
+  engine (databases round a decimal average to the input's scale), an empty
+  `SUM` comes back `NULL` and is reported as `0`, aggregate results take the
+  datatype of the mapping's `rr:datatype`, and string keys, `COUNT DISTINCT`
+  of strings and `MIN`/`MAX` of strings are pushed only where the dialect
+  compares bytes. `HAVING`, `ORDER BY` and `LIMIT` run in the engine over
+  the grouped rows; an `ORDER BY` over aggregates and required group keys
+  with a `LIMIT` and no `HAVING` is pushed as a top-k, again only when every
+  key can be ordered on. Any residual filter, a
+  `SUM`/`AVG` over a column whose SQL type does not match its datatype, or
+  an aggregate over an IRI template declines to the engine's grouping.
+
+**Where dialects differ**, the lane follows SPARQL's semantics (bytes, code
+points, instants) and declines rather than approximate:
+
+- String equality — a `FILTER`, an `IN` list, a key set, a constant subject
+  reversed into a string key column, or a join on string columns — compares
+  **bytes** on every dialect. Trino, SQLite and a deterministic Postgres
+  collation do so already; on `dialect: mysql` the renderer marks every
+  string literal and one side of every string join `BINARY`, since the
+  default collation there folds case. The duplicate-key probe at
+  registration groups `BINARY` for the same reason.
+- `SELECT DISTINCT`, `GROUP BY` and `COUNT(DISTINCT …)` over a string column
+  stay in the engine on MySQL: a grouping cannot be forced binary there
+  (`ONLY_FULL_GROUP_BY` rejects `GROUP BY BINARY col`), and a case-folding
+  collation would merge two distinct terms.
+- String `ORDER BY … LIMIT` (as a top-k) and `MIN`/`MAX` of strings are
+  pushed only on Trino and SQLite, which order by code point; Postgres and
+  MySQL order by a locale collation, so those run in the engine.
+- An `xsd:dateTime` literal against a `timestamp with time zone` column is
+  rendered as the zoned literal each dialect honors — `TIMESTAMP '… UTC'`
+  on Trino, `TIMESTAMP WITH TIME ZONE '… UTC'` on Postgres (a plain
+  `TIMESTAMP` literal there silently drops the zone and is read in the
+  session's zone), `TIMESTAMP '…+00:00'` on MySQL. A naive `timestamp`
+  column is taken as UTC when its term is built, on every dialect.
+- A decimal's lexical form follows the scale the endpoint reports for the
+  column (`decimal(10,2)` gives `99.50`); the bridge reports NUMERIC /
+  DECIMAL columns at the scale it was started with (`--decimal-scale`,
+  default 6), and SQLite's `NUMERIC` is a double.
+
+CI replays every lane case against SQLite, Postgres 16 and MySQL 8 behind
+the bridge, the two servers deliberately running five hours off UTC, and
+pins both the rows and which of these forms each statement took.
+
+Terms are always built in the engine from the returned columns, so
+datatypes come from the mapping, not from the SQL types. Shapes the lane
+cannot express exactly — variable predicates, several triples maps for one
+entity, disconnected entities (a Cartesian product), a filter inside an
+optional that is not exact, subject-targeted view policies — decline to the
+per-scan lane below, which is also the differential oracle in the test
+suite. `FLUREE_SQL_PUSHDOWN_LANE=0` disables the lane. The statement sent
+is logged at `info` as `SQL block pushdown`, and a tracked query (`"meta":
+true`) returns every statement the lane ran under `sql` as
+`[{"source", "sql"}]` — see [Tracking and
+Fuel](../query/tracking-and-fuel.md#tracked-information).
+
+### Subject keys must be unique
+
+Both lanes assume the columns of a subject template identify one row: a
+star over a subject reads its columns from one row. R2RML itself does not
+require that — the output graph is a set — so a subject minted from a
+non-key column, a joined `rr:sqlQuery` view or a denormalized fact table
+would return duplicate rows. Registration therefore probes every table
+(`SELECT 1 … GROUP BY <subject key columns> HAVING COUNT(*) > 1 LIMIT 1`,
+also over the parent columns of every foreign key pointing at the map) and
+reports repeats as `mapping_warnings`; the finding is stored on the source.
+The pushdown lane **refuses** a statement over a flagged table with an
+error naming it. Register with `allow_duplicate_subjects` to accept the
+duplicate rows instead, and run `fluree sql check <source>` to re-probe
+live tables. An unreachable endpoint skips the probe with a warning.
+
+**Not pushed** in the per-scan lane: `ORDER BY … LIMIT` (a NULL in a key or
+required column would consume `LIMIT` slots for rows the mapping drops) and
+joins between triples maps, which run in the engine.
 
 ### Types
 
@@ -238,7 +355,10 @@ moment. Consequently
   additionally pins the rule on the sessions it opens — `NO_BACKSLASH_ESCAPES`
   on MySQL, `standard_conforming_strings = on` on Postgres (already the
   default there, set explicitly so a server-, database- or role-level override
-  cannot change it). If you point a source at some other Trino-protocol
+  cannot change it). Its MySQL sessions also run with `time_zone = '+00:00'`
+  (the driver's default, pinned by a test), so a `TIMESTAMP` column reads back
+  as the instant it stores rather than the server's wall-clock time. If you
+  point a source at some other Trino-protocol
   endpoint, ensure the equivalent holds there.
 - Credentials can be indirected (`{"env_var": "TRINO_TOKEN"}` or
   `{"secret_ref": "…"}`) rather than stored inline — but only in a
@@ -250,8 +370,9 @@ moment. Consequently
 - View policy is enforced in the R2RML scan exactly as for an Iceberg source
   (static `f:onProperty` / `f:onClass` / `f:onSubject` targeting, subclass
   expansion and stored policies through a `--model` ledger; `f:query` fails
-  closed). See [Access policy](iceberg.md#access-policy). Enforcement happens
-  after the rows come back from SQL; hidden columns are still selected.
+  closed). See [Access policy](iceberg.md#access-policy). The pushdown lane
+  prunes the mapping before it builds its statement, so a hidden column is
+  never selected; the per-scan lane enforces after the rows come back.
 
 ## Running the bridge
 
@@ -296,8 +417,10 @@ class it found. Declare the column `NUMERIC` to read mixed storage as a
 |-|----------------|------------|
 | Reads | Parquet files directly (S3/GCS/local) | SQL through an endpoint |
 | Filters | file/row-group pruning by min/max stats | exact `WHERE` |
+| Joins, OPTIONAL, VALUES, outer bindings | in the engine | one statement per block (pushdown lane) |
+| `UNION`, `DISTINCT` | in the engine | one statement per branch; `SELECT DISTINCT` (pushdown lane) |
 | `COUNT` | manifest stats, when provably exact | exact `COUNT(*)` |
-| `ORDER BY … LIMIT` | top-k file ordering | not pushed |
+| `ORDER BY … LIMIT` | top-k file ordering | pushed by the pushdown lane on typed required columns |
 | Snapshots / time travel | pinned per query, incremental twins | none; full rebuilds |
 | `rr:sqlQuery` | refused | supported |
 | View policy | static targeting in the scan, `--model` ledger | same |

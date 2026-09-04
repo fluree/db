@@ -100,6 +100,25 @@ pub struct SqlGsConfig {
     /// (see the Iceberg config's field of the same name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_allow: Option<bool>,
+
+    /// Tables whose subject key columns were found non-unique by the last
+    /// registration or `check` probe. The pushdown lane refuses a statement
+    /// over them unless `allow_duplicate_subjects` is set, because a star
+    /// over a repeated subject returns wrong multiplicities.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duplicate_subject_tables: Vec<String>,
+
+    /// Tables whose uniqueness probe could not run (a timeout, or a dialect
+    /// that refused it). Kept apart from `duplicate_subject_tables` because
+    /// "not known to be unique" is not "known to be duplicated" and the two
+    /// need different advice. The lane refuses a statement over them for the
+    /// same reason it refuses a flagged one: it may not answer approximately.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unverified_subject_tables: Vec<String>,
+
+    /// Accept duplicate subject keys: the probe still warns, queries proceed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_duplicate_subjects: bool,
 }
 
 impl SqlGsConfig {
@@ -117,6 +136,9 @@ impl SqlGsConfig {
             mapping: None,
             model: None,
             default_allow: None,
+            duplicate_subject_tables: Vec::new(),
+            unverified_subject_tables: Vec::new(),
+            allow_duplicate_subjects: false,
         }
     }
 

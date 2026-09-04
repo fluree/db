@@ -2640,6 +2640,44 @@ fn build_operator_tree_inner(
         }
     }
 
+    // Fast-path: a grouped query over one SQL-source block runs as one grouped
+    // statement. Takes precedence over the fused aggregate below for SQL
+    // sources; its fallback is that fused operator when the shape admits (so
+    // an Iceberg source keeps its lane), else the generic pipeline.
+    if enable_fused_fast_paths {
+        if let Some(plan) = crate::r2rml::sql_lane::detect_sql_block_aggregate(query) {
+            let mut fallback_query = query.clone();
+            fallback_query.ordering = Vec::new();
+            fallback_query.order_binds = Vec::new();
+            fallback_query.limit = None;
+            fallback_query.offset = None;
+            let generic =
+                build_operator_tree_inner(&fallback_query, stats.clone(), false, planning)?;
+            let fallback: BoxedOperator = match crate::r2rml::detect_fused_r2rml_aggregate(query) {
+                Some(fused) => Box::new(crate::r2rml::FusedR2rmlAggregateOperator::new(
+                    fused, generic,
+                )),
+                None => generic,
+            };
+            let mut op: BoxedOperator = Box::new(
+                crate::r2rml::sql_lane::SqlAggregateOperator::new(plan, fallback),
+            );
+            if let Some(having) = query.grouping.as_ref().and_then(|g| g.having()) {
+                op = Box::new(crate::having::HavingOperator::new(op, having.clone()));
+            }
+            if !query.ordering.is_empty() {
+                op = Box::new(crate::sort::SortOperator::new(op, query.ordering.clone()));
+            }
+            if let Some(offset) = query.offset {
+                op = Box::new(OffsetOperator::new(op, offset));
+            }
+            if let Some(limit) = query.limit {
+                op = Box::new(LimitOperator::new(op, limit));
+            }
+            return Ok(op);
+        }
+    }
+
     // Fast-path: a single R2RML graph-source scan feeding a simple COUNT
     // aggregate — fold straight from column batches instead of materializing an
     // RDF binding per table row. Falls back to the normal pipeline at open if
@@ -3690,6 +3728,11 @@ pub(crate) fn apply_solution_modifiers(
     }
 
     if can_project_distinct_before_sort {
+        let distinct_vars: Vec<VarId> = match select_vars {
+            Some(vars) => vars.to_vec(),
+            None => operator.schema().to_vec(),
+        };
+        operator.set_distinct(&distinct_vars);
         // PROJECT
         if let Some(vars) = select_vars {
             operator = Box::new(ProjectOperator::new(operator, vars.to_vec()));
@@ -3735,29 +3778,15 @@ pub(crate) fn apply_solution_modifiers(
                 (Some(limit), None) => limit,
                 _ => 0,
             };
-            // PR-5 / item 8 (F-AUD-6): offer the primary sort key + k to the
-            // row-preserving scan below, so a single-column `ORDER BY <scan col>
-            // LIMIT k` over an R2RML scan can read only the files that can hold the
-            // top-k. DESC is offered for any scalar column; ASC is offered too but
-            // the scan honors it ONLY when the column is REQUIRED (non-nullable) —
-            // SPARQL orders unbound values FIRST under ASC, so a nullable column
-            // could hide an unread top-k row (the provider re-checks). The scan
-            // honors either direction ONLY if the key resolves to a single scalar
-            // scan column, else no-op. Pure optimization — this `SortOperator`
-            // remains the authority for the exact (compound) order + LIMIT.
+            // PR-5 / item 8 (F-AUD-6): offer the ORDER BY + k to the
+            // row-preserving source below. The R2RML scan uses the primary key
+            // to read only the files that can hold the top-k (a superset under
+            // ties; this `SortOperator` remains the authority for the exact
+            // compound order + LIMIT), and applies its own FLUREE_R2RML_TOPK_ASC
+            // gate in `set_topk`. The SQL pushdown lane answers exactly k rows,
+            // so it pushes the LIMIT only when it can order on every key.
             if can_topk {
-                if let Some(primary) = ordering.first() {
-                    use crate::sort::SortDirection;
-                    match primary.direction {
-                        SortDirection::Descending => operator.set_topk(primary.var, k, false),
-                        // Gated by FLUREE_R2RML_TOPK_ASC: OFF is byte-identical to
-                        // the pre-item-8 DESC-only behavior.
-                        SortDirection::Ascending if crate::r2rml::topk_asc_enabled() => {
-                            operator.set_topk(primary.var, k, true);
-                        }
-                        SortDirection::Ascending => {}
-                    }
-                }
+                operator.set_topk(ordering, k);
             }
             let mut sort_op = if can_topk {
                 SortOperator::new_topk(operator, ordering.to_vec(), k)
@@ -3770,6 +3799,16 @@ pub(crate) fn apply_solution_modifiers(
                     .map(|d| d.required_sort_vars.as_slice()),
             );
             operator = Box::new(sort_op);
+        }
+
+        if distinct {
+            // Reaches a source only when nothing but row-preserving operators
+            // sit between (a Sort above swallows it).
+            let distinct_vars: Vec<VarId> = match select_vars {
+                Some(vars) if !vars.is_empty() => vars.to_vec(),
+                _ => operator.schema().to_vec(),
+            };
+            operator.set_distinct(&distinct_vars);
         }
 
         // PROJECT
@@ -3842,8 +3881,13 @@ mod tests {
                 Ok(None)
             }
             fn close(&mut self) {}
-            fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
-                *self.recorded.lock().unwrap() = Some((sort_var, k, ascending));
+            fn set_topk(&mut self, ordering: &[crate::sort::SortSpec], k: usize) {
+                let primary = &ordering[0];
+                *self.recorded.lock().unwrap() = Some((
+                    primary.var,
+                    k,
+                    matches!(primary.direction, crate::sort::SortDirection::Ascending),
+                ));
             }
         }
 
@@ -3902,8 +3946,13 @@ mod tests {
                 Ok(None)
             }
             fn close(&mut self) {}
-            fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
-                *self.recorded.lock().unwrap() = Some((sort_var, k, ascending));
+            fn set_topk(&mut self, ordering: &[crate::sort::SortSpec], k: usize) {
+                let primary = &ordering[0];
+                *self.recorded.lock().unwrap() = Some((
+                    primary.var,
+                    k,
+                    matches!(primary.direction, crate::sort::SortDirection::Ascending),
+                ));
             }
         }
 

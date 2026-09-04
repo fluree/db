@@ -362,6 +362,50 @@ async fn sessions_use_standard_sql_string_literals() {
     }
 }
 
+/// A MySQL `TIMESTAMP` comes back as wall-clock time in the session's zone
+/// and the driver labels it UTC, so a session left in the server's zone
+/// would shift every zoned value by the server's offset. The driver pins
+/// `time_zone = '+00:00'` on connect by default (`MySqlConnectOptions::
+/// timezone`); this pins that default, since dropping it would go unnoticed
+/// on a UTC server. CI runs the server five hours behind UTC (`TZ` on the
+/// service) so the round trip below is non-vacuous there.
+#[tokio::test]
+async fn mysql_sessions_read_zoned_timestamps_as_utc() {
+    let Some(url) = backend_url("FLUREE_BRIDGE_MYSQL_URL") else {
+        return;
+    };
+    let pool = sqlx::mysql::MySqlPool::connect(&url).await.unwrap();
+    for stmt in [
+        "DROP TABLE IF EXISTS bridge_zoned",
+        "CREATE TABLE bridge_zoned (at TIMESTAMP NULL)",
+        // An offset literal names the instant regardless of the session zone.
+        "INSERT INTO bridge_zoned VALUES ('2024-01-10 03:00:00+00:00')",
+    ] {
+        pool.execute(stmt).await.unwrap();
+    }
+    drop(pool);
+    let router = router_for(&url).await;
+
+    let zone = rows(&router, "SELECT @@session.time_zone").await.unwrap();
+    assert_eq!(zone[0][0].as_str(), Some("+00:00"));
+
+    let found = rows(&router, "SELECT at FROM bridge_zoned").await.unwrap();
+    assert_eq!(
+        found[0][0].as_str(),
+        Some("2024-01-10 03:00:00.000000 UTC"),
+        "a zoned value must read back as the instant stored"
+    );
+    // And a zoned literal compares with it as an instant: the row sits three
+    // hours after the boundary, inside the server's offset.
+    let after = rows(
+        &router,
+        "SELECT COUNT(*) FROM bridge_zoned WHERE at > TIMESTAMP '2024-01-10 00:00:00.000000+00:00'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(after[0][0].as_i64(), Some(1));
+}
+
 /// A skipped test is not a passing one. CI must supply both backends.
 #[test]
 fn server_backends_are_configured_in_ci() {

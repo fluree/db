@@ -21,6 +21,9 @@ pub type ColumnBatchStream = Pin<Box<dyn Stream<Item = Result<ColumnBatch>> + Se
 
 // Re-export from fluree-db-r2rml for convenience
 pub use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+// The dialect-neutral plan a whole block lowers to (see `sql_lane`).
+pub use fluree_db_tabular::plan::{PushdownCapabilities, RelPlan, RelSource};
+pub use fluree_db_tabular::BatchSchema;
 
 /// Comparison operator for a pushed-down scan filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,6 +323,45 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
     ) -> Result<Option<u64>> {
         let _ = (graph_source_id, table_name, non_null_cols, as_of_t);
         Ok(None)
+    }
+
+    /// What this provider can execute for a whole pushed-down block over
+    /// `graph_source_id`, or `None` when the source cannot run a
+    /// [`RelPlan`] (an Iceberg source, or no source at all). Consulted once at
+    /// open by the SQL pushdown lane before it lowers anything.
+    async fn pushdown_capabilities(
+        &self,
+        graph_source_id: &str,
+    ) -> Result<Option<PushdownCapabilities>> {
+        let _ = graph_source_id;
+        Ok(None)
+    }
+
+    /// The probed column schema of one relation of `graph_source_id`, for a
+    /// provider that can execute plans (it caches the probe). The lowering
+    /// asks only for relations a typed literal has to be compared against.
+    async fn source_schema(
+        &self,
+        graph_source_id: &str,
+        source: &RelSource,
+    ) -> Result<Option<Arc<BatchSchema>>> {
+        let _ = (graph_source_id, source);
+        Ok(None)
+    }
+
+    /// Execute one pushed-down block and stream its rows. Returns the
+    /// statement actually sent (for the query log and explain output) with
+    /// the stream. Only called when [`Self::pushdown_capabilities`] was
+    /// `Some`; the default refuses.
+    async fn execute_plan(
+        &self,
+        graph_source_id: &str,
+        plan: &RelPlan,
+    ) -> Result<(String, ColumnBatchStream)> {
+        let _ = plan;
+        Err(crate::error::QueryError::Internal(format!(
+            "graph source '{graph_source_id}' cannot execute a pushed-down plan"
+        )))
     }
 
     /// Warm the per-query catalog session + caches for a known set of tables
