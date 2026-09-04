@@ -24,6 +24,7 @@ const SEED_STR: u64 = 0x4;
 const SEED_REF: u64 = 0x5;
 const SEED_TEMPORAL: u64 = 0x6;
 const SEED_OTHER: u64 = 0x7;
+const SEED_BYTES: u64 = 0x8;
 
 /// Hash a value under its kind's domain. Nulls have no hash; callers
 /// count them separately and never call this for them.
@@ -36,6 +37,7 @@ pub fn value_hash(value: &ProfileValue<'_>) -> Option<u64> {
         ProfileValue::Float(f) => float_hash(*f),
         ProfileValue::Str(s) => xxh3_64_with_seed(s.as_bytes(), SEED_STR),
         ProfileValue::Ref(s) => xxh3_64_with_seed(s.as_bytes(), SEED_REF),
+        ProfileValue::Bytes(b) => xxh3_64_with_seed(b, SEED_BYTES),
         ProfileValue::Temporal(t) => xxh3_64_with_seed(&t.to_le_bytes(), SEED_TEMPORAL),
         ProfileValue::Other(s) => xxh3_64_with_seed(s.as_bytes(), SEED_OTHER),
     })
@@ -90,9 +92,11 @@ mod tests {
         let s = value_hash(&ProfileValue::Str("7"));
         let i = value_hash(&ProfileValue::Int(7));
         let r = value_hash(&ProfileValue::Ref("7"));
+        let b = value_hash(&ProfileValue::Bytes(b"7"));
         assert_ne!(s, i);
         assert_ne!(s, r);
         assert_ne!(i, r);
+        assert_ne!(s, b);
     }
 
     #[test]

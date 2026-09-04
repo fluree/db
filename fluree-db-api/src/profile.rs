@@ -9,10 +9,18 @@
 //! same way whichever side they came from.
 //!
 //! Profiles are computed on demand and never touch the index statistics
-//! that ride on every reindex; a profile of a hundred-million-row column
-//! costs one scan and a few kilobytes of sketch.
+//! that ride on every reindex. The sketches themselves are a few
+//! kilobytes, but the ledger face has no streaming predicate walk to
+//! drive them from yet: each property's current flakes are ranged into
+//! memory once and folded from there, so peak memory is proportional to
+//! the largest property profiled. The table face streams batches and is
+//! bounded by the scan.
+//!
+//! Neither face applies view policy. Both read the ledger or lake
+//! directly and belong behind an administrative surface until they do.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use fluree_db_core::{
     range_with_overlay, FlakeValue, IndexType, LedgerSnapshot, RangeMatch, RangeOptions, RangeTest,
@@ -178,9 +186,10 @@ fn profile_value<'a>(
             ProfileValue::Temporal(i64::from(d.days_since_epoch()) * MILLIS_PER_DAY)
         }
         FlakeValue::BigInt(_) | FlakeValue::Decimal(_) => {
-            // Exact numbers read as floats for the moments and quantiles;
-            // the lexical form is what the sketches key on, so `7.00` and
-            // `7` still count once (see `fluree_db_stats::hash`).
+            // Exact numbers read as floats for the moments and quantiles.
+            // The float hash folds an integral value onto the integer's
+            // hash, so `7.00` and `7` still count once (see
+            // `fluree_db_stats::hash`).
             scratch.push_str(&value.to_string());
             match scratch.parse::<f64>() {
                 Ok(f) => ProfileValue::Float(f),
@@ -217,11 +226,15 @@ async fn property_flakes(
 impl crate::Fluree {
     /// Profile properties of a ledger at its current `t`.
     ///
-    /// Each named property is scanned once over the predicate-ordered
-    /// index with novelty folded in. With `group_by`, the grouping
-    /// properties are scanned first to map each subject to its key; a
-    /// subject with several values for one grouping property takes the
-    /// first seen, and a subject with none is counted as ungrouped.
+    /// Each named property is ranged once over the predicate-ordered
+    /// index with novelty folded in, held in memory for the fold, and
+    /// dropped before the next. With `group_by`, the grouping properties
+    /// are ranged first to map each subject to its key; a subject with
+    /// several values for one grouping property takes the first seen,
+    /// and a subject with none is counted as ungrouped. Keys are interned
+    /// so the map costs one pointer per subject.
+    ///
+    /// No view policy is applied.
     pub async fn profile_ledger(
         &self,
         ledger_id: &str,
@@ -243,7 +256,16 @@ impl crate::Fluree {
         // own map; a subject gets a key only when it has a value for every
         // one of them, several joined with " | ". A subject with several
         // values for one property takes the first seen.
-        let mut maps: Vec<HashMap<Sid, String>> = Vec::with_capacity(req.group_by.len());
+        let mut interner: HashMap<String, Arc<str>> = HashMap::new();
+        let mut intern = |text: String| -> Arc<str> {
+            if let Some(k) = interner.get(&text) {
+                return Arc::clone(k);
+            }
+            let k: Arc<str> = Arc::from(text.as_str());
+            interner.insert(text, Arc::clone(&k));
+            k
+        };
+        let mut maps: Vec<HashMap<Sid, Arc<str>>> = Vec::with_capacity(req.group_by.len());
         for iri in &req.group_by {
             let p = snapshot.encode_iri_strict(iri).ok_or_else(|| {
                 ApiError::NotFound(format!(
@@ -256,30 +278,34 @@ impl crate::Fluree {
                     "group-by property '{iri}' has no values in ledger '{ledger_id}'"
                 )));
             }
-            let mut map: HashMap<Sid, String> = HashMap::new();
+            let mut map: HashMap<Sid, Arc<str>> = HashMap::new();
             let mut scratch = String::new();
             for f in flakes {
                 if map.contains_key(&f.s) {
                     continue;
                 }
-                let text = display(profile_value(snapshot, &f.o, &mut scratch));
-                map.insert(f.s.clone(), text);
+                let text = profile_value(snapshot, &f.o, &mut scratch).to_text();
+                map.insert(f.s.clone(), intern(text));
             }
             maps.push(map);
         }
-        let keys: Option<HashMap<Sid, String>> = maps.first().map(|first| {
-            first
-                .iter()
-                .filter_map(|(s, head)| {
-                    let mut key = head.clone();
-                    for m in &maps[1..] {
-                        key.push_str(" | ");
-                        key.push_str(m.get(s)?);
-                    }
-                    Some((s.clone(), key))
-                })
-                .collect()
-        });
+        let keys: Option<HashMap<Sid, Arc<str>>> = match maps.as_slice() {
+            [] => None,
+            [single] => Some(single.clone()),
+            [first, rest @ ..] => Some(
+                first
+                    .iter()
+                    .filter_map(|(s, head)| {
+                        let mut key = head.to_string();
+                        for m in rest {
+                            key.push_str(" | ");
+                            key.push_str(m.get(s)?);
+                        }
+                        Some((s.clone(), intern(key)))
+                    })
+                    .collect(),
+            ),
+        };
 
         let mut columns = Vec::with_capacity(req.columns.len());
         let mut skipped = Vec::new();
@@ -302,7 +328,7 @@ impl crate::Fluree {
             }
             let mut acc = Accumulator::new(req);
             for f in flakes {
-                let key = keys.as_ref().and_then(|m| m.get(&f.s)).map(String::as_str);
+                let key = keys.as_ref().and_then(|m| m.get(&f.s)).map(|k| &**k);
                 let v = profile_value(snapshot, &f.o, &mut scratch);
                 acc.observe(key, v);
             }
@@ -321,7 +347,10 @@ impl crate::Fluree {
 
     /// Profile columns of a lake table behind a graph source, streaming
     /// the table through the same scan the virtual graph reads, at the
-    /// table's current snapshot.
+    /// table's current snapshot. Peak memory is one batch plus the
+    /// sketches.
+    ///
+    /// No view policy is applied.
     #[cfg(feature = "iceberg")]
     pub async fn profile_table(
         &self,
@@ -337,52 +366,63 @@ impl crate::Fluree {
         let snapshot_id = provider
             .current_snapshot_id(graph_source_id, table_name)
             .await?;
-
-        // Project only what the profile needs; an empty column list reads
-        // every column and profiles all of them.
-        let mut projection: Vec<String> = req.columns.clone();
+        let table_columns = provider
+            .table_column_names(graph_source_id, table_name)
+            .await?;
         for k in &req.group_by {
-            if !projection.contains(k) {
-                projection.push(k.clone());
+            if !table_columns.contains(k) {
+                return Err(ApiError::NotFound(format!(
+                    "group-by column '{k}' is not in table '{table_name}'"
+                )));
             }
         }
-        if req.columns.is_empty() {
-            projection.clear();
+
+        // The schema decides the columns up front, so an empty table still
+        // reports what was asked for and what was not there.
+        let names: Vec<String> = if req.columns.is_empty() {
+            table_columns.clone()
+        } else {
+            req.columns.clone()
+        };
+        let mut accs: Vec<Option<Accumulator>> = Vec::with_capacity(names.len());
+        let mut skipped = Vec::new();
+        for name in &names {
+            if table_columns.contains(name) {
+                accs.push(Some(Accumulator::new(req)));
+            } else {
+                accs.push(None);
+                skipped.push(SkippedColumn {
+                    name: name.clone(),
+                    reason: "column is not in the table".into(),
+                });
+            }
+        }
+
+        // Project only what the profile needs; every column when the
+        // request named none.
+        let mut projection: Vec<String> = if req.columns.is_empty() {
+            Vec::new()
+        } else {
+            names
+                .iter()
+                .filter(|n| table_columns.contains(n))
+                .cloned()
+                .collect()
+        };
+        if !projection.is_empty() {
+            for k in &req.group_by {
+                if !projection.contains(k) {
+                    projection.push(k.clone());
+                }
+            }
         }
         let mut stream = provider
             .scan_table(graph_source_id, table_name, &projection, &[], None, None)
             .await?;
 
-        // Column order and accumulators are fixed by the first batch.
-        let mut names: Vec<String> = req.columns.clone();
-        let mut accs: Vec<Option<Accumulator>> = Vec::new();
-        let mut skipped = Vec::new();
         let mut key = String::new();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
-            if accs.is_empty() {
-                if names.is_empty() {
-                    names = batch.schema.fields.iter().map(|f| f.name.clone()).collect();
-                }
-                for name in &names {
-                    if batch.column_by_name(name).is_some() {
-                        accs.push(Some(Accumulator::new(req)));
-                    } else {
-                        accs.push(None);
-                        skipped.push(SkippedColumn {
-                            name: name.clone(),
-                            reason: "column is not in the table".into(),
-                        });
-                    }
-                }
-                for k in &req.group_by {
-                    if batch.column_by_name(k).is_none() {
-                        return Err(ApiError::NotFound(format!(
-                            "group-by column '{k}' is not in table '{table_name}'"
-                        )));
-                    }
-                }
-            }
             let key_cols: Vec<&fluree_db_tabular::Column> = req
                 .group_by
                 .iter()
@@ -423,15 +463,5 @@ impl crate::Fluree {
             columns,
             skipped,
         })
-    }
-}
-
-fn display(v: ProfileValue<'_>) -> String {
-    match v {
-        ProfileValue::Null => String::new(),
-        ProfileValue::Bool(b) => b.to_string(),
-        ProfileValue::Int(i) | ProfileValue::Temporal(i) => i.to_string(),
-        ProfileValue::Float(f) => f.to_string(),
-        ProfileValue::Str(s) | ProfileValue::Ref(s) | ProfileValue::Other(s) => s.to_string(),
     }
 }

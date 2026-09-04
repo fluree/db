@@ -11,7 +11,7 @@ const MILLIS_PER_DAY: i64 = 86_400_000;
 
 /// The cell at `row` as the profiler sees it. Decimals read as floats
 /// (unscaled value over ten to the scale); dates and timestamps become
-/// epoch milliseconds; bytes are counted but not inspected.
+/// epoch milliseconds; bytes hash on their content.
 pub fn value_at(col: &Column, row: usize) -> ProfileValue<'_> {
     match col {
         Column::Boolean(v) => v[row].map_or(ProfileValue::Null, ProfileValue::Bool),
@@ -25,8 +25,8 @@ pub fn value_at(col: &Column, row: usize) -> ProfileValue<'_> {
             .as_deref()
             .map_or(ProfileValue::Null, ProfileValue::Str),
         Column::Bytes(v) => v[row]
-            .as_ref()
-            .map_or(ProfileValue::Null, |_| ProfileValue::Other("<bytes>")),
+            .as_deref()
+            .map_or(ProfileValue::Null, ProfileValue::Bytes),
         Column::Date(v) => v[row].map_or(ProfileValue::Null, |d| {
             ProfileValue::Temporal(i64::from(d) * MILLIS_PER_DAY)
         }),
@@ -42,13 +42,7 @@ pub fn value_at(col: &Column, row: usize) -> ProfileValue<'_> {
 /// The cell at `row` as text, for building group keys. Nulls read as the
 /// empty string.
 pub fn display_at(col: &Column, row: usize) -> String {
-    match value_at(col, row) {
-        ProfileValue::Null => String::new(),
-        ProfileValue::Bool(b) => b.to_string(),
-        ProfileValue::Int(i) | ProfileValue::Temporal(i) => i.to_string(),
-        ProfileValue::Float(f) => f.to_string(),
-        ProfileValue::Str(s) | ProfileValue::Ref(s) | ProfileValue::Other(s) => s.to_string(),
-    }
+    value_at(col, row).to_text()
 }
 
 /// Fold every cell of `col` into `profile`.
@@ -87,6 +81,22 @@ mod tests {
         };
         assert_eq!(value_at(&col, 0), ProfileValue::Float(123.45));
         assert_eq!(value_at(&col, 1), ProfileValue::Null);
+    }
+
+    #[test]
+    fn bytes_are_distinct_by_content() {
+        let col = Column::Bytes(vec![
+            Some(vec![1, 2]),
+            Some(vec![1, 2]),
+            Some(vec![3]),
+            None,
+        ]);
+        let mut p = ColumnProfile::default();
+        profile_column(&mut p, &col);
+        let s = p.summary();
+        assert_eq!(s.distinct, 2);
+        assert_eq!(s.null_count, 1);
+        assert_eq!(display_at(&col, 2), "0x03");
     }
 
     #[test]

@@ -21,10 +21,13 @@ pub enum ProfileValue<'a> {
     Str(&'a str),
     /// An IRI reference to another node.
     Ref(&'a str),
+    /// Binary content, hashed on its bytes so distinct and frequent
+    /// values are real; reported as a hex sample.
+    Bytes(&'a [u8]),
     /// A point in time as milliseconds since the Unix epoch, or a date as
-    /// days × 86,400,000. Profiled numerically so ranges and quantiles
-    /// work, tallied separately so a date column is not reported as a
-    /// number.
+    /// days × 86,400,000. The millis feed the numeric moments and
+    /// quantiles so ranges work; the kind is tallied on its own so a
+    /// date column is visibly a date column, not a number column.
     Temporal(i64),
     /// Anything else, carried as its lexical form for counting only.
     Other(&'a str),
@@ -41,17 +44,19 @@ pub enum ValueKind {
     Float,
     Str,
     Ref,
+    Bytes,
     Temporal,
     Other,
 }
 
-const KINDS: [ValueKind; 8] = [
+const KINDS: [ValueKind; 9] = [
     ValueKind::Null,
     ValueKind::Bool,
     ValueKind::Int,
     ValueKind::Float,
     ValueKind::Str,
     ValueKind::Ref,
+    ValueKind::Bytes,
     ValueKind::Temporal,
     ValueKind::Other,
 ];
@@ -65,6 +70,7 @@ impl ProfileValue<'_> {
             ProfileValue::Float(_) => ValueKind::Float,
             ProfileValue::Str(_) => ValueKind::Str,
             ProfileValue::Ref(_) => ValueKind::Ref,
+            ProfileValue::Bytes(_) => ValueKind::Bytes,
             ProfileValue::Temporal(_) => ValueKind::Temporal,
             ProfileValue::Other(_) => ValueKind::Other,
         }
@@ -79,9 +85,10 @@ impl ProfileValue<'_> {
         }
     }
 
-    /// The display form kept as a sample for frequent values.
-    fn display(&self, max_len: usize) -> String {
-        let s = match self {
+    /// The value as text: what a group key or a display sample is built
+    /// from. Nulls read as the empty string, bytes as `0x` plus hex.
+    pub fn to_text(&self) -> String {
+        match self {
             ProfileValue::Null => String::new(),
             ProfileValue::Bool(b) => b.to_string(),
             ProfileValue::Int(i) | ProfileValue::Temporal(i) => i.to_string(),
@@ -89,8 +96,13 @@ impl ProfileValue<'_> {
             ProfileValue::Str(s) | ProfileValue::Ref(s) | ProfileValue::Other(s) => {
                 (*s).to_string()
             }
-        };
-        truncate(s, max_len)
+            ProfileValue::Bytes(b) => format!("0x{}", hex::encode(b)),
+        }
+    }
+
+    /// The display form kept as a sample for frequent values.
+    fn display(&self, max_len: usize) -> String {
+        truncate(self.to_text(), max_len)
     }
 }
 
@@ -134,12 +146,15 @@ impl Default for ProfileConfig {
 pub struct ColumnProfile {
     config: ProfileConfig,
     count: u64,
-    kinds: [u64; 8],
+    kinds: [u64; 9],
     distinct: Hll4096,
     numeric: Moments,
     quantiles: TDigest,
+    /// Length in characters of every text value.
     text_length: Moments,
     frequent: HeavyHitters,
+    /// The lexicographic extremes, kept whole so comparisons stay exact;
+    /// only the reported summary truncates them.
     min_text: Option<String>,
     max_text: Option<String>,
 }
@@ -155,7 +170,7 @@ impl ColumnProfile {
         Self {
             config,
             count: 0,
-            kinds: [0; 8],
+            kinds: [0; 9],
             distinct: Hll4096::new(),
             numeric: Moments::new(),
             quantiles: TDigest::new(config.digest_compression),
@@ -185,12 +200,12 @@ impl ColumnProfile {
             self.quantiles.add(x);
         }
         if let ProfileValue::Str(s) | ProfileValue::Ref(s) | ProfileValue::Other(s) = value {
-            self.text_length.add(s.len() as f64);
+            self.text_length.add(s.chars().count() as f64);
             if self.min_text.as_deref().is_none_or(|m| s < m) {
-                self.min_text = Some(truncate(s.to_string(), max_len));
+                self.min_text = Some(s.to_string());
             }
             if self.max_text.as_deref().is_none_or(|m| s > m) {
-                self.max_text = Some(truncate(s.to_string(), max_len));
+                self.max_text = Some(s.to_string());
             }
         }
     }
@@ -295,12 +310,13 @@ impl ColumnProfile {
             p95: self.quantiles.quantile(0.95),
             p99: self.quantiles.quantile(0.99),
         });
+        let sample_max_len = self.config.sample_max_len;
         let text = (self.text_length.count() > 0).then(|| TextSummary {
             min_length: self.text_length.min().unwrap_or(0.0) as u64,
             max_length: self.text_length.max().unwrap_or(0.0) as u64,
             mean_length: self.text_length.mean().unwrap_or(0.0),
-            min: self.min_text.clone(),
-            max: self.max_text.clone(),
+            min: self.min_text.clone().map(|s| truncate(s, sample_max_len)),
+            max: self.max_text.clone().map(|s| truncate(s, sample_max_len)),
         });
         let top_values = self
             .frequent
@@ -376,12 +392,14 @@ pub struct NumericSummary {
     pub p99: Option<f64>,
 }
 
+/// Lengths are in characters, not bytes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextSummary {
     pub min_length: u64,
     pub max_length: u64,
     pub mean_length: f64,
-    /// Lexicographically smallest value (truncated sample).
+    /// Lexicographically smallest value, truncated to the sample length
+    /// for display only; the comparison used the whole value.
     pub min: Option<String>,
     pub max: Option<String>,
 }
@@ -521,6 +539,51 @@ mod tests {
         );
         let d = sa.distinct as f64 - sw.distinct as f64;
         assert!(d.abs() / (sw.distinct as f64) < 0.05);
+    }
+
+    #[test]
+    fn text_extremes_compare_whole_values_and_lengths_are_chars() {
+        let mut p = ColumnProfile::new(ProfileConfig {
+            sample_max_len: 8,
+            ..ProfileConfig::default()
+        });
+        // Both share a prefix longer than the sample; a truncated compare
+        // would call them equal and keep whichever came first.
+        p.observe(ProfileValue::Str("prefix-prefix-zzz"));
+        p.observe(ProfileValue::Str("prefix-prefix-aaa"));
+        p.observe(ProfileValue::Str("héllo"));
+        let t = p.summary().text.unwrap();
+        assert_eq!(t.min.as_deref(), Some("héllo"));
+        assert_eq!(t.max.as_deref(), Some("prefix-p…"));
+        assert_eq!(t.min_length, 5, "characters, not bytes");
+        let mut other = ColumnProfile::new(p.config());
+        other.observe(ProfileValue::Str("prefix-prefix-zzzz"));
+        p.merge(&other);
+        assert_eq!(p.max_text.as_deref(), Some("prefix-prefix-zzzz"));
+    }
+
+    #[test]
+    fn bytes_hash_on_content() {
+        let mut p = ColumnProfile::default();
+        p.observe(ProfileValue::Bytes(&[1, 2, 3]));
+        p.observe(ProfileValue::Bytes(&[1, 2, 3]));
+        p.observe(ProfileValue::Bytes(&[9]));
+        let s = p.summary();
+        assert_eq!(s.distinct, 2);
+        assert!(!s.is_constant);
+        assert_eq!(s.kinds.get(&ValueKind::Bytes), Some(&3));
+        assert_eq!(s.top_values[0].value, "0x010203");
+        assert!(s.text.is_none());
+    }
+
+    #[test]
+    fn text_only_profile_round_trips_json() {
+        let mut p = ColumnProfile::default();
+        p.observe(ProfileValue::Str("a"));
+        let back: ColumnProfile =
+            serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
+        assert!(back.summary().numeric.is_none());
     }
 
     #[test]

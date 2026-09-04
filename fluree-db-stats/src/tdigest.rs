@@ -9,6 +9,10 @@
 //!
 //! Dunning & Ertl, "Computing extremely accurate quantiles using
 //! t-digests" (2019), with the `k_1` scale function.
+//!
+//! The observed extremes are options rather than ±infinity so an empty
+//! digest serialises to JSON and reads back (serde_json writes a
+//! non-finite float as `null`, which a bare `f64` refuses).
 
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
@@ -30,8 +34,8 @@ pub struct TDigest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     buffer: Vec<Centroid>,
     total: f64,
-    min: f64,
-    max: f64,
+    min: Option<f64>,
+    max: Option<f64>,
 }
 
 impl Default for TDigest {
@@ -47,8 +51,8 @@ impl TDigest {
             centroids: Vec::new(),
             buffer: Vec::new(),
             total: 0.0,
-            min: f64::INFINITY,
-            max: f64::NEG_INFINITY,
+            min: None,
+            max: None,
         }
     }
 
@@ -68,8 +72,8 @@ impl TDigest {
         }
         self.buffer.push(Centroid { mean: x, weight });
         self.total += weight;
-        self.min = self.min.min(x);
-        self.max = self.max.max(x);
+        self.min = Some(self.min.map_or(x, |m| m.min(x)));
+        self.max = Some(self.max.map_or(x, |m| m.max(x)));
         if self.buffer.len() >= self.buffer_capacity() {
             self.compress();
         }
@@ -84,8 +88,8 @@ impl TDigest {
         self.buffer.extend_from_slice(&other.centroids);
         self.buffer.extend_from_slice(&other.buffer);
         self.total += other.total;
-        self.min = self.min.min(other.min);
-        self.max = self.max.max(other.max);
+        self.min = min_of(self.min, other.min);
+        self.max = max_of(self.max, other.max);
         self.compress();
     }
 
@@ -153,12 +157,13 @@ impl TDigest {
             c.compress();
             return c.quantile(q);
         }
+        let (min, max) = (self.min?, self.max?);
         let q = q.clamp(0.0, 1.0);
         if q == 0.0 {
-            return Some(self.min);
+            return Some(min);
         }
         if q == 1.0 {
-            return Some(self.max);
+            return Some(max);
         }
         let target = q * self.total;
         let n = self.centroids.len();
@@ -171,7 +176,7 @@ impl TDigest {
         // the observed extremes and the outermost centroids.
         let mut cum = 0.0f64;
         let mut prev_pos = 0.0f64;
-        let mut prev_mean = self.min;
+        let mut prev_mean = min;
         for (i, c) in self.centroids.iter().enumerate() {
             let pos = cum + c.weight / 2.0;
             if target < pos {
@@ -193,10 +198,10 @@ impl TDigest {
                 } else {
                     1.0
                 };
-                return Some(c.mean + (self.max - c.mean) * frac);
+                return Some(c.mean + (max - c.mean) * frac);
             }
         }
-        Some(self.max)
+        Some(max)
     }
 
     pub fn median(&self) -> Option<f64> {
@@ -213,15 +218,16 @@ impl TDigest {
             c.compress();
             return c.cdf(x);
         }
-        if x <= self.min {
+        let (min, max) = (self.min?, self.max?);
+        if x <= min {
             return Some(0.0);
         }
-        if x >= self.max {
+        if x >= max {
             return Some(1.0);
         }
         let mut cum = 0.0f64;
         let mut prev_pos = 0.0f64;
-        let mut prev_mean = self.min;
+        let mut prev_mean = min;
         for c in &self.centroids {
             let pos = cum + c.weight / 2.0;
             if x < c.mean {
@@ -237,7 +243,7 @@ impl TDigest {
             prev_pos = pos;
             prev_mean = c.mean;
         }
-        let span = self.max - prev_mean;
+        let span = max - prev_mean;
         let frac = if span > 0.0 {
             (x - prev_mean) / span
         } else {
@@ -247,11 +253,25 @@ impl TDigest {
     }
 
     pub fn min(&self) -> Option<f64> {
-        (self.total > 0.0).then_some(self.min)
+        self.min
     }
 
     pub fn max(&self) -> Option<f64> {
-        (self.total > 0.0).then_some(self.max)
+        self.max
+    }
+}
+
+fn min_of(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn max_of(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
     }
 }
 
@@ -340,6 +360,15 @@ mod tests {
             let w = whole.quantile(q).unwrap();
             assert!((m - w).abs() < 2.0, "q={q} merged={m} whole={w}");
         }
+    }
+
+    #[test]
+    fn empty_digest_round_trips_json() {
+        let json = serde_json::to_string(&TDigest::default()).unwrap();
+        let back: TDigest = serde_json::from_str(&json).unwrap();
+        assert!(back.is_empty());
+        assert_eq!(back.min(), None);
+        assert_eq!(back.median(), None);
     }
 
     #[test]

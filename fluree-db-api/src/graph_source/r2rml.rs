@@ -1221,6 +1221,27 @@ impl<'a> FlureeR2rmlProvider<'a> {
         Ok(metadata.current_snapshot().map(|s| s.snapshot_id))
     }
 
+    /// The names of the table's top-level columns in its current schema:
+    /// the columns a projection can name and an unprojected scan reads.
+    pub(crate) async fn table_column_names(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+    ) -> QueryResult<Vec<String>> {
+        let (_storage, metadata, _loc) = self
+            .prepare_iceberg_scan(graph_source_id, table_name)
+            .await?;
+        let schema = metadata
+            .current_schema()
+            .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
+        Ok(schema
+            .fields
+            .iter()
+            .filter(|f| !f.is_nested())
+            .map(|f| f.name.clone())
+            .collect())
+    }
+
     /// The source graph source's materialization options from the persisted
     /// `IcebergGsConfig`: the optional tombstone/delete convention and the
     /// optional latest-by-key ordering column. Both `None` means additive,
