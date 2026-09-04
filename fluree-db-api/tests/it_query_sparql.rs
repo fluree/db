@@ -7041,6 +7041,49 @@ async fn assert_range_filter_cases(fluree: &MemoryFluree, ledger: &MemoryLedger,
     }
 }
 
+/// An oversized `xsd:integer` reaches lowering from every expression surface
+/// the widened parser opened, not just FILTER: BIND, arithmetic, ORDER BY and
+/// aggregation each route through a different `LiteralValue` match.
+#[tokio::test]
+async fn sparql_big_integer_lowers_from_every_expression_surface() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ranges(&fluree, "bigint:main").await.ledger;
+    let big = "100000000000000000000";
+
+    for (label, query) in [
+        ("bind", format!("SELECT ?x WHERE {{ BIND({big} AS ?x) }}")),
+        (
+            "arithmetic",
+            format!("SELECT ?x WHERE {{ BIND({big} + 1 AS ?x) }}"),
+        ),
+        (
+            "negated",
+            format!("SELECT ?x WHERE {{ BIND(-{big} AS ?x) }}"),
+        ),
+        (
+            "order-by",
+            format!(
+                "SELECT ?s WHERE {{ ?s <http://example.org/price> ?v }} ORDER BY (?v + {big}) LIMIT 1"
+            ),
+        ),
+        (
+            "having",
+            format!(
+                "SELECT (COUNT(?s) AS ?n) WHERE {{ ?s <http://example.org/price> ?v }} HAVING (COUNT(?s) < {big})"
+            ),
+        ),
+    ] {
+        let result = support::query_sparql(&fluree, &ledger, &query)
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] {query}: {e}"));
+        let rows = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        assert!(
+            !rows.as_array().expect("rows").is_empty(),
+            "[{label}] expected at least one row: {rows}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn sparql_range_filter_keeps_every_conjunct_over_novelty() {
     assert_index_defaults();
