@@ -24,6 +24,10 @@ troubleshooting.
 
 The Fluree-specific SPARQL surface (the 1.1 basics assumed): time travel with `FROM @t:`, fact history via `<< s p o >> f:t/f:op`, RDF 1.2 edge annotations (`{| |}`, `~`, `rdf:reifies`), cross-ledger `FROM`/`GRAPH` queries, and cross-surface round-trips.
 
+### [Unstructured documents into a graph](../unstructured/README.md)
+
+`fluree doc ingest` turns a folder of PDFs, Office files, Markdown and scans into a searchable, citable graph. Fluree Unstructured has its own section: tiers, connecting a Fluree AI account, what gets built, and publishing the result.
+
 ### [Full-Text and Vector Search](cookbook-search.md)
 
 Set up BM25 full-text search and vector similarity. Insert searchable data, write relevance-ranked queries, combine search with graph patterns, and build hybrid text+vector search.

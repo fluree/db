@@ -78,6 +78,7 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`sql`](sql.md) | Map and manage SQL tables as graph sources through a Trino-protocol endpoint (map, list, info, drop) |
 | [`materialize`](materialize.md) | Build a native ledger twin from a virtual (Iceberg/R2RML) graph source |
 | [`bm25`](bm25.md) | Manage BM25 full-text search indexes (create, list, sync, drop) |
+| [`doc`](doc.md) | Ingest a folder of documents into a searchable graph (structure, chunks, embeddings, indexes) and search it |
 
 ### Remote Sync
 

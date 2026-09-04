@@ -81,6 +81,8 @@ be fixed later; the first query surfaces the real error.
 | `auth` | none | `bearer` (static token) or `oauth2_client_credentials`; values accept the same `env_var` / `secret_ref` indirection as Iceberg catalog auth |
 | `session` | `{}` | Session properties, e.g. `{"query_max_run_time": "5m"}` |
 | `request_timeout_secs` | `120` | Per page fetch |
+| `model` | — | Model ledger (`name:branch`) whose default graph supplies view policies and the class/property hierarchy; must exist. See [Access policy](iceberg.md#access-policy) |
+| `default_allow` | — | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model |
 
 Table names in the mapping are dotted and quoted part by part:
 `rr:tableName "sales.orders"` becomes `"sales"."orders"`; with `catalog`
@@ -245,6 +247,11 @@ moment. Consequently
   a literal, so a secret supplied to either lives at rest in the record, which
   should be protected accordingly. This matches how the Iceberg REST catalog
   registers; accepting a `secret_ref` through those paths is a follow-up.
+- View policy is enforced in the R2RML scan exactly as for an Iceberg source
+  (static `f:onProperty` / `f:onClass` / `f:onSubject` targeting, subclass
+  expansion and stored policies through a `--model` ledger; `f:query` fails
+  closed). See [Access policy](iceberg.md#access-policy). Enforcement happens
+  after the rows come back from SQL; hidden columns are still selected.
 
 ## Running the bridge
 
@@ -266,6 +273,23 @@ The bridge holds the connection pool; Fluree holds nothing. It answers
 `POST /v1/statement` with the same paged JSON Trino returns, reporting column
 types in Trino's names, so everything on this page applies unchanged.
 
+Over SQLite, a table column is typed by its **declared** type under SQLite's
+own affinity rules (`NUMERIC`, `DECIMAL(10,2)` and any other numeric-affinity
+name report as `double`; `INT…` as `bigint`; `…CHAR`, `…TEXT`, `…CLOB` as
+`varchar`), and each cell is converted to that type. SQLite stores each cell
+in its own storage class, so a `NUMERIC` column can hold `5.00` as an integer
+next to `99.50` as a real; typing by declaration keeps both as `5.0` and
+`99.5` rather than letting the first row decide. An expression column
+(`SUM(total)`) has no declared type and takes the driver's inference.
+
+A `bigint` column is the exception: it converts nothing. SQLite already stores
+every losslessly-integral value in an `INT…` column as an integer (`3.0` lands
+as one), so a cell that is still a real, text or blob there is bad data rather
+than a storage-class choice, and converting it would report `2` for `2.5` and
+`0` for `'abc'`. The query fails instead, naming the column and the storage
+class it found. Declare the column `NUMERIC` to read mixed storage as a
+`double` — a `CAST` will not do it, since the result is an expression column.
+
 ## Comparison with Iceberg sources
 
 | | Iceberg source | SQL source |
@@ -276,6 +300,7 @@ types in Trino's names, so everything on this page applies unchanged.
 | `ORDER BY … LIMIT` | top-k file ordering | not pushed |
 | Snapshots / time travel | pinned per query, incremental twins | none; full rebuilds |
 | `rr:sqlQuery` | refused | supported |
+| View policy | static targeting in the scan, `--model` ledger | same |
 | Extra infrastructure | none | Trino, or a bridge sidecar |
 
 ## See also

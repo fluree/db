@@ -39,6 +39,55 @@ where
     wasm_bindgen_futures::spawn_local(fut);
 }
 
+/// Detach `fut` onto its own task and return a future for its result — the
+/// cancellation shield used by the commit windows ([`Fluree::commit_shielded`],
+/// [`Fluree::apply_staged_detached`]): the work is running from the moment this
+/// returns, and dropping the returned future abandons only the *wait*, never
+/// the work.
+///
+/// Native: `tokio::spawn`, exactly as the shield sites called it directly; the
+/// error string is the `JoinError` rendering, so panic/cancel detail survives.
+///
+/// [`Fluree::commit_shielded`]: crate::Fluree
+/// [`Fluree::apply_staged_detached`]: crate::Fluree
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn spawn_shielded<F>(
+    fut: F,
+) -> impl std::future::Future<Output = Result<F::Output, String>>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let handle = tokio::spawn(fut);
+    async move { handle.await.map_err(|e| e.to_string()) }
+}
+
+/// wasm32: `tokio::spawn` would panic (`TryCurrentError` — the exact trap the
+/// browser transact path hit under `wasm-pack test`). The browser event loop is
+/// the executor: the work runs to completion on its own `spawn_local` task and
+/// the result comes back over a oneshot, so the shield property is identical —
+/// a caller dropping the returned future cannot cancel the commit window. A
+/// task that dies without sending means the instance trapped (wasm panics
+/// abort the whole instance), so the error arm is type-completeness, not a
+/// live recovery path.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn spawn_shielded<F>(
+    fut: F,
+) -> impl std::future::Future<Output = Result<F::Output, String>>
+where
+    F: std::future::Future + 'static,
+    F::Output: 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = tx.send(fut.await);
+    });
+    async move {
+        rx.await
+            .map_err(|_| "shielded task dropped without a result".to_string())
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 mod stubs {
     /// Mirrors `fluree_db_indexer::gc::DEFAULT_MAX_OLD_INDEXES`.

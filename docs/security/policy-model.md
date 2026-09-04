@@ -230,7 +230,7 @@ When more than one policy targets the same flake, the engine combines them as fo
 
 1. If any **required** policy (`f:required: true`) targets the flake and does not allow it (either `f:allow: false`, missing `f:allow`, or `f:query` returning no rows), access is **denied** for that flake. Required policies are *gates*: they cannot be overridden by other allows or by `default-allow`.
 2. If at least one targeted (but not required) policy allows the flake, access is **granted**. Non-required allows combine with allow-overrides semantics.
-3. If a targeted policy's `f:query` returns false (no rows), that policy *applied but did not permit* — the flake is denied even if `default-allow` is `true`. Default-allow only applies when **no** policy targets the flake.
+3. If a targeted policy's `f:query` returns false (no rows) and no other targeted policy allows, that policy *applied but did not permit* — the flake is denied even if `default-allow` is `true`. Every targeted policy is evaluated before this decision, so the result never depends on the order policies were loaded in. Default-allow only applies when **no** policy targets the flake.
 4. If no policies target the flake, `default-allow` decides. `false` denies; `true` permits.
 
 `f:allow` always takes precedence over `f:query`: if both are set on the same policy, `f:allow` wins.
@@ -310,6 +310,10 @@ Pass policies in `opts.policy` (an array of policy nodes) for ad-hoc requests:
 ```
 
 Useful for tests, admin scripts, and migration tooling. Inline policies and stored policies can coexist in a single request: inline policies always merge **on top of** whatever stored policies the request selects — via `identity`, `policy-class`, or a cross-ledger `f:policySource` — never instead of them.
+
+### Virtual graph sources
+
+An Iceberg or SQL graph source has no ledger to store policies in. Its stored policies, identity `f:policyClass` assignments, and class hierarchy live in a **model ledger** named when the source is registered (`--model`), resolved through the [cross-ledger](cross-ledger-policy.md#virtual-graph-sources-iceberg--sql) mechanism. Inline policies work on a virtual source with or without a model. Only static targeting is enforceable there — `f:query` fails closed — see [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy).
 
 ## Request-time options
 

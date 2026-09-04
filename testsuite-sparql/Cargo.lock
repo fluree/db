@@ -957,6 +957,7 @@ dependencies = [
  "fluree-db-reasoner",
  "fluree-db-spatial",
  "fluree-db-tabular",
+ "fluree-graph-ir",
  "fluree-graph-json-ld",
  "fluree-search-protocol",
  "fluree-vocab",

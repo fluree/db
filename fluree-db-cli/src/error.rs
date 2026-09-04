@@ -78,6 +78,15 @@ impl fmt::Debug for CliError {
     }
 }
 
+impl From<fluree_db_doc::DocError> for CliError {
+    fn from(e: fluree_db_doc::DocError) -> Self {
+        match e {
+            fluree_db_doc::DocError::Config(m) => CliError::Config(m),
+            other => CliError::Input(other.to_string()),
+        }
+    }
+}
+
 impl From<fluree_db_api::ApiError> for CliError {
     fn from(e: fluree_db_api::ApiError) -> Self {
         CliError::Api(e)

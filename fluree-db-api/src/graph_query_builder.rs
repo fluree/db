@@ -162,7 +162,36 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                         fluree_db_novelty::Novelty::new(0),
                     );
                     let mut db = crate::view::GraphDb::from_ledger_state(&state);
+                    // A model-governed source carries its model ledger as the
+                    // policy / schema source so `wrap_policy` resolves both. A
+                    // lookup FAILURE must not read as "ungoverned": it would drop
+                    // the model silently and open the source.
+                    if let Some(record) = self
+                        .graph
+                        .fluree
+                        .nameservice()
+                        .lookup_graph_source(&gs_id)
+                        .await
+                        .map_err(|e| ApiError::internal(e.to_string()))?
+                    {
+                        db.resolved_config = crate::Fluree::graph_source_model_config(&record);
+                    }
                     db.graph_source_id = Some(gs_id.into());
+                    // Unlike the `from`-driven builder, nothing downstream of this
+                    // one wraps policy, so a governed source would otherwise be read
+                    // unfiltered. Gated on the request carrying a policy input, the
+                    // same rule `apply_source_or_global_policy` uses: a request with
+                    // none is unrestricted, exactly as for a native ledger.
+                    let opts = match self.core.input.as_ref() {
+                        Some(crate::view::QueryInput::JsonLd(json)) => {
+                            crate::GovernanceOptions::from_json(json)
+                                .map_err(|e| ApiError::query(e.to_string()))?
+                        }
+                        _ => crate::GovernanceOptions::default(),
+                    };
+                    if opts.has_any_policy_inputs() {
+                        return self.graph.fluree.wrap_policy(db, &opts, None).await;
+                    }
                     return Ok(db);
                 }
             }

@@ -205,6 +205,11 @@ pub struct PolicyEnforcement {
     /// `rdfs:domain`, `rdfs:range`) bypass policy, so a query over the ontology
     /// can still produce rows.
     pub denies_all_data: bool,
+    /// Policies whose `f:query` could not be evaluated for this request and
+    /// therefore denied their targets: a graph source (Iceberg / SQL) has no
+    /// graph to run a policy query against. Empty on native ledgers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unevaluable_policies: Vec<String>,
 }
 
 /// Fuel limit exceeded. Field values are micro-fuel; use the helpers for fuel decimals.
@@ -381,12 +386,43 @@ impl Tracker {
             // A dataset query prepares several views; keep the most restrictive
             // reading so `denies_all_data` means "every graph denied".
             *slot = Some(match slot.take() {
-                Some(prev) => PolicyEnforcement {
-                    enforced: true,
-                    denies_all_data: prev.denies_all_data && state.denies_all_data,
-                },
+                Some(prev) => {
+                    let mut unevaluable_policies = prev.unevaluable_policies;
+                    for id in state.unevaluable_policies {
+                        if !unevaluable_policies.contains(&id) {
+                            unevaluable_policies.push(id);
+                        }
+                    }
+                    PolicyEnforcement {
+                        enforced: true,
+                        denies_all_data: prev.denies_all_data && state.denies_all_data,
+                        unevaluable_policies,
+                    }
+                }
                 None => state,
             });
+        }
+    }
+
+    /// Record a policy whose `f:query` could not be evaluated for this request
+    /// (see [`PolicyEnforcement::unevaluable_policies`]). Recorded during
+    /// execution, so it merges into whatever enforcement state the prepared
+    /// view already stamped.
+    pub fn record_unevaluable_policy(&self, policy_id: &str) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if !inner.options.track_policy || policy_id.is_empty() {
+            return;
+        }
+        if let Ok(mut slot) = inner.policy_enforcement.write() {
+            let state = slot.get_or_insert_with(|| PolicyEnforcement {
+                enforced: true,
+                ..PolicyEnforcement::default()
+            });
+            if !state.unevaluable_policies.iter().any(|id| id == policy_id) {
+                state.unevaluable_policies.push(policy_id.to_string());
+            }
         }
     }
 
@@ -596,12 +632,14 @@ mod tests {
         t.record_policy_enforcement(Some(PolicyEnforcement {
             enforced: true,
             denies_all_data: true,
+            unevaluable_policies: Vec::new(),
         }));
         assert_eq!(
             t.tally().unwrap().policy_enforcement,
             Some(PolicyEnforcement {
                 enforced: true,
                 denies_all_data: true,
+                unevaluable_policies: Vec::new(),
             })
         );
     }
@@ -616,6 +654,7 @@ mod tests {
         t.record_policy_enforcement(Some(PolicyEnforcement {
             enforced: true,
             denies_all_data: true,
+            unevaluable_policies: Vec::new(),
         }));
         let tally = t.tally().unwrap();
         assert_eq!(tally.policy, None);
@@ -630,16 +669,19 @@ mod tests {
         t.record_policy_enforcement(Some(PolicyEnforcement {
             enforced: true,
             denies_all_data: true,
+            unevaluable_policies: Vec::new(),
         }));
         t.record_policy_enforcement(Some(PolicyEnforcement {
             enforced: true,
             denies_all_data: false,
+            unevaluable_policies: Vec::new(),
         }));
         assert_eq!(
             t.tally().unwrap().policy_enforcement,
             Some(PolicyEnforcement {
                 enforced: true,
                 denies_all_data: false,
+                unevaluable_policies: Vec::new(),
             })
         );
     }

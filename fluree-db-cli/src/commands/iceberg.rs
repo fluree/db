@@ -332,6 +332,7 @@ async fn run_iceberg_map_remote(
         );
     }
 
+    print_model_warnings(&model_warnings_of(&result));
     Ok(())
 }
 
@@ -356,6 +357,26 @@ pub(crate) fn infer_mapping_media_type(path: &std::path::Path) -> Option<String>
 }
 
 /// Convert CLI args to a JSON body for the server endpoint.
+/// Print registration warnings about the `--model` reference (one per line).
+pub(crate) fn print_model_warnings(warnings: &[String]) {
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
+}
+
+/// The `model_warnings` of a server map response, if any.
+pub(crate) fn model_warnings_of(result: &serde_json::Value) -> Vec<String> {
+    result
+        .get("model_warnings")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|w| w.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     let mut body = serde_json::json!({
         "name": args.name,
@@ -391,6 +412,12 @@ fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     }
     if let Some(ref v) = args.branch {
         obj.insert("branch".into(), v.clone().into());
+    }
+    if let Some(ref v) = args.model {
+        obj.insert("model".into(), v.clone().into());
+    }
+    if let Some(v) = args.default_allow {
+        obj.insert("default_allow".into(), v.into());
     }
     if let Some(ref v) = args.auth_bearer {
         obj.insert("auth_bearer".into(), v.clone().into());
@@ -579,6 +606,7 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
             result.graph_source_id
         );
         println!("  Table:       {}", result.table_identifier);
+        print_model_warnings(&result.model_warnings);
         println!("  Catalog:     {}", result.catalog_uri);
         println!("  R2RML:       {}", result.mapping_source);
         println!("  TriplesMaps: {}", result.triples_map_count);
@@ -610,6 +638,7 @@ async fn run_iceberg_map_local(args: IcebergMapArgs, dirs: &FlureeDir) -> CliRes
             result.graph_source_id
         );
         println!("  Table:       {}", result.table_identifier);
+        print_model_warnings(&result.model_warnings);
         println!("  Catalog:     {}", result.catalog_uri);
         println!(
             "  Connection:  {}",
@@ -673,6 +702,12 @@ fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::Icebe
 
     if let Some(ref branch) = args.branch {
         config = config.with_branch(branch);
+    }
+    if let Some(ref model) = args.model {
+        config = config.with_model(model);
+    }
+    if let Some(allow) = args.default_allow {
+        config = config.with_default_allow(allow);
     }
     if let Some(ref token) = args.auth_bearer {
         config = config.with_auth_bearer(token);
@@ -750,6 +785,8 @@ mod tests {
             r2rml: None,
             r2rml_type: None,
             branch: None,
+            model: None,
+            default_allow: None,
             auth_bearer: None,
             oauth2_token_url: None,
             oauth2_client_id: None,
@@ -762,6 +799,17 @@ mod tests {
             s3_endpoint: None,
             s3_path_style: false,
         }
+    }
+
+    #[test]
+    fn args_to_json_carries_model_ledger() {
+        let mut args = base_rest_args();
+        assert!(args_to_json(&args).unwrap().get("model").is_none());
+        args.model = Some("governance:main".to_string());
+        assert_eq!(args_to_json(&args).unwrap()["model"], "governance:main");
+        assert!(args_to_json(&args).unwrap().get("default_allow").is_none());
+        args.default_allow = Some(true);
+        assert_eq!(args_to_json(&args).unwrap()["default_allow"], true);
     }
 
     #[test]

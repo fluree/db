@@ -130,6 +130,61 @@ pub(crate) fn mapping_source_of(
     }
 }
 
+/// The policy configuration a virtual source's record carries: its model
+/// ledger and its `default-allow`, either of which may be unset.
+pub(crate) fn policy_config_of(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+) -> (Option<String>, Option<bool>) {
+    match record.source_type {
+        GraphSourceType::R2rml | GraphSourceType::Iceberg => {
+            IcebergGsConfig::from_json(&record.config)
+                .ok()
+                .map_or((None, None), |c| (c.model, c.default_allow))
+        }
+        #[cfg(feature = "sql")]
+        GraphSourceType::Sql => super::sql::policy_config(record),
+        _ => (None, None),
+    }
+}
+
+/// The resolved config a governed virtual source presents to the policy
+/// wrapper. With a model ledger, its default graph is both the
+/// `f:policySource` and the `f:schemaSource`, so `wrap_policy` takes the
+/// cross-ledger path unchanged and the R2RML policy gate sees
+/// hierarchy-expanded targets. `default_allow` fills a request that left it
+/// unset, exactly as a native ledger's `f:defaultAllow` does. `None` when the
+/// record sets neither.
+pub(crate) fn source_resolved_config(
+    model: Option<&str>,
+    default_allow: Option<bool>,
+) -> Option<fluree_db_core::ledger_config::ResolvedConfig> {
+    use fluree_db_core::ledger_config::{
+        GraphSourceRef, PolicyDefaults, ReasoningDefaults, ResolvedConfig,
+    };
+    if model.is_none() && default_allow.is_none() {
+        return None;
+    }
+    let graph_ref = |model: &str| GraphSourceRef {
+        ledger: Some(model.to_string()),
+        graph_selector: Some(fluree_vocab::config_iris::DEFAULT_GRAPH.to_string()),
+        at_t: None,
+        trust_policy: None,
+        rollback_guard: None,
+    };
+    Some(ResolvedConfig {
+        policy: Some(PolicyDefaults {
+            default_allow,
+            policy_source: model.map(graph_ref),
+            ..PolicyDefaults::default()
+        }),
+        reasoning: model.map(|m| ReasoningDefaults {
+            schema_source: Some(graph_ref(m)),
+            ..ReasoningDefaults::default()
+        }),
+        ..ResolvedConfig::default()
+    })
+}
+
 /// An Iceberg-backed source scans tables, never queries: refuse a mapping with
 /// `rr:sqlQuery` at registration rather than at first query.
 fn reject_sql_queries(compiled: &CompiledR2rmlMapping) -> Result<()> {
@@ -529,6 +584,7 @@ impl crate::Fluree {
 
         // 1. Validate configuration
         config.validate()?;
+        let model_warnings = self.validate_source_model(config.model.as_deref()).await?;
 
         // 2. Test catalog connection (REST mode only — Direct mode verified at query time)
         let connection_tested = if config.is_rest() {
@@ -568,6 +624,7 @@ impl crate::Fluree {
         );
 
         Ok(IcebergCreateResult {
+            model_warnings,
             graph_source_id,
             table_identifier: config.table_identifier_display(),
             catalog_uri: config.catalog_uri_or_location().to_string(),
@@ -590,6 +647,9 @@ impl crate::Fluree {
         info!(graph_source_id = %graph_source_id, "Creating R2RML graph source");
 
         config.validate()?;
+        let model_warnings = self
+            .validate_source_model(config.iceberg.model.as_deref())
+            .await?;
 
         // Resolve mapping: validate and store to CAS if inline content
         let (mapping_address, triples_map_count, table_names, mapping_validated) = match &config
@@ -659,6 +719,7 @@ impl crate::Fluree {
         info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, "Created R2RML graph source");
 
         Ok(R2rmlCreateResult {
+            model_warnings,
             graph_source_id,
             table_identifier: config.iceberg.table_identifier_display(),
             catalog_uri: config.iceberg.catalog_uri_or_location().to_string(),
@@ -4499,6 +4560,8 @@ mod tests {
             // materialization options stay absent (their serde defaults).
             delete: None,
             order_by: None,
+            model: None,
+            default_allow: None,
         }
         .to_json()
         .unwrap()

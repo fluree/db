@@ -21,6 +21,25 @@
 //! scope. So the lane is join-equivalent unconditionally, and the hash fast
 //! path engages only where the premise provably holds.
 //!
+//! **The premise can also fail inside one graph: RDF list rows.** A
+//! list-valued predicate stores one flake per position, so the same
+//! `(s, p, o)` recurs at multiple `o_i` values and the generic join emits
+//! one row per matching flake where keep/drop would emit one per driving
+//! row (#1687). Stats carry no list-ness, so this is not plan-detectable;
+//! instead the one-shot drain that builds the key set doubles as the
+//! detector — a key tuple inserted twice IS the premise's counterexample
+//! (two flakes matched one ground triple). When that happens the hash set
+//! is discarded and every row takes the exact per-row fallback, keeping
+//! the lane join-equivalent without ruling on what a var-object join over
+//! list positions should mean (that semantics call stays with #1687).
+//!
+//! Engagement is observable via [`MEMBERSHIP_JOIN_SITE`] routing stamps
+//! (the repo's `MustFire`/`MustNotFire` oracle): `Proceed` when the hash
+//! path serves probes, `Fallback(GateDeclined)` when the drain disproves
+//! the premise or a multi-graph scope forces exact mode, and
+//! `Fallback(KillSwitch)` from the planner when
+//! `FLUREE_DISABLE_QUERY_FAST_PATHS` suppresses the lane.
+//!
 //! **Rows with an unbound key var keep exact join semantics** — a join
 //! against a partially-ground pattern EXTENDS the row (possibly multiplying
 //! it), which a keep/drop semijoin cannot reproduce. Such rows fall back to
@@ -52,6 +71,14 @@ use async_trait::async_trait;
 use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
+/// Routing-stamp site for this lane (see `fast_path_outcome`). Stamped
+/// `Proceed` when the hash membership path serves probes,
+/// `Fallback(GateDeclined)` when the operator routes rows through the exact
+/// per-row join instead (multi-graph scope, or the build drain disproved
+/// the matches-at-most-once premise), and `Fallback(KillSwitch)` at plan
+/// time when the kill switch keeps the lane out of the plan.
+pub const MEMBERSHIP_JOIN_SITE: &str = "membership-join";
+
 pub struct MembershipJoinOperator {
     child: BoxedOperator,
     /// The right-side triple (all vars ∈ child schema).
@@ -65,9 +92,11 @@ pub struct MembershipJoinOperator {
     /// lazily on the first fully-bound row, so a stream that never grounds
     /// the pattern (or is empty) never pays for the scan.
     key_set: Option<FxHashSet<CompositeGroupKey>>,
-    /// Set at `open()` when more than one graph is in the active scope: the
-    /// hash set is never built and every row takes the exact per-row join
-    /// (see the multi-graph note in the module docs).
+    /// When set, every row takes the exact per-row join instead of the hash
+    /// keep/drop path. Set at `open()` when more than one graph is in the
+    /// active scope, and by `build_key_set` when the drain finds a duplicate
+    /// key tuple — proof that some ground triple matches more than one flake
+    /// (RDF list positions), so keep/drop is not join-equivalent (#1687).
     exact_only: bool,
     planning: PlanningContext,
     norm: Option<EqualityNorm>,
@@ -142,6 +171,7 @@ impl MembershipJoinOperator {
             &self.planning,
         )?;
         let mut set = FxHashSet::default();
+        let mut duplicate_ground_rows = false;
         inner.open(ctx).await?;
         while let Some(batch) = inner.next_batch(ctx).await? {
             ctx.check_cancelled()?;
@@ -155,22 +185,50 @@ impl MembershipJoinOperator {
                         binding_to_group_key_normalized(binding, store, gv)
                     })
                     .collect();
-                set.insert(CompositeGroupKey(key));
+                duplicate_ground_rows |= !set.insert(CompositeGroupKey(key));
             }
         }
         inner.close();
-        tracing::debug!(
-            keys = set.len(),
-            pattern = ?self.pattern,
-            "membership join key set built"
-        );
+        if duplicate_ground_rows {
+            // A key tuple drained twice means one ground triple matched more
+            // than one flake — RDF list positions (`o_i`) are the known case.
+            // The generic join emits one row per matching flake; keep/drop
+            // would collapse them. Discard the hash path and route every row
+            // through the exact per-row fallback so the lane's answer stays
+            // identical to the generic pipeline's (#1687).
+            tracing::debug!(
+                keys = set.len(),
+                pattern = ?self.pattern,
+                "membership join key set has duplicate ground rows; \
+                 falling back to exact per-row joins"
+            );
+            self.exact_only = true;
+            crate::fast_path_outcome::stamp_fast_path(
+                MEMBERSHIP_JOIN_SITE,
+                crate::fast_path_outcome::FastPathOutcome::Fallback(
+                    crate::fast_path_outcome::FastPathFallback::GateDeclined,
+                ),
+            );
+        } else {
+            tracing::debug!(
+                keys = set.len(),
+                pattern = ?self.pattern,
+                "membership join key set built"
+            );
+            crate::fast_path_outcome::stamp_fast_path(
+                MEMBERSHIP_JOIN_SITE,
+                crate::fast_path_outcome::FastPathOutcome::Proceed,
+            );
+        }
         self.key_set = Some(set);
         Ok(())
     }
 
-    /// Exact join fallback for a row that does NOT fully ground the
-    /// pattern: evaluate the triple seeded with the row and emit one
-    /// output row per match, with produced bindings filled in.
+    /// Exact join for a row the keep/drop drain cannot answer: one that
+    /// does NOT fully ground the pattern, or — once the drain declines
+    /// (`exact_only`: duplicate ground rows in the key set) — every row.
+    /// Evaluates the triple seeded with the row and emits one output row
+    /// per match, with produced bindings filled in.
     async fn per_row_join(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -226,6 +284,14 @@ impl Operator for MembershipJoinOperator {
             crate::dataset::ActiveGraphs::Single => false,
             crate::dataset::ActiveGraphs::Many(graphs) => graphs.len() > 1,
         };
+        if self.exact_only {
+            crate::fast_path_outcome::stamp_fast_path(
+                MEMBERSHIP_JOIN_SITE,
+                crate::fast_path_outcome::FastPathOutcome::Fallback(
+                    crate::fast_path_outcome::FastPathFallback::GateDeclined,
+                ),
+            );
+        }
         self.child.open(ctx).await?;
         self.key_set = None;
         self.state = OperatorState::Open;
@@ -260,28 +326,35 @@ impl Operator for MembershipJoinOperator {
                     if self.key_set.is_none() {
                         self.build_key_set(ctx).await?;
                     }
-                    self.probed_rows += 1;
-                    let key = self.extract_key(&input_batch, row_idx);
-                    let keep = self
-                        .key_set
-                        .as_ref()
-                        .expect("key set built above")
-                        .contains(&key);
-                    if keep {
-                        self.kept_rows += 1;
-                        for (col_idx, var) in self.schema.iter().enumerate() {
-                            let binding = input_batch
-                                .get(row_idx, *var)
-                                .cloned()
-                                .unwrap_or(Binding::Unbound);
-                            columns[col_idx].push(binding);
+                    // The build drain may have just disproved the
+                    // matches-at-most-once premise (duplicate ground rows —
+                    // list positions) and flipped `exact_only`; re-check so
+                    // no row is ever answered by a keep/drop the premise
+                    // does not cover.
+                    if !self.exact_only {
+                        self.probed_rows += 1;
+                        let key = self.extract_key(&input_batch, row_idx);
+                        let keep = self
+                            .key_set
+                            .as_ref()
+                            .expect("key set built above")
+                            .contains(&key);
+                        if keep {
+                            self.kept_rows += 1;
+                            for (col_idx, var) in self.schema.iter().enumerate() {
+                                let binding = input_batch
+                                    .get(row_idx, *var)
+                                    .cloned()
+                                    .unwrap_or(Binding::Unbound);
+                                columns[col_idx].push(binding);
+                            }
                         }
+                        continue;
                     }
-                } else {
-                    self.fallback_rows += 1;
-                    self.per_row_join(ctx, &input_batch, row_idx, &mut columns)
-                        .await?;
                 }
+                self.fallback_rows += 1;
+                self.per_row_join(ctx, &input_batch, row_idx, &mut columns)
+                    .await?;
             }
 
             if columns.first().is_none_or(std::vec::Vec::is_empty) {
@@ -298,7 +371,17 @@ impl Operator for MembershipJoinOperator {
     }
 
     fn estimated_rows(&self) -> Option<usize> {
-        // A filter: at most the child's cardinality (ground rows match ≤ once).
+        // Drain lane (keep/drop): a filter — at most the child's cardinality.
+        // Per-row-join fallback (`exact_only`, entered mid-execution when the
+        // drain finds duplicate ground rows): a bag join whose output can
+        // exceed the child's cardinality (the #1687 fixture emits 532 rows
+        // from 296 driving rows), making this an under-estimate. The regime
+        // isn't known yet when this is read (EXPLAIN `describe()` and lane
+        // gates run at plan/open time, before `build_key_set`), and every
+        // consumer treats a low value conservatively — a lane gate that reads
+        // it (`SubqueryOperator` materialize eligibility, the annotation-edge
+        // hash probe) declines its optimization and stays on the exact generic
+        // path — so the child estimate remains the honest upper-bound hint.
         self.child.estimated_rows()
     }
 }

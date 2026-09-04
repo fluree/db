@@ -85,6 +85,19 @@ async fn validate_report_shares_focus_nodes_across_shapes_targeting_same_class()
     );
     assert_eq!(report.shape_count, 2, "both shapes compiled");
 
+    // The report pins the exact snapshot it validated, so a caller measuring
+    // anything alongside the results can read at the same t.
+    let handle = fluree
+        .ledger_cached(ledger_id)
+        .await
+        .expect("ledger handle");
+    assert_eq!(
+        report.t,
+        handle.t().await,
+        "report.t must match the ledger head"
+    );
+    assert_eq!(report.t, 2, "two commits precede validation");
+
     // Subclass expansion: ex:rex (an ex:Dog) must appear as a focus node even
     // though the shapes target ex:Animal. ex:generic is a direct instance.
     let focus: std::collections::HashSet<String> = report
@@ -120,5 +133,62 @@ async fn validate_report_shares_focus_nodes_across_shapes_targeting_same_class()
         report.violation_count(),
         4,
         "each of 2 instances violates each of 2 shapes: {report:?}"
+    );
+}
+
+#[tokio::test]
+async fn validate_report_t_advances_with_ledger_head() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "test/validate-report/t-advances:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let r1 = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/", "sh": "http://www.w3.org/ns/shacl#"},
+                "@id": "ex:NameShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Thing"},
+                "sh:property": { "sh:path": {"@id": "ex:name"}, "sh:minCount": 1 }
+            }),
+        )
+        .await
+        .expect("seed shape");
+
+    let first = fluree
+        .validate_ledger(ledger_id, &ValidateOptions::default())
+        .await
+        .expect("validate must succeed");
+    assert!(first.conforms, "no instances yet: {first:?}");
+    assert_eq!(first.t, 1);
+
+    fluree
+        .insert(
+            r1.ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:thing",
+                "@type": "ex:Thing",
+                "ex:name": "named"
+            }),
+        )
+        .await
+        .expect("conforming instance commits");
+
+    let second = fluree
+        .validate_ledger(ledger_id, &ValidateOptions::default())
+        .await
+        .expect("validate must succeed");
+    assert!(second.conforms, "{second:?}");
+    let handle = fluree
+        .ledger_cached(ledger_id)
+        .await
+        .expect("ledger handle");
+    assert_eq!(second.t, 2);
+    assert_eq!(second.t, handle.t().await);
+    assert!(
+        second.t > first.t,
+        "report.t must move with the ledger head"
     );
 }
