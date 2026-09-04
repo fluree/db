@@ -85,6 +85,21 @@ const SHOP_R2RML: &str = r#"
                 rr:joinCondition [ rr:child "order_ref" ; rr:parent "id" ]
             ]
         ] .
+
+    # Two more maps minting order subjects from their own key columns: the
+    # shipment key is a bigint like the order's, the memo key is the text
+    # `order_ref`, which the database cannot compare with a bigint.
+    <http://example.org/mapping#Shipment>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.shipments" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{order_no}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:carrier ; rr:objectMap [ rr:column "carrier" ] ] .
+
+    <http://example.org/mapping#OrderMemo>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.notes" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{order_ref}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:memo ; rr:objectMap [ rr:column "body" ] ] .
 "#;
 
 /// The customer entity split across three triples maps sharing its subject
@@ -260,6 +275,11 @@ async fn shop() -> MockServer {
                 vec![json!(1), json!("10"), json!("gift wrap")],
                 vec![json!(2), json!("12"), json!("call first")],
             ],
+        ))
+        .table(Table::new(
+            "shop.shipments",
+            &[("order_no", "bigint"), ("carrier", "varchar")],
+            vec![vec![json!(10), json!("UPS")], vec![json!(12), json!("DHL")]],
         ))
         .mount()
         .await
@@ -871,6 +891,30 @@ fn cases() -> Vec<Case> {
             rows: &[
                 "b=call first o=http://example.org/order/12",
                 "b=gift wrap o=http://example.org/order/10",
+            ],
+            routing: Routing::MustNotFire,
+            declined: Some("join between two column classes"),
+        },
+        Case {
+            // Two templates of one skeleton mint one IRI when their
+            // placeholder values agree, whatever the columns are called.
+            name: "a subject shared by templates over different key columns joins the columns",
+            sparql: "SELECT ?o ?t ?k FROM <shop-sql:main> WHERE { ?o ex:total ?t . ?o ex:carrier ?k }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", "t1"."carrier" AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."shipments" AS "t1" ON "t0"."id" = "t1"."order_no" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."order_no" IS NOT NULL AND "t1"."carrier" IS NOT NULL"#],
+            rows: &[
+                "k=DHL o=http://example.org/order/12 t=42.00",
+                "k=UPS o=http://example.org/order/10 t=99.50",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a shared subject over key columns of two classes declines instead of failing to render",
+            sparql: "SELECT ?o ?t ?m FROM <shop-sql:main> WHERE { ?o ex:total ?t . ?o ex:memo ?m }",
+            sql: &[],
+            rows: &[
+                "m=call first o=http://example.org/order/12 t=42.00",
+                "m=gift wrap o=http://example.org/order/10 t=99.50",
             ],
             routing: Routing::MustNotFire,
             declined: Some("join between two column classes"),
@@ -1931,6 +1975,7 @@ const SQLITE: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS profiles",
         "DROP TABLE IF EXISTS people",
         "DROP TABLE IF EXISTS notes",
+        "DROP TABLE IF EXISTS shipments",
         "CREATE TABLE customers (id INTEGER, name TEXT, country TEXT)",
         "CREATE TABLE profiles (id INTEGER, email TEXT)",
         "CREATE TABLE people (id INTEGER, kind TEXT, name TEXT)",
@@ -1939,6 +1984,7 @@ const SQLITE: LiveBackend = LiveBackend {
         "CREATE TABLE tags (tag TEXT, n INTEGER)",
         "CREATE TABLE events (id INTEGER, at_tz TIMESTAMP, at_local TIMESTAMP)",
         "CREATE TABLE notes (id INTEGER, order_ref TEXT, body TEXT)",
+        "CREATE TABLE shipments (order_no INTEGER, carrier TEXT)",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
         PEOPLE_ROWS,
@@ -1951,6 +1997,7 @@ const SQLITE: LiveBackend = LiveBackend {
         TAG_ROWS,
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00', '2024-01-09 21:00:00')",
         "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
+        "INSERT INTO shipments VALUES (10, 'UPS'), (12, 'DHL')",
     ],
     // SQLite's `NUMERIC` reaches the bridge as text or double, so a SUM/AVG
     // over it declines (its datatype is decimal).
@@ -1974,6 +2021,7 @@ const POSTGRES: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS profiles",
         "DROP TABLE IF EXISTS people",
         "DROP TABLE IF EXISTS notes",
+        "DROP TABLE IF EXISTS shipments",
         "CREATE TABLE customers (id BIGINT, name TEXT, country TEXT)",
         "CREATE TABLE profiles (id BIGINT, email TEXT)",
         "CREATE TABLE people (id BIGINT, kind TEXT, name TEXT)",
@@ -1982,6 +2030,7 @@ const POSTGRES: LiveBackend = LiveBackend {
         "CREATE TABLE tags (tag TEXT, n INTEGER)",
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMPTZ, at_local TIMESTAMP)",
         "CREATE TABLE notes (id BIGINT, order_ref TEXT, body TEXT)",
+        "CREATE TABLE shipments (order_no BIGINT, carrier TEXT)",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
         PEOPLE_ROWS,
@@ -1994,6 +2043,7 @@ const POSTGRES: LiveBackend = LiveBackend {
         TAG_ROWS,
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00+00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00+00:00', '2024-01-09 21:00:00')",
         "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
+        "INSERT INTO shipments VALUES (10, 'UPS'), (12, 'DHL')",
     ],
     declines: &[],
 };
@@ -2010,6 +2060,7 @@ const MYSQL: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS profiles",
         "DROP TABLE IF EXISTS people",
         "DROP TABLE IF EXISTS notes",
+        "DROP TABLE IF EXISTS shipments",
         "CREATE TABLE customers (id BIGINT, name VARCHAR(64), country VARCHAR(64))",
         "CREATE TABLE profiles (id BIGINT, email VARCHAR(64))",
         "CREATE TABLE people (id BIGINT, kind VARCHAR(64), name VARCHAR(64))",
@@ -2018,6 +2069,7 @@ const MYSQL: LiveBackend = LiveBackend {
         "CREATE TABLE tags (tag VARCHAR(64), n INT)",
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMP NULL, at_local DATETIME)",
         "CREATE TABLE notes (id BIGINT, order_ref VARCHAR(64), body VARCHAR(64))",
+        "CREATE TABLE shipments (order_no BIGINT, carrier VARCHAR(64))",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
         PEOPLE_ROWS,
@@ -2030,6 +2082,7 @@ const MYSQL: LiveBackend = LiveBackend {
         TAG_ROWS,
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00+00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00+00:00', '2024-01-09 21:00:00')",
         "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
+        "INSERT INTO shipments VALUES (10, 'UPS'), (12, 'DHL')",
     ],
     declines: &[],
 };

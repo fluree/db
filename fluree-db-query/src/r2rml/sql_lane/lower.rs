@@ -415,9 +415,16 @@ impl<'a> Lowerer<'a> {
                         "ref object map parent on a table the entity does not access",
                     )));
                 }
-                // Another subject: no row of the child can join a row of
-                // that entity.
-                None => return Ok(Ok(None)),
+                // A subject the entity's accesses provably never mint: no
+                // row of the child can join a row of that entity.
+                None if accesses.iter().all(|(_, tm)| subjects_disjoint(tm, parent)) => {
+                    return Ok(Ok(None))
+                }
+                None => {
+                    return Ok(Err(Decline(
+                        "ref object map parent whose subject the entity may or may not mint",
+                    )))
+                }
             };
             for (child_col, parent_col) in conds {
                 self.edges.push((
@@ -880,10 +887,18 @@ impl<'a> Lowerer<'a> {
         }) {
             return decline("entity spans triples maps with a constant subject");
         }
-        // Different subjects never name one entity (the lane joins by key
-        // columns, never by rendered IRI): no row can carry every member.
-        if parts.iter().any(|(tm, _)| !same_subject(parts[0].0, tm)) {
+        // The lane joins parts by key columns, never by rendered IRI, so
+        // every part must mint the same subject space. Parts whose subjects
+        // provably never meet leave no row carrying every member; parts the
+        // lane cannot relate either way are left to the engine.
+        if parts
+            .iter()
+            .any(|(tm, _)| subjects_disjoint(parts[0].0, tm))
+        {
             return Ok(Err(Empty));
+        }
+        if parts.iter().any(|(tm, _)| !same_subject(parts[0].0, tm)) {
+            return decline("entity spans subject templates the lane cannot relate");
         }
         Ok(Ok(parts))
     }
@@ -1021,18 +1036,27 @@ impl<'a> Lowerer<'a> {
                 KeyShape::Template {
                     template: ta,
                     cols: ca,
-                    ..
+                    types: tya,
                 },
                 KeyShape::Template {
                     template: tb,
                     cols: cb,
-                    ..
+                    types: tyb,
                 },
             ) => {
-                if ta != tb || ca.len() != cb.len() {
+                // Two templates mint one IRI when their literal parts agree
+                // and their placeholders carry equal values, whatever the
+                // columns are called: `order/{id}` and `order/{order_ref}`
+                // join on `id = order_ref`.
+                if template_skeleton(ta) != template_skeleton(tb) || ca.len() != cb.len() {
                     return decline("repeated variable joins two different templates");
                 }
-                for (l, r) in ca.iter().zip(cb) {
+                for (i, (l, r)) in ca.iter().zip(cb).enumerate() {
+                    if let (Some(a), Some(b)) = (tya[i], tyb[i]) {
+                        if !fluree_db_tabular::plan::same_class(a, b) {
+                            return decline("join between two column classes");
+                        }
+                    }
                     self.push_edge(l.clone(), r.clone());
                 }
                 Ok(())
@@ -2012,17 +2036,70 @@ type Part<'a> = (&'a TriplesMap, Vec<usize>);
 
 /// Whether two triples maps mint their subject the same way from the same
 /// columns, so a row of each with equal key columns is one entity.
+/// A template with its placeholders anonymized: two templates of one
+/// skeleton mint one IRI exactly when their placeholder values agree.
+fn template_skeleton(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => {
+                out.push_str("{}");
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        break;
+                    }
+                }
+            }
+            '\\' => {
+                out.push(c);
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Whether two triples maps mint subjects in one space, so a subject
+/// shared between them is a join on their key columns: templates of one
+/// skeleton, or two column-valued subjects.
 fn same_subject(a: &TriplesMap, b: &TriplesMap) -> bool {
+    let (sa, sb) = (&a.subject_map, &b.subject_map);
+    match (&sa.template, &sb.template) {
+        (Some(ta), Some(tb)) => {
+            template_skeleton(ta) == template_skeleton(tb)
+                && sa.template_columns.len() == sb.template_columns.len()
+        }
+        (None, None) => sa.column.is_some() && sb.column.is_some(),
+        _ => false,
+    }
+}
+
+/// Whether no row of `a` can mint a subject of `b`: both are templates and
+/// neither's literal prefix (the text before the first placeholder) begins
+/// the other's. A column-valued subject can be anything, so it is never
+/// provably apart from another.
+fn subjects_disjoint(a: &TriplesMap, b: &TriplesMap) -> bool {
+    let (Some(ta), Some(tb)) = (&a.subject_map.template, &b.subject_map.template) else {
+        return false;
+    };
+    let prefix = |t: &str| t.split('{').next().unwrap_or("").to_string();
+    let (pa, pb) = (prefix(ta), prefix(tb));
+    !pa.starts_with(&pb) && !pb.starts_with(&pa)
+}
+
+/// Whether two triples maps read the same row: one relation, one subject
+/// map, column for column.
+fn same_row(a: &TriplesMap, b: &TriplesMap) -> bool {
     let (sa, sb) = (&a.subject_map, &b.subject_map);
     (sa.template.is_some() || sa.column.is_some())
         && sa.template == sb.template
         && sa.template_columns == sb.template_columns
         && sa.column == sb.column
-}
-
-/// Whether two triples maps read the same row: one relation, one subject.
-fn same_row(a: &TriplesMap, b: &TriplesMap) -> bool {
-    same_subject(a, b) && source_of_tm(a) == source_of_tm(b)
+        && source_of_tm(a) == source_of_tm(b)
 }
 
 fn collect_aliases(pred: &Pred, out: &mut HashSet<String>) {
