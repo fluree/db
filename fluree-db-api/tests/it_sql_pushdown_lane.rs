@@ -1267,20 +1267,23 @@ const SQLITE: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS words",
         "DROP TABLE IF EXISTS tags",
         "DROP TABLE IF EXISTS events",
+        "DROP TABLE IF EXISTS notes",
         "CREATE TABLE customers (id INTEGER, name TEXT, country TEXT)",
-        "CREATE TABLE orders (id INTEGER, customer_id INTEGER, total NUMERIC, placed DATE, shipped TIMESTAMP, updated TIMESTAMP)",
+        "CREATE TABLE orders (id INTEGER, customer_id INTEGER, total NUMERIC, placed DATE, shipped TIMESTAMP, updated TIMESTAMP, discount NUMERIC)",
         "CREATE TABLE words (id INTEGER, word TEXT, len INTEGER)",
         "CREATE TABLE tags (tag TEXT, n INTEGER)",
         "CREATE TABLE events (id INTEGER, at_tz TIMESTAMP, at_local TIMESTAMP)",
+        "CREATE TABLE notes (id INTEGER, order_ref TEXT, body TEXT)",
         CUSTOMER_ROWS,
         "INSERT INTO orders VALUES \
-            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00', '2024-01-06 09:30:00'), \
-            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00', '2024-02-02 18:00:00'), \
-            (12, 2, 42.00, '2024-03-01', NULL, NULL), \
-            (13, NULL, 7.00, NULL, NULL, NULL)",
+            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00', '2024-01-06 09:30:00', NULL), \
+            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00', '2024-02-02 18:00:00', NULL), \
+            (12, 2, 42.00, '2024-03-01', NULL, NULL, -5.00), \
+            (13, NULL, 7.00, NULL, NULL, NULL, NULL)",
         WORD_ROWS,
         TAG_ROWS,
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00', '2024-01-09 21:00:00')",
+        "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
     ],
     // SQLite's `NUMERIC` reaches the bridge as text or double, so a SUM/AVG
     // over it declines (its datatype is decimal).
@@ -1301,20 +1304,23 @@ const POSTGRES: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS words",
         "DROP TABLE IF EXISTS tags",
         "DROP TABLE IF EXISTS events",
+        "DROP TABLE IF EXISTS notes",
         "CREATE TABLE customers (id BIGINT, name TEXT, country TEXT)",
-        "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total NUMERIC(10,2), placed DATE, shipped TIMESTAMPTZ, updated TIMESTAMP)",
+        "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total NUMERIC(10,2), placed DATE, shipped TIMESTAMPTZ, updated TIMESTAMP, discount NUMERIC(10,2))",
         "CREATE TABLE words (id BIGINT, word TEXT, len INTEGER)",
         "CREATE TABLE tags (tag TEXT, n INTEGER)",
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMPTZ, at_local TIMESTAMP)",
+        "CREATE TABLE notes (id BIGINT, order_ref TEXT, body TEXT)",
         CUSTOMER_ROWS,
         "INSERT INTO orders VALUES \
-            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00'), \
-            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00'), \
-            (12, 2, 42.00, '2024-03-01', NULL, NULL), \
-            (13, NULL, 7.00, NULL, NULL, NULL)",
+            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00', NULL), \
+            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00', NULL), \
+            (12, 2, 42.00, '2024-03-01', NULL, NULL, -5.00), \
+            (13, NULL, 7.00, NULL, NULL, NULL, NULL)",
         WORD_ROWS,
         TAG_ROWS,
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00+00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00+00:00', '2024-01-09 21:00:00')",
+        "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
     ],
     declines: &[],
 };
@@ -1328,20 +1334,23 @@ const MYSQL: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS words",
         "DROP TABLE IF EXISTS tags",
         "DROP TABLE IF EXISTS events",
+        "DROP TABLE IF EXISTS notes",
         "CREATE TABLE customers (id BIGINT, name VARCHAR(64), country VARCHAR(64))",
-        "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total DECIMAL(10,2), placed DATE, shipped TIMESTAMP NULL, updated DATETIME)",
+        "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total DECIMAL(10,2), placed DATE, shipped TIMESTAMP NULL, updated DATETIME, discount DECIMAL(10,2))",
         "CREATE TABLE words (id BIGINT, word VARCHAR(64), len INT)",
         "CREATE TABLE tags (tag VARCHAR(64), n INT)",
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMP NULL, at_local DATETIME)",
+        "CREATE TABLE notes (id BIGINT, order_ref VARCHAR(64), body VARCHAR(64))",
         CUSTOMER_ROWS,
         "INSERT INTO orders VALUES \
-            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00'), \
-            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00'), \
-            (12, 2, 42.00, '2024-03-01', NULL, NULL), \
-            (13, NULL, 7.00, NULL, NULL, NULL)",
+            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00', NULL), \
+            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00', NULL), \
+            (12, 2, 42.00, '2024-03-01', NULL, NULL, -5.00), \
+            (13, NULL, 7.00, NULL, NULL, NULL, NULL)",
         WORD_ROWS,
         TAG_ROWS,
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00+00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00+00:00', '2024-01-09 21:00:00')",
+        "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
     ],
     declines: &[],
 };
@@ -1823,11 +1832,18 @@ async fn live_bridge_mysql_agrees_with_the_scan_lane() {
     live_differential(&MYSQL).await;
 }
 
-/// A skipped differential is not a passing one: CI must supply every backend.
+/// A skipped differential is not a passing one: the job that runs it must
+/// supply every backend.
+///
+/// Gated on the marker the differential step sets rather than on `CI`, because
+/// the workspace `test` job also runs with `CI` set and is not the job that
+/// starts the bridges — there this asserted three URLs that were never meant to
+/// be present, and failed. The marker sits beside the URLs in the same `env:`
+/// block, so removing a backend still trips this.
 #[test]
 fn live_bridge_backends_are_configured_in_ci() {
-    if std::env::var("CI").is_err() {
-        eprintln!("SKIPPED: not CI");
+    if std::env::var("FLUREE_LIVE_BRIDGE").is_err() {
+        eprintln!("SKIPPED: not the live-bridge job");
         return;
     }
     for b in [&SQLITE, &POSTGRES, &MYSQL] {

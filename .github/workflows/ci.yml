@@ -215,6 +215,10 @@ jobs:
 
       - name: Pushdown lane differential against SQLite, Postgres and MySQL
         env:
+          # `live_bridge_backends_are_configured_in_ci` keys on this marker to
+          # know it is in the job that starts the bridges, and then requires all
+          # three URLs below. Keep them together.
+          FLUREE_LIVE_BRIDGE: "1"
           FLUREE_SQL_BRIDGE_URL: http://127.0.0.1:18080
           FLUREE_SQL_BRIDGE_POSTGRES_URL: http://127.0.0.1:18081
           FLUREE_SQL_BRIDGE_MYSQL_URL: http://127.0.0.1:18082
