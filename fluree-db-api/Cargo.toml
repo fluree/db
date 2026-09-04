@@ -146,6 +146,7 @@ num-bigdecimal = { package = "bigdecimal", version = "0.4" }
 ed25519-dalek = "2.1"
 criterion = { version = "0.5", features = ["async_tokio"] }
 fluree-bench-support = { path = "../fluree-bench-support" }
+fluree-test-support = { path = "../fluree-test-support" }
 fluree-bench-alloc = { path = "../fluree-bench-alloc" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
@@ -160,6 +161,13 @@ fluree-db-binary-index = { path = "../fluree-db-binary-index", features = ["resi
 name = "it_residency_retry"
 path = "tests/it_residency_retry.rs"
 required-features = ["residency"]
+
+# Its own target, not a harness member: as a member, deleting the one #[path]
+# line that wires it in would silently stop it compiling — an orphan of exactly
+# the kind it exists to catch.
+[[test]]
+name = "harness_coverage"
+path = "tests/harness_coverage.rs"
 
 [[test]]
 name = "grp_graphsource"
@@ -347,6 +355,17 @@ path = "tests/it_minmax_fast_path_fired.rs"
 [[test]]
 name = "it_upsert_skip_fires"
 path = "tests/it_upsert_skip_fires.rs"
+
+# Standalone (NOT in grp_ledger): sets FLUREE_MAX_GRAPH_SCAN_FLAKES to exercise
+# the whole-graph-scan cap, then clears it. The limit is read from the process
+# env per scan and has no programmatic override, so a grouped binary — whose
+# tests are threads in one process under bare `cargo test` — leaks the cap into
+# every sibling running at the time. That surfaced as unrelated graph-sync tests
+# failing with WholeGraphScanTooLarge. nextest hides it by isolating per test.
+[[test]]
+name = "it_sync_graph_scan_backstop"
+path = "tests/it_sync_graph_scan_backstop.rs"
+required-features = ["native"]
 
 [[test]]
 name = "it_multi_graph_property_path"
