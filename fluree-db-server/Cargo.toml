@@ -184,6 +184,7 @@ wiremock = { workspace = true }
 indexmap = { workspace = true }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-test-support = { path = "../fluree-test-support" }
 
 [lints]
 workspace = true
@@ -197,9 +198,16 @@ workspace = true
 # iceberg, shacl, bolt), so grp_raft is the only harness that compiles to an
 # empty binary on a default build. The rest group by domain, not by feature.
 #
-# tests/harness_coverage.rs (in grp_http) fails if any tests/*.rs is neither
-# pulled into a harness nor declared below — without it, `autotests = false`
-# would let a new integration file silently never run.
+# tests/harness_coverage.rs fails if any tests/*.rs is neither pulled into a
+# harness nor declared below — without it, `autotests = false` would let a new
+# integration file silently never run.
+
+# Its own target, not a harness member: as a member, deleting the one #[path]
+# line that wires it in would silently stop it compiling — an orphan of exactly
+# the kind it exists to catch.
+[[test]]
+name = "harness_coverage"
+path = "tests/harness_coverage.rs"
 
 [[test]]
 name = "grp_http"

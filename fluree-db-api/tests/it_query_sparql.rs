@@ -6889,3 +6889,235 @@ async fn sparql_count_distinct_chain_fan_in() {
     let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(j, json!([[2]]), "2 distinct ?x values: {j}");
 }
+
+// =============================================================================
+// Range pushdown must be total-or-nothing
+// =============================================================================
+
+/// `ex:price` rows: a=497.26 b=0.005 c=12.5 d=0.01 (doubles), e=7 (integer),
+/// f=0.5 (decimal). `ex:shipped` rows: a=2019-12-31 b=2020-06-15 c=2021-06-01
+/// d=2022-01-01. A conjoined FILTER that mixed a pushable bound with an
+/// `xsd:decimal` bound used to push the representable half and drop the rest;
+/// two temporal bounds on the same side used to keep whichever came first.
+async fn seed_ranges(fluree: &MemoryFluree, ledger_id: &str) -> fluree_db_api::TransactResult {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": [
+            {"@id": "ex:a", "ex:price": {"@value": "4.972607E2", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2019-12-31", "@type": "xsd:date"}},
+            {"@id": "ex:b", "ex:price": {"@value": "0.005", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2020-06-15", "@type": "xsd:date"}},
+            {"@id": "ex:c", "ex:price": {"@value": "12.5", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2021-06-01", "@type": "xsd:date"}},
+            {"@id": "ex:d", "ex:price": {"@value": "1.0E-2", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2022-01-01", "@type": "xsd:date"}},
+            {"@id": "ex:e", "ex:price": 7},
+            {"@id": "ex:f", "ex:price": {"@value": "0.5", "@type": "xsd:decimal"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap()
+}
+
+async fn filtered_subjects(
+    fluree: &MemoryFluree,
+    ledger: &MemoryLedger,
+    predicate: &str,
+    filter: &str,
+) -> Vec<String> {
+    let query = format!(
+        r"
+        PREFIX ex: <http://example.org/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?s WHERE {{ ?s {predicate} ?v . FILTER({filter}) }}
+        "
+    );
+    let result = support::query_sparql(fluree, ledger, &query)
+        .await
+        .unwrap_or_else(|e| panic!("FILTER({filter}): {e}"));
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let mut subjects: Vec<String> = jsonld
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            row.as_array().expect("row")[0]
+                .as_str()
+                .expect("subject")
+                .trim_start_matches("ex:")
+                .to_string()
+        })
+        .collect();
+    subjects.sort();
+    subjects
+}
+
+const RANGE_FILTER_CASES: &[(&str, &str, &[&str])] = &[
+    // Baselines: a lone bound and same-type pairs already worked.
+    ("ex:price", "?v < 0.01", &["b"]),
+    ("ex:price", "?v >= 0.0 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v >= 0 && ?v < 1", &["b", "d", "f"]),
+    // Mixed pushable + decimal bound, either order and either side.
+    ("ex:price", "?v >= 0 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v < 0.01 && ?v >= 0", &["b"]),
+    ("ex:price", "?v >= 0e0 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v >= 1 && ?v <= 12.5", &["c", "e"]),
+    ("ex:price", "?v >= 0.5 && ?v < 20", &["c", "e", "f"]),
+    ("ex:price", "?v >= 0 && ?v < 1.0", &["b", "d", "f"]),
+    (
+        "ex:price",
+        "(?v >= 0) && (?v < 20.5)",
+        &["b", "c", "d", "e", "f"],
+    ),
+    (
+        "ex:price",
+        "?v >= 0 && ?v < 20.5 && ?v != 7",
+        &["b", "c", "d", "f"],
+    ),
+    // Two bounds on the same side: the tighter one must win, in either order.
+    ("ex:price", "?v < 5 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v < 0.01 && ?v < 5", &["b"]),
+    ("ex:price", "?v > 0.5 && ?v > 0e0", &["a", "c", "e"]),
+    ("ex:price", "?v >= 0 && ?v > 100000000000000000000", &[]),
+    (
+        "ex:price",
+        "?v >= 0 && ?v < 100000000000000000000",
+        &["a", "b", "c", "d", "e", "f"],
+    ),
+    (
+        "ex:price",
+        "?v > -100000000000000000000",
+        &["a", "b", "c", "d", "e", "f"],
+    ),
+    // Contradictory across types: empty, not "everything".
+    ("ex:price", "?v > 1.5 && ?v < 1", &[]),
+    // A conjunct with no RangeValue at all (xsd:integer past i64) must keep the
+    // whole filter rather than push the representable half. Both directions, so
+    // a lane that drops every row cannot pass the `[]` case by accident.
+    (
+        "ex:price",
+        "?v >= 0 && ?v > \"100000000000000000000\"^^xsd:integer",
+        &[],
+    ),
+    (
+        "ex:price",
+        "?v >= 0 && ?v < \"100000000000000000000\"^^xsd:integer",
+        &["a", "b", "c", "d", "e", "f"],
+    ),
+    // Temporal: same-side pair keeps the tighter bound.
+    (
+        "ex:shipped",
+        "?v >= \"2020-01-01\"^^xsd:date && ?v >= \"2021-06-01\"^^xsd:date",
+        &["c", "d"],
+    ),
+    (
+        "ex:shipped",
+        "?v >= \"2021-06-01\"^^xsd:date && ?v >= \"2020-01-01\"^^xsd:date",
+        &["c", "d"],
+    ),
+    (
+        "ex:shipped",
+        "?v < \"2022-01-01\"^^xsd:date && ?v < \"2021-01-01\"^^xsd:date",
+        &["a", "b"],
+    ),
+    (
+        "ex:shipped",
+        "?v >= \"2020-01-01\"^^xsd:date && ?v < \"2021-06-01\"^^xsd:date",
+        &["b"],
+    ),
+];
+
+async fn assert_range_filter_cases(fluree: &MemoryFluree, ledger: &MemoryLedger, lane: &str) {
+    for (predicate, filter, expected) in RANGE_FILTER_CASES {
+        let expected: Vec<String> = expected.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            filtered_subjects(fluree, ledger, predicate, filter).await,
+            expected,
+            "[{lane}] FILTER({filter})"
+        );
+    }
+}
+
+/// An oversized `xsd:integer` reaches lowering from every expression surface
+/// the widened parser opened, not just FILTER: BIND, arithmetic, ORDER BY and
+/// aggregation each route through a different `LiteralValue` match.
+#[tokio::test]
+async fn sparql_big_integer_lowers_from_every_expression_surface() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ranges(&fluree, "bigint:main").await.ledger;
+    let big = "100000000000000000000";
+
+    for (label, query) in [
+        ("bind", format!("SELECT ?x WHERE {{ BIND({big} AS ?x) }}")),
+        (
+            "arithmetic",
+            format!("SELECT ?x WHERE {{ BIND({big} + 1 AS ?x) }}"),
+        ),
+        (
+            "negated",
+            format!("SELECT ?x WHERE {{ BIND(-{big} AS ?x) }}"),
+        ),
+        (
+            "order-by",
+            format!(
+                "SELECT ?s WHERE {{ ?s <http://example.org/price> ?v }} ORDER BY (?v + {big}) LIMIT 1"
+            ),
+        ),
+        (
+            "having",
+            format!(
+                "SELECT (COUNT(?s) AS ?n) WHERE {{ ?s <http://example.org/price> ?v }} HAVING (COUNT(?s) < {big})"
+            ),
+        ),
+    ] {
+        let result = support::query_sparql(&fluree, &ledger, &query)
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] {query}: {e}"));
+        let rows = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        assert!(
+            !rows.as_array().expect("rows").is_empty(),
+            "[{label}] expected at least one row: {rows}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sparql_range_filter_keeps_every_conjunct_over_novelty() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ranges(&fluree, "ranges:main").await.ledger;
+    assert_range_filter_cases(&fluree, &ledger, "novelty").await;
+}
+
+#[tokio::test]
+async fn sparql_range_filter_keeps_every_conjunct_over_index() {
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "ranges/indexed:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    local
+        .run_until(async move {
+            let commit_t = seed_ranges(&fluree, ledger_id).await.receipt.t;
+            trigger_index_and_wait(&handle, ledger_id, commit_t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+            assert_eq!(
+                ledger.snapshot.t, commit_t,
+                "ledger must be indexed through the seed commit"
+            );
+            assert_range_filter_cases(&fluree, &ledger, "indexed").await;
+        })
+        .await;
+}
