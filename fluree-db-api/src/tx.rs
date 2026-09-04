@@ -3566,7 +3566,7 @@ impl crate::Fluree {
         if let Some(policy) = policy {
             options = options.with_policy(policy);
         }
-        let mut view = match stage_flakes(ledger, flakes, options).await {
+        let view = match stage_flakes(ledger, flakes, options).await {
             Ok(view) => view,
             Err(e) => {
                 self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
@@ -3579,6 +3579,9 @@ impl crate::Fluree {
         // metadata (that's TriG), so we pass `None` for graph_delta/graph_sids —
         // validation falls back to default-graph (g_id=0), matching how flakes
         // are produced by `FlakeSink`.
+        // The SHACL pass attaches the staged dictionaries to the view.
+        #[cfg(feature = "shacl")]
+        let mut view = view;
         #[cfg(feature = "shacl")]
         {
             // D's namespace codes → IRI prefixes (base + this document's

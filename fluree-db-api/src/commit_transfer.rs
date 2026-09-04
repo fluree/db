@@ -450,7 +450,7 @@ impl Fluree {
 
             // 4.3 Stage flakes (policy/backpressure). No WHERE/cancellation; flakes are prebuilt.
             let evolving_state = base_state.clone_with_novelty(Arc::new(evolving_novelty.clone()));
-            let mut staged_view = match stage_commit_flakes(
+            let staged_view = match stage_commit_flakes(
                 evolving_state,
                 &c.commit.flakes,
                 index_config,
@@ -489,6 +489,9 @@ impl Fluree {
             // the binary store) are intentionally absent from `graph_iris` and
             // therefore fall back to the ledger-wide baseline, which is the
             // correct behavior: config cannot exist for a graph not yet known.
+            // The SHACL pass attaches the staged dictionaries to the view.
+            #[cfg(feature = "shacl")]
+            let mut staged_view = staged_view;
             #[cfg(feature = "shacl")]
             {
                 crate::tx::apply_shacl_policy_to_staged_view(
