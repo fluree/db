@@ -100,6 +100,15 @@ const SHOP_R2RML: &str = r#"
         rr:logicalTable [ rr:tableName "shop.notes" ] ;
         rr:subjectMap [ rr:template "http://example.org/order/{order_ref}" ] ;
         rr:predicateObjectMap [ rr:predicate ex:memo ; rr:objectMap [ rr:column "body" ] ] .
+
+    # A subject under the order prefix with a different skeleton: an
+    # `order_ref` of `10/note` would collide with an order, so the lane can
+    # neither join nor rule the pair out.
+    <http://example.org/mapping#OrderNote>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.notes" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{order_ref}/note" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:noteBody ; rr:objectMap [ rr:column "body" ] ] .
 "#;
 
 /// The customer entity split across three triples maps sharing its subject
@@ -1183,6 +1192,14 @@ fn cases() -> Vec<Case> {
             ],
             routing: Routing::MustNotFire,
             declined: Some("join between two column classes"),
+        },
+        Case {
+            name: "a subject shared by templates of one prefix but different skeletons declines",
+            sparql: "SELECT ?o ?t ?b FROM <shop-sql:main> WHERE { ?o ex:total ?t . ?o ex:noteBody ?b }",
+            sql: &[],
+            rows: &[],
+            routing: Routing::MustNotFire,
+            declined: Some("entity spans subject templates the lane cannot relate"),
         },
         Case {
             name: "an optional hanging off an optional entity declines",
