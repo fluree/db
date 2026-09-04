@@ -141,6 +141,34 @@ const SHAPES: &[Shape] = &[
     },
 ];
 
+/// Outer bindings past one key set: a `VALUES` of the first `n` orders
+/// joined to the block, which is where seeding a statement per outer batch
+/// and fetching the block once part ways.
+fn outer_shapes() -> Vec<(String, String)> {
+    // `orders` (1M rows) is past the cache cap, so it stays seeded;
+    // `customers` (100k) fits, so past one key set it is fetched once.
+    [
+        ("orders", "order", "ex:total"),
+        ("customers", "customer", "ex:name"),
+    ]
+    .iter()
+    .flat_map(|(table, entity, pred)| {
+        [5_000usize, 50_000].map(|n| {
+            let values = (1..=n)
+                .map(|i| format!("<http://example.org/{entity}/{i}>"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            (
+                format!("outer-{table}-{}k", n / 1000),
+                format!(
+                    "SELECT ?s ?v FROM NAMED <shop:main> WHERE {{ VALUES ?s {{ {values} }} GRAPH <shop:main> {{ ?s {pred} ?v }} }}"
+                ),
+            )
+        })
+    })
+    .collect()
+}
+
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -245,19 +273,29 @@ async fn main() {
         "shape", "lane med", "lane min", "scan med", "scan min", "speedup"
     );
     let mut mismatches = 0;
-    for shape in SHAPES {
-        if !only.is_empty() && !only.iter().any(|o| o == shape.name) {
+    let shapes: Vec<(String, String, Compare)> = SHAPES
+        .iter()
+        .map(|s| (s.name.to_string(), s.sparql.to_string(), s.compare))
+        .chain(
+            outer_shapes()
+                .into_iter()
+                .map(|(n, q)| (n, q, Compare::Rows)),
+        )
+        .collect();
+    for (name, sparql, compare) in &shapes {
+        let (name, compare) = (name.as_str(), *compare);
+        if !only.is_empty() && !only.iter().any(|o| o == name) {
             continue;
         }
-        let sparql = format!("{PREFIX}{}", shape.sparql);
-        let lane = run(&fluree, &sparql, iters, true, shape.compare).await;
+        let sparql = format!("{PREFIX}{sparql}");
+        let lane = run(&fluree, &sparql, iters, true, compare).await;
         if lane.sent.is_empty() {
-            eprintln!("{}: the lane sent nothing (declined?)", shape.name);
+            eprintln!("{name}: the lane sent nothing (declined?)");
         }
         if skip_scan {
             println!(
                 "{:<20} {:>10} {:>10} {:>10} {:>9} {:>9}  {}",
-                shape.name,
+                name,
                 ms(median(&lane.times)),
                 ms(*lane.times.iter().min().unwrap()),
                 "-",
@@ -267,7 +305,7 @@ async fn main() {
             );
             continue;
         }
-        let scan = run(&fluree, &sparql, iters, false, shape.compare).await;
+        let scan = run(&fluree, &sparql, iters, false, compare).await;
         let lane_med = median(&lane.times);
         let scan_med = median(&scan.times);
         let same = lane.rows == scan.rows;
@@ -276,15 +314,14 @@ async fn main() {
             let only_lane: Vec<_> = lane.rows.difference(&scan.rows).take(3).collect();
             let only_scan: Vec<_> = scan.rows.difference(&lane.rows).take(3).collect();
             eprintln!(
-                "{}: ROW MISMATCH lane={} scan={}\n  only lane: {only_lane:?}\n  only scan: {only_scan:?}",
-                shape.name,
+                "{name}: ROW MISMATCH lane={} scan={}\n  only lane: {only_lane:?}\n  only scan: {only_scan:?}",
                 lane.rows.len(),
                 scan.rows.len()
             );
         }
         println!(
             "{:<20} {:>10} {:>10} {:>10} {:>9} {:>8.1}x  {}{}",
-            shape.name,
+            name,
             ms(lane_med),
             ms(*lane.times.iter().min().unwrap()),
             ms(scan_med),
@@ -295,10 +332,24 @@ async fn main() {
         );
     }
     if std::env::var("PROBE_SHOW_SQL").is_ok_and(|v| v == "1") {
-        for shape in SHAPES {
-            let sparql = format!("{PREFIX}{}", shape.sparql);
+        for (name, sparql, _) in &shapes {
+            if !only.is_empty() && !only.iter().any(|o| o == name) {
+                continue;
+            }
+            let sparql = format!("{PREFIX}{sparql}");
             let lane = run(&fluree, &sparql, 1, true, Compare::Rows).await;
-            println!("\n-- {}\n{}", shape.name, lane.sent.join("\n"));
+            let sent: Vec<String> = lane
+                .sent
+                .iter()
+                .map(|s| {
+                    if s.len() > 300 {
+                        format!("{}…", &s[..300])
+                    } else {
+                        s.clone()
+                    }
+                })
+                .collect();
+            println!("\n-- {name}\n{}", sent.join("\n"));
         }
     }
     if mismatches > 0 {

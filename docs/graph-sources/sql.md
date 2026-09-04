@@ -198,16 +198,64 @@ pushable. In that statement:
   (from `rr:datatype`; `xsd:string` when un-annotated), the literal's type
   and the **probed SQL type** agree, and for strings the dialect compares
   bytes. A numeric literal against a text column the mapping reads as a
-  number, or an `xsd:dateTime` literal (always a UTC instant) against a
-  `timestamp` without a zone, is not exact and stays in the engine as a
-  residual filter over the returned rows; against a `timestamp with time
-  zone` column it pushes as a zoned `TIMESTAMP` literal;
+  number is not exact and stays in the engine as a residual filter over the
+  returned rows; an `xsd:dateTime` literal (always a UTC instant) against a
+  `timestamp with time zone` column pushes as a zoned `TIMESTAMP` literal;
+- a filter the statement can only approximate is still pushed as a
+  **widening** predicate, with the exact filter kept in the engine over the
+  rows that come back: `STRSTARTS`, `STRENDS` and `CONTAINS` of a constant
+  against a string column, and a `REGEX` anchored on a literal prefix with
+  no flags, push a `LIKE` (a collation can only match more strings than a
+  byte prefix, never fewer; on MySQL the pattern is marked `BINARY`, since
+  a contraction collation could match fewer). An `xsd:dateTime` literal
+  compared with a `timestamp` column that has **no zone** pushes exactly,
+  rendered as a naive `TIMESTAMP` literal: the lane reads a zoneless column
+  as UTC when it builds the term, and the comparison follows the same
+  contract. On SQLite, where a timestamp is text in whatever format its
+  writer used, the comparison widens to whole-day bounds (`>= '2024-01-10'`),
+  which order correctly with either time separator, and the engine applies
+  the exact one. Inside a conjunction
+  the parts that cannot be widened are simply dropped from the pushed
+  predicate. A widened filter is a residual, so a `LIMIT` above it stays in
+  the engine and a grouped query over it declines;
+- an entity whose members come from **several triples maps sharing its
+  subject** (a vertically partitioned mapping: one map per column group, or
+  per table, over the same `rr:template`) is one access per distinct table,
+  joined on the subject's key columns; maps over the same table and subject
+  share a single access. Every member must have exactly one providing map
+  when no map provides them all, or the block is left to the engine;
+- the statement has limits the lane respects: outer bindings above the
+  provider's key-set cap (2000 rows, or half the statement budget) go out
+  as several statements, one per chunk; inside the block, an `IN` list
+  above that cap stays a residual on the lane and a `VALUES` block above it
+  declines the block to the engine; a `UNION` expanding to more than eight
+  branch combinations declines;
 - a constant subject or object IRI is reversed through its template into
   key predicates; a key that cannot be a value of its column (`order/abc`
-  over a `bigint`) makes the block empty without a round trip;
+  over a `bigint`) makes the block empty without a round trip. A class a
+  map derives from a column (`?p a <…/kind/staff>`) is reversed the same
+  way into a predicate on that column, and a class the template cannot
+  produce empties the block. (The per-scan lane cannot answer a
+  column-derived class constraint yet, so that shape has no fallback);
 - a `VALUES` block, and bindings the outer query already holds (a ledger
   pattern joined to the block), are sent as a `VALUES` key set so the
-  source does the semi-join;
+  source does the semi-join. Once the outer side has grown past one key
+  set (2000 rows), a seeded statement per outer batch stops paying: the
+  lane counts the block once (`SELECT COUNT(*)`, an index-only scan on
+  most tables) and, when it holds at most 100,000 rows and no more than
+  four rows per outer row seen so far, fetches it whole in one statement
+  and joins every outer batch to it in memory; a larger block stays
+  seeded. On a 1M-row Postgres table, 50,000 outer keys against a
+  100,000-row block run 2.2x faster this way, and 5,000 keys stay seeded.
+  The row cap is `FLUREE_SQL_PUSHDOWN_CACHE_ROWS` (`0` keeps every batch
+  seeded);
+- a `BIND` in the block keeps the block on one statement: the statement
+  returns the columns the expression reads and the engine computes the
+  value per row, before any residual filter (so a `FILTER` over the bound
+  variable is fine). The `BIND` must read only variables the block bound
+  before it, and nothing the statement joins or filters on may read the
+  bound variable; an `EXISTS` inside the expression, or a `BIND` inside an
+  `OPTIONAL` or a `UNION` branch, leaves the block to the engine;
 - `LIMIT`, and `ORDER BY … LIMIT` as a top-k, are pushed when no residual
   filter could drop rows afterwards. The top-k needs every `ORDER BY` key to
   be a typed, required column (either direction); a key the statement cannot
@@ -258,7 +306,10 @@ points, instants) and declines rather than approximate:
   on Trino, `TIMESTAMP WITH TIME ZONE '… UTC'` on Postgres (a plain
   `TIMESTAMP` literal there silently drops the zone and is read in the
   session's zone), `TIMESTAMP '…+00:00'` on MySQL. A naive `timestamp`
-  column is taken as UTC when its term is built, on every dialect.
+  column is taken as UTC when its term is built, on every dialect, and a
+  filter against it pushes the literal rendered naive
+  (`TIMESTAMP '2024-01-10 00:00:00.000000'`) under the same contract;
+  SQLite's text timestamps take the day bounds described above.
 - A decimal's lexical form follows the scale the endpoint reports for the
   column (`decimal(10,2)` gives `99.50`); the bridge reports NUMERIC /
   DECIMAL columns at the scale it was started with (`--decimal-scale`,
@@ -315,7 +366,7 @@ rules then apply as for any source.
 | `varchar`, `char`, `json`, `uuid`, … | String | `xsd:string` |
 | `varbinary` | Bytes | `xsd:base64Binary` |
 | `date` | Date | `xsd:date` |
-| `timestamp(p)` | Timestamp | `xsd:dateTime` |
+| `timestamp(p)` | Timestamp | `xsd:dateTime` (read as UTC) |
 | `timestamp(p) with time zone` | TimestampTz | `xsd:dateTime` (UTC) |
 | `array`, `map`, `row` | String (Trino's JSON rendering) | `xsd:string` |
 
@@ -372,7 +423,15 @@ moment. Consequently
   expansion and stored policies through a `--model` ledger; `f:query` fails
   closed). See [Access policy](iceberg.md#access-policy). The pushdown lane
   prunes the mapping before it builds its statement, so a hidden column is
-  never selected; the per-scan lane enforces after the rows come back.
+  never selected; the per-scan lane enforces after the rows come back. An
+  `f:onClass` policy over a map that derives `rdf:type` from one column
+  (`rr:template "…/kind/{kind}"` or an `rr:column` IRI map) is decided per
+  targeted class and pushed as a predicate on that column: rows of a denied
+  class drop out (`"kind" IS NULL OR NOT ("kind" IN ('staff'))`, a row
+  without a class keeping the default), or only rows of an allowed class stay
+  (`"kind" IN ('guest')`). A subject-targeted policy, a map deriving classes
+  from several columns or maps, and a policy on an `OPTIONAL` member of such
+  a map still leave the block to the per-scan lane.
 
 ## Running the bridge
 

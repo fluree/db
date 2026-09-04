@@ -85,6 +85,91 @@ const SHOP_R2RML: &str = r#"
                 rr:joinCondition [ rr:child "order_ref" ; rr:parent "id" ]
             ]
         ] .
+
+    # Two more maps minting order subjects from their own key columns: the
+    # shipment key is a bigint like the order's, the memo key is the text
+    # `order_ref`, which the database cannot compare with a bigint.
+    <http://example.org/mapping#Shipment>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.shipments" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{order_no}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:carrier ; rr:objectMap [ rr:column "carrier" ] ] .
+
+    <http://example.org/mapping#OrderMemo>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.notes" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{order_ref}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:memo ; rr:objectMap [ rr:column "body" ] ] .
+"#;
+
+/// The customer entity split across three triples maps sharing its subject
+/// template: two over `customers` (vertical partitioning by column) and one
+/// over `profiles` (by table). `ex:label` is on both `customers` maps.
+fn vp_mapping(prefix: &str) -> String {
+    VP_R2RML.replace("shop.", prefix)
+}
+
+fn typed_mapping(prefix: &str) -> String {
+    TYPED_R2RML.replace("shop.", prefix)
+}
+
+/// `rdf:type` derived from a column (one class per person), no `rr:class`.
+const TYPED_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.people" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate rdf:type ;
+            rr:objectMap [ rr:template "http://example.org/kind/{kind}" ; rr:termType rr:IRI ]
+        ] ;
+        rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+"#;
+
+const VP_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Customer>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.customers" ] ;
+        rr:subjectMap [ rr:template "http://example.org/customer/{id}" ; rr:class ex:Customer ] ;
+        rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+        rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "name" ] ] .
+
+    <http://example.org/mapping#CustomerCountry>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.customers" ] ;
+        rr:subjectMap [ rr:template "http://example.org/customer/{id}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:country ; rr:objectMap [ rr:column "country" ] ] ;
+        rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "name" ] ] .
+
+    <http://example.org/mapping#CustomerProfile>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.profiles" ] ;
+        rr:subjectMap [ rr:template "http://example.org/customer/{id}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:email ; rr:objectMap [ rr:column "email" ] ] .
+
+    <http://example.org/mapping#Order>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.orders" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{id}" ; rr:class ex:Order ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:total ;
+            rr:objectMap [ rr:column "total" ; rr:datatype xsd:decimal ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:customer ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Customer> ;
+                rr:joinCondition [ rr:child "customer_id" ; rr:parent "id" ]
+            ]
+        ] .
 "#;
 
 const SITE: &str = "sql_block_pushdown";
@@ -105,6 +190,24 @@ async fn shop() -> MockServer {
                 vec![json!(1), json!("Ada"), json!("UK")],
                 vec![json!(2), json!("Bo"), Value::Null],
                 vec![json!(3), json!("Cy"), json!("US")],
+            ],
+        ))
+        .table(Table::new(
+            "shop.profiles",
+            &[("id", "bigint"), ("email", "varchar")],
+            vec![
+                vec![json!(1), json!("ada@example.org")],
+                vec![json!(3), json!("cy@example.org")],
+            ],
+        ))
+        .table(Table::new(
+            "shop.people",
+            &[("id", "bigint"), ("kind", "varchar"), ("name", "varchar")],
+            vec![
+                vec![json!(1), json!("staff"), json!("Ada")],
+                vec![json!(2), json!("guest"), json!("Bo")],
+                vec![json!(3), json!("staff"), json!("Cy")],
+                vec![json!(4), Value::Null, json!("Di")],
             ],
         ))
         .table(Table::new(
@@ -173,6 +276,11 @@ async fn shop() -> MockServer {
                 vec![json!(2), json!("12"), json!("call first")],
             ],
         ))
+        .table(Table::new(
+            "shop.shipments",
+            &[("order_no", "bigint"), ("carrier", "varchar")],
+            vec![vec![json!(10), json!("UPS")], vec![json!(12), json!("DHL")]],
+        ))
         .mount()
         .await
 }
@@ -188,6 +296,22 @@ async fn setup() -> (MockServer, Fluree) {
         ))
         .await
         .expect("create sql source");
+    fluree
+        .create_sql_graph_source(SqlCreateConfig::new(
+            "shop-vp",
+            server.uri(),
+            vp_mapping("shop."),
+        ))
+        .await
+        .expect("create partitioned sql source");
+    fluree
+        .create_sql_graph_source(SqlCreateConfig::new(
+            "shop-typed",
+            server.uri(),
+            typed_mapping("shop."),
+        ))
+        .await
+        .expect("create typed sql source");
     (server, fluree)
 }
 
@@ -385,11 +509,37 @@ fn cases() -> Vec<Case> {
             routing: Routing::MustFire,
             declined: None,
         },
+        // A zoneless column is read as UTC when its term is built, so a
+        // comparison against it is exact rendered as a naive TIMESTAMP.
         Case {
-            name: "dateTime filter on a naive timestamp column stays in the engine",
+            name: "dateTime filter on a naive timestamp column pushes exactly, rendered naive",
             sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:updated ?u FILTER(?u > \"2024-01-10T00:00:00Z\"^^xsd:dateTime) }",
-            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."updated" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."updated" IS NOT NULL"#],
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."updated" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."updated" IS NOT NULL AND "t0"."updated" > TIMESTAMP '2024-01-10 00:00:00.000000'"#],
             rows: &["o=http://example.org/order/11"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "dateTime equality on a naive timestamp column pushes exactly",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:updated ?u FILTER(?u = \"2024-02-02T18:00:00Z\"^^xsd:dateTime) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."updated" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."updated" IS NOT NULL AND "t0"."updated" = TIMESTAMP '2024-02-02 18:00:00.000000'"#],
+            rows: &["o=http://example.org/order/11"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "dateTime upper bound on a naive timestamp column pushes the LIMIT",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:updated ?u FILTER(\"2024-01-10T00:00:00Z\"^^xsd:dateTime > ?u) } LIMIT 1",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."updated" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."updated" IS NOT NULL AND "t0"."updated" < TIMESTAMP '2024-01-10 00:00:00.000000' LIMIT 1"#],
+            rows: &["o=http://example.org/order/10"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "dateTime inequality on a naive timestamp column pushes exactly",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:updated ?u FILTER(?u != \"2024-01-10T00:00:00Z\"^^xsd:dateTime) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."updated" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."updated" IS NOT NULL AND "t0"."updated" <> TIMESTAMP '2024-01-10 00:00:00.000000'"#],
+            rows: &["o=http://example.org/order/10", "o=http://example.org/order/11"],
             routing: Routing::MustFire,
             declined: None,
         },
@@ -469,6 +619,226 @@ fn cases() -> Vec<Case> {
             declined: None,
         },
         Case {
+            name: "a BIND over block columns is computed in the engine",
+            sparql: "SELECT ?o ?d FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            rows: &[
+                "d=10.00 o=http://example.org/order/11",
+                "d=14.00 o=http://example.org/order/13",
+                "d=199.00 o=http://example.org/order/10",
+                "d=84.00 o=http://example.org/order/12",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a filter over a BIND variable stays in the engine after the BIND",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) FILTER(?d > 50) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            rows: &["o=http://example.org/order/10", "o=http://example.org/order/12"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "DISTINCT over a BIND keeps the columns the BIND reads",
+            sparql: "SELECT DISTINCT ?d FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) }",
+            sql: &[r#"SELECT DISTINCT "t0"."total" AS "c0" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            rows: &["d=10.00", "d=14.00", "d=199.00", "d=84.00"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a BIND after a UNION reads the union's variable",
+            sparql: "SELECT ?o ?s FROM <shop-sql:main> WHERE { { ?o ex:total ?v } UNION { ?o ex:placed ?v } BIND(STR(?v) AS ?s) }",
+            sql: &[
+                r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#,
+                r#"SELECT "t0"."id" AS "c0", "t0"."placed" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL"#,
+            ],
+            rows: &[
+                "o=http://example.org/order/10 s=2024-01-05",
+                "o=http://example.org/order/10 s=99.50",
+                "o=http://example.org/order/11 s=2024-02-01",
+                "o=http://example.org/order/11 s=5.00",
+                "o=http://example.org/order/12 s=2024-03-01",
+                "o=http://example.org/order/12 s=42.00",
+                "o=http://example.org/order/13 s=7.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a BIND reading a variable bound after it is not admitted",
+            sparql: "SELECT ?o ?d FROM <shop-sql:main> WHERE { BIND(?t * 2 AS ?d) ?o ex:total ?t }",
+            sql: &[],
+            // The engine binds ?t before the BIND runs; the lane leaves the
+            // shape to it rather than assume that order.
+            rows: &[
+                "d=10.00 o=http://example.org/order/11",
+                "d=14.00 o=http://example.org/order/13",
+                "d=199.00 o=http://example.org/order/10",
+                "d=84.00 o=http://example.org/order/12",
+            ],
+            routing: Routing::MustNotFire,
+            declined: None,
+        },
+        Case {
+            name: "a BIND variable joined by a triple is not admitted",
+            sparql: "SELECT ?o ?d FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(?t AS ?d) ?x ex:total ?d }",
+            sql: &[],
+            rows: &[
+                "d=42.00 o=http://example.org/order/12",
+                "d=5.00 o=http://example.org/order/11",
+                "d=7.00 o=http://example.org/order/13",
+                "d=99.50 o=http://example.org/order/10",
+            ],
+            routing: Routing::MustNotFire,
+            declined: None,
+        },
+        Case {
+            name: "a BIND inside a UNION branch is not admitted",
+            sparql: "SELECT ?o ?s FROM <shop-sql:main> WHERE { ?o ex:total ?v { BIND(STR(?v) AS ?s) } UNION { ?o ex:placed ?p } }",
+            sql: &[],
+            rows: &[
+                "o=http://example.org/order/10 s=",
+                "o=http://example.org/order/10 s=99.50",
+                "o=http://example.org/order/11 s=",
+                "o=http://example.org/order/11 s=5.00",
+                "o=http://example.org/order/12 s=",
+                "o=http://example.org/order/12 s=42.00",
+                "o=http://example.org/order/13 s=7.00",
+            ],
+            routing: Routing::MustNotFire,
+            declined: None,
+        },
+        Case {
+            name: "STRSTARTS pushes a LIKE prefix and keeps the exact filter in the engine",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(STRSTARTS(?n, \"A\")) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."name" LIKE 'A%' ESCAPE '!'"#],
+            rows: &["n=Ada"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "CONTAINS and STRENDS push LIKE patterns",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(CONTAINS(?n, \"d\") || STRENDS(?n, \"o\")) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND (("t0"."name" LIKE '%d%' ESCAPE '!') OR ("t0"."name" LIKE '%o' ESCAPE '!'))"#],
+            rows: &["n=Ada", "n=Bo"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "LIKE wildcards in the needle are escaped",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(CONTAINS(?n, \"%\") || CONTAINS(?n, \"_\") || CONTAINS(?n, \"!\")) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND ((("t0"."name" LIKE '%!%%' ESCAPE '!') OR ("t0"."name" LIKE '%!_%' ESCAPE '!')) OR ("t0"."name" LIKE '%!!%' ESCAPE '!'))"#],
+            rows: &[],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "an anchored literal REGEX pushes a LIKE prefix",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(REGEX(?n, \"^B\")) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."name" LIKE 'B%' ESCAPE '!'"#],
+            rows: &["n=Bo"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            // `\w` is a class, not the literal `\w`: a prefix ending in a
+            // backslash is no prefix at all.
+            name: "a REGEX whose anchored literal holds a backslash stays a plain residual",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(REGEX(?n, \"^A\\\\w\")) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            rows: &["n=Ada"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a REGEX with flags or metacharacters stays a plain residual",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(REGEX(?n, \"^b\", \"i\") || REGEX(?n, \"^C.\")) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            rows: &["n=Bo", "n=Cy"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a widened conjunction drops what it cannot widen and keeps the exact part",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n ; ex:country ?k FILTER(STRSTARTS(?n, \"A\") && STRLEN(?k) = 2 && ?k = \"UK\") }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t0"."country" AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."country" IS NOT NULL AND "t0"."name" LIKE 'A%' ESCAPE '!' AND "t0"."country" = 'UK'"#],
+            rows: &["n=Ada"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a widened filter keeps LIMIT in the engine",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(STRSTARTS(?n, \"A\")) } LIMIT 1",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."name" LIKE 'A%' ESCAPE '!'"#],
+            rows: &["n=Ada"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a widened filter over an optional variable is a top-level WHERE",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k } FILTER(STRSTARTS(?k, \"U\")) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t0"."country" AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."country" LIKE 'U%' ESCAPE '!'"#],
+            rows: &["k=UK n=Ada", "k=US n=Cy"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "members split across two maps over one table share one access",
+            sparql: "SELECT ?n ?k FROM <shop-vp:main> WHERE { ?c ex:name ?n ; ex:country ?k }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t0"."country" AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."country" IS NOT NULL"#],
+            rows: &["k=UK n=Ada", "k=US n=Cy"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a class from one map and a member from another share one access",
+            sparql: "SELECT ?k FROM <shop-vp:main> WHERE { ?c a ex:Customer ; ex:country ?k }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."country" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."country" IS NOT NULL"#],
+            rows: &["k=UK", "k=US"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "members split across two tables join on the subject's key",
+            sparql: "SELECT ?n ?e FROM <shop-vp:main> WHERE { ?c ex:name ?n ; ex:email ?e }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t1"."email" AS "c2" FROM "shop"."customers" AS "t0" JOIN "shop"."profiles" AS "t1" ON "t0"."id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL"#],
+            rows: &["e=ada@example.org n=Ada", "e=cy@example.org n=Cy"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a foreign key joins a partitioned entity on its shared subject",
+            sparql: "SELECT ?o ?k FROM <shop-vp:main> WHERE { ?o ex:customer ?c . ?c ex:country ?k }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t1"."id" AS "c1", "t1"."country" AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."country" IS NOT NULL"#],
+            rows: &["k=UK o=http://example.org/order/10", "k=UK o=http://example.org/order/11"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a predicate two maps provide, with no map providing the entity, declines",
+            sparql: "SELECT ?l ?e FROM <shop-vp:main> WHERE { ?c ex:label ?l ; ex:email ?e }",
+            sql: &[],
+            // The per-scan lane answers once per map minting the triple.
+            rows: &[
+                "e=ada@example.org l=Ada",
+                "e=ada@example.org l=Ada",
+                "e=cy@example.org l=Cy",
+                "e=cy@example.org l=Cy",
+            ],
+            routing: Routing::MustNotFire,
+            declined: Some("predicate provided by several triples maps"),
+        },
+        Case {
+            name: "UNION branch combinations above the cap decline",
+            sparql: "SELECT ?a ?b ?c ?d FROM <shop-sql:main> WHERE { { <http://example.org/order/13> ex:total ?a } UNION { <http://example.org/order/13> ex:placed ?a } { <http://example.org/order/13> ex:total ?b } UNION { <http://example.org/order/13> ex:placed ?b } { <http://example.org/order/13> ex:total ?c } UNION { <http://example.org/order/13> ex:placed ?c } { <http://example.org/order/13> ex:total ?d } UNION { <http://example.org/order/13> ex:placed ?d } }",
+            sql: &[],
+            rows: &["a=7.00 b=7.00 c=7.00 d=7.00"],
+            routing: Routing::MustNotFire,
+            declined: Some("too many UNION branch combinations"),
+        },
+        Case {
             name: "a variable shared by two value classes declines",
             sparql: "SELECT ?c ?o FROM <shop-sql:main> WHERE { ?c ex:name ?v . ?o ex:total ?v }",
             sql: &[],
@@ -519,6 +889,30 @@ fn cases() -> Vec<Case> {
             rows: &[
                 "b=call first o=http://example.org/order/12",
                 "b=gift wrap o=http://example.org/order/10",
+            ],
+            routing: Routing::MustNotFire,
+            declined: Some("join between two column classes"),
+        },
+        Case {
+            // Two templates of one skeleton mint one IRI when their
+            // placeholder values agree, whatever the columns are called.
+            name: "a subject shared by templates over different key columns joins the columns",
+            sparql: "SELECT ?o ?t ?k FROM <shop-sql:main> WHERE { ?o ex:total ?t . ?o ex:carrier ?k }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", "t1"."carrier" AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."shipments" AS "t1" ON "t0"."id" = "t1"."order_no" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."order_no" IS NOT NULL AND "t1"."carrier" IS NOT NULL"#],
+            rows: &[
+                "k=DHL o=http://example.org/order/12 t=42.00",
+                "k=UPS o=http://example.org/order/10 t=99.50",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a shared subject over key columns of two classes declines instead of failing to render",
+            sparql: "SELECT ?o ?t ?m FROM <shop-sql:main> WHERE { ?o ex:total ?t . ?o ex:memo ?m }",
+            sql: &[],
+            rows: &[
+                "m=call first o=http://example.org/order/12 t=42.00",
+                "m=gift wrap o=http://example.org/order/10 t=99.50",
             ],
             routing: Routing::MustNotFire,
             declined: Some("join between two column classes"),
@@ -917,6 +1311,263 @@ async fn outer_bindings_become_a_key_set() {
     assert_eq!(rows, vec!["n=Ada tier=gold", "n=Cy tier=silver"]);
 }
 
+/// A class a map derives from a column is a value of that column: the
+/// constraint is a predicate on it, and a class the template cannot
+/// produce empties the block without a round trip. Lane-only: the per-scan
+/// lane matches a constant class against `rr:class` alone and answers this
+/// shape with no rows (tracked separately), so it is no oracle here.
+#[tokio::test]
+async fn a_column_derived_class_constrains_the_column() {
+    let _lock = KILL_SWITCH.lock().await;
+    let (server, fluree) = setup().await;
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(
+        &query(
+            &fluree,
+            &format!("{PREFIX}SELECT ?n ?p FROM <shop-typed:main> WHERE {{ ?p a <http://example.org/kind/staff> ; ex:name ?n }}"),
+        )
+        .await,
+    );
+    assert_eq!(
+        rows,
+        vec![
+            "n=Ada p=http://example.org/person/1",
+            "n=Cy p=http://example.org/person/3"
+        ]
+    );
+    assert_eq!(
+        block_statements(&server).await[before..],
+        [r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."people" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."kind" = 'staff' AND "t0"."name" IS NOT NULL"#.to_string()]
+    );
+
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(
+        &query(
+            &fluree,
+            &format!(
+                "{PREFIX}SELECT ?n FROM <shop-typed:main> WHERE {{ ?p a ex:Nobody ; ex:name ?n }}"
+            ),
+        )
+        .await,
+    );
+    assert!(rows.is_empty(), "{rows:?}");
+    assert_eq!(
+        block_statements(&server).await.len(),
+        before,
+        "no round trip"
+    );
+}
+
+/// A class policy over a map deriving `rdf:type` from a column is decided
+/// per targeted class and pushed as a predicate on that column, where the
+/// lane used to decline the whole block. The per-scan lane, enforcing per
+/// row, is the oracle.
+#[tokio::test]
+async fn class_policy_on_a_derived_type_pushes_a_predicate() {
+    let _lock = KILL_SWITCH.lock().await;
+    let (server, fluree) = setup().await;
+    let context = json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"});
+    let on_class = |allow: bool, class: &str| {
+        json!([{
+            "@id": "http://example.org/p", "@type": "f:AccessPolicy", "f:action": "f:view",
+            "f:allow": allow, "f:onClass": [{"@id": class}]
+        }])
+    };
+    let run = |policy: Value, default_allow: bool, r#where: Value, oracle: bool| {
+        let fluree = &fluree;
+        let context = context.clone();
+        async move {
+            let q = json!({
+                "@context": context,
+                "from": "shop-typed:main",
+                "opts": {"policy": policy, "default-allow": default_allow},
+                "select": ["?n"],
+                "where": r#where,
+            });
+            let lane = fluree
+                .query_from()
+                .jsonld(&q)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("policy query failed: {e}"));
+            if oracle {
+                set_fast_paths_disabled(true);
+                let scan = fluree
+                    .query_from()
+                    .jsonld(&q)
+                    .execute_formatted()
+                    .await
+                    .unwrap_or_else(|e| panic!("policy query failed: {e}"));
+                set_fast_paths_disabled(false);
+                assert_eq!(lane, scan, "scan lane disagrees");
+            }
+            lane
+        }
+    };
+    let names = json!({"@id": "?p", "ex:name": "?n"});
+
+    // Denied class: its rows drop out, rows without a class keep the default.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        on_class(false, "http://example.org/kind/staff"),
+        true,
+        names.clone(),
+        true,
+    )
+    .await;
+    assert_eq!(rows, json!([["Bo"], ["Di"]]), "{rows}");
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert_eq!(
+        sent,
+        vec![r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."people" AS "t0" WHERE "t0"."id" IS NOT NULL AND (("t0"."kind" IS NULL) OR (NOT ("t0"."kind" IN ('staff')))) AND "t0"."name" IS NOT NULL"#.to_string()]
+    );
+
+    // Allowed class under a deny default: only its rows stay.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        on_class(true, "http://example.org/kind/guest"),
+        false,
+        names.clone(),
+        true,
+    )
+    .await;
+    assert_eq!(rows, json!([["Bo"]]), "{rows}");
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert_eq!(
+        sent,
+        vec![r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."people" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."kind" IN ('guest') AND "t0"."name" IS NOT NULL"#.to_string()]
+    );
+
+    // A denied class the block also asks for: nothing can pass, decided in
+    // the statement (lane-only: the per-scan lane cannot answer a derived
+    // class constraint, see `a_column_derived_class_constrains_the_column`).
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        on_class(false, "http://example.org/kind/staff"),
+        true,
+        json!({"@id": "?p", "@type": "http://example.org/kind/staff", "ex:name": "?n"}),
+        false,
+    )
+    .await;
+    assert_eq!(rows, json!([]), "{rows}");
+    assert_eq!(block_statements(&server).await.len(), before + 1);
+
+    // A class no policy names leaves the verdict static: no predicate.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        on_class(false, "http://example.org/Customer"),
+        true,
+        names,
+        true,
+    )
+    .await;
+    assert_eq!(rows, json!([["Ada"], ["Bo"], ["Cy"], ["Di"]]), "{rows}");
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert!(!sent[0].contains("kind"), "{}", sent[0]);
+}
+
+/// Outer bindings above the provider's key-set row cap go out as several
+/// statements. Inside the block, the key set is not chunked: an `IN` list
+/// above the cap stays a residual on the lane, and a `VALUES` block above it
+/// declines the block to the engine.
+#[tokio::test]
+async fn key_sets_above_the_cap_chunk_or_stay_in_the_engine() {
+    let _lock = KILL_SWITCH.lock().await;
+    let (server, fluree) = setup().await;
+    // 2001 distinct keys: 1..=3 exist, the rest match nothing.
+    let iris: Vec<String> = (1..=2001)
+        .map(|i| format!("<http://example.org/customer/{i}>"))
+        .collect();
+    let values = iris.join(" ");
+
+    let sparql = format!(
+        "{PREFIX}SELECT ?c ?n FROM NAMED <shop-sql:main> WHERE {{ VALUES ?c {{ {values} }} GRAPH <shop-sql:main> {{ ?c ex:name ?n }} }}"
+    );
+    let expected = vec![
+        "c=http://example.org/customer/1 n=Ada",
+        "c=http://example.org/customer/2 n=Bo",
+        "c=http://example.org/customer/3 n=Cy",
+    ];
+    // An outer side past one key set probes the block's size; the fake's
+    // three customers fit, so one unseeded statement answers every batch.
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(&query(&fluree, &sparql).await);
+    assert_eq!(rows, expected);
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert_eq!(
+        sent.len(),
+        2,
+        "a COUNT(*) probe then the whole block: {sent:?}"
+    );
+    assert_eq!(
+        sent[0],
+        r#"SELECT COUNT(*) AS "n" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#
+    );
+    assert_eq!(
+        sent[1],
+        r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#
+    );
+    set_fast_paths_disabled(true);
+    let scan = rows_of(&query(&fluree, &sparql).await);
+    set_fast_paths_disabled(false);
+    assert_eq!(scan, rows, "scan lane disagrees");
+
+    // A block above the cache cap (here: three rows against a cap of two)
+    // stays seeded, chunked at the key-set cap.
+    std::env::set_var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS", "2");
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(&query(&fluree, &sparql).await);
+    assert_eq!(rows, expected);
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert_eq!(
+        sent.len(),
+        3,
+        "a COUNT(*) probe, then 2000 + 1 keys: {sent:?}"
+    );
+    assert!(sent[0].starts_with("SELECT COUNT(*)"), "{}", sent[0]);
+    assert!(sent[1].contains("(2000)") && !sent[1].contains("(2001)"));
+    assert!(sent[2].contains("(VALUES (2001)) AS \"k\""), "{}", sent[2]);
+
+    // Caching off: no probe, every batch seeded.
+    std::env::set_var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS", "0");
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(&query(&fluree, &sparql).await);
+    assert_eq!(rows, expected);
+    let sent = block_statements(&server).await[before..].to_vec();
+    std::env::remove_var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS");
+    assert_eq!(sent.len(), 2, "2001 keys chunk into 2000 + 1: {sent:?}");
+    assert!(sent[0].contains("(2000)") && !sent[0].contains("(2001)"));
+    assert!(sent[1].contains("(VALUES (2001)) AS \"k\""), "{}", sent[1]);
+
+    let sparql = format!(
+        "{PREFIX}SELECT ?c ?n FROM <shop-sql:main> WHERE {{ ?c ex:name ?n VALUES ?c {{ {values} }} }}"
+    );
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(&query(&fluree, &sparql).await);
+    assert_eq!(rows.len(), 3);
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert!(
+        sent.is_empty(),
+        "an oversized VALUES in the block declines the lane: {sent:?}"
+    );
+
+    let names: Vec<String> = (1..=2001).map(|i| format!("\"n{i}\"")).collect();
+    let sparql = format!(
+        "{PREFIX}SELECT ?n FROM <shop-sql:main> WHERE {{ ?c ex:name ?n FILTER(?n IN (\"Ada\", {})) }}",
+        names.join(", ")
+    );
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(&query(&fluree, &sparql).await);
+    assert_eq!(rows, vec!["n=Ada"]);
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        !sent[0].contains(" IN ("),
+        "an oversized IN list stays a residual: {}",
+        sent[0]
+    );
+}
+
 const AGG_SITE: &str = "sql_aggregate_pushdown";
 
 fn aggregate_cases() -> Vec<Case> {
@@ -958,6 +1609,55 @@ fn aggregate_cases() -> Vec<Case> {
             rows: &["last=2024-03-01 lo=5.00"],
             routing: Routing::MustFire,
             declined: None,
+        },
+        Case {
+            name: "MIN and MAX of the same variable are two outputs of one column",
+            sparql: "SELECT (MIN(?t) AS ?lo) (MAX(?t) AS ?hi) FROM <shop-sql:main> WHERE { ?o ex:total ?t }",
+            sql: &[r#"SELECT MIN("t0"."total") AS "c0", MAX("t0"."total") AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            rows: &["hi=99.50 lo=5.00"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "MIN and MAX of the same variable per group",
+            sparql: "SELECT ?c (MIN(?t) AS ?lo) (MAX(?t) AS ?hi) FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?o ex:total ?t } GROUP BY ?c",
+            sql: &[r#"SELECT "t1"."id" AS "c0", MIN("t0"."total") AS "c1", MAX("t0"."total") AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            rows: &[
+                "c=http://example.org/customer/1 hi=99.50 lo=5.00",
+                "c=http://example.org/customer/2 hi=42.00 lo=42.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a BIND the aggregates do not read leaves the grouped statement alone",
+            sparql: "SELECT ?c (SUM(?t) AS ?s) FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?o ex:total ?t BIND(?t * 2 AS ?d) } GROUP BY ?c",
+            sql: &[r#"SELECT "t1"."id" AS "c0", SUM("t0"."total") AS "c1", COUNT("t0"."total") AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            rows: &[
+                "c=http://example.org/customer/1 s=104.50",
+                "c=http://example.org/customer/2 s=42.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "an aggregate over a BIND variable declines",
+            sparql: "SELECT ?c (SUM(?d) AS ?s) FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?o ex:total ?t BIND(?t * 2 AS ?d) } GROUP BY ?c",
+            sql: &[],
+            rows: &[
+                "c=http://example.org/customer/1 s=209.00",
+                "c=http://example.org/customer/2 s=84.00",
+            ],
+            routing: Routing::MustNotFire,
+            declined: Some("aggregate over a variable without columns"),
+        },
+        Case {
+            name: "a widened filter under an aggregate declines",
+            sparql: "SELECT (COUNT(*) AS ?n) FROM <shop-sql:main> WHERE { ?c ex:name ?nm FILTER(STRSTARTS(?nm, \"A\")) }",
+            sql: &[],
+            rows: &["n=1"],
+            routing: Routing::MustNotFire,
+            declined: Some("residual filter under an aggregate"),
         },
         Case {
             name: "COUNT DISTINCT of a foreign-key object",
@@ -1253,6 +1953,9 @@ const CUSTOMER_ROWS: &str =
 /// `words` holds strings a case-folding collation equates (`Ada`/`ada`), a
 /// padding one equates (`Bo`/`Bo `), and one a locale sorts among the ASCII
 /// letters (`Émile`, which code-point order puts last).
+const PROFILE_ROWS: &str =
+    "INSERT INTO profiles VALUES (1, 'ada@example.org'), (3, 'cy@example.org')";
+const PEOPLE_ROWS: &str = "INSERT INTO people VALUES (1, 'staff', 'Ada'), (2, 'guest', 'Bo'), (3, 'staff', 'Cy'), (4, NULL, 'Di')";
 const WORD_ROWS: &str = "INSERT INTO words VALUES (1, 'Ada', 3), (2, 'ada', 3), (3, 'Bo', 2), (4, 'Bo ', 3), (5, 'Émile', 5)";
 /// `tags` is keyed by a string column, so its subjects are minted from
 /// values a collation would merge.
@@ -1267,14 +1970,22 @@ const SQLITE: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS words",
         "DROP TABLE IF EXISTS tags",
         "DROP TABLE IF EXISTS events",
+        "DROP TABLE IF EXISTS profiles",
+        "DROP TABLE IF EXISTS people",
         "DROP TABLE IF EXISTS notes",
+        "DROP TABLE IF EXISTS shipments",
         "CREATE TABLE customers (id INTEGER, name TEXT, country TEXT)",
+        "CREATE TABLE profiles (id INTEGER, email TEXT)",
+        "CREATE TABLE people (id INTEGER, kind TEXT, name TEXT)",
         "CREATE TABLE orders (id INTEGER, customer_id INTEGER, total NUMERIC, placed DATE, shipped TIMESTAMP, updated TIMESTAMP, discount NUMERIC)",
         "CREATE TABLE words (id INTEGER, word TEXT, len INTEGER)",
         "CREATE TABLE tags (tag TEXT, n INTEGER)",
         "CREATE TABLE events (id INTEGER, at_tz TIMESTAMP, at_local TIMESTAMP)",
         "CREATE TABLE notes (id INTEGER, order_ref TEXT, body TEXT)",
+        "CREATE TABLE shipments (order_no INTEGER, carrier TEXT)",
         CUSTOMER_ROWS,
+        PROFILE_ROWS,
+        PEOPLE_ROWS,
         "INSERT INTO orders VALUES \
             (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00', '2024-01-06 09:30:00', NULL), \
             (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00', '2024-02-02 18:00:00', NULL), \
@@ -1284,6 +1995,7 @@ const SQLITE: LiveBackend = LiveBackend {
         TAG_ROWS,
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00', '2024-01-09 21:00:00')",
         "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
+        "INSERT INTO shipments VALUES (10, 'UPS'), (12, 'DHL')",
     ],
     // SQLite's `NUMERIC` reaches the bridge as text or double, so a SUM/AVG
     // over it declines (its datatype is decimal).
@@ -1304,14 +2016,22 @@ const POSTGRES: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS words",
         "DROP TABLE IF EXISTS tags",
         "DROP TABLE IF EXISTS events",
+        "DROP TABLE IF EXISTS profiles",
+        "DROP TABLE IF EXISTS people",
         "DROP TABLE IF EXISTS notes",
+        "DROP TABLE IF EXISTS shipments",
         "CREATE TABLE customers (id BIGINT, name TEXT, country TEXT)",
+        "CREATE TABLE profiles (id BIGINT, email TEXT)",
+        "CREATE TABLE people (id BIGINT, kind TEXT, name TEXT)",
         "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total NUMERIC(10,2), placed DATE, shipped TIMESTAMPTZ, updated TIMESTAMP, discount NUMERIC(10,2))",
         "CREATE TABLE words (id BIGINT, word TEXT, len INTEGER)",
         "CREATE TABLE tags (tag TEXT, n INTEGER)",
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMPTZ, at_local TIMESTAMP)",
         "CREATE TABLE notes (id BIGINT, order_ref TEXT, body TEXT)",
+        "CREATE TABLE shipments (order_no BIGINT, carrier TEXT)",
         CUSTOMER_ROWS,
+        PROFILE_ROWS,
+        PEOPLE_ROWS,
         "INSERT INTO orders VALUES \
             (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00', NULL), \
             (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00', NULL), \
@@ -1321,6 +2041,7 @@ const POSTGRES: LiveBackend = LiveBackend {
         TAG_ROWS,
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00+00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00+00:00', '2024-01-09 21:00:00')",
         "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
+        "INSERT INTO shipments VALUES (10, 'UPS'), (12, 'DHL')",
     ],
     declines: &[],
 };
@@ -1334,14 +2055,22 @@ const MYSQL: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS words",
         "DROP TABLE IF EXISTS tags",
         "DROP TABLE IF EXISTS events",
+        "DROP TABLE IF EXISTS profiles",
+        "DROP TABLE IF EXISTS people",
         "DROP TABLE IF EXISTS notes",
+        "DROP TABLE IF EXISTS shipments",
         "CREATE TABLE customers (id BIGINT, name VARCHAR(64), country VARCHAR(64))",
+        "CREATE TABLE profiles (id BIGINT, email VARCHAR(64))",
+        "CREATE TABLE people (id BIGINT, kind VARCHAR(64), name VARCHAR(64))",
         "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total DECIMAL(10,2), placed DATE, shipped TIMESTAMP NULL, updated DATETIME, discount DECIMAL(10,2))",
         "CREATE TABLE words (id BIGINT, word VARCHAR(64), len INT)",
         "CREATE TABLE tags (tag VARCHAR(64), n INT)",
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMP NULL, at_local DATETIME)",
         "CREATE TABLE notes (id BIGINT, order_ref VARCHAR(64), body VARCHAR(64))",
+        "CREATE TABLE shipments (order_no BIGINT, carrier VARCHAR(64))",
         CUSTOMER_ROWS,
+        PROFILE_ROWS,
+        PEOPLE_ROWS,
         "INSERT INTO orders VALUES \
             (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00', NULL), \
             (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00', NULL), \
@@ -1351,6 +2080,7 @@ const MYSQL: LiveBackend = LiveBackend {
         TAG_ROWS,
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00+00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00+00:00', '2024-01-09 21:00:00')",
         "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
+        "INSERT INTO shipments VALUES (10, 'UPS'), (12, 'DHL')",
     ],
     declines: &[],
 };
@@ -1413,6 +2143,10 @@ struct LiveCase {
     only: &'static [SqlDialect],
     sent: &'static [(SqlDialect, Sent)],
 }
+
+/// Live cases the per-scan lane cannot answer (it has no column-derived
+/// classes), so their rows are pinned without the oracle.
+const LANE_ONLY_LIVE: &[&str] = &["a column-derived class constrains the column"];
 
 fn live_cases() -> Vec<LiveCase> {
     use SqlDialect::{Mysql, Postgres, Sqlite};
@@ -1581,6 +2315,42 @@ fn live_cases() -> Vec<LiveCase> {
             only: &[],
             sent: &[],
         },
+        // A filter on a naive column pushes the literal rendered naive, so
+        // the server's zone never enters; SQLite's text timestamps get
+        // whole-day bounds, which order right with either time separator.
+        LiveCase {
+            name: "a column-derived class constrains the column",
+            sparql: "SELECT ?n FROM <shop-typed-live:main> WHERE { ?p a <http://example.org/kind/staff> ; ex:name ?n }",
+            rows: &["n=Ada", "n=Cy"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("\"kind\" = 'staff'")),
+                (Postgres, Sent::Contains("\"kind\" = 'staff'")),
+                (Mysql, Sent::Contains("`kind` = BINARY 'staff'")),
+            ],
+        },
+        LiveCase {
+            name: "a filter on a naive column pushes the literal naive, day bounds on text",
+            sparql: "SELECT ?e FROM <shop-live:main> WHERE { ?e ex:atLocal ?t FILTER(?t > \"2024-01-10T00:00:00Z\"^^xsd:dateTime) }",
+            rows: &["e=http://example.org/event/1"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("\"at_local\" >= '2024-01-10'")),
+                (Postgres, Sent::Contains("\"at_local\" > TIMESTAMP '2024-01-10 00:00:00.000000'")),
+                (Mysql, Sent::Contains("`at_local` > TIMESTAMP '2024-01-10 00:00:00.000000'")),
+            ],
+        },
+        LiveCase {
+            name: "equality on a naive column pushes exactly, both day bounds on text",
+            sparql: "SELECT ?e FROM <shop-live:main> WHERE { ?e ex:atLocal ?t FILTER(?t = \"2024-01-09T21:00:00Z\"^^xsd:dateTime) }",
+            rows: &["e=http://example.org/event/2"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("\"at_local\" < '2024-01-10'")),
+                (Postgres, Sent::Contains("\"at_local\" = TIMESTAMP '2024-01-09 21:00:00.000000'")),
+                (Mysql, Sent::Contains("`at_local` = TIMESTAMP '2024-01-09 21:00:00.000000'")),
+            ],
+        },
         // A decimal's lexical form follows the scale the endpoint reports for
         // the column: the bridge reports NUMERIC/DECIMAL as `decimal(38, 6)`
         // unless started with `--decimal-scale`, and SQLite's NUMERIC is a
@@ -1605,6 +2375,64 @@ fn live_cases() -> Vec<LiveCase> {
             rows: &["a=38.375 s=153.500000"],
             only: &[Postgres, Mysql],
             sent: &[(Postgres, Sent::Contains("SUM(")), (Mysql, Sent::Contains("SUM("))],
+        },
+        LiveCase {
+            name: "a BIND and a filter over it run in the engine",
+            sparql: "SELECT ?o ?d FROM <shop-live:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) FILTER(?d > 50) }",
+            rows: &[
+                "d=199.000000 o=http://example.org/order/10",
+                "d=84.000000 o=http://example.org/order/12",
+            ],
+            only: &[Postgres, Mysql],
+            sent: &[(Postgres, Sent::Lacks("* 2")), (Mysql, Sent::Lacks("* 2"))],
+        },
+        LiveCase {
+            name: "a BIND and a filter over it run in the engine on SQLite",
+            sparql: "SELECT ?o ?d FROM <shop-live:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) FILTER(?d > 50) }",
+            rows: &["d=199.0 o=http://example.org/order/10", "d=84 o=http://example.org/order/12"],
+            only: &[Sqlite],
+            sent: &[(Sqlite, Sent::Lacks("* 2"))],
+        },
+        LiveCase {
+            name: "STRSTARTS widens to a LIKE the engine narrows back",
+            sparql: "SELECT ?w FROM <shop-live:main> WHERE { ?x ex:word ?w FILTER(STRSTARTS(?w, \"A\")) }",
+            rows: &["w=Ada"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("LIKE 'A%' ESCAPE '!'")),
+                (Postgres, Sent::Contains("LIKE 'A%' ESCAPE '!'")),
+                (Mysql, Sent::Contains("LIKE BINARY 'A%' ESCAPE '!'")),
+            ],
+        },
+        LiveCase {
+            name: "CONTAINS widens to a LIKE on a non-ASCII word",
+            sparql: "SELECT ?w FROM <shop-live:main> WHERE { ?x ex:word ?w FILTER(CONTAINS(?w, \"mile\")) }",
+            rows: &["w=Émile"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("LIKE '%mile%' ESCAPE '!'")),
+                (Postgres, Sent::Contains("LIKE '%mile%' ESCAPE '!'")),
+                (Mysql, Sent::Contains("LIKE BINARY '%mile%' ESCAPE '!'")),
+            ],
+        },
+        LiveCase {
+            name: "MIN and MAX of one decimal column fold in the database",
+            sparql: "SELECT (MIN(?t) AS ?lo) (MAX(?t) AS ?hi) FROM <shop-live:main> WHERE { ?o ex:total ?t }",
+            rows: &["hi=99.500000 lo=5.000000"],
+            only: &[Postgres, Mysql],
+            sent: &[
+                (Postgres, Sent::Contains("MIN(")),
+                (Postgres, Sent::Contains("MAX(")),
+                (Mysql, Sent::Contains("MIN(")),
+                (Mysql, Sent::Contains("MAX(")),
+            ],
+        },
+        LiveCase {
+            name: "MIN and MAX of one decimal column fold in the database on SQLite",
+            sparql: "SELECT (MIN(?t) AS ?lo) (MAX(?t) AS ?hi) FROM <shop-live:main> WHERE { ?o ex:total ?t }",
+            rows: &["hi=99.5 lo=5"],
+            only: &[Sqlite],
+            sent: &[(Sqlite, Sent::Contains("MIN(")), (Sqlite, Sent::Contains("MAX("))],
         },
     ]
 }
@@ -1701,7 +2529,7 @@ async fn live_differential(backend: &LiveBackend) {
     let fluree = FlureeBuilder::memory().build_memory();
     let mut source = SqlCreateConfig::new(
         "shop-live",
-        url,
+        url.clone(),
         format!("{}{LIVE_R2RML}", shop_mapping("")),
     );
     source.dialect = backend.dialect;
@@ -1709,10 +2537,25 @@ async fn live_differential(backend: &LiveBackend) {
         .create_sql_graph_source(source)
         .await
         .expect("create live sql source");
+    let mut partitioned = SqlCreateConfig::new("shop-vp-live", url.clone(), vp_mapping(""));
+    partitioned.dialect = backend.dialect;
+    fluree
+        .create_sql_graph_source(partitioned)
+        .await
+        .expect("create live partitioned sql source");
+    let mut typed = SqlCreateConfig::new("shop-typed-live", url, typed_mapping(""));
+    typed.dialect = backend.dialect;
+    fluree
+        .create_sql_graph_source(typed)
+        .await
+        .expect("create live typed sql source");
 
     let mut failures: Vec<String> = Vec::new();
     for c in cases().into_iter().chain(aggregate_cases()) {
-        let sparql = format!("{PREFIX}{}", c.sparql).replace("shop-sql:main", "shop-live:main");
+        let sparql = format!("{PREFIX}{}", c.sparql)
+            .replace("shop-sql:main", "shop-live:main")
+            .replace("shop-vp:main", "shop-vp-live:main")
+            .replace("shop-typed:main", "shop-typed-live:main");
         let (lane_rows, sent) = lane_run(&fluree, &sparql, c.name).await;
         let declines = backend.declines.contains(&c.name);
         match (&c.routing, c.sql.is_empty()) {
@@ -1799,6 +2642,9 @@ async fn live_differential(backend: &LiveBackend) {
                 "{}: lane rows {lane_rows:?} differ from the pinned rows {:?} [sent: {sent:?}]",
                 c.name, c.rows
             ));
+        }
+        if LANE_ONLY_LIVE.contains(&c.name) {
+            continue;
         }
         let scan_rows = scan_run(&fluree, &sparql).await;
         if lane_rows != scan_rows {

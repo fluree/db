@@ -3208,6 +3208,82 @@ async fn fused_fallback_applies_offset_once() {
     );
 }
 
+/// A temporal column materializes as a temporal value, not a string carrying
+/// the datatype: ordering coerces a string against a dateTime literal but
+/// RDFterm-equal does not, so `=` on such a value matched nothing.
+#[tokio::test]
+async fn temporal_values_compare_equal_by_value() {
+    use fluree_db_core::{Date, DateTime};
+    let cases: Vec<(&str, Column, FieldType, FlakeValue, usize)> = vec![
+        (
+            "xsd:date",
+            Column::Date(vec![Some(1), Some(1), Some(2)]),
+            FieldType::Date,
+            FlakeValue::Date(Box::new(Date::parse("1970-01-02").unwrap())),
+            2,
+        ),
+        (
+            "xsd:dateTime",
+            Column::Timestamp(vec![Some(1_000_000), Some(2_000_000), Some(2_000_000)]),
+            FieldType::Timestamp,
+            FlakeValue::DateTime(Box::new(DateTime::parse("1970-01-01T00:00:02Z").unwrap())),
+            2,
+        ),
+    ];
+    for (datatype, column, field_type, literal, expected) in cases {
+        let mapping = R2rmlLoader::from_turtle(&val_mapping(datatype))
+            .unwrap()
+            .compile()
+            .unwrap();
+        let batch = id_val_batch(vec![Some(1), Some(2), Some(3)], column, field_type);
+        let provider = MockR2rmlProvider::new(mapping, vec![batch]);
+
+        let fluree = FlureeBuilder::memory().build_memory();
+        let mut ledger = genesis_ledger(&fluree, "fa:main");
+        Arc::make_mut(&mut ledger.snapshot)
+            .insert_namespace_code(9_999, "http://example.org/".to_string())
+            .unwrap();
+
+        let mut vars = VarRegistry::new();
+        let s = vars.get_or_insert("?s");
+        let o = vars.get_or_insert("?o");
+        let pred = ledger
+            .snapshot
+            .encode_iri("http://example.org/val")
+            .expect("example.org namespace registered");
+        let graph = Pattern::Graph {
+            name: GraphName::Iri("fa-gs:main".into()),
+            patterns: vec![
+                Pattern::Triple(TriplePattern::new(
+                    Ref::Var(s),
+                    Ref::Sid(pred),
+                    Term::Var(o),
+                )),
+                Pattern::Filter(Expression::eq(
+                    Expression::Var(o),
+                    Expression::Const(literal),
+                )),
+            ],
+        };
+        let mut parsed = Query::new(ParsedContext::default());
+        parsed.patterns = vec![graph];
+        parsed.output = QueryOutput::select_all(vec![s]);
+
+        let executable = ExecutableQuery::simple(parsed);
+        let tracker = Tracker::disabled();
+        let result = execute(
+            GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+            &vars,
+            &executable,
+            r2rml_test_config(&tracker, &provider),
+        )
+        .await
+        .expect("query should execute");
+        let rows: usize = result.iter().fold(0, |acc, b| acc + b.len());
+        assert_eq!(rows, expected, "{datatype}: `=` against a literal");
+    }
+}
+
 // =============================================================================
 // Scan-plan guardrails: rdf:type / class-pattern over-scan (Issue 1)
 // =============================================================================

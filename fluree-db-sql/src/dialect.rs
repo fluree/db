@@ -348,7 +348,11 @@ pub(crate) fn render_literal(lit: &Literal, ty: FieldType, dialect: SqlDialect) 
         Literal::Int(i) => is_numeric(ty).then(|| i.to_string()),
         Literal::Str(s) => matches!(ty, FieldType::String).then(|| binary_string(s, dialect))?,
         Literal::Date(days) => {
-            if !matches!(ty, FieldType::Date) {
+            // SQLite keeps a naive timestamp as text, and a date compares
+            // against it as a prefix: `'2024-01-09'` sorts below every
+            // timestamp of that day, whatever the time separator.
+            let day_bound = ty == FieldType::Timestamp && dialect == SqlDialect::Sqlite;
+            if !matches!(ty, FieldType::Date) && !day_bound {
                 return None;
             }
             let date = chrono::DateTime::from_timestamp(i64::from(*days) * 86_400, 0)?.date_naive();
@@ -371,21 +375,25 @@ pub(crate) fn render_literal(lit: &Literal, ty: FieldType, dialect: SqlDialect) 
             is_numeric(ty).then(|| render_decimal(*unscaled, *scale))
         }
         Literal::Timestamp { micros, tz } => {
-            let matches_col = match ty {
-                FieldType::Timestamp => !*tz,
-                FieldType::TimestampTz => *tz,
-                _ => false,
+            // A column with no zone holds UTC instants by the lane's contract
+            // (its term is built as UTC), so an instant compares against it
+            // rendered naive; a naive literal never meets a zoned column.
+            // SQLite keeps such a column as text in whatever format its
+            // writer used, which no rendering compares exactly: only a date
+            // bound (above) meets it.
+            let zoned = match ty {
+                FieldType::Timestamp if dialect == SqlDialect::Sqlite => return None,
+                FieldType::Timestamp => false,
+                FieldType::TimestampTz if *tz => true,
+                _ => return None,
             };
-            if !matches_col {
-                return None;
-            }
             let dt = chrono::DateTime::from_timestamp_micros(*micros)?;
             let text = dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
             // A zoned literal must carry its zone in a form the dialect
             // honors: Postgres silently drops the zone from a plain
             // `TIMESTAMP '…'` and reads the rest in the session's zone;
             // MySQL takes a numeric offset but no zone name.
-            match (dialect, *tz) {
+            match (dialect, zoned) {
                 (SqlDialect::Trino, true) => Some(format!("TIMESTAMP '{text} UTC'")),
                 (SqlDialect::Postgres, true) => {
                     Some(format!("TIMESTAMP WITH TIME ZONE '{text} UTC'"))
@@ -737,7 +745,29 @@ mod tests {
                 render_literal(&naive, FieldType::Timestamp, d).unwrap(),
                 "TIMESTAMP '2024-01-10 00:00:00.000000'"
             );
+            // A zoneless column is read as UTC, so an instant meets it naive.
+            assert_eq!(
+                render_literal(&lit, FieldType::Timestamp, d).unwrap(),
+                "TIMESTAMP '2024-01-10 00:00:00.000000'"
+            );
+            assert!(render_literal(&naive, FieldType::TimestampTz, d).is_none());
         }
+        assert!(render_literal(&lit, FieldType::Timestamp, SqlDialect::Sqlite).is_none());
+    }
+
+    /// A date bounds a text timestamp on SQLite (`'2024-01-09'` sorts below
+    /// every timestamp of that day); a typed column elsewhere rejects it.
+    #[test]
+    fn date_literal_bounds_a_naive_timestamp_only_on_sqlite() {
+        let lit = Literal::Date(19_731); // 2024-01-09
+        assert_eq!(
+            render_literal(&lit, FieldType::Timestamp, SqlDialect::Sqlite).unwrap(),
+            "'2024-01-09'"
+        );
+        for d in [SqlDialect::Trino, SqlDialect::Postgres, SqlDialect::Mysql] {
+            assert!(render_literal(&lit, FieldType::Timestamp, d).is_none());
+        }
+        assert!(render_literal(&lit, FieldType::TimestampTz, SqlDialect::Sqlite).is_none());
     }
 
     #[test]

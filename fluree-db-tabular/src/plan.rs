@@ -78,9 +78,27 @@ pub enum Pred {
     },
     IsNull(ColRef),
     IsNotNull(ColRef),
+    /// `col LIKE pattern ESCAPE '!'`: `%` and `_` are wildcards unless
+    /// escaped with `!` (see [`like_escape`]).
+    Like {
+        col: ColRef,
+        pattern: String,
+    },
     And(Vec<Pred>),
     Or(Vec<Pred>),
     Not(Box<Pred>),
+}
+
+/// `s` as a literal fragment of a [`Pred::Like`] pattern.
+pub fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '!') {
+            out.push('!');
+        }
+        out.push(c);
+    }
+    out
 }
 
 impl Pred {
@@ -261,6 +279,10 @@ pub struct PushdownCapabilities {
     pub string_distinct_is_binary: bool,
     /// String `<` orders by code point (not a locale collation).
     pub string_order_is_codepoint: bool,
+    /// A `timestamp` without a zone is stored as text (SQLite), ordered by
+    /// its characters. The date prefix orders correctly whatever the time
+    /// separator; a comparison at time-of-day granularity does not.
+    pub timestamp_is_text: bool,
 }
 
 /// Whether these two column types compare as the same class under a database

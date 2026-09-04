@@ -40,6 +40,20 @@ use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ConstantValue, ObjectMap, T
 use fluree_vocab::rdf;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+/// A `(triples map, predicate)` view verdict decided before any row is read.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Verdict {
+    Allow,
+    Deny,
+    /// Decided by the row's column-derived class: each class a view policy
+    /// targets whose verdict differs from `otherwise`, which a row of any
+    /// other class, or of none, gets.
+    ByClass {
+        classes: Vec<(String, bool)>,
+        otherwise: bool,
+    },
+}
+
 /// Per-scan view-policy gate for an R2RML graph source.
 pub(crate) struct R2rmlPolicyGate {
     /// Lane-local policy context: the request's view restrictions re-indexed
@@ -55,6 +69,9 @@ pub(crate) struct R2rmlPolicyGate {
     any_subject: Sid,
     /// Static classes per TriplesMap IRI, encoded.
     tm_classes: HashMap<String, Vec<Sid>>,
+    /// Every class a view restriction is selected by: the only classes a
+    /// row can carry that change a verdict.
+    policy_classes: Vec<String>,
     /// TriplesMap IRI → predicate IRI → allowed, for subject-independent maps.
     /// Nested so a lookup borrows both keys and only a miss allocates.
     static_cache: HashMap<String, HashMap<String, bool>>,
@@ -110,6 +127,12 @@ impl R2rmlPolicyGate {
         }
         let per_subject = !view.by_subject.is_empty();
         let has_class_policies = view.restrictions.iter().any(|r| r.class_policy);
+        let mut policy_classes: Vec<String> = view
+            .by_class
+            .keys()
+            .filter_map(|c| snapshot.decode_sid(c))
+            .collect();
+        policy_classes.sort();
         report_unevaluable_policies(ctx, graph_source_id, &view);
         let wrapper = PolicyWrapper::new(
             view,
@@ -138,6 +161,7 @@ impl R2rmlPolicyGate {
             has_class_policies,
             any_subject: Sid::new(fluree_vocab::namespaces::EMPTY, ""),
             tm_classes,
+            policy_classes,
             static_cache: HashMap::new(),
         })
     }
@@ -148,19 +172,23 @@ impl R2rmlPolicyGate {
     /// materialize each row's classes.
     /// Every `(triples map, predicate)` verdict the mapping can need, decided
     /// up front for a lane that plans the whole block before reading a row.
-    /// `None` when a verdict depends on the row (subject-targeted policies,
-    /// or a class policy over a column-derived `rdf:type`).
+    /// A class policy over a map with one column-derived `rdf:type` is
+    /// decided per targeted class ([`Verdict::ByClass`]), which the lane
+    /// turns into a predicate on that column. `None` when a verdict depends
+    /// on the row beyond that (subject-targeted policies, or a map deriving
+    /// classes the lane cannot key).
     pub(crate) async fn static_verdicts(
         &mut self,
         ctx: &ExecutionContext<'_>,
         mapping: &CompiledR2rmlMapping,
-    ) -> Result<Option<HashMap<(String, String), bool>>> {
+    ) -> Result<Option<HashMap<(String, String), Verdict>>> {
         if self.per_subject {
             return Ok(None);
         }
         let mut out = HashMap::new();
         for tm in mapping.triples_maps.values() {
-            if self.needs_row_classes(tm) {
+            let by_class = self.needs_row_classes(tm);
+            if by_class && derived_type_map(tm).is_none() {
                 return Ok(None);
             }
             let mut preds: Vec<String> = tm
@@ -173,8 +201,24 @@ impl R2rmlPolicyGate {
                 .collect();
             preds.push(rdf::TYPE.to_string());
             for pred in preds {
-                let allowed = self.allows(ctx, tm, None, &pred, &[]).await?;
-                out.insert((tm.iri.clone(), pred), allowed);
+                let otherwise = self.allows(ctx, tm, None, &pred, &[]).await?;
+                let mut classes = Vec::new();
+                if by_class {
+                    for class in self.policy_classes.clone() {
+                        let allowed = self
+                            .allows(ctx, tm, None, &pred, std::slice::from_ref(&class))
+                            .await?;
+                        if allowed != otherwise {
+                            classes.push((class, allowed));
+                        }
+                    }
+                }
+                let verdict = match (classes.is_empty(), otherwise) {
+                    (true, true) => Verdict::Allow,
+                    (true, false) => Verdict::Deny,
+                    (false, _) => Verdict::ByClass { classes, otherwise },
+                };
+                out.insert((tm.iri.clone(), pred), verdict);
             }
         }
         Ok(Some(out))
@@ -465,6 +509,22 @@ pub(crate) fn static_classes(tm: &TriplesMap) -> Vec<String> {
     classes.sort();
     classes.dedup();
     classes
+}
+
+/// The one object map deriving `rdf:type` from one column of `tm`'s row,
+/// so a row carries at most one class beyond its static ones and a class
+/// is a value of that column. `None` for no derived type, or for shapes
+/// (several maps, a multi-column template) a lane cannot key.
+pub(crate) fn derived_type_map(tm: &TriplesMap) -> Option<&ObjectMap> {
+    let mut derived = tm.predicate_object_maps.iter().filter(|pom| {
+        pom.predicate_map.as_constant() == Some(rdf::TYPE)
+            && !matches!(pom.object_map, ObjectMap::Constant { .. })
+    });
+    let om = &derived.next()?.object_map;
+    if derived.next().is_some() || om.referenced_columns().len() != 1 {
+        return None;
+    }
+    Some(om)
 }
 
 /// Columns feeding a non-constant `rdf:type` object map of `tm`.

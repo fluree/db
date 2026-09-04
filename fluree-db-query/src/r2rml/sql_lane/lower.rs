@@ -20,7 +20,8 @@ use fluree_db_r2rml::mapping::{
 use fluree_db_r2rml::materialize::reverse_subject_template;
 use fluree_db_r2rml::RdfTerm;
 use fluree_db_tabular::plan::{
-    CmpOp, ColRef, KeySet, Literal, OutputCol, Pred, PushdownCapabilities, RelNode, RelSource,
+    like_escape, CmpOp, ColRef, KeySet, Literal, OutputCol, Pred, PushdownCapabilities, RelNode,
+    RelSource,
 };
 use fluree_db_tabular::{BatchSchema, FieldType};
 use fluree_vocab::{rdf, xsd, UnresolvedDatatypeConstraint};
@@ -30,6 +31,7 @@ use crate::error::Result;
 use crate::ir::expression::Function;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Pattern};
+use crate::r2rml::policy::{derived_type_map, static_classes, Verdict};
 use crate::var_registry::VarId;
 
 /// Why the lane declined; logged at debug so a `MustNotFire` test can name it.
@@ -49,9 +51,12 @@ pub(crate) enum TermSource {
     Subject {
         alias: String,
     },
-    /// Object map `pom` of the triples map behind `alias`.
+    /// Object map `pom` of triples map `tm_iri`, read from the row of
+    /// `alias` (a map sharing the access's table and subject, when not the
+    /// access's own).
     Object {
         alias: String,
+        tm_iri: String,
         pom: usize,
     },
     Constant(RdfTerm),
@@ -100,6 +105,9 @@ pub(crate) struct AccessInfo {
     pub tm_iri: String,
     /// Columns returned for this alias, original names.
     pub columns: Vec<String>,
+    /// Statement outputs feeding `columns`, when they are not the columns
+    /// themselves: an aggregate's extreme stands in for the column it reads.
+    pub output_names: Option<Vec<String>>,
 }
 
 /// A block variable the engine can seed from bindings it already holds.
@@ -116,6 +124,9 @@ pub(crate) struct Lowered {
     pub accesses: Vec<AccessInfo>,
     pub terms: Vec<(VarId, TermSource)>,
     pub residual_filters: Vec<Expression>,
+    /// `BIND`s evaluated in the engine over each returned row, in order,
+    /// before the residual filters.
+    pub binds: Vec<(VarId, Expression)>,
     pub seeds: Vec<SeedSpec>,
     /// Variables the block binds, in schema order.
     pub block_vars: Vec<VarId>,
@@ -160,11 +171,12 @@ struct Block {
     filters: Vec<Expression>,
     optionals: Vec<(Vec<Tp>, Vec<Expression>)>,
     values: Vec<(Vec<VarId>, Vec<Vec<Binding>>)>,
+    binds: Vec<(VarId, Expression)>,
 }
 
-/// Per-`(triples map, predicate)` view-policy verdict: `Some(true)` allowed,
-/// `Some(false)` denied, `None` not decidable statically (the lane declines).
-pub(crate) type PolicyVerdict<'a> = &'a mut dyn FnMut(&TriplesMap, &str) -> Result<Option<bool>>;
+/// Per-`(triples map, predicate)` view-policy verdict; `None` when not
+/// decidable before the rows are read (the lane declines).
+pub(crate) type PolicyVerdict<'a> = &'a mut dyn FnMut(&TriplesMap, &str) -> Result<Option<Verdict>>;
 
 pub(crate) struct LowerInput<'a> {
     pub patterns: &'a [Pattern],
@@ -290,10 +302,16 @@ type RefEdge = (String, Vec<(String, String)>, String, VarId);
 impl<'a> Lowerer<'a> {
     fn lower(
         &mut self,
-        block: Block,
+        mut block: Block,
         child_vars: &[VarId],
         projection: Option<&[VarId]>,
     ) -> Result<Lowering<Option<Lowered>>> {
+        // A BIND is computed in the engine after the statement, so it cannot
+        // be a join key with the outer query.
+        let binds = std::mem::take(&mut block.binds);
+        if binds.iter().any(|(v, _)| child_vars.contains(v)) {
+            return Ok(Err(Decline("BIND variable bound by the outer query")));
+        }
         // Required entities.
         let entities = group_entities(&block.triples);
         let required_subjects: HashSet<VarId> = entities
@@ -303,60 +321,111 @@ impl<'a> Lowerer<'a> {
                 SubjRef::Iri(_) => None,
             })
             .collect();
-        let mut entity_alias: HashMap<usize, String> = HashMap::new();
+        // An entity whose members split across triples maps sharing its
+        // subject (vertical partitioning) is one access per distinct row
+        // source, joined on the subject's key columns; maps over the same
+        // table and subject share one access.
+        let mut entity_accesses: HashMap<usize, Vec<(String, &'a TriplesMap)>> = HashMap::new();
         let mut pending_refs: Vec<RefEdge> = Vec::new();
         for (idx, (subject, members)) in entities.iter().enumerate() {
-            let tm = match self.resolve_tm(members, None) {
-                Ok(Ok(tm)) => tm,
+            let parts = match self.resolve_parts(members, None) {
+                Ok(Ok(parts)) => parts,
                 Ok(Err(Empty)) => return Ok(Ok(None)),
                 Err(d) => return Ok(Err(d)),
             };
-            for (pred, _) in members {
-                match self.allowed(tm, pred)? {
-                    Some(true) => {}
-                    Some(false) => return Ok(Ok(None)),
-                    None => return Ok(Err(Decline("policy not static"))),
+            let mut accesses: Vec<(String, &'a TriplesMap)> = Vec::new();
+            for (tm, member_idxs) in parts {
+                let alias = match accesses.iter().find(|(_, a)| same_row(a, tm)) {
+                    Some((alias, _)) => alias.clone(),
+                    None => {
+                        let alias = self.new_access(tm);
+                        match self.bind_subject(&alias, tm, subject, false) {
+                            Ok(Ok(())) => {}
+                            Ok(Err(Empty)) => return Ok(Ok(None)),
+                            Err(d) => return Ok(Err(d)),
+                        }
+                        accesses.push((alias.clone(), tm));
+                        alias
+                    }
+                };
+                for i in &member_idxs {
+                    match self.allowed(tm, &members[*i].0)? {
+                        Some(Verdict::Allow) => {}
+                        Some(Verdict::Deny) => return Ok(Ok(None)),
+                        Some(Verdict::ByClass { classes, otherwise }) => {
+                            match self.policy_pred(&alias, tm, &classes, otherwise) {
+                                Ok(Ok(Some(pred))) => self.place_pred(pred),
+                                Ok(Ok(None)) => {}
+                                Ok(Err(Empty)) => return Ok(Ok(None)),
+                                Err(d) => return Ok(Err(d)),
+                            }
+                        }
+                        None => return Ok(Err(Decline("policy not static"))),
+                    }
+                }
+                for i in member_idxs {
+                    let (pred, obj) = &members[i];
+                    if pred == rdf::TYPE {
+                        // A class the map derives from a column is a value
+                        // of that column.
+                        let Obj::Iri(class) = obj else { continue };
+                        if static_classes(tm).iter().any(|c| c == class) {
+                            continue;
+                        }
+                        match self.class_value(&alias, tm, class) {
+                            Ok(Some((col, value))) => self.place_pred(Pred::Cmp {
+                                col,
+                                op: CmpOp::Eq,
+                                value,
+                            }),
+                            Ok(None) => return Ok(Ok(None)),
+                            Err(d) => return Ok(Err(d)),
+                        }
+                        continue;
+                    }
+                    match self.bind_member(&alias, tm, pred, obj, &required_subjects, false) {
+                        Ok(Ok(Some(edge))) => pending_refs.push(edge),
+                        Ok(Ok(None)) => {}
+                        Ok(Err(Empty)) => return Ok(Ok(None)),
+                        Err(d) => return Ok(Err(d)),
+                    }
                 }
             }
-            let alias = self.new_access(tm);
-            entity_alias.insert(idx, alias.clone());
-            match self.bind_subject(&alias, tm, subject, false) {
-                Ok(Ok(())) => {}
-                Ok(Err(Empty)) => return Ok(Ok(None)),
-                Err(d) => return Ok(Err(d)),
-            }
-            for (pred, obj) in members {
-                if pred == rdf::TYPE {
-                    continue;
-                }
-                match self.bind_member(&alias, tm, pred, obj, &required_subjects, false) {
-                    Ok(Ok(Some(edge))) => pending_refs.push(edge),
-                    Ok(Ok(None)) => {}
-                    Ok(Err(Empty)) => return Ok(Ok(None)),
-                    Err(d) => return Ok(Err(d)),
-                }
-            }
+            entity_accesses.insert(idx, accesses);
         }
         // Deferred foreign-key edges to entities that got their alias later.
         for (child_alias, conds, parent_tm_iri, var) in pending_refs {
             let target = entities
                 .iter()
                 .position(|(s, _)| matches!(s, SubjRef::Var(v) if *v == var))
-                .and_then(|i| entity_alias.get(&i).cloned());
-            let Some(parent_alias) = target else {
+                .and_then(|i| entity_accesses.get(&i));
+            let Some(accesses) = target else {
                 return Ok(Err(Decline("ref target entity missing")));
             };
-            let parent_tm = self
-                .accesses
-                .iter()
-                .find(|a| a.alias == parent_alias)
-                .map(|a| a.tm_iri.clone())
-                .unwrap_or_default();
-            if parent_tm != parent_tm_iri {
-                // The object's triples map is not the one the FK points at:
-                // no row of the child can join a row of that entity.
-                return Ok(Ok(None));
-            }
+            let Some(parent) = self.mapping.get(&parent_tm_iri) else {
+                return Ok(Err(Decline("ref object map parent missing")));
+            };
+            // The parent columns are on the parent map's table: join the
+            // entity's access over that table and subject, which need not
+            // be the parent map itself.
+            let parent_alias = match accesses.iter().find(|(_, tm)| same_row(tm, parent)) {
+                Some((alias, _)) => alias.clone(),
+                None if accesses.iter().any(|(_, tm)| same_subject(tm, parent)) => {
+                    return Ok(Err(Decline(
+                        "ref object map parent on a table the entity does not access",
+                    )));
+                }
+                // A subject the entity's accesses provably never mint: no
+                // row of the child can join a row of that entity.
+                None if accesses.iter().all(|(_, tm)| subjects_disjoint(tm, parent)) => {
+                    return Ok(Ok(None))
+                }
+                None => {
+                    return Ok(Err(Decline(
+                        "ref object map parent whose subject the entity may or may not mint",
+                    )))
+                }
+            };
             for (child_col, parent_col) in conds {
                 self.edges.push((
                     child_alias.clone(),
@@ -384,11 +453,17 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        // Filters: exact ones into the plan, the rest stay in the engine.
+        // Filters: exact ones into the plan; the rest stay in the engine,
+        // with a widening predicate in the plan where one exists.
         for f in &block.filters {
             match self.lower_filter(f) {
                 Some(pred) => self.place_pred(pred),
-                None => self.residuals.push(f.clone()),
+                None => {
+                    if let Some(pred) = self.lower_superset(f) {
+                        self.place_pred(pred);
+                    }
+                    self.residuals.push(f.clone());
+                }
             }
         }
 
@@ -410,6 +485,9 @@ impl<'a> Lowerer<'a> {
                 keep.extend(child_vars.iter().copied());
                 for f in &self.residuals {
                     keep.extend(f.referenced_vars());
+                }
+                for (_, e) in &binds {
+                    keep.extend(e.referenced_vars());
                 }
                 keep
             });
@@ -450,6 +528,7 @@ impl<'a> Lowerer<'a> {
                 alias: a.alias.clone(),
                 tm_iri: a.tm_iri.clone(),
                 columns: per_alias.remove(&a.alias).unwrap_or_default(),
+                output_names: None,
             })
             .collect();
 
@@ -516,6 +595,7 @@ impl<'a> Lowerer<'a> {
             accesses,
             terms,
             residual_filters: std::mem::take(&mut self.residuals),
+            binds,
             seeds,
             block_vars: self.var_order.clone(),
             vars: self.vars.clone(),
@@ -526,11 +606,112 @@ impl<'a> Lowerer<'a> {
         })))
     }
 
-    fn allowed(&mut self, tm: &TriplesMap, pred: &str) -> Result<Option<bool>> {
+    fn allowed(&mut self, tm: &TriplesMap, pred: &str) -> Result<Option<Verdict>> {
         match self.policy.as_mut() {
             Some(verdict) => verdict(tm, pred),
-            None => Ok(Some(true)),
+            None => Ok(Some(Verdict::Allow)),
         }
+    }
+
+    /// The column of `tm`'s derived `rdf:type` and the value that yields
+    /// `class` from it: `None` when no value can (the IRI is outside the
+    /// template), a decline when the template cannot be reversed or the
+    /// column's type cannot be keyed.
+    fn class_value(
+        &self,
+        alias: &str,
+        tm: &TriplesMap,
+        class: &str,
+    ) -> Lowering<Option<(ColRef, Literal)>> {
+        let Some(om) = derived_type_map(tm) else {
+            return decline("column-derived rdf:type with a class constraint");
+        };
+        let (column, raw) = match om {
+            ObjectMap::Column {
+                column, term_type, ..
+            } => {
+                if *term_type != TermType::Iri {
+                    return Ok(None);
+                }
+                (column.clone(), class.to_string())
+            }
+            ObjectMap::Template {
+                template,
+                term_type,
+                ..
+            } => {
+                if *term_type != TermType::Iri {
+                    return Ok(None);
+                }
+                let prefix = template.split('{').next().unwrap_or_default();
+                if !class.starts_with(prefix) {
+                    return Ok(None);
+                }
+                match reverse_subject_template(template, class).as_deref() {
+                    Some([(column, value)]) => (column.clone(), value.clone()),
+                    _ => return decline("rdf:type template cannot be reversed"),
+                }
+            }
+            _ => return decline("column-derived rdf:type with a class constraint"),
+        };
+        let col = ColRef::new(alias, &column);
+        match self.field_type(&col) {
+            None | Some(FieldType::String) => {}
+            Some(FieldType::Int32 | FieldType::Int64) => {
+                if raw.parse::<i64>().is_err() {
+                    return Ok(None);
+                }
+            }
+            _ => return decline("rdf:type column type cannot be keyed"),
+        }
+        Ok(Some((col, Literal::TemplateKey(raw))))
+    }
+
+    /// A [`Verdict::ByClass`] as a predicate on the class column of `tm`'s
+    /// access `alias`: rows of a denied class drop out (a row without a
+    /// class keeps `otherwise`), or only rows of an allowed class stay.
+    /// `Empty` when no row can pass.
+    fn policy_pred(
+        &self,
+        alias: &str,
+        tm: &TriplesMap,
+        classes: &[(String, bool)],
+        otherwise: bool,
+    ) -> Lowering<std::result::Result<Option<Pred>, Empty>> {
+        let mut col = None;
+        let (mut allowed, mut denied) = (Vec::new(), Vec::new());
+        for (class, ok) in classes {
+            let Some((c, value)) = self.class_value(alias, tm, class)? else {
+                continue; // no row of this map carries the class
+            };
+            col = Some(c);
+            if *ok { &mut allowed } else { &mut denied }.push(value);
+        }
+        let Some(col) = col else {
+            return Ok(if otherwise { Ok(None) } else { Err(Empty) });
+        };
+        Ok(Ok(Some(if otherwise {
+            if denied.is_empty() {
+                return Ok(Ok(None));
+            }
+            Pred::Or(vec![
+                Pred::IsNull(col.clone()),
+                Pred::Not(Box::new(Pred::Cmp {
+                    col,
+                    op: CmpOp::In,
+                    value: Literal::Set(denied),
+                })),
+            ])
+        } else {
+            if allowed.is_empty() {
+                return Ok(Err(Empty));
+            }
+            Pred::Cmp {
+                col,
+                op: CmpOp::In,
+                value: Literal::Set(allowed),
+            }
+        })))
     }
 
     fn new_access(&mut self, tm: &TriplesMap) -> String {
@@ -540,6 +721,7 @@ impl<'a> Lowerer<'a> {
             alias: alias.clone(),
             tm_iri: tm.iri.clone(),
             columns: Vec::new(),
+            output_names: None,
         });
         alias
     }
@@ -561,8 +743,9 @@ impl<'a> Lowerer<'a> {
     /// the probed column type must carry the class natively (a numeric
     /// literal against a text column the mapping *reads* as a number is the
     /// engine's comparison, not the database's). A dateTime literal is a UTC
-    /// instant, exact only against a zoned column. An unprobed column is
-    /// trusted; the renderer then types the literal.
+    /// instant; a zoneless column is read as UTC, so it is exact there too,
+    /// except where the database keeps it as text in an unknown format. An
+    /// unprobed column is trusted; the renderer then types the literal.
     fn literal_exact(&self, col: &ColRef, class: &RdfClass) -> bool {
         use FieldType as F;
         let Some(ty) = self.field_type(col) else {
@@ -576,7 +759,9 @@ impl<'a> Lowerer<'a> {
             RdfClass::Str | RdfClass::LangStr(_) => ty == F::String,
             RdfClass::Bool => ty == F::Boolean,
             RdfClass::Date => ty == F::Date,
-            RdfClass::DateTime => ty == F::TimestampTz,
+            RdfClass::DateTime => {
+                ty == F::TimestampTz || (ty == F::Timestamp && !self.caps.timestamp_is_text)
+            }
             RdfClass::Iri | RdfClass::Other => true,
         }
     }
@@ -590,44 +775,135 @@ impl<'a> Lowerer<'a> {
     }
 
     /// The single triples map every member of an entity resolves to.
+    /// The one triples map providing every member, for an entity that
+    /// must be a single access.
     fn resolve_tm(
         &self,
         members: &[(String, Obj)],
         only: Option<&'a TriplesMap>,
     ) -> Lowering<std::result::Result<&'a TriplesMap, Empty>> {
+        match self.resolve_parts(members, only)? {
+            Ok(parts) => match parts.as_slice() {
+                [(tm, _)] => Ok(Ok(tm)),
+                _ => decline("optional entity spans several triples maps"),
+            },
+            Err(Empty) => Ok(Err(Empty)),
+        }
+    }
+
+    /// The triples maps an entity's members come from, each with the
+    /// members (by index) it provides: one map providing everything, or a
+    /// vertical partition where every member has exactly one provider and
+    /// the providers mint the same subject.
+    fn resolve_parts(
+        &self,
+        members: &[(String, Obj)],
+        only: Option<&'a TriplesMap>,
+    ) -> Lowering<std::result::Result<Vec<Part<'a>>, Empty>> {
         let mut candidates: Vec<&'a TriplesMap> = match only {
             Some(tm) => vec![tm],
             None => self.mapping.triples_maps.values().collect(),
         };
         candidates.sort_by(|a, b| a.iri.cmp(&b.iri));
+        let mut providers: Vec<Vec<&'a TriplesMap>> = Vec::with_capacity(members.len());
         for (pred, obj) in members {
             if pred == rdf::TYPE {
                 let class = match obj {
                     Obj::Iri(c) => c,
                     _ => return decline("rdf:type object is not an IRI"),
                 };
-                if self
-                    .mapping
-                    .triples_maps
-                    .values()
-                    .any(|tm| !super::super::policy::derived_type_columns(tm).is_empty())
-                {
-                    return decline("column-derived rdf:type with a class constraint");
+                // A map deriving `rdf:type` from a column provides the class
+                // when the column can hold its value; a derivation the lane
+                // cannot key (several maps, a multi-column template) could
+                // provide any class, so it declines.
+                let mut found: Vec<&'a TriplesMap> = Vec::new();
+                for tm in &candidates {
+                    let derived = !super::super::policy::derived_type_columns(tm).is_empty();
+                    if static_classes(tm).iter().any(|c| c == class) {
+                        found.push(tm);
+                    } else if derived {
+                        if derived_type_map(tm).is_none() {
+                            return decline("column-derived rdf:type with a class constraint");
+                        }
+                        if self.class_value("t", tm, class)?.is_some() {
+                            found.push(tm);
+                        }
+                    }
                 }
-                candidates.retain(|tm| {
-                    super::super::policy::static_classes(tm)
-                        .iter()
-                        .any(|c| c == class)
-                });
+                providers.push(found);
             } else {
-                candidates.retain(|tm| pom_for(tm, pred).is_some());
+                providers.push(
+                    candidates
+                        .iter()
+                        .copied()
+                        .filter(|tm| pom_for(tm, pred).is_some())
+                        .collect(),
+                );
             }
         }
-        match candidates.len() {
-            0 => Ok(Err(Empty)),
-            1 => Ok(Ok(candidates[0])),
-            _ => decline("entity spans several triples maps"),
+        let whole: Vec<&'a TriplesMap> = candidates
+            .iter()
+            .copied()
+            .filter(|tm| providers.iter().all(|p| p.iter().any(|c| c.iri == tm.iri)))
+            .collect();
+        match whole.as_slice() {
+            [tm] => return Ok(Ok(vec![(tm, (0..members.len()).collect())])),
+            [] => {}
+            _ => return decline("entity spans several triples maps"),
         }
+        let mut parts: Vec<Part<'a>> = Vec::new();
+        let mut classes: Vec<usize> = Vec::new();
+        for (i, p) in providers.iter().enumerate() {
+            if members[i].0 == rdf::TYPE {
+                classes.push(i);
+                continue;
+            }
+            match p.as_slice() {
+                [] => return Ok(Err(Empty)),
+                [tm] => match parts.iter_mut().find(|(t, _)| t.iri == tm.iri) {
+                    Some((_, idxs)) => idxs.push(i),
+                    None => parts.push((tm, vec![i])),
+                },
+                _ => return decline("predicate provided by several triples maps"),
+            }
+        }
+        // A class comes with any part's map that declares it; otherwise it
+        // is a part of its own (a type-only access on the shared subject).
+        for i in classes {
+            let p = &providers[i];
+            if let Some((_, idxs)) = parts
+                .iter_mut()
+                .find(|(t, _)| p.iter().any(|c| c.iri == t.iri))
+            {
+                idxs.push(i);
+                continue;
+            }
+            match p.as_slice() {
+                [] => return Ok(Err(Empty)),
+                [tm] => parts.push((tm, vec![i])),
+                _ => return decline("class declared by several triples maps"),
+            }
+        }
+        if parts.iter().any(|(tm, _)| {
+            let sm = &tm.subject_map;
+            sm.template.is_none() && sm.column.is_none()
+        }) {
+            return decline("entity spans triples maps with a constant subject");
+        }
+        // The lane joins parts by key columns, never by rendered IRI, so
+        // every part must mint the same subject space. Parts whose subjects
+        // provably never meet leave no row carrying every member; parts the
+        // lane cannot relate either way are left to the engine.
+        if parts
+            .iter()
+            .any(|(tm, _)| subjects_disjoint(parts[0].0, tm))
+        {
+            return Ok(Err(Empty));
+        }
+        if parts.iter().any(|(tm, _)| !same_subject(parts[0].0, tm)) {
+            return decline("entity spans subject templates the lane cannot relate");
+        }
+        Ok(Ok(parts))
     }
 
     /// The key shape of a template over `cols`, declined when a column's
@@ -763,18 +1039,27 @@ impl<'a> Lowerer<'a> {
                 KeyShape::Template {
                     template: ta,
                     cols: ca,
-                    ..
+                    types: tya,
                 },
                 KeyShape::Template {
                     template: tb,
                     cols: cb,
-                    ..
+                    types: tyb,
                 },
             ) => {
-                if ta != tb || ca.len() != cb.len() {
+                // Two templates mint one IRI when their literal parts agree
+                // and their placeholders carry equal values, whatever the
+                // columns are called: `order/{id}` and `order/{order_ref}`
+                // join on `id = order_ref`.
+                if template_skeleton(ta) != template_skeleton(tb) || ca.len() != cb.len() {
                     return decline("repeated variable joins two different templates");
                 }
-                for (l, r) in ca.iter().zip(cb) {
+                for (i, (l, r)) in ca.iter().zip(cb).enumerate() {
+                    if let (Some(a), Some(b)) = (tya[i], tyb[i]) {
+                        if !fluree_db_tabular::plan::same_class(a, b) {
+                            return decline("join between two column classes");
+                        }
+                    }
                     self.push_edge(l.clone(), r.clone());
                 }
                 Ok(())
@@ -834,6 +1119,7 @@ impl<'a> Lowerer<'a> {
         let om = &tm.predicate_object_maps[pom_idx].object_map;
         let term = TermSource::Object {
             alias: alias.to_string(),
+            tm_iri: tm.iri.clone(),
             pom: pom_idx,
         };
         match om {
@@ -1126,9 +1412,11 @@ impl<'a> Lowerer<'a> {
                     .allowed(tm, pred)
                     .map_err(|_| Decline("policy error"))?
                 {
-                    Some(true) => {}
-                    Some(false) => continue, // hidden: the variable stays unbound
-                    None => return decline("policy not static"),
+                    Some(Verdict::Allow) => {}
+                    Some(Verdict::Deny) => continue, // hidden: the variable stays unbound
+                    // Hidden per row: the column would have to be nulled
+                    // by a predicate, which no statement here expresses.
+                    Some(Verdict::ByClass { .. }) | None => return decline("policy not static"),
                 }
                 match self.bind_member(&alias, tm, pred, obj, required_subjects, true) {
                     Ok(Ok(None)) => {}
@@ -1150,9 +1438,9 @@ impl<'a> Lowerer<'a> {
                 .allowed(tm, pred)
                 .map_err(|_| Decline("policy error"))?
             {
-                Some(true) => {}
-                Some(false) => return Ok(()),
-                None => return decline("policy not static"),
+                Some(Verdict::Allow) => {}
+                Some(Verdict::Deny) => return Ok(()),
+                Some(Verdict::ByClass { .. }) | None => return decline("policy not static"),
             }
         }
         let alias = self.new_access(tm);
@@ -1300,6 +1588,13 @@ impl<'a> Lowerer<'a> {
         if out_rows.is_empty() {
             return decline("empty VALUES");
         }
+        // A key set the provider would not take in one statement stays with
+        // the engine: the block's VALUES is not chunked the way outer
+        // bindings are.
+        let bytes: usize = out_rows.iter().flatten().map(|l| literal_len(l) + 4).sum();
+        if out_rows.len() > self.caps.keyset_max_rows || bytes > self.caps.statement_max_bytes / 2 {
+            return decline("VALUES too large to push");
+        }
         self.static_keysets.push((
             KeySet {
                 alias: kalias,
@@ -1351,7 +1646,7 @@ impl<'a> Lowerer<'a> {
                     }
                     members.push(lit);
                 }
-                if members.is_empty() {
+                if members.is_empty() || members.len() > self.caps.keyset_max_rows {
                     return None;
                 }
                 let pred = Pred::Cmp {
@@ -1417,6 +1712,118 @@ impl<'a> Lowerer<'a> {
                     _ => None,
                 }
             }
+            _ => None,
+        }
+    }
+
+    /// A predicate every row `expr` keeps satisfies, for an `expr` the plan
+    /// cannot evaluate exactly: the statement filters with it and the engine
+    /// still runs `expr` over what comes back. `None` when nothing can be
+    /// said. A `LIKE` widens because a collation can only match more (case
+    /// or accent folding), never fewer, of the strings a byte prefix does.
+    fn lower_superset(&self, expr: &Expression) -> Option<Pred> {
+        if let Some(pred) = self.lower_filter(expr) {
+            return Some(pred);
+        }
+        let Expression::Call { func, args } = expr else {
+            return None;
+        };
+        match func {
+            // Dropping a conjunct widens; every disjunct must widen.
+            Function::And => {
+                Pred::and(args.iter().filter_map(|a| self.lower_superset(a)).collect())
+            }
+            Function::Or => {
+                let parts: Option<Vec<Pred>> =
+                    args.iter().map(|a| self.lower_superset(a)).collect();
+                let parts = parts?;
+                (!parts.is_empty()).then_some(Pred::Or(parts))
+            }
+            Function::StrStarts | Function::StrEnds | Function::Contains => {
+                let (col, needle) = self.string_column_and_literal(args)?;
+                let needle = like_escape(&needle);
+                let pattern = match func {
+                    Function::StrStarts => format!("{needle}%"),
+                    Function::StrEnds => format!("%{needle}"),
+                    _ => format!("%{needle}%"),
+                };
+                Some(Pred::Like { col, pattern })
+            }
+            Function::Eq | Function::Lt | Function::Le | Function::Gt | Function::Ge => {
+                self.text_timestamp_day_bounds(func, args)
+            }
+            // `^literal` with no flags is a case-sensitive prefix.
+            Function::Regex => {
+                if args.len() != 2 {
+                    return None;
+                }
+                let (col, pattern) = self.string_column_and_literal(args)?;
+                let prefix = pattern.strip_prefix('^')?;
+                if prefix.is_empty() || prefix.chars().any(|c| r".^$*+?()[]{}|\".contains(c)) {
+                    return None;
+                }
+                Some(Pred::Like {
+                    col,
+                    pattern: format!("{}%", like_escape(prefix)),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// An `xsd:dateTime` literal compared with a timestamp the database
+    /// keeps as text (SQLite), in whatever format its writer used: the day
+    /// of the literal bounds the comparison, `'2024-01-10'` sorting below
+    /// every timestamp of that day with either time separator, and the
+    /// engine applies the exact one. The column is read as UTC, like every
+    /// zoneless timestamp, so the literal's own day is the bound.
+    fn text_timestamp_day_bounds(&self, func: &Function, args: &[Expression]) -> Option<Pred> {
+        if !self.caps.timestamp_is_text {
+            return None;
+        }
+        let (var, lit, reversed) = match args {
+            [Expression::Var(v), Expression::Const(c)] => (*v, c, false),
+            [Expression::Const(c), Expression::Var(v)] => (*v, c, true),
+            _ => return None,
+        };
+        let (col, RdfClass::DateTime) = self.literal_column(var)? else {
+            return None;
+        };
+        if self.field_type(&col) != Some(FieldType::Timestamp) {
+            return None;
+        }
+        let (Literal::Timestamp { micros, tz: true }, _) = literal_of(lit, None)? else {
+            return None;
+        };
+        let day = micros.div_euclid(MICROS_PER_DAY);
+        let bound = |day: i64| Some(Literal::Date(i32::try_from(day).ok()?));
+        let (lo, hi) = (bound(day)?, bound(day + 1)?);
+        let cmp = |op, value| Pred::Cmp {
+            col: col.clone(),
+            op,
+            value,
+        };
+        let below = matches!(func, Function::Lt | Function::Le) != reversed;
+        Some(match func {
+            Function::Eq => Pred::And(vec![cmp(CmpOp::GtEq, lo), cmp(CmpOp::Lt, hi)]),
+            _ if below => cmp(CmpOp::Lt, hi),
+            _ => cmp(CmpOp::GtEq, lo),
+        })
+    }
+
+    /// `(?v, "literal")` where `?v` is a physical string column.
+    fn string_column_and_literal(&self, args: &[Expression]) -> Option<(ColRef, String)> {
+        let [Expression::Var(v), Expression::Const(c)] = args else {
+            return None;
+        };
+        let (col, class) = self.literal_column(*v)?;
+        if !matches!(class, RdfClass::Str | RdfClass::LangStr(_))
+            || !self.literal_exact(&col, &class)
+        {
+            return None;
+        }
+        match literal_of(c, None)? {
+            (Literal::Str(s), RdfClass::Str) => Some((col, s)),
             _ => None,
         }
     }
@@ -1583,8 +1990,9 @@ impl<'a> Lowerer<'a> {
                 })
                 .unwrap_or_default()
             }
-            TermSource::Object { alias, pom } => self
-                .tm_of(alias)
+            TermSource::Object { alias, tm_iri, pom } => self
+                .mapping
+                .get(tm_iri)
                 .map(|tm| {
                     object_columns(&tm.predicate_object_maps[*pom].object_map)
                         .into_iter()
@@ -1605,9 +2013,92 @@ impl<'a> Lowerer<'a> {
     }
 }
 
+/// Rendered size of a key-set literal, roughly: what the chunking budgets.
+pub(crate) fn literal_len(l: &Literal) -> usize {
+    match l {
+        Literal::Str(s) | Literal::TemplateKey(s) => s.len() + 2,
+        Literal::Set(items) => items.iter().map(literal_len).sum(),
+        _ => 24,
+    }
+}
+
+/// A triples map and the entity members (by index) it provides.
+type Part<'a> = (&'a TriplesMap, Vec<usize>);
+
+/// Whether two triples maps mint their subject the same way from the same
+/// columns, so a row of each with equal key columns is one entity.
+/// A template with its placeholders anonymized: two templates of one
+/// skeleton mint one IRI exactly when their placeholder values agree.
+fn template_skeleton(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => {
+                out.push_str("{}");
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        break;
+                    }
+                }
+            }
+            '\\' => {
+                out.push(c);
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Whether two triples maps mint subjects in one space, so a subject
+/// shared between them is a join on their key columns: templates of one
+/// skeleton, or two column-valued subjects.
+fn same_subject(a: &TriplesMap, b: &TriplesMap) -> bool {
+    let (sa, sb) = (&a.subject_map, &b.subject_map);
+    match (&sa.template, &sb.template) {
+        (Some(ta), Some(tb)) => {
+            template_skeleton(ta) == template_skeleton(tb)
+                && sa.template_columns.len() == sb.template_columns.len()
+        }
+        (None, None) => sa.column.is_some() && sb.column.is_some(),
+        _ => false,
+    }
+}
+
+/// Whether no row of `a` can mint a subject of `b`: both are templates and
+/// neither's literal prefix (the text before the first placeholder) begins
+/// the other's. A column-valued subject can be anything, so it is never
+/// provably apart from another.
+fn subjects_disjoint(a: &TriplesMap, b: &TriplesMap) -> bool {
+    let (Some(ta), Some(tb)) = (&a.subject_map.template, &b.subject_map.template) else {
+        return false;
+    };
+    let prefix = |t: &str| t.split('{').next().unwrap_or("").to_string();
+    let (pa, pb) = (prefix(ta), prefix(tb));
+    !pa.starts_with(&pb) && !pb.starts_with(&pa)
+}
+
+/// Whether two triples maps read the same row: one relation, one subject
+/// map, column for column.
+fn same_row(a: &TriplesMap, b: &TriplesMap) -> bool {
+    let (sa, sb) = (&a.subject_map, &b.subject_map);
+    (sa.template.is_some() || sa.column.is_some())
+        && sa.template == sb.template
+        && sa.template_columns == sb.template_columns
+        && sa.column == sb.column
+        && source_of_tm(a) == source_of_tm(b)
+}
+
 fn collect_aliases(pred: &Pred, out: &mut HashSet<String>) {
     match pred {
-        Pred::Cmp { col, .. } | Pred::IsNull(col) | Pred::IsNotNull(col) => {
+        Pred::Cmp { col, .. }
+        | Pred::IsNull(col)
+        | Pred::IsNotNull(col)
+        | Pred::Like { col, .. } => {
             out.insert(col.alias.clone());
         }
         Pred::ColEq { left, right } => {
@@ -1657,6 +2148,7 @@ fn parse_block(patterns: &[Pattern], snapshot: &LedgerSnapshot) -> Lowering<Bloc
         filters: Vec::new(),
         optionals: Vec::new(),
         values: Vec::new(),
+        binds: Vec::new(),
     };
     for p in patterns {
         match p {
@@ -1678,6 +2170,7 @@ fn parse_block(patterns: &[Pattern], snapshot: &LedgerSnapshot) -> Lowering<Bloc
                 block.optionals.push((triples, filters));
             }
             Pattern::Values { vars, rows } => block.values.push((vars.clone(), rows.clone())),
+            Pattern::Bind { var, expr } => block.binds.push((*var, expr.clone())),
             _ => return decline("unsupported pattern in block"),
         }
     }
@@ -1815,6 +2308,10 @@ fn decimal_literal(bd: &bigdecimal::BigDecimal) -> Option<Literal> {
     })
 }
 
+/// The widest offset a zone can put between a naive timestamp and the
+/// instant it denotes (UTC-12 to UTC+14), as micros.
+const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
+
 pub(crate) fn source_of_tm(tm: &TriplesMap) -> RelSource {
     match tm.sql_query() {
         Some(q) => RelSource::Query(q.to_string()),
@@ -1903,7 +2400,8 @@ pub(crate) fn key_fits(ty: Option<FieldType>, raw: &str) -> bool {
 /// The mapping-dependent decisions happen at open.
 pub(crate) fn block_is_admissible(patterns: &[Pattern]) -> bool {
     let mut has_triple = false;
-    for p in patterns {
+    let mut in_scope: Vec<VarId> = Vec::new();
+    for (i, p) in patterns.iter().enumerate() {
         match p {
             Pattern::Triple(tp) => {
                 has_triple = true;
@@ -1912,6 +2410,24 @@ pub(crate) fn block_is_admissible(patterns: &[Pattern]) -> bool {
                 }
             }
             Pattern::Filter(_) | Pattern::Values { .. } => {}
+            // Evaluated in the engine over the statement's rows, so it must
+            // read only what the block bound before it, and nothing the
+            // statement joins or filters on may read it (a filter above is
+            // group-scoped and runs after the BIND either way).
+            Pattern::Bind { var, expr } => {
+                if crate::filter::contains_exists(expr)
+                    || crate::eval::metadata_resolve::contains_metadata_read(expr)
+                    || in_scope.contains(var)
+                    || expr.referenced_vars().iter().any(|v| !in_scope.contains(v))
+                    || patterns.iter().enumerate().any(|(j, q)| {
+                        j != i
+                            && !matches!(q, Pattern::Filter(_))
+                            && q.referenced_vars().contains(var)
+                    })
+                {
+                    return false;
+                }
+            }
             Pattern::Optional(inner) => {
                 if !inner.iter().all(|q| match q {
                     Pattern::Triple(tp) => triple_is_admissible(tp),
@@ -1931,6 +2447,7 @@ pub(crate) fn block_is_admissible(patterns: &[Pattern]) -> bool {
             }
             _ => return false,
         }
+        in_scope.extend(p.produced_vars());
     }
     has_triple
 }

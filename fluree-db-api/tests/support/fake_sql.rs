@@ -206,7 +206,7 @@ impl FakeSql {
                 for row in &rels[idx].rows {
                     let mut cand = t.clone();
                     cand.push(Some(row.clone()));
-                    if on.eval(&cand, &resolver) {
+                    if on.eval(&cand, &resolver) == Some(true) {
                         matched = true;
                         next.push(cand);
                     }
@@ -260,7 +260,7 @@ impl FakeSql {
         let resolver = Resolver { rels: &rels };
         if let Some(w) = where_text {
             let pred = parse_pred(w)?;
-            tuples.retain(|t| pred.eval(t, &resolver));
+            tuples.retain(|t| pred.eval(t, &resolver) == Some(true));
         }
 
         // Ordering on join columns alone happens before grouping/projection;
@@ -674,6 +674,7 @@ type Col = (Option<String>, String);
 
 enum Pred {
     IsNull(Col, bool),
+    Like(Col, String),
     Cmp(Col, String, Value),
     ColEq(Col, Col),
     In(Col, Vec<Value>),
@@ -683,16 +684,22 @@ enum Pred {
 }
 
 impl Pred {
-    fn eval(&self, t: &Tuple, r: &Resolver<'_>) -> bool {
+    /// Three-valued, as SQL is: `None` is NULL, which a NULL operand yields
+    /// and `NOT` preserves, so `NOT (NULL IN (…))` keeps no row here either.
+    fn eval(&self, t: &Tuple, r: &Resolver<'_>) -> Option<bool> {
         let get = |c: &Col| r.resolve(c).map(|(ri, ci)| cell(t, ri, ci)).ok();
-        match self {
+        let value = |c: &Col| get(c).filter(|v| !v.is_null());
+        Some(match self {
             Pred::IsNull(c, want_null) => get(c).is_none_or(|v| v.is_null()) == *want_null,
+            Pred::Like(c, pattern) => match value(c)? {
+                Value::String(s) => like_matches(
+                    &pattern.chars().collect::<Vec<_>>(),
+                    &s.chars().collect::<Vec<_>>(),
+                ),
+                _ => false,
+            },
             Pred::Cmp(c, op, lit) => {
-                let Some(v) = get(c) else { return false };
-                if v.is_null() {
-                    return false;
-                }
-                let o = cmp_values(&v, lit);
+                let o = cmp_values(&value(c)?, lit);
                 match op.as_str() {
                     "=" => o.is_eq(),
                     "<>" => o.is_ne(),
@@ -703,18 +710,29 @@ impl Pred {
                     _ => false,
                 }
             }
-            Pred::ColEq(a, b) => match (get(a), get(b)) {
-                (Some(x), Some(y)) => !x.is_null() && !y.is_null() && values_eq(&x, &y),
-                _ => false,
-            },
+            Pred::ColEq(a, b) => values_eq(&value(a)?, &value(b)?),
             Pred::In(c, lits) => {
-                let Some(v) = get(c) else { return false };
-                !v.is_null() && lits.iter().any(|l| values_eq(&v, l))
+                let v = value(c)?;
+                lits.iter().any(|l| values_eq(&v, l))
             }
-            Pred::Not(p) => !p.eval(t, r),
-            Pred::And(ps) => ps.iter().all(|p| p.eval(t, r)),
-            Pred::Or(ps) => ps.iter().any(|p| p.eval(t, r)),
-        }
+            Pred::Not(p) => !p.eval(t, r)?,
+            Pred::And(ps) => {
+                let parts: Vec<Option<bool>> = ps.iter().map(|p| p.eval(t, r)).collect();
+                if parts.contains(&Some(false)) {
+                    false
+                } else {
+                    parts.iter().all(Option::is_some).then_some(true)?
+                }
+            }
+            Pred::Or(ps) => {
+                let parts: Vec<Option<bool>> = ps.iter().map(|p| p.eval(t, r)).collect();
+                if parts.contains(&Some(true)) {
+                    true
+                } else {
+                    parts.iter().all(Option::is_some).then_some(false)?
+                }
+            }
+        })
     }
 }
 
@@ -741,6 +759,15 @@ fn parse_pred(text: &str) -> Result<Pred, String> {
     if let Some(c) = text.strip_suffix(" IS NULL") {
         return Ok(Pred::IsNull(colref(c), true));
     }
+    if let Some((c, rest)) = split_once_top(text, " LIKE ") {
+        let lit = rest
+            .strip_suffix(" ESCAPE '!'")
+            .ok_or("LIKE without the lane's ESCAPE clause")?;
+        let Value::String(pattern) = parse_literal(lit)? else {
+            return Err("LIKE pattern is not a string".into());
+        };
+        return Ok(Pred::Like(colref(c), pattern));
+    }
     if let Some((c, list)) = split_once_top(text, " IN ") {
         let inner = strip_parens(list.trim());
         let lits = split_top(inner, ", ")
@@ -758,6 +785,18 @@ fn parse_pred(text: &str) -> Result<Pred, String> {
         }
     }
     Err(format!("unparsed predicate: {text}"))
+}
+
+/// Case-sensitive `LIKE` with `!` as the escape character.
+fn like_matches(pattern: &[char], text: &[char]) -> bool {
+    match pattern {
+        [] => text.is_empty(),
+        ['%', rest @ ..] => (0..=text.len()).any(|i| like_matches(rest, &text[i..])),
+        ['_', rest @ ..] => !text.is_empty() && like_matches(rest, &text[1..]),
+        ['!', c, rest @ ..] | [c, rest @ ..] => {
+            text.first() == Some(c) && like_matches(rest, &text[1..])
+        }
+    }
 }
 
 /// `"alias"."col"` or `"col"` → (alias, col).
