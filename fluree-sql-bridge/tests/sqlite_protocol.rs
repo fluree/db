@@ -249,3 +249,77 @@ async fn bearer_token_is_enforced_and_cancel_drops_the_statement() {
     let (status, _) = call(&router, get(&next, Some("s3cret"))).await;
     assert_eq!(status, StatusCode::GONE);
 }
+
+/// Drain a statement, returning the error message if any page reports one.
+async fn run_err(router: &axum::Router, sql: &str) -> Option<String> {
+    let (status, first) = call(router, post(sql, None)).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    if let Some(m) = first["error"]["message"].as_str() {
+        return Some(m.to_string());
+    }
+    let mut next = first["nextUri"].as_str().unwrap().to_string();
+    loop {
+        let (status, page) = call(router, get(&next, None)).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        if let Some(m) = page["error"]["message"].as_str() {
+            return Some(m.to_string());
+        }
+        match page["nextUri"].as_str() {
+            Some(n) => next = n.to_string(),
+            None => return None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn off_type_cells_in_an_integer_column_are_rejected_not_coerced() {
+    let (router, _dir) = app(None, 10).await;
+    for stmt in [
+        "CREATE TABLE counts (v INTEGER)",
+        // SQLite converts a losslessly-integral REAL on insert, so `3.0` is
+        // stored as an INTEGER and is a legitimate value, not an off-type cell.
+        "INSERT INTO counts VALUES (1), (3.0)",
+        "CREATE TABLE fractional (v INTEGER)",
+        "INSERT INTO fractional VALUES (1), (2.5)",
+        "CREATE TABLE texty (v INTEGER)",
+        "INSERT INTO texty VALUES (1), ('abc')",
+        "CREATE TABLE bloby (v INTEGER)",
+        "INSERT INTO bloby VALUES (1), (x'0102')",
+    ] {
+        run(&router, stmt).await;
+    }
+
+    let (types, rows) = run(&router, "SELECT v FROM counts ORDER BY v").await;
+    assert_eq!(types, ["bigint"]);
+    assert_eq!(
+        rows,
+        vec![json!([1]), json!([3])],
+        "integral REALs still read"
+    );
+
+    // Coercing these would emit 2, 0 and 0 — fabricated numbers indistinguishable
+    // from real ones. The read fails instead.
+    for (table, storage) in [("fractional", "REAL"), ("texty", "TEXT"), ("bloby", "BLOB")] {
+        let err = run_err(&router, &format!("SELECT v FROM {table}"))
+            .await
+            .unwrap_or_else(|| panic!("{table}: an off-type cell must not be coerced"));
+        assert!(
+            err.contains(storage) && err.contains("INTEGER-affinity"),
+            "{table}: {err}"
+        );
+    }
+
+    // Declaring the column NUMERIC is the remedy the error names: the same
+    // mixed storage then types as `double` and every cell converts. A CAST
+    // would not do it — an expression column has no declared type and falls
+    // back to the driver's first-row inference.
+    for stmt in [
+        "CREATE TABLE declared (v NUMERIC)",
+        "INSERT INTO declared VALUES (1), (2.5)",
+    ] {
+        run(&router, stmt).await;
+    }
+    let (types, rows) = run(&router, "SELECT v FROM declared").await;
+    assert_eq!(types, ["double"]);
+    assert_eq!(rows, vec![json!([1.0]), json!([2.5])]);
+}
