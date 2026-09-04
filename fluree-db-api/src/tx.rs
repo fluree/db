@@ -190,11 +190,20 @@ impl SequentialStager {
         }
 
         if advance {
+            // Detach the range provider around the in-place dictionary
+            // mutation: attached, it pins the dictionaries (so `make_mut`
+            // deep-clones them) and would keep reading the pre-op copies,
+            // leaving the next operation's WHERE unable to translate the
+            // subjects this one introduced.
+            let store = fluree_db_transact::detach_binary_provider(&mut state_i);
             state_i.apply_staged_flakes_for_sequential_staging(
                 flakes_i,
                 &ns_delta,
                 graph_iris.iter().map(String::as_str),
             )?;
+            if let Some(store) = store {
+                fluree_db_transact::attach_binary_provider(&mut state_i, store);
+            }
             self.current = Some(state_i);
         }
         Ok(staged_count)
@@ -949,7 +958,7 @@ pub(crate) fn resolve_shapes_source_g_ids(
 /// is API-layer policy, not a staging primitive.
 #[cfg(feature = "shacl")]
 pub(crate) async fn apply_shacl_policy_to_staged_view(
-    view: &StagedLedger,
+    view: &mut StagedLedger,
     ctx: StagedShaclContext<'_>,
     preresolved_config: Option<Arc<LedgerConfig>>,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
@@ -1228,6 +1237,14 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
         return Ok(());
     }
 
+    // Validation reads the staged view on the binary lane; its dictionaries
+    // must cover the subjects this transaction introduces, or every probe
+    // re-translates the whole graph novelty and merges the new subjects'
+    // flakes raw. Mutably re-borrowed here so `base` (an immutable borrow of
+    // the view) is released first.
+    fluree_db_transact::attach_staged_dicts(view)?;
+    let view: &StagedLedger = view;
+
     // 5. Validate. `per_graph_policy` drives which graphs participate and
     //    what mode their violations carry. `None` = shapes-exist heuristic
     //    path → every graph validated in reject mode (the transact helper's
@@ -1437,7 +1454,7 @@ async fn stage_with_config_shacl(
     let cross_ledger_schema =
         resolve_cross_ledger_schema_for_tx(&ledger, config.as_ref(), resolve_ctx).await?;
 
-    let (view, mut ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
+    let (mut view, mut ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
     // Parse inline shapes (if any) against the staged namespace
     // registry. The bundle becomes an additional shape DB in
@@ -1494,7 +1511,7 @@ async fn stage_with_config_shacl(
     };
 
     apply_shacl_policy_to_staged_view(
-        &view,
+        &mut view,
         StagedShaclContext {
             graph_delta: Some(&graph_delta),
             graph_sids: Some(&graph_sids),
@@ -3549,7 +3566,7 @@ impl crate::Fluree {
         if let Some(policy) = policy {
             options = options.with_policy(policy);
         }
-        let view = match stage_flakes(ledger, flakes, options).await {
+        let mut view = match stage_flakes(ledger, flakes, options).await {
             Ok(view) => view,
             Err(e) => {
                 self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
@@ -3590,7 +3607,7 @@ impl crate::Fluree {
                 _ => None,
             };
             apply_shacl_policy_to_staged_view(
-                &view,
+                &mut view,
                 StagedShaclContext {
                     graph_delta: None,
                     graph_sids: None,

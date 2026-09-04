@@ -179,6 +179,19 @@ pub struct StagedLedger {
     staged: StagedOverlay,
     /// Unique epoch for cache keys (different from base novelty)
     staged_epoch: u64,
+    /// Process-unique content stamp (see [`OverlayProvider::content_version`]).
+    ///
+    /// `staged_epoch` is only unique within the base novelty's lineage: it is
+    /// exactly the epoch the novelty reports once these flakes commit, at the
+    /// same `to_t`. Any cross-query cache keyed on the epoch would therefore
+    /// serve this view's translation for the committed state.
+    content_version: u64,
+    /// Whether the base snapshot's range provider has been given dictionaries
+    /// that cover the staged flakes (see `attach_staged_dicts` in
+    /// `fluree-db-transact`). Off by default: the base provider's
+    /// dictionaries know nothing of subjects and strings this transaction is
+    /// introducing.
+    dicts_cover_staged: bool,
 }
 
 impl StagedLedger {
@@ -198,8 +211,22 @@ impl StagedLedger {
         Ok(Self {
             staged: StagedOverlay::from_flakes(flakes, reverse_graph)?,
             staged_epoch,
+            content_version: fluree_db_core::overlay::next_overlay_content_version(),
+            dicts_cover_staged: false,
             base,
         })
+    }
+
+    /// Whether the base snapshot's range provider dictionaries cover the
+    /// staged flakes' novel subjects and strings.
+    pub fn dicts_cover_staged(&self) -> bool {
+        self.dicts_cover_staged
+    }
+
+    /// Record that a provider whose dictionaries cover the staged flakes has
+    /// been attached to the base snapshot.
+    pub fn set_dicts_cover_staged(&mut self) {
+        self.dicts_cover_staged = true;
     }
 
     /// Get the base ledger state
@@ -283,6 +310,10 @@ impl OverlayProvider for StagedLedger {
         self.staged_epoch
     }
 
+    fn content_version(&self) -> Option<u64> {
+        Some(self.content_version)
+    }
+
     fn for_each_overlay_flake(
         &self,
         g_id: GraphId,
@@ -362,6 +393,43 @@ mod tests {
             true,
             None,
         )
+    }
+
+    /// A staged view reports the epoch its flakes will carry once committed,
+    /// so only `content_version` can tell the two apart in a cache key.
+    #[test]
+    fn content_version_is_unique_per_view_and_distinct_from_base() {
+        use fluree_db_core::LedgerSnapshot;
+
+        let mut novelty = Novelty::new(0);
+        novelty
+            .apply_commit(vec![make_flake(1, 1, 100, 1)], 1, &HashMap::new())
+            .unwrap();
+        let base_version = OverlayProvider::content_version(&novelty).expect("novelty vouches");
+        let base_epoch = novelty.epoch;
+        let state = LedgerState::new(LedgerSnapshot::genesis("test:main"), novelty);
+
+        let a = StagedLedger::new(
+            state.clone(),
+            vec![make_flake(2, 1, 200, 2)],
+            &HashMap::new(),
+        )
+        .unwrap();
+        let b = StagedLedger::new(state, vec![make_flake(2, 1, 200, 2)], &HashMap::new()).unwrap();
+
+        assert_eq!(
+            a.epoch(),
+            base_epoch + 1,
+            "staged epoch is the post-commit epoch"
+        );
+        let va = OverlayProvider::content_version(&a).expect("staged view vouches");
+        let vb = OverlayProvider::content_version(&b).expect("staged view vouches");
+        assert_ne!(va, base_version);
+        assert_ne!(
+            va, vb,
+            "identical staged content on the same base is still a distinct stamp"
+        );
+        assert!(!a.dicts_cover_staged());
     }
 
     #[test]

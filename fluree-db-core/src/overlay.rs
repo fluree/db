@@ -62,6 +62,21 @@ pub struct OverlaySegmentMeta {
 /// without core depending on novelty types.
 ///
 /// Uses a push-based API to avoid `Box<dyn Iterator>` allocations in hot path.
+/// Process-wide counter behind [`next_overlay_content_version`]. Starts at 1
+/// so `0` can mean "empty since construction" for overlays that want it.
+static NEXT_CONTENT_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Allocate a process-unique [`OverlayProvider::content_version`] stamp.
+///
+/// Every overlay type that reports a content version draws from this one
+/// counter, which is what makes the version unique across overlay *types* —
+/// a staged view and the committed novelty it will become must never share
+/// one, or a cache keyed on it would serve the staged product for the
+/// committed state.
+pub fn next_overlay_content_version() -> u64 {
+    NEXT_CONTENT_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub trait OverlayProvider: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 

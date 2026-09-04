@@ -450,7 +450,7 @@ impl Fluree {
 
             // 4.3 Stage flakes (policy/backpressure). No WHERE/cancellation; flakes are prebuilt.
             let evolving_state = base_state.clone_with_novelty(Arc::new(evolving_novelty.clone()));
-            let staged_view = match stage_commit_flakes(
+            let mut staged_view = match stage_commit_flakes(
                 evolving_state,
                 &c.commit.flakes,
                 index_config,
@@ -492,7 +492,7 @@ impl Fluree {
             #[cfg(feature = "shacl")]
             {
                 crate::tx::apply_shacl_policy_to_staged_view(
-                    &staged_view,
+                    &mut staged_view,
                     crate::tx::StagedShaclContext {
                         graph_delta: Some(&routing.graph_iris),
                         graph_sids: Some(&routing.graph_sids),
@@ -1237,6 +1237,11 @@ fn apply_pushed_commits_to_state(
 
     // Apply all flakes to novelty (we already validated them; re-apply for state).
     let mut novelty = (*base.novelty).clone();
+    // Detach the range provider first: it pins `dict_novelty`, so mutating
+    // with it attached deep-clones the dictionary and leaves the provider —
+    // the copy every read through `base.snapshot` resolves against — without
+    // the subjects and strings these commits introduce.
+    let provider_store = fluree_db_transact::detach_binary_provider(&mut base);
     let mut dict_novelty = base.dict_novelty.clone();
 
     let store_opt: Option<&BinaryIndexStore> = base
@@ -1264,6 +1269,9 @@ fn apply_pushed_commits_to_state(
 
     base.novelty = Arc::new(novelty);
     base.dict_novelty = dict_novelty;
+    if let Some(store) = provider_store {
+        fluree_db_transact::attach_binary_provider(&mut base, store);
+    }
     base.head_commit_id = stored_commits.last().map(|c| c.commit_id.clone());
     if let Some(ref mut r) = base.ns_record {
         if let Some(last) = stored_commits.last() {
