@@ -3,7 +3,13 @@ use crate::error::{CliError, CliResult};
 use colored::Colorize;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_api::wire::ReindexResponse;
-use fluree_db_api::ReindexOptions;
+use fluree_db_api::{Fluree, ReindexOptions};
+
+/// What an index build produced.
+pub struct IndexOutcome {
+    pub index_t: i64,
+    pub root_id: String,
+}
 
 /// Run incremental indexing for a ledger.
 ///
@@ -21,7 +27,19 @@ pub async fn run_index(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> 
     }
 
     eprintln!("  {} indexing {}...", "index:".cyan().bold(), alias);
+    let result = index_ledger(&fluree, &ledger_id).await?;
+    println!(
+        "Indexed {} to t={} (root: {})",
+        alias, result.index_t, result.root_id
+    );
+    Ok(())
+}
 
+/// Build or update the ledger's binary index and publish it: incremental
+/// over the new commits when possible, a full rebuild otherwise. Shared by
+/// `fluree index` and by commands that write in bulk and should not leave
+/// every later invocation replaying their commits.
+pub async fn index_ledger(fluree: &Fluree, ledger_id: &str) -> CliResult<IndexOutcome> {
     // Attach the api-side full-text config provider so each incremental
     // build picks up `f:fullTextDefaults` changes — otherwise configured
     // plain-string values written since the last reindex wouldn't flow
@@ -50,24 +68,24 @@ pub async fn run_index(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> 
     // The CLI shared the same code shape pre-gate and was vulnerable
     // to the same regression; keep the two paths symmetric.
     if let Some(provider) = fluree.attachment_events_provider() {
-        let handle = fluree.ledger_cached(&ledger_id).await.map_err(|e| {
+        let handle = fluree.ledger_cached(ledger_id).await.map_err(|e| {
             CliError::Import(format!("indexing failed: failed to load ledger: {e}"))
         })?;
         let view = handle.snapshot().await;
         let ledger_has_annotations =
             view.snapshot.has_annotations || view.novelty.attachments.has_annotations();
         if ledger_has_annotations {
-            config.attachment_events = provider.attachment_events(&ledger_id).await;
+            config.attachment_events = provider.attachment_events(ledger_id).await;
         }
     }
 
     let cs = fluree
-        .branched_content_store(&ledger_id)
+        .branched_content_store(ledger_id)
         .await
         .map_err(|e| CliError::Import(format!("indexing failed: {e}")))?;
 
     let result =
-        fluree_db_indexer::build_index_for_ledger(cs, fluree.nameservice(), &ledger_id, config)
+        fluree_db_indexer::build_index_for_ledger(cs, fluree.nameservice(), ledger_id, config)
             .await
             .map_err(|e| CliError::Import(format!("indexing failed: {e}")))?;
 
@@ -78,16 +96,14 @@ pub async fn run_index(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> 
         .ok_or_else(|| {
             CliError::Config("write operations require a read-write nameservice".into())
         })?
-        .publish_index_allow_equal(&ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal(ledger_id, result.index_t, &result.root_id)
         .await
         .map_err(|e| CliError::Import(format!("failed to publish index: {e}")))?;
 
-    println!(
-        "Indexed {} to t={} (root: {})",
-        alias, result.index_t, result.root_id
-    );
-
-    Ok(())
+    Ok(IndexOutcome {
+        index_t: result.index_t,
+        root_id: result.root_id.to_string(),
+    })
 }
 
 /// Run a full reindex (rebuild from commit history) for a ledger.

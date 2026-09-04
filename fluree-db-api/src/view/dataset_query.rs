@@ -411,11 +411,15 @@ impl Fluree {
         })?;
 
         // Build executable
+        // Report the error's own status, as the single-view tracked path
+        // does: query preparation completes the ledger's config defaults, so
+        // a fault in the config graph surfaces here and is not the caller's.
         let executable = self
             .build_executable_for_dataset(dataset, &parsed)
             .await
             .map_err(|e| {
-                crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+                let status = e.status_code();
+                crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
             })?;
 
         // Execute with tracking
@@ -531,11 +535,15 @@ impl Fluree {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
         })?;
 
+        // Report the error's own status, as the single-view tracked path
+        // does: query preparation completes the ledger's config defaults, so
+        // a fault in the config graph surfaces here and is not the caller's.
         let executable = self
             .build_executable_for_dataset(dataset, &parsed)
             .await
             .map_err(|e| {
-                crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
+                let status = e.status_code();
+                crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
             })?;
 
         let batches = self
@@ -615,10 +623,14 @@ impl Fluree {
         let mut executable = prepare_for_execution(parsed);
 
         if let Some(primary) = dataset.primary() {
+            // Server-verified identity for `f:overrideControl`. `None` until
+            // the request boundary threads it through; see
+            // `complete_config_defaults`.
             self.apply_reasoning_to_executable(
                 primary,
                 &mut executable,
                 dataset.any_non_root_policy(),
+                None,
             )
             .await?;
         } else if dataset.any_non_root_policy() && !executable.reasoning.modes.rules.is_empty() {
@@ -798,7 +810,11 @@ impl Fluree {
         // policy-enforced query. Do not "upgrade" this.
         let index_provider = crate::FlureeIndexProvider::new(self);
 
-        let config = ContextConfig {
+        #[allow(
+            unused_mut,
+            reason = "vector_provider is set inside cfg(feature = \"vector\")"
+        )]
+        let mut config = ContextConfig {
             tracker: if tracker.is_enabled() {
                 Some(tracker)
             } else {
@@ -825,6 +841,10 @@ impl Fluree {
             trust_fk_refs: options.trust_fk_refs,
             ..Default::default()
         };
+        #[cfg(feature = "vector")]
+        {
+            config.vector_provider = Some(&index_provider);
+        }
 
         let exec_db = db.with_t(to_t);
         fluree_db_query::execute::execute_prepared_streaming(exec_db, vars, prepared, config, sink)
@@ -961,7 +981,11 @@ impl Fluree {
         // policy-enforced query. Do not "upgrade" this.
         let index_provider = crate::FlureeIndexProvider::new(self);
 
-        let config = ContextConfig {
+        #[allow(
+            unused_mut,
+            reason = "vector_provider is set inside cfg(feature = \"vector\")"
+        )]
+        let mut config = ContextConfig {
             tracker: Some(tracker),
             cancellation: options.cancellation.clone(),
             dataset: Some(&runtime_dataset),
@@ -984,6 +1008,10 @@ impl Fluree {
             trust_fk_refs: options.trust_fk_refs,
             ..Default::default()
         };
+        #[cfg(feature = "vector")]
+        {
+            config.vector_provider = Some(&index_provider);
+        }
 
         let exec_db = db.with_t(to_t);
         execute_prepared(exec_db, vars, prepared, config).await

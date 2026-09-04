@@ -369,19 +369,11 @@ pub async fn clean_garbage(
     })
 }
 
-/// Walk the prev-index chain using `ContentStore::get` (CID-based).
+/// Collect the whole prev-index chain, newest root first, reading storage
+/// directly.
 ///
-/// Returns entries in order from newest to oldest.
-///
-/// **Tolerant behavior**: if a prev_index link points at a root that no longer
-/// exists — the normal result of a prior GC truncating the chain — the walk
-/// stops gracefully there rather than returning an error, which is what makes
-/// GC idempotent.
-///
-/// A root that *does* exist but cannot be read propagates the error instead.
-/// Returning a short chain would be indistinguishable from a genuinely short
-/// one, and callers that decide which artifacts are unreferenced would treat
-/// everything past the unreadable root as garbage.
+/// See [`PrevIndexChainWalk::next_entry`] for how the walk ends, and prefer
+/// the walk itself where each root can be consumed and dropped.
 pub(crate) async fn walk_prev_index_chain_cs(
     store: &dyn ContentStore,
     current_root_id: &ContentId,
@@ -411,61 +403,118 @@ pub(crate) async fn walk_prev_index_chain_cs_cached(
     current_root_id: &ContentId,
     cache_dir: Option<&Path>,
 ) -> Result<Vec<IndexChainEntry>> {
+    let mut walk = PrevIndexChainWalk::new(store, current_root_id, cache_dir);
     let mut chain = Vec::new();
-    let mut current_id = current_root_id.clone();
 
-    loop {
+    while let Some(entry) = walk.next_entry().await? {
+        chain.push(entry);
+    }
+
+    Ok(chain)
+}
+
+/// A prev-index chain walk in progress, newest root first.
+///
+/// Yields one root at a time. A caller that reduces each root to a summary —
+/// the storage sweep's reachable CID set, say — then holds one decoded root
+/// rather than the whole chain, which on a long chain is the difference
+/// between a bounded working set and one that grows with the ledger's index
+/// history.
+pub(crate) struct PrevIndexChainWalk<'a> {
+    store: &'a dyn ContentStore,
+    cache_dir: Option<&'a Path>,
+    /// The root to read next, or `None` once the chain has ended.
+    next_id: Option<ContentId>,
+    /// Whether any root has been yielded, which decides how an unreadable
+    /// root is interpreted.
+    yielded: bool,
+}
+
+impl<'a> PrevIndexChainWalk<'a> {
+    pub(crate) fn new(
+        store: &'a dyn ContentStore,
+        head_id: &ContentId,
+        cache_dir: Option<&'a Path>,
+    ) -> Self {
+        Self {
+            store,
+            cache_dir,
+            next_id: Some(head_id.clone()),
+            yielded: false,
+        }
+    }
+
+    /// The next root in the chain, or `None` at its end.
+    ///
+    /// **Tolerant behavior**: if a prev_index link points at a root that no
+    /// longer exists — the normal result of a prior GC truncating the chain —
+    /// the walk ends gracefully rather than returning an error, which is what
+    /// makes GC idempotent. A root that *does* exist but cannot be read
+    /// propagates the error instead: a short chain would be
+    /// indistinguishable from a genuinely short one, and callers deciding
+    /// which artifacts are unreferenced would treat everything past the
+    /// unreadable root as garbage.
+    ///
+    /// A `cache_dir` weakens that ending. A cached copy of a released root
+    /// reads back, so the walk never learns storage has dropped it and
+    /// continues into a chain the collector already truncated. Callers that
+    /// must not act on a released root have to establish existence
+    /// themselves — see `gc::sweep::chain_cas_ids`, which reads a failed
+    /// expansion plus an absent root as the ending this walk missed.
+    pub(crate) async fn next_entry(&mut self) -> Result<Option<IndexChainEntry>> {
+        let Some(current_id) = self.next_id.take() else {
+            return Ok(None);
+        };
+
         let read_started = std::time::Instant::now();
-        let bytes = match get_cached_or_remote(store, &current_id, cache_dir).await {
-            Ok(b) => b,
-            Err(e) => {
-                if chain.is_empty() {
-                    return Err(e);
-                }
-                // A *released* root is the normal end of a walk: GC truncates
-                // the chain from the oldest end, leaving the retained
-                // boundary's prev_index dangling. Any other read failure is
-                // not an ending — it is a root whose contents could not be
-                // seen, and a caller deciding what is unreferenced would treat
-                // everything beyond it as garbage. Distinguish by existence,
-                // since the disk-cache path stringifies the error and loses
-                // its kind. If existence cannot be established either, treat
-                // the root as present and propagate.
-                if store.has(&current_id).await.unwrap_or(true) {
-                    return Err(e);
-                }
-                tracing::debug!(
-                    root_id = %current_id,
-                    "prev_index released by prior GC, chain ends here"
-                );
-                break;
-            }
+        let bytes = match get_cached_or_remote(self.store, &current_id, self.cache_dir).await {
+            Ok(bytes) => bytes,
+            Err(e) => return self.end_of_chain_or_error(&current_id, e).await,
         };
         tracing::trace!(
             root_id = %current_id,
             bytes = bytes.len(),
             elapsed_ms = read_started.elapsed().as_millis() as u64,
-            from_cache_enabled = cache_dir.is_some(),
+            from_cache_enabled = self.cache_dir.is_some(),
             "GC loaded prev-index root"
         );
 
         let (t, prev_index_id, garbage_id, root) = parse_chain_fields(&bytes)?;
+        self.next_id = prev_index_id;
+        self.yielded = true;
 
-        let next_id = prev_index_id;
-        chain.push(IndexChainEntry {
+        Ok(Some(IndexChainEntry {
             t,
             root_id: current_id,
             garbage_id,
             root,
-        });
-
-        match next_id {
-            Some(id) => current_id = id,
-            None => break,
-        }
+        }))
     }
 
-    Ok(chain)
+    /// Whether a root that would not read ends the chain or fails the walk.
+    ///
+    /// A *released* root is the normal end: GC truncates from the oldest end,
+    /// leaving the retained boundary's prev_index dangling. Distinguish by
+    /// existence, since the disk-cache path stringifies the error and loses
+    /// its kind. If existence cannot be established either, treat the root as
+    /// present and propagate. The head is never an ending — a walk that could
+    /// not read its first root saw nothing at all.
+    async fn end_of_chain_or_error(
+        &self,
+        root_id: &ContentId,
+        error: crate::error::IndexerError,
+    ) -> Result<Option<IndexChainEntry>> {
+        if !self.yielded || self.store.has(root_id).await.unwrap_or(true) {
+            return Err(error);
+        }
+
+        tracing::debug!(
+            root_id = %root_id,
+            "prev_index released by prior GC, chain ends here"
+        );
+
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

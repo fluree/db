@@ -495,7 +495,8 @@ pub struct NameServiceState {
     /// Iceberg) keyed by `name:branch`. Mutated through the three
     /// [`fluree_db_nameservice::GraphSourcePublisher`] commands:
     /// [`Command::PublishGraphSource`] upserts the config side
-    /// (preserving any existing index pointer and retraction flag),
+    /// (preserving any existing index pointer; a retraction is cleared,
+    /// so a create after a drop comes back active),
     /// [`Command::PublishGraphSourceIndex`] advances the index
     /// pointer with strict monotonicity, and
     /// [`Command::RetractGraphSource`] flips the retracted flag.
@@ -2145,13 +2146,14 @@ fn apply_publish_graph_source(
     let graph_source_id = format_ledger_id(&name, &branch);
     match state.graph_sources.get_mut(&graph_source_id) {
         Some(record) => {
-            // Existing record: touch only config-side fields. The
-            // index pointer and retracted flag are owned by
-            // `Command::PublishGraphSourceIndex` and
-            // `Command::RetractGraphSource`.
+            // Existing record: config-side fields plus the retracted
+            // flag, which publishing clears — a create after a drop
+            // must come back active. The index pointer stays owned by
+            // `Command::PublishGraphSourceIndex`.
             record.source_type = source_type;
             record.config = config;
             record.dependencies = dependencies;
+            record.retracted = false;
         }
         None => {
             state.graph_sources.insert(
@@ -5405,7 +5407,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_graph_source_preserves_index_and_retracted_on_update() {
+    fn publish_graph_source_preserves_index_and_clears_retracted_on_update() {
         let mut state = NameServiceState::new();
         apply(
             &mut state,
@@ -5431,7 +5433,8 @@ mod tests {
             3,
         );
 
-        // Re-publish with new config — index pointer + retracted preserved.
+        // Re-publish with new config — index pointer preserved, retraction
+        // cleared: this is what a create after a drop does.
         let resp = apply(
             &mut state,
             publish_graph_source_cmd(
@@ -5449,7 +5452,10 @@ mod tests {
         assert_eq!(rec.dependencies, vec!["new-dep:main".to_string()]);
         assert_eq!(rec.index_id, Some(cid(42)));
         assert_eq!(rec.index_t, 5);
-        assert!(rec.retracted);
+        assert!(
+            !rec.retracted,
+            "re-publishing config revives a retracted source"
+        );
     }
 
     #[test]

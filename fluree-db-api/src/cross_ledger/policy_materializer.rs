@@ -185,6 +185,10 @@ pub(super) async fn materialize_policy_rules(
     //    set. Subjects the loader returns `None` for are silently
     //    skipped — that's the existing local-side semantics for
     //    malformed rules.
+    // Sorted so the wire artifact (and everything cached from it) is
+    // deterministic rather than following HashSet iteration order.
+    let mut policy_subjects: Vec<Sid> = policy_subjects.into_iter().collect();
+    policy_subjects.sort();
     let policy_graphs = [g_id];
     let mut wire_restrictions = Vec::with_capacity(policy_subjects.len());
     for policy_sid in policy_subjects {

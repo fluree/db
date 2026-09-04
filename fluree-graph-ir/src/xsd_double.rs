@@ -15,6 +15,71 @@
 
 use std::fmt::{self, Write as _};
 
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+}
+
+/// Float scalar admitted to the XSD lexical formatters (`f32`/`f64`); sealed.
+///
+/// Carries the two facts every formatter needs and `LowerExp` alone cannot
+/// provide: whether the value is finite (so [`finite_canonical`]'s contract
+/// stays machine-checked now that the writer is generic) and the XSD spelling
+/// of the non-finite values, written once here for every call site — the
+/// canonical formatters below and the XPath cast renderers in
+/// `fluree-db-query` alike.
+pub trait XsdFloat: sealed::Sealed + fmt::LowerExp + Copy {
+    #[doc(hidden)]
+    fn is_nan_v(self) -> bool;
+    #[doc(hidden)]
+    fn is_infinite_v(self) -> bool;
+    #[doc(hidden)]
+    fn is_sign_positive_v(self) -> bool;
+
+    /// The XSD lexical spelling of a non-finite value — `NaN`, `INF`,
+    /// `-INF` — or `None` when the value is finite. Static strings only;
+    /// allocates nothing.
+    #[inline]
+    fn nonfinite_xsd(self) -> Option<&'static str> {
+        if self.is_nan_v() {
+            Some("NaN")
+        } else if self.is_infinite_v() {
+            Some(if self.is_sign_positive_v() {
+                "INF"
+            } else {
+                "-INF"
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl XsdFloat for f64 {
+    fn is_nan_v(self) -> bool {
+        self.is_nan()
+    }
+    fn is_infinite_v(self) -> bool {
+        self.is_infinite()
+    }
+    fn is_sign_positive_v(self) -> bool {
+        self.is_sign_positive()
+    }
+}
+
+impl XsdFloat for f32 {
+    fn is_nan_v(self) -> bool {
+        self.is_nan()
+    }
+    fn is_infinite_v(self) -> bool {
+        self.is_infinite()
+    }
+    fn is_sign_positive_v(self) -> bool {
+        self.is_sign_positive()
+    }
+}
+
 /// Upper bound for the canonical form of any finite `f64`:
 /// sign (1) + 17-digit shortest-round-trip mantissa with dot (18) +
 /// inserted ".0" (2) + 'E' (1) + exponent up to "-308" (4) = 26. Rounded up.
@@ -54,18 +119,25 @@ impl fmt::Write for StackBuf {
     }
 }
 
-/// Render the canonical form of a *finite* `f64` into a stack buffer.
+/// Render the canonical form of a *finite* float (`f64` or `f32`) into a
+/// stack buffer.
 ///
 /// Builds on Rust's shortest-round-trip scientific formatter (`{:e}`), which
 /// already produces exactly one (nonzero, unless the value is zero) digit
 /// before the optional decimal point and an exponent with no `+`/leading
 /// zeros. Canonicalization is then purely syntactic: ensure the mantissa
 /// contains a `.` (insert `.0`) and uppercase the exponent marker.
-fn finite_canonical(d: f64) -> StackBuf {
-    debug_assert!(d.is_finite());
-
+///
+/// Callers must exclude NaN/±INF first (via [`XsdFloat::nonfinite_xsd`]) —
+/// their `{:e}` forms carry no exponent, and their XSD spellings (`NaN`,
+/// `INF`, `-INF`) differ from Rust's.
+fn finite_canonical<F: XsdFloat>(d: F) -> StackBuf {
+    debug_assert!(
+        d.nonfinite_xsd().is_none(),
+        "finite_canonical requires a finite input"
+    );
     let mut sci = StackBuf::new();
-    write!(sci, "{d:e}").expect("`{:e}` of an f64 fits in 32 bytes");
+    write!(sci, "{d:e}").expect("`{:e}` of a float fits in 32 bytes");
 
     let s = sci.as_bytes();
     let e_pos = s
@@ -90,11 +162,8 @@ fn finite_canonical(d: f64) -> StackBuf {
 /// `0.0 → "0.0E0"`, `-0.0 → "-0.0E0"`, `NaN → "NaN"`, `f64::INFINITY → "INF"`.
 #[must_use]
 pub fn canonical_xsd_double(d: f64) -> String {
-    if d.is_nan() {
-        return "NaN".to_string();
-    }
-    if d.is_infinite() {
-        return if d.is_sign_positive() { "INF" } else { "-INF" }.to_string();
+    if let Some(s) = d.nonfinite_xsd() {
+        return s.to_string();
     }
     let buf = finite_canonical(d);
     // The canonical form is pure ASCII.
@@ -103,16 +172,32 @@ pub fn canonical_xsd_double(d: f64) -> String {
         .to_string()
 }
 
+/// The canonical XSD lexical form of an `xsd:float` value, as a `String`.
+///
+/// Same grammar as [`canonical_xsd_double`] — mantissa with a decimal point,
+/// uppercase `E`, no `+`/leading zeros in the exponent, and the XSD special
+/// spellings `NaN`/`INF`/`-INF` — but the mantissa is the f32
+/// shortest-round-trip form, so a single-precision value never picks up
+/// double-precision widening artifacts (`33.33f32` stays `3.333E1`, not
+/// `3.333000183105469E1`).
+#[must_use]
+pub fn canonical_xsd_float(f: f32) -> String {
+    if let Some(s) = f.nonfinite_xsd() {
+        return s.to_string();
+    }
+    let buf = finite_canonical(f);
+    // The canonical form is pure ASCII.
+    std::str::from_utf8(buf.as_bytes())
+        .expect("canonical xsd:float form is ASCII")
+        .to_string()
+}
+
 /// Append the canonical XSD lexical form of `d` to a `String`.
 ///
 /// Allocation-free apart from growing `out`.
 pub fn push_canonical_xsd_double(out: &mut String, d: f64) {
-    if d.is_nan() {
-        out.push_str("NaN");
-        return;
-    }
-    if d.is_infinite() {
-        out.push_str(if d.is_sign_positive() { "INF" } else { "-INF" });
+    if let Some(s) = d.nonfinite_xsd() {
+        out.push_str(s);
         return;
     }
     let buf = finite_canonical(d);
@@ -123,16 +208,8 @@ pub fn push_canonical_xsd_double(out: &mut String, d: f64) {
 ///
 /// Zero-allocation variant for the delimited (CSV/TSV) writer's cell buffers.
 pub fn write_canonical_xsd_double(out: &mut Vec<u8>, d: f64) {
-    if d.is_nan() {
-        out.extend_from_slice(b"NaN");
-        return;
-    }
-    if d.is_infinite() {
-        out.extend_from_slice(if d.is_sign_positive() {
-            b"INF" as &[u8]
-        } else {
-            b"-INF"
-        });
+    if let Some(s) = d.nonfinite_xsd() {
+        out.extend_from_slice(s.as_bytes());
         return;
     }
     let buf = finite_canonical(d);
@@ -211,6 +288,48 @@ mod tests {
     fn canonical_form_round_trips() {
         for &(input, _) in CASES {
             let parsed: f64 = canonical_xsd_double(input).parse().expect("parse back");
+            assert_eq!(parsed.to_bits(), input.to_bits(), "round trip of {input:?}");
+        }
+    }
+
+    /// Same forms table shape for the f32 (`xsd:float`) variant, including
+    /// the single-precision-mantissa guarantee and range extremes.
+    const F32_CASES: &[(f32, &str)] = &[
+        (1.0, "1.0E0"),
+        (5.0, "5.0E0"),
+        (33.33, "3.333E1"),
+        (0.001, "1.0E-3"),
+        (0.0, "0.0E0"),
+        (-0.0, "-0.0E0"),
+        (-12.5, "-1.25E1"),
+        (1e30, "1.0E30"),
+        (f32::MAX, "3.4028235E38"),
+        (f32::MIN_POSITIVE, "1.1754944E-38"),
+        (1e-45, "1.0E-45"), // subnormal minimum
+    ];
+
+    #[test]
+    fn float_canonical_forms() {
+        for &(input, expected) in F32_CASES {
+            assert_eq!(
+                canonical_xsd_float(input),
+                expected,
+                "canonical_xsd_float({input:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn float_special_values_keep_xsd_spellings() {
+        assert_eq!(canonical_xsd_float(f32::NAN), "NaN");
+        assert_eq!(canonical_xsd_float(f32::INFINITY), "INF");
+        assert_eq!(canonical_xsd_float(f32::NEG_INFINITY), "-INF");
+    }
+
+    #[test]
+    fn float_canonical_form_round_trips() {
+        for &(input, _) in F32_CASES {
+            let parsed: f32 = canonical_xsd_float(input).parse().expect("parse back");
             assert_eq!(parsed.to_bits(), input.to_bits(), "round trip of {input:?}");
         }
     }

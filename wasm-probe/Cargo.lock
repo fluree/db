@@ -784,6 +784,7 @@ dependencies = [
  "num-traits",
  "once_cell",
  "parking_lot",
+ "rand 0.8.8",
  "rustc-hash",
  "serde",
  "serde_json",

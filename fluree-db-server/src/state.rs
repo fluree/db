@@ -412,6 +412,23 @@ impl Drop for AppState {
 //   the Raft startup path where every node's reads must observe
 //   replicated state. Requires direct (non-proxy) storage.
 
+/// Who owns the background indexer's catch-up sweeps for this build.
+///
+/// A process can run more than one `BackgroundIndexerWorker` against the same
+/// nameservice, and catch-up must have exactly one owner: the workers hold
+/// independent `states` maps, so `trigger_if_idle` cannot see the other's
+/// claim and both would queue and build the same ledger concurrently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CatchupSweeps {
+    /// The worker this build spawns is the only one, and sweeps.
+    Owned,
+    /// Another worker in this process already sweeps this nameservice, so the
+    /// worker this build spawns must not. It stays a fully functional indexer
+    /// for explicit requests — see
+    /// [`FlureeBuilder::without_indexer_catchup_sweeps`](fluree_db_api::FlureeBuilder::without_indexer_catchup_sweeps).
+    Delegated,
+}
+
 /// Build the default `Fluree` instance from server config — picks
 /// proxy or direct mode based on `config.is_proxy_storage_mode()`.
 ///
@@ -424,7 +441,7 @@ pub async fn build_default_fluree(
     if config.is_proxy_storage_mode() {
         build_proxy_fluree(config)
     } else {
-        build_direct_fluree(config, None, event_bus).await
+        build_direct_fluree(config, None, event_bus, CatchupSweeps::Owned).await
     }
 }
 
@@ -452,7 +469,19 @@ pub async fn build_fluree_with_nameservice(
              use direct storage (file or S3) instead",
         ));
     }
-    build_direct_fluree(config, Some(nameservice), event_bus).await
+    // Raft delegates catch-up to the leader-scope worker that
+    // `Server::run` spawns inside `leader_tasks` — the one wired to the
+    // consensus event bus, started and stopped with leadership. Indexing under
+    // raft is leader-only because publishing an index result proposes to the
+    // state machine, so a follower must not initiate builds, and the leader
+    // must not sweep from two workers at once.
+    build_direct_fluree(
+        config,
+        Some(nameservice),
+        event_bus,
+        CatchupSweeps::Delegated,
+    )
+    .await
 }
 
 /// Build a direct-storage `Fluree` (file, S3, DynamoDB, etc.) from
@@ -463,6 +492,7 @@ async fn build_direct_fluree(
     config: &ServerConfig,
     nameservice: Option<fluree_db_api::NameServiceMode>,
     event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
+    catchup_sweeps: CatchupSweeps,
 ) -> Result<(Arc<Fluree>, tokio::task::JoinHandle<()>), fluree_db_api::ApiError> {
     let mut builder = if let Some(ref path) = config.connection_config {
         // Connection config: build from JSON-LD (supports S3,
@@ -506,7 +536,14 @@ async fn build_direct_fluree(
         let max_bytes = config
             .reindex_max_bytes
             .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes);
-        builder = builder.with_indexing_thresholds(config.reindex_min_bytes, max_bytes);
+        builder = builder
+            .with_indexing_thresholds(config.reindex_min_bytes, max_bytes)
+            .with_indexer_catchup_interval(std::time::Duration::from_secs(
+                config.indexer_catchup_interval_secs,
+            ));
+        if catchup_sweeps == CatchupSweeps::Delegated {
+            builder = builder.without_indexer_catchup_sweeps();
+        }
     } else {
         // Peer / external-indexer mode: skip spawning a background
         // indexer, but still set novelty thresholds so backpressure
