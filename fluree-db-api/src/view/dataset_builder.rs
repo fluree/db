@@ -1,7 +1,9 @@
 //! Builder for DataSetDb from DatasetSpec
 //!
 //! Provides utilities to construct `DataSetDb` from query dataset
-//! specifications, applying time travel, policy, and reasoning wrappers.
+//! specifications, applying time travel and policy wrappers. Config-graph
+//! defaults are applied later, at the query-preparation choke point
+//! (`Fluree::complete_config_defaults`).
 
 use crate::view::{DataSetDb, GraphDb};
 use crate::{dataset, time_resolve, ApiError, DatasetSpec, Fluree, GovernanceOptions, Result};
@@ -33,11 +35,10 @@ macro_rules! build_dataset_view_from_spec {
         } else {
             let mut dataset_db = DataSetDb::new();
 
-            // Load default graphs, applying per-source policy and config reasoning
+            // Load default graphs, applying per-source policy
             for source in &spec.default_graphs {
                 let view = ($load_view)(source).await?;
                 let view = ($apply_policy)(view, source).await?;
-                let view = $self.apply_config_defaults(view, None);
                 // If this is a graph source, also register as a named graph
                 // so GRAPH <gs_id> patterns can resolve it during execution.
                 if let Some(ref gs_id) = view.graph_source_id {
@@ -46,11 +47,10 @@ macro_rules! build_dataset_view_from_spec {
                 dataset_db = dataset_db.with_default(view);
             }
 
-            // Load named graphs, applying per-source policy and config reasoning
+            // Load named graphs, applying per-source policy
             for source in &spec.named_graphs {
                 let view = ($load_view)(source).await?;
                 let view = ($apply_policy)(view, source).await?;
-                let view = $self.apply_config_defaults(view, None);
                 // Register under exactly ONE key: the dataset-local name the user
                 // wrote. When an alias is present it IS that name, and the
                 // identifier is only how we load the source — on the ledger-scoped
@@ -145,10 +145,7 @@ impl Fluree {
         build_dataset_view_from_spec!(
             self,
             spec,
-            history_transform = |view| async {
-                let view = self.wrap_policy(view, opts, None).await?;
-                Ok::<GraphDb, ApiError>(self.apply_config_defaults(view, None))
-            },
+            history_transform = |view| async { self.wrap_policy(view, opts, None).await },
             load_view = |source| self.load_view_from_source(source),
             apply_policy = |view, source| self.apply_policy_with_override(view, source, opts),
         )

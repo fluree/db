@@ -47,6 +47,75 @@ use lower::{block_is_admissible, literal_len, lower_block, Decline, LowerInput, 
 use terms::{seed_values, Materializer};
 use union::{UnionLayout, UNION_ALIAS};
 
+/// A seed key-set row, hashed for de-duplication.
+///
+/// `Literal` cannot derive `Eq`/`Hash` because it carries an `f64`, so the
+/// wrapper supplies both, hashing a double by its bits and treating two NaNs
+/// as one key. That is exactly right here: the set exists to avoid sending the
+/// same key twice, and two keys that render identically are the same key.
+#[derive(Clone)]
+struct SeedKey(Vec<Literal>);
+
+impl SeedKey {
+    fn hash_literal<H: std::hash::Hasher>(l: &Literal, state: &mut H) {
+        use std::hash::Hash;
+        std::mem::discriminant(l).hash(state);
+        match l {
+            Literal::Bool(b) => b.hash(state),
+            Literal::Int(i) => i.hash(state),
+            Literal::Str(s) | Literal::TemplateKey(s) => s.hash(state),
+            Literal::Date(d) => d.hash(state),
+            Literal::Double(d) => d.to_bits().hash(state),
+            Literal::Decimal { unscaled, scale } => {
+                unscaled.hash(state);
+                scale.hash(state);
+            }
+            Literal::Timestamp { micros, tz } => {
+                micros.hash(state);
+                tz.hash(state);
+            }
+            Literal::Set(items) => {
+                items.len().hash(state);
+                for i in items {
+                    Self::hash_literal(i, state);
+                }
+            }
+        }
+    }
+
+    fn eq_literal(a: &Literal, b: &Literal) -> bool {
+        match (a, b) {
+            (Literal::Double(x), Literal::Double(y)) => x.to_bits() == y.to_bits(),
+            (Literal::Set(x), Literal::Set(y)) => {
+                x.len() == y.len() && x.iter().zip(y).all(|(l, r)| Self::eq_literal(l, r))
+            }
+            _ => a == b,
+        }
+    }
+}
+
+impl PartialEq for SeedKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(&other.0)
+                .all(|(a, b)| Self::eq_literal(a, b))
+    }
+}
+
+impl Eq for SeedKey {}
+
+impl std::hash::Hash for SeedKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for l in &self.0 {
+            Self::hash_literal(l, state);
+        }
+    }
+}
+
 /// Routing stamp site for `MustFire` / `MustNotFire` tests.
 pub const SQL_BLOCK_PUSHDOWN_SITE: &str = "sql_block_pushdown";
 
@@ -61,6 +130,11 @@ pub(crate) fn sql_pushdown_lane_enabled() -> bool {
 /// `FLUREE_SQL_PUSHDOWN_CACHE_ROWS` overrides; `0` keeps every batch seeded.
 const BLOCK_CACHE_MAX_ROWS: usize = 100_000;
 
+/// Bytes a cached block may hold, estimated from its materialized rows: the
+/// row cap alone leaves wide text columns unbounded. The join index adds a
+/// copy of every key on top. `FLUREE_SQL_PUSHDOWN_CACHE_BYTES` overrides.
+const BLOCK_CACHE_MAX_BYTES: usize = 64 << 20;
+
 /// Block rows per outer row above which seeding stays cheaper than fetching
 /// the block whole. On the 1M-row Postgres probe a seeded key costs ~7.6µs
 /// and a fetched row ~1.4µs, so the break-even is near five; four keeps the
@@ -72,6 +146,31 @@ fn block_cache_max_rows() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(BLOCK_CACHE_MAX_ROWS)
+}
+
+fn block_cache_max_bytes() -> usize {
+    std::env::var("FLUREE_SQL_PUSHDOWN_CACHE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BLOCK_CACHE_MAX_BYTES)
+}
+
+/// A row's footprint in the block cache: the bindings plus the heap their
+/// strings own. Encoded and numeric bindings own nothing.
+fn row_bytes(row: &[(VarId, Binding)]) -> usize {
+    row.iter()
+        .map(|(_, b)| {
+            let heap = match b {
+                Binding::Iri(s) | Binding::IriMatch { iri: s, .. } => s.len(),
+                Binding::Lit {
+                    val: fluree_db_core::FlakeValue::String(s),
+                    ..
+                } => s.len(),
+                _ => 0,
+            };
+            std::mem::size_of::<(VarId, Binding)>() + heap
+        })
+        .sum()
 }
 
 /// Whether the planner should route this GRAPH block through the lane.
@@ -169,6 +268,12 @@ pub(super) async fn resolve_block(
 ) -> Result<Option<Resolved>> {
     let iri = graph_iri;
     match ctx.dataset {
+        // Dataset mode reaches the lane: a `FROM <sql-source>` query builds a
+        // dataset in which the source is a named graph, and the lane serves it.
+        // The membership test is also what keeps a non-member name from
+        // reaching the capability lookup below (a nameservice round trip), so
+        // this is already the cheap order — it returns before the lookup for
+        // exactly the names the lane could not serve.
         Some(ds) => {
             if !ds.has_named_graph(iri) {
                 return Ok(None);
@@ -268,6 +373,7 @@ pub(super) async fn resolve_block(
         mapping,
         schemas,
         cache_max_rows: block_cache_max_rows(),
+        cache_max_bytes: block_cache_max_bytes(),
     }))
 }
 
@@ -291,6 +397,8 @@ pub(super) struct Resolved {
     pub schemas: HashMap<RelSource, Arc<BatchSchema>>,
     /// See [`BLOCK_CACHE_MAX_ROWS`].
     pub cache_max_rows: usize,
+    /// See [`BLOCK_CACHE_MAX_BYTES`].
+    pub cache_max_bytes: usize,
 }
 
 #[async_trait::async_trait]
@@ -369,22 +477,19 @@ impl Operator for SqlBlockOperator {
         let Some(batch) = chain.next_batch(ctx).await? else {
             return Ok(None);
         };
-        if batch.schema() == self.schema.as_ref() {
-            return Ok(Some(batch));
+        if batch.schema() != self.schema.as_ref() {
+            // Both the lane and the fallback `GraphOperator` declare their
+            // schema in pattern order, so this cannot differ. Permuting here
+            // instead would rebuild every batch of every declined block — the
+            // common path on a native ledger, where `admits` is shape-only — and
+            // the fallback has to be free for the wrap to be acceptable there.
+            return Err(QueryError::Internal(format!(
+                "sql lane fallback changed the block's schema: declared {:?}, got {:?}",
+                self.schema.as_ref(),
+                batch.schema()
+            )));
         }
-        // The fallback `GraphOperator` orders its output from a set, so one
-        // built at open can differ from the schema declared at plan time,
-        // which parents resolved column positions against. Permute into it.
-        let mut columns: Vec<Vec<Binding>> = Vec::with_capacity(self.schema.len());
-        for var in self.schema.iter() {
-            columns.push(match batch.column(*var) {
-                Some(col) => col.to_vec(),
-                None => vec![Binding::Unbound; batch.len()],
-            });
-        }
-        Batch::new(Arc::clone(&self.schema), columns)
-            .map(Some)
-            .map_err(|e| QueryError::Internal(e.to_string()))
+        Ok(Some(batch))
     }
 
     fn close(&mut self) {
@@ -684,13 +789,29 @@ impl SqlBlockSource {
             limit: None,
             having: None,
         };
-        let (sql, mut stream) = table_provider
+        // The count is an optimization: a provider that cannot run it, or a
+        // transient failure, leaves the branch seeded rather than failing a
+        // query the seeded path answers.
+        let (sql, mut stream) = match table_provider
             .execute_plan(&self.graph_iri, &count_plan)
-            .await?;
+            .await
+        {
+            Ok(started) => started,
+            Err(e) => {
+                tracing::debug!(branch, error = %e, "sql pushdown: block count failed, staying seeded");
+                return Ok(BlockCache::Seeded);
+            }
+        };
         ctx.tracker.record_statement(&self.graph_iri, &sql);
         let mut count: Option<i64> = None;
         while let Some(page) = stream.next().await {
-            let page = page?;
+            let page = match page {
+                Ok(page) => page,
+                Err(e) => {
+                    tracing::debug!(branch, error = %e, "sql pushdown: block count failed, staying seeded");
+                    return Ok(BlockCache::Seeded);
+                }
+            };
             count = match page.columns.first() {
                 Some(Column::Int64(v)) => v.first().copied().flatten(),
                 Some(Column::Int32(v)) => v.first().copied().flatten().map(i64::from),
@@ -736,25 +857,51 @@ impl SqlBlockSource {
         ctx: &ExecutionContext<'_>,
     ) -> Result<BlockCache> {
         let max_rows = self.resolved.cache_max_rows;
+        let max_bytes = self.resolved.cache_max_bytes;
         let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
             QueryError::InvalidQuery("R2RML table provider not configured".into())
         })?;
         use futures::StreamExt;
         let lowered = self.lowered(branch);
         let plan = self.plan_for_cache(branch);
-        let (sql, mut stream) = table_provider.execute_plan(&self.graph_iri, &plan).await?;
+        let (sql, mut stream) = match table_provider.execute_plan(&self.graph_iri, &plan).await {
+            Ok(started) => started,
+            Err(e) => {
+                tracing::debug!(branch, error = %e, "sql pushdown: block fetch failed, staying seeded");
+                return Ok(BlockCache::Seeded);
+            }
+        };
         ctx.tracker.record_statement(&self.graph_iri, &sql);
         let b = &self.resolved.branches[branch];
         let mut rows: Vec<Vec<(VarId, Binding)>> = Vec::with_capacity(count);
+        let mut bytes = 0usize;
         while let Some(page) = stream.next().await {
             ctx.checkpoint()?;
-            let batches = b.materializer.split_page(page?, &b.lowered.outputs)?;
+            let page = match page {
+                Ok(page) => page,
+                Err(e) => {
+                    tracing::debug!(branch, error = %e, "sql pushdown: block fetch failed, staying seeded");
+                    return Ok(BlockCache::Seeded);
+                }
+            };
+            let batches = b.materializer.split_page(page, &b.lowered.outputs)?;
             let num_rows = batches.values().next().map(|b| b.num_rows).unwrap_or(0);
             for i in 0..num_rows {
-                rows.push(b.materializer.row(&batches, i)?);
+                let row = b.materializer.row(&batches, i)?;
+                bytes += row_bytes(&row);
+                rows.push(row);
             }
             if rows.len() > max_rows {
                 tracing::debug!(branch, max_rows, "sql pushdown: block outgrew its count");
+                return Ok(BlockCache::Seeded);
+            }
+            if bytes > max_bytes {
+                tracing::debug!(
+                    branch,
+                    bytes,
+                    max_bytes,
+                    "sql pushdown: block outgrew the cache budget"
+                );
                 return Ok(BlockCache::Seeded);
             }
         }
@@ -911,15 +1058,22 @@ impl SqlBlockSource {
         }
         let gv = ctx.graph_view();
         let child_schema = child_batch.schema();
+        // Resolved once per batch, not once per seed per row.
+        let mut seed_positions: Vec<usize> = Vec::with_capacity(lowered.seeds.len());
+        for seed in &lowered.seeds {
+            let Some(pos) = child_schema.iter().position(|v| *v == seed.var) else {
+                return vec![None];
+            };
+            seed_positions.push(pos);
+        }
         let mut rows: Vec<Vec<Literal>> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Keyed on the literals themselves rather than their `Debug` rendering,
+        // which allocated and formatted a string per outer row per batch.
+        let mut seen: std::collections::HashSet<SeedKey> = std::collections::HashSet::new();
         for row_idx in 0..child_batch.len() {
             let mut key: Vec<Literal> = Vec::new();
-            for seed in &lowered.seeds {
-                let Some(pos) = child_schema.iter().position(|v| *v == seed.var) else {
-                    return vec![None];
-                };
-                let b = &child_batch.column_by_idx(pos).unwrap()[row_idx];
+            for (seed, pos) in lowered.seeds.iter().zip(&seed_positions) {
+                let b = &child_batch.column_by_idx(*pos).unwrap()[row_idx];
                 if !b.is_bound() {
                     // An unbound outer value joins with everything: no seeding.
                     tracing::debug!(var = ?seed.var, "sql pushdown: unbound outer value, no key set");
@@ -944,7 +1098,7 @@ impl SqlBlockSource {
             if key.is_empty() {
                 continue;
             }
-            if seen.insert(format!("{key:?}")) {
+            if seen.insert(SeedKey(key.clone())) {
                 rows.push(key);
             }
         }
@@ -999,22 +1153,27 @@ impl SqlBlockSource {
         ctx: &ExecutionContext<'_>,
     ) -> JoinPlan {
         let child_schema = child_batch.schema();
-        let join_vars: Vec<VarId> = child_schema
+        // Carry each join variable's column position, which is just its index
+        // in the child schema, instead of re-scanning the schema for it once
+        // per variable per row.
+        let positioned: Vec<(VarId, usize)> = child_schema
             .iter()
             .copied()
-            .filter(|v| self.lowered(branch).block_vars.contains(v))
+            .enumerate()
+            .filter(|(_, v)| self.lowered(branch).block_vars.contains(v))
+            .map(|(pos, v)| (v, pos))
             .collect();
-        if join_vars.is_empty() {
+        if positioned.is_empty() {
             return JoinPlan::Cross;
         }
+        let join_vars: Vec<VarId> = positioned.iter().map(|(v, _)| *v).collect();
         let mut full_index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
         let mut partial_rows: Vec<(usize, Vec<Option<GroupKeyOwned>>)> = Vec::new();
         for row_idx in 0..child_batch.len() {
             let mut key: Vec<Option<GroupKeyOwned>> = Vec::with_capacity(join_vars.len());
             let mut all_bound = true;
             let mut poisoned = false;
-            for &jv in &join_vars {
-                let pos = child_schema.iter().position(|&v| v == jv).unwrap();
+            for &(_, pos) in &positioned {
                 let b = &child_batch.column_by_idx(pos).unwrap()[row_idx];
                 if b.is_poisoned() {
                     poisoned = true;

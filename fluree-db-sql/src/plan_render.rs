@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use fluree_db_tabular::plan::{
-    ArithOp, ColRef, Expr, KeySet, Literal, OrderKey, OutputCol, OutputExpr, Pred,
-    PushdownCapabilities, RelNode, RelPlan, RelSource,
+    collect_col_eqs, same_class, ArithOp, ColRef, Expr, KeySet, Literal, OrderKey, OutputCol,
+    OutputExpr, Pred, PushdownCapabilities, RelNode, RelPlan, RelSource,
 };
 use fluree_db_tabular::{BatchSchema, FieldType};
 
@@ -590,7 +590,10 @@ impl Renderer<'_> {
                         col.alias, col.column
                     )));
                 }
-                let lit = sql_string(pattern, self.dialect).ok_or_else(|| {
+                // `BINARY` on MySQL: a widened LIKE is a superset only if the
+                // pattern matches at least the byte prefix, and a contraction
+                // collation (`ch` as one element) can match fewer.
+                let lit = binary_string(pattern, self.dialect).ok_or_else(|| {
                     SqlError::Unsupported(format!("LIKE pattern {pattern:?} cannot be rendered"))
                 })?;
                 format!("{} LIKE {lit} ESCAPE '!'", self.col(col))
@@ -754,46 +757,6 @@ impl Renderer<'_> {
                 col.alias, col.column
             ))
         })
-    }
-}
-
-fn collect_col_eqs(node: &RelNode, out: &mut Vec<(ColRef, ColRef)>) {
-    fn from_pred(p: &Pred, out: &mut Vec<(ColRef, ColRef)>) {
-        match p {
-            Pred::ColEq { left, right } => out.push((left.clone(), right.clone())),
-            Pred::And(ps) | Pred::Or(ps) => ps.iter().for_each(|q| from_pred(q, out)),
-            Pred::Not(q) => from_pred(q, out),
-            _ => {}
-        }
-    }
-    match node {
-        RelNode::Access { .. }
-        | RelNode::KeySet(_)
-        | RelNode::Derived { .. }
-        | RelNode::UnionAll { .. } => {}
-        RelNode::Filter { input, pred } => {
-            from_pred(pred, out);
-            collect_col_eqs(input, out);
-        }
-        RelNode::Join { left, right, on } | RelNode::LeftJoin { left, right, on } => {
-            from_pred(on, out);
-            collect_col_eqs(left, out);
-            collect_col_eqs(right, out);
-        }
-    }
-}
-
-fn same_class(a: FieldType, b: FieldType) -> bool {
-    use FieldType as F;
-    match (a, b) {
-        _ if is_numeric(a) && is_numeric(b) => true,
-        (F::String, F::String)
-        | (F::Boolean, F::Boolean)
-        | (F::Date, F::Date)
-        | (F::Timestamp, F::Timestamp)
-        | (F::TimestampTz, F::TimestampTz)
-        | (F::Bytes, F::Bytes) => true,
-        _ => false,
     }
 }
 
@@ -1063,8 +1026,10 @@ mod tests {
     }
 
     /// A `LIKE` carries its own escape character, so a needle's wildcards
-    /// survive on every dialect; MySQL's backslash-escaping literals decline
-    /// as string comparisons do, and a non-string column is refused.
+    /// survive on every dialect; MySQL marks the pattern `BINARY` so a
+    /// contraction collation cannot match fewer strings than the byte
+    /// prefix, its backslash-escaping literals decline as string comparisons
+    /// do, and a non-string column is refused.
     #[test]
     fn like_renders_with_an_escape_clause() {
         let like = |col: &str, pattern: &str| RelPlan {
@@ -1089,7 +1054,7 @@ mod tests {
         );
         assert_eq!(
             render_plan(&like("name", "O'B%"), &schemas(), SqlDialect::Mysql).unwrap(),
-            "SELECT `c`.`id` AS `c0` FROM `customers` AS `c` WHERE `c`.`name` LIKE 'O''B%' ESCAPE '!'"
+            "SELECT `c`.`id` AS `c0` FROM `customers` AS `c` WHERE `c`.`name` LIKE BINARY 'O''B%' ESCAPE '!'"
         );
         assert!(render_plan(&like("name", r"c:\%"), &schemas(), SqlDialect::Mysql).is_err());
         assert!(render_plan(&like("id", "1%"), &schemas(), SqlDialect::Postgres).is_err());

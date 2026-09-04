@@ -186,9 +186,14 @@ columns of an identical IRI template — never on a rendered IRI string — and
 every required column is `IS NOT NULL`, which is also what makes `LIMIT`
 pushable. In that statement:
 
-- an `OPTIONAL` member of the same entity is a nullable column of the same
-  access (no join); an optional entity hanging off a foreign key is a
-  `LEFT JOIN`;
+- a **single** `OPTIONAL` member of the same entity, with a variable object, is
+  a nullable column of the same access (no join); an optional entity hanging
+  off a foreign key is a `LEFT JOIN`. Several members on that entity stay in
+  the engine, because SPARQL binds an `OPTIONAL` group as a unit — if one of
+  its triples is absent for a row, every variable the group binds is unbound,
+  where independent nullable columns would bind the ones that are present. A
+  constant object stays in the engine too: its equality would filter the
+  required rows rather than the optional ones;
 - a `FILTER` is pushed only when it is exact — the column's RDF datatype
   (from `rr:datatype`; `xsd:string` when un-annotated), the literal's type
   and the **probed SQL type** agree, and for strings the dialect compares
@@ -201,15 +206,15 @@ pushable. In that statement:
   rows that come back: `STRSTARTS`, `STRENDS` and `CONTAINS` of a constant
   against a string column, and a `REGEX` anchored on a literal prefix with
   no flags, push a `LIKE` (a collation can only match more strings than a
-  byte prefix, never fewer). An `xsd:dateTime` literal compared (`=`, `<`,
-  `<=`, `>`, `>=`) with a `timestamp` column that has **no zone** pushes a
-  window of ±14 hours around the literal, rendered as a naive `TIMESTAMP`
-  so the database converts nothing: whatever zone the column was written
-  in, its values lie within that span of the instant they denote (UTC-12 to
-  UTC+14), so the window keeps every row the exact comparison can and the
-  engine, which reads the column as UTC, applies the exact one. On SQLite,
-  where a timestamp is text, the bounds are whole days (`>= '2024-01-09'`),
-  which order correctly with either time separator. Inside a conjunction
+  byte prefix, never fewer; on MySQL the pattern is marked `BINARY`, since
+  a contraction collation could match fewer). An `xsd:dateTime` literal
+  compared with a `timestamp` column that has **no zone** pushes exactly,
+  rendered as a naive `TIMESTAMP` literal: the lane reads a zoneless column
+  as UTC when it builds the term, and the comparison follows the same
+  contract. On SQLite, where a timestamp is text in whatever format its
+  writer used, the comparison widens to whole-day bounds (`>= '2024-01-10'`),
+  which order correctly with either time separator, and the engine applies
+  the exact one. Inside a conjunction
   the parts that cannot be widened are simply dropped from the pushed
   predicate. A widened filter is a residual, so a `LIMIT` above it stays in
   the engine and a grouped query over it declines;
@@ -251,10 +256,10 @@ pushable. In that statement:
   union entity, and a union inside a sub-select decline;
 - the statement has limits the lane respects: outer bindings above the
   provider's key-set cap (2000 rows, or half the statement budget) go out
-  as several statements, one per chunk; a `VALUES` block or an `IN` list
-  inside the block above that cap is not pushed (the block still runs on
-  the lane, the `VALUES` in the engine and the `IN` as a residual); a
-  `UNION` expanding to more than eight branch combinations declines;
+  as several statements, one per chunk; inside the block, an `IN` list
+  above that cap stays a residual on the lane and a `VALUES` block above it
+  declines the block to the engine; a `UNION` expanding to more than eight
+  branch combinations declines;
 - a constant subject or object IRI is reversed through its template into
   key predicates; a key that cannot be a value of its column (`order/abc`
   over a `bigint`) makes the block empty without a round trip. A class a
@@ -367,7 +372,9 @@ points, instants) and declines rather than approximate:
   `TIMESTAMP` literal there silently drops the zone and is read in the
   session's zone), `TIMESTAMP '…+00:00'` on MySQL. A naive `timestamp`
   column is taken as UTC when its term is built, on every dialect, and a
-  filter against it pushes the ±14h widening window described above.
+  filter against it pushes the literal rendered naive
+  (`TIMESTAMP '2024-01-10 00:00:00.000000'`) under the same contract;
+  SQLite's text timestamps take the day bounds described above.
 - A decimal's lexical form follows the scale the endpoint reports for the
   column (`decimal(10,2)` gives `99.50`); the bridge reports NUMERIC /
   DECIMAL columns at the scale it was started with (`--decimal-scale`,
@@ -426,7 +433,7 @@ rules then apply as for any source.
 | `varchar`, `char`, `json`, `uuid`, … | String | `xsd:string` |
 | `varbinary` | Bytes | `xsd:base64Binary` |
 | `date` | Date | `xsd:date` |
-| `timestamp(p)` | Timestamp | `xsd:dateTime` |
+| `timestamp(p)` | Timestamp | `xsd:dateTime` (read as UTC) |
 | `timestamp(p) with time zone` | TimestampTz | `xsd:dateTime` (UTC) |
 | `array`, `map`, `row` | String (Trino's JSON rendering) | `xsd:string` |
 
@@ -523,11 +530,19 @@ types in Trino's names, so everything on this page applies unchanged.
 Over SQLite, a table column is typed by its **declared** type under SQLite's
 own affinity rules (`NUMERIC`, `DECIMAL(10,2)` and any other numeric-affinity
 name report as `double`; `INT…` as `bigint`; `…CHAR`, `…TEXT`, `…CLOB` as
-`varchar`), and every cell is converted to that type. SQLite stores each cell
+`varchar`), and each cell is converted to that type. SQLite stores each cell
 in its own storage class, so a `NUMERIC` column can hold `5.00` as an integer
 next to `99.50` as a real; typing by declaration keeps both as `5.0` and
 `99.5` rather than letting the first row decide. An expression column
 (`SUM(total)`) has no declared type and takes the driver's inference.
+
+A `bigint` column is the exception: it converts nothing. SQLite already stores
+every losslessly-integral value in an `INT…` column as an integer (`3.0` lands
+as one), so a cell that is still a real, text or blob there is bad data rather
+than a storage-class choice, and converting it would report `2` for `2.5` and
+`0` for `'abc'`. The query fails instead, naming the column and the storage
+class it found. Declare the column `NUMERIC` to read mixed storage as a
+`double` — a `CAST` will not do it, since the result is an expression column.
 
 ## Comparison with Iceberg sources
 

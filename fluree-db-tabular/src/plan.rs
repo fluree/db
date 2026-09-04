@@ -382,3 +382,57 @@ pub struct PushdownCapabilities {
     /// separator; a comparison at time-of-day granularity does not.
     pub timestamp_is_text: bool,
 }
+
+/// Whether these two column types compare as the same class under a database
+/// `=`. Lives here, beside the plan the check is about, so that a lowering
+/// deciding whether to push a join and a renderer deciding whether it can emit
+/// one read the same verdict: when they drifted, a renderer refusal surfaced as
+/// a query error after the lowering had already committed to the pushdown.
+pub fn same_class(a: FieldType, b: FieldType) -> bool {
+    use FieldType as F;
+    let numeric = |t| {
+        matches!(
+            t,
+            F::Int32 | F::Int64 | F::Float32 | F::Float64 | F::Decimal { .. }
+        )
+    };
+    match (a, b) {
+        _ if numeric(a) && numeric(b) => true,
+        (F::String, F::String)
+        | (F::Boolean, F::Boolean)
+        | (F::Date, F::Date)
+        | (F::Timestamp, F::Timestamp)
+        | (F::TimestampTz, F::TimestampTz)
+        | (F::Bytes, F::Bytes) => true,
+        _ => false,
+    }
+}
+
+/// Every column-to-column equality this plan will render, from any join `ON` or
+/// `WHERE`, so a caller can vet the pairs before committing to the plan.
+pub fn collect_col_eqs(node: &RelNode, out: &mut Vec<(ColRef, ColRef)>) {
+    fn from_pred(p: &Pred, out: &mut Vec<(ColRef, ColRef)>) {
+        match p {
+            Pred::ColEq { left, right } => out.push((left.clone(), right.clone())),
+            Pred::And(ps) | Pred::Or(ps) => ps.iter().for_each(|q| from_pred(q, out)),
+            Pred::Not(q) => from_pred(q, out),
+            _ => {}
+        }
+    }
+    match node {
+        RelNode::Access { .. } | RelNode::KeySet(_) => {}
+        RelNode::Derived { plan, .. } => collect_col_eqs(&plan.root, out),
+        RelNode::UnionAll { branches, .. } => {
+            branches.iter().for_each(|b| collect_col_eqs(&b.root, out));
+        }
+        RelNode::Filter { input, pred } => {
+            from_pred(pred, out);
+            collect_col_eqs(input, out);
+        }
+        RelNode::Join { left, right, on } | RelNode::LeftJoin { left, right, on } => {
+            from_pred(on, out);
+            collect_col_eqs(left, out);
+            collect_col_eqs(right, out);
+        }
+    }
+}

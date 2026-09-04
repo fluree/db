@@ -128,6 +128,22 @@ fn cell(row: &SqliteRow, i: usize, trino: &str) -> Result<Value, String> {
     // Unchecked: SQLite stores each cell in its own storage class (a
     // `NUMERIC` column holds `5.00` as an INTEGER and `99.50` as a REAL), so
     // the declared type is a conversion target, not a guarantee.
+    //
+    // `bigint` is the one column where conversion is not wanted. It comes only
+    // from an INTEGER-affinity declaration, and SQLite already stores every
+    // losslessly-integral value there as an INTEGER (`3.0` lands as one), so a
+    // REAL, TEXT or BLOB cell is bad data rather than a representation choice.
+    // Converting it would emit `2` for `2.5` and `0` for `'abc'` — a fabricated
+    // number no consumer can tell from a real one. Reject it, as the checked
+    // decode did before mixed storage classes needed reading.
+    let storage_info = raw.type_info();
+    let storage = storage_info.name();
+    if trino == trino::BIGINT && storage != "INTEGER" {
+        return Err(format!(
+            "column {i}: {storage} value in an INTEGER-affinity column; \
+             declare it NUMERIC to read mixed storage as a double"
+        ));
+    }
     macro_rules! get {
         ($ty:ty) => {
             row.try_get_unchecked::<$ty, _>(i)

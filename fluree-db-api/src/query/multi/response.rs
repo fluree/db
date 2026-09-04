@@ -368,6 +368,7 @@ mod tests {
                     policy_enforcement: None,
                     reasoning: None,
                     sql: None,
+                    sql_elided: None,
                 })),
             },
         }];
@@ -411,6 +412,7 @@ mod tests {
                     policy_enforcement: None,
                     reasoning: None,
                     sql: None,
+                    sql_elided: None,
                 },
             ),
             success_with_tally(
@@ -423,6 +425,7 @@ mod tests {
                     policy_enforcement: None,
                     reasoning: None,
                     sql: None,
+                    sql_elided: None,
                 },
             ),
         ];
@@ -458,6 +461,7 @@ mod tests {
                     policy_enforcement: None,
                     reasoning: None,
                     sql: None,
+                    sql_elided: None,
                 },
             ),
             success("brian", serde_json::json!([])),
@@ -483,6 +487,7 @@ mod tests {
                     policy_enforcement: None,
                     reasoning: None,
                     sql: None,
+                    sql_elided: None,
                 },
             ),
             success_with_tally(
@@ -495,6 +500,7 @@ mod tests {
                     policy_enforcement: None,
                     reasoning: None,
                     sql: None,
+                    sql_elided: None,
                 },
             ),
         ];

@@ -81,14 +81,23 @@ Violation: http://example.org/ns/bob
     component: MinCountConstraintComponent
     message:   Expected at least 1 value(s) but found 0
 
-Conforms: false — 1 violation(s), 0 warning(s), 0 info (1 shape(s) checked)
+Conforms: false — 1 violation(s), 0 warning(s), 0 info (1 shape(s) checked at t=3)
 ```
+
+`t` is the ledger commit the report describes — the exact state (index plus
+unindexed commits) the shapes were evaluated against. Anything you measure
+alongside the results, such as record counts for a violation rate, should be
+read at that same `t` (`fluree query --at 3 ...`), or the two numbers come
+from different states.
 
 `jsonld` and `turtle` emit a W3C-shaped `sh:ValidationReport` with
 `sh:focusNode`, `sh:resultPath` (single-predicate paths only — complex paths
 are omitted rather than misrepresented), `sh:resultSeverity`,
 `sh:sourceShape`, `sh:sourceConstraintComponent`, `sh:resultMessage`, and
-`sh:value`.
+`sh:value`. The validated `t` rides on the report node as `f:t`
+(`f` = `https://ns.flur.ee/db#`), since `sh:ValidationReport` has no slot
+for a ledger time. In file mode `t` is the ephemeral ledger's head: `2`, since
+the loader commits the staging-SHACL-disable config before your data.
 
 If the shapes source produces no shapes, the report is vacuously conforming
 and a warning is printed to stderr.

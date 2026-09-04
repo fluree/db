@@ -598,9 +598,16 @@ impl<'a> Lowerer<'a> {
                         "ref object map parent on a table the entity does not access",
                     )));
                 }
-                // Another subject: no row of the child can join a row of
-                // that entity.
-                None => return Ok(Ok(None)),
+                // A subject the entity's accesses provably never mint: no
+                // row of the child can join a row of that entity.
+                None if accesses.iter().all(|(_, tm)| subjects_disjoint(tm, parent)) => {
+                    return Ok(Ok(None))
+                }
+                None => {
+                    return Ok(Err(Decline(
+                        "ref object map parent whose subject the entity may or may not mint",
+                    )))
+                }
             };
             for (child_col, parent_col) in conds {
                 self.edges.push((
@@ -830,6 +837,23 @@ impl<'a> Lowerer<'a> {
             })
             .map(|(v, (e, _))| (*v, e.clone()))
             .collect();
+        // Every column equality the renderer will emit must be one it accepts.
+        // `same_class` is its own predicate, exported rather than restated so
+        // the two cannot drift: on a mismatch the renderer raises `Unsupported`,
+        // which reaches the caller as an `InvalidQuery` — but `open` has already
+        // committed to the lane by then, so the query hard-fails where the
+        // per-scan lane would have answered it. A `varchar` FK against a
+        // `bigint` key is the common legacy shape that hits this.
+        let mut eqs: Vec<(ColRef, ColRef)> = Vec::new();
+        fluree_db_tabular::plan::collect_col_eqs(&root, &mut eqs);
+        for (l, r) in &eqs {
+            if let (Some(a), Some(b)) = (self.field_type(l), self.field_type(r)) {
+                if !fluree_db_tabular::plan::same_class(a, b) {
+                    return Ok(Err(Decline("join between two column classes")));
+                }
+            }
+        }
+
         let limit_is_exact = self.residuals.is_empty() && all_shared_seeded;
         Ok(Ok(Some(Lowered {
             root,
@@ -1780,8 +1804,9 @@ impl<'a> Lowerer<'a> {
     /// the probed column type must carry the class natively (a numeric
     /// literal against a text column the mapping *reads* as a number is the
     /// engine's comparison, not the database's). A dateTime literal is a UTC
-    /// instant, exact only against a zoned column. An unprobed column is
-    /// trusted; the renderer then types the literal.
+    /// instant; a zoneless column is read as UTC, so it is exact there too,
+    /// except where the database keeps it as text in an unknown format. An
+    /// unprobed column is trusted; the renderer then types the literal.
     fn literal_exact(&self, col: &ColRef, class: &RdfClass) -> bool {
         use FieldType as F;
         let Some(ty) = self.field_type(col) else {
@@ -1795,7 +1820,9 @@ impl<'a> Lowerer<'a> {
             RdfClass::Str | RdfClass::LangStr(_) => ty == F::String,
             RdfClass::Bool => ty == F::Boolean,
             RdfClass::Date => ty == F::Date,
-            RdfClass::DateTime => ty == F::TimestampTz,
+            RdfClass::DateTime => {
+                ty == F::TimestampTz || (ty == F::Timestamp && !self.caps.timestamp_is_text)
+            }
             RdfClass::Iri | RdfClass::Other => true,
         }
     }
@@ -2076,18 +2103,27 @@ impl<'a> Lowerer<'a> {
                 KeyShape::Template {
                     template: ta,
                     cols: ca,
-                    ..
+                    types: tya,
                 },
                 KeyShape::Template {
                     template: tb,
                     cols: cb,
-                    ..
+                    types: tyb,
                 },
             ) => {
-                if ta != tb || ca.len() != cb.len() {
+                // Two templates mint one IRI when their literal parts agree
+                // and their placeholders carry equal values, whatever the
+                // columns are called: `order/{id}` and `order/{order_ref}`
+                // join on `id = order_ref`.
+                if template_skeleton(ta) != template_skeleton(tb) || ca.len() != cb.len() {
                     return decline("repeated variable joins two different templates");
                 }
-                for (l, r) in ca.iter().zip(cb) {
+                for (i, (l, r)) in ca.iter().zip(cb).enumerate() {
+                    if let (Some(a), Some(b)) = (tya[i], tyb[i]) {
+                        if !fluree_db_tabular::plan::same_class(a, b) {
+                            return decline("join between two column classes");
+                        }
+                    }
                     self.push_edge(l.clone(), r.clone());
                 }
                 Ok(())
@@ -2095,6 +2131,18 @@ impl<'a> Lowerer<'a> {
             (KeyShape::Column { col: l, class: cl }, KeyShape::Column { col: r, class: cr }) => {
                 if cl != cr {
                     return decline("repeated variable joins two value classes");
+                }
+                // Matching RDF classes are not a matching comparison. The class
+                // is what the mapping *reads* the column as, so two text columns
+                // both mapped `xsd:decimal` agree here and render a string `=`,
+                // where '99.5' and '99.50' are different strings and the same
+                // number — a silently wrong answer rather than an error. Require
+                // both sides to carry the class natively, the rule
+                // `literal_exact` already applies to a literal comparison.
+                // `Str` is exempt: a string join on text columns is exact.
+                if *cl != RdfClass::Str && !(self.literal_exact(l, cl) && self.literal_exact(r, cr))
+                {
+                    return decline("repeated variable joins columns that do not carry the class");
                 }
                 self.push_edge(l.clone(), r.clone());
                 Ok(())
@@ -2395,9 +2443,31 @@ impl<'a> Lowerer<'a> {
             if !filters.is_empty() {
                 return decline("filter inside a folded optional");
             }
+            // SPARQL's LeftJoin binds an OPTIONAL group as a unit: if any triple
+            // of the group is absent for a row, every variable the group binds
+            // is unbound. Folding members into nullable columns of the required
+            // access makes each column independently NULL, so an order with
+            // `placed` set and `shipped` absent bound ?p and left ?s unbound
+            // where SPARQL unbinds both. One member is the case where
+            // per-column and per-group agree — including a policy-hidden one
+            // below, which then leaves the group's only variable unbound, as it
+            // should. Several members need a self LEFT JOIN; until the lowering
+            // can build one, they belong to the per-scan lane.
+            if members.len() != 1 {
+                return decline("several members in a folded optional");
+            }
             for (pred, obj) in members {
                 if pred == rdf::TYPE {
                     return decline("rdf:type inside an optional");
+                }
+                // A constant object's equality lands in `access_preds` of the
+                // *required* access — only the new-entity path below relocates
+                // its predicates into the ON clause — so the OPTIONAL would
+                // filter the rows it is supposed to leave alone:
+                // `OPTIONAL { ?o ex:placed "2024-01-05"^^xsd:date }` returned
+                // one row where SPARQL returns every order.
+                if !matches!(obj, Obj::Var(_)) {
+                    return decline("constant object in a folded optional");
                 }
                 if pom_for(tm, pred).is_none() {
                     return decline("optional member not on the entity's triples map");
@@ -2804,9 +2874,9 @@ impl<'a> Lowerer<'a> {
             }
             Function::Eq => self
                 .case_fold_superset(args)
-                .or_else(|| self.naive_timestamp_window(func, args)),
+                .or_else(|| self.text_timestamp_day_bounds(func, args)),
             Function::Lt | Function::Le | Function::Gt | Function::Ge => {
-                self.naive_timestamp_window(func, args)
+                self.text_timestamp_day_bounds(func, args)
             }
             // `^literal` with no flags is a case-sensitive prefix.
             Function::Regex => {
@@ -2815,7 +2885,7 @@ impl<'a> Lowerer<'a> {
                 }
                 let (col, pattern) = self.string_column_and_literal(args)?;
                 let prefix = pattern.strip_prefix('^')?;
-                if prefix.is_empty() || prefix.chars().any(|c| r".^$*+?()[]{}|".contains(c)) {
+                if prefix.is_empty() || prefix.chars().any(|c| r".^$*+?()[]{}|\".contains(c)) {
                     return None;
                 }
                 Some(Pred::Like {
@@ -2827,13 +2897,16 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// An `xsd:dateTime` literal (a UTC instant) compared with a `timestamp`
-    /// column that carries no zone: the column's values sit within
-    /// [`NAIVE_ZONE_SPAN`] of the instant they denote whatever zone they were
-    /// written in, so a window that wide around the literal keeps every row
-    /// the exact comparison can. Rendered naive, so the database converts
-    /// nothing. Where timestamps are text the bounds are whole days.
-    fn naive_timestamp_window(&self, func: &Function, args: &[Expression]) -> Option<Pred> {
+    /// An `xsd:dateTime` literal compared with a timestamp the database
+    /// keeps as text (SQLite), in whatever format its writer used: the day
+    /// of the literal bounds the comparison, `'2024-01-10'` sorting below
+    /// every timestamp of that day with either time separator, and the
+    /// engine applies the exact one. The column is read as UTC, like every
+    /// zoneless timestamp, so the literal's own day is the bound.
+    fn text_timestamp_day_bounds(&self, func: &Function, args: &[Expression]) -> Option<Pred> {
+        if !self.caps.timestamp_is_text {
+            return None;
+        }
         let (var, lit, reversed) = match args {
             [Expression::Var(v), Expression::Const(c)] => (*v, c, false),
             [Expression::Const(c), Expression::Var(v)] => (*v, c, true),
@@ -2848,24 +2921,9 @@ impl<'a> Lowerer<'a> {
         let (Literal::Timestamp { micros, tz: true }, _) = literal_of(lit, None)? else {
             return None;
         };
-        let lo = micros.checked_sub(NAIVE_ZONE_SPAN)?;
-        let hi = micros.checked_add(NAIVE_ZONE_SPAN)?;
-        // Text bounds are the day of the low end and the day after the high
-        // end, so the upper comparison is strict.
-        let bound = |micros: i64, upper: bool| -> Option<Literal> {
-            if self.caps.timestamp_is_text {
-                let day = micros.div_euclid(MICROS_PER_DAY) + i64::from(upper);
-                Some(Literal::Date(i32::try_from(day).ok()?))
-            } else {
-                Some(Literal::Timestamp { micros, tz: false })
-            }
-        };
-        let (lo, hi) = (bound(lo, false)?, bound(hi, true)?);
-        let hi_op = if self.caps.timestamp_is_text {
-            CmpOp::Lt
-        } else {
-            CmpOp::LtEq
-        };
+        let day = micros.div_euclid(MICROS_PER_DAY);
+        let bound = |day: i64| Some(Literal::Date(i32::try_from(day).ok()?));
+        let (lo, hi) = (bound(day)?, bound(day + 1)?);
         let cmp = |op, value| Pred::Cmp {
             col: col.clone(),
             op,
@@ -2873,8 +2931,8 @@ impl<'a> Lowerer<'a> {
         };
         let below = matches!(func, Function::Lt | Function::Le) != reversed;
         Some(match func {
-            Function::Eq => Pred::And(vec![cmp(CmpOp::GtEq, lo), cmp(hi_op, hi)]),
-            _ if below => cmp(hi_op, hi),
+            Function::Eq => Pred::And(vec![cmp(CmpOp::GtEq, lo), cmp(CmpOp::Lt, hi)]),
+            _ if below => cmp(CmpOp::Lt, hi),
             _ => cmp(CmpOp::GtEq, lo),
         })
     }
@@ -3337,10 +3395,18 @@ fn parts_of<'a>(
     }) {
         return decline("entity spans triples maps with a constant subject");
     }
-    // Different subjects never name one entity (the lane joins by key
-    // columns, never by rendered IRI).
-    if parts.iter().any(|(tm, _)| !same_subject(parts[0].0, tm)) {
+    // The lane joins parts by key columns, never by rendered IRI, so every
+    // part must mint the same subject space. Parts whose subjects provably
+    // never meet leave no row carrying every member; parts the lane cannot
+    // relate either way are left to the engine.
+    if parts
+        .iter()
+        .any(|(tm, _)| subjects_disjoint(parts[0].0, tm))
+    {
         return Ok(None);
+    }
+    if parts.iter().any(|(tm, _)| !same_subject(parts[0].0, tm)) {
+        return decline("entity spans subject templates the lane cannot relate");
     }
     for (_, idxs) in &mut parts {
         idxs.sort_unstable();
@@ -3348,19 +3414,70 @@ fn parts_of<'a>(
     Ok(Some(parts))
 }
 
-/// Whether two triples maps mint their subject the same way from the same
-/// columns, so a row of each with equal key columns is one entity.
+/// A template with its placeholders anonymized: two templates of one
+/// skeleton mint one IRI exactly when their placeholder values agree.
+fn template_skeleton(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => {
+                out.push_str("{}");
+                for c in chars.by_ref() {
+                    if c == '}' {
+                        break;
+                    }
+                }
+            }
+            '\\' => {
+                out.push(c);
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Whether two triples maps mint subjects in one space, so a subject
+/// shared between them is a join on their key columns: templates of one
+/// skeleton, or two column-valued subjects.
 fn same_subject(a: &TriplesMap, b: &TriplesMap) -> bool {
+    let (sa, sb) = (&a.subject_map, &b.subject_map);
+    match (&sa.template, &sb.template) {
+        (Some(ta), Some(tb)) => {
+            template_skeleton(ta) == template_skeleton(tb)
+                && sa.template_columns.len() == sb.template_columns.len()
+        }
+        (None, None) => sa.column.is_some() && sb.column.is_some(),
+        _ => false,
+    }
+}
+
+/// Whether no row of `a` can mint a subject of `b`: both are templates and
+/// neither's literal prefix (the text before the first placeholder) begins
+/// the other's. A column-valued subject can be anything, so it is never
+/// provably apart from another.
+fn subjects_disjoint(a: &TriplesMap, b: &TriplesMap) -> bool {
+    let (Some(ta), Some(tb)) = (&a.subject_map.template, &b.subject_map.template) else {
+        return false;
+    };
+    let prefix = |t: &str| t.split('{').next().unwrap_or("").to_string();
+    let (pa, pb) = (prefix(ta), prefix(tb));
+    !pa.starts_with(&pb) && !pb.starts_with(&pa)
+}
+
+/// Whether two triples maps read the same row: one relation, one subject
+/// map, column for column.
+fn same_row(a: &TriplesMap, b: &TriplesMap) -> bool {
     let (sa, sb) = (&a.subject_map, &b.subject_map);
     (sa.template.is_some() || sa.column.is_some())
         && sa.template == sb.template
         && sa.template_columns == sb.template_columns
         && sa.column == sb.column
-}
-
-/// Whether two triples maps read the same row: one relation, one subject.
-fn same_row(a: &TriplesMap, b: &TriplesMap) -> bool {
-    same_subject(a, b) && source_of_tm(a) == source_of_tm(b)
+        && source_of_tm(a) == source_of_tm(b)
 }
 
 fn collect_aliases(pred: &Pred, out: &mut HashSet<String>) {
@@ -3633,7 +3750,6 @@ fn any_of(mut keys: Vec<Pred>) -> Pred {
 
 /// The widest offset a zone can put between a naive timestamp and the
 /// instant it denotes (UTC-12 to UTC+14), as micros.
-const NAIVE_ZONE_SPAN: i64 = 14 * 3_600 * 1_000_000;
 const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
 
 pub(crate) fn source_of_tm(tm: &TriplesMap) -> RelSource {
@@ -3669,16 +3785,42 @@ pub(crate) fn candidate_sources(
         })
         .map(|t| t.p.as_str())
         .collect();
-    let mut out: Vec<RelSource> = Vec::new();
+    let mut reached: Vec<&str> = Vec::new();
     for tm in mapping.triples_maps.values() {
         if preds
             .iter()
             .any(|p| *p == rdf::TYPE || pom_for(tm, p).is_some())
         {
-            let src = source_of_tm(tm);
-            if !out.contains(&src) {
-                out.push(src);
+            reached.push(tm.iri.as_str());
+        }
+    }
+    // A `rr:parentTriplesMap` is reached through its FK, not through a
+    // predicate of the block, so its table has to be walked to as well:
+    // without it the parent's columns are unprobed, `field_type` reads them as
+    // unknown, and every check that vets a column type — the join-class check
+    // above all — silently passes on the half it cannot see.
+    let mut i = 0;
+    while i < reached.len() {
+        let Some(tm) = mapping.get(reached[i]) else {
+            i += 1;
+            continue;
+        };
+        for pom in &tm.predicate_object_maps {
+            if let ObjectMap::RefObjectMap(rom) = &pom.object_map {
+                let parent = rom.parent_triples_map.as_str();
+                if mapping.get(parent).is_some() && !reached.contains(&parent) {
+                    reached.push(parent);
+                }
             }
+        }
+        i += 1;
+    }
+    let mut out: Vec<RelSource> = Vec::new();
+    for iri in reached {
+        let Some(tm) = mapping.get(iri) else { continue };
+        let src = source_of_tm(tm);
+        if !out.contains(&src) {
+            out.push(src);
         }
     }
     // A sub-select's tables are typed the same way.

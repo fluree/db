@@ -46,6 +46,7 @@ pub mod stats;
 pub use config::{
     AttachmentEventCoverage, AttachmentEventsProvider, ConfiguredFulltextProperty,
     ConfiguredFulltextScope, FulltextConfigProvider, IndexerConfig, WarmCacheSource,
+    DEFAULT_CATCHUP_INTERVAL_SECS,
 };
 pub use drop::collect_ledger_cids;
 pub use error::{IndexerError, Result};

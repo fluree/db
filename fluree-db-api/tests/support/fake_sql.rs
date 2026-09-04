@@ -246,7 +246,7 @@ impl FakeSql {
                 for row in &rels[idx].rows {
                     let mut cand = t.clone();
                     cand.push(Some(row.clone()));
-                    if on.eval(&cand, &resolver) {
+                    if on.eval(&cand, &resolver) == Some(true) {
                         matched = true;
                         next.push(cand);
                     }
@@ -305,7 +305,7 @@ impl FakeSql {
         let resolver = Resolver { rels: &rels };
         if let Some(w) = where_text {
             let pred = parse_pred(w)?;
-            tuples.retain(|t| pred.eval(t, &resolver));
+            tuples.retain(|t| pred.eval(t, &resolver) == Some(true));
         }
 
         // Ordering on join columns alone happens before grouping/projection;
@@ -979,23 +979,22 @@ enum Pred {
 }
 
 impl Pred {
-    fn eval(&self, t: &Tuple, r: &Resolver<'_>) -> bool {
+    /// Three-valued, as SQL is: `None` is NULL, which a NULL operand yields
+    /// and `NOT` preserves, so `NOT (NULL IN (…))` keeps no row here either.
+    fn eval(&self, t: &Tuple, r: &Resolver<'_>) -> Option<bool> {
         let get = |c: &Col| r.resolve(c).map(|(ri, ci)| cell(t, ri, ci)).ok();
-        match self {
+        let value = |c: &Col| get(c).filter(|v| !v.is_null());
+        Some(match self {
             Pred::IsNull(c, want_null) => get(c).is_none_or(|v| v.is_null()) == *want_null,
-            Pred::Like(c, pattern) => match get(c) {
-                Some(Value::String(s)) => like_matches(
+            Pred::Like(c, pattern) => match value(c)? {
+                Value::String(s) => like_matches(
                     &pattern.chars().collect::<Vec<_>>(),
                     &s.chars().collect::<Vec<_>>(),
                 ),
                 _ => false,
             },
             Pred::Cmp(c, op, lit) => {
-                let Some(v) = get(c) else { return false };
-                if v.is_null() {
-                    return false;
-                }
-                let o = cmp_values(&v, lit);
+                let o = cmp_values(&value(c)?, lit);
                 match op.as_str() {
                     "=" => o.is_eq(),
                     "<>" => o.is_ne(),
@@ -1006,37 +1005,49 @@ impl Pred {
                     _ => false,
                 }
             }
-            Pred::AsciiOnly(c) => get(c)
-                .and_then(|v| {
-                    v.as_str()
-                        .map(|s| s.chars().all(|ch| (' '..='~').contains(&ch)))
-                })
-                .unwrap_or(false),
-            Pred::ExprCmp(e, op, lit) => {
-                let Some(v) = e.eval(t, r) else { return false };
-                let o = cmp_values(&v, lit);
-                match op.as_str() {
-                    "=" => o.is_eq(),
-                    "<>" => o.is_ne(),
-                    "<" => o.is_lt(),
-                    "<=" => o.is_le(),
-                    ">" => o.is_gt(),
-                    ">=" => o.is_ge(),
-                    _ => false,
-                }
-            }
-            Pred::ColEq(a, b) => match (get(a), get(b)) {
-                (Some(x), Some(y)) => !x.is_null() && !y.is_null() && values_eq(&x, &y),
+            Pred::AsciiOnly(c) => match value(c)? {
+                Value::String(s) => s.chars().all(|ch| (' '..='~').contains(&ch)),
                 _ => false,
             },
-            Pred::In(c, lits) => {
-                let Some(v) = get(c) else { return false };
-                !v.is_null() && lits.iter().any(|l| values_eq(&v, l))
+            Pred::ExprCmp(e, op, lit) => {
+                let v = e.eval(t, r)?;
+                if v.is_null() {
+                    return None;
+                }
+                let o = cmp_values(&v, lit);
+                match op.as_str() {
+                    "=" => o.is_eq(),
+                    "<>" => o.is_ne(),
+                    "<" => o.is_lt(),
+                    "<=" => o.is_le(),
+                    ">" => o.is_gt(),
+                    ">=" => o.is_ge(),
+                    _ => false,
+                }
             }
-            Pred::Not(p) => !p.eval(t, r),
-            Pred::And(ps) => ps.iter().all(|p| p.eval(t, r)),
-            Pred::Or(ps) => ps.iter().any(|p| p.eval(t, r)),
-        }
+            Pred::ColEq(a, b) => values_eq(&value(a)?, &value(b)?),
+            Pred::In(c, lits) => {
+                let v = value(c)?;
+                lits.iter().any(|l| values_eq(&v, l))
+            }
+            Pred::Not(p) => !p.eval(t, r)?,
+            Pred::And(ps) => {
+                let parts: Vec<Option<bool>> = ps.iter().map(|p| p.eval(t, r)).collect();
+                if parts.contains(&Some(false)) {
+                    false
+                } else {
+                    parts.iter().all(Option::is_some).then_some(true)?
+                }
+            }
+            Pred::Or(ps) => {
+                let parts: Vec<Option<bool>> = ps.iter().map(|p| p.eval(t, r)).collect();
+                if parts.contains(&Some(true)) {
+                    true
+                } else {
+                    parts.iter().all(Option::is_some).then_some(false)?
+                }
+            }
+        })
     }
 }
 

@@ -206,6 +206,121 @@ mod tests {
         }
     }
 
+    /// `source_branch` and `branches` are carried from the wire.
+    ///
+    /// They were previously hardcoded to `None`/`0` here regardless of what
+    /// the server sent, so a branched ledger arrived at the peer looking
+    /// unbranched. Pinned because this is a deliberate behavior change made
+    /// alongside a large restructure of the subscription task, and without a
+    /// test a regression here has no failing test and no clean bisect
+    /// boundary between "the refactor broke it" and "the intended change
+    /// broke it".
+    #[test]
+    fn ledger_event_carries_branch_metadata_from_the_wire() {
+        let event = SseEvent {
+            event_type: Some("ns-record".to_string()),
+            data: r#"{
+                "action": "ns-record",
+                "kind": "ledger",
+                "resource_id": "mydb:feature",
+                "record": {
+                    "ledger_id": "mydb:feature",
+                    "branch": "feature",
+                    "commit_t": 7,
+                    "index_t": 0,
+                    "retracted": false,
+                    "source_branch": "main",
+                    "branches": 3
+                },
+                "emitted_at": "2025-01-01T00:00:00Z"
+            }"#
+            .to_string(),
+            id: None,
+        };
+
+        match parse_server_sse_event(&event).unwrap() {
+            Some(RemoteEvent::LedgerUpdated(record)) => {
+                assert_eq!(record.source_branch.as_deref(), Some("main"));
+                assert_eq!(record.branches, 3);
+            }
+            other => panic!("expected LedgerUpdated, got {other:?}"),
+        }
+
+        // Absent on the wire is still the old default, not an error: the
+        // fields are `#[serde(default)]` so an older server stays readable.
+        let older = SseEvent {
+            event_type: Some("ns-record".to_string()),
+            data: r#"{
+                "action": "ns-record",
+                "kind": "ledger",
+                "resource_id": "mydb:main",
+                "record": {
+                    "ledger_id": "mydb:main",
+                    "branch": "main",
+                    "commit_t": 1,
+                    "index_t": 0,
+                    "retracted": false
+                },
+                "emitted_at": "2025-01-01T00:00:00Z"
+            }"#
+            .to_string(),
+            id: None,
+        };
+        match parse_server_sse_event(&older).unwrap() {
+            Some(RemoteEvent::LedgerUpdated(record)) => {
+                assert_eq!(record.source_branch, None);
+                assert_eq!(record.branches, 0);
+            }
+            other => panic!("expected LedgerUpdated, got {other:?}"),
+        }
+    }
+
+    /// A `ledger_id` the parser rejects degrades to the verbatim id plus the
+    /// wire's `branch`, rather than erroring the event and tearing down the
+    /// stream.
+    ///
+    /// The trade is deliberate: one unreadable record should not stop a peer
+    /// from receiving every other ledger's updates. Pinned so the choice is
+    /// visible — the failure mode it accepts is a record whose `name` is not
+    /// a real name, which is strictly better than a dead subscription.
+    #[test]
+    fn an_unparseable_ledger_id_degrades_rather_than_killing_the_stream() {
+        let event = SseEvent {
+            event_type: Some("ns-record".to_string()),
+            data: r#"{
+                "action": "ns-record",
+                "kind": "ledger",
+                "resource_id": "mydb:main:extra",
+                "record": {
+                    "ledger_id": "mydb:main:extra",
+                    "branch": "main",
+                    "commit_t": 2,
+                    "index_t": 0,
+                    "retracted": false
+                },
+                "emitted_at": "2025-01-01T00:00:00Z"
+            }"#
+            .to_string(),
+            id: None,
+        };
+
+        // Precondition: this id really is one the canonical parser rejects,
+        // so the test exercises the fallback rather than the happy path.
+        assert!(
+            fluree_db_core::ledger_id::split_ledger_id("mydb:main:extra").is_err(),
+            "fixture must be an id the parser rejects, or this test is vacuous"
+        );
+
+        match parse_server_sse_event(&event).unwrap() {
+            Some(RemoteEvent::LedgerUpdated(record)) => {
+                assert_eq!(record.ledger_id, "mydb:main:extra");
+                assert_eq!(record.name, "mydb:main:extra", "verbatim, not split");
+                assert_eq!(record.branch, "main", "the wire's branch is the fallback");
+            }
+            other => panic!("expected LedgerUpdated, not a torn-down stream, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_parse_retracted_event() {
         let event = SseEvent {

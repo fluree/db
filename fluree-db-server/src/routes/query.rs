@@ -741,6 +741,7 @@ pub async fn query(
                             policy_enforcement: r.policy_enforcement.clone(),
                             reasoning: r.reasoning.clone(),
                             sql: r.sql.clone(),
+                            sql_elided: r.sql_elided,
                         };
                         let mut resp_headers = tracking_headers(&tally);
                         resp_headers.extend(warn_headers);
@@ -820,6 +821,7 @@ pub async fn query(
                 policy_enforcement: response.policy_enforcement.clone(),
                 reasoning: response.reasoning.clone(),
                 sql: response.sql.clone(),
+                sql_elided: response.sql_elided,
             };
             let mut resp_headers = tracking_headers(&tally);
             resp_headers.extend(warn_headers);
@@ -2154,6 +2156,7 @@ async fn execute_query(
             policy_enforcement: response.policy_enforcement.clone(),
             reasoning: response.reasoning.clone(),
             sql: response.sql.clone(),
+            sql_elided: response.sql_elided,
         };
         let headers = tracking_headers(&tally);
 
@@ -2267,6 +2270,7 @@ async fn execute_query_proxy(
             policy_enforcement: response.policy_enforcement.clone(),
             reasoning: response.reasoning.clone(),
             sql: response.sql.clone(),
+            sql_elided: response.sql_elided,
         };
         let headers = tracking_headers(&tally);
 
@@ -2951,6 +2955,7 @@ async fn execute_sparql_ledger(
                     policy_enforcement: response.policy_enforcement.clone(),
                     reasoning: response.reasoning.clone(),
                     sql: response.sql.clone(),
+                    sql_elided: response.sql_elided,
                 };
                 let mut headers = tracking_headers(&tally);
                 headers.extend(warn_headers);
@@ -3209,6 +3214,7 @@ async fn execute_sparql_ledger(
                 policy_enforcement: response.policy_enforcement.clone(),
                 reasoning: response.reasoning.clone(),
                 sql: response.sql.clone(),
+                sql_elided: response.sql_elided,
             };
             let resp_headers = tracking_headers(&tally);
 
@@ -3784,6 +3790,7 @@ async fn execute_history_query(
             policy_enforcement: response.policy_enforcement.clone(),
             reasoning: response.reasoning.clone(),
             sql: response.sql.clone(),
+            sql_elided: response.sql_elided,
         };
         let headers = tracking_headers(&tally);
 

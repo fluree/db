@@ -17,9 +17,12 @@
 //!   an empty ledger.
 //!
 //! Decisions are static per `(TriplesMap, predicate)` unless the policy set
-//! targets specific subjects or the map derives `rdf:type` from a column, so
-//! the per-row cost is a hash lookup in the common case, and a map whose
-//! required predicates are all denied is skipped before its table is scanned.
+//! targets specific subjects or the map derives `rdf:type` from a column. In
+//! that common case a window's decision is settled once before its rows are
+//! walked at all, and a map whose required predicates are all denied is skipped
+//! before its table is scanned. Only a bound predicate variable, a
+//! subject-targeted policy, or column-derived classes put the gate on the
+//! per-row path, where it costs a borrowed hash lookup.
 
 use crate::binding::Binding;
 use crate::context::ExecutionContext;
@@ -78,8 +81,9 @@ pub(crate) struct R2rmlPolicyGate {
     /// Every subject a view restriction targets; `None` when one could not
     /// be named as an IRI, so no verdict is static.
     policy_subjects: Option<Vec<String>>,
-    /// `(TriplesMap IRI, predicate IRI)` → allowed, for subject-independent maps.
-    static_cache: HashMap<(String, String), bool>,
+    /// TriplesMap IRI → predicate IRI → allowed, for subject-independent maps.
+    /// Nested so a lookup borrows both keys and only a miss allocates.
+    static_cache: HashMap<String, HashMap<String, bool>>,
 }
 
 impl R2rmlPolicyGate {
@@ -298,7 +302,39 @@ impl R2rmlPolicyGate {
         let subject_var = pattern.subject_var;
         let predicate_var = pattern.predicate_var;
         let type_var = pattern.type_var;
+        let needs_type = type_var.is_some() && !required.iter().any(|p| p == rdf::TYPE);
         let no_classes: Vec<String> = Vec::new();
+
+        // When no view restriction targets subjects and the map derives no row
+        // classes, every input to a decision is fixed for the whole window: the
+        // subject is ignored (`allows` substitutes `any_subject`) and the class
+        // set is the map's own. Settle `required` and the projected `rdf:type`
+        // once here rather than re-asking them for each of up to a window's
+        // worth of rows; only a bound predicate variable still varies per row.
+        if !self.per_subject && row_classes.is_none() {
+            for pred in &required {
+                if !self.allows(ctx, tm, None, pred, &no_classes).await? {
+                    return Ok(Vec::new());
+                }
+            }
+            if needs_type && !self.allows(ctx, tm, None, rdf::TYPE, &no_classes).await? {
+                return Ok(Vec::new());
+            }
+            let Some(pv) = predicate_var else {
+                return Ok(rows);
+            };
+            let mut kept = Vec::with_capacity(rows.len());
+            for row in rows {
+                let ok = match bound_iri(&row, pv) {
+                    Some(p) => self.allows(ctx, tm, None, p, &no_classes).await?,
+                    None => true,
+                };
+                if ok {
+                    kept.push(row);
+                }
+            }
+            return Ok(kept);
+        }
 
         let mut kept = Vec::with_capacity(rows.len());
         for (i, row) in rows.into_iter().enumerate() {
@@ -320,12 +356,11 @@ impl R2rmlPolicyGate {
             if ok {
                 if let Some(pv) = predicate_var {
                     if let Some(p) = bound_iri(&row, pv) {
-                        let p = p.to_string();
-                        ok = self.allows(ctx, tm, subject, &p, classes).await?;
+                        ok = self.allows(ctx, tm, subject, p, classes).await?;
                     }
                 }
             }
-            if ok && type_var.is_some() && !required.iter().any(|p| p == rdf::TYPE) {
+            if ok && needs_type {
                 ok = self.allows(ctx, tm, subject, rdf::TYPE, classes).await?;
             }
             if ok {
@@ -346,9 +381,12 @@ impl R2rmlPolicyGate {
         row_classes: &[String],
     ) -> Result<bool> {
         let static_decision = !self.per_subject && row_classes.is_empty();
-        let key = (tm.iri.clone(), pred.to_string());
         if static_decision {
-            if let Some(&allowed) = self.static_cache.get(&key) {
+            if let Some(&allowed) = self
+                .static_cache
+                .get(tm.iri.as_str())
+                .and_then(|preds| preds.get(pred))
+            {
                 return Ok(allowed);
             }
         }
@@ -388,7 +426,10 @@ impl R2rmlPolicyGate {
             .await
             .map_err(|e| QueryError::Policy(e.to_string()))?;
         if static_decision {
-            self.static_cache.insert(key, allowed);
+            self.static_cache
+                .entry(tm.iri.clone())
+                .or_default()
+                .insert(pred.to_string(), allowed);
         }
         Ok(allowed)
     }
