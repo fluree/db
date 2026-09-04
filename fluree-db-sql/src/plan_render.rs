@@ -22,7 +22,7 @@ use fluree_db_tabular::plan::{
 };
 use fluree_db_tabular::{BatchSchema, FieldType};
 
-use crate::dialect::{cmp_sql, render_literal, sql_string, SqlDialect};
+use crate::dialect::{binary_string, cmp_sql, render_literal, SqlDialect};
 use crate::error::{Result, SqlError};
 
 struct Renderer<'a> {
@@ -402,7 +402,10 @@ impl Renderer<'_> {
                         col.alias, col.column
                     )));
                 }
-                let lit = sql_string(pattern, self.dialect).ok_or_else(|| {
+                // `BINARY` on MySQL: a widened LIKE is a superset only if the
+                // pattern matches at least the byte prefix, and a contraction
+                // collation (`ch` as one element) can match fewer.
+                let lit = binary_string(pattern, self.dialect).ok_or_else(|| {
                     SqlError::Unsupported(format!("LIKE pattern {pattern:?} cannot be rendered"))
                 })?;
                 format!("{} LIKE {lit} ESCAPE '!'", self.col(col))
@@ -691,8 +694,10 @@ mod tests {
     }
 
     /// A `LIKE` carries its own escape character, so a needle's wildcards
-    /// survive on every dialect; MySQL's backslash-escaping literals decline
-    /// as string comparisons do, and a non-string column is refused.
+    /// survive on every dialect; MySQL marks the pattern `BINARY` so a
+    /// contraction collation cannot match fewer strings than the byte
+    /// prefix, its backslash-escaping literals decline as string comparisons
+    /// do, and a non-string column is refused.
     #[test]
     fn like_renders_with_an_escape_clause() {
         let like = |col: &str, pattern: &str| RelPlan {
@@ -716,7 +721,7 @@ mod tests {
         );
         assert_eq!(
             render_plan(&like("name", "O'B%"), &schemas(), SqlDialect::Mysql).unwrap(),
-            "SELECT `c`.`id` AS `c0` FROM `customers` AS `c` WHERE `c`.`name` LIKE 'O''B%' ESCAPE '!'"
+            "SELECT `c`.`id` AS `c0` FROM `customers` AS `c` WHERE `c`.`name` LIKE BINARY 'O''B%' ESCAPE '!'"
         );
         assert!(render_plan(&like("name", r"c:\%"), &schemas(), SqlDialect::Mysql).is_err());
         assert!(render_plan(&like("id", "1%"), &schemas(), SqlDialect::Postgres).is_err());

@@ -206,7 +206,8 @@ pushable. In that statement:
   rows that come back: `STRSTARTS`, `STRENDS` and `CONTAINS` of a constant
   against a string column, and a `REGEX` anchored on a literal prefix with
   no flags, push a `LIKE` (a collation can only match more strings than a
-  byte prefix, never fewer). An `xsd:dateTime` literal
+  byte prefix, never fewer; on MySQL the pattern is marked `BINARY`, since
+  a contraction collation could match fewer). An `xsd:dateTime` literal
   compared with a `timestamp` column that has **no zone** pushes exactly,
   rendered as a naive `TIMESTAMP` literal: the lane reads a zoneless column
   as UTC when it builds the term, and the comparison follows the same

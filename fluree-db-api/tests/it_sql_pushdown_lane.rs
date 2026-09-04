@@ -2401,7 +2401,7 @@ fn live_cases() -> Vec<LiveCase> {
             sent: &[
                 (Sqlite, Sent::Contains("LIKE 'A%' ESCAPE '!'")),
                 (Postgres, Sent::Contains("LIKE 'A%' ESCAPE '!'")),
-                (Mysql, Sent::Contains("LIKE 'A%' ESCAPE '!'")),
+                (Mysql, Sent::Contains("LIKE BINARY 'A%' ESCAPE '!'")),
             ],
         },
         LiveCase {
@@ -2412,7 +2412,7 @@ fn live_cases() -> Vec<LiveCase> {
             sent: &[
                 (Sqlite, Sent::Contains("LIKE '%mile%' ESCAPE '!'")),
                 (Postgres, Sent::Contains("LIKE '%mile%' ESCAPE '!'")),
-                (Mysql, Sent::Contains("LIKE '%mile%' ESCAPE '!'")),
+                (Mysql, Sent::Contains("LIKE BINARY '%mile%' ESCAPE '!'")),
             ],
         },
         LiveCase {
