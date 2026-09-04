@@ -215,6 +215,10 @@ jobs:
 
       - name: Pushdown lane differential against SQLite, Postgres and MySQL
         env:
+          # `live_bridge_backends_are_configured_in_ci` keys on this marker to
+          # know it is in the job that starts the bridges, and then requires all
+          # three URLs below. Keep them together.
+          FLUREE_LIVE_BRIDGE: "1"
           FLUREE_SQL_BRIDGE_URL: http://127.0.0.1:18080
           FLUREE_SQL_BRIDGE_POSTGRES_URL: http://127.0.0.1:18081
           FLUREE_SQL_BRIDGE_MYSQL_URL: http://127.0.0.1:18082
@@ -369,20 +373,18 @@ jobs:
           tool: wasm-pack
 
       # clippy, not check: `cargo check` cannot see clippy-only lints, and
-      # nothing else runs clippy against the wasm32 target. Two of those lints
-      # (a dropped un-awaited future in the CAS bridge stub, a needless return
-      # in a wasm-cfg storage arm) sat red under this exact command while the
+      # nothing else runs clippy against the wasm32 target. Three of those
+      # lints (a dropped un-awaited future in the CAS bridge stub, a needless
+      # return in a wasm-cfg storage arm, an explicit into_iter loop in the
+      # sequential multi-query twin) sat red under this command while the
       # check-only gate reported green. clippy lints every workspace member in
-      # the -p closure, so this covers the engine crates behind fluree-db-api,
-      # not just the umbrella.
+      # the -p closure at lib level, so this covers the engine crates behind
+      # fluree-db-api, nameservice-sync and the browser crate, not just the
+      # umbrellas.
       # No --all-targets: it drags in fluree-db-api's dev-dependencies, whose
-      # tokio `net`/mio does not build for wasm32 (unrelated to our code). The
-      # lib-level pass is what matters here anyway — clippy lints every
-      # workspace member in the -p closure at lib level, which is how the two
-      # latent lints this gate exists for (in fluree-db-binary-index and
-      # fluree-db-connection) surfaced.
+      # tokio `net`/mio does not build for wasm32 (unrelated to our code).
       - name: Lint engine stack (wasm32 clippy)
-        run: cargo clippy --target wasm32-unknown-unknown -p fluree-db-api --no-default-features
+        run: cargo clippy --target wasm32-unknown-unknown -p fluree-db-api -p fluree-db-nameservice-sync -p fluree-db-browser --no-default-features
 
       - name: Lint parse layer, no default features (wasm32 clippy)
         run: cargo clippy --target wasm32-unknown-unknown --no-default-features -p fluree-vocab -p fluree-graph-ir -p fluree-graph-turtle -p fluree-graph-json-ld -p fluree-db-sparql
@@ -394,3 +396,73 @@ jobs:
       # exits 0 only on the future's own Ok (see wasm-probe/README.md).
       - name: Runtime smoke (wasm32 under Node)
         run: node wasm-probe/run-node.mjs
+
+  # Executes the browser build (the wasm32 job only proves it compiles).
+  # 1. The playground binding runs create → insert → query → format inside a
+  #    dedicated worker in headless Chrome (wasm-bindgen-test, assertions on
+  #    returned rows — a positive ran-marker, never "didn't crash").
+  # 2. The SHIPPED npm package (main-thread proxy → module worker → wasm) is
+  #    driven end to end over the DevTools protocol with no COOP/COEP headers,
+  #    which is the package's hosting contract.
+  # ubuntu-latest ships a matching Chrome + chromedriver pair. Same RUSTFLAGS
+  # restatement as the wasm32 job (an env RUSTFLAGS masks .cargo/config.toml).
+  wasm-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # wasm-pack pinned via the same installer action the wasm32 job uses —
+      # not an unpinned `curl | sh`.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.13.1
+
+      - name: Install wasm-bindgen CLI (Cargo.lock version) and binaryen
+        # Native host build: clear the job-level wasm `getrandom_backend` cfg
+        # (getrandom 0.3.4+ hard-errors when that cfg is set for a non-wasm
+        # target), exactly as the fluree-server native build step below does.
+        env:
+          RUSTFLAGS: ""
+        run: |
+          VER=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | tail -1 | cut -d'"' -f2)
+          if [ "$(wasm-bindgen --version 2>/dev/null | awk '{print $2}')" != "$VER" ]; then
+            cargo install wasm-bindgen-cli --version "$VER" --locked --force
+          fi
+          sudo apt-get update -qq && sudo apt-get install -y -qq binaryen
+
+      - name: Browser tests (wasm-bindgen-test in a dedicated worker, headless Chrome)
+        run: wasm-pack test --headless --chrome fluree-db-wasm
+
+      # The browser I/O crate's real-browser suites (fetch round-trip, error
+      # classification, IndexedDB persistence, SSE streaming) — review H-3:
+      # without this line they never execute in CI.
+      - name: Browser I/O tests (headless Chrome)
+        run: wasm-pack test --headless --chrome fluree-db-browser
+
+      - name: Build npm package (wasm-release profile + wasm-opt + tsc)
+        working-directory: fluree-db-wasm/js
+        run: |
+          npm ci
+          node scripts/build.mjs
+
+      # --packed: smoke the `npm pack` tarball, not the repo dir, so a `files`
+      # allowlist regression (e.g. the .wasm dropped from the tarball) fails
+      # here instead of in consumers' installs.
+      - name: Smoke the packed package (headless Chrome over CDP, no isolation headers)
+        working-directory: fluree-db-wasm/js
+        run: node scripts/smoke-browser.mjs --packed
+
+      - name: Size report
+        run: cat fluree-db-wasm/js/pkg/size-report.json

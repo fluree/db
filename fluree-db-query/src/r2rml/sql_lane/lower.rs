@@ -564,6 +564,23 @@ impl<'a> Lowerer<'a> {
             }
         }
 
+        // Every column equality the renderer will emit must be one it accepts.
+        // `same_class` is its own predicate, exported rather than restated so
+        // the two cannot drift: on a mismatch the renderer raises `Unsupported`,
+        // which reaches the caller as an `InvalidQuery` — but `open` has already
+        // committed to the lane by then, so the query hard-fails where the
+        // per-scan lane would have answered it. A `varchar` FK against a
+        // `bigint` key is the common legacy shape that hits this.
+        let mut eqs: Vec<(ColRef, ColRef)> = Vec::new();
+        fluree_db_tabular::plan::collect_col_eqs(&root, &mut eqs);
+        for (l, r) in &eqs {
+            if let (Some(a), Some(b)) = (self.field_type(l), self.field_type(r)) {
+                if !fluree_db_tabular::plan::same_class(a, b) {
+                    return Ok(Err(Decline("join between two column classes")));
+                }
+            }
+        }
+
         let limit_is_exact = self.residuals.is_empty() && all_shared_seeded;
         Ok(Ok(Some(Lowered {
             root,
@@ -1024,6 +1041,18 @@ impl<'a> Lowerer<'a> {
                 if cl != cr {
                     return decline("repeated variable joins two value classes");
                 }
+                // Matching RDF classes are not a matching comparison. The class
+                // is what the mapping *reads* the column as, so two text columns
+                // both mapped `xsd:decimal` agree here and render a string `=`,
+                // where '99.5' and '99.50' are different strings and the same
+                // number — a silently wrong answer rather than an error. Require
+                // both sides to carry the class natively, the rule
+                // `literal_exact` already applies to a literal comparison.
+                // `Str` is exempt: a string join on text columns is exact.
+                if *cl != RdfClass::Str && !(self.literal_exact(l, cl) && self.literal_exact(r, cr))
+                {
+                    return decline("repeated variable joins columns that do not carry the class");
+                }
                 self.push_edge(l.clone(), r.clone());
                 Ok(())
             }
@@ -1323,9 +1352,31 @@ impl<'a> Lowerer<'a> {
             if !filters.is_empty() {
                 return decline("filter inside a folded optional");
             }
+            // SPARQL's LeftJoin binds an OPTIONAL group as a unit: if any triple
+            // of the group is absent for a row, every variable the group binds
+            // is unbound. Folding members into nullable columns of the required
+            // access makes each column independently NULL, so an order with
+            // `placed` set and `shipped` absent bound ?p and left ?s unbound
+            // where SPARQL unbinds both. One member is the case where
+            // per-column and per-group agree — including a policy-hidden one
+            // below, which then leaves the group's only variable unbound, as it
+            // should. Several members need a self LEFT JOIN; until the lowering
+            // can build one, they belong to the per-scan lane.
+            if members.len() != 1 {
+                return decline("several members in a folded optional");
+            }
             for (pred, obj) in members {
                 if pred == rdf::TYPE {
                     return decline("rdf:type inside an optional");
+                }
+                // A constant object's equality lands in `access_preds` of the
+                // *required* access — only the new-entity path below relocates
+                // its predicates into the ON clause — so the OPTIONAL would
+                // filter the rows it is supposed to leave alone:
+                // `OPTIONAL { ?o ex:placed "2024-01-05"^^xsd:date }` returned
+                // one row where SPARQL returns every order.
+                if !matches!(obj, Obj::Var(_)) {
+                    return decline("constant object in a folded optional");
                 }
                 if pom_for(tm, pred).is_none() {
                     return decline("optional member not on the entity's triples map");
@@ -2227,16 +2278,42 @@ pub(crate) fn candidate_sources(
         })
         .map(|t| t.p.as_str())
         .collect();
-    let mut out: Vec<RelSource> = Vec::new();
+    let mut reached: Vec<&str> = Vec::new();
     for tm in mapping.triples_maps.values() {
         if preds
             .iter()
             .any(|p| *p == rdf::TYPE || pom_for(tm, p).is_some())
         {
-            let src = source_of_tm(tm);
-            if !out.contains(&src) {
-                out.push(src);
+            reached.push(tm.iri.as_str());
+        }
+    }
+    // A `rr:parentTriplesMap` is reached through its FK, not through a
+    // predicate of the block, so its table has to be walked to as well:
+    // without it the parent's columns are unprobed, `field_type` reads them as
+    // unknown, and every check that vets a column type — the join-class check
+    // above all — silently passes on the half it cannot see.
+    let mut i = 0;
+    while i < reached.len() {
+        let Some(tm) = mapping.get(reached[i]) else {
+            i += 1;
+            continue;
+        };
+        for pom in &tm.predicate_object_maps {
+            if let ObjectMap::RefObjectMap(rom) = &pom.object_map {
+                let parent = rom.parent_triples_map.as_str();
+                if mapping.get(parent).is_some() && !reached.contains(&parent) {
+                    reached.push(parent);
+                }
             }
+        }
+        i += 1;
+    }
+    let mut out: Vec<RelSource> = Vec::new();
+    for iri in reached {
+        let Some(tm) = mapping.get(iri) else { continue };
+        let src = source_of_tm(tm);
+        if !out.contains(&src) {
+            out.push(src);
         }
     }
     out

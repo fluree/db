@@ -396,6 +396,16 @@ impl RemoteLedgerClient {
         self.refreshed.lock().take()
     }
 
+    /// The bearer token requests currently carry — the refreshed one once a
+    /// refresh has happened.
+    pub fn current_token(&self) -> Option<String> {
+        self.token.lock().clone()
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     fn add_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         let token = self.token.lock();
         if let Some(ref t) = *token {

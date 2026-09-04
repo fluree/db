@@ -17,12 +17,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use fluree_db_tabular::plan::{
-    ColRef, KeySet, Literal, OrderKey, OutputCol, OutputExpr, Pred, PushdownCapabilities, RelNode,
-    RelPlan, RelSource,
+    collect_col_eqs, same_class, ColRef, KeySet, Literal, OrderKey, OutputCol, OutputExpr, Pred,
+    PushdownCapabilities, RelNode, RelPlan, RelSource,
 };
 use fluree_db_tabular::{BatchSchema, FieldType};
 
-use crate::dialect::{cmp_sql, is_numeric, render_literal, sql_string, SqlDialect};
+use crate::dialect::{cmp_sql, render_literal, sql_string, SqlDialect};
 use crate::error::{Result, SqlError};
 
 struct Renderer<'a> {
@@ -431,43 +431,6 @@ impl Renderer<'_> {
                 col.alias, col.column
             ))
         })
-    }
-}
-
-fn collect_col_eqs(node: &RelNode, out: &mut Vec<(ColRef, ColRef)>) {
-    fn from_pred(p: &Pred, out: &mut Vec<(ColRef, ColRef)>) {
-        match p {
-            Pred::ColEq { left, right } => out.push((left.clone(), right.clone())),
-            Pred::And(ps) | Pred::Or(ps) => ps.iter().for_each(|q| from_pred(q, out)),
-            Pred::Not(q) => from_pred(q, out),
-            _ => {}
-        }
-    }
-    match node {
-        RelNode::Access { .. } | RelNode::KeySet(_) => {}
-        RelNode::Filter { input, pred } => {
-            from_pred(pred, out);
-            collect_col_eqs(input, out);
-        }
-        RelNode::Join { left, right, on } | RelNode::LeftJoin { left, right, on } => {
-            from_pred(on, out);
-            collect_col_eqs(left, out);
-            collect_col_eqs(right, out);
-        }
-    }
-}
-
-fn same_class(a: FieldType, b: FieldType) -> bool {
-    use FieldType as F;
-    match (a, b) {
-        _ if is_numeric(a) && is_numeric(b) => true,
-        (F::String, F::String)
-        | (F::Boolean, F::Boolean)
-        | (F::Date, F::Date)
-        | (F::Timestamp, F::Timestamp)
-        | (F::TimestampTz, F::TimestampTz)
-        | (F::Bytes, F::Bytes) => true,
-        _ => false,
     }
 }
 

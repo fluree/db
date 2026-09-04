@@ -59,10 +59,30 @@ const SHOP_R2RML: &str = r#"
             rr:objectMap [ rr:column "updated" ; rr:datatype xsd:dateTime ]
         ] ;
         rr:predicateObjectMap [
+            rr:predicate ex:discount ;
+            rr:objectMap [ rr:column "discount" ; rr:datatype xsd:decimal ]
+        ] ;
+        rr:predicateObjectMap [
             rr:predicate ex:customer ;
             rr:objectMap [
                 rr:parentTriplesMap <http://example.org/mapping#Customer> ;
                 rr:joinCondition [ rr:child "customer_id" ; rr:parent "id" ]
+            ]
+        ] .
+
+    # The legacy shape: the foreign key is text where the parent key is a
+    # bigint, so the database cannot compare them and the lane must decline
+    # rather than let the renderer refuse after the fallback decision is past.
+    <http://example.org/mapping#Note>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.notes" ] ;
+        rr:subjectMap [ rr:template "http://example.org/note/{id}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:body ; rr:objectMap [ rr:column "body" ] ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:aboutOrder ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Order> ;
+                rr:joinCondition [ rr:child "order_ref" ; rr:parent "id" ]
             ]
         ] .
 "#;
@@ -186,6 +206,9 @@ async fn shop() -> MockServer {
                 // exactly with an xsd:dateTime literal in SQL.
                 ("shipped", "timestamp(6) with time zone"),
                 ("updated", "timestamp(6)"),
+                // Nullable numeric: a group whose rows are all NULL here sums
+                // to SPARQL's identity 0, which SQL cannot order as 0.
+                ("discount", "decimal(10,2)"),
             ],
             vec![
                 vec![
@@ -195,6 +218,7 @@ async fn shop() -> MockServer {
                     json!("2024-01-05"),
                     json!("2024-01-06 09:30:00.000000 UTC"),
                     json!("2024-01-06 09:30:00.000000"),
+                    Value::Null,
                 ],
                 vec![
                     json!(11),
@@ -203,6 +227,7 @@ async fn shop() -> MockServer {
                     json!("2024-02-01"),
                     json!("2024-02-02 18:00:00.000000 UTC"),
                     json!("2024-02-02 18:00:00.000000"),
+                    Value::Null,
                 ],
                 vec![
                     json!(12),
@@ -211,6 +236,7 @@ async fn shop() -> MockServer {
                     json!("2024-03-01"),
                     Value::Null,
                     Value::Null,
+                    json!("-5.00"),
                 ],
                 vec![
                     json!(13),
@@ -219,7 +245,20 @@ async fn shop() -> MockServer {
                     Value::Null,
                     Value::Null,
                     Value::Null,
+                    Value::Null,
                 ],
+            ],
+        ))
+        .table(Table::new(
+            "shop.notes",
+            &[
+                ("id", "bigint"),
+                ("order_ref", "varchar"),
+                ("body", "varchar"),
+            ],
+            vec![
+                vec![json!(1), json!("10"), json!("gift wrap")],
+                vec![json!(2), json!("12"), json!("call first")],
             ],
         ))
         .mount()
@@ -778,6 +817,53 @@ fn cases() -> Vec<Case> {
             rows: &[],
             routing: Routing::MustNotFire,
             declined: Some("repeated variable joins two value classes"),
+        },
+        Case {
+            // SPARQL's LeftJoin binds the group as a unit: order 12 has
+            // `placed` but no `shipped`, so BOTH ?p and ?s are unbound. Folded
+            // into two nullable columns of the required access they would be
+            // independently NULL, binding ?p and leaving ?s unbound.
+            name: "an optional with several members on the same entity declines",
+            sparql: "SELECT ?o ?p ?s FROM <shop-sql:main> WHERE { ?o ex:total ?t OPTIONAL { ?o ex:placed ?p . ?o ex:shipped ?s } }",
+            sql: &[],
+            rows: &[
+                "o=http://example.org/order/10 p=2024-01-05 s=2024-01-06T09:30:00Z",
+                "o=http://example.org/order/11 p=2024-02-01 s=2024-02-02T18:00:00Z",
+                "o=http://example.org/order/12 p= s=",
+                "o=http://example.org/order/13 p= s=",
+            ],
+            routing: Routing::MustNotFire,
+            declined: Some("several members in a folded optional"),
+        },
+        Case {
+            // The constant's equality would land in the WHERE of the REQUIRED
+            // access, so the OPTIONAL would filter the rows it must leave
+            // alone: one order back instead of every order.
+            name: "a constant object inside a folded optional declines",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t OPTIONAL { ?o ex:placed \"2024-01-05\"^^xsd:date } }",
+            sql: &[],
+            rows: &[
+                "o=http://example.org/order/10",
+                "o=http://example.org/order/11",
+                "o=http://example.org/order/12",
+                "o=http://example.org/order/13",
+            ],
+            routing: Routing::MustNotFire,
+            declined: Some("constant object in a folded optional"),
+        },
+        Case {
+            // varchar FK against a bigint key. The renderer refuses this pair,
+            // but only after `open` committed to the lane, so the query used to
+            // hard-fail where the per-scan lane answers it.
+            name: "a join between two column classes declines instead of failing to render",
+            sparql: "SELECT ?b ?o FROM <shop-sql:main> WHERE { ?n ex:body ?b . ?n ex:aboutOrder ?o }",
+            sql: &[],
+            rows: &[
+                "b=call first o=http://example.org/order/12",
+                "b=gift wrap o=http://example.org/order/10",
+            ],
+            routing: Routing::MustNotFire,
+            declined: Some("join between two column classes"),
         },
         Case {
             name: "an optional hanging off an optional entity declines",
@@ -1538,6 +1624,20 @@ fn aggregate_cases() -> Vec<Case> {
             declined: None,
         },
         Case {
+            // The database applies ORDER BY … LIMIT before the engine maps a
+            // NULL sum to SPARQL's empty-sum identity of 0. Customer 1's orders
+            // have no discount at all, so its sum is 0 and must sort ahead of
+            // customer 2's -5.00 — but SQL has only NULL to order, and puts it
+            // at one end. The grouped statement still pushes; the top-k does
+            // not, and the engine picks k after decoding.
+            name: "a top-k over SUM of a nullable variable keeps the ordering in the engine",
+            sparql: "SELECT ?c (SUM(?d) AS ?s) FROM <shop-sql:main> WHERE { ?o ex:customer ?c OPTIONAL { ?o ex:discount ?d } } GROUP BY ?c ORDER BY ?s LIMIT 1",
+            sql: &[r#"SELECT "t1"."id" AS "c0", SUM("t0"."discount") AS "c1", COUNT("t0"."discount") AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            rows: &["c=http://example.org/customer/2 s=-5.00"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
             name: "ORDER BY an aggregate with LIMIT pushes a top-k on the output",
             sparql: "SELECT ?c (COUNT(?o) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c } GROUP BY ?c ORDER BY DESC(?n) LIMIT 1",
             sql: &[r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id" ORDER BY "c1" DESC LIMIT 1"#],
@@ -1820,24 +1920,27 @@ const SQLITE: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS events",
         "DROP TABLE IF EXISTS profiles",
         "DROP TABLE IF EXISTS people",
+        "DROP TABLE IF EXISTS notes",
         "CREATE TABLE customers (id INTEGER, name TEXT, country TEXT)",
         "CREATE TABLE profiles (id INTEGER, email TEXT)",
         "CREATE TABLE people (id INTEGER, kind TEXT, name TEXT)",
-        "CREATE TABLE orders (id INTEGER, customer_id INTEGER, total NUMERIC, placed DATE, shipped TIMESTAMP, updated TIMESTAMP)",
+        "CREATE TABLE orders (id INTEGER, customer_id INTEGER, total NUMERIC, placed DATE, shipped TIMESTAMP, updated TIMESTAMP, discount NUMERIC)",
         "CREATE TABLE words (id INTEGER, word TEXT, len INTEGER)",
         "CREATE TABLE tags (tag TEXT, n INTEGER)",
         "CREATE TABLE events (id INTEGER, at_tz TIMESTAMP, at_local TIMESTAMP)",
+        "CREATE TABLE notes (id INTEGER, order_ref TEXT, body TEXT)",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
         PEOPLE_ROWS,
         "INSERT INTO orders VALUES \
-            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00', '2024-01-06 09:30:00'), \
-            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00', '2024-02-02 18:00:00'), \
-            (12, 2, 42.00, '2024-03-01', NULL, NULL), \
-            (13, NULL, 7.00, NULL, NULL, NULL)",
+            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00', '2024-01-06 09:30:00', NULL), \
+            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00', '2024-02-02 18:00:00', NULL), \
+            (12, 2, 42.00, '2024-03-01', NULL, NULL, -5.00), \
+            (13, NULL, 7.00, NULL, NULL, NULL, NULL)",
         WORD_ROWS,
         TAG_ROWS,
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00', '2024-01-09 21:00:00')",
+        "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
     ],
     // SQLite's `NUMERIC` reaches the bridge as text or double, so a SUM/AVG
     // over it declines (its datatype is decimal).
@@ -1860,24 +1963,27 @@ const POSTGRES: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS events",
         "DROP TABLE IF EXISTS profiles",
         "DROP TABLE IF EXISTS people",
+        "DROP TABLE IF EXISTS notes",
         "CREATE TABLE customers (id BIGINT, name TEXT, country TEXT)",
         "CREATE TABLE profiles (id BIGINT, email TEXT)",
         "CREATE TABLE people (id BIGINT, kind TEXT, name TEXT)",
-        "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total NUMERIC(10,2), placed DATE, shipped TIMESTAMPTZ, updated TIMESTAMP)",
+        "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total NUMERIC(10,2), placed DATE, shipped TIMESTAMPTZ, updated TIMESTAMP, discount NUMERIC(10,2))",
         "CREATE TABLE words (id BIGINT, word TEXT, len INTEGER)",
         "CREATE TABLE tags (tag TEXT, n INTEGER)",
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMPTZ, at_local TIMESTAMP)",
+        "CREATE TABLE notes (id BIGINT, order_ref TEXT, body TEXT)",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
         PEOPLE_ROWS,
         "INSERT INTO orders VALUES \
-            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00'), \
-            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00'), \
-            (12, 2, 42.00, '2024-03-01', NULL, NULL), \
-            (13, NULL, 7.00, NULL, NULL, NULL)",
+            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00', NULL), \
+            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00', NULL), \
+            (12, 2, 42.00, '2024-03-01', NULL, NULL, -5.00), \
+            (13, NULL, 7.00, NULL, NULL, NULL, NULL)",
         WORD_ROWS,
         TAG_ROWS,
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00+00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00+00:00', '2024-01-09 21:00:00')",
+        "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
     ],
     declines: &[],
 };
@@ -1893,24 +1999,27 @@ const MYSQL: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS events",
         "DROP TABLE IF EXISTS profiles",
         "DROP TABLE IF EXISTS people",
+        "DROP TABLE IF EXISTS notes",
         "CREATE TABLE customers (id BIGINT, name VARCHAR(64), country VARCHAR(64))",
         "CREATE TABLE profiles (id BIGINT, email VARCHAR(64))",
         "CREATE TABLE people (id BIGINT, kind VARCHAR(64), name VARCHAR(64))",
-        "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total DECIMAL(10,2), placed DATE, shipped TIMESTAMP NULL, updated DATETIME)",
+        "CREATE TABLE orders (id BIGINT, customer_id BIGINT, total DECIMAL(10,2), placed DATE, shipped TIMESTAMP NULL, updated DATETIME, discount DECIMAL(10,2))",
         "CREATE TABLE words (id BIGINT, word VARCHAR(64), len INT)",
         "CREATE TABLE tags (tag VARCHAR(64), n INT)",
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMP NULL, at_local DATETIME)",
+        "CREATE TABLE notes (id BIGINT, order_ref VARCHAR(64), body VARCHAR(64))",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
         PEOPLE_ROWS,
         "INSERT INTO orders VALUES \
-            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00'), \
-            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00'), \
-            (12, 2, 42.00, '2024-03-01', NULL, NULL), \
-            (13, NULL, 7.00, NULL, NULL, NULL)",
+            (10, 1, 99.50, '2024-01-05', '2024-01-06 09:30:00+00:00', '2024-01-06 09:30:00', NULL), \
+            (11, 1, 5.00, '2024-02-01', '2024-02-02 18:00:00+00:00', '2024-02-02 18:00:00', NULL), \
+            (12, 2, 42.00, '2024-03-01', NULL, NULL, -5.00), \
+            (13, NULL, 7.00, NULL, NULL, NULL, NULL)",
         WORD_ROWS,
         TAG_ROWS,
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00+00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00+00:00', '2024-01-09 21:00:00')",
+        "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
     ],
     declines: &[],
 };
@@ -2508,11 +2617,18 @@ async fn live_bridge_mysql_agrees_with_the_scan_lane() {
     live_differential(&MYSQL).await;
 }
 
-/// A skipped differential is not a passing one: CI must supply every backend.
+/// A skipped differential is not a passing one: the job that runs it must
+/// supply every backend.
+///
+/// Gated on the marker the differential step sets rather than on `CI`, because
+/// the workspace `test` job also runs with `CI` set and is not the job that
+/// starts the bridges — there this asserted three URLs that were never meant to
+/// be present, and failed. The marker sits beside the URLs in the same `env:`
+/// block, so removing a backend still trips this.
 #[test]
 fn live_bridge_backends_are_configured_in_ci() {
-    if std::env::var("CI").is_err() {
-        eprintln!("SKIPPED: not CI");
+    if std::env::var("FLUREE_LIVE_BRIDGE").is_err() {
+        eprintln!("SKIPPED: not the live-bridge job");
         return;
     }
     for b in [&SQLITE, &POSTGRES, &MYSQL] {
@@ -2626,4 +2742,225 @@ async fn duplicate_subject_keys_are_detected_and_refused() {
             "i=http://example.org/item/2 t=blue",
         ]
     );
+}
+
+/// A JSON-LD twin for the shapes whose routing depends on how the *parser*
+/// groups a block.
+///
+/// The lane keys on `Pattern::Graph { name: GraphName::Iri(..) }`, which both
+/// query surfaces lower to (`parse/lower.rs` for JSON-LD), so every admission
+/// and decline in this file is reachable from JSON-LD as well — yet every case
+/// above is written in SPARQL. That matters most for the folded-OPTIONAL rules,
+/// which count the members of the optional group: `["optional", {a}, {b}]` is
+/// one conjunctive OPTIONAL and a single node object may itself carry two
+/// predicates, so the two surfaces could plausibly present the same query to
+/// the lowering as a different number of members — and a group that folds where
+/// it should decline gives the wrong answer, not a slower one.
+///
+/// Each twin asserts the routing stamp, that the rows equal what the same query
+/// returns through SPARQL, and that they equal what the per-scan lane returns
+/// for the JSON-LD query itself. The last is the one that is an oracle: if a
+/// decline regressed, both surfaces would fold and be wrong the same way, so
+/// surface-to-surface agreement alone would still pass.
+struct Twin {
+    name: &'static str,
+    /// The SPARQL spelling, the oracle for the rows.
+    sparql: &'static str,
+    /// The JSON-LD `where`, run with the same `from`.
+    jsonld_where: Value,
+    select: &'static [&'static str],
+    routing: Routing,
+}
+
+fn twins() -> Vec<Twin> {
+    vec![
+        Twin {
+            name: "star with a filter fires on both surfaces",
+            sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { ?o ex:total ?t FILTER(?t > 40) }",
+            jsonld_where: json!([
+                {"@id": "?o", "ex:total": "?t"},
+                ["filter", "(> ?t 40)"]
+            ]),
+            select: &["?o", "?t"],
+            routing: Routing::MustFire,
+        },
+        Twin {
+            // The control for the two declines below: one member still folds.
+            name: "a single-member optional folds on both surfaces",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k } }",
+            jsonld_where: json!([
+                {"@id": "?c", "ex:name": "?n"},
+                ["optional", {"@id": "?c", "ex:country": "?k"}]
+            ]),
+            select: &["?n", "?k"],
+            routing: Routing::MustFire,
+        },
+        Twin {
+            // Two node objects on the same subject inside one OPTIONAL.
+            name: "a several-member optional declines on both surfaces",
+            sparql: "SELECT ?o ?p ?s FROM <shop-sql:main> WHERE { ?o ex:total ?t OPTIONAL { ?o ex:placed ?p . ?o ex:shipped ?s } }",
+            jsonld_where: json!([
+                {"@id": "?o", "ex:total": "?t"},
+                ["optional",
+                    {"@id": "?o", "ex:placed": "?p"},
+                    {"@id": "?o", "ex:shipped": "?s"}]
+            ]),
+            select: &["?o", "?p", "?s"],
+            routing: Routing::MustNotFire,
+        },
+        Twin {
+            // The same group written as ONE node object carrying two
+            // predicates — the spelling with no SPARQL counterpart, and the
+            // one most likely to reach the lowering shaped differently.
+            name: "one optional node object with two predicates declines",
+            sparql: "SELECT ?o ?p ?s FROM <shop-sql:main> WHERE { ?o ex:total ?t OPTIONAL { ?o ex:placed ?p . ?o ex:shipped ?s } }",
+            jsonld_where: json!([
+                {"@id": "?o", "ex:total": "?t"},
+                ["optional", {"@id": "?o", "ex:placed": "?p", "ex:shipped": "?s"}]
+            ]),
+            select: &["?o", "?p", "?s"],
+            routing: Routing::MustNotFire,
+        },
+        Twin {
+            name: "a constant object inside an optional declines on both surfaces",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t OPTIONAL { ?o ex:placed \"2024-01-05\"^^xsd:date } }",
+            jsonld_where: json!([
+                {"@id": "?o", "ex:total": "?t"},
+                ["optional", {"@id": "?o", "ex:placed": {"@value": "2024-01-05", "@type": "xsd:date"}}]
+            ]),
+            select: &["?o"],
+            routing: Routing::MustNotFire,
+        },
+        Twin {
+            name: "an explicit graph block fires",
+            sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { ?o ex:total ?t }",
+            jsonld_where: json!([
+                ["graph", "shop-sql:main", {"@id": "?o", "ex:total": "?t"}]
+            ]),
+            select: &["?o", "?t"],
+            routing: Routing::MustFire,
+        },
+    ]
+}
+
+/// JSON-LD select rows rendered like [`rows_of`], so the two surfaces compare.
+fn jsonld_rows_of(v: &Value, select: &[&str]) -> Vec<String> {
+    let mut order: Vec<(usize, String)> = select
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i, s.trim_start_matches('?').to_string()))
+        .collect();
+    order.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut out: Vec<String> = v
+        .as_array()
+        .unwrap_or_else(|| panic!("not JSON-LD select results: {v}"))
+        .iter()
+        .map(|row| {
+            order
+                .iter()
+                .map(|(i, var)| {
+                    let cell = &row[*i];
+                    let val = match cell {
+                        Value::Null => String::new(),
+                        Value::String(s) => s.clone(),
+                        Value::Object(o) => o
+                            .get("@value")
+                            .map(|x| match x {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            })
+                            .unwrap_or_default(),
+                        other => other.to_string(),
+                    };
+                    format!("{var}={val}")
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[tokio::test]
+async fn jsonld_blocks_route_like_their_sparql_twins() {
+    assert!(
+        std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_none(),
+        "unset FLUREE_DISABLE_QUERY_FAST_PATHS: this pins nothing otherwise"
+    );
+    let _lock = KILL_SWITCH.lock().await;
+    let (_server, fluree) = setup().await;
+    let twins = twins();
+
+    let (store, tracing_guard) = span_capture::init_test_tracing();
+    set_fast_paths_disabled(false);
+    let mut failures: Vec<String> = Vec::new();
+    let mut lane_rows: Vec<(Value, Vec<String>)> = Vec::new();
+    for t in &twins {
+        let q = json!({
+            "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+            "from": "shop-sql:main",
+            "select": t.select,
+            "where": t.jsonld_where,
+        });
+        let before_events = store.find_events("fast-path outcome").len();
+        let out = fluree
+            .query_from()
+            .jsonld(&q)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{}: json-ld query failed: {e}", t.name));
+        let proceeded = proceeded_sites(&store, before_events);
+        let rows = jsonld_rows_of(&out, t.select);
+
+        match t.routing {
+            Routing::MustFire => {
+                if !proceeded.iter().any(|s| s == SITE) {
+                    failures.push(format!(
+                        "{}: expected `{SITE}` to proceed on JSON-LD [proceeded: {proceeded:?}]",
+                        t.name
+                    ));
+                }
+            }
+            Routing::MustNotFire => {
+                if proceeded.iter().any(|s| s == SITE) {
+                    failures.push(format!(
+                        "{}: `{SITE}` proceeded on JSON-LD for a shape SPARQL declines",
+                        t.name
+                    ));
+                }
+            }
+        }
+
+        let sparql_rows = rows_of(&query(&fluree, &format!("{PREFIX}{}", t.sparql)).await);
+        if rows != sparql_rows {
+            failures.push(format!(
+                "{}: json-ld rows {rows:?} differ from sparql rows {sparql_rows:?}",
+                t.name
+            ));
+        }
+        lane_rows.push((q, rows));
+    }
+    drop(tracing_guard);
+
+    // The oracle: the same JSON-LD queries with the lane off.
+    set_fast_paths_disabled(true);
+    for (t, (q, lane)) in twins.iter().zip(&lane_rows) {
+        let out = fluree
+            .query_from()
+            .jsonld(q)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{}: scan-lane json-ld query failed: {e}", t.name));
+        let scan = jsonld_rows_of(&out, t.select);
+        if &scan != lane {
+            failures.push(format!(
+                "{}: scan lane rows {scan:?} differ from lane rows {lane:?}",
+                t.name
+            ));
+        }
+    }
+    set_fast_paths_disabled(false);
+
+    assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
 }

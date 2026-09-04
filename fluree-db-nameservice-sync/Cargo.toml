@@ -6,32 +6,50 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# Target split: the proxy clients (`ProxyStorage`, `ProxyNameService`), the
+# `HttpTransport` seam, and CID integrity verification are runtime-agnostic
+# and build for wasm32; the sync/pull/clone machinery, SSE watchers, and the
+# reqwest-backed transport are native-only. Native dependency resolution is
+# unchanged by the split.
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
-fluree-db-nameservice = { path = "../fluree-db-nameservice" }
+fluree-db-nameservice = { path = "../fluree-db-nameservice", default-features = false }
 fluree-db-novelty = { path = "../fluree-db-novelty" }
 fluree-sse = { path = "../fluree-sse" }
 
 async-trait = { workspace = true }
 futures = { workspace = true }
-reqwest = { workspace = true, features = ["stream"] }
+http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["time", "sync"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-rand = { workspace = true }
 bytes = { workspace = true }
-parking_lot = "0.12"
 urlencoding = { workspace = true }
-async-stream = "0.3"
+# Backoff jitter in the shared head-stream pump (wasm gets the JS
+# getrandom backend through fluree-db-core's target deps).
+rand = { workspace = true }
 
 # Vended S3 credentials consumer (feature "aws")
 fluree-db-storage-aws = { path = "../fluree-db-storage-aws", optional = true, default-features = false, features = ["s3"] }
 aws-config = { workspace = true, optional = true }
 aws-credential-types = { workspace = true, optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { workspace = true, features = ["stream"] }
+tokio = { workspace = true, features = ["time", "sync"] }
+parking_lot = "0.12"
+async-stream = "0.3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Runtime-less sync primitives for the shared head-stream pump's stop
+# signal; no runtime, no timers.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
 [features]
+default = ["native"]
+# Filesystem-backed nameservice + core (tokio). Off for wasm32 consumers.
+native = ["fluree-db-nameservice/native", "fluree-db-core/native"]
 # Consume vended S3 credentials: build an S3 reader from a grant minted by
 # a remote server's GET /storage/credentials endpoint.
 aws = ["dep:fluree-db-storage-aws", "dep:aws-config", "dep:aws-credential-types"]

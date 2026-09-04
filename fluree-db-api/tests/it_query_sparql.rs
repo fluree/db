@@ -4709,6 +4709,212 @@ async fn sparql_double_canonical_lexical_form_across_formats() {
     );
 }
 
+/// Issue #1695: `STR()` on an `xsd:double` must return the same W3C canonical
+/// lexical form the serializer emits for the very same term — the companion
+/// of `sparql_double_canonical_lexical_form_across_formats`, which pins the
+/// serializer side but never exercises expression evaluation. Each row
+/// asserts `STR(?d) == serialized ?d` (self-anchoring: the two paths cannot
+/// drift apart again) plus the expected canonical spelling.
+///
+/// The `xsd:string()` cast is pinned alongside precisely because it must NOT
+/// always follow: SPARQL §17.5 defers casting to XPath, whose double→string
+/// rule is plain decimal notation for absolute values in `[1e-6, 1e6)` — W3C
+/// `cast-string` requires `xsd:string("1E0"^^xsd:double)` to be `"1"` — and
+/// the canonical (scientific) lexical form outside that range, on BOTH sides
+/// (`1.0E-7` and `1.0E30` alike, never `0.0000001` or a 31-digit integer).
+/// This test states both answers so neither function drifts into the other.
+#[tokio::test]
+async fn sparql_str_double_matches_serializer_canonical_form() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "canon:str-double");
+
+    // Representative doubles: the issue's repro (1E0), an integral value,
+    // a large exponent, a small exponent, a negative, and the specials.
+    // Columns: id, stored lexical, canonical (STR + serializer), cast form.
+    let cases = [
+        ("ex:d1", "1E0", "1.0E0", "1"),
+        ("ex:d2", "5.0", "5.0E0", "5"),
+        // 1e6 sits just OUTSIDE the XPath decimal-notation range (the upper
+        // bound is exclusive), so cast and canonical agree here.
+        ("ex:d3", "1.0E6", "1.0E6", "1.0E6"),
+        ("ex:d4", "0.001", "1.0E-3", "0.001"),
+        ("ex:d5", "-12.5", "-1.25E1", "-12.5"),
+        // Outside the XPath range on either side the cast is the canonical
+        // scientific form too — the range rule is two-sided.
+        ("ex:d9", "1.0E-7", "1.0E-7", "1.0E-7"),
+        ("ex:d10", "1.0E30", "1.0E30", "1.0E30"),
+        // Specials share one spelling across both renderings — and neither is
+        // Rust's `Display` ("inf"), which is a lexical form of nothing.
+        ("ex:d6", "NaN", "NaN", "NaN"),
+        ("ex:d7", "INF", "INF", "INF"),
+        ("ex:d8", "-INF", "-INF", "-INF"),
+    ];
+    let graph: Vec<serde_json::Value> = cases
+        .iter()
+        .map(|(id, lex, _, _)| {
+            json!({"@id": id, "ex:score": {"@value": lex, "@type": "xsd:double"}})
+        })
+        .collect();
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": graph
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.expect("seed").ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?s ?d (STR(?d) AS ?lex) (xsd:string(?d) AS ?cast)
+        WHERE { ?s ex:score ?d }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("STR(double) query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(bindings.len(), cases.len(), "{sparql_json}");
+
+    for row in bindings {
+        let subject = row["s"]["value"].as_str().expect("subject IRI");
+        let serialized = row["d"]["value"].as_str().expect("serialized double");
+        let str_lex = row["lex"]["value"].as_str().expect("STR result");
+        let cast_lex = row["cast"]["value"].as_str().expect("xsd:string result");
+        // The core pin: expression evaluation agrees with the serializer on
+        // the SAME term in the SAME result set.
+        assert_eq!(
+            str_lex, serialized,
+            "STR(?d) diverges from the serializer for {subject}: {sparql_json}"
+        );
+        // And the shared form is the W3C canonical one.
+        let (_, _, canonical, cast) = cases
+            .iter()
+            .find(|(id, _, _, _)| subject.ends_with(&id[3..]))
+            .expect("known subject");
+        assert_eq!(serialized, *canonical, "{subject}: {sparql_json}");
+        // The cast keeps its own XPath-mandated rendering (W3C cast-string).
+        assert_eq!(
+            cast_lex, *cast,
+            "xsd:string(?d) must follow the XPath cast rule for {subject}: {sparql_json}"
+        );
+    }
+}
+
+/// Issue #1695 (float sibling): a stored `xsd:float` is carried as a
+/// full-precision f64 (ingest never narrows) and the serializer prints THAT
+/// value; expression evaluation narrows the same binding to an f32. `STR()`
+/// must side with the serializer — it reads the stored f64 off the binding
+/// (`stored_float_f64`) rather than spelling the f32 truncation. The
+/// f32-inexact rows are the ones that catch it: for `3.14159265358979` the
+/// truncated spelling would be `3.1415927E0`.
+#[tokio::test]
+async fn sparql_str_float_matches_serializer_canonical_form() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "canon:str-float");
+
+    let cases = [
+        ("ex:f1", "1E0", "1.0E0"),
+        ("ex:f2", "33.33", "3.333E1"),
+        ("ex:f3", "-0.5", "-5.0E-1"),
+        // f32-INEXACT: the stored f64 keeps more precision than an f32 can
+        // hold, so serializer-vs-STR() agreement is only possible if STR()
+        // reads the stored f64. (These rows go red if STR() ever routes
+        // through the f32 materialization again.)
+        ("ex:f4", "3.14159265358979", "3.14159265358979E0"),
+        ("ex:f5", "1.23456789012345E-5", "1.23456789012345E-5"),
+    ];
+    let graph: Vec<serde_json::Value> = cases
+        .iter()
+        .map(|(id, lex, _)| json!({"@id": id, "ex:reading": {"@value": lex, "@type": "xsd:float"}}))
+        .collect();
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": graph
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.expect("seed").ledger;
+
+    let query = r"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT ?s ?f (STR(?f) AS ?lex)
+        WHERE { ?s ex:reading ?f }
+    ";
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("STR(float) query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let bindings = sparql_json["results"]["bindings"]
+        .as_array()
+        .expect("bindings array");
+    assert_eq!(bindings.len(), cases.len(), "{sparql_json}");
+
+    for row in bindings {
+        let subject = row["s"]["value"].as_str().expect("subject IRI");
+        let serialized = row["f"]["value"].as_str().expect("serialized float");
+        let str_lex = row["lex"]["value"].as_str().expect("STR result");
+        assert_eq!(
+            str_lex, serialized,
+            "STR(?f) diverges from the serializer for {subject}: {sparql_json}"
+        );
+        let expected = cases
+            .iter()
+            .find(|(id, _, _)| subject.ends_with(&id[3..]))
+            .map(|(_, _, canonical)| *canonical)
+            .expect("known subject");
+        assert_eq!(serialized, expected, "{subject}: {sparql_json}");
+    }
+}
+
+/// Issue #1695 (aggregate sibling): GROUP_CONCAT's lenient numeric coercion
+/// stringifies a double through the same seam, and must use the same
+/// canonical form the serializer would give the value.
+#[tokio::test]
+async fn sparql_group_concat_double_canonical_form() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "canon:gc-double");
+
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/ns/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@id": "ex:s",
+        "ex:score": [
+            {"@value": "1E0", "@type": "xsd:double"},
+            {"@value": "1.0E6", "@type": "xsd:double"}
+        ]
+    });
+    let ledger = fluree.insert(ledger0, &insert).await.expect("seed").ledger;
+
+    let query = r#"
+        PREFIX ex: <http://example.org/ns/>
+        SELECT (GROUP_CONCAT(?d; separator="|") AS ?all)
+        WHERE { ex:s ex:score ?d }
+    "#;
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("GROUP_CONCAT(double) query");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let all = sparql_json["results"]["bindings"][0]["all"]["value"]
+        .as_str()
+        .expect("group_concat result");
+    let mut parts: Vec<&str> = all.split('|').collect();
+    parts.sort_unstable();
+    assert_eq!(parts, vec!["1.0E0", "1.0E6"], "{sparql_json}");
+}
+
 #[tokio::test]
 async fn sparql_integer_division_yields_decimal() {
     // Per XPath op:numeric-divide, xsd:integer / xsd:integer yields xsd:decimal:
@@ -6682,4 +6888,236 @@ async fn sparql_count_distinct_chain_fan_in() {
         .expect("count distinct over chain");
     let j = r.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     assert_eq!(j, json!([[2]]), "2 distinct ?x values: {j}");
+}
+
+// =============================================================================
+// Range pushdown must be total-or-nothing
+// =============================================================================
+
+/// `ex:price` rows: a=497.26 b=0.005 c=12.5 d=0.01 (doubles), e=7 (integer),
+/// f=0.5 (decimal). `ex:shipped` rows: a=2019-12-31 b=2020-06-15 c=2021-06-01
+/// d=2022-01-01. A conjoined FILTER that mixed a pushable bound with an
+/// `xsd:decimal` bound used to push the representable half and drop the rest;
+/// two temporal bounds on the same side used to keep whichever came first.
+async fn seed_ranges(fluree: &MemoryFluree, ledger_id: &str) -> fluree_db_api::TransactResult {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    let insert = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "xsd": "http://www.w3.org/2001/XMLSchema#"
+        },
+        "@graph": [
+            {"@id": "ex:a", "ex:price": {"@value": "4.972607E2", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2019-12-31", "@type": "xsd:date"}},
+            {"@id": "ex:b", "ex:price": {"@value": "0.005", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2020-06-15", "@type": "xsd:date"}},
+            {"@id": "ex:c", "ex:price": {"@value": "12.5", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2021-06-01", "@type": "xsd:date"}},
+            {"@id": "ex:d", "ex:price": {"@value": "1.0E-2", "@type": "xsd:double"},
+             "ex:shipped": {"@value": "2022-01-01", "@type": "xsd:date"}},
+            {"@id": "ex:e", "ex:price": 7},
+            {"@id": "ex:f", "ex:price": {"@value": "0.5", "@type": "xsd:decimal"}}
+        ]
+    });
+    fluree.insert(ledger0, &insert).await.unwrap()
+}
+
+async fn filtered_subjects(
+    fluree: &MemoryFluree,
+    ledger: &MemoryLedger,
+    predicate: &str,
+    filter: &str,
+) -> Vec<String> {
+    let query = format!(
+        r"
+        PREFIX ex: <http://example.org/>
+        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+        SELECT ?s WHERE {{ ?s {predicate} ?v . FILTER({filter}) }}
+        "
+    );
+    let result = support::query_sparql(fluree, ledger, &query)
+        .await
+        .unwrap_or_else(|e| panic!("FILTER({filter}): {e}"));
+    let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let mut subjects: Vec<String> = jsonld
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            row.as_array().expect("row")[0]
+                .as_str()
+                .expect("subject")
+                .trim_start_matches("ex:")
+                .to_string()
+        })
+        .collect();
+    subjects.sort();
+    subjects
+}
+
+const RANGE_FILTER_CASES: &[(&str, &str, &[&str])] = &[
+    // Baselines: a lone bound and same-type pairs already worked.
+    ("ex:price", "?v < 0.01", &["b"]),
+    ("ex:price", "?v >= 0.0 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v >= 0 && ?v < 1", &["b", "d", "f"]),
+    // Mixed pushable + decimal bound, either order and either side.
+    ("ex:price", "?v >= 0 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v < 0.01 && ?v >= 0", &["b"]),
+    ("ex:price", "?v >= 0e0 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v >= 1 && ?v <= 12.5", &["c", "e"]),
+    ("ex:price", "?v >= 0.5 && ?v < 20", &["c", "e", "f"]),
+    ("ex:price", "?v >= 0 && ?v < 1.0", &["b", "d", "f"]),
+    (
+        "ex:price",
+        "(?v >= 0) && (?v < 20.5)",
+        &["b", "c", "d", "e", "f"],
+    ),
+    (
+        "ex:price",
+        "?v >= 0 && ?v < 20.5 && ?v != 7",
+        &["b", "c", "d", "f"],
+    ),
+    // Two bounds on the same side: the tighter one must win, in either order.
+    ("ex:price", "?v < 5 && ?v < 0.01", &["b"]),
+    ("ex:price", "?v < 0.01 && ?v < 5", &["b"]),
+    ("ex:price", "?v > 0.5 && ?v > 0e0", &["a", "c", "e"]),
+    ("ex:price", "?v >= 0 && ?v > 100000000000000000000", &[]),
+    (
+        "ex:price",
+        "?v >= 0 && ?v < 100000000000000000000",
+        &["a", "b", "c", "d", "e", "f"],
+    ),
+    (
+        "ex:price",
+        "?v > -100000000000000000000",
+        &["a", "b", "c", "d", "e", "f"],
+    ),
+    // Contradictory across types: empty, not "everything".
+    ("ex:price", "?v > 1.5 && ?v < 1", &[]),
+    // A conjunct with no RangeValue at all (xsd:integer past i64) must keep the
+    // whole filter rather than push the representable half. Both directions, so
+    // a lane that drops every row cannot pass the `[]` case by accident.
+    (
+        "ex:price",
+        "?v >= 0 && ?v > \"100000000000000000000\"^^xsd:integer",
+        &[],
+    ),
+    (
+        "ex:price",
+        "?v >= 0 && ?v < \"100000000000000000000\"^^xsd:integer",
+        &["a", "b", "c", "d", "e", "f"],
+    ),
+    // Temporal: same-side pair keeps the tighter bound.
+    (
+        "ex:shipped",
+        "?v >= \"2020-01-01\"^^xsd:date && ?v >= \"2021-06-01\"^^xsd:date",
+        &["c", "d"],
+    ),
+    (
+        "ex:shipped",
+        "?v >= \"2021-06-01\"^^xsd:date && ?v >= \"2020-01-01\"^^xsd:date",
+        &["c", "d"],
+    ),
+    (
+        "ex:shipped",
+        "?v < \"2022-01-01\"^^xsd:date && ?v < \"2021-01-01\"^^xsd:date",
+        &["a", "b"],
+    ),
+    (
+        "ex:shipped",
+        "?v >= \"2020-01-01\"^^xsd:date && ?v < \"2021-06-01\"^^xsd:date",
+        &["b"],
+    ),
+];
+
+async fn assert_range_filter_cases(fluree: &MemoryFluree, ledger: &MemoryLedger, lane: &str) {
+    for (predicate, filter, expected) in RANGE_FILTER_CASES {
+        let expected: Vec<String> = expected.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            filtered_subjects(fluree, ledger, predicate, filter).await,
+            expected,
+            "[{lane}] FILTER({filter})"
+        );
+    }
+}
+
+/// An oversized `xsd:integer` reaches lowering from every expression surface
+/// the widened parser opened, not just FILTER: BIND, arithmetic, ORDER BY and
+/// aggregation each route through a different `LiteralValue` match.
+#[tokio::test]
+async fn sparql_big_integer_lowers_from_every_expression_surface() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ranges(&fluree, "bigint:main").await.ledger;
+    let big = "100000000000000000000";
+
+    for (label, query) in [
+        ("bind", format!("SELECT ?x WHERE {{ BIND({big} AS ?x) }}")),
+        (
+            "arithmetic",
+            format!("SELECT ?x WHERE {{ BIND({big} + 1 AS ?x) }}"),
+        ),
+        (
+            "negated",
+            format!("SELECT ?x WHERE {{ BIND(-{big} AS ?x) }}"),
+        ),
+        (
+            "order-by",
+            format!(
+                "SELECT ?s WHERE {{ ?s <http://example.org/price> ?v }} ORDER BY (?v + {big}) LIMIT 1"
+            ),
+        ),
+        (
+            "having",
+            format!(
+                "SELECT (COUNT(?s) AS ?n) WHERE {{ ?s <http://example.org/price> ?v }} HAVING (COUNT(?s) < {big})"
+            ),
+        ),
+    ] {
+        let result = support::query_sparql(&fluree, &ledger, &query)
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] {query}: {e}"));
+        let rows = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+        assert!(
+            !rows.as_array().expect("rows").is_empty(),
+            "[{label}] expected at least one row: {rows}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sparql_range_filter_keeps_every_conjunct_over_novelty() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_ranges(&fluree, "ranges:main").await.ledger;
+    assert_range_filter_cases(&fluree, &ledger, "novelty").await;
+}
+
+#[tokio::test]
+async fn sparql_range_filter_keeps_every_conjunct_over_index() {
+    use crate::support::{start_background_indexer_local, trigger_index_and_wait};
+
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "ranges/indexed:main";
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    local
+        .run_until(async move {
+            let commit_t = seed_ranges(&fluree, ledger_id).await.receipt.t;
+            trigger_index_and_wait(&handle, ledger_id, commit_t).await;
+            let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+            assert_eq!(
+                ledger.snapshot.t, commit_t,
+                "ledger must be indexed through the seed commit"
+            );
+            assert_range_filter_cases(&fluree, &ledger, "indexed").await;
+        })
+        .await;
 }

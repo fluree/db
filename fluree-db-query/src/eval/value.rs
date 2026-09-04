@@ -658,9 +658,23 @@ impl ComparableValue {
                 sid.namespace_code, sid.name
             )))),
             ComparableValue::Long(n) => Some(ComparableValue::String(Arc::from(n.to_string()))),
-            ComparableValue::Double(d) => Some(ComparableValue::String(Arc::from(d.to_string()))),
+            // STR() must return the literal's lexical form — the same W3C
+            // canonical form the RDF-lexical serializers emit for the same
+            // term (#1695; the serializer side was #1445). `f64::to_string()`
+            // gave "1" for 1.0 and "inf" for INF, so `STR(?d)` disagreed with
+            // the value printed two fields over in the same result set.
+            ComparableValue::Double(d) => Some(ComparableValue::String(Arc::from(
+                fluree_graph_ir::canonical_xsd_double(d),
+            ))),
+            // A `Float` here is a value computed in f32 (arithmetic, casts);
+            // its canonical form is the f32 one. A STORED float never takes
+            // this arm for STR(): `Float` cannot recover the full-precision
+            // stored f64 (`lit_to_comparable` narrows), so `eval_str` reads
+            // the f64 off the binding first (`stored_float_f64`) and renders
+            // the serializer's `canonical_xsd_double` — see #1776 for the
+            // variant-vs-datatype conflation underneath.
             ComparableValue::Float(f) => Some(ComparableValue::String(Arc::from(
-                super::cast::format_f32(f),
+                fluree_graph_ir::canonical_xsd_float(f),
             ))),
             ComparableValue::Bool(b) => Some(ComparableValue::String(Arc::from(b.to_string()))),
             ComparableValue::BigInt(n) => Some(ComparableValue::String(Arc::from(n.to_string()))),
@@ -680,7 +694,10 @@ impl ComparableValue {
             ComparableValue::TypedLiteral { val, .. } => match val {
                 FlakeValue::String(s) => Some(ComparableValue::String(Arc::from(s))),
                 FlakeValue::Long(n) => Some(ComparableValue::String(Arc::from(n.to_string()))),
-                FlakeValue::Double(d) => Some(ComparableValue::String(Arc::from(d.to_string()))),
+                // Same canonical form as the bare `Double` arm above (#1695).
+                FlakeValue::Double(d) => Some(ComparableValue::String(Arc::from(
+                    fluree_graph_ir::canonical_xsd_double(d),
+                ))),
                 FlakeValue::Boolean(b) => Some(ComparableValue::String(Arc::from(b.to_string()))),
                 _ => None,
             },
@@ -732,7 +749,21 @@ impl ComparableValue {
                 datatypes.xsd_double.clone(),
             )),
             // xsd:float renders its lexical form from the f32 (avoiding f64
-            // display artifacts) and carries the xsd:float datatype.
+            // display artifacts) and carries the xsd:float datatype. This
+            // CONSTRUCTS a float literal, so it keeps the cast-side rendering
+            // (`format_f32`) rather than STR()'s canonical form.
+            //
+            // DELIBERATE consequence: one float VALUE can spell two ways by
+            // provenance — a stored `"1.0E0"^^xsd:float` serializes
+            // canonically while `BIND(?f + 0 AS ?y)` mints `"1"^^xsd:float`.
+            // The minted term is internally consistent (the serializer,
+            // `STR()`, and `xsd:string()` of it all return this one string
+            // verbatim, the per-term invariant #1695 is about), and minting
+            // the canonical form instead would break the cast on the rebound
+            // term: `xsd:string(?y)` reads the stored lexical verbatim, and
+            // XPath requires `"1"`, not `"1.0E0"`. Cross-provenance
+            // canonicalization is the serializer-side variant-vs-datatype
+            // conflation, tracked in #1776.
             ComparableValue::Float(f) => Ok(Binding::lit(
                 FlakeValue::String(super::cast::format_f32(f)),
                 datatypes.xsd_float.clone(),
@@ -1533,6 +1564,50 @@ mod tests {
         let cv = ComparableValue::Long(42);
         let sv = cv.into_string_value();
         assert_eq!(sv, Some(ComparableValue::String(Arc::from("42"))));
+    }
+
+    /// #1695: STR()'s stringification of doubles/floats must be the W3C
+    /// canonical XSD lexical form — the exact routine the RDF-lexical
+    /// serializers use — never Rust `Display` ("1", "inf").
+    #[test]
+    fn test_into_string_value_double_float_canonical() {
+        let cases: &[(f64, &str)] = &[
+            (1.0, "1.0E0"),
+            (5.0, "5.0E0"),
+            (1_000_000.0, "1.0E6"),
+            (0.001, "1.0E-3"),
+            (-12.5, "-1.25E1"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "INF"),
+            (f64::NEG_INFINITY, "-INF"),
+        ];
+        for &(d, expected) in cases {
+            assert_eq!(
+                ComparableValue::Double(d).into_string_value(),
+                Some(ComparableValue::String(Arc::from(expected))),
+                "Double({d:?})"
+            );
+            // A double wrapped in a TypedLiteral takes the same form.
+            let tl = ComparableValue::TypedLiteral {
+                val: FlakeValue::Double(d),
+                dtc: None,
+            };
+            assert_eq!(
+                tl.into_string_value(),
+                Some(ComparableValue::String(Arc::from(expected))),
+                "TypedLiteral(Double({d:?}))"
+            );
+        }
+        // A stored xsd:float materializes as `Float`; its canonical form uses
+        // the f32 shortest-round-trip mantissa.
+        assert_eq!(
+            ComparableValue::Float(33.33).into_string_value(),
+            Some(ComparableValue::String(Arc::from("3.333E1")))
+        );
+        assert_eq!(
+            ComparableValue::Float(f32::NEG_INFINITY).into_string_value(),
+            Some(ComparableValue::String(Arc::from("-INF")))
+        );
     }
 
     #[test]

@@ -263,8 +263,8 @@ When multiple policy options are provided, they follow this precedence:
 When multiple policies match a flake, they are combined using **Deny Overrides**:
 
 1. If **any** matching policy explicitly denies (`f:allow: false`), access is **denied**
-2. If a targeted policy's `f:query` returns false, access is **denied** (doesn't fall through to Default policies)
-3. If any policy allows (`f:allow: true` or `f:query` returns true), access is **granted**
+2. If any targeted policy allows (`f:allow: true` or `f:query` returns true), access is **granted** — every targeted policy is evaluated, regardless of order
+3. If a targeted policy's `f:query` returns false and no other targeted policy allows, access is **denied** (doesn't fall through to Default policies)
 4. If no policies match and `default_allow` is `true` → access is **granted**
 5. Otherwise, access is **denied**
 
