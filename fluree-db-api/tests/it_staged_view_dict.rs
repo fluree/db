@@ -364,7 +364,7 @@ async fn post_state_policy_over_staged_view_translates_new_subjects() {
     // alone takes the overlay-only seek and never translates). The city is
     // one the indexed seed already holds: a join on a string the same
     // transaction introduces is denied on a staged view with or without a
-    // staged dictionary layer, which is a separate gap.
+    // staged dictionary layer, which is a separate gap (#1790).
     let policies = json!([
         {"@id": "ex:viewAll", "f:action": "f:view", "f:allow": true},
         {
