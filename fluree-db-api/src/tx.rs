@@ -1234,7 +1234,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
 
     // No shapes → nothing to validate, whether config enabled SHACL or the
     // shapes-exist heuristic applies. Skipping here keeps a shapeless
-    // transaction from paying the staged-dictionary clone below.
+    // transaction from paying for the staged dictionary layer below.
     if shacl_cache.is_empty() {
         return Ok(());
     }

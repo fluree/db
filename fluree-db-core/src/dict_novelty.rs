@@ -13,6 +13,19 @@
 //! 3. **Query** → read-only: `find_subject`, `resolve_subject`, watermark routing.
 //! 4. **Next index build** → discard and recreate with new watermarks.
 //!
+//! # Layers
+//!
+//! A read over uncommitted state (SHACL validation, a post-state policy
+//! condition, a staged preview) needs the committed dictionary plus the
+//! subjects and strings that transaction introduces. [`DictNovelty::layered_over`]
+//! builds that as an empty delta over a shared `Arc` of the committed
+//! dictionary: lookups probe the delta then fall through to the parent, the
+//! delta allocates from the parent's frontier so its ids never collide with
+//! the parent's, and the persisted watermarks are the parent's. Nothing is
+//! copied, whatever the parent's size, and the parent is never mutated. The
+//! layer's ids are view-local: commit re-derives its own from the canonical
+//! dictionary.
+//!
 //! # Key invariants
 //!
 //! - Reverse lookup keys use the same compressed encoding as the persisted
@@ -24,7 +37,9 @@
 //! - `initialized` must be true before any commit on a non-genesis ledger.
 //!   `ensure_initialized()` panics unconditionally (debug and release).
 
-use crate::ns_vec_bi_dict::NsVecBiDict;
+use std::sync::Arc;
+
+use crate::ns_vec_bi_dict::{lookup_key, NsVecBiDict};
 use crate::vec_bi_dict::VecBiDict;
 use crate::{Flake, FlakeValue};
 
@@ -113,13 +128,36 @@ impl DictNovelty {
         Self {
             subjects: SubjectDictNovelty {
                 inner: NsVecBiDict::with_watermarks(trimmed_wm, overflow_wm),
+                parent: None,
             },
             strings: StringDictNovelty {
                 inner: VecBiDict::new(string_wm + 1),
                 watermark: string_wm,
+                parent: None,
             },
             initialized: true,
         }
+    }
+
+    /// An empty delta over `parent` (see the module doc on layers).
+    pub fn layered_over(parent: Arc<DictNovelty>) -> Self {
+        Self {
+            subjects: SubjectDictNovelty {
+                inner: parent.subjects.inner.layer_above(),
+                parent: Some(Arc::clone(&parent)),
+            },
+            strings: StringDictNovelty {
+                inner: VecBiDict::new(parent.strings.inner.next_id()),
+                watermark: parent.strings.watermark,
+                parent: Some(Arc::clone(&parent)),
+            },
+            initialized: parent.initialized,
+        }
+    }
+
+    /// The dictionary this one is layered over, if any.
+    pub fn parent(&self) -> Option<&Arc<DictNovelty>> {
+        self.subjects.parent.as_ref()
     }
 
     /// Returns true if watermarks have been initialized.
@@ -195,56 +233,98 @@ impl Default for DictNovelty {
 /// Subject dictionary novelty: `(ns_code, suffix)` ↔ `sid64`.
 ///
 /// Backed by [`NsVecBiDict`]: Vec-indexed forward lookups (zero hashing),
-/// single-HashMap reverse lookups. Arc-shared string storage.
+/// single-HashMap reverse lookups. Arc-shared string storage. A layered
+/// dictionary (see [`DictNovelty::layered_over`]) probes its own entries
+/// first and falls through to `parent`.
 #[derive(Clone, Debug, Default)]
 pub struct SubjectDictNovelty {
     inner: NsVecBiDict,
+    parent: Option<Arc<DictNovelty>>,
 }
 
 impl SubjectDictNovelty {
     /// Look up or assign a sid64 for `(ns_code, suffix)`.
     ///
-    /// If already present, returns the existing sid64.
+    /// If already present here or in a parent, returns the existing sid64.
     /// Otherwise allocates a new sid64 with the next local_id for this
     /// namespace.
     pub fn assign_or_lookup(&mut self, ns_code: u16, suffix: &str) -> u64 {
-        self.inner.assign_or_lookup(ns_code, suffix)
+        let key = lookup_key(ns_code, suffix);
+        if let Some(id) = self.find_by_key(&key) {
+            return id;
+        }
+        self.inner.insert_new(ns_code, suffix, key)
     }
 
     /// Reverse lookup: find sid64 by `(ns_code, suffix)`.
     pub fn find_subject(&self, ns_code: u16, suffix: &str) -> Option<u64> {
-        self.inner.find_subject(ns_code, suffix)
+        self.find_by_key(&lookup_key(ns_code, suffix))
+    }
+
+    /// Reverse lookup through the layer chain with the key encoded once.
+    fn find_by_key(&self, key: &[u8]) -> Option<u64> {
+        let mut dict = self;
+        loop {
+            if let Some(id) = dict.inner.find_by_key(key) {
+                return Some(id);
+            }
+            dict = &dict.parent.as_ref()?.subjects;
+        }
     }
 
     /// Forward lookup: resolve sid64 → `(ns_code, &suffix)`.
     pub fn resolve_subject(&self, sid64: u64) -> Option<(u16, &str)> {
-        self.inner.resolve_subject(sid64)
+        let mut dict = self;
+        loop {
+            if let Some(hit) = dict.inner.resolve_subject(sid64) {
+                return Some(hit);
+            }
+            dict = &dict.parent.as_ref()?.subjects;
+        }
     }
 
     /// Get the watermark (max persisted local_id) for a namespace code.
     ///
-    /// Returns 0 for unknown/out-of-range namespace codes.
+    /// Returns 0 for unknown/out-of-range namespace codes. A layer answers
+    /// from its root: its own floor is the parent's allocation frontier, not
+    /// a persisted boundary.
     pub fn watermark_for_ns(&self, ns_code: u16) -> u64 {
-        self.inner.watermark_for_ns(ns_code)
+        self.root().inner.watermark_for_ns(ns_code)
     }
 
-    /// Number of entries in the novelty layer.
+    fn root(&self) -> &SubjectDictNovelty {
+        let mut dict = self;
+        while let Some(parent) = dict.parent.as_ref() {
+            dict = &parent.subjects;
+        }
+        dict
+    }
+
+    /// Number of entries in the novelty layer, parents included.
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.inner.len() + self.parent.as_ref().map_or(0, |p| p.subjects.len())
     }
 
-    /// True if no novel subjects have been registered.
+    /// True if no novel subjects have been registered here or in a parent.
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.len() == 0
     }
 
-    /// Iterate every novel `(ns_code, suffix)` entry.
+    /// Iterate every novel `(ns_code, suffix)` entry, parents first.
     ///
     /// Query-time overlay translation reverse-looks-up exactly these entries
     /// against the persisted subject dictionary; residency-mode loads
     /// prefetch the reverse-tree leaves they will touch.
-    pub fn iter_entries(&self) -> impl Iterator<Item = (u16, &str)> {
-        self.inner.iter_entries()
+    pub fn iter_entries(&self) -> Box<dyn Iterator<Item = (u16, &str)> + '_> {
+        match self.parent.as_ref() {
+            Some(parent) => Box::new(
+                parent
+                    .subjects
+                    .iter_entries()
+                    .chain(self.inner.iter_entries()),
+            ),
+            None => Box::new(self.inner.iter_entries()),
+        }
     }
 }
 
@@ -259,8 +339,10 @@ impl SubjectDictNovelty {
 #[derive(Clone, Debug)]
 pub struct StringDictNovelty {
     inner: VecBiDict<u32>,
-    /// Max persisted string_id from the last index build.
+    /// Max persisted string_id from the last index build (a layer copies
+    /// its parent's).
     watermark: u32,
+    parent: Option<Arc<DictNovelty>>,
 }
 
 impl Default for StringDictNovelty {
@@ -268,24 +350,40 @@ impl Default for StringDictNovelty {
         Self {
             inner: VecBiDict::new(1),
             watermark: 0,
+            parent: None,
         }
     }
 }
 
 impl StringDictNovelty {
-    /// Look up or assign a string_id for `value`.
+    /// Look up or assign a string_id for `value`, here or in a parent.
     pub fn assign_or_lookup(&mut self, value: &str) -> u32 {
+        if let Some(id) = self.find_string(value) {
+            return id;
+        }
         self.inner.assign_or_lookup(value)
     }
 
     /// Reverse lookup: find string_id by value.
     pub fn find_string(&self, value: &str) -> Option<u32> {
-        self.inner.find(value)
+        let mut dict = self;
+        loop {
+            if let Some(id) = dict.inner.find(value) {
+                return Some(id);
+            }
+            dict = &dict.parent.as_ref()?.strings;
+        }
     }
 
     /// Forward lookup: resolve string_id → value.
     pub fn resolve_string(&self, id: u32) -> Option<&str> {
-        self.inner.resolve(id)
+        let mut dict = self;
+        loop {
+            if let Some(value) = dict.inner.resolve(id) {
+                return Some(value);
+            }
+            dict = &dict.parent.as_ref()?.strings;
+        }
     }
 
     /// Get the watermark (max persisted string_id).
@@ -293,20 +391,24 @@ impl StringDictNovelty {
         self.watermark
     }
 
-    /// Iterate every novel string value. Mirror of
+    /// Iterate every novel string value, parents first. Mirror of
     /// [`SubjectDictNovelty::iter_entries`] for the string dictionary.
-    pub fn iter_values(&self) -> impl Iterator<Item = &str> {
-        self.inner.iter().map(|(_, s)| s)
+    pub fn iter_values(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        let own = self.inner.iter().map(|(_, s)| s);
+        match self.parent.as_ref() {
+            Some(parent) => Box::new(parent.strings.iter_values().chain(own)),
+            None => Box::new(own),
+        }
     }
 
-    /// Number of entries in the novelty layer.
+    /// Number of entries in the novelty layer, parents included.
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.inner.len() + self.parent.as_ref().map_or(0, |p| p.strings.len())
     }
 
-    /// True if no novel strings have been registered.
+    /// True if no novel strings have been registered here or in a parent.
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.len() == 0
     }
 }
 
@@ -563,6 +665,138 @@ mod tests {
         assert_eq!(dn.subjects.watermark_for_ns(0), 10);
         assert_eq!(dn.subjects.watermark_for_ns(1), 20);
         assert_eq!(dn.subjects.watermark_for_ns(NS_OVERFLOW), 0); // no overflow wm set
+    }
+
+    // -----------------------------------------------------------------------
+    // Layers
+    // -----------------------------------------------------------------------
+
+    fn committed_parent() -> Arc<DictNovelty> {
+        let mut dn = DictNovelty::with_watermarks(vec![0, 0, 100], 500);
+        dn.subjects.assign_or_lookup(2, "alice"); // 2:101
+        dn.subjects.assign_or_lookup(2, "bob"); // 2:102
+        dn.subjects.assign_or_lookup(NS_OVERFLOW, "http://full/iri"); // ovf:1
+        dn.strings.assign_or_lookup("hello"); // 501
+        Arc::new(dn)
+    }
+
+    #[test]
+    fn layer_copies_nothing_and_falls_through_to_its_parent() {
+        let parent = committed_parent();
+        let layer = DictNovelty::layered_over(Arc::clone(&parent));
+        assert!(Arc::ptr_eq(layer.parent().unwrap(), &parent));
+        // One `Arc` per sub-dictionary; nothing is copied.
+        assert_eq!(Arc::strong_count(&parent), 3);
+        assert!(layer.is_initialized());
+
+        let alice = parent.subjects.find_subject(2, "alice").unwrap();
+        assert_eq!(layer.subjects.find_subject(2, "alice"), Some(alice));
+        assert_eq!(layer.subjects.resolve_subject(alice), Some((2, "alice")));
+        assert_eq!(
+            layer.subjects.find_subject(NS_OVERFLOW, "http://full/iri"),
+            parent.subjects.find_subject(NS_OVERFLOW, "http://full/iri")
+        );
+        assert_eq!(layer.strings.find_string("hello"), Some(501));
+        assert_eq!(layer.strings.resolve_string(501), Some("hello"));
+        assert_eq!(layer.subjects.len(), parent.subjects.len());
+        assert_eq!(layer.strings.len(), parent.strings.len());
+        assert!(!layer.subjects.is_empty());
+    }
+
+    #[test]
+    fn layer_allocates_above_the_parent_and_never_re_mints_a_parent_entry() {
+        let parent = committed_parent();
+        let mut layer = DictNovelty::layered_over(Arc::clone(&parent));
+
+        // Known to the parent: same id, nothing minted.
+        let alice = parent.subjects.find_subject(2, "alice").unwrap();
+        assert_eq!(layer.subjects.assign_or_lookup(2, "alice"), alice);
+        assert_eq!(layer.strings.assign_or_lookup("hello"), 501);
+
+        // Novel: allocated from the parent's frontier.
+        let carol = layer.subjects.assign_or_lookup(2, "carol");
+        assert_eq!(SubjectId::from_u64(carol).local_id(), 103);
+        let ovf = layer
+            .subjects
+            .assign_or_lookup(NS_OVERFLOW, "http://other/iri");
+        assert_eq!(SubjectId::from_u64(ovf).local_id(), 2);
+        assert_eq!(layer.strings.assign_or_lookup("world"), 502);
+
+        // Resolvable through the layer, absent from the parent.
+        assert_eq!(layer.subjects.resolve_subject(carol), Some((2, "carol")));
+        assert_eq!(layer.strings.resolve_string(502), Some("world"));
+        assert_eq!(parent.subjects.find_subject(2, "carol"), None);
+        assert_eq!(parent.subjects.resolve_subject(carol), None);
+        assert_eq!(parent.strings.find_string("world"), None);
+        assert_eq!(parent.subjects.len(), 3);
+        assert_eq!(parent.strings.len(), 1);
+        assert_eq!(layer.subjects.len(), 5);
+        assert_eq!(layer.strings.len(), 2);
+    }
+
+    #[test]
+    fn layer_reports_persisted_watermarks_not_the_parent_frontier() {
+        let parent = committed_parent();
+        let mut layer = DictNovelty::layered_over(Arc::clone(&parent));
+        let carol = layer.subjects.assign_or_lookup(2, "carol");
+
+        // Persisted boundary, unchanged by either dictionary's allocations.
+        assert_eq!(layer.subjects.watermark_for_ns(2), 100);
+        assert_eq!(layer.subjects.watermark_for_ns(NS_OVERFLOW), 0);
+        assert_eq!(layer.strings.watermark(), 500);
+        // Everything above it, in either layer, classifies as novel.
+        assert!(SubjectId::from_u64(carol).local_id() > layer.subjects.watermark_for_ns(2));
+        let alice = parent.subjects.find_subject(2, "alice").unwrap();
+        assert!(SubjectId::from_u64(alice).local_id() > layer.subjects.watermark_for_ns(2));
+    }
+
+    #[test]
+    fn sibling_layers_allocate_independently_and_do_not_see_each_other() {
+        let parent = committed_parent();
+        let mut a = DictNovelty::layered_over(Arc::clone(&parent));
+        let mut b = DictNovelty::layered_over(Arc::clone(&parent));
+
+        let a_id = a.subjects.assign_or_lookup(2, "from-a");
+        let b_id = b.subjects.assign_or_lookup(2, "from-b");
+        assert_eq!(
+            a_id, b_id,
+            "view-local ids may coincide; they never reach a committed state"
+        );
+        assert_eq!(a.subjects.resolve_subject(a_id), Some((2, "from-a")));
+        assert_eq!(b.subjects.resolve_subject(b_id), Some((2, "from-b")));
+        assert_eq!(a.subjects.find_subject(2, "from-b"), None);
+        assert_eq!(b.subjects.find_subject(2, "from-a"), None);
+
+        // Dropping a layer (an aborted staging) leaves the parent as it was.
+        drop(a);
+        assert_eq!(
+            Arc::strong_count(&parent),
+            3,
+            "only b's two references remain"
+        );
+        assert_eq!(parent.subjects.len(), 3);
+        assert_eq!(parent.subjects.find_subject(2, "from-a"), None);
+    }
+
+    #[test]
+    fn layer_iteration_covers_parent_then_own_entries() {
+        let parent = committed_parent();
+        let mut layer = DictNovelty::layered_over(Arc::clone(&parent));
+        layer.subjects.assign_or_lookup(3, "new");
+        layer.strings.assign_or_lookup("world");
+
+        let subjects: Vec<(u16, &str)> = layer.subjects.iter_entries().collect();
+        assert_eq!(
+            subjects,
+            vec![
+                (2, "alice"),
+                (2, "bob"),
+                (NS_OVERFLOW, "http://full/iri"),
+                (3, "new")
+            ]
+        );
+        let strings: Vec<&str> = layer.strings.iter_values().collect();
+        assert_eq!(strings, vec!["hello", "world"]);
     }
 
     // -----------------------------------------------------------------------

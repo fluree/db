@@ -396,6 +396,92 @@ async fn preview_over_staged_transaction_translates_new_subjects() {
     );
 }
 
+/// The staged extension is a layer over the committed dictionary, not a
+/// copy of it: the cost of covering a transaction's own subjects is
+/// proportional to the staged flakes, however far the indexer trails the
+/// head, and the committed dictionary is never touched.
+#[tokio::test]
+async fn staged_dictionaries_layer_over_the_committed_dictionary() {
+    use fluree_db_api::GraphDb;
+    use fluree_db_query::BinaryRangeProvider;
+    use std::sync::Arc;
+
+    let _serial = serialize().await;
+    install_probe();
+    let (fluree, _dir) = new_fluree().await;
+    const LEDGER: &str = "staged-view-dict/layer:main";
+    let ledger = indexed_ledger(&fluree, LEDGER).await;
+    // One commit past the index, so the committed dictionary holds an entry
+    // the layer must find through its parent.
+    let ledger = fluree
+        .insert_with_opts(
+            ledger,
+            &person("ex:committed", Some("Committed")),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &quiet_index_cfg(),
+        )
+        .await
+        .expect("commit")
+        .ledger;
+    let canonical = Arc::clone(&ledger.dict_novelty);
+    let committed = ledger
+        .snapshot
+        .encode_iri("http://example.org/ns/committed")
+        .expect("known namespace");
+    let committed_id = canonical
+        .subjects
+        .find_subject(committed.namespace_code, &committed.name)
+        .expect("committed subject is in the canonical dictionary");
+
+    let staged = fluree
+        .stage_owned(ledger.clone())
+        .insert(&person("ex:staged", Some("Staged")))
+        .stage()
+        .await
+        .expect("stage");
+    let preview = GraphDb::from_staged(&staged).expect("preview view");
+    let provider = preview
+        .snapshot
+        .range_provider
+        .as_ref()
+        .expect("preview carries a range provider")
+        .as_any()
+        .downcast_ref::<BinaryRangeProvider>()
+        .expect("binary provider");
+    let layer = provider.dict_novelty();
+
+    let parent = layer.parent().expect("staged dictionary is a layer");
+    assert!(
+        Arc::ptr_eq(parent, &canonical),
+        "the layer shares the committed dictionary rather than copying it"
+    );
+    assert_eq!(
+        layer
+            .subjects
+            .find_subject(committed.namespace_code, &committed.name),
+        Some(committed_id),
+        "committed entries resolve through the parent"
+    );
+    let staged_subject = ledger
+        .snapshot
+        .encode_iri("http://example.org/ns/staged")
+        .expect("known namespace");
+    let staged_id = layer
+        .subjects
+        .find_subject(staged_subject.namespace_code, &staged_subject.name)
+        .expect("the staged subject is minted in the layer");
+    assert_ne!(staged_id, committed_id);
+    assert_eq!(
+        canonical
+            .subjects
+            .find_subject(staged_subject.namespace_code, &staged_subject.name),
+        None,
+        "the committed dictionary is untouched by staging"
+    );
+    assert!(canonical.parent().is_none());
+}
+
 /// The cross-query translation cache must never serve a product built over
 /// uncommitted state for the committed state. A discarded preview's novelty
 /// reports the very epoch and `to_t` the next commit will report, so an

@@ -9,11 +9,13 @@
 //! to raw-flake merging of the whole graph novelty.
 //!
 //! [`attach_staged_dicts`] gives a staged view a provider whose dictionaries
-//! are the base ones extended by the staged flakes. The extension is
-//! view-local: commit rebuilds the provider from the ledger's canonical
-//! dictionaries (see `commit_txn`), so the ids minted here never reach a
-//! committed state, and the staged view's own
-//! [`content_version`](fluree_db_core::OverlayProvider::content_version)
+//! are the base ones extended by the staged flakes: a
+//! [`DictNovelty::layered_over`] delta over a shared `Arc` of the committed
+//! dictionary, so the cost is proportional to the staged flakes however far
+//! the indexer trails the head. The extension is view-local: commit rebuilds
+//! the provider from the ledger's canonical dictionaries (see `commit_txn`),
+//! so the ids minted here never reach a committed state, and the staged
+//! view's own [`content_version`](fluree_db_core::OverlayProvider::content_version)
 //! keeps every cross-query translation cache from serving its products for
 //! the committed state.
 //!
@@ -68,11 +70,10 @@ impl StagedDicts {
 ///
 /// `None` when there is nothing to cover: no staged flakes, no binary
 /// provider on the base (genesis / overlay-only state — the range path there
-/// never translates), or an uninitialized dictionary. The base dictionaries
-/// are cloned and extended, persisted-first, so an id is minted only for
-/// entries in neither the persisted dictionary nor the committed novelty
-/// layer. Cost is one dictionary clone per call, against the per-probe
-/// whole-novelty re-translation it replaces.
+/// never translates), or an uninitialized dictionary. The extension is a
+/// layer over the base dictionary, populated persisted-first, so an id is
+/// minted only for entries in neither the persisted dictionary nor the
+/// committed novelty layer, and nothing of the base is copied.
 pub fn staged_dicts(base: &LedgerState, staged: &[Flake]) -> Result<Option<StagedDicts>> {
     if staged.is_empty() {
         return Ok(None);
@@ -84,7 +85,7 @@ pub fn staged_dicts(base: &LedgerState, staged: &[Flake]) -> Result<Option<Stage
         return Ok(None);
     }
     let store = Arc::clone(brp.store());
-    let mut dict_novelty: DictNovelty = (**brp.dict_novelty()).clone();
+    let mut dict_novelty = DictNovelty::layered_over(Arc::clone(brp.dict_novelty()));
     populate_dict_novelty_safe(&mut dict_novelty, Some(&store), staged.iter())
         .map_err(|e| TransactError::FlakeGeneration(format!("staged dict novelty layer: {e}")))?;
     let mut runtime_small_dicts = (**brp.runtime_small_dicts()).clone();
