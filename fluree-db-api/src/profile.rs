@@ -189,7 +189,9 @@ fn profile_value<'a>(
             // Exact numbers read as floats for the moments and quantiles.
             // The float hash folds an integral value onto the integer's
             // hash, so `7.00` and `7` still count once (see
-            // `fluree_db_stats::hash`).
+            // `fluree_db_stats::hash`). The cost is double precision:
+            // two decimals that round to the same `f64` count as one
+            // distinct value, and moments lose exactness past 2^53.
             scratch.push_str(&value.to_string());
             match scratch.parse::<f64>() {
                 Ok(f) => ProfileValue::Float(f),

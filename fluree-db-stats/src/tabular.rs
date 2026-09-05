@@ -10,8 +10,10 @@ use crate::profile::{ColumnProfile, ProfileValue};
 const MILLIS_PER_DAY: i64 = 86_400_000;
 
 /// The cell at `row` as the profiler sees it. Decimals read as floats
-/// (unscaled value over ten to the scale); dates and timestamps become
-/// epoch milliseconds; bytes hash on their content.
+/// (unscaled value over ten to the scale), so two decimals that round to
+/// the same `f64` count as one distinct value and moments lose exactness
+/// past 2^53; dates and timestamps become epoch milliseconds; bytes hash
+/// on their content.
 pub fn value_at(col: &Column, row: usize) -> ProfileValue<'_> {
     match col {
         Column::Boolean(v) => v[row].map_or(ProfileValue::Null, ProfileValue::Bool),

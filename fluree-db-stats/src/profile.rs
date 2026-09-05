@@ -322,6 +322,11 @@ impl ColumnProfile {
         self.non_null_count() > 0 && self.distinct_exact() == Some(1)
     }
 
+    /// Whether any numeric cell was a number rather than a point in time.
+    fn has_summable_kind(&self) -> bool {
+        self.kind_count(ValueKind::Int) > 0 || self.kind_count(ValueKind::Float) > 0
+    }
+
     /// The reportable summary.
     pub fn summary(&self) -> ColumnSummary {
         let non_null = self.non_null_count();
@@ -346,7 +351,10 @@ impl ColumnProfile {
             max: self.numeric.max().unwrap_or(0.0),
             mean: self.numeric.mean().and_then(finite),
             stddev: self.numeric.stddev().and_then(finite),
-            sum: finite(self.numeric.sum()),
+            sum: self
+                .has_summable_kind()
+                .then(|| self.numeric.sum())
+                .and_then(finite),
             p01: quantiles.quantile(0.01).and_then(finite),
             p05: quantiles.quantile(0.05).and_then(finite),
             p25: quantiles.quantile(0.25).and_then(finite),
@@ -435,8 +443,11 @@ pub struct NumericSummary {
     /// `None` when there are fewer than two values, or when the sum of
     /// squares overflowed.
     pub stddev: Option<f64>,
-    /// `None` when the running total overflowed: two cells at `1e308`
-    /// are enough, from wholly finite input.
+    /// `None` when the running total overflowed (two cells at `1e308`
+    /// are enough, from wholly finite input), and `None` for a column
+    /// whose only numeric kind is temporal: a total of epoch
+    /// milliseconds means nothing, while its mean, extremes and
+    /// quantiles are still dates.
     pub sum: Option<f64>,
     pub p01: Option<f64>,
     pub p05: Option<f64>,
@@ -640,6 +651,21 @@ mod tests {
         assert!((n.p50.unwrap() - 500.0).abs() < 10.0);
         assert_eq!(s.kinds.get(&ValueKind::Str), Some(&1));
         assert_eq!(s.kinds.get(&ValueKind::Float), Some(&1000));
+    }
+
+    #[test]
+    fn temporal_only_column_has_no_sum() {
+        let mut p = ColumnProfile::default();
+        p.observe(ProfileValue::Temporal(86_400_000));
+        p.observe(ProfileValue::Temporal(172_800_000));
+        let n = p.summary().numeric.unwrap();
+        assert_eq!(n.sum, None);
+        assert_eq!(n.mean, Some(129_600_000.0));
+        assert_eq!(n.max, 172_800_000.0);
+        assert!(n.p50.is_some());
+        // One number among the dates and the total is reported again.
+        p.observe(ProfileValue::Int(1));
+        assert_eq!(p.summary().numeric.unwrap().sum, Some(259_200_001.0));
     }
 
     #[test]
