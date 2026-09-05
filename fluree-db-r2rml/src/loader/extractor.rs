@@ -217,26 +217,73 @@ impl<'a> MappingExtractor<'a> {
         }
 
         // Extract rr:graph / rr:graphMap (subject-map-level named-graph routing).
-        subject_map.graph_map = self.extract_graph_map(&sm_triples);
+        subject_map.graph_map = self.extract_graph_map(&sm_triples)?;
 
         Ok(subject_map)
     }
 
     /// Extract a graph map from a term's triples: `rr:graph <iri>` (constant
     /// shortcut) or `rr:graphMap [ rr:template | rr:column | rr:constant ]`.
-    /// Returns `None` when neither is present (the triples land in the default
-    /// graph). A graph term is always an IRI, so there is no term-type to parse.
-    fn extract_graph_map(&self, triples: &[&Triple]) -> Option<GraphMap> {
+    /// `Ok(None)` means neither is present, so the triples land in the default
+    /// graph. A graph term is always an IRI, so there is no term-type to parse.
+    ///
+    /// **Support here is deliberately a subset of R2RML, and the constructs
+    /// outside it are refused rather than ignored.** Silently dropping a graph
+    /// map is the failure mode with data consequences: `materialize_graph_from_batch`
+    /// keys the accumulator on the resolved graph, so a dropped map leaves every
+    /// row in the default graph, and two partitions holding the same subject IRI
+    /// then collapse onto one key and overwrite each other per predicate. A
+    /// mapping that asks for routing and silently gets none is worse than one
+    /// told it cannot have it, so each case below returns an error naming the
+    /// construct it refused.
+    fn extract_graph_map(&self, triples: &[&Triple]) -> R2rmlResult<Option<GraphMap>> {
+        let graph_shortcuts = self.find_objects(triples, R2RML::GRAPH);
+        let graph_maps = self.find_objects(triples, R2RML::GRAPH_MAP);
+
+        // R2RML treats rr:graph and rr:graphMap as cumulative and repeatable — a
+        // term map may name several graphs and the triple goes into all of them.
+        // Exactly one is implemented, so anything asking for more has to fail
+        // rather than have all but the first silently discarded.
+        if graph_shortcuts.len() + graph_maps.len() > 1 {
+            return Err(R2rmlError::Unsupported(format!(
+                "multiple graph maps on one term map ({} rr:graph + {} rr:graphMap): \
+                 R2RML treats these as cumulative, but only a single graph per term \
+                 map is supported. Use one rr:graph or one rr:graphMap.",
+                graph_shortcuts.len(),
+                graph_maps.len()
+            )));
+        }
+
         // rr:graph <iri> — constant shortcut.
-        if let Some(graph_obj) = self.find_object_optional(triples, R2RML::GRAPH) {
-            if let Some(iri) = self.term_to_iri(&graph_obj) {
-                return Some(GraphMap::constant(iri));
+        if let Some(graph_obj) = graph_shortcuts.first() {
+            if let Some(iri) = self.term_to_iri(graph_obj) {
+                if iri == R2RML::DEFAULT_GRAPH {
+                    return Err(R2rmlError::Unsupported(
+                        "rr:graph rr:defaultGraph is not supported. It would be parsed as \
+                         an ordinary constant and mint a named graph called \
+                         'http://www.w3.org/ns/r2rml#defaultGraph'. Omit the graph map \
+                         entirely to target the default graph."
+                            .to_string(),
+                    ));
+                }
+                return Ok(Some(GraphMap::constant(iri)));
             }
         }
 
         // rr:graphMap [ ... ] — a term map producing the graph IRI.
-        let graph_map_obj = self.find_object_optional(triples, R2RML::GRAPH_MAP)?;
+        let Some(graph_map_obj) = graph_maps.into_iter().next() else {
+            return Ok(None);
+        };
         let gm_triples = self.get_triples_for_term(&graph_map_obj);
+        if let Some(constant_obj) = self.find_object_optional(&gm_triples, R2RML::CONSTANT) {
+            if self.term_to_iri(&constant_obj).as_deref() == Some(R2RML::DEFAULT_GRAPH) {
+                return Err(R2rmlError::Unsupported(
+                    "rr:graphMap [ rr:constant rr:defaultGraph ] is not supported. Omit the \
+                     graph map entirely to target the default graph."
+                        .to_string(),
+                ));
+            }
+        }
         let mut graph_map = GraphMap::default();
 
         if let Some(template_obj) = self.find_object_optional(&gm_triples, R2RML::TEMPLATE) {
@@ -256,12 +303,17 @@ impl<'a> MappingExtractor<'a> {
             }
         }
 
-        // A graphMap that parsed no usable value source is treated as absent.
+        // A graphMap that parsed no usable value source is a malformed mapping,
+        // not an absent one. Treating it as absent is exactly how routing
+        // silently degrades to the default graph.
         if graph_map.is_empty() {
-            None
-        } else {
-            Some(graph_map)
+            return Err(R2rmlError::Unsupported(
+                "rr:graphMap has no rr:template, rr:column or rr:constant, so it names no \
+                 graph. Omit it to target the default graph."
+                    .to_string(),
+            ));
         }
+        Ok(Some(graph_map))
     }
 
     /// Extract all predicate-object maps from a TriplesMap
@@ -282,6 +334,25 @@ impl<'a> MappingExtractor<'a> {
     /// Extract a single predicate-object map
     fn extract_predicate_object_map(&self, pom_term: &Term) -> R2rmlResult<PredicateObjectMap> {
         let pom_triples = self.get_triples_for_term(pom_term);
+
+        // R2RML also allows a graph map on a predicate-object map, scoping just
+        // that map's triples. `PredicateObjectMap` has no field for one and the
+        // materializer resolves the graph once per row from the SUBJECT map, so a
+        // POM-level graph map would be read and then ignored — the silent
+        // cross-partition collapse described on `extract_graph_map`. Refuse it by
+        // name; implementing it later can relax this without changing what the
+        // error means today.
+        if !self.find_objects(&pom_triples, R2RML::GRAPH).is_empty()
+            || !self.find_objects(&pom_triples, R2RML::GRAPH_MAP).is_empty()
+        {
+            return Err(R2rmlError::Unsupported(
+                "rr:graph / rr:graphMap on a predicate-object map is not supported. Only \
+                 subject-map-level graph maps are honored; a POM-level graph map would be \
+                 ignored and its triples would land in the subject's graph. Move the graph \
+                 map to the subject map."
+                    .to_string(),
+            ));
+        }
 
         // Extract predicate map
         let predicate_map = self.extract_predicate_map(&pom_triples)?;
@@ -664,6 +735,182 @@ mod tests {
             .expect("graph map parsed");
         assert_eq!(gm.constant.as_deref(), Some("http://example.org/g1"));
         assert!(gm.template.is_none() && gm.column.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Named-graph routing: what is refused, and why refusing beats ignoring.
+    //
+    // Each of these parsed successfully before, yielding `None` — a mapping that
+    // asked for routing, got none, and said nothing. Every assertion below names
+    // the construct in the message so the mapping author can find it.
+    // ------------------------------------------------------------------
+
+    /// Extract the message of an `Unsupported` error, or panic saying what came
+    /// back instead. Asserting on the message rather than just `is_err()` is what
+    /// stops one refusal standing in for another.
+    fn unsupported_message(r2rml: &str) -> String {
+        let graph = parse_r2rml(r2rml);
+        let extractor = MappingExtractor::new(&graph);
+        match extractor.extract_all() {
+            Err(R2rmlError::Unsupported(msg)) => msg,
+            Err(other) => panic!("expected Unsupported, got {other:?}"),
+            Ok(_) => panic!("this mapping must be refused, not silently accepted"),
+        }
+    }
+
+    #[test]
+    fn refuses_multiple_cumulative_graph_maps() {
+        // R2RML would put the triples in BOTH graphs. One graph is implemented,
+        // so accepting this would discard the second without saying so.
+        let msg = unsupported_message(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "t" ] ;
+                rr:subjectMap [
+                    rr:template "http://example.org/{id}" ;
+                    rr:graph ex:g1 ;
+                    rr:graph ex:g2
+                ] ;
+                rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "c" ] ] .
+        "#,
+        );
+        assert!(
+            msg.contains("multiple graph maps"),
+            "message must name the construct: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuses_rr_graph_default_graph() {
+        // As an ordinary constant this mints a named graph literally called
+        // 'http://www.w3.org/ns/r2rml#defaultGraph' — the opposite of what the
+        // mapping asked for, and silent.
+        let msg = unsupported_message(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "t" ] ;
+                rr:subjectMap [
+                    rr:template "http://example.org/{id}" ;
+                    rr:graph rr:defaultGraph
+                ] ;
+                rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "c" ] ] .
+        "#,
+        );
+        assert!(
+            msg.contains("rr:defaultGraph"),
+            "message must name the construct: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuses_graph_map_constant_default_graph() {
+        // The long form of the same mistake.
+        let msg = unsupported_message(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "t" ] ;
+                rr:subjectMap [
+                    rr:template "http://example.org/{id}" ;
+                    rr:graphMap [ rr:constant rr:defaultGraph ]
+                ] ;
+                rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "c" ] ] .
+        "#,
+        );
+        assert!(
+            msg.contains("rr:defaultGraph"),
+            "message must name the construct: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_graph_map_that_names_no_graph() {
+        // No template, column or constant: malformed, not absent. Treating it as
+        // absent is precisely how routing degrades to the default graph unseen.
+        let msg = unsupported_message(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "t" ] ;
+                rr:subjectMap [
+                    rr:template "http://example.org/{id}" ;
+                    rr:graphMap [ rr:termType rr:IRI ]
+                ] ;
+                rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "c" ] ] .
+        "#,
+        );
+        assert!(
+            msg.contains("no rr:template, rr:column or rr:constant"),
+            "message must say which value sources were missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_predicate_object_map_graph_map() {
+        // Valid R2RML that scopes just this map's triples. `PredicateObjectMap`
+        // has no field for it and the graph is resolved once per row from the
+        // subject map, so it would be read and ignored.
+        let msg = unsupported_message(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "t" ] ;
+                rr:subjectMap [ rr:template "http://example.org/{id}" ] ;
+                rr:predicateObjectMap [
+                    rr:predicate ex:p ;
+                    rr:objectMap [ rr:column "c" ] ;
+                    rr:graph ex:g1
+                ] .
+        "#,
+        );
+        assert!(
+            msg.contains("predicate-object map"),
+            "message must name the construct: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_single_subject_graph_map_is_still_accepted() {
+        // The refusals must not fire on the supported shape — this is the guard
+        // against over-rejecting, and it is the case the feature exists for.
+        let graph = parse_r2rml(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "t" ] ;
+                rr:subjectMap [
+                    rr:template "http://example.org/{id}" ;
+                    rr:graphMap [ rr:template "http://example.org/g/{tenant_id}" ]
+                ] ;
+                rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "c" ] ] .
+        "#,
+        );
+        let tms = MappingExtractor::new(&graph)
+            .extract_all()
+            .expect("a single subject-map graph map is supported");
+        let gm = tms[0]
+            .subject_map
+            .graph_map
+            .as_ref()
+            .expect("graph map parsed");
+        assert_eq!(
+            gm.template.as_deref(),
+            Some("http://example.org/g/{tenant_id}")
+        );
     }
 
     #[test]
