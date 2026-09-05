@@ -3419,6 +3419,18 @@ impl CountingProvider {
         }
     }
 
+    /// The EDW fixture's tables under another mapping over them.
+    fn edw_with_mapping(ttl: &str) -> Self {
+        let mut p = Self::edw();
+        p.mapping = Arc::new(
+            R2rmlLoader::from_turtle(ttl)
+                .expect("parse mapping")
+                .compile()
+                .expect("compile mapping"),
+        );
+        p
+    }
+
     /// Scan count per table name across the whole query.
     fn scan_counts(&self) -> HashMap<String, usize> {
         let mut counts: HashMap<String, usize> = HashMap::new();
@@ -3546,6 +3558,77 @@ async fn run_edw_guard(
     .expect("EDW guard query should execute");
     let rows = result.iter().fold(0, |acc, b| acc + b.len());
     (provider.scan_counts(), rows)
+}
+
+/// Two maps over `dw.store` minting the same subjects and `ex:name` alike
+/// but declaring different class sets. The alike-provider dedupe keeps one
+/// of them for `ex:name` (the graph holds the triple once), but a projected
+/// `?s a ?t` must still see both maps' classes: `{Store, Shop}`, whichever
+/// map the mapping's `HashMap` yields first.
+#[tokio::test]
+async fn projected_type_keeps_every_class_over_alike_maps() {
+    const TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<http://example.org/mapping#StoreA> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.store" ] ;
+    rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Store, ex:Shop ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "store_name" ] ] .
+
+<http://example.org/mapping#StoreB> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.store" ] ;
+    rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Store ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "store_name" ] ] .
+"#;
+    let provider = CountingProvider::edw_with_mapping(TTL);
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let t = vars.get_or_insert("?t");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+    let inner = vec![
+        type_triple(s, "http://example.org/Store"),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Iri(RDF_TYPE.into()),
+            Term::Var(t),
+        )),
+        Pattern::Triple(TriplePattern::new(Ref::Var(s), Ref::Var(p), Term::Var(o))),
+    ];
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner,
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    parsed.output = QueryOutput::select_all(vec![s, t]);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let batches = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("query should execute");
+    let mut types: std::collections::BTreeSet<String> = Default::default();
+    for b in &batches {
+        for r in 0..b.len() {
+            let ty = b.get(r, t).expect("?t column present");
+            types.insert(ty.get_iri().expect("?t is an IRI").to_string());
+        }
+    }
+    assert_eq!(
+        types.into_iter().collect::<Vec<_>>(),
+        vec![
+            "http://example.org/Shop".to_string(),
+            "http://example.org/Store".to_string()
+        ],
+        "a projected type must not depend on which alike map the dedupe keeps"
+    );
 }
 
 /// `?s a ex:Store ; ex:storeId ?id ; ex:name ?name` must scan ONLY dw.store,
