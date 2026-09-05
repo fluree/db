@@ -3029,10 +3029,12 @@ impl<'a> Lowerer<'a> {
                     _ => None,
                 }
             }
+            // An integer constant is exact in every dialect; a decimal or
+            // double one is typed per dialect (SQLite computes in floating
+            // point, Postgres reads `1E-1` as exact), so an expression over
+            // one stays in the engine.
             Expression::Const(c) => match literal_of(c, None)? {
-                (lit @ (Literal::Int(_) | Literal::Decimal { .. } | Literal::Double(_)), _) => {
-                    Some((Expr::Lit(lit), ExprKind::Num))
-                }
+                (lit @ Literal::Int(_), _) => Some((Expr::Lit(lit), ExprKind::Num)),
                 (lit @ Literal::Str(_), RdfClass::Str) => Some((Expr::Lit(lit), ExprKind::Str)),
                 _ => None,
             },
@@ -3916,9 +3918,10 @@ pub(crate) fn block_is_admissible(patterns: &[Pattern]) -> bool {
 /// A sub-select the lane embeds as a derived table: evaluated once (SPARQL's
 /// sub-`SELECT`, or a subquery without a `LIMIT` per-row seeding could
 /// change), its own block admissible with no nested subquery, grouped
-/// without `HAVING` or aggregate `BIND`s, and hiding no variable the
-/// enclosing block uses (a non-projected inner variable is invisible
-/// outside in SPARQL, which the join must not reconnect).
+/// without aggregate `BIND`s (a `HAVING` goes with it when the grouped
+/// lane can push it; the lowering declines one it cannot), and hiding no
+/// variable the enclosing block uses (a non-projected inner variable is
+/// invisible outside in SPARQL, which the join must not reconnect).
 fn subquery_is_admissible(sq: &SubqueryPattern, enclosing: &[Pattern]) -> bool {
     if !sq.pinned_vars.is_empty()
         || !sq.order_binds.is_empty()

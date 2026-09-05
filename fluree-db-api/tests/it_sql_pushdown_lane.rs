@@ -366,7 +366,10 @@ async fn shop() -> MockServer {
         .table(Table::new(
             "shop.pointers",
             &[("id", "bigint"), ("ref", "varchar")],
-            vec![vec![json!(1), json!("10")], vec![json!(2), json!("10-note")]],
+            vec![
+                vec![json!(1), json!("10")],
+                vec![json!(2), json!("10-note")],
+            ],
         ))
         .mount()
         .await
@@ -816,6 +819,17 @@ fn cases() -> Vec<Case> {
             sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) FILTER(?d > 50) }",
             sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND ("t0"."total" * 2) > 50"#],
             rows: &["o=http://example.org/order/10", "o=http://example.org/order/12"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            // A decimal constant is typed per dialect (SQLite would compute
+            // 99.50 * 0.1 in floating point and miss 9.95), so the
+            // expression stays a residual in the engine.
+            name: "an expression over a decimal constant stays in the engine",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t FILTER(?t * 0.1 = 9.95) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            rows: &["o=http://example.org/order/10"],
             routing: Routing::MustFire,
             declined: None,
         },
@@ -2254,6 +2268,44 @@ async fn key_sets_above_the_cap_chunk_or_stay_in_the_engine() {
     assert_eq!(sent.len(), 2, "2001 keys chunk into 2000 + 1: {sent:?}");
     assert!(sent[0].contains("(2000)") && !sent[0].contains("(2001)"));
     assert!(sent[1].contains("(VALUES (2001)) AS \"k\""), "{}", sent[1]);
+
+    // Branches of one UNION ALL statement each carry the key set, so two
+    // of them share the cap: 2001 keys go out as 1000 + 1000 + 1.
+    std::env::set_var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS", "0");
+    let union = format!(
+        "{PREFIX}SELECT ?c ?n FROM NAMED <shop-sql:main> WHERE {{ VALUES ?c {{ {values} }} GRAPH <shop-sql:main> {{ {{ ?c ex:name ?n }} UNION {{ ?c ex:country ?n }} }} }}"
+    );
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(&query(&fluree, &union).await);
+    let sent = block_statements(&server).await[before..].to_vec();
+    std::env::remove_var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS");
+    assert_eq!(
+        rows,
+        vec![
+            "c=http://example.org/customer/1 n=Ada",
+            "c=http://example.org/customer/1 n=UK",
+            "c=http://example.org/customer/2 n=Bo",
+            "c=http://example.org/customer/3 n=Cy",
+            "c=http://example.org/customer/3 n=US",
+        ]
+    );
+    assert_eq!(
+        sent.len(),
+        3,
+        "2001 keys chunk into 1000 + 1000 + 1: {sent:?}"
+    );
+    assert!(sent[0].contains("UNION ALL"), "{}", sent[0]);
+    assert!(
+        sent[0].contains("(1000)") && !sent[0].contains("(1001)"),
+        "{}",
+        sent[0]
+    );
+    assert!(
+        sent[1].contains("(2000)") && !sent[1].contains("(2001)"),
+        "{}",
+        sent[1]
+    );
+    assert!(sent[2].contains("(VALUES (2001)) AS \"k\""), "{}", sent[2]);
 
     let sparql = format!(
         "{PREFIX}SELECT ?c ?n FROM <shop-sql:main> WHERE {{ ?c ex:name ?n VALUES ?c {{ {values} }} }}"

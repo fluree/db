@@ -195,17 +195,28 @@ impl R2rmlPolicyGate {
     /// turns into a predicate on that column; a subject-targeted policy is
     /// decided per targeted subject ([`Verdict::BySubject`]) the same way.
     /// `None` when a verdict depends on the row beyond that (both at once,
-    /// or a map deriving classes the lane cannot key).
+    /// or a map deriving classes the lane cannot key), or when the policies
+    /// name more than `subject_cap` subjects: each costs an evaluation per
+    /// (map, predicate) here and a member of an `IN` list in the statement.
     pub(crate) async fn static_verdicts(
         &mut self,
         ctx: &ExecutionContext<'_>,
         mapping: &CompiledR2rmlMapping,
+        subject_cap: usize,
     ) -> Result<Option<HashMap<(String, String), Verdict>>> {
         let subjects = match (&self.policy_subjects, self.per_subject) {
             (Some(s), true) => s.clone(),
             (None, true) => return Ok(None),
             (_, false) => Vec::new(),
         };
+        if subjects.len() > subject_cap {
+            tracing::debug!(
+                subjects = subjects.len(),
+                subject_cap,
+                "sql pushdown: policy names more subjects than the key-set cap"
+            );
+            return Ok(None);
+        }
         let mut out = HashMap::new();
         for tm in mapping.triples_maps.values() {
             let by_class = self.needs_row_classes(tm);

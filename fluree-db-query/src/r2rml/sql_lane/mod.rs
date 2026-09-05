@@ -308,7 +308,10 @@ pub(super) async fn resolve_block(
     let graph_ctx = ctx.with_active_graph(Arc::clone(iri));
     let verdicts = match R2rmlPolicyGate::build(&graph_ctx, &mapping, iri) {
         None => None,
-        Some(mut gate) => match gate.static_verdicts(&graph_ctx, &mapping).await? {
+        Some(mut gate) => match gate
+            .static_verdicts(&graph_ctx, &mapping, caps.keyset_max_rows)
+            .await?
+        {
             Some(v) => Some(v),
             None => {
                 tracing::debug!(graph = %iri, "sql pushdown declined: policy is not static");
@@ -1059,6 +1062,7 @@ impl SqlBlockSource {
     fn keysets_for(
         &self,
         branch: usize,
+        copies: usize,
         child_batch: &Batch,
         ctx: &ExecutionContext<'_>,
     ) -> Vec<Option<KeySet>> {
@@ -1118,8 +1122,11 @@ impl SqlBlockSource {
         let width = rows[0].len();
         let columns: Vec<(String, Option<fluree_db_tabular::FieldType>)> =
             (0..width).map(|i| (format!("k{i}"), None)).collect();
-        let max_rows = self.resolved.caps.keyset_max_rows.max(1);
-        let byte_budget = self.resolved.caps.statement_max_bytes / 2;
+        // A grouped statement carries the key set once per branch, so the
+        // branches share the row cap and the byte budget.
+        let copies = copies.max(1);
+        let max_rows = (self.resolved.caps.keyset_max_rows / copies).max(1);
+        let byte_budget = self.resolved.caps.statement_max_bytes / 2 / copies;
         let mut chunks = Vec::new();
         let mut current: Vec<Vec<Literal>> = Vec::new();
         let mut bytes = 0usize;
@@ -1508,12 +1515,14 @@ impl Operator for SqlBlockSource {
                     // are the group's. A branch no outer row can match
                     // contributes nothing.
                     if self.grouped && seeded.len() > 1 {
-                        for ks in self.keysets_for(seeded[0], &child_batch, &graph_ctx) {
+                        for ks in
+                            self.keysets_for(seeded[0], seeded.len(), &child_batch, &graph_ctx)
+                        {
                             chunks.push_back((seeded.clone(), ks));
                         }
                     } else {
                         for branch in seeded {
-                            for ks in self.keysets_for(branch, &child_batch, &graph_ctx) {
+                            for ks in self.keysets_for(branch, 1, &child_batch, &graph_ctx) {
                                 chunks.push_back((vec![branch], ks));
                             }
                         }
