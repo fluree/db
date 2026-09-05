@@ -2796,6 +2796,8 @@ const SQLITE: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS people",
         "DROP TABLE IF EXISTS notes",
         "DROP TABLE IF EXISTS shipments",
+        "DROP TABLE IF EXISTS memos",
+        "DROP TABLE IF EXISTS pointers",
         "CREATE TABLE customers (id INTEGER, name TEXT, country TEXT)",
         "CREATE TABLE profiles (id INTEGER, email TEXT)",
         "CREATE TABLE people (id INTEGER, kind TEXT, name TEXT)",
@@ -2805,6 +2807,8 @@ const SQLITE: LiveBackend = LiveBackend {
         "CREATE TABLE events (id INTEGER, at_tz TIMESTAMP, at_local TIMESTAMP)",
         "CREATE TABLE notes (id INTEGER, order_ref TEXT, body TEXT)",
         "CREATE TABLE shipments (order_no INTEGER, carrier TEXT)",
+        "CREATE TABLE memos (id INTEGER, order_ref TEXT, body TEXT)",
+        "CREATE TABLE pointers (id INTEGER, ref TEXT)",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
         PEOPLE_ROWS,
@@ -2818,6 +2822,8 @@ const SQLITE: LiveBackend = LiveBackend {
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00', '2024-01-09 21:00:00')",
         "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
         "INSERT INTO shipments VALUES (10, 'UPS'), (12, 'DHL')",
+        "INSERT INTO memos VALUES (1, '10', 'gift wrap'), (2, '10-note', 'wrapped'), (3, '12', 'call first')",
+        "INSERT INTO pointers VALUES (1, '10'), (2, '10-note')",
     ],
     // SQLite's `NUMERIC` reaches the bridge as text or double, so a SUM/AVG
     // over it declines (its datatype is decimal).
@@ -2843,6 +2849,8 @@ const POSTGRES: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS people",
         "DROP TABLE IF EXISTS notes",
         "DROP TABLE IF EXISTS shipments",
+        "DROP TABLE IF EXISTS memos",
+        "DROP TABLE IF EXISTS pointers",
         "CREATE TABLE customers (id BIGINT, name TEXT, country TEXT)",
         "CREATE TABLE profiles (id BIGINT, email TEXT)",
         "CREATE TABLE people (id BIGINT, kind TEXT, name TEXT)",
@@ -2852,6 +2860,8 @@ const POSTGRES: LiveBackend = LiveBackend {
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMPTZ, at_local TIMESTAMP)",
         "CREATE TABLE notes (id BIGINT, order_ref TEXT, body TEXT)",
         "CREATE TABLE shipments (order_no BIGINT, carrier TEXT)",
+        "CREATE TABLE memos (id BIGINT, order_ref TEXT, body TEXT)",
+        "CREATE TABLE pointers (id BIGINT, ref TEXT)",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
         PEOPLE_ROWS,
@@ -2865,6 +2875,8 @@ const POSTGRES: LiveBackend = LiveBackend {
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00+00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00+00:00', '2024-01-09 21:00:00')",
         "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
         "INSERT INTO shipments VALUES (10, 'UPS'), (12, 'DHL')",
+        "INSERT INTO memos VALUES (1, '10', 'gift wrap'), (2, '10-note', 'wrapped'), (3, '12', 'call first')",
+        "INSERT INTO pointers VALUES (1, '10'), (2, '10-note')",
     ],
     declines: &[],
 };
@@ -2882,6 +2894,8 @@ const MYSQL: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS people",
         "DROP TABLE IF EXISTS notes",
         "DROP TABLE IF EXISTS shipments",
+        "DROP TABLE IF EXISTS memos",
+        "DROP TABLE IF EXISTS pointers",
         "CREATE TABLE customers (id BIGINT, name VARCHAR(64), country VARCHAR(64))",
         "CREATE TABLE profiles (id BIGINT, email VARCHAR(64))",
         "CREATE TABLE people (id BIGINT, kind VARCHAR(64), name VARCHAR(64))",
@@ -2891,6 +2905,8 @@ const MYSQL: LiveBackend = LiveBackend {
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMP NULL, at_local DATETIME)",
         "CREATE TABLE notes (id BIGINT, order_ref VARCHAR(64), body VARCHAR(64))",
         "CREATE TABLE shipments (order_no BIGINT, carrier VARCHAR(64))",
+        "CREATE TABLE memos (id BIGINT, order_ref VARCHAR(64), body VARCHAR(64))",
+        "CREATE TABLE pointers (id BIGINT, ref VARCHAR(64))",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
         PEOPLE_ROWS,
@@ -2904,6 +2920,8 @@ const MYSQL: LiveBackend = LiveBackend {
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00+00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00+00:00', '2024-01-09 21:00:00')",
         "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
         "INSERT INTO shipments VALUES (10, 'UPS'), (12, 'DHL')",
+        "INSERT INTO memos VALUES (1, '10', 'gift wrap'), (2, '10-note', 'wrapped'), (3, '12', 'call first')",
+        "INSERT INTO pointers VALUES (1, '10'), (2, '10-note')",
     ],
     declines: &[],
 };
@@ -3252,6 +3270,38 @@ fn live_cases() -> Vec<LiveCase> {
             ],
         },
         LiveCase {
+            // Outer rows past the key-set cap probe the block's size with a
+            // COUNT(*) over the fetch statement as a derived table under a
+            // LIMIT of the cache cap plus one; the block then comes back
+            // whole and every batch joins in memory. Every dialect here must
+            // accept a LIMIT inside a derived table.
+            name: "the block-size probe is bounded at the cache cap on every database",
+            sparql: Box::leak(
+                format!(
+                    "SELECT ?c ?n FROM NAMED <shop-live:main> WHERE {{ VALUES ?c {{ {} }} GRAPH <shop-live:main> {{ ?c ex:name ?n }} }}",
+                    (1..=2001)
+                        .map(|i| format!("<http://example.org/customer/{i}>"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+                .into_boxed_str(),
+            ),
+            rows: &[
+                "c=http://example.org/customer/1 n=Ada",
+                "c=http://example.org/customer/2 n=Bo",
+                "c=http://example.org/customer/3 n=Cy",
+            ],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("SELECT COUNT(*) AS \"n\" FROM (SELECT")),
+                (Sqlite, Sent::Contains("LIMIT 100001) AS \"p\"")),
+                (Postgres, Sent::Contains("SELECT COUNT(*) AS \"n\" FROM (SELECT")),
+                (Postgres, Sent::Contains("LIMIT 100001) AS \"p\"")),
+                (Mysql, Sent::Contains("SELECT COUNT(*) AS")),
+                (Mysql, Sent::Contains("LIMIT 100001) AS")),
+            ],
+        },
+        LiveCase {
             name: "MIN and MAX of one decimal column fold in the database",
             sparql: "SELECT (MIN(?t) AS ?lo) (MAX(?t) AS ?hi) FROM <shop-live:main> WHERE { ?o ex:total ?t }",
             rows: &["hi=99.500000 lo=5.000000"],
@@ -3379,12 +3429,18 @@ async fn live_differential(backend: &LiveBackend) {
         .create_sql_graph_source(partitioned)
         .await
         .expect("create live partitioned sql source");
-    let mut typed = SqlCreateConfig::new("shop-typed-live", url, typed_mapping(""));
+    let mut typed = SqlCreateConfig::new("shop-typed-live", url.clone(), typed_mapping(""));
     typed.dialect = backend.dialect;
     fluree
         .create_sql_graph_source(typed)
         .await
         .expect("create live typed sql source");
+    let mut memo = SqlCreateConfig::new("shop-memo-live", url, memo_mapping(""));
+    memo.dialect = backend.dialect;
+    fluree
+        .create_sql_graph_source(memo)
+        .await
+        .expect("create live memo sql source");
     seed_native_twin(&fluree).await;
 
     let mut failures: Vec<String> = Vec::new();
@@ -3392,7 +3448,8 @@ async fn live_differential(backend: &LiveBackend) {
         let sparql = format!("{PREFIX}{}", c.sparql)
             .replace("shop-sql:main", "shop-live:main")
             .replace("shop-vp:main", "shop-vp-live:main")
-            .replace("shop-typed:main", "shop-typed-live:main");
+            .replace("shop-typed:main", "shop-typed-live:main")
+            .replace("shop-memo:main", "shop-memo-live:main");
         let declines = backend.declines.contains(&c.name);
         // A sub-select the lane declines has no other lane here: the query
         // refuses (pinned in `sub_selects_the_lane_cannot_take_still_refuse`).
