@@ -192,7 +192,9 @@ impl TriplesMap {
     }
 
     /// The object map of the first predicate-object map naming `predicate`
-    /// as a constant.
+    /// as a constant — the one the projection path materializes under a
+    /// predicate filter (`columns_for_predicate`); a second map for the same
+    /// predicate is not read there either.
     pub fn object_map_for(&self, predicate: &str) -> Option<&super::term_map::ObjectMap> {
         self.predicate_object_maps
             .iter()
@@ -557,6 +559,53 @@ mod tests {
 
         let cols = extract_template_columns("{a}{b}{c}");
         assert_eq!(cols, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn mints_alike_needs_same_rows_subject_and_object_map() {
+        use super::super::{ObjectMap, PredicateMap, RefObjectMap};
+        const LABEL: &str = "http://example.org/label";
+        let pom = |om: ObjectMap| PredicateObjectMap {
+            predicate_map: PredicateMap::constant(LABEL),
+            object_map: om,
+        };
+        let base = || {
+            TriplesMap::new("<#A>", "customers")
+                .with_subject_template("http://example.org/customer/{id}")
+                .with_class("http://example.org/A")
+        };
+        let a = base().with_predicate_object(pom(ObjectMap::column("name")));
+
+        // Classes aside, the same rows, subject and object map.
+        let b = TriplesMap::new("<#B>", "customers")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_class("http://example.org/B")
+            .with_predicate_object(pom(ObjectMap::column("name")));
+        assert!(a.mints_alike(&b, LABEL));
+        assert!(b.mints_alike(&a, LABEL));
+
+        // Another column, a datatype, a template or a reference derive the
+        // value differently.
+        for om in [
+            ObjectMap::column("nickname"),
+            ObjectMap::column_typed("name", "http://www.w3.org/2001/XMLSchema#string"),
+            ObjectMap::template("{name}", vec!["name".into()]),
+            ObjectMap::RefObjectMap(RefObjectMap::new("<#Parent>", "name", "id")),
+        ] {
+            assert!(!a.mints_alike(&base().with_predicate_object(pom(om)), LABEL));
+        }
+        // Other rows or another subject.
+        let other_table = TriplesMap::new("<#C>", "profiles")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_predicate_object(pom(ObjectMap::column("name")));
+        assert!(!a.mints_alike(&other_table, LABEL));
+        let other_subject = base()
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(ObjectMap::column("name")));
+        assert!(!a.mints_alike(&other_subject, LABEL));
+        // A predicate one side lacks.
+        assert!(!a.mints_alike(&base(), LABEL));
+        assert!(!a.mints_alike(&b, "http://example.org/other"));
     }
 
     #[test]
