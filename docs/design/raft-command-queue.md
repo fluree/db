@@ -103,6 +103,15 @@ Apply receipts come in two flavors:
 
 The split keeps the log encoding small (the heavy receipt fields don't replicate) while still giving the proposing client the rich result on the happy path. Followers that forwarded the original request see the leader's full response; followers reading the head independently see the minimal version.
 
+### Waiting for the outcome
+
+The leader's `QueuedTransactor` parks on its waiter ticket in probe intervals (default 8 s; `EmbeddedRaftConfig::with_submit_wait`). A probe that fires is a check, not a verdict: while the entry is still in the replicated per-branch queue and the cluster has a leader, the submission is alive and the wait continues without spending a retry attempt. Only a probe that finds the entry gone, or the node leaderless, spends an attempt on the idempotent re-propose path. A ceiling on total parked time (default 10 minutes; `with_submit_max_wait`) backstops a worker that never finishes, and reports the outcome as unknown rather than failed, because the commit may still land.
+
+Two consequences of that shape:
+
+- The entry leaves the queue under the state lock, but the waiter resolves in the observer's effects, after the lock drops. A probe can see the entry gone a moment before the receipt lands, so a gone-entry probe waits a short grace on the ticket before spending an attempt.
+- The ceiling is longer than every other timeout on the path. The follower → leader forward middleware gives up after 60 s (`FORWARD_REQUEST_TIMEOUT` in `fluree-raft-core`), and the server binary applies no request timeout of its own, so a forwarded write whose stage outlasts 60 s returns a 504 at the follower while the leader commits it. Load balancers in front of the server usually sever idle requests sooner still. Aligning these is tracked in #1382.
+
 ## Log entry types
 
 `Command` variants are grouped by purpose:
