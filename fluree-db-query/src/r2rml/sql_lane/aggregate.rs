@@ -102,8 +102,15 @@ pub fn detect_sql_block_aggregate(query: &Query) -> Option<SqlAggregatePlan> {
         .chain(aggregates.iter().map(|(v, _)| *v))
         .collect();
     // An aggregate a HAVING lifted out is an output the projection drops.
+    // Nothing applies a DISTINCT over that narrower projection (the fast
+    // path returns before the generic tail's Project + Distinct), so one
+    // stays with the generic lane; over every output it is a no-op, the
+    // groups being distinct on their keys already.
     if let Some(projected) = query.output.projected_vars() {
         if projected.iter().any(|v| !outs.contains(v)) {
+            return None;
+        }
+        if query.output.is_distinct() && projected.len() != outs.len() {
             return None;
         }
     }
@@ -459,7 +466,7 @@ pub(super) fn group_plan(
     // The HAVING goes with the statement when every comparison in it is
     // over an output the database evaluates as the engine does; otherwise
     // the engine's HAVING keeps it, and no top-k can be pushed below it.
-    let having_pred = having.and_then(|h| lower_having(h, group_by, aggregates, &decodes));
+    let having_pred = having.and_then(|h| lower_having(h, group_by, aggregates, &decodes, lowered));
     let topk = if having.is_some() && having_pred.is_none() {
         None
     } else {
@@ -543,12 +550,15 @@ pub(super) fn group_plan(
 /// of comparisons between an aggregate output and a numeric constant.
 /// `COUNT`s and `SUM`s of exact numbers compare as in the engine; an
 /// `AVG` (divided in the engine), a `MIN`/`MAX` (a term, not a number the
-/// database holds natively) or a key does not.
+/// database holds natively) or a key does not. Nor does a `SUM` over a
+/// nullable member: a group NULL throughout sums to NULL, which no SQL
+/// comparison keeps, where SPARQL's empty sum is 0 and may.
 fn lower_having(
     expr: &Expression,
     group_by: &[VarId],
     aggregates: &[(VarId, AggregateFn)],
     decodes: &[Decode],
+    lowered: &Lowered,
 ) -> Option<Pred> {
     use crate::ir::expression::Function;
     let Expression::Call { func, args } = expr else {
@@ -566,33 +576,35 @@ fn lower_having(
                 avg: false,
                 kind: NumKind::Integer | NumKind::Decimal,
                 ..
-            } => sum.clone(),
+            } => {
+                let nullable = match &aggregates[i].1 {
+                    AggregateFn::Sum(v, _) => lowered.vars.get(v).is_none_or(|src| src.nullable),
+                    _ => true,
+                };
+                if nullable {
+                    return None;
+                }
+                sum.clone()
+            }
             _ => return None,
         };
         Some(Pred::OutputCmp { output, op, value })
     };
+    let lower = |a: &Expression| lower_having(a, group_by, aggregates, decodes, lowered);
     match func {
         Function::And => {
-            let parts: Option<Vec<Pred>> = args
-                .iter()
-                .map(|a| lower_having(a, group_by, aggregates, decodes))
-                .collect();
+            let parts: Option<Vec<Pred>> = args.iter().map(lower).collect();
             Some(Pred::And(parts?))
         }
         Function::Or => {
-            let parts: Option<Vec<Pred>> = args
-                .iter()
-                .map(|a| lower_having(a, group_by, aggregates, decodes))
-                .collect();
+            let parts: Option<Vec<Pred>> = args.iter().map(lower).collect();
             Some(Pred::Or(parts?))
         }
         Function::Not => {
             let [a] = args.as_slice() else {
                 return None;
             };
-            Some(Pred::Not(Box::new(lower_having(
-                a, group_by, aggregates, decodes,
-            )?)))
+            Some(Pred::Not(Box::new(lower(a)?)))
         }
         Function::Eq | Function::Ne | Function::Lt | Function::Le | Function::Gt | Function::Ge => {
             let (v, c, reversed) = match args.as_slice() {

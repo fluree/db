@@ -2367,6 +2367,36 @@ fn aggregate_cases() -> Vec<Case> {
             declined: None,
         },
         Case {
+            // SQL's SUM over a group NULL throughout is NULL, and no HAVING
+            // comparison keeps a NULL, where SPARQL's empty sum is 0 and
+            // `>= 0` does: the HAVING stays in the engine, above the
+            // grouped statement.
+            name: "HAVING over SUM of a nullable variable stays in the engine",
+            sparql: "SELECT ?c (SUM(?d) AS ?s) FROM <shop-sql:main> WHERE { ?o ex:customer ?c OPTIONAL { ?o ex:discount ?d } } GROUP BY ?c HAVING (SUM(?d) >= 0)",
+            sql: &[r#"SELECT "t1"."id" AS "c0", SUM("t0"."discount") AS "c1", COUNT("t0"."discount") AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            rows: &["c=http://example.org/customer/1 s=0"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "HAVING under NOT over SUM of a nullable variable stays in the engine",
+            sparql: "SELECT ?c (SUM(?d) AS ?s) FROM <shop-sql:main> WHERE { ?o ex:customer ?c OPTIONAL { ?o ex:discount ?d } } GROUP BY ?c HAVING (!(SUM(?d) < 0))",
+            sql: &[r#"SELECT "t1"."id" AS "c0", SUM("t0"."discount") AS "c1", COUNT("t0"."discount") AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            rows: &["c=http://example.org/customer/1 s=0"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            // The fast path returns before the generic tail applies the
+            // DISTINCT over a projection narrower than the outputs.
+            name: "SELECT DISTINCT over a narrower projection of a grouped statement declines",
+            sparql: "SELECT DISTINCT (COUNT(*) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:total ?t } GROUP BY ?o",
+            sql: &[],
+            rows: &["n=1"],
+            routing: Routing::MustNotFire,
+            declined: None,
+        },
+        Case {
             name: "an optional member counts only bound values",
             sparql: "SELECT (COUNT(?k) AS ?n) (COUNT(*) AS ?all) FROM <shop-sql:main> WHERE { ?c ex:name ?x OPTIONAL { ?c ex:country ?k } }",
             sql: &[r#"SELECT COUNT("t0"."country") AS "c0", COUNT(*) AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],

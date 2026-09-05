@@ -516,6 +516,11 @@ impl Having {
         Ok(match self {
             Having::Cmp(e, op, lit) => {
                 let (_, v) = e.eval_group(members, r, rels)?;
+                // A NULL aggregate (a SUM over no non-NULL value) compares
+                // UNKNOWN, which HAVING drops like the real databases do.
+                if v.is_null() {
+                    return Ok(false);
+                }
                 let o = cmp_values(&v, lit);
                 match op.as_str() {
                     "=" => o.is_eq(),
