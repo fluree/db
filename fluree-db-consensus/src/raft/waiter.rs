@@ -36,9 +36,9 @@
 //! entry leaving the replicated queue without a terminal apply this
 //! node observes (a snapshot install, a partition). The transactor
 //! parks on the ticket in probe intervals: a timeout that finds the
-//! entry still queued keeps waiting; one that finds it gone spends a
-//! retry attempt on an idempotency-keyed re-issue (see
-//! `QueuedTransactor`).
+//! entry still queued keeps waiting; one that finds it gone waits a
+//! short grace for the outcome, then spends a retry attempt on an
+//! idempotency-keyed re-issue (see `QueuedTransactor`).
 
 use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::state_machine::{PoisonReason, RefKey};

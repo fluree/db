@@ -69,6 +69,15 @@ const DEFAULT_MAX_RETRIES: usize = 3;
 /// costs is a still-progressing commit reported as a 504.
 const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(600);
 
+/// How long a probe that found its entry gone waits for the outcome
+/// before spending an attempt. The entry leaves the replicated queue
+/// under the state lock, but its terminal apply resolves the waiter in
+/// the observer's effects, after that lock drops — so a probe can read
+/// the queue in between and see the entry gone while the receipt is
+/// moments from landing. A genuinely stranded entry just times out
+/// again; the cost is paid only on that path.
+const GONE_ENTRY_GRACE: Duration = Duration::from_millis(250);
+
 /// Committer that routes transactions through the per-branch Raft
 /// queue.
 ///
@@ -235,7 +244,9 @@ impl QueuedTransactor {
                     // resolves when the new leader's worker finishes it.
                     // Displaced (a duplicate submission took the slot)
                     // and a timeout that finds the entry gone are handled
-                    // the same: retry if eligible, error otherwise.
+                    // the same: retry if eligible, error otherwise. A gone
+                    // entry first gets `GONE_ENTRY_GRACE` for its outcome
+                    // to land.
                     loop {
                         match ticket.wait(self.wait_timeout).await {
                             Ok(outcome) => return Ok(SubmissionOutcome::Waiter(outcome)),
@@ -244,7 +255,12 @@ impl QueuedTransactor {
                                 let alive = self.entry_alive(&ref_key, ticket.queue_id()).await;
                                 match probe_verdict(alive, parked_since.elapsed(), self.max_wait) {
                                     ProbeVerdict::KeepWaiting => continue,
-                                    ProbeVerdict::SpendAttempt => break,
+                                    ProbeVerdict::SpendAttempt => {
+                                        if let Ok(outcome) = ticket.wait(GONE_ENTRY_GRACE).await {
+                                            return Ok(SubmissionOutcome::Waiter(outcome));
+                                        }
+                                        break;
+                                    }
                                     ProbeVerdict::CeilingReached => {
                                         return Err(self.ceiling_error(retry_eligible));
                                     }

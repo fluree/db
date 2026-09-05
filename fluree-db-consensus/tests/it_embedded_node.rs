@@ -223,10 +223,16 @@ async fn stand_up(
 /// A transaction large enough that staging plus the Raft round trip
 /// always outlasts a probe interval measured in milliseconds.
 fn bulk_request(ledger_id: &str, nodes: usize) -> TransactionRequest {
+    bulk_request_round(ledger_id, nodes, 0)
+}
+
+/// [`bulk_request`] with subjects unique to `round`, so consecutive
+/// submissions to one ledger each assert new data.
+fn bulk_request_round(ledger_id: &str, nodes: usize, round: usize) -> TransactionRequest {
     let graph: Vec<serde_json::Value> = (0..nodes)
         .map(|i| {
             serde_json::json!({
-                "@id": format!("ex:item{i}"),
+                "@id": format!("ex:round{round}-item{i}"),
                 "@type": "ex:Item",
                 "ex:name": format!("Item {i}"),
                 "ex:rank": i as i64
@@ -311,4 +317,38 @@ async fn the_wait_ceiling_bounds_a_live_submission_and_reports_it_unknown() {
             .is_some_and(|record| record.commit_t >= 1)
     })
     .await;
+}
+
+/// The entry leaves the replicated queue under the state lock, but its
+/// terminal apply resolves the waiter only after that lock drops. A probe
+/// that reads in between sees the entry gone while the receipt is moments
+/// from landing, and must wait for that receipt rather than report the
+/// submission stranded. One submission at a 1 ms probe hits the window
+/// roughly one time in six; twenty in a row make missing it the exception.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_that_finds_the_entry_just_popped_still_returns_the_receipt() {
+    let (_integration, fluree, node, _dirs) = stand_up(13, |config| {
+        config.with_submit_wait(Duration::from_millis(1), 1)
+    })
+    .await;
+    fluree
+        .create_ledger("embedded/popped")
+        .await
+        .expect("create ledger");
+
+    let mut last_t = 0;
+    for round in 0..20 {
+        let receipt = node
+            .committer
+            .transact(bulk_request_round("embedded/popped:main", 200, round))
+            .await
+            .unwrap_or_else(|err| {
+                panic!("round {round}: a receipt landing right behind the probe must not be reported stranded: {err:?}")
+            });
+        assert!(
+            receipt.commit.t > last_t,
+            "round {round}: head must advance: {receipt:?}"
+        );
+        last_t = receipt.commit.t;
+    }
 }
