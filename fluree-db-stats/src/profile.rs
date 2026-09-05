@@ -170,7 +170,16 @@ pub struct ColumnProfile {
     config: ProfileConfig,
     count: u64,
     kinds: [u64; 9],
-    distinct: Hll4096,
+    /// Absent until the frequent-value table fills. Below that the
+    /// distinct count is exact from the counters and the sketch would
+    /// never be read; a grouped profile keeps one profile per group and
+    /// most groups never get there, so the 4 KB of registers is not
+    /// paid for them. Allocated the moment the table reaches capacity,
+    /// seeded with the counters' hashes while they are still all there,
+    /// and fed every hash from then on, so its registers are exactly
+    /// what an always-present sketch would hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    distinct: Option<Box<Hll4096>>,
     numeric: Moments,
     quantiles: TDigest,
     /// Length in characters of every text value.
@@ -200,7 +209,7 @@ impl ColumnProfile {
             config,
             count: 0,
             kinds: [0; 9],
-            distinct: Hll4096::new(),
+            distinct: None,
             numeric: Moments::new(),
             quantiles: TDigest::new(config.digest_compression),
             text_length: Moments::new(),
@@ -222,9 +231,15 @@ impl ColumnProfile {
         let Some(hash) = value_hash(&value) else {
             return;
         };
-        self.distinct.insert_hash(hash);
         let max_len = self.config.sample_max_len;
         self.frequent.observe(hash, || value.display(max_len));
+        match &mut self.distinct {
+            Some(hll) => hll.insert_hash(hash),
+            None if self.frequent.len() >= self.frequent.capacity() => {
+                self.distinct = Some(Box::new(sketch_of(self.frequent.hashes())));
+            }
+            None => {}
+        }
         if let Some(x) = value.as_f64() {
             if x.is_finite() {
                 self.numeric.add(x);
@@ -246,7 +261,25 @@ impl ColumnProfile {
 
     /// Fold another profile of the same column in.
     pub fn merge(&mut self, other: &ColumnProfile) {
-        self.distinct.merge(&other.distinct);
+        // The sketch must exist before the frequent-value merge trims,
+        // since a trimmed counter's hash is gone. Two exact tables that
+        // fit together stay exact and need none.
+        let could_trim = self.frequent.len() + other.frequent.len() > self.frequent.capacity();
+        if self.distinct.is_some() || other.distinct.is_some() || could_trim {
+            let mut hll = self
+                .distinct
+                .take()
+                .unwrap_or_else(|| Box::new(sketch_of(self.frequent.hashes())));
+            match &other.distinct {
+                Some(theirs) => hll.merge(theirs),
+                None => {
+                    for hash in other.frequent.hashes() {
+                        hll.insert_hash(hash);
+                    }
+                }
+            }
+            self.distinct = Some(hll);
+        }
         self.count += other.count;
         for (mine, theirs) in self.kinds.iter_mut().zip(&other.kinds) {
             *mine += theirs;
@@ -286,7 +319,14 @@ impl ColumnProfile {
     /// Estimated distinct non-null values.
     pub fn distinct_estimate(&self) -> u64 {
         self.distinct_exact()
-            .unwrap_or_else(|| self.distinct.estimate())
+            .or_else(|| self.distinct.as_ref().map(|h| h.estimate()))
+            .unwrap_or(0)
+    }
+
+    /// Whether the cardinality sketch has been allocated: only once the
+    /// frequent-value table has filled.
+    pub fn has_sketch(&self) -> bool {
+        self.distinct.is_some()
     }
 
     /// Exact distinct count, known only while the frequent-value sketch
@@ -341,6 +381,7 @@ impl ColumnProfile {
         } else {
             (distinct as f64 / non_null as f64).min(1.0)
         };
+        let distinct_error = Hll4096::typical_error();
         // One compression for the seven quantiles below: `quantile`
         // would otherwise clone and compress the digest on each call,
         // and a grouped profile summarises every group.
@@ -387,12 +428,12 @@ impl ColumnProfile {
             },
             distinct,
             distinct_is_exact: self.distinct_exact().is_some(),
-            distinct_error: self.distinct.relative_error(),
+            distinct_error,
             uniqueness,
             is_constant: self.is_constant(),
             key_candidate: self.count > 0
                 && self.null_count() == 0
-                && uniqueness >= 1.0 - 2.0 * self.distinct.relative_error(),
+                && uniqueness >= 1.0 - 2.0 * distinct_error,
             kinds,
             non_finite: self.non_finite,
             numeric,
@@ -470,6 +511,15 @@ pub struct TextSummary {
     pub max: Option<String>,
 }
 
+/// A fresh sketch over the given hashes.
+fn sketch_of(hashes: impl Iterator<Item = u64>) -> Hll4096 {
+    let mut hll = Hll4096::new();
+    for hash in hashes {
+        hll.insert_hash(hash);
+    }
+    hll
+}
+
 fn is_zero(n: &u64) -> bool {
     *n == 0
 }
@@ -501,7 +551,11 @@ pub struct ColumnSummary {
     /// `distinct / non-null`, capped at 1.
     pub uniqueness: f64,
     pub is_constant: bool,
-    /// No nulls and distinct within sketch error of the row count.
+    /// No nulls, and distinct within two sigma of the row count: the
+    /// sketch could not disprove a key. Not proof of one. A column with
+    /// fewer duplicates than twice `distinct_error` (about 3% at the
+    /// default sketch size) passes here; only an exact probe can
+    /// confirm it. Exact when `distinct_is_exact`.
     pub key_candidate: bool,
     pub kinds: BTreeMap<ValueKind, u64>,
     /// Numeric cells that were infinite or NaN. They are counted here
@@ -730,6 +784,82 @@ mod tests {
         other.observe(ProfileValue::Str("prefix-prefix-zzzz"));
         p.merge(&other);
         assert_eq!(p.max_text.as_deref(), Some("prefix-prefix-zzzz"));
+    }
+
+    #[test]
+    fn sketch_is_allocated_only_when_the_table_fills() {
+        let cap = ProfileConfig::default().top_capacity;
+        let mut p = ColumnProfile::default();
+        for i in 0..cap - 1 {
+            p.observe(ProfileValue::Int(i as i64));
+        }
+        assert!(!p.has_sketch());
+        assert_eq!(p.distinct_estimate(), (cap - 1) as u64);
+        p.observe(ProfileValue::Int((cap - 1) as i64));
+        assert!(
+            p.has_sketch(),
+            "allocated on the value that fills the table"
+        );
+        assert!(
+            p.summary().distinct_is_exact,
+            "and still exact until an eviction"
+        );
+    }
+
+    #[test]
+    fn lazy_sketch_matches_an_eager_one_register_for_register() {
+        // Every hash the profile has seen must be in the sketch, the
+        // first `capacity` by replay and the rest directly, so its
+        // registers equal a sketch that saw them all as they came.
+        let mut p = ColumnProfile::default();
+        let mut eager = Hll4096::new();
+        for i in 0..20_000 {
+            let s = format!("v{}", i % 7_000);
+            let v = ProfileValue::Str(&s);
+            p.observe(v);
+            eager.insert_hash(value_hash(&v).unwrap());
+        }
+        assert_eq!(p.distinct.as_deref(), Some(&eager));
+        assert_eq!(p.distinct_estimate(), eager.estimate());
+    }
+
+    #[test]
+    fn merge_allocates_a_sketch_only_when_the_union_could_trim() {
+        let profile_over = |lo: i64, hi: i64| {
+            let mut p = ColumnProfile::default();
+            for i in lo..hi {
+                p.observe(ProfileValue::Int(i));
+            }
+            p
+        };
+        // Two small exact tables that fit together: still exact, no sketch.
+        let mut a = profile_over(0, 20);
+        a.merge(&profile_over(10, 40));
+        assert!(!a.has_sketch());
+        assert_eq!(a.distinct_estimate(), 40);
+
+        // Two exact tables whose union overflows: the sketch is built
+        // from both counter sets before the trim, so no hash is lost.
+        let mut b = profile_over(0, 50);
+        b.merge(&profile_over(30, 100));
+        assert!(b.has_sketch());
+        let mut whole = Hll4096::new();
+        for i in 0..100 {
+            whole.insert_hash(value_hash(&ProfileValue::Int(i)).unwrap());
+        }
+        assert_eq!(b.distinct.as_deref(), Some(&whole));
+
+        // Sketch on one side, exact table on the other.
+        let mut c = profile_over(0, 5_000);
+        c.merge(&profile_over(4_990, 5_010));
+        let mut whole = Hll4096::new();
+        for i in 0..5_010 {
+            whole.insert_hash(value_hash(&ProfileValue::Int(i)).unwrap());
+        }
+        assert_eq!(c.distinct.as_deref(), Some(&whole));
+        let mut d = profile_over(4_990, 5_010);
+        d.merge(&profile_over(0, 5_000));
+        assert_eq!(d.distinct.as_deref(), Some(&whole));
     }
 
     #[test]

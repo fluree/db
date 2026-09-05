@@ -162,9 +162,16 @@ impl<const M: usize> Hll<M> {
         raw.round() as u64
     }
 
+    /// Typical relative standard error of this register count,
+    /// `1.04 / sqrt(M)`; a property of the type, so a caller can quote
+    /// it without holding a sketch.
+    pub fn typical_error() -> f64 {
+        1.04 / (M as f64).sqrt()
+    }
+
     /// Typical relative standard error, `1.04 / sqrt(M)`.
     pub fn relative_error(&self) -> f64 {
-        1.04 / (M as f64).sqrt()
+        Self::typical_error()
     }
 
     /// Whether nothing has been inserted.

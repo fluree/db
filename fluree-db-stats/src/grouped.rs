@@ -16,27 +16,25 @@ use crate::profile::{ColumnProfile, ColumnSummary, ProfileConfig, ProfileValue};
 
 /// Groups kept when a caller does not choose.
 ///
-/// A kept group is a whole [`ColumnProfile`] — its own HLL, t-digest and
-/// frequent-value sketch — which is on the order of a few kilobytes once
-/// it has seen values, and more for a group large enough to fill the
-/// digest. Ten thousand groups is therefore tens of megabytes per
-/// profiled column, and a caller profiling several columns pays it per
-/// column. Raise `max_groups` deliberately, against that arithmetic;
-/// keys beyond the cap are not lost, they pool into `overflow` and are
-/// counted.
+/// A kept group is a whole [`ColumnProfile`]: about a kilobyte while it
+/// holds a handful of values, growing to some twenty kilobytes once it
+/// has seen enough distinct values to allocate its cardinality sketch
+/// and enough values to fill its digest. Ten thousand small groups is
+/// therefore about ten megabytes per profiled column, ten thousand
+/// large ones two hundred, and a caller profiling several columns pays
+/// it per column. Raise `max_groups` deliberately, against that
+/// arithmetic; keys beyond the cap are not lost, they pool into
+/// `overflow` and are counted.
 pub const DEFAULT_MAX_GROUPS: usize = 10_000;
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct Group {
-    key: String,
-    profile: ColumnProfile,
-}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GroupedProfile {
     config: ProfileConfig,
     max_groups: usize,
-    groups: HashMap<u64, Group>,
+    /// Keyed on the key text itself, so two keys are the same group only
+    /// when they are the same string; the overflow sketch is the one
+    /// place a key is reduced to a hash.
+    groups: HashMap<String, ColumnProfile>,
     /// Everything observed under keys that arrived after the cap.
     overflow: ColumnProfile,
     /// Distinct keys that spilled into `overflow`.
@@ -81,24 +79,17 @@ impl GroupedProfile {
     /// Record one cell under `key`.
     pub fn observe(&mut self, key: &str, value: ProfileValue<'_>) {
         self.total.observe(value);
-        let h = group_hash(key);
-        if let Some(g) = self.groups.get_mut(&h) {
-            g.profile.observe(value);
+        if let Some(profile) = self.groups.get_mut(key) {
+            profile.observe(value);
             return;
         }
         if self.groups.len() < self.max_groups {
             let mut profile = ColumnProfile::new(self.config);
             profile.observe(value);
-            self.groups.insert(
-                h,
-                Group {
-                    key: key.to_string(),
-                    profile,
-                },
-            );
+            self.groups.insert(key.to_string(), profile);
             return;
         }
-        self.overflow_keys.insert_hash(h);
+        self.overflow_keys.insert_hash(group_hash(key));
         self.overflow.observe(value);
     }
 
@@ -109,25 +100,30 @@ impl GroupedProfile {
         self.ungrouped += other.ungrouped;
         self.overflow.merge(&other.overflow);
         self.overflow_keys.merge(&other.overflow_keys);
-        for (h, theirs) in &other.groups {
-            match self.groups.get_mut(h) {
-                Some(mine) => mine.profile.merge(&theirs.profile),
+        for (key, theirs) in &other.groups {
+            match self.groups.get_mut(key) {
+                Some(mine) => mine.merge(theirs),
                 None => {
-                    self.groups.insert(*h, theirs.clone());
+                    self.groups.insert(key.clone(), theirs.clone());
                 }
             }
         }
         if self.groups.len() > self.max_groups {
-            let mut by_size: Vec<(u64, u64)> = self
+            let mut by_size: Vec<(u64, &str)> = self
                 .groups
                 .iter()
-                .map(|(h, g)| (g.profile.count(), *h))
+                .map(|(key, p)| (p.count(), key.as_str()))
                 .collect();
             by_size.sort_unstable_by(|a, b| b.cmp(a));
-            for (_, h) in by_size.into_iter().skip(self.max_groups) {
-                if let Some(g) = self.groups.remove(&h) {
-                    self.overflow.merge(&g.profile);
-                    self.overflow_keys.insert_hash(h);
+            let spilled: Vec<String> = by_size
+                .into_iter()
+                .skip(self.max_groups)
+                .map(|(_, key)| key.to_string())
+                .collect();
+            for key in spilled {
+                if let Some(p) = self.groups.remove(&key) {
+                    self.overflow.merge(&p);
+                    self.overflow_keys.insert_hash(group_hash(&key));
                 }
             }
         }
@@ -140,12 +136,12 @@ impl GroupedProfile {
 
     /// The profile for one key, if it was kept.
     pub fn group(&self, key: &str) -> Option<&ColumnProfile> {
-        self.groups.get(&group_hash(key)).map(|g| &g.profile)
+        self.groups.get(key)
     }
 
     /// Every kept group as `(key, profile)`, in no particular order.
     pub fn groups(&self) -> impl Iterator<Item = (&str, &ColumnProfile)> {
-        self.groups.values().map(|g| (g.key.as_str(), &g.profile))
+        self.groups.iter().map(|(k, p)| (k.as_str(), p))
     }
 
     pub fn group_count(&self) -> usize {
@@ -170,10 +166,10 @@ impl GroupedProfile {
     pub fn summary(&self) -> GroupedSummary {
         let mut groups: Vec<GroupSummary> = self
             .groups
-            .values()
-            .map(|g| GroupSummary {
-                key: g.key.clone(),
-                summary: g.profile.summary(),
+            .iter()
+            .map(|(key, p)| GroupSummary {
+                key: key.clone(),
+                summary: p.summary(),
             })
             .collect();
         groups.sort_by(|a, b| {
@@ -247,6 +243,21 @@ mod tests {
         assert!((44..=50).contains(&est), "est={est}");
         let s = g.summary();
         assert_eq!(s.overflow_keys, Some(est));
+    }
+
+    #[test]
+    fn small_groups_carry_no_sketch() {
+        let mut g = GroupedProfile::default();
+        for i in 0..1_000 {
+            g.observe(&format!("k{i}"), ProfileValue::Int(i % 5));
+        }
+        assert!(g.groups().all(|(_, p)| !p.has_sketch()));
+        assert!(!g.total().has_sketch(), "five distinct values overall");
+        for i in 0..200 {
+            g.observe("wide", ProfileValue::Int(i));
+        }
+        assert!(g.group("wide").unwrap().has_sketch());
+        assert!(g.total().has_sketch());
     }
 
     #[test]

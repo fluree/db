@@ -165,6 +165,13 @@ impl HeavyHitters {
         out
     }
 
+    /// The hashes currently counted. While [`Self::is_exact`] this is
+    /// every distinct hash ever observed, which is what lets a profile
+    /// defer its cardinality sketch until the table fills.
+    pub fn hashes(&self) -> impl Iterator<Item = u64> + '_ {
+        self.counters.keys().copied()
+    }
+
     /// Lower-bound count for one value's hash; zero when not tracked.
     pub fn count_of(&self, hash: u64) -> u64 {
         self.counters.get(&hash).map_or(0, |c| c.count)
