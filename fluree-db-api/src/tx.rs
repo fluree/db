@@ -1232,8 +1232,10 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     };
     let shacl_cache = engine.shared_cache();
 
-    // No config + no shapes → skip (backward compat: shapes-exist heuristic).
-    if !has_config && shacl_cache.is_empty() {
+    // No shapes → nothing to validate, whether config enabled SHACL or the
+    // shapes-exist heuristic applies. Skipping here keeps a shapeless
+    // transaction from paying the staged-dictionary clone below.
+    if shacl_cache.is_empty() {
         return Ok(());
     }
 

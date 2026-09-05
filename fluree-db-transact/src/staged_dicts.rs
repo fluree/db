@@ -26,9 +26,10 @@
 use crate::error::{Result, TransactError};
 use fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe;
 use fluree_db_binary_index::BinaryIndexStore;
-use fluree_db_core::DictNovelty;
+use fluree_db_core::{DictNovelty, Flake, RuntimeSmallDicts};
 use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_query::BinaryRangeProvider;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 fn provider_of(state: &LedgerState) -> Option<&BinaryRangeProvider> {
@@ -39,43 +40,76 @@ fn provider_of(state: &LedgerState) -> Option<&BinaryRangeProvider> {
         .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
 }
 
+/// A base state's dictionaries extended, view-locally, by a set of staged
+/// flakes (see [`staged_dicts`]).
+pub struct StagedDicts {
+    pub store: Arc<BinaryIndexStore>,
+    pub dict_novelty: Arc<DictNovelty>,
+    pub runtime_small_dicts: Arc<RuntimeSmallDicts>,
+}
+
+impl StagedDicts {
+    /// A range provider over these dictionaries.
+    pub fn provider(
+        &self,
+        namespace_codes_fallback: Arc<HashMap<u16, String>>,
+    ) -> Arc<BinaryRangeProvider> {
+        Arc::new(BinaryRangeProvider::new(
+            Arc::clone(&self.store),
+            Arc::clone(&self.dict_novelty),
+            Arc::clone(&self.runtime_small_dicts),
+            Some(namespace_codes_fallback),
+        ))
+    }
+}
+
+/// Extend `base`'s dictionaries with the subjects and strings `staged`
+/// introduces.
+///
+/// `None` when there is nothing to cover: no staged flakes, no binary
+/// provider on the base (genesis / overlay-only state — the range path there
+/// never translates), or an uninitialized dictionary. The base dictionaries
+/// are cloned and extended, persisted-first, so an id is minted only for
+/// entries in neither the persisted dictionary nor the committed novelty
+/// layer. Cost is one dictionary clone per call, against the per-probe
+/// whole-novelty re-translation it replaces.
+pub fn staged_dicts(base: &LedgerState, staged: &[Flake]) -> Result<Option<StagedDicts>> {
+    if staged.is_empty() {
+        return Ok(None);
+    }
+    let Some(brp) = provider_of(base) else {
+        return Ok(None);
+    };
+    if !brp.dict_novelty().is_initialized() {
+        return Ok(None);
+    }
+    let store = Arc::clone(brp.store());
+    let mut dict_novelty: DictNovelty = (**brp.dict_novelty()).clone();
+    populate_dict_novelty_safe(&mut dict_novelty, Some(&store), staged.iter())
+        .map_err(|e| TransactError::FlakeGeneration(format!("staged dict novelty layer: {e}")))?;
+    let mut runtime_small_dicts = (**brp.runtime_small_dicts()).clone();
+    runtime_small_dicts.populate_from_flakes(staged);
+    Ok(Some(StagedDicts {
+        store,
+        dict_novelty: Arc::new(dict_novelty),
+        runtime_small_dicts: Arc::new(runtime_small_dicts),
+    }))
+}
+
 /// Attach a range provider whose dictionaries cover the staged flakes.
 ///
-/// No-op when the view has no staged flakes, no binary provider (genesis /
-/// overlay-only state — the range path there never translates), an
-/// uninitialized dictionary, or when it has already been attached. The base
-/// dictionaries are cloned and extended, persisted-first, so an id is minted
-/// only for entries in neither the persisted dictionary nor the committed
-/// novelty layer. Cost is one dictionary clone per transaction that actually
-/// reads its own staged state, against the per-probe whole-novelty
-/// re-translation it replaces.
+/// No-op when [`staged_dicts`] has nothing to cover or when it has already
+/// been attached. Runs only before a read of the staged view (SHACL
+/// validation, post-state policy conditions), so a transaction that never
+/// reads its own staged state pays nothing.
 pub fn attach_staged_dicts(view: &mut StagedLedger) -> Result<()> {
-    if view.dicts_cover_staged() || !view.has_staged() {
+    if view.dicts_cover_staged() {
         return Ok(());
     }
-    let provider = {
-        let base = view.base();
-        let Some(brp) = provider_of(base) else {
-            return Ok(());
-        };
-        if !brp.dict_novelty().is_initialized() {
-            return Ok(());
-        }
-        let store = Arc::clone(brp.store());
-        let mut dict_novelty: DictNovelty = (**brp.dict_novelty()).clone();
-        populate_dict_novelty_safe(&mut dict_novelty, Some(&store), view.staged_flakes().iter())
-            .map_err(|e| {
-                TransactError::FlakeGeneration(format!("staged dict novelty layer: {e}"))
-            })?;
-        let mut runtime_small_dicts = (**brp.runtime_small_dicts()).clone();
-        runtime_small_dicts.populate_from_flakes(view.staged_flakes());
-        Arc::new(BinaryRangeProvider::new(
-            store,
-            Arc::new(dict_novelty),
-            Arc::new(runtime_small_dicts),
-            Some(base.snapshot.shared_namespaces()),
-        ))
+    let Some(dicts) = staged_dicts(view.base(), view.staged_flakes())? else {
+        return Ok(());
     };
+    let provider = dicts.provider(view.base().snapshot.shared_namespaces());
     Arc::make_mut(&mut view.base_mut().snapshot).range_provider = Some(provider);
     view.set_dicts_cover_staged();
     Ok(())

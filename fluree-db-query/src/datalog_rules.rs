@@ -1974,6 +1974,10 @@ impl OverlayProvider for OverlayRef<'_> {
         self.0.epoch()
     }
 
+    fn content_version(&self) -> Option<u64> {
+        self.0.content_version()
+    }
+
     fn overlay_flake_count(&self, g_id: fluree_db_core::GraphId) -> Option<usize> {
         self.0.overlay_flake_count(g_id)
     }

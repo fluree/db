@@ -44,7 +44,9 @@ use std::sync::Arc;
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::flake::Flake;
 use fluree_db_core::ids::GraphId;
-use fluree_db_core::overlay::OverlayProvider;
+use fluree_db_core::overlay::{
+    compose_content_version, next_overlay_content_version, OverlayProvider,
+};
 use fluree_db_core::range::range_with_overlay;
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{
@@ -66,6 +68,11 @@ pub struct SchemaBundleFlakes {
     opst: Arc<[Flake]>,
     /// Stable identifier for cache composition with other overlays.
     epoch: u64,
+    /// Process-unique stamp drawn at construction (shared by clones); the
+    /// bundle is immutable, so it is also its
+    /// [`OverlayProvider::content_version`]. `epoch` is derived from the
+    /// flake count and cannot separate two bundles of the same size.
+    content_version: u64,
 }
 
 impl SchemaBundleFlakes {
@@ -77,6 +84,7 @@ impl SchemaBundleFlakes {
             post: Arc::from([]),
             opst: Arc::from([]),
             epoch: 0,
+            content_version: next_overlay_content_version(),
         }
     }
 
@@ -125,6 +133,7 @@ impl SchemaBundleFlakes {
             post: post.into(),
             opst: opst.into(),
             epoch,
+            content_version: next_overlay_content_version(),
         })
     }
 
@@ -141,6 +150,11 @@ impl SchemaBundleFlakes {
     /// Epoch value used for `OverlayProvider::epoch` composition.
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// Process-unique content stamp (see the field doc).
+    pub fn content_version(&self) -> u64 {
+        self.content_version
     }
 
     /// Return the projected flakes as a flat `Vec`, suitable for
@@ -334,6 +348,7 @@ where
         post: post.into(),
         opst: opst.into(),
         epoch,
+        content_version: next_overlay_content_version(),
     })
 }
 
@@ -345,6 +360,9 @@ pub struct SchemaBundleOverlay<'a> {
     base: &'a dyn OverlayProvider,
     bundle: Arc<SchemaBundleFlakes>,
     epoch: u64,
+    /// Composed content version (see [`compose_content_version`]); `None`
+    /// when the base cannot vouch for its own.
+    content_version: Option<u64>,
 }
 
 impl<'a> SchemaBundleOverlay<'a> {
@@ -354,10 +372,14 @@ impl<'a> SchemaBundleOverlay<'a> {
             .epoch()
             .wrapping_mul(1_000_003)
             .wrapping_add(bundle.epoch());
+        let content_version = base
+            .content_version()
+            .map(|b| compose_content_version(&[b, bundle.content_version()]));
         Self {
             base,
             bundle,
             epoch,
+            content_version,
         }
     }
 }
@@ -369,6 +391,10 @@ impl OverlayProvider for SchemaBundleOverlay<'_> {
 
     fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    fn content_version(&self) -> Option<u64> {
+        self.content_version
     }
 
     fn for_each_overlay_flake(
@@ -453,6 +479,28 @@ mod tests {
             count += 1;
         });
         assert_eq!(count, 0);
+    }
+
+    /// Same (base, bundle) pair → one stable version across constructions;
+    /// a different bundle of the same size → a different version (the
+    /// length-derived epoch cannot tell those apart).
+    #[test]
+    fn content_version_is_stable_per_pair_and_separates_equal_sized_bundles() {
+        let base = NoOverlay;
+        let bundle = Arc::new(SchemaBundleFlakes::empty());
+        let first = SchemaBundleOverlay::new(&base, bundle.clone())
+            .content_version()
+            .expect("NoOverlay vouches");
+        assert_eq!(
+            SchemaBundleOverlay::new(&base, bundle.clone()).content_version(),
+            Some(first)
+        );
+        let same_size = Arc::new(SchemaBundleFlakes::empty());
+        assert_eq!(same_size.epoch(), bundle.epoch());
+        assert_ne!(
+            SchemaBundleOverlay::new(&base, same_size).content_version(),
+            Some(first)
+        );
     }
 
     #[test]

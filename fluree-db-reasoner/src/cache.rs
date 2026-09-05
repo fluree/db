@@ -25,8 +25,13 @@ pub struct ReasoningCacheKey {
     pub db_epoch: u64,
     /// Query "as-of" time (historical query support)
     pub to_t: i64,
-    /// Novelty/staged overlay epoch for execute_with_overlay_*
-    pub overlay_epoch: u64,
+    /// The overlay's process-unique content stamp
+    /// ([`OverlayProvider::content_version`](fluree_db_core::OverlayProvider::content_version)),
+    /// never its epoch: a staged preview reports the very epoch the committed
+    /// novelty reports once those flakes commit, at the same `to_t`, so an
+    /// epoch key would serve the preview's materialization for the committed
+    /// state. Overlays that cannot vouch for a version are not cached.
+    pub overlay_version: u64,
     /// Schema version that affects rules
     pub ontology_epoch: u64,
     /// Hash of rule-specific options
@@ -42,7 +47,7 @@ impl Hash for ReasoningCacheKey {
         self.ledger_id.hash(state);
         self.db_epoch.hash(state);
         self.to_t.hash(state);
-        self.overlay_epoch.hash(state);
+        self.overlay_version.hash(state);
         self.ontology_epoch.hash(state);
         self.rule_config_hash.hash(state);
     }
@@ -53,7 +58,7 @@ impl PartialEq for ReasoningCacheKey {
         self.ledger_id == other.ledger_id
             && self.db_epoch == other.db_epoch
             && self.to_t == other.to_t
-            && self.overlay_epoch == other.overlay_epoch
+            && self.overlay_version == other.overlay_version
             && self.ontology_epoch == other.ontology_epoch
             && self.rule_config_hash == other.rule_config_hash
     }
@@ -280,7 +285,7 @@ mod tests {
             ledger_id: alias.into(),
             db_epoch: epoch,
             to_t: 0,
-            overlay_epoch: 0,
+            overlay_version: 0,
             ontology_epoch: 0,
             rule_config_hash: 0,
         }
