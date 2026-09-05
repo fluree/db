@@ -148,7 +148,7 @@ See the [R2RML documentation](../graph-sources/r2rml.md) for details.
 - Serverless deployments — every scan is a stateless HTTP request
 
 **Key Features:**
-- Typed filter pushdown and exact `COUNT` per table; joins in the engine
+- One SQL statement per graph block where its shape allows (joins, `OPTIONAL`, `VALUES`, `UNION`, grouping, sub-selects); typed filter pushdown and exact `COUNT` per table otherwise
 - `rr:sqlQuery` logical tables
 - Reads the current table state (no snapshots or time travel)
 

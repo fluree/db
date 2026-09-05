@@ -10,8 +10,10 @@ long-running server and from a Lambda.
 ## Where the SQL runs
 
 Fluree does not talk to Postgres, MySQL, Snowflake or Oracle directly. It sends
-one `POST /v1/statement` per table scan to an endpoint and pages through the
-result. Anything that implements that protocol works:
+one `POST /v1/statement` per statement to an endpoint — one per graph block
+where the [pushdown lane](#the-pushdown-lane-one-statement-per-block) takes
+the block, one per table scan otherwise — and pages through the result.
+Anything that implements that protocol works:
 
 | Endpoint | When to use it |
 |----------|----------------|
@@ -146,10 +148,13 @@ empty — the same dataset rule that applies to Iceberg sources.
 
 ### What is pushed to SQL
 
-The query engine asks the source for **one table at a time** — a projection,
+Two lanes read a SQL source. The pushdown lane (next section) compiles a
+whole graph block into one statement when the block's shape allows, and is
+the default. Where it declines, the per-scan lane below answers: the query
+engine asks the source for **one table at a time** — a projection,
 conjunctive filters, and nothing else — and does joins, `OPTIONAL`, `UNION`,
-property paths and aggregation itself over the returned rows. So each triples
-map touched by a query becomes one statement of the shape:
+property paths and aggregation itself over the returned rows. Each triples
+map touched by a query then becomes one statement of the shape:
 
 ```sql
 SELECT "id", "customer_id", "total" FROM "sales"."orders" WHERE "total" > 1E2
@@ -245,9 +250,9 @@ pushable. In that statement:
   shared columns, each row tagged with its branch so its terms decode
   through that branch's maps. The rest of the block joins the union once.
   Two maps minting a triple alike (the same table, subject template and
-  object map) count as one provider, since the graph holds the triple
-  once; maps deriving the same value differently still come back once
-  each. Filters and a top-k on a union variable push on the union's
+  object map) count as one provider in both lanes, since the graph holds
+  the triple once; maps deriving the same value differently still come
+  back once each. Filters and a top-k on a union variable push on the union's
   columns; a variable keeps its key shape (so it can be seeded or joined)
   only where every branch agrees on it. A foreign key into a union entity
   joins the parent's columns, which every branch exposes: a branch on the
