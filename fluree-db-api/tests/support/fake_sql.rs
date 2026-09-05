@@ -135,6 +135,46 @@ impl FakeSql {
                 after[cend + 1..].trim_start(),
             ));
         }
+        // A nested statement the lane built, unless it is a registered
+        // `rr:sqlQuery` (resolved as a table below).
+        if s.starts_with("(SELECT ")
+            && matching_paren(s).is_some_and(|end| self.table_for_source(&s[..=end]).is_none())
+        {
+            let end = matching_paren(s).ok_or("unbalanced derived table")?;
+            // A `UNION ALL` of statements: the first branch's columns, every
+            // branch's rows.
+            let mut branches = split_top(&s[1..end], " UNION ALL ").into_iter();
+            let (mut columns, mut rows) =
+                self.eval(branches.next().ok_or("empty derived table")?)?;
+            for b in branches {
+                let (cols, more) = self.eval(b)?;
+                if cols.len() != columns.len() {
+                    return Err("UNION ALL branches project different column counts".into());
+                }
+                // A NULL padding takes the type of a branch projecting a
+                // value there.
+                for (slot, (_, ty)) in columns.iter_mut().zip(cols) {
+                    if slot.1 == "unknown" {
+                        slot.1 = ty;
+                    }
+                }
+                rows.extend(more);
+            }
+            let after = s[end + 1..].trim_start();
+            let after = after
+                .strip_prefix("AS ")
+                .ok_or("derived table without alias")?;
+            let sp = after.find(' ').unwrap_or(after.len());
+            let alias = after[..sp].replace('"', "");
+            return Ok((
+                Rel {
+                    alias,
+                    columns,
+                    rows,
+                },
+                after[sp..].trim_start(),
+            ));
+        }
         let (item, rest) = if s.starts_with('(') {
             let end = matching_paren(s).ok_or("unbalanced derived table")?;
             (&s[..=end], s[end + 1..].trim_start())
@@ -223,8 +263,8 @@ impl FakeSql {
 
         let mut where_text = None;
         let mut group_by: Option<Vec<Col>> = None;
-        let mut having_min_count: Option<usize> = None;
-        let mut order: Vec<(Col, bool)> = Vec::new();
+        let mut having: Option<Having> = None;
+        let mut order: Vec<(SortKey, bool)> = Vec::new();
         let mut limit = None;
         if let Some(r) = rest.strip_prefix("WHERE ") {
             let (w, tail) = cut_clause(r);
@@ -236,16 +276,21 @@ impl FakeSql {
             group_by = Some(split_top(g, ", ").into_iter().map(colref).collect());
             rest = tail;
         }
-        if let Some(r) = rest.strip_prefix("HAVING COUNT(*) > ") {
+        if let Some(r) = rest.strip_prefix("HAVING ") {
             let (h, tail) = cut_clause(r);
-            having_min_count = Some(h.trim().parse::<usize>().map_err(|e| e.to_string())? + 1);
+            having = Some(parse_having(h)?);
             rest = tail;
         }
         if let Some(r) = rest.strip_prefix("ORDER BY ") {
             let (o, tail) = cut_clause(r);
             for key in split_top(o, ", ") {
                 let (c, dir) = key.rsplit_once(' ').ok_or("ORDER BY without direction")?;
-                order.push((colref(c), dir == "ASC"));
+                let key = if c.trim().starts_with('(') {
+                    SortKey::Expr(parse_expr(c)?)
+                } else {
+                    SortKey::Col(colref(c))
+                };
+                order.push((key, dir == "ASC"));
             }
             rest = tail;
         }
@@ -267,25 +312,33 @@ impl FakeSql {
         // a key list naming an output happens after, over the projection.
         let mut order_output: Vec<(Col, bool)> = Vec::new();
         if !order.is_empty() {
-            let resolved: Vec<_> = order
-                .iter()
-                .map(|(c, asc)| (c, resolver.resolve(c), *asc))
-                .collect();
-            if let Some((_, Err(e), _)) = resolved
-                .iter()
-                .find(|(c, r, _)| c.0.is_some() && r.is_err())
-            {
-                return Err(e.clone());
+            // An expression key always reads the tuple; a column key that
+            // resolves does too.
+            enum Key {
+                Cell(usize, usize),
+                Expr(Expr),
             }
-            if resolved.iter().all(|(_, r, _)| r.is_ok()) {
-                let keys: Vec<((usize, usize), bool)> = resolved
-                    .into_iter()
-                    .map(|(_, r, asc)| (r.unwrap(), asc))
-                    .collect();
+            let mut keys: Vec<(Key, bool)> = Vec::new();
+            let mut by_output = false;
+            for (k, asc) in &order {
+                match k {
+                    SortKey::Expr(e) => keys.push((Key::Expr(e.clone()), *asc)),
+                    SortKey::Col(c) => match resolver.resolve(c) {
+                        Ok((ri, ci)) => keys.push((Key::Cell(ri, ci), *asc)),
+                        Err(e) if c.0.is_some() => return Err(e),
+                        Err(_) => by_output = true,
+                    },
+                }
+            }
+            if !by_output {
+                let value = |t: &Tuple, k: &Key| match k {
+                    Key::Cell(ri, ci) => cell(t, *ri, *ci),
+                    Key::Expr(e) => e.eval(t, &resolver).unwrap_or(Value::Null),
+                };
                 tuples.sort_by(|a, b| {
                     keys.iter()
-                        .map(|((ri, ci), asc)| {
-                            let o = cmp_values(&cell(a, *ri, *ci), &cell(b, *ri, *ci));
+                        .map(|(k, asc)| {
+                            let o = cmp_values(&value(a, k), &value(b, k));
                             if *asc {
                                 o
                             } else {
@@ -296,7 +349,14 @@ impl FakeSql {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
             } else {
-                order_output = order.clone();
+                for (k, asc) in &order {
+                    match k {
+                        SortKey::Col(c) => order_output.push((c.clone(), *asc)),
+                        SortKey::Expr(_) => {
+                            return Err("ORDER BY mixes an expression with an output name".into())
+                        }
+                    }
+                }
             }
         }
 
@@ -347,8 +407,17 @@ impl FakeSql {
                 // An implicit group over no rows still yields one row.
                 groups.push((Vec::new(), Vec::new()));
             }
-            let min = having_min_count.unwrap_or(0);
-            for (_, members) in groups.into_iter().filter(|(_, m)| m.len() >= min) {
+            let mut kept = Vec::new();
+            for (_, members) in groups {
+                let keep = match &having {
+                    Some(h) => h.eval(&members, &resolver, &rels)?,
+                    None => true,
+                };
+                if keep {
+                    kept.push(members);
+                }
+            }
+            for members in kept {
                 let mut row = Vec::with_capacity(items.len());
                 for item in &items {
                     let (ty, v) = item.expr.eval_group(&members, &resolver, &rels)?;
@@ -434,8 +503,91 @@ struct SelectItem {
     name: String,
 }
 
+/// A `HAVING`: comparisons of aggregate expressions with literals.
+enum Having {
+    Cmp(SelectExpr, String, Value),
+    And(Vec<Having>),
+    Or(Vec<Having>),
+    Not(Box<Having>),
+}
+
+impl Having {
+    fn eval(&self, members: &[Tuple], r: &Resolver<'_>, rels: &[Rel]) -> Result<bool, String> {
+        Ok(match self {
+            Having::Cmp(e, op, lit) => {
+                let (_, v) = e.eval_group(members, r, rels)?;
+                // A NULL aggregate (a SUM over no non-NULL value) compares
+                // UNKNOWN, which HAVING drops like the real databases do.
+                if v.is_null() {
+                    return Ok(false);
+                }
+                let o = cmp_values(&v, lit);
+                match op.as_str() {
+                    "=" => o.is_eq(),
+                    "<>" => o.is_ne(),
+                    "<" => o.is_lt(),
+                    "<=" => o.is_le(),
+                    ">" => o.is_gt(),
+                    ">=" => o.is_ge(),
+                    _ => false,
+                }
+            }
+            Having::And(hs) => {
+                for h in hs {
+                    if !h.eval(members, r, rels)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            Having::Or(hs) => {
+                for h in hs {
+                    if h.eval(members, r, rels)? {
+                        return Ok(true);
+                    }
+                }
+                false
+            }
+            Having::Not(h) => !h.eval(members, r, rels)?,
+        })
+    }
+}
+
+fn parse_having(text: &str) -> Result<Having, String> {
+    let text = strip_parens(text.trim());
+    let ands = split_top(text, " AND ");
+    if ands.len() > 1 {
+        return Ok(Having::And(
+            ands.into_iter()
+                .map(parse_having)
+                .collect::<Result<_, _>>()?,
+        ));
+    }
+    let ors = split_top(text, " OR ");
+    if ors.len() > 1 {
+        return Ok(Having::Or(
+            ors.into_iter()
+                .map(parse_having)
+                .collect::<Result<_, _>>()?,
+        ));
+    }
+    if let Some(inner) = text.strip_prefix("NOT ") {
+        return Ok(Having::Not(Box::new(parse_having(inner)?)));
+    }
+    for op in ["<>", "<=", ">=", "=", "<", ">"] {
+        if let Some((l, r)) = split_once_top(text, &format!(" {op} ")) {
+            let item = parse_select_item(l.trim())?;
+            return Ok(Having::Cmp(item.expr, op.to_string(), parse_literal(r)?));
+        }
+    }
+    Err(format!("unparsed HAVING: {text}"))
+}
+
 enum SelectExpr {
     One,
+    /// An integer literal.
+    Const(i64),
+    Null,
     Col(Col),
     CountRows,
     Count(Col, bool),
@@ -446,7 +598,10 @@ enum SelectExpr {
 
 impl SelectExpr {
     fn is_aggregate(&self) -> bool {
-        !matches!(self, SelectExpr::One | SelectExpr::Col(_))
+        !matches!(
+            self,
+            SelectExpr::One | SelectExpr::Const(_) | SelectExpr::Null | SelectExpr::Col(_)
+        )
     }
 
     fn col_type(&self, resolver: &Resolver<'_>, rels: &[Rel]) -> Result<String, String> {
@@ -465,7 +620,11 @@ impl SelectExpr {
 
     fn type_hint(&self, resolver: &Resolver<'_>, rels: &[Rel]) -> String {
         match self {
-            SelectExpr::One | SelectExpr::CountRows | SelectExpr::Count(..) => "bigint".into(),
+            SelectExpr::One
+            | SelectExpr::Const(_)
+            | SelectExpr::CountRows
+            | SelectExpr::Count(..) => "bigint".into(),
+            SelectExpr::Null => "unknown".into(),
             SelectExpr::Sum(c, _) => sum_type(&self.col_type(resolver, rels).unwrap_or_default())
                 .unwrap_or_else(|| format!("unsummable {}", c.1)),
             _ => self.col_type(resolver, rels).unwrap_or_default(),
@@ -475,6 +634,8 @@ impl SelectExpr {
     fn eval_row(&self, t: &Tuple, resolver: &Resolver<'_>) -> Result<Value, String> {
         match self {
             SelectExpr::One => Ok(json!(1)),
+            SelectExpr::Const(n) => Ok(json!(n)),
+            SelectExpr::Null => Ok(Value::Null),
             SelectExpr::Col(c) => {
                 let (ri, ci) = resolver.resolve(c)?;
                 Ok(cell(t, ri, ci))
@@ -507,6 +668,8 @@ impl SelectExpr {
         };
         Ok(match self {
             SelectExpr::One => ("bigint".into(), json!(1)),
+            SelectExpr::Const(n) => ("bigint".into(), json!(n)),
+            SelectExpr::Null => ("unknown".into(), Value::Null),
             SelectExpr::Col(c) => {
                 let (ri, ci) = resolver.resolve(c)?;
                 (
@@ -607,6 +770,10 @@ fn parse_select_item(item: &str) -> Result<SelectItem, String> {
         SelectExpr::Min(colref(inner))
     } else if let Some(inner) = expr.strip_prefix("MAX(").and_then(|r| r.strip_suffix(')')) {
         SelectExpr::Max(colref(inner))
+    } else if let Ok(n) = expr.parse::<i64>() {
+        SelectExpr::Const(n)
+    } else if expr == "NULL" {
+        SelectExpr::Null
     } else {
         SelectExpr::Col(colref(expr))
     };
@@ -672,10 +839,143 @@ impl Respond for FakeSql {
 
 type Col = (Option<String>, String);
 
+/// A parenthesized arithmetic expression over columns and numbers.
+#[derive(Debug, Clone)]
+enum Expr {
+    Col(Col),
+    Num(f64),
+    Str(String),
+    Bin(char, Box<Expr>, Box<Expr>),
+    Concat(Vec<Expr>),
+    Length(Box<Expr>),
+    Substr(Box<Expr>, usize, Option<usize>),
+    Lower(Box<Expr>),
+    Upper(Box<Expr>),
+}
+
+impl Expr {
+    /// `None` is SQL NULL.
+    fn eval(&self, t: &Tuple, r: &Resolver<'_>) -> Option<Value> {
+        let text = |e: &Expr| -> Option<String> {
+            match e.eval(t, r)? {
+                Value::String(s) => Some(s),
+                other => Some(other.to_string()),
+            }
+        };
+        match self {
+            Expr::Col(c) => {
+                let (ri, ci) = r.resolve(c).ok()?;
+                let v = cell(t, ri, ci);
+                (!v.is_null()).then_some(v)
+            }
+            Expr::Num(n) => Some(json!(n)),
+            Expr::Str(s) => Some(json!(s)),
+            Expr::Bin(op, l, r2) => {
+                let (a, b) = (number_of(&l.eval(t, r)?)?, number_of(&r2.eval(t, r)?)?);
+                Some(json!(match op {
+                    '+' => a + b,
+                    '-' => a - b,
+                    _ => a * b,
+                }))
+            }
+            Expr::Concat(parts) => {
+                let parts: Option<Vec<String>> = parts.iter().map(text).collect();
+                Some(json!(parts?.concat()))
+            }
+            Expr::Length(e) => Some(json!(text(e)?.chars().count())),
+            Expr::Substr(e, start, len) => {
+                let s = text(e)?;
+                let taken: String = match len {
+                    Some(n) => s.chars().skip(start - 1).take(*n).collect(),
+                    None => s.chars().skip(start - 1).collect(),
+                };
+                Some(json!(taken))
+            }
+            Expr::Lower(e) => Some(json!(text(e)?.to_lowercase())),
+            Expr::Upper(e) => Some(json!(text(e)?.to_uppercase())),
+        }
+    }
+}
+
+fn number_of(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn parse_expr(text: &str) -> Result<Expr, String> {
+    let text = text.trim();
+    let inner = if text.starts_with('(') && matching_paren(text) == Some(text.len() - 1) {
+        &text[1..text.len() - 1]
+    } else {
+        text
+    };
+    let parts = split_top(inner, " || ");
+    if parts.len() > 1 {
+        return Ok(Expr::Concat(
+            parts
+                .into_iter()
+                .map(parse_expr)
+                .collect::<Result<_, _>>()?,
+        ));
+    }
+    for op in [" + ", " - ", " * "] {
+        if let Some((l, r)) = split_once_top(inner, op) {
+            return Ok(Expr::Bin(
+                op.trim().chars().next().unwrap(),
+                Box::new(parse_expr(l)?),
+                Box::new(parse_expr(r)?),
+            ));
+        }
+    }
+    for (name, unary) in [
+        ("LENGTH(", Expr::Length as fn(Box<Expr>) -> Expr),
+        ("LOWER(", Expr::Lower),
+        ("UPPER(", Expr::Upper),
+    ] {
+        if let Some(arg) = inner.strip_prefix(name).and_then(|r| r.strip_suffix(')')) {
+            return Ok(unary(Box::new(parse_expr(arg)?)));
+        }
+    }
+    if let Some(args) = inner
+        .strip_prefix("SUBSTR(")
+        .and_then(|r| r.strip_suffix(')'))
+    {
+        let args = split_top(args, ", ");
+        let count = |i: usize| -> Result<usize, String> {
+            args[i].trim().parse::<usize>().map_err(|e| e.to_string())
+        };
+        return Ok(match args.len() {
+            2 => Expr::Substr(Box::new(parse_expr(args[0])?), count(1)?, None),
+            3 => Expr::Substr(Box::new(parse_expr(args[0])?), count(1)?, Some(count(2)?)),
+            _ => return Err(format!("SUBSTR arity in: {inner}")),
+        });
+    }
+    if inner.starts_with('"') {
+        return Ok(Expr::Col(colref(inner)));
+    }
+    match parse_literal(inner)? {
+        v if number_of(&v).is_some() => Ok(Expr::Num(number_of(&v).unwrap())),
+        Value::String(s) => Ok(Expr::Str(s)),
+        other => Err(format!("not a value in an expression: {other}")),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum SortKey {
+    Col(Col),
+    Expr(Expr),
+}
+
 enum Pred {
     IsNull(Col, bool),
     Like(Col, String),
     Cmp(Col, String, Value),
+    ExprCmp(Expr, String, Value),
+    /// `regexp_like(col, '^[ -~]*$')`: printable ASCII only.
+    AsciiOnly(Col),
     ColEq(Col, Col),
     In(Col, Vec<Value>),
     Not(Box<Pred>),
@@ -700,6 +1000,26 @@ impl Pred {
             },
             Pred::Cmp(c, op, lit) => {
                 let o = cmp_values(&value(c)?, lit);
+                match op.as_str() {
+                    "=" => o.is_eq(),
+                    "<>" => o.is_ne(),
+                    "<" => o.is_lt(),
+                    "<=" => o.is_le(),
+                    ">" => o.is_gt(),
+                    ">=" => o.is_ge(),
+                    _ => false,
+                }
+            }
+            Pred::AsciiOnly(c) => match value(c)? {
+                Value::String(s) => s.chars().all(|ch| (' '..='~').contains(&ch)),
+                _ => false,
+            },
+            Pred::ExprCmp(e, op, lit) => {
+                let v = e.eval(t, r)?;
+                if v.is_null() {
+                    return None;
+                }
+                let o = cmp_values(&v, lit);
                 match op.as_str() {
                     "=" => o.is_eq(),
                     "<>" => o.is_ne(),
@@ -753,6 +1073,12 @@ fn parse_pred(text: &str) -> Result<Pred, String> {
     if let Some(inner) = text.strip_prefix("NOT ") {
         return Ok(Pred::Not(Box::new(parse_pred(inner)?)));
     }
+    if let Some(c) = text
+        .strip_prefix("regexp_like(")
+        .and_then(|r| r.strip_suffix(", '^[ -~]*$')"))
+    {
+        return Ok(Pred::AsciiOnly(colref(c)));
+    }
     if let Some(c) = text.strip_suffix(" IS NOT NULL") {
         return Ok(Pred::IsNull(colref(c), false));
     }
@@ -780,6 +1106,13 @@ fn parse_pred(text: &str) -> Result<Pred, String> {
         if let Some((l, r)) = split_once_top(text, &format!(" {op} ")) {
             if r.trim().starts_with('"') {
                 return Ok(Pred::ColEq(colref(l), colref(r)));
+            }
+            if l.trim().starts_with('(') || l.contains('(') {
+                return Ok(Pred::ExprCmp(
+                    parse_expr(l)?,
+                    op.to_string(),
+                    parse_literal(r)?,
+                ));
             }
             return Ok(Pred::Cmp(colref(l), op.to_string(), parse_literal(r)?));
         }

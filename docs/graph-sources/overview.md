@@ -170,7 +170,7 @@ at registration (`--model`). See [Access policy](iceberg.md#access-policy).
 
 **Purpose:** Virtual graph over a relational database or warehouse, read live
 
-SQL sources use the same [R2RML mapping](r2rml.md) as Iceberg sources and additionally accept `rr:sqlQuery`. The engine pushes one typed single-table `SELECT` per triples map and performs joins itself. No database driver is linked into Fluree; the endpoint holds the connections.
+SQL sources use the same [R2RML mapping](r2rml.md) as Iceberg sources and additionally accept `rr:sqlQuery`. The engine compiles a graph block over the source into one SQL statement where the block's shape allows — joins, `OPTIONAL`, `VALUES`, `UNION`, grouping and sub-selects included — and otherwise pushes one typed single-table `SELECT` per triples map and joins itself. No database driver is linked into Fluree; the endpoint holds the connections.
 
 See [SQL endpoints](sql.md) for configuration, pushdown rules and the bridge.
 

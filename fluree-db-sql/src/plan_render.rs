@@ -17,18 +17,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use fluree_db_tabular::plan::{
-    collect_col_eqs, same_class, ColRef, KeySet, Literal, OrderKey, OutputCol, OutputExpr, Pred,
-    PushdownCapabilities, RelNode, RelPlan, RelSource,
+    collect_col_eqs, same_class, ArithOp, ColRef, Expr, KeySet, Literal, OrderKey, OutputCol,
+    OutputExpr, Pred, PushdownCapabilities, RelNode, RelPlan, RelSource,
 };
 use fluree_db_tabular::{BatchSchema, FieldType};
 
-use crate::dialect::{binary_string, cmp_sql, render_literal, SqlDialect};
+use crate::dialect::{binary_string, cmp_sql, is_numeric, render_literal, sql_string, SqlDialect};
 use crate::error::{Result, SqlError};
 
 struct Renderer<'a> {
     dialect: SqlDialect,
     schemas: &'a HashMap<String, Arc<BatchSchema>>,
     keysets: HashMap<String, Vec<(String, Option<FieldType>)>>,
+    /// Column types of every derived table, by alias.
+    derived: HashMap<String, Vec<(String, FieldType)>>,
     from: String,
     where_preds: Vec<Pred>,
 }
@@ -44,10 +46,14 @@ pub fn render_plan(
         dialect,
         schemas,
         keysets: HashMap::new(),
+        derived: HashMap::new(),
         from: String::new(),
         where_preds: Vec::new(),
     };
     r.collect_keysets(&plan.root);
+    // Derived tables first: a key set may be equated with a derived or
+    // union column, whose type comes from its own plan.
+    r.collect_derived(&plan.root)?;
     r.infer_keyset_types(&plan.root)?;
     r.render_from(&plan.root)?;
 
@@ -75,6 +81,10 @@ pub fn render_plan(
         sql.push_str(" GROUP BY ");
         sql.push_str(&keys.join(", "));
     }
+    if let Some(h) = &plan.having {
+        sql.push_str(" HAVING ");
+        sql.push_str(&r.render_having(h, &plan.output)?);
+    }
     if !plan.order_by.is_empty() {
         let keys: Vec<String> = plan
             .order_by
@@ -83,10 +93,11 @@ pub fn render_plan(
                 let key = match k {
                     OrderKey::Col(c) => r.col(c),
                     OrderKey::Output(name) => dialect.quote_ident(name),
+                    OrderKey::Expr(e) => r.render_expr(e)?,
                 };
-                format!("{key} {}", if *asc { "ASC" } else { "DESC" })
+                Ok(format!("{key} {}", if *asc { "ASC" } else { "DESC" }))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         sql.push_str(" ORDER BY ");
         sql.push_str(&keys.join(", "));
     }
@@ -102,13 +113,105 @@ impl Renderer<'_> {
             RelNode::KeySet(k) => {
                 self.keysets.insert(k.alias.clone(), k.columns.clone());
             }
-            RelNode::Access { .. } => {}
+            // A derived table's key sets are its own statement's.
+            RelNode::Access { .. } | RelNode::Derived { .. } | RelNode::UnionAll { .. } => {}
             RelNode::Filter { input, .. } => self.collect_keysets(input),
             RelNode::Join { left, right, .. } | RelNode::LeftJoin { left, right, .. } => {
                 self.collect_keysets(left);
                 self.collect_keysets(right);
             }
         }
+    }
+
+    /// Type every derived table's columns from its own plan, so an outer
+    /// predicate or join over them renders like one over a table column.
+    fn collect_derived(&mut self, node: &RelNode) -> Result<()> {
+        match node {
+            RelNode::Derived { alias, plan } => {
+                let cols = self
+                    .output_types(plan)?
+                    .into_iter()
+                    .filter_map(|(n, t)| t.map(|t| (n, t)))
+                    .collect();
+                self.derived.insert(alias.clone(), cols);
+                Ok(())
+            }
+            // A union's column is typed by the branches projecting a value
+            // there, which must agree, or the database would coerce (or
+            // refuse) the union; a branch's NULL padding takes that type.
+            RelNode::UnionAll { alias, branches } => {
+                let Some(first) = branches.first() else {
+                    return Err(SqlError::Unsupported("UNION ALL without branches".into()));
+                };
+                let mut cols = self.output_types(first)?;
+                for b in &branches[1..] {
+                    let other = self.output_types(b)?;
+                    if other.len() != cols.len() {
+                        return Err(SqlError::Unsupported(
+                            "UNION ALL branches project different column counts".into(),
+                        ));
+                    }
+                    for ((_, slot), (_, ty)) in cols.iter_mut().zip(other) {
+                        match (&slot, ty) {
+                            (_, None) => {}
+                            (None, Some(t)) => *slot = Some(t),
+                            (Some(s), Some(t)) if *s == t => {}
+                            _ => {
+                                return Err(SqlError::Unsupported(
+                                    "UNION ALL branch column types differ".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                let cols = cols
+                    .into_iter()
+                    .filter_map(|(n, t)| t.map(|t| (n, t)))
+                    .collect();
+                self.derived.insert(alias.clone(), cols);
+                Ok(())
+            }
+            RelNode::Access { .. } | RelNode::KeySet(_) => Ok(()),
+            RelNode::Filter { input, .. } => self.collect_derived(input),
+            RelNode::Join { left, right, .. } | RelNode::LeftJoin { left, right, .. } => {
+                self.collect_derived(left)?;
+                self.collect_derived(right)
+            }
+        }
+    }
+
+    /// The output column types of a nested plan, from a renderer of its
+    /// own; a `NULL` padding has none.
+    fn output_types(&self, plan: &RelPlan) -> Result<Vec<(String, Option<FieldType>)>> {
+        let mut inner = Renderer {
+            dialect: self.dialect,
+            schemas: self.schemas,
+            keysets: HashMap::new(),
+            derived: HashMap::new(),
+            from: String::new(),
+            where_preds: Vec::new(),
+        };
+        inner.collect_keysets(&plan.root);
+        inner.collect_derived(&plan.root)?;
+        inner.infer_keyset_types(&plan.root)?;
+        let mut cols = Vec::with_capacity(plan.output.len());
+        for o in &plan.output {
+            let ty = match &o.expr {
+                OutputExpr::Col(c) | OutputExpr::Min(c) | OutputExpr::Max(c) => {
+                    Some(inner.col_type(c)?)
+                }
+                OutputExpr::Tag(_) | OutputExpr::CountRows | OutputExpr::Count { .. } => {
+                    Some(FieldType::Int64)
+                }
+                OutputExpr::Sum { .. } => Some(FieldType::Decimal {
+                    precision: 38,
+                    scale: 6,
+                }),
+                OutputExpr::Null => None,
+            };
+            cols.push((o.name.clone(), ty));
+        }
+        Ok(cols)
     }
 
     /// Give every untyped key-set column the type of the table column it is
@@ -160,6 +263,18 @@ impl Renderer<'_> {
                     ))
                 });
         }
+        if let Some(cols) = self.derived.get(&c.alias) {
+            return cols
+                .iter()
+                .find(|(n, _)| n == &c.column)
+                .map(|(_, t)| *t)
+                .ok_or_else(|| {
+                    SqlError::Unsupported(format!(
+                        "derived table '{}' has no column '{}'",
+                        c.alias, c.column
+                    ))
+                });
+        }
         let schema = self.schemas.get(&c.alias).ok_or_else(|| {
             SqlError::Unsupported(format!("no probed schema for relation '{}'", c.alias))
         })?;
@@ -174,8 +289,45 @@ impl Renderer<'_> {
             })
     }
 
+    /// A `HAVING` predicate: comparisons over outputs render the output's
+    /// own expression, since Postgres and Trino do not resolve a select
+    /// alias there.
+    fn render_having(&self, pred: &Pred, outputs: &[OutputCol]) -> Result<String> {
+        Ok(match pred {
+            Pred::OutputCmp { output, op, value } => {
+                let o = outputs.iter().find(|o| &o.name == output).ok_or_else(|| {
+                    SqlError::Unsupported(format!("HAVING over unknown output '{output}'"))
+                })?;
+                format!(
+                    "{} {} {}",
+                    self.render_output_expr(o)?,
+                    cmp_sql(*op),
+                    self.expr_literal(value)?
+                )
+            }
+            Pred::And(ps) | Pred::Or(ps) => {
+                let sep = if matches!(pred, Pred::And(_)) {
+                    " AND "
+                } else {
+                    " OR "
+                };
+                let parts: Vec<String> = ps
+                    .iter()
+                    .map(|p| Ok(format!("({})", self.render_having(p, outputs)?)))
+                    .collect::<Result<_>>()?;
+                parts.join(sep)
+            }
+            Pred::Not(p) => format!("NOT ({})", self.render_having(p, outputs)?),
+            other => self.render_pred(other)?,
+        })
+    }
+
     fn render_output(&self, o: &OutputCol) -> Result<String> {
         let name = self.dialect.quote_ident(&o.name);
+        Ok(format!("{} AS {name}", self.render_output_expr(o)?))
+    }
+
+    fn render_output_expr(&self, o: &OutputCol) -> Result<String> {
         let zoned = |c: &ColRef, rendered: String| -> Result<String> {
             Ok(match (self.col_type(c)?, self.dialect) {
                 (FieldType::TimestampTz, SqlDialect::Trino) => {
@@ -187,6 +339,8 @@ impl Renderer<'_> {
         let distinct = |d: bool| if d { "DISTINCT " } else { "" };
         let expr = match &o.expr {
             OutputExpr::Col(c) => zoned(c, self.col(c))?,
+            OutputExpr::Tag(n) => n.to_string(),
+            OutputExpr::Null => "NULL".to_string(),
             OutputExpr::CountRows => "COUNT(*)".to_string(),
             OutputExpr::Count { col, distinct: d } => {
                 format!("COUNT({}{})", distinct(*d), self.col(col))
@@ -197,7 +351,7 @@ impl Renderer<'_> {
             OutputExpr::Min(c) => zoned(c, format!("MIN({})", self.col(c)))?,
             OutputExpr::Max(c) => zoned(c, format!("MAX({})", self.col(c)))?,
         };
-        Ok(format!("{expr} AS {name}"))
+        Ok(expr)
     }
 
     /// A flat `a AND b AND c`: nested conjunctions are spliced in, and only a
@@ -233,6 +387,38 @@ impl Renderer<'_> {
                 Ok((self.render_source(alias, source), Vec::new()))
             }
             RelNode::KeySet(k) => Ok((self.render_keyset(k)?, Vec::new())),
+            RelNode::Derived { alias, plan } => Ok((
+                format!(
+                    "({}) AS {}",
+                    render_plan(plan, self.schemas, self.dialect)?,
+                    self.dialect.quote_ident(alias)
+                ),
+                Vec::new(),
+            )),
+            // Branches go bare: SQLite rejects a parenthesized compound
+            // member, so a branch cannot carry its own ORDER BY or LIMIT.
+            RelNode::UnionAll { alias, branches } => {
+                if branches
+                    .iter()
+                    .any(|b| !b.order_by.is_empty() || b.limit.is_some())
+                {
+                    return Err(SqlError::Unsupported(
+                        "UNION ALL branch with ORDER BY or LIMIT is not rendered".into(),
+                    ));
+                }
+                let rendered: Vec<String> = branches
+                    .iter()
+                    .map(|b| render_plan(b, self.schemas, self.dialect))
+                    .collect::<Result<_>>()?;
+                Ok((
+                    format!(
+                        "({}) AS {}",
+                        rendered.join(" UNION ALL "),
+                        self.dialect.quote_ident(alias)
+                    ),
+                    Vec::new(),
+                ))
+            }
             RelNode::Filter { input, pred } => {
                 let (item, mut preds) = self.render_leaf(input)?;
                 preds.push(pred.clone());
@@ -253,7 +439,11 @@ impl Renderer<'_> {
                 self.where_preds.push(pred.clone());
                 Ok(())
             }
-            RelNode::Access { .. } | RelNode::KeySet(_) | RelNode::Filter { .. } => {
+            RelNode::Access { .. }
+            | RelNode::KeySet(_)
+            | RelNode::Derived { .. }
+            | RelNode::UnionAll { .. }
+            | RelNode::Filter { .. } => {
                 let (item, preds) = self.render_leaf(node)?;
                 self.from = item;
                 self.where_preds.extend(preds);
@@ -410,9 +600,144 @@ impl Renderer<'_> {
                 })?;
                 format!("{} LIKE {lit} ESCAPE '!'", self.col(col))
             }
+            Pred::ExprCmp { expr, op, value } => {
+                let rhs = match value {
+                    // Compared, not computed with: bytes on MySQL too.
+                    Literal::Str(s) => binary_string(s, self.dialect).ok_or_else(|| {
+                        SqlError::Unsupported(format!("string {s:?} cannot be rendered"))
+                    })?,
+                    other => self.expr_literal(other)?,
+                };
+                format!("{} {} {rhs}", self.render_expr(expr)?, cmp_sql(*op))
+            }
+            Pred::OutputCmp { .. } => {
+                return Err(SqlError::Unsupported(
+                    "an output comparison belongs in HAVING".into(),
+                ))
+            }
+            // Printable ASCII is the range every dialect's case mapping and
+            // collation agree on; anything else goes back to the engine.
+            Pred::NonAscii(col) => {
+                let c = self.col(col);
+                match self.dialect {
+                    SqlDialect::Postgres => format!("{c} !~ '^[ -~]*$'"),
+                    SqlDialect::Mysql => format!("{c} NOT REGEXP '^[ -~]*$'"),
+                    SqlDialect::Sqlite => format!("{c} GLOB '*[^ -~]*'"),
+                    SqlDialect::Trino => format!("NOT regexp_like({c}, '^[ -~]*$')"),
+                }
+            }
             Pred::And(ps) => self.render_junction(ps, " AND ")?,
             Pred::Or(ps) => self.render_junction(ps, " OR ")?,
             Pred::Not(p) => format!("NOT ({})", self.render_pred(p)?),
+        })
+    }
+
+    /// An expression, every operation parenthesized so precedence is the
+    /// plan's, not the dialect's.
+    fn render_expr(&self, expr: &Expr) -> Result<String> {
+        Ok(match expr {
+            Expr::Col(c) => {
+                let ty = self.col_type(c)?;
+                if !is_numeric(ty) && ty != FieldType::String {
+                    return Err(SqlError::Unsupported(format!(
+                        "expression over {}.{}, neither numeric nor text",
+                        c.alias, c.column
+                    )));
+                }
+                self.col(c)
+            }
+            Expr::Lit(l) => self.expr_literal(l)?,
+            Expr::Arith { op, left, right } => {
+                for side in [left, right] {
+                    self.operand_is(side, is_numeric, "numeric")?;
+                }
+                let op = match op {
+                    ArithOp::Add => "+",
+                    ArithOp::Sub => "-",
+                    ArithOp::Mul => "*",
+                };
+                format!(
+                    "({} {op} {})",
+                    self.render_expr(left)?,
+                    self.render_expr(right)?
+                )
+            }
+            Expr::Concat(parts) => {
+                for p in parts {
+                    self.operand_is(p, |t| t == FieldType::String, "text")?;
+                }
+                let parts: Vec<String> = parts
+                    .iter()
+                    .map(|p| self.render_expr(p))
+                    .collect::<Result<_>>()?;
+                // `||` is OR on MySQL unless the session says otherwise.
+                match self.dialect {
+                    SqlDialect::Mysql => format!("CONCAT({})", parts.join(", ")),
+                    _ => format!("({})", parts.join(" || ")),
+                }
+            }
+            Expr::Strlen(e) => {
+                self.operand_is(e, |t| t == FieldType::String, "text")?;
+                let f = match self.dialect {
+                    SqlDialect::Mysql => "CHAR_LENGTH",
+                    _ => "LENGTH",
+                };
+                format!("{f}({})", self.render_expr(e)?)
+            }
+            Expr::Substr { expr, start, len } => {
+                self.operand_is(expr, |t| t == FieldType::String, "text")?;
+                match len {
+                    Some(n) => format!("SUBSTR({}, {start}, {n})", self.render_expr(expr)?),
+                    None => format!("SUBSTR({}, {start})", self.render_expr(expr)?),
+                }
+            }
+            Expr::Lower(e) | Expr::Upper(e) => {
+                self.operand_is(e, |t| t == FieldType::String, "text")?;
+                let f = if matches!(expr, Expr::Lower(_)) {
+                    "LOWER"
+                } else {
+                    "UPPER"
+                };
+                format!("{f}({})", self.render_expr(e)?)
+            }
+        })
+    }
+
+    /// A column operand of an operation must carry the operation's kind.
+    fn operand_is(&self, e: &Expr, ok: impl Fn(FieldType) -> bool, kind: &str) -> Result<()> {
+        if let Expr::Col(c) = e {
+            let ty = self.col_type(c)?;
+            if !ok(ty) {
+                return Err(SqlError::Unsupported(format!(
+                    "{kind} operation over {}.{} ({ty:?})",
+                    c.alias, c.column
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// A literal inside an expression, typed by its own kind.
+    fn expr_literal(&self, lit: &Literal) -> Result<String> {
+        if let Literal::Str(s) = lit {
+            return sql_string(s, self.dialect)
+                .ok_or_else(|| SqlError::Unsupported(format!("string {s:?} cannot be rendered")));
+        }
+        let ty = match lit {
+            Literal::Int(_) => FieldType::Int64,
+            Literal::Decimal { scale, .. } => FieldType::Decimal {
+                precision: 38,
+                scale: (*scale).max(0),
+            },
+            Literal::Double(_) => FieldType::Float64,
+            other => {
+                return Err(SqlError::Unsupported(format!(
+                    "literal {other:?} in an expression"
+                )))
+            }
+        };
+        render_literal(lit, ty, self.dialect).ok_or_else(|| {
+            SqlError::Unsupported(format!("literal {lit:?} cannot be rendered as {ty:?}"))
         })
     }
 
@@ -457,6 +782,10 @@ pub fn capabilities(dialect: SqlDialect) -> PushdownCapabilities {
         // the `GROUP BY` as itself, so grouping folds case-variants together.
         string_distinct_is_binary: !matches!(dialect, SqlDialect::Mysql),
         string_order_is_codepoint: matches!(dialect, SqlDialect::Trino | SqlDialect::Sqlite),
+        // SQLite types a compound's column from the first branch's
+        // expression (a NULL literal has none), so a padded slot would come
+        // back as text.
+        union_null_is_typed: !matches!(dialect, SqlDialect::Sqlite),
         timestamp_is_text: matches!(dialect, SqlDialect::Sqlite),
     }
 }
@@ -546,6 +875,7 @@ mod tests {
             distinct: false,
             order_by: vec![(OrderKey::Col(ColRef::new("o", "total")), false)],
             limit: Some(10),
+            having: None,
         };
         let sql = render_plan(&plan, &schemas(), SqlDialect::Trino).unwrap();
         assert_eq!(
@@ -594,6 +924,7 @@ mod tests {
             distinct: false,
             order_by: vec![(OrderKey::Output("c1".into()), false)],
             limit: Some(5),
+            having: None,
         };
         let sql = render_plan(&plan, &schemas(), SqlDialect::Trino).unwrap();
         assert_eq!(
@@ -621,6 +952,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         };
         let sql = render_plan(&plan, &schemas(), SqlDialect::Postgres).unwrap();
         assert_eq!(
@@ -648,6 +980,7 @@ mod tests {
             distinct: true,
             order_by: vec![],
             limit: None,
+            having: None,
         }
     }
 
@@ -685,6 +1018,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         };
         let sql = render_plan(&plan, &schemas(), SqlDialect::Mysql).unwrap();
         assert_eq!(
@@ -713,6 +1047,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         };
         let pattern = format!("{}%", fluree_db_tabular::plan::like_escape("50%_!"));
         assert_eq!(
@@ -725,6 +1060,270 @@ mod tests {
         );
         assert!(render_plan(&like("name", r"c:\%"), &schemas(), SqlDialect::Mysql).is_err());
         assert!(render_plan(&like("id", "1%"), &schemas(), SqlDialect::Postgres).is_err());
+    }
+
+    /// An expression is parenthesized at every operation, its literals
+    /// typed by their own kind, and it orders a top-k; a string column in
+    /// arithmetic is refused.
+    #[test]
+    fn expressions_render_parenthesized() {
+        let times_two = |col: &str| Expr::Arith {
+            op: ArithOp::Mul,
+            left: Box::new(Expr::Col(ColRef::new("c", col))),
+            right: Box::new(Expr::Lit(Literal::Int(2))),
+        };
+        let plan = |col: &str| RelPlan {
+            root: RelNode::Filter {
+                input: Box::new(access("c", "customers")),
+                pred: Pred::ExprCmp {
+                    expr: Expr::Arith {
+                        op: ArithOp::Add,
+                        left: Box::new(times_two(col)),
+                        right: Box::new(Expr::Lit(Literal::Decimal {
+                            unscaled: 15,
+                            scale: 1,
+                        })),
+                    },
+                    op: CmpOp::Gt,
+                    value: Literal::Double(100.0),
+                },
+            },
+            output: vec![out("c", "id", "c0")],
+            group_by: Vec::new(),
+            distinct: false,
+            order_by: vec![(OrderKey::Expr(times_two(col)), false)],
+            limit: Some(2),
+            having: None,
+        };
+        assert_eq!(
+            render_plan(&plan("id"), &schemas(), SqlDialect::Postgres).unwrap(),
+            r#"SELECT "c"."id" AS "c0" FROM "customers" AS "c" WHERE (("c"."id" * 2) + 1.5) > 1E2 ORDER BY ("c"."id" * 2) DESC LIMIT 2"#
+        );
+        assert!(render_plan(&plan("name"), &schemas(), SqlDialect::Postgres).is_err());
+    }
+
+    /// A derived table renders as its own statement in parentheses, its
+    /// outputs typed from that statement so an outer join over them renders
+    /// like one over a table column.
+    #[test]
+    fn derived_table_renders_nested() {
+        let inner = RelPlan {
+            root: access("o", "orders"),
+            output: vec![
+                out("o", "customer_id", "c0"),
+                OutputCol {
+                    expr: OutputExpr::CountRows,
+                    name: "c1".into(),
+                },
+            ],
+            group_by: vec![ColRef::new("o", "customer_id")],
+            distinct: false,
+            order_by: vec![],
+            limit: None,
+            having: None,
+        };
+        let plan = RelPlan {
+            root: RelNode::Join {
+                left: Box::new(access("c", "customers")),
+                right: Box::new(RelNode::Derived {
+                    alias: "d0".into(),
+                    plan: Box::new(inner),
+                }),
+                on: Pred::ColEq {
+                    left: ColRef::new("c", "id"),
+                    right: ColRef::new("d0", "c0"),
+                },
+            },
+            output: vec![out("c", "name", "c0"), out("d0", "c1", "c1")],
+            group_by: Vec::new(),
+            distinct: false,
+            order_by: vec![],
+            limit: None,
+            having: None,
+        };
+        assert_eq!(
+            render_plan(&plan, &schemas(), SqlDialect::Postgres).unwrap(),
+            r#"SELECT "c"."name" AS "c0", "d0"."c1" AS "c1" FROM "customers" AS "c" JOIN (SELECT "o"."customer_id" AS "c0", COUNT(*) AS "c1" FROM "orders" AS "o" GROUP BY "o"."customer_id") AS "d0" ON "c"."id" = "d0"."c0""#
+        );
+    }
+
+    fn plain(root: RelNode, output: Vec<OutputCol>) -> RelPlan {
+        RelPlan {
+            root,
+            output,
+            group_by: Vec::new(),
+            distinct: false,
+            order_by: vec![],
+            limit: None,
+            having: None,
+        }
+    }
+
+    /// A union is a derived table of bare branches, each tagged; a filter
+    /// over its columns types like one over the first branch's.
+    #[test]
+    fn union_all_renders_as_a_tagged_derived_table() {
+        let branch = |alias: &str, tag: i64| {
+            plain(
+                RelNode::Filter {
+                    input: Box::new(access(alias, "customers")),
+                    pred: Pred::IsNotNull(ColRef::new(alias, "name")),
+                },
+                vec![
+                    out(alias, "id", "c0"),
+                    out(alias, "name", "c1"),
+                    OutputCol {
+                        expr: OutputExpr::Tag(tag),
+                        name: "c2".into(),
+                    },
+                ],
+            )
+        };
+        let mut schemas = schemas();
+        schemas.insert("c2".to_string(), schemas["c"].clone());
+        let plan = plain(
+            RelNode::Filter {
+                input: Box::new(RelNode::UnionAll {
+                    alias: "u0".into(),
+                    branches: vec![branch("c", 0), branch("c2", 1)],
+                }),
+                pred: Pred::Cmp {
+                    col: ColRef::new("u0", "c1"),
+                    op: CmpOp::Eq,
+                    value: Literal::Str("Ada".into()),
+                },
+            },
+            vec![
+                out("u0", "c0", "c0"),
+                out("u0", "c1", "c1"),
+                out("u0", "c2", "c2"),
+            ],
+        );
+        assert_eq!(
+            render_plan(&plan, &schemas, SqlDialect::Mysql).unwrap(),
+            r"SELECT `u0`.`c0` AS `c0`, `u0`.`c1` AS `c1`, `u0`.`c2` AS `c2` FROM (SELECT `c`.`id` AS `c0`, `c`.`name` AS `c1`, 0 AS `c2` FROM `customers` AS `c` WHERE `c`.`name` IS NOT NULL UNION ALL SELECT `c2`.`id` AS `c0`, `c2`.`name` AS `c1`, 1 AS `c2` FROM `customers` AS `c2` WHERE `c2`.`name` IS NOT NULL) AS `u0` WHERE `u0`.`c1` = BINARY 'Ada'"
+        );
+    }
+
+    /// String expressions take each dialect's own spelling; a compared
+    /// string is bytes on MySQL, a concatenated one is not.
+    #[test]
+    fn string_expressions_render_per_dialect() {
+        let name = || Box::new(Expr::Col(ColRef::new("c", "name")));
+        let plan = plain(
+            RelNode::Filter {
+                input: Box::new(access("c", "customers")),
+                pred: Pred::And(vec![
+                    Pred::ExprCmp {
+                        expr: Expr::Concat(vec![*name(), Expr::Lit(Literal::Str("-".into()))]),
+                        op: CmpOp::Eq,
+                        value: Literal::Str("Ada-".into()),
+                    },
+                    Pred::ExprCmp {
+                        expr: Expr::Strlen(name()),
+                        op: CmpOp::Gt,
+                        value: Literal::Int(2),
+                    },
+                    Pred::ExprCmp {
+                        expr: Expr::Substr {
+                            expr: name(),
+                            start: 1,
+                            len: Some(1),
+                        },
+                        op: CmpOp::Eq,
+                        value: Literal::Str("A".into()),
+                    },
+                    Pred::Or(vec![
+                        Pred::ExprCmp {
+                            expr: Expr::Lower(name()),
+                            op: CmpOp::Eq,
+                            value: Literal::Str("ada".into()),
+                        },
+                        Pred::NonAscii(ColRef::new("c", "name")),
+                    ]),
+                ]),
+            },
+            vec![out("c", "id", "c0")],
+        );
+        let sql = |d| render_plan(&plan, &schemas(), d).unwrap();
+        assert_eq!(
+            sql(SqlDialect::Postgres),
+            r#"SELECT "c"."id" AS "c0" FROM "customers" AS "c" WHERE ("c"."name" || '-') = 'Ada-' AND LENGTH("c"."name") > 2 AND SUBSTR("c"."name", 1, 1) = 'A' AND ((LOWER("c"."name") = 'ada') OR ("c"."name" !~ '^[ -~]*$'))"#
+        );
+        assert_eq!(
+            sql(SqlDialect::Mysql),
+            r"SELECT `c`.`id` AS `c0` FROM `customers` AS `c` WHERE CONCAT(`c`.`name`, '-') = BINARY 'Ada-' AND CHAR_LENGTH(`c`.`name`) > 2 AND SUBSTR(`c`.`name`, 1, 1) = BINARY 'A' AND ((LOWER(`c`.`name`) = BINARY 'ada') OR (`c`.`name` NOT REGEXP '^[ -~]*$'))"
+        );
+        assert_eq!(
+            sql(SqlDialect::Sqlite),
+            r#"SELECT "c"."id" AS "c0" FROM "customers" AS "c" WHERE ("c"."name" || '-') = 'Ada-' AND LENGTH("c"."name") > 2 AND SUBSTR("c"."name", 1, 1) = 'A' AND ((LOWER("c"."name") = 'ada') OR ("c"."name" GLOB '*[^ -~]*'))"#
+        );
+        assert!(
+            sql(SqlDialect::Trino).ends_with(r#"OR (NOT regexp_like("c"."name", '^[ -~]*$')))"#)
+        );
+    }
+
+    /// Branches whose columns differ in type are refused, not coerced.
+    #[test]
+    fn union_all_branches_must_align() {
+        let plan = plain(
+            RelNode::UnionAll {
+                alias: "u0".into(),
+                branches: vec![
+                    plain(access("c", "customers"), vec![out("c", "name", "c0")]),
+                    plain(access("o", "orders"), vec![out("o", "total", "c0")]),
+                ],
+            },
+            vec![out("u0", "c0", "c0")],
+        );
+        let err = render_plan(&plan, &schemas(), SqlDialect::Postgres).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("UNION ALL branch column types differ"),
+            "{err}"
+        );
+    }
+
+    /// HAVING repeats the output's expression rather than naming it.
+    #[test]
+    fn having_renders_the_aggregate_expression() {
+        let mut plan = plain(
+            access("o", "orders"),
+            vec![
+                out("o", "customer_id", "c0"),
+                OutputCol {
+                    expr: OutputExpr::CountRows,
+                    name: "c1".into(),
+                },
+                OutputCol {
+                    expr: OutputExpr::Sum {
+                        col: ColRef::new("o", "total"),
+                        distinct: false,
+                    },
+                    name: "c2".into(),
+                },
+            ],
+        );
+        plan.group_by = vec![ColRef::new("o", "customer_id")];
+        plan.having = Some(Pred::And(vec![
+            Pred::OutputCmp {
+                output: "c1".into(),
+                op: CmpOp::Gt,
+                value: Literal::Int(1),
+            },
+            Pred::OutputCmp {
+                output: "c2".into(),
+                op: CmpOp::GtEq,
+                value: Literal::Decimal {
+                    unscaled: 1000,
+                    scale: 1,
+                },
+            },
+        ]));
+        assert_eq!(
+            render_plan(&plan, &schemas(), SqlDialect::Postgres).unwrap(),
+            r#"SELECT "o"."customer_id" AS "c0", COUNT(*) AS "c1", SUM("o"."total") AS "c2" FROM "orders" AS "o" GROUP BY "o"."customer_id" HAVING (COUNT(*) > 1) AND (SUM("o"."total") >= 100.0)"#
+        );
     }
 
     /// A string join on MySQL compares bytes too, and an integer join is
@@ -756,6 +1355,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         };
         let sql = render_plan(&plan, &schemas, SqlDialect::Mysql).unwrap();
         assert_eq!(
@@ -780,6 +1380,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         };
         assert!(matches!(
             render_plan(&plan, &schemas(), SqlDialect::Trino),
@@ -803,6 +1404,7 @@ mod tests {
             distinct: false,
             order_by: vec![],
             limit: None,
+            having: None,
         };
         assert!(matches!(
             render_plan(&plan, &schemas(), SqlDialect::Trino),

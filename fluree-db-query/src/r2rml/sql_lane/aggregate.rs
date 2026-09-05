@@ -6,9 +6,11 @@
 //! `AVG` is pushed as `SUM` + `COUNT` and divided in the engine (databases
 //! round a decimal average to the input scale), an empty `SUM` comes back
 //! `NULL` and is reported as `0`, and string keys or `MIN`/`MAX` are pushed
-//! only when the dialect compares bytes. HAVING, ORDER BY and LIMIT stay
-//! with the engine's own operators above; a top-k is offered to the
-//! statement when no HAVING could drop rows afterwards.
+//! only when the dialect compares bytes. A `HAVING` comparing `COUNT`,
+//! `SUM`, `MIN` or `MAX` outputs with constants goes with the statement;
+//! the engine's own HAVING, ORDER BY and LIMIT operators stay above, and a
+//! top-k is offered to the statement when no HAVING left in the engine
+//! could drop rows afterwards.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +18,7 @@ use std::sync::Arc;
 use bigdecimal::BigDecimal;
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_r2rml::mapping::ObjectMap;
-use fluree_db_tabular::plan::{ColRef, OrderKey, OutputCol, OutputExpr, RelPlan};
+use fluree_db_tabular::plan::{CmpOp, ColRef, OrderKey, OutputCol, OutputExpr, Pred, RelPlan};
 use fluree_db_tabular::{Column, ColumnBatch, FieldType};
 use fluree_vocab::xsd;
 use num_bigint::BigInt;
@@ -30,7 +32,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::ir::grouping::{AggregateFn, InputSemantics};
-use crate::ir::{GraphName, Pattern, Query};
+use crate::ir::{Expression, GraphName, Pattern, Query};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::sort::SortSpec;
 use crate::var_registry::VarId;
@@ -44,7 +46,9 @@ pub struct SqlAggregatePlan {
     inner_patterns: Vec<Pattern>,
     group_by: Vec<VarId>,
     aggregates: Vec<(VarId, AggregateFn)>,
-    /// The complete ORDER BY and k when a LIMIT above may be pushed.
+    having: Option<Expression>,
+    /// The complete ORDER BY and k when a LIMIT above may be pushed (only
+    /// with the HAVING, if any).
     topk: Option<(Vec<SortSpec>, usize)>,
 }
 
@@ -97,16 +101,24 @@ pub fn detect_sql_block_aggregate(query: &Query) -> Option<SqlAggregatePlan> {
         .copied()
         .chain(aggregates.iter().map(|(v, _)| *v))
         .collect();
+    // An aggregate a HAVING lifted out is an output the projection drops.
+    // Nothing applies a DISTINCT over that narrower projection (the fast
+    // path returns before the generic tail's Project + Distinct), so one
+    // stays with the generic lane; over every output it is a no-op, the
+    // groups being distinct on their keys already.
     if let Some(projected) = query.output.projected_vars() {
-        if projected.len() != outs.len() || projected.iter().any(|v| !outs.contains(v)) {
+        if projected.iter().any(|v| !outs.contains(v)) {
+            return None;
+        }
+        if query.output.is_distinct() && projected.len() != outs.len() {
             return None;
         }
     }
     if query.ordering.iter().any(|s| !outs.contains(&s.var)) {
         return None;
     }
-    let topk = match (query.limit, grouping.having()) {
-        (Some(limit), None) if !query.ordering.is_empty() => Some((
+    let topk = match query.limit {
+        Some(limit) if !query.ordering.is_empty() => Some((
             query.ordering.clone(),
             limit.saturating_add(query.offset.unwrap_or(0)),
         )),
@@ -117,12 +129,13 @@ pub fn detect_sql_block_aggregate(query: &Query) -> Option<SqlAggregatePlan> {
         inner_patterns: patterns.clone(),
         group_by,
         aggregates,
+        having: grouping.having().cloned(),
         topk,
     })
 }
 
 /// How one output of the grouped statement becomes a binding.
-enum Decode {
+pub(super) enum Decode {
     /// A key or a `MIN`/`MAX`: the `idx`-th term the materializer builds.
     Term { idx: usize },
     /// `COUNT`: the named integer output.
@@ -136,8 +149,8 @@ enum Decode {
     },
 }
 
-#[derive(Clone, Copy)]
-enum NumKind {
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NumKind {
     Integer,
     Decimal,
     Double,
@@ -148,6 +161,21 @@ struct AggLowered {
     materializer: Materializer,
     /// Aligned with the operator's schema (keys, then aggregate outputs).
     decodes: Vec<Decode>,
+}
+
+/// A grouped plan over a lowered block: keys, aggregate outputs, the terms
+/// and accesses that decode them, and a top-k. What [`lower_aggregate`]
+/// runs as a statement and a subquery embeds as a derived table.
+pub(super) struct Grouped {
+    pub plan: RelPlan,
+    /// Aligned with `decodes`' `Term` indices.
+    pub terms: Vec<(VarId, TermSource)>,
+    /// Mapping columns each access must carry, by alias.
+    pub access_columns: HashMap<String, Vec<String>>,
+    /// Per-extreme materialization aliases (see `MIN`/`MAX` below).
+    pub extremes: Vec<AccessInfo>,
+    /// Keys, then aggregates, in `group_by` / `aggregates` order.
+    pub decodes: Vec<Decode>,
 }
 
 /// The grouped statement for a lowered block, or `None` (a reason) when the
@@ -161,16 +189,58 @@ fn lower_aggregate(
     if !lowered.residual_filters.is_empty() {
         return Err("residual filter under an aggregate");
     }
-    let caps = &resolved.caps;
+    let mut grouped = group_plan(
+        &plan.group_by,
+        &plan.aggregates,
+        plan.having.as_ref(),
+        plan.topk.as_ref(),
+        lowered,
+        &resolved.mapping,
+        &resolved.caps,
+        &resolved.schemas,
+    )?;
+    let mut for_terms = lowered.clone();
+    for_terms.outputs = grouped.plan.output.clone();
+    for_terms.terms = grouped.terms;
+    for a in &mut for_terms.accesses {
+        a.columns = grouped.access_columns.remove(&a.alias).unwrap_or_default();
+    }
+    for_terms.accesses.extend(grouped.extremes);
+    let materializer =
+        Materializer::new(&for_terms, &resolved.mapping, snapshot).map_err(|_| "materializer")?;
+    Ok(AggLowered {
+        plan: grouped.plan,
+        materializer,
+        decodes: grouped.decodes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn group_plan(
+    group_by: &[VarId],
+    aggregates: &[(VarId, AggregateFn)],
+    having: Option<&Expression>,
+    topk: Option<&(Vec<SortSpec>, usize)>,
+    lowered: &Lowered,
+    mapping: &fluree_db_r2rml::mapping::CompiledR2rmlMapping,
+    caps: &fluree_db_tabular::plan::PushdownCapabilities,
+    schemas: &HashMap<fluree_db_tabular::plan::RelSource, Arc<fluree_db_tabular::BatchSchema>>,
+) -> std::result::Result<Grouped, &'static str> {
+    if lowered
+        .terms
+        .iter()
+        .any(|(_, t)| matches!(t, TermSource::Union { .. }))
+    {
+        return Err("aggregate over a union entity");
+    }
     let field_type = |col: &ColRef| -> Option<FieldType> {
         let tm_iri = lowered
             .accesses
             .iter()
             .find(|a| a.alias == col.alias)
             .map(|a| a.tm_iri.as_str())?;
-        let tm = resolved.mapping.get(tm_iri)?;
-        resolved
-            .schemas
+        let tm = mapping.get(tm_iri)?;
+        schemas
             .get(&source_of_tm(tm))?
             .field_by_name(&col.column)
             .map(|f| f.field_type)
@@ -179,7 +249,7 @@ fn lower_aggregate(
         let TermSource::Object { tm_iri, pom, .. } = term else {
             return None;
         };
-        let tm = resolved.mapping.get(tm_iri)?;
+        let tm = mapping.get(tm_iri)?;
         Some(tm.predicate_object_maps.get(*pom)?.object_map.clone())
     };
     let var_of =
@@ -191,16 +261,16 @@ fn lower_aggregate(
         };
 
     let mut outputs: Vec<OutputCol> = Vec::new();
-    let mut group_by: Vec<ColRef> = Vec::new();
+    let mut group_cols: Vec<ColRef> = Vec::new();
     let mut key_decodes: Vec<Decode> = Vec::new();
-    let mut agg_decodes: Vec<Option<Decode>> = (0..plan.aggregates.len()).map(|_| None).collect();
+    let mut agg_decodes: Vec<Option<Decode>> = (0..aggregates.len()).map(|_| None).collect();
     let mut terms: Vec<(VarId, TermSource)> = Vec::new();
     let mut access_columns: HashMap<String, Vec<String>> = HashMap::new();
     let mut claimed: std::collections::HashSet<(String, String)> = Default::default();
     let name = |outputs: &Vec<OutputCol>| format!("c{}", outputs.len());
 
     // Keys: every column the key's term reads, grouped and projected.
-    for v in &plan.group_by {
+    for v in group_by {
         let (src, cols) = var_of(*v)?;
         for col in cols {
             if field_type(col) == Some(FieldType::String) && !caps.string_distinct_is_binary {
@@ -213,7 +283,7 @@ fn lower_aggregate(
                 .entry(col.alias.clone())
                 .or_default()
                 .push(col.column.clone());
-            group_by.push(col.clone());
+            group_cols.push(col.clone());
             let n = name(&outputs);
             outputs.push(OutputCol::column(col.clone(), n));
         }
@@ -224,7 +294,7 @@ fn lower_aggregate(
     // Each extreme reads its column through its own materialization alias,
     // so MIN and MAX of one column, or of a key, are distinct outputs.
     let mut extremes: Vec<AccessInfo> = Vec::new();
-    for (pos, (out, f)) in plan.aggregates.iter().enumerate() {
+    for (pos, (out, f)) in aggregates.iter().enumerate() {
         agg_decodes[pos] = Some(match f {
             AggregateFn::Min(v) | AggregateFn::Max(v) => {
                 let (src, cols) = var_of(*v)?;
@@ -393,20 +463,30 @@ fn lower_aggregate(
         )
         .collect();
 
+    // The HAVING goes with the statement when every comparison in it is
+    // over an output the database evaluates as the engine does; otherwise
+    // the engine's HAVING keeps it, and no top-k can be pushed below it.
+    let having_pred = having.and_then(|h| lower_having(h, group_by, aggregates, &decodes, lowered));
+    let topk = if having.is_some() && having_pred.is_none() {
+        None
+    } else {
+        topk
+    };
+
     // A top-k over aggregate outputs and required scalar keys. The statement
     // answers exactly k groups, so the LIMIT goes only with the whole ORDER BY.
     let mut order_by = Vec::new();
     let mut limit = None;
-    if let Some((ordering, k)) = &plan.topk {
+    if let Some((ordering, k)) = topk {
         let keys: Option<Vec<(OrderKey, bool)>> = ordering
             .iter()
             .map(|s| {
-                let key = if plan.group_by.contains(&s.var) {
+                let key = if group_by.contains(&s.var) {
                     let (col, _) = lowered.order_columns.get(&s.var)?;
                     OrderKey::Col(col.clone())
                 } else {
-                    let i = plan.aggregates.iter().position(|(v, _)| *v == s.var)?;
-                    match &decodes[plan.group_by.len() + i] {
+                    let i = aggregates.iter().position(|(v, _)| *v == s.var)?;
+                    match &decodes[group_by.len() + i] {
                         Decode::Count { name } => OrderKey::Output(name.clone()),
                         Decode::Numeric {
                             sum, avg: false, ..
@@ -421,7 +501,7 @@ fn lower_aggregate(
                             // groups come back. A required member carries an
                             // IS NOT NULL, so only a nullable one can sum to
                             // NULL; that ordering stays in the engine.
-                            let nullable = match &plan.aggregates[i].1 {
+                            let nullable = match &aggregates[i].1 {
                                 AggregateFn::Sum(v, _) => {
                                     lowered.vars.get(v).is_none_or(|src| src.nullable)
                                 }
@@ -444,32 +524,107 @@ fn lower_aggregate(
         }
     }
 
-    let rel = RelPlan {
+    let plan = RelPlan {
         root: lowered.root.clone(),
         output: outputs,
-        distinct: plan.aggregates.is_empty(),
-        group_by: if plan.aggregates.is_empty() {
+        distinct: aggregates.is_empty(),
+        group_by: if aggregates.is_empty() {
             Vec::new()
         } else {
-            group_by
+            group_cols
         },
         order_by,
         limit,
+        having: having_pred,
     };
-    let mut for_terms = lowered.clone();
-    for_terms.outputs = rel.output.clone();
-    for_terms.terms = terms;
-    for a in &mut for_terms.accesses {
-        a.columns = access_columns.remove(&a.alias).unwrap_or_default();
-    }
-    for_terms.accesses.extend(extremes);
-    let materializer =
-        Materializer::new(&for_terms, &resolved.mapping, snapshot).map_err(|_| "materializer")?;
-    Ok(AggLowered {
-        plan: rel,
-        materializer,
+    Ok(Grouped {
+        plan,
+        terms,
+        access_columns,
+        extremes,
         decodes,
     })
+}
+
+/// The `HAVING` as a predicate over the grouped outputs: `AND`/`OR`/`NOT`
+/// of comparisons between an aggregate output and a numeric constant.
+/// `COUNT`s and `SUM`s of exact numbers compare as in the engine; an
+/// `AVG` (divided in the engine), a `MIN`/`MAX` (a term, not a number the
+/// database holds natively) or a key does not. Nor does a `SUM` over a
+/// nullable member: a group NULL throughout sums to NULL, which no SQL
+/// comparison keeps, where SPARQL's empty sum is 0 and may.
+fn lower_having(
+    expr: &Expression,
+    group_by: &[VarId],
+    aggregates: &[(VarId, AggregateFn)],
+    decodes: &[Decode],
+    lowered: &Lowered,
+) -> Option<Pred> {
+    use crate::ir::expression::Function;
+    let Expression::Call { func, args } = expr else {
+        return None;
+    };
+    let cmp = |v: VarId, op: CmpOp, c: &FlakeValue| -> Option<Pred> {
+        let i = aggregates.iter().position(|(out, _)| *out == v)?;
+        let (value, RdfClass::Numeric) = super::lower::literal_of(c, None)? else {
+            return None;
+        };
+        let output = match &decodes[group_by.len() + i] {
+            Decode::Count { name } => name.clone(),
+            Decode::Numeric {
+                sum,
+                avg: false,
+                kind: NumKind::Integer | NumKind::Decimal,
+                ..
+            } => {
+                let nullable = match &aggregates[i].1 {
+                    AggregateFn::Sum(v, _) => lowered.vars.get(v).is_none_or(|src| src.nullable),
+                    _ => true,
+                };
+                if nullable {
+                    return None;
+                }
+                sum.clone()
+            }
+            _ => return None,
+        };
+        Some(Pred::OutputCmp { output, op, value })
+    };
+    let lower = |a: &Expression| lower_having(a, group_by, aggregates, decodes, lowered);
+    match func {
+        Function::And => {
+            let parts: Option<Vec<Pred>> = args.iter().map(lower).collect();
+            Some(Pred::And(parts?))
+        }
+        Function::Or => {
+            let parts: Option<Vec<Pred>> = args.iter().map(lower).collect();
+            Some(Pred::Or(parts?))
+        }
+        Function::Not => {
+            let [a] = args.as_slice() else {
+                return None;
+            };
+            Some(Pred::Not(Box::new(lower(a)?)))
+        }
+        Function::Eq | Function::Ne | Function::Lt | Function::Le | Function::Gt | Function::Ge => {
+            let (v, c, reversed) = match args.as_slice() {
+                [Expression::Var(v), Expression::Const(c)] => (*v, c, false),
+                [Expression::Const(c), Expression::Var(v)] => (*v, c, true),
+                _ => return None,
+            };
+            let op = match (func, reversed) {
+                (Function::Eq, _) => CmpOp::Eq,
+                (Function::Ne, _) => CmpOp::NotEq,
+                (Function::Lt, false) | (Function::Gt, true) => CmpOp::Lt,
+                (Function::Le, false) | (Function::Ge, true) => CmpOp::LtEq,
+                (Function::Gt, false) | (Function::Lt, true) => CmpOp::Gt,
+                (Function::Ge, false) | (Function::Le, true) => CmpOp::GtEq,
+                _ => return None,
+            };
+            cmp(v, op, c)
+        }
+        _ => None,
+    }
 }
 
 /// The grouped-query operator: one statement at open, rows decoded into
@@ -657,7 +812,7 @@ impl GroupedSource {
                         .map(|(_, b)| b.clone())
                         .unwrap_or(Binding::Unbound),
                     Decode::Count { name } => Binding::lit(
-                        FlakeValue::Long(int_at(&by_name, name, i)?),
+                        FlakeValue::Long(int_at(column(&by_name, name)?, name, i)?),
                         Sid::xsd_integer(),
                     ),
                     Decode::Numeric {
@@ -666,13 +821,14 @@ impl GroupedSource {
                         kind,
                         avg,
                     } => {
-                        let count = int_at(&by_name, count, i)? as u64;
+                        let count = int_at(column(&by_name, count)?, count, i)? as u64;
                         let acc = match kind {
-                            NumKind::Double => {
-                                NumericAcc::from_double_total(double_at(&by_name, sum, i)?, count)
-                            }
+                            NumKind::Double => NumericAcc::from_double_total(
+                                double_at(column(&by_name, sum)?, sum, i)?,
+                                count,
+                            ),
                             NumKind::Integer | NumKind::Decimal => NumericAcc::from_exact_total(
-                                exact_at(&by_name, sum, i)?,
+                                exact_at(column(&by_name, sum)?, sum, i)?,
                                 count,
                                 matches!(kind, NumKind::Decimal),
                             ),
@@ -718,14 +874,54 @@ impl GroupedSource {
     }
 }
 
+/// An aggregate output of a derived table, read from the batch holding it.
+pub(super) fn decode_aggregate(
+    batch: &ColumnBatch,
+    kind: &super::lower::AggTerm,
+    i: usize,
+) -> Result<Binding> {
+    let col = |name: &str| {
+        batch.column_by_name(name).ok_or_else(|| {
+            QueryError::Internal(format!("derived table lacks aggregate output '{name}'"))
+        })
+    };
+    Ok(match kind {
+        super::lower::AggTerm::Count { column } => Binding::lit(
+            FlakeValue::Long(int_at(col(column)?, column, i)?),
+            Sid::xsd_integer(),
+        ),
+        super::lower::AggTerm::Numeric {
+            sum,
+            count,
+            kind,
+            avg,
+        } => {
+            let n = int_at(col(count)?, count, i)? as u64;
+            let acc = match kind {
+                NumKind::Double => NumericAcc::from_double_total(double_at(col(sum)?, sum, i)?, n),
+                NumKind::Integer | NumKind::Decimal => NumericAcc::from_exact_total(
+                    exact_at(col(sum)?, sum, i)?,
+                    n,
+                    matches!(kind, NumKind::Decimal),
+                ),
+            };
+            if *avg {
+                acc.finalize_avg()
+            } else {
+                acc.finalize_sum()
+            }
+        }
+    })
+}
+
 fn column<'a>(by_name: &'a HashMap<String, Column>, name: &str) -> Result<&'a Column> {
     by_name
         .get(name)
         .ok_or_else(|| QueryError::Internal(format!("grouped statement lacks output '{name}'")))
 }
 
-fn int_at(by_name: &HashMap<String, Column>, name: &str, i: usize) -> Result<i64> {
-    Ok(match column(by_name, name)? {
+fn int_at(col: &Column, name: &str, i: usize) -> Result<i64> {
+    Ok(match col {
         Column::Int64(v) => v.get(i).copied().flatten().unwrap_or(0),
         Column::Int32(v) => v.get(i).copied().flatten().map(i64::from).unwrap_or(0),
         Column::Decimal { values, scale, .. } if *scale == 0 => values
@@ -743,8 +939,8 @@ fn int_at(by_name: &HashMap<String, Column>, name: &str, i: usize) -> Result<i64
     })
 }
 
-fn double_at(by_name: &HashMap<String, Column>, name: &str, i: usize) -> Result<f64> {
-    Ok(match column(by_name, name)? {
+fn double_at(col: &Column, name: &str, i: usize) -> Result<f64> {
+    Ok(match col {
         Column::Float64(v) => v.get(i).copied().flatten().unwrap_or(0.0),
         Column::Float32(v) => v.get(i).copied().flatten().map(f64::from).unwrap_or(0.0),
         Column::Int64(v) => v.get(i).copied().flatten().unwrap_or(0) as f64,
@@ -763,8 +959,8 @@ fn double_at(by_name: &HashMap<String, Column>, name: &str, i: usize) -> Result<
     })
 }
 
-fn exact_at(by_name: &HashMap<String, Column>, name: &str, i: usize) -> Result<BigDecimal> {
-    Ok(match column(by_name, name)? {
+fn exact_at(col: &Column, name: &str, i: usize) -> Result<BigDecimal> {
+    Ok(match col {
         Column::Decimal { values, scale, .. } => values
             .get(i)
             .copied()
