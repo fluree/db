@@ -50,6 +50,12 @@ pub struct ProfileRequest {
     pub config: ProfileConfig,
     /// Most groups kept per column before pooling into overflow.
     pub max_groups: usize,
+    /// Ledger only: refuse a property (profiled or grouping) with more
+    /// current values than this rather than range it into memory. The
+    /// ledger face has no streaming walk yet, so a property's flakes are
+    /// held whole; this turns an out-of-memory into an error. `None`
+    /// means unbounded.
+    pub max_values: Option<usize>,
 }
 
 impl ProfileRequest {
@@ -60,6 +66,7 @@ impl ProfileRequest {
             group_by: Vec::new(),
             config: ProfileConfig::default(),
             max_groups: fluree_db_stats::grouped::DEFAULT_MAX_GROUPS,
+            max_values: None,
         }
     }
 
@@ -80,6 +87,11 @@ impl ProfileRequest {
 
     pub fn max_groups(mut self, n: usize) -> Self {
         self.max_groups = n;
+        self
+    }
+
+    pub fn max_values(mut self, n: usize) -> Self {
+        self.max_values = Some(n);
         self
     }
 }
@@ -206,12 +218,23 @@ fn profile_value<'a>(
 }
 
 /// Every current assertion of `p` in graph `g_id` at the view's `t`.
+///
+/// With `max_values`, the range stops one flake past the cap and the
+/// property is refused, so memory is bounded by the cap rather than by
+/// the property. The check runs before retractions are filtered out:
+/// a retraction that survives into the result can only make a refusal
+/// earlier, never later.
 async fn property_flakes(
     view: &crate::ledger_view::LedgerView,
     g_id: fluree_db_core::GraphId,
     p: Sid,
+    iri: &str,
+    max_values: Option<usize>,
 ) -> Result<Vec<fluree_db_core::Flake>> {
-    let opts = RangeOptions::default().with_to_t(view.t);
+    let mut opts = RangeOptions::default().with_to_t(view.t);
+    if let Some(max) = max_values {
+        opts = opts.with_flake_limit(max.saturating_add(1));
+    }
     let flakes = range_with_overlay(
         &view.snapshot,
         g_id,
@@ -222,6 +245,13 @@ async fn property_flakes(
         opts,
     )
     .await?;
+    if let Some(max) = max_values {
+        if flakes.len() > max {
+            return Err(ApiError::config(format!(
+                "property '{iri}' has more than {max} values; raise max_values to profile it"
+            )));
+        }
+    }
     Ok(flakes.into_iter().filter(|f| f.op).collect())
 }
 
@@ -274,7 +304,7 @@ impl crate::Fluree {
                     "group-by property '{iri}' is unknown to ledger '{ledger_id}'"
                 ))
             })?;
-            let flakes = property_flakes(&view, g_id, p).await?;
+            let flakes = property_flakes(&view, g_id, p, iri, req.max_values).await?;
             if flakes.is_empty() {
                 return Err(ApiError::NotFound(format!(
                     "group-by property '{iri}' has no values in ledger '{ledger_id}'"
@@ -329,7 +359,7 @@ impl crate::Fluree {
                 });
                 continue;
             };
-            let flakes = property_flakes(&view, g_id, p).await?;
+            let flakes = property_flakes(&view, g_id, p, iri, req.max_values).await?;
             if flakes.is_empty() {
                 skipped.push(SkippedColumn {
                     name: iri.clone(),
