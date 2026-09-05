@@ -89,6 +89,7 @@ mod overlay;
 pub mod pack;
 pub mod policy_builder;
 pub mod policy_view;
+pub mod profile;
 pub mod query;
 mod rebase;
 pub mod remote_service;

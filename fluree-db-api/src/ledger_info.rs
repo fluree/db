@@ -679,7 +679,7 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
 // ============================================================================
 
 /// Resolve a `GraphSelector` to a numeric `g_id`.
-fn resolve_graph_selector(
+pub(crate) fn resolve_graph_selector(
     selector: &GraphSelector,
     store: Option<&BinaryIndexStore>,
 ) -> Result<GraphId> {

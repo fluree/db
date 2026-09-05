@@ -34,8 +34,11 @@ pub mod error;
 pub mod fuel;
 pub mod fulltext_hook;
 pub mod gc;
-#[path = "stats/hll256.rs"]
-pub mod hll;
+/// The per-(graph, property) cardinality sketch: the stats kernel's
+/// 256-register HyperLogLog, persisted as exactly 256 bytes.
+pub mod hll {
+    pub use fluree_db_stats::Hll256 as HllSketch256;
+}
 pub mod mem;
 pub mod orchestrator;
 pub mod run_index;

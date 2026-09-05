@@ -78,8 +78,8 @@ impl IdPropertyHll {
     /// HLL: register-wise max. Counts: additive. last_modified_t: max.
     pub fn merge_from(&mut self, other: &IdPropertyHll) {
         self.count += other.count;
-        self.values_hll.merge_inplace(&other.values_hll);
-        self.subjects_hll.merge_inplace(&other.subjects_hll);
+        self.values_hll.merge(&other.values_hll);
+        self.subjects_hll.merge(&other.subjects_hll);
         self.last_modified_t = self.last_modified_t.max(other.last_modified_t);
         for (&dt, &delta) in &other.datatypes {
             *self.datatypes.entry(dt).or_insert(0) += delta;
@@ -965,6 +965,42 @@ mod tests {
         let key = GraphPropertyKey { g_id: 0, p_id: 1 };
         assert_eq!(props[&key].count, 5);
         assert_eq!(props[&key].last_modified_t, 3);
+    }
+
+    /// The indexer's own guard on the sketch it persists.
+    ///
+    /// `merge_from` is register-wise max, so merging a disjoint sketch
+    /// can only raise the estimate, and the merged estimate must be
+    /// near the true union cardinality. The kernel tests this too, but
+    /// the indexer had no test that would redden if the kernel's merge
+    /// regressed under it -- flipping that max to a min left all of the
+    /// indexer's tests green.
+    #[test]
+    fn merge_from_unions_the_sketches() {
+        // Fed the way the refresh path feeds it: `subject_hash`, not a
+        // raw counter. The sketch takes an already-mixed 64-bit hash,
+        // and a value with structure left in it (`i * odd`) inflates
+        // the estimate by most of a factor of two.
+        let mut a = IdPropertyHll::new();
+        let mut b = IdPropertyHll::new();
+        for i in 0..5_000u64 {
+            a.subjects_hll.insert_hash(subject_hash(i));
+        }
+        for i in 5_000..10_000u64 {
+            b.subjects_hll.insert_hash(subject_hash(i));
+        }
+        let (only_a, only_b) = (a.subjects_hll.estimate(), b.subjects_hll.estimate());
+
+        a.merge_from(&b);
+        let merged = a.subjects_hll.estimate();
+
+        assert!(
+            merged >= only_a && merged >= only_b,
+            "merge must not lower the estimate: {only_a} + {only_b} -> {merged}"
+        );
+        // 256 registers is about 6.5% relative error; allow three sigma.
+        let err = (merged as f64 - 10_000.0).abs() / 10_000.0;
+        assert!(err < 0.20, "merged estimate {merged} is not near 10,000");
     }
 
     fn record(op: bool, t: i64) -> StatsRecord {
