@@ -372,11 +372,11 @@ impl crate::Fluree {
         use futures::StreamExt;
 
         let provider = crate::graph_source::FlureeR2rmlProvider::new(self);
-        let snapshot_id = provider
-            .current_snapshot_id(graph_source_id, table_name)
-            .await?;
-        let table_columns = provider
-            .table_column_names(graph_source_id, table_name)
+        // One resolution for both, and the same session pin the scan
+        // below will resolve to: the reported snapshot is the scanned
+        // one, and the table is not loaded three times.
+        let (snapshot_id, table_columns) = provider
+            .pinned_snapshot_and_columns(graph_source_id, table_name)
             .await?;
         for k in &req.group_by {
             if !table_columns.contains(k) {
@@ -444,7 +444,8 @@ impl crate::Fluree {
             .scan_table(graph_source_id, table_name, &projection, &[], None, None)
             .await?;
 
-        let mut key = String::new();
+        // Reused across batches; each batch refills the rows it needs.
+        let mut keys: Vec<String> = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             let key_cols: Vec<&fluree_db_tabular::Column> = req
@@ -452,24 +453,39 @@ impl crate::Fluree {
                 .iter()
                 .filter_map(|k| batch.column_by_name(k))
                 .collect();
+
+            // Built once per batch, not once per profiled column: the
+            // key of a row is the same whichever column is being folded,
+            // so building it inside the column loop cost one pass and
+            // one string per key cell per column.
+            let grouping = !key_cols.is_empty();
+            if grouping {
+                if keys.len() < batch.num_rows {
+                    keys.resize_with(batch.num_rows, String::new);
+                }
+                for (row, key) in keys.iter_mut().take(batch.num_rows).enumerate() {
+                    key.clear();
+                    for (i, kc) in key_cols.iter().enumerate() {
+                        if i > 0 {
+                            key.push_str(" | ");
+                        }
+                        tabular::append_display_at(key, kc, row);
+                    }
+                }
+            }
+
             for (name, acc) in names.iter().zip(accs.iter_mut()) {
                 let (Some(acc), Some(col)) = (acc.as_mut(), batch.column_by_name(name)) else {
                     continue;
                 };
-                for row in 0..batch.num_rows {
-                    let k = if key_cols.is_empty() {
-                        None
-                    } else {
-                        key.clear();
-                        for (i, kc) in key_cols.iter().enumerate() {
-                            if i > 0 {
-                                key.push_str(" | ");
-                            }
-                            key.push_str(&tabular::display_at(kc, row));
-                        }
-                        Some(key.as_str())
-                    };
-                    acc.observe(k, tabular::value_at(col, row));
+                if grouping {
+                    for (row, key) in keys.iter().take(batch.num_rows).enumerate() {
+                        acc.observe(Some(key.as_str()), tabular::value_at(col, row));
+                    }
+                } else {
+                    for row in 0..batch.num_rows {
+                        acc.observe(None, tabular::value_at(col, row));
+                    }
                 }
             }
         }

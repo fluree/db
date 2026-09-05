@@ -88,15 +88,38 @@ impl ProfileValue<'_> {
     /// The value as text: what a group key or a display sample is built
     /// from. Nulls read as the empty string, bytes as `0x` plus hex.
     pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        self.write_text(&mut out);
+        out
+    }
+
+    /// Append the display form to `out`.
+    ///
+    /// Building a group key over several cells is the hot use, and it
+    /// wants the text in a buffer it already owns rather than one
+    /// `String` per cell.
+    pub fn write_text(&self, out: &mut String) {
+        use std::fmt::Write;
         match self {
-            ProfileValue::Null => String::new(),
-            ProfileValue::Bool(b) => b.to_string(),
-            ProfileValue::Int(i) | ProfileValue::Temporal(i) => i.to_string(),
-            ProfileValue::Float(f) => f.to_string(),
-            ProfileValue::Str(s) | ProfileValue::Ref(s) | ProfileValue::Other(s) => {
-                (*s).to_string()
+            ProfileValue::Null => {}
+            ProfileValue::Bool(b) => {
+                let _ = write!(out, "{b}");
             }
-            ProfileValue::Bytes(b) => format!("0x{}", hex::encode(b)),
+            ProfileValue::Int(i) | ProfileValue::Temporal(i) => {
+                let _ = write!(out, "{i}");
+            }
+            ProfileValue::Float(f) => {
+                let _ = write!(out, "{f}");
+            }
+            ProfileValue::Str(s) | ProfileValue::Ref(s) | ProfileValue::Other(s) => {
+                out.push_str(s);
+            }
+            ProfileValue::Bytes(b) => {
+                out.push_str("0x");
+                for byte in *b {
+                    let _ = write!(out, "{byte:02x}");
+                }
+            }
         }
     }
 

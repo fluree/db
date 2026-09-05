@@ -45,6 +45,12 @@ pub fn display_at(col: &Column, row: usize) -> String {
     value_at(col, row).to_text()
 }
 
+/// Append the cell at `row` to `out` as text. [`display_at`] without the
+/// per-cell allocation, for callers assembling a key from several cells.
+pub fn append_display_at(out: &mut String, col: &Column, row: usize) {
+    value_at(col, row).write_text(out);
+}
+
 /// Fold every cell of `col` into `profile`.
 pub fn profile_column(profile: &mut ColumnProfile, col: &Column) {
     for row in 0..col.len() {
@@ -62,7 +68,7 @@ pub fn profile_column_grouped(grouped: &mut GroupedProfile, col: &Column, key_co
             if i > 0 {
                 key.push_str(" | ");
             }
-            key.push_str(&display_at(k, row));
+            append_display_at(&mut key, k, row);
         }
         grouped.observe(&key, value_at(col, row));
     }
