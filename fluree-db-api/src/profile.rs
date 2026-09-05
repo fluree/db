@@ -13,8 +13,10 @@
 //! kilobytes, but the ledger face has no streaming predicate walk to
 //! drive them from yet: each property's current flakes are ranged into
 //! memory once and folded from there, so peak memory is proportional to
-//! the largest property profiled. The table face streams batches and is
-//! bounded by the scan.
+//! the largest property profiled unless the request sets
+//! [`ProfileRequest::max_values`], which refuses a property past the cap
+//! instead of ranging it. The table face streams batches and is bounded
+//! by the scan.
 //!
 //! Neither face applies view policy. Both read the ledger or lake
 //! directly and belong behind an administrative surface until they do.
