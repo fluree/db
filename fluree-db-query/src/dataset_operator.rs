@@ -542,15 +542,24 @@ impl Operator for DatasetOperator {
         match ctx.active_graphs() {
             ActiveGraphs::Single => {
                 // Single-graph mode: build one operator, open with parent
-                // context directly. No fanout, no provenance stamping.
+                // context directly. No fanout; provenance stamping only when
+                // the context demands it — a cross-ledger SERVICE subtree sets
+                // `scan_provenance_ledger` so raw target-encoded `Sid`s never
+                // escape a scan (they would be re-decoded against the
+                // requester's namespace table the moment an intra-body join
+                // substitutes them into a pattern; issue #1665). Everywhere
+                // else the flag is `None` and this lane is unchanged.
                 let mut inner = self.builder.build()?;
                 self.apply_member_directives(inner.as_mut());
                 inner.open(ctx).await?;
+                self.needs_provenance = ctx.scan_provenance_ledger.is_some();
                 self.members.push(DatasetMember {
                     operator: inner,
-                    ledger_id: Arc::from(""),
+                    ledger_id: ctx
+                        .scan_provenance_ledger
+                        .clone()
+                        .unwrap_or_else(|| Arc::from("")),
                 });
-                self.needs_provenance = false;
             }
             ActiveGraphs::Many(graphs) => {
                 // Pre-scan: determine whether graphs span multiple ledgers

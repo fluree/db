@@ -185,9 +185,35 @@ impl ServiceOperator {
 
         // Create execution context for the target ledger
         // If graph_ref is Some, create a new context; otherwise use the current context (self-reference)
+        //
+        // A target in a DIFFERENT ledger also needs provenance stamping on the
+        // way back out: its SIDs are meaningless in the parent's namespace
+        // table, so a term that escapes this block un-stamped is decoded
+        // against the wrong prefixes downstream. `DatasetOperator` solves this
+        // for its own members; mirror it here, including forcing the range
+        // fallback so inner scans yield `Binding::Sid` rather than an
+        // `EncodedSid` that `stamp_binding` cannot decode.
+        //
+        // Stamping only at this boundary is not enough when the block holds
+        // more than one pattern: the joins INSIDE the subtree substitute
+        // bindings back into patterns, and the scan layer decodes constant
+        // SIDs against `original_snapshot` — the requester — while a raw scan
+        // `Sid` here is target-encoded (issue #1665). `scan_provenance_ledger`
+        // arms the same per-scan stamping the multi-ledger dataset lane uses,
+        // so every binding inside the subtree is namespace-neutral `IriMatch`
+        // before any join touches it.
         let target_ctx;
+        let mut cross_ledger: Option<Arc<str>> = None;
         let ctx_to_use: &ExecutionContext<'_> = if let Some(gref) = graph_ref {
-            target_ctx = ctx.with_graph_ref(gref);
+            let mut per_graph_ctx = ctx.with_graph_ref(gref);
+            if gref.ledger_id.as_ref() != ctx.active_snapshot.ledger_id.as_str() {
+                per_graph_ctx.binary_store = None;
+                per_graph_ctx.dict_novelty = None;
+                per_graph_ctx.runtime_small_dicts = None;
+                per_graph_ctx.scan_provenance_ledger = Some(Arc::clone(&gref.ledger_id));
+                cross_ledger = Some(Arc::clone(&gref.ledger_id));
+            }
+            target_ctx = per_graph_ctx;
             &target_ctx
         } else {
             ctx
@@ -222,6 +248,26 @@ impl ServiceOperator {
                     inner.close();
                     return Err(e);
                 }
+            };
+
+            // Stamp before merging, so only the columns this block produced are
+            // rewritten — the parent's own bindings are copied from
+            // `parent_batch` below and are already correct for its ledger.
+            //
+            // A decode failure propagates even under SILENT: it means the term
+            // cannot be named correctly, and SILENT's contract is to swallow a
+            // failing *endpoint*, not to emit a wrong IRI as if it were right.
+            let batch = match &cross_ledger {
+                Some(ledger_id) => {
+                    match crate::dataset_operator::stamp_provenance(batch, ledger_id, ctx) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            inner.close();
+                            return Err(e);
+                        }
+                    }
+                }
+                None => batch,
             };
 
             // Merge each inner result with parent row
