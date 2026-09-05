@@ -21,11 +21,11 @@
 
 use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::state_machine::{
-    ApplyOutcome, ApplyRecord, BodyKind, Command as SmCommand, PoisonRecord, QueueSubmission,
-    RefKey, Response as SmResponse,
+    ApplyOutcome, ApplyRecord, BodyKind, Command as SmCommand, NameServiceState, PoisonRecord,
+    QueueSubmission, RefKey, Response as SmResponse,
 };
 use crate::raft::state_machine_adapter::SharedState;
-use crate::raft::waiter::{AbortReason, WaiterMap, WaiterOutcome};
+use crate::raft::waiter::{AbortReason, WaitError, WaiterMap, WaiterOutcome};
 use crate::raft::TypeConfig;
 use crate::{
     CommittedSubmission, Committer, IdempotencyCacheKey, IdempotencyKey, MergeReceipt,
@@ -45,10 +45,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// How long a single waiter `await` blocks before the transactor
-/// considers the call stranded by a leader transition and either
-/// re-issues (idempotent submissions) or errors out (anonymous
-/// submissions). Conservative — the typical Raft round-trip is
-/// sub-second; this is the budget for "something went wrong."
+/// checks on the submission. A timeout is a *probe*, not a verdict:
+/// while the entry is still in the replicated queue and the cluster
+/// has a leader, the submission is alive — a slow stage, a deep
+/// per-branch queue — and the wait simply continues. Only a timeout
+/// that finds the entry gone (or the cluster leaderless) spends one of
+/// the retry attempts, which is the leader-transition case this budget
+/// was always meant for.
 const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Number of (propose → register waiter → await) attempts before the
@@ -56,6 +59,24 @@ const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 /// re-proposes the same `EnqueueCommand`; the state machine's
 /// idempotency cache makes repeats safe.
 const DEFAULT_MAX_RETRIES: usize = 3;
+
+/// Ceiling on the total time a submission may stay parked on a live
+/// queue entry before the transactor reports its outcome unknown. This
+/// is the backstop for a worker that never finishes — a wedged stage,
+/// a former leader partitioned away from the cluster with a stale copy
+/// of the queue. The number is deliberately generous: a submission
+/// that hits it has already survived every probe, so the only thing it
+/// costs is a still-progressing commit reported as a 504.
+const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(600);
+
+/// How long a probe that found its entry gone waits for the outcome
+/// before spending an attempt. The entry leaves the replicated queue
+/// under the state lock, but its terminal apply resolves the waiter in
+/// the observer's effects, after that lock drops — so a probe can read
+/// the queue in between and see the entry gone while the receipt is
+/// moments from landing. A genuinely stranded entry just times out
+/// again; the cost is paid only on that path.
+const GONE_ENTRY_GRACE: Duration = Duration::from_millis(250);
 
 /// Committer that routes transactions through the per-branch Raft
 /// queue.
@@ -74,6 +95,7 @@ pub struct QueuedTransactor {
     shared_state: SharedState,
     wait_timeout: Duration,
     max_retries: usize,
+    max_wait: Duration,
 }
 
 impl QueuedTransactor {
@@ -90,12 +112,21 @@ impl QueuedTransactor {
             shared_state,
             wait_timeout: DEFAULT_WAIT_TIMEOUT,
             max_retries: DEFAULT_MAX_RETRIES,
+            max_wait: DEFAULT_MAX_WAIT,
         }
     }
 
-    /// Override the per-attempt waiter timeout (default 8s).
+    /// Override the waiter probe interval (default 8s) — how often a
+    /// parked submission checks that its queue entry is still alive.
     pub fn with_wait_timeout(mut self, timeout: Duration) -> Self {
         self.wait_timeout = timeout;
+        self
+    }
+
+    /// Override the ceiling on total time parked on a live queue entry
+    /// (default 10 minutes). See [`DEFAULT_MAX_WAIT`].
+    pub fn with_max_wait(mut self, max_wait: Duration) -> Self {
+        self.max_wait = max_wait;
         self
     }
 
@@ -158,7 +189,8 @@ impl QueuedTransactor {
         // applies the enqueue and binds it — which is what lets a fast
         // worker's ApplyHead find a waiter, and what keeps followers
         // from tracking anything at all. Dropped on every return path.
-        let mut ticket = self.waiter_map.arm(request_cid.clone(), ref_key);
+        let mut ticket = self.waiter_map.arm(request_cid.clone(), ref_key.clone());
+        let parked_since = std::time::Instant::now();
         for attempt in 0..attempts_allowed {
             let response = match self.raft.client_write(cmd.clone()).await {
                 Ok(response) => response,
@@ -204,16 +236,40 @@ impl QueuedTransactor {
                     // enqueue, so there is nothing to register here.
                     // On a retry the response is `InFlight` for the same
                     // entry and the ticket is already bound to it.
-                    match ticket.wait(self.wait_timeout).await {
-                        Ok(outcome) => return Ok(SubmissionOutcome::Waiter(outcome)),
-                        // Displaced (a duplicate submission took the
-                        // slot) and timed-out are handled the same:
-                        // retry if eligible, error otherwise.
-                        Err(_) => {
-                            if attempt + 1 >= attempts_allowed {
-                                return Err(self.stranded_error(retry_eligible));
+                    // Park until the outcome lands. A probe timeout that
+                    // finds the entry still queued keeps waiting without
+                    // spending an attempt — the entry is alive, and the
+                    // former-leader case is covered too: `ApplyHead`
+                    // replicates to every node, so a waiter bound here
+                    // resolves when the new leader's worker finishes it.
+                    // Displaced (a duplicate submission took the slot)
+                    // and a timeout that finds the entry gone are handled
+                    // the same: retry if eligible, error otherwise. A gone
+                    // entry first gets `GONE_ENTRY_GRACE` for its outcome
+                    // to land.
+                    loop {
+                        match ticket.wait(self.wait_timeout).await {
+                            Ok(outcome) => return Ok(SubmissionOutcome::Waiter(outcome)),
+                            Err(WaitError::Displaced) => break,
+                            Err(WaitError::TimedOut) => {
+                                let alive = self.entry_alive(&ref_key, ticket.queue_id()).await;
+                                match probe_verdict(alive, parked_since.elapsed(), self.max_wait) {
+                                    ProbeVerdict::KeepWaiting => continue,
+                                    ProbeVerdict::SpendAttempt => {
+                                        if let Ok(outcome) = ticket.wait(GONE_ENTRY_GRACE).await {
+                                            return Ok(SubmissionOutcome::Waiter(outcome));
+                                        }
+                                        break;
+                                    }
+                                    ProbeVerdict::CeilingReached => {
+                                        return Err(self.ceiling_error(retry_eligible));
+                                    }
+                                }
                             }
                         }
+                    }
+                    if attempt + 1 >= attempts_allowed {
+                        return Err(self.stranded_error(retry_eligible));
                     }
                 }
                 SmResponse::IdempotencyHit { record } => {
@@ -275,6 +331,39 @@ impl QueuedTransactor {
             }
         }
         Err(self.stranded_error(retry_eligible))
+    }
+
+    /// Whether the submission bound to `queue_id` is still alive: its
+    /// entry is present in the replicated per-branch queue and the
+    /// cluster has a leader to drive it. An unbound ticket (this node
+    /// never applied the enqueue) and a leaderless view — which is also
+    /// what a partitioned former leader sees — both read as not alive,
+    /// so the retry path gets to surface the real condition.
+    async fn entry_alive(&self, ref_key: &RefKey, queue_id: Option<u64>) -> bool {
+        let Some(queue_id) = queue_id else {
+            return false;
+        };
+        if self.raft.current_leader().await.is_none() {
+            return false;
+        }
+        let state = self.shared_state.read().await;
+        entry_queued(&state, ref_key, queue_id)
+    }
+
+    fn ceiling_error(&self, retry_eligible: bool) -> SubmissionError {
+        let recourse = if retry_eligible {
+            "poll with the idempotency key"
+        } else {
+            "it carried no idempotency key, so check the ledger head before retrying"
+        };
+        SubmissionError::Execution {
+            status: 504,
+            message: format!(
+                "submission still queued after {:?}; its outcome is unknown and it may \
+                 still commit — {recourse}",
+                self.max_wait
+            ),
+        }
     }
 
     fn stranded_error(&self, retry_eligible: bool) -> SubmissionError {
@@ -1044,6 +1133,36 @@ fn rebase_receipt_from(
     }
 }
 
+/// What a probe timeout means for the parked submission.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeVerdict {
+    /// The entry is alive; park again without spending an attempt.
+    KeepWaiting,
+    /// The entry is gone or the cluster is leaderless; spend an attempt
+    /// on a re-propose (idempotent) or report stranded (anonymous).
+    SpendAttempt,
+    /// Alive, but parked longer than the ceiling allows.
+    CeilingReached,
+}
+
+fn probe_verdict(alive: bool, parked_for: Duration, max_wait: Duration) -> ProbeVerdict {
+    if !alive {
+        ProbeVerdict::SpendAttempt
+    } else if parked_for >= max_wait {
+        ProbeVerdict::CeilingReached
+    } else {
+        ProbeVerdict::KeepWaiting
+    }
+}
+
+/// Whether `queue_id` is still an entry of `ref_key`'s replicated queue.
+fn entry_queued(state: &NameServiceState, ref_key: &RefKey, queue_id: u64) -> bool {
+    state
+        .queues
+        .get(ref_key)
+        .is_some_and(|queue| queue.iter().any(|entry| entry.queue_id == queue_id))
+}
+
 fn submission_error_from_abort(reason: AbortReason) -> SubmissionError {
     match reason {
         AbortReason::BranchDropped => SubmissionError::Execution {
@@ -1078,7 +1197,94 @@ fn submission_error_from_abort(reason: AbortReason) -> SubmissionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::state_machine::PoisonReason;
+    use crate::raft::state_machine::{PoisonReason, QueueEntry};
+
+    #[test]
+    fn a_probe_timeout_on_a_live_entry_keeps_waiting() {
+        let ceiling = Duration::from_secs(600);
+        assert_eq!(
+            probe_verdict(true, Duration::from_secs(30), ceiling),
+            ProbeVerdict::KeepWaiting,
+            "a slow stage on a queued entry must not spend an attempt"
+        );
+        assert_eq!(
+            probe_verdict(true, Duration::from_secs(599), ceiling),
+            ProbeVerdict::KeepWaiting
+        );
+    }
+
+    #[test]
+    fn a_probe_timeout_on_a_missing_entry_spends_an_attempt() {
+        let ceiling = Duration::from_secs(600);
+        assert_eq!(
+            probe_verdict(false, Duration::from_millis(1), ceiling),
+            ProbeVerdict::SpendAttempt
+        );
+        // Gone beats the ceiling: the retry path gets to surface why.
+        assert_eq!(
+            probe_verdict(false, Duration::from_secs(601), ceiling),
+            ProbeVerdict::SpendAttempt
+        );
+    }
+
+    #[test]
+    fn the_ceiling_only_applies_to_a_live_entry() {
+        let ceiling = Duration::from_secs(600);
+        assert_eq!(
+            probe_verdict(true, ceiling, ceiling),
+            ProbeVerdict::CeilingReached
+        );
+        assert_eq!(
+            probe_verdict(true, Duration::from_secs(601), ceiling),
+            ProbeVerdict::CeilingReached
+        );
+    }
+
+    #[test]
+    fn entry_queued_finds_the_entry_only_on_its_own_branch() {
+        fn cid(seed: u8) -> ContentId {
+            ContentId::new(ContentKind::Commit, &[seed])
+        }
+        let entry = |queue_id: u64| QueueEntry {
+            queue_id,
+            enqueued_index: 1,
+            enqueued_at_millis: 0,
+            idempotency: None,
+            request_cid: cid(queue_id as u8),
+            body_cid: cid(queue_id as u8),
+            body_kind: BodyKind::JsonLdInsert,
+        };
+        let main = RefKey::new("db", "main");
+        let dev = RefKey::new("db", "dev");
+        let mut state = NameServiceState::default();
+        state
+            .queues
+            .entry(main.clone())
+            .or_default()
+            .extend([entry(1), entry(2)]);
+        state
+            .queues
+            .entry(dev.clone())
+            .or_default()
+            .push_back(entry(3));
+
+        assert!(entry_queued(&state, &main, 1));
+        assert!(
+            entry_queued(&state, &main, 2),
+            "a second entry is still queued behind the front"
+        );
+        assert!(
+            !entry_queued(&state, &main, 3),
+            "another branch's entry does not count"
+        );
+        assert!(!entry_queued(&state, &dev, 1));
+        assert!(
+            !entry_queued(&state, &RefKey::new("other", "main"), 1),
+            "an absent queue reads as gone"
+        );
+        state.queues.get_mut(&main).unwrap().pop_front();
+        assert!(!entry_queued(&state, &main, 1), "a popped entry is gone");
+    }
 
     fn status(err: &SubmissionError) -> u16 {
         match err {
