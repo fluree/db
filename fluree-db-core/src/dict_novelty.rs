@@ -315,16 +315,22 @@ impl SubjectDictNovelty {
     /// Query-time overlay translation reverse-looks-up exactly these entries
     /// against the persisted subject dictionary; residency-mode loads
     /// prefetch the reverse-tree leaves they will touch.
-    pub fn iter_entries(&self) -> Box<dyn Iterator<Item = (u16, &str)> + '_> {
-        match self.parent.as_ref() {
-            Some(parent) => Box::new(
-                parent
-                    .subjects
-                    .iter_entries()
-                    .chain(self.inner.iter_entries()),
-            ),
-            None => Box::new(self.inner.iter_entries()),
+    pub fn iter_entries(&self) -> impl Iterator<Item = (u16, &str)> + '_ {
+        self.chain_root_first()
+            .into_iter()
+            .flat_map(|dict| dict.inner.iter_entries())
+    }
+
+    /// This dictionary and its parents, root first.
+    fn chain_root_first(&self) -> Vec<&SubjectDictNovelty> {
+        let mut chain = vec![self];
+        let mut dict = self;
+        while let Some(parent) = dict.parent.as_ref() {
+            dict = &parent.subjects;
+            chain.push(dict);
         }
+        chain.reverse();
+        chain
     }
 }
 
@@ -393,12 +399,17 @@ impl StringDictNovelty {
 
     /// Iterate every novel string value, parents first. Mirror of
     /// [`SubjectDictNovelty::iter_entries`] for the string dictionary.
-    pub fn iter_values(&self) -> Box<dyn Iterator<Item = &str> + '_> {
-        let own = self.inner.iter().map(|(_, s)| s);
-        match self.parent.as_ref() {
-            Some(parent) => Box::new(parent.strings.iter_values().chain(own)),
-            None => Box::new(own),
+    pub fn iter_values(&self) -> impl Iterator<Item = &str> + '_ {
+        let mut chain = vec![self];
+        let mut dict = self;
+        while let Some(parent) = dict.parent.as_ref() {
+            dict = &parent.strings;
+            chain.push(dict);
         }
+        chain.reverse();
+        chain
+            .into_iter()
+            .flat_map(|dict| dict.inner.iter().map(|(_, s)| s))
     }
 
     /// Number of entries in the novelty layer, parents included.
