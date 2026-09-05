@@ -289,22 +289,31 @@ impl crate::Fluree {
             }
             maps.push(map);
         }
-        let keys: Option<HashMap<Sid, Arc<str>>> = match maps.as_slice() {
-            [] => None,
-            [single] => Some(single.clone()),
-            [first, rest @ ..] => Some(
-                first
-                    .iter()
-                    .filter_map(|(s, head)| {
-                        let mut key = head.to_string();
-                        for m in rest {
-                            key.push_str(" | ");
-                            key.push_str(m.get(s)?);
-                        }
-                        Some((s.clone(), intern(key)))
-                    })
-                    .collect(),
-            ),
+        // Taken by value: the one-key case is the common one, and
+        // cloning it would hold two whole subject maps at once.
+        let mut maps = maps.into_iter();
+        let keys: Option<HashMap<Sid, Arc<str>>> = match maps.next() {
+            None => None,
+            Some(first) => {
+                let rest: Vec<HashMap<Sid, Arc<str>>> = maps.collect();
+                if rest.is_empty() {
+                    Some(first)
+                } else {
+                    Some(
+                        first
+                            .into_iter()
+                            .filter_map(|(s, head)| {
+                                let mut key = head.to_string();
+                                for m in &rest {
+                                    key.push_str(" | ");
+                                    key.push_str(m.get(&s)?);
+                                }
+                                Some((s, intern(key)))
+                            })
+                            .collect(),
+                    )
+                }
+            }
         };
 
         let mut columns = Vec::with_capacity(req.columns.len());
@@ -396,6 +405,21 @@ impl crate::Fluree {
                     reason: "column is not in the table".into(),
                 });
             }
+        }
+
+        // Nothing the request named is in the table, so there is no
+        // accumulator to feed. An empty projection means "every
+        // column" to the scan, which would read the whole table to
+        // produce a report of nothing but skips.
+        if accs.iter().all(Option::is_none) {
+            return Ok(ProfileReport {
+                source: format!("{graph_source_id}/{table_name}"),
+                t: None,
+                snapshot_id,
+                group_by: req.group_by.clone(),
+                columns: Vec::new(),
+                skipped,
+            });
         }
 
         // Project only what the profile needs; every column when the
