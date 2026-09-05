@@ -822,6 +822,10 @@ impl FlureeServerBuilder {
                         .expect("index_config set by AppState::new"),
                     liveness: self.liveness_config.clone(),
                     extra_leader_tasks: Some(Box::new(leader_tasks)),
+                    // Transactor defaults. Operator tuning of the write
+                    // path's timeouts is tracked under #1382.
+                    submit_wait: None,
+                    submit_max_wait: None,
                 };
                 let node = fluree_db_consensus::raft::embedded::EmbeddedRaftNode::attach(
                     Arc::clone(integration),
