@@ -2418,10 +2418,18 @@ impl Operator for BinaryScanOperator {
             // Single source of truth for the cross-query key, shared by the
             // warm probe and the build path below so the two can never
             // disagree on a key dimension.
-            let make_global_key = || GlobalTranslationKey {
+            // The cross-query layer is keyed on the overlay's process-unique
+            // content version, never its epoch: a `StagedLedger` reports the
+            // very epoch and `to_t` the committed novelty reports right after
+            // its flakes commit, so an epoch key would serve the staged
+            // translation (ids from a view-local dictionary) for the
+            // committed state. An overlay that cannot vouch for a content
+            // version is not cached across queries at all.
+            let content_version = ctx.overlay().content_version();
+            let make_global_key = |content_version: u64| GlobalTranslationKey {
                 ledger_id: ctx.active_snapshot.ledger_id.as_str().into(),
                 snapshot_t: ctx.active_snapshot.t,
-                overlay_epoch: epoch,
+                content_version,
                 store_id: store_arc.store_id(),
                 to_t: ctx.to_t,
                 g_id: self.g_id,
@@ -2440,7 +2448,7 @@ impl Operator for BinaryScanOperator {
                         return Some(Arc::clone(hit));
                     }
                 }
-                let hit = global_translation_cache().get(&make_global_key())?;
+                let hit = global_translation_cache().get(&make_global_key(content_version?))?;
                 translate_span.record("cache_hit", true);
                 ctx.translated_overlay_cache
                     .lock()
@@ -2469,7 +2477,7 @@ impl Operator for BinaryScanOperator {
                 // materializations) cost O(overlay × dict lookups) to
                 // translate, which would otherwise put a flat multi-second
                 // floor under every query at scale.
-                let global_key = make_global_key();
+                let global_key = content_version.map(make_global_key);
                 // Segment-aware path (raw Novelty): assemble from
                 // per-segment caches so a write burst re-translates only
                 // new segments. Falls back to the whole-graph translate
@@ -2503,7 +2511,9 @@ impl Operator for BinaryScanOperator {
                     untranslated,
                     ephemeral_preds,
                 });
-                global_translation_cache().insert(global_key, Arc::clone(&entry));
+                if let Some(global_key) = global_key {
+                    global_translation_cache().insert(global_key, Arc::clone(&entry));
+                }
                 ctx.translated_overlay_cache
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2876,8 +2886,11 @@ pub type EphemeralPredicateMap = HashMap<Sid, u32>;
 /// Identity of an overlay translation across query executions.
 ///
 /// Every component that can change the translated product is included:
-/// commits bump the overlay epoch (covering novelty contents, dict novelty,
-/// and runtime small dicts), snapshot/store swaps change `snapshot_t` /
+/// `content_version` is the overlay's process-unique content stamp (see
+/// [`fluree_db_core::OverlayProvider::content_version`] — it moves on every
+/// commit, covering novelty contents, dict novelty, and runtime small dicts,
+/// and it is what separates a staged view from the committed novelty it
+/// becomes, which share an epoch), snapshot/store swaps change `snapshot_t` /
 /// `store_id`, and `to_t` bounds which overlay flakes are visible.
 ///
 /// `store_id` (process-unique per store instance) is used instead of
@@ -2889,7 +2902,7 @@ pub type EphemeralPredicateMap = HashMap<Sid, u32>;
 pub struct GlobalTranslationKey {
     pub ledger_id: Arc<str>,
     pub snapshot_t: i64,
-    pub overlay_epoch: u64,
+    pub content_version: u64,
     pub store_id: u64,
     pub to_t: i64,
     pub g_id: GraphId,

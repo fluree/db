@@ -270,6 +270,20 @@ name = "it_cached_handle_cow"
 path = "tests/it_cached_handle_cow.rs"
 required-features = ["native"]
 
+# Own binary: installs a process-global tracing probe over overlay-translation
+# WARN events emitted while a transaction's SHACL pass queries the staged view.
+[[test]]
+name = "it_staged_view_dict"
+path = "tests/it_staged_view_dict.rs"
+required-features = ["native", "shacl"]
+
+# Own binary: installs a process-global tracing probe over the scan lane's
+# `overlay_translate` spans to pin cross-query translation cache hits.
+[[test]]
+name = "it_overlay_content_version"
+path = "tests/it_overlay_content_version.rs"
+required-features = ["native"]
+
 # Own binary for the same reason (process-global `fluree::cow_probe` capture),
 # covering the branch-op (merge / revert) commit flows.
 [[test]]

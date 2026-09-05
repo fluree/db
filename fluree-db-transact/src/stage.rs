@@ -1986,11 +1986,9 @@ async fn enforce_modify_policies(
     // StagedLedger overlay (the same view SHACL validates against) provides
     // it. Built only when such a condition is loaded.
     let staged_view = if policy.wrapper().has_post_state_conditions() {
-        Some(StagedLedger::new(
-            ledger.clone(),
-            flakes.to_vec(),
-            reverse_graph,
-        )?)
+        let mut view = StagedLedger::new(ledger.clone(), flakes.to_vec(), reverse_graph)?;
+        crate::staged_dicts::attach_staged_dicts(&mut view)?;
+        Some(view)
     } else {
         None
     };
@@ -2119,7 +2117,9 @@ async fn enforce_modify_policy_per_flake(
             )
             .with_graph_id(g_id);
             if let Some(staged) = staged_view {
-                ex = ex.with_post_state(staged, staged.staged_t());
+                ex = ex
+                    .with_post_state(staged, staged.staged_t())
+                    .with_post_state_snapshot(staged.db());
             }
             ex
         });
@@ -3230,13 +3230,17 @@ pub async fn stage_with_shacl(
     let tracker = options.tracker;
 
     // First, perform regular staging
-    let (view, mut ns_registry) = stage(ledger, txn, ns_registry, options).await?;
+    let (mut view, mut ns_registry) = stage(ledger, txn, ns_registry, options).await?;
 
     // Fast path: if there are no SHACL shapes, elide validation entirely.
     // This ensures SHACL has *zero* transaction-time overhead unless rules exist.
     if shacl_cache.is_empty() {
         return Ok((view, ns_registry));
     }
+
+    // Validation reads the staged view on the binary lane; its dictionaries
+    // must cover the subjects this transaction introduces.
+    crate::staged_dicts::attach_staged_dicts(&mut view)?;
 
     // Rebuild graph_sids from the cloned graph_delta + returned ns_registry.
     // These IRIs were already resolved during stage(), so sid_for_iri will find

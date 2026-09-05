@@ -1970,12 +1970,18 @@ impl UpdatePlan {
             // Large gap — full reload
             UpdatePlan::Reload
         } else {
-            // ns.commit_t < local_t - shouldn't happen (time travel?)
-            // Treat as noop - local is somehow ahead
-            tracing::warn!(
+            // ns.commit_t < local_t: the record is older than the cached
+            // state. Routine under the raft commit worker — `notify` reads
+            // the record before taking the ledger's state lock, and the
+            // worker holds that lock's write side across the next chunk's
+            // stage + publish + install, so a reconciliation queued behind
+            // it wakes to a local state one commit newer than the record
+            // it fetched. Local is the fresher of the two; the next lookup
+            // catches the record up. Nothing to do.
+            tracing::debug!(
                 local_t = local_t,
                 ns_commit_t = ns.commit_t,
-                "Local t is ahead of nameservice commit_t - unexpected"
+                "nameservice record older than local state; ignoring"
             );
             UpdatePlan::Noop
         }
@@ -2627,7 +2633,9 @@ mod tests {
 
     #[test]
     fn test_update_plan_noop_when_local_ahead() {
-        // Edge case: local is somehow ahead of ns (shouldn't happen, but be safe)
+        // The record is older than the cached state: a reconciliation that
+        // fetched it, then waited on the state lock across the raft worker's
+        // next install. Stale record, nothing to do — never a reload.
         let local_idx = make_index_cid("index:5");
         let ns = make_ns_record(5, 5, Some(make_cid("commit:5")), Some(local_idx.clone()));
         let plan = UpdatePlan::plan(10, 5, Some(&local_idx), &ns);
