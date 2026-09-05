@@ -896,25 +896,31 @@ impl<'a> Lowerer<'a> {
             })
             .collect();
         // A foreign key certain to point at this entity joins its parent's
-        // row: a resolution minting another subject can never meet it and
-        // is dropped; one on the parent's subject over other tables takes
-        // the parent's row as a part of its own, joined on the subject key.
+        // row: a resolution minting subjects provably apart from the
+        // parent's can never meet it and is dropped; one on the parent's
+        // subject over other tables takes the parent's row as a part of its
+        // own, joined on the subject key; one the lane can neither join nor
+        // rule out (one prefix, another skeleton) declines.
         let mapping = self.mapping;
         let mut alternatives = alternatives;
         for inc in incoming.iter().filter(|i| i.certain) {
             let Some(parent) = mapping.get(&inc.parent) else {
                 return Ok(Err(Decline("ref object map parent missing")));
             };
-            alternatives.retain_mut(|parts| {
+            let mut kept = Vec::with_capacity(alternatives.len());
+            for mut parts in alternatives {
                 if parts.iter().any(|(tm, _)| same_row(tm, parent)) {
-                    return true;
-                }
-                if parts.iter().any(|(tm, _)| same_subject(tm, parent)) {
+                    kept.push(parts);
+                } else if parts.iter().any(|(tm, _)| same_subject(tm, parent)) {
                     parts.push((parent, Vec::new()));
-                    return true;
+                    kept.push(parts);
+                } else if !parts.iter().all(|(tm, _)| subjects_disjoint(tm, parent)) {
+                    return Ok(Err(Decline(
+                        "ref object map into a union entity over templates the lane cannot relate",
+                    )));
                 }
-                false
-            });
+            }
+            alternatives = kept;
         }
         let mut branches: Vec<(Lowered, HashSet<(String, String)>)> = Vec::new();
         for alt in alternatives {
@@ -1417,7 +1423,7 @@ impl<'a> Lowerer<'a> {
                         VarSource {
                             term,
                             key: None,
-                            nullable: false,
+                            nullable: lowered.vars.get(&v).is_some_and(|s| s.nullable),
                         },
                     ));
                     continue;
@@ -1477,12 +1483,14 @@ impl<'a> Lowerer<'a> {
                     }
                 };
             }
+            // An OPTIONAL variable stays nullable across the derived table,
+            // so the outer block declines to unify it as it would inside.
             binds.push((
                 v,
                 VarSource {
                     term,
                     key,
-                    nullable: false,
+                    nullable: lowered.vars.get(&v).is_some_and(|s| s.nullable),
                 },
             ));
         }

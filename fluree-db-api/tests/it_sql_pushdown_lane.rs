@@ -118,6 +118,43 @@ fn vp_mapping(prefix: &str) -> String {
     VP_R2RML.replace("shop.", prefix)
 }
 
+/// Two maps minting `ex:memo` for subjects under the order prefix from one
+/// table: `order/{order_ref}` and `order/{order_ref}-note`, whose subjects
+/// meet where one key is another's under the suffix, and a pointer whose
+/// foreign key targets the first.
+fn memo_mapping(prefix: &str) -> String {
+    format!(
+        r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Memo>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "{prefix}memos" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{{order_ref}}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:memo ; rr:objectMap [ rr:column "body" ] ] .
+
+    <http://example.org/mapping#MemoNote>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "{prefix}memos" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{{order_ref}}-note" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:memo ; rr:objectMap [ rr:column "body" ] ] .
+
+    <http://example.org/mapping#Pointer>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "{prefix}pointers" ] ;
+        rr:subjectMap [ rr:template "http://example.org/pointer/{{id}}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:about ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Memo> ;
+                rr:joinCondition [ rr:child "ref" ; rr:parent "order_ref" ]
+            ]
+        ] .
+"#
+    )
+}
+
 fn typed_mapping(prefix: &str) -> String {
     TYPED_R2RML.replace("shop.", prefix)
 }
@@ -311,6 +348,26 @@ async fn shop() -> MockServer {
             &[("order_no", "bigint"), ("carrier", "varchar")],
             vec![vec![json!(10), json!("UPS")], vec![json!(12), json!("DHL")]],
         ))
+        // Memos keyed by text under the order prefix, where one key is
+        // another's under a `-note` suffix; pointers into them.
+        .table(Table::new(
+            "shop.memos",
+            &[
+                ("id", "bigint"),
+                ("order_ref", "varchar"),
+                ("body", "varchar"),
+            ],
+            vec![
+                vec![json!(1), json!("10"), json!("gift wrap")],
+                vec![json!(2), json!("10-note"), json!("wrapped")],
+                vec![json!(3), json!("12"), json!("call first")],
+            ],
+        ))
+        .table(Table::new(
+            "shop.pointers",
+            &[("id", "bigint"), ("ref", "varchar")],
+            vec![vec![json!(1), json!("10")], vec![json!(2), json!("10-note")]],
+        ))
         .mount()
         .await
 }
@@ -342,6 +399,14 @@ async fn setup() -> (MockServer, Fluree) {
         ))
         .await
         .expect("create typed sql source");
+    fluree
+        .create_sql_graph_source(SqlCreateConfig::new(
+            "shop-memo",
+            server.uri(),
+            memo_mapping("shop."),
+        ))
+        .await
+        .expect("create memo sql source");
     seed_native_twin(&fluree).await;
     (server, fluree)
 }
@@ -350,6 +415,7 @@ async fn setup() -> (MockServer, Fluree) {
 /// for the engine's subquery operator), checked against the native twin
 /// of the shop fixture instead.
 const LANE_ONLY_CASES: &[&str] = &[
+    "a sub-select projects an OPTIONAL variable as nullable",
     "a grouped sub-select joins its counts to the outer rows",
     "a grouped sub-select sums in the database and finalizes in the engine",
     "a DISTINCT sub-select pushes as a distinct derived table",
@@ -1065,6 +1131,16 @@ fn cases() -> Vec<Case> {
         // it. HAVING, OFFSET, a nested sub-select and a hidden inner
         // variable the block reuses decline.
         Case {
+            // The derived table keeps the inner LEFT JOIN's column nullable,
+            // so a customer without a country still comes back unbound.
+            name: "a sub-select projects an OPTIONAL variable as nullable",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c ?k WHERE { ?c ex:name ?x OPTIONAL { ?c ex:country ?k } } } }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "d0"."c0" AS "c2", "d0"."c1" AS "c3" FROM "shop"."customers" AS "t0" JOIN (SELECT "t1"."id" AS "c0", "t1"."country" AS "c1" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL) AS "d0" ON "t0"."id" = "d0"."c0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            rows: &["k= n=Bo", "k=UK n=Ada", "k=US n=Cy"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
             name: "a sub-select's HAVING pushes inside its derived table",
             sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c (COUNT(?o) AS ?k) WHERE { ?o ex:customer ?c } GROUP BY ?c HAVING (COUNT(?o) > 1) } }",
             sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "d0"."c1" AS "c2" FROM "shop"."customers" AS "t0" JOIN (SELECT "t2"."id" AS "c0", COUNT("t1"."id") AS "c1" FROM "shop"."orders" AS "t1" JOIN "shop"."customers" AS "t2" ON "t1"."customer_id" = "t2"."id" WHERE "t1"."id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL AND "t2"."id" IS NOT NULL GROUP BY "t2"."id" HAVING COUNT("t1"."id") > 1) AS "d0" ON "t0"."id" = "d0"."c0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
@@ -1200,6 +1276,22 @@ fn cases() -> Vec<Case> {
             rows: &[],
             routing: Routing::MustNotFire,
             declined: Some("entity spans subject templates the lane cannot relate"),
+        },
+        Case {
+            // Pointer 2 targets order/10-note, which the `-note` map mints
+            // from the `10` memo as well as the plain map from the `10-note`
+            // one: a branch the lane can neither join to the parent nor
+            // rule out declines rather than drops.
+            name: "a foreign key into a union entity over templates of one prefix but different skeletons declines",
+            sparql: "SELECT ?n ?o ?m FROM <shop-memo:main> WHERE { ?n ex:about ?o . ?o ex:memo ?m }",
+            sql: &[],
+            rows: &[
+                "m=gift wrap n=http://example.org/pointer/1 o=http://example.org/order/10",
+                "m=gift wrap n=http://example.org/pointer/2 o=http://example.org/order/10-note",
+                "m=wrapped n=http://example.org/pointer/2 o=http://example.org/order/10-note",
+            ],
+            routing: Routing::MustNotFire,
+            declined: Some("ref object map into a union entity over templates the lane cannot relate"),
         },
         Case {
             name: "an optional hanging off an optional entity declines",
@@ -2051,6 +2143,10 @@ async fn sub_selects_the_lane_cannot_take_still_refuse() {
         (
             "a HAVING over an AVG",
             "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c (COUNT(?o) AS ?k) WHERE { ?o ex:customer ?c ; ex:total ?t } GROUP BY ?c HAVING (AVG(?t) > 1) } }",
+        ),
+        (
+            "an OPTIONAL variable the outer block binds",
+            "SELECT ?c ?k ?x FROM <shop-sql:main> WHERE { ?x ex:country ?k { SELECT ?c ?k WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k } } } }",
         ),
         (
             "a hidden variable the block reuses",
