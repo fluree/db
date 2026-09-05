@@ -84,6 +84,12 @@ impl HeavyHitters {
             return;
         }
         // Full and unseen: charge one to every counter, drop the zeros.
+        //
+        // O(capacity) in this arm, which is Misra-Gries' known cost. It
+        // amortises to O(1) over a mostly-unique column, since the pass
+        // empties the table and the next `capacity` values refill it --
+        // but it is paid on every singleton when a set of genuinely
+        // heavy values keeps the table full.
         self.decrements += 1;
         self.counters.retain(|_, c| {
             c.count -= 1;
@@ -138,6 +144,12 @@ impl HeavyHitters {
     }
 
     /// The most frequent values, highest first, at most `n`.
+    ///
+    /// Empty while [`Self::is_exact`] is false means "nothing provably
+    /// frequent", not "nothing frequent": once the sketch has evicted,
+    /// a counter only survives if its value outran the decrements. The
+    /// merge of equal shards drops every counter for exactly this
+    /// reason, and the bound still holds.
     pub fn top(&self, n: usize) -> Vec<HitCount> {
         let mut out: Vec<HitCount> = self
             .counters
