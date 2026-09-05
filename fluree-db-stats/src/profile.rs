@@ -88,15 +88,38 @@ impl ProfileValue<'_> {
     /// The value as text: what a group key or a display sample is built
     /// from. Nulls read as the empty string, bytes as `0x` plus hex.
     pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        self.write_text(&mut out);
+        out
+    }
+
+    /// Append the display form to `out`.
+    ///
+    /// Building a group key over several cells is the hot use, and it
+    /// wants the text in a buffer it already owns rather than one
+    /// `String` per cell.
+    pub fn write_text(&self, out: &mut String) {
+        use std::fmt::Write;
         match self {
-            ProfileValue::Null => String::new(),
-            ProfileValue::Bool(b) => b.to_string(),
-            ProfileValue::Int(i) | ProfileValue::Temporal(i) => i.to_string(),
-            ProfileValue::Float(f) => f.to_string(),
-            ProfileValue::Str(s) | ProfileValue::Ref(s) | ProfileValue::Other(s) => {
-                (*s).to_string()
+            ProfileValue::Null => {}
+            ProfileValue::Bool(b) => {
+                let _ = write!(out, "{b}");
             }
-            ProfileValue::Bytes(b) => format!("0x{}", hex::encode(b)),
+            ProfileValue::Int(i) | ProfileValue::Temporal(i) => {
+                let _ = write!(out, "{i}");
+            }
+            ProfileValue::Float(f) => {
+                let _ = write!(out, "{f}");
+            }
+            ProfileValue::Str(s) | ProfileValue::Ref(s) | ProfileValue::Other(s) => {
+                out.push_str(s);
+            }
+            ProfileValue::Bytes(b) => {
+                out.push_str("0x");
+                for byte in *b {
+                    let _ = write!(out, "{byte:02x}");
+                }
+            }
         }
     }
 
@@ -147,11 +170,26 @@ pub struct ColumnProfile {
     config: ProfileConfig,
     count: u64,
     kinds: [u64; 9],
-    distinct: Hll4096,
+    /// Absent until the frequent-value table fills. Below that the
+    /// distinct count is exact from the counters and the sketch would
+    /// never be read; a grouped profile keeps one profile per group and
+    /// most groups never get there, so the 4 KB of registers is not
+    /// paid for them. Allocated the moment the table reaches capacity,
+    /// seeded with the counters' hashes while they are still all there,
+    /// and fed every hash from then on, so its registers are exactly
+    /// what an always-present sketch would hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    distinct: Option<Box<Hll4096>>,
     numeric: Moments,
     quantiles: TDigest,
     /// Length in characters of every text value.
     text_length: Moments,
+    /// Numeric cells that were not finite. They count toward `count` and
+    /// their kind, but are kept out of the moments and the digest: one
+    /// infinity poisons `sum`, `mean`, `min` and `max` alike, and a
+    /// non-finite `f64` serialises as JSON `null`, which then fails to
+    /// read back as an `f64` — the whole report stops round-tripping.
+    non_finite: u64,
     frequent: HeavyHitters,
     /// The lexicographic extremes, kept whole so comparisons stay exact;
     /// only the reported summary truncates them.
@@ -171,10 +209,11 @@ impl ColumnProfile {
             config,
             count: 0,
             kinds: [0; 9],
-            distinct: Hll4096::new(),
+            distinct: None,
             numeric: Moments::new(),
             quantiles: TDigest::new(config.digest_compression),
             text_length: Moments::new(),
+            non_finite: 0,
             frequent: HeavyHitters::new(config.top_capacity),
             min_text: None,
             max_text: None,
@@ -192,12 +231,22 @@ impl ColumnProfile {
         let Some(hash) = value_hash(&value) else {
             return;
         };
-        self.distinct.insert_hash(hash);
         let max_len = self.config.sample_max_len;
         self.frequent.observe(hash, || value.display(max_len));
+        match &mut self.distinct {
+            Some(hll) => hll.insert_hash(hash),
+            None if self.frequent.len() >= self.frequent.capacity() => {
+                self.distinct = Some(Box::new(sketch_of(self.frequent.hashes())));
+            }
+            None => {}
+        }
         if let Some(x) = value.as_f64() {
-            self.numeric.add(x);
-            self.quantiles.add(x);
+            if x.is_finite() {
+                self.numeric.add(x);
+                self.quantiles.add(x);
+            } else {
+                self.non_finite += 1;
+            }
         }
         if let ProfileValue::Str(s) | ProfileValue::Ref(s) | ProfileValue::Other(s) = value {
             self.text_length.add(s.chars().count() as f64);
@@ -212,7 +261,25 @@ impl ColumnProfile {
 
     /// Fold another profile of the same column in.
     pub fn merge(&mut self, other: &ColumnProfile) {
-        self.distinct.merge(&other.distinct);
+        // The sketch must exist before the frequent-value merge trims,
+        // since a trimmed counter's hash is gone. Two exact tables that
+        // fit together stay exact and need none.
+        let could_trim = self.frequent.len() + other.frequent.len() > self.frequent.capacity();
+        if self.distinct.is_some() || other.distinct.is_some() || could_trim {
+            let mut hll = self
+                .distinct
+                .take()
+                .unwrap_or_else(|| Box::new(sketch_of(self.frequent.hashes())));
+            match &other.distinct {
+                Some(theirs) => hll.merge(theirs),
+                None => {
+                    for hash in other.frequent.hashes() {
+                        hll.insert_hash(hash);
+                    }
+                }
+            }
+            self.distinct = Some(hll);
+        }
         self.count += other.count;
         for (mine, theirs) in self.kinds.iter_mut().zip(&other.kinds) {
             *mine += theirs;
@@ -220,6 +287,7 @@ impl ColumnProfile {
         self.numeric.merge(&other.numeric);
         self.quantiles.merge(&other.quantiles);
         self.text_length.merge(&other.text_length);
+        self.non_finite += other.non_finite;
         self.frequent.merge(&other.frequent);
         self.min_text = match (self.min_text.take(), other.min_text.clone()) {
             (Some(a), Some(b)) => Some(if b < a { b } else { a }),
@@ -251,7 +319,14 @@ impl ColumnProfile {
     /// Estimated distinct non-null values.
     pub fn distinct_estimate(&self) -> u64 {
         self.distinct_exact()
-            .unwrap_or_else(|| self.distinct.estimate())
+            .or_else(|| self.distinct.as_ref().map(|h| h.estimate()))
+            .unwrap_or(0)
+    }
+
+    /// Whether the cardinality sketch has been allocated: only once the
+    /// frequent-value table has filled.
+    pub fn has_sketch(&self) -> bool {
+        self.distinct.is_some()
     }
 
     /// Exact distinct count, known only while the frequent-value sketch
@@ -276,9 +351,20 @@ impl ColumnProfile {
         &self.text_length
     }
 
+    /// Numeric cells that were infinite or NaN, and so were left out of
+    /// the moments and the digest.
+    pub fn non_finite_count(&self) -> u64 {
+        self.non_finite
+    }
+
     /// Whether every non-null value is the same value.
     pub fn is_constant(&self) -> bool {
         self.non_null_count() > 0 && self.distinct_exact() == Some(1)
+    }
+
+    /// Whether any numeric cell was a number rather than a point in time.
+    fn has_summable_kind(&self) -> bool {
+        self.kind_count(ValueKind::Int) > 0 || self.kind_count(ValueKind::Float) > 0
     }
 
     /// The reportable summary.
@@ -295,20 +381,28 @@ impl ColumnProfile {
         } else {
             (distinct as f64 / non_null as f64).min(1.0)
         };
+        let distinct_error = Hll4096::typical_error();
+        // One compression for the seven quantiles below: `quantile`
+        // would otherwise clone and compress the digest on each call,
+        // and a grouped profile summarises every group.
+        let quantiles = self.quantiles.compressed();
         let numeric = (self.numeric.count() > 0).then(|| NumericSummary {
             count: self.numeric.count(),
             min: self.numeric.min().unwrap_or(0.0),
             max: self.numeric.max().unwrap_or(0.0),
-            mean: self.numeric.mean().unwrap_or(0.0),
-            stddev: self.numeric.stddev(),
-            sum: self.numeric.sum(),
-            p01: self.quantiles.quantile(0.01),
-            p05: self.quantiles.quantile(0.05),
-            p25: self.quantiles.quantile(0.25),
-            p50: self.quantiles.quantile(0.50),
-            p75: self.quantiles.quantile(0.75),
-            p95: self.quantiles.quantile(0.95),
-            p99: self.quantiles.quantile(0.99),
+            mean: self.numeric.mean().and_then(finite),
+            stddev: self.numeric.stddev().and_then(finite),
+            sum: self
+                .has_summable_kind()
+                .then(|| self.numeric.sum())
+                .and_then(finite),
+            p01: quantiles.quantile(0.01).and_then(finite),
+            p05: quantiles.quantile(0.05).and_then(finite),
+            p25: quantiles.quantile(0.25).and_then(finite),
+            p50: quantiles.quantile(0.50).and_then(finite),
+            p75: quantiles.quantile(0.75).and_then(finite),
+            p95: quantiles.quantile(0.95).and_then(finite),
+            p99: quantiles.quantile(0.99).and_then(finite),
         });
         let sample_max_len = self.config.sample_max_len;
         let text = (self.text_length.count() > 0).then(|| TextSummary {
@@ -334,13 +428,14 @@ impl ColumnProfile {
             },
             distinct,
             distinct_is_exact: self.distinct_exact().is_some(),
-            distinct_error: self.distinct.relative_error(),
+            distinct_error,
             uniqueness,
             is_constant: self.is_constant(),
             key_candidate: self.count > 0
                 && self.null_count() == 0
-                && uniqueness >= 1.0 - 2.0 * self.distinct.relative_error(),
+                && uniqueness >= 1.0 - 2.0 * distinct_error,
             kinds,
+            non_finite: self.non_finite,
             numeric,
             text,
             top_values,
@@ -378,11 +473,23 @@ impl TopValue {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NumericSummary {
     pub count: u64,
+    /// Observed extremes, so always finite: `observe` turns away
+    /// non-finite input before it reaches the moments.
     pub min: f64,
     pub max: f64,
-    pub mean: f64,
+    /// `None` when the running mean overflowed. Welford's increment is
+    /// `mean += (x - mean) / n`, and `x - mean` can overflow when the
+    /// column mixes extreme magnitudes of opposite sign.
+    pub mean: Option<f64>,
+    /// `None` when there are fewer than two values, or when the sum of
+    /// squares overflowed.
     pub stddev: Option<f64>,
-    pub sum: f64,
+    /// `None` when the running total overflowed (two cells at `1e308`
+    /// are enough, from wholly finite input), and `None` for a column
+    /// whose only numeric kind is temporal: a total of epoch
+    /// milliseconds means nothing, while its mean, extremes and
+    /// quantiles are still dates.
+    pub sum: Option<f64>,
     pub p01: Option<f64>,
     pub p05: Option<f64>,
     pub p25: Option<f64>,
@@ -404,6 +511,31 @@ pub struct TextSummary {
     pub max: Option<String>,
 }
 
+/// A fresh sketch over the given hashes.
+fn sketch_of(hashes: impl Iterator<Item = u64>) -> Hll4096 {
+    let mut hll = Hll4096::new();
+    for hash in hashes {
+        hll.insert_hash(hash);
+    }
+    hll
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Keep a derived float only when it is finite.
+///
+/// `observe` already turns away non-finite input, but a total or a sum
+/// of squares over finite cells can still overflow — two cells at
+/// `1e308` overflow both. A non-finite `f64` serialises as JSON `null`
+/// and only reads back into an `Option`, so every derived float the
+/// summary reports goes through here and is absent rather than
+/// unreadable.
+pub(crate) fn finite(x: f64) -> Option<f64> {
+    x.is_finite().then_some(x)
+}
+
 /// The reportable face of a [`ColumnProfile`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -419,9 +551,17 @@ pub struct ColumnSummary {
     /// `distinct / non-null`, capped at 1.
     pub uniqueness: f64,
     pub is_constant: bool,
-    /// No nulls and distinct within sketch error of the row count.
+    /// No nulls, and distinct within two sigma of the row count: the
+    /// sketch could not disprove a key. Not proof of one. A column with
+    /// fewer duplicates than twice `distinct_error` (about 3% at the
+    /// default sketch size) passes here; only an exact probe can
+    /// confirm it. Exact when `distinct_is_exact`.
     pub key_candidate: bool,
     pub kinds: BTreeMap<ValueKind, u64>,
+    /// Numeric cells that were infinite or NaN. They are counted here
+    /// and in `kinds`, and excluded from `numeric`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub non_finite: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub numeric: Option<NumericSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -484,6 +624,72 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_floats_stay_out_of_the_numeric_summary() {
+        // A Parquet double column can carry these; one of them used to
+        // poison sum/mean/min/max into JSON `null`, which no longer
+        // reads back as an `f64`.
+        let mut p = ColumnProfile::default();
+        p.observe(ProfileValue::Float(1.0));
+        p.observe(ProfileValue::Float(3.0));
+        p.observe(ProfileValue::Float(f64::INFINITY));
+        p.observe(ProfileValue::Float(f64::NEG_INFINITY));
+        p.observe(ProfileValue::Float(f64::NAN));
+        p.observe(ProfileValue::Float(1e308));
+        p.observe(ProfileValue::Float(1e308));
+
+        let s = p.summary();
+        assert_eq!(s.count, 7);
+        assert_eq!(s.non_finite, 3);
+        assert_eq!(s.kinds.get(&ValueKind::Float), Some(&7));
+
+        let n = s.numeric.as_ref().unwrap();
+        assert_eq!(n.count, 4);
+        assert_eq!(n.mean, Some(5e307));
+        assert!(n.min.is_finite() && n.max.is_finite());
+        assert_eq!(n.min, 1.0);
+        assert_eq!(n.max, 1e308);
+        // Two 1e308 cells overflow the running total. That is finite
+        // input, so the ingest guard cannot catch it; the summary
+        // reports no sum rather than an unreadable one.
+        assert_eq!(n.sum, None);
+
+        let json = serde_json::to_string(&s).unwrap();
+        let back: ColumnSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn extreme_mixed_magnitudes_still_round_trip() {
+        // Opposite-signed extremes are the case that can overflow a
+        // centroid interpolation as well as the total.
+        let mut p = ColumnProfile::default();
+        for _ in 0..50 {
+            p.observe(ProfileValue::Float(f64::MAX));
+            p.observe(ProfileValue::Float(f64::MIN));
+            p.observe(ProfileValue::Float(0.0));
+        }
+        let s = p.summary();
+        let json = serde_json::to_string(&s).unwrap();
+        let back: ColumnSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn non_finite_counts_survive_a_merge() {
+        let mut a = ColumnProfile::default();
+        a.observe(ProfileValue::Float(f64::NAN));
+        a.observe(ProfileValue::Float(2.0));
+        let mut b = ColumnProfile::default();
+        b.observe(ProfileValue::Float(f64::INFINITY));
+        b.observe(ProfileValue::Float(4.0));
+        a.merge(&b);
+        assert_eq!(a.non_finite_count(), 2);
+        let n = a.summary().numeric.unwrap();
+        assert_eq!(n.count, 2);
+        assert_eq!(n.mean, Some(3.0));
+    }
+
+    #[test]
     fn numeric_summary_and_mixed_kinds() {
         let mut p = ColumnProfile::default();
         for i in 1..=1000 {
@@ -495,10 +701,25 @@ mod tests {
         assert_eq!(n.count, 1000);
         assert_eq!(n.min, 1.0);
         assert_eq!(n.max, 1000.0);
-        assert!((n.mean - 500.5).abs() < 1e-9);
+        assert!((n.mean.unwrap() - 500.5).abs() < 1e-9);
         assert!((n.p50.unwrap() - 500.0).abs() < 10.0);
         assert_eq!(s.kinds.get(&ValueKind::Str), Some(&1));
         assert_eq!(s.kinds.get(&ValueKind::Float), Some(&1000));
+    }
+
+    #[test]
+    fn temporal_only_column_has_no_sum() {
+        let mut p = ColumnProfile::default();
+        p.observe(ProfileValue::Temporal(86_400_000));
+        p.observe(ProfileValue::Temporal(172_800_000));
+        let n = p.summary().numeric.unwrap();
+        assert_eq!(n.sum, None);
+        assert_eq!(n.mean, Some(129_600_000.0));
+        assert_eq!(n.max, 172_800_000.0);
+        assert!(n.p50.is_some());
+        // One number among the dates and the total is reported again.
+        p.observe(ProfileValue::Int(1));
+        assert_eq!(p.summary().numeric.unwrap().sum, Some(259_200_001.0));
     }
 
     #[test]
@@ -535,7 +756,10 @@ mod tests {
         assert_eq!(sa.null_count, sw.null_count);
         assert_eq!(sa.kinds, sw.kinds);
         assert!(
-            (sa.numeric.as_ref().unwrap().mean - sw.numeric.as_ref().unwrap().mean).abs() < 1e-9
+            (sa.numeric.as_ref().unwrap().mean.unwrap()
+                - sw.numeric.as_ref().unwrap().mean.unwrap())
+            .abs()
+                < 1e-9
         );
         let d = sa.distinct as f64 - sw.distinct as f64;
         assert!(d.abs() / (sw.distinct as f64) < 0.05);
@@ -560,6 +784,82 @@ mod tests {
         other.observe(ProfileValue::Str("prefix-prefix-zzzz"));
         p.merge(&other);
         assert_eq!(p.max_text.as_deref(), Some("prefix-prefix-zzzz"));
+    }
+
+    #[test]
+    fn sketch_is_allocated_only_when_the_table_fills() {
+        let cap = ProfileConfig::default().top_capacity;
+        let mut p = ColumnProfile::default();
+        for i in 0..cap - 1 {
+            p.observe(ProfileValue::Int(i as i64));
+        }
+        assert!(!p.has_sketch());
+        assert_eq!(p.distinct_estimate(), (cap - 1) as u64);
+        p.observe(ProfileValue::Int((cap - 1) as i64));
+        assert!(
+            p.has_sketch(),
+            "allocated on the value that fills the table"
+        );
+        assert!(
+            p.summary().distinct_is_exact,
+            "and still exact until an eviction"
+        );
+    }
+
+    #[test]
+    fn lazy_sketch_matches_an_eager_one_register_for_register() {
+        // Every hash the profile has seen must be in the sketch, the
+        // first `capacity` by replay and the rest directly, so its
+        // registers equal a sketch that saw them all as they came.
+        let mut p = ColumnProfile::default();
+        let mut eager = Hll4096::new();
+        for i in 0..20_000 {
+            let s = format!("v{}", i % 7_000);
+            let v = ProfileValue::Str(&s);
+            p.observe(v);
+            eager.insert_hash(value_hash(&v).unwrap());
+        }
+        assert_eq!(p.distinct.as_deref(), Some(&eager));
+        assert_eq!(p.distinct_estimate(), eager.estimate());
+    }
+
+    #[test]
+    fn merge_allocates_a_sketch_only_when_the_union_could_trim() {
+        let profile_over = |lo: i64, hi: i64| {
+            let mut p = ColumnProfile::default();
+            for i in lo..hi {
+                p.observe(ProfileValue::Int(i));
+            }
+            p
+        };
+        // Two small exact tables that fit together: still exact, no sketch.
+        let mut a = profile_over(0, 20);
+        a.merge(&profile_over(10, 40));
+        assert!(!a.has_sketch());
+        assert_eq!(a.distinct_estimate(), 40);
+
+        // Two exact tables whose union overflows: the sketch is built
+        // from both counter sets before the trim, so no hash is lost.
+        let mut b = profile_over(0, 50);
+        b.merge(&profile_over(30, 100));
+        assert!(b.has_sketch());
+        let mut whole = Hll4096::new();
+        for i in 0..100 {
+            whole.insert_hash(value_hash(&ProfileValue::Int(i)).unwrap());
+        }
+        assert_eq!(b.distinct.as_deref(), Some(&whole));
+
+        // Sketch on one side, exact table on the other.
+        let mut c = profile_over(0, 5_000);
+        c.merge(&profile_over(4_990, 5_010));
+        let mut whole = Hll4096::new();
+        for i in 0..5_010 {
+            whole.insert_hash(value_hash(&ProfileValue::Int(i)).unwrap());
+        }
+        assert_eq!(c.distinct.as_deref(), Some(&whole));
+        let mut d = profile_over(4_990, 5_010);
+        d.merge(&profile_over(0, 5_000));
+        assert_eq!(d.distinct.as_deref(), Some(&whole));
     }
 
     #[test]

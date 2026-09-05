@@ -36,7 +36,7 @@ Relational database mapping:
 Relational databases and warehouses through a Trino-protocol endpoint:
 - Trino / Starburst / PrestoDB, or the `fluree-sql-bridge` sidecar
 - R2RML mappings with `rr:tableName` and `rr:sqlQuery`
-- Typed filter pushdown and exact `COUNT`
+- One SQL statement per graph block where its shape allows; typed filter pushdown and exact `COUNT` per table otherwise
 - No database drivers in the Fluree binary
 
 ### [BM25 Graph Source](bm25.md)

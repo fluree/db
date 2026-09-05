@@ -1221,25 +1221,33 @@ impl<'a> FlureeR2rmlProvider<'a> {
         Ok(metadata.current_snapshot().map(|s| s.snapshot_id))
     }
 
-    /// The names of the table's top-level columns in its current schema:
-    /// the columns a projection can name and an unprojected scan reads.
-    pub(crate) async fn table_column_names(
+    /// The table's current snapshot id and top-level column names, both
+    /// read from one session-pinned resolution.
+    ///
+    /// [`Self::current_snapshot_id`] resolves the table for itself
+    /// through `prepare_iceberg_scan`, which is uncached, and reading
+    /// the schema separately cost a second one: two catalog
+    /// `loadTable`s, and two chances to observe different snapshots.
+    /// This goes through `load_table_context` instead, whose pin a
+    /// following `scan_table` reuses, so a caller that reports a
+    /// snapshot and then scans reports the one it read.
+    pub(crate) async fn pinned_snapshot_and_columns(
         &self,
         graph_source_id: &str,
         table_name: &str,
-    ) -> QueryResult<Vec<String>> {
-        let (_storage, metadata, _loc) = self
-            .prepare_iceberg_scan(graph_source_id, table_name)
-            .await?;
+    ) -> QueryResult<(Option<i64>, Vec<String>)> {
+        let (_storage, metadata, _loc) =
+            self.load_table_context(graph_source_id, table_name).await?;
         let schema = metadata
             .current_schema()
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
-        Ok(schema
+        let columns = schema
             .fields
             .iter()
             .filter(|f| !f.is_nested())
             .map(|f| f.name.clone())
-            .collect())
+            .collect();
+        Ok((metadata.current_snapshot().map(|s| s.snapshot_id), columns))
     }
 
     /// The source graph source's materialization options from the persisted

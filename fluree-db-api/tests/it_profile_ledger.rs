@@ -1,6 +1,6 @@
 //! Column profiling over a ledger: the native face of the stats kernel.
 
-use crate::support::MemoryFluree;
+use crate::support::{build_and_publish_index, MemoryFluree};
 use fluree_db_api::profile::ProfileRequest;
 use fluree_db_api::FlureeBuilder;
 use serde_json::json;
@@ -138,4 +138,126 @@ async fn unknown_group_property_is_an_error() {
     let req = ProfileRequest::columns([format!("{EX}price")]).group_by([format!("{EX}missing")]);
     let err = fluree.profile_ledger(&ledger, &req).await.unwrap_err();
     assert!(err.to_string().contains("missing"), "{err}");
+}
+
+/// Seed, publish a binary index over it, and reload so the range provider
+/// serves the base: the other tests here never leave the genesis
+/// overlay-only arm of `range_with_overlay`.
+async fn seed_and_index(fluree: &MemoryFluree) -> String {
+    let ledger_id = seed(fluree).await;
+    build_and_publish_index(fluree, &ledger_id).await;
+    fluree.disconnect_ledger(&ledger_id).await;
+    let state = fluree.ledger(&ledger_id).await.expect("reload");
+    assert!(
+        state.snapshot.range_provider.is_some(),
+        "test needs the binary index behind the profile"
+    );
+    ledger_id
+}
+
+/// The indexed base merged with novelty that retracts, rewrites and adds
+/// on top of it, without reindexing. Counts and extremes must net out:
+/// the retracted wild line leaves the moments and the digest, the
+/// rewritten price is counted once at its new value, and a subject that
+/// exists only in novelty is keyed by its novelty-only division.
+#[tokio::test]
+async fn indexed_base_with_novelty_retractions_nets_out() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = seed_and_index(&fluree).await;
+    let ledger = fluree.ledger(&ledger_id).await.expect("ledger");
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": {"ex": EX},
+                "where": [
+                    {"@id": "ex:wild", "ex:price": "?wild"},
+                    {"@id": "ex:line1", "ex:price": "?old"}
+                ],
+                "delete": [
+                    {"@id": "ex:wild", "ex:price": "?wild"},
+                    {"@id": "ex:line1", "ex:price": "?old"}
+                ],
+                "insert": [
+                    {"@id": "ex:line1", "ex:price": 700.0},
+                    {
+                        "@id": "ex:novel",
+                        "@type": "ex:ReceiptLine",
+                        "ex:division": "montreal",
+                        "ex:part": {"@id": "ex:p0"},
+                        "ex:price": 52.0
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("retract, rewrite and add in novelty");
+
+    let req = ProfileRequest::columns([format!("{EX}price")]).group_by([format!("{EX}division")]);
+    let report = fluree
+        .profile_ledger(&ledger_id, &req)
+        .await
+        .expect("profile");
+    assert_eq!(report.t, Some(2));
+
+    let col = &report.columns[0];
+    let num = col.summary.numeric.as_ref().expect("numeric");
+    // 122 seeded, minus the wild line, plus the novel one; the rewrite
+    // is a wash.
+    assert_eq!(col.summary.count, 122);
+    assert_eq!(num.count, 122);
+    assert_eq!(
+        num.max, 700.0,
+        "retracted 55,809 is gone; rewrite is the new max"
+    );
+    assert_eq!(num.min, 1.0);
+
+    let grouped = col.grouped.as_ref().expect("grouped");
+    assert_eq!(grouped.ungrouped, 1);
+    let rome = grouped.groups.iter().find(|g| g.key == "rome").unwrap();
+    let montreal = grouped.groups.iter().find(|g| g.key == "montreal").unwrap();
+    assert_eq!(rome.summary.count, 30, "wild line left rome");
+    assert_eq!(rome.summary.numeric.as_ref().unwrap().max, 700.0);
+    assert_eq!(
+        montreal.summary.count, 31,
+        "novelty-only subject joined montreal"
+    );
+    assert_eq!(montreal.summary.numeric.as_ref().unwrap().max, 59.0);
+}
+
+#[tokio::test]
+async fn max_values_refuses_a_property_past_the_cap() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = seed_and_index(&fluree).await;
+    let price = format!("{EX}price");
+
+    let err = fluree
+        .profile_ledger(
+            &ledger_id,
+            &ProfileRequest::columns([&price]).max_values(121),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("max_values"), "{err}");
+
+    let report = fluree
+        .profile_ledger(
+            &ledger_id,
+            &ProfileRequest::columns([&price]).max_values(122),
+        )
+        .await
+        .expect("exactly at the cap profiles");
+    assert_eq!(report.columns[0].summary.count, 122);
+
+    // The cap guards grouping properties too.
+    let err = fluree
+        .profile_ledger(
+            &ledger_id,
+            &ProfileRequest::columns([&price])
+                .group_by([format!("{EX}division")])
+                .max_values(100),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("division"), "{err}");
 }

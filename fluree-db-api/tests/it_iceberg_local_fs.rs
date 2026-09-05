@@ -300,4 +300,19 @@ async fn local_table_profiles_through_the_scan() {
         g.groups.iter().map(|x| x.summary.count).sum::<u64>() + g.ungrouped,
         5
     );
+
+    // Every named column unknown: an empty projection reads the whole
+    // table, so the scan is skipped rather than run for nothing. The
+    // report still says what was asked for and what was not there.
+    let none = fluree
+        .profile_table(
+            gs,
+            "silver.people",
+            &ProfileRequest::columns(["nope", "also-nope"]),
+        )
+        .await
+        .expect("profile with no known columns");
+    assert!(none.columns.is_empty(), "{:?}", none.columns);
+    assert_eq!(none.skipped.len(), 2);
+    assert!(none.snapshot_id.is_some(), "still pinned to a snapshot");
 }
