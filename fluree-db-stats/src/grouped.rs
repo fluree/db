@@ -15,7 +15,16 @@ use crate::hll::Hll4096;
 use crate::profile::{ColumnProfile, ColumnSummary, ProfileConfig, ProfileValue};
 
 /// Groups kept when a caller does not choose.
-pub const DEFAULT_MAX_GROUPS: usize = 100_000;
+///
+/// A kept group is a whole [`ColumnProfile`] — its own HLL, t-digest and
+/// frequent-value sketch — which is on the order of a few kilobytes once
+/// it has seen values, and more for a group large enough to fill the
+/// digest. Ten thousand groups is therefore tens of megabytes per
+/// profiled column, and a caller profiling several columns pays it per
+/// column. Raise `max_groups` deliberately, against that arithmetic;
+/// keys beyond the cap are not lost, they pool into `overflow` and are
+/// counted.
+pub const DEFAULT_MAX_GROUPS: usize = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Group {

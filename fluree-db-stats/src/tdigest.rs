@@ -21,6 +21,24 @@ use std::f64::consts::PI;
 /// digest holds at most about this many centroids after compression.
 pub const DEFAULT_COMPRESSION: f64 = 100.0;
 
+/// Smallest compression that still bounds the centroid count.
+const MIN_COMPRESSION: f64 = 10.0;
+
+fn clamp_compression(c: f64) -> f64 {
+    if c.is_finite() {
+        c.max(MIN_COMPRESSION)
+    } else {
+        DEFAULT_COMPRESSION
+    }
+}
+
+fn de_compression<'de, D>(d: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(clamp_compression(f64::deserialize(d)?))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct Centroid {
     mean: f64,
@@ -29,6 +47,11 @@ struct Centroid {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TDigest {
+    /// Clamped on the way in as well as in [`TDigest::new`]: `q_limit`
+    /// is NaN for a compression of zero, so every point survives
+    /// compression as its own centroid and the digest silently stops
+    /// being a sketch.
+    #[serde(deserialize_with = "de_compression")]
     compression: f64,
     centroids: Vec<Centroid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -47,7 +70,7 @@ impl Default for TDigest {
 impl TDigest {
     pub fn new(compression: f64) -> Self {
         Self {
-            compression: compression.max(10.0),
+            compression: clamp_compression(compression),
             centroids: Vec::new(),
             buffer: Vec::new(),
             total: 0.0,
@@ -94,6 +117,11 @@ impl TDigest {
     }
 
     /// Total weight observed.
+    /// Centroids currently held, buffer excluded.
+    pub fn centroid_count(&self) -> usize {
+        self.centroids.len()
+    }
+
     pub fn count(&self) -> f64 {
         self.total
     }
@@ -135,6 +163,12 @@ impl TDigest {
             }
         }
         merged.push(current);
+        // `merged` was sized for every input point but holds only the
+        // surviving centroids — around a hundred against a buffer of
+        // five hundred. A grouped profile keeps one digest per group,
+        // so the slack is per group; the shrink costs one realloc
+        // against the sort just done.
+        merged.shrink_to_fit();
         self.centroids = merged;
         self.total = total;
     }
@@ -147,15 +181,32 @@ impl TDigest {
         f64::midpoint((k * 2.0 * PI / self.compression).sin(), 1.0)
     }
 
+    /// A copy with its buffer folded in, or `self` when there is
+    /// nothing buffered.
+    ///
+    /// [`Self::quantile`] has to do this internally when the buffer is
+    /// dirty, so a caller reading several quantiles from one digest —
+    /// the seven a column summary reports — should compress once here
+    /// and read them all from the result.
+    pub fn compressed(&self) -> std::borrow::Cow<'_, TDigest> {
+        if self.buffer.is_empty() {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut c = self.clone();
+        c.compress();
+        std::borrow::Cow::Owned(c)
+    }
+
     /// The value at quantile `q` in `[0, 1]`. `None` when empty.
+    ///
+    /// Compresses a clone when the buffer is dirty; see
+    /// [`Self::compressed`] to pay that once across several reads.
     pub fn quantile(&self, q: f64) -> Option<f64> {
         if self.total == 0.0 {
             return None;
         }
         if !self.buffer.is_empty() {
-            let mut c = self.clone();
-            c.compress();
-            return c.quantile(q);
+            return self.compressed().quantile(q);
         }
         let (min, max) = (self.min?, self.max?);
         let q = q.clamp(0.0, 1.0);
@@ -277,6 +328,22 @@ fn max_of(a: Option<f64>, b: Option<f64>) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deserialised_compression_is_clamped() {
+        // Without the clamp `q_limit` is NaN, no two centroids ever
+        // merge, and the digest keeps one centroid per point.
+        let mut d: super::TDigest = serde_json::from_str(
+            r#"{"compression":0.0,"centroids":[],"total":0.0,"min":null,"max":null}"#,
+        )
+        .unwrap();
+        for i in 0..5_000 {
+            d.add(f64::from(i));
+        }
+        d.compress();
+        assert!(d.centroid_count() < 600, "{}", d.centroid_count());
+        assert!((d.median().unwrap() - 2_500.0).abs() < 100.0);
+    }
+
     use super::*;
     use rand::{rngs::StdRng, Rng, SeedableRng};
 

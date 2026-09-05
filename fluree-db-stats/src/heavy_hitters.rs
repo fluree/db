@@ -54,7 +54,12 @@ impl HeavyHitters {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
-            counters: HashMap::with_capacity(capacity.max(1) + 1),
+            // Deliberately unreserved. Reserving `capacity` up front
+            // costs a table's worth of slots on a sketch that may only
+            // ever see one value, and a grouped profile holds one of
+            // these per group; growth to the same table is amortised
+            // over the first `capacity` inserts anyway.
+            counters: HashMap::new(),
             decrements: 0,
         }
     }

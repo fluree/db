@@ -152,6 +152,12 @@ pub struct ColumnProfile {
     quantiles: TDigest,
     /// Length in characters of every text value.
     text_length: Moments,
+    /// Numeric cells that were not finite. They count toward `count` and
+    /// their kind, but are kept out of the moments and the digest: one
+    /// infinity poisons `sum`, `mean`, `min` and `max` alike, and a
+    /// non-finite `f64` serialises as JSON `null`, which then fails to
+    /// read back as an `f64` — the whole report stops round-tripping.
+    non_finite: u64,
     frequent: HeavyHitters,
     /// The lexicographic extremes, kept whole so comparisons stay exact;
     /// only the reported summary truncates them.
@@ -175,6 +181,7 @@ impl ColumnProfile {
             numeric: Moments::new(),
             quantiles: TDigest::new(config.digest_compression),
             text_length: Moments::new(),
+            non_finite: 0,
             frequent: HeavyHitters::new(config.top_capacity),
             min_text: None,
             max_text: None,
@@ -196,8 +203,12 @@ impl ColumnProfile {
         let max_len = self.config.sample_max_len;
         self.frequent.observe(hash, || value.display(max_len));
         if let Some(x) = value.as_f64() {
-            self.numeric.add(x);
-            self.quantiles.add(x);
+            if x.is_finite() {
+                self.numeric.add(x);
+                self.quantiles.add(x);
+            } else {
+                self.non_finite += 1;
+            }
         }
         if let ProfileValue::Str(s) | ProfileValue::Ref(s) | ProfileValue::Other(s) = value {
             self.text_length.add(s.chars().count() as f64);
@@ -220,6 +231,7 @@ impl ColumnProfile {
         self.numeric.merge(&other.numeric);
         self.quantiles.merge(&other.quantiles);
         self.text_length.merge(&other.text_length);
+        self.non_finite += other.non_finite;
         self.frequent.merge(&other.frequent);
         self.min_text = match (self.min_text.take(), other.min_text.clone()) {
             (Some(a), Some(b)) => Some(if b < a { b } else { a }),
@@ -276,6 +288,12 @@ impl ColumnProfile {
         &self.text_length
     }
 
+    /// Numeric cells that were infinite or NaN, and so were left out of
+    /// the moments and the digest.
+    pub fn non_finite_count(&self) -> u64 {
+        self.non_finite
+    }
+
     /// Whether every non-null value is the same value.
     pub fn is_constant(&self) -> bool {
         self.non_null_count() > 0 && self.distinct_exact() == Some(1)
@@ -295,20 +313,24 @@ impl ColumnProfile {
         } else {
             (distinct as f64 / non_null as f64).min(1.0)
         };
+        // One compression for the seven quantiles below: `quantile`
+        // would otherwise clone and compress the digest on each call,
+        // and a grouped profile summarises every group.
+        let quantiles = self.quantiles.compressed();
         let numeric = (self.numeric.count() > 0).then(|| NumericSummary {
             count: self.numeric.count(),
             min: self.numeric.min().unwrap_or(0.0),
             max: self.numeric.max().unwrap_or(0.0),
-            mean: self.numeric.mean().unwrap_or(0.0),
-            stddev: self.numeric.stddev(),
-            sum: self.numeric.sum(),
-            p01: self.quantiles.quantile(0.01),
-            p05: self.quantiles.quantile(0.05),
-            p25: self.quantiles.quantile(0.25),
-            p50: self.quantiles.quantile(0.50),
-            p75: self.quantiles.quantile(0.75),
-            p95: self.quantiles.quantile(0.95),
-            p99: self.quantiles.quantile(0.99),
+            mean: self.numeric.mean().and_then(finite),
+            stddev: self.numeric.stddev().and_then(finite),
+            sum: finite(self.numeric.sum()),
+            p01: quantiles.quantile(0.01).and_then(finite),
+            p05: quantiles.quantile(0.05).and_then(finite),
+            p25: quantiles.quantile(0.25).and_then(finite),
+            p50: quantiles.quantile(0.50).and_then(finite),
+            p75: quantiles.quantile(0.75).and_then(finite),
+            p95: quantiles.quantile(0.95).and_then(finite),
+            p99: quantiles.quantile(0.99).and_then(finite),
         });
         let sample_max_len = self.config.sample_max_len;
         let text = (self.text_length.count() > 0).then(|| TextSummary {
@@ -341,6 +363,7 @@ impl ColumnProfile {
                 && self.null_count() == 0
                 && uniqueness >= 1.0 - 2.0 * self.distinct.relative_error(),
             kinds,
+            non_finite: self.non_finite,
             numeric,
             text,
             top_values,
@@ -378,11 +401,20 @@ impl TopValue {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NumericSummary {
     pub count: u64,
+    /// Observed extremes, so always finite: `observe` turns away
+    /// non-finite input before it reaches the moments.
     pub min: f64,
     pub max: f64,
-    pub mean: f64,
+    /// `None` when the running mean overflowed. Welford's increment is
+    /// `mean += (x - mean) / n`, and `x - mean` can overflow when the
+    /// column mixes extreme magnitudes of opposite sign.
+    pub mean: Option<f64>,
+    /// `None` when there are fewer than two values, or when the sum of
+    /// squares overflowed.
     pub stddev: Option<f64>,
-    pub sum: f64,
+    /// `None` when the running total overflowed: two cells at `1e308`
+    /// are enough, from wholly finite input.
+    pub sum: Option<f64>,
     pub p01: Option<f64>,
     pub p05: Option<f64>,
     pub p25: Option<f64>,
@@ -404,6 +436,22 @@ pub struct TextSummary {
     pub max: Option<String>,
 }
 
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// Keep a derived float only when it is finite.
+///
+/// `observe` already turns away non-finite input, but a total or a sum
+/// of squares over finite cells can still overflow — two cells at
+/// `1e308` overflow both. A non-finite `f64` serialises as JSON `null`
+/// and only reads back into an `Option`, so every derived float the
+/// summary reports goes through here and is absent rather than
+/// unreadable.
+pub(crate) fn finite(x: f64) -> Option<f64> {
+    x.is_finite().then_some(x)
+}
+
 /// The reportable face of a [`ColumnProfile`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -422,6 +470,10 @@ pub struct ColumnSummary {
     /// No nulls and distinct within sketch error of the row count.
     pub key_candidate: bool,
     pub kinds: BTreeMap<ValueKind, u64>,
+    /// Numeric cells that were infinite or NaN. They are counted here
+    /// and in `kinds`, and excluded from `numeric`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub non_finite: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub numeric: Option<NumericSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -484,6 +536,72 @@ mod tests {
     }
 
     #[test]
+    fn non_finite_floats_stay_out_of_the_numeric_summary() {
+        // A Parquet double column can carry these; one of them used to
+        // poison sum/mean/min/max into JSON `null`, which no longer
+        // reads back as an `f64`.
+        let mut p = ColumnProfile::default();
+        p.observe(ProfileValue::Float(1.0));
+        p.observe(ProfileValue::Float(3.0));
+        p.observe(ProfileValue::Float(f64::INFINITY));
+        p.observe(ProfileValue::Float(f64::NEG_INFINITY));
+        p.observe(ProfileValue::Float(f64::NAN));
+        p.observe(ProfileValue::Float(1e308));
+        p.observe(ProfileValue::Float(1e308));
+
+        let s = p.summary();
+        assert_eq!(s.count, 7);
+        assert_eq!(s.non_finite, 3);
+        assert_eq!(s.kinds.get(&ValueKind::Float), Some(&7));
+
+        let n = s.numeric.as_ref().unwrap();
+        assert_eq!(n.count, 4);
+        assert_eq!(n.mean, Some(5e307));
+        assert!(n.min.is_finite() && n.max.is_finite());
+        assert_eq!(n.min, 1.0);
+        assert_eq!(n.max, 1e308);
+        // Two 1e308 cells overflow the running total. That is finite
+        // input, so the ingest guard cannot catch it; the summary
+        // reports no sum rather than an unreadable one.
+        assert_eq!(n.sum, None);
+
+        let json = serde_json::to_string(&s).unwrap();
+        let back: ColumnSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn extreme_mixed_magnitudes_still_round_trip() {
+        // Opposite-signed extremes are the case that can overflow a
+        // centroid interpolation as well as the total.
+        let mut p = ColumnProfile::default();
+        for _ in 0..50 {
+            p.observe(ProfileValue::Float(f64::MAX));
+            p.observe(ProfileValue::Float(f64::MIN));
+            p.observe(ProfileValue::Float(0.0));
+        }
+        let s = p.summary();
+        let json = serde_json::to_string(&s).unwrap();
+        let back: ColumnSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn non_finite_counts_survive_a_merge() {
+        let mut a = ColumnProfile::default();
+        a.observe(ProfileValue::Float(f64::NAN));
+        a.observe(ProfileValue::Float(2.0));
+        let mut b = ColumnProfile::default();
+        b.observe(ProfileValue::Float(f64::INFINITY));
+        b.observe(ProfileValue::Float(4.0));
+        a.merge(&b);
+        assert_eq!(a.non_finite_count(), 2);
+        let n = a.summary().numeric.unwrap();
+        assert_eq!(n.count, 2);
+        assert_eq!(n.mean, Some(3.0));
+    }
+
+    #[test]
     fn numeric_summary_and_mixed_kinds() {
         let mut p = ColumnProfile::default();
         for i in 1..=1000 {
@@ -495,7 +613,7 @@ mod tests {
         assert_eq!(n.count, 1000);
         assert_eq!(n.min, 1.0);
         assert_eq!(n.max, 1000.0);
-        assert!((n.mean - 500.5).abs() < 1e-9);
+        assert!((n.mean.unwrap() - 500.5).abs() < 1e-9);
         assert!((n.p50.unwrap() - 500.0).abs() < 10.0);
         assert_eq!(s.kinds.get(&ValueKind::Str), Some(&1));
         assert_eq!(s.kinds.get(&ValueKind::Float), Some(&1000));
@@ -535,7 +653,10 @@ mod tests {
         assert_eq!(sa.null_count, sw.null_count);
         assert_eq!(sa.kinds, sw.kinds);
         assert!(
-            (sa.numeric.as_ref().unwrap().mean - sw.numeric.as_ref().unwrap().mean).abs() < 1e-9
+            (sa.numeric.as_ref().unwrap().mean.unwrap()
+                - sw.numeric.as_ref().unwrap().mean.unwrap())
+            .abs()
+                < 1e-9
         );
         let d = sa.distinct as f64 - sw.distinct as f64;
         assert!(d.abs() / (sw.distinct as f64) < 0.05);
