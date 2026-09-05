@@ -136,8 +136,15 @@ impl<const M: usize> Hll<M> {
         }
     }
 
-    /// Estimated number of distinct hashes inserted, with the standard
-    /// small-range (linear counting) and large-range corrections.
+    /// Estimated number of distinct hashes inserted, with linear counting
+    /// below `2.5 M`.
+    ///
+    /// There is no large-range correction. The original paper's
+    /// `-2^32 ln(1 - E/2^32)` term compensates for 32-bit hash
+    /// collisions; every hash here is 64 bits, so the raw estimator holds
+    /// all the way up. Applied to 64-bit hashes that term read 2.3% high
+    /// at ~200 M and, once `E` passed `2^32`, took the log of a negative
+    /// number and reported zero.
     pub fn estimate(&self) -> u64 {
         let m = M as f64;
         let mut sum = 0.0f64;
@@ -152,16 +159,19 @@ impl<const M: usize> Hll<M> {
         if raw <= 2.5 * m && zeros > 0 {
             return (m * (m / f64::from(zeros)).ln()).round() as u64;
         }
-        let two_pow_32 = 4_294_967_296.0f64;
-        if raw > two_pow_32 / 30.0 {
-            return (-two_pow_32 * (1.0 - raw / two_pow_32).ln()).round() as u64;
-        }
         raw.round() as u64
+    }
+
+    /// Typical relative standard error of this register count,
+    /// `1.04 / sqrt(M)`; a property of the type, so a caller can quote
+    /// it without holding a sketch.
+    pub fn typical_error() -> f64 {
+        1.04 / (M as f64).sqrt()
     }
 
     /// Typical relative standard error, `1.04 / sqrt(M)`.
     pub fn relative_error(&self) -> f64 {
-        1.04 / (M as f64).sqrt()
+        Self::typical_error()
     }
 
     /// Whether nothing has been inserted.
@@ -260,6 +270,23 @@ mod tests {
         let h = filled::<256>(n);
         let err = (h.estimate() as f64 - n as f64).abs() / n as f64;
         assert!(err < 3.0 * h.relative_error(), "256: {err}");
+    }
+
+    #[test]
+    fn billions_of_distinct_hashes_do_not_estimate_zero() {
+        // Every register at the same rank makes the raw estimate exactly
+        // `alpha * M * 2^rank`. Rank 21 at 4096 registers is ~6.2 billion,
+        // past 2^32; the 32-bit large-range correction took `ln` of a
+        // negative number there and rounded NaN to zero. Rank 16 is
+        // ~194 million, where the same correction read 2.3% high.
+        let raw = |m: usize, rank: u8| alpha(m) * m as f64 * 2f64.powi(i32::from(rank));
+        let h = Hll::<4096>::from_registers([21u8; 4096]);
+        assert!(h.estimate() > 6_000_000_000, "{}", h.estimate());
+        assert_eq!(h.estimate(), raw(4096, 21).round() as u64);
+        let h = Hll::<4096>::from_registers([16u8; 4096]);
+        assert_eq!(h.estimate(), raw(4096, 16).round() as u64);
+        let h = Hll256::from_registers([25u8; 256]);
+        assert_eq!(h.estimate(), raw(256, 25).round() as u64);
     }
 
     #[test]

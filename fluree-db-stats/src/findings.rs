@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::grouped::GroupedProfile;
-use crate::profile::ColumnProfile;
+use crate::profile::{finite, ColumnProfile};
 
 /// A group's numeric baseline.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -80,12 +80,16 @@ impl ZScoreRule {
 
 fn baseline_of(key: &str, p: &ColumnProfile) -> Option<GroupBaseline> {
     let n = p.numeric();
+    // A group whose mean or median overflowed has no baseline worth
+    // comparing against — every `RatioRule` against a NaN centre
+    // answers false — so it is omitted like a group with no numeric
+    // values at all, rather than reported as an unreadable one.
     Some(GroupBaseline {
         key: key.to_string(),
         count: n.count(),
-        mean: n.mean()?,
-        median: p.quantiles().median()?,
-        stddev: n.stddev(),
+        mean: finite(n.mean()?)?,
+        median: finite(p.quantiles().median()?)?,
+        stddev: n.stddev().and_then(finite),
         min: n.min()?,
         max: n.max()?,
     })
@@ -180,6 +184,20 @@ pub struct ScaleDrift {
     pub ratio: f64,
 }
 
+/// How far a ratio sits from one, on a log scale, for ordering only.
+///
+/// The rule is defined for positive-scale columns, so a group whose
+/// median is zero or negative has no log ratio. Such a group is still
+/// reported — a group at -5 against an overall 60 is the anomaly the
+/// rule exists to surface — and sorts first as maximally drifted.
+fn drift_distance(ratio: f64) -> f64 {
+    if ratio > 0.0 {
+        ratio.ln().abs()
+    } else {
+        f64::INFINITY
+    }
+}
+
 /// Every kept group's median against the whole column's, sorted by how
 /// far the ratio is from one.
 pub fn scale_drift(g: &GroupedProfile) -> Vec<ScaleDrift> {
@@ -202,11 +220,13 @@ pub fn scale_drift(g: &GroupedProfile) -> Vec<ScaleDrift> {
             })
         })
         .collect();
+    // `total_cmp` on a precomputed distance: `partial_cmp` on a raw
+    // `ln` would return `None` for a non-positive ratio, and a
+    // comparator that answers `Equal` to a NaN is not a total order,
+    // which makes `sort_by` panic rather than merely misorder.
     out.sort_by(|a, b| {
-        let da = (a.ratio.ln()).abs();
-        let db = (b.ratio.ln()).abs();
-        db.partial_cmp(&da)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        drift_distance(b.ratio)
+            .total_cmp(&drift_distance(a.ratio))
             .then_with(|| a.key.cmp(&b.key))
     });
     out
@@ -282,6 +302,42 @@ mod tests {
         let drift = scale_drift(&magna_like());
         assert_eq!(drift[0].key, "montreal");
         assert!(drift[0].ratio < 0.2, "{:?}", drift[0]);
+    }
+
+    #[test]
+    fn scale_drift_keeps_negative_median_groups_first() {
+        // A negative group median gives `ratio < 0`, whose `ln` is NaN.
+        // Ordering through that NaN is not a total order and `sort_by`
+        // panics on it; the group is also the one worth reporting.
+        let mut g = GroupedProfile::new(ProfileConfig::default(), 1_000);
+        for i in 0..200 {
+            let key = format!("g-{i}");
+            let value = if i % 3 == 0 {
+                -10.0 - f64::from(i)
+            } else {
+                10.0 + f64::from(i)
+            };
+            for _ in 0..5 {
+                g.observe(&key, ProfileValue::Float(value));
+            }
+        }
+
+        let drift = scale_drift(&g);
+        assert_eq!(drift.len(), 200);
+
+        let negatives = drift.iter().filter(|d| d.median < 0.0).count();
+        assert_eq!(negatives, 67);
+        assert!(
+            drift[..negatives].iter().all(|d| d.median < 0.0),
+            "negative-median groups sort first: {:?}",
+            &drift[..negatives.min(3)]
+        );
+        // The rest stay ordered by distance from the overall median.
+        let tail: Vec<f64> = drift[negatives..]
+            .iter()
+            .map(|d| drift_distance(d.ratio))
+            .collect();
+        assert!(tail.windows(2).all(|w| w[0] >= w[1]), "{tail:?}");
     }
 
     #[test]

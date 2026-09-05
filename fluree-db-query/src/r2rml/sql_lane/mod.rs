@@ -14,6 +14,7 @@
 mod aggregate;
 mod lower;
 mod terms;
+mod union;
 
 pub use aggregate::{
     detect_sql_block_aggregate, SqlAggregateOperator, SQL_AGGREGATE_PUSHDOWN_SITE,
@@ -25,7 +26,7 @@ use std::sync::Arc;
 use fluree_db_tabular::plan::{
     ColRef, KeySet, Literal, OrderKey, OutputCol, OutputExpr, Pred, RelNode, RelPlan, RelSource,
 };
-use fluree_db_tabular::{BatchSchema, Column};
+use fluree_db_tabular::{BatchSchema, Column, ColumnBatch};
 
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
@@ -44,6 +45,7 @@ use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 
 use lower::{block_is_admissible, literal_len, lower_block, Decline, LowerInput, Lowered};
 use terms::{seed_values, Materializer};
+use union::{UnionLayout, UNION_ALIAS};
 
 /// A seed key-set row, hashed for de-duplication.
 ///
@@ -138,6 +140,9 @@ const BLOCK_CACHE_MAX_BYTES: usize = 64 << 20;
 /// and a fetched row ~1.4µs, so the break-even is near five; four keeps the
 /// wrong call on the side that only costs what it costs today.
 const CACHE_ROWS_PER_OUTER_ROW: usize = 4;
+
+/// Alias of the bounded fetch the size probe counts.
+const PROBE_ALIAS: &str = "p";
 
 fn block_cache_max_rows() -> usize {
     std::env::var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS")
@@ -303,7 +308,10 @@ pub(super) async fn resolve_block(
     let graph_ctx = ctx.with_active_graph(Arc::clone(iri));
     let verdicts = match R2rmlPolicyGate::build(&graph_ctx, &mapping, iri) {
         None => None,
-        Some(mut gate) => match gate.static_verdicts(&graph_ctx, &mapping).await? {
+        Some(mut gate) => match gate
+            .static_verdicts(&graph_ctx, &mapping, caps.keyset_max_rows)
+            .await?
+        {
             Some(v) => Some(v),
             None => {
                 tracing::debug!(graph = %iri, "sql pushdown declined: policy is not static");
@@ -341,6 +349,7 @@ pub(super) async fn resolve_block(
         }
         Ok(l) => l,
     };
+    let union = UnionLayout::new(&lowered, &caps, &mapping, &schemas);
     let mut branches = Vec::with_capacity(lowered.len());
     for lowered in lowered {
         tracing::debug!(
@@ -365,6 +374,7 @@ pub(super) async fn resolve_block(
     }
     Ok(Some(Resolved {
         branches,
+        union,
         caps,
         mapping,
         schemas,
@@ -385,6 +395,8 @@ pub(super) struct Branch {
 pub(super) struct Resolved {
     /// Empty: the block provably yields no rows.
     pub branches: Vec<Branch>,
+    /// How the branches share one statement, when they can.
+    pub union: Option<UnionLayout>,
     pub caps: PushdownCapabilities,
     pub mapping: Arc<CompiledR2rmlMapping>,
     /// Probed schemas of the relations the block can reach.
@@ -537,9 +549,10 @@ struct InFlight {
     /// One join plan per branch (a branch binds its own subset of the
     /// shared variables).
     joins: Vec<JoinPlan>,
-    /// `(branch, key-set chunk)` statements still to run.
-    chunks: VecDeque<(usize, Option<KeySet>)>,
-    stream: Option<(usize, ColumnBatchStream)>,
+    /// `(branches, key-set chunk)` statements still to run: one branch,
+    /// or the grouped branches of a `UNION` sharing one statement.
+    chunks: VecDeque<(Vec<usize>, Option<KeySet>)>,
+    stream: Option<(Vec<usize>, ColumnBatchStream)>,
 }
 
 /// The source proper: executes each branch's plan per child batch and
@@ -561,6 +574,8 @@ struct SqlBlockSource {
     /// Outer rows seen so far, the statistic behind [`BlockCache`].
     outer_rows: usize,
     caches: Vec<BlockCache>,
+    /// The branches run as one statement (see [`UnionLayout`]).
+    grouped: bool,
 }
 
 impl SqlBlockSource {
@@ -576,6 +591,13 @@ impl SqlBlockSource {
         let caches = (0..resolved.branches.len())
             .map(|_| BlockCache::Untried)
             .collect();
+        // A top-k the union cannot order on stays one statement per branch,
+        // where each still pushes its own LIMIT.
+        let grouped = match (&resolved.union, &topk) {
+            (Some(u), Some((ordering, _))) => !u.limit_is_exact || u.order_keys(ordering).is_some(),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
         Self {
             child,
             graph_iri,
@@ -590,6 +612,7 @@ impl SqlBlockSource {
             out_pos,
             outer_rows: 0,
             caches,
+            grouped,
         }
     }
 
@@ -597,9 +620,90 @@ impl SqlBlockSource {
         &self.resolved.branches[branch].lowered
     }
 
-    /// The statement for one branch and key-set chunk (or none), with the
-    /// modifiers the engine's LIMIT / top-k channels allow.
-    fn plan_for(&self, branch: usize, keyset: Option<KeySet>) -> RelPlan {
+    /// The statement for a group of branches and a key-set chunk (or
+    /// none): one branch's own statement, or the branches `UNION ALL`ed
+    /// under the layout's slots, with the modifiers the engine's LIMIT /
+    /// top-k channels allow.
+    fn plan_for_group(&self, branches: &[usize], keyset: Option<KeySet>) -> RelPlan {
+        let [branch] = branches else {
+            return self.union_plan(branches, keyset);
+        };
+        self.plan_for(*branch, keyset)
+    }
+
+    fn union_plan(&self, branches: &[usize], keyset: Option<KeySet>) -> RelPlan {
+        let layout = self
+            .resolved
+            .union
+            .as_ref()
+            .expect("grouped branches have a layout");
+        // The branches go unseeded; the key set joins the union once, on
+        // the slots the seeds' columns share (the grouping precondition).
+        let plans = branches
+            .iter()
+            .map(|&b| RelPlan {
+                root: self.seeded_root(b, None),
+                output: layout.branch_outputs[b].clone(),
+                group_by: Vec::new(),
+                distinct: self.lowered(b).distinct,
+                order_by: Vec::new(),
+                limit: None,
+                having: None,
+            })
+            .collect();
+        let mut root = RelNode::UnionAll {
+            alias: UNION_ALIAS.into(),
+            branches: plans,
+        };
+        if let Some(mut ks) = keyset {
+            let on: Vec<Pred> = layout
+                .seed_slots
+                .iter()
+                .zip(ks.columns.iter_mut())
+                .map(|((slot, ty), (name, col_ty))| {
+                    col_ty.get_or_insert(*ty);
+                    Pred::ColEq {
+                        left: ColRef::new(&ks.alias, name.as_str()),
+                        right: ColRef::new(UNION_ALIAS, &layout.slots[*slot]),
+                    }
+                })
+                .collect();
+            root = RelNode::Join {
+                left: Box::new(root),
+                right: Box::new(RelNode::KeySet(ks)),
+                on: Pred::and(on).expect("a key set has columns"),
+            };
+        }
+        let mut order_by = Vec::new();
+        let mut limit = None;
+        if layout.limit_is_exact {
+            match &self.topk {
+                Some((ordering, k)) => {
+                    if let Some(keys) = layout.order_keys(ordering) {
+                        order_by = keys;
+                        limit = Some(*k as u64);
+                    }
+                }
+                None => {
+                    if let Some(b) = self.row_budget {
+                        limit = Some(b as u64);
+                    }
+                }
+            }
+        }
+        RelPlan {
+            root,
+            output: layout.outputs(),
+            group_by: Vec::new(),
+            distinct: false,
+            order_by,
+            limit,
+            having: None,
+        }
+    }
+
+    /// A branch's plan tree joined to its key-set chunk, when there is one.
+    fn seeded_root(&self, branch: usize, keyset: Option<KeySet>) -> RelNode {
         let lowered = self.lowered(branch);
         let mut root = lowered.root.clone();
         if let Some(ks) = keyset {
@@ -622,6 +726,14 @@ impl SqlBlockSource {
                 on: Pred::and(on).expect("a key set has columns"),
             };
         }
+        root
+    }
+
+    /// The statement for one branch and key-set chunk (or none), with the
+    /// modifiers the engine's LIMIT / top-k channels allow.
+    fn plan_for(&self, branch: usize, keyset: Option<KeySet>) -> RelPlan {
+        let lowered = self.lowered(branch);
+        let root = self.seeded_root(branch, keyset);
         let mut order_by = Vec::new();
         let mut limit = None;
         if lowered.limit_is_exact {
@@ -633,8 +745,11 @@ impl SqlBlockSource {
                     let keys: Option<Vec<(OrderKey, bool)>> = ordering
                         .iter()
                         .map(|s| {
-                            let (col, _) = lowered.order_columns.get(&s.var)?;
-                            Some((OrderKey::Col(col.clone()), s.ascending()))
+                            let key = match lowered.order_columns.get(&s.var) {
+                                Some((col, _)) => OrderKey::Col(col.clone()),
+                                None => OrderKey::Expr(lowered.order_exprs.get(&s.var)?.clone()),
+                            };
+                            Some((key, s.ascending()))
                         })
                         .collect();
                     if let Some(keys) = keys {
@@ -656,6 +771,7 @@ impl SqlBlockSource {
             distinct: lowered.distinct,
             order_by,
             limit,
+            having: None,
         }
     }
 
@@ -670,6 +786,7 @@ impl SqlBlockSource {
             distinct: lowered.distinct,
             order_by: Vec::new(),
             limit: None,
+            having: None,
         }
     }
 
@@ -687,9 +804,16 @@ impl SqlBlockSource {
             QueryError::InvalidQuery("R2RML table provider not configured".into())
         })?;
         use futures::StreamExt;
-        let lowered = self.lowered(branch);
+        // Counted through the fetch statement bounded at the cap plus one:
+        // the answer past the cap is only "too large", so the probe never
+        // scans further than a fetch would.
+        let mut probe = self.plan_for_cache(branch);
+        probe.limit = Some(max_rows as u64 + 1);
         let count_plan = RelPlan {
-            root: lowered.root.clone(),
+            root: RelNode::Derived {
+                alias: PROBE_ALIAS.into(),
+                plan: Box::new(probe),
+            },
             output: vec![OutputCol {
                 expr: OutputExpr::CountRows,
                 name: "n".into(),
@@ -698,6 +822,7 @@ impl SqlBlockSource {
             distinct: false,
             order_by: Vec::new(),
             limit: None,
+            having: None,
         };
         // The count is an optimization: a provider that cannot run it, or a
         // transient failure, leaves the branch seeded rather than failing a
@@ -922,6 +1047,40 @@ impl SqlBlockSource {
     /// Key-set chunks for a child batch on one branch: `[None]` when nothing
     /// can be seeded (the statement runs once, unconstrained, and the
     /// in-memory join does the rest), empty when no outer row can match.
+    /// A grouped page split by its tag into each branch's rows; one
+    /// branch's page is its own.
+    fn group_pages(&self, group: &[usize], page: ColumnBatch) -> Result<Vec<(usize, ColumnBatch)>> {
+        let [branch] = group else {
+            let layout = self
+                .resolved
+                .union
+                .as_ref()
+                .expect("grouped branches have a layout");
+            let tag = page.schema.index_by_name(&layout.tag).ok_or_else(|| {
+                QueryError::Internal(format!("grouped page lacks its tag '{}'", layout.tag))
+            })?;
+            let col = &page.columns[tag];
+            let mut indices: Vec<Vec<usize>> = vec![Vec::new(); self.resolved.branches.len()];
+            for row in 0..page.num_rows {
+                let b = col
+                    .get_i64(row)
+                    .or_else(|| col.get_i32(row).map(i64::from))
+                    .and_then(|n| usize::try_from(n).ok())
+                    .filter(|n| group.contains(n))
+                    .ok_or_else(|| {
+                        QueryError::Internal("grouped page row without a branch tag".into())
+                    })?;
+                indices[b].push(row);
+            }
+            return Ok(group
+                .iter()
+                .filter(|b| !indices[**b].is_empty())
+                .map(|b| (*b, page.filter_by_indices(&indices[*b])))
+                .collect());
+        };
+        Ok(vec![(*branch, page)])
+    }
+
     fn keysets_for(
         &self,
         branch: usize,
@@ -1276,27 +1435,38 @@ impl Operator for SqlBlockSource {
                 return Ok(Some(batch));
             }
             if let Some(mut inflight) = self.inflight.take() {
-                if let Some((branch, stream)) = inflight.stream.as_mut() {
+                if let Some((group, stream)) = inflight.stream.as_mut() {
                     use futures::StreamExt;
                     match stream.next().await {
                         Some(page) => {
                             let page = page?;
-                            let branch = *branch;
-                            let b = &self.resolved.branches[branch];
-                            let batches = b.materializer.split_page(page, &b.lowered.outputs)?;
-                            let num_rows = batches.values().next().map(|b| b.num_rows).unwrap_or(0);
-                            let mut rows = Vec::with_capacity(num_rows);
-                            for i in 0..num_rows {
-                                rows.push(b.materializer.row(&batches, i)?);
+                            let group = group.clone();
+                            let mut rows: Vec<(usize, Vec<Vec<(VarId, Binding)>>)> = Vec::new();
+                            for (branch, page) in self.group_pages(&group, page)? {
+                                let b = &self.resolved.branches[branch];
+                                let outputs = match &self.resolved.union {
+                                    Some(u) if group.len() > 1 => &u.renamed[branch],
+                                    _ => &b.lowered.outputs,
+                                };
+                                let batches = b.materializer.split_page(page, outputs)?;
+                                let num_rows =
+                                    batches.values().next().map(|b| b.num_rows).unwrap_or(0);
+                                let mut prods = Vec::with_capacity(num_rows);
+                                for i in 0..num_rows {
+                                    prods.push(b.materializer.row(&batches, i)?);
+                                }
+                                rows.push((branch, prods));
                             }
-                            for prod in &rows {
-                                self.join_and_emit(
-                                    branch,
-                                    &inflight.child_batch,
-                                    &inflight.joins[branch],
-                                    prod,
-                                    &graph_ctx,
-                                )?;
+                            for (branch, prods) in &rows {
+                                for prod in prods {
+                                    self.join_and_emit(
+                                        *branch,
+                                        &inflight.child_batch,
+                                        &inflight.joins[*branch],
+                                        prod,
+                                        &graph_ctx,
+                                    )?;
+                                }
                             }
                             self.inflight = Some(inflight);
                             continue;
@@ -1306,14 +1476,14 @@ impl Operator for SqlBlockSource {
                         }
                     }
                 }
-                if let Some((branch, keyset)) = inflight.chunks.pop_front() {
-                    let plan = self.plan_for(branch, keyset);
+                if let Some((group, keyset)) = inflight.chunks.pop_front() {
+                    let plan = self.plan_for_group(&group, keyset);
                     let table_provider = graph_ctx.r2rml_table_provider.ok_or_else(|| {
                         QueryError::InvalidQuery("R2RML table provider not configured".into())
                     })?;
                     let (sql, stream) = table_provider.execute_plan(&self.graph_iri, &plan).await?;
                     graph_ctx.tracker.record_statement(&self.graph_iri, &sql);
-                    inflight.stream = Some((branch, stream));
+                    inflight.stream = Some((group, stream));
                     self.inflight = Some(inflight);
                 }
                 continue;
@@ -1329,8 +1499,9 @@ impl Operator for SqlBlockSource {
                 Some(child_batch) => {
                     self.outer_rows += child_batch.len();
                     let outgrown = self.outer_rows > self.resolved.caps.keyset_max_rows;
-                    let mut chunks: VecDeque<(usize, Option<KeySet>)> = VecDeque::new();
+                    let mut chunks: VecDeque<(Vec<usize>, Option<KeySet>)> = VecDeque::new();
                     let mut joins = Vec::with_capacity(self.resolved.branches.len());
+                    let mut seeded: Vec<usize> = Vec::new();
                     for branch in 0..self.resolved.branches.len() {
                         if outgrown && matches!(self.caches[branch], BlockCache::Untried) {
                             self.caches[branch] = self.count_block(branch, &graph_ctx).await?;
@@ -1355,11 +1526,22 @@ impl Operator for SqlBlockSource {
                             joins.push(JoinPlan::Cross);
                             continue;
                         }
-                        // A branch no outer row can match contributes nothing.
-                        for ks in self.keysets_for(branch, &child_batch, &graph_ctx) {
-                            chunks.push_back((branch, ks));
-                        }
+                        seeded.push(branch);
                         joins.push(self.build_join_plan(branch, &child_batch, &graph_ctx));
+                    }
+                    // Grouped branches seed alike, so one branch's key sets
+                    // are the group's, joined to the union once. A branch
+                    // no outer row can match contributes nothing.
+                    if self.grouped && seeded.len() > 1 {
+                        for ks in self.keysets_for(seeded[0], &child_batch, &graph_ctx) {
+                            chunks.push_back((seeded.clone(), ks));
+                        }
+                    } else {
+                        for branch in seeded {
+                            for ks in self.keysets_for(branch, &child_batch, &graph_ctx) {
+                                chunks.push_back((vec![branch], ks));
+                            }
+                        }
                     }
                     if chunks.is_empty() {
                         continue;

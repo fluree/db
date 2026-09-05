@@ -38,6 +38,58 @@ pub enum Literal {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+/// A scalar expression over columns and literals: what a `BIND` computes,
+/// when a filter or an ordering over it is pushed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Col(ColRef),
+    Lit(Literal),
+    Arith {
+        op: ArithOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    /// String concatenation.
+    Concat(Vec<Expr>),
+    /// Length of a string in characters.
+    Strlen(Box<Expr>),
+    /// A substring from the 1-based `start`, `len` characters long (to the
+    /// end when `None`).
+    Substr {
+        expr: Box<Expr>,
+        start: u64,
+        len: Option<u64>,
+    },
+    /// The dialect's own case mapping: exact on ASCII, not beyond it.
+    Lower(Box<Expr>),
+    Upper(Box<Expr>),
+}
+
+impl Expr {
+    /// Every column the expression reads.
+    pub fn columns<'a>(&'a self, out: &mut Vec<&'a ColRef>) {
+        match self {
+            Expr::Col(c) => out.push(c),
+            Expr::Lit(_) => {}
+            Expr::Arith { left, right, .. } => {
+                left.columns(out);
+                right.columns(out);
+            }
+            Expr::Concat(parts) => parts.iter().for_each(|p| p.columns(out)),
+            Expr::Strlen(e) | Expr::Substr { expr: e, .. } | Expr::Lower(e) | Expr::Upper(e) => {
+                e.columns(out);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CmpOp {
     Eq,
     NotEq,
@@ -83,6 +135,22 @@ pub enum Pred {
     Like {
         col: ColRef,
         pattern: String,
+    },
+    /// `expr op value` for a computed expression.
+    ExprCmp {
+        expr: Expr,
+        op: CmpOp,
+        value: Literal,
+    },
+    /// The string column holds a character outside printable ASCII.
+    NonAscii(ColRef),
+    /// `output op value` over a named output of the plan, for `HAVING`:
+    /// rendered as the output's expression, since a dialect need not let a
+    /// `HAVING` name a select alias.
+    OutputCmp {
+        output: String,
+        op: CmpOp,
+        value: Literal,
     },
     And(Vec<Pred>),
     Or(Vec<Pred>),
@@ -147,6 +215,20 @@ pub enum RelNode {
         source: RelSource,
     },
     KeySet(KeySet),
+    /// A nested plan as a derived table: `(SELECT …) AS alias`, its outputs
+    /// the columns of `alias`.
+    Derived {
+        alias: String,
+        plan: Box<RelPlan>,
+    },
+    /// A `UNION ALL` of statements as a derived table: `(SELECT … UNION ALL
+    /// SELECT …) AS alias`. Every branch projects the same number of
+    /// columns, of the same types position by position; the first branch's
+    /// output names name the columns of `alias`.
+    UnionAll {
+        alias: String,
+        branches: Vec<RelPlan>,
+    },
     Filter {
         input: Box<RelNode>,
         pred: Pred,
@@ -175,6 +257,10 @@ impl RelNode {
         match self {
             RelNode::Access { alias, source } => out.push((alias, source)),
             RelNode::KeySet(_) => {}
+            RelNode::Derived { plan, .. } => plan.root.collect_accesses(out),
+            RelNode::UnionAll { branches, .. } => {
+                branches.iter().for_each(|b| b.root.collect_accesses(out));
+            }
             RelNode::Filter { input, .. } => input.collect_accesses(out),
             RelNode::Join { left, right, .. } | RelNode::LeftJoin { left, right, .. } => {
                 left.collect_accesses(out);
@@ -189,6 +275,11 @@ impl RelNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputExpr {
     Col(ColRef),
+    /// An integer literal: a `UNION ALL` branch tag.
+    Tag(i64),
+    /// A bare `NULL`: a `UNION ALL` branch's padding for a column another
+    /// branch projects.
+    Null,
     /// `COUNT(*)`.
     CountRows,
     /// `COUNT([DISTINCT] col)`: non-null values.
@@ -213,7 +304,7 @@ impl OutputExpr {
             | OutputExpr::Sum { col: c, .. }
             | OutputExpr::Min(c)
             | OutputExpr::Max(c) => Some(c),
-            OutputExpr::CountRows => None,
+            OutputExpr::CountRows | OutputExpr::Tag(_) | OutputExpr::Null => None,
         }
     }
 
@@ -240,10 +331,11 @@ impl OutputCol {
 
 /// An `ORDER BY` key: a column of the join, or one of the plan's outputs by
 /// name (the only way to order by an aggregate).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum OrderKey {
     Col(ColRef),
     Output(String),
+    Expr(Expr),
 }
 
 /// A complete pushed-down block: a join tree, a projection, and the
@@ -258,6 +350,8 @@ pub struct RelPlan {
     /// `(key, ascending)`.
     pub order_by: Vec<(OrderKey, bool)>,
     pub limit: Option<u64>,
+    /// A `HAVING` over the grouped outputs.
+    pub having: Option<Pred>,
 }
 
 /// What a provider can execute, consulted by the lowering before it emits a
@@ -279,6 +373,10 @@ pub struct PushdownCapabilities {
     pub string_distinct_is_binary: bool,
     /// String `<` orders by code point (not a locale collation).
     pub string_order_is_codepoint: bool,
+    /// A bare `NULL` projected by one `UNION ALL` branch takes the type of
+    /// the column the other branches project there. False where the result
+    /// column is typed from the first branch's expression alone.
+    pub union_null_is_typed: bool,
     /// A `timestamp` without a zone is stored as text (SQLite), ordered by
     /// its characters. The date prefix orders correctly whatever the time
     /// separator; a comparison at time-of-day granularity does not.
@@ -323,6 +421,10 @@ pub fn collect_col_eqs(node: &RelNode, out: &mut Vec<(ColRef, ColRef)>) {
     }
     match node {
         RelNode::Access { .. } | RelNode::KeySet(_) => {}
+        RelNode::Derived { plan, .. } => collect_col_eqs(&plan.root, out),
+        RelNode::UnionAll { branches, .. } => {
+            branches.iter().for_each(|b| collect_col_eqs(&b.root, out));
+        }
         RelNode::Filter { input, pred } => {
             from_pred(pred, out);
             collect_col_eqs(input, out);

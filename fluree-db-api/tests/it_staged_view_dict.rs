@@ -11,8 +11,8 @@
 //! flake, with the whole graph novelty re-walked each time.
 //!
 //! These tests pin the translation outcome through a tracing probe rather
-//! than timings, and pin post-commit reads so a staged product can never be
-//! served for the committed state.
+//! than timings, and pin post-commit reads so a product built over
+//! uncommitted state can never be served for the committed state.
 //!
 //! Run with:
 //!   cargo test -p fluree-db-api --test it_staged_view_dict --features shacl
@@ -312,6 +312,8 @@ async fn post_commit_whole_graph_scan_reads_committed_dictionaries() {
         .await
         .expect("batch accepted");
 
+    // Observe this scan only, not the staging pass above.
+    let _ = drain_failures();
     let view = fluree.db(LEDGER).await.expect("db view");
     let q = json!({
         "@context": ctx(),
@@ -339,6 +341,249 @@ async fn post_commit_whole_graph_scan_reads_committed_dictionaries() {
         failures.is_empty(),
         "post-commit scan hit translation failures; first: {}",
         failures.first().map(String::as_str).unwrap_or("")
+    );
+}
+
+/// A staged preview (`GraphDb::from_staged`) is the third binary-lane reader
+/// of uncommitted state: its scans must resolve the transaction's own
+/// subjects through a staged dictionary layer rather than fall back to raw
+/// merging with a WARN per flake per scan.
+#[tokio::test]
+async fn preview_over_staged_transaction_translates_new_subjects() {
+    use fluree_db_api::GraphDb;
+
+    let _serial = serialize().await;
+    install_probe();
+    let (fluree, _dir) = new_fluree().await;
+    const LEDGER: &str = "staged-view-dict/preview:main";
+    let ledger = indexed_ledger(&fluree, LEDGER).await;
+
+    let staged = fluree
+        .stage_owned(ledger)
+        .insert(&person("ex:previewed", Some("Previewed")))
+        .stage()
+        .await
+        .expect("stage");
+    let preview = GraphDb::from_staged(&staged).expect("preview view");
+
+    // Predicate-bound: the scan translates every staged `ex:name` flake (a
+    // subject-bound pattern alone takes the overlay-only seek and never
+    // translates).
+    let _ = drain_failures();
+    let q = json!({
+        "@context": ctx(),
+        "select": ["?s", "?name"],
+        "where": {"@id": "?s", "ex:name": "?name"}
+    });
+    let out = fluree
+        .query(&preview, QueryInput::JsonLd(&q))
+        .await
+        .expect("preview query");
+    let rows = out
+        .to_jsonld(&preview.snapshot)
+        .expect("jsonld")
+        .to_string();
+    assert!(
+        rows.contains("\"ex:previewed\"") && rows.contains("\"Previewed\""),
+        "preview must see the staged subject: {rows}"
+    );
+    let failures = drain_failures();
+    assert!(
+        failures.is_empty(),
+        "{} overlay flake(s) failed V3 translation during the preview scan; first: {}",
+        failures.len(),
+        failures.first().map(String::as_str).unwrap_or("")
+    );
+}
+
+/// The staged extension is a layer over the committed dictionary, not a
+/// copy of it: the cost of covering a transaction's own subjects is
+/// proportional to the staged flakes, however far the indexer trails the
+/// head, and the committed dictionary is never touched.
+#[tokio::test]
+async fn staged_dictionaries_layer_over_the_committed_dictionary() {
+    use fluree_db_api::GraphDb;
+    use fluree_db_query::BinaryRangeProvider;
+    use std::sync::Arc;
+
+    let _serial = serialize().await;
+    install_probe();
+    let (fluree, _dir) = new_fluree().await;
+    const LEDGER: &str = "staged-view-dict/layer:main";
+    let ledger = indexed_ledger(&fluree, LEDGER).await;
+    // One commit past the index, so the committed dictionary holds an entry
+    // the layer must find through its parent.
+    let ledger = fluree
+        .insert_with_opts(
+            ledger,
+            &person("ex:committed", Some("Committed")),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &quiet_index_cfg(),
+        )
+        .await
+        .expect("commit")
+        .ledger;
+    let canonical = Arc::clone(&ledger.dict_novelty);
+    let committed = ledger
+        .snapshot
+        .encode_iri("http://example.org/ns/committed")
+        .expect("known namespace");
+    let committed_id = canonical
+        .subjects
+        .find_subject(committed.namespace_code, &committed.name)
+        .expect("committed subject is in the canonical dictionary");
+
+    let staged = fluree
+        .stage_owned(ledger.clone())
+        .insert(&person("ex:staged", Some("Staged")))
+        .stage()
+        .await
+        .expect("stage");
+    let preview = GraphDb::from_staged(&staged).expect("preview view");
+    let provider = preview
+        .snapshot
+        .range_provider
+        .as_ref()
+        .expect("preview carries a range provider")
+        .as_any()
+        .downcast_ref::<BinaryRangeProvider>()
+        .expect("binary provider");
+    let layer = provider.dict_novelty();
+
+    let parent = layer.parent().expect("staged dictionary is a layer");
+    assert!(
+        Arc::ptr_eq(parent, &canonical),
+        "the layer shares the committed dictionary rather than copying it"
+    );
+    assert_eq!(
+        layer
+            .subjects
+            .find_subject(committed.namespace_code, &committed.name),
+        Some(committed_id),
+        "committed entries resolve through the parent"
+    );
+    let staged_subject = ledger
+        .snapshot
+        .encode_iri("http://example.org/ns/staged")
+        .expect("known namespace");
+    let staged_id = layer
+        .subjects
+        .find_subject(staged_subject.namespace_code, &staged_subject.name)
+        .expect("the staged subject is minted in the layer");
+    assert_ne!(staged_id, committed_id);
+    assert_eq!(
+        canonical
+            .subjects
+            .find_subject(staged_subject.namespace_code, &staged_subject.name),
+        None,
+        "the committed dictionary is untouched by staging"
+    );
+    assert!(canonical.parent().is_none());
+}
+
+/// The cross-query translation cache must never serve a product built over
+/// uncommitted state for the committed state. A discarded preview's novelty
+/// reports the very epoch and `to_t` the next commit will report, so an
+/// epoch-keyed cache would hand that commit the preview's product: the
+/// preview's values under the committed subject's freshly minted ids.
+///
+/// Integer objects are inline in a translated op (no dictionary), so the
+/// aliased product decodes cleanly to the *wrong* value instead of failing.
+#[tokio::test]
+async fn post_commit_scan_is_never_served_a_discarded_previews_product() {
+    use fluree_db_api::GraphDb;
+
+    let _serial = serialize().await;
+    install_probe();
+    let (fluree, _dir) = new_fluree().await;
+    const LEDGER: &str = "staged-view-dict/discarded-preview:main";
+    let ledger = indexed_ledger(&fluree, LEDGER).await;
+
+    let scan = json!({
+        "@context": ctx(),
+        "select": ["?s", "?p", "?o"],
+        "where": {"@id": "?s", "?p": "?o"}
+    });
+
+    // Preview a transaction with an unbounded scan (a whole-graph product is
+    // built and cached), then discard it.
+    let discarded = json!({
+        "@context": ctx(),
+        "@id": "ex:ghost",
+        "@type": "ex:Person",
+        "ex:name": "Ghost",
+        "ex:age": 1
+    });
+    let staged = fluree
+        .stage_owned(ledger.clone())
+        .insert(&discarded)
+        .stage()
+        .await
+        .expect("stage");
+    let preview = GraphDb::from_staged(&staged).expect("preview view");
+    let out = fluree
+        .query(&preview, QueryInput::JsonLd(&scan))
+        .await
+        .expect("preview scan");
+    let rows = out
+        .to_jsonld(&preview.snapshot)
+        .expect("jsonld")
+        .to_string();
+    assert!(
+        rows.contains("\"Ghost\""),
+        "preview sees its own flakes: {rows}"
+    );
+    drop(preview);
+    drop(staged);
+
+    // Commit a different transaction at the same epoch and t. Indexing is
+    // quiesced so the committed view keeps the preview's snapshot and store,
+    // the state an epoch key cannot tell apart.
+    let committed = json!({
+        "@context": ctx(),
+        "@id": "ex:real",
+        "@type": "ex:Person",
+        "ex:name": "Real",
+        "ex:age": 2
+    });
+    let committed = fluree
+        .insert_with_opts(
+            ledger,
+            &committed,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &quiet_index_cfg(),
+        )
+        .await
+        .expect("commit")
+        .ledger;
+
+    // The same unbounded scan (same index order as the cached product). The
+    // committed subject's and string's ids line up positionally with the
+    // preview's, so an aliased product decodes to the committed subject
+    // carrying the preview's age.
+    let view = GraphDb::from_ledger_state(&committed);
+    let out = fluree
+        .query(&view, QueryInput::JsonLd(&scan))
+        .await
+        .expect("committed whole-graph scan");
+    let rows = out.to_jsonld(&view.snapshot).expect("jsonld");
+    let ages: Vec<Value> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .filter(|row| row[1] == json!("ex:age"))
+        .map(|row| json!([&row[0], &row[2]]))
+        .collect();
+    assert_eq!(
+        ages,
+        vec![json!(["ex:real", 2])],
+        "committed state must read its own flakes, not the discarded preview's"
+    );
+    assert!(
+        !rows.to_string().contains("\"Ghost\""),
+        "whole-graph scan after commit: {rows}"
     );
 }
 

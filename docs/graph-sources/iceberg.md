@@ -752,6 +752,21 @@ Iceberg optimizations:
   - Column pruning (only read order_id, order_date)
 ```
 
+### Same-subject stars over several triples maps
+
+A star of predicates on one subject is read in one scan when a single
+triples map provides every member. Where a second map over the same table
+and subject template provides only some of them and mints each the same way
+(the same column under the same predicate — the one-map-per-class idiom,
+where a `Customer` map and a `CustomerCountry` map both carry `ex:label`
+from `name`), the star stays one scan: that map adds no triple the fused
+scan misses, and an RDF graph holds a triple once. A map deriving a member
+differently (another column, a datatype, a reference) is a real second
+provider: the star is then read as one scan per member and joined on the
+subject, so every provider's rows come back. Two maps minting a pattern's
+triples alike are read once at the scan as well; when the pattern projects
+the type (`?s a ?t`), both are kept unless their class sets are equal.
+
 ### Best Practices
 
 1. **Partition by Common Filters:**

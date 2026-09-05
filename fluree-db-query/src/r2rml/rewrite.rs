@@ -31,7 +31,7 @@ use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
 use crate::r2rml::{ObjectConstant, ScanCmpOp, ScanValue};
 use crate::var_registry::VarId;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot};
-use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap};
+use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, TriplesMap};
 use fluree_vocab::namespaces::XSD;
 use std::collections::HashSet;
 
@@ -437,13 +437,45 @@ pub fn rewrite_patterns_for_r2rml(
                 .chain(&const_members)
                 .filter_map(|p| p.predicate_filter.as_deref())
                 .collect();
-            let covered = m.triples_maps.values().any(|tm| {
-                preds.iter().all(|pred| {
-                    tm.predicate_object_maps
-                        .iter()
-                        .any(|pom| pom.predicate_map.as_constant() == Some(pred))
-                })
-            });
+            // A fused scan reads the star from maps carrying every member.
+            // A map providing only some of them loses its rows unless its
+            // subjects provably never meet a covering map's (disjoint
+            // templates) or a covering map mints every member it provides
+            // alike (its triples are that map's, held once): a vertical
+            // partition's second provider of one member keeps the star
+            // unfused; another entity's, or a second class over the same
+            // rows sharing a label-type predicate, does not.
+            let provides = |tm: &TriplesMap, pred: &str| {
+                tm.predicate_object_maps
+                    .iter()
+                    .any(|pom| pom.predicate_map.as_constant() == Some(pred))
+            };
+            let covering: Vec<&TriplesMap> = m
+                .triples_maps
+                .values()
+                .filter(|tm| preds.iter().all(|pred| provides(tm, pred)))
+                .collect();
+            let covered = !covering.is_empty()
+                && m.triples_maps.values().all(|tm| {
+                    !preds.iter().any(|pred| provides(tm, pred))
+                        || preds.iter().all(|pred| provides(tm, pred))
+                        || covering.iter().all(|c| {
+                            match (
+                                tm.subject_map.template.as_deref(),
+                                c.subject_map.template.as_deref(),
+                            ) {
+                                (Some(a), Some(b)) => templates_provably_disjoint(a, b),
+                                _ => false,
+                            }
+                        })
+                        || covering.iter().any(|c| {
+                            c.same_source_row(tm)
+                                && preds
+                                    .iter()
+                                    .filter(|p| provides(tm, p))
+                                    .all(|p| c.mints_alike(tm, p))
+                        })
+                });
             if !covered {
                 for m in var_members.into_iter().chain(const_members) {
                     result_patterns.push(Pattern::R2rml(m));
@@ -2047,6 +2079,62 @@ mod tests {
         .collect();
         assert_eq!(fused.len(), 1, "one map covers both members");
         assert_eq!(fused[0].star_bindings.len(), 1);
+    }
+
+    // A second map over the same rows and template providing only some
+    // members, each minted alike by the covering map, adds no triple the
+    // fused scan misses: the star stays one scan. One deriving a member
+    // differently (another column) is a real second provider and un-fuses.
+    #[test]
+    fn star_partial_provider_minted_alike_keeps_fusion() {
+        const LABEL: &str = "http://example.org/label";
+        const COUNTRY: &str = "http://example.org/country";
+        let customer = TriplesMap::new("#Customer", "customers")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_class("http://example.org/Customer")
+            .with_predicate_object(pom(PRED, "name"))
+            .with_predicate_object(pom(LABEL, "name"));
+        let by_country = TriplesMap::new("#CustomerCountry", "customers")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_class("http://example.org/CustomerCountry")
+            .with_predicate_object(pom(COUNTRY, "country"))
+            .with_predicate_object(pom(LABEL, "name"));
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let star = |pred: &str, obj: u16| {
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(pred.into()),
+                Term::Var(VarId(obj)),
+            ))
+        };
+        let rewrite = |mapping: &CompiledR2rmlMapping| -> Vec<R2rmlPattern> {
+            rewrite_patterns_for_r2rml(
+                &[star(PRED, 1), star(LABEL, 2)],
+                "gs:main",
+                &snapshot,
+                Some(mapping),
+                false,
+                false,
+            )
+            .patterns
+            .into_iter()
+            .filter_map(|p| match p {
+                Pattern::R2rml(rp) => Some(rp),
+                _ => None,
+            })
+            .collect()
+        };
+        let mapping = CompiledR2rmlMapping::new(vec![customer.clone(), by_country]);
+        let fused = rewrite(&mapping);
+        assert_eq!(fused.len(), 1, "the alike partial provider keeps one scan");
+        assert_eq!(fused[0].star_bindings.len(), 1);
+
+        let alias = TriplesMap::new("#CustomerAlias", "customers")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_predicate_object(pom(LABEL, "nickname"));
+        let mapping = CompiledR2rmlMapping::new(vec![customer, alias]);
+        let split = rewrite(&mapping);
+        assert_eq!(split.len(), 2, "a differently derived label un-fuses");
     }
 
     // ---- PR-F20: RefObjectMap-target resolution prune (invariants A + B) ----

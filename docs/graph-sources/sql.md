@@ -10,8 +10,10 @@ long-running server and from a Lambda.
 ## Where the SQL runs
 
 Fluree does not talk to Postgres, MySQL, Snowflake or Oracle directly. It sends
-one `POST /v1/statement` per table scan to an endpoint and pages through the
-result. Anything that implements that protocol works:
+one `POST /v1/statement` per statement to an endpoint — one per graph block
+where the [pushdown lane](#the-pushdown-lane-one-statement-per-block) takes
+the block, one per table scan otherwise — and pages through the result.
+Anything that implements that protocol works:
 
 | Endpoint | When to use it |
 |----------|----------------|
@@ -146,10 +148,13 @@ empty — the same dataset rule that applies to Iceberg sources.
 
 ### What is pushed to SQL
 
-The query engine asks the source for **one table at a time** — a projection,
+Two lanes read a SQL source. The pushdown lane (next section) compiles a
+whole graph block into one statement when the block's shape allows, and is
+the default. Where it declines, the per-scan lane below answers: the query
+engine asks the source for **one table at a time** — a projection,
 conjunctive filters, and nothing else — and does joins, `OPTIONAL`, `UNION`,
-property paths and aggregation itself over the returned rows. So each triples
-map touched by a query becomes one statement of the shape:
+property paths and aggregation itself over the returned rows. Each triples
+map touched by a query then becomes one statement of the shape:
 
 ```sql
 SELECT "id", "customer_id", "total" FROM "sales"."orders" WHERE "total" > 1E2
@@ -218,15 +223,51 @@ pushable. In that statement:
   the parts that cannot be widened are simply dropped from the pushed
   predicate. A widened filter is a residual, so a `LIMIT` above it stays in
   the engine and a grouped query over it declines;
+- a **sub-`SELECT`** inside the block is a derived table joined on its
+  projected variables' key columns: its own block is lowered like the
+  enclosing one, `GROUP BY` with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` becomes
+  the derived table's grouping (the engine decodes the aggregate outputs
+  as the grouped lane does), `DISTINCT` and `ORDER BY … LIMIT` push inside
+  it, as does a `HAVING` the grouped lane can push (below). A projected
+  `OPTIONAL` variable stays nullable across the derived table, so an outer
+  pattern binding it too is declined as it would be inside one block. A
+  sub-select with another `HAVING`, an `OFFSET`, a `BIND`, a nested
+  sub-select, a filter the statement cannot evaluate exactly, or one that
+  hides an inner variable the enclosing block also uses is not admitted. There is
+  no other lane for a sub-select over a graph source (the engine's
+  subquery operator has no native index to run against), so one the lane
+  does not take still refuses the query, as it did before;
 - an entity whose members come from **several triples maps sharing its
   subject** (a vertically partitioned mapping: one map per column group, or
   per table, over the same `rr:template`) is one access per distinct table,
   joined on the subject's key columns; maps over the same table and subject
-  share a single access. Every member must have exactly one providing map
-  when no map provides them all, or the block is left to the engine;
+  share a single access;
+- an entity with **several resolutions** — a predicate two maps mint, on
+  the same subject or on different ones (`?s ex:name ?n` where people and
+  companies both have names) — is one derived table: every resolution
+  (one choice of providing map per member, the chosen maps minting the same
+  subject) is lowered on its own and the branches are `UNION ALL`ed under
+  shared columns, each row tagged with its branch so its terms decode
+  through that branch's maps. The rest of the block joins the union once.
+  Two maps minting a triple alike (the same table, subject template and
+  object map) count as one provider in both lanes, since the graph holds
+  the triple once; maps deriving the same value differently still come
+  back once each. Filters and a top-k on a union variable push on the union's
+  columns; a variable keeps its key shape (so it can be seeded or joined)
+  only where every branch agrees on it. A foreign key into a union entity
+  joins the parent's columns, which every branch exposes: a branch on the
+  parent's subject over another table takes the parent's row as a part of
+  its own, a branch whose subjects are provably apart from the parent's
+  (templates of different prefixes) can never meet the key and is dropped,
+  and one the lane can neither join nor rule out (one prefix, another
+  skeleton) declines. The branches must bind their columns with the same database
+  types, an entity with more than eight resolutions, an aggregate over a
+  union entity, and a union inside a sub-select decline;
 - the statement has limits the lane respects: outer bindings above the
   provider's key-set cap (2000 rows, or half the statement budget) go out
-  as several statements, one per chunk; inside the block, an `IN` list
+  as several statements, one per chunk (a key set joins a shared `UNION
+  ALL` statement once, outside the union, on the slot the branches' key
+  columns share); inside the block, an `IN` list
   above that cap stays a residual on the lane and a `VALUES` block above it
   declines the block to the engine; a `UNION` expanding to more than eight
   branch combinations declines;
@@ -241,8 +282,9 @@ pushable. In that statement:
   pattern joined to the block), are sent as a `VALUES` key set so the
   source does the semi-join. Once the outer side has grown past one key
   set (2000 rows), a seeded statement per outer batch stops paying: the
-  lane counts the block once (`SELECT COUNT(*)`, an index-only scan on
-  most tables) and, when it holds at most 100,000 rows and no more than
+  lane counts the block once (a `SELECT COUNT(*)` over the block's own
+  statement bounded at the cap plus one, so the probe never scans past the
+  cap) and, when it holds at most 100,000 rows and no more than
   four rows per outer row seen so far, fetches it whole in one statement
   and joins every outer batch to it in memory; a larger block stays
   seeded. On a 1M-row Postgres table, 50,000 outer keys against a
@@ -252,10 +294,33 @@ pushable. In that statement:
 - a `BIND` in the block keeps the block on one statement: the statement
   returns the columns the expression reads and the engine computes the
   value per row, before any residual filter (so a `FILTER` over the bound
-  variable is fine). The `BIND` must read only variables the block bound
+  variable is fine). When the expression is `+`, `-` and `*` over numeric
+  columns the database holds natively, integer constants and other such
+  `BIND`s, a `FILTER` comparing it with a number pushes as the expression
+  (`("total" * 2) > 50`) and an `ORDER BY … LIMIT` over it pushes as a
+  top-k (`ORDER BY ("total" * 2) DESC LIMIT 2`); the bound value is still
+  built in the engine. `CONCAT`, `STRLEN`, `SUBSTR` from a positive
+  constant position, and `STR` over plain string columns and constants
+  push the same way (`("name" || '-' || "country") = 'Ada-UK'`,
+  `LENGTH("name") > 2`; `CHAR_LENGTH` and `CONCAT()` on `dialect: mysql`),
+  a string comparison where the dialect compares bytes and a string
+  ordering where it orders code points. A `FILTER` that writes the
+  expression out instead of binding it pushes too. Division stays in the
+  engine (SPARQL divides integers into a decimal, SQL into an integer), as
+  do language-tagged strings, `SUBSTR` from a computed or non-positive
+  position, and an expression over a decimal or double constant (dialects
+  type such a constant differently: SQLite computes `"total" * 0.1` in
+  floating point, Postgres reads `1E-1` as exact). The `BIND` must read only variables the block bound
   before it, and nothing the statement joins or filters on may read the
   bound variable; an `EXISTS` inside the expression, or a `BIND` inside an
   `OPTIONAL` or a `UNION` branch, leaves the block to the engine;
+- `LCASE(?v) = "…"` and `UCASE(?v) = "…"` over a plain string column widen
+  rather than push exactly: every dialect's case mapping agrees with
+  SPARQL's on printable ASCII and nowhere else for certain (SPARQL maps
+  `ß` to `SS` and a ligature to two letters; the databases do not), so the
+  statement keeps the rows whose folded value matches **or** that hold any
+  other character (`LOWER("name") = 'ada' OR "name" !~ '^[ -~]*$'`), and
+  the engine decides the rest;
 - `LIMIT`, and `ORDER BY … LIMIT` as a top-k, are pushed when no residual
   filter could drop rows afterwards. The top-k needs every `ORDER BY` key to
   be a typed, required column (either direction); a key the statement cannot
@@ -265,10 +330,20 @@ pushable. In that statement:
   columns of the projected variables (plus what the join and any residual
   filter read), where the dialect's string equality is byte equality; the
   engine still deduplicates the returned terms;
-- a `UNION` runs **one statement per branch combination**, each branch
-  joined with the rest of the block and carrying its own residual filters,
-  so the branches may bind a variable from columns of different types; a
-  branch that can yield nothing sends nothing;
+- a `UNION` is one block per branch combination, each joined with the rest
+  of the block and carrying its own residual filters. The branches share
+  **one `UNION ALL` statement** under typed columns: a variable bound on
+  columns of the same database type in several branches takes one column,
+  a differently typed binding takes its own, and a branch not binding it
+  projects `NULL` there (on `dialect: sqlite`, whose compound columns are
+  typed from the first branch alone, such padding is not sent and the
+  branches run one statement each). Each row carries its branch, so its
+  terms decode through that branch's maps. `ORDER BY … LIMIT` pushes onto
+  the union when every branch orders on the same required column; when a
+  branch lacks the ordering variable the branches run one statement each so
+  that each keeps its own `LIMIT`. Branches seeded differently by the outer
+  query run one statement each; a branch that can yield nothing sends
+  nothing;
 - a grouped query over the block (`GROUP BY` with `COUNT`, `COUNT DISTINCT`,
   `SUM`, `AVG`, `MIN`, `MAX`; or `GROUP BY` alone, which is `SELECT
   DISTINCT`) is **one grouped statement**, with SPARQL's semantics patched
@@ -277,10 +352,17 @@ pushable. In that statement:
   `SUM` comes back `NULL` and is reported as `0`, aggregate results take the
   datatype of the mapping's `rr:datatype`, and string keys, `COUNT DISTINCT`
   of strings and `MIN`/`MAX` of strings are pushed only where the dialect
-  compares bytes. `HAVING`, `ORDER BY` and `LIMIT` run in the engine over
-  the grouped rows; an `ORDER BY` over aggregates and required group keys
-  with a `LIMIT` and no `HAVING` is pushed as a top-k, again only when every
-  key can be ordered on. Any residual filter, a
+  compares bytes. A `HAVING` made of `AND`/`OR`/`NOT` over comparisons of
+  a `COUNT`, or a `SUM` of integers or decimals, with a constant goes with
+  the statement (`HAVING (SUM("total") > 10) AND (COUNT("id") >= 1)`); one
+  over an `AVG` (divided in the engine), a `MIN`/`MAX`, a group key, or a
+  `SUM` of an `OPTIONAL` member stays in the engine (SQL sums a group with
+  no value to `NULL`, which no comparison keeps, where SPARQL's sum is
+  `0`). A `SELECT DISTINCT` projecting fewer than the grouped outputs
+  stays in the engine too. `ORDER BY` and `LIMIT` run in the engine over the grouped
+  rows; an `ORDER BY` over aggregates and required group keys with a
+  `LIMIT` is pushed as a top-k when no `HAVING` is left in the engine and
+  every key can be ordered on. Any residual filter, a
   `SUM`/`AVG` over a column whose SQL type does not match its datatype, or
   an aggregate over an IRI template declines to the engine's grouping.
 
@@ -321,10 +403,12 @@ pins both the rows and which of these forms each statement took.
 
 Terms are always built in the engine from the returned columns, so
 datatypes come from the mapping, not from the SQL types. Shapes the lane
-cannot express exactly — variable predicates, several triples maps for one
-entity, disconnected entities (a Cartesian product), a filter inside an
-optional that is not exact, subject-targeted view policies — decline to the
-per-scan lane below, which is also the differential oracle in the test
+cannot express exactly — variable predicates, an entity with more
+resolutions than the union cap or with branches of differing column types,
+disconnected entities (a Cartesian product), a filter inside an optional
+that is not exact, a view policy targeting both subjects and a
+column-derived class — decline to the per-scan lane below, which is also
+the differential oracle in the test
 suite. `FLUREE_SQL_PUSHDOWN_LANE=0` disables the lane. The statement sent
 is logged at `info` as `SQL block pushdown`, and a tracked query (`"meta":
 true`) returns every statement the lane ran under `sql` as
@@ -429,9 +513,18 @@ moment. Consequently
   targeted class and pushed as a predicate on that column: rows of a denied
   class drop out (`"kind" IS NULL OR NOT ("kind" IN ('staff'))`, a row
   without a class keeping the default), or only rows of an allowed class stay
-  (`"kind" IN ('guest')`). A subject-targeted policy, a map deriving classes
-  from several columns or maps, and a policy on an `OPTIONAL` member of such
-  a map still leave the block to the per-scan lane.
+  (`"kind" IN ('guest')`). An `f:onSubject` policy is decided per targeted
+  subject the same way and pushed on the subject key columns, each subject
+  reversed through the subject template (`NOT ("id" IN (1, 9))`, or
+  `"id" IN (2, 3)` under a deny default); a subject the template cannot
+  mint adds nothing, and policies naming more subjects than the provider's
+  key-set cap (2000) leave the block to the per-scan lane rather than
+  evaluate and render every one. On an optional entity either predicate joins as a
+  condition, so a hidden row leaves the optional variables unbound. A
+  subject policy beside a class policy over a column-derived type, a map
+  deriving classes from several columns or maps, and a policy on an
+  `OPTIONAL` member of the entity it hides still leave the block to the
+  per-scan lane.
 
 ## Running the bridge
 
@@ -477,7 +570,7 @@ class it found. Declare the column `NUMERIC` to read mixed storage as a
 | Reads | Parquet files directly (S3/GCS/local) | SQL through an endpoint |
 | Filters | file/row-group pruning by min/max stats | exact `WHERE` |
 | Joins, OPTIONAL, VALUES, outer bindings | in the engine | one statement per block (pushdown lane) |
-| `UNION`, `DISTINCT` | in the engine | one statement per branch; `SELECT DISTINCT` (pushdown lane) |
+| `UNION`, `DISTINCT` | in the engine | one `UNION ALL` statement for the branches; `SELECT DISTINCT` (pushdown lane) |
 | `COUNT` | manifest stats, when provably exact | exact `COUNT(*)` |
 | `ORDER BY … LIMIT` | top-k file ordering | pushed by the pushdown lane on typed required columns |
 | Snapshots / time travel | pinned per query, incremental twins | none; full rebuilds |

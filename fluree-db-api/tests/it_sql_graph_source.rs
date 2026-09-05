@@ -335,9 +335,11 @@ async fn registration_survives_an_unreachable_endpoint() {
 /// `FLUREE_SQL_BRIDGE_DIALECT=sqlite|postgres|mysql|trino` (default `sqlite`,
 /// which is what CI's bridge job supplies); `FLUREE_SQL_BRIDGE_CATALOG` /
 /// `FLUREE_SQL_BRIDGE_SCHEMA` qualify the table. Behind a bridge the test
-/// seeds its own `people(id, name, score, born)` table through the bridge; a
-/// Trino endpoint must already serve it. Skips (loudly) when unset, so CI
-/// without a bridge does not silently pass it.
+/// seeds its own `bridge_people(id, name, score, born)` table through the
+/// bridge (its own name, so the pushdown lane's live suite over the same
+/// bridge cannot leave a `people` of another shape behind); a Trino endpoint
+/// must already serve it. Skips (loudly) when unset, so CI without a bridge
+/// does not silently pass it.
 #[tokio::test]
 async fn live_bridge_round_trip() {
     use fluree_db_api::SqlDialect;
@@ -353,14 +355,14 @@ async fn live_bridge_round_trip() {
     };
     let ddl = match dialect {
         SqlDialect::Sqlite => {
-            Some("CREATE TABLE people (id INTEGER, name TEXT, score REAL, born DATE)")
+            Some("CREATE TABLE bridge_people (id INTEGER, name TEXT, score REAL, born DATE)")
         }
-        SqlDialect::Postgres => {
-            Some("CREATE TABLE people (id BIGINT, name TEXT, score DOUBLE PRECISION, born DATE)")
-        }
-        SqlDialect::Mysql => {
-            Some("CREATE TABLE people (id BIGINT, name VARCHAR(64), score DOUBLE, born DATE)")
-        }
+        SqlDialect::Postgres => Some(
+            "CREATE TABLE bridge_people (id BIGINT, name TEXT, score DOUBLE PRECISION, born DATE)",
+        ),
+        SqlDialect::Mysql => Some(
+            "CREATE TABLE bridge_people (id BIGINT, name VARCHAR(64), score DOUBLE, born DATE)",
+        ),
         SqlDialect::Trino => None,
     };
     if let Some(ddl) = ddl {
@@ -370,9 +372,9 @@ async fn live_bridge_round_trip() {
         let auth = cfg.auth.create_provider_arc().expect("auth");
         let client = fluree_db_sql::TrinoClient::new(&cfg, auth).expect("client");
         for stmt in [
-            "DROP TABLE IF EXISTS people",
+            "DROP TABLE IF EXISTS bridge_people",
             ddl,
-            "INSERT INTO people VALUES (1, 'alice', 9.25, '1985-01-02'), (2, 'bob', NULL, NULL), (3, NULL, 7.5, '1990-05-06')",
+            "INSERT INTO bridge_people VALUES (1, 'alice', 9.25, '1985-01-02'), (2, 'bob', NULL, NULL), (3, NULL, 7.5, '1990-05-06')",
         ] {
             client
                 .execute_collect(stmt)
@@ -380,7 +382,7 @@ async fn live_bridge_round_trip() {
                 .unwrap_or_else(|e| panic!("seed failed: {e}\n{stmt}"));
         }
     }
-    let mapping = PEOPLE_R2RML.replace("sales.people", "people");
+    let mapping = PEOPLE_R2RML.replace("sales.people", "bridge_people");
     let fluree = FlureeBuilder::memory().build_memory();
     let mut config = SqlCreateConfig::new("live-sql", endpoint, mapping);
     config.dialect = dialect;

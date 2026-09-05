@@ -2651,6 +2651,20 @@ fn build_operator_tree_inner(
             fallback_query.order_binds = Vec::new();
             fallback_query.limit = None;
             fallback_query.offset = None;
+            // The HAVING above reads every aggregate, including one lifted
+            // out of it that the projection drops: the fallback must keep
+            // them all, as the lane's own operator does.
+            if let (Some(g), Some(projected)) =
+                (query.grouping.as_ref(), query.output.projected_vars())
+            {
+                let outs: Vec<VarId> = g
+                    .group_by_vars()
+                    .chain(g.aggregates().map(|a| a.output_var))
+                    .collect();
+                if outs.iter().any(|v| !projected.contains(v)) {
+                    fallback_query.output = QueryOutput::select_all(outs);
+                }
+            }
             let generic =
                 build_operator_tree_inner(&fallback_query, stats.clone(), false, planning)?;
             let fallback: BoxedOperator = match crate::r2rml::detect_fused_r2rml_aggregate(query) {

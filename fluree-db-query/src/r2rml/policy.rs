@@ -52,6 +52,12 @@ pub(crate) enum Verdict {
         classes: Vec<(String, bool)>,
         otherwise: bool,
     },
+    /// Decided by the row's subject: each subject a view policy targets
+    /// whose verdict differs from `otherwise`, which any other subject gets.
+    BySubject {
+        subjects: Vec<(String, bool)>,
+        otherwise: bool,
+    },
 }
 
 /// Per-scan view-policy gate for an R2RML graph source.
@@ -72,6 +78,9 @@ pub(crate) struct R2rmlPolicyGate {
     /// Every class a view restriction is selected by: the only classes a
     /// row can carry that change a verdict.
     policy_classes: Vec<String>,
+    /// Every subject a view restriction targets; `None` when one could not
+    /// be named as an IRI, so no verdict is static.
+    policy_subjects: Option<Vec<String>>,
     /// TriplesMap IRI → predicate IRI → allowed, for subject-independent maps.
     /// Nested so a lookup borrows both keys and only a miss allocates.
     static_cache: HashMap<String, HashMap<String, bool>>,
@@ -133,6 +142,14 @@ impl R2rmlPolicyGate {
             .filter_map(|c| snapshot.decode_sid(c))
             .collect();
         policy_classes.sort();
+        let mut policy_subjects: Option<Vec<String>> = view
+            .by_subject
+            .keys()
+            .map(|s| snapshot.decode_sid(s))
+            .collect();
+        if let Some(subjects) = policy_subjects.as_mut() {
+            subjects.sort();
+        }
         report_unevaluable_policies(ctx, graph_source_id, &view);
         let wrapper = PolicyWrapper::new(
             view,
@@ -162,6 +179,7 @@ impl R2rmlPolicyGate {
             any_subject: Sid::new(fluree_vocab::namespaces::EMPTY, ""),
             tm_classes,
             policy_classes,
+            policy_subjects,
             static_cache: HashMap::new(),
         })
     }
@@ -174,21 +192,35 @@ impl R2rmlPolicyGate {
     /// up front for a lane that plans the whole block before reading a row.
     /// A class policy over a map with one column-derived `rdf:type` is
     /// decided per targeted class ([`Verdict::ByClass`]), which the lane
-    /// turns into a predicate on that column. `None` when a verdict depends
-    /// on the row beyond that (subject-targeted policies, or a map deriving
-    /// classes the lane cannot key).
+    /// turns into a predicate on that column; a subject-targeted policy is
+    /// decided per targeted subject ([`Verdict::BySubject`]) the same way.
+    /// `None` when a verdict depends on the row beyond that (both at once,
+    /// or a map deriving classes the lane cannot key), or when the policies
+    /// name more than `subject_cap` subjects: each costs an evaluation per
+    /// (map, predicate) here and a member of an `IN` list in the statement.
     pub(crate) async fn static_verdicts(
         &mut self,
         ctx: &ExecutionContext<'_>,
         mapping: &CompiledR2rmlMapping,
+        subject_cap: usize,
     ) -> Result<Option<HashMap<(String, String), Verdict>>> {
-        if self.per_subject {
+        let subjects = match (&self.policy_subjects, self.per_subject) {
+            (Some(s), true) => s.clone(),
+            (None, true) => return Ok(None),
+            (_, false) => Vec::new(),
+        };
+        if subjects.len() > subject_cap {
+            tracing::debug!(
+                subjects = subjects.len(),
+                subject_cap,
+                "sql pushdown: policy names more subjects than the key-set cap"
+            );
             return Ok(None);
         }
         let mut out = HashMap::new();
         for tm in mapping.triples_maps.values() {
             let by_class = self.needs_row_classes(tm);
-            if by_class && derived_type_map(tm).is_none() {
+            if by_class && (derived_type_map(tm).is_none() || self.per_subject) {
                 return Ok(None);
             }
             let mut preds: Vec<String> = tm
@@ -213,10 +245,21 @@ impl R2rmlPolicyGate {
                         }
                     }
                 }
-                let verdict = match (classes.is_empty(), otherwise) {
-                    (true, true) => Verdict::Allow,
-                    (true, false) => Verdict::Deny,
-                    (false, _) => Verdict::ByClass { classes, otherwise },
+                let mut by_subject = Vec::new();
+                for subject in &subjects {
+                    let allowed = self.allows(ctx, tm, Some(subject), &pred, &[]).await?;
+                    if allowed != otherwise {
+                        by_subject.push((subject.clone(), allowed));
+                    }
+                }
+                let verdict = match (classes.is_empty(), by_subject.is_empty(), otherwise) {
+                    (true, true, true) => Verdict::Allow,
+                    (true, true, false) => Verdict::Deny,
+                    (false, _, _) => Verdict::ByClass { classes, otherwise },
+                    (true, false, _) => Verdict::BySubject {
+                        subjects: by_subject,
+                        otherwise,
+                    },
                 };
                 out.insert((tm.iri.clone(), pred), verdict);
             }

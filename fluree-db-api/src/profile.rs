@@ -13,8 +13,10 @@
 //! kilobytes, but the ledger face has no streaming predicate walk to
 //! drive them from yet: each property's current flakes are ranged into
 //! memory once and folded from there, so peak memory is proportional to
-//! the largest property profiled. The table face streams batches and is
-//! bounded by the scan.
+//! the largest property profiled unless the request sets
+//! [`ProfileRequest::max_values`], which refuses a property past the cap
+//! instead of ranging it. The table face streams batches and is bounded
+//! by the scan.
 //!
 //! Neither face applies view policy. Both read the ledger or lake
 //! directly and belong behind an administrative surface until they do.
@@ -50,6 +52,12 @@ pub struct ProfileRequest {
     pub config: ProfileConfig,
     /// Most groups kept per column before pooling into overflow.
     pub max_groups: usize,
+    /// Ledger only: refuse a property (profiled or grouping) with more
+    /// current values than this rather than range it into memory. The
+    /// ledger face has no streaming walk yet, so a property's flakes are
+    /// held whole; this turns an out-of-memory into an error. `None`
+    /// means unbounded.
+    pub max_values: Option<usize>,
 }
 
 impl ProfileRequest {
@@ -60,6 +68,7 @@ impl ProfileRequest {
             group_by: Vec::new(),
             config: ProfileConfig::default(),
             max_groups: fluree_db_stats::grouped::DEFAULT_MAX_GROUPS,
+            max_values: None,
         }
     }
 
@@ -80,6 +89,11 @@ impl ProfileRequest {
 
     pub fn max_groups(mut self, n: usize) -> Self {
         self.max_groups = n;
+        self
+    }
+
+    pub fn max_values(mut self, n: usize) -> Self {
+        self.max_values = Some(n);
         self
     }
 }
@@ -189,7 +203,9 @@ fn profile_value<'a>(
             // Exact numbers read as floats for the moments and quantiles.
             // The float hash folds an integral value onto the integer's
             // hash, so `7.00` and `7` still count once (see
-            // `fluree_db_stats::hash`).
+            // `fluree_db_stats::hash`). The cost is double precision:
+            // two decimals that round to the same `f64` count as one
+            // distinct value, and moments lose exactness past 2^53.
             scratch.push_str(&value.to_string());
             match scratch.parse::<f64>() {
                 Ok(f) => ProfileValue::Float(f),
@@ -204,12 +220,23 @@ fn profile_value<'a>(
 }
 
 /// Every current assertion of `p` in graph `g_id` at the view's `t`.
+///
+/// With `max_values`, the range stops one flake past the cap and the
+/// property is refused, so memory is bounded by the cap rather than by
+/// the property. The check runs before retractions are filtered out:
+/// a retraction that survives into the result can only make a refusal
+/// earlier, never later.
 async fn property_flakes(
     view: &crate::ledger_view::LedgerView,
     g_id: fluree_db_core::GraphId,
     p: Sid,
+    iri: &str,
+    max_values: Option<usize>,
 ) -> Result<Vec<fluree_db_core::Flake>> {
-    let opts = RangeOptions::default().with_to_t(view.t);
+    let mut opts = RangeOptions::default().with_to_t(view.t);
+    if let Some(max) = max_values {
+        opts = opts.with_flake_limit(max.saturating_add(1));
+    }
     let flakes = range_with_overlay(
         &view.snapshot,
         g_id,
@@ -220,6 +247,13 @@ async fn property_flakes(
         opts,
     )
     .await?;
+    if let Some(max) = max_values {
+        if flakes.len() > max {
+            return Err(ApiError::config(format!(
+                "property '{iri}' has more than {max} values; raise max_values to profile it"
+            )));
+        }
+    }
     Ok(flakes.into_iter().filter(|f| f.op).collect())
 }
 
@@ -272,7 +306,7 @@ impl crate::Fluree {
                     "group-by property '{iri}' is unknown to ledger '{ledger_id}'"
                 ))
             })?;
-            let flakes = property_flakes(&view, g_id, p).await?;
+            let flakes = property_flakes(&view, g_id, p, iri, req.max_values).await?;
             if flakes.is_empty() {
                 return Err(ApiError::NotFound(format!(
                     "group-by property '{iri}' has no values in ledger '{ledger_id}'"
@@ -289,22 +323,31 @@ impl crate::Fluree {
             }
             maps.push(map);
         }
-        let keys: Option<HashMap<Sid, Arc<str>>> = match maps.as_slice() {
-            [] => None,
-            [single] => Some(single.clone()),
-            [first, rest @ ..] => Some(
-                first
-                    .iter()
-                    .filter_map(|(s, head)| {
-                        let mut key = head.to_string();
-                        for m in rest {
-                            key.push_str(" | ");
-                            key.push_str(m.get(s)?);
-                        }
-                        Some((s.clone(), intern(key)))
-                    })
-                    .collect(),
-            ),
+        // Taken by value: the one-key case is the common one, and
+        // cloning it would hold two whole subject maps at once.
+        let mut maps = maps.into_iter();
+        let keys: Option<HashMap<Sid, Arc<str>>> = match maps.next() {
+            None => None,
+            Some(first) => {
+                let rest: Vec<HashMap<Sid, Arc<str>>> = maps.collect();
+                if rest.is_empty() {
+                    Some(first)
+                } else {
+                    Some(
+                        first
+                            .into_iter()
+                            .filter_map(|(s, head)| {
+                                let mut key = head.to_string();
+                                for m in &rest {
+                                    key.push_str(" | ");
+                                    key.push_str(m.get(&s)?);
+                                }
+                                Some((s, intern(key)))
+                            })
+                            .collect(),
+                    )
+                }
+            }
         };
 
         let mut columns = Vec::with_capacity(req.columns.len());
@@ -318,7 +361,7 @@ impl crate::Fluree {
                 });
                 continue;
             };
-            let flakes = property_flakes(&view, g_id, p).await?;
+            let flakes = property_flakes(&view, g_id, p, iri, req.max_values).await?;
             if flakes.is_empty() {
                 skipped.push(SkippedColumn {
                     name: iri.clone(),
@@ -363,11 +406,11 @@ impl crate::Fluree {
         use futures::StreamExt;
 
         let provider = crate::graph_source::FlureeR2rmlProvider::new(self);
-        let snapshot_id = provider
-            .current_snapshot_id(graph_source_id, table_name)
-            .await?;
-        let table_columns = provider
-            .table_column_names(graph_source_id, table_name)
+        // One resolution for both, and the same session pin the scan
+        // below will resolve to: the reported snapshot is the scanned
+        // one, and the table is not loaded three times.
+        let (snapshot_id, table_columns) = provider
+            .pinned_snapshot_and_columns(graph_source_id, table_name)
             .await?;
         for k in &req.group_by {
             if !table_columns.contains(k) {
@@ -398,6 +441,21 @@ impl crate::Fluree {
             }
         }
 
+        // Nothing the request named is in the table, so there is no
+        // accumulator to feed. An empty projection means "every
+        // column" to the scan, which would read the whole table to
+        // produce a report of nothing but skips.
+        if accs.iter().all(Option::is_none) {
+            return Ok(ProfileReport {
+                source: format!("{graph_source_id}/{table_name}"),
+                t: None,
+                snapshot_id,
+                group_by: req.group_by.clone(),
+                columns: Vec::new(),
+                skipped,
+            });
+        }
+
         // Project only what the profile needs; every column when the
         // request named none.
         let mut projection: Vec<String> = if req.columns.is_empty() {
@@ -420,7 +478,8 @@ impl crate::Fluree {
             .scan_table(graph_source_id, table_name, &projection, &[], None, None)
             .await?;
 
-        let mut key = String::new();
+        // Reused across batches; each batch refills the rows it needs.
+        let mut keys: Vec<String> = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch?;
             let key_cols: Vec<&fluree_db_tabular::Column> = req
@@ -428,24 +487,39 @@ impl crate::Fluree {
                 .iter()
                 .filter_map(|k| batch.column_by_name(k))
                 .collect();
+
+            // Built once per batch, not once per profiled column: the
+            // key of a row is the same whichever column is being folded,
+            // so building it inside the column loop cost one pass and
+            // one string per key cell per column.
+            let grouping = !key_cols.is_empty();
+            if grouping {
+                if keys.len() < batch.num_rows {
+                    keys.resize_with(batch.num_rows, String::new);
+                }
+                for (row, key) in keys.iter_mut().take(batch.num_rows).enumerate() {
+                    key.clear();
+                    for (i, kc) in key_cols.iter().enumerate() {
+                        if i > 0 {
+                            key.push_str(" | ");
+                        }
+                        tabular::append_display_at(key, kc, row);
+                    }
+                }
+            }
+
             for (name, acc) in names.iter().zip(accs.iter_mut()) {
                 let (Some(acc), Some(col)) = (acc.as_mut(), batch.column_by_name(name)) else {
                     continue;
                 };
-                for row in 0..batch.num_rows {
-                    let k = if key_cols.is_empty() {
-                        None
-                    } else {
-                        key.clear();
-                        for (i, kc) in key_cols.iter().enumerate() {
-                            if i > 0 {
-                                key.push_str(" | ");
-                            }
-                            key.push_str(&tabular::display_at(kc, row));
-                        }
-                        Some(key.as_str())
-                    };
-                    acc.observe(k, tabular::value_at(col, row));
+                if grouping {
+                    for (row, key) in keys.iter().take(batch.num_rows).enumerate() {
+                        acc.observe(Some(key.as_str()), tabular::value_at(col, row));
+                    }
+                } else {
+                    for row in 0..batch.num_rows {
+                        acc.observe(None, tabular::value_at(col, row));
+                    }
                 }
             }
         }

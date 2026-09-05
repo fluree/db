@@ -8,8 +8,16 @@
 //!
 //! `f:query` is the deliberate exception: a virtual source has no graph to run
 //! a policy query against, so it fails closed where native would evaluate it.
+//!
+//! With the `sql` feature every parity shape also runs against a SQL source
+//! over a fake endpoint holding the same five rows, so the SQL pushdown lane
+//! (and the per-scan lane it declines to) is held to the same oracle.
 
 #![cfg(all(feature = "iceberg", feature = "native"))]
+
+#[cfg(feature = "sql")]
+#[path = "support/fake_sql.rs"]
+mod fake_sql;
 
 use fluree_db_api::{FlureeBuilder, R2rmlCreateConfig};
 use serde_json::{json, Value};
@@ -45,6 +53,24 @@ const KINDS_R2RML: &str = r#"
 
 const GS: &str = "local-people:main";
 const KINDS_GS: &str = "local-kinds:main";
+#[cfg(feature = "sql")]
+const SQL_GS: &str = "sql-people:main";
+#[cfg(feature = "sql")]
+const SQL_KINDS: &str = "sql-kinds:main";
+
+/// The same source twice: the Iceberg fixture, and (with `sql`) the fake
+/// SQL endpoint over identical rows.
+fn virtual_sources(iceberg: &'static str) -> Vec<&'static str> {
+    #[cfg(feature = "sql")]
+    {
+        let sql = if iceberg == GS { SQL_GS } else { SQL_KINDS };
+        vec![iceberg, sql]
+    }
+    #[cfg(not(feature = "sql"))]
+    {
+        vec![iceberg]
+    }
+}
 const NATIVE: &str = "native-people:main";
 
 fn table_location() -> String {
@@ -79,6 +105,33 @@ async fn setup() -> fluree_db_api::Fluree {
         (4, "dave", 60),
         (5, "erin", 95),
     ];
+    #[cfg(feature = "sql")]
+    {
+        let rows = people
+            .iter()
+            .map(|(id, name, score)| vec![json!(id), json!(name), json!(score)])
+            .collect();
+        let server = fake_sql::FakeSql::new()
+            .table(fake_sql::Table::new(
+                "silver.people",
+                &[("id", "bigint"), ("name", "varchar"), ("score", "bigint")],
+                rows,
+            ))
+            .mount()
+            .await;
+        for (name, mapping) in [("sql-people", PEOPLE_R2RML), ("sql-kinds", KINDS_R2RML)] {
+            fluree
+                .create_sql_graph_source(fluree_db_api::SqlCreateConfig::new(
+                    name,
+                    server.uri(),
+                    mapping.to_string(),
+                ))
+                .await
+                .expect("create sql graph source");
+        }
+        // The server lives on this test's runtime; dropping it would stop it.
+        std::mem::forget(server);
+    }
     let graph: Vec<Value> = people
         .iter()
         .map(|(id, name, score)| {
@@ -193,11 +246,18 @@ async fn assert_parity(
         r#where.clone(),
     )
     .await;
-    let virt = run(fluree, GS, policies, default_allow, select, r#where).await;
-    assert_eq!(
-        virt, native,
-        "[{label}] virtual source must match native twin"
-    );
+    for source in virtual_sources(GS) {
+        let virt = run(
+            fluree,
+            source,
+            policies.clone(),
+            default_allow,
+            select.clone(),
+            r#where.clone(),
+        )
+        .await;
+        assert_eq!(virt, native, "[{label}] {source} must match native twin");
+    }
     assert_eq!(
         native.len(),
         expected_rows,
@@ -495,20 +555,22 @@ async fn pattern_shapes_match_native_twin() {
         1,
     )
     .await;
-    let counted = run(
-        &fluree,
-        GS,
-        vec![allow("ex:s", on_subject("http://example.org/person/1"))],
-        false,
-        json!(["(count ?s)"]),
-        json!({ "@id": "?s", "ex:name": "?name" }),
-    )
-    .await;
-    assert_eq!(
-        counted,
-        vec!["[1]".to_string()],
-        "count sees only the allowed subject"
-    );
+    for source in virtual_sources(GS) {
+        let counted = run(
+            &fluree,
+            source,
+            vec![allow("ex:s", on_subject("http://example.org/person/1"))],
+            false,
+            json!(["(count ?s)"]),
+            json!({ "@id": "?s", "ex:name": "?name" }),
+        )
+        .await;
+        assert_eq!(
+            counted,
+            vec!["[1]".to_string()],
+            "{source}: count sees only the allowed subject"
+        );
+    }
 }
 
 #[tokio::test]
@@ -562,19 +624,21 @@ async fn query_policies_fail_closed() {
     .await;
     assert_eq!(native.len(), 1, "oracle: {native:?}");
     // The virtual source cannot run it: the targeted flakes are denied.
-    let virt = run(
-        &fluree,
-        GS,
-        vec![gate.clone()],
-        true,
-        sel.clone(),
-        wh.clone(),
-    )
-    .await;
-    assert!(
-        virt.is_empty(),
-        "f:query must fail closed on a virtual source: {virt:?}"
-    );
+    for source in virtual_sources(GS) {
+        let virt = run(
+            &fluree,
+            source,
+            vec![gate.clone()],
+            true,
+            sel.clone(),
+            wh.clone(),
+        )
+        .await;
+        assert!(
+            virt.is_empty(),
+            "f:query must fail closed on {source}: {virt:?}"
+        );
+    }
     // A static allow ahead of it still grants (allow-overrides, in order), as
     // native. (Listed after the gate, the failing query would deny first on
     // both sides for every subject the query rejects.)
@@ -585,85 +649,89 @@ async fn query_policies_fail_closed() {
 #[tokio::test]
 async fn column_derived_classes_are_enforced_per_row() {
     let fluree = setup().await;
-    let q = |policies: Vec<Value>, default_allow: bool| {
-        json!({
-            "@context": context(),
-            "from": KINDS_GS,
-            "opts": { "policy": policies, "default-allow": default_allow },
-            "select": ["?s", "?name"],
-            "where": { "@id": "?s", "ex:name": "?name" },
-        })
-    };
-    let count = |v: Value| v.as_array().map_or(0, Vec::len);
+    for source in virtual_sources(KINDS_GS) {
+        let q = |policies: Vec<Value>, default_allow: bool| {
+            json!({
+                "@context": context(),
+                "from": source,
+                "opts": { "policy": policies, "default-allow": default_allow },
+                "select": ["?s", "?name"],
+                "where": { "@id": "?s", "ex:name": "?name" },
+            })
+        };
+        let count = |v: Value| v.as_array().map_or(0, Vec::len);
 
-    let all = fluree
-        .query_from()
-        .jsonld(&q(vec![], true))
-        .execute_formatted()
-        .await
-        .unwrap();
-    assert_eq!(count(all), 5);
-    // Deny one row's class: only that row disappears.
-    let hidden = fluree
-        .query_from()
-        .jsonld(&q(
-            vec![deny("ex:c", on_class("http://example.org/kind/alice"))],
-            true,
-        ))
-        .execute_formatted()
-        .await
-        .unwrap();
-    assert_eq!(count(hidden.clone()), 4, "{hidden}");
-    assert!(!hidden.to_string().contains("alice"));
-    // Allow one row's class under default deny: only that row survives.
-    let only = fluree
-        .query_from()
-        .jsonld(&q(
-            vec![allow("ex:c", on_class("http://example.org/kind/bob"))],
-            false,
-        ))
-        .execute_formatted()
-        .await
-        .unwrap();
-    assert_eq!(count(only.clone()), 1, "{only}");
-    assert!(only.to_string().contains("bob"));
+        let all = fluree
+            .query_from()
+            .jsonld(&q(vec![], true))
+            .execute_formatted()
+            .await
+            .unwrap();
+        assert_eq!(count(all), 5, "{source}");
+        // Deny one row's class: only that row disappears.
+        let hidden = fluree
+            .query_from()
+            .jsonld(&q(
+                vec![deny("ex:c", on_class("http://example.org/kind/alice"))],
+                true,
+            ))
+            .execute_formatted()
+            .await
+            .unwrap();
+        assert_eq!(count(hidden.clone()), 4, "{source}: {hidden}");
+        assert!(!hidden.to_string().contains("alice"));
+        // Allow one row's class under default deny: only that row survives.
+        let only = fluree
+            .query_from()
+            .jsonld(&q(
+                vec![allow("ex:c", on_class("http://example.org/kind/bob"))],
+                false,
+            ))
+            .execute_formatted()
+            .await
+            .unwrap();
+        assert_eq!(count(only.clone()), 1, "{source}: {only}");
+        assert!(only.to_string().contains("bob"));
+    }
 }
 
 #[tokio::test]
 async fn dataset_mode_enforces_per_graph() {
     let fluree = setup().await;
-    // FROM NAMED + GRAPH over the virtual source, joined with the native twin.
-    let q = json!({
-        "@context": context(),
-        "from": NATIVE,
-        "from-named": [GS],
-        "opts": {
-            "policy": [deny("ex:p", on_property("http://example.org/score"))],
-            "default-allow": true
-        },
-        "select": ["?s", "?score"],
-        "where": [["graph", GS, { "@id": "?s", "ex:score": "?score" }]],
-    });
-    let rows = fluree
-        .query_from()
-        .jsonld(&q)
-        .execute_formatted()
-        .await
-        .expect("dataset query");
-    assert_eq!(rows.as_array().unwrap().len(), 0, "{rows}");
-    let q_allowed = {
-        let mut q = q.clone();
-        q["opts"]["policy"] = json!([allow("ex:p", on_property("http://example.org/score"))]);
-        q["opts"]["default-allow"] = json!(false);
-        q
-    };
-    let rows = fluree
-        .query_from()
-        .jsonld(&q_allowed)
-        .execute_formatted()
-        .await
-        .expect("dataset query");
-    assert_eq!(rows.as_array().unwrap().len(), 5, "{rows}");
+    for source in virtual_sources(GS) {
+        // FROM NAMED + GRAPH over the virtual source, joined with the native twin.
+        let q = json!({
+            "@context": context(),
+            "from": NATIVE,
+            "from-named": [source],
+            "opts": {
+                "policy": [deny("ex:p", on_property("http://example.org/score"))],
+                "default-allow": true
+            },
+            "select": ["?s", "?score"],
+            "where": [["graph", source, { "@id": "?s", "ex:score": "?score" }]],
+        });
+        let rows = fluree
+            .query_from()
+            .jsonld(&q)
+            .execute_formatted()
+            .await
+            .expect("dataset query");
+        assert_eq!(rows.as_array().unwrap().len(), 0, "{rows}");
+        let q_allowed = {
+            let mut q = q.clone();
+            q["opts"]["policy"] = json!([allow("ex:p", on_property("http://example.org/score"))]);
+            q["opts"]["default-allow"] = json!(false);
+            q
+        };
+        let rows = fluree
+            .query_from()
+            .jsonld(&q_allowed)
+            .execute_formatted()
+            .await
+            .expect("dataset query");
+        assert_eq!(rows.as_array().unwrap().len(), 5, "{source}: {rows}");
+    }
 }
 
 /// A source registered with `--model`: its policies and class hierarchy come
@@ -1051,11 +1119,13 @@ async fn topk_limit_is_declined_under_view_policy() {
     // k = 1 is the shape that prunes: the denied row alone fills the heap.
     for k in [1usize, 2, 3] {
         let native = run_topk(NATIVE, policies.clone(), k).await;
-        let virt = run_topk(GS, policies.clone(), k).await;
-        assert_eq!(
-            virt, native,
-            "top-{k} under an f:onSubject deny must match the native twin"
-        );
+        for source in virtual_sources(GS) {
+            let virt = run_topk(source, policies.clone(), k).await;
+            assert_eq!(
+                virt, native,
+                "top-{k} under an f:onSubject deny on {source} must match the native twin"
+            );
+        }
     }
 
     // Control: with no policy the scan-side top-k still runs and still answers

@@ -10,8 +10,10 @@ use crate::profile::{ColumnProfile, ProfileValue};
 const MILLIS_PER_DAY: i64 = 86_400_000;
 
 /// The cell at `row` as the profiler sees it. Decimals read as floats
-/// (unscaled value over ten to the scale); dates and timestamps become
-/// epoch milliseconds; bytes hash on their content.
+/// (unscaled value over ten to the scale), so two decimals that round to
+/// the same `f64` count as one distinct value and moments lose exactness
+/// past 2^53; dates and timestamps become epoch milliseconds; bytes hash
+/// on their content.
 pub fn value_at(col: &Column, row: usize) -> ProfileValue<'_> {
     match col {
         Column::Boolean(v) => v[row].map_or(ProfileValue::Null, ProfileValue::Bool),
@@ -45,6 +47,12 @@ pub fn display_at(col: &Column, row: usize) -> String {
     value_at(col, row).to_text()
 }
 
+/// Append the cell at `row` to `out` as text. [`display_at`] without the
+/// per-cell allocation, for callers assembling a key from several cells.
+pub fn append_display_at(out: &mut String, col: &Column, row: usize) {
+    value_at(col, row).write_text(out);
+}
+
 /// Fold every cell of `col` into `profile`.
 pub fn profile_column(profile: &mut ColumnProfile, col: &Column) {
     for row in 0..col.len() {
@@ -62,7 +70,7 @@ pub fn profile_column_grouped(grouped: &mut GroupedProfile, col: &Column, key_co
             if i > 0 {
                 key.push_str(" | ");
             }
-            key.push_str(&display_at(k, row));
+            append_display_at(&mut key, k, row);
         }
         grouped.observe(&key, value_at(col, row));
     }
