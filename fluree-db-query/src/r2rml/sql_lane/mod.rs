@@ -637,10 +637,12 @@ impl SqlBlockSource {
             .union
             .as_ref()
             .expect("grouped branches have a layout");
+        // The branches go unseeded; the key set joins the union once, on
+        // the slots the seeds' columns share (the grouping precondition).
         let plans = branches
             .iter()
             .map(|&b| RelPlan {
-                root: self.seeded_root(b, keyset.clone()),
+                root: self.seeded_root(b, None),
                 output: layout.branch_outputs[b].clone(),
                 group_by: Vec::new(),
                 distinct: self.lowered(b).distinct,
@@ -649,6 +651,29 @@ impl SqlBlockSource {
                 having: None,
             })
             .collect();
+        let mut root = RelNode::UnionAll {
+            alias: UNION_ALIAS.into(),
+            branches: plans,
+        };
+        if let Some(mut ks) = keyset {
+            let on: Vec<Pred> = layout
+                .seed_slots
+                .iter()
+                .zip(ks.columns.iter_mut())
+                .map(|((slot, ty), (name, col_ty))| {
+                    col_ty.get_or_insert(*ty);
+                    Pred::ColEq {
+                        left: ColRef::new(&ks.alias, name.as_str()),
+                        right: ColRef::new(UNION_ALIAS, &layout.slots[*slot]),
+                    }
+                })
+                .collect();
+            root = RelNode::Join {
+                left: Box::new(root),
+                right: Box::new(RelNode::KeySet(ks)),
+                on: Pred::and(on).expect("a key set has columns"),
+            };
+        }
         let mut order_by = Vec::new();
         let mut limit = None;
         if layout.limit_is_exact {
@@ -667,10 +692,7 @@ impl SqlBlockSource {
             }
         }
         RelPlan {
-            root: RelNode::UnionAll {
-                alias: UNION_ALIAS.into(),
-                branches: plans,
-            },
+            root,
             output: layout.outputs(),
             group_by: Vec::new(),
             distinct: false,
@@ -1062,7 +1084,6 @@ impl SqlBlockSource {
     fn keysets_for(
         &self,
         branch: usize,
-        copies: usize,
         child_batch: &Batch,
         ctx: &ExecutionContext<'_>,
     ) -> Vec<Option<KeySet>> {
@@ -1122,11 +1143,8 @@ impl SqlBlockSource {
         let width = rows[0].len();
         let columns: Vec<(String, Option<fluree_db_tabular::FieldType>)> =
             (0..width).map(|i| (format!("k{i}"), None)).collect();
-        // A grouped statement carries the key set once per branch, so the
-        // branches share the row cap and the byte budget.
-        let copies = copies.max(1);
-        let max_rows = (self.resolved.caps.keyset_max_rows / copies).max(1);
-        let byte_budget = self.resolved.caps.statement_max_bytes / 2 / copies;
+        let max_rows = self.resolved.caps.keyset_max_rows.max(1);
+        let byte_budget = self.resolved.caps.statement_max_bytes / 2;
         let mut chunks = Vec::new();
         let mut current: Vec<Vec<Literal>> = Vec::new();
         let mut bytes = 0usize;
@@ -1512,17 +1530,15 @@ impl Operator for SqlBlockSource {
                         joins.push(self.build_join_plan(branch, &child_batch, &graph_ctx));
                     }
                     // Grouped branches seed alike, so one branch's key sets
-                    // are the group's. A branch no outer row can match
-                    // contributes nothing.
+                    // are the group's, joined to the union once. A branch
+                    // no outer row can match contributes nothing.
                     if self.grouped && seeded.len() > 1 {
-                        for ks in
-                            self.keysets_for(seeded[0], seeded.len(), &child_batch, &graph_ctx)
-                        {
+                        for ks in self.keysets_for(seeded[0], &child_batch, &graph_ctx) {
                             chunks.push_back((seeded.clone(), ks));
                         }
                     } else {
                         for branch in seeded {
-                            for ks in self.keysets_for(branch, 1, &child_batch, &graph_ctx) {
+                            for ks in self.keysets_for(branch, &child_batch, &graph_ctx) {
                                 chunks.push_back((vec![branch], ks));
                             }
                         }

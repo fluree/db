@@ -1445,6 +1445,22 @@ fn cases() -> Vec<Case> {
             routing: Routing::MustFire,
             declined: None,
         },
+        Case {
+            // An outer key set (bound above the graph block) joins the
+            // union once, on the slot the seed's key column shares across
+            // the branches, rather than once per branch.
+            name: "an outer key set joins a shared UNION statement once",
+            sparql: "SELECT ?c ?v FROM NAMED <shop-sql:main> WHERE { VALUES ?c { <http://example.org/customer/1> <http://example.org/customer/3> } GRAPH <shop-sql:main> { { ?c ex:name ?v } UNION { ?c ex:country ?v } } }",
+            sql: &[r#"SELECT "u"."c0" AS "c0", "u"."c1" AS "c1", "u"."c2" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t0"."id" AS "c0", "t0"."country" AS "c1", 1 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."country" IS NOT NULL) AS "u" JOIN (VALUES (1), (3)) AS "k" ("k0") ON "k"."k0" = "u"."c0""#],
+            rows: &[
+                "c=http://example.org/customer/1 v=Ada",
+                "c=http://example.org/customer/1 v=UK",
+                "c=http://example.org/customer/3 v=Cy",
+                "c=http://example.org/customer/3 v=US",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
         // String expressions push as the dialect's own functions where
         // their definition is SPARQL's: CONCAT, STRLEN and SUBSTR from a
         // positive position, over plain string columns; the bound value is
@@ -2269,8 +2285,8 @@ async fn key_sets_above_the_cap_chunk_or_stay_in_the_engine() {
     assert!(sent[0].contains("(2000)") && !sent[0].contains("(2001)"));
     assert!(sent[1].contains("(VALUES (2001)) AS \"k\""), "{}", sent[1]);
 
-    // Branches of one UNION ALL statement each carry the key set, so two
-    // of them share the cap: 2001 keys go out as 1000 + 1000 + 1.
+    // The key set joins a shared UNION ALL statement once, outside the
+    // union, so two branches still chunk at the cap: 2000 + 1.
     std::env::set_var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS", "0");
     let union = format!(
         "{PREFIX}SELECT ?c ?n FROM NAMED <shop-sql:main> WHERE {{ VALUES ?c {{ {values} }} GRAPH <shop-sql:main> {{ {{ ?c ex:name ?n }} UNION {{ ?c ex:country ?n }} }} }}"
@@ -2289,23 +2305,18 @@ async fn key_sets_above_the_cap_chunk_or_stay_in_the_engine() {
             "c=http://example.org/customer/3 n=US",
         ]
     );
-    assert_eq!(
-        sent.len(),
-        3,
-        "2001 keys chunk into 1000 + 1000 + 1: {sent:?}"
-    );
-    assert!(sent[0].contains("UNION ALL"), "{}", sent[0]);
+    assert_eq!(sent.len(), 2, "2001 keys chunk into 2000 + 1: {sent:?}");
     assert!(
-        sent[0].contains("(1000)") && !sent[0].contains("(1001)"),
-        "{}",
+        sent[0].contains(") AS \"u\" JOIN (VALUES ") && sent[0].matches("VALUES").count() == 1,
+        "the key set joins the union once, outside it: {}",
         sent[0]
     );
     assert!(
-        sent[1].contains("(2000)") && !sent[1].contains("(2001)"),
+        sent[0].contains("(2000)") && !sent[0].contains("(2001)"),
         "{}",
-        sent[1]
+        sent[0]
     );
-    assert!(sent[2].contains("(VALUES (2001)) AS \"k\""), "{}", sent[2]);
+    assert!(sent[1].contains("(VALUES (2001)) AS \"k\""), "{}", sent[1]);
 
     let sparql = format!(
         "{PREFIX}SELECT ?c ?n FROM <shop-sql:main> WHERE {{ ?c ex:name ?n VALUES ?c {{ {values} }} }}"

@@ -260,8 +260,9 @@ pushable. In that statement:
   union entity, and a union inside a sub-select decline;
 - the statement has limits the lane respects: outer bindings above the
   provider's key-set cap (2000 rows, or half the statement budget) go out
-  as several statements, one per chunk (the branches of one `UNION ALL`
-  statement each carry the key set, so they share the cap); inside the block, an `IN` list
+  as several statements, one per chunk (a key set joins a shared `UNION
+  ALL` statement once, outside the union, on the slot the branches' key
+  columns share); inside the block, an `IN` list
   above that cap stays a residual on the lane and a `VALUES` block above it
   declines the block to the engine; a `UNION` expanding to more than eight
   branch combinations declines;

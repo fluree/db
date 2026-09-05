@@ -37,6 +37,10 @@ pub(crate) struct UnionLayout {
     pub renamed: Vec<Vec<OutputCol>>,
     /// Per branch, the slot of each `ORDER BY`-able column.
     order_slots: Vec<HashMap<VarId, usize>>,
+    /// The slots (and their types) the seeds' key columns land in, in seed
+    /// column order — the same in every branch, so one key set joins the
+    /// union once instead of each branch.
+    pub seed_slots: Vec<(usize, FieldType)>,
     /// Every branch's statement answers exactly its rows, so the union's
     /// `LIMIT` may be pushed.
     pub limit_is_exact: bool,
@@ -45,7 +49,8 @@ pub(crate) struct UnionLayout {
 impl UnionLayout {
     /// The layout of `branches` as one statement, or `None` when they
     /// cannot share one: different seeds (each would need its own key
-    /// set), a column of unknown type, padding the provider cannot type,
+    /// set), a seed column a branch does not project or lands in another
+    /// slot, a column of unknown type, padding the provider cannot type,
     /// or branches disagreeing on whether their `LIMIT` is exact.
     pub(super) fn new(
         branches: &[Lowered],
@@ -113,6 +118,27 @@ impl UnionLayout {
         }
         let slots: Vec<String> = (0..keys.len()).map(|k| format!("c{k}")).collect();
         let tag = format!("c{}", keys.len());
+        let mut seed_slots: Option<Vec<(usize, FieldType)>> = None;
+        for (i, b) in branches.iter().enumerate() {
+            let mine: Vec<(usize, FieldType)> = b
+                .seeds
+                .iter()
+                .flat_map(|seed| match &seed.shape {
+                    KeyShape::Template { cols, .. } => cols.clone(),
+                    KeyShape::Column { col, .. } => vec![col.clone()],
+                })
+                .map(|col| {
+                    let at = b.outputs.iter().position(|o| o.expr.col() == Some(&col))?;
+                    let slot = assigned[i][at];
+                    Some((slot, keys[slot].2))
+                })
+                .collect::<Option<_>>()?;
+            match &seed_slots {
+                None => seed_slots = Some(mine),
+                Some(first) if *first != mine => return None,
+                Some(_) => {}
+            }
+        }
         let mut branch_outputs = Vec::with_capacity(branches.len());
         let mut renamed = Vec::with_capacity(branches.len());
         let mut order_slots = Vec::with_capacity(branches.len());
@@ -154,6 +180,7 @@ impl UnionLayout {
             branch_outputs,
             renamed,
             order_slots,
+            seed_slots: seed_slots.unwrap_or_default(),
             limit_is_exact: first.limit_is_exact,
         })
     }

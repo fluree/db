@@ -51,8 +51,10 @@ pub fn render_plan(
         where_preds: Vec::new(),
     };
     r.collect_keysets(&plan.root);
-    r.infer_keyset_types(&plan.root)?;
+    // Derived tables first: a key set may be equated with a derived or
+    // union column, whose type comes from its own plan.
     r.collect_derived(&plan.root)?;
+    r.infer_keyset_types(&plan.root)?;
     r.render_from(&plan.root)?;
 
     let mut sql = String::from("SELECT ");
@@ -190,8 +192,8 @@ impl Renderer<'_> {
             where_preds: Vec::new(),
         };
         inner.collect_keysets(&plan.root);
-        inner.infer_keyset_types(&plan.root)?;
         inner.collect_derived(&plan.root)?;
+        inner.infer_keyset_types(&plan.root)?;
         let mut cols = Vec::with_capacity(plan.output.len());
         for o in &plan.output {
             let ty = match &o.expr {
