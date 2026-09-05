@@ -223,10 +223,12 @@ pushable. In that statement:
   enclosing one, `GROUP BY` with `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` becomes
   the derived table's grouping (the engine decodes the aggregate outputs
   as the grouped lane does), `DISTINCT` and `ORDER BY … LIMIT` push inside
-  it, as does a `HAVING` the grouped lane can push (below). A sub-select
-  with another `HAVING`, an `OFFSET`, a `BIND`, a nested sub-select, a
-  filter the statement cannot evaluate exactly, or one that hides an inner
-  variable the enclosing block also uses is not admitted. There is
+  it, as does a `HAVING` the grouped lane can push (below). A projected
+  `OPTIONAL` variable stays nullable across the derived table, so an outer
+  pattern binding it too is declined as it would be inside one block. A
+  sub-select with another `HAVING`, an `OFFSET`, a `BIND`, a nested
+  sub-select, a filter the statement cannot evaluate exactly, or one that
+  hides an inner variable the enclosing block also uses is not admitted. There is
   no other lane for a sub-select over a graph source (the engine's
   subquery operator has no native index to run against), so one the lane
   does not take still refuses the query, as it did before;
@@ -250,13 +252,16 @@ pushable. In that statement:
   only where every branch agrees on it. A foreign key into a union entity
   joins the parent's columns, which every branch exposes: a branch on the
   parent's subject over another table takes the parent's row as a part of
-  its own, and a branch minting another subject can never meet the key and
-  is dropped. The branches must bind their columns with the same database
+  its own, a branch whose subjects are provably apart from the parent's
+  (templates of different prefixes) can never meet the key and is dropped,
+  and one the lane can neither join nor rule out (one prefix, another
+  skeleton) declines. The branches must bind their columns with the same database
   types, an entity with more than eight resolutions, an aggregate over a
   union entity, and a union inside a sub-select decline;
 - the statement has limits the lane respects: outer bindings above the
   provider's key-set cap (2000 rows, or half the statement budget) go out
-  as several statements, one per chunk; inside the block, an `IN` list
+  as several statements, one per chunk (the branches of one `UNION ALL`
+  statement each carry the key set, so they share the cap); inside the block, an `IN` list
   above that cap stays a residual on the lane and a `VALUES` block above it
   declines the block to the engine; a `UNION` expanding to more than eight
   branch combinations declines;
@@ -284,7 +289,7 @@ pushable. In that statement:
   returns the columns the expression reads and the engine computes the
   value per row, before any residual filter (so a `FILTER` over the bound
   variable is fine). When the expression is `+`, `-` and `*` over numeric
-  columns the database holds natively, numeric constants and other such
+  columns the database holds natively, integer constants and other such
   `BIND`s, a `FILTER` comparing it with a number pushes as the expression
   (`("total" * 2) > 50`) and an `ORDER BY … LIMIT` over it pushes as a
   top-k (`ORDER BY ("total" * 2) DESC LIMIT 2`); the bound value is still
@@ -296,8 +301,10 @@ pushable. In that statement:
   ordering where it orders code points. A `FILTER` that writes the
   expression out instead of binding it pushes too. Division stays in the
   engine (SPARQL divides integers into a decimal, SQL into an integer), as
-  do language-tagged strings and `SUBSTR` from a computed or non-positive
-  position. The `BIND` must read only variables the block bound
+  do language-tagged strings, `SUBSTR` from a computed or non-positive
+  position, and an expression over a decimal or double constant (dialects
+  type such a constant differently: SQLite computes `"total" * 0.1` in
+  floating point, Postgres reads `1E-1` as exact). The `BIND` must read only variables the block bound
   before it, and nothing the statement joins or filters on may read the
   bound variable; an `EXISTS` inside the expression, or a `BIND` inside an
   `OPTIONAL` or a `UNION` branch, leaves the block to the engine;
@@ -342,8 +349,11 @@ pushable. In that statement:
   compares bytes. A `HAVING` made of `AND`/`OR`/`NOT` over comparisons of
   a `COUNT`, or a `SUM` of integers or decimals, with a constant goes with
   the statement (`HAVING (SUM("total") > 10) AND (COUNT("id") >= 1)`); one
-  over an `AVG` (divided in the engine), a `MIN`/`MAX` or a group key stays
-  in the engine. `ORDER BY` and `LIMIT` run in the engine over the grouped
+  over an `AVG` (divided in the engine), a `MIN`/`MAX`, a group key, or a
+  `SUM` of an `OPTIONAL` member stays in the engine (SQL sums a group with
+  no value to `NULL`, which no comparison keeps, where SPARQL's sum is
+  `0`). A `SELECT DISTINCT` projecting fewer than the grouped outputs
+  stays in the engine too. `ORDER BY` and `LIMIT` run in the engine over the grouped
   rows; an `ORDER BY` over aggregates and required group keys with a
   `LIMIT` is pushed as a top-k when no `HAVING` is left in the engine and
   every key can be ordered on. Any residual filter, a
@@ -501,7 +511,9 @@ moment. Consequently
   subject the same way and pushed on the subject key columns, each subject
   reversed through the subject template (`NOT ("id" IN (1, 9))`, or
   `"id" IN (2, 3)` under a deny default); a subject the template cannot
-  mint adds nothing. On an optional entity either predicate joins as a
+  mint adds nothing, and policies naming more subjects than the provider's
+  key-set cap (2000) leave the block to the per-scan lane rather than
+  evaluate and render every one. On an optional entity either predicate joins as a
   condition, so a hidden row leaves the optional variables unbound. A
   subject policy beside a class policy over a column-derived type, a map
   deriving classes from several columns or maps, and a policy on an
