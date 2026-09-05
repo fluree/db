@@ -246,7 +246,7 @@ impl QueuedTransactor {
                                     ProbeVerdict::KeepWaiting => continue,
                                     ProbeVerdict::SpendAttempt => break,
                                     ProbeVerdict::CeilingReached => {
-                                        return Err(self.ceiling_error());
+                                        return Err(self.ceiling_error(retry_eligible));
                                     }
                                 }
                             }
@@ -334,12 +334,17 @@ impl QueuedTransactor {
         entry_queued(&state, ref_key, queue_id)
     }
 
-    fn ceiling_error(&self) -> SubmissionError {
+    fn ceiling_error(&self, retry_eligible: bool) -> SubmissionError {
+        let recourse = if retry_eligible {
+            "poll with the idempotency key"
+        } else {
+            "it carried no idempotency key, so check the ledger head before retrying"
+        };
         SubmissionError::Execution {
             status: 504,
             message: format!(
                 "submission still queued after {:?}; its outcome is unknown and it may \
-                 still commit — poll with the idempotency key",
+                 still commit — {recourse}",
                 self.max_wait
             ),
         }
