@@ -190,11 +190,20 @@ impl SequentialStager {
         }
 
         if advance {
+            // Detach the range provider around the in-place dictionary
+            // mutation: attached, it pins the dictionaries (so `make_mut`
+            // deep-clones them) and would keep reading the pre-op copies,
+            // leaving the next operation's WHERE unable to translate the
+            // subjects this one introduced.
+            let store = fluree_db_transact::detach_binary_provider(&mut state_i);
             state_i.apply_staged_flakes_for_sequential_staging(
                 flakes_i,
                 &ns_delta,
                 graph_iris.iter().map(String::as_str),
             )?;
+            if let Some(store) = store {
+                fluree_db_transact::attach_binary_provider(&mut state_i, store);
+            }
             self.current = Some(state_i);
         }
         Ok(staged_count)
@@ -949,7 +958,7 @@ pub(crate) fn resolve_shapes_source_g_ids(
 /// is API-layer policy, not a staging primitive.
 #[cfg(feature = "shacl")]
 pub(crate) async fn apply_shacl_policy_to_staged_view(
-    view: &StagedLedger,
+    view: &mut StagedLedger,
     ctx: StagedShaclContext<'_>,
     preresolved_config: Option<Arc<LedgerConfig>>,
 ) -> std::result::Result<(), fluree_db_transact::TransactError> {
@@ -1223,10 +1232,20 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     };
     let shacl_cache = engine.shared_cache();
 
-    // No config + no shapes → skip (backward compat: shapes-exist heuristic).
-    if !has_config && shacl_cache.is_empty() {
+    // No shapes → nothing to validate, whether config enabled SHACL or the
+    // shapes-exist heuristic applies. Skipping here keeps a shapeless
+    // transaction from paying for the staged dictionary layer below.
+    if shacl_cache.is_empty() {
         return Ok(());
     }
+
+    // Validation reads the staged view on the binary lane; its dictionaries
+    // must cover the subjects this transaction introduces, or every probe
+    // re-translates the whole graph novelty and merges the new subjects'
+    // flakes raw. Mutably re-borrowed here so `base` (an immutable borrow of
+    // the view) is released first.
+    fluree_db_transact::attach_staged_dicts(view)?;
+    let view: &StagedLedger = view;
 
     // 5. Validate. `per_graph_policy` drives which graphs participate and
     //    what mode their violations carry. `None` = shapes-exist heuristic
@@ -1437,7 +1456,7 @@ async fn stage_with_config_shacl(
     let cross_ledger_schema =
         resolve_cross_ledger_schema_for_tx(&ledger, config.as_ref(), resolve_ctx).await?;
 
-    let (view, mut ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
+    let (mut view, mut ns_registry) = stage_txn(ledger, txn, ns_registry, options).await?;
 
     // Parse inline shapes (if any) against the staged namespace
     // registry. The bundle becomes an additional shape DB in
@@ -1494,7 +1513,7 @@ async fn stage_with_config_shacl(
     };
 
     apply_shacl_policy_to_staged_view(
-        &view,
+        &mut view,
         StagedShaclContext {
             graph_delta: Some(&graph_delta),
             graph_sids: Some(&graph_sids),
@@ -3562,6 +3581,9 @@ impl crate::Fluree {
         // metadata (that's TriG), so we pass `None` for graph_delta/graph_sids —
         // validation falls back to default-graph (g_id=0), matching how flakes
         // are produced by `FlakeSink`.
+        // The SHACL pass attaches the staged dictionaries to the view.
+        #[cfg(feature = "shacl")]
+        let mut view = view;
         #[cfg(feature = "shacl")]
         {
             // D's namespace codes → IRI prefixes (base + this document's
@@ -3590,7 +3612,7 @@ impl crate::Fluree {
                 _ => None,
             };
             apply_shacl_policy_to_staged_view(
-                &view,
+                &mut view,
                 StagedShaclContext {
                     graph_delta: None,
                     graph_sids: None,

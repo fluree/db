@@ -524,10 +524,6 @@ pub struct Novelty {
     fact_state: NoveltyFactState,
 }
 
-/// Process-wide counter backing [`Novelty::content_version`]. Starts at 1 so
-/// `0` uniquely means "empty since construction".
-static NEXT_CONTENT_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 #[inline]
 fn flake_has_list_meta(flake: &Flake) -> bool {
     flake.m.as_ref().is_some_and(|m| m.i.is_some())
@@ -570,8 +566,9 @@ impl Novelty {
     /// the content version keys cross-instance caches (see
     /// [`OverlayProvider::content_version`]).
     fn refresh_content_version(&mut self) {
-        self.content_version =
-            NEXT_CONTENT_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Drawn from the process-wide allocator shared by every overlay type
+        // (see `next_overlay_content_version`); `0` = empty since construction.
+        self.content_version = fluree_db_core::overlay::next_overlay_content_version();
     }
 
     /// Append a freshly built segment to a graph, growing the graphs vec.

@@ -407,18 +407,39 @@ impl GraphDb {
                 .map_err(|e| crate::ApiError::internal(e.to_string()))?;
         }
 
+        // The binary lane resolves overlay flakes through the persisted
+        // dictionary plus `DictNovelty`, both committed-state artefacts: the
+        // subjects and strings this transaction introduces are in neither.
+        // Read through a view-local extension of the base dictionaries, as
+        // SHACL and post-state policy do, so a preview neither fails to
+        // translate its own flakes nor re-walks the whole novelty per scan.
+        let staged_flakes = staged.view.staged_flakes();
+        let (dict_novelty, runtime_small_dicts) =
+            match fluree_db_transact::staged_dicts(base, staged_flakes)? {
+                Some(dicts) => {
+                    let provider = dicts.provider(snapshot.shared_namespaces());
+                    Arc::make_mut(&mut snapshot).range_provider = Some(provider);
+                    (dicts.dict_novelty, dicts.runtime_small_dicts)
+                }
+                None => {
+                    let mut runtime_small_dicts = (*base.runtime_small_dicts).clone();
+                    runtime_small_dicts.populate_from_flakes(staged_flakes);
+                    (
+                        Arc::clone(&base.dict_novelty),
+                        Arc::new(runtime_small_dicts),
+                    )
+                }
+            };
+
         // Clone base novelty and merge staged flakes into it so queries see
         // both committed and staged data.
         let mut combined = (*base.novelty).clone();
-        let staged_flakes = staged.view.staged_flakes().to_vec();
-        let mut runtime_small_dicts = (*base.runtime_small_dicts).clone();
         if !staged_flakes.is_empty() {
-            runtime_small_dicts.populate_from_flakes(&staged_flakes);
             let reverse_graph = snapshot
                 .build_reverse_graph()
                 .map_err(|e| crate::ApiError::internal(e.to_string()))?;
             combined
-                .apply_commit(staged_flakes, staged_t, &reverse_graph)
+                .apply_commit(staged_flakes.to_vec(), staged_t, &reverse_graph)
                 .map_err(|e| {
                     crate::ApiError::internal(format!(
                         "Failed to merge staged flakes into novelty: {e}"
@@ -435,8 +456,8 @@ impl GraphDb {
             staged_t,
             base.ledger_id(),
         );
-        gdb.dict_novelty = Some(base.dict_novelty.clone());
-        gdb.runtime_small_dicts = Some(Arc::new(runtime_small_dicts));
+        gdb.dict_novelty = Some(dict_novelty);
+        gdb.runtime_small_dicts = Some(runtime_small_dicts);
         // Carry binary store from the base ledger state
         gdb.binary_store = base
             .binary_store
