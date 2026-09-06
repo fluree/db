@@ -499,3 +499,110 @@ async fn language_tags_are_case_insensitive() {
         })
         .await;
 }
+
+/// A datatype IRI whose namespace is not registered on the ledger can match
+/// NOTHING: ingest registers every namespace it stores, so no stored term
+/// carries such a datatype. SPARQL lowering used to rewrite the unresolvable
+/// datatype to `xsd:string`, so `"a"^^ex:NoSuchType` matched every
+/// plain-string `"a"` row — fail-open — while the JSON-LD surface already
+/// answered the empty result (#1686). Both surfaces are pinned in both
+/// lanes, on the triple-pattern site and its `term_to_binding` VALUES twin,
+/// with a registered-custom-datatype control that must keep matching.
+#[tokio::test]
+async fn unencodable_datatype_matches_nothing_in_novelty_and_index() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .unwrap();
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let id = "it/literal-identity-unenc:main";
+            let ledger = fluree.create_ledger(id).await.unwrap();
+            let data = json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": [
+                {"@id": "ex:u1", "ex:q": "a"},
+                {"@id": "ex:u2", "ex:q": {"@value": "a", "@language": "en"}},
+                {"@id": "ex:u3", "ex:q": {"@value": "z", "@type": "http://custom.example.com/T"}}
+            ]});
+            let r = fluree.insert(ledger, &data).await.unwrap();
+
+            const BOGUS: &str = "http://no-such-namespace.example.com/NoSuchType";
+            for phase in ["novelty", "indexed"] {
+                if phase == "indexed" {
+                    trigger_index_and_wait_outcome(&handle, id, r.receipt.t).await;
+                }
+                let view = fluree.ledger(id).await.unwrap();
+                assert_eq!(
+                    view.snapshot.range_provider.is_some(),
+                    phase == "indexed",
+                    "{phase}: setup"
+                );
+
+                let bogus_pattern = format!(r#"SELECT ?s WHERE {{ ?s ex:q "a"^^<{BOGUS}> }}"#);
+                let bogus_values =
+                    format!(r#"SELECT ?s WHERE {{ VALUES ?o {{ "a"^^<{BOGUS}> }} ?s ex:q ?o }}"#);
+                let cases: &[(&str, &str, Value)] = &[
+                    (
+                        "unregistered datatype in a triple pattern matches nothing",
+                        &bogus_pattern,
+                        json!([]),
+                    ),
+                    (
+                        "unregistered datatype in a VALUES row matches nothing",
+                        &bogus_values,
+                        json!([]),
+                    ),
+                    // Controls: a custom datatype whose namespace WAS
+                    // registered by ingest still matches exactly its row.
+                    (
+                        "registered custom datatype still matches (pattern)",
+                        r#"SELECT ?s WHERE { ?s ex:q "z"^^<http://custom.example.com/T> }"#,
+                        json!([["ex:u3"]]),
+                    ),
+                    (
+                        "registered custom datatype still matches (VALUES)",
+                        r#"SELECT ?s WHERE { VALUES ?o { "z"^^<http://custom.example.com/T> } ?s ex:q ?o }"#,
+                        json!([["ex:u3"]]),
+                    ),
+                ];
+                for (name, body, expected) in cases {
+                    let got = sparql(&fluree, &view, body).await;
+                    assert_eq!(&got, expected, "{phase}: {name}");
+                }
+
+                // JSON-LD parity: the surface that always used the
+                // non-strict encoder answers the same on both shapes.
+                let jl = |o: Value| {
+                    json!({"@context": {"ex": "http://example.org/ns/"},
+                           "select": "?s", "where": {"@id": "?s", "ex:q": o}})
+                };
+                let bogus_jl = query_jsonld_formatted(
+                    &fluree,
+                    &view,
+                    &jl(json!({"@value": "a", "@type": BOGUS})),
+                )
+                .await
+                .unwrap();
+                assert_eq!(bogus_jl, json!([]), "{phase}: json-ld unregistered datatype");
+                let control_jl = query_jsonld_formatted(
+                    &fluree,
+                    &view,
+                    &jl(json!({"@value": "z", "@type": "http://custom.example.com/T"})),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    control_jl,
+                    json!(["ex:u3"]),
+                    "{phase}: json-ld registered custom datatype"
+                );
+            }
+        })
+        .await;
+}

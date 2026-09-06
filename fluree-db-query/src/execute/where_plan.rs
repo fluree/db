@@ -2689,6 +2689,7 @@ pub fn build_where_operators_seeded_with_needed(
                 i += 1;
             }
 
+            #[cfg(not(target_arch = "wasm32"))]
             Pattern::S2Search(s2p) => {
                 // S2 spatial search against spatial index sidecar
                 let child = get_or_empty_seed(operator.take());
@@ -2701,6 +2702,13 @@ pub fn build_where_operators_seeded_with_needed(
                 ));
                 i += 1;
             }
+            // Spatial search is unsupported on wasm32 (s2 stack is native-only).
+            #[cfg(target_arch = "wasm32")]
+            Pattern::S2Search(_) => {
+                return Err(crate::error::QueryError::UnsupportedFeature(
+                    "spatial (S2) search is unsupported on wasm32".into(),
+                ));
+            }
 
             Pattern::Graph {
                 name,
@@ -2708,12 +2716,26 @@ pub fn build_where_operators_seeded_with_needed(
             } => {
                 // GRAPH pattern - scope inner patterns to a named graph
                 let child = require_child(operator, "GRAPH pattern")?;
-                operator = Some(Box::new(crate::graph::GraphOperator::new(
-                    child,
-                    name.clone(),
-                    inner_patterns.clone(),
-                    *planning,
-                )));
+                operator = Some(match name {
+                    crate::ir::GraphName::Iri(iri)
+                        if crate::r2rml::sql_lane::admits(name, inner_patterns) =>
+                    {
+                        // A block a SQL-backed source could run as one
+                        // statement; decides at open, falls back to GRAPH.
+                        Box::new(crate::r2rml::SqlBlockOperator::new(
+                            child,
+                            Arc::clone(iri),
+                            inner_patterns.clone(),
+                            *planning,
+                        ))
+                    }
+                    _ => Box::new(crate::graph::GraphOperator::new(
+                        child,
+                        name.clone(),
+                        inner_patterns.clone(),
+                        *planning,
+                    )),
+                });
                 i += 1;
             }
 
@@ -2862,12 +2884,28 @@ pub(crate) fn build_scan_or_join(
                 if let Some(key_vars) =
                     membership_join_key_vars(&left_schema, tp, planning, hash_planner, driving_rows)
                 {
-                    return Box::new(crate::membership_join::MembershipJoinOperator::new(
-                        left,
-                        tp.clone(),
-                        key_vars,
-                        *planning,
-                    ));
+                    // The lane honors the differential kill switch
+                    // (`FLUREE_DISABLE_QUERY_FAST_PATHS`) like the other
+                    // fast paths, so a harness can compare it against the
+                    // generic nested-loop join. Checked here rather than in
+                    // `membership_join_key_vars` so the eligibility predicate
+                    // stays pure and the stamp fires only on shapes the lane
+                    // would actually have taken.
+                    if super::fast_paths_disabled() {
+                        crate::fast_path_outcome::stamp_fast_path(
+                            crate::membership_join::MEMBERSHIP_JOIN_SITE,
+                            crate::fast_path_outcome::FastPathOutcome::Fallback(
+                                crate::fast_path_outcome::FastPathFallback::KillSwitch,
+                            ),
+                        );
+                    } else {
+                        return Box::new(crate::membership_join::MembershipJoinOperator::new(
+                            left,
+                            tp.clone(),
+                            key_vars,
+                            *planning,
+                        ));
+                    }
                 }
             }
 

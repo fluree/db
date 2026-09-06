@@ -20,7 +20,7 @@ use fluree_db_core::{
 };
 
 use crate::binary_range::BinaryRangeProvider;
-use fluree_db_spatial::SpatialIndexProvider;
+use fluree_db_binary_index::wasm_compat::SpatialIndexProvider;
 use fluree_vocab::namespaces::{FLUREE_DB, JSON_LD, OGC_GEO, RDF, XSD};
 use fluree_vocab::{geo_names, xsd_names};
 use rustc_hash::FxHashMap;
@@ -41,7 +41,12 @@ pub fn query_memory_budget_bytes() -> usize {
                 return n; // explicit override; 0 disables the guard
             }
         }
+        // 8 GiB on 64-bit; wasm32 usize is 32-bit, and browser wasm memory
+        // tops out at 4 GiB — use 1 GiB there. SEAM(wasm): budgets are usize.
+        #[cfg(not(target_arch = "wasm32"))]
         const FALLBACK: usize = 8 * 1024 * 1024 * 1024; // 8 GiB
+        #[cfg(target_arch = "wasm32")]
+        const FALLBACK: usize = 1024 * 1024 * 1024; // 1 GiB
         match detect_container_memory_bytes() {
             Some(total) => total / 100 * 78,
             None => FALLBACK,
@@ -115,9 +120,9 @@ fn detect_container_memory_bytes() -> Option<usize> {
         }
     }
     if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
-        if let Ok(n) = s.trim().parse::<usize>() {
-            if n < (1usize << 62) {
-                return Some(n);
+        if let Ok(n) = s.trim().parse::<u64>() {
+            if n < (1u64 << 62) {
+                return Some(usize::try_from(n).unwrap_or(usize::MAX));
             }
         }
     }
@@ -190,8 +195,28 @@ pub type FulltextProviders = HashMap<(GraphId, u32, u16), Arc<FulltextArena>>;
 ///
 /// Scoping: contexts that swap the overlay (`with_graph_ref`) start a fresh
 /// memo, mirroring `const_sid_cache`; same-overlay derivations share it.
-pub type TranslatedOverlayCache =
-    Arc<Mutex<FxHashMap<(u64, GraphId, IndexType), Arc<crate::binary_scan::TranslatedOverlayOps>>>>;
+///
+/// The key's `OverlayWalkScope` distinguishes the whole-overlay product from
+/// the subject-/predicate-bounded ones a bound-term scan builds instead, so the
+/// two never alias. Only `Whole` products are actually inserted: a bounded
+/// walk is a sub-microsecond seek even uncached, and per-row join probes bind
+/// a distinct subject per left row — memoizing bounded products would grow
+/// this map by one entry per probed subject for the execution's lifetime with
+/// no eviction. The scope stays in the key as a type-level guard against a
+/// future bounded insert aliasing the whole product.
+pub type TranslatedOverlayCache = Arc<
+    Mutex<
+        FxHashMap<
+            (
+                u64,
+                GraphId,
+                IndexType,
+                crate::binary_scan::OverlayWalkScope,
+            ),
+            Arc<crate::binary_scan::TranslatedOverlayOps>,
+        >,
+    >,
+>;
 
 /// Execution context providing access to database and query state.
 ///

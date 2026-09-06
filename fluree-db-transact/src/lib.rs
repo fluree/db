@@ -44,10 +44,12 @@ pub mod namespace;
 pub mod parse;
 pub mod raw_txn_upload;
 pub mod stage;
+pub mod staged_dicts;
 pub mod value_convert;
 
 #[cfg(feature = "import")]
 pub mod import;
+#[cfg(feature = "import")]
 pub mod import_sink;
 /// Re-export from `fluree_graph_turtle::splitter` for backwards compatibility.
 #[cfg(feature = "import")]
@@ -79,6 +81,9 @@ pub use parse::{
 };
 pub use raw_txn_upload::PendingRawTxnUpload;
 pub use stage::{generate_txn_id, stage, stage_flakes, StageOptions};
+pub use staged_dicts::{
+    attach_binary_provider, attach_staged_dicts, detach_binary_provider, staged_dicts, StagedDicts,
+};
 
 #[cfg(feature = "shacl")]
 pub use stage::{

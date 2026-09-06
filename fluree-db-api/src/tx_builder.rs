@@ -1815,11 +1815,14 @@ impl Fluree {
 
         // Run the commit on its own task and await the handle: the window where
         // the cache slot is empty MUST NOT be cancellable. See
-        // [`Fluree::commit_shielded`].
+        // [`Fluree::commit_shielded`]. `spawn_shielded` is the target seam:
+        // `tokio::spawn` on native, `spawn_local` + oneshot on wasm32, where a
+        // bare `tokio::spawn` panics (no runtime) — the same seam rationale as
+        // `wasm_compat::spawn_detached`, but with the result awaited.
         // .instrument keeps the caller's span parentage on the spawned tail —
         // a bare spawn would orphan commit-side log events from the request's
         // transact span (request-id linkage).
-        let shielded = tokio::spawn(tracing::Instrument::instrument(
+        let shielded = crate::wasm_compat::spawn_shielded(tracing::Instrument::instrument(
             Self::commit_shielded(
                 self.clone(),
                 write_guard,
@@ -1938,7 +1941,7 @@ impl Fluree {
         write_guard: LedgerWriteGuard,
         staged: fluree_db_transact::StagedCommit,
     ) -> Result<fluree_db_transact::CommitReceipt> {
-        let shielded = tokio::spawn(tracing::Instrument::instrument(
+        let shielded = crate::wasm_compat::spawn_shielded(tracing::Instrument::instrument(
             Self::apply_staged_shielded(self.clone(), write_guard, staged),
             tracing::Span::current(),
         ));

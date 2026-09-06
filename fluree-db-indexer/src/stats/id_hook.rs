@@ -78,8 +78,8 @@ impl IdPropertyHll {
     /// HLL: register-wise max. Counts: additive. last_modified_t: max.
     pub fn merge_from(&mut self, other: &IdPropertyHll) {
         self.count += other.count;
-        self.values_hll.merge_inplace(&other.values_hll);
-        self.subjects_hll.merge_inplace(&other.subjects_hll);
+        self.values_hll.merge(&other.values_hll);
+        self.subjects_hll.merge(&other.subjects_hll);
         self.last_modified_t = self.last_modified_t.max(other.last_modified_t);
         for (&dt, &delta) in &other.datatypes {
             *self.datatypes.entry(dt).or_insert(0) += delta;
@@ -531,6 +531,29 @@ impl IdStatsHook {
         }
     }
 
+    /// Discount duplicate statements collapsed by the import SPOT merge.
+    ///
+    /// Import worker hooks are fed per chunk, upstream of the cross-chunk
+    /// merge, so a statement duplicated across chunks was counted once per
+    /// copy; the merge reports the collapsed copies here. Only the exact
+    /// counters move — HLL sketches, `last_modified_t`, and historical
+    /// datatype tags are duplicate-insensitive and stay untouched. Worker
+    /// hooks never track class detail (rdf:type p_id unset), so class maps
+    /// need no correction; the set-view class stats come from the
+    /// `SpotClassStatsCollector` on the already-deduplicated merge output.
+    pub fn discount_import_duplicates(&mut self, g_id: GraphId, p_id: u32, o_type: u16, n: u64) {
+        let delta = n as i64;
+        self.flake_count = self.flake_count.saturating_sub(n as usize);
+        *self.graph_flakes.entry(g_id).or_insert(0) -= delta;
+        let hll = self
+            .properties
+            .entry(GraphPropertyKey { g_id, p_id })
+            .or_insert_with(IdPropertyHll::new);
+        hll.count -= delta;
+        let dt = otype_to_value_type_tag(fluree_db_core::o_type::OType::from_u16(o_type));
+        *hll.datatypes.entry(dt.as_u8()).or_insert(0) -= delta;
+    }
+
     /// Merge another hook into this one (for cross-commit accumulation).
     ///
     /// HLL: register-wise max. Counts: additive.
@@ -944,6 +967,42 @@ mod tests {
         assert_eq!(props[&key].last_modified_t, 3);
     }
 
+    /// The indexer's own guard on the sketch it persists.
+    ///
+    /// `merge_from` is register-wise max, so merging a disjoint sketch
+    /// can only raise the estimate, and the merged estimate must be
+    /// near the true union cardinality. The kernel tests this too, but
+    /// the indexer had no test that would redden if the kernel's merge
+    /// regressed under it -- flipping that max to a min left all of the
+    /// indexer's tests green.
+    #[test]
+    fn merge_from_unions_the_sketches() {
+        // Fed the way the refresh path feeds it: `subject_hash`, not a
+        // raw counter. The sketch takes an already-mixed 64-bit hash,
+        // and a value with structure left in it (`i * odd`) inflates
+        // the estimate by most of a factor of two.
+        let mut a = IdPropertyHll::new();
+        let mut b = IdPropertyHll::new();
+        for i in 0..5_000u64 {
+            a.subjects_hll.insert_hash(subject_hash(i));
+        }
+        for i in 5_000..10_000u64 {
+            b.subjects_hll.insert_hash(subject_hash(i));
+        }
+        let (only_a, only_b) = (a.subjects_hll.estimate(), b.subjects_hll.estimate());
+
+        a.merge_from(&b);
+        let merged = a.subjects_hll.estimate();
+
+        assert!(
+            merged >= only_a && merged >= only_b,
+            "merge must not lower the estimate: {only_a} + {only_b} -> {merged}"
+        );
+        // 256 registers is about 6.5% relative error; allow three sigma.
+        let err = (merged as f64 - 10_000.0).abs() / 10_000.0;
+        assert!(err < 0.20, "merged estimate {merged} is not near 10,000");
+    }
+
     fn record(op: bool, t: i64) -> StatsRecord {
         StatsRecord {
             g_id: 0,
@@ -1004,6 +1063,36 @@ mod tests {
         let hll = &hook.properties()[&GraphPropertyKey { g_id: 0, p_id: 1 }];
         assert_eq!(hll.last_modified_t, 9);
         assert!(hll.values_hll.estimate() > 0, "value sketch observed");
+    }
+
+    /// Import-merge duplicate discounts move exactly the exact counters —
+    /// graph flakes, property count, per-datatype count — and leave the
+    /// monotone accumulators (HLL, last_modified_t, historical tags) alone.
+    #[test]
+    fn discount_import_duplicates_moves_exact_counters_only() {
+        use fluree_db_core::o_type::OType;
+
+        let mut hook = IdStatsHook::new();
+        // Two copies of the same fact counted by per-chunk worker hooks.
+        hook.on_record(&record(true, 1));
+        hook.on_record(&record(true, 1));
+        let hll_before = hook.properties()[&GraphPropertyKey { g_id: 0, p_id: 1 }]
+            .values_hll
+            .estimate();
+
+        // The merge collapsed one copy. record() uses ValueTypeTag::INTEGER,
+        // which OType::XSD_INTEGER maps back to.
+        hook.discount_import_duplicates(0, 1, OType::XSD_INTEGER.as_u16(), 1);
+
+        assert_eq!(property_count(&hook), 1);
+        assert_eq!(hook.graph_flakes_mut()[&0], 1);
+        let hll = &hook.properties()[&GraphPropertyKey { g_id: 0, p_id: 1 }];
+        assert_eq!(
+            hll.datatypes[&fluree_db_core::value_id::ValueTypeTag::INTEGER.as_u8()],
+            1
+        );
+        assert_eq!(hll.values_hll.estimate(), hll_before, "HLL untouched");
+        assert_eq!(hll.last_modified_t, 1);
     }
 
     /// The op-derived path is unchanged: ±1 regardless of any base.

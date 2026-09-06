@@ -54,7 +54,10 @@ impl FastPathOutcome {
 /// Stamp a fast-path `outcome` for the named gate `site`.
 ///
 /// Emits on [`FAST_PATH_TARGET`]; no allocation, no lock. Called at plan time
-/// from the kill-switch gate sites and at `open()` time from `FastPathOperator`.
+/// from the kill-switch gate sites, at `open()` time from `FastPathOperator`,
+/// and mid-execution from gates that can only decide once they have seen data
+/// (`MembershipJoinOperator::build_key_set` stamps on its first fully-bound
+/// row). A new site may stamp at whichever point its gate actually decides.
 #[inline]
 pub fn stamp_fast_path(site: &'static str, outcome: FastPathOutcome) {
     tracing::debug!(

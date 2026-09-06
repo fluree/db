@@ -618,7 +618,7 @@ fn schema_names(
 /// fallback (the common shape paired with a handful of specific denies)
 /// leaves everything else listed, matching what an ordinary read would show
 /// for those classes.
-fn class_denied(enforcer: &QueryPolicyEnforcer, class_sid: &Sid) -> bool {
+pub(crate) fn class_denied(enforcer: &QueryPolicyEnforcer, class_sid: &Sid) -> bool {
     let view = enforcer.policy().wrapper().view();
     view.restrictions.iter().any(|r| {
         r.class_policy
@@ -635,7 +635,7 @@ fn class_denied(enforcer: &QueryPolicyEnforcer, class_sid: &Sid) -> bool {
 /// `f:onProperty` restriction, or an `f:onClass` restriction where `p` is
 /// exclusive to that class so no runtime class check is needed — see
 /// [`class_denied`] for why this checks only the unconditional case).
-fn predicate_denied(enforcer: &QueryPolicyEnforcer, p: &Sid) -> bool {
+pub(crate) fn predicate_denied(enforcer: &QueryPolicyEnforcer, p: &Sid) -> bool {
     let view = enforcer.policy().wrapper().view();
     view.by_property.get(p).is_some_and(|entries| {
         entries.iter().any(|e| {

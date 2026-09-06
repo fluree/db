@@ -24,6 +24,7 @@ use fluree_db_shacl::{Severity, ShaclCache, ShaclCacheKey, ShaclEngine};
 use fluree_db_transact::namespace::NamespaceRegistry;
 use fluree_db_transact::TransactError;
 use fluree_vocab::config_iris;
+use fluree_vocab::fluree::DB as FLUREE_NS;
 use fluree_vocab::shacl as sh_vocab;
 use serde_json::{json, Value as JsonValue};
 
@@ -114,6 +115,10 @@ pub struct ValidateReport {
     /// Number of compiled shapes that were checked. `0` means the shapes
     /// source produced no shapes — the report is vacuously conforming.
     pub shape_count: usize,
+    /// The ledger `t` this report describes: the exact snapshot (index plus
+    /// novelty overlay) the shapes were evaluated against. Anything a caller
+    /// measures alongside these results must be read at this `t`.
+    pub t: i64,
 }
 
 impl ValidateReport {
@@ -176,18 +181,24 @@ impl ValidateReport {
             .collect();
 
         json!({
-            "@context": {"sh": "http://www.w3.org/ns/shacl#"},
+            "@context": {
+                "sh": "http://www.w3.org/ns/shacl#",
+                "f": FLUREE_NS,
+            },
             "@type": "sh:ValidationReport",
             "sh:conforms": self.conforms,
+            "f:t": self.t,
             "sh:result": results,
         })
     }
 
     /// Serialize as a W3C `sh:ValidationReport` Turtle document.
     pub fn to_turtle(&self) -> String {
-        let mut out = String::from("@prefix sh: <http://www.w3.org/ns/shacl#> .\n\n");
+        let mut out = String::from("@prefix sh: <http://www.w3.org/ns/shacl#> .\n");
+        out.push_str(&format!("@prefix f: <{FLUREE_NS}> .\n\n"));
         out.push_str("[] a sh:ValidationReport ;\n");
-        out.push_str(&format!("    sh:conforms {}", self.conforms));
+        out.push_str(&format!("    sh:conforms {} ;\n", self.conforms));
+        out.push_str(&format!("    f:t {}", self.t));
         for r in &self.results {
             out.push_str(" ;\n    sh:result [\n        a sh:ValidationResult ;\n");
             let focus_term = match r.focus_node.as_str() {
@@ -621,6 +632,7 @@ async fn validate_view_inner(
             conforms: true,
             results: Vec::new(),
             shape_count,
+            t: to_t,
         });
     }
 
@@ -694,6 +706,7 @@ async fn validate_view_inner(
         conforms: raw.conforms,
         results,
         shape_count,
+        t: to_t,
     })
 }
 
@@ -854,6 +867,7 @@ mod tests {
                 value: None,
             }],
             shape_count: 1,
+            t: 7,
         }
     }
 
@@ -867,6 +881,21 @@ mod tests {
         assert!(graph.len() >= 8, "expected full report triples: {turtle}");
         assert!(turtle.contains("sh:MinCountConstraintComponent"));
         assert!(turtle.contains("<http://example.org/ns/nameless>"));
+    }
+
+    #[test]
+    fn rendered_reports_carry_ledger_t() {
+        let report = sample_report();
+        let jsonld = report.to_jsonld();
+        assert_eq!(jsonld["f:t"], json!(7));
+        assert_eq!(jsonld["@context"]["f"], json!(FLUREE_NS));
+        assert!(
+            report.to_turtle().contains("    f:t 7"),
+            "turtle must carry f:t: {}",
+            report.to_turtle()
+        );
+        let summary = serde_json::to_value(&report).unwrap();
+        assert_eq!(summary["t"], json!(7));
     }
 
     #[test]

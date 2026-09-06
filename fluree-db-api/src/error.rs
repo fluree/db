@@ -248,6 +248,16 @@ pub enum ApiError {
     #[error("Invalid configuration: {0}")]
     Config(String),
 
+    /// Faults in a ledger's stored config graph.
+    ///
+    /// Distinct from [`Config`](Self::Config), which covers configuration the
+    /// caller supplies and is therefore a 400. The config graph is operator
+    /// data: no request can cause a fault in it and no change to a request can
+    /// clear one, so telling the caller their request was bad sends them
+    /// looking in the wrong place.
+    #[error("Ledger configuration error: {0}")]
+    LedgerConfig(String),
+
     /// A materialize pass's subject accumulator outgrew its memory budget.
     ///
     /// A pre-OOM circuit breaker, not an allocator meter: the bytes are
@@ -460,7 +470,7 @@ pub enum ApiError {
 
     /// Indexer crate errors
     #[error("Indexer error: {0}")]
-    Indexer(#[from] fluree_db_indexer::IndexerError),
+    Indexer(#[from] crate::wasm_compat::IndexerError),
 
     /// Builder validation errors (one or more problems with builder configuration)
     #[error("{0}")]
@@ -507,6 +517,11 @@ impl ApiError {
     /// Create a configuration error
     pub fn config(msg: impl Into<String>) -> Self {
         ApiError::Config(msg.into())
+    }
+
+    /// Create an error describing a fault in the ledger's stored config graph.
+    pub fn ledger_config(msg: impl Into<String>) -> Self {
+        ApiError::LedgerConfig(msg.into())
     }
 
     /// Create a SPARQL error with diagnostics
@@ -607,7 +622,7 @@ impl ApiError {
             ApiError::NoveltyDeferred { .. } => 503,
             ApiError::IndexingDisabled => 400, // Bad Request
             ApiError::Indexer(e) => {
-                use fluree_db_indexer::IndexerError;
+                use crate::wasm_compat::IndexerError;
                 match e {
                     IndexerError::LedgerNotFound(_) => 404,
                     IndexerError::NoCommits => 400,
@@ -630,6 +645,9 @@ impl ApiError {
                 fluree_db_query::QueryError::StorageAccessDenied { .. }
                 | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. },
             ) => 403,
+            // A malformed ledger config graph is the operator's to fix, and no
+            // change to the request can clear it.
+            ApiError::LedgerConfig(_) => 500,
             // Most errors are client errors (bad input)
             ApiError::Parse(_)
             | ApiError::Query(_)

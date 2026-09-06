@@ -447,7 +447,7 @@ For bulk imports:
 For initial ledger bootstraps (large Turtle datasets), prefer the Rust bulk import API which
 streams commits and builds multi-order binary indexes:
 
-- [Using Fluree as a Rust library → Bulk import Turtle chunks](../getting-started/rust-api.md#bulk-import-turtle-chunks-high-throughput)
+- [Using Fluree as a Rust library → Bulk import Turtle chunks](../getting-started/rust-api.md#bulk-import-high-throughput)
 
 See [Indexing Side-Effects](indexing-side-effects.md) for details.
 

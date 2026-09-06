@@ -431,8 +431,8 @@ mod tests {
 
     use fluree_db_iceberg::FieldType;
     use fluree_db_r2rml::mapping::{
-        JoinCondition, ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap, SubjectMap,
-        TriplesMap,
+        GraphMap, JoinCondition, ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap,
+        SubjectMap, TriplesMap,
     };
 
     use super::super::iceberg_catalog::{ColumnStats, SnapshotRef};
@@ -580,6 +580,22 @@ mod tests {
         let diags = cross_check_mapping(&compiled, &schemas, &no_errors());
         assert!(has_code(&diags, DiagCode::ColumnNotFound), "{diags:?}");
         assert!(diags.iter().any(|d| d.column.as_deref() == Some("BOGUS")));
+    }
+
+    #[test]
+    fn graph_map_column_absent_flags_column_not_found() {
+        // The graph template names `REGION`, which the table lacks. Unchecked,
+        // every row would route to the default graph with nothing to say so.
+        let mut tm = dim_store_map();
+        tm.subject_map.graph_map = Some(GraphMap::template("http://ex/g/{REGION}"));
+        let compiled = CompiledR2rmlMapping::new(vec![tm]);
+
+        let mut schemas = HashMap::new();
+        schemas.insert("DW.DIM_STORE".to_string(), dim_store_schema());
+
+        let diags = cross_check_mapping(&compiled, &schemas, &no_errors());
+        assert!(has_code(&diags, DiagCode::ColumnNotFound), "{diags:?}");
+        assert!(diags.iter().any(|d| d.column.as_deref() == Some("REGION")));
     }
 
     #[test]

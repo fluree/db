@@ -284,7 +284,7 @@ When multiple policies match a flake:
 - If no required policy applies, **any** allow is enough — Fluree uses *allow-overrides* over the non-required set.
 - If no policy applies, the request falls back to `default-allow`. Setting `default-allow: false` is the fail-closed default for production.
 
-See [Policy model and inputs](../security/policy-model.md#policy-combining-algorithm) for the full state diagram.
+See [Policy model and inputs](../security/policy-model.md#combining-algorithm) for the full state diagram.
 
 ## Invoking policies via HTTP
 

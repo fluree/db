@@ -30,10 +30,15 @@
 //!
 //! ## Scope
 //!
-//! Per-process. A leader transition strands waiters from the former
-//! leader — the new leader's adapter does not know they exist. The
-//! transactor recovers via a per-call timeout plus idempotency-keyed
-//! re-issue (see the design doc, "Leader transition mid-flight").
+//! Per-process, but not leader-only: `ApplyHead` replicates to every
+//! node, so a waiter bound on a former leader still resolves when the
+//! new leader's worker finishes the entry. What strands a waiter is the
+//! entry leaving the replicated queue without a terminal apply this
+//! node observes (a snapshot install, a partition). The transactor
+//! parks on the ticket in probe intervals: a timeout that finds the
+//! entry still queued keeps waiting; one that finds it gone waits a
+//! short grace for the outcome, then spends a retry attempt on an
+//! idempotency-keyed re-issue (see `QueuedTransactor`).
 
 use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::state_machine::{PoisonReason, RefKey};

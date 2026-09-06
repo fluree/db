@@ -521,14 +521,6 @@ impl FlureeIndexProvider<'_> {
 
         let _ = params.timeout_ms; // Reserved for future use
 
-        // Vector indexes are head-only -- reject as_of_t requests
-        if params.as_of_t.is_some() {
-            return Err(QueryError::InvalidQuery(format!(
-                "Vector index '{graph_source_id}' does not support time-travel queries (as_of_t). \
-                 Only the latest snapshot is available."
-            )));
-        }
-
         // Load head snapshot via nameservice head pointer
         let record = self
             .fluree
@@ -540,6 +532,22 @@ impl FlureeIndexProvider<'_> {
         let record = record.ok_or_else(|| {
             QueryError::InvalidQuery(format!("Graph source not found: {graph_source_id}"))
         })?;
+
+        // Vector indexes are head-only. A single-ledger view always names its
+        // `t`, so `as_of_t` alone is not time travel: only a request for a
+        // state older than the index watermark asks for something the
+        // snapshot cannot answer. At or past the watermark the head snapshot
+        // is the right answer, possibly stale, exactly as for a head query.
+        if let Some(t) = params.as_of_t {
+            if t < record.index_t {
+                return Err(QueryError::InvalidQuery(format!(
+                    "Vector index '{graph_source_id}' does not support time-travel queries: \
+                     requested t={t} but the index snapshot is at t={}. Only the latest \
+                     snapshot is available.",
+                    record.index_t
+                )));
+            }
+        }
 
         let index_id = match &record.index_id {
             Some(id) => id.clone(),

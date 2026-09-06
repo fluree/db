@@ -130,6 +130,11 @@ impl Fluree {
     ///
     /// Intended to be `tokio::spawn`ed by the HTTP handler. Owns the
     /// `LedgerState` (the `GraphDb` borrows it) so it outlives the request.
+    ///
+    /// NOT wrapped by the residency retry loop (`query_with_options`): rows
+    /// are emitted before execution completes, so a residency miss
+    /// mid-stream cannot be re-run transparently. Residency-mode peers
+    /// (wasm32 browser) must use the buffered query entry instead.
     pub async fn run_stream_query(
         &self,
         ledger: LedgerState,

@@ -43,12 +43,12 @@ use crate::seed::SeedOperator;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_core::clock::Instant;
 use fluree_db_core::StatsView;
 use lru::LruCache;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Instant;
 
 /// Keep OPTIONAL diagnostics concise during perf captures by surfacing only
 /// expensive batches or obvious cache/planning churn at debug level.

@@ -3208,6 +3208,82 @@ async fn fused_fallback_applies_offset_once() {
     );
 }
 
+/// A temporal column materializes as a temporal value, not a string carrying
+/// the datatype: ordering coerces a string against a dateTime literal but
+/// RDFterm-equal does not, so `=` on such a value matched nothing.
+#[tokio::test]
+async fn temporal_values_compare_equal_by_value() {
+    use fluree_db_core::{Date, DateTime};
+    let cases: Vec<(&str, Column, FieldType, FlakeValue, usize)> = vec![
+        (
+            "xsd:date",
+            Column::Date(vec![Some(1), Some(1), Some(2)]),
+            FieldType::Date,
+            FlakeValue::Date(Box::new(Date::parse("1970-01-02").unwrap())),
+            2,
+        ),
+        (
+            "xsd:dateTime",
+            Column::Timestamp(vec![Some(1_000_000), Some(2_000_000), Some(2_000_000)]),
+            FieldType::Timestamp,
+            FlakeValue::DateTime(Box::new(DateTime::parse("1970-01-01T00:00:02Z").unwrap())),
+            2,
+        ),
+    ];
+    for (datatype, column, field_type, literal, expected) in cases {
+        let mapping = R2rmlLoader::from_turtle(&val_mapping(datatype))
+            .unwrap()
+            .compile()
+            .unwrap();
+        let batch = id_val_batch(vec![Some(1), Some(2), Some(3)], column, field_type);
+        let provider = MockR2rmlProvider::new(mapping, vec![batch]);
+
+        let fluree = FlureeBuilder::memory().build_memory();
+        let mut ledger = genesis_ledger(&fluree, "fa:main");
+        Arc::make_mut(&mut ledger.snapshot)
+            .insert_namespace_code(9_999, "http://example.org/".to_string())
+            .unwrap();
+
+        let mut vars = VarRegistry::new();
+        let s = vars.get_or_insert("?s");
+        let o = vars.get_or_insert("?o");
+        let pred = ledger
+            .snapshot
+            .encode_iri("http://example.org/val")
+            .expect("example.org namespace registered");
+        let graph = Pattern::Graph {
+            name: GraphName::Iri("fa-gs:main".into()),
+            patterns: vec![
+                Pattern::Triple(TriplePattern::new(
+                    Ref::Var(s),
+                    Ref::Sid(pred),
+                    Term::Var(o),
+                )),
+                Pattern::Filter(Expression::eq(
+                    Expression::Var(o),
+                    Expression::Const(literal),
+                )),
+            ],
+        };
+        let mut parsed = Query::new(ParsedContext::default());
+        parsed.patterns = vec![graph];
+        parsed.output = QueryOutput::select_all(vec![s]);
+
+        let executable = ExecutableQuery::simple(parsed);
+        let tracker = Tracker::disabled();
+        let result = execute(
+            GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+            &vars,
+            &executable,
+            r2rml_test_config(&tracker, &provider),
+        )
+        .await
+        .expect("query should execute");
+        let rows: usize = result.iter().fold(0, |acc, b| acc + b.len());
+        assert_eq!(rows, expected, "{datatype}: `=` against a literal");
+    }
+}
+
 // =============================================================================
 // Scan-plan guardrails: rdf:type / class-pattern over-scan (Issue 1)
 // =============================================================================
@@ -3343,6 +3419,18 @@ impl CountingProvider {
         }
     }
 
+    /// The EDW fixture's tables under another mapping over them.
+    fn edw_with_mapping(ttl: &str) -> Self {
+        let mut p = Self::edw();
+        p.mapping = Arc::new(
+            R2rmlLoader::from_turtle(ttl)
+                .expect("parse mapping")
+                .compile()
+                .expect("compile mapping"),
+        );
+        p
+    }
+
     /// Scan count per table name across the whole query.
     fn scan_counts(&self) -> HashMap<String, usize> {
         let mut counts: HashMap<String, usize> = HashMap::new();
@@ -3470,6 +3558,77 @@ async fn run_edw_guard(
     .expect("EDW guard query should execute");
     let rows = result.iter().fold(0, |acc, b| acc + b.len());
     (provider.scan_counts(), rows)
+}
+
+/// Two maps over `dw.store` minting the same subjects and `ex:name` alike
+/// but declaring different class sets. The alike-provider dedupe keeps one
+/// of them for `ex:name` (the graph holds the triple once), but a projected
+/// `?s a ?t` must still see both maps' classes: `{Store, Shop}`, whichever
+/// map the mapping's `HashMap` yields first.
+#[tokio::test]
+async fn projected_type_keeps_every_class_over_alike_maps() {
+    const TTL: &str = r#"
+@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<http://example.org/mapping#StoreA> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.store" ] ;
+    rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Store, ex:Shop ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "store_name" ] ] .
+
+<http://example.org/mapping#StoreB> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "dw.store" ] ;
+    rr:subjectMap [ rr:template "http://example.org/store/{store_key}" ; rr:class ex:Store ] ;
+    rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "store_name" ] ] .
+"#;
+    let provider = CountingProvider::edw_with_mapping(TTL);
+    let (_fluree, ledger) = edw_guard_ledger();
+    let mut vars = VarRegistry::new();
+    let s = vars.get_or_insert("?s");
+    let t = vars.get_or_insert("?t");
+    let p = vars.get_or_insert("?p");
+    let o = vars.get_or_insert("?o");
+    let inner = vec![
+        type_triple(s, "http://example.org/Store"),
+        Pattern::Triple(TriplePattern::new(
+            Ref::Var(s),
+            Ref::Iri(RDF_TYPE.into()),
+            Term::Var(t),
+        )),
+        Pattern::Triple(TriplePattern::new(Ref::Var(s), Ref::Var(p), Term::Var(o))),
+    ];
+    let graph = Pattern::Graph {
+        name: GraphName::Iri("edw-gs:main".into()),
+        patterns: inner,
+    };
+    let mut parsed = Query::new(ParsedContext::default());
+    parsed.patterns = vec![graph];
+    parsed.output = QueryOutput::select_all(vec![s, t]);
+    let executable = ExecutableQuery::simple(parsed);
+    let tracker = Tracker::disabled();
+    let batches = execute(
+        GraphDbRef::new(&ledger.snapshot, 0, &NoOverlay, ledger.t()),
+        &vars,
+        &executable,
+        r2rml_test_config(&tracker, &provider),
+    )
+    .await
+    .expect("query should execute");
+    let mut types: std::collections::BTreeSet<String> = Default::default();
+    for b in &batches {
+        for r in 0..b.len() {
+            let ty = b.get(r, t).expect("?t column present");
+            types.insert(ty.get_iri().expect("?t is an IRI").to_string());
+        }
+    }
+    assert_eq!(
+        types.into_iter().collect::<Vec<_>>(),
+        vec![
+            "http://example.org/Shop".to_string(),
+            "http://example.org/Store".to_string()
+        ],
+        "a projected type must not depend on which alike map the dedupe keeps"
+    );
 }
 
 /// `?s a ex:Store ; ex:storeId ?id ; ex:name ?name` must scan ONLY dw.store,

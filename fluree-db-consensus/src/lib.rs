@@ -691,7 +691,9 @@ pub struct PushReceipt {
 /// the [`Committer`] surface.
 #[derive(Debug, Clone)]
 pub enum OperationReceipt {
-    Transaction(TransactionReceipt),
+    /// Boxed: a transaction receipt carries a tracking tally, several times
+    /// the size of the other receipts.
+    Transaction(Box<TransactionReceipt>),
     Revert(RevertReceipt),
     Merge(MergeReceipt),
     Rebase(RebaseReceipt),

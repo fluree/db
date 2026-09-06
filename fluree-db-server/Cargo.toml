@@ -23,7 +23,7 @@ name = "fluree_db_server"
 path = "src/lib.rs"
 
 [features]
-default = ["native", "credential", "iceberg", "shacl", "bolt"]
+default = ["native", "credential", "iceberg", "sql", "shacl", "bolt", "graphql"]
 native = ["fluree-db-api/native"]
 # AWS S3 storage + DynamoDB nameservice (via connection JSON-LD config)
 aws = ["fluree-db-api/aws"]
@@ -32,10 +32,14 @@ aws = ["fluree-db-api/aws"]
 credential = ["fluree-db-api/credential"]
 # SHACL constraint validation at transaction time
 shacl = ["fluree-db-api/shacl"]
+# GraphQL endpoints over the schema derived from each ledger's data
+graphql = ["fluree-db-api/graphql"]
 # Enable OIDC JWT verification via JWKS (RS256 tokens from external IdPs)
 oidc = ["fluree-db-credential/oidc", "dep:jsonwebtoken"]
 # Iceberg / R2RML graph source support
 iceberg = ["fluree-db-api/iceberg"]
+# SQL graph sources (R2RML over a Trino-protocol endpoint)
+sql = ["iceberg", "fluree-db-api/sql"]
 # Use mimalloc as the global allocator. Better multicore allocation throughput
 # for the allocation-heavy query/materialization paths (e.g. R2RML/Iceberg
 # scans). Opt-in: enable in release packaging after a soak.
@@ -180,6 +184,7 @@ wiremock = { workspace = true }
 indexmap = { workspace = true }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-test-support = { path = "../fluree-test-support" }
 
 [lints]
 workspace = true
@@ -193,9 +198,16 @@ workspace = true
 # iceberg, shacl, bolt), so grp_raft is the only harness that compiles to an
 # empty binary on a default build. The rest group by domain, not by feature.
 #
-# tests/harness_coverage.rs (in grp_http) fails if any tests/*.rs is neither
-# pulled into a harness nor declared below — without it, `autotests = false`
-# would let a new integration file silently never run.
+# tests/harness_coverage.rs fails if any tests/*.rs is neither pulled into a
+# harness nor declared below — without it, `autotests = false` would let a new
+# integration file silently never run.
+
+# Its own target, not a harness member: as a member, deleting the one #[path]
+# line that wires it in would silently stop it compiling — an orphan of exactly
+# the kind it exists to catch.
+[[test]]
+name = "harness_coverage"
+path = "tests/harness_coverage.rs"
 
 [[test]]
 name = "grp_http"

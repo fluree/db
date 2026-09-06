@@ -237,12 +237,13 @@ fn print_table(report: &ValidateReport) {
         println!();
     }
     println!(
-        "Conforms: {} — {} violation(s), {} warning(s), {} info ({} shape(s) checked)",
+        "Conforms: {} — {} violation(s), {} warning(s), {} info ({} shape(s) checked at t={})",
         report.conforms,
         report.violation_count(),
         report.warning_count(),
         report.info_count(),
-        report.shape_count
+        report.shape_count,
+        report.t
     );
 }
 

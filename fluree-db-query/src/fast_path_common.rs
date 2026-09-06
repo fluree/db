@@ -395,7 +395,7 @@ pub(crate) fn predicate_unsafe_for_cross_predicate_o_key_join(
     for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
         for (idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
@@ -606,7 +606,7 @@ pub fn collect_subjects_for_predicate_sorted(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
@@ -644,7 +644,7 @@ pub fn collect_subjects_for_predicate_set(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
@@ -847,7 +847,7 @@ impl<'a> PsotSubjectCountIter<'a> {
                             leaf_entry.sidecar_cid.as_ref(),
                             false,
                         )
-                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
                 );
             }
 
@@ -1072,7 +1072,7 @@ impl<'a> PsotSubjectSeek<'a> {
                             leaf_entry.sidecar_cid.as_ref(),
                             false,
                         )
-                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
                 );
             }
 
@@ -1278,7 +1278,7 @@ impl<'a> PostObjectGroupCountIter<'a> {
                             leaf_entry.sidecar_cid.as_ref(),
                             false,
                         )
-                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
                 );
             }
 
@@ -1519,7 +1519,7 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
                             leaf_entry.sidecar_cid.as_ref(),
                             false,
                         )
-                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
                 );
             }
 
@@ -1803,7 +1803,7 @@ impl<'a> PsotObjectFilterCountIter<'a> {
                             leaf_entry.sidecar_cid.as_ref(),
                             false,
                         )
-                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
                 );
             }
 
@@ -1932,7 +1932,7 @@ pub fn collect_subjects_with_object_in_set(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
 
         let dir = handle.dir();
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
@@ -1988,7 +1988,7 @@ pub fn sum_post_object_counts_filtered(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
@@ -3247,7 +3247,7 @@ pub fn count_predicate_overlay_delta(
         } else {
             let handle = store
                 .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-                .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+                .map_err(|e| QueryError::from_io("leaf open", e))?;
             for entry in &handle.dir().entries {
                 if entry.row_count != 0 && entry.p_const == Some(p_id) {
                     base_touched = base_touched.saturating_add(entry.row_count as u64);

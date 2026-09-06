@@ -1064,19 +1064,15 @@ impl GraphSourcePublisher for FileNameService {
 
         self.storage
             .compare_and_swap::<(), _>(&address, |bytes| {
-                // For graph source config, we always update (config changes are allowed)
-                // Only preserve retracted status if already set
-                let status = match bytes {
-                    Some(data) => {
-                        let existing: GraphSourceNsFileV2 = deserialize_json(data)?;
-                        if existing.status == "retracted" {
-                            "retracted".to_string()
-                        } else {
-                            "ready".to_string()
-                        }
-                    }
-                    None => "ready".to_string(),
-                };
+                // Publishing config is what creating or reconfiguring a graph
+                // source does, so the record comes out active — including a
+                // record retracted by an earlier drop. Preserving the
+                // retraction here made `drop` then `create` under the same
+                // name report success and publish an invisible index.
+                // Retraction is `retract_graph_source`'s to set, and the
+                // index pointer is left to `publish_graph_source_index`.
+                let _ = bytes;
+                let status = "ready".to_string();
 
                 let file = GraphSourceNsFileV2 {
                     context: ns_context(),
@@ -1949,6 +1945,33 @@ mod tests {
 
         let record = ns.lookup_graph_source("gs:main").await.unwrap().unwrap();
         assert!(record.retracted);
+    }
+
+    #[tokio::test]
+    async fn test_graph_source_recreate_after_retract_is_active() {
+        let (_temp, ns) = setup().await;
+
+        ns.publish_graph_source("gs", "main", GraphSourceType::Bm25, "{}", &[])
+            .await
+            .unwrap();
+        ns.retract_graph_source("gs", "main").await.unwrap();
+        assert!(
+            ns.lookup_graph_source("gs:main")
+                .await
+                .unwrap()
+                .unwrap()
+                .retracted
+        );
+
+        ns.publish_graph_source("gs", "main", GraphSourceType::Bm25, "{\"v\":2}", &[])
+            .await
+            .unwrap();
+        let record = ns.lookup_graph_source("gs:main").await.unwrap().unwrap();
+        assert!(
+            !record.retracted,
+            "a re-published graph source is active again"
+        );
+        assert_eq!(record.config, "{\"v\":2}");
     }
 
     #[tokio::test]

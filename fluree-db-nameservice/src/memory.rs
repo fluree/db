@@ -500,10 +500,13 @@ impl GraphSourcePublisher for MemoryNameService {
         let mut graph_source_records = self.graph_source_records.write();
 
         if let Some(record) = graph_source_records.get_mut(&key) {
-            // Update config but preserve retracted status if already set
+            // Publishing config creates or reconfigures: the record is
+            // active again even if an earlier drop retracted it. The index
+            // pointer is untouched.
             record.source_type = source_type.clone();
             record.config = config.to_string();
             record.dependencies = dependencies.to_vec();
+            record.retracted = false;
         } else {
             // Create new graph source record
             let record = GraphSourceRecord::new(
@@ -851,6 +854,20 @@ mod tests {
 
         let record = ns.lookup("mydb:main").await.unwrap().unwrap();
         assert!(record.retracted);
+    }
+
+    #[tokio::test]
+    async fn graph_source_recreate_after_retract_is_active() {
+        let ns = MemoryNameService::new();
+        ns.publish_graph_source("gs", "main", GraphSourceType::Bm25, "{}", &[])
+            .await
+            .unwrap();
+        ns.retract_graph_source("gs", "main").await.unwrap();
+        ns.publish_graph_source("gs", "main", GraphSourceType::Bm25, "{}", &[])
+            .await
+            .unwrap();
+        let record = ns.lookup_graph_source("gs:main").await.unwrap().unwrap();
+        assert!(!record.retracted);
     }
 
     #[tokio::test]

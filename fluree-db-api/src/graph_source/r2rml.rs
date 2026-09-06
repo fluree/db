@@ -25,7 +25,7 @@ use fluree_db_iceberg::{
         ColumnBatch, FileIcebergStorage, IcebergStorageBackend, S3IcebergStorage,
         SendIcebergStorage, SendParquetReader,
     },
-    metadata::TableMetadata,
+    metadata::{TableMetadata, WindowCap},
     scan::{
         topk::{batch_sort_values, plan_topk_read, TopKBound},
         ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner,
@@ -93,6 +93,111 @@ fn iceberg_scan_concurrency(num_files: usize) -> usize {
 /// reference, so rotating the underlying secret leaves the fingerprint unchanged
 /// — the client cache's TTL (see `cache::DEFAULT_REST_CLIENT_TTL_SECS`), not this
 /// fingerprint, is what bounds staleness in that case.
+/// The R2RML mapping reference carried by a mapped graph-source record, per
+/// source family. `None` for a non-mapped type, an unparseable config, or a
+/// record registered without a mapping.
+/// The Iceberg-only paths (snapshot pinning, incremental materialization,
+/// tracking) parse the record as `IcebergGsConfig`; a SQL record would fail
+/// that parse with a misleading message. Refuse it by name instead.
+fn require_iceberg_backed(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+    graph_source_id: &str,
+) -> QueryResult<()> {
+    #[cfg(feature = "sql")]
+    if record.source_type == GraphSourceType::Sql {
+        return Err(QueryError::InvalidQuery(format!(
+            "Graph source '{graph_source_id}' is SQL-backed: snapshot pinning and \
+             materialization are not available for SQL graph sources (they read the \
+             live tables); query it directly instead"
+        )));
+    }
+    let _ = (record, graph_source_id);
+    Ok(())
+}
+
+pub(crate) fn mapping_source_of(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+) -> Option<fluree_db_iceberg::config::MappingSource> {
+    match record.source_type {
+        GraphSourceType::R2rml | GraphSourceType::Iceberg => {
+            IcebergGsConfig::from_json(&record.config)
+                .ok()
+                .and_then(|c| c.mapping)
+        }
+        #[cfg(feature = "sql")]
+        GraphSourceType::Sql => super::sql::mapping_source(record),
+        _ => None,
+    }
+}
+
+/// The policy configuration a virtual source's record carries: its model
+/// ledger and its `default-allow`, either of which may be unset.
+pub(crate) fn policy_config_of(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+) -> (Option<String>, Option<bool>) {
+    match record.source_type {
+        GraphSourceType::R2rml | GraphSourceType::Iceberg => {
+            IcebergGsConfig::from_json(&record.config)
+                .ok()
+                .map_or((None, None), |c| (c.model, c.default_allow))
+        }
+        #[cfg(feature = "sql")]
+        GraphSourceType::Sql => super::sql::policy_config(record),
+        _ => (None, None),
+    }
+}
+
+/// The resolved config a governed virtual source presents to the policy
+/// wrapper. With a model ledger, its default graph is both the
+/// `f:policySource` and the `f:schemaSource`, so `wrap_policy` takes the
+/// cross-ledger path unchanged and the R2RML policy gate sees
+/// hierarchy-expanded targets. `default_allow` fills a request that left it
+/// unset, exactly as a native ledger's `f:defaultAllow` does. `None` when the
+/// record sets neither.
+pub(crate) fn source_resolved_config(
+    model: Option<&str>,
+    default_allow: Option<bool>,
+) -> Option<fluree_db_core::ledger_config::ResolvedConfig> {
+    use fluree_db_core::ledger_config::{
+        GraphSourceRef, PolicyDefaults, ReasoningDefaults, ResolvedConfig,
+    };
+    if model.is_none() && default_allow.is_none() {
+        return None;
+    }
+    let graph_ref = |model: &str| GraphSourceRef {
+        ledger: Some(model.to_string()),
+        graph_selector: Some(fluree_vocab::config_iris::DEFAULT_GRAPH.to_string()),
+        at_t: None,
+        trust_policy: None,
+        rollback_guard: None,
+    };
+    Some(ResolvedConfig {
+        policy: Some(PolicyDefaults {
+            default_allow,
+            policy_source: model.map(graph_ref),
+            ..PolicyDefaults::default()
+        }),
+        reasoning: model.map(|m| ReasoningDefaults {
+            schema_source: Some(graph_ref(m)),
+            ..ReasoningDefaults::default()
+        }),
+        ..ResolvedConfig::default()
+    })
+}
+
+/// An Iceberg-backed source scans tables, never queries: refuse a mapping with
+/// `rr:sqlQuery` at registration rather than at first query.
+fn reject_sql_queries(compiled: &CompiledR2rmlMapping) -> Result<()> {
+    if compiled.has_sql_queries() {
+        return Err(crate::ApiError::Config(
+            "rr:sqlQuery logical tables are only supported by SQL graph sources; \
+             use rr:tableName for Iceberg-backed mappings"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn config_fingerprint(config: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -170,6 +275,23 @@ pub struct MaterializeScan {
     /// stored watermark) or when the stored snapshot is no longer resolvable —
     /// both of which mean "persist regardless".
     pub window_age_ms: Option<i64>,
+    /// The highest source COMMIT SEQUENCE this pass covers, when the pass was cut
+    /// short by the row budget — and `None` when it covers the whole plan.
+    ///
+    /// That distinction is the point of the field, and inverting it is silent data
+    /// loss. `Some(s)` means the target will hold only a PREFIX of the window, so
+    /// `to_snapshot_id` must NOT be persisted as the watermark: a watermark naming
+    /// the head while the target holds a prefix claims rows that were never applied,
+    /// and the next scan starts after them. That is the applied-marker ratchet that
+    /// discarded ~80 % of a deployment's entities. Persist the sequence instead; the
+    /// snapshot advances only once a pass reports `None` here.
+    ///
+    /// A sequence rather than a snapshot id because it SURVIVES SNAPSHOT EXPIRY.
+    /// Iceberg assigns sequence numbers per commit and never reuses or reorders
+    /// them, and unlike a snapshot id a sequence stays meaningful after the snapshot
+    /// that carried it has been expired away — which is the state that forced the
+    /// full read to begin with.
+    pub to_sequence: Option<i64>,
     /// Column batches, streamed. See [`Self::stream`] usage notes on the method.
     pub stream: ColumnBatchStream,
 }
@@ -242,6 +364,304 @@ impl ScanChoice {
     fn is_incremental(&self) -> bool {
         matches!(self, Self::Incremental)
     }
+}
+
+/// Bytes of flakes one materialized row costs, for sizing the per-pass budget.
+///
+/// `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW`, default 108 — measured on the
+/// production table this bound was tuned against. It exists only to convert the
+/// novelty ceiling into a row count. A deployment whose rows are much wider or
+/// narrower should set THIS rather than overriding the row budget directly, so
+/// the derivation below keeps tracking the ceiling instead of drifting from it.
+fn flake_bytes_per_row() -> i64 {
+    static CACHED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(108)
+    })
+}
+
+/// Rows one materialize pass may take before checkpointing — a full read's
+/// commit-ordered prefix, or an incremental window's snapshot prefix.
+///
+/// `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` overrides; `0` disables the bound on
+/// both paths and restores read-it-all. Left unset it is DERIVED from `ceiling_bytes`, the
+/// novelty ceiling this process enforces, and that derivation is the whole point
+/// rather than a convenience.
+///
+/// A bounded pass is only worth anything if it can COMMIT. A window over the
+/// ceiling is DEFERRED, and a deferral discards the window's progress, so the
+/// next poll re-reads the same rows and stops at the same wall — nothing
+/// accumulates. A bound that does not fit under the ceiling is therefore not a
+/// bound at all: it changes how much is read and nothing about whether any of it
+/// lands. The previous flat 250_000 rows is ~27 MB of flakes, which against a
+/// deployment that has pinned the ceiling to 8 MiB could never commit, so the
+/// read repeated on every poll indefinitely.
+///
+/// Floored at 1_000 rows so a very small ceiling still makes forward progress
+/// rather than producing a zero-row pass that reads nothing and checkpoints
+/// nowhere.
+///
+/// The ceiling is a PARAMETER, not an environment read. `FLUREE_REINDEX_MAX_BYTES`
+/// is only one of the ways `IndexConfig::reindex_max_bytes` gets set: the
+/// `--reindex-max-bytes` flag, the `[server.indexing]` config-file key and
+/// `FlureeBuilder::with_indexing_thresholds` all configure it without touching the
+/// environment. A budget derived from the env var alone was sized against a
+/// sysinfo default on every one of those deployments, while `at_max_novelty`
+/// enforced the operator's value — the "bound that cannot commit" all over again,
+/// with a log line claiming the two could not drift.
+fn materialize_max_rows_per_pass(ceiling_bytes: usize) -> i64 {
+    if let Some(explicit) = std::env::var("FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+    {
+        return explicit;
+    }
+    let ceiling = i64::try_from(ceiling_bytes).unwrap_or(i64::MAX);
+    rows_for_ceiling(ceiling, flake_bytes_per_row())
+}
+
+/// Fraction of the novelty ceiling one pass may spend.
+///
+/// A pass gets a QUARTER of the ceiling, not all of it, and the reason is a
+/// production failure rather than caution. Spending the whole ceiling makes the
+/// budget so large that it exceeds the table, `full_read_prefix` answers
+/// `PlanFits`, no prefix is taken, no cursor is written — and the pass then fails
+/// anyway in the APPLY, which is where novelty is actually spent. The bound has to
+/// ENGAGE to be worth anything, and a budget bigger than the table cannot engage.
+///
+/// Observed 2026-08-18: raising the ceiling 8 MiB -> 96 MiB took the budget to
+/// ~932k rows against a 733,608-row table, so the bound stopped firing entirely
+/// while two of four targets still could not absorb the window. Raising the
+/// ceiling had DISABLED the mechanism meant to chip away at it.
+///
+/// A quarter is also the honest share: the ceiling is per-ledger and 17 sources
+/// commit into it, so one table's pass laying claim to all of it was never right.
+/// It matches the per-transaction budget's own `reindexMaxBytes / 4` derivation,
+/// and it leaves margin for `flake_bytes_per_row` being an UNDER-estimate — it was
+/// measured per accumulated item, and a source row can yield several.
+const PASS_CEILING_FRACTION: i64 = 4;
+
+/// Rows that fit under a pass's share of `ceiling_bytes` at `bytes_per_row`,
+/// floored at 1_000.
+///
+/// Split out from the env plumbing above so the arithmetic — the part that has
+/// to be right — is testable without touching process-global state.
+fn rows_for_ceiling(ceiling_bytes: i64, bytes_per_row: i64) -> i64 {
+    if bytes_per_row <= 0 {
+        return 1_000;
+    }
+    ((ceiling_bytes / PASS_CEILING_FRACTION) / bytes_per_row).max(1_000)
+}
+
+/// The outcome of sizing a full read down to a commit prefix.
+///
+/// Typed rather than `Option`, so the caller can say WHICH reason fired. Every
+/// non-`Cut` outcome means "read it whole", and on a table whose window exceeds
+/// the novelty ceiling that read cannot commit — an uncommitted window writes no
+/// watermark, so the same read repeats on the next poll, forever. A silent
+/// decline is therefore an invisible livelock, and one was: in production the
+/// bound's success line never appeared across 16 consecutive passes and there was
+/// nothing in the log to say why. Finding it needed a state-ledger query.
+#[derive(Debug, PartialEq, Eq)]
+enum FullReadCut {
+    /// Cut after this commit sequence; keep every task at or below it.
+    Cut(i64),
+    /// The bound is switched off (`FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS=0`).
+    Disabled,
+    /// The plan already fits the budget — not alarming, and not worth a warning.
+    PlanFits,
+    /// A data file carries no commit sequence, so no ordering — and therefore no
+    /// cut — is safe.
+    NoSequence,
+    /// Every row sits in ONE commit, so there is no boundary short of the head to
+    /// checkpoint at.
+    SingleCommit,
+}
+
+impl FullReadCut {
+    /// Operator-facing reason for declining to bound the read.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Cut(_) => "bounded",
+            Self::Disabled => "the row bound is disabled",
+            Self::PlanFits => "the plan already fits the row budget",
+            Self::NoSequence => "a data file carries no commit sequence, so no cut is safe",
+            Self::SingleCommit => {
+                "every row is in a single commit, so there is no boundary short of the head"
+            }
+        }
+    }
+
+    /// Whether this outcome should be shouted about. `PlanFits` is the healthy
+    /// small-read case and `Disabled` is a deliberate configuration choice;
+    /// neither is news. The other two mean an unbounded read that may never
+    /// commit.
+    fn is_alarming(&self) -> bool {
+        matches!(self, Self::NoSequence | Self::SingleCommit)
+    }
+}
+
+/// The commit sequence to stop a full read at, or why it could not be cut.
+///
+/// Walks `tasks` (already sorted by `(data_sequence_number, path)`) accumulating
+/// rows, and returns the sequence of the commit the budget ran out in. The whole
+/// of that commit is kept: a cut INSIDE a commit leaves the target in a state no
+/// snapshot names, and an unnameable state cannot be checkpointed.
+///
+/// DEPENDS ON `mor_guard` failing closed. A row-budgeted prefix is only sound
+/// because the planner refuses merge-on-read delete files: a delete file with a
+/// sequence ABOVE the cut that targets data files at or below it would be applied
+/// by a later pass against rows this pass already committed as live. If MoR
+/// delete support ever lands, this cut must keep the deletes that target its
+/// prefix, or decline.
+fn full_read_prefix(tasks: &[fluree_db_iceberg::scan::FileScanTask], max_rows: i64) -> FullReadCut {
+    if max_rows <= 0 {
+        return FullReadCut::Disabled;
+    }
+    let total: i64 = tasks.iter().map(|t| t.data_file.record_count).sum();
+    if total <= max_rows {
+        return FullReadCut::PlanFits;
+    }
+    let Some(last_seq) = tasks
+        .iter()
+        .filter_map(|t| t.data_sequence_number)
+        .next_back()
+    else {
+        return FullReadCut::NoSequence;
+    };
+    let mut rows = 0i64;
+    for t in tasks {
+        let Some(seq) = t.data_sequence_number else {
+            return FullReadCut::NoSequence;
+        };
+        rows = rows.saturating_add(t.data_file.record_count);
+        if rows >= max_rows {
+            if seq < last_seq {
+                return FullReadCut::Cut(seq);
+            }
+            // The budget ran out inside the HEAD commit. Checkpointing at the
+            // head is the whole read with extra bookkeeping — but declining
+            // outright, which is what this used to do, is how a COMPACTED table
+            // livelocks. A compaction rewrites the table into files that all
+            // share one sequence number, so from then on the budget always lands
+            // in the head commit, the read is never bounded, and if the window
+            // is over the novelty ceiling it can never commit either.
+            //
+            // Fall back to the newest boundary STRICTLY BELOW the head. That is
+            // a smaller pass than the budget asked for, and it is still forward
+            // progress, which is the only property that matters here.
+            return tasks
+                .iter()
+                .filter_map(|t| t.data_sequence_number)
+                .filter(|s| *s < last_seq)
+                .max()
+                .map_or(FullReadCut::SingleCommit, FullReadCut::Cut);
+        }
+    }
+    // Unreachable: `total > max_rows` guarantees the accumulator crosses the
+    // budget above. Typed as the harmless outcome rather than a panic.
+    FullReadCut::PlanFits
+}
+
+/// How a bounded full read records the prefix it applied.
+#[derive(Debug, PartialEq, Eq)]
+enum FullReadRoute {
+    /// A retained snapshot names the prefix: report it as the scan's `to`, so the
+    /// caller's existing watermark write lands there and the next pass is an
+    /// ordinary incremental scan from it.
+    Checkpoint(i64),
+    /// Nothing retained short of the head names the prefix: persist the cut as a
+    /// SEQUENCE cursor and let the next pass resume above it.
+    Cursor,
+}
+
+/// Choose between the two, given the newest retained ancestor at or below the cut.
+///
+/// The cursor is the fallback, and it is what lets the bound take its FIRST step
+/// on the tables it was written for. A table whose watermark has expired has, by
+/// definition, lost its old snapshots, so the cut — which lands near the start of
+/// the backlog — usually sits below every retained one and `checkpoint` is `None`.
+/// Falling through to an unbounded read there was the livelock: the read exceeds
+/// the novelty ceiling, defers, records nothing, and repeats. Recording the cut as
+/// a cursor instead costs nothing — the prefix is already whole commits — and the
+/// cursor route needs no snapshot at all.
+///
+/// The head is never a checkpoint: reporting `to` as the watermark while the
+/// target holds a prefix would claim rows that were never applied.
+fn route_full_read_cut(checkpoint: Option<i64>, to_snapshot_id: i64) -> FullReadRoute {
+    match checkpoint {
+        Some(id) if id != to_snapshot_id => FullReadRoute::Checkpoint(id),
+        _ => FullReadRoute::Cursor,
+    }
+}
+
+/// How far a sequence-bounded pass gets through the tasks above its cursor.
+#[derive(Debug, PartialEq, Eq)]
+enum SeqCut {
+    /// Everything above the cursor fits the budget — the pass is COMPLETE, so the
+    /// snapshot watermark may advance and no cursor need be kept.
+    Complete,
+    /// Only a prefix fits; this is the highest commit sequence it covers. The
+    /// snapshot watermark must NOT advance.
+    Prefix(i64),
+}
+
+/// Where to stop a full read that is resuming from a SEQUENCE cursor.
+///
+/// Sibling of [`full_read_prefix`], and the difference is what each needs to be
+/// true. `full_read_prefix` hands back a sequence the caller must then name a
+/// RETAINED snapshot for; on a table whose history has been expired away — the only
+/// reason a full read is happening — there is no such snapshot, so it declines and
+/// the read stays unbounded. A cursor needs nothing retained: Iceberg sequence
+/// numbers are monotonic, never reused, and stay meaningful after the snapshot that
+/// carried them is gone.
+///
+/// `None` when any task lacks a sequence: without a total order there is no safe
+/// cut, and the caller falls back to the snapshot route.
+fn sequence_prefix_cut(
+    tasks: &[fluree_db_iceberg::scan::FileScanTask],
+    cursor: i64,
+    max_rows: i64,
+) -> Option<SeqCut> {
+    if tasks.iter().any(|t| t.data_sequence_number.is_none()) {
+        return None;
+    }
+    // Tasks arrive sorted by `(data_sequence_number, path)`, so "above the cursor"
+    // is a suffix and the walk below is in commit order.
+    let above: Vec<&fluree_db_iceberg::scan::FileScanTask> = tasks
+        .iter()
+        .filter(|t| t.data_sequence_number.is_some_and(|sq| sq > cursor))
+        .collect();
+    if above.is_empty() {
+        return Some(SeqCut::Complete);
+    }
+    let total: i64 = above.iter().map(|t| t.data_file.record_count).sum();
+    if max_rows <= 0 || total <= max_rows {
+        return Some(SeqCut::Complete);
+    }
+    let last_seq = above.last()?.data_sequence_number?;
+    let mut rows = 0i64;
+    for t in &above {
+        let sq = t.data_sequence_number?;
+        rows = rows.saturating_add(t.data_file.record_count);
+        if rows >= max_rows {
+            // Keep the WHOLE commit the budget ran out in: a cut inside one leaves
+            // the target holding part of a commit, which no cursor can honestly
+            // describe. Landing in the newest commit means the budget covers
+            // everything above the cursor, so the pass is complete, not a prefix.
+            return Some(if sq < last_seq {
+                SeqCut::Prefix(sq)
+            } else {
+                SeqCut::Complete
+            });
+        }
+    }
+    Some(SeqCut::Complete)
 }
 
 /// Field ids to project for `projection` against `schema`: every non-nested
@@ -479,6 +899,7 @@ impl crate::Fluree {
 
         // 1. Validate configuration
         config.validate()?;
+        let model_warnings = self.validate_source_model(config.model.as_deref()).await?;
 
         // 2. Test catalog connection (REST mode only — Direct mode verified at query time)
         let connection_tested = if config.is_rest() {
@@ -518,6 +939,7 @@ impl crate::Fluree {
         );
 
         Ok(IcebergCreateResult {
+            model_warnings,
             graph_source_id,
             table_identifier: config.table_identifier_display(),
             catalog_uri: config.catalog_uri_or_location().to_string(),
@@ -540,6 +962,9 @@ impl crate::Fluree {
         info!(graph_source_id = %graph_source_id, "Creating R2RML graph source");
 
         config.validate()?;
+        let model_warnings = self
+            .validate_source_model(config.iceberg.model.as_deref())
+            .await?;
 
         // Resolve mapping: validate and store to CAS if inline content
         let (mapping_address, triples_map_count, table_names, mapping_validated) = match &config
@@ -551,6 +976,7 @@ impl crate::Fluree {
                 // CID address, which is also extensionless).
                 let compiled =
                     Self::compile_r2rml_content(content, config.mapping_media_type.as_deref(), "")?;
+                reject_sql_queries(&compiled)?;
                 let count = compiled.len();
                 let tables = Self::sorted_table_names(&compiled);
                 let gs_id = config.graph_source_id();
@@ -608,6 +1034,7 @@ impl crate::Fluree {
         info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, "Created R2RML graph source");
 
         Ok(R2rmlCreateResult {
+            model_warnings,
             graph_source_id,
             table_identifier: config.iceberg.table_identifier_display(),
             catalog_uri: config.iceberg.catalog_uri_or_location().to_string(),
@@ -684,7 +1111,7 @@ impl crate::Fluree {
     /// `media_type` is given. Format selection goes through the shared
     /// [`fluree_db_r2rml::loader::MappingFormat`] resolver (default Turtle) so
     /// registration and query time can never disagree (issue #1397).
-    fn compile_r2rml_content(
+    pub(crate) fn compile_r2rml_content(
         content: &str,
         media_type: Option<&str>,
         source: &str,
@@ -734,7 +1161,7 @@ impl crate::Fluree {
 
     /// Collect the distinct logical table names referenced by a compiled
     /// mapping, sorted for deterministic reporting.
-    fn sorted_table_names(compiled: &CompiledR2rmlMapping) -> Vec<String> {
+    pub(crate) fn sorted_table_names(compiled: &CompiledR2rmlMapping) -> Vec<String> {
         let mut names: Vec<String> = compiled
             .table_names()
             .into_iter()
@@ -774,12 +1201,51 @@ pub struct FlureeR2rmlProvider<'a> {
 }
 
 impl<'a> FlureeR2rmlProvider<'a> {
+    /// The row budget one FULL materialize pass may read before checkpointing.
+    ///
+    /// Derived from `Fluree::index_config`, the ceiling `at_max_novelty` actually
+    /// compares novelty against, however it was configured. Public so a test that
+    /// drains a real table can predict where the passes cut. See
+    /// [`materialize_max_rows_per_pass`] for the derivation and its override.
+    pub fn pass_row_budget(&self) -> i64 {
+        materialize_max_rows_per_pass(self.fluree.index_config.reindex_max_bytes)
+    }
+
     /// Create a new R2RML provider wrapping a Fluree instance.
     pub fn new(fluree: &'a crate::Fluree) -> Self {
         Self {
             fluree,
             session: std::sync::Arc::new(super::catalog_session::IcebergCatalogSession::default()),
         }
+    }
+
+    /// The SQL source behind `graph_source_id`, or `None` when it is
+    /// Iceberg-backed. Decided once per query session: the nameservice lookup
+    /// is not free on a storage-backed nameservice, and a query scans a source
+    /// once per triples map it touches.
+    #[cfg(feature = "sql")]
+    async fn sql_source(
+        &self,
+        graph_source_id: &str,
+    ) -> QueryResult<Option<Arc<super::sql::SqlSource>>> {
+        if let Some(decision) = self.session.sql_dispatch(graph_source_id) {
+            return Ok(decision);
+        }
+        let record = self
+            .fluree
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
+        let decision = match record {
+            Some(r) if r.source_type == GraphSourceType::Sql => Some(Arc::new(
+                super::sql::SqlSource::open(self.fluree, &r).await?,
+            )),
+            _ => None,
+        };
+        self.session
+            .memo_sql_dispatch(graph_source_id, decision.clone());
+        Ok(decision)
     }
 
     /// Resolve a graph source's storage backend, parsed table metadata, and
@@ -805,6 +1271,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
 
+        require_iceberg_backed(&record, graph_source_id)?;
         let iceberg_config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
             QueryError::Internal(format!(
                 "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
@@ -1079,6 +1546,35 @@ impl<'a> FlureeR2rmlProvider<'a> {
         Ok(metadata.current_snapshot().map(|s| s.snapshot_id))
     }
 
+    /// The table's current snapshot id and top-level column names, both
+    /// read from one session-pinned resolution.
+    ///
+    /// [`Self::current_snapshot_id`] resolves the table for itself
+    /// through `prepare_iceberg_scan`, which is uncached, and reading
+    /// the schema separately cost a second one: two catalog
+    /// `loadTable`s, and two chances to observe different snapshots.
+    /// This goes through `load_table_context` instead, whose pin a
+    /// following `scan_table` reuses, so a caller that reports a
+    /// snapshot and then scans reports the one it read.
+    pub(crate) async fn pinned_snapshot_and_columns(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+    ) -> QueryResult<(Option<i64>, Vec<String>)> {
+        let (_storage, metadata, _loc) =
+            self.load_table_context(graph_source_id, table_name).await?;
+        let schema = metadata
+            .current_schema()
+            .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
+        let columns = schema
+            .fields
+            .iter()
+            .filter(|f| !f.is_nested())
+            .map(|f| f.name.clone())
+            .collect();
+        Ok((metadata.current_snapshot().map(|s| s.snapshot_id), columns))
+    }
+
     /// The source graph source's materialization options from the persisted
     /// `IcebergGsConfig`: the optional tombstone/delete convention and the
     /// optional latest-by-key ordering column. Both `None` means additive,
@@ -1096,6 +1592,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
+        require_iceberg_backed(&record, graph_source_id)?;
         let config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
             QueryError::Internal(format!(
                 "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
@@ -1243,6 +1740,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
         projection: &[String],
         from_snapshot_id: Option<i64>,
         to_snapshot_id: Option<i64>,
+        from_sequence: Option<i64>,
     ) -> QueryResult<MaterializeScan> {
         let (storage, metadata, _loc) = self
             .prepare_iceberg_scan(graph_source_id, table_name)
@@ -1253,6 +1751,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
         } else {
             table_name
         };
+        let pinned = to_snapshot_id.is_some();
         let to_snapshot = match to_snapshot_id {
             // A caller's pin must resolve — typed error, never fall-forward
             // (see the doc comment).
@@ -1268,25 +1767,19 @@ impl<'a> FlureeR2rmlProvider<'a> {
             }
             None => metadata.current_snapshot(),
         };
-        let Some(to_snapshot) = to_snapshot else {
+        let Some(head_snapshot) = to_snapshot else {
             // Table has no snapshots: nothing to materialize.
             return Ok(MaterializeScan {
                 to_snapshot_id: None,
                 incremental: false,
                 window_age_ms: None,
+                to_sequence: None,
                 stream: empty_batch_stream(),
             });
         };
-        let to_snapshot_id = to_snapshot.snapshot_id;
+        let head_snapshot_id = head_snapshot.snapshot_id;
 
-        // Schema AT the `to` snapshot (falls back to current when the snapshot
-        // carries no schema-id) — identical to current for an unpinned read.
-        let schema = metadata
-            .schema_for_snapshot(to_snapshot)
-            .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
-        let projected_field_ids = projected_field_ids(schema, projection);
-
-        let choice = ScanChoice::decide(&metadata, from_snapshot_id, to_snapshot_id);
+        let choice = ScanChoice::decide(&metadata, from_snapshot_id, head_snapshot_id);
         let incremental = choice.is_incremental();
 
         // Say WHY, at a level that matches how alarming it is. The routine
@@ -1298,14 +1791,14 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 graph_source_id = %graph_source_id,
                 table = %table_name,
                 from_snapshot_id = ?from_snapshot_id,
-                to_snapshot_id,
+                to_snapshot_id = head_snapshot_id,
                 "materialize: window contains overwrite/delete, full read required"
             ),
             ScanChoice::FullUndeterminable(reason) => warn!(
                 graph_source_id = %graph_source_id,
                 table = %table_name,
                 from_snapshot_id = ?from_snapshot_id,
-                to_snapshot_id,
+                to_snapshot_id = head_snapshot_id,
                 reason = %reason,
                 "materialize: CANNOT DETERMINE incremental safety — falling back to a FULL \
                  table read, which loads the whole table into memory. Usually means the stored \
@@ -1315,9 +1808,113 @@ impl<'a> FlureeR2rmlProvider<'a> {
             ),
         }
 
+        let budget_rows = self.pass_row_budget();
+
+        // An UNPINNED incremental window is read in bounded steps.
+        //
+        // A pass only advances the watermark when its whole window commits, and a
+        // window whose flakes exceed the target's novelty ceiling never can: it is
+        // deferred, nothing is recorded, and the next poll re-reads a window one
+        // poll wider. Left alone, that window outgrows the source's snapshot
+        // retention, the watermark stops resolving, and every later poll is a full
+        // read of the whole table — bounded, but a drain of the entire table to
+        // recover a backlog that was a few snapshots wide. Stopping short of the
+        // head keeps the watermark moving, which keeps it inside retention, which
+        // is what keeps this path incremental at all.
+        //
+        // Only when the whole window is incremental-safe: a window with an
+        // overwrite anywhere in it full-reads the head regardless, and that read
+        // subsumes every prefix, so cutting first would only add passes. Capping
+        // only ever moves `to` EARLIER, never later, so no snapshot is skipped —
+        // the next poll resumes from the watermark this pass writes. A pinned
+        // read is a point-in-time consumer's and is read exactly as asked.
+        let to_snapshot = if !pinned && incremental {
+            match metadata.cap_window_by_rows(from_snapshot_id, head_snapshot_id, budget_rows) {
+                Ok(WindowCap::Capped(id)) => {
+                    let capped = metadata.snapshot(id).ok_or_else(|| {
+                        QueryError::Internal(format!(
+                            "capped window end {id} is not a snapshot of the table"
+                        ))
+                    })?;
+                    info!(
+                        graph_source_id = %graph_source_id,
+                        table = %table_name,
+                        from_snapshot_id = ?from_snapshot_id,
+                        head_snapshot_id,
+                        to_snapshot_id = id,
+                        budget_rows,
+                        "materialize: backlog exceeds the per-pass budget; reading a prefix of \
+                         it and checkpointing short of the head"
+                    );
+                    capped
+                }
+                Ok(WindowCap::Whole) => head_snapshot,
+                // Neither decline is alarming on its own — the pass may still commit,
+                // and if it cannot, the deferral says so loudly — but a bound that
+                // quietly fails to engage is indistinguishable from one that did. Say
+                // which reason it was.
+                Ok(WindowCap::Unsized(id)) => {
+                    info!(
+                        graph_source_id = %graph_source_id,
+                        table = %table_name,
+                        from_snapshot_id = ?from_snapshot_id,
+                        to_snapshot_id = head_snapshot_id,
+                        unsized_snapshot_id = id,
+                        budget_rows,
+                        "materialize: incremental window could not be bounded — a snapshot \
+                         carries no added-records summary, so the window cannot be sized; \
+                         reading it whole"
+                    );
+                    head_snapshot
+                }
+                Ok(WindowCap::SingleCommit) => {
+                    info!(
+                        graph_source_id = %graph_source_id,
+                        table = %table_name,
+                        from_snapshot_id = ?from_snapshot_id,
+                        to_snapshot_id = head_snapshot_id,
+                        budget_rows,
+                        "materialize: incremental window is a single commit over the per-pass \
+                         budget, with no boundary short of the head; reading it whole. If it \
+                         cannot commit under the novelty ceiling this repeats every poll"
+                    );
+                    head_snapshot
+                }
+                // `ScanChoice::decide` walked this exact window a moment ago and found
+                // it incremental-safe, so an unwalkable window here can only mean the
+                // metadata changed underneath us. Read to the head, as before.
+                Err(e) => {
+                    warn!(
+                        graph_source_id = %graph_source_id,
+                        table = %table_name,
+                        from_snapshot_id = ?from_snapshot_id,
+                        to_snapshot_id = head_snapshot_id,
+                        error = %e,
+                        "materialize: could not size the incremental window; reading it whole"
+                    );
+                    head_snapshot
+                }
+            }
+        } else {
+            head_snapshot
+        };
+        let mut to_snapshot_id = to_snapshot.snapshot_id;
+
+        // Schema AT the `to` snapshot (falls back to current when the snapshot
+        // carries no schema-id) — identical to current for an uncapped, unpinned
+        // read.
+        let schema = metadata
+            .schema_for_snapshot(to_snapshot)
+            .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
+        let projected_field_ids = projected_field_ids(schema, projection);
+
         let scan_config = ScanConfig::new().with_projection(projected_field_ids);
         let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
 
+        // Set only when this pass covers a PREFIX of the plan; see
+        // `MaterializeScan::to_sequence` for why `Some` must SUPPRESS the snapshot
+        // watermark write rather than accompany it.
+        let mut to_sequence: Option<i64> = None;
         let tasks = if incremental {
             let plan = planner
                 .plan_incremental(from_snapshot_id, to_snapshot_id)
@@ -1358,7 +1955,146 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 estimated_rows = plan.estimated_row_count,
                 "materialize: full scan plan"
             );
-            plan.tasks
+
+            // A full read cannot be bounded by snapshot — there is no `from` to
+            // take a prefix after — so bound it by rows instead, and checkpoint
+            // at the snapshot that prefix corresponds to.
+            //
+            // This is the path a source lands on once its watermark has expired,
+            // and without a bound it is a trap: the read is the most expensive
+            // one the table has, so it is the most likely to exhaust the target's
+            // novelty and defer, which writes no watermark, which guarantees the
+            // same read next poll. Every later poll is then the same full read,
+            // forever. Bounding it means each pass finishes, writes a watermark,
+            // and the one after starts incremental.
+            //
+            // Tasks arrive sorted by `(data_sequence_number, path)`, so a prefix
+            // is a prefix in COMMIT order. The cut is then extended to the end of
+            // its commit: splitting inside one would leave the target holding
+            // part of a commit with no snapshot to name that state, and a
+            // checkpoint that cannot be named cannot be resumed from.
+            // A stored SEQUENCE cursor takes precedence, and it is the only route
+            // that recovers a watermark which has fallen out of retention. The
+            // snapshot-checkpoint route below has to name a RETAINED snapshot for
+            // its cut; on a table whose old snapshots have been expired away —
+            // which is the only reason this full read is happening — there is
+            // nothing to name, so it declines and the read stays unbounded. That is
+            // the livelock: an unbounded read exceeds the novelty ceiling, a window
+            // over the ceiling is deferred, a deferral records no progress, and the
+            // next poll performs the identical read. Forever.
+            let cursor_cut = from_sequence.and_then(|cursor| {
+                sequence_prefix_cut(&plan.tasks, cursor, budget_rows).map(|c| (cursor, c))
+            });
+
+            if let Some((cursor, seq_cut)) = cursor_cut {
+                let keep_through = match seq_cut {
+                    SeqCut::Prefix(sq) => Some(sq),
+                    SeqCut::Complete => None,
+                };
+                let files_total = plan.files_selected;
+                let kept: Vec<_> = plan
+                    .tasks
+                    .into_iter()
+                    .filter(|t| {
+                        t.data_sequence_number
+                            .is_some_and(|sq| sq > cursor && keep_through.is_none_or(|k| sq <= k))
+                    })
+                    .collect();
+                info!(
+                    to_snapshot_id,
+                    from_sequence = cursor,
+                    to_sequence = ?keep_through,
+                    files_this_pass = kept.len(),
+                    files_total,
+                    budget_rows,
+                    complete = keep_through.is_none(),
+                    "materialize: full read resumed from a sequence cursor"
+                );
+                // `Some` => prefix only, so the caller persists the cursor and
+                // leaves the snapshot watermark alone.
+                to_sequence = keep_through;
+                kept
+            } else {
+                let cut = full_read_prefix(&plan.tasks, budget_rows);
+                match cut {
+                    FullReadCut::Cut(cut_seq) => {
+                        // The prefix is the same either way; only how it is RECORDED
+                        // differs. `Err` from the walk can only mean `to` itself failed
+                        // to resolve, which the lookup above rules out — and the cursor
+                        // route needs no snapshot, so it is folded into "nothing
+                        // nameable" rather than aborting a read that can still make
+                        // progress.
+                        let checkpoint = metadata
+                            .snapshot_at_or_before_sequence(to_snapshot_id, cut_seq)
+                            .ok()
+                            .flatten()
+                            .map(|s| s.snapshot_id);
+                        let files_total = plan.files_selected;
+                        let kept: Vec<_> = plan
+                            .tasks
+                            .into_iter()
+                            .filter(|t| t.data_sequence_number.is_some_and(|s| s <= cut_seq))
+                            .collect();
+                        match route_full_read_cut(checkpoint, to_snapshot_id) {
+                            FullReadRoute::Checkpoint(checkpoint_id) => {
+                                info!(
+                                    to_snapshot_id,
+                                    checkpoint_snapshot_id = checkpoint_id,
+                                    checkpoint_sequence = cut_seq,
+                                    files_this_pass = kept.len(),
+                                    files_total,
+                                    budget_rows,
+                                    "materialize: full read bounded to a commit prefix; \
+                                     the watermark will checkpoint short of the head"
+                                );
+                                // Reporting the checkpoint as this scan's `to` is what
+                                // makes the caller's existing watermark write land there —
+                                // no new vocabulary, and the crash-safety ordering
+                                // (watermark after data) is unchanged.
+                                to_snapshot_id = checkpoint_id;
+                            }
+                            // No retained snapshot names the cut. This is the FIRST pass
+                            // on every table whose history has expired — the shape this
+                            // bound exists for — and it used to fall through to the
+                            // unbounded read. The cursor is what the next pass resumes
+                            // from instead; see `route_full_read_cut`.
+                            FullReadRoute::Cursor => {
+                                info!(
+                                    to_snapshot_id,
+                                    to_sequence = cut_seq,
+                                    files_this_pass = kept.len(),
+                                    files_total,
+                                    budget_rows,
+                                    "materialize: full read bounded to a commit prefix; no \
+                                     retained snapshot names it, so the pass records a \
+                                     sequence cursor and the snapshot watermark stays put"
+                                );
+                                to_sequence = Some(cut_seq);
+                            }
+                        }
+                        kept
+                    }
+                    // Not every decline is news: `PlanFits` is the healthy small read
+                    // and `Disabled` is a deliberate choice. The other two mean an
+                    // unbounded read, which is the shape that livelocks.
+                    decline => {
+                        if decline.is_alarming() {
+                            warn!(
+                                to_snapshot_id,
+                                budget_rows,
+                                estimated_rows = plan.estimated_row_count,
+                                files = plan.files_selected,
+                                reason = decline.reason(),
+                                "materialize: full read could NOT be bounded — reading the whole \
+                             table. If this window exceeds the novelty ceiling it cannot \
+                             commit, and an uncommitted window writes no watermark, so this \
+                             repeats on every poll"
+                            );
+                        }
+                        plan.tasks
+                    }
+                }
+            }
         };
 
         // How OLD is the window we are about to read? Measured from Iceberg's own
@@ -1373,13 +2109,14 @@ impl<'a> FlureeR2rmlProvider<'a> {
         // source ended up full-reading 739k rows on every poll.
         let window_age_ms = from_snapshot_id
             .and_then(|from| metadata.snapshot(from).map(|s| s.timestamp_ms))
-            .map(|from_ms| to_snapshot.timestamp_ms.saturating_sub(from_ms));
+            .map(|from_ms| head_snapshot.timestamp_ms.saturating_sub(from_ms));
 
         let stream = self.stream_scan_tasks(&storage, tasks);
         Ok(MaterializeScan {
             to_snapshot_id: Some(to_snapshot_id),
             incremental,
             window_age_ms,
+            to_sequence,
             stream,
         })
     }
@@ -1402,21 +2139,7 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             .lookup_graph_source(graph_source_id)
             .await
         {
-            Ok(Some(record)) => {
-                // First check if this is an R2RML or Iceberg graph source type
-                if !matches!(
-                    record.source_type,
-                    GraphSourceType::R2rml | GraphSourceType::Iceberg
-                ) {
-                    return false;
-                }
-
-                // Parse into typed config to stay aligned with real config schema
-                match IcebergGsConfig::from_json(&record.config) {
-                    Ok(config) => config.mapping.is_some(),
-                    Err(_) => false,
-                }
-            }
+            Ok(Some(record)) => mapping_source_of(&record).is_some(),
             Ok(None) => false,
             Err(_) => false,
         }
@@ -1441,29 +2164,23 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
 
-        // Verify it's an R2RML or Iceberg graph source
-        if !matches!(
-            record.source_type,
-            GraphSourceType::R2rml | GraphSourceType::Iceberg
-        ) {
+        if !record
+            .source_type
+            .kind()
+            .eq(&fluree_db_nameservice::GraphSourceKind::Mapped)
+        {
             return Err(QueryError::InvalidQuery(format!(
                 "Graph source '{}' is not an R2RML graph source (type: {:?})",
                 graph_source_id, record.source_type
             )));
         }
 
-        // Parse into typed config
-        let iceberg_config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
-            QueryError::Internal(format!(
-                "Failed to parse graph source config for '{graph_source_id}': {e}"
-            ))
-        })?;
-
-        let mapping_config = iceberg_config.mapping.as_ref().ok_or_else(|| {
+        let mapping_config = mapping_source_of(&record).ok_or_else(|| {
             QueryError::InvalidQuery(format!(
                 "Graph source '{graph_source_id}' is missing 'mapping' in config"
             ))
         })?;
+        let mapping_config = &mapping_config;
 
         let mapping_source = &mapping_config.source;
         let media_type = mapping_config.media_type.as_deref();
@@ -1587,7 +2304,12 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
         graph_source_id: &str,
     ) -> std::result::Result<(), fluree_db_r2rml::R2rmlError> {
         use fluree_db_r2rml::R2rmlError;
-        if !super::catalog_session::cache_enabled() {
+        // A SQL source pins nothing (its watermark is endpoint+table+time), so
+        // the loadTable-cache precondition is meaningless for it. Known only
+        // once a scan has run, which is fine: the up-front check at build start
+        // still applies to a mixed session's Iceberg sources.
+        if !super::catalog_session::cache_enabled() && !self.session.is_sql_source(graph_source_id)
+        {
             return Err(R2rmlError::BuildSnapshotIntegrity(
                 "the loadTable metadata cache is disabled (FLUREE_ICEBERG_LOADTABLE_CACHE=0), so \
                  Iceberg snapshot pinning is a no-op and the twin's stamped watermark cannot be \
@@ -1668,6 +2390,51 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
     /// `record_count` sum only if [`sound_manifest_row_count`] proves it equals a
     /// full scan: no delete manifests, and every `non_null_col` provably zero-null.
     /// Otherwise `Ok(None)` and the caller falls back to the scan.
+    async fn pushdown_capabilities(
+        &self,
+        graph_source_id: &str,
+    ) -> QueryResult<Option<fluree_db_query::r2rml::PushdownCapabilities>> {
+        #[cfg(feature = "sql")]
+        if let Some(sql) = self.sql_source(graph_source_id).await? {
+            return Ok(Some(sql.pushdown_capabilities()));
+        }
+        let _ = graph_source_id;
+        Ok(None)
+    }
+
+    async fn source_schema(
+        &self,
+        graph_source_id: &str,
+        source: &fluree_db_query::r2rml::RelSource,
+    ) -> QueryResult<Option<Arc<fluree_db_query::r2rml::BatchSchema>>> {
+        #[cfg(feature = "sql")]
+        if let Some(sql) = self.sql_source(graph_source_id).await? {
+            let mapping = self.compiled_mapping(graph_source_id, None).await?;
+            return sql
+                .source_schema(&self.session, &mapping, source)
+                .await
+                .map(Some);
+        }
+        let _ = (graph_source_id, source);
+        Ok(None)
+    }
+
+    async fn execute_plan(
+        &self,
+        graph_source_id: &str,
+        plan: &fluree_db_query::r2rml::RelPlan,
+    ) -> QueryResult<(String, ColumnBatchStream)> {
+        #[cfg(feature = "sql")]
+        if let Some(sql) = self.sql_source(graph_source_id).await? {
+            let mapping = self.compiled_mapping(graph_source_id, None).await?;
+            return sql.execute_plan(&self.session, &mapping, plan).await;
+        }
+        let _ = plan;
+        Err(QueryError::Internal(format!(
+            "graph source '{graph_source_id}' cannot execute a pushed-down plan"
+        )))
+    }
+
     async fn table_row_count(
         &self,
         graph_source_id: &str,
@@ -1966,6 +2733,13 @@ impl FlureeR2rmlProvider<'_> {
         non_null_cols: &[String],
         _as_of_t: Option<i64>,
     ) -> QueryResult<Option<u64>> {
+        #[cfg(feature = "sql")]
+        if let Some(sql) = self.sql_source(graph_source_id).await? {
+            let mapping = self.compiled_mapping(graph_source_id, None).await?;
+            return sql
+                .row_count(&self.session, &mapping, table_name, non_null_cols)
+                .await;
+        }
         // Same pinned context as the scan: one Iceberg snapshot per query (the
         // shared `self.session` pin), so a count and a scan cannot disagree.
         // GREP: r2rml-as-of-t — `as_of_t` is ignored here exactly as the scan path
@@ -2180,6 +2954,12 @@ impl FlureeR2rmlProvider<'_> {
         graph_source_id: &str,
         table_name: &str,
     ) -> QueryResult<(Arc<LazyS3Storage<'static>>, Arc<TableMetadata>, String)> {
+        if fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(table_name) {
+            return Err(QueryError::InvalidQuery(format!(
+                "Graph source '{graph_source_id}': rr:sqlQuery logical tables are only \
+                 supported by SQL graph sources"
+            )));
+        }
         // Look up the graph source record to get Iceberg connection info
         let record = self
             .fluree
@@ -2192,6 +2972,7 @@ impl FlureeR2rmlProvider<'_> {
             })?;
 
         // Parse the Iceberg graph source config
+        require_iceberg_backed(&record, graph_source_id)?;
         let iceberg_config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
             QueryError::Internal(format!(
                 "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
@@ -2688,6 +3469,13 @@ impl FlureeR2rmlProvider<'_> {
         // `_as_of_t` is deliberately ignored. If as-of semantics ever land here,
         // `table_row_count_inner` MUST honor them identically (matching breadcrumb
         // there): a COUNT and a scan in one query must read the same snapshot.
+        #[cfg(feature = "sql")]
+        if let Some(sql) = self.sql_source(graph_source_id).await? {
+            let mapping = self.compiled_mapping(graph_source_id, None).await?;
+            return sql
+                .scan(&self.session, &mapping, table_name, projection, filters)
+                .await;
+        }
         info!(
             graph_source_id = %graph_source_id,
             table_name = %table_name,
@@ -4411,6 +5199,8 @@ mod tests {
             // materialization options stay absent (their serde defaults).
             delete: None,
             order_by: None,
+            model: None,
+            default_allow: None,
         }
         .to_json()
         .unwrap()
@@ -4541,5 +5331,322 @@ mod tests {
             "dim_customer.AbCdEf/".to_string(),
         ]));
         assert!(!super::listing_is_single_table(&[]));
+    }
+
+    fn t(seq: i64, rows: i64) -> fluree_db_iceberg::scan::FileScanTask {
+        let df = fluree_db_iceberg::manifest::DataFile {
+            file_path: format!("f{seq}-{rows}.parquet"),
+            file_format: fluree_db_iceberg::manifest::FileFormat::Parquet,
+            record_count: rows,
+            file_size_in_bytes: rows,
+            partition: fluree_db_iceberg::manifest::PartitionData::default(),
+            column_sizes: None,
+            value_counts: None,
+            null_value_counts: None,
+            nan_value_counts: None,
+            lower_bounds: None,
+            upper_bounds: None,
+            split_offsets: None,
+            sort_order_id: None,
+        };
+        fluree_db_iceberg::scan::FileScanTask::for_whole_file(df, vec![], None)
+            .with_data_sequence_number(seq)
+    }
+
+    /// The cut lands on a COMMIT boundary, never inside one. A partial commit
+    /// leaves the target in a state no snapshot names, and an unnameable state
+    /// cannot be checkpointed or resumed from.
+    #[test]
+    fn full_read_prefix_cuts_on_a_commit_boundary() {
+        // commit 10: 60 rows, commit 20: 60, commit 30: 60 => 180 total
+        let tasks = vec![
+            t(10, 30),
+            t(10, 30),
+            t(20, 30),
+            t(20, 30),
+            t(30, 30),
+            t(30, 30),
+        ];
+
+        // Budget runs out inside commit 20 -> keep all of 20, cut there.
+        assert_eq!(
+            super::full_read_prefix(&tasks, 70),
+            super::FullReadCut::Cut(20)
+        );
+        // Budget runs out on the first file of commit 10 -> cut at 10.
+        assert_eq!(
+            super::full_read_prefix(&tasks, 10),
+            super::FullReadCut::Cut(10)
+        );
+    }
+
+    /// Every reason to decline to cut. Each returns `None`, meaning "read it
+    /// whole" — the pre-existing behaviour.
+    #[test]
+    fn full_read_prefix_declines_when_a_cut_would_not_help() {
+        let tasks = vec![t(10, 30), t(20, 30), t(30, 30)];
+
+        use super::FullReadCut;
+        assert_eq!(
+            super::full_read_prefix(&tasks, 0),
+            FullReadCut::Disabled,
+            "disabled"
+        );
+        assert_eq!(
+            super::full_read_prefix(&tasks, -1),
+            FullReadCut::Disabled,
+            "negative"
+        );
+        assert_eq!(
+            super::full_read_prefix(&tasks, 90),
+            FullReadCut::PlanFits,
+            "already fits"
+        );
+        assert_eq!(
+            super::full_read_prefix(&tasks, 1_000),
+            FullReadCut::PlanFits,
+            "budget exceeds total"
+        );
+        assert_eq!(
+            super::full_read_prefix(&[], 10),
+            FullReadCut::PlanFits,
+            "no tasks"
+        );
+
+        // The budget runs out in the FINAL commit. Checkpointing at the head
+        // would be the whole read with extra bookkeeping — but declining
+        // outright is what livelocked a compacted table in production, so fall
+        // back to the newest boundary strictly below the head instead.
+        assert_eq!(
+            super::full_read_prefix(&tasks, 85),
+            FullReadCut::Cut(20),
+            "falls back below the head commit rather than declining"
+        );
+
+        // A task with no attributable sequence cannot be ordered, so no cut is
+        // safe — better an expensive honest read than a wrong checkpoint.
+        let unattributed = vec![
+            t(10, 30),
+            fluree_db_iceberg::scan::FileScanTask::for_whole_file(
+                tasks[0].data_file.clone(),
+                vec![],
+                None,
+            ),
+            t(30, 30),
+        ];
+        assert_eq!(
+            super::full_read_prefix(&unattributed, 40),
+            FullReadCut::NoSequence,
+            "unknown sequence"
+        );
+    }
+
+    /// A COMPACTED table is the case the old `None` return livelocked on: a
+    /// compaction rewrites every file with one sequence number, so the budget
+    /// always lands in the head commit and there is no boundary below it. That
+    /// is genuinely uncuttable — but it must be REPORTED, not returned as a bare
+    /// "declined", because an unbounded read over the novelty ceiling never
+    /// commits and so repeats on every poll.
+    #[test]
+    fn full_read_prefix_reports_a_single_commit_table() {
+        let one_commit = vec![t(7, 400_000), t(7, 400_000)];
+        assert_eq!(
+            super::full_read_prefix(&one_commit, 250_000),
+            super::FullReadCut::SingleCommit
+        );
+        assert!(
+            super::FullReadCut::SingleCommit.is_alarming(),
+            "an uncuttable full read must be shouted about, not swallowed"
+        );
+        // And the two healthy outcomes must NOT be, or the log fills with noise
+        // on every small read and the real signal is lost.
+        assert!(!super::FullReadCut::PlanFits.is_alarming());
+        assert!(!super::FullReadCut::Disabled.is_alarming());
+    }
+
+    /// The row budget has to fit under the novelty ceiling, because a pass that
+    /// cannot commit defers, and a deferral discards the window's progress. The
+    /// old flat 250_000 rows is ~27 MB of flakes: against the 8 MiB ceiling this
+    /// deployment pins, it could never commit, so the read repeated forever.
+    #[test]
+    fn the_row_budget_is_derived_to_fit_the_novelty_ceiling() {
+        const BYTES_PER_ROW: i64 = 108;
+        let eight_mib = 8 * 1024 * 1024;
+
+        let rows = super::rows_for_ceiling(eight_mib, BYTES_PER_ROW);
+        assert!(
+            rows * BYTES_PER_ROW <= eight_mib,
+            "a full pass must fit the ceiling it has to commit under: \
+             {rows} rows * {BYTES_PER_ROW}B > {eight_mib}B"
+        );
+        assert!(
+            rows < 250_000,
+            "the derived budget must be tighter than the flat 250_000 that could not commit"
+        );
+
+        // A generous ceiling derives a generous budget — the derivation tracks
+        // the ceiling rather than clamping to some other constant.
+        assert!(super::rows_for_ceiling(256 * 1024 * 1024, BYTES_PER_ROW) > rows);
+
+        // Floors: a tiny or nonsensical ceiling still makes forward progress
+        // rather than a zero-row pass that reads nothing and checkpoints nowhere.
+        assert_eq!(super::rows_for_ceiling(1, BYTES_PER_ROW), 1_000);
+        assert_eq!(super::rows_for_ceiling(eight_mib, 0), 1_000);
+        assert_eq!(super::rows_for_ceiling(eight_mib, -5), 1_000);
+
+        // A pass claims a QUARTER of the ceiling, not all of it — see
+        // PASS_CEILING_FRACTION for why spending the whole thing disables the bound.
+        assert_eq!(
+            rows,
+            (eight_mib / 4) / BYTES_PER_ROW,
+            "a pass must budget a quarter of the ceiling"
+        );
+    }
+
+    /// The regression for the way this failed IN PRODUCTION on 2026-08-18, which no
+    /// unit test would have caught because the arithmetic was individually correct.
+    ///
+    /// Raising the ceiling 8 MiB -> 96 MiB to make the window committable also took
+    /// the derived budget to ~932k rows against a 733,608-row table. The budget
+    /// exceeded the table, so `full_read_prefix` answered `PlanFits`, no prefix was
+    /// taken and no cursor was written — while two of four fan-out targets still
+    /// could not absorb the window and kept deferring. Raising the ceiling had
+    /// DISABLED the mechanism meant to drain it, and the watermark stayed frozen.
+    ///
+    /// So the property is not "the budget fits the ceiling" — it is "the budget is
+    /// small enough to ENGAGE on the table that livelocked".
+    #[test]
+    fn the_budget_still_engages_on_the_table_that_livelocked() {
+        const BYTES_PER_ROW: i64 = 108;
+        const OBSERVED_PLAN_ROWS: i64 = 733_608;
+        let ninety_six_mib = 96 * 1024 * 1024;
+
+        let budget = super::rows_for_ceiling(ninety_six_mib, BYTES_PER_ROW);
+        assert!(
+            budget < OBSERVED_PLAN_ROWS,
+            "the bound must still cut a {OBSERVED_PLAN_ROWS}-row plan at a 96 MiB \
+             ceiling, else no prefix is taken and no cursor is ever written: \
+             budget was {budget}"
+        );
+        // And it must still fit comfortably under the ceiling it has to commit
+        // beneath, or we are back to a bound that cannot commit.
+        assert!(budget * BYTES_PER_ROW <= ninety_six_mib / 4);
+        // Sanity: raising the ceiling still raises the budget. The fix is a
+        // fraction, not a cap that stops tracking the ceiling.
+        assert!(budget > super::rows_for_ceiling(8 * 1024 * 1024, BYTES_PER_ROW));
+    }
+
+    /// The cursor route exists because the snapshot route cannot work on the only
+    /// tables that need it. Note what is absent from every assertion below: any
+    /// `TableMetadata`, any snapshot lookup, any retained history. That absence IS
+    /// the fix — a cut named by a commit sequence survives the expiry that makes
+    /// `snapshot_at_or_before_sequence` return `None` and leaves the read unbounded.
+    #[test]
+    fn sequence_prefix_cut_resumes_above_the_cursor_without_naming_a_snapshot() {
+        use super::SeqCut;
+        // commit 10: 30 rows, 20: 30, 30: 30
+        let tasks = vec![t(10, 30), t(20, 30), t(30, 30)];
+
+        // Budget runs out inside commit 20 -> keep whole commits up to 20.
+        assert_eq!(
+            super::sequence_prefix_cut(&tasks, 0, 50),
+            Some(SeqCut::Prefix(20))
+        );
+        // A cursor already past commit 10 shrinks the remaining work, so the same
+        // budget now covers everything left.
+        assert_eq!(
+            super::sequence_prefix_cut(&tasks, 10, 70),
+            Some(SeqCut::Complete)
+        );
+        // Nothing above the cursor: COMPLETE, not stuck. Reporting a prefix here
+        // would pin the snapshot watermark forever on an idle table.
+        assert_eq!(
+            super::sequence_prefix_cut(&tasks, 30, 10),
+            Some(SeqCut::Complete)
+        );
+        assert_eq!(
+            super::sequence_prefix_cut(&tasks, 9_999, 10),
+            Some(SeqCut::Complete)
+        );
+        // Budget disabled means "read everything above the cursor", matching the
+        // row-bound's own `0` semantics.
+        assert_eq!(
+            super::sequence_prefix_cut(&tasks, 0, 0),
+            Some(SeqCut::Complete)
+        );
+    }
+
+    /// Without a total order there is no safe cut, so the caller must fall back to
+    /// the snapshot route rather than guess. `None`, not an arbitrary boundary.
+    #[test]
+    fn sequence_prefix_cut_declines_when_a_task_has_no_sequence() {
+        let mixed = vec![
+            t(10, 30),
+            fluree_db_iceberg::scan::FileScanTask::for_whole_file(
+                t(10, 30).data_file.clone(),
+                vec![],
+                None,
+            ),
+            t(30, 30),
+        ];
+        assert_eq!(super::sequence_prefix_cut(&mixed, 0, 40), None);
+    }
+
+    /// The cut never splits a commit. A target holding half a commit is a state no
+    /// cursor can honestly describe, and resuming from an unnameable state is how
+    /// data goes missing.
+    #[test]
+    fn sequence_prefix_cut_keeps_whole_commits() {
+        use super::SeqCut;
+        // One fat commit (100) then two small ones.
+        let tasks = vec![t(10, 100), t(20, 10), t(30, 10)];
+        // A budget that expires part-way through commit 10 still keeps all of it.
+        assert_eq!(
+            super::sequence_prefix_cut(&tasks, 0, 40),
+            Some(SeqCut::Prefix(10))
+        );
+    }
+
+    /// The route decision, on its own. `None` — the only answer an expired-history
+    /// table can give — must become a cursor, never an unbounded read.
+    #[test]
+    fn an_unnameable_cut_becomes_a_cursor_and_a_retained_one_a_checkpoint() {
+        use super::FullReadRoute;
+        assert_eq!(super::route_full_read_cut(None, 7), FullReadRoute::Cursor);
+        assert_eq!(
+            super::route_full_read_cut(Some(6), 7),
+            FullReadRoute::Checkpoint(6)
+        );
+        // The head is never a checkpoint: a watermark at `to` while the target
+        // holds a prefix claims rows that were never applied.
+        assert_eq!(
+            super::route_full_read_cut(Some(7), 7),
+            FullReadRoute::Cursor
+        );
+    }
+
+    /// The budget is derived from the ceiling THIS process enforces, whichever way
+    /// it was configured — not from a re-read of `FLUREE_REINDEX_MAX_BYTES`, which
+    /// only one of the configuration routes sets. (Assumes
+    /// `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` is unset, as it is in CI.)
+    #[tokio::test]
+    async fn the_pass_budget_tracks_the_configured_ceiling() {
+        let budget_at = |ceiling: usize| {
+            let fluree = crate::FlureeBuilder::memory()
+                .with_novelty_thresholds(1, ceiling)
+                .build_memory();
+            super::FlureeR2rmlProvider::new(&fluree).pass_row_budget()
+        };
+        let small = 8 * 1024 * 1024;
+        let large = 256 * 1024 * 1024;
+        assert_eq!(
+            budget_at(small),
+            super::rows_for_ceiling(small as i64, super::flake_bytes_per_row())
+        );
+        assert!(
+            budget_at(large) > budget_at(small),
+            "a builder-configured ceiling must move the budget; a fixed default \
+             would mean the env var is still the only route that counts"
+        );
     }
 }

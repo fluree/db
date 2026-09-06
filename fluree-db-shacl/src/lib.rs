@@ -89,6 +89,18 @@
 //! — scoped to the shapes that use it — when the shape fires. See
 //! [`sparql`] for the full semantics.
 //!
+//! # Annotation Properties
+//!
+//! `sh:name`, `sh:description`, `sh:order` and `sh:defaultValue` are compiled
+//! onto [`CompiledShape`] / [`PropertyShape`] but constrain nothing —
+//! validation never reads them. They exist for consumers that render or
+//! generate from shapes (the GraphQL schema derivation in `fluree-db-graphql`
+//! takes its field names, docs and field order from them).
+//!
+//! `sh:defaultValue` is deliberately **never materialized**: a default is a
+//! statement about presentation, not about what the graph holds, and asserting
+//! the triple would make `sh:minCount 1` self-satisfying.
+//!
 //! # Not Yet Supported
 //!
 //! - SPARQL-based constraint *components* (`sh:ConstraintComponent`,
@@ -126,8 +138,9 @@ pub mod sparql;
 pub mod validate;
 
 pub use cache::{ShaclCache, ShaclCacheKey};
+pub use compile::NodeKind;
 pub use compile::{CompiledShape, LiteralTarget, PropertyShape, Severity, ShapeId, TargetType};
-pub use constraints::Constraint;
+pub use constraints::{Constraint, NodeConstraint};
 pub use error::{Result, ShaclError};
 pub use path::PropertyPath;
 pub use report_text::{format_violations, unresolved_sid, violations_of};

@@ -1905,14 +1905,15 @@ impl GraphSourcePublisher for DynamoDbNameService {
                 .collect(),
         );
 
-        // 1. Meta (UpdateItem — preserves retracted via if_not_exists)
+        // 1. Meta (UpdateItem — clears retracted: publishing config is a
+        //    create or reconfigure, so a dropped source comes back active)
         let meta_update = Update::builder()
             .table_name(&self.table_name)
             .key(ATTR_PK, AttributeValue::S(pk.clone()))
             .key(ATTR_SK, AttributeValue::S(SK_META.to_string()))
             .update_expression(
                 "SET #kind = :gs, #st = :src_type, #name = :name, #br = :branch, \
-                 #deps = :deps, #ret = if_not_exists(#ret, :false_val), \
+                 #deps = :deps, #ret = :false_val, \
                  #ua = :now, #schema = :sv",
             )
             .expression_attribute_names("#kind", ATTR_KIND)

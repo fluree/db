@@ -450,7 +450,7 @@ impl Fluree {
 
             // 4.3 Stage flakes (policy/backpressure). No WHERE/cancellation; flakes are prebuilt.
             let evolving_state = base_state.clone_with_novelty(Arc::new(evolving_novelty.clone()));
-            let staged_view = stage_commit_flakes(
+            let staged_view = match stage_commit_flakes(
                 evolving_state,
                 &c.commit.flakes,
                 index_config,
@@ -458,7 +458,23 @@ impl Fluree {
                 &routing.graph_sids,
             )
             .await
-            .map_err(PushError::into_api_error)?;
+            {
+                Ok(view) => view,
+                Err(e) => {
+                    // Replication is a write family like any other, and it hits
+                    // the same accumulated-novelty gate. Without this, a
+                    // follower whose novelty is past `reindex_max_bytes`
+                    // rejects every incoming commit and never asks for the
+                    // build that would drain it.
+                    self.request_index_after_novelty_rejection(
+                        base_state.ledger_id(),
+                        current_t,
+                        &e,
+                    )
+                    .await;
+                    return Err(push_error_for_stage(e).into_api_error());
+                }
+            };
 
             // 4.4 SHACL (optional feature).
             //
@@ -473,10 +489,13 @@ impl Fluree {
             // the binary store) are intentionally absent from `graph_iris` and
             // therefore fall back to the ledger-wide baseline, which is the
             // correct behavior: config cannot exist for a graph not yet known.
+            // The SHACL pass attaches the staged dictionaries to the view.
+            #[cfg(feature = "shacl")]
+            let mut staged_view = staged_view;
             #[cfg(feature = "shacl")]
             {
                 crate::tx::apply_shacl_policy_to_staged_view(
-                    &staged_view,
+                    &mut staged_view,
                     crate::tx::StagedShaclContext {
                         graph_delta: Some(&routing.graph_iris),
                         graph_sids: Some(&routing.graph_sids),
@@ -971,27 +990,35 @@ async fn build_policy_ctx_for_push(
     .await
 }
 
+/// Map a staging failure onto the push surface.
+///
+/// Split out from `stage_commit_flakes` so the caller sees the typed
+/// `TransactError` first: novelty backpressure has to be recognised by variant
+/// to ask the indexer for a build, and it is indistinguishable once flattened
+/// into `PushError::Invalid(String)`.
+fn push_error_for_stage(e: fluree_db_transact::TransactError) -> PushError {
+    match e {
+        fluree_db_transact::TransactError::PolicyViolation(p) => {
+            PushError::Forbidden(p.to_string())
+        }
+        other => PushError::Invalid(other.to_string()),
+    }
+}
+
 async fn stage_commit_flakes(
     ledger: LedgerState,
     flakes: &[Flake],
     index_config: &IndexConfig,
     policy_ctx: Option<&PolicyContext>,
     graph_sids: &HashMap<GraphId, Sid>,
-) -> std::result::Result<fluree_db_ledger::StagedLedger, PushError> {
+) -> std::result::Result<fluree_db_ledger::StagedLedger, fluree_db_transact::TransactError> {
     let mut options = fluree_db_transact::StageOptions::new()
         .with_index_config(index_config)
         .with_graph_sids(graph_sids);
     if let Some(policy_ctx) = policy_ctx.filter(|p| !p.wrapper().is_root()) {
         options = options.with_policy(policy_ctx);
     }
-    fluree_db_transact::stage_flakes(ledger, flakes.to_vec(), options)
-        .await
-        .map_err(|e| match e {
-            fluree_db_transact::TransactError::PolicyViolation(p) => {
-                PushError::Forbidden(p.to_string())
-            }
-            other => PushError::Invalid(other.to_string()),
-        })
+    fluree_db_transact::stage_flakes(ledger, flakes.to_vec(), options).await
 }
 
 async fn assert_retractions_exist(
@@ -1213,6 +1240,11 @@ fn apply_pushed_commits_to_state(
 
     // Apply all flakes to novelty (we already validated them; re-apply for state).
     let mut novelty = (*base.novelty).clone();
+    // Detach the range provider first: it pins `dict_novelty`, so mutating
+    // with it attached deep-clones the dictionary and leaves the provider —
+    // the copy every read through `base.snapshot` resolves against — without
+    // the subjects and strings these commits introduce.
+    let provider_store = fluree_db_transact::detach_binary_provider(&mut base);
     let mut dict_novelty = base.dict_novelty.clone();
 
     let store_opt: Option<&BinaryIndexStore> = base
@@ -1240,6 +1272,9 @@ fn apply_pushed_commits_to_state(
 
     base.novelty = Arc::new(novelty);
     base.dict_novelty = dict_novelty;
+    if let Some(store) = provider_store {
+        fluree_db_transact::attach_binary_provider(&mut base, store);
+    }
     base.head_commit_id = stored_commits.last().map(|c| c.commit_id.clone());
     if let Some(ref mut r) = base.ns_record {
         if let Some(last) = stored_commits.last() {
@@ -1713,6 +1748,14 @@ impl Fluree {
                 // already written are harmless content-addressed orphans (a
                 // retry rewrites identical bytes; GC reclaims them otherwise).
                 // `drop_ledger` takes the bare name, so strip the branch suffix.
+                // (admin::drop_ledger is native-only; on wasm32 the orphaned
+                // name is left for the server/external admin to reap.)
+                #[cfg(target_arch = "wasm32")]
+                error!(
+                    ledger = %new_ledger_id,
+                    "restore rollback (drop_ledger) unavailable on wasm32"
+                );
+                #[cfg(not(target_arch = "wasm32"))]
                 match fluree_db_core::ledger_id::split_ledger_id(new_ledger_id) {
                     Ok((name, _branch)) => {
                         if let Err(drop_err) = self.drop_ledger(&name, crate::DropMode::Soft).await

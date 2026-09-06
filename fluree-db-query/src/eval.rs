@@ -471,6 +471,50 @@ pub fn passes_filters(
     Ok(true)
 }
 
+/// The stored f64 behind a float-datatyped variable binding, when `var` is
+/// bound to one.
+///
+/// A stored `xsd:float` is carried as a full-precision `FlakeValue::Double`
+/// (ingest never narrows) and deliberately truncated to an f32 on the way into
+/// `ComparableValue` — the numeric lanes are single-precision, and
+/// `datatype()` keys off the `Float` variant. The lexical builders must NOT
+/// inherit that truncation: the serializer prints the stored f64
+/// (`canonical_xsd_double`, variant-keyed), so `STR()` has to read the f64
+/// from the binding itself or it spells the truncated value (#1695's float
+/// sibling). Returns `None` for anything that is not a stored-float binding —
+/// including a decode failure on the encoded path, which falls back to the
+/// generic (error-raising) evaluation.
+pub(crate) fn stored_float_f64<R: RowAccess>(
+    row: &R,
+    var: VarId,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Option<f64> {
+    match row.get(var)? {
+        Binding::Lit {
+            val: FlakeValue::Double(d),
+            dtc,
+            ..
+        } if is_xsd_float(dtc) => Some(*d),
+        Binding::EncodedLit {
+            o_kind,
+            o_key,
+            p_id,
+            dt_id,
+            lang_id,
+            ..
+        } if *dt_id == DatatypeDictId::FLOAT.as_u16() => {
+            match ctx?
+                .decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?
+                .ok()?
+            {
+                FlakeValue::Double(d) => Some(d),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Convert a literal binding's value to a `ComparableValue`, carrying the
 /// datatype for the datatype-sensitive cases:
 /// - xsd:float (stored as an f64, tagged only by its datatype) becomes `Float`

@@ -239,6 +239,7 @@ fn negotiate_response(report: &ValidateReport, headers: &FlureeHeaders) -> Respo
         "warnings": report.warning_count(),
         "infos": report.info_count(),
         "shapesChecked": report.shape_count,
+        "t": report.t,
         "results": report.results,
     }))
     .into_response()

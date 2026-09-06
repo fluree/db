@@ -187,9 +187,9 @@ fn create_sync_connection(config: ConnectionConfig) -> Result<ConnectionHandle> 
         StorageType::File => {
             #[cfg(not(all(feature = "native", not(target_arch = "wasm32"))))]
             {
-                return Err(ConnectionError::unsupported_component(
+                Err(ConnectionError::unsupported_component(
                     "https://ns.flur.ee/system#filePath (native feature disabled)",
-                ));
+                ))
             }
             #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
             {
@@ -228,9 +228,9 @@ async fn create_async_connection(config: ConnectionConfig) -> Result<ConnectionH
         StorageType::File => {
             #[cfg(not(all(feature = "native", not(target_arch = "wasm32"))))]
             {
-                return Err(ConnectionError::unsupported_component(
+                Err(ConnectionError::unsupported_component(
                     "https://ns.flur.ee/system#filePath (native feature disabled)",
-                ));
+                ))
             }
             #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
             {

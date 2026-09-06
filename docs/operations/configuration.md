@@ -39,6 +39,8 @@ storage_path = "/var/lib/fluree"
 log_level = "info"
 query_timeout_ms = 900000  # 15 minutes; set to 0 to disable
 query_min_t_timeout_ms = 5000
+graphql_max_depth = 15         # GraphQL nesting depth; 0 disables
+graphql_max_complexity = 1000  # GraphQL fields per document; 0 disables
 # cache_max_mb = 4096  # global in-memory cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
 # disk_cache_max_mb = 20480  # global on-disk cache budget (MB), shared across object storage + Iceberg; default: auto-detect; 0 disables
 # iceberg_local_roots = "/data/warehouse:/srv/lake"  # allow catalog-less Iceberg tables under these dirs; default: unset (local-filesystem tables disabled)
@@ -360,6 +362,36 @@ operators can stop at the next checkpoint.
 
 `stream_heartbeat_ms` is the keep-alive cadence for the [streaming query endpoint](../api/streaming-query.md) (`/stream/query`). Records flush at this interval during stalls so a long-running query survives a fronting proxy's idle timeout; set it below that timeout (e.g. under CloudFront/ALB's ~60s). `0` disables heartbeats.
 
+The [GraphQL endpoint](../query/graphql.md) runs inside the same timeout and
+cancellation scope, and one document's root fields share a single handle — so a
+timeout or a client disconnect stops all of them, not whichever field checks
+next.
+
+### GraphQL Document Limits
+
+A GraphQL schema derived from a ledger is cyclic wherever one class references
+another, so nesting depth is chosen by the caller rather than by the schema.
+Root fields also resolve concurrently, which means aliases multiply whatever one
+field costs. Two limits bound a document; both apply only to the GraphQL
+surface.
+
+| Flag                        | Env Var                          | Default |
+| --------------------------- | -------------------------------- | ------- |
+| `--graphql-max-depth`       | `FLUREE_GRAPHQL_MAX_DEPTH`       | `15`    |
+| `--graphql-max-complexity`  | `FLUREE_GRAPHQL_MAX_COMPLEXITY`  | `1000`  |
+
+`graphql_max_depth` counts field levels the way GraphQL tooling does: the root
+field is level 1 and a leaf is a level of its own, so
+`{ persons { knows { name } } }` is depth 3. Fragments and inline fragments are
+flattened into the level that holds them and do not count. `graphql_max_complexity`
+is a budget of fields per document, across every alias and fragment, which is
+what bounds alias fan-out.
+
+Both are checked before execution: a document past either limit comes back as a
+`200` with an `errors` array — the GraphQL spec's shape for a refusal — having
+run nothing. Set either to `0` to disable that limit, the same way
+`query_timeout_ms = 0` disables the timeout.
+
 ### Query-Time Refresh
 
 Long-running query servers can opt in to a bounded nameservice freshness check before current-head queries. When enabled, the server calls the same `Fluree::refresh()` API used by serverless query handlers, but gates the call by a per-process, per-ledger TTL so high-QPS traffic does not check DynamoDB on every request.
@@ -412,6 +444,14 @@ Enable background indexing and configure novelty backpressure thresholds:
 | `--reindex-min-bytes` | `FLUREE_REINDEX_MIN_BYTES` | `100`     | Soft threshold (triggers background indexing; default ≈ reindex every commit) |
 | `--reindex-max-bytes` | `FLUREE_REINDEX_MAX_BYTES` | 20% of system RAM (256 MB fallback) | Hard threshold: transactions are rejected with HTTP 503 `err:db/NoveltyAtMax` (+ `Retry-After`) until the indexer catches up — nothing waits or queues; clients should retry |
 
+Index garbage-collection retention (see [Index Retention](../indexing-and-search/background-indexing.md#index-retention)):
+
+| Flag                         | Env Var                           | Default | Description                                     |
+| ---------------------------- | --------------------------------- | ------- | ----------------------------------------------- |
+| `--gc-max-old-indexes`       | `FLUREE_GC_MAX_OLD_INDEXES`       | `5`     | Old index versions to retain before GC |
+| `--gc-min-time-mins`         | `FLUREE_GC_MIN_TIME_MINS`         | `30`    | Minimum age (minutes) before an index version can be collected. Protects queries that started against an older version. ANDed with the count, so the slower of the two wins |
+| `--gc-hard-max-old-indexes`  | `FLUREE_GC_HARD_MAX_OLD_INDEXES`  | unset   | Version ceiling past which the age guard is overridden and versions are collected regardless of age. Bounds retained versions, not bytes; past it GC can release artifacts a still-running query needs, so set it well above the versions published during your longest query |
+
 Config file equivalent:
 
 ```toml
@@ -419,6 +459,9 @@ Config file equivalent:
 enabled = true
 reindex_min_bytes = 100            # ≈ every commit — soft trigger
 # reindex_max_bytes = 536870912    # 512 MB — defaults to 20% of system RAM if omitted
+# gc_max_old_indexes = 5
+# gc_min_time_mins = 30
+# gc_hard_max_old_indexes = 40     # unset by default: the age guard is never overridden
 ```
 
 ## Server Role Configuration
@@ -860,6 +903,9 @@ fluree server run \
 | `FLUREE_INDEXING_ENABLED`               | Enable background indexing                      | `true`                                                                  |
 | `FLUREE_REINDEX_MIN_BYTES`              | Soft reindex threshold (bytes)                  | `100000`                                                                |
 | `FLUREE_REINDEX_MAX_BYTES`              | Hard reindex threshold (bytes)                  | 20% of system RAM (256 MB fallback)                                      |
+| `FLUREE_GC_MAX_OLD_INDEXES`             | Old index versions to retain before GC          | `5`                                                                     |
+| `FLUREE_GC_MIN_TIME_MINS`               | Minimum age (minutes) before an index version can be collected; protects queries that started against an older version | `30`                              |
+| `FLUREE_GC_HARD_MAX_OLD_INDEXES`        | Version ceiling past which the age guard is overridden. Bounds versions, not bytes; past it GC can release artifacts a still-running query needs — see [Index Retention](../indexing-and-search/background-indexing.md#index-retention) | Unset (no ceiling) |
 | `FLUREE_DICT_COMPACTION`                | Merge forward dictionary packs during incremental index builds. Off (`0`/`false`/`off`/`no`) appends packs without ever merging them, so a dictionary's object and mapping count grows once per build forever — see [Forward pack compaction](../design/index-format.md#forward-pack-compaction). Read once per process. | `true` |
 | `FLUREE_CACHE_MAX_MB`                   | Global in-memory cache budget (MB)              | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
 | `FLUREE_DISK_CACHE_MAX_MB`              | Global on-disk cache budget (MB), shared across object storage + Iceberg | Auto-detect from free disk; `0` disables |
@@ -1058,6 +1104,8 @@ environment-only.
 | `FLUREE_ICEBERG_SCAN_CONCURRENCY` | `min(cores, files, 8)` | Number of data files read concurrently within one scan. Raise it for high-latency remote object stores (it is not capped, but is bounded by the number of files in the scan). |
 | `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` | `1024` | Memory budget (MB) for one materialize pass's subject accumulator — the pass's dominant memory term (one retained node per distinct subject in the window). A window whose **estimated** accumulator exceeds the budget fails with a typed error *before any commit* (nothing partially applied, watermark un-advanced) instead of the process being OOM-killed. The failure is deterministic and recurs every poll until the budget or the window changes: shorten the poll interval so incremental windows stay small, or raise the budget for a large full read. `0` disables the gate. |
 | `FLUREE_MATERIALIZE_WATERMARK_REFRESH_MINS` | `30` | How old a materialize window may grow before an *empty* poll still persists its watermark. Skipping watermark writes on no-data polls keeps the state ledger from taking ~1,200 empty commits/hour, but never refreshing lets the stored snapshot age out of the source's snapshot retention — after which every poll degrades to a full table read. This bound is the compromise: quiet tables refresh their watermark at most once per interval. |
+| `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` | derived | Rows one materialize pass may take before checkpointing, on both the full-read and the incremental path. Unset, it is derived from the configured novelty ceiling (`reindex_max_bytes`, however it was set): a quarter of the ceiling divided by `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW`, floored at 1,000 rows, so that a bounded pass can actually commit. A **full read** stops at a commit boundary and records where it got to — as a snapshot checkpoint when a retained snapshot names it, otherwise as a commit-sequence cursor, which survives snapshot expiry. An **incremental window** whose snapshots (sized from their `added-records` summaries) exceed the budget stops at the last snapshot the budget covers and advances the watermark to it, so a backlog drains in bounded steps instead of re-reading a growing window on every poll until the watermark expires. Either way the next poll resumes from where this one stopped. `0` disables the bound and reads the whole window in one pass. |
+| `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW` | `108` | Estimated bytes of novelty one materialized row costs; used only to convert the novelty ceiling into the row budget above. Set this, rather than the row budget, when rows are much wider or narrower, so the budget keeps tracking the ceiling. |
 
 **Caching model.** Catalog access is cached at two scopes. Within a single query,
 the first scan of a table pins its `metadata_location`, so every scan in that
