@@ -99,6 +99,7 @@ impl StorageRegistry {
                 .endpoint
                 .as_ref()
                 .map(std::string::ToString::to_string),
+            force_path_style: s3_config.force_path_style,
             timeout_ms,
             max_retries: s3_config.max_retries.map(|n| n as u32),
             retry_base_delay_ms: s3_config.retry_base_delay_ms,

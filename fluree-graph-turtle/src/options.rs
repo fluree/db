@@ -16,14 +16,16 @@
 pub enum CollectionStyle {
     /// Object-position collections become indexed
     /// [`emit_list_item`](fluree_graph_ir::GraphSink::emit_list_item) events
-    /// on the enclosing subject/predicate, and an object-position `()` emits
-    /// nothing.
+    /// on the enclosing subject/predicate. An object-position `()` is the
+    /// IRI `rdf:nil` and emits that one triple, exactly as if `rdf:nil` had
+    /// been written out (issue #1694 — it used to emit nothing, silently
+    /// losing the statement).
     ///
     /// This is Fluree's storage shape — a list is metadata on the edge, not a
-    /// chain of blank nodes — and it is lossy as RDF: the W3C-defined three
-    /// triples of a one-item collection arrive as one event, and the empty
-    /// collection's `rdf:nil` triple is dropped entirely. Subject-position
-    /// collections are unaffected; they have always emitted a spine.
+    /// chain of blank nodes — and it is lossy as RDF for non-empty
+    /// collections: the W3C-defined three triples of a one-item collection
+    /// arrive as one event. Subject-position collections are unaffected;
+    /// they have always emitted a spine.
     #[default]
     IndexedItems,
 
@@ -33,9 +35,10 @@ pub enum CollectionStyle {
     /// Turtle suite tests.
     ///
     /// In this mode a collection has a single object term (the spine head),
-    /// so an RDF 1.2 annotation may follow one — the deferral that applies in
-    /// [`CollectionStyle::IndexedItems`] exists only because indexed items
-    /// leave nothing to reify.
+    /// so an RDF 1.2 annotation may follow one — the deferral that applies to
+    /// non-empty collections in [`CollectionStyle::IndexedItems`] exists only
+    /// because indexed items leave nothing to reify. (`()` is a single term —
+    /// `rdf:nil` — in both styles, and annotations on it work in both.)
     Spine,
 }
 

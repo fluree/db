@@ -43,6 +43,10 @@ const SUBJECT_SITE: &str = "distinct subject COUNT";
 /// starts with `p_id` and therefore scopes the arena handle correctly.
 const PREDICATE_SITE: &str = "COUNT(DISTINCT)";
 
+/// Site stamped when the exact arena-slice branch runs, distinct from the
+/// operator's own label so the two can be told apart.
+const EXACT_SITE: &str = "distinct object COUNT (numbig exact)";
+
 const Q_COUNT: &str = "SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE { ?s ?p ?o }";
 
 /// The reported fixture: two different decimals under two different predicates.
@@ -140,12 +144,12 @@ const F_STR_CROSS: &str = r#"
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Routing {
-    /// The graph holds a NumBig object: the whole-graph object count must fall
-    /// through to the general pipeline.
-    MustDecline,
-    /// No NumBig object anywhere: the fast path must still serve it, so an
-    /// over-broad gate (or a blanket disable) fails here.
-    MustProceed,
+    /// The graph holds NumBig objects within the cap: the operator proceeds and
+    /// the exact branch is what answers the arena slice.
+    ExactBranch,
+    /// No NumBig object anywhere: the operator proceeds from directory metadata
+    /// alone and the exact branch must not run — it would be pure added cost.
+    MetadataOnly,
 }
 
 struct Case {
@@ -161,67 +165,67 @@ const CASES: &[Case] = &[
         name: "reported: two decimals, two predicates",
         ttl: F_REPORTED,
         truth: 2,
-        routing: Routing::MustDecline,
+        routing: Routing::ExactBranch,
     },
     Case {
         name: "two decimals under one predicate",
         ttl: F_ONE_PRED,
         truth: 2,
-        routing: Routing::MustDecline,
+        routing: Routing::ExactBranch,
     },
     Case {
         name: "same decimal value under two predicates",
         ttl: F_SAME_VALUE,
         truth: 1,
-        routing: Routing::MustDecline,
+        routing: Routing::ExactBranch,
     },
     Case {
         name: "decimals 3 and 1 disjoint",
         ttl: F_MAXPRED,
         truth: 4,
-        routing: Routing::MustDecline,
+        routing: Routing::ExactBranch,
     },
     Case {
         name: "decimals 3 and 3 disjoint",
         ttl: F_LOSS3,
         truth: 6,
-        routing: Routing::MustDecline,
+        routing: Routing::ExactBranch,
     },
     Case {
         name: "decimals 5 and 4 sharing one",
         ttl: F_LIFECYCLE,
         truth: 8,
-        routing: Routing::MustDecline,
+        routing: Routing::ExactBranch,
     },
     Case {
         name: "decimals mixed with strings and small integers",
         ttl: F_MIXED,
         truth: 8,
-        routing: Routing::MustDecline,
+        routing: Routing::ExactBranch,
     },
     Case {
         name: "overflow xsd:integer across two predicates",
         ttl: F_BIGINT_CROSS,
         truth: 2,
-        routing: Routing::MustDecline,
+        routing: Routing::ExactBranch,
     },
     Case {
         name: "CTRL i64 integers across two predicates",
         ttl: F_INT_CROSS,
         truth: 2,
-        routing: Routing::MustProceed,
+        routing: Routing::MetadataOnly,
     },
     Case {
         name: "CTRL doubles across two predicates",
         ttl: F_DOUBLE_CROSS,
         truth: 2,
-        routing: Routing::MustProceed,
+        routing: Routing::MetadataOnly,
     },
     Case {
         name: "CTRL strings across two predicates",
         ttl: F_STR_CROSS,
         truth: 2,
-        routing: Routing::MustProceed,
+        routing: Routing::MetadataOnly,
     },
 ];
 
@@ -360,16 +364,24 @@ async fn distinct_object_count_declines_numbig_object_keys() {
             ));
         }
         let did_proceed = sites.iter().any(|s| s == OBJECT_SITE);
+        let took_exact = sites.iter().any(|s| s == EXACT_SITE);
+        if !did_proceed {
+            failures.push(format!(
+                "{}: expected `{OBJECT_SITE}` to proceed — every fixture here is \
+                 within the exact branch's row cap [proceeded: {sites:?}]",
+                case.name
+            ));
+        }
         match case.routing {
-            Routing::MustDecline if did_proceed => failures.push(format!(
-                "{}: `{OBJECT_SITE}` proceeded on a graph holding a NumBig \
-                 object key, whose (o_type, o_key) lead is per-predicate",
+            Routing::ExactBranch if !took_exact => failures.push(format!(
+                "{}: expected `{EXACT_SITE}` to run — the arena slice cannot be \
+                 counted from the (o_type, o_key) lead, so the metadata walk \
+                 alone would undercount [proceeded: {sites:?}]",
                 case.name
             )),
-            Routing::MustProceed if !did_proceed => failures.push(format!(
-                "{}: expected `{OBJECT_SITE}` to proceed — no NumBig object \
-                 here, so the gate must narrow the fast path, not remove it \
-                 [proceeded: {sites:?}]",
+            Routing::MetadataOnly if took_exact => failures.push(format!(
+                "{}: `{EXACT_SITE}` ran on a graph with no NumBig object — the \
+                 exact branch is pure added cost there",
                 case.name
             )),
             _ => {}
@@ -519,6 +531,37 @@ async fn distinct_object_count_declines_numbig_object_keys() {
             if got != *truth {
                 failures.push(format!("{name}: {got} rows, expected {truth}"));
             }
+        }
+    }
+
+    // ---- Phase 4: the rollout cap still declines --------------------------
+    // Above the cap the whole count falls to the general pipeline. That bound
+    // is a rollout guard on a new read path rather than a crossover — the
+    // fallback is measured slower at every size — but it has to actually work,
+    // or the cap is decoration.
+    {
+        let (_db, _data, fluree, ledger_id) = build_indexed(F_LOSS3, "over-cap").await;
+        let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
+        // The 3-and-3 fixture holds 6 NumBig rows; a cap of 1 puts it over.
+        std::env::set_var("FLUREE_NUMBIG_EXACT_MAX_ROWS", "1");
+        let (store, tracing_guard) = span_capture::init_test_tracing();
+        set_fast_paths_disabled(false);
+        let got = scalar(&run(&fluree, &ledger, Q_COUNT).await);
+        let sites = proceeded(&store, 0);
+        drop(tracing_guard);
+        std::env::remove_var("FLUREE_NUMBIG_EXACT_MAX_ROWS");
+
+        if got != "6" {
+            failures.push(format!(
+                "over the cap: got {got}, expected 6 — declining changes the \
+                 lane, never the answer"
+            ));
+        }
+        if sites.iter().any(|s| s == OBJECT_SITE || s == EXACT_SITE) {
+            failures.push(format!(
+                "over the cap: expected the count to decline to the general \
+                 pipeline [proceeded: {sites:?}]"
+            ));
         }
     }
 

@@ -15,7 +15,9 @@ use async_trait::async_trait;
 use fluree_db_binary_index::format::branch::LeafEntry;
 use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
-use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
+use fluree_db_binary_index::format::run_record_v2::{
+    cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
+};
 use fluree_db_binary_index::read::column_loader::load_columns_cached_via_handle;
 use fluree_db_binary_index::{
     BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnBatch, ColumnProjection, ColumnSet,
@@ -354,6 +356,86 @@ pub fn leaf_entries_for_predicate(
     &branch.leaves[leaf_range]
 }
 
+/// Whether `p_id`'s stored rows make `(s_id, o_type, o_key)` unreliable as a
+/// join key **across two different predicates** (#1652 case 3). True when any
+/// POST leaflet shows either hazard:
+///
+/// - a `NUM_BIG_OVERFLOW` object: its `o_key` is a handle into a
+///   **per-predicate** arena (see [`OType::o_key_is_globally_identifying`]),
+///   so equal big decimals under two predicates carry unrelated handles and
+///   never compare equal;
+/// - a list row (`HAS_O_I`): the generic pipeline's list-element bindings join
+///   neither like plain values nor purely by value, so a key that drops `o_i`
+///   diverges from it on multiplicity.
+///
+/// Per-predicate consumers need neither check — their key fixes the `p_id`
+/// that scopes the arena handle, and within one predicate `o_i` only splits a
+/// group it fully contains.
+///
+/// Metadata-first: `HAS_O_I` is a leaflet flag, and a homogeneous leaflet's
+/// o_type is answered by `o_type_const` — no payload touched. A mixed leaflet
+/// is bounded by the o_type of its first/last keys (exact bounds — POST orders
+/// `o_type` immediately after `p_id`); only when that range straddles a
+/// non-identifying o_type is the leaflet's o_type column decoded for an exact
+/// membership check, because the range alone over-declines (inline numerics
+/// sort below `NUM_BIG_OVERFLOW` and langstrings above it, so a plain
+/// int+string+langstring leaflet straddles it without containing one).
+///
+/// Covers the base index only — novelty NumBig values get query-scoped
+/// ephemeral handles that ARE value-deduped across predicates
+/// (`DictOverlay::assign_numbig_handle`), a novelty value reuses a base arena
+/// handle only when the predicate's base arena is non-empty (already reported
+/// here), and novelty *list* rows need a row-level check in the overlay lane.
+pub(crate) fn predicate_unsafe_for_cross_predicate_o_key_join(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+) -> Result<bool> {
+    use fluree_db_binary_index::format::leaflet::flags::HAS_O_I;
+    for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
+        let handle = store
+            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
+        let dir = handle.dir();
+        for (idx, entry) in dir.entries.iter().enumerate() {
+            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+                continue;
+            }
+            if entry.flags & HAS_O_I != 0 {
+                return Ok(true);
+            }
+            match entry.o_type_const {
+                Some(ot) => {
+                    if !OType::from_u16(ot).o_key_is_globally_identifying() {
+                        return Ok(true);
+                    }
+                }
+                None => {
+                    let lo = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key).o_type;
+                    let hi = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key).o_type;
+                    if !OType::range_holds_non_globally_identifying(
+                        OType::from_u16(lo),
+                        OType::from_u16(hi),
+                    ) {
+                        continue;
+                    }
+                    // Range straddles a non-identifying o_type: decode this
+                    // leaflet's o_type column and check exact membership.
+                    let batch = handle
+                        .load_columns(idx, &projection_otype_only(), RunSortOrder::Post)
+                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                    for i in 0..batch.row_count {
+                        if !OType::from_u16(batch.o_type.get(i)).o_key_is_globally_identifying() {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Minimum total predicate rows before a parallel leaf-chunk scan is worth its
 /// thread-spawn overhead; below this the reducer runs serially on the whole slice.
 const PARALLEL_LEAF_SCAN_MIN_ROWS: u64 = 50_000;
@@ -524,7 +606,7 @@ pub fn collect_subjects_for_predicate_sorted(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
@@ -562,7 +644,7 @@ pub fn collect_subjects_for_predicate_set(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
@@ -765,7 +847,7 @@ impl<'a> PsotSubjectCountIter<'a> {
                             leaf_entry.sidecar_cid.as_ref(),
                             false,
                         )
-                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
                 );
             }
 
@@ -990,7 +1072,7 @@ impl<'a> PsotSubjectSeek<'a> {
                             leaf_entry.sidecar_cid.as_ref(),
                             false,
                         )
-                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
                 );
             }
 
@@ -1135,8 +1217,15 @@ impl<'a> PsotSubjectSeek<'a> {
 /// Streaming iterator over POST leaflets for a predicate that yields
 /// `(object_key, row_count)` groups in POST order, restricted to IRI_REF objects.
 ///
-/// Returns `Ok(None)` from `next_group` if a non-IRI_REF leaflet is encountered
-/// (unless it's a mixed-type leaflet, in which case non-IRI rows are skipped).
+/// Non-IRI rows contribute nothing: mixed-type leaflets skip them row-wise and
+/// homogeneous non-IRI leaflets are skipped whole (POST sorts `o_type` before
+/// `o_key`, so the IRI rows form one contiguous run either way).
+///
+/// Groups span leaflet/leaf boundaries — an `o_key` whose rows straddle two
+/// leaflets is emitted ONCE with its full count (`cur_key`/`cur_count` carry,
+/// mirroring [`PsotSubjectCountIter`]). Callers rely on strictly increasing
+/// group keys: `execute_chain`'s forward-only PSOT seek treats a repeated key
+/// as "absent" and would silently drop the second fragment's rows (#1652).
 pub struct PostObjectGroupCountIter<'a> {
     store: &'a BinaryIndexStore,
     p_id: u32,
@@ -1147,6 +1236,9 @@ pub struct PostObjectGroupCountIter<'a> {
     handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
     batch: Option<ColumnBatch>,
     mixed: bool,
+    /// Accumulated object key for a group that may span leaflet boundaries.
+    cur_key: Option<u64>,
+    cur_count: u64,
 }
 
 impl<'a> PostObjectGroupCountIter<'a> {
@@ -1161,6 +1253,8 @@ impl<'a> PostObjectGroupCountIter<'a> {
             handle: None,
             batch: None,
             mixed: false,
+            cur_key: None,
+            cur_count: 0,
         }))
     }
 
@@ -1184,7 +1278,7 @@ impl<'a> PostObjectGroupCountIter<'a> {
                             leaf_entry.sidecar_cid.as_ref(),
                             false,
                         )
-                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
                 );
             }
 
@@ -1199,7 +1293,10 @@ impl<'a> PostObjectGroupCountIter<'a> {
                 }
                 let mixed = entry.o_type_const.is_none();
                 if !mixed && entry.o_type_const != Some(OType::IRI_REF.as_u16()) {
-                    return Ok(None);
+                    // Homogeneous non-IRI leaflet: no IRI rows in it, skip it.
+                    // (Terminating here instead — the pre-#1652 behavior — cut
+                    // off every IRI group sorting after the leaflet's o_type.)
+                    continue;
                 }
                 let batch = if let Some(cache) = self.store.leaflet_cache() {
                     let idx_u32: u32 = idx
@@ -1237,12 +1334,19 @@ impl<'a> PostObjectGroupCountIter<'a> {
 
     /// Return the next `(object_key, count)` group.
     ///
-    /// Only counts IRI_REF objects. Mixed-type leaflets are handled by filtering
-    /// to IRI rows. Returns `None` when exhausted or if a non-IRI homogeneous
-    /// leaflet is encountered.
+    /// Only counts IRI_REF objects (mixed-type leaflets filter to IRI rows;
+    /// homogeneous non-IRI leaflets are skipped in `load_next_batch`). Groups
+    /// accumulate across leaflet/leaf boundaries — each distinct `o_key` is
+    /// emitted exactly once, with its complete count.
     pub fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
         loop {
+            // Load a batch if needed. If there are no more, flush any group
+            // carried across the last boundary.
             if self.batch.is_none() && self.load_next_batch()?.is_none() {
+                if let Some(k) = self.cur_key.take() {
+                    let n = std::mem::take(&mut self.cur_count);
+                    return Ok(Some((k, n)));
+                }
                 return Ok(None);
             }
             let batch = self.batch.as_ref().unwrap();
@@ -1250,37 +1354,35 @@ impl<'a> PostObjectGroupCountIter<'a> {
                 self.batch = None;
                 continue;
             }
-            if !self.mixed {
-                let b = batch.o_key.get(self.row);
-                let mut count: u64 = 0;
-                while self.row < batch.row_count && batch.o_key.get(self.row) == b {
-                    count += 1;
-                    self.row += 1;
-                }
-                return Ok(Some((b, count)));
-            }
-
-            // Mixed-type leaflet: skip non-IRI_REF rows and group by o_key.
-            while self.row < batch.row_count
-                && batch.o_type.get(self.row) != OType::IRI_REF.as_u16()
-            {
+            if self.mixed && batch.o_type.get(self.row) != OType::IRI_REF.as_u16() {
                 self.row += 1;
-            }
-            if self.row >= batch.row_count {
-                self.batch = None;
                 continue;
             }
 
-            let b = batch.o_key.get(self.row);
-            let mut count: u64 = 0;
+            let key = batch.o_key.get(self.row);
+            match self.cur_key {
+                None => {
+                    self.cur_key = Some(key);
+                    self.cur_count = 0;
+                }
+                Some(cur) if cur != key => {
+                    // New group starts; emit the previous one without
+                    // consuming this row.
+                    self.cur_key = Some(key);
+                    let n = std::mem::take(&mut self.cur_count);
+                    return Ok(Some((cur, n)));
+                }
+                Some(_) => {}
+            }
+
+            // Accumulate the current group's run within this batch.
             while self.row < batch.row_count
-                && batch.o_type.get(self.row) == OType::IRI_REF.as_u16()
-                && batch.o_key.get(self.row) == b
+                && (!self.mixed || batch.o_type.get(self.row) == OType::IRI_REF.as_u16())
+                && batch.o_key.get(self.row) == key
             {
-                count += 1;
+                self.cur_count += 1;
                 self.row += 1;
             }
-            return Ok(Some((b, count)));
         }
     }
 }
@@ -1417,7 +1519,7 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
                             leaf_entry.sidecar_cid.as_ref(),
                             false,
                         )
-                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
                 );
             }
 
@@ -1701,7 +1803,7 @@ impl<'a> PsotObjectFilterCountIter<'a> {
                             leaf_entry.sidecar_cid.as_ref(),
                             false,
                         )
-                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
                 );
             }
 
@@ -1830,7 +1932,7 @@ pub fn collect_subjects_with_object_in_set(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
 
         let dir = handle.dir();
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
@@ -1886,7 +1988,7 @@ pub fn sum_post_object_counts_filtered(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
@@ -1972,7 +2074,11 @@ pub fn build_range_cursor(
 /// before any flake of a higher predicate. The bounds are a superset
 /// optimization for `for_each_overlay_flake` — callers must still filter the
 /// callback by predicate.
-fn predicate_walk_bounds(pred: &Sid) -> (fluree_db_core::Flake, fluree_db_core::Flake) {
+///
+/// `pub(crate)` only so `binary_scan`'s
+/// `every_bound_builder_pins_the_sentinel_guard` can quantify over it; the
+/// sole production caller is [`collect_resolved_overlay_ops`] below.
+pub(crate) fn predicate_walk_bounds(pred: &Sid) -> (fluree_db_core::Flake, fluree_db_core::Flake) {
     use fluree_db_core::flake::FlakeMeta;
     use fluree_db_core::Flake;
     let first = Flake::new(
@@ -3141,7 +3247,7 @@ pub fn count_predicate_overlay_delta(
         } else {
             let handle = store
                 .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-                .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+                .map_err(|e| QueryError::from_io("leaf open", e))?;
             for entry in &handle.dir().entries {
                 if entry.row_count != 0 && entry.p_const == Some(p_id) {
                     base_touched = base_touched.saturating_add(entry.row_count as u64);

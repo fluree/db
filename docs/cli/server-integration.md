@@ -4,7 +4,7 @@ This document is for implementers building a custom server (for example in `../s
 
 The CLI supports two broad categories of remote operations:
 
-- **Data API**: query / update / insert / upsert / info / exists / show / log / history / context / explain, plus admin operations like create / drop / reindex / branch (create / drop / rebase / merge) / publish / export / import.
+- **Data API**: query / update / insert / upsert / sync / info / exists / show / log / history / context / explain, plus admin operations like create / drop / reindex / branch (create / drop / rebase / merge) / publish / export / import.
 - **Replication / sync**: clone / pull / fetch (content-addressed replication by CID, via pack + storage proxy), ledger-archive (`export --format ledger`), and wholesale restore (`create --remote --from <archive>.flpack`, via `POST /import`).
 
 ## Base URL And Discovery
@@ -251,6 +251,7 @@ See [Ledger portability](#ledger-portability-flpack-files) below for the on-disk
 - `POST {api_base_url}/query/*ledger`
 - `POST {api_base_url}/insert/*ledger`
 - `POST {api_base_url}/upsert/*ledger`
+- `POST {api_base_url}/sync/*ledger` — see [Sync Contract](#sync-contract).
 - `POST {api_base_url}/update/*ledger`
 - `GET {api_base_url}/info/*ledger`
 - `GET {api_base_url}/exists/*ledger`
@@ -329,6 +330,20 @@ MATCH (n:Person {id: 7}) RETURN n
   `POST /explain` returns 400 for Cypher (no ledger to resolve).
 - Bearer ledger scope (`can_read`) and `Fluree-Min-T` apply as on the query
   path. `--at` is rejected for remote Cypher explain (use `--direct`).
+
+### `fluree sync --remote <name>` (graph synchronization)
+
+- `POST {api_base_url}/sync/*ledger?graph=<iri>[&dryRun=true][&allowEmpty=true]`
+
+Makes one named graph's contents exactly the JSON-LD payload, committing
+only the delta. Data-bearer auth (same bracket as `/insert` / `/upsert`),
+not admin. The CLI converts Turtle to JSON-LD client-side, so the endpoint
+only ever sees `application/json`. A dry run answers with a delta report and
+must commit nothing; a real run answers with the standard transact response.
+Designed so the CLI's source of desired contents (today RDF text; later
+R2RML-mapped Iceberg / CSV / spreadsheet data) is invisible to the server —
+every source arrives as the same payload. See
+[Sync Contract](#sync-contract).
 
 ### `fluree load` (CSV → batched upserts), `fluree update --format cypher`
 
@@ -1407,6 +1422,83 @@ them all.
 | Absolute-IRI validator | `validate_absolute_iri` (same file) |
 | Report struct | `fluree_db_api::DropNamedGraphReport` |
 | Graph registry | `fluree_db_core::graph_registry` (system graph constants and IRI helpers) |
+
+## Sync Contract
+
+`fluree sync <ledger> --graph <iri> [--dry-run] [--allow-empty] --remote <name>`
+issues:
+
+```
+POST {api_base_url}/sync/{ledger}?graph=urn%3Aexample%3Aontology[&dryRun=true][&allowEmpty=true]
+Content-Type: application/json
+
+{ "@context": { ... }, "@graph": [ ... desired full contents of the graph ... ] }
+```
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `graph` (query) | Yes | Full **absolute** IRI of the target named graph (same validation rules as `/drop-graph`'s `graph`). The sync scope is exactly this graph — the payload must not address named graphs itself, and the ledger's `txn-meta` / `config` system graphs are rejected. |
+| `dryRun` (query) | No | `true` → stage and report the delta; commit nothing. |
+| `allowEmpty` (query) | No | `true` → accept an explicitly empty payload (`"@graph": []`), which clears the graph. Without it an empty payload is a `400`. |
+| body | Yes | Insert-shaped JSON-LD describing the graph's desired full contents. The CLI always sends JSON-LD (Turtle is converted client-side). Policy headers / `opts` injection follow the [Policy Enforcement Contract](#policy-enforcement-contract). |
+
+### Auth
+
+Data-bearer auth, same bracket as `/insert` and `/upsert` (a token scoped to
+the ledger with write access). Not admin.
+
+### Required semantics
+
+Given the graph's current contents `A` and the payload `B`:
+
+1. Retract `A − B`, assert `B − A`; facts in `A ∩ B` produce no flakes.
+2. Identical payload (`A = B`) → **no commit** and a successful response
+   whose `t` is the unchanged head.
+3. One commit for the whole delta (`t = current + 1`); history preserved.
+4. Policy, SHACL, and uniqueness constraints apply exactly as for a normal
+   transaction. The current-contents scan is an authoritative replacement
+   (not view-policy filtered) — a row the caller cannot see is still
+   retracted if absent from the payload; modify-policy is enforced on the
+   resulting delta.
+5. A dry run stages under the **same** policy / option inputs as the real
+   run, so its counts (and its failures) predict the real run.
+6. Blank nodes are skolemized with a deterministic, graph-scoped key so a
+   payload with stable labels resyncs bnode structures without churn.
+
+### Response
+
+Real run (`200 OK`): the standard transact response (`ledger`, `t`,
+`tx-id`, commit info) — identical in shape to `/upsert`.
+
+Dry run (`200 OK`):
+
+```json
+{
+  "ledger": "mydb:main",
+  "graph": "urn:example:ontology",
+  "asserted": 2,
+  "retracted": 2,
+  "committed": false,
+  "dryRun": true,
+  "t": 7
+}
+```
+
+The CLI's `--json` output uses this same shape for both local and remote
+runs, so scripts consume either path identically.
+
+### Error responses
+
+| Status | When |
+|--------|------|
+| `400` | missing `graph`; malformed / relative graph IRI; system-graph target; empty payload without `allowEmpty`; payload addressing named graphs; non-JSON body (Turtle/TriG are not accepted here) |
+| `401` / `403` | per the policy contract |
+| `404` | unknown ledger |
+
+### Reference implementation
+
+`fluree-db-server/src/routes/transact.rs` (`sync`, `sync_ledger`,
+`sync_local`) and `Fluree::sync_named_graph_with` in `fluree-db-api`.
 
 ## Rebase Contract
 

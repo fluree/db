@@ -171,6 +171,8 @@ Four smoke queries **did not finish** on virtual (capped at their `timeout_s`) w
 
 **Fix owner (future, rewrite — not PR-3).** Refuse to fuse a star when no TriplesMap covers all members, falling back to per-member scans joined on subject (the always-correct pre-fusion path). Once formation refuses that shape, fix (a)'s "provably empty" argument holds unconditionally rather than relative to formation behavior.
 
+**Fixed 2026-09-03.** The star loop in `rewrite.rs` now checks coverage against the mapping before fusing and emits the members as separate scans when no map covers them all (`star_no_map_covers_is_not_fused`). The SQL pushdown lane resolves the same shape to one access per distinct table joined on the subject's key columns (`resolve_parts` in `sql_lane/lower.rs`), and its live differential replays a partitioned mapping on SQLite, Postgres and MySQL.
+
 ---
 
 ## F11 — Ad-hoc `run --out` JSONL parsing must skip the `meta` header *(harness-note; recorded during PR-4 as F10, renumbered F11 at the PR-3 restack — F10 was taken by the star-formation gap above)*

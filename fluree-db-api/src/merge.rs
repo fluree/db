@@ -331,18 +331,26 @@ impl crate::Fluree {
             Some(GuardedStagedCommit {
                 write_guard,
                 staged: staged_commit,
-            }) => {
-                let content_store = self.content_store(&target_id);
-                let publisher = self.publisher()?;
-                let (receipt, new_state) = staged_commit.apply(&content_store, publisher).await?;
-
-                if let Some(guard) = write_guard {
-                    let needs_reindex = new_state.should_reindex(&self.index_config);
-                    self.finalize_commit(guard, new_state, receipt.t, needs_reindex)
-                        .await?;
+            }) => match write_guard {
+                // Cached-handle path: the staged base was cloned from the
+                // locked cache, so detach the slot for the apply window —
+                // otherwise the merge commit's dictionary `make_mut`s
+                // deep-clone against the cache's co-held Arcs. Shielded +
+                // evict-on-failure semantics live in the shared helper.
+                Some(guard) => {
+                    let receipt = self.apply_staged_detached(guard, staged_commit).await?;
+                    (receipt.t, receipt.commit_id)
                 }
-                (receipt.t, receipt.commit_id)
-            }
+                // No manager: the build loaded fresh state with no shared
+                // cache to detach or finalize.
+                None => {
+                    let content_store = self.content_store(&target_id);
+                    let publisher = self.publisher()?;
+                    let (receipt, _new_state) =
+                        staged_commit.apply(&content_store, publisher).await?;
+                    (receipt.t, receipt.commit_id)
+                }
+            },
             None => {
                 // Fast-forward: advance target's HEAD to the source's head.
                 self.publisher()?
@@ -657,7 +665,18 @@ impl crate::Fluree {
                 let Some(ref txn_cid) = envelope.txn else {
                     return Ok(());
                 };
-                let txn_bytes = source_store.get(txn_cid).await?;
+                let txn_bytes = match source_store.get(txn_cid).await {
+                    Ok(bytes) => bytes,
+                    Err(fluree_db_core::Error::NotFound(_)) => {
+                        tracing::warn!(
+                            commit = %cid,
+                            %txn_cid,
+                            "commit references a txn blob that is missing from storage; merging without it"
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e.into()),
+                };
                 storage
                     .content_write_bytes_with_hash(
                         ContentKind::Txn,

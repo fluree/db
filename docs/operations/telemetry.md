@@ -263,7 +263,7 @@ All operation, phase, and operator spans. Visible when OTEL is enabled or when `
 RUST_LOG=info,fluree_db_query=debug,fluree_db_transact=debug,fluree_db_indexer=debug
 ```
 
-Spans: `query_execute`, `query_prepare`, `query_run`, `txn_stage`, `txn_commit`, `commit_*` sub-spans, `index_build`, `build_all_indexes`, `build_index`, `sort_blocking`, `groupby_blocking`, core operators (`scan`, `join`, `filter`, `project`, `sort`), `format`, `policy_enforce`, etc.
+Spans: `query_execute`, `query_prepare`, `query_run`, `txn_stage`, `txn_commit`, `commit_*` sub-spans, `index_build`, `build_all_indexes`, `build_index`, `sort_blocking`, `groupby_blocking`, core operators (`scan`, `join`, `filter`, `project`, `sort`), `operator_open`, `overlay_translate`, `format`, `policy_enforce`, etc.
 
 #### Tier 2: TRACE (maximum detail)
 
@@ -285,6 +285,8 @@ query_execute (debug)
 │   ├── pattern_rewrite (debug, patterns_before, patterns_after)
 │   └── plan (debug, pattern_count)
 ├── query_run (debug)
+│   ├── operator_open (debug — wraps the operator tree's open())
+│   │   └── overlay_translate (debug: g_id, index, bounded, fallback, cache_hit, segments, ops_len — novelty→overlay-op translation on a binary scan open; bounded=true when a bound subject/predicate bracketed the walk to a seek, fallback=true when the selectivity guard discarded an unselective bounded product for the whole-graph cached path, cache_hit=true when the open was served from a warm whole-graph product — per-execution memo or cross-query cache — including bounded=true opens that short-circuited the seek because a warm product already existed at this epoch)
 │   ├── scan (debug)
 │   ├── join (debug)
 │   │   └── join_next_batch (debug, per iteration)
@@ -383,6 +385,24 @@ index_gc (debug, separate trace)
 ├── gc_walk_chain (debug)
 └── gc_delete_entries (debug)
 ```
+
+Once a build completes, installing the new index root into a live cached
+ledger handle emits its own spans (nested under whatever task performs the
+install — a nameservice notify, or a background-index publish event):
+
+```
+index_install (debug, ledger_id, index_t)
+├── index_install_wait (debug)
+└── index_install_lock (debug)
+```
+
+`index_install_wait` covers acquisition of the exclusive ledger-state lock —
+its duration is contention (committers hold the same lock). `index_install_lock`
+covers the section that holds the lock: novelty trim, runtime-dict reseed, and
+the store/range-provider swap, which scale with accumulated novelty. The two
+are separate spans precisely so each aggregates independently: a commit-latency
+spike attributes to lock contention or to install hold time without per-trace
+arithmetic.
 
 #### Span Tree (Bulk Import / fluree-ingest)
 

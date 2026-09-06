@@ -10,8 +10,9 @@ use fluree_db_core::{ContentId, ContentKind, StorageRead, StorageWrite};
 use fluree_db_nameservice::{
     AdminPublisher, CasResult, ConfigCasResult, ConfigLookup, ConfigPayload, ConfigPublisher,
     ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceType, IndexPublisher,
-    LedgerLifecycle, NameServiceLookup, NsLookupResult, RefKind, RefLookup, RefPublisher, RefValue,
-    StatusCasResult, StatusLookup, StatusPayload, StatusPublisher, StatusValue,
+    LedgerHeads, LedgerLifecycle, NameServiceLookup, NsLookupResult, RefKind, RefLookup,
+    RefPublisher, RefValue, StatusCasResult, StatusLookup, StatusPayload, StatusPublisher,
+    StatusValue,
 };
 use fluree_db_storage_aws::DynamoDbNameService;
 use fs2::FileExt;
@@ -548,12 +549,13 @@ async fn nameservice_ref_publisher() {
 
     let alias = "ref-test:main";
 
-    // get_ref before init → None
+    // get_ref / heads before init → None
     assert!(ns
         .get_ref(alias, RefKind::CommitHead)
         .await
         .unwrap()
         .is_none());
+    assert!(ns.heads(alias).await.unwrap().is_none());
 
     ns.init(alias).await.unwrap();
 
@@ -565,6 +567,9 @@ async fn nameservice_ref_publisher() {
         .expect("exists after init");
     assert!(ref_val.id.is_none());
     assert_eq!(ref_val.t, 0);
+    let heads = ns.heads(alias).await.unwrap().expect("exists after init");
+    assert_eq!(heads.commit, ref_val);
+    assert_eq!(heads.index, RefValue { id: None, t: 0 });
 
     // CAS: unborn → first commit
     let commit_id_1 = test_commit_id("commit:1");
@@ -642,6 +647,13 @@ async fn nameservice_ref_publisher() {
         .await
         .unwrap();
     assert!(matches!(result, CasResult::Updated));
+
+    // heads() = one projected query; must agree with lookup() and get_ref().
+    let heads = ns.heads(alias).await.unwrap().unwrap();
+    let rec = ns.lookup(alias).await.unwrap().unwrap();
+    assert_eq!(heads, LedgerHeads::from_record(&rec));
+    assert_eq!(heads.commit.id.as_ref(), Some(&commit_id_2));
+    assert_eq!(heads.index, new_idx);
 
     // ── CAS expected=None creates ledger (matches StorageNameService) ────
     let new_alias = "cas-create-test:main";

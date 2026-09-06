@@ -26,6 +26,19 @@ pub trait IriEncoder {
     }
 }
 
+// References delegate, so `&dyn IriEncoder` (and `&E`) satisfy generic
+// `E: IriEncoder` bounds — used to override the encoder at SPARQL lowering
+// time (e.g. SHACL sh:sparql lowering against a staged namespace registry).
+impl<T: IriEncoder + ?Sized> IriEncoder for &T {
+    fn encode_iri(&self, iri: &str) -> Option<Sid> {
+        (**self).encode_iri(iri)
+    }
+
+    fn encode_iri_strict(&self, iri: &str) -> Option<Sid> {
+        (**self).encode_iri_strict(iri)
+    }
+}
+
 // Native: LedgerSnapshot implements IriEncoder
 impl IriEncoder for LedgerSnapshot {
     fn encode_iri(&self, iri: &str) -> Option<Sid> {

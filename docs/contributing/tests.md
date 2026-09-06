@@ -50,7 +50,7 @@ fn test_query_workflow() {
 }
 ```
 
-#### Grouped integration binaries (`fluree-db-api`)
+#### Grouped integration binaries (`fluree-db-api`, `fluree-db-server`)
 
 Every top-level `tests/*.rs` file is a **separate test binary** that links the
 entire crate dependency graph. With ~160 integration files that meant ~160 full
@@ -86,10 +86,13 @@ binary. No new `[[test]]` entry is needed unless you are creating a new group.
 - Feature-gated suites (`credential`, `iceberg`, `aws-testcontainers`, `vector`)
   — declared with `required-features`.
 - Tests that mutate **process-global env vars** (e.g. `FLUREE_*` toggles). A
-  grouped binary runs its tests as threads in one process under plain
-  `cargo test`, so env mutation must stay in a dedicated binary to remain
-  isolated. (Under `cargo nextest`, every test already runs in its own process,
-  so this only matters for bare `cargo test`.)
+  binary runs its tests as threads in one process under plain `cargo test`, so
+  a mutating test must be **alone in its binary**: moving a whole file out of a
+  group is not enough, because the mutation still leaks to every sibling test
+  in that file. `it_sync_graph_scan_backstop` holds one test for exactly this
+  reason; the rest of the graph-sync suite stays in `grp_ledger`. (Under
+  `cargo nextest`, every test already runs in its own process, so this only
+  matters for bare `cargo test`.)
 - Tests whose **assertions are about instrumentation** — presence/absence of
   tracing events captured via a thread-local `span_capture` subscriber (e.g.
   `it_cyclic_bgp_probe`, `it_minmax_fast_path_fired`,
@@ -97,6 +100,34 @@ binary. No new `[[test]]` entry is needed unless you are creating a new group.
   callsite-interest cache is process-global and the capture is thread-local,
   so these assertions are only reliable when the test is alone in its
   process. (Same caveat as above: bites bare `cargo test` only.)
+
+`fluree-db-server` uses the same pattern and the same standalone rules, with
+harnesses named for its domains (`grp_http`, `grp_query`, `grp_proxy`,
+`grp_policy`, `grp_search`, `grp_raft`, `grp_bolt`). It has no shared
+`support/` module, so its case files are self-contained; `telemetry_test` and
+`multi_query_tracing_integration` are kept standalone under the
+instrumentation-assertion rule above.
+
+Because `autotests = false` means an unwired file silently never compiles and
+never runs — with `cargo test` still reporting success — both crates carry a
+`tests/harness_coverage.rs` that asserts every `tests/*.rs` is either declared
+as a `[[test]]` target or reachable from one through `#[path = "…"] mod x;` or
+plain `mod x;` lines. It derives reachability from `Cargo.toml` outwards rather
+than from file names, so an undeclared `grp_*.rs` is flagged as an orphan
+itself instead of being assumed to be a target. Only those two line-anchored
+forms are followed; a file included any other way is reported as an orphan
+rather than missed, and the fix is to wire it in with `#[path]`.
+
+The other two standalone rules — env mutation and instrumentation assertions —
+are **not** mechanically enforced. Detecting them means scanning Rust source for
+call shapes, which costs more in false positives and blind spots than review
+does. They are conventions; honour them when adding a test.
+
+The check lives in the `fluree-test-support` crate, so adopting it in a third
+crate is a dev-dependency plus a `tests/harness_coverage.rs` calling
+`assert_every_test_file_is_reachable(env!("CARGO_MANIFEST_DIR"))`, declared as
+its own `[[test]]` target. `env!` expands at the call site, so each crate is
+checked against its own manifest.
 
 ### Example Tests
 

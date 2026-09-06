@@ -268,6 +268,14 @@ impl Operator for ValuesOperator {
         // shape). Plain `check_cancelled` — this operator streams and retains no
         // buffer beyond the current batch, so it needs no memory-budget checkpoint.
         ctx.check_cancelled()?;
+        // Charge the join's row work here at the batch boundary (one call per
+        // input batch, not per row — hot-loop purity): each input row costs
+        // one `PER_ROW_MICRO_FUEL` unit. Without this, a VALUES joined
+        // against a large child did unbounded in-memory work while reporting
+        // floor-level fuel, invisible to `max_fuel` limits.
+        ctx.tracker.consume_fuel(
+            input_batch.len() as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
+        )?;
         let num_cols = self.schema.len();
         let child_num_cols = self.child.schema().len();
         let max_rows = input_batch.len() * self.value_rows.len();

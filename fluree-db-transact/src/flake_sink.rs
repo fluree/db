@@ -170,15 +170,7 @@ impl<'a> FlakeSink<'a> {
             return None;
         }
 
-        let meta = match (&lang, list_index) {
-            (Some(l), Some(i)) => Some(FlakeMeta {
-                lang: Some(l.clone()),
-                i: Some(i),
-            }),
-            (Some(l), None) => Some(FlakeMeta::with_lang(l)),
-            (None, Some(i)) => Some(FlakeMeta::with_index(i)),
-            (None, None) => None,
-        };
+        let meta = FlakeMeta::from_parts(lang.as_deref(), list_index);
 
         Some(Flake::new(s, p, o, dt, self.t, true, meta))
     }

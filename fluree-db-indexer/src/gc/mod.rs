@@ -43,7 +43,35 @@
 //! - `max_old_indexes`: Maximum number of old index versions to keep (default: 5)
 //! - `min_time_garbage_mins`: Minimum age before an index can be GC'd (default: 30)
 //!
-//! Both thresholds must be satisfied for GC to occur.
+//! Both thresholds must be satisfied for GC to occur, so the slower of the two
+//! wins. Under a sustained publish rate that is the age guard: a ledger
+//! publishing twice a minute holds ~60 versions inside a 30-minute guard, and
+//! `max_old_indexes = 5` then bounds nothing. Real retention becomes "however
+//! many versions fit in `min_time_garbage_mins`", which grows with publish rate
+//! and per-version size.
+//!
+//! Observed on a deployment: 79 retained versions against a target of 5, with
+//! `objects/history` at 14 GiB for a ledger whose live index was 260 MiB and
+//! whose entire commit log was 417 MiB — i.e. ~34x the dataset, all of it
+//! age-guarded garbage.
+//!
+//! ## Version Ceiling
+//!
+//! An optional third threshold overrides the age guard:
+//! - `hard_max_old_indexes`: past this many old versions, collect regardless of age
+//!
+//! It is off by default. The age guard is what keeps a query that started
+//! against an older index version from having that version's artifacts
+//! released underneath it; overriding the guard removes artifacts such a query
+//! may still need. Enabling the ceiling is therefore an operator decision that
+//! trades reader safety for a bound on the chain. Once set, the guard still
+//! governs everything inside the ceiling.
+//!
+//! A ceiling bounds the number of retained versions, not their bytes. What a
+//! retained version costs varies by orders of magnitude between ledgers (one
+//! deployment held ~7.7 GiB per version on one ledger and ~3.3 GiB on another),
+//! so size the ceiling from observed per-version bytes rather than treating it
+//! as a disk limit.
 
 pub(crate) mod collector;
 mod record;
@@ -76,6 +104,24 @@ pub struct CleanGarbageConfig {
     ///
     /// Garbage records must be at least this old before their nodes can be deleted.
     pub min_time_garbage_mins: Option<u32>,
+    /// Ceiling on retained old index versions, past which
+    /// `min_time_garbage_mins` is overridden and versions are collected
+    /// regardless of age. `None` (the default) sets no ceiling: the age guard
+    /// is always honoured.
+    ///
+    /// Exists because `max_old_indexes` and `min_time_garbage_mins` are ANDed, so
+    /// under a fast publish rate the age guard always wins and the count target
+    /// bounds nothing (see the module docs).
+    ///
+    /// Setting it trades reader safety for that bound. The guard is what keeps a
+    /// query that started against an older version from having that version's
+    /// artifacts released while it is still reading them; past the ceiling those
+    /// artifacts go regardless, and such a query fails or reads a torn version.
+    /// Set it well above the number of versions published during the longest
+    /// query the ledger serves. It bounds versions, not bytes: per-version size
+    /// varies widely between ledgers, so derive it from observed per-version
+    /// disk use.
+    pub hard_max_old_indexes: Option<u32>,
     /// Optional disk artifact cache for root and garbage-record reads.
     pub artifact_cache_dir: Option<PathBuf>,
 }
@@ -83,6 +129,10 @@ pub struct CleanGarbageConfig {
 /// Result of garbage collection
 #[derive(Debug, Clone, Default)]
 pub struct CleanGarbageResult {
+    /// Versions collected past `hard_max_old_indexes`, where the age guard was
+    /// not applied. Non-zero means a query that was still reading one of them
+    /// may have lost artifacts it needed.
+    pub age_guard_overridden: usize,
     /// Number of old index versions cleaned up
     pub indexes_cleaned: usize,
     /// Number of nodes deleted

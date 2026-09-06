@@ -80,6 +80,10 @@ struct PendingCommit {
     t: i64,
     /// Flakes in this pending commit; summed into the commit receipt.
     flake_count: usize,
+    /// Asserted flakes in this pending commit.
+    assert_count: usize,
+    /// Retracted flakes in this pending commit.
+    retract_count: usize,
 }
 
 /// Per-statement outcome of a write inside a transaction.
@@ -334,6 +338,7 @@ impl Fluree {
             ns_registry,
             txn_meta,
             graph_delta,
+            sync_graph: _,
         } = stage_result;
 
         if !view.has_staged() {
@@ -390,6 +395,8 @@ impl Fluree {
             bytes,
             t: receipt.t,
             flake_count: receipt.flake_count,
+            assert_count: receipt.assert_count,
+            retract_count: receipt.retract_count,
         });
         txn.state = next_state;
         Ok(receipt.flake_count)
@@ -431,6 +438,8 @@ impl Fluree {
                     commit_id: ContentId::new(ContentKind::Commit, &[]),
                     t: txn.base_t,
                     flake_count: 0,
+                    assert_count: 0,
+                    retract_count: 0,
                 },
                 indexing: IndexingStatus {
                     enabled: self.indexing_mode.is_enabled(),
@@ -497,7 +506,19 @@ impl Fluree {
         // Total flakes across every staged statement — the single-commit
         // accounting the transactor expects for a multi-statement transaction.
         let flake_count = txn.pending.iter().map(|p| p.flake_count).sum();
+        let assert_count = txn.pending.iter().map(|p| p.assert_count).sum();
+        let retract_count = txn.pending.iter().map(|p| p.retract_count).sum();
 
+        // No cache detach here (unlike the autocommit/branch-op flows): the
+        // dictionary `make_mut`s for this flow run per-statement at *stage*
+        // time (`pend_stage_result` → `finalize_state`), outside any lock and
+        // while the cache must stay readable for the transaction's lifetime —
+        // by publish time `txn.state` is fully built and this window does no
+        // dictionary work. The per-statement deep-clone that remains (base
+        // shared with `txn.state` itself, plus the cache for the first
+        // statement) needs owned state threading through the stage path, not
+        // a commit-window detach.
+        //
         // Capture indexing signals + tally before `txn.state` is moved into
         // finalize_commit (which triggers background reindex when needed).
         let needs_reindex = txn.state.should_reindex(&index_config);
@@ -511,6 +532,8 @@ impl Fluree {
                 commit_id,
                 t: final_t,
                 flake_count,
+                assert_count,
+                retract_count,
             },
             indexing,
             tally,

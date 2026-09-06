@@ -103,7 +103,13 @@ Controls SHACL shape validation at transaction time.
 | `f:validationMode` | IRI | `f:ValidationReject` | `f:ValidationReject` (reject invalid data) or `f:ValidationWarn` (log warning, allow) |
 | `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
 
-`f:shapesSource` is non-overridable. `f:shaclEnabled` and `f:validationMode` are overridable.
+`f:shapesSource` is non-overridable. `f:shaclEnabled` and `f:validationMode` are overridable per graph.
+
+`f:validationMode` can additionally be overridden per **transaction** via
+`opts.validationMode` (`"warn"` / `"reject"`): strengthening is always
+honored, softening only when `f:overrideControl` permits it for the
+request's verified identity. See
+[Override control](override-control.md#shacl-fshacldefaults).
 
 ### Example
 
