@@ -384,31 +384,12 @@ fn flake_bytes_per_row() -> i64 {
     })
 }
 
-/// The novelty ceiling this deployment commits against, in bytes.
-///
-/// Read from `FLUREE_REINDEX_MAX_BYTES` — the SAME variable that configures
-/// `IndexConfig::reindex_max_bytes`, which `at_max_novelty` compares novelty
-/// against (`novelty.size >= reindex_max_bytes`) — so the budget below and the
-/// wall it has to fit under cannot drift apart.
-fn novelty_ceiling_bytes() -> i64 {
-    static CACHED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("FLUREE_REINDEX_MAX_BYTES")
-            .ok()
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or_else(|| {
-                i64::try_from(crate::server_defaults::default_reindex_max_bytes())
-                    .unwrap_or(i64::MAX)
-            })
-    })
-}
-
 /// Rows a single FULL materialize read may take before checkpointing.
 ///
 /// `FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS` overrides; `0` disables the bound
-/// and restores read-it-all. Left unset it is DERIVED from the novelty ceiling,
-/// and that derivation is the whole point rather than a convenience.
+/// and restores read-it-all. Left unset it is DERIVED from `ceiling_bytes`, the
+/// novelty ceiling this process enforces, and that derivation is the whole point
+/// rather than a convenience.
 ///
 /// A bounded pass is only worth anything if it can COMMIT. A window over the
 /// ceiling is DEFERRED, and a deferral discards the window's progress, so the
@@ -422,18 +403,25 @@ fn novelty_ceiling_bytes() -> i64 {
 /// Floored at 1_000 rows so a very small ceiling still makes forward progress
 /// rather than producing a zero-row pass that reads nothing and checkpoints
 /// nowhere.
-fn materialize_max_rows_per_full_pass() -> i64 {
-    static CACHED: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        if let Some(explicit) = std::env::var("FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS")
-            .ok()
-            .and_then(|v| v.trim().parse::<i64>().ok())
-            .filter(|v| *v >= 0)
-        {
-            return explicit;
-        }
-        rows_for_ceiling(novelty_ceiling_bytes(), flake_bytes_per_row())
-    })
+///
+/// The ceiling is a PARAMETER, not an environment read. `FLUREE_REINDEX_MAX_BYTES`
+/// is only one of the ways `IndexConfig::reindex_max_bytes` gets set: the
+/// `--reindex-max-bytes` flag, the `[server.indexing]` config-file key and
+/// `FlureeBuilder::with_indexing_thresholds` all configure it without touching the
+/// environment. A budget derived from the env var alone was sized against a
+/// sysinfo default on every one of those deployments, while `at_max_novelty`
+/// enforced the operator's value — the "bound that cannot commit" all over again,
+/// with a log line claiming the two could not drift.
+fn materialize_max_rows_per_full_pass(ceiling_bytes: usize) -> i64 {
+    if let Some(explicit) = std::env::var("FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+    {
+        return explicit;
+    }
+    let ceiling = i64::try_from(ceiling_bytes).unwrap_or(i64::MAX);
+    rows_for_ceiling(ceiling, flake_bytes_per_row())
 }
 
 /// Fraction of the novelty ceiling one full pass may spend.
@@ -1173,6 +1161,16 @@ pub struct FlureeR2rmlProvider<'a> {
 }
 
 impl<'a> FlureeR2rmlProvider<'a> {
+    /// The row budget one FULL materialize pass may read before checkpointing.
+    ///
+    /// Derived from `Fluree::index_config`, the ceiling `at_max_novelty` actually
+    /// compares novelty against, however it was configured. Public so a test that
+    /// drains a real table can predict where the passes cut. See
+    /// [`materialize_max_rows_per_full_pass`] for the derivation and its override.
+    pub fn full_pass_row_budget(&self) -> i64 {
+        materialize_max_rows_per_full_pass(self.fluree.index_config.reindex_max_bytes)
+    }
+
     /// Create a new R2RML provider wrapping a Fluree instance.
     pub fn new(fluree: &'a crate::Fluree) -> Self {
         Self {
@@ -1841,7 +1839,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             // its commit: splitting inside one would leave the target holding
             // part of a commit with no snapshot to name that state, and a
             // checkpoint that cannot be named cannot be resumed from.
-            let budget_rows = materialize_max_rows_per_full_pass();
+            let budget_rows = self.full_pass_row_budget();
 
             // A stored SEQUENCE cursor takes precedence, and it is the only route
             // that recovers a watermark which has fallen out of retention. The
@@ -5470,6 +5468,31 @@ mod tests {
         assert_eq!(
             super::sequence_prefix_cut(&tasks, 0, 40),
             Some(SeqCut::Prefix(10))
+        );
+    }
+
+    /// The budget is derived from the ceiling THIS process enforces, whichever way
+    /// it was configured — not from a re-read of `FLUREE_REINDEX_MAX_BYTES`, which
+    /// only one of the configuration routes sets. (Assumes
+    /// `FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS` is unset, as it is in CI.)
+    #[tokio::test]
+    async fn the_full_pass_budget_tracks_the_configured_ceiling() {
+        let budget_at = |ceiling: usize| {
+            let fluree = crate::FlureeBuilder::memory()
+                .with_novelty_thresholds(1, ceiling)
+                .build_memory();
+            super::FlureeR2rmlProvider::new(&fluree).full_pass_row_budget()
+        };
+        let small = 8 * 1024 * 1024;
+        let large = 256 * 1024 * 1024;
+        assert_eq!(
+            budget_at(small),
+            super::rows_for_ceiling(small as i64, super::flake_bytes_per_row())
+        );
+        assert!(
+            budget_at(large) > budget_at(small),
+            "a builder-configured ceiling must move the budget; a fixed default \
+             would mean the env var is still the only route that counts"
         );
     }
 }
