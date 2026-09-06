@@ -25,7 +25,7 @@ use fluree_db_iceberg::{
         ColumnBatch, FileIcebergStorage, IcebergStorageBackend, S3IcebergStorage,
         SendIcebergStorage, SendParquetReader,
     },
-    metadata::TableMetadata,
+    metadata::{TableMetadata, WindowCap},
     scan::{
         topk::{batch_sort_values, plan_topk_read, TopKBound},
         ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner,
@@ -366,39 +366,7 @@ impl ScanChoice {
     }
 }
 
-/// How many source snapshots one unpinned materialize pass may advance through.
-///
-/// `FLUREE_MATERIALIZE_MAX_SNAPSHOTS_PER_PASS`, default 64; `0` disables the cap
-/// and restores the previous "always read to head" behaviour.
-///
-/// **Why a cap exists at all.** The materialize watermark only advances when a
-/// whole pass succeeds. A pass that cannot finish its window writes no
-/// watermark, so the next pass re-reads a window one poll wider, and so on. Once
-/// that window outgrows the source's snapshot retention the stored watermark can
-/// no longer be resolved, and every subsequent poll falls back to a full table
-/// read — which is far more expensive, so it is even less likely to finish. The
-/// failure is self-reinforcing and has no exit: the entry condition for the
-/// incremental path is exactly what was lost.
-///
-/// Observed on a 17-table deployment: one affected table became 13 of 17 in
-/// about four hours, with every table then reading its whole self on every poll.
-///
-/// A cap bounds the work per pass, so the watermark advances every time and
-/// therefore stays inside retention. 64 is deliberately generous — a source
-/// committing 37-72 snapshots an hour stays under it at any sane poll interval,
-/// so a healthy job never notices the cap, while a backlogged one drains in
-/// bounded steps instead of never.
-fn materialize_max_snapshots_per_pass() -> usize {
-    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        std::env::var("FLUREE_MATERIALIZE_MAX_SNAPSHOTS_PER_PASS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(64)
-    })
-}
-
-/// Bytes of flakes one materialized row costs, for sizing the full-read budget.
+/// Bytes of flakes one materialized row costs, for sizing the per-pass budget.
 ///
 /// `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW`, default 108 — measured on the
 /// production table this bound was tuned against. It exists only to convert the
@@ -416,10 +384,11 @@ fn flake_bytes_per_row() -> i64 {
     })
 }
 
-/// Rows a single FULL materialize read may take before checkpointing.
+/// Rows one materialize pass may take before checkpointing — a full read's
+/// commit-ordered prefix, or an incremental window's snapshot prefix.
 ///
-/// `FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS` overrides; `0` disables the bound
-/// and restores read-it-all. Left unset it is DERIVED from `ceiling_bytes`, the
+/// `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` overrides; `0` disables the bound on
+/// both paths and restores read-it-all. Left unset it is DERIVED from `ceiling_bytes`, the
 /// novelty ceiling this process enforces, and that derivation is the whole point
 /// rather than a convenience.
 ///
@@ -444,8 +413,8 @@ fn flake_bytes_per_row() -> i64 {
 /// sysinfo default on every one of those deployments, while `at_max_novelty`
 /// enforced the operator's value — the "bound that cannot commit" all over again,
 /// with a log line claiming the two could not drift.
-fn materialize_max_rows_per_full_pass(ceiling_bytes: usize) -> i64 {
-    if let Some(explicit) = std::env::var("FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS")
+fn materialize_max_rows_per_pass(ceiling_bytes: usize) -> i64 {
+    if let Some(explicit) = std::env::var("FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS")
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
         .filter(|v| *v >= 0)
@@ -456,7 +425,7 @@ fn materialize_max_rows_per_full_pass(ceiling_bytes: usize) -> i64 {
     rows_for_ceiling(ceiling, flake_bytes_per_row())
 }
 
-/// Fraction of the novelty ceiling one full pass may spend.
+/// Fraction of the novelty ceiling one pass may spend.
 ///
 /// A pass gets a QUARTER of the ceiling, not all of it, and the reason is a
 /// production failure rather than caution. Spending the whole ceiling makes the
@@ -502,7 +471,7 @@ fn rows_for_ceiling(ceiling_bytes: i64, bytes_per_row: i64) -> i64 {
 enum FullReadCut {
     /// Cut after this commit sequence; keep every task at or below it.
     Cut(i64),
-    /// The bound is switched off (`FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS=0`).
+    /// The bound is switched off (`FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS=0`).
     Disabled,
     /// The plan already fits the budget — not alarming, and not worth a warning.
     PlanFits,
@@ -1237,9 +1206,9 @@ impl<'a> FlureeR2rmlProvider<'a> {
     /// Derived from `Fluree::index_config`, the ceiling `at_max_novelty` actually
     /// compares novelty against, however it was configured. Public so a test that
     /// drains a real table can predict where the passes cut. See
-    /// [`materialize_max_rows_per_full_pass`] for the derivation and its override.
-    pub fn full_pass_row_budget(&self) -> i64 {
-        materialize_max_rows_per_full_pass(self.fluree.index_config.reindex_max_bytes)
+    /// [`materialize_max_rows_per_pass`] for the derivation and its override.
+    pub fn pass_row_budget(&self) -> i64 {
+        materialize_max_rows_per_pass(self.fluree.index_config.reindex_max_bytes)
     }
 
     /// Create a new R2RML provider wrapping a Fluree instance.
@@ -1782,6 +1751,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
         } else {
             table_name
         };
+        let pinned = to_snapshot_id.is_some();
         let to_snapshot = match to_snapshot_id {
             // A caller's pin must resolve — typed error, never fall-forward
             // (see the doc comment).
@@ -1795,41 +1765,9 @@ impl<'a> FlureeR2rmlProvider<'a> {
                         })?,
                 )
             }
-            // Unpinned: read to the source's head, but advance through a long
-            // backlog in bounded steps rather than in one unbounded pass.
-            //
-            // A materialization whose watermark cannot advance re-reads a window
-            // that grows without bound, and once that window outgrows the source's
-            // snapshot retention the watermark can never be resolved again — every
-            // later poll degrades to a full table read, with no path back. Capping
-            // the pass keeps the watermark moving, which keeps it inside retention.
-            //
-            // Capping only ever moves `to` EARLIER, so it cannot skip a snapshot:
-            // the next poll resumes from the watermark this pass wrote. On any
-            // error (expired ancestor, non-ancestor, rollback) fall through to the
-            // head unchanged — the existing full-read fallback owns that case and
-            // must keep owning it.
-            None => {
-                let cap = materialize_max_snapshots_per_pass();
-                let chosen = metadata.capped_scan_end(from_snapshot_id, cap);
-                // Log only when the cap actually bit, so a healthy job stays quiet.
-                if let (Some(chosen), Some(head)) = (chosen, metadata.current_snapshot()) {
-                    if chosen.snapshot_id != head.snapshot_id {
-                        info!(
-                            graph_source_id = %graph_source_id,
-                            table = %table_name,
-                            from_snapshot_id = ?from_snapshot_id,
-                            head_snapshot_id = head.snapshot_id,
-                            bounded_to_snapshot_id = chosen.snapshot_id,
-                            max_snapshots_per_pass = cap,
-                            "materialize: backlog exceeds the per-pass cap, advancing by a prefix"
-                        );
-                    }
-                }
-                chosen
-            }
+            None => metadata.current_snapshot(),
         };
-        let Some(to_snapshot) = to_snapshot else {
+        let Some(head_snapshot) = to_snapshot else {
             // Table has no snapshots: nothing to materialize.
             return Ok(MaterializeScan {
                 to_snapshot_id: None,
@@ -1839,16 +1777,9 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 stream: empty_batch_stream(),
             });
         };
-        let mut to_snapshot_id = to_snapshot.snapshot_id;
+        let head_snapshot_id = head_snapshot.snapshot_id;
 
-        // Schema AT the `to` snapshot (falls back to current when the snapshot
-        // carries no schema-id) — identical to current for an unpinned read.
-        let schema = metadata
-            .schema_for_snapshot(to_snapshot)
-            .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
-        let projected_field_ids = projected_field_ids(schema, projection);
-
-        let choice = ScanChoice::decide(&metadata, from_snapshot_id, to_snapshot_id);
+        let choice = ScanChoice::decide(&metadata, from_snapshot_id, head_snapshot_id);
         let incremental = choice.is_incremental();
 
         // Say WHY, at a level that matches how alarming it is. The routine
@@ -1860,14 +1791,14 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 graph_source_id = %graph_source_id,
                 table = %table_name,
                 from_snapshot_id = ?from_snapshot_id,
-                to_snapshot_id,
+                to_snapshot_id = head_snapshot_id,
                 "materialize: window contains overwrite/delete, full read required"
             ),
             ScanChoice::FullUndeterminable(reason) => warn!(
                 graph_source_id = %graph_source_id,
                 table = %table_name,
                 from_snapshot_id = ?from_snapshot_id,
-                to_snapshot_id,
+                to_snapshot_id = head_snapshot_id,
                 reason = %reason,
                 "materialize: CANNOT DETERMINE incremental safety — falling back to a FULL \
                  table read, which loads the whole table into memory. Usually means the stored \
@@ -1876,6 +1807,106 @@ impl<'a> FlureeR2rmlProvider<'a> {
                  stopped for longer than retention."
             ),
         }
+
+        let budget_rows = self.pass_row_budget();
+
+        // An UNPINNED incremental window is read in bounded steps.
+        //
+        // A pass only advances the watermark when its whole window commits, and a
+        // window whose flakes exceed the target's novelty ceiling never can: it is
+        // deferred, nothing is recorded, and the next poll re-reads a window one
+        // poll wider. Left alone, that window outgrows the source's snapshot
+        // retention, the watermark stops resolving, and every later poll is a full
+        // read of the whole table — bounded, but a drain of the entire table to
+        // recover a backlog that was a few snapshots wide. Stopping short of the
+        // head keeps the watermark moving, which keeps it inside retention, which
+        // is what keeps this path incremental at all.
+        //
+        // Only when the whole window is incremental-safe: a window with an
+        // overwrite anywhere in it full-reads the head regardless, and that read
+        // subsumes every prefix, so cutting first would only add passes. Capping
+        // only ever moves `to` EARLIER, never later, so no snapshot is skipped —
+        // the next poll resumes from the watermark this pass writes. A pinned
+        // read is a point-in-time consumer's and is read exactly as asked.
+        let to_snapshot = if !pinned && incremental {
+            match metadata.cap_window_by_rows(from_snapshot_id, head_snapshot_id, budget_rows) {
+                Ok(WindowCap::Capped(id)) => {
+                    let capped = metadata.snapshot(id).ok_or_else(|| {
+                        QueryError::Internal(format!(
+                            "capped window end {id} is not a snapshot of the table"
+                        ))
+                    })?;
+                    info!(
+                        graph_source_id = %graph_source_id,
+                        table = %table_name,
+                        from_snapshot_id = ?from_snapshot_id,
+                        head_snapshot_id,
+                        to_snapshot_id = id,
+                        budget_rows,
+                        "materialize: backlog exceeds the per-pass budget; reading a prefix of \
+                         it and checkpointing short of the head"
+                    );
+                    capped
+                }
+                Ok(WindowCap::Whole) => head_snapshot,
+                // Neither decline is alarming on its own — the pass may still commit,
+                // and if it cannot, the deferral says so loudly — but a bound that
+                // quietly fails to engage is indistinguishable from one that did. Say
+                // which reason it was.
+                Ok(WindowCap::Unsized(id)) => {
+                    info!(
+                        graph_source_id = %graph_source_id,
+                        table = %table_name,
+                        from_snapshot_id = ?from_snapshot_id,
+                        to_snapshot_id = head_snapshot_id,
+                        unsized_snapshot_id = id,
+                        budget_rows,
+                        "materialize: incremental window could not be bounded — a snapshot \
+                         carries no added-records summary, so the window cannot be sized; \
+                         reading it whole"
+                    );
+                    head_snapshot
+                }
+                Ok(WindowCap::SingleCommit) => {
+                    info!(
+                        graph_source_id = %graph_source_id,
+                        table = %table_name,
+                        from_snapshot_id = ?from_snapshot_id,
+                        to_snapshot_id = head_snapshot_id,
+                        budget_rows,
+                        "materialize: incremental window is a single commit over the per-pass \
+                         budget, with no boundary short of the head; reading it whole. If it \
+                         cannot commit under the novelty ceiling this repeats every poll"
+                    );
+                    head_snapshot
+                }
+                // `ScanChoice::decide` walked this exact window a moment ago and found
+                // it incremental-safe, so an unwalkable window here can only mean the
+                // metadata changed underneath us. Read to the head, as before.
+                Err(e) => {
+                    warn!(
+                        graph_source_id = %graph_source_id,
+                        table = %table_name,
+                        from_snapshot_id = ?from_snapshot_id,
+                        to_snapshot_id = head_snapshot_id,
+                        error = %e,
+                        "materialize: could not size the incremental window; reading it whole"
+                    );
+                    head_snapshot
+                }
+            }
+        } else {
+            head_snapshot
+        };
+        let mut to_snapshot_id = to_snapshot.snapshot_id;
+
+        // Schema AT the `to` snapshot (falls back to current when the snapshot
+        // carries no schema-id) — identical to current for an uncapped, unpinned
+        // read.
+        let schema = metadata
+            .schema_for_snapshot(to_snapshot)
+            .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
+        let projected_field_ids = projected_field_ids(schema, projection);
 
         let scan_config = ScanConfig::new().with_projection(projected_field_ids);
         let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
@@ -1942,8 +1973,6 @@ impl<'a> FlureeR2rmlProvider<'a> {
             // its commit: splitting inside one would leave the target holding
             // part of a commit with no snapshot to name that state, and a
             // checkpoint that cannot be named cannot be resumed from.
-            let budget_rows = self.full_pass_row_budget();
-
             // A stored SEQUENCE cursor takes precedence, and it is the only route
             // that recovers a watermark which has fallen out of retention. The
             // snapshot-checkpoint route below has to name a RETAINED snapshot for
@@ -2080,7 +2109,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
         // source ended up full-reading 739k rows on every poll.
         let window_age_ms = from_snapshot_id
             .and_then(|from| metadata.snapshot(from).map(|s| s.timestamp_ms))
-            .map(|from_ms| to_snapshot.timestamp_ms.saturating_sub(from_ms));
+            .map(|from_ms| head_snapshot.timestamp_ms.saturating_sub(from_ms));
 
         let stream = self.stream_scan_tasks(&storage, tasks);
         Ok(MaterializeScan {
@@ -5599,14 +5628,14 @@ mod tests {
     /// The budget is derived from the ceiling THIS process enforces, whichever way
     /// it was configured — not from a re-read of `FLUREE_REINDEX_MAX_BYTES`, which
     /// only one of the configuration routes sets. (Assumes
-    /// `FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS` is unset, as it is in CI.)
+    /// `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` is unset, as it is in CI.)
     #[tokio::test]
-    async fn the_full_pass_budget_tracks_the_configured_ceiling() {
+    async fn the_pass_budget_tracks_the_configured_ceiling() {
         let budget_at = |ceiling: usize| {
             let fluree = crate::FlureeBuilder::memory()
                 .with_novelty_thresholds(1, ceiling)
                 .build_memory();
-            super::FlureeR2rmlProvider::new(&fluree).full_pass_row_budget()
+            super::FlureeR2rmlProvider::new(&fluree).pass_row_budget()
         };
         let small = 8 * 1024 * 1024;
         let large = 256 * 1024 * 1024;

@@ -10,5 +10,5 @@ mod table;
 pub use snapshot::{select_snapshot, Snapshot, SnapshotSelection};
 pub use table::{
     PartitionField, PartitionSpec, Schema, SchemaField, SnapshotLogEntry, SortField, SortOrder,
-    TableMetadata,
+    TableMetadata, WindowCap,
 };

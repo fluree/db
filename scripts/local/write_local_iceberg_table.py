@@ -6,6 +6,10 @@
   materialize source is in once its watermark has fallen out of the source
   table's snapshot retention: a full read is forced, and no retained
   snapshot names an early enough checkpoint.
+- `silver.people_window`: the same five 600-row appends with every snapshot
+  RETAINED. This is the shape of a healthy source that got ahead of its
+  materialize job: the watermark still resolves, so the window is read
+  incrementally, and it is too large to commit in one pass.
 """
 import shutil, sys
 from pathlib import Path
@@ -91,3 +95,24 @@ for sid in expired:
     for f in meta_dir.glob(f"snap-{sid}-*.avro"):
         f.unlink()
         print("removed", f.name)
+
+# ---------------------------------------------------------------------------
+# silver.people_window: the same commits, nothing expired.
+# ---------------------------------------------------------------------------
+window = catalog.create_table("silver.people_window", schema=schema)
+for c in range(COMMITS):
+    lo = c * ROWS_PER_COMMIT + 1
+    ids = list(range(lo, lo + ROWS_PER_COMMIT))
+    window.append(pa.table({
+        "id": pa.array(ids, pa.int64()),
+        "name": pa.array([f"person-{i:04d}" for i in ids]),
+        "score": pa.array([float(i % 100) for i in ids], pa.float64()),
+        "active": pa.array([i % 2 == 0 for i in ids]),
+    }))
+
+window = catalog.load_table("silver.people_window")
+print("window table_location:", window.location())
+print("window snapshots:", [
+    (s.snapshot_id, s.sequence_number, s.parent_snapshot_id, s.summary.get("added-records"))
+    for s in sorted(window.snapshots(), key=lambda s: s.sequence_number)
+])
