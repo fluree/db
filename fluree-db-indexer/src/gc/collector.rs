@@ -963,39 +963,43 @@ mod tests {
         assert!(store.has(&cid3).await.unwrap());
     }
 
-    /// Does repeated publish-then-GC leave root objects behind?
+    /// Directory prefix under which this store writes index roots, taken from a
+    /// real derived address so it cannot drift from the write path.
     ///
-    /// This reproduces the shape of a live deployment rather than a single GC call:
-    /// publish a generation, run GC, repeat. On a real cluster the root COUNT ON
-    /// DISK grew without bound (one ledger reached 190 root files) while GC
-    /// reported `chain_len=22` on every pass, with publishes tracking 1:1 and zero
-    /// release failures — so roots were escaping GC's view before it could collect
-    /// them. If that is a defect in the truncation loop, it must show up here.
-    ///
-    /// The assertion is deliberately generous: retention is 2, so a correct
-    /// implementation settles at ~3 roots, and anything under 10 after 40
-    /// generations proves boundedness. A linear grower reaches ~40.
-    #[tokio::test]
-    async fn repeated_publish_then_gc_keeps_root_count_bounded() {
-        const GENERATIONS: usize = 40;
-        const MAX_OLD: u32 = 2;
+    /// An earlier version of the harness below listed
+    /// `"test:main/main/index/roots/"`, which never matched the stored
+    /// `fluree:memory://test/main/index/roots/…` addresses: every generation
+    /// counted zero roots and every bound held vacuously, with GC deleted
+    /// outright. The harness now refuses a zero count.
+    fn roots_prefix() -> String {
+        let (_, addr) = cid_and_addr(ContentKind::IndexRoot, b"prefix-probe");
+        let dir_end = addr.rfind('/').expect("root address has a directory") + 1;
+        addr[..dir_end].to_string()
+    }
 
+    /// Publish `generations` index versions, running GC after each exactly as
+    /// the orchestrator does, and return how many root objects the store holds
+    /// after every generation.
+    ///
+    /// Each generation's garbage record is stamped `garbage_ts()` and names one
+    /// superseded leaf, which is what a real build records.
+    async fn publish_then_gc(
+        generations: usize,
+        garbage_ts: impl Fn() -> i64,
+        config: CleanGarbageConfig,
+    ) -> Vec<usize> {
         let storage = MemoryStorage::new();
         let store = test_store(&storage);
-        // Well past any age guard, so this isolates the truncation loop rather
-        // than re-testing the age check.
-        let old_ts = current_timestamp_ms() - (24 * 60 * 60 * 1000);
+        let prefix = roots_prefix();
 
         let mut prev: Option<(i64, ContentId)> = None;
-        let mut counts = Vec::new();
+        let mut counts = Vec::with_capacity(generations);
 
-        for gen in 1..=GENERATIONS {
+        for gen in 1..=generations {
             let t = gen as i64;
             let (root_cid, root_addr) =
                 cid_and_addr(ContentKind::IndexRoot, format!("root{gen}").as_bytes());
 
-            // Each generation supersedes an artifact of its predecessor, which is
-            // what a real build records.
             let garbage_ref = if prev.is_some() {
                 let (g_cid, g_addr) =
                     cid_and_addr(ContentKind::GarbageRecord, format!("garb{gen}").as_bytes());
@@ -1005,8 +1009,9 @@ mod tests {
                     .write_bytes(&dead_addr, b"superseded")
                     .await
                     .unwrap();
+                let ts = garbage_ts();
                 let body = format!(
-                    r#"{{"ledger_id": "{LEDGER}", "t": {t}, "garbage": ["{dead_cid}"], "created_at_ms": {old_ts}}}"#
+                    r#"{{"ledger_id": "{LEDGER}", "t": {t}, "garbage": ["{dead_cid}"], "created_at_ms": {ts}}}"#
                 );
                 storage.write_bytes(&g_addr, body.as_bytes()).await.unwrap();
                 Some(BinaryGarbageRef { id: g_cid })
@@ -1024,142 +1029,104 @@ mod tests {
             );
             storage.write_bytes(&root_addr, &bytes).await.unwrap();
 
-            // Exactly what the orchestrator does after a successful publish.
-            clean_garbage(
-                &store,
-                &root_cid,
-                CleanGarbageConfig {
-                    max_old_indexes: Some(MAX_OLD),
-                    min_time_garbage_mins: Some(0),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-            let roots = storage
-                .list_prefix(&format!("{LEDGER}/main/index/roots/"))
+            clean_garbage(&store, &root_cid, config.clone())
                 .await
-                .map(|v| v.len())
-                .unwrap_or(0);
+                .unwrap();
+
+            let roots = storage.list_prefix(&prefix).await.unwrap().len();
+            // The current root is always present, so zero means the harness is
+            // not observing the store at all — see `roots_prefix`.
+            assert!(
+                roots >= 1,
+                "generation {gen}: no roots observed under {prefix}"
+            );
             counts.push(roots);
             prev = Some((t, root_cid));
         }
+        counts
+    }
 
-        let final_roots = *counts.last().unwrap();
+    fn every_fifth(counts: &[usize]) -> Vec<(usize, usize)> {
+        counts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 5 == 4)
+            .map(|(i, c)| (i + 1, *c))
+            .collect()
+    }
+
+    /// Baseline: with no age guard in play, repeated publish-then-GC settles at
+    /// exactly `1 + max_old_indexes` roots. This passes on `main` too — it pins
+    /// the truncation loop, not the ceiling — and gives the two tests below a
+    /// known-good shape to differ from. Deleting GC fails it at 40 roots.
+    #[tokio::test]
+    async fn repeated_publish_then_gc_keeps_root_count_bounded() {
+        const GENERATIONS: usize = 40;
+        const MAX_OLD: u32 = 2;
+        // A day old: past any age guard.
+        let old_ts = current_timestamp_ms() - (24 * 60 * 60 * 1000);
+
+        let counts = publish_then_gc(
+            GENERATIONS,
+            || old_ts,
+            CleanGarbageConfig {
+                max_old_indexes: Some(MAX_OLD),
+                min_time_garbage_mins: Some(0),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let keep_count = 1 + MAX_OLD as usize;
+        assert_eq!(
+            *counts.last().unwrap(),
+            keep_count,
+            "roots should settle at 1 + max_old_indexes; every 5th generation: {:?}",
+            every_fifth(&counts)
+        );
         assert!(
-            final_roots < 10,
-            "root objects on disk grew with generations — GC is leaving roots behind.\n\
-             retention={MAX_OLD} (so ~{expected} expected), after {GENERATIONS} generations: {final_roots}\n\
-             counts every 5th generation: {sample:?}",
-            expected = MAX_OLD + 1,
-            sample = counts
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| i % 5 == 4)
-                .map(|(i, c)| (i + 1, *c))
-                .collect::<Vec<_>>(),
+            counts.iter().all(|&c| c <= keep_count),
+            "roots must never exceed the retention target once GC runs; \
+             every 5th generation: {:?}",
+            every_fifth(&counts)
         );
     }
 
-    /// The same loop, but with production's parameters: a REAL age guard and
-    /// FRESH garbage records.
-    ///
-    /// This is the variant that matters. The test above sets
-    /// `min_time_garbage_mins: 0`, so nothing is age-protected and the loop runs
-    /// all the way down to the retention target. In production the guard is 30
-    /// minutes and every recent generation is inside it, so the loop stops at the
-    /// hard ceiling — a completely different exit path, and the one a live cluster
-    /// actually takes (`chain_len=22` on every pass, ceiling firing, roots on disk
-    /// still climbing to 190).
-    ///
-    /// With retention 2 the ceiling is `1 + 2*4 = 9`, so a correct implementation
-    /// still bounds root objects at roughly that. Unbounded growth here is the
-    /// production defect, reproduced.
+    /// The same regime with a ceiling set: past it the age guard is overridden,
+    /// so roots stay at exactly `1 + hard_max_old_indexes` instead of growing
+    /// with every publish. This is the defect the ceiling exists for,
+    /// reproduced. Removing the override — which is what `main` does — fails it
+    /// with all 40 roots retained; deleting GC fails it the same way.
     #[tokio::test]
     async fn repeated_publish_then_gc_bounded_with_a_live_age_guard() {
         const GENERATIONS: usize = 40;
         const MAX_OLD: u32 = 2;
-        // 1 + MAX_OLD * DEFAULT_HARD_MAX_MULTIPLE
-        let hard_keep = 1 + MAX_OLD * super::super::DEFAULT_HARD_MAX_MULTIPLE;
+        const HARD_MAX_OLD: u32 = 8;
 
-        let storage = MemoryStorage::new();
-        let store = test_store(&storage);
+        let counts = publish_then_gc(
+            GENERATIONS,
+            current_timestamp_ms,
+            CleanGarbageConfig {
+                max_old_indexes: Some(MAX_OLD),
+                min_time_garbage_mins: Some(30),
+                hard_max_old_indexes: Some(HARD_MAX_OLD),
+                ..Default::default()
+            },
+        )
+        .await;
 
-        let mut prev: Option<(i64, ContentId)> = None;
-        let mut counts = Vec::new();
-
-        for gen in 1..=GENERATIONS {
-            let t = gen as i64;
-            let (root_cid, root_addr) =
-                cid_and_addr(ContentKind::IndexRoot, format!("aroot{gen}").as_bytes());
-
-            let garbage_ref = if prev.is_some() {
-                let (g_cid, g_addr) =
-                    cid_and_addr(ContentKind::GarbageRecord, format!("agarb{gen}").as_bytes());
-                let (dead_cid, dead_addr) =
-                    cid_and_addr(ContentKind::IndexLeaf, format!("aleaf{gen}").as_bytes());
-                storage
-                    .write_bytes(&dead_addr, b"superseded")
-                    .await
-                    .unwrap();
-                // FRESH: every record is inside the 30-minute guard, exactly as on a
-                // ledger publishing every few seconds.
-                let fresh_ts = current_timestamp_ms();
-                let body = format!(
-                    r#"{{"ledger_id": "{LEDGER}", "t": {t}, "garbage": ["{dead_cid}"], "created_at_ms": {fresh_ts}}}"#
-                );
-                storage.write_bytes(&g_addr, body.as_bytes()).await.unwrap();
-                Some(BinaryGarbageRef { id: g_cid })
-            } else {
-                None
-            };
-
-            let bytes = minimal_fir6(
-                t,
-                prev.as_ref().map(|(pt, pid)| BinaryPrevIndexRef {
-                    t: *pt,
-                    id: pid.clone(),
-                }),
-                garbage_ref,
-            );
-            storage.write_bytes(&root_addr, &bytes).await.unwrap();
-
-            clean_garbage(
-                &store,
-                &root_cid,
-                CleanGarbageConfig {
-                    max_old_indexes: Some(MAX_OLD),
-                    min_time_garbage_mins: Some(30),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-            counts.push(
-                storage
-                    .list_prefix(&format!("{LEDGER}/main/index/roots/"))
-                    .await
-                    .map(|v| v.len())
-                    .unwrap_or(0),
-            );
-            prev = Some((t, root_cid));
-        }
-
-        let final_roots = *counts.last().unwrap();
+        let hard_keep = 1 + HARD_MAX_OLD as usize;
+        assert_eq!(
+            *counts.last().unwrap(),
+            hard_keep,
+            "roots must be pinned at the ceiling under a live age guard; \
+             every 5th generation: {:?}",
+            every_fifth(&counts)
+        );
         assert!(
-            final_roots <= (hard_keep as usize) + 2,
-            "root objects on disk are UNBOUNDED under a live age guard.\n\
-             retention={MAX_OLD}, ceiling={hard_keep} (so ~{hard_keep} expected), \
-             after {GENERATIONS} generations: {final_roots}\n\
-             counts every 5th generation: {sample:?}",
-            sample = counts
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| i % 5 == 4)
-                .map(|(i, c)| (i + 1, *c))
-                .collect::<Vec<_>>(),
+            counts.iter().all(|&c| c <= hard_keep),
+            "roots must never exceed the ceiling; every 5th generation: {:?}",
+            every_fifth(&counts)
         );
     }
 
