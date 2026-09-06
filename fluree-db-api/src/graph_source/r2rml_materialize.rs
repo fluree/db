@@ -92,6 +92,14 @@ const WATERMARK_SUBJECT_PREFIX: &str = "urn:fluree:materialize-state:";
 /// Predicate holding the last materialized source snapshot id (stored as a
 /// string to preserve full i64 precision for 19-digit snapshot ids).
 const WATERMARK_SNAPSHOT_PRED: &str = "urn:fluree:materialize#lastSnapshotId";
+/// The resumable SEQUENCE cursor, written when a pass covered only a prefix.
+///
+/// Additive on purpose: `lastSnapshotId` keeps its meaning and its readers, so a
+/// deployment can roll back to an image without this and lose only the resumability,
+/// not its watermarks. A sequence is stored alongside rather than instead of the
+/// snapshot because the snapshot is still the fast path — the cursor only matters
+/// once the snapshot stops resolving.
+const WATERMARK_SEQUENCE_PRED: &str = "urn:fluree:materialize#appliedSequence";
 /// Predicate recording which source the watermark belongs to (informational).
 const WATERMARK_SOURCE_PRED: &str = "urn:fluree:materialize#source";
 /// Predicate recording which target-spec (ledger id or template) the watermark
@@ -99,6 +107,36 @@ const WATERMARK_SOURCE_PRED: &str = "urn:fluree:materialize#source";
 const WATERMARK_TARGET_PRED: &str = "urn:fluree:materialize#target";
 /// Predicate recording which source table the watermark belongs to.
 const WATERMARK_TABLE_PRED: &str = "urn:fluree:materialize#table";
+
+/// Subject-IRI prefix for a per-(source, RESOLVED target, table) applied marker.
+///
+/// Distinct from [`WATERMARK_SUBJECT_PREFIX`] because the two are keyed on
+/// different things and must never collide: the watermark is keyed on the target
+/// SPEC (one per job, `silver_{tenant}_{user}:main`), this on the RESOLVED ledger
+/// (`silver_acme_u1:main`). For a non-templated job those strings are equal, so a
+/// shared prefix would put both on the same subject.
+const APPLIED_SUBJECT_PREFIX: &str = "urn:fluree:materialize-applied:";
+/// Predicate holding the snapshot id a single resolved target has fully applied
+/// (string-encoded, like the watermark, to preserve i64 precision).
+///
+/// WHY THIS EXISTS. The watermark is shared across every target a templated job
+/// fans into, and it may not advance while ANY target is behind — otherwise the
+/// laggards would skip that window permanently. Correct, but it means the targets
+/// that DID commit earn no credit: the next poll re-reads the window and
+/// re-commits all of them, forever, for as long as one target cannot fit.
+///
+/// Measured in production: 19 of 23 targets committing and 4 deferring on every
+/// poll, unchanged across 22 consecutive polls, so 19 targets were rewritten every
+/// ~4 minutes for 13.7 h. The re-commits are idempotent but not free — they are
+/// writes, and they filled a 100 GiB volume to ENOSPC, which is unrecoverable
+/// because GC needs to write in order to reclaim.
+///
+/// This marker records what each resolved target has already applied, so a target
+/// that is caught up is SKIPPED rather than rewritten. It deliberately does not
+/// touch the scan window: the shared watermark still chooses it, so the source read
+/// is unchanged and there is no risk of starting a scan after rows a newly-created
+/// target still needs.
+const APPLIED_SNAPSHOT_PRED: &str = "urn:fluree:materialize#appliedSnapshotId";
 
 /// Subject-IRI prefix for a persisted tracking job. The full subject is
 /// `{PREFIX}{source}:{target-spec}`, matching the worker's own
@@ -213,6 +251,7 @@ pub trait MaterializeSource: Send + Sync {
         graph_source_id: &str,
         table_name: &str,
         from_snapshot_id: Option<i64>,
+        from_sequence: Option<i64>,
     ) -> Result<MaterializeScan>;
 }
 
@@ -236,11 +275,19 @@ impl MaterializeSource for FlureeR2rmlProvider<'_> {
         graph_source_id: &str,
         table_name: &str,
         from_snapshot_id: Option<i64>,
+        from_sequence: Option<i64>,
     ) -> Result<MaterializeScan> {
         Ok(self
             // `to = None`: the sync-to-head worker always reads to the source's
             // current snapshot; explicit pins are for point-in-time consumers.
-            .scan_for_materialize_stream(graph_source_id, table_name, &[], from_snapshot_id, None)
+            .scan_for_materialize_stream(
+                graph_source_id,
+                table_name,
+                &[],
+                from_snapshot_id,
+                None,
+                from_sequence,
+            )
             .await?)
     }
 }
@@ -382,8 +429,7 @@ impl Fluree {
         // Set when at least one table's window has aged past the refresh bound, so a
         // no-data poll must still persist its watermark to keep it resolvable.
         let mut watermark_refresh_due = false;
-        // (table, from-snapshot, advanced to-snapshot) per source table.
-        let mut table_watermarks: Vec<(String, Option<i64>, i64)> = Vec::new();
+        let mut table_watermarks: Vec<TableWindow> = Vec::new();
 
         for (table_name, tms) in &tables {
             let from_t = if force_full {
@@ -397,6 +443,21 @@ impl Fluree {
                 )
                 .await?
             };
+            // The SEQUENCE cursor, when a previous pass stopped short. It is what
+            // makes a full read resumable on a table whose snapshot history has been
+            // expired away: a snapshot id stops resolving, a commit sequence does
+            // not. `force_full` deliberately ignores it — an explicit full refresh
+            // means "start over", so honouring a cursor would silently narrow it —
+            // but still reads it, so the complete pass that follows retires it.
+            let stored_seq = self
+                .materialize_sequence_cursor(
+                    MATERIALIZE_STATE_LEDGER,
+                    source_graph_source_id,
+                    target_ledger_id,
+                    table_name,
+                )
+                .await?;
+            let from_seq = if force_full { None } else { stored_seq };
 
             // STREAM the scan; do not collect it. A full read is mandatory whenever
             // the snapshot window contains overwrite/delete, so on some sources this
@@ -413,9 +474,12 @@ impl Fluree {
             // and more predictable term than the raw columnar data, but it is not
             // O(1) — a window with millions of distinct subjects is still large.
             let scan = provider
-                .scan_window(source_graph_source_id, table_name, from_t)
+                .scan_window(source_graph_source_id, table_name, from_t, from_seq)
                 .await?;
             let (to_id, incremental) = (scan.to_snapshot_id, scan.incremental);
+            // `Some` => this pass covers only a PREFIX, so the snapshot watermark
+            // must not advance; see `MaterializeScan::to_sequence`.
+            let to_seq = scan.to_sequence;
             // A window older than the refresh bound must persist its watermark even
             // with zero rows — see `watermark_refresh_bound_ms`.
             if scan
@@ -436,7 +500,13 @@ impl Fluree {
             if let Some(to) = to_id {
                 any_table = true;
                 incremental_all = incremental_all && incremental;
-                table_watermarks.push(((*table_name).to_string(), from_t, to));
+                table_watermarks.push(TableWindow {
+                    table: (*table_name).to_string(),
+                    from: from_t,
+                    to,
+                    to_sequence: to_seq,
+                    had_cursor: stored_seq.is_some(),
+                });
             }
 
             while let Some(batch) = batch_stream.next().await {
@@ -532,7 +602,7 @@ impl Fluree {
         // Surface from/to on the result only for a single-table mapping (one
         // materialized table); multi-table watermarks live per-table in the ledger.
         let (from_snapshot_id, to_snapshot_id) = if table_watermarks.len() == 1 {
-            (table_watermarks[0].1, Some(table_watermarks[0].2))
+            (table_watermarks[0].from, Some(table_watermarks[0].to))
         } else {
             (None, None)
         };
@@ -646,8 +716,39 @@ impl Fluree {
         let mut ok_targets = 0usize;
         let mut deferred: Vec<(String, usize)> = Vec::new();
         let mut failed: Vec<(String, ApiError)> = Vec::new();
+        let mut skipped_targets = 0usize;
+        let mut newly_applied: Vec<String> = Vec::new();
+
+        // What each resolved target has already applied. Read once per pass, not per
+        // target. `force_full` ignores the markers for the same reason it ignores the
+        // watermark: the caller is asking for a rebuild, not a resume.
+        let applied = if force_full {
+            std::collections::HashMap::new()
+        } else {
+            self.materialize_applied_markers(MATERIALIZE_STATE_LEDGER, source_graph_source_id)
+                .await
+                .unwrap_or_else(|e| {
+                    // Non-fatal: an unreadable marker set costs the skip, not the pass.
+                    // Failing here would turn a state-ledger hiccup into a stalled job,
+                    // and re-applying is idempotent.
+                    warn!(
+                        source = %source_graph_source_id,
+                        error = %e,
+                        "materialize: could not read applied markers; re-applying every target"
+                    );
+                    std::collections::HashMap::new()
+                })
+        };
 
         for (target, (live, deletions)) in by_target {
+            // Already has this whole window. Skipping is what stops a job whose
+            // watermark cannot advance from rewriting its healthy targets on every
+            // poll — the amplification that filled a 100 GiB volume.
+            if target_is_caught_up(&applied, &target, &table_watermarks) {
+                skipped_targets += 1;
+                ok_targets += 1;
+                continue;
+            }
             match self
                 .materialize_one_target(&target, live, deletions, latest_by_key, txn_budget)
                 .await
@@ -655,6 +756,7 @@ impl Fluree {
                 Ok(retracted) => {
                     subjects_retracted += retracted;
                     ok_targets += 1;
+                    newly_applied.push(target);
                 }
                 // Deferral is not failure — it is backpressure on THIS target only.
                 Err(ApiError::NoveltyDeferred { remaining }) => {
@@ -678,13 +780,69 @@ impl Fluree {
             deferred: deferred.len(),
             failed: failed.len(),
         };
+        // Report skips on EVERY pass, not only an incomplete one.
+        //
+        // An all-skip pass is `is_complete()`, so it would otherwise be the ONE outcome
+        // that prints nothing whatsoever — and that is precisely the shape a
+        // wrongly-skipped target takes. `all_skipped` is the specific alarm: nothing was
+        // written this pass, yet the watermark is about to advance. That is legitimate
+        // for a genuinely idle window and a data-loss signature otherwise, so it has to
+        // be visible either way rather than inferred by diffing a target ledger's `t`.
+        if skipped_targets > 0 {
+            info!(
+                source = %source_graph_source_id,
+                targets_skipped = skipped_targets,
+                targets_ok = tally.ok,
+                all_skipped = skipped_targets == tally.ok && tally.is_complete(),
+                "materialize: targets already held this window; nothing written for them"
+            );
+        }
         if !tally.is_complete() {
             info!(
                 targets_ok = tally.ok,
                 targets_deferred = tally.deferred,
                 targets_failed = tally.failed,
+                targets_skipped = skipped_targets,
                 "materialize: partial window"
             );
+        }
+
+        // Record what just landed, BEFORE the partial-window returns below.
+        //
+        // The ordering is the whole point. A job whose watermark can never advance is
+        // exactly the job that needs these markers, and both early returns sit between
+        // here and the watermark write — so putting this after them would record
+        // progress only for jobs that never needed it.
+        //
+        // After the data commits, never before: a crash in the gap re-applies the
+        // window, which is idempotent, whereas a marker written first would skip rows
+        // that were never committed. Same argument as the watermark, one target down.
+        //
+        // Non-fatal, exactly as the marker READ above is, and for the same reason: a
+        // marker that fails to land costs one redundant re-apply on the next poll and
+        // nothing else, so it must not be able to fail the pass.
+        //
+        // Here it would cost more than the pass. This write sits BETWEEN the target
+        // loop and the failed/deferred returns, so propagating its error would surface
+        // a state-ledger error INSTEAD of `MaterializePartial { tally, detail }` —
+        // discarding the per-target tally and the identity of the target that actually
+        // failed. And the condition most likely to fail this write is the one this
+        // module most needs to report: at ENOSPC, the incident these markers exist to
+        // prevent, every state-ledger write fails, so an operator would get a bare disk
+        // error where the useful signal is "target X failed: No space left on device".
+        if !newly_applied.is_empty() && !table_watermarks.is_empty() {
+            if let Err(e) = self
+                .write_applied_markers(source_graph_source_id, &newly_applied, &table_watermarks)
+                .await
+            {
+                warn!(
+                    source = %source_graph_source_id,
+                    targets = newly_applied.len(),
+                    error = %e,
+                    "materialize: could not record applied markers; \
+                     those targets will be re-applied next poll"
+                );
+            }
         }
 
         // The watermark is still SHARED across targets (per-target watermarks are the
@@ -728,8 +886,14 @@ impl Fluree {
             let state = self.materialize_state_ledger().await?;
             let watermark_nodes: Vec<JsonValue> = table_watermarks
                 .iter()
-                .map(|(table, _from, to)| {
-                    watermark_node(source_graph_source_id, target_ledger_id, table, *to)
+                .map(|w| {
+                    watermark_node(
+                        source_graph_source_id,
+                        target_ledger_id,
+                        &w.table,
+                        w.to,
+                        w.to_sequence,
+                    )
                 })
                 .collect();
             // Through the backpressure helper, not a bare upsert. This write is
@@ -737,13 +901,41 @@ impl Fluree {
             // poll redoes all of it — the most expensive possible place to give up
             // on a transient novelty condition. One chunk: the watermark nodes are
             // a handful of small records, so this is purely about the retry.
-            self.transact_chunks_with_backpressure(
-                state,
-                vec![watermark_nodes],
-                |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
-                ChunkVerb::Upsert,
-            )
-            .await?;
+            let state = self
+                .transact_chunks_with_backpressure(
+                    state,
+                    vec![watermark_nodes],
+                    |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
+                    ChunkVerb::Upsert,
+                )
+                .await?;
+
+            // A COMPLETE pass retires the cursor a partial one left behind. The
+            // upsert above is per predicate, and a complete node carries no cursor,
+            // so without this the cursor would simply linger — and a stale cursor
+            // is not inert: it narrows every later full read to "above this
+            // sequence", which is right for this table and silently wrong the day
+            // the source is re-pointed at one whose sequences start over.
+            //
+            // AFTER the watermark, never before. A crash between the two leaves a
+            // cursor the next full read still honours, and honouring it is
+            // correct: everything at or below it is exactly what this pass applied.
+            // The other order would leave a complete pass with neither, and the
+            // next poll would start the drain from nothing.
+            let retired: Vec<String> = table_watermarks
+                .iter()
+                .filter(|w| w.had_cursor && !w.is_partial())
+                .map(|w| watermark_subject(source_graph_source_id, target_ledger_id, &w.table))
+                .collect();
+            if !retired.is_empty() {
+                self.transact_chunks_with_backpressure(
+                    state,
+                    vec![retired],
+                    |c: &[String]| retire_cursor_doc(c),
+                    ChunkVerb::Update,
+                )
+                .await?;
+            }
         }
 
         Ok(MaterializeResult {
@@ -792,6 +984,166 @@ impl Fluree {
             .to_jsonld(&db.snapshot)
             .map_err(|e| ApiError::Internal(format!("Failed to format watermark query: {e}")))?;
         Ok(extract_first_i64(&json))
+    }
+
+    /// The stored SEQUENCE cursor for one (source, target, table), if any.
+    ///
+    /// Mirrors [`Self::materialize_watermark`] but reads
+    /// [`WATERMARK_SEQUENCE_PRED`]. Absent means "no pass has stopped short", which
+    /// is both the first-run state and the steady state — a healthy job never writes
+    /// one, so its absence must read as "no constraint", never as zero. Zero would be
+    /// a cursor at the very beginning of history and would silently narrow every
+    /// subsequent read to "everything after the start", which is a different query.
+    pub async fn materialize_sequence_cursor(
+        &self,
+        state_ledger_id: &str,
+        source_graph_source_id: &str,
+        target_spec: &str,
+        table_name: &str,
+    ) -> Result<Option<i64>> {
+        if !self.ledger_exists(state_ledger_id).await? {
+            return Ok(None);
+        }
+        let db = self.db(state_ledger_id).await?;
+
+        let subject = watermark_subject(source_graph_source_id, target_spec, table_name);
+        let mut where_obj = Map::new();
+        where_obj.insert("@id".to_string(), JsonValue::String(subject));
+        where_obj.insert(
+            WATERMARK_SEQUENCE_PRED.to_string(),
+            JsonValue::String("?v".to_string()),
+        );
+        let query = json!({ "select": ["?v"], "where": JsonValue::Object(where_obj) });
+
+        let result = self.query(&db, &query).await?;
+        let json = result.to_jsonld(&db.snapshot).map_err(|e| {
+            ApiError::Internal(format!("Failed to format sequence-cursor query: {e}"))
+        })?;
+        Ok(extract_first_i64(&json))
+    }
+
+    /// Every resolved target's applied marker for one source, as
+    /// `(target, table) -> applied snapshot id`.
+    ///
+    /// ONE query for the whole job, not one per target: a templated job fans into as
+    /// many ledgers as it has (tenant,user) pairs — 23 here, unbounded in principle —
+    /// and a per-target read would put that many round trips in front of every poll.
+    ///
+    /// An empty map is the correct answer for a state ledger written before this
+    /// existed, and it makes the first poll behave exactly as it did before: nothing
+    /// is skipped, everything is applied, and the markers are written on the way out.
+    ///
+    /// GROWTH. This set is unbounded in a way the watermark deliberately is not. The
+    /// watermark is keyed on the target SPEC, so a templated job keeps one row per
+    /// source table no matter how wide it fans; a marker is keyed on the RESOLVED
+    /// ledger, so the set grows with the fan-out and every poll reads all of it.
+    /// Nothing evicts a marker when a target ledger is retired, so a job that cycles
+    /// through `(tenant, user)` pairs accumulates rows it will never read usefully
+    /// again. Immaterial at the 23 targets this was built for; revisit before a fan-out
+    /// large enough that the per-poll read is a cost of its own.
+    async fn materialize_applied_markers(
+        &self,
+        state_ledger_id: &str,
+        source_graph_source_id: &str,
+    ) -> Result<std::collections::HashMap<(String, String), i64>> {
+        let mut out = std::collections::HashMap::new();
+        if !self.ledger_exists(state_ledger_id).await? {
+            return Ok(out);
+        }
+        let db = self.db(state_ledger_id).await?;
+
+        let mut where_obj = Map::new();
+        where_obj.insert("@id".to_string(), JsonValue::String("?s".to_string()));
+        where_obj.insert(
+            WATERMARK_SOURCE_PRED.to_string(),
+            JsonValue::String(source_graph_source_id.to_string()),
+        );
+        where_obj.insert(
+            WATERMARK_TARGET_PRED.to_string(),
+            JsonValue::String("?target".to_string()),
+        );
+        where_obj.insert(
+            WATERMARK_TABLE_PRED.to_string(),
+            JsonValue::String("?table".to_string()),
+        );
+        // Binding the applied predicate is also what EXCLUDES watermark subjects:
+        // they carry the same source/target/table triple but never this predicate.
+        where_obj.insert(
+            APPLIED_SNAPSHOT_PRED.to_string(),
+            JsonValue::String("?applied".to_string()),
+        );
+        let query = json!({
+            "select": ["?target", "?table", "?applied"],
+            "where": JsonValue::Object(where_obj),
+        });
+
+        let result = self.query(&db, &query).await?;
+        let json = result.to_jsonld(&db.snapshot).map_err(|e| {
+            ApiError::Internal(format!("Failed to format applied-marker query: {e}"))
+        })?;
+        if let Some(rows) = json.as_array() {
+            for row in rows {
+                let Some(cols) = row.as_array() else { continue };
+                let (Some(t), Some(tbl), Some(a)) = (cols.first(), cols.get(1), cols.get(2)) else {
+                    continue;
+                };
+                let (Some(t), Some(tbl)) = (t.as_str(), tbl.as_str()) else {
+                    continue;
+                };
+                // String-encoded on write; tolerate a numeric literal rather than
+                // dropping the marker, since dropping it silently re-enables the
+                // rewrite this exists to prevent.
+                let applied = a
+                    .as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .or_else(|| a.as_i64());
+                if let Some(applied) = applied {
+                    out.insert((t.to_string(), tbl.to_string()), applied);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Record that `targets` have fully applied this window, one marker per
+    /// (source, resolved target, table).
+    ///
+    /// Errors are the caller's to swallow — see the call site for why this must not
+    /// fail a pass.
+    async fn write_applied_markers(
+        &self,
+        source_graph_source_id: &str,
+        targets: &[String],
+        table_watermarks: &[TableWindow],
+    ) -> Result<()> {
+        // A PARTIAL window earns no marker: the marker says "this target holds
+        // snapshot `to`", and after a prefix pass it does not. Writing one anyway
+        // would make the next pass — which re-presents the same `to` with a cursor —
+        // skip the target for the rest of the drain.
+        let nodes: Vec<JsonValue> = targets
+            .iter()
+            .flat_map(|target| {
+                table_watermarks
+                    .iter()
+                    .filter(|w| !w.is_partial())
+                    .map(move |w| applied_node(source_graph_source_id, target, &w.table, w.to))
+            })
+            .collect();
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        let state = self.materialize_state_ledger().await?;
+        // Through the backpressure helper for the same reason the watermark write is:
+        // giving up on a transient novelty condition would discard the knowledge of a
+        // window that DID commit, and the next poll would rewrite it.
+        self.transact_chunks_with_backpressure(
+            state,
+            vec![nodes],
+            |c: &[JsonValue]| JsonValue::Array(c.to_vec()),
+            ChunkVerb::Upsert,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Open the shared materialization-state ledger, creating it if absent.
@@ -900,6 +1252,156 @@ fn watermark_subject(source_graph_source_id: &str, target_spec: &str, table_name
     )
 }
 
+/// The per-(source, RESOLVED target, table) applied-marker subject IRI. Same
+/// injective escaping as [`watermark_subject`], different prefix — see
+/// [`APPLIED_SUBJECT_PREFIX`] for why they must not share one.
+fn applied_subject(
+    source_graph_source_id: &str,
+    resolved_target: &str,
+    table_name: &str,
+) -> String {
+    fn esc(s: &str) -> String {
+        s.replace('%', "%25").replace(':', "%3A")
+    }
+    format!(
+        "{APPLIED_SUBJECT_PREFIX}{}:{}:{}",
+        esc(source_graph_source_id),
+        esc(resolved_target),
+        esc(table_name)
+    )
+}
+
+/// Build an applied-marker JSON-LD node for one resolved target and table.
+fn applied_node(
+    source_graph_source_id: &str,
+    resolved_target: &str,
+    table_name: &str,
+    applied_snapshot_id: i64,
+) -> JsonValue {
+    let mut node = Map::new();
+    node.insert(
+        "@id".to_string(),
+        JsonValue::String(applied_subject(
+            source_graph_source_id,
+            resolved_target,
+            table_name,
+        )),
+    );
+    node.insert(
+        APPLIED_SNAPSHOT_PRED.to_string(),
+        JsonValue::String(applied_snapshot_id.to_string()),
+    );
+    node.insert(
+        WATERMARK_SOURCE_PRED.to_string(),
+        JsonValue::String(source_graph_source_id.to_string()),
+    );
+    node.insert(
+        WATERMARK_TARGET_PRED.to_string(),
+        JsonValue::String(resolved_target.to_string()),
+    );
+    node.insert(
+        WATERMARK_TABLE_PRED.to_string(),
+        JsonValue::String(table_name.to_string()),
+    );
+    JsonValue::Object(node)
+}
+
+/// Is this target caught up on every table in the window?
+///
+/// `true` only when EVERY table's `to` is already covered. A target that has
+/// applied one table of a two-table window still has work, so it must not be
+/// skipped — that is the difference between skipping a no-op and silently dropping
+/// half a window.
+///
+/// # Why this is `==` and must not become an inequality
+///
+/// `applied` and `to` are Iceberg **snapshot ids**, and the spec assigns those
+/// randomly: there is no ordering between two snapshot ids, not even between a
+/// snapshot and its own parent. `a >= to` therefore compares two unrelated random
+/// i64s and calls the answer "has this target already applied the window".
+///
+/// That comparison makes the marker a one-way ratchet. It is only rewritten when a
+/// window's `to` happens to compare greater, so it climbs the running maximum of a
+/// random sequence and then exceeds every later draw permanently — after roughly
+/// `ln(n)` windows a target stops being written to at all. Measured on a 17-source
+/// deployment: every marker had ratcheted to between 8.19e18 and 9.22e18 against an
+/// `i64::MAX` of 9.223e18, so all 17 were skipped on every poll, each skip was
+/// counted as an ok target, and the watermark advanced past data that was never
+/// applied. About 80% of the entities in the source lakehouse were discarded.
+///
+/// Equality is what the question actually asks, and it fully covers the case this
+/// skip exists for: a job whose watermark cannot advance re-presents the SAME `to`
+/// on every poll, so equality matches and the skip fires.
+///
+/// The two cases an inequality was reaching for both survive equality:
+///
+/// - A re-poll of an older snapshot: equality declines to skip, so the target
+///   re-applies. Re-application is idempotent, so the cost is repeated work, never
+///   corruption — strictly safer than skipping data that was never applied.
+/// - A window that moved backwards after a forced full: moot, because `force_full`
+///   discards the markers before the target loop runs.
+///
+/// If "at or beyond" is ever genuinely needed it requires a quantity that IS
+/// ordered — the Iceberg **sequence number**, which increases by one per commit —
+/// which means storing the sequence alongside the snapshot id in the marker. Do not
+/// reintroduce an inequality over snapshot ids.
+fn target_is_caught_up(
+    applied: &std::collections::HashMap<(String, String), i64>,
+    target: &str,
+    table_watermarks: &[TableWindow],
+) -> bool {
+    // A partial window is never "held": the target has a prefix of it, and the
+    // marker — if one existed from an earlier complete pass at this `to` — would
+    // describe a state the target no longer matches once the drain restarted.
+    !table_watermarks.is_empty()
+        && table_watermarks.iter().all(|w| {
+            !w.is_partial()
+                && applied
+                    .get(&(target.to_string(), w.table.clone()))
+                    .is_some_and(|a| *a == w.to)
+        })
+}
+
+/// One source table's window in a pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableWindow {
+    table: String,
+    /// The snapshot watermark the scan started from; `None` on a first run or a
+    /// forced full.
+    from: Option<i64>,
+    /// The snapshot the scan resolved as its end.
+    to: i64,
+    /// `Some` when the pass covers only a PREFIX of the window, up to this commit
+    /// sequence. Such a pass persists the cursor instead of the snapshot, earns no
+    /// applied marker, and never counts a target as caught up.
+    to_sequence: Option<i64>,
+    /// Whether a cursor was stored when the pass began, so a complete pass knows
+    /// there is one to retire.
+    had_cursor: bool,
+}
+
+impl TableWindow {
+    fn is_partial(&self) -> bool {
+        self.to_sequence.is_some()
+    }
+}
+
+/// Retract the sequence cursor from each watermark subject in `subjects`.
+///
+/// `values`-driven like [`build_retract_doc`], and scoped to the ONE predicate: the
+/// snapshot watermark on the same subject was just written and must survive.
+fn retire_cursor_doc(subjects: &[String]) -> JsonValue {
+    let rows: Vec<JsonValue> = subjects
+        .iter()
+        .map(|iri| JsonValue::Array(vec![json!({ "@type": "@id", "@value": iri })]))
+        .collect();
+    json!({
+        "values": ["?s", rows],
+        "where": { "@id": "?s", WATERMARK_SEQUENCE_PRED: "?seq" },
+        "delete": { "@id": "?s", WATERMARK_SEQUENCE_PRED: "?seq" }
+    })
+}
+
 /// Build the watermark JSON-LD node (`@id` + last snapshot id + source + target +
 /// table). The snapshot id is stored as a string to preserve full i64 precision;
 /// `upsert` retracts-then-asserts so the watermark advances cleanly in place.
@@ -908,6 +1410,7 @@ fn watermark_node(
     target_spec: &str,
     table_name: &str,
     to_snapshot_id: i64,
+    to_sequence: Option<i64>,
 ) -> JsonValue {
     let mut node = Map::new();
     node.insert(
@@ -918,10 +1421,25 @@ fn watermark_node(
             table_name,
         )),
     );
-    node.insert(
-        WATERMARK_SNAPSHOT_PRED.to_string(),
-        JsonValue::String(to_snapshot_id.to_string()),
-    );
+    // A PARTIAL pass must not advance the snapshot. Writing `to` while the target
+    // holds only a prefix would claim rows that were never applied and the next
+    // scan would start after them — the applied-marker ratchet, which discarded
+    // ~80 % of a deployment's entities. So a prefix writes the resumable SEQUENCE
+    // instead, and the snapshot stays exactly where it was.
+    match to_sequence {
+        Some(seq) => {
+            node.insert(
+                WATERMARK_SEQUENCE_PRED.to_string(),
+                JsonValue::String(seq.to_string()),
+            );
+        }
+        None => {
+            node.insert(
+                WATERMARK_SNAPSHOT_PRED.to_string(),
+                JsonValue::String(to_snapshot_id.to_string()),
+            );
+        }
+    }
     node.insert(
         WATERMARK_SOURCE_PRED.to_string(),
         JsonValue::String(source_graph_source_id.to_string()),
@@ -2663,6 +3181,27 @@ mod tests {
         );
     }
 
+    /// A PARTIAL pass must write the sequence cursor and must NOT advance the
+    /// snapshot. Advancing it while the target holds only a prefix claims rows that
+    /// were never applied and makes the next scan start after them — the
+    /// applied-marker ratchet that discarded ~80 % of a deployment's entities. This
+    /// is the assertion that stops that from being reintroduced.
+    #[test]
+    fn a_partial_pass_writes_the_cursor_and_never_advances_the_snapshot() {
+        let node = watermark_node(
+            "people:main",
+            "silver:main",
+            "demo.actors",
+            5_648_190_075_564_901_028,
+            Some(4_242),
+        );
+        assert_eq!(node[WATERMARK_SEQUENCE_PRED], json!("4242"));
+        assert!(
+            node.get(WATERMARK_SNAPSHOT_PRED).is_none(),
+            "a prefix pass must not advance the snapshot watermark"
+        );
+    }
+
     #[test]
     fn watermark_node_is_per_job_and_string_encoded() {
         let node = watermark_node(
@@ -2670,6 +3209,7 @@ mod tests {
             "silver:main",
             "demo.actors",
             5_648_190_075_564_901_028,
+            None,
         );
         // Every segment's ':' is escaped (%3A) so the (source, target, table)
         // encoding is injective.
@@ -2680,8 +3220,203 @@ mod tests {
         // String-encoded to preserve full i64 precision.
         assert_eq!(node[WATERMARK_SNAPSHOT_PRED], json!("5648190075564901028"));
         assert_eq!(node[WATERMARK_SOURCE_PRED], json!("people:main"));
+        // A COMPLETE pass writes no sequence cursor.
+        assert!(node.get(WATERMARK_SEQUENCE_PRED).is_none());
         assert_eq!(node[WATERMARK_TARGET_PRED], json!("silver:main"));
         assert_eq!(node[WATERMARK_TABLE_PRED], json!("demo.actors"));
+    }
+
+    /// Helper: build an applied-marker map the way a pass would read it.
+    #[cfg(test)]
+    fn applied_map(
+        entries: &[(&str, &str, i64)],
+    ) -> std::collections::HashMap<(String, String), i64> {
+        entries
+            .iter()
+            .map(|(target, table, a)| ((target.to_string(), table.to_string()), *a))
+            .collect()
+    }
+
+    /// Helper: a COMPLETE window for `table`, as a pass that read it whole records it.
+    fn window(table: &str, from: Option<i64>, to: i64) -> TableWindow {
+        TableWindow {
+            table: table.to_string(),
+            from,
+            to,
+            to_sequence: None,
+            had_cursor: false,
+        }
+    }
+
+    /// A partial window is never "held", whatever the markers say. The target has a
+    /// prefix of it, and a marker at this `to` from an earlier complete pass describes
+    /// a state the target stopped matching when the drain restarted. Skipping here
+    /// would skip the rest of the drain.
+    #[test]
+    fn a_partial_window_is_never_caught_up() {
+        let applied = applied_map(&[("x:main", "t", 20)]);
+        let mut w = window("t", None, 20);
+        assert!(target_is_caught_up(
+            &applied,
+            "x:main",
+            std::slice::from_ref(&w)
+        ));
+        w.to_sequence = Some(4);
+        assert!(!target_is_caught_up(
+            &applied,
+            "x:main",
+            std::slice::from_ref(&w)
+        ));
+    }
+
+    /// Retiring the cursor must not take the snapshot watermark with it — the two
+    /// share a subject, and the snapshot was written one transaction earlier.
+    #[test]
+    fn retire_cursor_doc_deletes_only_the_cursor() {
+        let doc = retire_cursor_doc(&["urn:x".to_string()]);
+        assert_eq!(
+            doc["delete"],
+            json!({ "@id": "?s", WATERMARK_SEQUENCE_PRED: "?seq" })
+        );
+        assert_eq!(doc["values"][1].as_array().map(Vec::len), Some(1));
+        assert!(
+            !doc.to_string().contains(WATERMARK_SNAPSHOT_PRED),
+            "the snapshot predicate must not appear anywhere in the retraction: {doc}"
+        );
+    }
+
+    /// The case this whole change exists for: a job whose watermark cannot advance
+    /// must still skip the targets that already have the window.
+    #[test]
+    fn a_target_that_applied_the_window_is_caught_up() {
+        let tw = vec![window("silver.observation", Some(10), 20)];
+        let applied = applied_map(&[("silver_acme_u1:main", "silver.observation", 20)]);
+        assert!(target_is_caught_up(&applied, "silver_acme_u1:main", &tw));
+        // A target the markers say nothing about must NOT be skipped.
+        assert!(!target_is_caught_up(&applied, "silver_acme_u2:main", &tw));
+    }
+
+    /// `==`, and only `==`. A marker that merely DIFFERS from this window's `to` — in
+    /// either numeric direction — has not applied this window.
+    #[test]
+    fn only_an_applied_marker_equal_to_the_window_counts_as_caught_up() {
+        let tw = vec![window("t", None, 20)];
+        assert!(target_is_caught_up(
+            &applied_map(&[("x:main", "t", 20)]),
+            "x:main",
+            &tw
+        ));
+        assert!(
+            !target_is_caught_up(&applied_map(&[("x:main", "t", 21)]), "x:main", &tw),
+            "a marker numerically above `to` is a DIFFERENT snapshot, not a later one"
+        );
+        assert!(!target_is_caught_up(
+            &applied_map(&[("x:main", "t", 19)]),
+            "x:main",
+            &tw
+        ));
+    }
+
+    /// Snapshot ids are random, so an applied marker can be numerically far larger
+    /// than a snapshot committed long after it. Skipping on `>=` therefore ratchets:
+    /// the marker climbs the running maximum of a random sequence and then exceeds
+    /// every later draw permanently, and the target is never written to again.
+    ///
+    /// These are real values from a deployment where that happened — all 17 markers
+    /// had reached 8.19e18–9.22e18 against an `i64::MAX` of 9.223e18, every target was
+    /// skipped on every poll, and the watermark advanced past data that was never
+    /// applied. Each `to` below is a genuinely LATER commit than the marker beside it,
+    /// despite being numerically smaller.
+    ///
+    /// Small sequence-shaped fixtures cannot catch this — an ordered fixture will
+    /// ratify an ordering comparison — which is why these are the production numbers.
+    #[test]
+    fn a_marker_numerically_above_a_later_snapshot_is_not_caught_up() {
+        // (table, ratcheted applied marker, the genuinely later snapshot it skipped)
+        let observed = [
+            (
+                "silver.place",
+                9_220_834_252_869_770_488i64,
+                5_644_295_785_472_712_989i64,
+            ),
+            (
+                "silver.observation",
+                9_217_340_116_954_323_563,
+                3_238_671_374_642_079_740,
+            ),
+            (
+                "silver.concept_scheme",
+                9_086_429_568_298_186_029,
+                753_340_878_885_049_461,
+            ),
+            (
+                "silver.concept",
+                9_052_937_455_619_636_065,
+                1_349_575_232_631_351_152,
+            ),
+            (
+                "silver.link",
+                9_196_238_952_972_422_466,
+                9_139_397_570_598_290_786,
+            ),
+        ];
+        for (table, marker, later_to) in observed {
+            assert!(
+                marker > later_to,
+                "{table}: this fixture is only meaningful while the marker is \
+                 numerically larger than the later snapshot — that is the whole trap"
+            );
+            let tw = vec![window(table, None, later_to)];
+            assert!(
+                !target_is_caught_up(
+                    &applied_map(&[("silver_acme_u1:main", table, marker)]),
+                    "silver_acme_u1:main",
+                    &tw
+                ),
+                "{table}: marker {marker} is a different snapshot from {later_to}, not \
+                 a later one — skipping here is what discarded the window"
+            );
+        }
+    }
+
+    /// ALL tables, not any. A target that applied one table of a two-table window
+    /// still owes the other one, and skipping it there would drop half a window
+    /// silently — the one bug in this change that would lose data rather than repeat
+    /// work.
+    #[test]
+    fn a_target_behind_on_any_table_is_not_caught_up() {
+        let tw = vec![window("t_a", None, 20), window("t_b", None, 30)];
+        let both = applied_map(&[("x:main", "t_a", 20), ("x:main", "t_b", 30)]);
+        assert!(target_is_caught_up(&both, "x:main", &tw));
+        let only_a = applied_map(&[("x:main", "t_a", 20)]);
+        assert!(!target_is_caught_up(&only_a, "x:main", &tw));
+        let a_ok_b_behind = applied_map(&[("x:main", "t_a", 20), ("x:main", "t_b", 29)]);
+        assert!(!target_is_caught_up(&a_ok_b_behind, "x:main", &tw));
+    }
+
+    /// An empty window must never mark anything caught up. `all()` over an empty
+    /// slice is vacuously true, so without the guard a source with no snapshots yet
+    /// would skip every target forever and materialize nothing.
+    #[test]
+    fn an_empty_window_leaves_every_target_not_caught_up() {
+        let applied = applied_map(&[("x:main", "t", 99)]);
+        assert!(!target_is_caught_up(&applied, "x:main", &[]));
+    }
+
+    /// The markers key on the RESOLVED target, and must not collide with the
+    /// spec-keyed watermark subject — which they would if both used one prefix, since
+    /// for a non-templated job spec == resolved.
+    #[test]
+    fn applied_and_watermark_subjects_never_collide() {
+        let w = watermark_subject("src:main", "silver:main", "t");
+        let a = applied_subject("src:main", "silver:main", "t");
+        assert_ne!(w, a);
+        assert!(a.starts_with(APPLIED_SUBJECT_PREFIX));
+        // Injective in the resolved target, like the watermark is in the spec.
+        assert_ne!(
+            applied_subject("s", "silver_a:main_b", "t"),
+            applied_subject("s", "silver_a:main", "b:t")
+        );
     }
 
     #[test]
@@ -2962,7 +3697,21 @@ mod engine_tests {
         /// `None` means "first run / watermark unresolvable", which C3 treats as
         /// persist-regardless. Default to a FRESH window so tests opt in to staleness.
         window_age_ms: Option<i64>,
+        /// What the next scan reports as `to_sequence` — `Some` makes it a PARTIAL
+        /// pass. A mutex so a test can script a drain across several passes.
+        to_sequence: std::sync::Mutex<Option<i64>>,
+        /// `(from_snapshot, from_sequence)` handed to each scan, in order: the
+        /// engine's side of the state-ledger round trip, observable from a test.
+        windows: std::sync::Mutex<Vec<(Option<i64>, Option<i64>)>>,
         scans: std::sync::atomic::AtomicUsize,
+        /// Re-present the same batches on every scan instead of draining them.
+        ///
+        /// Draining is the right default — it catches a fixture that gets pulled twice
+        /// when it should be pulled once. But it cannot model the case this module's
+        /// applied markers exist for: a window that is re-read because the shared
+        /// watermark could not advance. That needs the SAME rows and the SAME
+        /// `to_snapshot_id` presented again.
+        repeat: bool,
     }
 
     impl FakeSource {
@@ -2974,11 +3723,26 @@ mod engine_tests {
                 order_by: None,
                 to_snapshot_id: Some(7),
                 window_age_ms: Some(0),
+                to_sequence: std::sync::Mutex::new(None),
+                windows: std::sync::Mutex::new(Vec::new()),
                 scans: std::sync::atomic::AtomicUsize::new(0),
+                repeat: false,
             }
+        }
+        /// Same window on every scan — see [`FakeSource::repeat`].
+        fn repeating(mut self) -> Self {
+            self.repeat = true;
+            self
         }
         fn scans(&self) -> usize {
             self.scans.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        /// Make the NEXT scan a partial pass ending at `seq`, or complete for `None`.
+        fn set_to_sequence(&self, seq: Option<i64>) {
+            *self.to_sequence.lock().unwrap() = seq;
+        }
+        fn windows(&self) -> Vec<(Option<i64>, Option<i64>)> {
+            self.windows.lock().unwrap().clone()
         }
     }
 
@@ -2997,14 +3761,21 @@ mod engine_tests {
             &self,
             _gs: &str,
             _table: &str,
-            _from: Option<i64>,
+            from: Option<i64>,
+            from_sequence: Option<i64>,
         ) -> Result<MaterializeScan> {
             self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let taken: Vec<ColumnBatch> = std::mem::take(&mut *self.batches.lock().unwrap());
+            self.windows.lock().unwrap().push((from, from_sequence));
+            let taken: Vec<ColumnBatch> = if self.repeat {
+                self.batches.lock().unwrap().clone()
+            } else {
+                std::mem::take(&mut *self.batches.lock().unwrap())
+            };
             Ok(MaterializeScan {
                 to_snapshot_id: self.to_snapshot_id,
                 incremental: false,
                 window_age_ms: self.window_age_ms,
+                to_sequence: *self.to_sequence.lock().unwrap(),
                 stream: Box::pin(futures::stream::iter(taken.into_iter().map(Ok))),
             })
         }
@@ -3114,6 +3885,169 @@ mod engine_tests {
                 "still no rows — only the watermark moved"
             );
         }
+    }
+
+    /// The amplification this module's applied markers exist to stop, end to end.
+    ///
+    /// A re-presented window — same rows, same `to_snapshot_id`, which is exactly what
+    /// a job whose shared watermark cannot advance sees on every poll — must not
+    /// rewrite the targets that already have it.
+    ///
+    /// The assertion is each target ledger's `t`, and the choice matters. Reading the
+    /// DATA proves nothing, because re-application is idempotent and leaves it
+    /// identical either way. `subjects_upserted` proves nothing either — it is
+    /// `live.len()`, the subjects the accumulator PREPARED, counted before the target
+    /// loop runs, so it reads 3 whether or not a single commit happened. `t` only
+    /// advances on an actual commit, so it is the one observable that separates
+    /// "skipped" from "rewritten to the same value".
+    #[tokio::test]
+    async fn a_re_presented_window_does_not_rewrite_targets_that_already_applied_it() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(
+            people_mapping(),
+            vec![batch(&[
+                ("id", &["1", "2", "3"]),
+                ("name", &["alice", "bob", "carol"]),
+                ("tenant", &["acme", "acme", "globex"]),
+            ])],
+        )
+        .repeating();
+
+        let first = fluree
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("first pass");
+        assert_eq!(first.tally.ok, 2, "two tenants => two target ledgers");
+
+        let targets = ["people_acme:main", "people_globex:main"];
+        let mut t_after_first = Vec::new();
+        for id in targets {
+            t_after_first.push(fluree.ledger(id).await.expect("target ledger").t());
+        }
+        assert!(
+            t_after_first.iter().all(|t| *t > 0),
+            "first pass must actually commit or the second proves nothing: {t_after_first:?}"
+        );
+
+        let second = fluree
+            .materialize_from_source(
+                &src,
+                "people:main",
+                "people_{tenant}:main",
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("second pass");
+
+        assert_eq!(
+            src.scans(),
+            2,
+            "the window really was re-read, not short-circuited"
+        );
+        for (id, before) in targets.iter().zip(&t_after_first) {
+            let after = fluree.ledger(id).await.expect("target ledger").t();
+            assert_eq!(
+                after, *before,
+                "{id} already applied this window; a second commit means the rewrite is back"
+            );
+        }
+        assert_eq!(
+            second.tally.ok, 2,
+            "a skipped target still counts as ok — it HAS the window; reporting it as \
+             anything else would read as a regression in the tally"
+        );
+        assert_eq!(
+            second.tally.deferred + second.tally.failed,
+            0,
+            "skipping is not deferral and not failure"
+        );
+    }
+
+    /// The state-ledger half of a bounded full read, through the real ledger: a partial
+    /// pass persists a SEQUENCE cursor and no snapshot; the next pass is handed that
+    /// cursor; a complete pass advances the snapshot and retires the cursor; the pass
+    /// after that resumes from the snapshot with no cursor at all.
+    ///
+    /// The source is a fake, so this pins the ENGINE's side of the loop — what it
+    /// reads, what it hands the scan, what it writes — independently of Iceberg. The
+    /// Iceberg side, cutting a real plan and resuming above the cut, is
+    /// `it_iceberg_local_fs::an_expired_history_table_drains_in_bounded_passes`.
+    #[tokio::test]
+    async fn a_partial_pass_hands_its_cursor_to_the_next_and_a_complete_pass_retires_it() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = FakeSource::new(
+            people_mapping(),
+            vec![batch(&[("id", &["1", "2"]), ("name", &["alice", "bob"])])],
+        )
+        .repeating();
+        let (gs, target, table) = ("people:main", "people_native:main", "people");
+        let state = |f: &Fluree| {
+            let f = f.clone();
+            async move {
+                (
+                    f.materialize_watermark(MATERIALIZE_STATE_LEDGER, gs, target, table)
+                        .await
+                        .expect("read watermark"),
+                    f.materialize_sequence_cursor(MATERIALIZE_STATE_LEDGER, gs, target, table)
+                        .await
+                        .expect("read cursor"),
+                    f.materialize_applied_markers(MATERIALIZE_STATE_LEDGER, gs)
+                        .await
+                        .expect("read markers")
+                        .len(),
+                )
+            }
+        };
+        let src = &src;
+        let run = |f: &Fluree| {
+            let f = f.clone();
+            async move {
+                f.materialize_from_source(src, gs, target, false, None, None)
+                    .await
+                    .expect("materialize pass")
+            }
+        };
+
+        // Pass 1: partial. The cursor lands, the snapshot does not, and — because the
+        // target holds only a prefix — no applied marker is earned either.
+        src.set_to_sequence(Some(2));
+        let first = run(&fluree).await;
+        assert!(first.committed, "a partial pass with rows still commits");
+        assert_eq!(state(&fluree).await, (None, Some(2), 0));
+
+        // Pass 2: still partial, and it must be handed the cursor pass 1 wrote.
+        src.set_to_sequence(Some(4));
+        run(&fluree).await;
+        assert_eq!(state(&fluree).await, (None, Some(4), 0));
+
+        // Pass 3: complete. The snapshot advances, the cursor is retired, the marker
+        // is earned.
+        src.set_to_sequence(None);
+        run(&fluree).await;
+        assert_eq!(state(&fluree).await, (Some(7), None, 1));
+
+        // Pass 4: steady state — from the snapshot, with no cursor.
+        run(&fluree).await;
+
+        assert_eq!(
+            src.windows(),
+            vec![
+                (None, None),
+                (None, Some(2)),
+                (None, Some(4)),
+                (Some(7), None)
+            ],
+            "each scan must be handed exactly what the previous pass persisted"
+        );
     }
 
     /// A templated target fans out: one scan, N target ledgers, each its own commit

@@ -120,6 +120,42 @@ impl<T: MergeSource, F: Fn(&RunRecordV2, &RunRecordV2) -> Ordering> KWayMerge<T,
         Ok(Some((winner, winner_op)))
     }
 
+    /// Dequeue the next record, collapsing equal-identity asserts (import).
+    ///
+    /// Bulk import writes only asserts, so repeated identities are duplicate
+    /// input statements rather than lifecycle events: the earliest `t` wins
+    /// (a fact is present from its first assertion; later copies re-assert
+    /// an already-present fact) and each collapsed copy increments `dropped`.
+    /// A retract — which the import path never produces, but the spool wire
+    /// format can round-trip — is passed through verbatim, never collapsed,
+    /// so the caller's `op == 0` guard sees exactly what `next_record()`
+    /// would have shown it.
+    pub fn next_unique_assert(
+        &mut self,
+        dropped: &mut u64,
+    ) -> io::Result<Option<(RunRecordV2, u8)>> {
+        let (mut winner, winner_op) = match self.next_record()? {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
+        if winner_op == 0 {
+            return Ok(Some((winner, winner_op)));
+        }
+
+        while let Some(entry) = self.heap.first() {
+            if entry.op == 0 || !same_identity_v2(&winner, &entry.record) {
+                break;
+            }
+            let (dup, _) = self.next_record()?.unwrap();
+            if dup.t < winner.t {
+                winner.t = dup.t;
+            }
+            *dropped += 1;
+        }
+
+        Ok(Some((winner, winner_op)))
+    }
+
     /// Dequeue the next record with deduplication.
     ///
     /// When multiple records share the same identity, keeps the one with
@@ -337,6 +373,74 @@ mod tests {
         assert_eq!(winner.t, 5);
         assert_eq!(op, 1); // winner's op
         assert!(merge.next_deduped().unwrap().is_none());
+    }
+
+    #[test]
+    fn unique_assert_collapses_duplicates_min_t_wins() {
+        // Same identity in three streams at t=3, t=1, t=5 → one record, t=1.
+        let s1 = VecSource::new(vec![make_rec(1, 1, 10, 3)]);
+        let s2 = VecSource::new(vec![make_rec(1, 1, 10, 1)]);
+        let s3 = VecSource::new(vec![make_rec(1, 1, 10, 5)]);
+
+        let mut merge = KWayMerge::new(vec![s1, s2, s3], cmp_v2_spot).unwrap();
+        let mut dropped = 0u64;
+        let (winner, op) = merge.next_unique_assert(&mut dropped).unwrap().unwrap();
+        assert_eq!(winner.t, 1, "earliest assertion wins");
+        assert_eq!(op, 1);
+        assert_eq!(dropped, 2);
+        assert!(merge.next_unique_assert(&mut dropped).unwrap().is_none());
+        assert_eq!(dropped, 2);
+    }
+
+    #[test]
+    fn unique_assert_passes_distinct_records_through() {
+        let s1 = VecSource::new(vec![make_rec(1, 1, 10, 1), make_rec(2, 1, 20, 1)]);
+        let s2 = VecSource::new(vec![make_rec(1, 2, 10, 1)]);
+
+        let mut merge = KWayMerge::new(vec![s1, s2], cmp_v2_spot).unwrap();
+        let mut dropped = 0u64;
+        let mut seen = Vec::new();
+        while let Some((rec, _)) = merge.next_unique_assert(&mut dropped).unwrap() {
+            seen.push((rec.s_id.as_u64(), rec.p_id));
+        }
+        assert_eq!(seen, vec![(1, 1), (1, 2), (2, 1)]);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn unique_assert_does_not_collapse_across_o_i() {
+        // Same (s, p, o) at two list positions is two facts.
+        let mut r1 = make_rec(1, 1, 10, 1);
+        r1.o_i = 0;
+        let mut r2 = make_rec(1, 1, 10, 1);
+        r2.o_i = 1;
+        let mut recs = vec![r1, r2];
+        recs.sort_by(cmp_v2_spot);
+
+        let s = VecSource::new(recs);
+        let mut merge = KWayMerge::new(vec![s], cmp_v2_spot).unwrap();
+        let mut dropped = 0u64;
+        assert!(merge.next_unique_assert(&mut dropped).unwrap().is_some());
+        assert!(merge.next_unique_assert(&mut dropped).unwrap().is_some());
+        assert!(merge.next_unique_assert(&mut dropped).unwrap().is_none());
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn unique_assert_passes_retracts_through_verbatim() {
+        // A retract sharing the winner's identity is not collapsed: the
+        // import path never produces one, and if a source ever does, the
+        // caller's op == 0 guard must see it.
+        let s1 = VecSourceWithOp::new(vec![make_rec(1, 1, 10, 1)], vec![1]);
+        let s2 = VecSourceWithOp::new(vec![make_rec(1, 1, 10, 2)], vec![0]);
+
+        let mut merge = KWayMerge::new(vec![s1, s2], cmp_v2_spot).unwrap();
+        let mut dropped = 0u64;
+        let (first, first_op) = merge.next_unique_assert(&mut dropped).unwrap().unwrap();
+        assert_eq!((first.t, first_op), (1, 1));
+        let (second, second_op) = merge.next_unique_assert(&mut dropped).unwrap().unwrap();
+        assert_eq!((second.t, second_op), (2, 0));
+        assert_eq!(dropped, 0);
     }
 
     #[test]

@@ -295,6 +295,14 @@ fn process_list<S: GraphSink>(list_val: &Value, sink: &mut S) -> Result<Processe
         }
     };
 
+    // An empty @list denotes the IRI rdf:nil (JSON-LD 1.1 § List to RDF
+    // Conversion): the statement stores as one ordinary triple, the twin of
+    // Turtle's `()` fix (issue #1694). It used to produce zero events,
+    // silently losing the statement.
+    if items.is_empty() {
+        return Ok(ProcessedValue::Single(sink.term_iri(rdf::NIL)));
+    }
+
     let mut indexed_items = Vec::with_capacity(items.len());
 
     for (index, item) in items.iter().enumerate() {
@@ -989,8 +997,16 @@ mod tests {
         to_graph_events(&expanded, &mut sink).unwrap();
 
         let graph = sink.into_graph();
-        // Empty list produces no triples
-        assert_eq!(graph.len(), 0, "Empty list should produce no triples");
+        // An empty @list denotes rdf:nil: one ordinary triple, no list
+        // metadata (issue #1694 twin — it used to produce zero events).
+        assert_eq!(graph.len(), 1, "empty @list must store the rdf:nil triple");
+        let triple = graph.iter().next().unwrap();
+        assert!(!triple.is_list_element());
+        assert!(
+            matches!(&triple.o, Term::Iri(iri) if iri.as_ref() == rdf::NIL),
+            "expected rdf:nil object, got {:?}",
+            triple.o
+        );
     }
 
     #[test]

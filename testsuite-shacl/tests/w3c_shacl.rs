@@ -1,9 +1,10 @@
-//! W3C SHACL core test-suite runner.
+//! W3C SHACL test-suite runner (core + SHACL-SPARQL sections).
 //!
 //! Env vars:
 //! - `SHACL_CATEGORY=node`  — run one category only
 //! - `SHACL_TEST=minLength-001` — run tests whose name contains the string
-//! - `W3C_REPORT_JSON=report.json` — write a machine-readable report
+//! - `W3C_REPORT_JSON=report.json` — write a machine-readable report (the
+//!   sparql suite appends `-sparql` before the extension)
 //! - `SHACL_STRICT=1` — fail the test on any non-pass (default: report only)
 
 use std::collections::BTreeMap;
@@ -13,7 +14,24 @@ use testsuite_shacl::{collect_tests, run_case, Outcome};
 
 #[test]
 fn shacl_core_w3c_testsuite() {
-    let manifest = Path::new("data-shapes/data-shapes-test-suite/tests/core/manifest.ttl");
+    run_suite(
+        "data-shapes/data-shapes-test-suite/tests/core/manifest.ttl",
+        "W3C SHACL Core",
+        "",
+    );
+}
+
+#[test]
+fn shacl_sparql_w3c_testsuite() {
+    run_suite(
+        "data-shapes/data-shapes-test-suite/tests/sparql/manifest.ttl",
+        "W3C SHACL-SPARQL",
+        "-sparql",
+    );
+}
+
+fn run_suite(manifest_rel: &str, title: &str, report_suffix: &str) {
+    let manifest = Path::new(manifest_rel);
     assert!(
         manifest.exists(),
         "data-shapes submodule missing — run: git submodule update --init testsuite-shacl/data-shapes"
@@ -77,7 +95,7 @@ fn shacl_core_w3c_testsuite() {
     let passed: usize = per_category.values().map(|(p, _)| p).sum();
 
     println!();
-    println!("=== W3C SHACL Core — Per-Category Breakdown ===");
+    println!("=== {title} — Per-Category Breakdown ===");
     for (cat, (p, t)) in &per_category {
         println!("  {cat:20} {p:3}/{t:<3}");
     }
@@ -93,6 +111,14 @@ fn shacl_core_w3c_testsuite() {
     );
 
     if let Ok(path) = std::env::var("W3C_REPORT_JSON") {
+        let path = if report_suffix.is_empty() {
+            path
+        } else {
+            match path.rsplit_once('.') {
+                Some((stem, ext)) => format!("{stem}{report_suffix}.{ext}"),
+                None => format!("{path}{report_suffix}"),
+            }
+        };
         let report = serde_json::json!({
             "total": total,
             "passed": passed,

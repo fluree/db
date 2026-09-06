@@ -317,6 +317,7 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
                 commit.flakes = enforcer
                     .filter_flakes_for_graph(
                         &snapshot.snapshot,
+                        db.g_id,
                         overlay,
                         commit.t,
                         &tracker,

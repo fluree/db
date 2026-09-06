@@ -271,12 +271,19 @@ pub async fn build_policy_context(
 /// `f:policyClass` in D's config to be enforced. This is the safer default
 /// than "load every structurally-policy-looking subject from M," which
 /// would silently include rules the operator never opted into.
+///
+/// `virtual_source` relaxes that contract for a graph source governed by a
+/// model ledger: the source has no ledger of its own to hold the identity's
+/// `f:policyClass` triples, so they are looked up in M instead (M is the only
+/// place they could live). An identity M does not know selects no rules, and
+/// `default-allow` governs, as identity-mode's NotFound does.
 pub(crate) async fn resolve_cross_ledger_policy_restrictions(
     snapshot: &LedgerSnapshot,
     effective_opts: &GovernanceOptions,
     config_policy_class: Option<&[String]>,
     source: &fluree_db_core::ledger_config::GraphSourceRef,
     ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
+    virtual_source: bool,
 ) -> Result<Vec<fluree_db_policy::PolicyRestriction>> {
     const DEFAULT_POLICY_CLASS_IRI: &str = fluree_vocab::policy_iris::ACCESS_POLICY;
     let filter: std::collections::HashSet<String> = if let Some(classes) = effective_opts
@@ -289,6 +296,11 @@ pub(crate) async fn resolve_cross_ledger_policy_restrictions(
         classes.iter().cloned().collect()
     } else if effective_opts.identity.is_none() {
         [DEFAULT_POLICY_CLASS_IRI.to_string()].into_iter().collect()
+    } else if let (true, Some(identity)) = (virtual_source, effective_opts.identity.as_deref()) {
+        identity_policy_classes_in_model(ctx.fluree, source, identity)
+            .await?
+            .into_iter()
+            .collect()
     } else {
         return Err(crate::error::ApiError::config(
             "cross-ledger f:policySource with an identity requires an explicit \
@@ -328,6 +340,65 @@ pub(crate) async fn resolve_cross_ledger_policy_restrictions(
 
     fluree_db_policy::wire_to_restrictions(wire, |iri| snapshot.encode_iri(iri), Some(&filter))
         .map_err(crate::error::ApiError::from)
+}
+
+/// `<identity> f:policyClass ?class` read from the model ledger's policy graph,
+/// as class IRIs. Used for virtual sources, which have no ledger of their own
+/// to hold the identity's class assignments.
+async fn identity_policy_classes_in_model(
+    fluree: &crate::Fluree,
+    source: &fluree_db_core::ledger_config::GraphSourceRef,
+    identity: &str,
+) -> Result<Vec<String>> {
+    use fluree_db_core::GraphDbRef;
+    use fluree_db_query::{execute_pattern, Ref, Term, TriplePattern, VarRegistry};
+
+    let Some(model) = source.ledger.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let view = fluree.db(model).await?;
+    let selector = source
+        .graph_selector
+        .as_deref()
+        .unwrap_or(fluree_vocab::config_iris::DEFAULT_GRAPH);
+    let g_id = crate::cross_ledger::resolve_selector_g_id(&view.snapshot, selector)
+        .map_err(crate::error::ApiError::CrossLedger)?;
+    let Some(g_id) = g_id else {
+        return Ok(Vec::new());
+    };
+    // An identity in a namespace M has never seen cannot have triples in M.
+    let Some(identity_sid) = view.snapshot.encode_iri_strict(identity) else {
+        return Ok(Vec::new());
+    };
+    let Some(policy_class_sid) = view
+        .snapshot
+        .encode_iri_strict(fluree_vocab::policy_iris::POLICY_CLASS)
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut vars = VarRegistry::new();
+    let class_var = vars.get_or_insert("?class");
+    let pattern = TriplePattern::new(
+        Ref::Sid(identity_sid),
+        Ref::Sid(policy_class_sid),
+        Term::Var(class_var),
+    );
+    let db = GraphDbRef::new(&view.snapshot, g_id, view.overlay.as_ref(), view.t).eager();
+    let batches = execute_pattern(db, &vars, pattern).await?;
+    let mut classes = Vec::new();
+    for batch in &batches {
+        for row in 0..batch.len() {
+            if let Some(sid) = batch.get(row, class_var).and_then(|b| b.as_sid()) {
+                if let Some(iri) = view.snapshot.decode_sid(sid) {
+                    classes.push(iri);
+                }
+            }
+        }
+    }
+    classes.sort();
+    classes.dedup();
+    Ok(classes)
 }
 
 /// Build the policy context for a write (or other non-view enforcement
@@ -409,6 +480,7 @@ pub async fn build_transact_policy_context(
             config_policy_class,
             source,
             &mut ctx,
+            false,
         )
         .await?;
         let policy_ctx = policy_builder::build_policy_context_from_opts_with_cross_ledger(
@@ -453,8 +525,10 @@ pub async fn build_transact_policy_context(
     Ok(Some(policy_ctx))
 }
 
-/// Resolve the raw ledger config for the write path, memoized per-ledger by the
-/// novelty config-write marker (`Novelty::config_write_t`).
+/// Resolve the raw ledger config, memoized per-ledger by the novelty
+/// config-write marker (`Novelty::config_write_t`). Shared by the write path
+/// (transaction policy) and the read path (`resolve_and_attach_config`, which
+/// query preparation reaches on every view that arrives without a config).
 ///
 /// Reading the config graph on every write — including writes that carry no
 /// policy inputs — is feature-necessary (you must read config to learn
@@ -463,14 +537,16 @@ pub async fn build_transact_policy_context(
 /// advances iff a commit touches the config graph, so a configured-but-static
 /// ledger resolves config once per config change instead of once per write (and
 /// once per stage/commit retry — retries triggered by unrelated data conflicts
-/// leave the marker untouched and hit the cache).
+/// leave the marker untouched and hit the cache). Reads over the ledger-scoped
+/// server routes have the same shape: a fresh `LedgerState` per request, so a
+/// fresh resolve per request without this.
 ///
 /// Fail-safe by construction: the cache is consulted only at head, with a
 /// readable marker and a loaded handle. Any deviation — time-travel (`to_t`
 /// below head), a non-`Novelty` overlay, or no loaded handle — resolves fresh
 /// against the passed snapshot/overlay. A cache miss or a marker reset (e.g.
 /// after reindex) costs an extra resolve, never a stale (fail-open) read.
-async fn resolve_ledger_config_cached(
+pub(crate) async fn resolve_ledger_config_cached(
     fluree: &crate::Fluree,
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,

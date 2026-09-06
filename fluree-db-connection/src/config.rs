@@ -52,6 +52,9 @@ pub struct S3StorageConfig {
     pub bucket: Arc<str>,
     pub prefix: Option<Arc<str>>,
     pub endpoint: Option<Arc<str>>,
+    /// Path-style bucket addressing; needed for MinIO-class endpoints
+    /// without bucket-subdomain DNS.
+    pub force_path_style: Option<bool>,
     pub read_timeout_ms: Option<u64>,
     pub write_timeout_ms: Option<u64>,
     pub list_timeout_ms: Option<u64>,
@@ -400,6 +403,7 @@ fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageCo
             bucket: Arc::from(bucket),
             prefix: resolve_string(graph, node, vocab::FIELD_S3_PREFIX).map(Arc::from),
             endpoint: resolve_string(graph, node, vocab::FIELD_S3_ENDPOINT).map(Arc::from),
+            force_path_style: resolve_bool(graph, node, vocab::FIELD_S3_FORCE_PATH_STYLE),
             read_timeout_ms: resolve_u64(graph, node, vocab::FIELD_S3_READ_TIMEOUT_MS),
             write_timeout_ms: resolve_u64(graph, node, vocab::FIELD_S3_WRITE_TIMEOUT_MS),
             list_timeout_ms: resolve_u64(graph, node, vocab::FIELD_S3_LIST_TIMEOUT_MS),
@@ -1080,6 +1084,55 @@ mod tests {
         let parsed = ConnectionConfig::from_json_ld(&config).expect("Should parse config");
         assert_eq!(parsed.parallelism, 8);
         assert!(parsed.commit_storage.is_none());
+    }
+
+    /// MinIO-class endpoints need path-style addressing; an endpoint
+    /// override alone still yields `http://bucket.host/...`. The key
+    /// must parse, and its absence must stay `None` so the SDK default
+    /// (virtual-hosted) is untouched for real AWS.
+    #[test]
+    fn s3_force_path_style_parses_and_defaults_unset() {
+        let with = json!({
+            "@context": {
+                "@base": "https://ns.flur.ee/config/connection/",
+                "@vocab": "https://ns.flur.ee/system#"
+            },
+            "@graph": [
+                {
+                    "@id": "s3",
+                    "@type": "Storage",
+                    "s3Bucket": "fluree",
+                    "s3Endpoint": "http://minio:9000",
+                    "s3ForcePathStyle": true
+                },
+                {"@id": "connection", "@type": "Connection", "indexStorage": {"@id": "s3"}}
+            ]
+        });
+        let parsed = ConnectionConfig::from_json_ld(&with).expect("parses");
+        let StorageType::S3(s3) = &parsed.index_storage.storage_type else {
+            panic!("expected S3 storage");
+        };
+        assert_eq!(s3.endpoint.as_deref(), Some("http://minio:9000"));
+        assert_eq!(s3.force_path_style, Some(true));
+
+        let without = json!({
+            "@context": {
+                "@base": "https://ns.flur.ee/config/connection/",
+                "@vocab": "https://ns.flur.ee/system#"
+            },
+            "@graph": [
+                {"@id": "s3", "@type": "Storage", "s3Bucket": "fluree"},
+                {"@id": "connection", "@type": "Connection", "indexStorage": {"@id": "s3"}}
+            ]
+        });
+        let parsed = ConnectionConfig::from_json_ld(&without).expect("parses");
+        let StorageType::S3(s3) = &parsed.index_storage.storage_type else {
+            panic!("expected S3 storage");
+        };
+        assert_eq!(
+            s3.force_path_style, None,
+            "unset must not override the SDK default"
+        );
     }
 
     #[test]

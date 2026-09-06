@@ -140,14 +140,18 @@ impl<'a> MappingExtractor<'a> {
             }
         }
 
-        // Check for rr:sqlQuery (not supported)
-        if self
-            .find_object_optional(&table_triples, R2RML::SQL_QUERY)
-            .is_some()
-        {
-            return Err(R2rmlError::Unsupported(
-                "rr:sqlQuery is not supported for Iceberg graph sources".to_string(),
-            ));
+        // rr:sqlQuery — scanned as a derived table by SQL graph sources;
+        // Iceberg-backed sources refuse the alias at registration.
+        if let Some(query) = self.find_object_optional(&table_triples, R2RML::SQL_QUERY) {
+            if let Some(sql) = self.term_to_string(&query) {
+                if sql.trim().is_empty() {
+                    return Err(R2rmlError::InvalidValue {
+                        property: "rr:sqlQuery".to_string(),
+                        message: "query text is empty".to_string(),
+                    });
+                }
+                return Ok(LogicalTable::sql_query(sql));
+            }
         }
 
         Err(R2rmlError::MissingProperty(

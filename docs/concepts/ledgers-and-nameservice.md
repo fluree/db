@@ -151,6 +151,21 @@ let record = nameservice.lookup("mydb:main").await?;
 // Returns: NsRecord with commit_id, index_id, timestamps, etc.
 ```
 
+Three read depths exist on every backend, all on `NameServiceLookup`. Pick the
+shallowest that answers the question — the deeper reads cost extra items on
+DynamoDB and extra files plus config/context parsing on file and S3:
+
+| Call | Returns | Use when |
+|------|---------|----------|
+| `get_ref(id, RefKind::CommitHead)` | `RefValue { id, t }` | "has this ledger moved?" — one head |
+| `heads(id)` | `LedgerHeads { commit, index }` | both heads; converts to `NsRecordSnapshot` for rollback |
+| `lookup(id)` | full `NsRecord` | branch metadata, config, retraction flag |
+
+`heads` is one round trip on DynamoDB (a projected query over the two ref
+items), the main + index file on file/S3, and a single lock on the in-memory
+and Raft backends. `None` means unknown (and, on Raft, retracted) — the same
+rule as `get_ref`; only `lookup` surfaces `retracted: true`.
+
 #### Publishing
 
 Record new commits and indexes:
@@ -521,7 +536,7 @@ fluree branch list --ledger mydb
 
 Branches can be deleted with `drop_branch`. The **root** branch — any branch
 whose `source_branch.is_none()` on its `NsRecord` — cannot be dropped via
-`drop_branch`; use [`drop_ledger`](#dropping-a-whole-ledger) to remove the
+`drop_branch`; use [`drop_ledger`](../cli/drop.md) to remove the
 entire ledger including its root. `"main"` is the default branch name and so
 is the root on most ledgers, but the refusal is structural: a ledger created
 as `mydb:trunk` has `trunk` as its root, and `drop_branch("mydb", "trunk")`

@@ -210,18 +210,7 @@ impl<'a> FlakeGenerator<'a> {
 
         // Create metadata if language tag or list_index is present
         let meta_lang = template_lang.or(bound_lang);
-        let meta = match (&meta_lang, &template.list_index) {
-            (Some(lang), Some(idx)) => {
-                // Both language and list_index
-                Some(FlakeMeta {
-                    lang: Some(lang.clone()),
-                    i: Some(*idx),
-                })
-            }
-            (Some(lang), None) => Some(FlakeMeta::with_lang(lang)),
-            (None, Some(idx)) => Some(FlakeMeta::with_index(*idx)),
-            (None, None) => None,
-        };
+        let meta = FlakeMeta::from_parts(meta_lang.as_deref(), template.list_index);
 
         // Create flake in named graph if template has graph_id
         let flake = if let Some(g_id) = template.graph_id {

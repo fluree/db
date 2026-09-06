@@ -127,8 +127,7 @@ async fn cached_handle_applies_local_background_index_publish_without_refresh() 
         .build()
         .expect("build file fluree");
     let indexer = fluree
-        .indexing_mode
-        .handle()
+        .indexer_handle()
         .expect("file builder should start background indexing")
         .clone();
 

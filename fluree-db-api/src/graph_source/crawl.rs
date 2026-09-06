@@ -1986,6 +1986,8 @@ mod e2e {
             tables: vec!["customers".to_string(), "accounts".to_string()],
             snapshot_id: Some(1),
             mor_approximate_tables: Vec::new(),
+            model: None,
+            default_allow: None,
         };
         let mut counts = HashMap::new();
         counts.insert("customers".to_string(), 1);

@@ -1,0 +1,17 @@
+[package]
+name = "fluree-test-support"
+description = "Shared guard for crates that group their integration tests: asserts every tests/*.rs is reachable under `autotests = false`"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Internal test tooling — never a release artifact.
+[package.metadata.dist]
+dist = false
+
+[dependencies]
+toml = "0.8"
+
+[lints]
+workspace = true

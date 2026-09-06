@@ -42,6 +42,7 @@ pub const FIELD_S3_PREFIX: &str = "https://ns.flur.ee/system#s3Prefix";
 
 /// S3 endpoint field for S3 storage
 pub const FIELD_S3_ENDPOINT: &str = "https://ns.flur.ee/system#s3Endpoint";
+pub const FIELD_S3_FORCE_PATH_STYLE: &str = "https://ns.flur.ee/system#s3ForcePathStyle";
 
 /// S3 read timeout (ms)
 pub const FIELD_S3_READ_TIMEOUT_MS: &str = "https://ns.flur.ee/system#s3ReadTimeoutMs";

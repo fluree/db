@@ -1,99 +1,59 @@
-//! Temporal types for XSD dateTime, date, and time
+//! Temporal types for XSD dateTime, date, time and the gYear family.
 //!
-//! This module provides structured temporal types that:
-//! - Preserve the original lexical form for round-trip serialization
-//! - Normalize to UTC instants for consistent comparison
-//! - Support SPARQL accessor functions (YEAR, MONTH, DAY, HOURS, MINUTES, SECONDS, TZ)
+//! ## Timezone offsets are not supported
 //!
-//! ## Comparison Semantics
+//! Every value is canonicalized the moment it is parsed, and the source offset
+//! is retained nowhere — not in novelty, not in the commit log, not in the
+//! index. One representation per value means comparison, hashing, arithmetic,
+//! the calendar accessors, `TZ()`/`TIMEZONE()` and rendering all agree
+//! whichever storage lane serves the value.
 //!
-//! Temporal values are compared by their normalized UTC instant, not by lexical form.
-//! This means `"2024-01-01T05:00:00Z"` equals `"2024-01-01T00:00:00-05:00"` (same instant).
+//! - `dateTime`: the offset is **applied**. The value is a UTC instant, and a
+//!   lexical form with no offset is read as UTC. `…T15:38:02-08:00` is
+//!   `…T23:38:02Z`.
+//! - `date`, `time` and the gYear family: the offset is validated and then
+//!   **discarded**, not applied. `2026-01-01+05:00` is `2026-01-01` and
+//!   `17:00:00-06:00` is `17:00:00`. Applying it would move a calendar day, and
+//!   the index has only ever stored the day / the wall clock.
 //!
-//! ## Timezone Handling
-//!
-//! - DateTime: Normalize to UTC instant; preserve original timezone for output
-//! - Date: If timezone present, compare by instant at midnight in that offset
-//! - Time: If timezone present, compare by UTC-normalized time-of-day
-//!
-//! Values without timezone are treated as UTC for comparison purposes.
+//! Before this, a parsed value kept its offset and source lexical while it sat
+//! in novelty and lost both once indexed, so every consumer that read either
+//! answered one thing before a background reindex and another after. The
+//! user-facing statement is in `docs/reference/compatibility.md`.
 
 use chrono::{
-    DateTime as ChronoDateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime,
-    Timelike, Utc,
+    DateTime as ChronoDateTime, Datelike, FixedOffset, Months, NaiveDate, NaiveDateTime, NaiveTime,
+    TimeDelta, Timelike, Utc,
 };
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt;
 
-/// Serde helper for Option<FixedOffset> - serializes as Option<i32> (seconds from UTC)
-mod tz_offset_serde {
-    use super::*;
-
-    pub fn serialize<S>(offset: &Option<FixedOffset>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match offset {
-            Some(o) => serializer.serialize_some(&o.local_minus_utc()),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<FixedOffset>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let opt: Option<i32> = Option::deserialize(deserializer)?;
-        Ok(opt.and_then(FixedOffset::east_opt))
-    }
-}
-
-/// XSD dateTime with timezone preservation
+/// XSD dateTime, held as a UTC instant.
 ///
-/// Stores both the normalized UTC instant (for comparison) and the original
-/// string representation (for serialization).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// A source offset is applied and then discarded: `2010-12-21T15:38:02-08:00`
+/// and `2010-12-21T23:38:02Z` are the same value, render the same and hash the
+/// same. A lexical form with no offset is read as UTC. See the module docs.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DateTime {
-    /// Normalized UTC instant for comparison
     instant: ChronoDateTime<Utc>,
-    /// Original timezone offset (None = no timezone in input, treated as UTC)
-    #[serde(with = "tz_offset_serde")]
-    tz_offset: Option<FixedOffset>,
-    /// Original string for round-trip serialization
-    original: String,
 }
 
 impl DateTime {
-    /// Parse an XSD dateTime string
+    /// Parse an XSD dateTime lexical.
     ///
-    /// Accepts:
-    /// - RFC3339/ISO8601 with timezone: `2024-01-15T10:30:00Z`, `2024-01-15T10:30:00+05:00`
-    /// - Without timezone (treated as UTC): `2024-01-15T10:30:00`
-    /// - With fractional seconds: `2024-01-15T10:30:00.123Z`
+    /// Accepts RFC 3339 / ISO 8601 with an offset (`…Z`, `…+05:00`, `…+0500`)
+    /// or without one (read as UTC), with or without fractional seconds.
     pub fn parse(s: &str) -> Result<Self, String> {
-        // Try RFC3339/ISO8601 with timezone
         if let Ok(dt) = ChronoDateTime::parse_from_rfc3339(s) {
-            return Ok(Self {
-                instant: dt.with_timezone(&Utc),
-                tz_offset: Some(*dt.offset()),
-                original: s.to_string(),
-            });
+            return Ok(Self::from_instant(dt.with_timezone(&Utc)));
         }
-
-        // Try with explicit timezone offset formats not covered by RFC3339
-        // e.g., "2024-01-15T10:30:00+0500" (no colon in offset)
+        // Offset forms RFC 3339 does not cover, e.g. `+0500` (no colon).
         for fmt in &["%Y-%m-%dT%H:%M:%S%.f%z", "%Y-%m-%dT%H:%M:%S%z"] {
             if let Ok(dt) = ChronoDateTime::parse_from_str(s, fmt) {
-                return Ok(Self {
-                    instant: dt.with_timezone(&Utc),
-                    tz_offset: Some(*dt.offset()),
-                    original: s.to_string(),
-                });
+                return Ok(Self::from_instant(dt.with_timezone(&Utc)));
             }
         }
-
-        // Try without timezone - multiple formats
         for fmt in &[
             "%Y-%m-%dT%H:%M:%S%.f",
             "%Y-%m-%dT%H:%M:%S",
@@ -101,30 +61,35 @@ impl DateTime {
             "%Y-%m-%d %H:%M:%S",
         ] {
             if let Ok(ndt) = NaiveDateTime::parse_from_str(s, fmt) {
-                return Ok(Self {
-                    instant: ndt.and_utc(),
-                    tz_offset: None,
-                    original: s.to_string(),
-                });
+                return Ok(Self::from_instant(ndt.and_utc()));
             }
         }
-
         Err(format!("Cannot parse dateTime: {s}"))
     }
 
-    /// Get the normalized UTC instant
+    pub fn from_instant(instant: ChronoDateTime<Utc>) -> Self {
+        Self { instant }
+    }
+
+    /// From the index key encoding (`ObjKey::encode_datetime`).
+    pub fn from_epoch_micros(micros: i64) -> Option<Self> {
+        ChronoDateTime::from_timestamp_micros(micros).map(Self::from_instant)
+    }
+
+    /// The UTC instant.
     pub fn instant(&self) -> ChronoDateTime<Utc> {
         self.instant
     }
 
-    /// Get the original timezone offset (if any)
-    pub fn tz_offset(&self) -> Option<FixedOffset> {
-        self.tz_offset
-    }
-
-    /// Get the original string representation
-    pub fn original(&self) -> &str {
-        &self.original
+    /// Canonical lexical form: UTC with a `Z`, fractional seconds only when
+    /// non-zero and without trailing zeros. The only form a dateTime renders
+    /// in, whichever lane serves it.
+    pub fn canonical(&self) -> String {
+        format!(
+            "{}{}Z",
+            self.instant.format("%Y-%m-%dT%H:%M:%S"),
+            canonical_fraction(self.instant.timestamp_subsec_micros())
+        )
     }
 
     // === SPARQL accessor functions ===
@@ -159,21 +124,6 @@ impl DateTime {
         self.instant.second() as f64 + self.instant.nanosecond() as f64 / 1e9
     }
 
-    /// Get the timezone string (e.g., "+05:00", "Z") or None if no timezone
-    pub fn timezone(&self) -> Option<String> {
-        self.tz_offset.map(|tz| {
-            let secs = tz.local_minus_utc();
-            if secs == 0 {
-                "Z".to_string()
-            } else {
-                let hours = secs.abs() / 3600;
-                let mins = (secs.abs() % 3600) / 60;
-                let sign = if secs >= 0 { '+' } else { '-' };
-                format!("{sign}{hours:02}:{mins:02}")
-            }
-        })
-    }
-
     /// Get epoch milliseconds (for Parquet storage)
     pub fn epoch_millis(&self) -> i64 {
         self.instant.timestamp_millis()
@@ -183,113 +133,98 @@ impl DateTime {
     pub fn epoch_micros(&self) -> i64 {
         self.instant.timestamp_micros()
     }
-}
 
-impl PartialEq for DateTime {
-    fn eq(&self, other: &Self) -> bool {
-        self.instant == other.instant
+    /// Shift by an `xsd:dayTimeDuration`, in microseconds
+    /// (XPath `op:add-dayTimeDuration-to-dateTime`; pass a negative value to
+    /// subtract).
+    pub fn checked_add_day_time_micros(&self, micros: i64) -> Option<Self> {
+        self.instant
+            .checked_add_signed(TimeDelta::microseconds(micros))
+            .map(Self::from_instant)
     }
-}
 
-impl Eq for DateTime {}
-
-impl Ord for DateTime {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.instant.cmp(&other.instant)
-    }
-}
-
-impl PartialOrd for DateTime {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl std::hash::Hash for DateTime {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.instant.timestamp_nanos_opt().hash(state);
+    /// Shift by an `xsd:yearMonthDuration`, in months (XPath
+    /// `op:add-yearMonthDuration-to-dateTime`; negative subtracts).
+    ///
+    /// Calendar arithmetic, so the day is clamped to the last day of the
+    /// resulting month: `2026-01-31 + P1M` is `2026-02-28`, not March 3rd.
+    pub fn checked_add_months(&self, months: i32) -> Option<Self> {
+        add_months_to_naive(self.instant.naive_utc(), months)
+            .map(|ndt| Self::from_instant(ndt.and_utc()))
     }
 }
 
 impl fmt::Display for DateTime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.original)
+        f.write_str(&self.canonical())
     }
 }
 
-/// XSD date (year-month-day with optional timezone)
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Fractional-seconds suffix of a canonical lexical: empty when zero, else
+/// `.` and the digits with trailing zeros removed (the XSD canonical form).
+fn canonical_fraction(micros: u32) -> String {
+    if micros == 0 {
+        String::new()
+    } else {
+        let digits = format!("{micros:06}");
+        format!(".{}", digits.trim_end_matches('0'))
+    }
+}
+
+/// Add a signed month count with end-of-month clamping, the XPath rule for
+/// `yearMonthDuration` arithmetic.
+fn add_months_to_naive(dt: NaiveDateTime, months: i32) -> Option<NaiveDateTime> {
+    let magnitude = Months::new(months.unsigned_abs());
+    if months >= 0 {
+        dt.checked_add_months(magnitude)
+    } else {
+        dt.checked_sub_months(magnitude)
+    }
+}
+
+/// The same clamped month shift over a bare date.
+fn add_months_to_date(date: NaiveDate, months: i32) -> Option<NaiveDate> {
+    let magnitude = Months::new(months.unsigned_abs());
+    if months >= 0 {
+        date.checked_add_months(magnitude)
+    } else {
+        date.checked_sub_months(magnitude)
+    }
+}
+
+/// XSD date, held as a calendar date.
+///
+/// A source offset is validated and then discarded: `2026-01-01+05:00` and
+/// `2026-01-01` are the same value. Applying it would move the calendar day,
+/// which is not what a date means, and the index has only ever kept the day
+/// (`days_since_epoch`). See the module docs.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Date {
-    /// The date value
     date: NaiveDate,
-    /// Original timezone offset (None = no timezone in input)
-    #[serde(with = "tz_offset_serde")]
-    tz_offset: Option<FixedOffset>,
-    /// Original string for round-trip serialization
-    original: String,
 }
 
 impl Date {
-    /// Parse an XSD date string
-    ///
-    /// Accepts:
-    /// - With timezone: `2024-01-15Z`, `2024-01-15+05:00`
-    /// - Without timezone: `2024-01-15`
+    /// Parse an XSD date lexical: `2024-01-15`, `2024-01-15Z`, `2024-01-15+05:00`.
     pub fn parse(s: &str) -> Result<Self, String> {
+        let err = || format!("Cannot parse date: {s}");
         if !is_strict_date_lexical(s) {
-            return Err(format!("Cannot parse date: {s}"));
+            return Err(err());
         }
+        let date_part = strip_tz_suffix(s).ok_or_else(err)?;
+        NaiveDate::parse_from_str(date_part, "%Y-%m-%d")
+            .map(Self::from_naive)
+            .map_err(|_| err())
+    }
 
-        // Try parsing with timezone suffix
-        if let Some(date_part) = s.strip_suffix('Z') {
-            if let Ok(date) = NaiveDate::parse_from_str(date_part, "%Y-%m-%d") {
-                return Ok(Self {
-                    date,
-                    tz_offset: Some(FixedOffset::east_opt(0).unwrap()),
-                    original: s.to_string(),
-                });
-            }
-        }
+    pub fn from_naive(date: NaiveDate) -> Self {
+        Self { date }
+    }
 
-        // Try parsing with explicit offset (e.g., +05:00 or -05:00)
-        if let Some(offset_start) = s.rfind(['+', '-']) {
-            // Make sure this is actually a timezone, not just a negative year
-            if offset_start > 0 && s[offset_start..].contains(':') {
-                let date_part = &s[..offset_start];
-                let offset_part = &s[offset_start..];
-
-                if let Ok(date) = NaiveDate::parse_from_str(date_part, "%Y-%m-%d") {
-                    // Parse the offset
-                    let sign = if offset_part.starts_with('-') { -1 } else { 1 };
-                    let offset_str = &offset_part[1..];
-                    if let Some((hours_str, mins_str)) = offset_str.split_once(':') {
-                        if let (Ok(hours), Ok(mins)) =
-                            (hours_str.parse::<i32>(), mins_str.parse::<i32>())
-                        {
-                            let total_secs = sign * (hours * 3600 + mins * 60);
-                            if let Some(offset) = FixedOffset::east_opt(total_secs) {
-                                return Ok(Self {
-                                    date,
-                                    tz_offset: Some(offset),
-                                    original: s.to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Try without timezone
-        if let Ok(date) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-            return Ok(Self {
-                date,
-                tz_offset: None,
-                original: s.to_string(),
-            });
-        }
-
-        Err(format!("Cannot parse date: {s}"))
+    /// From the index key encoding (`ObjKey::encode_date`).
+    pub fn from_days_since_epoch(days: i32) -> Option<Self> {
+        NaiveDate::from_ymd_opt(1970, 1, 1)?
+            .checked_add_signed(TimeDelta::days(i64::from(days)))
+            .map(Self::from_naive)
     }
 
     /// Get the date value
@@ -297,27 +232,10 @@ impl Date {
         self.date
     }
 
-    /// Get the original timezone offset (if any)
-    pub fn tz_offset(&self) -> Option<FixedOffset> {
-        self.tz_offset
-    }
-
-    /// Get the original string representation
-    pub fn original(&self) -> &str {
-        &self.original
-    }
-
-    /// Convert to UTC instant at midnight for timezone-aware comparison
-    fn to_instant(&self) -> ChronoDateTime<Utc> {
-        let midnight = self.date.and_hms_opt(0, 0, 0).unwrap();
-        match self.tz_offset {
-            Some(offset) => midnight
-                .and_local_timezone(offset)
-                .single()
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|| midnight.and_utc()),
-            None => midnight.and_utc(),
-        }
+    /// Canonical lexical form, `YYYY-MM-DD`. No timezone designator — a date
+    /// carries none.
+    pub fn canonical(&self) -> String {
+        self.date.format("%Y-%m-%d").to_string()
     }
 
     // === SPARQL accessor functions ===
@@ -334,144 +252,92 @@ impl Date {
         self.date.day()
     }
 
-    pub fn timezone(&self) -> Option<String> {
-        self.tz_offset.map(|tz| {
-            let secs = tz.local_minus_utc();
-            if secs == 0 {
-                "Z".to_string()
-            } else {
-                let hours = secs.abs() / 3600;
-                let mins = (secs.abs() % 3600) / 60;
-                let sign = if secs >= 0 { '+' } else { '-' };
-                format!("{sign}{hours:02}:{mins:02}")
-            }
-        })
-    }
-
     /// Get days since epoch (for Parquet storage)
     pub fn days_since_epoch(&self) -> i32 {
         let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         self.date.signed_duration_since(epoch).num_days() as i32
     }
-}
 
-impl PartialEq for Date {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
+    /// Epoch microseconds of midnight UTC on this date — the reference instant
+    /// `date - date` subtracts from.
+    pub fn epoch_micros(&self) -> i64 {
+        self.midnight().and_utc().timestamp_micros()
     }
-}
 
-impl Eq for Date {}
-
-impl Ord for Date {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // If either side has a timezone, compare by instant at midnight UTC
-        match (self.tz_offset, other.tz_offset) {
-            (Some(_) | None, Some(_)) | (Some(_), None) => {
-                self.to_instant().cmp(&other.to_instant())
-            }
-            (None, None) => self.date.cmp(&other.date),
-        }
+    /// Shift by an `xsd:dayTimeDuration`, in microseconds (XPath
+    /// `op:add-dayTimeDuration-to-date`; negative subtracts).
+    ///
+    /// Per XPath the date is taken to midnight, shifted, and the *date part* of
+    /// the result kept — so a sub-day duration can leave the date unchanged.
+    pub fn checked_add_day_time_micros(&self, micros: i64) -> Option<Self> {
+        self.midnight()
+            .checked_add_signed(TimeDelta::microseconds(micros))
+            .map(|ndt| Self::from_naive(ndt.date()))
     }
-}
 
-impl PartialOrd for Date {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+    /// Shift by an `xsd:yearMonthDuration`, in months, with the same
+    /// end-of-month clamping as [`DateTime::checked_add_months`].
+    pub fn checked_add_months(&self, months: i32) -> Option<Self> {
+        add_months_to_date(self.date, months).map(Self::from_naive)
     }
-}
 
-impl std::hash::Hash for Date {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.date.hash(state);
-        self.tz_offset.map(|o| o.local_minus_utc()).hash(state);
+    fn midnight(&self) -> NaiveDateTime {
+        self.date
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is a valid time")
     }
 }
 
 impl fmt::Display for Date {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.original)
+        f.write_str(&self.canonical())
     }
 }
 
-/// XSD time (hour:minute:second with optional timezone)
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// XSD time, held as a wall-clock time of day.
+///
+/// A source offset is validated and then discarded — it is *not* applied:
+/// `17:00:00-06:00` is read as `17:00:00`, not `23:00:00`. The index has only
+/// ever kept the wall clock (`micros_since_midnight`), so this is the reading
+/// both lanes agree on without re-encoding every stored time. See the module
+/// docs.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Time {
-    /// The time value
     time: NaiveTime,
-    /// Original timezone offset (None = no timezone in input)
-    #[serde(with = "tz_offset_serde")]
-    tz_offset: Option<FixedOffset>,
-    /// Original string for round-trip serialization
-    original: String,
 }
 
 impl Time {
-    /// Parse an XSD time string
-    ///
-    /// Accepts:
-    /// - With timezone: `10:30:00Z`, `10:30:00+05:00`
-    /// - Without timezone: `10:30:00`
-    /// - With fractional seconds: `10:30:00.123Z`
+    /// Parse an XSD time lexical: `10:30:00`, `10:30:00.123`, `10:30:00Z`,
+    /// `10:30:00+05:00`.
     pub fn parse(s: &str) -> Result<Self, String> {
+        let err = || format!("Cannot parse time: {s}");
         if !is_strict_time_lexical(s) {
-            return Err(format!("Cannot parse time: {s}"));
+            return Err(err());
         }
+        let time_part = strip_tz_suffix(s).ok_or_else(err)?;
+        // `HH:MM` is tolerated only without a designator, as it always was.
+        let formats: &[&str] = if time_part.len() == s.len() {
+            &["%H:%M:%S%.f", "%H:%M:%S", "%H:%M"]
+        } else {
+            &["%H:%M:%S%.f", "%H:%M:%S"]
+        };
+        formats
+            .iter()
+            .find_map(|fmt| NaiveTime::parse_from_str(time_part, fmt).ok())
+            .map(Self::from_naive)
+            .ok_or_else(err)
+    }
 
-        // Try parsing with Z suffix
-        if let Some(time_part) = s.strip_suffix('Z') {
-            for fmt in &["%H:%M:%S%.f", "%H:%M:%S"] {
-                if let Ok(time) = NaiveTime::parse_from_str(time_part, fmt) {
-                    return Ok(Self {
-                        time,
-                        tz_offset: Some(FixedOffset::east_opt(0).unwrap()),
-                        original: s.to_string(),
-                    });
-                }
-            }
-        }
+    pub fn from_naive(time: NaiveTime) -> Self {
+        Self { time }
+    }
 
-        // Try parsing with explicit offset
-        if let Some(offset_start) = s.rfind(['+', '-']) {
-            if s[offset_start..].contains(':') {
-                let time_part = &s[..offset_start];
-                let offset_part = &s[offset_start..];
-
-                for fmt in &["%H:%M:%S%.f", "%H:%M:%S"] {
-                    if let Ok(time) = NaiveTime::parse_from_str(time_part, fmt) {
-                        let sign = if offset_part.starts_with('-') { -1 } else { 1 };
-                        let offset_str = &offset_part[1..];
-                        if let Some((hours_str, mins_str)) = offset_str.split_once(':') {
-                            if let (Ok(hours), Ok(mins)) =
-                                (hours_str.parse::<i32>(), mins_str.parse::<i32>())
-                            {
-                                let total_secs = sign * (hours * 3600 + mins * 60);
-                                if let Some(offset) = FixedOffset::east_opt(total_secs) {
-                                    return Ok(Self {
-                                        time,
-                                        tz_offset: Some(offset),
-                                        original: s.to_string(),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Try without timezone
-        for fmt in &["%H:%M:%S%.f", "%H:%M:%S", "%H:%M"] {
-            if let Ok(time) = NaiveTime::parse_from_str(s, fmt) {
-                return Ok(Self {
-                    time,
-                    tz_offset: None,
-                    original: s.to_string(),
-                });
-            }
-        }
-
-        Err(format!("Cannot parse time: {s}"))
+    /// From the index key encoding (`ObjKey::encode_time`).
+    pub fn from_micros_since_midnight(micros: i64) -> Option<Self> {
+        let secs = u32::try_from(micros / 1_000_000).ok()?;
+        let frac_micros = u32::try_from(micros % 1_000_000).ok()?;
+        NaiveTime::from_num_seconds_from_midnight_opt(secs, frac_micros * 1000)
+            .map(Self::from_naive)
     }
 
     /// Get the time value
@@ -479,30 +345,15 @@ impl Time {
         self.time
     }
 
-    /// Get the original timezone offset (if any)
-    pub fn tz_offset(&self) -> Option<FixedOffset> {
-        self.tz_offset
-    }
-
-    /// Get the original string representation
-    pub fn original(&self) -> &str {
-        &self.original
-    }
-
-    /// Normalize to UTC time-of-day for timezone-aware comparison
-    fn to_utc_time(&self) -> NaiveTime {
-        match self.tz_offset {
-            Some(offset) => {
-                let secs = self.time.num_seconds_from_midnight() as i32 - offset.local_minus_utc();
-                let normalized_secs = secs.rem_euclid(86400) as u32;
-                NaiveTime::from_num_seconds_from_midnight_opt(
-                    normalized_secs,
-                    self.time.nanosecond(),
-                )
-                .unwrap_or(self.time)
-            }
-            None => self.time,
-        }
+    /// Canonical lexical form: `HH:MM:SS`, fractional seconds only when
+    /// non-zero and without trailing zeros. No timezone designator — a time
+    /// carries none.
+    pub fn canonical(&self) -> String {
+        format!(
+            "{}{}",
+            self.time.format("%H:%M:%S"),
+            canonical_fraction(self.time.nanosecond() / 1000)
+        )
     }
 
     // === SPARQL accessor functions ===
@@ -519,25 +370,31 @@ impl Time {
         self.time.second() as f64 + self.time.nanosecond() as f64 / 1e9
     }
 
-    pub fn timezone(&self) -> Option<String> {
-        self.tz_offset.map(|tz| {
-            let secs = tz.local_minus_utc();
-            if secs == 0 {
-                "Z".to_string()
-            } else {
-                let hours = secs.abs() / 3600;
-                let mins = (secs.abs() % 3600) / 60;
-                let sign = if secs >= 0 { '+' } else { '-' };
-                format!("{sign}{hours:02}:{mins:02}")
-            }
-        })
-    }
-
     /// Get microseconds since midnight (for Parquet storage)
     pub fn micros_since_midnight(&self) -> i64 {
         let secs = self.time.num_seconds_from_midnight() as i64;
         let nanos = self.time.nanosecond() as i64;
         secs * 1_000_000 + nanos / 1000
+    }
+
+    /// Shift by an `xsd:dayTimeDuration`, in microseconds (XPath
+    /// `op:add-dayTimeDuration-to-time`; negative subtracts).
+    ///
+    /// A time has no date to carry into, so the result wraps within the day:
+    /// `23:00:00 + PT2H` is `01:00:00`.
+    pub fn checked_add_day_time_micros(&self, micros: i64) -> Option<Self> {
+        const DAY_MICROS: i64 = 86_400 * 1_000_000;
+        let shifted = self
+            .micros_since_midnight()
+            .checked_add(micros)?
+            .rem_euclid(DAY_MICROS);
+        Self::from_micros_since_midnight(shifted)
+    }
+}
+
+impl fmt::Display for Time {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.canonical())
     }
 }
 
@@ -641,89 +498,25 @@ fn is_strict_time_lexical(s: &str) -> bool {
     true
 }
 
-impl PartialEq for Time {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-
-impl Eq for Time {}
-
-impl Ord for Time {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // If either side has a timezone, compare by normalized UTC time-of-day
-        match (self.tz_offset, other.tz_offset) {
-            (Some(_) | None, Some(_)) | (Some(_), None) => {
-                self.to_utc_time().cmp(&other.to_utc_time())
-            }
-            (None, None) => self.time.cmp(&other.time),
-        }
-    }
-}
-
-impl PartialOrd for Time {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl std::hash::Hash for Time {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.time.hash(state);
-        self.tz_offset.map(|o| o.local_minus_utc()).hash(state);
-    }
-}
-
-impl fmt::Display for Time {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.original)
-    }
-}
-
-// ============================================================================
-// Common helpers
-// ============================================================================
-
-/// Parse an optional timezone suffix from the end of a string.
-/// Returns (value_part, optional_timezone_offset).
-fn parse_tz_suffix(s: &str) -> (&str, Option<FixedOffset>) {
+/// Split a trailing timezone designator (`Z` or `±hh:mm`) off a temporal
+/// lexical, validating it, and return what precedes it. `None` means the
+/// designator is malformed. The offset itself is never applied — see the
+/// module docs.
+fn strip_tz_suffix(s: &str) -> Option<&str> {
     if let Some(stripped) = s.strip_suffix('Z') {
-        (stripped, Some(FixedOffset::east_opt(0).unwrap()))
-    } else if s.len() >= 6 {
+        return Some(stripped);
+    }
+    if s.len() >= 6 && s.is_char_boundary(s.len() - 6) {
         let tail = &s[s.len() - 6..];
-        if (tail.starts_with('+') || tail.starts_with('-')) && tail.as_bytes()[3] == b':' {
-            let sign = if tail.starts_with('-') { -1 } else { 1 };
-            let hours: i32 = tail[1..3].parse().unwrap_or(0);
-            let mins: i32 = tail[4..6].parse().unwrap_or(0);
-            let total_secs = sign * (hours * 3600 + mins * 60);
-            if let Some(offset) = FixedOffset::east_opt(total_secs) {
-                return (&s[..s.len() - 6], Some(offset));
-            }
-            (s, None)
-        } else {
-            (s, None)
-        }
-    } else {
-        (s, None)
-    }
-}
-
-/// Format a timezone offset as a string suffix.
-fn format_tz_suffix(tz: Option<FixedOffset>) -> String {
-    match tz {
-        None => String::new(),
-        Some(offset) => {
-            let secs = offset.local_minus_utc();
-            if secs == 0 {
-                "Z".to_string()
-            } else {
-                let hours = secs.abs() / 3600;
-                let mins = (secs.abs() % 3600) / 60;
-                let sign = if secs >= 0 { '+' } else { '-' };
-                format!("{sign}{hours:02}:{mins:02}")
-            }
+        let b = tail.as_bytes();
+        if (b[0] == b'+' || b[0] == b'-') && b[3] == b':' {
+            let hours: i32 = tail[1..3].parse().ok()?;
+            let mins: i32 = tail[4..6].parse().ok()?;
+            FixedOffset::east_opt(hours * 3600 + mins * 60)?;
+            return Some(&s[..s.len() - 6]);
         }
     }
+    Some(s)
 }
 
 // ============================================================================
@@ -734,9 +527,6 @@ fn format_tz_suffix(tz: Option<FixedOffset>) -> String {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GYear {
     year: i32,
-    #[serde(with = "tz_offset_serde")]
-    tz_offset: Option<FixedOffset>,
-    original: String,
 }
 
 impl GYear {
@@ -744,56 +534,39 @@ impl GYear {
     ///
     /// Accepts: `"2024"`, `"2024Z"`, `"2024+05:00"`, `"-0050"`, `"-0050Z"`
     pub fn parse(s: &str) -> Result<Self, String> {
-        let (value, tz) = parse_tz_suffix(s);
+        let value =
+            strip_tz_suffix(s).ok_or_else(|| format!("Cannot parse timezone designator: {s}"))?;
 
         // Handle negative years: the year string itself starts with '-'
         let year: i32 = value
             .parse()
             .map_err(|_| format!("Cannot parse gYear: {s}"))?;
 
-        Ok(Self {
-            year,
-            tz_offset: tz,
-            original: s.to_string(),
-        })
+        Ok(Self { year })
     }
 
     /// Construct from a year value with no timezone.
     pub fn from_year(year: i32) -> Self {
-        let original = Self::canonical_string(year, None);
-        Self {
-            year,
-            tz_offset: None,
-            original,
-        }
+        Self { year }
     }
 
     /// Canonical string representation.
     pub fn canonical(&self) -> String {
-        Self::canonical_string(self.year, self.tz_offset)
+        Self::canonical_string(self.year)
     }
 
-    fn canonical_string(year: i32, tz: Option<FixedOffset>) -> String {
-        let tz_str = format_tz_suffix(tz);
+    fn canonical_string(year: i32) -> String {
         if year >= 10000 || year <= -10000 {
-            format!("{year}{tz_str}")
+            format!("{year}")
         } else if year < 0 {
-            format!("-{:04}{}", year.unsigned_abs(), tz_str)
+            format!("-{:04}", year.unsigned_abs())
         } else {
-            format!("{year:04}{tz_str}")
+            format!("{year:04}")
         }
     }
 
     pub fn year(&self) -> i32 {
         self.year
-    }
-
-    pub fn tz_offset(&self) -> Option<FixedOffset> {
-        self.tz_offset
-    }
-
-    pub fn original(&self) -> &str {
-        &self.original
     }
 }
 
@@ -825,7 +598,7 @@ impl std::hash::Hash for GYear {
 
 impl fmt::Display for GYear {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.original)
+        f.write_str(&self.canonical())
     }
 }
 
@@ -838,9 +611,6 @@ impl fmt::Display for GYear {
 pub struct GYearMonth {
     year: i32,
     month: u32,
-    #[serde(with = "tz_offset_serde")]
-    tz_offset: Option<FixedOffset>,
-    original: String,
 }
 
 impl GYearMonth {
@@ -848,7 +618,8 @@ impl GYearMonth {
     ///
     /// Accepts: `"2024-01"`, `"2024-01Z"`, `"2024-01+05:00"`, `"-0050-06"`
     pub fn parse(s: &str) -> Result<Self, String> {
-        let (value, tz) = parse_tz_suffix(s);
+        let value =
+            strip_tz_suffix(s).ok_or_else(|| format!("Cannot parse timezone designator: {s}"))?;
 
         // Handle negative years. The format is YYYY-MM or -YYYY-MM.
         // For negative years, the string starts with '-', so we need to find
@@ -885,28 +656,12 @@ impl GYearMonth {
             return Err(format!("Invalid month {month} in gYearMonth: {s}"));
         }
 
-        Ok(Self {
-            year,
-            month,
-            tz_offset: tz,
-            original: s.to_string(),
-        })
+        Ok(Self { year, month })
     }
 
     /// Construct from year and month with no timezone.
     pub fn from_components(year: i32, month: u32) -> Self {
-        let tz_str = format_tz_suffix(None);
-        let original = if year < 0 {
-            format!("-{:04}-{:02}{}", year.unsigned_abs(), month, tz_str)
-        } else {
-            format!("{year:04}-{month:02}{tz_str}")
-        };
-        Self {
-            year,
-            month,
-            tz_offset: None,
-            original,
-        }
+        Self { year, month }
     }
 
     pub fn year(&self) -> i32 {
@@ -917,12 +672,13 @@ impl GYearMonth {
         self.month
     }
 
-    pub fn tz_offset(&self) -> Option<FixedOffset> {
-        self.tz_offset
-    }
-
-    pub fn original(&self) -> &str {
-        &self.original
+    /// Canonical lexical form, `YYYY-MM`. No timezone designator.
+    pub fn canonical(&self) -> String {
+        if self.year < 0 {
+            format!("-{:04}-{:02}", self.year.unsigned_abs(), self.month)
+        } else {
+            format!("{:04}-{:02}", self.year, self.month)
+        }
     }
 }
 
@@ -955,7 +711,7 @@ impl std::hash::Hash for GYearMonth {
 
 impl fmt::Display for GYearMonth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.original)
+        f.write_str(&self.canonical())
     }
 }
 
@@ -967,9 +723,6 @@ impl fmt::Display for GYearMonth {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GMonth {
     month: u32,
-    #[serde(with = "tz_offset_serde")]
-    tz_offset: Option<FixedOffset>,
-    original: String,
 }
 
 impl GMonth {
@@ -982,7 +735,8 @@ impl GMonth {
         }
 
         let after_prefix = &s[2..];
-        let (value, tz) = parse_tz_suffix(after_prefix);
+        let value = strip_tz_suffix(after_prefix)
+            .ok_or_else(|| format!("Cannot parse timezone designator: {s}"))?;
 
         let month: u32 = value
             .parse()
@@ -992,33 +746,21 @@ impl GMonth {
             return Err(format!("Invalid month {month} in gMonth: {s}"));
         }
 
-        Ok(Self {
-            month,
-            tz_offset: tz,
-            original: s.to_string(),
-        })
+        Ok(Self { month })
     }
 
     /// Construct from a month value with no timezone.
     pub fn from_month(month: u32) -> Self {
-        let original = format!("--{month:02}");
-        Self {
-            month,
-            tz_offset: None,
-            original,
-        }
+        Self { month }
     }
 
     pub fn month(&self) -> u32 {
         self.month
     }
 
-    pub fn tz_offset(&self) -> Option<FixedOffset> {
-        self.tz_offset
-    }
-
-    pub fn original(&self) -> &str {
-        &self.original
+    /// Canonical lexical form, `--MM`. No timezone designator.
+    pub fn canonical(&self) -> String {
+        format!("--{:02}", self.month)
     }
 }
 
@@ -1050,7 +792,7 @@ impl std::hash::Hash for GMonth {
 
 impl fmt::Display for GMonth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.original)
+        f.write_str(&self.canonical())
     }
 }
 
@@ -1062,9 +804,6 @@ impl fmt::Display for GMonth {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GDay {
     day: u32,
-    #[serde(with = "tz_offset_serde")]
-    tz_offset: Option<FixedOffset>,
-    original: String,
 }
 
 impl GDay {
@@ -1077,7 +816,8 @@ impl GDay {
         }
 
         let after_prefix = &s[3..];
-        let (value, tz) = parse_tz_suffix(after_prefix);
+        let value = strip_tz_suffix(after_prefix)
+            .ok_or_else(|| format!("Cannot parse timezone designator: {s}"))?;
 
         let day: u32 = value
             .parse()
@@ -1087,33 +827,21 @@ impl GDay {
             return Err(format!("Invalid day {day} in gDay: {s}"));
         }
 
-        Ok(Self {
-            day,
-            tz_offset: tz,
-            original: s.to_string(),
-        })
+        Ok(Self { day })
     }
 
     /// Construct from a day value with no timezone.
     pub fn from_day(day: u32) -> Self {
-        let original = format!("---{day:02}");
-        Self {
-            day,
-            tz_offset: None,
-            original,
-        }
+        Self { day }
     }
 
     pub fn day(&self) -> u32 {
         self.day
     }
 
-    pub fn tz_offset(&self) -> Option<FixedOffset> {
-        self.tz_offset
-    }
-
-    pub fn original(&self) -> &str {
-        &self.original
+    /// Canonical lexical form, `---DD`. No timezone designator.
+    pub fn canonical(&self) -> String {
+        format!("---{:02}", self.day)
     }
 }
 
@@ -1145,7 +873,7 @@ impl std::hash::Hash for GDay {
 
 impl fmt::Display for GDay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.original)
+        f.write_str(&self.canonical())
     }
 }
 
@@ -1158,9 +886,6 @@ impl fmt::Display for GDay {
 pub struct GMonthDay {
     month: u32,
     day: u32,
-    #[serde(with = "tz_offset_serde")]
-    tz_offset: Option<FixedOffset>,
-    original: String,
 }
 
 impl GMonthDay {
@@ -1173,7 +898,8 @@ impl GMonthDay {
         }
 
         let after_prefix = &s[2..];
-        let (value, tz) = parse_tz_suffix(after_prefix);
+        let value = strip_tz_suffix(after_prefix)
+            .ok_or_else(|| format!("Cannot parse timezone designator: {s}"))?;
 
         // value should be "MM-DD"
         let dash_pos = value
@@ -1194,23 +920,12 @@ impl GMonthDay {
             return Err(format!("Invalid day {day} in gMonthDay: {s}"));
         }
 
-        Ok(Self {
-            month,
-            day,
-            tz_offset: tz,
-            original: s.to_string(),
-        })
+        Ok(Self { month, day })
     }
 
     /// Construct from month and day with no timezone.
     pub fn from_components(month: u32, day: u32) -> Self {
-        let original = format!("--{month:02}-{day:02}");
-        Self {
-            month,
-            day,
-            tz_offset: None,
-            original,
-        }
+        Self { month, day }
     }
 
     pub fn month(&self) -> u32 {
@@ -1221,12 +936,9 @@ impl GMonthDay {
         self.day
     }
 
-    pub fn tz_offset(&self) -> Option<FixedOffset> {
-        self.tz_offset
-    }
-
-    pub fn original(&self) -> &str {
-        &self.original
+    /// Canonical lexical form, `--MM-DD`. No timezone designator.
+    pub fn canonical(&self) -> String {
+        format!("--{:02}-{:02}", self.month, self.day)
     }
 }
 
@@ -1259,7 +971,7 @@ impl std::hash::Hash for GMonthDay {
 
 impl fmt::Display for GMonthDay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.original)
+        f.write_str(&self.canonical())
     }
 }
 
@@ -2263,6 +1975,264 @@ fn compose_components(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Which calendar fields a temporal datatype actually carries
+// ---------------------------------------------------------------------------
+
+/// A calendar field of a temporal value, as the SPARQL accessor functions
+/// (`YEAR`, `MONTH`, `DAY`, `HOURS`, `MINUTES`, `SECONDS`) name them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CalendarField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+impl CalendarField {
+    /// Filler for a field absent from a value being promoted to a whole
+    /// instant. Year takes the Unix epoch's 1970 and the calendar fields their
+    /// first valid value, matching the XSD timeline mapping the promotion has
+    /// always used.
+    ///
+    /// For whole-value uses only — comparison, ordering, `TZ`/`TIMEZONE`.
+    /// Reading a field OFF a promoted instant must consult
+    /// [`TemporalKind::carries`] first and yield unbound rather than reporting
+    /// one of these as if it came from the data.
+    pub const fn promotion_default(self) -> i64 {
+        match self {
+            Self::Year => 1970,
+            Self::Month | Self::Day => 1,
+            Self::Hour | Self::Minute | Self::Second => 0,
+        }
+    }
+}
+
+/// An XSD temporal datatype, identified from any of the engine's three value
+/// representations: a [`FlakeValue`](crate::value::FlakeValue), an index
+/// [`OType`](crate::o_type::OType), or an encoded
+/// [`ObjKind`](crate::value_id::ObjKind).
+///
+/// Exists for [`Self::carries`] — the single answer to "does this value have
+/// that field at all", which three separate fast/slow paths in
+/// `fluree-db-query` previously each answered with their own hand-rolled
+/// defaults table.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TemporalKind {
+    DateTime,
+    Date,
+    Time,
+    GYear,
+    GYearMonth,
+    GMonth,
+    GDay,
+    GMonthDay,
+}
+
+impl TemporalKind {
+    /// Whether a value of this datatype carries `field` in its lexical form.
+    ///
+    /// `xsd:gYear` has a year and nothing else; `xsd:gMonth` has a month and
+    /// nothing else. Asking for a field the value does not carry —
+    /// `DAY("2005"^^xsd:gYear)`, `YEAR("--03"^^xsd:gMonth)` — has no answer in
+    /// the data, and the caller must yield unbound rather than report the
+    /// promotion's filler (day 1, month 1, or the epoch's year 1970) as though
+    /// it came from the value. That filler is invisible in an answer: on a
+    /// predicate mixing `xsd:date` with `xsd:gYear`, ordinary in bibliographic
+    /// data, it dragged `AVG(DAY(?o))` toward 1 and made `FILTER(DAY(?o) < 15)`
+    /// select precisely the rows with no day at all.
+    ///
+    /// `xsd:date` is treated as carrying the time-of-day fields, at the
+    /// midnight the XSD timeline maps it to. That one is a documented
+    /// convention rather than invented data — a date does begin at midnight,
+    /// and `YEAR`/`MONTH`/`DAY` of a date, the overwhelmingly common uses, are
+    /// genuine either way — so it stays.
+    pub const fn carries(self, field: CalendarField) -> bool {
+        use CalendarField::{Day, Hour, Minute, Month, Second, Year};
+        match self {
+            Self::DateTime | Self::Date => true,
+            Self::Time => matches!(field, Hour | Minute | Second),
+            Self::GYear => matches!(field, Year),
+            Self::GYearMonth => matches!(field, Year | Month),
+            Self::GMonth => matches!(field, Month),
+            Self::GDay => matches!(field, Day),
+            Self::GMonthDay => matches!(field, Month | Day),
+        }
+    }
+
+    /// Identify the datatype of a [`FlakeValue`](crate::value::FlakeValue).
+    ///
+    /// `FlakeValue::Long` carries no datatype of its own; a caller holding one
+    /// under an `xsd:gYear` binding (the numeric gYear encoding) passes
+    /// [`Self::GYear`] itself after checking that datatype.
+    pub fn from_flake_value(val: &crate::value::FlakeValue) -> Option<Self> {
+        use crate::value::FlakeValue;
+        Some(match val {
+            FlakeValue::DateTime(_) => Self::DateTime,
+            FlakeValue::Date(_) => Self::Date,
+            FlakeValue::Time(_) => Self::Time,
+            FlakeValue::GYear(_) => Self::GYear,
+            FlakeValue::GYearMonth(_) => Self::GYearMonth,
+            FlakeValue::GMonth(_) => Self::GMonth,
+            FlakeValue::GDay(_) => Self::GDay,
+            FlakeValue::GMonthDay(_) => Self::GMonthDay,
+            _ => return None,
+        })
+    }
+
+    /// Identify the datatype of an index [`OType`](crate::o_type::OType).
+    pub fn from_o_type(o_type: crate::o_type::OType) -> Option<Self> {
+        use crate::o_type::OType;
+        Some(match o_type {
+            OType::XSD_DATE_TIME => Self::DateTime,
+            OType::XSD_DATE => Self::Date,
+            OType::XSD_TIME => Self::Time,
+            OType::XSD_G_YEAR => Self::GYear,
+            OType::XSD_G_YEAR_MONTH => Self::GYearMonth,
+            OType::XSD_G_MONTH => Self::GMonth,
+            OType::XSD_G_DAY => Self::GDay,
+            OType::XSD_G_MONTH_DAY => Self::GMonthDay,
+            _ => return None,
+        })
+    }
+
+    /// Identify the datatype of an encoded literal's
+    /// [`ObjKind`](crate::value_id::ObjKind).
+    pub fn from_obj_kind(kind: crate::value_id::ObjKind) -> Option<Self> {
+        use crate::value_id::ObjKind;
+        Some(match kind {
+            ObjKind::DATE_TIME => Self::DateTime,
+            ObjKind::DATE => Self::Date,
+            ObjKind::TIME => Self::Time,
+            ObjKind::G_YEAR => Self::GYear,
+            ObjKind::G_YEAR_MONTH => Self::GYearMonth,
+            ObjKind::G_MONTH => Self::GMonth,
+            ObjKind::G_DAY => Self::GDay,
+            ObjKind::G_MONTH_DAY => Self::GMonthDay,
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod calendar_field_tests {
+    use super::CalendarField::{Day, Hour, Minute, Month, Second, Year};
+    use super::*;
+    use crate::o_type::OType;
+    use crate::value_id::ObjKind;
+
+    /// The fields each datatype genuinely carries, spelled out independently of
+    /// `carries`'s own match arms so a typo there cannot pass by agreeing with
+    /// itself.
+    const CARRIED: &[(TemporalKind, &[CalendarField])] = &[
+        (
+            TemporalKind::DateTime,
+            &[Year, Month, Day, Hour, Minute, Second],
+        ),
+        // xsd:date carries the time fields by the midnight convention.
+        (
+            TemporalKind::Date,
+            &[Year, Month, Day, Hour, Minute, Second],
+        ),
+        (TemporalKind::Time, &[Hour, Minute, Second]),
+        (TemporalKind::GYear, &[Year]),
+        (TemporalKind::GYearMonth, &[Year, Month]),
+        (TemporalKind::GMonth, &[Month]),
+        (TemporalKind::GDay, &[Day]),
+        (TemporalKind::GMonthDay, &[Month, Day]),
+    ];
+
+    #[test]
+    fn carries_matches_the_declared_table() {
+        const ALL: &[CalendarField] = &[Year, Month, Day, Hour, Minute, Second];
+        for (kind, carried) in CARRIED {
+            for field in ALL {
+                assert_eq!(
+                    kind.carries(*field),
+                    carried.contains(field),
+                    "{kind:?}.carries({field:?})"
+                );
+            }
+        }
+    }
+
+    /// The fabrications this table exists to stop: a year-only value has no
+    /// month or day, and a month/day-only value has no year to report.
+    #[test]
+    fn absent_fields_are_not_carried() {
+        assert!(!TemporalKind::GYear.carries(Month));
+        assert!(!TemporalKind::GYear.carries(Day));
+        assert!(!TemporalKind::GYearMonth.carries(Day));
+        assert!(!TemporalKind::GMonth.carries(Year));
+        assert!(!TemporalKind::GDay.carries(Year));
+        assert!(!TemporalKind::GMonthDay.carries(Year));
+        assert!(!TemporalKind::Time.carries(Year));
+    }
+
+    /// The two index representations must classify the same datatype the same
+    /// way, or the fast and generic lanes disagree about what is carried.
+    #[test]
+    fn o_type_and_obj_kind_classify_alike() {
+        for (o_type, obj_kind) in [
+            (OType::XSD_DATE_TIME, ObjKind::DATE_TIME),
+            (OType::XSD_DATE, ObjKind::DATE),
+            (OType::XSD_TIME, ObjKind::TIME),
+            (OType::XSD_G_YEAR, ObjKind::G_YEAR),
+            (OType::XSD_G_YEAR_MONTH, ObjKind::G_YEAR_MONTH),
+            (OType::XSD_G_MONTH, ObjKind::G_MONTH),
+            (OType::XSD_G_DAY, ObjKind::G_DAY),
+            (OType::XSD_G_MONTH_DAY, ObjKind::G_MONTH_DAY),
+        ] {
+            let from_o_type = TemporalKind::from_o_type(o_type);
+            assert!(from_o_type.is_some(), "{o_type:?} unclassified");
+            assert_eq!(
+                from_o_type,
+                TemporalKind::from_obj_kind(obj_kind),
+                "{o_type:?} vs {obj_kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_temporal_types_are_unclassified() {
+        assert_eq!(TemporalKind::from_o_type(OType::XSD_STRING), None);
+        assert_eq!(TemporalKind::from_obj_kind(ObjKind::NUM_BIG), None);
+    }
+
+    #[test]
+    fn flake_values_classify_by_variant() {
+        let gy = GYear::parse("2005").expect("parse gYear");
+        assert_eq!(
+            TemporalKind::from_flake_value(&crate::value::FlakeValue::GYear(Box::new(gy))),
+            Some(TemporalKind::GYear)
+        );
+        assert_eq!(
+            TemporalKind::from_flake_value(&crate::value::FlakeValue::String("x".into())),
+            None
+        );
+        // A bare Long is the numeric gYear encoding; its datatype, not its
+        // value, settles the kind, so this helper declines it.
+        assert_eq!(
+            TemporalKind::from_flake_value(&crate::value::FlakeValue::Long(2005)),
+            None
+        );
+    }
+
+    /// The promotion filler, which is exactly what `carries` keeps out of an
+    /// answer. 1970 is the epoch's year and has no relation to any value.
+    #[test]
+    fn promotion_defaults_are_the_epoch_origin() {
+        assert_eq!(Year.promotion_default(), 1970);
+        assert_eq!(Month.promotion_default(), 1);
+        assert_eq!(Day.promotion_default(), 1);
+        assert_eq!(Hour.promotion_default(), 0);
+        assert_eq!(Minute.promotion_default(), 0);
+        assert_eq!(Second.promotion_default(), 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2275,21 +2245,43 @@ mod tests {
         assert_eq!(dt.day(), 15);
         assert_eq!(dt.hours(), 10);
         assert_eq!(dt.minutes(), 30);
-        assert_eq!(dt.timezone(), Some("Z".to_string()));
+        assert_eq!(dt.canonical(), "2024-01-15T10:30:00Z");
     }
 
     #[test]
-    fn test_datetime_parse_with_offset() {
+    fn test_datetime_offset_is_applied_then_discarded() {
         let dt = DateTime::parse("2024-01-15T10:30:00+05:00").unwrap();
-        assert_eq!(dt.hours(), 5); // Normalized to UTC
-        assert_eq!(dt.timezone(), Some("+05:00".to_string()));
+        assert_eq!(dt.hours(), 5);
+        assert_eq!(dt.canonical(), "2024-01-15T05:30:00Z");
+        // Same instant, three spellings, one value.
+        let z = DateTime::parse("2024-01-15T05:30:00Z").unwrap();
+        let no_colon = DateTime::parse("2024-01-15T10:30:00+0500").unwrap();
+        assert_eq!(dt, z);
+        assert_eq!(dt, no_colon);
+        assert_eq!(no_colon.canonical(), z.canonical());
     }
 
     #[test]
-    fn test_datetime_parse_no_timezone() {
+    fn test_datetime_naive_is_utc() {
         let dt = DateTime::parse("2024-01-15T10:30:00").unwrap();
         assert_eq!(dt.hours(), 10);
-        assert!(dt.timezone().is_none());
+        assert_eq!(dt.canonical(), "2024-01-15T10:30:00Z");
+        assert_eq!(dt, DateTime::parse("2024-01-15T10:30:00Z").unwrap());
+    }
+
+    #[test]
+    fn test_datetime_canonical_fraction() {
+        let canon = |s: &str| DateTime::parse(s).unwrap().canonical();
+        assert_eq!(canon("2024-01-15T10:30:00.5Z"), "2024-01-15T10:30:00.5Z");
+        assert_eq!(
+            canon("2024-01-15T10:30:00.500000Z"),
+            "2024-01-15T10:30:00.5Z"
+        );
+        assert_eq!(
+            canon("2024-01-15T10:30:00.123456Z"),
+            "2024-01-15T10:30:00.123456Z"
+        );
+        assert_eq!(canon("2024-01-15T10:30:00.000Z"), "2024-01-15T10:30:00Z");
     }
 
     #[test]
@@ -2308,21 +2300,58 @@ mod tests {
     }
 
     #[test]
+    fn test_datetime_index_round_trip() {
+        // What the index key holds is the whole value: decoding it yields the
+        // same struct, not a lookalike.
+        let dt = DateTime::parse("2010-12-21T15:38:02.25-08:00").unwrap();
+        let back = DateTime::from_epoch_micros(dt.epoch_micros()).unwrap();
+        assert_eq!(back, dt);
+        assert_eq!(back.canonical(), "2010-12-21T23:38:02.25Z");
+    }
+
+    #[test]
     fn test_date_parse() {
         let d = Date::parse("2024-01-15").unwrap();
         assert_eq!(d.year(), 2024);
         assert_eq!(d.month(), 1);
         assert_eq!(d.day(), 15);
-        assert!(d.timezone().is_none());
+        assert_eq!(d.canonical(), "2024-01-15");
     }
 
     #[test]
-    fn test_date_parse_with_timezone() {
-        let d = Date::parse("2024-01-15Z").unwrap();
-        assert_eq!(d.timezone(), Some("Z".to_string()));
+    fn test_date_offset_is_discarded_not_applied() {
+        // Midnight at +05:00 is the previous UTC day; applying the offset would
+        // move the calendar date, which is not what a date means.
+        let plain = Date::parse("2024-01-15").unwrap();
+        for s in ["2024-01-15Z", "2024-01-15+05:00", "2024-01-15-08:00"] {
+            let d = Date::parse(s).unwrap();
+            assert_eq!(d, plain, "{s}");
+            assert_eq!(d.day(), 15, "{s}");
+            assert_eq!(d.canonical(), "2024-01-15", "{s}");
+        }
+    }
 
-        let d2 = Date::parse("2024-01-15+05:00").unwrap();
-        assert_eq!(d2.timezone(), Some("+05:00".to_string()));
+    #[test]
+    fn test_date_rejects_malformed_designator() {
+        assert!(Date::parse("2024-01-15+ab:cd").is_err());
+        assert!(Date::parse("2024-01-15+5:00").is_err());
+    }
+
+    #[test]
+    fn test_date_index_round_trip() {
+        let d = Date::parse("2024-01-15+05:00").unwrap();
+        assert_eq!(
+            Date::from_days_since_epoch(d.days_since_epoch()).unwrap(),
+            d
+        );
+        assert_eq!(
+            Date::from_days_since_epoch(0).unwrap().canonical(),
+            "1970-01-01"
+        );
+        assert_eq!(
+            Date::from_days_since_epoch(-1).unwrap().canonical(),
+            "1969-12-31"
+        );
     }
 
     #[test]
@@ -2330,77 +2359,58 @@ mod tests {
         let t = Time::parse("10:30:00").unwrap();
         assert_eq!(t.hours(), 10);
         assert_eq!(t.minutes(), 30);
-        assert!(t.timezone().is_none());
+        assert_eq!(t.canonical(), "10:30:00");
     }
 
     #[test]
-    fn test_time_parse_with_timezone() {
-        let t = Time::parse("10:30:00Z").unwrap();
-        assert_eq!(t.timezone(), Some("Z".to_string()));
-
-        let t2 = Time::parse("10:30:00+05:00").unwrap();
-        assert_eq!(t2.timezone(), Some("+05:00".to_string()));
+    fn test_time_offset_is_discarded_not_applied() {
+        // 15:00:00+05:00 is 10:00:00 UTC, but the index has only ever held the
+        // wall clock, so the offset is dropped rather than applied.
+        let plain = Time::parse("15:00:00").unwrap();
+        for s in ["15:00:00Z", "15:00:00+05:00", "15:00:00-06:00"] {
+            let t = Time::parse(s).unwrap();
+            assert_eq!(t, plain, "{s}");
+            assert_eq!(t.hours(), 15, "{s}");
+            assert_eq!(t.canonical(), "15:00:00", "{s}");
+        }
+        // Used to be asserted equal (same UTC time of day). Not any more.
+        assert_ne!(
+            Time::parse("10:00:00Z").unwrap(),
+            Time::parse("15:00:00+05:00").unwrap()
+        );
     }
 
     #[test]
-    fn test_time_ordering_with_timezone() {
-        // 10:00:00Z and 15:00:00+05:00 are the same UTC time
-        let t1 = Time::parse("10:00:00Z").unwrap();
-        let t2 = Time::parse("15:00:00+05:00").unwrap();
-        assert_eq!(t1, t2);
-    }
-
-    // ---- parse_tz_suffix / format_tz_suffix ----
-
-    #[test]
-    fn test_parse_tz_suffix_z() {
-        let (val, tz) = parse_tz_suffix("2024Z");
-        assert_eq!(val, "2024");
-        assert_eq!(tz.unwrap().local_minus_utc(), 0);
+    fn test_time_canonical_fraction() {
+        let canon = |s: &str| Time::parse(s).unwrap().canonical();
+        assert_eq!(canon("10:30:00.5"), "10:30:00.5");
+        assert_eq!(canon("10:30:00.500000Z"), "10:30:00.5");
+        assert_eq!(canon("10:30:00.000"), "10:30:00");
     }
 
     #[test]
-    fn test_parse_tz_suffix_positive_offset() {
-        let (val, tz) = parse_tz_suffix("2024+05:00");
-        assert_eq!(val, "2024");
-        assert_eq!(tz.unwrap().local_minus_utc(), 5 * 3600);
+    fn test_time_index_round_trip() {
+        let t = Time::parse("17:00:00.25-06:00").unwrap();
+        let back = Time::from_micros_since_midnight(t.micros_since_midnight()).unwrap();
+        assert_eq!(back, t);
+        assert_eq!(back.canonical(), "17:00:00.25");
+        assert!(Time::from_micros_since_midnight(-1).is_none());
+        assert!(Time::from_micros_since_midnight(86_400_000_000).is_none());
     }
 
-    #[test]
-    fn test_parse_tz_suffix_negative_offset() {
-        let (val, tz) = parse_tz_suffix("2024-05:30");
-        assert_eq!(val, "2024");
-        assert_eq!(tz.unwrap().local_minus_utc(), -(5 * 3600 + 30 * 60));
-    }
+    // ---- strip_tz_suffix ----
 
     #[test]
-    fn test_parse_tz_suffix_none() {
-        let (val, tz) = parse_tz_suffix("2024");
-        assert_eq!(val, "2024");
-        assert!(tz.is_none());
-    }
-
-    #[test]
-    fn test_format_tz_suffix_none() {
-        assert_eq!(format_tz_suffix(None), "");
-    }
-
-    #[test]
-    fn test_format_tz_suffix_utc() {
-        let tz = FixedOffset::east_opt(0).unwrap();
-        assert_eq!(format_tz_suffix(Some(tz)), "Z");
-    }
-
-    #[test]
-    fn test_format_tz_suffix_positive() {
-        let tz = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
-        assert_eq!(format_tz_suffix(Some(tz)), "+05:30");
-    }
-
-    #[test]
-    fn test_format_tz_suffix_negative() {
-        let tz = FixedOffset::east_opt(-8 * 3600).unwrap();
-        assert_eq!(format_tz_suffix(Some(tz)), "-08:00");
+    fn test_strip_tz_suffix() {
+        assert_eq!(strip_tz_suffix("2024Z"), Some("2024"));
+        assert_eq!(strip_tz_suffix("2024+05:00"), Some("2024"));
+        assert_eq!(strip_tz_suffix("2024-05:30"), Some("2024"));
+        assert_eq!(strip_tz_suffix("2024"), Some("2024"));
+        // A date's own separators are not a designator.
+        assert_eq!(strip_tz_suffix("2024-01-15"), Some("2024-01-15"));
+        assert_eq!(strip_tz_suffix("--03"), Some("--03"));
+        // A malformed designator is rejected, not kept as data.
+        assert_eq!(strip_tz_suffix("2024+ab:cd"), None);
     }
 
     // ---- GYear ----
@@ -2409,22 +2419,21 @@ mod tests {
     fn test_gyear_parse_plain() {
         let y = GYear::parse("2024").unwrap();
         assert_eq!(y.year(), 2024);
-        assert!(y.tz_offset().is_none());
-        assert_eq!(y.original(), "2024");
+        assert_eq!(y.canonical(), "2024");
     }
 
     #[test]
     fn test_gyear_parse_with_z() {
         let y = GYear::parse("2024Z").unwrap();
         assert_eq!(y.year(), 2024);
-        assert_eq!(y.tz_offset().unwrap().local_minus_utc(), 0);
+        assert_eq!(y.canonical(), "2024");
     }
 
     #[test]
     fn test_gyear_parse_with_offset() {
         let y = GYear::parse("2024+05:00").unwrap();
         assert_eq!(y.year(), 2024);
-        assert_eq!(y.tz_offset().unwrap().local_minus_utc(), 5 * 3600);
+        assert_eq!(y.canonical(), "2024");
     }
 
     #[test]
@@ -2437,7 +2446,7 @@ mod tests {
     fn test_gyear_parse_negative_with_z() {
         let y = GYear::parse("-0050Z").unwrap();
         assert_eq!(y.year(), -50);
-        assert_eq!(y.tz_offset().unwrap().local_minus_utc(), 0);
+        assert_eq!(y.canonical(), "-0050");
     }
 
     #[test]
@@ -2476,7 +2485,7 @@ mod tests {
     #[test]
     fn test_gyear_display() {
         let y = GYear::parse("2024+05:00").unwrap();
-        assert_eq!(format!("{y}"), "2024+05:00");
+        assert_eq!(format!("{y}"), "2024");
     }
 
     #[test]
@@ -2492,7 +2501,6 @@ mod tests {
         let ym = GYearMonth::parse("2024-01").unwrap();
         assert_eq!(ym.year(), 2024);
         assert_eq!(ym.month(), 1);
-        assert!(ym.tz_offset().is_none());
     }
 
     #[test]
@@ -2500,7 +2508,7 @@ mod tests {
         let ym = GYearMonth::parse("2024-01Z").unwrap();
         assert_eq!(ym.year(), 2024);
         assert_eq!(ym.month(), 1);
-        assert_eq!(ym.tz_offset().unwrap().local_minus_utc(), 0);
+        assert_eq!(ym.canonical(), "2024-01");
     }
 
     #[test]
@@ -2508,7 +2516,7 @@ mod tests {
         let ym = GYearMonth::parse("2024-06+05:00").unwrap();
         assert_eq!(ym.year(), 2024);
         assert_eq!(ym.month(), 6);
-        assert_eq!(ym.tz_offset().unwrap().local_minus_utc(), 5 * 3600);
+        assert_eq!(ym.canonical(), "2024-06");
     }
 
     #[test]
@@ -2523,13 +2531,13 @@ mod tests {
         let ym = GYearMonth::from_components(2024, 3);
         assert_eq!(ym.year(), 2024);
         assert_eq!(ym.month(), 3);
-        assert_eq!(ym.original(), "2024-03");
+        assert_eq!(ym.canonical(), "2024-03");
     }
 
     #[test]
     fn test_gyearmonth_from_components_negative() {
         let ym = GYearMonth::from_components(-50, 6);
-        assert_eq!(ym.original(), "-0050-06");
+        assert_eq!(ym.canonical(), "-0050-06");
     }
 
     #[test]
@@ -2557,7 +2565,7 @@ mod tests {
     #[test]
     fn test_gyearmonth_display() {
         let ym = GYearMonth::parse("2024-01+05:00").unwrap();
-        assert_eq!(format!("{ym}"), "2024-01+05:00");
+        assert_eq!(format!("{ym}"), "2024-01");
     }
 
     // ---- GMonth ----
@@ -2566,28 +2574,27 @@ mod tests {
     fn test_gmonth_parse_plain() {
         let m = GMonth::parse("--01").unwrap();
         assert_eq!(m.month(), 1);
-        assert!(m.tz_offset().is_none());
     }
 
     #[test]
     fn test_gmonth_parse_with_z() {
         let m = GMonth::parse("--07Z").unwrap();
         assert_eq!(m.month(), 7);
-        assert_eq!(m.tz_offset().unwrap().local_minus_utc(), 0);
+        assert_eq!(m.canonical(), "--07");
     }
 
     #[test]
     fn test_gmonth_parse_with_offset() {
         let m = GMonth::parse("--12+05:00").unwrap();
         assert_eq!(m.month(), 12);
-        assert_eq!(m.tz_offset().unwrap().local_minus_utc(), 5 * 3600);
+        assert_eq!(m.canonical(), "--12");
     }
 
     #[test]
     fn test_gmonth_from_month() {
         let m = GMonth::from_month(3);
         assert_eq!(m.month(), 3);
-        assert_eq!(m.original(), "--03");
+        assert_eq!(m.canonical(), "--03");
     }
 
     #[test]
@@ -2614,7 +2621,7 @@ mod tests {
     #[test]
     fn test_gmonth_display() {
         let m = GMonth::parse("--07Z").unwrap();
-        assert_eq!(format!("{m}"), "--07Z");
+        assert_eq!(format!("{m}"), "--07");
     }
 
     // ---- GDay ----
@@ -2623,28 +2630,27 @@ mod tests {
     fn test_gday_parse_plain() {
         let d = GDay::parse("---15").unwrap();
         assert_eq!(d.day(), 15);
-        assert!(d.tz_offset().is_none());
     }
 
     #[test]
     fn test_gday_parse_with_z() {
         let d = GDay::parse("---01Z").unwrap();
         assert_eq!(d.day(), 1);
-        assert_eq!(d.tz_offset().unwrap().local_minus_utc(), 0);
+        assert_eq!(d.canonical(), "---01");
     }
 
     #[test]
     fn test_gday_parse_with_offset() {
         let d = GDay::parse("---31+05:00").unwrap();
         assert_eq!(d.day(), 31);
-        assert_eq!(d.tz_offset().unwrap().local_minus_utc(), 5 * 3600);
+        assert_eq!(d.canonical(), "---31");
     }
 
     #[test]
     fn test_gday_from_day() {
         let d = GDay::from_day(7);
         assert_eq!(d.day(), 7);
-        assert_eq!(d.original(), "---07");
+        assert_eq!(d.canonical(), "---07");
     }
 
     #[test]
@@ -2671,7 +2677,7 @@ mod tests {
     #[test]
     fn test_gday_display() {
         let d = GDay::parse("---15+05:00").unwrap();
-        assert_eq!(format!("{d}"), "---15+05:00");
+        assert_eq!(format!("{d}"), "---15");
     }
 
     // ---- GMonthDay ----
@@ -2681,7 +2687,6 @@ mod tests {
         let md = GMonthDay::parse("--01-15").unwrap();
         assert_eq!(md.month(), 1);
         assert_eq!(md.day(), 15);
-        assert!(md.tz_offset().is_none());
     }
 
     #[test]
@@ -2689,7 +2694,7 @@ mod tests {
         let md = GMonthDay::parse("--12-25Z").unwrap();
         assert_eq!(md.month(), 12);
         assert_eq!(md.day(), 25);
-        assert_eq!(md.tz_offset().unwrap().local_minus_utc(), 0);
+        assert_eq!(md.canonical(), "--12-25");
     }
 
     #[test]
@@ -2697,7 +2702,7 @@ mod tests {
         let md = GMonthDay::parse("--06-15+05:00").unwrap();
         assert_eq!(md.month(), 6);
         assert_eq!(md.day(), 15);
-        assert_eq!(md.tz_offset().unwrap().local_minus_utc(), 5 * 3600);
+        assert_eq!(md.canonical(), "--06-15");
     }
 
     #[test]
@@ -2705,7 +2710,7 @@ mod tests {
         let md = GMonthDay::from_components(3, 14);
         assert_eq!(md.month(), 3);
         assert_eq!(md.day(), 14);
-        assert_eq!(md.original(), "--03-14");
+        assert_eq!(md.canonical(), "--03-14");
     }
 
     #[test]
@@ -2734,7 +2739,7 @@ mod tests {
     #[test]
     fn test_gmonthday_display() {
         let md = GMonthDay::parse("--12-25Z").unwrap();
-        assert_eq!(format!("{md}"), "--12-25Z");
+        assert_eq!(format!("{md}"), "--12-25");
     }
 
     // ---- YearMonthDuration ----

@@ -231,7 +231,7 @@ impl From<SubmissionState> for SubmissionStateResponse {
 impl From<OperationReceipt> for OperationDetailResponse {
     fn from(receipt: OperationReceipt) -> Self {
         match receipt {
-            OperationReceipt::Transaction(r) => Self::Transaction(r.into()),
+            OperationReceipt::Transaction(r) => Self::Transaction((*r).into()),
             OperationReceipt::Revert(r) => Self::Revert(r.into()),
             OperationReceipt::Merge(r) => Self::Merge(r.into()),
             OperationReceipt::Rebase(r) => Self::Rebase(r.into()),
@@ -248,6 +248,7 @@ fn body_kind_tag(kind: BodyKind) -> &'static str {
         BodyKind::JsonLdInsert
         | BodyKind::JsonLdUpsert
         | BodyKind::JsonLdUpdate
+        | BodyKind::JsonLdGraphSync
         | BodyKind::TurtleInsert
         | BodyKind::TurtleUpsert
         | BodyKind::TrigUpsert
@@ -362,18 +363,20 @@ mod tests {
             commit_id: commit_id.clone(),
             t: 42,
             tally: None,
-            receipt: Some(Box::new(OperationReceipt::Transaction(
+            receipt: Some(Box::new(OperationReceipt::Transaction(Box::new(
                 TransactionReceipt {
                     idempotency_key: Some(IdempotencyKey::new("client-key-42").expect("fits cap")),
                     commit: CommitReceipt {
                         commit_id,
                         t: 42,
                         flake_count: 3,
+                        assert_count: 3,
+                        retract_count: 0,
                     },
                     tally: None,
                     cypher_return: None,
                 },
-            ))),
+            )))),
         }))
     }
 

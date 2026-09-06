@@ -244,7 +244,7 @@ fn build_leaf_via_rebuild(
         leaflet_target_rows: 100,
         leaf_target_rows: 1000,
         zstd_level: 1,
-        skip_dedup: false,
+        import_unique_asserts: false,
         skip_history: false,
         g_id: 0,
         progress: None,

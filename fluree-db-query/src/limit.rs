@@ -130,6 +130,19 @@ impl Operator for LimitOperator {
             self.emitted = self.limit;
             self.state = OperatorState::Exhausted;
 
+            // Zero-column input (every WHERE var projected away — e.g. a
+            // constant-template CONSTRUCT, or an ASK under its dedup license):
+            // a column-less `Batch` carries no row count through `Batch::new`
+            // (it reads the count off `columns.first()`), so the general
+            // rebuild below would produce a zero-row batch and the surviving
+            // `remaining` rows would silently vanish — an ASK reads false, a
+            // CONSTRUCT builds an empty graph. Same trap `DistinctOperator`
+            // had; `Batch::empty_schema_with_len` is the constructor that
+            // preserves the count.
+            if self.schema.is_empty() {
+                return Ok(Some(Batch::empty_schema_with_len(remaining)));
+            }
+
             // Build truncated batch
             let num_cols = self.schema.len();
             let mut columns: Vec<Vec<Binding>> = Vec::with_capacity(num_cols);
@@ -241,6 +254,52 @@ mod tests {
             })
             .collect();
         Batch::new(schema, columns).unwrap()
+    }
+
+    /// Truncating a zero-column batch must preserve the surviving row count.
+    ///
+    /// A column-less `Batch` carries no row count through `Batch::new` (it
+    /// reads the count off `columns.first()`), so the column-by-column rebuild
+    /// in the truncation branch produced a zero-row batch and the surviving
+    /// rows vanished. Reachable from a constant-template
+    /// `CONSTRUCT { <s> <p> "x" } WHERE { ?s ?p ?o } LIMIT 1` (empty graph
+    /// instead of one triple) and from a licensed `ASK` whose WHERE schema
+    /// prunes empty (`false` instead of `true` — W3C `ask-7` caught it). Same
+    /// trap family as `DistinctOperator`'s zero-column fix.
+    #[tokio::test]
+    async fn test_limit_truncation_keeps_zero_column_row_count() {
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        // 5 empty-tuple rows, LIMIT 2: the truncation branch must report 2.
+        let mock = MockOperator::new(vec![Batch::empty_schema_with_len(5)]);
+        let mut limit_op = LimitOperator::new(Box::new(mock), 2);
+        limit_op.open(&ctx).await.unwrap();
+
+        let batch = limit_op
+            .next_batch(&ctx)
+            .await
+            .unwrap()
+            .expect("truncated batch must survive");
+        assert_eq!(batch.len(), 2, "zero-column truncation lost the row count");
+        assert!(limit_op.next_batch(&ctx).await.unwrap().is_none());
+    }
+
+    /// The pass-through side of the same seam: a zero-column batch entirely
+    /// under the limit must flow through with its count intact.
+    #[tokio::test]
+    async fn test_limit_passthrough_keeps_zero_column_row_count() {
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+
+        let mock = MockOperator::new(vec![Batch::empty_schema_with_len(3)]);
+        let mut limit_op = LimitOperator::new(Box::new(mock), 10);
+        limit_op.open(&ctx).await.unwrap();
+
+        let batch = limit_op.next_batch(&ctx).await.unwrap().expect("batch");
+        assert_eq!(batch.len(), 3);
     }
 
     #[tokio::test]

@@ -11,6 +11,11 @@ Billions of graph facts on commodity hardware. Over 2M facts/second bulk import.
 > Persistent, searchable memory for AI coding assistants. Give Claude Code, Cursor, and other AI tools long-term project memory: facts, decisions, and preferences persist across sessions in a Fluree ledger you control — scoped per-repo or per-user, shareable via git.
 > [Fluree Memory docs →](https://labs.flur.ee/docs)
 
+> [!NOTE]
+> **Fluree Unstructured** — is part of the Fluree DB CLI.
+> Unstructured documents in, a knowledge graph out. `fluree doc ingest ./folder` turns PDFs, Office files, Markdown and scans into a searchable, citable graph — structure, chunks and embeddings in a ledger you control. Deterministic and offline by default, with the best model-free parsing engine on a public 200-document benchmark — ahead of Nutrient, Docling, Marker, Unstructured, MinerU and PyMuPDF4LLM; add your own vision model or a Fluree AI account and it outscores every engine measured, OpenDataLoader's hybrid included.
+> [Fluree Unstructured docs →](docs/unstructured/README.md)
+
 ## Install
 
 **Cloud / Serverless** — Run in a dedicated serverless stack at no cost at [flur.ee](https://flur.ee/solo) (usage limited), spin up dedicated servers on demand as needed. Interact seamlessly with local fluree CLI (install instructions below).
@@ -287,7 +292,7 @@ fluree mcp serve            # stdio transport for Claude Desktop, Cursor, etc.
 | | |
 |---|---|
 | **Performance** | [Columnar integer-ID engine, cost-based planner, 16 fast-path operators](docs/design/performance.md) — [benchmarks](https://github.com/fluree/benchmark-db) |
-| **Query languages** | [SPARQL 1.1](docs/query/sparql.md), [JSON-LD Query](docs/query/jsonld-query.md), [openCypher](docs/query/cypher.md) |
+| **Query languages** | [SPARQL 1.1](docs/query/sparql.md), [JSON-LD Query](docs/query/jsonld-query.md), [openCypher](docs/query/cypher.md), [GraphQL](docs/query/graphql.md) (schema derived from your data) |
 | **Data formats** | JSON-LD, [Turtle, TriG](docs/transactions/turtle.md), N-Triples, N-Quads |
 | **Edge annotations** | [Property-graph edges & statement-level metadata (RDF 1.2 / SPARQL 1.2)](docs/concepts/edge-annotations.md) |
 | **Time travel** | [Transaction number, ISO timestamp, commit ID](docs/concepts/time-travel.md) |

@@ -112,6 +112,14 @@ pub enum TransactError {
         max_bytes: usize,
     },
 
+    /// Whole-graph scan larger than the memory backstop
+    #[error(
+        "whole-graph operation would materialize more than {limit} currently-asserted flakes; \
+         this is the memory backstop for graph sync / CLEAR / DROP / COPY / MOVE — raise or \
+         disable it with FLUREE_MAX_GRAPH_SCAN_FLAKES (0 disables)"
+    )]
+    WholeGraphScanTooLarge { limit: usize },
+
     /// Invalid template term
     #[error("Invalid template term: {0}")]
     InvalidTerm(String),

@@ -30,7 +30,10 @@
 //! ```
 
 use crate::{ApiError, Result};
-use fluree_db_nameservice::{GraphSourcePublisher, NameServiceEvent, NameServiceLookup};
+use fluree_db_core::ledger_id::normalize_ledger_id;
+use fluree_db_nameservice::{
+    GraphSourcePublisher, GraphSourceType, NameServiceEvent, NameServiceLookup,
+};
 use futures::StreamExt;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -38,6 +41,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -46,6 +50,27 @@ use tracing::{debug, error, info, warn};
 /// `Send` so [`Bm25MaintenanceWorker::run`] can be driven by a multi-threaded
 /// executor via `tokio::spawn`.
 type SyncFuture<'a> = Pin<Box<dyn Future<Output = (String, Result<()>)> + Send + 'a>>;
+
+/// Canonicalize a ledger / graph-source alias to `name:branch`.
+///
+/// Aliases reach this worker in two spellings. `LedgerCommitPublished` always
+/// carries the canonical `name:branch`, but a graph source's stored
+/// `dependencies` are whatever the creator passed: `create_bm25_index` records
+/// `Bm25CreateConfig::ledger` verbatim, and a bare `name` means `name:main` to
+/// the rest of Fluree. Registering under the raw spelling therefore files an
+/// index created with `ledger: "docs"` under `docs`, while every commit event
+/// for it says `docs:main` — the reverse lookup misses and that index silently
+/// never auto-syncs.
+///
+/// Normalizing every key into and out of the maps closes that, and makes the
+/// two spellings one registration rather than two. Unparseable aliases are
+/// passed through unchanged so a malformed id still matches itself.
+///
+/// The same hazard is already handled one layer up, in the CLI's
+/// `resolve_source_t`, which tries the stored alias and then `{alias}:main`.
+fn canonical_alias(alias: &str) -> String {
+    normalize_ledger_id(alias).unwrap_or_else(|_| alias.to_string())
+}
 
 /// Log a sync that ended in an error.
 ///
@@ -145,18 +170,32 @@ impl Bm25WorkerState {
 
     /// Register a graph source with its dependencies.
     pub fn register_graph_source(&mut self, graph_source_id: &str, dependencies: &[String]) {
-        let deps_set: HashSet<String> = dependencies.iter().cloned().collect();
+        let graph_source_id = canonical_alias(graph_source_id);
+        let deps_set: HashSet<String> = dependencies.iter().map(|d| canonical_alias(d)).collect();
+
+        // Clear the old reverse edges first. Overwriting the forward entry
+        // alone would leave any ledger dropped from `dependencies` still
+        // pointing here, so its commits would keep queueing a sync of an index
+        // that no longer reads it, and `watched_ledgers` would report a ledger
+        // nobody watches. Reachable through the `auto_register` arm, which
+        // re-registers on every config republish.
+        //
+        // Prune directly rather than via `unregister_graph_source`: that logs
+        // "Unregistered graph source from maintenance", and an ordinary config
+        // republish emitting it mid-re-register is a misleading breadcrumb for
+        // anyone reading logs to find out why an index stopped syncing.
+        self.prune_reverse_edges(&graph_source_id);
 
         // Update forward map
         self.gs_to_ledgers
-            .insert(graph_source_id.to_string(), deps_set.clone());
+            .insert(graph_source_id.clone(), deps_set.clone());
 
         // Update reverse map
         for ledger in &deps_set {
             self.ledger_to_graph_sources
                 .entry(ledger.clone())
                 .or_default()
-                .insert(graph_source_id.to_string());
+                .insert(graph_source_id.clone());
         }
 
         self.stats.registered_graph_sources = self.gs_to_ledgers.len();
@@ -167,30 +206,51 @@ impl Bm25WorkerState {
         );
     }
 
-    /// Unregister a graph source.
-    pub fn unregister_graph_source(&mut self, graph_source_id: &str) {
-        if let Some(ledgers) = self.gs_to_ledgers.remove(graph_source_id) {
-            // Remove from reverse map
-            for ledger in ledgers {
-                if let Some(graph_sources) = self.ledger_to_graph_sources.get_mut(&ledger) {
-                    graph_sources.remove(graph_source_id);
-                    if graph_sources.is_empty() {
-                        self.ledger_to_graph_sources.remove(&ledger);
+    /// Drop every map entry for an already-canonical graph source id, without
+    /// logging. Returns whether it had been registered.
+    ///
+    /// The removal half of both [`register_graph_source`](Self::register_graph_source)
+    /// (which prunes stale edges before rewriting them) and
+    /// [`unregister_graph_source`](Self::unregister_graph_source) (which adds the
+    /// log). Keeping the log out of here is what stops a re-register from
+    /// announcing an unregistration that did not happen.
+    fn prune_reverse_edges(&mut self, canonical_id: &str) -> bool {
+        let was_registered = match self.gs_to_ledgers.remove(canonical_id) {
+            Some(ledgers) => {
+                // Remove from reverse map
+                for ledger in ledgers {
+                    if let Some(graph_sources) = self.ledger_to_graph_sources.get_mut(&ledger) {
+                        graph_sources.remove(canonical_id);
+                        if graph_sources.is_empty() {
+                            self.ledger_to_graph_sources.remove(&ledger);
+                        }
                     }
                 }
+                true
             }
-        }
+            None => false,
+        };
         self.stats.registered_graph_sources = self.gs_to_ledgers.len();
-        debug!(
-            graph_source_id,
-            "Unregistered graph source from maintenance"
-        );
+        was_registered
+    }
+
+    /// Unregister a graph source. Returns whether it had been registered.
+    pub fn unregister_graph_source(&mut self, graph_source_id: &str) -> bool {
+        let graph_source_id = canonical_alias(graph_source_id);
+        let was_registered = self.prune_reverse_edges(&graph_source_id);
+        if was_registered {
+            debug!(
+                graph_source_id,
+                "Unregistered graph source from maintenance"
+            );
+        }
+        was_registered
     }
 
     /// Get graph sources that depend on a ledger.
     pub fn graph_sources_for_ledger(&self, ledger_id: &str) -> Vec<String> {
         self.ledger_to_graph_sources
-            .get(ledger_id)
+            .get(&canonical_alias(ledger_id))
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default()
     }
@@ -269,9 +329,10 @@ impl Bm25WorkerHandle {
             .register_graph_source(graph_source_id, dependencies);
     }
 
-    /// Unregister a graph source from automatic maintenance.
-    pub fn unregister_graph_source(&self, graph_source_id: &str) {
-        self.state.lock().unregister_graph_source(graph_source_id);
+    /// Unregister a graph source from automatic maintenance. Returns whether
+    /// it had been registered. The index itself is left untouched.
+    pub fn unregister_graph_source(&self, graph_source_id: &str) -> bool {
+        self.state.lock().unregister_graph_source(graph_source_id)
     }
 
     /// Get current worker statistics.
@@ -371,11 +432,15 @@ impl Bm25MaintenanceWorker {
             }
             NameServiceEvent::GraphSourceConfigPublished {
                 graph_source_id,
+                source_type,
                 dependencies,
-                ..
             } => {
-                // Auto-register graph source if configured
-                if self.config.auto_register {
+                // BM25 only. Vector, R2RML and Iceberg sources have their own
+                // maintenance paths; registering one here would queue a
+                // `sync_bm25_index` against it on every commit to its source
+                // ledger, and every one of those fails. This mirrors the
+                // start-up pass, which already filters on `is_bm25()`.
+                if self.config.auto_register && *source_type == GraphSourceType::Bm25 {
                     self.state
                         .lock()
                         .register_graph_source(graph_source_id, dependencies);
@@ -384,9 +449,13 @@ impl Bm25MaintenanceWorker {
                 vec![]
             }
             NameServiceEvent::GraphSourceRetracted { graph_source_id } => {
-                // Unregister retracted graph source
-                self.state.lock().unregister_graph_source(graph_source_id);
-                info!(graph_source = %graph_source_id, "Unregistered retracted graph source");
+                // The event carries no `source_type`, so this fires for every
+                // retraction in the system — vector, R2RML, Iceberg included.
+                // Log only when one of ours actually went away, or the line is
+                // mostly noise about graph sources this worker never held.
+                if self.state.lock().unregister_graph_source(graph_source_id) {
+                    info!(graph_source = %graph_source_id, "Unregistered retracted graph source");
+                }
                 vec![]
             }
             _ => vec![], // Other events don't trigger sync
@@ -532,13 +601,40 @@ impl Bm25MaintenanceWorker {
                                 next_flush = Some(Instant::now() + Duration::from_millis(self.config.debounce_ms));
                             }
                         }
-                        Err(e) => {
-                            // Broadcast channel lagged or closed
-                            warn!(error = %e, "Event channel error, resubscribing");
-                            subscription = self
-                                .fluree
-                                .event_bus()
-                                .subscribe(fluree_db_nameservice::SubscriptionScope::All);
+                        Err(RecvError::Lagged(skipped)) => {
+                            // Keep this receiver. `Lagged` has already moved it
+                            // to the oldest event still in the ring, so it is
+                            // positioned to deliver everything that survived;
+                            // resubscribing would jump to the tail instead and
+                            // throw that remainder away on top of the `skipped`
+                            // the channel already dropped.
+                            //
+                            // The evicted commits are gone either way, so the
+                            // indexes they would have queued stay stale until
+                            // their next commit.
+                            warn!(
+                                skipped,
+                                "BM25 maintenance worker lagged on the event bus; \
+                                 those commits will not queue a sync"
+                            );
+                        }
+                        Err(RecvError::Closed) => {
+                            // The bus lives on the `Fluree` we hold an `Arc` to,
+                            // so this only happens at teardown. Resubscribing
+                            // would return `Closed` again immediately and spin
+                            // this loop at full tilt.
+                            //
+                            // Drain first, for the same reason the stop path
+                            // does: an abandoned sync can leave a snapshot in
+                            // storage that no manifest points at.
+                            info!(
+                                draining = in_flight.len(),
+                                "Event bus closed; BM25 maintenance worker exiting"
+                            );
+                            while let Some((graph_source_id, res)) = in_flight.next().await {
+                                log_sync_failure(&graph_source_id, res);
+                            }
+                            break;
                         }
                     }
                 }
@@ -683,6 +779,297 @@ mod tests {
         // ledger3 triggers only gs2
         let graph_sources = state.graph_sources_for_ledger("ledger3:main");
         assert_eq!(graph_sources, vec!["gs2:main"]);
+    }
+
+    /// `create_bm25_index` stores `Bm25CreateConfig::ledger` verbatim, so a
+    /// branchless dependency is a real record shape — and commit events always
+    /// spell the ledger canonically. Before normalization the reverse lookup
+    /// missed and such an index never auto-synced.
+    #[test]
+    fn a_branchless_dependency_is_woken_by_its_canonical_commit_event() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source("search:main", &["ledger1".to_string()]);
+
+        assert_eq!(
+            state.graph_sources_for_ledger("ledger1:main"),
+            vec!["search:main"],
+            "a bare `name` dependency must be woken by `name:main` commits"
+        );
+        assert_eq!(state.watched_ledgers(), vec!["ledger1:main"]);
+    }
+
+    /// The start-up pass registers under the record's canonical id while an
+    /// operator may name the index bare. Both spellings must be one entry, or
+    /// the index is registered twice and synced twice per commit.
+    #[test]
+    fn a_branchless_graph_source_id_is_the_same_registration() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source("search", &["ledger1:main".to_string()]);
+        state.register_graph_source("search:main", &["ledger1:main".to_string()]);
+
+        assert_eq!(
+            state.registered_graph_sources(),
+            vec!["search:main"],
+            "the two spellings must be one registration, not two"
+        );
+        assert_eq!(
+            state.graph_sources_for_ledger("ledger1:main"),
+            vec!["search:main"],
+            "and one entry in the reverse map, so one sync per commit"
+        );
+    }
+
+    /// Unregistering by the other spelling has to find it, or `untrack docs`
+    /// silently leaves `docs:main` registered.
+    #[test]
+    fn unregistering_by_the_branchless_spelling_finds_the_registration() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source("search:main", &["ledger1:main".to_string()]);
+        state.unregister_graph_source("search");
+
+        assert!(
+            state.registered_graph_sources().is_empty(),
+            "untrack by the bare name must find the canonical registration"
+        );
+        assert!(
+            state.watched_ledgers().is_empty(),
+            "and must take its reverse edge with it"
+        );
+    }
+
+    /// An id `normalize_ledger_id` cannot parse must still match itself rather
+    /// than being dropped on the floor.
+    #[test]
+    fn an_unparseable_alias_still_matches_itself() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source("a:b:c", &["ledger1:main".to_string()]);
+
+        assert_eq!(state.registered_graph_sources(), vec!["a:b:c"]);
+        assert_eq!(
+            state.graph_sources_for_ledger("ledger1:main"),
+            vec!["a:b:c"]
+        );
+    }
+
+    /// The retract event carries no `source_type`, so it fires for every graph
+    /// source in the deployment. The return value is what lets the caller tell
+    /// a real removal from one this worker never held.
+    #[test]
+    fn unregister_reports_whether_anything_was_removed() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source("search:main", &["ledger1:main".to_string()]);
+
+        assert!(
+            state.unregister_graph_source("search:main"),
+            "removing a registered index reports true"
+        );
+        assert!(
+            !state.unregister_graph_source("search:main"),
+            "removing it twice reports false the second time"
+        );
+        assert!(
+            !state.unregister_graph_source("never-registered:main"),
+            "an index this worker never held reports false"
+        );
+    }
+
+    /// A config republish that repoints an index at a different source ledger
+    /// must not leave the old one triggering syncs.
+    #[test]
+    fn re_registering_replaces_stale_dependency_edges() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source("search:main", &["ledger1:main".to_string()]);
+        state.register_graph_source("search:main", &["ledger2:main".to_string()]);
+
+        assert!(
+            state.graph_sources_for_ledger("ledger1:main").is_empty(),
+            "the dropped dependency must stop triggering syncs"
+        );
+        assert_eq!(
+            state.watched_ledgers(),
+            vec!["ledger2:main"],
+            "and must stop being reported as watched"
+        );
+        assert_eq!(
+            state.graph_sources_for_ledger("ledger2:main"),
+            vec!["search:main"]
+        );
+        assert_eq!(
+            state.stats().registered_graph_sources,
+            1,
+            "re-registering is not a second registration"
+        );
+    }
+
+    /// Capture the `debug!` messages emitted while `f` runs, on this thread.
+    fn captured_debug_messages(f: impl FnOnce()) -> Vec<String> {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Clone, Default)]
+        struct Collect(Arc<Mutex<Vec<String>>>);
+        struct Visit<'a>(&'a mut Option<String>);
+        impl tracing::field::Visit for Visit<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    *self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> Layer<S> for Collect {
+            fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+                let mut msg = None;
+                event.record(&mut Visit(&mut msg));
+                if let Some(m) = msg {
+                    self.0.lock().unwrap().push(m);
+                }
+            }
+        }
+
+        let collect = Collect::default();
+        let sink = Arc::clone(&collect.0);
+        let subscriber = tracing_subscriber::registry().with(collect);
+        tracing::subscriber::with_default(subscriber, f);
+        let out = sink.lock().unwrap().clone();
+        out
+    }
+
+    /// A config republish re-registers, which prunes the old reverse edges —
+    /// but it must not announce an unregistration. That log line is what an
+    /// operator greps for when an index stops syncing, so emitting it on an
+    /// ordinary republish points the investigation at the wrong event.
+    ///
+    /// Enforced under `cargo nextest` (CI), which runs each test in its own
+    /// process. Under a bare parallel `cargo test` this can pass vacuously:
+    /// `with_default` is thread-local while tracing's callsite-interest cache
+    /// is process-global, so a sibling test hitting these callsites with no
+    /// subscriber installed can leave them cached as uninteresting and the
+    /// events never reach the collector. Verified by mutation
+    /// (`prune_reverse_edges` -> `unregister_graph_source`): red under nextest
+    /// and under `--test-threads=1`, green under bare parallel `cargo test`.
+    #[test]
+    fn re_registering_does_not_log_an_unregistration() {
+        let messages = captured_debug_messages(|| {
+            let mut state = Bm25WorkerState::new();
+            state.register_graph_source("search:main", &["ledger1:main".to_string()]);
+            state.register_graph_source("search:main", &["ledger2:main".to_string()]);
+        });
+
+        assert!(
+            !messages.iter().any(|m| m.contains("Unregistered")),
+            "a re-register must not log an unregistration, got: {messages:?}"
+        );
+
+        // The real thing still says so, or the log would be useless.
+        let messages = captured_debug_messages(|| {
+            let mut state = Bm25WorkerState::new();
+            state.register_graph_source("search:main", &["ledger1:main".to_string()]);
+            state.unregister_graph_source("search:main");
+        });
+        assert!(
+            messages.iter().any(|m| m.contains("Unregistered")),
+            "an actual unregister must still log, got: {messages:?}"
+        );
+    }
+
+    /// Narrowing a dependency set must drop only the removed ledger.
+    #[test]
+    fn re_registering_keeps_the_dependencies_that_remain() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source(
+            "search:main",
+            &["ledger1:main".to_string(), "ledger2:main".to_string()],
+        );
+        state.register_graph_source("search:main", &["ledger2:main".to_string()]);
+
+        assert!(state.graph_sources_for_ledger("ledger1:main").is_empty());
+        assert_eq!(
+            state.graph_sources_for_ledger("ledger2:main"),
+            vec!["search:main"],
+            "a dependency that survived the republish must still trigger syncs"
+        );
+    }
+
+    /// Re-registering one index must not disturb another that shares a ledger.
+    #[test]
+    fn re_registering_leaves_a_co_dependent_index_alone() {
+        let mut state = Bm25WorkerState::new();
+
+        state.register_graph_source("search:main", &["ledger1:main".to_string()]);
+        state.register_graph_source("titles:main", &["ledger1:main".to_string()]);
+
+        state.register_graph_source("search:main", &["ledger2:main".to_string()]);
+
+        assert_eq!(
+            state.graph_sources_for_ledger("ledger1:main"),
+            vec!["titles:main"],
+            "the other index must keep its edge to the shared ledger"
+        );
+    }
+
+    fn worker() -> Bm25MaintenanceWorker {
+        Bm25MaintenanceWorker::new(Arc::new(crate::fluree_memory()))
+    }
+
+    fn config_published(graph_source_id: &str, source_type: GraphSourceType) -> NameServiceEvent {
+        NameServiceEvent::GraphSourceConfigPublished {
+            graph_source_id: graph_source_id.to_string(),
+            source_type,
+            dependencies: vec!["ledger1:main".to_string()],
+        }
+    }
+
+    /// A vector / R2RML / Iceberg source registered here would be handed to
+    /// `sync_bm25_index` on every commit to its source ledger, and every one of
+    /// those fails. The start-up pass already filters on `is_bm25()`; this is
+    /// the runtime half of the same rule.
+    #[tokio::test]
+    async fn only_bm25_sources_are_auto_registered() {
+        let worker = worker();
+
+        for source_type in [
+            GraphSourceType::Vector,
+            GraphSourceType::Geo,
+            GraphSourceType::R2rml,
+            GraphSourceType::Iceberg,
+            GraphSourceType::Unknown("custom".to_string()),
+        ] {
+            worker.process_event(&config_published("other:main", source_type.clone()));
+            assert!(
+                worker.handle().registered_graph_sources().is_empty(),
+                "{source_type:?} must not be registered with the BM25 worker"
+            );
+        }
+
+        worker.process_event(&config_published("search:main", GraphSourceType::Bm25));
+        assert_eq!(
+            worker.handle().registered_graph_sources(),
+            vec!["search:main"],
+            "a BM25 source must still auto-register"
+        );
+    }
+
+    /// `auto_register: false` still means no registration, whatever the type.
+    #[tokio::test]
+    async fn auto_register_off_registers_nothing() {
+        let worker = Bm25MaintenanceWorker::with_config(
+            Arc::new(crate::fluree_memory()),
+            Bm25WorkerConfig {
+                auto_register: false,
+                ..Bm25WorkerConfig::default()
+            },
+        );
+
+        worker.process_event(&config_published("search:main", GraphSourceType::Bm25));
+
+        assert!(worker.handle().registered_graph_sources().is_empty());
     }
 
     #[test]

@@ -313,6 +313,7 @@ fn aggregate_policy_enforcement(
     any_enforced.then_some(fluree_db_core::PolicyEnforcement {
         enforced: true,
         denies_all_data: all_deny,
+        unevaluable_policies: Vec::new(),
     })
 }
 
@@ -326,6 +327,7 @@ mod tests {
         Some(PolicyEnforcement {
             enforced: true,
             denies_all_data,
+            unevaluable_policies: Vec::new(),
         })
     }
 

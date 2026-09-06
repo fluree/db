@@ -18,7 +18,7 @@
 //! - `ns-retracted` - Record retracted/deleted
 
 use axum::{
-    extract::{Query, State},
+    extract::{RawQuery, State},
     response::sse::{Event, KeepAlive, Sse},
 };
 use chrono::Utc;
@@ -38,7 +38,7 @@ use crate::extract::{EventsPrincipal, MaybeBearer};
 use crate::state::AppState;
 
 /// Query parameters for the events endpoint
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct EventsQuery {
     /// Subscribe to all ledgers and graph sources
     #[serde(default)]
@@ -54,6 +54,81 @@ pub struct EventsQuery {
 }
 
 impl EventsQuery {
+    /// Parse this endpoint's query string.
+    ///
+    /// Hand-rolled rather than `Query<EventsQuery>`, because the subscription
+    /// params are REPEATED keys (`?ledger=a&ledger=b`) and
+    /// `serde_urlencoded` — what `axum::extract::Query` deserializes with —
+    /// cannot build a `Vec` from repeated keys *into a struct*. It rejects
+    /// the whole request with `invalid type: string "…", expected a
+    /// sequence`, so *every* `?ledger=` form answered 400, a single alias
+    /// included; only `?all=true` ever worked. The `Deserialize` derive
+    /// stays for the in-process constructions and tests.
+    ///
+    /// `serde_urlencoded::from_str::<Vec<(String, String)>>` — the pair-list
+    /// shape rather than the struct shape — *does* handle repeats, and is
+    /// the obvious replacement for this function. It is not used because it
+    /// collapses the two spellings this endpoint distinguishes: measured,
+    /// both `"all"` and `"all="` deserialize to `("all", "")`, losing the
+    /// bare-flag form. It would also not remove the decode handling below —
+    /// it does not reject undecodable input, it passes it through
+    /// (`ledger=books%ZZmain` → `"books%ZZmain"`) or replaces it lossily
+    /// (`a%FFb` → `a\u{FFFD}b`), which is the silent-match-nothing failure
+    /// this parser rejects outright.
+    ///
+    /// Unknown keys are ignored (forward compatibility), and so is an empty
+    /// `ledger=` / `graph-source=` — one alias among however many were
+    /// asked for, and dropping it changes the scope but never erases it.
+    ///
+    /// A component that does not percent-decode is a 400, keys included.
+    /// Passing the raw text through instead would hand back an alias that
+    /// cannot match any ledger — a 200 SSE stream that emits nothing,
+    /// forever — which is the same silent freeze the repeated-key fix
+    /// exists to remove. Keys are decoded before matching for the same
+    /// reason: `%6Cedger=books%3Amain` is a subscription request, and
+    /// matching on the raw key would drop it and serve that empty stream.
+    ///
+    /// `all` is different, and is the one value this parser REJECTS. It is
+    /// the whole subscription request, so a value we do not understand can
+    /// only be resolved one of two ways: guess `false` and hand back a 200
+    /// SSE stream that matches nothing and emits nothing, forever, with no
+    /// error for the client to notice — or say so. `serde_urlencoded`, what
+    /// this parser replaced, said so (a non-boolean 400d), and the silent
+    /// never-emits stream is the exact failure class the repeated-key fix
+    /// above exists to remove. `?all` bare is the flag form and means true;
+    /// `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off` are accepted
+    /// case-insensitively; anything else, empty included, is a 400.
+    pub fn from_query_str(raw: &str) -> Result<Self, ServerError> {
+        let mut query = EventsQuery::default();
+        for pair in raw.split('&').filter(|p| !p.is_empty()) {
+            // `None` distinguishes a bare flag (`?all`) from an explicitly
+            // empty value (`?all=`), which are not the same request.
+            let (raw_key, raw_value) = match pair.split_once('=') {
+                Some((k, v)) => (k, Some(v)),
+                None => (pair, None),
+            };
+            let key = decode_component(raw_key, "parameter name")?;
+            let value = raw_value
+                .map(|v| decode_component(v, "parameter value"))
+                .transpose()?;
+            match key.as_str() {
+                "all" => query.all = parse_all(value.as_deref())?,
+                "ledger" => {
+                    if let Some(v) = value.filter(|v| !v.is_empty()) {
+                        query.ledgers.push(v);
+                    }
+                }
+                "graph-source" => {
+                    if let Some(v) = value.filter(|v| !v.is_empty()) {
+                        query.graph_sources.push(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(query)
+    }
+
     /// Check if this query matches a given resource ID and kind
     #[cfg(test)]
     pub fn matches(&self, resource_id: &str, kind: &str) -> bool {
@@ -65,6 +140,59 @@ impl EventsQuery {
             SSE_KIND_GRAPH_SOURCE => self.graph_sources.iter().any(|v| v == resource_id),
             _ => false,
         }
+    }
+}
+
+/// `?all` → true (flag form); `?all=<boolean>` → that boolean; anything
+/// else → 400 rather than a stream that silently never emits.
+/// Percent/`+`-decode one query-string component.
+///
+/// `+` is a space in application/x-www-form-urlencoded; percent escapes
+/// cover everything else (`:` in `books:main` is commonly sent as `%3A`).
+/// A component that does not decode is an error rather than a passthrough —
+/// see [`EventsQuery::from_query_str`] for why.
+fn decode_component(raw: &str, what: &str) -> Result<String, ServerError> {
+    let reject = |why: &str| {
+        ServerError::BadRequest(format!(
+            "events: {what} {raw:?} is not valid percent-encoded UTF-8 ({why}). \
+             It is rejected rather than used verbatim, because an alias that \
+             cannot match any resource would open an SSE stream that never emits."
+        ))
+    };
+
+    // `urlencoding::decode` only fails on invalid UTF-8: a MALFORMED escape
+    // (`%ZZ`, a trailing `%`) is left in the string verbatim and returns
+    // `Ok`. That is the passthrough this function exists to prevent, so the
+    // escapes are validated before decoding rather than trusted to it.
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            match bytes.get(i + 1..i + 3) {
+                Some(hex) if hex.iter().all(u8::is_ascii_hexdigit) => i += 3,
+                _ => return Err(reject("malformed percent-escape")),
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    urlencoding::decode(&raw.replace('+', " "))
+        .map(std::borrow::Cow::into_owned)
+        .map_err(|e| reject(&e.to_string()))
+}
+
+fn parse_all(value: Option<&str>) -> Result<bool, ServerError> {
+    let Some(value) = value else {
+        return Ok(true);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        other => Err(ServerError::BadRequest(format!(
+            "events: `all` must be a boolean (true/false, 1/0, yes/no, on/off); got {other:?}. \
+             Subscribing to specific resources uses `?ledger=` / `?graph-source=` instead."
+        ))),
     }
 }
 
@@ -420,9 +548,10 @@ fn filter_to_allowed(params: &EventsQuery, principal: &EventsPrincipal) -> Event
 /// - `None` mode: Token ignored (default)
 pub async fn events(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<EventsQuery>,
+    RawQuery(raw_query): RawQuery,
     MaybeBearer(principal): MaybeBearer,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ServerError> {
+    let params = EventsQuery::from_query_str(raw_query.as_deref().unwrap_or_default())?;
     // Peer mode: return 404 - events endpoint not available
     // Peers subscribe to the transaction server's events endpoint instead
     if state.config.server_role == ServerRole::Peer {
@@ -579,5 +708,116 @@ mod tests {
 
         assert!(query.matches("any:main", "ledger"));
         assert!(query.matches("any:main", "graph-source"));
+    }
+
+    /// Parse a query string that this test expects to be valid.
+    fn parsed(raw: &str) -> EventsQuery {
+        EventsQuery::from_query_str(raw).unwrap_or_else(|e| panic!("{raw} must parse: {e}"))
+    }
+
+    /// The wire form, which nothing used to cover: every test above builds
+    /// an `EventsQuery` in process, so the fact that no `?ledger=` request
+    /// could ever be deserialized went unnoticed. Repeated keys must
+    /// accumulate, and a percent-encoded `:` must survive.
+    #[test]
+    fn test_events_query_from_query_str() {
+        let one = parsed("ledger=books%3Amain");
+        assert_eq!(one.ledgers, vec!["books:main".to_string()]);
+        assert!(!one.all);
+        assert!(one.matches("books:main", "ledger"));
+
+        let many = parsed("ledger=books%3Amain&ledger=users%3Amain&graph-source=search%3Amain");
+        assert_eq!(
+            many.ledgers,
+            vec!["books:main".to_string(), "users:main".to_string()]
+        );
+        assert_eq!(many.graph_sources, vec!["search:main".to_string()]);
+
+        assert!(parsed("all=true").all);
+        assert!(parsed("all=1").all);
+        assert!(!parsed("all=false").all);
+        assert!(!parsed("").all);
+
+        // Unknown keys and empty values are ignored, not fatal.
+        let odd = parsed("ledger=&future=1&ledger=a%3Ab");
+        assert_eq!(odd.ledgers, vec!["a:b".to_string()]);
+    }
+
+    /// A component that does not percent-decode is rejected rather than used
+    /// verbatim. The verbatim form is the silent freeze one parameter over:
+    /// `"books%ZZmain"` cannot match any ledger, so the client gets a 200 SSE
+    /// stream that emits nothing, forever, with nothing to notice.
+    ///
+    /// This is also the case `serde_urlencoded`'s pair-list shape would NOT
+    /// have fixed — it passes `%ZZ` through raw and replaces `%FF` lossily,
+    /// rather than erroring — which is why this parser stays hand-rolled.
+    #[test]
+    fn an_undecodable_component_is_rejected_rather_than_passed_through() {
+        for raw in ["ledger=books%ZZmain", "ledger=a%FFb", "graph-source=x%FF"] {
+            let err = EventsQuery::from_query_str(raw)
+                .err()
+                .unwrap_or_else(|| panic!("{raw} must not be accepted"));
+            assert_eq!(
+                err.status_code(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{raw}"
+            );
+        }
+
+        // An undecodable KEY is rejected for the same reason: the server
+        // cannot tell whether it was a `ledger=` it is now dropping.
+        let err = EventsQuery::from_query_str("%FFedger=books%3Amain")
+            .expect_err("an undecodable key must not be silently ignored");
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    /// Keys are percent-decoded before matching. A client that encodes the
+    /// key is making a real subscription request; matching on the raw key
+    /// would drop it and serve the empty stream instead.
+    #[test]
+    fn an_encoded_key_still_selects_its_parameter() {
+        let q = parsed("%6Cedger=books%3Amain");
+        assert_eq!(q.ledgers, vec!["books:main".to_string()]);
+        assert!(q.matches("books:main", "ledger"));
+
+        // `+` is a space in both halves of the pair.
+        let spaced = parsed("ledger=a+b");
+        assert_eq!(spaced.ledgers, vec!["a b".to_string()]);
+    }
+
+    /// `?all=` is the whole subscription request. A value this parser does
+    /// not understand must NOT resolve to `false`: that hands the client a
+    /// 200 SSE stream matching nothing, emitting nothing, forever, with
+    /// nothing to notice — the silent-freeze class this endpoint's parser
+    /// exists to remove, and what `serde_urlencoded` used to 400 on.
+    #[test]
+    fn an_uninterpretable_all_is_rejected_rather_than_silently_false() {
+        for raw in ["all=ture", "all=maybe", "all=", "all=2", "all=null"] {
+            let err = EventsQuery::from_query_str(raw)
+                .err()
+                .unwrap_or_else(|| panic!("{raw} must not be accepted"));
+            assert_eq!(
+                err.status_code(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{raw}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("`all`"),
+                "must name the parameter: {message}"
+            );
+        }
+
+        // The spellings a human actually types all work, either case.
+        for raw in ["all=TRUE", "all=Yes", "all=on", "all=1", "all"] {
+            assert!(parsed(raw).all, "{raw} must mean true");
+        }
+        for raw in ["all=FALSE", "all=no", "all=off", "all=0"] {
+            assert!(!parsed(raw).all, "{raw} must mean false");
+        }
+
+        // And an unusable `ledger=` stays ignorable: it is one alias among
+        // however many, not the entire request.
+        assert!(EventsQuery::from_query_str("ledger=&ledger=a%3Ab").is_ok());
     }
 }
