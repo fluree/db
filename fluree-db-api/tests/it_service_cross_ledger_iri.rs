@@ -467,3 +467,460 @@ async fn service_multi_pattern_aligned_namespaces() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Binding producers inside the body other than a scan. Per-scan stamping makes
+// every scan output an `IriMatch`; anything else that puts a reference into a
+// body row — a BIND, a VALUES cell, the parent row itself, a property path —
+// has to arrive in the same namespace-neutral form, or the fused-BIND clobber
+// check, `=`/`!=`, and the boundary decode see a `Sid` against an `IriMatch`.
+// ---------------------------------------------------------------------------
+
+async fn seeded(fluree: &MemoryFluree, suffix: &str) -> (String, DataSetDb, String) {
+    let (alpha, beta) = seed_pair(fluree, suffix).await;
+    let dataset = dataset_for(fluree, &alpha, &beta).await;
+    let svc = format!("fluree:ledger:{beta}");
+    (beta, dataset, svc)
+}
+
+/// The SERVICE form of `body` must return exactly what the GRAPH form does,
+/// and the GRAPH form must return `expect_rows` rows (so the control is not
+/// vacuous).
+async fn assert_matches_graph(
+    fluree: &MemoryFluree,
+    dataset: &DataSetDb,
+    beta: &str,
+    svc: &str,
+    projection: &str,
+    body: &str,
+    expect_rows: usize,
+) {
+    let graph = rows(
+        fluree,
+        dataset,
+        &format!(r"SELECT {projection} WHERE {{ GRAPH <{beta}> {{ {body} }} }}"),
+    )
+    .await;
+    assert_eq!(graph.len(), expect_rows, "GRAPH control for: {body}");
+    let service = rows(
+        fluree,
+        dataset,
+        &format!(r"SELECT {projection} WHERE {{ SERVICE <{svc}> {{ {body} }} }}"),
+    )
+    .await;
+    assert_eq!(service, graph, "SERVICE body must match GRAPH for: {body}");
+}
+
+/// A BIND that mints a reference the body then joins on: leading, via
+/// `IRI()`, and in object position. Each used to return zero rows — the
+/// minted `Sid` never unified with the stamped scan output.
+#[tokio::test]
+async fn service_body_bind_minted_reference_joins() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (beta, ds, svc) = seeded(&fluree, "bind-mint").await;
+    for body in [
+        format!(r"BIND(<{BETA}b1> AS ?s) ?s <{BETA}rank> ?r"),
+        format!(r#"BIND(IRI("{BETA}b1") AS ?s) ?s <{BETA}rank> ?r"#),
+        format!(r"?s <{BETA}rank> ?r . BIND(<{BETA}b1> AS ?x) FILTER(?s = ?x)"),
+    ] {
+        assert_matches_graph(&fluree, &ds, &beta, &svc, "?s ?r", &body, 1).await;
+    }
+    // Trailing BIND with no dependency and STR() of a stamped term were never
+    // affected; pinned so the representation change cannot disturb them.
+    assert_matches_graph(
+        &fluree,
+        &ds,
+        &beta,
+        &svc,
+        "?s ?r ?x",
+        &format!(r"?s <{BETA}rank> ?r BIND(<{BETA}b1> AS ?x)"),
+        2,
+    )
+    .await;
+    assert_matches_graph(
+        &fluree,
+        &ds,
+        &beta,
+        &svc,
+        "?s ?str",
+        &format!(r"?s <{BETA}rank> ?r BIND(STR(?s) AS ?str)"),
+        2,
+    )
+    .await;
+}
+
+/// A BIND-minted reference in OBJECT position, and a ref-valued chain.
+#[tokio::test]
+async fn service_body_bind_minted_object_joins() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let alpha = "xl-alpha-bind-obj:main";
+    let beta = "xl-beta-bind-obj:main";
+    seed(
+        &fluree,
+        alpha,
+        json!([{"@id": format!("{ALPHA}a1"), format!("{ALPHA}tag"): "shared"}]),
+    )
+    .await;
+    seed(
+        &fluree,
+        beta,
+        json!([
+            {"@id": format!("{BETA}b1"), format!("{BETA}tag"): "shared",
+             format!("{BETA}knows"): {"@id": format!("{BETA}b2")}},
+            {"@id": format!("{BETA}b2"), format!("{BETA}tag"): "shared"}
+        ]),
+    )
+    .await;
+    let ds = dataset_for(&fluree, alpha, beta).await;
+    let svc = format!("fluree:ledger:{beta}");
+    assert_matches_graph(
+        &fluree,
+        &ds,
+        beta,
+        &svc,
+        "?s",
+        &format!(r"BIND(<{BETA}b2> AS ?o) ?s <{BETA}knows> ?o"),
+        1,
+    )
+    .await;
+    assert_matches_graph(
+        &fluree,
+        &ds,
+        beta,
+        &svc,
+        "?s ?o",
+        &format!(r"?s <{BETA}knows> ?o . ?o <{BETA}tag> ?t"),
+        1,
+    )
+    .await;
+    assert_matches_graph(
+        &fluree,
+        &ds,
+        beta,
+        &svc,
+        "?s ?o",
+        &format!(r"?s <{BETA}knows> ?o FILTER(?o = <{BETA}b2>)"),
+        1,
+    )
+    .await;
+}
+
+/// `=` / `!=` / `IN` / `sameTerm` between a stamped variable and an IRI
+/// constant, in both fused (single scan) and post-join positions. The
+/// post-join predicate case compares an `IriMatch` with a `Sid`-encoded
+/// constant and used to be "different resource" — `!=` kept every row.
+#[tokio::test]
+async fn service_body_reference_equality_against_constants() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (beta, ds, svc) = seeded(&fluree, "ref-eq").await;
+    for (body, n) in [
+        (format!(r"?s <{BETA}rank> ?r FILTER(?s = <{BETA}b1>)"), 1),
+        (format!(r"?s <{BETA}rank> ?r FILTER(?s != <{BETA}b1>)"), 1),
+        (format!(r"?s <{BETA}rank> ?r FILTER(?s IN (<{BETA}b1>))"), 1),
+        (
+            format!(r"?s <{BETA}rank> ?r FILTER(sameTerm(?s, <{BETA}b1>))"),
+            1,
+        ),
+        (
+            format!(r"?s <{BETA}rank> ?r . ?s ?p ?o FILTER(isIRI(?s) && ?p = <{BETA}tag>)"),
+            2,
+        ),
+        (
+            format!(r"?s <{BETA}rank> ?r . ?s ?p ?o FILTER(?p != <{BETA}tag>)"),
+            2,
+        ),
+        (
+            format!(r"?s <{BETA}rank> ?r . ?s ?p ?o FILTER(?p IN (<{BETA}tag>))"),
+            2,
+        ),
+        (
+            format!(r"?s <{BETA}rank> ?r . ?s ?p ?o FILTER(sameTerm(?p, <{BETA}tag>))"),
+            2,
+        ),
+    ] {
+        assert_matches_graph(&fluree, &ds, &beta, &svc, "?s ?o", &body, n).await;
+    }
+}
+
+/// Compound operators inside the body all match their GRAPH form.
+#[tokio::test]
+async fn service_body_compound_operators_match_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (beta, ds, svc) = seeded(&fluree, "compound").await;
+    let cases: [(&str, String, usize); 8] = [
+        (
+            "?s ?r",
+            format!(r"VALUES ?s {{ <{BETA}b1> }} ?s <{BETA}rank> ?r"),
+            1,
+        ),
+        (
+            "?s ?r ?t",
+            format!(
+                r#"?s ?p "shared" OPTIONAL {{ ?s <{BETA}rank> ?r }} OPTIONAL {{ ?s <{BETA}tag> ?t }}"#
+            ),
+            2,
+        ),
+        (
+            "?s",
+            format!(r#"?s ?p "shared" MINUS {{ ?s <{BETA}rank> 2 }}"#),
+            1,
+        ),
+        (
+            "?s ?r",
+            format!(r"{{ ?s <{BETA}rank> ?r }} UNION {{ ?s <{BETA}rank> ?r FILTER(?r = 1) }}"),
+            3,
+        ),
+        (
+            "?s",
+            format!(r#"?s ?p "shared" FILTER EXISTS {{ ?s <{BETA}rank> 2 }}"#),
+            1,
+        ),
+        (
+            "?s",
+            format!(r#"?s ?p "shared" FILTER NOT EXISTS {{ ?s <{BETA}rank> 2 }}"#),
+            1,
+        ),
+        (
+            "?s ?r",
+            format!(r#"{{ SELECT ?s WHERE {{ ?s ?p "shared" }} }} ?s <{BETA}rank> ?r"#),
+            2,
+        ),
+        (
+            "?s ?n",
+            format!(
+                r"{{ SELECT ?s (COUNT(?p) AS ?n) WHERE {{ ?s ?p ?o }} GROUP BY ?s }} ?s <{BETA}rank> ?r"
+            ),
+            2,
+        ),
+    ];
+    for (projection, body, n) in cases {
+        assert_matches_graph(&fluree, &ds, &beta, &svc, projection, &body, n).await;
+    }
+}
+
+/// Property paths are not wrapped by `DatasetOperator`, so their output is
+/// stamped by the operator itself. Covered: the path alone at the boundary,
+/// a path consuming a stamped scan binding, and a path whose output is
+/// substituted into the next scan (the #1665 shape, one operator over).
+/// The last is asserted literally: its GRAPH form is #1770.
+#[tokio::test]
+async fn service_body_property_path() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let alpha = "xl-alpha-path:main";
+    let beta = "xl-beta-path:main";
+    seed(
+        &fluree,
+        alpha,
+        json!([{"@id": format!("{ALPHA}a1"), format!("{ALPHA}tag"): "shared"}]),
+    )
+    .await;
+    seed(
+        &fluree,
+        beta,
+        json!([
+            {"@id": format!("{BETA}b1"), format!("{BETA}tag"): "one",
+             format!("{BETA}knows"): {"@id": format!("{BETA}b2")}},
+            {"@id": format!("{BETA}b2"), format!("{BETA}tag"): "two",
+             format!("{BETA}knows"): {"@id": format!("{BETA}b3")}},
+            {"@id": format!("{BETA}b3"), format!("{BETA}tag"): "three"}
+        ]),
+    )
+    .await;
+    let ds = dataset_for(&fluree, alpha, beta).await;
+    let svc = format!("fluree:ledger:{beta}");
+    let b = |n: &str| json!(format!("{BETA}{n}"));
+
+    assert_matches_graph(
+        &fluree,
+        &ds,
+        beta,
+        &svc,
+        "?o",
+        &format!(r"<{BETA}b1> <{BETA}knows>+ ?o"),
+        2,
+    )
+    .await;
+    assert_matches_graph(
+        &fluree,
+        &ds,
+        beta,
+        &svc,
+        "?s ?o",
+        &format!(r#"?o <{BETA}tag> "three" . ?s <{BETA}knows>+ ?o"#),
+        2,
+    )
+    .await;
+    let path_then_join = rows(
+        &fluree,
+        &ds,
+        &format!(
+            r"SELECT ?o ?t WHERE {{ SERVICE <{svc}> {{ <{BETA}b1> <{BETA}knows>+ ?o . ?o <{BETA}tag> ?t }} }}"
+        ),
+    )
+    .await;
+    assert_eq!(
+        path_then_join,
+        vec![json!([b("b2"), "two"]), json!([b("b3"), "three"])]
+    );
+}
+
+/// alpha allocates `http://alpha.example/` and a filler prefix before
+/// `http://beta.example/`; beta allocates only `http://beta.example/`. The same
+/// absolute IRI therefore carries a DIFFERENT namespace code in each ledger,
+/// and beta's table has no entry at alpha's code — a requester-encoded `Sid`
+/// decoded through beta's table fails outright instead of merely mis-naming.
+async fn seed_colliding_codes(fluree: &MemoryFluree, suffix: &str) -> (String, String) {
+    let alpha = format!("xl-alpha-coll-{suffix}:main");
+    let beta = format!("xl-beta-coll-{suffix}:main");
+    seed(
+        fluree,
+        &alpha,
+        json!([
+            {"@id": format!("{ALPHA}a1"), format!("{ALPHA}tag"): "x"},
+            {"@id": "http://filler.example/f1", "http://filler.example/tag": "y"},
+            {"@id": format!("{BETA}b1"), format!("{BETA}tag"): "A"}
+        ]),
+    )
+    .await;
+    seed(
+        fluree,
+        &beta,
+        json!([
+            {"@id": format!("{BETA}b1"), format!("{BETA}tag"): "B", format!("{BETA}rank"): 2},
+            {"@id": format!("{BETA}b2"), format!("{BETA}tag"): "B", format!("{BETA}rank"): 1}
+        ]),
+    )
+    .await;
+    (alpha, beta)
+}
+
+/// Requester-encoded references that enter the body other than by pattern
+/// substitution — a VALUES cell (lowered against the requester), and the
+/// parent row copied by `BIND(?parent AS ?x)` — must be stamped in the
+/// REQUESTER's ledger before the boundary stamp sees them. Under colliding
+/// codes the boundary stamp used to fail with a decode error on both.
+///
+/// The `GRAPH <ledger>` form of a multi-ledger dataset has the same boundary
+/// stamp and the same entry points, so it is held to the same answers.
+#[tokio::test]
+async fn service_body_requester_encoded_terms_under_colliding_codes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (alpha, beta) = seed_colliding_codes(&fluree, "entry").await;
+    let ds = dataset_for(&fluree, &alpha, &beta).await;
+    let svc = format!("fluree:ledger:{beta}");
+    for blk in [format!("GRAPH <{beta}>"), format!("SERVICE <{svc}>")] {
+        let values = rows(
+            &fluree,
+            &ds,
+            &format!(
+                r"SELECT ?s ?r WHERE {{ {blk} {{ VALUES ?s {{ <{BETA}b1> }} ?s <{BETA}rank> ?r }} }}"
+            ),
+        )
+        .await;
+        assert_eq!(values, vec![json!([format!("{BETA}b1"), 2])], "{blk}");
+
+        let bind_parent = rows(
+            &fluree,
+            &ds,
+            &format!(
+                r#"SELECT ?a ?x ?s WHERE {{ ?a <{BETA}tag> "A" .
+                   {blk} {{ BIND(?a AS ?x) ?s <{BETA}rank> 2 }} }}"#
+            ),
+        )
+        .await;
+        assert_eq!(
+            bind_parent,
+            vec![json!([
+                format!("{BETA}b1"),
+                format!("{BETA}b1"),
+                format!("{BETA}b1")
+            ])],
+            "{blk}"
+        );
+
+        // A parent term compared (not substituted) inside the body; `!=`
+        // keeps the comparison out of the equijoin fold.
+        let compared = rows(
+            &fluree,
+            &ds,
+            &format!(
+                r#"SELECT ?a ?s WHERE {{ ?a <{BETA}tag> "A" .
+                   {blk} {{ ?s <{BETA}tag> "B" FILTER(?s != ?a) }} }}"#
+            ),
+        )
+        .await;
+        assert_eq!(
+            compared,
+            vec![json!([format!("{BETA}b1"), format!("{BETA}b2")])],
+            "{blk}"
+        );
+    }
+}
+
+/// A parent term the target ledger does not know must match nothing there —
+/// in both the substituted and the compared form, in both lanes.
+#[tokio::test]
+async fn service_body_foreign_subject_absent_in_target() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (beta, ds, svc) = seeded(&fluree, "foreign").await;
+    for blk in [format!("GRAPH <{beta}>"), format!("SERVICE <{svc}>")] {
+        for body in [
+            format!(r"?a <{BETA}tag> ?t"),
+            format!(r"?s <{BETA}tag> ?t FILTER(?s = ?a)"),
+        ] {
+            let r = rows(
+                &fluree,
+                &ds,
+                &format!(
+                    r#"SELECT ?a ?t WHERE {{ ?a <{ALPHA}tag> "shared" . {blk} {{ {body} }} }}"#
+                ),
+            )
+            .await;
+            assert!(r.is_empty(), "{blk} {{ {body} }} must be empty, got {r:?}");
+        }
+    }
+}
+
+/// `?p = <iri>` after a join, where the constant DOES encode in the primary
+/// (colliding codes: `http://beta.example/` exists in alpha too). The scan
+/// side is a stamped `IriMatch`, the constant a `Sid` comparable; without the
+/// decode bridge they are "different resources", so `=` drops every row and
+/// `!=` keeps every row — in the GRAPH form as much as the SERVICE form. The
+/// `isIRI(?s)` conjunct keeps the filter out of the pattern-constant fold, so
+/// the comparison actually runs.
+#[tokio::test]
+async fn stamped_predicate_equality_against_primary_encodable_constant() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (alpha, beta) = seed_colliding_codes(&fluree, "pred-eq").await;
+    let ds = dataset_for(&fluree, &alpha, &beta).await;
+    let svc = format!("fluree:ledger:{beta}");
+    let b = |n: &str| json!(format!("{BETA}{n}"));
+    for blk in [format!("GRAPH <{beta}>"), format!("SERVICE <{svc}>")] {
+        let eq = rows(
+            &fluree,
+            &ds,
+            &format!(
+                r"SELECT ?s ?o WHERE {{ {blk} {{ ?s <{BETA}rank> ?r . ?s ?p ?o FILTER(isIRI(?s) && ?p = <{BETA}tag>) }} }} ORDER BY ?s"
+            ),
+        )
+        .await;
+        assert_eq!(
+            eq,
+            vec![json!([b("b1"), "B"]), json!([b("b2"), "B"])],
+            "= in {blk}"
+        );
+        let ne = rows(
+            &fluree,
+            &ds,
+            &format!(
+                r"SELECT ?s ?o WHERE {{ {blk} {{ ?s <{BETA}rank> ?r . ?s ?p ?o FILTER(isIRI(?s) && ?p != <{BETA}tag>) }} }} ORDER BY ?s"
+            ),
+        )
+        .await;
+        assert_eq!(
+            ne,
+            vec![json!([b("b1"), 2]), json!([b("b2"), 1])],
+            "!= in {blk}"
+        );
+    }
+}

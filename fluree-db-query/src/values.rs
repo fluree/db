@@ -152,6 +152,23 @@ impl ValuesOperator {
         true
     }
 
+    /// Inside a cross-ledger SERVICE body every reference binding is
+    /// namespace-neutral. VALUES cells were lowered against the requesting
+    /// query's snapshot, so they are stamped in THAT ledger — a raw `Sid` here
+    /// would be decoded through the target's table at the boundary.
+    fn stamp_value_rows(&mut self, ctx: &ExecutionContext<'_>) {
+        let requester: Arc<str> = Arc::from(ctx.original_snapshot.ledger_id.as_str());
+        for row in &mut self.value_rows {
+            for cell in row.iter_mut() {
+                if let Binding::Sid { sid, .. } = cell {
+                    if let Some(iri) = ctx.original_snapshot.decode_sid(sid) {
+                        *cell = Binding::iri_match(iri, sid.clone(), Arc::clone(&requester));
+                    }
+                }
+            }
+        }
+    }
+
     /// Build the value-row hash lane (see the field docs). Called once per
     /// open, on the first batch.
     fn build_value_index(&mut self, ctx: &ExecutionContext<'_>) {
@@ -232,6 +249,9 @@ impl Operator for ValuesOperator {
         self.state = OperatorState::Open;
         self.value_index = None;
         self.fallback_value_rows.clear();
+        if ctx.scan_provenance_ledger.is_some() {
+            self.stamp_value_rows(ctx);
+        }
         self.build_value_index(ctx);
         Ok(())
     }

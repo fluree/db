@@ -412,7 +412,7 @@ impl CompareOp {
                 // unrecognized/ill-typed datatype that might still denote the same
                 // value) are a type error that excludes the row for BOTH `=` and
                 // `!=` (open-eq-04..12, eq-2/4, eq-graph, eq-dateTime).
-                CompareOp::Eq | CompareOp::Ne => match rdf_term_equal(&prev, &curr) {
+                CompareOp::Eq | CompareOp::Ne => match rdf_term_equal_in(&prev, &curr, ctx) {
                     EqOutcome::Eq => matches!(self, CompareOp::Eq),
                     EqOutcome::Ne => matches!(self, CompareOp::Ne),
                     EqOutcome::TypeError => {
@@ -580,6 +580,42 @@ fn lang_parts(v: &ComparableValue) -> Option<(&str, &str)> {
             dtc: Some(U::LangTag(tag)),
         } => Some((s.as_str(), tag.as_ref())),
         _ => None,
+    }
+}
+
+/// Whether a `Sid` and an `Iri` comparable name the same resource, when the
+/// pair is that shape and the context can decode the SID. `None` for every
+/// other pair (or an undecodable SID).
+///
+/// The `Sid` side is encoded in the active snapshot's space — a raw scan
+/// output, or an `IRI(..)` constant — while the `Iri` side is a stamped
+/// `IriMatch` (a cross-ledger SERVICE body, a multi-graph dataset), a
+/// constructed IRI, or a foreign-ledger term. `rdf_term_equal` alone calls
+/// them different resources, so `?p != <iri>` silently keeps every row.
+pub(crate) fn resource_iri_eq(
+    a: &ComparableValue,
+    b: &ComparableValue,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> Option<bool> {
+    match (a, b) {
+        (ComparableValue::Sid(sid), ComparableValue::Iri(iri))
+        | (ComparableValue::Iri(iri), ComparableValue::Sid(sid)) => {
+            ctx?.decode_sid(sid).map(|decoded| decoded == iri.as_ref())
+        }
+        _ => None,
+    }
+}
+
+/// [`rdf_term_equal`] with the [`resource_iri_eq`] bridge in front of it.
+pub(crate) fn rdf_term_equal_in(
+    a: &ComparableValue,
+    b: &ComparableValue,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> EqOutcome {
+    match resource_iri_eq(a, b, ctx) {
+        Some(true) => EqOutcome::Eq,
+        Some(false) => EqOutcome::Ne,
+        None => rdf_term_equal(a, b),
     }
 }
 

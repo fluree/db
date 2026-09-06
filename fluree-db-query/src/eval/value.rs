@@ -776,7 +776,7 @@ impl ComparableValue {
                 FlakeValue::Boolean(b),
                 datatypes.xsd_boolean.clone(),
             )),
-            ComparableValue::Sid(sid) => Ok(Binding::sid(sid)),
+            ComparableValue::Sid(sid) => stamp_minted(Binding::sid(sid), ctx),
             ComparableValue::Vector(v) => Ok(Binding::lit(
                 FlakeValue::Vector(v),
                 datatypes.fluree_vector.clone(),
@@ -811,7 +811,7 @@ impl ComparableValue {
                 // (UUID, IRI() function) that don't exist in the database.
                 if let Some(ctx) = ctx {
                     if let Some(sid) = ctx.active_snapshot.encode_iri_strict(&iri) {
-                        return Ok(Binding::sid(sid));
+                        return stamp_minted(Binding::sid(sid), Some(ctx));
                     }
                 }
                 Ok(Binding::Iri(iri))
@@ -908,6 +908,38 @@ impl From<Arc<str>> for ComparableValue {
 // =============================================================================
 // Conversions from FlakeValue
 // =============================================================================
+
+/// A reference minted by an expression (`BIND(<iri> AS ?x)`, `IRI(..)`,
+/// `DATATYPE(..)`) is encoded in the ACTIVE snapshot's space. Inside a
+/// cross-ledger SERVICE or multi-ledger GRAPH body every scan output is
+/// stamped to `IriMatch`, and `Sid` vs `IriMatch` never compares equal — so
+/// the minted term carries provenance too, or the fused-BIND clobber check
+/// and `?x = ?y` drop rows that should join. Stamped in the active snapshot's
+/// own ledger (the SERVICE path switches it to the target; the GRAPH path
+/// keeps the primary and lets the scans re-encode), so the alias always names
+/// the table the SID was encoded against. A pass-through everywhere else.
+fn stamp_minted(
+    binding: Binding,
+    ctx: Option<&ExecutionContext<'_>>,
+) -> crate::error::Result<Binding> {
+    let Some(ctx) = ctx.filter(|c| c.scan_provenance_ledger.is_some()) else {
+        return Ok(binding);
+    };
+    let Binding::Sid { sid, .. } = binding else {
+        return Ok(binding);
+    };
+    let iri = ctx.active_snapshot.decode_sid(&sid).ok_or_else(|| {
+        QueryError::Internal(format!(
+            "failed to decode minted SID (ns={}, name={:?}) in ledger {:?}",
+            sid.namespace_code, sid.name, ctx.active_snapshot.ledger_id
+        ))
+    })?;
+    Ok(Binding::iri_match(
+        iri,
+        sid,
+        Arc::<str>::from(ctx.active_snapshot.ledger_id.as_str()),
+    ))
+}
 
 impl TryFrom<&FlakeValue> for ComparableValue {
     type Error = NullValueError;

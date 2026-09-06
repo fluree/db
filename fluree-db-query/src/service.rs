@@ -173,8 +173,31 @@ impl ServiceOperator {
             None // Signal to use ctx directly (self-reference)
         };
 
-        // Build seed operator from parent row (like EXISTS/Subquery)
-        let seed = SeedOperator::from_batch_row(parent_batch, row_idx);
+        // A target in a DIFFERENT ledger: the body executes against a foreign
+        // snapshot, and every reference binding inside it must be
+        // namespace-neutral (`IriMatch`) — see the context setup below.
+        let cross_ledger: Option<Arc<str>> = graph_ref.and_then(|gref| {
+            (gref.ledger_id.as_ref() != ctx.active_snapshot.ledger_id.as_str())
+                .then(|| Arc::clone(&gref.ledger_id))
+        });
+
+        // Build seed operator from parent row (like EXISTS/Subquery). Across a
+        // ledger boundary the parent's raw `Sid`s are stamped in the
+        // REQUESTER's ledger first: a body `BIND(?parent AS ?x)` would
+        // otherwise copy a requester-encoded `Sid` into a column the boundary
+        // stamp then decodes through the target's table.
+        let seed = match &cross_ledger {
+            Some(_) => {
+                let schema: Arc<[VarId]> =
+                    Arc::from(parent_batch.schema().to_vec().into_boxed_slice());
+                let row = parent_batch
+                    .row_view(row_idx)
+                    .expect("row_idx must be valid for parent batch")
+                    .to_vec();
+                SeedOperator::from_row(schema, crate::dataset_operator::stamp_seed_row(row, ctx))
+            }
+            None => SeedOperator::from_batch_row(parent_batch, row_idx),
+        };
         let mut inner = build_where_operators_seeded(
             Some(Box::new(seed)),
             &self.service.patterns,
@@ -203,15 +226,13 @@ impl ServiceOperator {
         // so every binding inside the subtree is namespace-neutral `IriMatch`
         // before any join touches it.
         let target_ctx;
-        let mut cross_ledger: Option<Arc<str>> = None;
         let ctx_to_use: &ExecutionContext<'_> = if let Some(gref) = graph_ref {
             let mut per_graph_ctx = ctx.with_graph_ref(gref);
-            if gref.ledger_id.as_ref() != ctx.active_snapshot.ledger_id.as_str() {
+            if let Some(ledger_id) = &cross_ledger {
                 per_graph_ctx.binary_store = None;
                 per_graph_ctx.dict_novelty = None;
                 per_graph_ctx.runtime_small_dicts = None;
-                per_graph_ctx.scan_provenance_ledger = Some(Arc::clone(&gref.ledger_id));
-                cross_ledger = Some(Arc::clone(&gref.ledger_id));
+                per_graph_ctx.scan_provenance_ledger = Some(Arc::clone(ledger_id));
             }
             target_ctx = per_graph_ctx;
             &target_ctx
