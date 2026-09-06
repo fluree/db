@@ -608,6 +608,17 @@ target. The materializer enforces what it can and documents the rest:
   target *partially applied* — some subjects re-asserted, others not yet — until
   the next successful poll re-materializes the window (the watermark only
   advances after the whole window commits).
+- **A full read is bounded and resumable.** When a source falls back to a full
+  read — first run, a watermark expired by the source's snapshot retention, or a
+  window containing an `overwrite`/`delete` — the pass reads a commit-ordered
+  prefix sized to the novelty ceiling (`FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS`,
+  derived from `reindex_max_bytes` by default) and records where it stopped: at a
+  retained snapshot when one names the prefix, otherwise as a commit-sequence
+  cursor (`urn:fluree:materialize#appliedSequence`), which survives snapshot
+  expiry. Each poll resumes above the cursor until the read completes, at which
+  point the snapshot watermark advances and the cursor is retired. Without the
+  bound, a full read too large to commit deferred on every poll and never made
+  progress.
 - **A window's working memory is budgeted, not unbounded.** The pass retains one
   node per distinct subject in the window; a window whose estimated accumulator
   exceeds `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` (default 1024; `0` disables)
