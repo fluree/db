@@ -656,7 +656,7 @@ Use plain Turtle when:
 For high-throughput ingest of large Turtle datasets into a **fresh ledger**, prefer the bulk import
 pipeline exposed by `fluree-db-api`:
 
-- See: [Using Fluree as a Rust library → Bulk import Turtle chunks](../getting-started/rust-api.md#bulk-import-turtle-chunks-high-throughput)
+- See: [Using Fluree as a Rust library → Bulk import Turtle chunks](../getting-started/rust-api.md#bulk-import-high-throughput)
 
 This pipeline:
 - Parses Turtle in parallel, but **writes commits serially** (hash-linked commit chain).

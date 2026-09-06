@@ -201,6 +201,9 @@ pub(crate) struct Fir6Inputs {
     pub total_commit_size: u64,
     pub total_asserts: u64,
     pub total_retracts: u64,
+    /// Whether the resolver observed any list-carrying (`@list`) row.
+    /// Full rebuilds observe every row, so the root records `Some(_)`.
+    pub saw_list_meta: bool,
     /// Full query-time stats (HLL-derived cardinalities, per-graph properties).
     /// `None` if stats collection was skipped or deferred.
     pub db_stats: Option<fluree_db_core::index_stats::IndexStats>,
@@ -335,6 +338,7 @@ pub(crate) async fn encode_and_write_root_v6(
         // signal carried forward — defensive-drop semantics live
         // exclusively on the incremental path.
         had_annotation_arena: false,
+        has_list_meta: Some(inputs.saw_list_meta),
     };
 
     // `IndexStats.size` is defined as total commit data size (bytes) for the ledger.
@@ -630,6 +634,7 @@ mod tests {
             sketch_ref: None,
             has_annotations: false,
             had_annotation_arena: false,
+            has_list_meta: None,
             annotation_index: None,
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),

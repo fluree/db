@@ -53,7 +53,7 @@ fluree publish origin mydb
 ## Prerequisites
 
 - A remote must be configured: `fluree remote add origin <url>`
-- The remote must support the Fluree HTTP API (see [Server implementation guide](../design/server-implementation.md))
+- The remote must support the Fluree HTTP API (see [Server implementation guide](server-integration.md))
 - A valid auth token if the remote requires authentication: `fluree auth login --remote origin`
 
 ## After Publishing

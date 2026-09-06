@@ -14,12 +14,13 @@ use crate::fast_path_common::{
     ProbeLanePlan, ProbeOps, PsotSubjectSeek, RowFate, SharedOverlayOps,
 };
 use crate::ir::triple::{Ref, TriplePattern};
-use crate::object_binding::late_materialized_object_binding;
+use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::plan_node::PlanChild;
 use crate::temporal_mode::TemporalMode;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{PropertyStatData, StatsView};
@@ -242,18 +243,34 @@ struct RawEdgeRow {
     p_id: u32,
 }
 
-/// Join identity of an encoded object value, mirroring `Binding` equality:
-/// refs compare by s_id, blank nodes by handle, literals by
-/// `(o_kind, dt_id, lang_id, o_key)` with `p_id` participating only for
-/// NUM_BIG (per-predicate arena) — see `Binding::eq`.
+/// Join identity of an encoded object value, mirroring the term equality the
+/// fallback operator tree computes for the same rows: refs compare by s_id,
+/// blank nodes by handle, literals by `(o_type, o_key)` with `p_id`
+/// participating only for NUM_BIG (per-predicate arena).
+///
+/// Keying literals on `o_type` matches `Binding` equality, in two layers:
+///
+/// - For the o_types `late_materialized_object_binding` encodes, `o_type` ↔
+///   `(o_kind, dt_id, lang_id)` is a bijection: each arm reads those fields
+///   off the o_type alone, and no two o_types share a triple — pinned
+///   exhaustively by `encoded_lit_identity_fields_are_injective_over_o_types`.
+///   So this partitions rows exactly as `Binding::eq` does on `EncodedLit`.
+/// - The string-dictionary datatypes the materializer declines (#1729 —
+///   `xsd:anyURI`, `xsd:token`, …, customer datatypes, whose only dict id is
+///   per-ledger and doesn't fit `EncodedLit`) still have `(o_type, o_key)` as
+///   their full term identity within one store view: `o_key` is the interned
+///   lexical form and `o_type` names the datatype. Every relation in one
+///   operator is scanned from the one `(ctx.binary_store, ctx.binary_g_id)`
+///   pair — the fast path never opens multi-ledger (`allow_cursor_fast_path`)
+///   — so a per-ledger id never meets another ledger's. These rows decode at
+///   emit ([`EncObj::to_binding`]) into the same materialized `Binding::Lit`
+///   the fallback scan produces, so nothing per-ledger leaves the operator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum EncIdentity {
     Ref(u64),
     Blank(u64),
     Lit {
-        o_kind: u8,
-        dt_id: u16,
-        lang_id: u16,
+        o_type: u16,
         o_key: u64,
         num_big_p_id: u32,
     },
@@ -313,12 +330,15 @@ impl EncObj {
         }
     }
 
-    /// Encode a raw object column value, or `None` for o_types the late
-    /// materializer does not support. Identity is derived from the binding
-    /// the materializer builds, so `EncObj` equality matches `Binding`
-    /// equality by construction.
+    /// Encode a raw object column value, or `None` for o_types the join
+    /// cannot carry. Identity is `(o_type, o_key)` — see [`EncIdentity`] for
+    /// why that matches the term equality the fallback computes. The late
+    /// materializer still decides which non-string o_types are join-safe, so
+    /// the decline set (booleans, `xsd:int`/`xsd:short`/…, the minor
+    /// temporals, geo/spatial) cannot drift from the scan path's.
     fn encode(o_type: u16, o_key: u64, p_id: u32) -> Option<Self> {
-        if OType::from_u16(o_type).decode_kind() == DecodeKind::BlankNode {
+        let ot = OType::from_u16(o_type);
+        if ot.decode_kind() == DecodeKind::BlankNode {
             // Blank handles compare by o_key; skip the per-row label format!.
             return Some(Self {
                 id: EncIdentity::Blank(o_key),
@@ -327,19 +347,10 @@ impl EncObj {
                 o_key,
             });
         }
-        let id = match late_materialized_object_binding(o_type, o_key, p_id, 0, u32::MAX, None)? {
-            Binding::EncodedSid { s_id, .. } => EncIdentity::Ref(s_id),
-            Binding::EncodedLit {
-                o_kind,
-                o_key,
-                p_id,
-                dt_id,
-                lang_id,
-                ..
-            } => EncIdentity::Lit {
-                o_kind,
-                dt_id,
-                lang_id,
+        let id = match late_materialized_object_binding(o_type, o_key, p_id, 0, u32::MAX, None) {
+            Some(Binding::EncodedSid { s_id, .. }) => EncIdentity::Ref(s_id),
+            Some(Binding::EncodedLit { o_kind, .. }) => EncIdentity::Lit {
+                o_type,
                 o_key,
                 num_big_p_id: if o_kind == ObjKind::NUM_BIG.as_u8() {
                     p_id
@@ -349,7 +360,17 @@ impl EncObj {
             },
             // The materializer only builds other variants for blank nodes,
             // handled above.
-            _ => return None,
+            Some(_) => return None,
+            // String-dictionary datatypes without a reserved dict id (#1729).
+            // They have no `EncodedLit` form, but `(o_type, o_key)` is their
+            // full term identity within this store view, so they stay in the
+            // join; the rows that survive it decode at emit.
+            None if ot.decode_kind() == DecodeKind::StringDict => EncIdentity::Lit {
+                o_type,
+                o_key,
+                num_big_p_id: 0,
+            },
+            None => return None,
         };
         Some(Self {
             id,
@@ -359,10 +380,39 @@ impl EncObj {
         })
     }
 
-    /// Rebuild the exact `Binding` the scan path would have produced.
-    fn to_binding(self) -> Binding {
-        late_materialized_object_binding(self.o_type, self.o_key, self.p_id, 0, u32::MAX, None)
-            .expect("EncObj is only constructed from materializable o_types")
+    /// Rebuild the exact `Binding` the scan path would have produced: the
+    /// encoded form where one exists, otherwise (non-reserved string-dict
+    /// datatypes) the decoded `Binding::Lit` carrying its exact datatype
+    /// `Sid`, built by the same `materialized_object_binding` the fallback
+    /// scan uses for these rows. The decode runs once per row that
+    /// *survives* the join, not per row scanned.
+    fn to_binding(self, view: Option<&BinaryGraphView>) -> Result<Binding> {
+        if let Some(binding) =
+            late_materialized_object_binding(self.o_type, self.o_key, self.p_id, 0, u32::MAX, None)
+        {
+            return Ok(binding);
+        }
+        let Some(view) = view else {
+            return Err(QueryError::Internal(
+                "cyclic bgp emit: string-dict object binding requires a graph view".into(),
+            ));
+        };
+        let val = view
+            .decode_value(self.o_type, self.o_key, self.p_id)
+            .map_err(|e| {
+                QueryError::dictionary_lookup(format!(
+                    "cyclic bgp emit decode: o_type={}, o_key={}, p_id={}: {e}",
+                    self.o_type, self.o_key, self.p_id
+                ))
+            })?;
+        Ok(materialized_object_binding(
+            view.store(),
+            self.o_type,
+            self.p_id,
+            val,
+            None,
+            None,
+        ))
     }
 }
 
@@ -531,6 +581,10 @@ pub(crate) struct CyclicBgpOperator {
     used_fast_path: bool,
     raw_relation_rows: usize,
     pruned_relation_rows: usize,
+    /// Emit-side decoder for non-reserved string-dictionary objects
+    /// (novelty-aware). Set when the encoded fast path opens; `None` in
+    /// RefOnly mode and on the fallback path.
+    emit_view: Option<BinaryGraphView>,
 }
 
 impl CyclicBgpOperator {
@@ -589,6 +643,7 @@ impl CyclicBgpOperator {
             used_fast_path: false,
             raw_relation_rows: 0,
             pruned_relation_rows: 0,
+            emit_view: None,
         }
     }
 
@@ -1054,7 +1109,18 @@ impl CyclicBgpOperator {
 
         match self.join_mode {
             CyclicJoinMode::RefOnly => self.open_ref_fast_path(ctx),
-            CyclicJoinMode::EncodedObject => self.open_encoded_fast_path(ctx),
+            CyclicJoinMode::EncodedObject => {
+                // Emit-side decoder for string-dictionary objects: same view
+                // construction as `ExecutionContext::graph_view`, against the
+                // one `(store, g_id)` pair the relation scans below read.
+                self.emit_view = ctx.binary_store.as_ref().map(|store| {
+                    store
+                        .graph_with_novelty(ctx.binary_g_id, ctx.dict_novelty.clone())
+                        .with_namespace_codes_fallback(ctx.namespace_codes_fallback.clone())
+                        .with_tracker(ctx.tracker.clone())
+                });
+                self.open_encoded_fast_path(ctx)
+            }
         }
     }
 
@@ -2144,8 +2210,13 @@ impl CyclicBgpOperator {
 
     /// Materialize one fully-assigned row into the output columns. Vars that
     /// appear in subject position bind as plain `EncodedSid` (matching the
-    /// scan path); object-only vars rebuild the late-materialized binding.
-    fn assignment_to_columns(&self, assignment: &[EncObj], cols: &mut [Vec<Binding>]) {
+    /// scan path); object-only vars rebuild the late-materialized binding
+    /// (decoding non-reserved string-dict values through `emit_view`).
+    fn assignment_to_columns(
+        &self,
+        assignment: &[EncObj],
+        cols: &mut [Vec<Binding>],
+    ) -> Result<()> {
         for (out_idx, var_idx) in self.schema_positions.iter().copied().enumerate() {
             let var = self.plan.vars[var_idx];
             let value = assignment[var_idx];
@@ -2156,10 +2227,11 @@ impl CyclicBgpOperator {
                         .expect("subject-positioned cyclic vars only bind refs"),
                 )
             } else {
-                value.to_binding()
+                value.to_binding(self.emit_view.as_ref())?
             };
             cols[out_idx].push(binding);
         }
+        Ok(())
     }
 
     fn next_square_wedge_match(
@@ -2266,7 +2338,10 @@ impl CyclicBgpOperator {
             assignment[self.var_pos(state.plan.probe_center)] = probe_center;
             assignment[self.var_pos(state.plan.key_a)] = key_a;
             assignment[self.var_pos(state.plan.key_b)] = key_b;
-            self.assignment_to_columns(&assignment, &mut cols);
+            if let Err(e) = self.assignment_to_columns(&assignment, &mut cols) {
+                self.square_wedge = Some(state);
+                return Err(e);
+            }
             produced += 1;
         }
         self.square_wedge = Some(state);
@@ -2347,7 +2422,7 @@ impl CyclicBgpOperator {
                 if cols.is_empty() {
                     produced += 1;
                 } else {
-                    self.assignment_to_columns(&assignment, &mut cols);
+                    self.assignment_to_columns(&assignment, &mut cols)?;
                     produced += 1;
                 }
                 continue;
@@ -2535,6 +2610,7 @@ impl Operator for CyclicBgpOperator {
         self.pending.clear();
         self.square_wedge = None;
         self.probed_edges = 0;
+        self.emit_view = None;
         self.state = OperatorState::Closed;
     }
 }
@@ -2600,7 +2676,9 @@ mod tests {
         let object = object.expect("encoded literal object should be accepted");
         assert!(matches!(object.id, EncIdentity::Lit { o_key: 42, .. }));
         assert!(matches!(
-            object.to_binding(),
+            object
+                .to_binding(None)
+                .expect("reserved string-dict o_types need no view"),
             Binding::EncodedLit { o_key: 42, .. }
         ));
     }
@@ -2628,9 +2706,94 @@ mod tests {
         let object = object.expect("encoded temporal object should be accepted");
         assert!(matches!(object.id, EncIdentity::Lit { o_key: 12_345, .. }));
         assert!(matches!(
-            object.to_binding(),
+            object
+                .to_binding(None)
+                .expect("encoded temporal o_types need no view"),
             Binding::EncodedLit { o_key: 12_345, .. }
         ));
+    }
+
+    /// Non-reserved string-dictionary datatypes (#1729) stay in the encoded
+    /// join keyed by `(o_type, o_key)`: same key unifies, different datatype
+    /// over the same lexical form splits, and the emit-side rebuild demands a
+    /// graph view (the decode has no `EncodedLit` form to fall back on).
+    #[test]
+    fn object_only_cycle_vars_accept_non_reserved_string_dict_objects() {
+        use fluree_db_core::ids::DatatypeDictId;
+
+        let triples = vec![
+            triple(0, "p1", 1),
+            triple(0, "p2", 2),
+            triple(3, "p3", 1),
+            triple(3, "p4", 2),
+        ];
+        let op = operator_for(&triples);
+        assert_eq!(op.join_mode, CyclicJoinMode::EncodedObject);
+
+        let encode = |o_type: OType, o_key: u64| {
+            op.encode_object_for_edge(
+                &op.plan.edges[0],
+                RawEdgeRow {
+                    subject: 10,
+                    o_type: o_type.as_u16(),
+                    object: o_key,
+                    p_id: 7,
+                },
+            )
+        };
+
+        let any_uri =
+            encode(OType::XSD_ANY_URI, 42).expect("xsd:anyURI object should stay on the fast path");
+        let customer = encode(OType::customer_datatype(DatatypeDictId::RESERVED_COUNT), 42)
+            .expect("customer-datatype object should stay on the fast path");
+        let string = encode(OType::XSD_STRING, 42).expect("xsd:string object");
+
+        // Same dictionary key, three distinct terms (#1729's failure shape).
+        assert_ne!(any_uri, string);
+        assert_ne!(customer, string);
+        assert_ne!(any_uri, customer);
+        // Same datatype + key unifies; a different key splits.
+        assert_eq!(any_uri, encode(OType::XSD_ANY_URI, 42).unwrap());
+        assert_ne!(any_uri, encode(OType::XSD_ANY_URI, 43).unwrap());
+
+        // Emit needs the store: there is no encoded binding to rebuild.
+        assert!(any_uri.to_binding(None).is_err());
+        assert!(customer.to_binding(None).is_err());
+    }
+
+    /// `EncIdentity::Lit` keys on `o_type` where `Binding::eq` on `EncodedLit`
+    /// compares `(o_kind, dt_id, lang_id)` — sound only while the materializer
+    /// maps o_types to those triples injectively. Walk the entire u16 space:
+    /// a future encoded arm that reuses an existing triple for a second
+    /// o_type must fail here, because it would make the cyclic join split
+    /// terms the rest of the engine unifies.
+    #[test]
+    fn encoded_lit_identity_fields_are_injective_over_o_types() {
+        let mut seen: FxHashMap<(u8, u16, u16), u16> = FxHashMap::default();
+        for raw in 0..=u16::MAX {
+            let Some(Binding::EncodedLit {
+                o_kind,
+                dt_id,
+                lang_id,
+                ..
+            }) = late_materialized_object_binding(raw, 1, 1, 0, u32::MAX, None)
+            else {
+                continue;
+            };
+            if let Some(prev) = seen.insert((o_kind, dt_id, lang_id), raw) {
+                panic!(
+                    "o_types {prev:#06x} and {raw:#06x} share EncodedLit identity fields \
+                     (o_kind={o_kind}, dt_id={dt_id}, lang_id={lang_id}); \
+                     EncIdentity::Lit's o_type keying would split what Binding::eq unifies"
+                );
+            }
+        }
+        // The walk must have covered the encoded arms, not vacuously skipped.
+        assert!(
+            seen.len() > 10,
+            "expected the full encoded o_type set, saw {}",
+            seen.len()
+        );
     }
 
     #[test]

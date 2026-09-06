@@ -310,7 +310,7 @@ fn scan_string_fold(
                                 leaf_entry.sidecar_cid.as_ref(),
                                 false,
                             )
-                            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                            .map_err(|e| QueryError::from_io("leaf open", e))?,
                     );
                 }
                 let projection = if entry.o_type_const.is_some() {

@@ -110,6 +110,13 @@ pub struct LedgerSnapshotMetadata {
     /// `annotation_index` is present (handles pre-this-change
     /// roots that already sealed an arena).
     pub had_annotation_arena: bool,
+
+    /// Whether any indexed row carries an RDF-list position. `Some(false)`
+    /// lets the write path skip list-meta hydration; `None` means the root
+    /// predates tracking and lists must be assumed possible. See
+    /// `IndexRoot.has_list_meta` in `fluree-db-binary-index` for the
+    /// canonical contract.
+    pub has_list_meta: Option<bool>,
 }
 
 /// Database value at a specific point in time.
@@ -229,6 +236,13 @@ pub struct LedgerSnapshot {
     /// `IndexRoot.had_annotation_arena` via the FIR6 extended-flags
     /// byte.
     pub had_annotation_arena: bool,
+
+    /// Whether any indexed row carries an RDF-list position. `Some(false)`
+    /// lets the write path skip list-meta hydration; `None` means the root
+    /// predates tracking and lists must be assumed possible. See
+    /// `IndexRoot.has_list_meta` in `fluree-db-binary-index` for the
+    /// canonical contract.
+    pub has_list_meta: Option<bool>,
 }
 
 impl Clone for LedgerSnapshot {
@@ -251,6 +265,7 @@ impl Clone for LedgerSnapshot {
             has_annotations: self.has_annotations,
             annotation_index: self.annotation_index.clone(),
             had_annotation_arena: self.had_annotation_arena,
+            has_list_meta: self.has_list_meta,
             content_store: self.content_store.clone(),
         }
     }
@@ -305,6 +320,9 @@ impl LedgerSnapshot {
             has_annotations: false,
             annotation_index: None,
             had_annotation_arena: false,
+            // An empty snapshot has no indexed rows, so "no list rows" is
+            // exact — everything lives in novelty, which tracks its own bit.
+            has_list_meta: Some(false),
             content_store: None,
         }
     }
@@ -344,6 +362,7 @@ impl LedgerSnapshot {
             has_annotations: meta.has_annotations,
             annotation_index: meta.annotation_index,
             had_annotation_arena: meta.had_annotation_arena,
+            has_list_meta: meta.has_list_meta,
             content_store: None,
         })
     }
@@ -685,8 +704,15 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     // roots whose `annotation_index` was sealed before this
     // change shipped.
     const FLAG_EXT_HAD_ANNOTATION_ARENA: u8 = 1 << 0;
+    const FLAG_EXT_LIST_META_TRACKED: u8 = 1 << 1;
+    const FLAG_EXT_HAS_LIST_META: u8 = 1 << 2;
     let flags_ext = bytes[6];
     let had_annotation_arena = flags_ext & FLAG_EXT_HAD_ANNOTATION_ARENA != 0;
+    let has_list_meta = if flags_ext & FLAG_EXT_LIST_META_TRACKED == 0 {
+        None
+    } else {
+        Some(flags_ext & FLAG_EXT_HAS_LIST_META != 0)
+    };
 
     #[inline]
     fn ensure(bytes: &[u8], pos: usize, need: usize, ctx: &str) -> std::io::Result<()> {
@@ -1041,6 +1067,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         has_annotations,
         annotation_index,
         had_annotation_arena,
+        has_list_meta,
     })
 }
 
@@ -1140,6 +1167,7 @@ mod tests {
             has_annotations: false,
             annotation_index: None,
             had_annotation_arena: false,
+            has_list_meta: None,
         })
         .unwrap();
 

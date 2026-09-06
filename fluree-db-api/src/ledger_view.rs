@@ -16,7 +16,7 @@ use std::sync::Arc;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::db::LedgerSnapshot;
 use fluree_db_core::{CommitId, ContentId};
-use fluree_db_ledger::{LedgerState, TypeErasedStore};
+use fluree_db_ledger::{HeadTemporal, LedgerState, TypeErasedStore};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_novelty::Novelty;
 
@@ -99,6 +99,13 @@ pub struct LedgerView {
     /// Present when `snapshot.range_provider` is also set — the two are always
     /// set/cleared together (see coherence `debug_assert` in `snapshot()`).
     pub binary_store: Option<Arc<BinaryIndexStore>>,
+    /// Temporal metadata of the head commit, carried so a write staged from
+    /// this view keeps `HeadTemporal`'s contract — the event-time
+    /// monotonicity guard and sticky dual-stamp decision stay in-memory
+    /// integer checks. Dropping it here made every optimistic-path commit
+    /// re-read and decode the whole head commit blob (`ensure_head_temporal`)
+    /// inside the locked commit window.
+    pub head_temporal: Option<HeadTemporal>,
 }
 
 impl LedgerView {
@@ -122,6 +129,7 @@ impl LedgerView {
             head_index_id: state.head_index_id.clone(),
             ns_record: state.ns_record.clone(),
             binary_store: None,
+            head_temporal: state.head_temporal,
         }
     }
 
@@ -180,10 +188,13 @@ impl LedgerView {
             ns_record: self.ns_record,
             binary_store: self.binary_store.map(|store| TypeErasedStore(store)),
             spatial_indexes: None,
-            // Read-path conversion: head temporal metadata is only needed by
-            // the write path, which resolves it lazily via
-            // `ensure_head_temporal`.
-            head_temporal: None,
+            // Carried from the state this view was taken from (same head
+            // commit, so the same temporal metadata). Hardcoding `None` here
+            // forced `ensure_head_temporal` — a head-commit-blob read plus
+            // decode — on every optimistic-path commit, inside the locked
+            // window; the lazy resolve now only fires for views built from
+            // states that never observed it (e.g. index == head at load).
+            head_temporal: self.head_temporal,
         }
     }
 }

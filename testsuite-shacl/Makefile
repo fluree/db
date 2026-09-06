@@ -1,6 +1,6 @@
 # testsuite-shacl/Makefile
 #
-# Developer targets for the W3C SHACL core compliance test suite.
+# Developer targets for the W3C SHACL compliance test suite (core + sparql sections).
 # Run `make help` to see available targets.
 #
 # NOTE: this crate is excluded from the workspace — run make (or cargo)
@@ -12,7 +12,7 @@ REPORT_JSON := report.json
 .PHONY: help test count summary test-cat test-one report-json failures show clean update-submodule
 
 help: ## Show this help
-	@echo "W3C SHACL Core Compliance Test Suite"
+	@echo "W3C SHACL Compliance Test Suite (core + sparql)"
 	@echo ""
 	@echo "Usage: make <target>"
 	@echo ""
@@ -27,7 +27,7 @@ help: ## Show this help
 	@echo "  make failures                     # list failing tests with reasons"
 	@echo "  make show TEST=node/minLength-001 # print a test file"
 
-test: ## Run the full core suite (report-only; never fails the build)
+test: ## Run the full suite, core + sparql (report-only; never fails the build)
 	@$(CARGO) test --test w3c_shacl -- --nocapture
 
 count: ## Overall pass/fail numbers
@@ -53,9 +53,10 @@ report-json: ## Write machine-readable report to report.json
 failures: ## List failing tests with reasons (from a fresh run)
 	@$(CARGO) test --test w3c_shacl -- --nocapture 2>&1 | grep -A1 -E "^(FAIL|ERROR)" || echo "no failures"
 
-show: ## Print a W3C test file: make show TEST=node/minLength-001
+show: ## Print a W3C test file: make show TEST=node/minLength-001 (or sparql/node/sparql-001)
 	@test -n "$(TEST)" || (echo "usage: make show TEST=node/minLength-001" && exit 2)
-	@cat data-shapes/data-shapes-test-suite/tests/core/$(TEST).ttl
+	@cat data-shapes/data-shapes-test-suite/tests/core/$(TEST).ttl 2>/dev/null || \
+		cat data-shapes/data-shapes-test-suite/tests/$(TEST).ttl
 
 clean: ## Remove build artifacts and reports
 	@$(CARGO) clean

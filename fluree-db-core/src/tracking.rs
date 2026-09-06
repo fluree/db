@@ -7,12 +7,13 @@
 //! micro-fuel. Use the helper methods (`limit_fuel`, `used_fuel`) for
 //! user-facing decimal representations.
 
+use crate::clock::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
 
 /// Conversion factor between fuel and micro-fuel.
@@ -72,7 +73,11 @@ pub mod schedule {
     /// Per row/flake materialized from in-memory state: `db.range` flakes,
     /// overlay/novelty rows, and history rows. The same 1 µf-per-unit rate also
     /// applies to staged flakes during transactions and bulk imports, where it
-    /// is charged as a raw count (`flakes.len()`) at those call sites.
+    /// is charged as a raw count (`flakes.len()`) at those call sites, and to
+    /// rows handled by the fused join lanes (`PropertyJoinOperator` scan/probe
+    /// drains, `ValuesOperator` join input), charged per batch/chunk at the
+    /// existing cancellation boundaries — never per iteration inside the merge
+    /// loops (hot-loop purity).
     pub const PER_ROW_MICRO_FUEL: u64 = 1;
 
     /// Transaction/commit baseline, charged once per `stage` and once per
@@ -200,6 +205,11 @@ pub struct PolicyEnforcement {
     /// `rdfs:domain`, `rdfs:range`) bypass policy, so a query over the ontology
     /// can still produce rows.
     pub denies_all_data: bool,
+    /// Policies whose `f:query` could not be evaluated for this request and
+    /// therefore denied their targets: a graph source (Iceberg / SQL) has no
+    /// graph to run a policy query against. Empty on native ledgers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unevaluable_policies: Vec<String>,
 }
 
 /// Fuel limit exceeded. Field values are micro-fuel; use the helpers for fuel decimals.
@@ -242,6 +252,12 @@ struct TrackerInner {
     // reasoning mode ran). Not gated by an option: a capped materialization
     // is a correctness signal, so any enabled tracker reports it.
     reasoning: RwLock<Option<ReasoningTally>>,
+    /// Statements the SQL pushdown lane sent to graph sources, in order,
+    /// capped at [`STATEMENT_REPORT_CAP`].
+    statements: RwLock<Vec<PushedStatement>>,
+    /// Statements sent past the cap, so a truncated report says so rather
+    /// than reading as the whole story.
+    statements_elided: AtomicU64,
 
     options: TrackingOptions,
 }
@@ -266,6 +282,8 @@ impl Tracker {
             policy_stats: RwLock::new(HashMap::new()),
             policy_enforcement: RwLock::new(None),
             reasoning: RwLock::new(None),
+            statements: RwLock::new(Vec::new()),
+            statements_elided: AtomicU64::new(0),
             options,
         })))
     }
@@ -376,12 +394,43 @@ impl Tracker {
             // A dataset query prepares several views; keep the most restrictive
             // reading so `denies_all_data` means "every graph denied".
             *slot = Some(match slot.take() {
-                Some(prev) => PolicyEnforcement {
-                    enforced: true,
-                    denies_all_data: prev.denies_all_data && state.denies_all_data,
-                },
+                Some(prev) => {
+                    let mut unevaluable_policies = prev.unevaluable_policies;
+                    for id in state.unevaluable_policies {
+                        if !unevaluable_policies.contains(&id) {
+                            unevaluable_policies.push(id);
+                        }
+                    }
+                    PolicyEnforcement {
+                        enforced: true,
+                        denies_all_data: prev.denies_all_data && state.denies_all_data,
+                        unevaluable_policies,
+                    }
+                }
                 None => state,
             });
+        }
+    }
+
+    /// Record a policy whose `f:query` could not be evaluated for this request
+    /// (see [`PolicyEnforcement::unevaluable_policies`]). Recorded during
+    /// execution, so it merges into whatever enforcement state the prepared
+    /// view already stamped.
+    pub fn record_unevaluable_policy(&self, policy_id: &str) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if !inner.options.track_policy || policy_id.is_empty() {
+            return;
+        }
+        if let Ok(mut slot) = inner.policy_enforcement.write() {
+            let state = slot.get_or_insert_with(|| PolicyEnforcement {
+                enforced: true,
+                ..PolicyEnforcement::default()
+            });
+            if !state.unevaluable_policies.iter().any(|id| id == policy_id) {
+                state.unevaluable_policies.push(policy_id.to_string());
+            }
         }
     }
 
@@ -395,6 +444,29 @@ impl Tracker {
         };
         if let Ok(mut slot) = inner.reasoning.write() {
             *slot = Some(tally);
+        }
+    }
+
+    /// Record a statement the SQL pushdown lane sent to `source`, so the
+    /// response reports what ran remotely.
+    pub fn record_statement(&self, source: &str, sql: &str) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        // Bounded: outer bindings chunk at 2,000 rows and a statement may run
+        // to `statement_max_bytes` (1 MiB), so an unbounded tally over a large
+        // seed set retains tens of MiB and echoes all of it in the response.
+        // The first `STATEMENT_REPORT_CAP` are what a reader needs to see the
+        // shape; the rest are counted, never silently dropped.
+        if let Ok(mut slot) = inner.statements.write() {
+            if slot.len() >= STATEMENT_REPORT_CAP {
+                inner.statements_elided.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            slot.push(PushedStatement {
+                source: source.to_string(),
+                sql: sql.to_string(),
+            });
         }
     }
 
@@ -441,6 +513,16 @@ impl Tracker {
             },
             policy_enforcement: inner.policy_enforcement.read().ok().and_then(|p| p.clone()),
             reasoning: inner.reasoning.read().ok().and_then(|r| r.clone()),
+            sql: inner
+                .statements
+                .read()
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.clone()),
+            sql_elided: match inner.statements_elided.load(Ordering::Relaxed) {
+                0 => None,
+                n => Some(n),
+            },
         })
     }
 }
@@ -465,6 +547,26 @@ pub struct TrackingTally {
     /// Reasoning materialization outcome, when a reasoning mode ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningTally>,
+    /// Statements the SQL pushdown lane sent to graph sources, in the order
+    /// they ran. Absent when no block was pushed down.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql: Option<Vec<PushedStatement>>,
+    /// Statements sent beyond the reported cap. Present only when `sql` is a
+    /// prefix rather than the whole list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_elided: Option<u64>,
+}
+
+/// How many pushed statements a tracked response lists before it starts
+/// counting instead.
+pub const STATEMENT_REPORT_CAP: usize = 64;
+
+/// One statement the SQL pushdown lane sent to a graph source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushedStatement {
+    /// The graph source the statement ran against.
+    pub source: String,
+    pub sql: String,
 }
 
 /// Outcome of an OWL2-RL materialization, reported per request.
@@ -591,12 +693,14 @@ mod tests {
         t.record_policy_enforcement(Some(PolicyEnforcement {
             enforced: true,
             denies_all_data: true,
+            unevaluable_policies: Vec::new(),
         }));
         assert_eq!(
             t.tally().unwrap().policy_enforcement,
             Some(PolicyEnforcement {
                 enforced: true,
                 denies_all_data: true,
+                unevaluable_policies: Vec::new(),
             })
         );
     }
@@ -611,6 +715,7 @@ mod tests {
         t.record_policy_enforcement(Some(PolicyEnforcement {
             enforced: true,
             denies_all_data: true,
+            unevaluable_policies: Vec::new(),
         }));
         let tally = t.tally().unwrap();
         assert_eq!(tally.policy, None);
@@ -625,16 +730,19 @@ mod tests {
         t.record_policy_enforcement(Some(PolicyEnforcement {
             enforced: true,
             denies_all_data: true,
+            unevaluable_policies: Vec::new(),
         }));
         t.record_policy_enforcement(Some(PolicyEnforcement {
             enforced: true,
             denies_all_data: false,
+            unevaluable_policies: Vec::new(),
         }));
         assert_eq!(
             t.tally().unwrap().policy_enforcement,
             Some(PolicyEnforcement {
                 enforced: true,
                 denies_all_data: false,
+                unevaluable_policies: Vec::new(),
             })
         );
     }

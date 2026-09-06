@@ -204,8 +204,10 @@ mod tests {
             structural_constraints: vec![],
             severity: Severity::Violation,
             name: None,
+            description: None,
             message: None,
             deactivated: false,
+            sparql_constraints: vec![],
         }
     }
 

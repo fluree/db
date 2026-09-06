@@ -713,7 +713,7 @@ fn scan_partitioned(
         for leaf in leaves {
             let handle = store
                 .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-                .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+                .map_err(|e| QueryError::from_io("leaf open", e))?;
             for entry in &handle.dir().entries {
                 if entry.row_count == 0 || entry.p_const != Some(p_id) {
                     continue;

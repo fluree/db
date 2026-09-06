@@ -1979,6 +1979,41 @@ async fn jsonld_encoded_xsd_float_result_datatype() {
     );
 }
 
+// STR() on the encoded lane (#1695 float sibling): the decode folds the
+// stored xsd:float to a full-precision f64 and the #1470 re-tag then narrows
+// it to an f32 for the numeric lanes — but STR() must spell the STORED f64,
+// the same rendering the serializer gives the term. An f32-inexact value is
+// the discriminating case: through the f32 the lexical would come back
+// `3.1415927E0`.
+#[tokio::test]
+async fn sparql_encoded_xsd_float_str_matches_serializer() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let tx = json!({
+        "@context": ctx(),
+        "@graph": [{
+            "@id": "ex:n",
+            "ex:f": { "@value": "3.14159265358979", "@type": "xsd:float" }
+        }]
+    });
+    let ledger = seed_indexed(&fluree, "x2/encfloat:str", &tx).await;
+    let q = "PREFIX ex: <http://example.org/ns/> \
+             SELECT ?f (STR(?f) AS ?lex) WHERE { ex:n ex:f ?f }";
+    let result = support::query_sparql(&fluree, &ledger, q)
+        .await
+        .expect("STR over encoded float");
+    let sparql_json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("to_sparql_json");
+    let row = &sparql_json["results"]["bindings"][0];
+    let serialized = row["f"]["value"].as_str().expect("serialized float");
+    let str_lex = row["lex"]["value"].as_str().expect("STR result");
+    assert_eq!(
+        str_lex, serialized,
+        "STR(?f) diverges from the serializer on the encoded lane: {sparql_json}"
+    );
+    assert_eq!(serialized, "3.14159265358979E0", "{sparql_json}");
+}
+
 fn lang_ebv_tx() -> JsonValue {
     json!({
         "@context": ctx(),
