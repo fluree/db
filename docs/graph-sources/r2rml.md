@@ -382,9 +382,11 @@ An R2RML graph source is *virtual* — every query re-reads the underlying table
    map with no value source or more than one, or an `rr:termType` other than
    `rr:IRI`. Only
    [materialization into a native ledger](iceberg.md#materialization-into-a-native-ledger)
-   honors the graph map today; the virtual query path and the
-   [native twin](iceberg.md#materializing-a-native-twin) builder place every
-   triple in the default graph (tracked in #1607).
+   honors the graph map today. The
+   [native twin](iceberg.md#materializing-a-native-twin) builder refuses a
+   mapping that carries one, since it would place every triple in the default
+   graph and its parity gate would not notice; the virtual query path still
+   reads everything from the default graph (tracked in #1607).
 
 ## Troubleshooting
 

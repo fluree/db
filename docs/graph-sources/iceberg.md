@@ -641,7 +641,8 @@ target. The materializer enforces what it can and documents the rest:
   rows into named graphs per the subject map's graph map; the virtual query path
   does not yet read graph maps, so a graph-scoped query returns different
   results against the source and its twin. Query-path parity is a tracked
-  follow-up.
+  follow-up. The [native twin](#materializing-a-native-twin) builder refuses a
+  mapping with a graph map rather than flattening it into the default graph.
 - **Compaction can silently turn incremental into a full re-read.** The
   incremental window treats `replace` (compaction) snapshots as safe when the
   writer preserves data sequence numbers (Spark's `rewrite_data_files` default).

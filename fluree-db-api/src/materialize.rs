@@ -122,6 +122,32 @@ fn scan_projection(tm: &TriplesMap, parents: &ParentIndexSet) -> Vec<String> {
     cols
 }
 
+/// Refuse a mapping that routes rows into named graphs. This builder emits
+/// bare `(s, p, o)` triples — [`TripleObserver`] carries no graph — so every
+/// triple would land in the default graph, and the parity gate would pass it,
+/// since both of its sides run this same enumerator. A mapping that asks for
+/// routing and silently gets none is worse than one told it cannot have it. The
+/// tracking materializer honors graph maps; this check lifts when the builder
+/// routes too.
+fn ensure_no_graph_maps(mapping: &CompiledR2rmlMapping) -> Result<(), MaterializeError> {
+    let mut routed: Vec<&str> = mapping
+        .triples_maps
+        .values()
+        .filter(|tm| tm.subject_map.graph_map.is_some())
+        .map(|tm| tm.iri.as_str())
+        .collect();
+    if routed.is_empty() {
+        return Ok(());
+    }
+    routed.sort_unstable();
+    Err(MaterializeError::Mapping(R2rmlError::Unsupported(format!(
+        "rr:graph / rr:graphMap on {}: the twin builder does not yet honor graph maps and \
+         would place every triple in the default graph. Materialize this source with the \
+         tracking materializer, which routes rows per graph map, or remove the graph map.",
+        routed.join(", ")
+    ))))
+}
+
 /// Enumerate every triple of a virtual R2RML graph source, streaming each
 /// logical table through the whole-graph enumerator and emitting to `observer`.
 /// Returns the [`MaterializeStats`] for the run (triple counts and the
@@ -147,6 +173,7 @@ where
     P: R2rmlProvider + R2rmlTableProvider,
 {
     let mapping = provider.compiled_mapping(graph_source_id, None).await?;
+    ensure_no_graph_maps(&mapping)?;
     let mut parents = ParentIndexSet::new(&mapping)?;
     let materialization = plan(&mapping);
 
@@ -977,6 +1004,7 @@ pub async fn drive_virtual_import(
     use std::sync::Mutex;
 
     let mapping = Arc::new(provider.compiled_mapping(graph_source_id, None).await?);
+    ensure_no_graph_maps(&mapping)?;
     // MAJOR-2 (#1529 review): refuse UP FRONT if snapshot pinning is a no-op (the
     // loadTable cache is disabled) — building a twin whose stamp cannot be trusted
     // is worse than not building it. The mid-build snapshot-move check is re-run
@@ -2820,6 +2848,159 @@ mod tests {
         let (m2, e2) = super::diff_sorted_files(&src, &src).unwrap();
         assert_eq!((m2, e2), (0, 0), "identical inputs diff to zero");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- graph maps: refused up front; projection reads every mapped column ---
+
+    /// A one-table mapping whose subject is an `rr:column` and whose rows route
+    /// by a graph template, with one batch behind it.
+    fn graph_routed_provider() -> MockBuildProvider {
+        use fluree_db_r2rml::mapping::{
+            CompiledR2rmlMapping, GraphMap, ObjectMap, PredicateMap, PredicateObjectMap,
+            SubjectMap, TriplesMap,
+        };
+        use fluree_db_tabular::{BatchSchema, Column, FieldInfo, FieldType};
+
+        let mut tm = TriplesMap::new("<#Tenant>", "t");
+        tm.subject_map = SubjectMap::column("uri");
+        tm.subject_map.graph_map = Some(GraphMap::template("http://ex/g/{tenant}/{region}"));
+        tm.predicate_object_maps = vec![PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex/name"),
+            object_map: ObjectMap::column("name"),
+        }];
+
+        let field = |name: &str, id: i32| FieldInfo {
+            name: name.to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: id,
+        };
+        let schema = Arc::new(BatchSchema::new(vec![
+            field("uri", 1),
+            field("tenant", 2),
+            field("region", 3),
+            field("name", 4),
+        ]));
+        let col =
+            |values: &[&str]| Column::String(values.iter().map(|v| Some(v.to_string())).collect());
+        let batch = fluree_db_tabular::ColumnBatch::new(
+            schema,
+            vec![
+                col(&["http://ex/s/1", "http://ex/s/2"]),
+                col(&["acme", "globex"]),
+                col(&["eu", "us"]),
+                col(&["one", "two"]),
+            ],
+        )
+        .unwrap();
+
+        let mut batches = HashMap::new();
+        batches.insert("t".to_string(), vec![batch]);
+        MockBuildProvider {
+            mapping: Arc::new(CompiledR2rmlMapping::new(vec![tm])),
+            batches,
+        }
+    }
+
+    #[test]
+    fn scan_projection_reads_the_subject_column_and_graph_map_columns() {
+        // The projection goes straight to the Iceberg scan, which reads only the
+        // named columns. Leave the rr:column subject out and every row is
+        // skipped; leave the graph columns out and every row routes to the
+        // default graph — both with a passing parity gate.
+        let provider = graph_routed_provider();
+        let tm = provider.mapping.triples_maps.get("<#Tenant>").unwrap();
+        let parents = super::ParentIndexSet::new(&provider.mapping).unwrap();
+        assert_eq!(
+            super::scan_projection(tm, &parents),
+            vec!["name", "region", "tenant", "uri"]
+        );
+    }
+
+    /// Counts what an enumeration emits — nothing may reach it before a refusal.
+    struct CountingObserver(u64);
+
+    impl fluree_db_r2rml::materialize::TripleObserver for CountingObserver {
+        fn observe(
+            &mut self,
+            _subject: &fluree_db_r2rml::RdfTerm,
+            _predicate: &str,
+            _object: &fluree_db_r2rml::RdfTerm,
+        ) -> fluree_db_r2rml::R2rmlResult<()> {
+            self.0 += 1;
+            Ok(())
+        }
+    }
+
+    fn assert_refuses_graph_maps(err: &super::MaterializeError) {
+        assert!(
+            matches!(
+                err,
+                super::MaterializeError::Mapping(fluree_db_r2rml::R2rmlError::Unsupported(msg))
+                    if msg.contains("rr:graphMap") && msg.contains("<#Tenant>")
+            ),
+            "expected the graph-map refusal naming the triples map, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn serial_build_refuses_a_graph_mapped_source_before_emitting() {
+        let provider = graph_routed_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut observer = CountingObserver(0);
+        let err = rt
+            .block_on(super::materialize_graph(
+                &provider,
+                "mock-gs",
+                &mut observer,
+            ))
+            .unwrap_err();
+        assert_refuses_graph_maps(&err);
+        assert_eq!(observer.0, 0, "nothing may be emitted before the refusal");
+    }
+
+    #[test]
+    fn parallel_build_refuses_a_graph_mapped_source_before_scanning() {
+        use fluree_db_transact::namespace::{NamespaceRegistry, SharedNamespaceAllocator};
+
+        let provider = graph_routed_provider();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let shared_alloc = Arc::new(SharedNamespaceAllocator::from_registry(
+            &NamespaceRegistry::new(),
+        ));
+        let spool_dir =
+            std::env::temp_dir().join(format!("fluree-graph-map-refusal-{}", std::process::id()));
+        std::fs::create_dir_all(&spool_dir).unwrap();
+
+        // Drain anything a build that wrongly proceeds would send, so the
+        // bounded channel cannot wedge the test instead of failing it.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<super::ChunkResult>(1);
+        let drain = std::thread::spawn(move || rx.iter().count());
+
+        let result = rt.block_on(async {
+            let ctx = super::VirtualChunkContext {
+                shared_alloc: &shared_alloc,
+                ledger_id: "mock-twin",
+                compress: false,
+                spool_dir: &spool_dir,
+                spool_config: None,
+            };
+            super::drive_virtual_import(&provider, "mock-gs", 64, 2, 0, true, &ctx, tx).await
+        });
+        let chunks_sent = drain.join().unwrap();
+        let _ = std::fs::remove_dir_all(&spool_dir);
+
+        assert_refuses_graph_maps(&result.unwrap_err());
+        assert_eq!(
+            chunks_sent, 0,
+            "no chunk may be produced before the refusal"
+        );
     }
 
     // --- O1 parallel produce: p=1 vs p=2 differential (hermetic) ---
