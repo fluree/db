@@ -271,8 +271,14 @@ impl GraphOperator {
                 .map(|g| Arc::clone(&g.ledger_id)),
             _ => None,
         };
-        if stamp_ledger_id.is_some() {
+        if let Some(ledger_id) = &stamp_ledger_id {
             graph_ctx.eager_materialization = true;
+            // The scans inside already stamp (the dataset spans ledgers), but
+            // a BIND-minted term, a VALUES cell, and a property path do not
+            // unless the context arms it — and each of those lands next to
+            // stamped scan output, where a raw `Sid` never unifies. Same
+            // machinery as the cross-ledger SERVICE path.
+            graph_ctx.scan_provenance_ledger = Some(Arc::clone(ledger_id));
         }
 
         // Check if this graph is backed by an R2RML mapping.
@@ -347,7 +353,22 @@ impl GraphOperator {
                     .expect("row_idx must be valid for batch")
                     .to_vec();
                 row.push(Binding::iri(graph_iri.clone()));
+                if stamp_ledger_id.is_some() {
+                    row = crate::dataset_operator::stamp_seed_row(row, ctx);
+                }
                 SeedOperator::from_row(Arc::from(schema_vec.into_boxed_slice()), row)
+            }
+            // Across a ledger boundary the parent's raw `Sid`s are stamped in
+            // the requester's ledger before seeding (see `stamp_seed_row`).
+            _ if stamp_ledger_id.is_some() => {
+                let row = parent_batch
+                    .row_view(row_idx)
+                    .expect("row_idx must be valid for batch")
+                    .to_vec();
+                SeedOperator::from_row(
+                    Arc::from(parent_batch.schema().to_vec().into_boxed_slice()),
+                    crate::dataset_operator::stamp_seed_row(row, ctx),
+                )
             }
             _ => SeedOperator::from_batch_row(parent_batch, row_idx),
         };

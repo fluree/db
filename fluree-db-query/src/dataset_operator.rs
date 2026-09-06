@@ -412,6 +412,36 @@ pub(crate) fn stamp_provenance(
     Batch::new(schema, stamped_columns).map_err(|e| QueryError::Internal(e.to_string()))
 }
 
+/// Stamp `batch` in the ledger a cross-ledger SERVICE body executes against,
+/// when the context arms per-scan provenance (`scan_provenance_ledger`); a
+/// pass-through everywhere else. For binding producers that are not wrapped
+/// by a `DatasetOperator` (property paths) but emit target-encoded `Sid`s.
+pub(crate) fn stamp_if_armed(batch: Batch, ctx: &ExecutionContext<'_>) -> Result<Batch> {
+    match &ctx.scan_provenance_ledger {
+        Some(ledger_id) => stamp_provenance(batch, ledger_id, ctx),
+        None => Ok(batch),
+    }
+}
+
+/// Stamp a parent row's raw `Sid`s in the REQUESTER's ledger (the context's
+/// active snapshot) before it seeds a body that executes against another
+/// ledger. Inside such a body every reference is namespace-neutral; a
+/// requester-encoded `Sid` copied into a body column (`BIND(?parent AS ?x)`)
+/// would otherwise be decoded through the target's table at the boundary.
+/// An undecodable `Sid` is left as is.
+pub(crate) fn stamp_seed_row(row: Vec<Binding>, ctx: &ExecutionContext<'_>) -> Vec<Binding> {
+    let requester: Arc<str> = Arc::from(ctx.active_snapshot.ledger_id.as_str());
+    row.into_iter()
+        .map(|b| match b {
+            Binding::Sid { sid, .. } => match ctx.active_snapshot.decode_sid(&sid) {
+                Some(iri) => Binding::iri_match(iri, sid, Arc::clone(&requester)),
+                None => Binding::sid(sid),
+            },
+            other => other,
+        })
+        .collect()
+}
+
 /// Stamp a single binding with ledger provenance.
 ///
 /// `Binding::Sid` is converted to `IriMatch`; all other variants are moved
@@ -542,15 +572,24 @@ impl Operator for DatasetOperator {
         match ctx.active_graphs() {
             ActiveGraphs::Single => {
                 // Single-graph mode: build one operator, open with parent
-                // context directly. No fanout, no provenance stamping.
+                // context directly. No fanout; provenance stamping only when
+                // the context demands it — a cross-ledger SERVICE subtree sets
+                // `scan_provenance_ledger` so raw target-encoded `Sid`s never
+                // escape a scan (they would be re-decoded against the
+                // requester's namespace table the moment an intra-body join
+                // substitutes them into a pattern; issue #1665). Everywhere
+                // else the flag is `None` and this lane is unchanged.
                 let mut inner = self.builder.build()?;
                 self.apply_member_directives(inner.as_mut());
                 inner.open(ctx).await?;
+                self.needs_provenance = ctx.scan_provenance_ledger.is_some();
                 self.members.push(DatasetMember {
                     operator: inner,
-                    ledger_id: Arc::from(""),
+                    ledger_id: ctx
+                        .scan_provenance_ledger
+                        .clone()
+                        .unwrap_or_else(|| Arc::from("")),
                 });
-                self.needs_provenance = false;
             }
             ActiveGraphs::Many(graphs) => {
                 // Pre-scan: determine whether graphs span multiple ledgers
