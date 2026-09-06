@@ -117,6 +117,20 @@ pub fn parse_transaction(
     }
     let lpg_mode = opts.lpg_edge_lifecycle.unwrap_or(false);
 
+    // Requested SHACL validation mode ("warn" / "reject"), same JSON-over-
+    // programmatic precedence as the opts above. Whether the request is
+    // honored is decided later against the ledger config's override control
+    // (see TxnOpts::validation_mode); an unrecognized string is ignored.
+    if opts.validation_mode.is_none() {
+        opts.validation_mode = json
+            .as_object()
+            .and_then(|m| m.get("opts"))
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("validationMode"))
+            .and_then(Value::as_str)
+            .and_then(fluree_db_core::ledger_config::ValidationMode::parse_opt);
+    }
+
     // M1: lower `@annotation` / `@edge` / `@reifies` into the seven-fact
     // `f:reifies*` system encoding before JSON-LD expansion, rejecting
     // user-authored `f:reifies*` IRIs and every deferred shape (literal-
@@ -161,6 +175,56 @@ pub fn parse_transaction(
         TxnType::Upsert => parse_upsert(&lowered, opts, ns_registry),
         TxnType::Update => parse_update(&lowered, opts, ns_registry),
     }
+}
+
+/// Transaction-local graph id assigned to the sync target graph. The
+/// payload may not address named graphs itself (rejected below), so the
+/// assigner never hands this id to anything else.
+const SYNC_GRAPH_LOCAL_ID: u16 = 2;
+
+/// Parse a graph-sync transaction (see [`Txn::sync_graph`]).
+///
+/// The payload is an ordinary insert-shaped JSON-LD document describing the
+/// target graph's DESIRED full contents. Parsing is exactly insert parsing
+/// (same context handling, annotation lowering, txn-meta extraction), after
+/// which every template is re-homed onto `graph_iri` and the sync directive
+/// is stamped on the transaction.
+///
+/// Differences from insert:
+/// - an explicitly empty document (`"@graph": []`) is allowed — it means
+///   "the graph's desired contents are empty" (the API layer gates this
+///   behind an explicit opt-in before it becomes a whole-graph clear);
+/// - a payload that addresses named graphs itself (`@graph` with a graph
+///   `@id`) is rejected: the sync scope is exactly one graph, named by the
+///   caller, never inferred from the data.
+pub fn parse_sync_transaction(
+    json: &Value,
+    graph_iri: &str,
+    opts: TxnOpts,
+    ns_registry: &mut NamespaceRegistry,
+) -> Result<Txn> {
+    let explicitly_empty = json
+        .get("@graph")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty);
+    let mut txn = if explicitly_empty {
+        Txn::insert().with_opts(opts)
+    } else {
+        parse_transaction(json, TxnType::Insert, opts, ns_registry)?
+    };
+    if !txn.graph_delta.is_empty() {
+        return Err(TransactError::Parse(
+            "sync payload must not address named graphs; the target graph is the sync scope"
+                .to_string(),
+        ));
+    }
+    for t in &mut txn.insert_templates {
+        t.graph_id = Some(SYNC_GRAPH_LOCAL_ID);
+    }
+    txn.graph_delta
+        .insert(SYNC_GRAPH_LOCAL_ID, graph_iri.to_string());
+    txn.sync_graph = Some(graph_iri.to_string());
+    Ok(txn)
 }
 
 /// Parse an insert transaction
@@ -1809,8 +1873,8 @@ fn convert_typed_value_with_meta(
 /// @list objects and uses `parse_list_values` instead to get all elements with indices.
 ///
 /// This function only handles the fallback case and returns the first element.
-/// Empty lists produce an error here since we can't return "no value" - the proper
-/// empty list handling happens in `parse_expanded_objects` via `parse_list_values`.
+/// An empty @list denotes the IRI rdf:nil and returns that single term, in
+/// both this fallback and the `parse_list_values` path (issue #1694 twin).
 #[allow(clippy::too_many_arguments)]
 fn parse_list_value_with_ctx(
     list_val: &Value,
@@ -1827,15 +1891,13 @@ fn parse_list_value_with_ctx(
         }
     };
 
-    // Empty list: we can't return "no value" from this function.
-    // The proper path for empty lists is through parse_expanded_objects which
-    // uses parse_list_values and filters empty results. If we get here with an
-    // empty list, it's an edge case where @list wasn't detected at the array level.
+    // An empty @list denotes the IRI rdf:nil (JSON-LD 1.1 § List to RDF
+    // Conversion) — same as `parse_list_values_with_ctx`. This position used
+    // to error ("Empty @list in unexpected position").
     if items.is_empty() {
-        return Err(TransactError::Parse(
-            "Empty @list in unexpected position (should be handled by parse_expanded_objects)"
-                .to_string(),
-        ));
+        return Ok(ParsedValue::new(TemplateTerm::Sid(
+            ctx.ns_registry.sid_for_iri(rdf::NIL),
+        )));
     }
 
     // Parse the first element with index 0
@@ -1862,9 +1924,14 @@ fn parse_list_values_with_ctx(
         }
     };
 
-    // Empty list produces zero triples
+    // An empty @list denotes the IRI rdf:nil (JSON-LD 1.1 § List to RDF
+    // Conversion): store the one triple, as an ordinary IRI object with no
+    // list index — the twin of the Turtle `()` fix (issue #1694). It used
+    // to produce zero templates, silently losing the statement.
     if items.is_empty() {
-        return Ok(Vec::new());
+        return Ok(vec![ParsedValue::new(TemplateTerm::Sid(
+            ctx.ns_registry.sid_for_iri(rdf::NIL),
+        ))]);
     }
 
     // Parse each item with its index
@@ -2446,7 +2513,9 @@ mod tests {
         let mut ns_registry = test_registry();
         let ctx = ParsedContext::new();
 
-        // Empty @list produces zero ParsedValues
+        // An empty @list denotes rdf:nil: ONE ParsedValue, an ordinary IRI
+        // object with no list index (issue #1694 twin — it used to produce
+        // zero values, silently losing the statement).
         let list_val = json!([]);
         let mut templates = Vec::new();
         let mut graph_ids = GraphIdAssigner::new();
@@ -2464,7 +2533,49 @@ mod tests {
             &mut blank_counter,
         )
         .unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results.len(), 1);
+        assert!(results[0].list_index.is_none());
+        let nil_sid = ns_registry.sid_for_iri(rdf::NIL);
+        assert!(
+            matches!(&results[0].term, TemplateTerm::Sid(sid) if *sid == nil_sid),
+            "empty @list must parse to the rdf:nil IRI"
+        );
+        assert!(templates.is_empty(), "no side-emitted templates");
+    }
+
+    /// The singular fallback (`parse_expanded_value` reaching a `@list`
+    /// object outside the array position) must agree with the plural path:
+    /// an empty `@list` is the single term rdf:nil. It used to error with
+    /// "Empty @list in unexpected position".
+    #[test]
+    fn test_parse_empty_list_single_value_position() {
+        let mut vars = VarRegistry::new();
+        let mut ns_registry = test_registry();
+        let mut templates: Vec<TripleTemplate> = Vec::new();
+        let ctx = ParsedContext::new();
+        let mut graph_ids = GraphIdAssigner::new();
+        let mut blank_counter: usize = 0;
+
+        let val = json!({"@list": []});
+        let result = parse_expanded_value(
+            &val,
+            &ctx,
+            &mut vars,
+            &mut ns_registry,
+            &mut templates,
+            true,
+            &mut graph_ids,
+            None,
+            &HashMap::new(),
+            &mut blank_counter,
+        )
+        .unwrap();
+        assert!(result.list_index.is_none());
+        let nil_sid = ns_registry.sid_for_iri(rdf::NIL);
+        assert!(
+            matches!(&result.term, TemplateTerm::Sid(sid) if *sid == nil_sid),
+            "empty @list must parse to the rdf:nil IRI"
+        );
     }
 
     #[test]

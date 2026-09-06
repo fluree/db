@@ -993,3 +993,165 @@ async fn sparql_construct_shared_object_rdfxml_keeps_both_predicates() {
         "RDF/XML must carry both predicates: {rdfxml}"
     );
 }
+
+/// A fully-constant template prunes the WHERE schema to zero columns
+/// (`compute_variable_deps` seeds an empty needed set from a template that
+/// references no variable), and a column-less `Batch` carries its row count
+/// out-of-band — so every operator that rebuilds a batch column-by-column is a
+/// place the count can silently vanish. `DistinctOperator` was the first
+/// (fixed here); `LimitOperator`'s truncation branch and `OffsetOperator`'s
+/// partial-skip branch were the second and third, both rebuilding via
+/// `Batch::new(schema, vec![])` and losing the length. Reachable from main:
+/// this exact query returned an **empty graph** whenever the WHERE matched
+/// more rows than the limit, because the truncated zero-column batch read as
+/// zero rows and ASK/CONSTRUCT formatting reads emptiness.
+#[tokio::test]
+async fn constant_template_construct_with_limit_keeps_its_triple() {
+    let (fluree, ledger) = seed_people().await;
+
+    // WHERE matches many rows; LIMIT slices the solution sequence. The
+    // template is constant, so any surviving solution instantiates the same
+    // single triple — the graph must never be empty.
+    for q in [
+        "CONSTRUCT { <http://ex/s> <http://ex/p> \"dup\" } WHERE { ?s ?p ?o } LIMIT 1",
+        "CONSTRUCT { <http://ex/s> <http://ex/p> \"dup\" } WHERE { ?s ?p ?o } LIMIT 5",
+        "CONSTRUCT { <http://ex/s> <http://ex/p> \"dup\" } WHERE { ?s ?p ?o } OFFSET 2",
+        "CONSTRUCT { <http://ex/s> <http://ex/p> \"dup\" } WHERE { ?s ?p ?o } LIMIT 3 OFFSET 2",
+    ] {
+        let result = support::query_sparql(&fluree, &ledger, q)
+            .await
+            .expect("construct query");
+        let graph = result
+            .to_construct(&ledger.snapshot)
+            .expect("construct format");
+        let n = graph["@graph"].as_array().map_or(0, Vec::len);
+        assert_eq!(
+            n, 1,
+            "{q}: a constant template over a non-empty sliced WHERE must \
+             yield exactly one triple, got {n} nodes: {graph}"
+        );
+    }
+}
+
+// ============================================================================
+// The WHERE-dedup license's output-path gate (#1700 follow-up, #1706)
+// ============================================================================
+
+/// Every output format must either canonicalize a CONSTRUCT graph or refuse
+/// CONSTRUCT outright — asserted behaviorally, per format, against a result
+/// that provably still carries duplicate solutions.
+///
+/// This is the gate that keeps `result_is_multiplicity_blind` (in
+/// `fluree-db-query`'s `execute::operator_tree`) honest. That license lets the
+/// WHERE planner collapse duplicate solutions for a blank-free, unsliced
+/// CONSTRUCT on the argument that *no* output path can observe them: every
+/// serializer either calls `Graph::canonicalize()` or rejects CONSTRUCT. The
+/// plan is built before the output format is chosen, so the license is sound
+/// only while that holds for EVERY format — one non-canonicalizing serializer
+/// anywhere and the license silently changes query results for it.
+///
+/// The enumeration is structural, not a comment: `classify` matches every
+/// `OutputFormat` variant with no wildcard arm, so adding a variant stops this
+/// file compiling until the new path is classified — and the classification is
+/// then executed, not taken on faith. If a future format legitimately needs to
+/// render CONSTRUCT without canonicalizing, the license itself has to change;
+/// this test failing is the reminder.
+mod construct_license_output_gate {
+    use crate::support;
+    use fluree_db_api::format::{format_results_string, FormatterConfig, OutputFormat};
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum ConstructPath {
+        /// Serializes the graph; duplicate solutions must collapse.
+        Canonicalizes,
+        /// Refuses CONSTRUCT results outright.
+        Rejects,
+    }
+
+    /// One list, used twice: the `match` (no wildcard) is the compile-time
+    /// exhaustiveness gate, and the same identifiers feed the runtime
+    /// iteration, so a variant cannot be classified without also being tested.
+    macro_rules! classified_formats {
+        ($($variant:ident => $path:ident),* $(,)?) => {
+            fn classify(format: OutputFormat) -> ConstructPath {
+                match format {
+                    $(OutputFormat::$variant => ConstructPath::$path,)*
+                }
+            }
+            fn all_formats() -> Vec<OutputFormat> {
+                vec![$(OutputFormat::$variant),*]
+            }
+        };
+    }
+
+    classified_formats! {
+        JsonLd     => Canonicalizes, // format_results → construct::format → Graph::canonicalize
+        SparqlJson => Canonicalizes, // coerced to the same construct::format path (#1274)
+        SparqlXml  => Rejects,       // sparql_xml::format: SELECT/ASK only
+        RdfXml     => Canonicalizes, // rdf_xml::format → Graph::canonicalize
+        TypedJson  => Canonicalizes, // coerced to construct::format
+        Tsv        => Rejects,       // delimited::reject_non_tabular
+        Csv        => Rejects,       // delimited::reject_non_tabular
+        AgentJson  => Canonicalizes, // coerced to construct::format
+        CypherJson => Canonicalizes, // coerced to construct::format
+    }
+
+    #[tokio::test]
+    async fn every_output_format_collapses_or_rejects_construct() {
+        let (fluree, ledger) = super::seed_people().await;
+
+        // `favNums` is multi-valued (jdoe 4, bbob 1, jbob 7 = 12 solutions over
+        // 3 subjects), and the LIMIT keeps the query outside the license, so
+        // the WHERE stage may not collapse anything: the duplicates must still
+        // be present when each serializer runs. The constant-object template
+        // then instantiates to one identical triple per solution.
+        let sparql = "CONSTRUCT { ?s <http://example.org/flagged> \"dup-collapse-marker\" } \
+                      WHERE { ?s <http://example.org/Person#favNums> ?n } LIMIT 100";
+        let result = support::query_sparql(&fluree, &ledger, sparql)
+            .await
+            .expect("construct query");
+
+        // Ran-marker: the gate is vacuous unless duplicate solutions actually
+        // reach the formatters. 12 rows over 3 distinct subjects, by fixture
+        // arithmetic — if WHERE-level dedup ever starts firing here (e.g. the
+        // license grows to cover sliced CONSTRUCT), this stops the test before
+        // the per-format loop can pass on an already-collapsed stream.
+        let rows: usize = result.batches.iter().map(fluree_db_api::Batch::len).sum();
+        assert_eq!(
+            rows, 12,
+            "precondition: the formatter input must still carry all 12 \
+             duplicate-bearing solutions (3 subjects x their favNums counts)"
+        );
+
+        for format in all_formats() {
+            let config = FormatterConfig {
+                format,
+                ..FormatterConfig::default()
+            };
+            let out = format_results_string(&result, &result.context, &ledger.snapshot, &config);
+            match classify(format) {
+                ConstructPath::Canonicalizes => {
+                    let s = out.unwrap_or_else(|e| {
+                        panic!("{format:?} is classified Canonicalizes but errored: {e}")
+                    });
+                    let occurrences = s.matches("dup-collapse-marker").count();
+                    assert_eq!(
+                        occurrences, 3,
+                        "{format:?} must collapse the 12 duplicate solutions to \
+                         one triple per subject (3); its output carried the \
+                         constructed object {occurrences} times:\n{s}"
+                    );
+                }
+                ConstructPath::Rejects => {
+                    assert!(
+                        out.is_err(),
+                        "{format:?} is classified Rejects but serialized a \
+                         CONSTRUCT result — if it now supports CONSTRUCT it \
+                         must canonicalize, and this gate must reclassify it: \
+                         {out:?}"
+                    );
+                }
+            }
+        }
+    }
+}

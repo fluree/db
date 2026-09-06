@@ -89,6 +89,7 @@ pub mod reasoning;
 pub mod remote_service;
 pub mod rewrite;
 pub mod rewrite_owl_ql;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod s2_search;
 pub mod schema_bundle;
 pub mod search_readability;

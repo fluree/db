@@ -110,7 +110,7 @@ impl Operator for UnionStarCountAllOperator {
         let allow_fast = !ctx.is_multi_ledger() && ctx.from_t.is_none() && ctx.allow_unfiltered();
         if allow_fast {
             if let Some(store) = ctx.binary_store.as_ref() {
-                let started = std::time::Instant::now();
+                let started = fluree_db_core::clock::Instant::now();
                 let Some(n) = count_union_star(
                     store,
                     ctx,

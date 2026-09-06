@@ -180,6 +180,12 @@ impl<Id: DictId> VecBiDict<Id> {
         self.base_id
     }
 
+    /// The ID the next allocation would take.
+    #[inline]
+    pub fn next_id(&self) -> Id {
+        self.next_id
+    }
+
     /// Number of entries.
     #[inline]
     pub fn len(&self) -> usize {

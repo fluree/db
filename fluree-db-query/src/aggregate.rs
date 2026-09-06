@@ -26,12 +26,12 @@ use crate::operator::{
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use bigdecimal::{BigDecimal, ToPrimitive};
+use fluree_db_core::clock::Instant;
 use fluree_db_core::{FlakeValue, Sid};
 use num_bigint::BigInt;
 use num_traits::{Signed, Zero};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
 use tracing::Instrument;
 
 /// Aggregate operator - applies aggregate functions to grouped values
@@ -1015,7 +1015,9 @@ fn agg_group_concat(values: &[Binding], separator: &str) -> Binding {
                 FlakeValue::String(s) => Some(s.clone()),
                 FlakeValue::Json(s) => Some(s.clone()), // JSON as string
                 FlakeValue::Long(n) => Some(n.to_string()),
-                FlakeValue::Double(n) => Some(n.to_string()),
+                // Canonical xsd:double lexical form — the same string the
+                // serializer and STR() give this value (#1695).
+                FlakeValue::Double(n) => Some(fluree_graph_ir::canonical_xsd_double(*n)),
                 FlakeValue::Decimal(d) => Some(d.to_plain_string()),
                 FlakeValue::BigInt(n) => Some(n.to_string()),
                 FlakeValue::Boolean(b) => Some(b.to_string()),

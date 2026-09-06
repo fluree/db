@@ -120,6 +120,15 @@ impl crate::NameServiceLookup for MemoryNameService {
             .cloned()
             .collect())
     }
+
+    async fn heads(&self, ledger_id: &str) -> Result<Option<crate::LedgerHeads>> {
+        let key = self.normalize_ledger_id(ledger_id);
+        Ok(self
+            .records
+            .read()
+            .get(&key)
+            .map(crate::LedgerHeads::from_record))
+    }
 }
 
 #[async_trait]
@@ -491,10 +500,13 @@ impl GraphSourcePublisher for MemoryNameService {
         let mut graph_source_records = self.graph_source_records.write();
 
         if let Some(record) = graph_source_records.get_mut(&key) {
-            // Update config but preserve retracted status if already set
+            // Publishing config creates or reconfigures: the record is
+            // active again even if an earlier drop retracted it. The index
+            // pointer is untouched.
             record.source_type = source_type.clone();
             record.config = config.to_string();
             record.dependencies = dependencies.to_vec();
+            record.retracted = false;
         } else {
             // Create new graph source record
             let record = GraphSourceRecord::new(
@@ -738,6 +750,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_memory_ns_heads() {
+        let ns = MemoryNameService::new();
+        assert_eq!(ns.heads("mydb:main").await.unwrap(), None);
+
+        ns.publish_commit("mydb:main", 2, &test_commit_id("c2"))
+            .await
+            .unwrap();
+        ns.publish_index("mydb:main", 1, &test_index_id("i1"))
+            .await
+            .unwrap();
+
+        let heads = ns.heads("mydb:main").await.unwrap().unwrap();
+        assert_eq!(heads.commit.id, Some(test_commit_id("c2")));
+        assert_eq!(heads.commit.t, 2);
+        assert_eq!(heads.index.id, Some(test_index_id("i1")));
+        assert_eq!(heads.index.t, 1);
+        let record = ns.lookup("mydb:main").await.unwrap().unwrap();
+        assert_eq!(heads, crate::LedgerHeads::from_record(&record));
+    }
+
+    #[tokio::test]
     async fn test_memory_ns_publish_commit() {
         let ns = MemoryNameService::new();
 
@@ -821,6 +854,20 @@ mod tests {
 
         let record = ns.lookup("mydb:main").await.unwrap().unwrap();
         assert!(record.retracted);
+    }
+
+    #[tokio::test]
+    async fn graph_source_recreate_after_retract_is_active() {
+        let ns = MemoryNameService::new();
+        ns.publish_graph_source("gs", "main", GraphSourceType::Bm25, "{}", &[])
+            .await
+            .unwrap();
+        ns.retract_graph_source("gs", "main").await.unwrap();
+        ns.publish_graph_source("gs", "main", GraphSourceType::Bm25, "{}", &[])
+            .await
+            .unwrap();
+        let record = ns.lookup_graph_source("gs:main").await.unwrap().unwrap();
+        assert!(!record.retracted);
     }
 
     #[tokio::test]

@@ -346,23 +346,32 @@ the request at all (`policy_enforcement`). See
 
 ## PAYLOAD_TOO_LARGE
 
+A 413 carries one of two `@type` codes — branch on `@type`, not the status
+(see [API Errors](../api/errors.md) for the full contract):
+
 ```json
 {
-  "error": "PayloadTooLarge",
-  "message": "Transaction exceeds maximum size of 10485760 bytes",
-  "code": "PAYLOAD_TOO_LARGE",
-  "details": {
-    "max_size": 10485760,
-    "actual_size": 15000000
-  }
+  "error": "request body exceeds the configured limit",
+  "status": 413,
+  "@type": "err:db/PayloadTooLarge"
+}
+```
+
+```json
+{
+  "error": "Transaction would exceed novelty limit: current=0, delta=2048576, max=1048576",
+  "status": 413,
+  "@type": "err:db/NoveltyDeltaTooLarge"
 }
 ```
 
 ### Causes
 
-1. Transaction too large
-2. Query result too large
-3. Large embedded data
+1. `err:db/PayloadTooLarge`: the raw HTTP request body exceeds the server's
+   configured body-size limit (refused before parsing)
+2. `err:db/NoveltyDeltaTooLarge`: the parsed transaction's novelty delta
+   alone meets or exceeds `reindex_max_bytes` — no indexer draining can ever
+   admit it, so retrying the same request can never succeed
 
 ### Solutions
 

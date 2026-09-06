@@ -55,7 +55,10 @@ pub use path::{
     ShortestPathPattern,
 };
 pub use pattern::{GraphName, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern};
-pub use projection::{Column, ForwardItem, HydrationSpec, NestedSelectSpec, Projection, Root};
+pub use projection::{
+    Column, ForwardItem, HydrationSpec, NestedModifiers, NestedOrderKey, NestedSelectSpec,
+    Projection, Root,
+};
 pub use query::{ConstructTemplate, Query, QueryOutput, Restriction};
 pub use reasoning::{ReasoningConfig, ReasoningModes};
 pub use triple::{Ref, Term, TriplePattern};

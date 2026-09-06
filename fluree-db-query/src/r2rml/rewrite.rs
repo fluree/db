@@ -31,7 +31,7 @@ use crate::ir::{Expression, Function, Pattern, R2rmlPattern};
 use crate::r2rml::{ObjectConstant, ScanCmpOp, ScanValue};
 use crate::var_registry::VarId;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot};
-use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap};
+use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, TriplesMap};
 use fluree_vocab::namespaces::XSD;
 use std::collections::HashSet;
 
@@ -373,12 +373,11 @@ pub fn rewrite_patterns_for_r2rml(
     // `class_filter`, which constrains TriplesMap resolution to the class and
     // removes the separate class operator's correlated re-scan.
     //
-    // Fusing is unconditional, which assumes some single TriplesMap covers all
-    // members: required members split across template-sharing maps yield zero
-    // star rows (materialization is per-map — no cross-map member join), where
-    // a per-member plan would subject-join them. Recorded as F10 in
-    // `04-findings-register.md`; the fix is to refuse to fuse when no map
-    // covers every member.
+    // Fusing assumes some single TriplesMap covers all members (materialization
+    // is per map, with no cross-map member join), so a star no map covers —
+    // required members split across template-sharing maps, F10 in
+    // `04-findings-register.md` — keeps its members as separate scans the
+    // engine joins on the subject.
     // W4-1b: const-object members whose subject has a co-located crawl wildcard are
     // folded onto that wildcard as star_constraints AFTER the class-fusion loop
     // below, so W4-1's pushdown prunes the crawl scan instead of reading the whole
@@ -430,6 +429,59 @@ pub fn rewrite_patterns_for_r2rml(
                 result_patterns.push(Pattern::R2rml(m));
             }
             continue;
+        }
+
+        if let Some(m) = mapping {
+            let preds: Vec<&str> = var_members
+                .iter()
+                .chain(&const_members)
+                .filter_map(|p| p.predicate_filter.as_deref())
+                .collect();
+            // A fused scan reads the star from maps carrying every member.
+            // A map providing only some of them loses its rows unless its
+            // subjects provably never meet a covering map's (disjoint
+            // templates) or a covering map mints every member it provides
+            // alike (its triples are that map's, held once): a vertical
+            // partition's second provider of one member keeps the star
+            // unfused; another entity's, or a second class over the same
+            // rows sharing a label-type predicate, does not.
+            let provides = |tm: &TriplesMap, pred: &str| {
+                tm.predicate_object_maps
+                    .iter()
+                    .any(|pom| pom.predicate_map.as_constant() == Some(pred))
+            };
+            let covering: Vec<&TriplesMap> = m
+                .triples_maps
+                .values()
+                .filter(|tm| preds.iter().all(|pred| provides(tm, pred)))
+                .collect();
+            let covered = !covering.is_empty()
+                && m.triples_maps.values().all(|tm| {
+                    !preds.iter().any(|pred| provides(tm, pred))
+                        || preds.iter().all(|pred| provides(tm, pred))
+                        || covering.iter().all(|c| {
+                            match (
+                                tm.subject_map.template.as_deref(),
+                                c.subject_map.template.as_deref(),
+                            ) {
+                                (Some(a), Some(b)) => templates_provably_disjoint(a, b),
+                                _ => false,
+                            }
+                        })
+                        || covering.iter().any(|c| {
+                            c.same_source_row(tm)
+                                && preds
+                                    .iter()
+                                    .filter(|p| provides(tm, p))
+                                    .all(|p| c.mints_alike(tm, p))
+                        })
+                });
+            if !covered {
+                for m in var_members.into_iter().chain(const_members) {
+                    result_patterns.push(Pattern::R2rml(m));
+                }
+                continue;
+            }
         }
 
         let star_constraints: Vec<(String, ObjectConstant)> = const_members
@@ -875,14 +927,16 @@ fn to_scan_value(value: &FlakeValue) -> Option<ScanValue> {
         FlakeValue::Decimal(d) if crate::r2rml::iceberg_numeric_stats_enabled() => {
             scan_value_from_bigdecimal(d)
         }
-        // Item 10 (F-AUD-11): an xsd:dateTime pushes as micros-since-epoch, carrying
-        // whether the source was tz-AWARE (an explicit offset ⇒ UTC frame) so the
-        // provider can frame-match it to a `timestamp` vs `timestamptz` column.
-        // Gated by FLUREE_ICEBERG_TIMESTAMP_STATS.
+        // Item 10 (F-AUD-11): an xsd:dateTime pushes as micros-since-epoch in the
+        // UTC frame, so it frame-matches a `timestamptz` column. Every dateTime
+        // is a UTC instant (see fluree_db_core::temporal) — a naive lexical is
+        // read as UTC too — so the push is declined against a plain `timestamp`
+        // column and the in-engine FILTER handles it. Gated by
+        // FLUREE_ICEBERG_TIMESTAMP_STATS.
         FlakeValue::DateTime(dt) if crate::r2rml::iceberg_timestamp_stats_enabled() => {
             Some(ScanValue::Timestamp {
                 micros: dt.epoch_micros(),
-                tz: dt.tz_offset().is_some(),
+                tz: true,
             })
         }
         _ => None,
@@ -1967,6 +2021,122 @@ mod tests {
         );
     }
 
+    // F10: members split across maps sharing the subject template. No single
+    // map covers the star, so fusing would materialize no row; the members stay
+    // separate scans the engine joins on the subject.
+    #[test]
+    fn star_no_map_covers_is_not_fused() {
+        const COUNTRY: &str = "http://example.org/country";
+        let names = TriplesMap::new("#Names", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(PRED, "name"));
+        let countries = TriplesMap::new("#Countries", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(COUNTRY, "country"));
+        let mapping = CompiledR2rmlMapping::new(vec![names, countries]);
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let star = |pred: &str, obj: u16| {
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(pred.into()),
+                Term::Var(VarId(obj)),
+            ))
+        };
+        let rewrite = |patterns: &[Pattern]| -> Vec<R2rmlPattern> {
+            rewrite_patterns_for_r2rml(patterns, "gs:main", &snapshot, Some(&mapping), false, false)
+                .patterns
+                .into_iter()
+                .filter_map(|p| match p {
+                    Pattern::R2rml(rp) => Some(rp),
+                    _ => None,
+                })
+                .collect()
+        };
+        let split = rewrite(&[star(PRED, 1), star(COUNTRY, 2)]);
+        assert_eq!(split.len(), 2, "one scan per map, joined on the subject");
+        assert!(split.iter().all(|p| p.star_bindings.is_empty()));
+
+        // A star one map does cover still fuses.
+        let names2 = TriplesMap::new("#Names", "people")
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(PRED, "name"))
+            .with_predicate_object(pom(COUNTRY, "country"));
+        let mapping = CompiledR2rmlMapping::new(vec![names2]);
+        let fused: Vec<R2rmlPattern> = rewrite_patterns_for_r2rml(
+            &[star(PRED, 1), star(COUNTRY, 2)],
+            "gs:main",
+            &snapshot,
+            Some(&mapping),
+            false,
+            false,
+        )
+        .patterns
+        .into_iter()
+        .filter_map(|p| match p {
+            Pattern::R2rml(rp) => Some(rp),
+            _ => None,
+        })
+        .collect();
+        assert_eq!(fused.len(), 1, "one map covers both members");
+        assert_eq!(fused[0].star_bindings.len(), 1);
+    }
+
+    // A second map over the same rows and template providing only some
+    // members, each minted alike by the covering map, adds no triple the
+    // fused scan misses: the star stays one scan. One deriving a member
+    // differently (another column) is a real second provider and un-fuses.
+    #[test]
+    fn star_partial_provider_minted_alike_keeps_fusion() {
+        const LABEL: &str = "http://example.org/label";
+        const COUNTRY: &str = "http://example.org/country";
+        let customer = TriplesMap::new("#Customer", "customers")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_class("http://example.org/Customer")
+            .with_predicate_object(pom(PRED, "name"))
+            .with_predicate_object(pom(LABEL, "name"));
+        let by_country = TriplesMap::new("#CustomerCountry", "customers")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_class("http://example.org/CustomerCountry")
+            .with_predicate_object(pom(COUNTRY, "country"))
+            .with_predicate_object(pom(LABEL, "name"));
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let star = |pred: &str, obj: u16| {
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Iri(pred.into()),
+                Term::Var(VarId(obj)),
+            ))
+        };
+        let rewrite = |mapping: &CompiledR2rmlMapping| -> Vec<R2rmlPattern> {
+            rewrite_patterns_for_r2rml(
+                &[star(PRED, 1), star(LABEL, 2)],
+                "gs:main",
+                &snapshot,
+                Some(mapping),
+                false,
+                false,
+            )
+            .patterns
+            .into_iter()
+            .filter_map(|p| match p {
+                Pattern::R2rml(rp) => Some(rp),
+                _ => None,
+            })
+            .collect()
+        };
+        let mapping = CompiledR2rmlMapping::new(vec![customer.clone(), by_country]);
+        let fused = rewrite(&mapping);
+        assert_eq!(fused.len(), 1, "the alike partial provider keeps one scan");
+        assert_eq!(fused[0].star_bindings.len(), 1);
+
+        let alias = TriplesMap::new("#CustomerAlias", "customers")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_predicate_object(pom(LABEL, "nickname"));
+        let mapping = CompiledR2rmlMapping::new(vec![customer, alias]);
+        let split = rewrite(&mapping);
+        assert_eq!(split.len(), 2, "a differently derived label un-fuses");
+    }
+
     // ---- PR-F20: RefObjectMap-target resolution prune (invariants A + B) ----
 
     const NAME: &str = "http://ex/name";
@@ -2938,10 +3108,13 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    // ---- Item 10 (F-AUD-11): xsd:dateTime → frame-aware Timestamp ----
+    // ---- Item 10 (F-AUD-11): xsd:dateTime → UTC-frame Timestamp ----
 
+    // Used to assert `tz: false` for the naive literal. Every dateTime is now a
+    // UTC instant with no notion of a source offset, so both push in the UTC
+    // frame with identical micros.
     #[test]
-    fn datetime_emits_frame_aware_timestamp() {
+    fn datetime_emits_utc_frame_timestamp() {
         use fluree_db_core::DateTime;
         let mk =
             |s: &str| to_scan_value(&FlakeValue::DateTime(Box::new(DateTime::parse(s).unwrap())));
@@ -2956,11 +3129,8 @@ mod tests {
                     micros: m_n,
                 }),
             ) => {
-                assert!(tz_a, "explicit Z ⇒ tz-aware (UTC frame)");
-                assert!(!tz_n, "no offset ⇒ naive (wall-clock frame)");
-                // A naive dateTime is treated as UTC, so the same wall-clock yields
-                // the same micros — only the frame flag differs.
-                assert_eq!(m_a, m_n);
+                assert!(tz_a && tz_n, "every dateTime pushes in the UTC frame");
+                assert_eq!(m_a, m_n, "a naive dateTime is read as UTC");
             }
             other => panic!("expected two Timestamps, got {other:?}"),
         }

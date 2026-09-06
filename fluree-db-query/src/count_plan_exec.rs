@@ -106,7 +106,7 @@ pub(crate) fn count_plan_operator(
                 overlay,
             };
 
-            let started = std::time::Instant::now();
+            let started = fluree_db_core::clock::Instant::now();
             match execute_plan(&plan.root, &ec)? {
                 Some(count) => {
                     tracing::debug!(
@@ -1021,7 +1021,7 @@ fn driver_subject_boundaries(
     for leaf in leaves {
         let handle = store
             .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         for entry in &handle.dir().entries {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
@@ -2834,7 +2834,7 @@ fn execute_chain(
                                 leaf_entry.sidecar_cid.as_ref(),
                                 false,
                             )
-                            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                            .map_err(|e| QueryError::from_io("leaf open", e))?,
                     );
                 }
 
@@ -3467,7 +3467,7 @@ fn predicate_objects_all_iri(store: &BinaryIndexStore, g_id: GraphId, p_id: u32)
     for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         for entry in &handle.dir().entries {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
@@ -3502,11 +3502,12 @@ fn execute_optional_chain_head(
         return Ok(Some(0));
     };
 
-    // This lane drives the IRI-only `PostObjectGroupCountIter`, which terminates
-    // on a homogeneous non-IRI leaflet (and POST orders such leaflets before
-    // `IRI_REF`). A literal-valued `?b` still survives the OPTIONAL with
-    // multiplier 1, so rather than undercount we defer any non-all-IRI `p1` to
-    // the generic pipeline.
+    // This lane drives the IRI-only `PostObjectGroupCountIter`, which drops
+    // non-IRI rows — row-wise in a mixed leaflet, whole-leaflet for a
+    // homogeneous non-IRI one. A literal-valued `?b` has no inner-chain
+    // continuation but still survives the OPTIONAL with multiplier 1, so those
+    // dropped rows would undercount; defer any non-all-IRI `p1` to the generic
+    // pipeline instead.
     if !predicate_objects_all_iri(store, g_id, p1_id)? {
         return Ok(None);
     }
@@ -3684,7 +3685,7 @@ impl<'a> PsotSoIter<'a> {
                             leaf_entry.sidecar_cid.as_ref(),
                             false,
                         )
-                        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?,
+                        .map_err(|e| QueryError::from_io("leaf open", e))?,
                 );
             }
 
@@ -3732,10 +3733,17 @@ impl<'a> PsotSoIter<'a> {
 
 /// Streams `SoKey { s, o_type, o_key }` rows from an overlay-merged PSOT cursor,
 /// in `(s, o_type, o_key)` order (matching `SoKey`'s ordering and `PsotSoIter`).
+///
+/// A **list row** (live `o_i`) sets `declined` and ends the stream: the
+/// directory gate keeps base list predicates off this lane, but novelty can
+/// introduce list rows the directories haven't seen, and `SoKey` drops the
+/// `o_i` the generic pipeline's list-element join semantics depend on. The
+/// caller must treat `declined` as "bail to the generic fallback".
 struct CursorSoIter {
     cursor: BinaryCursor,
     current: Option<fluree_db_binary_index::ColumnBatch>,
     row: usize,
+    declined: bool,
 }
 
 impl CursorSoIter {
@@ -3744,10 +3752,15 @@ impl CursorSoIter {
             cursor,
             current: None,
             row: 0,
+            declined: false,
         }
     }
 
     fn next_row(&mut self) -> Result<Option<SoKey>> {
+        use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
+        if self.declined {
+            return Ok(None);
+        }
         loop {
             if self.current.is_none() {
                 self.current = self
@@ -3763,6 +3776,14 @@ impl CursorSoIter {
             if self.row >= batch.row_count {
                 self.current = None;
                 continue;
+            }
+            // `o_i` is absent from the narrow no-overlay projection (base list
+            // predicates never reach this lane — the directory gate declines
+            // them first), and forced into the projection whenever overlay ops
+            // merge — exactly when novelty list rows could appear.
+            if batch.o_i.get_or(self.row, LIST_INDEX_NONE) != LIST_INDEX_NONE {
+                self.declined = true;
+                return Ok(None);
             }
             let key = SoKey {
                 s: batch.s_id.get(self.row),
@@ -3791,6 +3812,12 @@ impl SoRows<'_> {
             SoRows::Meta(it) => it.next_row(),
             SoRows::Cursor(c) => c.next_row(),
         }
+    }
+
+    /// True when the stream ended early on a novelty list row (see
+    /// [`CursorSoIter`]); the composite-join count must bail to its fallback.
+    fn declined(&self) -> bool {
+        matches!(self, SoRows::Cursor(c) if c.declined)
     }
 }
 
@@ -3826,12 +3853,36 @@ fn so_rows<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<SoRows<'a>>> {
     }
 }
 
-/// Count `(s, o)` pairs present in BOTH predicate relations via a streaming
-/// merge-join on the composite `(s_id, o_type, o_key)` key. Each shared pair is
-/// counted once (intersection cardinality), NOT the product of per-subject counts.
-/// `Ok(None)` bails the plan (overlay present but a predicate is absent from the
-/// base index, or an overlay flake failed to translate).
+/// Count join rows of `?s <p1> ?o . ?s <p2> ?o` via a streaming merge-join on
+/// the composite `(s_id, o_type, o_key)` key. Each shared key is counted once:
+/// the eligibility gates below make the key a full live-fact identity (no list
+/// rows survive them, and without `o_i` a live fact appears exactly once per
+/// predicate), so per-key multiplicity is always 1×1.
+///
+/// `Ok(None)` bails the plan:
+/// - overlay present but a predicate is absent from the base index, or an
+///   overlay flake failed to translate;
+/// - either predicate fails
+///   [`predicate_unsafe_for_cross_predicate_o_key_join`] (#1652): a
+///   `NUM_BIG_OVERFLOW` object's `o_key` is a per-predicate arena handle, so
+///   cross-predicate `o_key` equality is not value equality — equal big
+///   decimals under the two predicates would never match; list rows join by
+///   rules `SoKey` cannot express. Directory-metadata gate; ledgers without
+///   decimals/overflow-integers/lists under these predicates keep the fast
+///   path;
+/// - a novelty list row surfaced in the overlay lane (`SoRows::declined`).
 fn count_composite_join_pairs(ec: &ExecCtx<'_, '_>, p1: &Ref, p2: &Ref) -> Result<Option<u64>> {
+    for pred in [p1, p2] {
+        let sid = normalize_pred_sid(ec.store, pred)?;
+        if let Some(p_id) = ec.store.sid_to_p_id(&sid) {
+            if crate::fast_path_common::predicate_unsafe_for_cross_predicate_o_key_join(
+                ec.store, ec.g_id, p_id,
+            )? {
+                return Ok(None);
+            }
+        }
+    }
+
     let Some(mut it1) = so_rows(ec, p1)? else {
         return Ok(None);
     };
@@ -3853,6 +3904,10 @@ fn count_composite_join_pairs(ec: &ExecCtx<'_, '_>, p1: &Ref, p2: &Ref) -> Resul
                 b = it2.next_row()?;
             }
         }
+    }
+
+    if it1.declined() || it2.declined() {
+        return Ok(None);
     }
 
     Ok(Some(count))

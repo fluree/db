@@ -9,15 +9,33 @@
 //!
 //! ## Soundness
 //!
-//! A join unifies on the *encoded term*; SPARQL `=` is *value* equality. They
-//! coincide for nodes (IRIs / blank nodes have no `"1" = "1.0"`-style cross-
-//! datatype equality) but diverge for literals. So `=` is folded only when both
-//! variables are provably **node-valued**: each is used as a subject/predicate
-//! position (always a node) or appears only as the object of predicates whose
-//! stats prove every object is a ref ([`StatsView::is_property_ref_only`],
-//! current-state-exact including novelty). `sameTerm` *is* term equality, so it
-//! folds with no node guard. When node-ness can't be proven, the filter is left
-//! untouched — correct, just not accelerated.
+//! A join unifies on the *encoded term*, which is neither SPARQL value equality
+//! nor RDF term equality. It is exact for nodes, and for literals it sits
+//! somewhere between the two:
+//!
+//! - looser than term equality, on purpose. A bare numeric object carries no
+//!   datatype constraint into the probe, so `1`, `"1"^^xsd:long` and `1.0` all
+//!   unify — a deliberate product decision, pinned by
+//!   `it_literal_identity.rs::bare_numeric_literals_stay_lenient_across_subtypes`,
+//!   and one the index's normalized numeric key is built around.
+//! - looser again where the encoding flattens datatypes: every string-dictionary
+//!   datatype that is not `xsd:string` or `rdf:langString` reaches the join key
+//!   as `xsd:string`, so `"abc"^^ex:custom` unifies with `"abc"`.
+//! - and it is not value equality either: `"1"^^xsd:string` and `1` never unify,
+//!   while `=` raises a type error rather than the join's silent non-match.
+//!
+//! So **neither** `=` **nor** `sameTerm` may be folded on a literal-valued
+//! variable, and the fold requires both variables to be provably
+//! **node-valued**: each is used as a subject/predicate position (always a node)
+//! or appears only as the object of predicates whose stats prove every object is
+//! a ref ([`StatsView::is_property_ref_only`]). On nodes the three notions
+//! coincide — an IRI or blank node has no cross-datatype equality and no
+//! encoding to flatten — so one guard serves both functions. When node-ness
+//! can't be proven, the filter is left untouched: correct, just not accelerated.
+//!
+//! `sameTerm` used to fold with no guard at all, on the premise that it *is*
+//! term equality and so needs none; the premise was about SPARQL, not about this
+//! engine's join, and it turned a 21-row answer into 35 (#1723).
 //!
 //! The fold runs once over the lowered query (recursing into every sub-SELECT
 //! scope) before operator construction. It only rewrites variables it can
@@ -171,7 +189,7 @@ fn find_foldable(
         let Pattern::Filter(expr) = p else {
             continue;
         };
-        let Some((x, y, same_term)) = equality_vars(expr) else {
+        let Some((x, y)) = equality_vars(expr) else {
             continue;
         };
 
@@ -189,11 +207,11 @@ fn find_foldable(
             continue;
         }
 
-        // `=` is value equality; a join is term equality. Equivalent only when
-        // both vars are node-valued. `sameTerm` is term equality unconditionally.
-        if !same_term
-            && (!var_node_valued(patterns, x, stats) || !var_node_valued(patterns, y, stats))
-        {
+        // The join unifies on the encoded term, which matches neither `=` (value
+        // equality) nor `sameTerm` (term equality) on literals — see the module
+        // doc. Both functions therefore need both vars to be node-valued, where
+        // all three notions agree.
+        if !var_node_valued(patterns, x, stats) || !var_node_valued(patterns, y, stats) {
             continue;
         }
 
@@ -221,21 +239,20 @@ fn find_foldable(
 }
 
 /// Match `FILTER(?x = ?y)` or `FILTER(sameTerm(?x, ?y))`; returns the two
-/// variables and whether the comparison was `sameTerm` (term equality).
-fn equality_vars(expr: &Expression) -> Option<(VarId, VarId, bool)> {
+/// variables. Which of the two functions it was does not survive: both fold
+/// under the same node-valued guard, and on nodes they mean the same thing.
+fn equality_vars(expr: &Expression) -> Option<(VarId, VarId)> {
     let Expression::Call { func, args } = expr else {
         return None;
     };
-    let same_term = match func {
-        Function::Eq => false,
-        Function::SameTerm => true,
-        _ => return None,
-    };
+    if !matches!(func, Function::Eq | Function::SameTerm) {
+        return None;
+    }
     if args.len() != 2 {
         return None;
     }
     match (&args[0], &args[1]) {
-        (Expression::Var(x), Expression::Var(y)) => Some((*x, *y, same_term)),
+        (Expression::Var(x), Expression::Var(y)) => Some((*x, *y)),
         _ => None,
     }
 }
@@ -529,13 +546,43 @@ mod tests {
     }
 
     #[test]
-    fn sameterm_folds_without_node_guard() {
-        // sameTerm is term equality, so it folds even when the predicate is not
-        // provably ref-only.
+    fn sameterm_folds_on_ref_predicate() {
+        // On a provably ref-only predicate the join IS term equality, so
+        // `sameTerm` folds exactly like `=`.
         let mut query = shared_feature_query(Function::SameTerm);
-        fold_equijoin_filters(&mut query, Some(&stats_with_feature_ref_only(false)));
+        fold_equijoin_filters(&mut query, Some(&stats_with_feature_ref_only(true)));
 
         assert_eq!(query.patterns.len(), 2);
         assert_eq!(count_input_var(&query), Some(VarId(0)));
+    }
+
+    #[test]
+    fn does_not_fold_sameterm_on_literal_predicate() {
+        // #1723: the join unifies on the encoded term, which is looser than term
+        // equality for literals (`1` unifies with `1.0`, `"abc"^^ex:custom` with
+        // `"abc"`). `sameTerm` needs the same node guard as `=`.
+        let mut query = shared_feature_query(Function::SameTerm);
+        fold_equijoin_filters(&mut query, Some(&stats_with_feature_ref_only(false)));
+
+        assert_eq!(query.patterns.len(), 3);
+        assert!(query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_))));
+        assert_eq!(count_input_var(&query), Some(VarId(1)));
+    }
+
+    #[test]
+    fn does_not_fold_sameterm_on_unknown_predicate() {
+        // No stats entry for the predicate at all: `is_property_ref_only` is
+        // `None`, which must fail closed for `sameTerm` as it does for `=`.
+        let mut query = shared_feature_query(Function::SameTerm);
+        fold_equijoin_filters(&mut query, Some(&StatsView::default()));
+
+        assert_eq!(query.patterns.len(), 3);
+        assert!(query
+            .patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Filter(_))));
     }
 }

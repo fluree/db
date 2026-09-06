@@ -396,6 +396,16 @@ impl RemoteLedgerClient {
         self.refreshed.lock().take()
     }
 
+    /// The bearer token requests currently carry — the refreshed one once a
+    /// refresh has happened.
+    pub fn current_token(&self) -> Option<String> {
+        self.token.lock().clone()
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     fn add_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         let token = self.token.lock();
         if let Some(ref t) = *token {
@@ -1232,6 +1242,42 @@ impl RemoteLedgerClient {
             &url,
             "text/turtle",
             Some(RequestBody::Text(turtle)),
+        )
+        .await
+    }
+
+    // =========================================================================
+    // Sync (graph synchronization)
+    // =========================================================================
+
+    /// Synchronize a named graph: make its contents exactly `body`,
+    /// committing only the delta.
+    ///
+    /// `POST {base}/sync/{ledger}?graph=<iri>[&dryRun=true][&allowEmpty=true]`
+    /// with a JSON-LD body. A dry run answers with the delta report; a real
+    /// run with the standard transact response.
+    pub async fn sync_jsonld(
+        &self,
+        ledger: &str,
+        graph: &str,
+        body: &serde_json::Value,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let mut url = self.op_url("sync", ledger);
+        url.push_str("?graph=");
+        url.push_str(&urlencoding::encode(graph));
+        if dry_run {
+            url.push_str("&dryRun=true");
+        }
+        if allow_empty {
+            url.push_str("&allowEmpty=true");
+        }
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
         )
         .await
     }
@@ -2726,6 +2772,23 @@ impl RemoteLedgerClient {
     // =========================================================================
     // Iceberg graph source operations
     // =========================================================================
+
+    /// Map a SQL endpoint as a graph source on the remote server.
+    ///
+    /// Calls `POST {base_url}/sql/map`.
+    pub async fn sql_map(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("sql/map");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
 
     /// Map an Iceberg table as a graph source on the remote server.
     ///

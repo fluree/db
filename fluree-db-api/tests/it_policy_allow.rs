@@ -1066,3 +1066,58 @@ async fn policy_onclass_governs_subclass_via_cross_ledger_schema() {
         "onClass Employee must govern Manager via M's cross-ledger hierarchy"
     );
 }
+
+/// Same-ledger twin of the cross-ledger multi-rule test: two `f:onClass`
+/// rules with `f:query` on one class, selected by identity + policy class.
+/// The policy set is rebuilt per query, so an order-dependent evaluator
+/// flips answers between identical queries with no commit in between.
+#[tokio::test]
+async fn multiple_targeted_query_rules_any_allow_grants_stably() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/multi-query:main";
+    let ctx = json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"});
+    fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({"@context": ctx, "@graph": [
+                {"@id": "ex:acme", "@type": "ex:Supplier"},
+                {"@id": "ex:acme-rome", "@type": "ex:SupplierRecord", "ex:canonical": {"@id": "ex:acme"}},
+                {"@id": "ex:line1", "@type": "ex:Line", "ex:supplier": {"@id": "ex:acme-rome"}},
+                {"@id": "ex:line2", "@type": "ex:Line", "ex:supplier": {"@id": "ex:nobody"}},
+                {"@id": "ex:one-hop", "@type": "f:AccessPolicy", "f:action": {"@id": "f:view"},
+                 "f:onClass": [{"@id": "ex:Line"}],
+                 "f:query": "{\"where\":{\"@id\":\"?$this\",\"http://example.org/supplier\":{\"@id\":\"?$identity\"}}}"},
+                {"@id": "ex:two-hop", "@type": "f:AccessPolicy", "f:action": {"@id": "f:view"},
+                 "f:onClass": [{"@id": "ex:Line"}],
+                 "f:query": "{\"where\":{\"@id\":\"?$this\",\"http://example.org/supplier\":{\"@id\":\"?rec\",\"http://example.org/canonical\":{\"@id\":\"?$identity\"}}}}"}
+            ]}),
+        )
+        .await
+        .expect("seed");
+
+    for identity in ["http://example.org/acme", "http://example.org/acme-rome"] {
+        let opts = fluree_db_api::GovernanceOptions {
+            identity: Some(identity.into()),
+            policy_class: Some(vec!["https://ns.flur.ee/db#AccessPolicy".into()]),
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        for round in 0..16 {
+            let wrapped = fluree
+                .db_with_policy(ledger_id, &opts)
+                .await
+                .expect("db_with_policy");
+            let rows = fluree
+                .query(
+                    &wrapped,
+                    &json!({"@context": {"ex": "http://example.org/"}, "select": ["?l"],
+                            "where": {"@id": "?l", "@type": "ex:Line"}}),
+                )
+                .await
+                .expect("query")
+                .to_jsonld(&wrapped.snapshot)
+                .expect("jsonld");
+            assert_eq!(rows, json!([["ex:line1"]]), "{identity} round {round}");
+        }
+    }
+}

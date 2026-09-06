@@ -634,6 +634,9 @@ impl Worker {
             TransactionBody::JsonLdInsert(json) => staged.insert(json),
             TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
             TransactionBody::JsonLdUpdate(json) => staged.update(json),
+            TransactionBody::JsonLdGraphSync { graph_iri, body } => {
+                staged.sync_graph(graph_iri.as_str(), body)
+            }
             TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
             TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
                 staged.upsert_turtle(text.as_str())
@@ -672,10 +675,33 @@ impl Worker {
             builder = builder.policy(policy);
         }
 
-        let (write_guard, staged_commit) = builder
+        let Some((write_guard, staged_commit)) = builder
             .build_commit()
             .await
-            .map_err(|e| stage_failure(&format!("build_commit failed: {e}")))?;
+            .map_err(|e| stage_failure(&format!("build_commit failed: {e}")))?
+        else {
+            // No-change transaction (e.g. a graph sync whose payload already
+            // matches the graph): mirror the revert NoOp short-circuit —
+            // republish the current head with `install: None` so the queue
+            // entry completes without advancing and the local state is
+            // untouched. A no-op requires an already-registered graph, hence
+            // an existing head.
+            let snap = ledger_handle.snapshot().await;
+            let head_id = snap.head_commit_id.clone().ok_or_else(|| {
+                stage(PoisonReason::WorkerPanic {
+                    message: "no-op transaction on a ledger without a head commit".into(),
+                })
+            })?;
+            return Ok(StagedOutcome {
+                receipt: AppliedReceipt::Transact(TransactApplied {
+                    commit_id: head_id,
+                    commit_t: snap.t,
+                    flake_count: 0,
+                    tally: None,
+                }),
+                install: None,
+            });
+        };
 
         let commit_cid = staged_commit.commit.id.clone().ok_or_else(|| {
             stage(PoisonReason::WorkerPanic {
@@ -721,11 +747,12 @@ impl Worker {
     /// blob to CAS, finalize local state, and return the new head
     /// identity. NoOp short-circuits (the conflict strategy dropped
     /// every reverted flake) republish the existing head so the
-    /// queue entry completes cleanly without advancing — `ApplyHead`
-    /// against the same head is a stale-write that the state machine
-    /// surfaces via `QueueDesync::WrongFront` only if another
-    /// transactor jumped ahead, which is exactly the race the queue
-    /// already serializes against.
+    /// queue entry completes cleanly without advancing. `ApplyHead`
+    /// recognizes that republish — equal `t` AND equal commit id —
+    /// as the designed no-op completion: it consumes the queue entry
+    /// and leaves the ref untouched. Equal `t` with a DIFFERENT
+    /// commit id is still a stale writer and is still refused with
+    /// `HeadNotMonotonic`.
     async fn process_revert(&self, revert: QueuedRevert) -> Result<StagedOutcome, WorkerError> {
         use fluree_db_api::GuardedStagedCommit;
 
@@ -841,6 +868,9 @@ impl Worker {
                 .into_iter()
                 .map(|(k, v)| (k, Base64Bytes(v)))
                 .collect(),
+            // The staged bundle carries every blob it resolved; a gap it
+            // could not resolve is not distinguished here yet.
+            missing_blobs: Vec::new(),
         };
         let StagedPush {
             accepted,
@@ -1803,7 +1833,7 @@ mod tests {
             "feature",
             vec![enqueued_entry(9, cid(3), BodyKind::Sparql)],
         );
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
 
         let main_front = snapshot_front_for_test(&shared, &RefKey::new("test/db", "main"))
             .await
@@ -1822,7 +1852,7 @@ mod tests {
     async fn snapshot_front_is_none_when_empty_or_missing() {
         let mut state = NameServiceState::default();
         install_queue(&mut state, "test/db", "empty", vec![]);
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
 
         assert!(
             snapshot_front_for_test(&shared, &RefKey::new("test/db", "empty"))
@@ -1850,7 +1880,7 @@ mod tests {
             vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
         );
         install_queue(&mut state, "test/db", "feature", vec![]);
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
 
         let desired = desired_owners_under_lock(&shared, 1, &[1]).await;
         assert_eq!(desired.len(), 2);
@@ -1868,7 +1898,7 @@ mod tests {
         for i in 0..50 {
             install_queue(&mut state, "test/db", &format!("branch-{i}"), vec![]);
         }
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
         let voters = vec![1u64, 2, 3, 4];
 
         let mut union = HashSet::new();
@@ -1901,7 +1931,7 @@ mod tests {
             "main",
             vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
         );
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
 
         let desired = desired_owners_under_lock(&shared, 1, &[]).await;
         assert!(desired.is_empty());
@@ -1921,7 +1951,7 @@ mod tests {
         // only {1, 2} should host workers, and 3 must own nothing.
         state.configured_voters = [1, 2, 3].into_iter().collect();
         state.worker_eligible_voters = [1, 2].into_iter().collect();
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
         let fallback = vec![1u64, 2, 3];
 
         // The demoted voter claims nothing despite still being in
@@ -1960,7 +1990,7 @@ mod tests {
             install_queue(&mut state, "test/db", &format!("branch-{i}"), vec![]);
         }
         // `worker_eligible_voters` deliberately left empty.
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
         let fallback = vec![1u64, 2, 3];
 
         // Each of the three fallback voters covers a share of the
@@ -1992,7 +2022,7 @@ mod tests {
             vec![enqueued_entry(7, cid(1), BodyKind::JsonLdInsert)],
         );
         state.worker_eligible_voters = [1, 2].into_iter().collect();
-        let shared = Arc::new(RwLock::new(state));
+        let shared = SharedState::view_of(Arc::new(RwLock::new(state)));
         // Voter 3 is in the fallback, but not in the eligible set.
         let desired = desired_owners_under_lock(&shared, 3, &[1, 2, 3]).await;
         assert!(desired.is_empty());

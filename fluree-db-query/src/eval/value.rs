@@ -9,7 +9,8 @@ use crate::error::QueryError;
 use crate::ir::ArithmeticOp;
 use bigdecimal::BigDecimal;
 use fluree_db_core::temporal::{
-    Date as FlureeDate, DateTime as FlureeDateTime, Time as FlureeTime,
+    Date as FlureeDate, DateTime as FlureeDateTime, DayTimeDuration, Time as FlureeTime,
+    YearMonthDuration,
 };
 use fluree_db_core::{coerce_value, FlakeValue, GeoPointBits};
 use num_bigint::BigInt;
@@ -296,10 +297,170 @@ impl ArithmeticOp {
                 ComparableValue::Double(a),
                 ComparableValue::Double(b as f64),
             ),
+            // Temporal subtraction, per XPath op:subtract-dateTimes /
+            // op:subtract-dates / op:subtract-times. Neither SPARQL 1.1 nor the
+            // 1.2 draft maps `-` over temporal operands; this follows SEP-0002,
+            // which every engine that implements it agrees on — the result is an
+            // xsd:dayTimeDuration.
+            //
+            // dateTime matches XPath exactly: the value is a UTC instant. date
+            // and time carry no offset at all (it is discarded at parse — see
+            // fluree_db_core::temporal), so where XPath would anchor an operand
+            // in its own timezone these subtract calendar dates / wall clocks.
+            // Deviation documented in docs/reference/compatibility.md and
+            // pinned by it_temporal_lane_stability.
+            //
+            // The guard matters: only `-` is defined here. `+`, `*`, `/` and `%`
+            // on temporal operands fall through to the type error below, as they
+            // must — adding two dateTimes is meaningless.
+            (ComparableValue::DateTime(a), ComparableValue::DateTime(b))
+                if self == ArithmeticOp::Sub =>
+            {
+                day_time_duration_between(a.epoch_micros(), b.epoch_micros())
+            }
+            (ComparableValue::Date(a), ComparableValue::Date(b)) if self == ArithmeticOp::Sub => {
+                day_time_duration_between(a.epoch_micros(), b.epoch_micros())
+            }
+            (ComparableValue::Time(a), ComparableValue::Time(b)) if self == ArithmeticOp::Sub => {
+                day_time_duration_between(a.micros_since_midnight(), b.micros_since_midnight())
+            }
+            // Temporal ± duration, per XPath / SEP-0002. `xsd:time` has no
+            // months to carry, so `time ± yearMonthDuration` is not defined and
+            // falls through to the type error, as XPath has it.
+            (ComparableValue::DateTime(a), rhs) if self.is_additive() => {
+                match Duration::from_operand(&rhs).ok_or(ArithmeticError::TypeMismatch)? {
+                    Duration::DayTime(micros) => a
+                        .checked_add_day_time_micros(self.signed(micros))
+                        .map(ComparableValue::DateTime),
+                    Duration::YearMonth(months) => a
+                        .checked_add_months(self.signed_months(months))
+                        .map(ComparableValue::DateTime),
+                }
+                .ok_or(ArithmeticError::Overflow)
+            }
+            (ComparableValue::Date(a), rhs) if self.is_additive() => {
+                match Duration::from_operand(&rhs).ok_or(ArithmeticError::TypeMismatch)? {
+                    Duration::DayTime(micros) => a
+                        .checked_add_day_time_micros(self.signed(micros))
+                        .map(ComparableValue::Date),
+                    Duration::YearMonth(months) => a
+                        .checked_add_months(self.signed_months(months))
+                        .map(ComparableValue::Date),
+                }
+                .ok_or(ArithmeticError::Overflow)
+            }
+            (ComparableValue::Time(a), rhs) if self.is_additive() => {
+                match Duration::from_operand(&rhs).ok_or(ArithmeticError::TypeMismatch)? {
+                    Duration::DayTime(micros) => a
+                        .checked_add_day_time_micros(self.signed(micros))
+                        .map(ComparableValue::Time)
+                        .ok_or(ArithmeticError::Overflow),
+                    Duration::YearMonth(_) => Err(ArithmeticError::TypeMismatch),
+                }
+            }
+            // Duration ± duration. XPath defines these; SEP-0002's operator
+            // table does not list them, but it says outright that it does not
+            // enumerate every relevant operator, and summing durations is the
+            // first thing a caller reaches for after computing one. Mixing the
+            // two duration families has no XPath operator and stays an error.
+            (ref lhs, ref rhs)
+                if self.is_additive()
+                    && Duration::from_operand(lhs).is_some()
+                    && Duration::from_operand(rhs).is_some() =>
+            {
+                match (
+                    Duration::from_operand(lhs).expect("checked by guard"),
+                    Duration::from_operand(rhs).expect("checked by guard"),
+                ) {
+                    (Duration::DayTime(a), Duration::DayTime(b)) => a
+                        .checked_add(self.signed(b))
+                        .map(day_time_duration)
+                        .ok_or(ArithmeticError::Overflow),
+                    (Duration::YearMonth(a), Duration::YearMonth(b)) => a
+                        .checked_add(self.signed_months(b))
+                        .map(year_month_duration)
+                        .ok_or(ArithmeticError::Overflow),
+                    _ => Err(ArithmeticError::TypeMismatch),
+                }
+            }
             // Non-numeric types can't do arithmetic
             _ => Err(ArithmeticError::TypeMismatch),
         }
     }
+
+    /// Whether this is `+` or `-`, the only operators defined over a temporal
+    /// or duration operand.
+    fn is_additive(self) -> bool {
+        matches!(self, ArithmeticOp::Add | ArithmeticOp::Sub)
+    }
+
+    /// Flip the sign of a microsecond magnitude for `-`.
+    fn signed(self, micros: i64) -> i64 {
+        if self == ArithmeticOp::Sub {
+            -micros
+        } else {
+            micros
+        }
+    }
+
+    /// Flip the sign of a month magnitude for `-`.
+    fn signed_months(self, months: i32) -> i32 {
+        if self == ArithmeticOp::Sub {
+            -months
+        } else {
+            months
+        }
+    }
+}
+
+/// A duration operand, in the unit its family is measured in. The two families
+/// are deliberately not interconvertible: months have no fixed length.
+enum Duration {
+    DayTime(i64),
+    YearMonth(i32),
+}
+
+impl Duration {
+    /// Durations have no dedicated `ComparableValue` variant — they ride as a
+    /// `TypedLiteral` wrapping the `FlakeValue`.
+    fn from_operand(v: &ComparableValue) -> Option<Self> {
+        let ComparableValue::TypedLiteral { val, .. } = v else {
+            return None;
+        };
+        match val {
+            FlakeValue::DayTimeDuration(d) => Some(Duration::DayTime(d.micros())),
+            FlakeValue::YearMonthDuration(d) => Some(Duration::YearMonth(d.months())),
+            _ => None,
+        }
+    }
+}
+
+/// Wrap a microsecond count as an `xsd:dayTimeDuration` result.
+fn day_time_duration(micros: i64) -> ComparableValue {
+    ComparableValue::TypedLiteral {
+        val: FlakeValue::DayTimeDuration(Box::new(DayTimeDuration::from_micros(micros))),
+        dtc: None,
+    }
+}
+
+/// Wrap a month count as an `xsd:yearMonthDuration` result.
+fn year_month_duration(months: i32) -> ComparableValue {
+    ComparableValue::TypedLiteral {
+        val: FlakeValue::YearMonthDuration(Box::new(YearMonthDuration::from_months(months))),
+        dtc: None,
+    }
+}
+
+/// Build the `xsd:dayTimeDuration` separating two instants, both expressed as
+/// microseconds against a shared origin.
+fn day_time_duration_between(
+    lhs_micros: i64,
+    rhs_micros: i64,
+) -> Result<ComparableValue, ArithmeticError> {
+    let micros = lhs_micros
+        .checked_sub(rhs_micros)
+        .ok_or(ArithmeticError::Overflow)?;
+    Ok(day_time_duration(micros))
 }
 
 /// Comparable value extracted from expression evaluation
@@ -497,9 +658,23 @@ impl ComparableValue {
                 sid.namespace_code, sid.name
             )))),
             ComparableValue::Long(n) => Some(ComparableValue::String(Arc::from(n.to_string()))),
-            ComparableValue::Double(d) => Some(ComparableValue::String(Arc::from(d.to_string()))),
+            // STR() must return the literal's lexical form — the same W3C
+            // canonical form the RDF-lexical serializers emit for the same
+            // term (#1695; the serializer side was #1445). `f64::to_string()`
+            // gave "1" for 1.0 and "inf" for INF, so `STR(?d)` disagreed with
+            // the value printed two fields over in the same result set.
+            ComparableValue::Double(d) => Some(ComparableValue::String(Arc::from(
+                fluree_graph_ir::canonical_xsd_double(d),
+            ))),
+            // A `Float` here is a value computed in f32 (arithmetic, casts);
+            // its canonical form is the f32 one. A STORED float never takes
+            // this arm for STR(): `Float` cannot recover the full-precision
+            // stored f64 (`lit_to_comparable` narrows), so `eval_str` reads
+            // the f64 off the binding first (`stored_float_f64`) and renders
+            // the serializer's `canonical_xsd_double` — see #1776 for the
+            // variant-vs-datatype conflation underneath.
             ComparableValue::Float(f) => Some(ComparableValue::String(Arc::from(
-                super::cast::format_f32(f),
+                fluree_graph_ir::canonical_xsd_float(f),
             ))),
             ComparableValue::Bool(b) => Some(ComparableValue::String(Arc::from(b.to_string()))),
             ComparableValue::BigInt(n) => Some(ComparableValue::String(Arc::from(n.to_string()))),
@@ -519,7 +694,10 @@ impl ComparableValue {
             ComparableValue::TypedLiteral { val, .. } => match val {
                 FlakeValue::String(s) => Some(ComparableValue::String(Arc::from(s))),
                 FlakeValue::Long(n) => Some(ComparableValue::String(Arc::from(n.to_string()))),
-                FlakeValue::Double(d) => Some(ComparableValue::String(Arc::from(d.to_string()))),
+                // Same canonical form as the bare `Double` arm above (#1695).
+                FlakeValue::Double(d) => Some(ComparableValue::String(Arc::from(
+                    fluree_graph_ir::canonical_xsd_double(d),
+                ))),
                 FlakeValue::Boolean(b) => Some(ComparableValue::String(Arc::from(b.to_string()))),
                 _ => None,
             },
@@ -571,7 +749,21 @@ impl ComparableValue {
                 datatypes.xsd_double.clone(),
             )),
             // xsd:float renders its lexical form from the f32 (avoiding f64
-            // display artifacts) and carries the xsd:float datatype.
+            // display artifacts) and carries the xsd:float datatype. This
+            // CONSTRUCTS a float literal, so it keeps the cast-side rendering
+            // (`format_f32`) rather than STR()'s canonical form.
+            //
+            // DELIBERATE consequence: one float VALUE can spell two ways by
+            // provenance — a stored `"1.0E0"^^xsd:float` serializes
+            // canonically while `BIND(?f + 0 AS ?y)` mints `"1"^^xsd:float`.
+            // The minted term is internally consistent (the serializer,
+            // `STR()`, and `xsd:string()` of it all return this one string
+            // verbatim, the per-term invariant #1695 is about), and minting
+            // the canonical form instead would break the cast on the rebound
+            // term: `xsd:string(?y)` reads the stored lexical verbatim, and
+            // XPath requires `"1"`, not `"1.0E0"`. Cross-provenance
+            // canonicalization is the serializer-side variant-vs-datatype
+            // conflation, tracked in #1776.
             ComparableValue::Float(f) => Ok(Binding::lit(
                 FlakeValue::String(super::cast::format_f32(f)),
                 datatypes.xsd_float.clone(),
@@ -643,7 +835,31 @@ impl ComparableValue {
                         })?;
                     Ok(Binding::lit(val, dt))
                 }
-                None => Ok(Binding::lit(val, datatypes.xsd_string.clone())),
+                // No datatype constraint rides along on the value, so recover it
+                // from the value itself. Only string-shaped values default to
+                // xsd:string: the temporal, duration and gregorian variants
+                // reach here (they have no dedicated `ComparableValue` arm) and
+                // stamping those xsd:string would re-type a duration or a gYear
+                // as a string on the way out.
+                None => {
+                    let dt = match &val {
+                        FlakeValue::DateTime(_) => datatypes.xsd_datetime.clone(),
+                        FlakeValue::Date(_) => datatypes.xsd_date.clone(),
+                        FlakeValue::Time(_) => datatypes.xsd_time.clone(),
+                        FlakeValue::GYear(_) => datatypes.xsd_g_year.clone(),
+                        FlakeValue::GYearMonth(_) => datatypes.xsd_g_year_month.clone(),
+                        FlakeValue::GMonth(_) => datatypes.xsd_g_month.clone(),
+                        FlakeValue::GDay(_) => datatypes.xsd_g_day.clone(),
+                        FlakeValue::GMonthDay(_) => datatypes.xsd_g_month_day.clone(),
+                        FlakeValue::Duration(_) => datatypes.xsd_duration.clone(),
+                        FlakeValue::DayTimeDuration(_) => datatypes.xsd_day_time_duration.clone(),
+                        FlakeValue::YearMonthDuration(_) => {
+                            datatypes.xsd_year_month_duration.clone()
+                        }
+                        _ => datatypes.xsd_string.clone(),
+                    };
+                    Ok(Binding::lit(val, dt))
+                }
             },
         }
     }
@@ -810,6 +1026,341 @@ impl From<&ComparableValue> for FlakeValue {
 mod tests {
     use super::*;
     use fluree_db_core::Sid;
+
+    // === Temporal subtraction (XPath op:subtract-dateTimes/-dates/-times) ===
+
+    fn dt(s: &str) -> ComparableValue {
+        ComparableValue::DateTime(FlureeDateTime::parse(s).expect("dateTime"))
+    }
+
+    fn date(s: &str) -> ComparableValue {
+        ComparableValue::Date(FlureeDate::parse(s).expect("date"))
+    }
+
+    fn time(s: &str) -> ComparableValue {
+        ComparableValue::Time(FlureeTime::parse(s).expect("time"))
+    }
+
+    /// Canonical lexical form of a duration-valued arithmetic result.
+    fn duration_of(v: Result<ComparableValue, ArithmeticError>) -> String {
+        match v.expect("temporal subtraction should succeed") {
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::DayTimeDuration(d),
+                ..
+            } => d.to_canonical_string(),
+            other => panic!("expected xsd:dayTimeDuration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subtract_datetimes_yields_day_time_duration() {
+        assert_eq!(
+            duration_of(
+                ArithmeticOp::Sub.apply(dt("2026-01-02T00:00:00Z"), dt("2026-01-01T00:00:00Z"))
+            ),
+            "P1D"
+        );
+        assert_eq!(
+            duration_of(
+                ArithmeticOp::Sub.apply(dt("2026-01-01T12:30:00Z"), dt("2026-01-01T10:00:00Z"))
+            ),
+            "PT2H30M"
+        );
+    }
+
+    #[test]
+    fn subtract_datetimes_is_signed() {
+        assert_eq!(
+            duration_of(
+                ArithmeticOp::Sub.apply(dt("2026-01-01T00:00:00Z"), dt("2026-01-02T00:00:00Z"))
+            ),
+            "-P1D"
+        );
+    }
+
+    #[test]
+    fn subtract_datetimes_normalizes_timezones() {
+        // Both operands denote the same instant (10:00Z), so they cancel.
+        assert_eq!(
+            duration_of(
+                ArithmeticOp::Sub
+                    .apply(dt("2026-01-01T12:00:00+02:00"), dt("2026-01-01T10:00:00Z"))
+            ),
+            "PT0S"
+        );
+    }
+
+    #[test]
+    fn subtract_datetimes_keeps_sub_second_precision() {
+        assert_eq!(
+            duration_of(
+                ArithmeticOp::Sub.apply(dt("2026-01-01T00:00:01.500Z"), dt("2026-01-01T00:00:00Z"))
+            ),
+            "PT1.5S"
+        );
+    }
+
+    #[test]
+    fn subtract_dates_yields_day_time_duration() {
+        // XPath op:subtract-dates example: both operands share the implicit
+        // timezone, so it cancels and the answer is a whole number of days.
+        assert_eq!(
+            duration_of(ArithmeticOp::Sub.apply(date("2000-10-30"), date("1999-11-28"))),
+            "P337D"
+        );
+    }
+
+    #[test]
+    fn subtract_dates_reads_the_stored_calendar_date() {
+        // Previously `subtract_dates_accounts_for_timezone_offset`, asserting
+        // PT5H here: midnight at +05:00 is 19:00Z the previous day, so folding
+        // the offset in made the difference five hours. That is what XPath's
+        // op:subtract-dates says, but the offset is not persisted — only
+        // days_since_epoch reaches the index — so PT5H was reachable in novelty
+        // and PT0S once reindexed. Now the calendar date is read on both lanes,
+        // pinned end-to-end by it_temporal_lane_stability.
+        assert_eq!(
+            duration_of(ArithmeticOp::Sub.apply(date("2026-01-01Z"), date("2026-01-01+05:00"))),
+            "PT0S"
+        );
+        // Offsets ignored, so a real difference in calendar dates is unaffected.
+        assert_eq!(
+            duration_of(ArithmeticOp::Sub.apply(date("2026-01-03Z"), date("2026-01-01Z"))),
+            "P2D"
+        );
+    }
+
+    #[test]
+    fn subtract_times_yields_day_time_duration() {
+        // XPath op:subtract-times example, offset-free so it is unaffected.
+        assert_eq!(
+            duration_of(ArithmeticOp::Sub.apply(time("11:12:00Z"), time("04:00:00Z"))),
+            "PT7H12M"
+        );
+        // This pair used to assert PT0S, on the grounds that 11:00-05:00 and
+        // 21:30+05:30 are both 16:00Z. Only micros_since_midnight is stored, so
+        // that answer held in novelty and became -PT10H30M after a reindex.
+        // Wall clocks are now what is subtracted on both lanes: 11:00 − 21:30.
+        assert_eq!(
+            duration_of(ArithmeticOp::Sub.apply(time("11:00:00-05:00"), time("21:30:00+05:30"))),
+            "-PT10H30M"
+        );
+    }
+
+    fn dtd(s: &str) -> ComparableValue {
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::DayTimeDuration(Box::new(
+                fluree_db_core::temporal::DayTimeDuration::parse(s).expect("dayTimeDuration"),
+            )),
+            dtc: None,
+        }
+    }
+
+    fn ymd(s: &str) -> ComparableValue {
+        ComparableValue::TypedLiteral {
+            val: FlakeValue::YearMonthDuration(Box::new(
+                YearMonthDuration::parse(s).expect("yearMonthDuration"),
+            )),
+            dtc: None,
+        }
+    }
+
+    /// Lexical form of a temporal-valued arithmetic result.
+    fn lexical_of(v: Result<ComparableValue, ArithmeticError>) -> String {
+        match v.expect("temporal arithmetic should succeed") {
+            ComparableValue::DateTime(d) => d.canonical(),
+            ComparableValue::Date(d) => d.canonical(),
+            ComparableValue::Time(t) => t.canonical(),
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::DayTimeDuration(d),
+                ..
+            } => d.to_canonical_string(),
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::YearMonthDuration(d),
+                ..
+            } => d.to_canonical_string(),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn datetime_plus_and_minus_day_time_duration() {
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dt("2026-01-01T09:30:00Z"), dtd("PT2H30M"))),
+            "2026-01-01T12:00:00Z"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Sub.apply(dt("2026-01-01T09:30:00Z"), dtd("PT2H30M"))),
+            "2026-01-01T07:00:00Z"
+        );
+        // Crossing a day boundary carries into the date.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dt("2026-01-01T23:00:00Z"), dtd("PT2H"))),
+            "2026-01-02T01:00:00Z"
+        );
+    }
+
+    #[test]
+    fn datetime_plus_year_month_duration_clamps_to_end_of_month() {
+        // The XPath rule: the day is clamped to the last day of the resulting
+        // month rather than overflowing into the next one.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dt("2026-01-31T00:00:00Z"), ymd("P1M"))),
+            "2026-02-28T00:00:00Z"
+        );
+        // 2028 is a leap year, so the same shift lands on the 29th.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dt("2028-01-31T00:00:00Z"), ymd("P1M"))),
+            "2028-02-29T00:00:00Z"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Sub.apply(dt("2026-03-31T00:00:00Z"), ymd("P1M"))),
+            "2026-02-28T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn date_plus_duration_keeps_the_date_part() {
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(date("2026-01-01"), ymd("P1Y2M"))),
+            "2027-03-01"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(date("2026-01-01"), dtd("P2D"))),
+            "2026-01-03"
+        );
+        // Per XPath the date is taken to midnight and the date part of the
+        // shifted instant kept, so a sub-day duration moves nothing.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(date("2026-01-01"), dtd("PT5H"))),
+            "2026-01-01"
+        );
+    }
+
+    #[test]
+    fn time_plus_day_time_duration_wraps_within_the_day() {
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(time("09:30:00Z"), dtd("PT2H"))),
+            "11:30:00"
+        );
+        // A time has no date to carry into, so it wraps.
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(time("23:00:00Z"), dtd("PT2H"))),
+            "01:00:00"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Sub.apply(time("01:00:00Z"), dtd("PT2H"))),
+            "23:00:00"
+        );
+    }
+
+    #[test]
+    fn durations_add_and_subtract_within_their_family() {
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(dtd("PT2H"), dtd("PT3H30M"))),
+            "PT5H30M"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Sub.apply(dtd("PT3H"), dtd("PT2H"))),
+            "PT1H"
+        );
+        assert_eq!(
+            lexical_of(ArithmeticOp::Add.apply(ymd("P1Y"), ymd("P2M"))),
+            "P1Y2M"
+        );
+    }
+
+    #[test]
+    fn temporal_duration_arithmetic_rejects_undefined_combinations() {
+        // Months have no fixed length, so the two duration families do not mix.
+        assert_eq!(
+            ArithmeticOp::Add.apply(dtd("PT2H"), ymd("P1Y")),
+            Err(ArithmeticError::TypeMismatch)
+        );
+        // A time carries no months.
+        assert_eq!(
+            ArithmeticOp::Add.apply(time("09:30:00Z"), ymd("P1Y")),
+            Err(ArithmeticError::TypeMismatch)
+        );
+        // Only + and - are defined over these operands.
+        for op in [ArithmeticOp::Mul, ArithmeticOp::Div, ArithmeticOp::Mod] {
+            assert_eq!(
+                op.apply(dt("2026-01-01T00:00:00Z"), dtd("PT2H")),
+                Err(ArithmeticError::TypeMismatch),
+                "{op:?} over dateTime and a duration must stay a type error"
+            );
+        }
+    }
+
+    #[test]
+    fn temporal_operands_reject_every_operator_but_subtraction() {
+        for op in [
+            ArithmeticOp::Add,
+            ArithmeticOp::Mul,
+            ArithmeticOp::Div,
+            ArithmeticOp::Mod,
+        ] {
+            assert_eq!(
+                op.apply(dt("2026-01-02T00:00:00Z"), dt("2026-01-01T00:00:00Z")),
+                Err(ArithmeticError::TypeMismatch),
+                "{op:?} on two dateTimes must stay a type error"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_temporal_and_numeric_operands_stay_a_type_error() {
+        assert_eq!(
+            ArithmeticOp::Sub.apply(dt("2026-01-02T00:00:00Z"), ComparableValue::Long(1)),
+            Err(ArithmeticError::TypeMismatch)
+        );
+        // Mismatched temporal kinds have no XPath operator either.
+        assert_eq!(
+            ArithmeticOp::Sub.apply(dt("2026-01-02T00:00:00Z"), date("2026-01-01")),
+            Err(ArithmeticError::TypeMismatch)
+        );
+    }
+
+    #[test]
+    fn subtraction_result_renders_as_xsd_day_time_duration() {
+        // Regression guard for the `dtc: None` arm of `to_binding`, which used
+        // to stamp every non-primitive typed literal xsd:string.
+        let binding = ArithmeticOp::Sub
+            .apply(dt("2026-01-02T00:00:00Z"), dt("2026-01-01T00:00:00Z"))
+            .expect("subtraction")
+            .to_binding(None)
+            .expect("binding");
+        match binding {
+            Binding::Lit { val, dtc, .. } => {
+                assert_eq!(
+                    dtc.datatype(),
+                    &WELL_KNOWN_DATATYPES.xsd_day_time_duration,
+                    "duration must not be re-typed as xsd:string"
+                );
+                assert!(matches!(val, FlakeValue::DayTimeDuration(_)));
+            }
+            other => panic!("expected a literal binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gregorian_typed_literals_keep_their_datatype_on_output() {
+        // Same `to_binding` arm: a gYear round-tripping through the expression
+        // evaluator must not come back as xsd:string either.
+        let g = FlakeValue::GYear(Box::new(
+            fluree_db_core::temporal::GYear::parse("2026").expect("gYear"),
+        ));
+        let binding = ComparableValue::try_from(g)
+            .expect("comparable")
+            .to_binding(None)
+            .expect("binding");
+        match binding {
+            Binding::Lit { dtc, .. } => {
+                assert_eq!(dtc.datatype(), &WELL_KNOWN_DATATYPES.xsd_g_year);
+            }
+            other => panic!("expected a literal binding, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_ebv_bool() {
@@ -1013,6 +1564,50 @@ mod tests {
         let cv = ComparableValue::Long(42);
         let sv = cv.into_string_value();
         assert_eq!(sv, Some(ComparableValue::String(Arc::from("42"))));
+    }
+
+    /// #1695: STR()'s stringification of doubles/floats must be the W3C
+    /// canonical XSD lexical form — the exact routine the RDF-lexical
+    /// serializers use — never Rust `Display` ("1", "inf").
+    #[test]
+    fn test_into_string_value_double_float_canonical() {
+        let cases: &[(f64, &str)] = &[
+            (1.0, "1.0E0"),
+            (5.0, "5.0E0"),
+            (1_000_000.0, "1.0E6"),
+            (0.001, "1.0E-3"),
+            (-12.5, "-1.25E1"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "INF"),
+            (f64::NEG_INFINITY, "-INF"),
+        ];
+        for &(d, expected) in cases {
+            assert_eq!(
+                ComparableValue::Double(d).into_string_value(),
+                Some(ComparableValue::String(Arc::from(expected))),
+                "Double({d:?})"
+            );
+            // A double wrapped in a TypedLiteral takes the same form.
+            let tl = ComparableValue::TypedLiteral {
+                val: FlakeValue::Double(d),
+                dtc: None,
+            };
+            assert_eq!(
+                tl.into_string_value(),
+                Some(ComparableValue::String(Arc::from(expected))),
+                "TypedLiteral(Double({d:?}))"
+            );
+        }
+        // A stored xsd:float materializes as `Float`; its canonical form uses
+        // the f32 shortest-round-trip mantissa.
+        assert_eq!(
+            ComparableValue::Float(33.33).into_string_value(),
+            Some(ComparableValue::String(Arc::from("3.333E1")))
+        );
+        assert_eq!(
+            ComparableValue::Float(f32::NEG_INFINITY).into_string_value(),
+            Some(ComparableValue::String(Arc::from("-INF")))
+        );
     }
 
     #[test]

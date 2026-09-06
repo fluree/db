@@ -492,3 +492,216 @@ ORDER BY DESC(?changes) ?person"
         "rows: {rows:#?}"
     );
 }
+
+// ===========================================================================
+// Regression: GROUP BY over index-served history must not split groups.
+//
+// `rdf_star_history_group_by_count` above holds the same data purely in
+// novelty whenever the query outruns the background indexer (novelty is
+// SPOT-sorted, so history events happen to arrive subject-adjacent and the
+// planner's partitioned streaming-aggregate hint is satisfied by accident).
+// Once any part of the range is served from a published index,
+// `BinaryHistoryScanOperator::collect_history_flakes` emits the event
+// stream in collection order — persisted sidecar + base rows first, then
+// novelty appended — which is NOT partitioned by subject. The
+// adjacency-based partitioned lane then emitted one group per key *run*:
+// `[("alice", 1), ("alice", 1), ("bob", 1), ("bob", 1)]`.
+//
+// These tests pin the two index states that made the stock test's race
+// deterministic (fluree/db#1732 CI): the whole range index-served, and a
+// published index plus trailing novelty (the overlay-translation shape the
+// bounded overlay walk targets: bound predicate, unbound subject).
+// ===========================================================================
+
+/// `team_ledger`, but with a full index rebuild published after each of the
+/// listed commit `t`s, so the history range is deterministically split
+/// between the persisted index and novelty.
+async fn team_ledger_indexed(
+    name: &str,
+    index_after: &[i64],
+) -> (tempfile::TempDir, fluree_db_api::Fluree, String) {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let fluree = FlureeBuilder::file(tmp.path().to_str().unwrap())
+        .build()
+        .expect("build");
+    let ledger_id = format!("test/history-sparql-team-idx-{name}:main");
+
+    let l0 = fluree.create_ledger(&ledger_id).await.expect("create");
+    fluree
+        .insert(
+            l0,
+            &json!({"@context": ctx(), "@graph": [
+                {"@id": "ex:alice", "ex:name": "Alice", "ex:dept": "Eng"},
+                {"@id": "ex:bob", "ex:name": "Bob"},
+            ]}),
+        )
+        .await
+        .expect("t=1");
+    if index_after.contains(&1) {
+        crate::support::rebuild_and_publish_index(&fluree, &ledger_id).await;
+    }
+    let l1 = fluree.ledger(&ledger_id).await.expect("reload t1");
+    fluree
+        .upsert(
+            l1,
+            &json!({"@context": ctx(), "@id": "ex:alice", "ex:name": "Alicia"}),
+        )
+        .await
+        .expect("t=2");
+    if index_after.contains(&2) {
+        crate::support::rebuild_and_publish_index(&fluree, &ledger_id).await;
+    }
+    let l2 = fluree.ledger(&ledger_id).await.expect("reload t2");
+    let r3 = fluree
+        .upsert(
+            l2,
+            &json!({"@context": ctx(), "@id": "ex:bob", "ex:name": "Bobby"}),
+        )
+        .await
+        .expect("t=3");
+    assert_eq!(r3.receipt.t, 3);
+    if index_after.contains(&3) {
+        crate::support::rebuild_and_publish_index(&fluree, &ledger_id).await;
+    }
+    let _ = fluree.ledger(&ledger_id).await.expect("reload final");
+
+    (tmp, fluree, ledger_id)
+}
+
+/// The stock aggregate query + assertions, against a deterministic index
+/// state. Also pins the pre-aggregation row multiset so a "fix" that
+/// collapses or drops history events (instead of grouping them correctly)
+/// cannot pass.
+async fn assert_history_group_by_counts(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
+    let raw_sparql = format!(
+        r"PREFIX ex: <http://example.org/>
+PREFIX f: <https://ns.flur.ee/db#>
+SELECT ?person ?value ?t
+FROM <{ledger_id}@t:1>
+TO <{ledger_id}@t:latest>
+WHERE {{
+  << ?person ex:name ?value >> f:t ?t ; f:op ?op .
+  FILTER(?op = true)
+}}
+ORDER BY ?t ?person"
+    );
+    let raw_rows = run_sparql(fluree, &raw_sparql).await;
+    let raw: Vec<(String, String, i64)> = raw_rows
+        .as_array()
+        .expect("raw rows")
+        .iter()
+        .map(|r| {
+            (
+                local_name(&r["?person"]),
+                r["?value"]["@value"].as_str().expect("?value").to_string(),
+                r["?t"]["@value"].as_i64().expect("?t"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        raw,
+        vec![
+            ("alice".to_string(), "Alice".to_string(), 1),
+            ("bob".to_string(), "Bob".to_string(), 1),
+            ("alice".to_string(), "Alicia".to_string(), 2),
+            ("bob".to_string(), "Bobby".to_string(), 3),
+        ],
+        "pre-aggregation assert events: {raw_rows:#?}"
+    );
+
+    let sparql = format!(
+        r"PREFIX ex: <http://example.org/>
+PREFIX f: <https://ns.flur.ee/db#>
+SELECT ?person (COUNT(*) AS ?changes)
+FROM <{ledger_id}@t:1>
+TO <{ledger_id}@t:latest>
+WHERE {{
+  << ?person ex:name ?value >> f:t ?t ; f:op ?op .
+  FILTER(?op = true)
+}}
+GROUP BY ?person
+ORDER BY DESC(?changes) ?person"
+    );
+    let rows = run_sparql(fluree, &sparql).await;
+    let got: Vec<(String, i64)> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| {
+            (
+                local_name(&r["?person"]),
+                r["?changes"]["@value"].as_i64().expect("?changes"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        vec![("alice".to_string(), 2), ("bob".to_string(), 2)],
+        "history events for one subject are not adjacent in the scan's \
+         event stream, so a partitioned (adjacency-based) GROUP BY splits \
+         each subject into one group per run: {rows:#?}"
+    );
+}
+
+/// Whole range index-served: every event comes from the persisted pass
+/// (base rows + history sidecar), whose emit order is per-source, not
+/// per-subject.
+#[tokio::test]
+async fn rdf_star_history_group_by_count_index_complete() {
+    let (_tmp, fluree, ledger_id) = team_ledger_indexed("complete", &[3]).await;
+    assert_history_group_by_counts(&fluree, &ledger_id).await;
+}
+
+/// Published index at t=1 plus trailing novelty (t=2, t=3): persisted
+/// events first, then the novelty walk appended — the overlay-translation
+/// shape (bound predicate, unbound subject) the bounded overlay walk
+/// brackets.
+#[tokio::test]
+async fn rdf_star_history_group_by_count_index_plus_novelty() {
+    let (_tmp, fluree, ledger_id) = team_ledger_indexed("mixed", &[1]).await;
+    assert_history_group_by_counts(&fluree, &ledger_id).await;
+}
+
+/// JSON-LD twin of the index-complete shape (three-surface parity: the two
+/// surfaces share the IR, so the partitioned-hint demotion must hold for
+/// both). Groups ALL name events (asserts + retracts): 3 per person.
+#[tokio::test]
+async fn history_group_by_count_jsonld_over_indexed_range() {
+    let (_tmp, fluree, ledger_id) = team_ledger_indexed("jsonld", &[3]).await;
+
+    let q = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}@t:1"),
+        "to":   format!("{ledger_id}@t:latest"),
+        "select": ["?person", "(as (count ?value) ?changes)"],
+        "where": { "@id": "?person", "ex:name": {"@value": "?value", "@op": "?op"} },
+        "groupBy": ["?person"]
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&q)
+        .format(FormatterConfig::typed_json().with_normalize_arrays())
+        .execute_tracked()
+        .await
+        .expect("jsonld history query");
+    let rows = serde_json::to_value(&result.result).expect("serialize");
+
+    let mut got: Vec<(String, i64)> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| {
+            (
+                local_name(&r["?person"]),
+                r["?changes"]["@value"].as_i64().expect("?changes"),
+            )
+        })
+        .collect();
+    got.sort();
+    // Each person: assert@1, retract@overwrite-t, assert@overwrite-t.
+    assert_eq!(
+        got,
+        vec![("alice".to_string(), 3), ("bob".to_string(), 3)],
+        "rows: {rows:#?}"
+    );
+}

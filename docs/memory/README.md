@@ -44,4 +44,4 @@ Fluree Memory is:
 
 ## How it fits
 
-Fluree Memory is a feature of [Fluree DB](../docs/README.md) — installing the `fluree` CLI gives you both. If you only care about the memory tooling, you can still install and use Fluree as a single binary and never touch the rest of the database features.
+Fluree Memory is a feature of [Fluree DB](../README.md) — installing the `fluree` CLI gives you both. If you only care about the memory tooling, you can still install and use Fluree as a single binary and never touch the rest of the database features.

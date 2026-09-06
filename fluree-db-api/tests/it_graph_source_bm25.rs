@@ -1497,3 +1497,227 @@ async fn bm25_sync_refuses_a_retracted_index() {
     let resync = fluree.resync_bm25_index(&created.graph_source_id).await;
     assert!(resync.is_err(), "resync must refuse a retracted index");
 }
+
+/// The incremental sync path must produce byte-for-byte the same index as a
+/// full rebuild.
+///
+/// `sync_bm25_index` narrows its indexing query to the subjects the commit log
+/// says changed, instead of re-running the whole query over the whole ledger
+/// and filtering afterwards. That is the difference between O(delta) and
+/// O(corpus) per sync, but it is only a safe optimisation if the narrowed query
+/// yields exactly what the wide one did.
+///
+/// So: build two identical indexes over one ledger, mutate the ledger, then
+/// take one down the incremental path and rebuild the other from scratch, and
+/// require the resulting structures to match. Nothing here asserts *how* the
+/// query was narrowed — only that narrowing changed no outcome, which is the
+/// property that has to hold even if the scoping heuristic changes later.
+#[tokio::test]
+async fn bm25_incremental_sync_matches_full_resync() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/diff:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let seed = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"alpha beta gamma" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"beta delta" },
+            { "@id":"ex:doc3", "@type":"ex:Doc", "ex:title":"gamma epsilon zeta" }
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &seed).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    let incremental = fluree
+        .create_full_text_index(Bm25CreateConfig::new(
+            "diff-incremental",
+            ledger_id,
+            query.clone(),
+        ))
+        .await
+        .unwrap();
+    let rebuilt = fluree
+        .create_full_text_index(Bm25CreateConfig::new(
+            "diff-rebuilt",
+            ledger_id,
+            query.clone(),
+        ))
+        .await
+        .unwrap();
+
+    // Touch a subset: one existing document changes, one new one appears, so the
+    // affected set is a strict subset of the corpus and the narrowing is load
+    // bearing rather than incidentally equal to "everything".
+    let delta = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"beta delta omega" },
+            { "@id":"ex:doc4", "@type":"ex:Doc", "ex:title":"eta theta" }
+        ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &delta).await.unwrap().ledger;
+
+    let sync = fluree
+        .sync_bm25_index(&incremental.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        !sync.was_full_resync,
+        "this test is meaningless if the sync silently fell back to a full resync"
+    );
+
+    fluree
+        .resync_bm25_index(&rebuilt.graph_source_id)
+        .await
+        .unwrap();
+
+    let a = fluree
+        .load_bm25_index(&incremental.graph_source_id)
+        .await
+        .unwrap();
+    let b = fluree
+        .load_bm25_index(&rebuilt.graph_source_id)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        a.num_docs(),
+        b.num_docs(),
+        "document count diverged between incremental and full rebuild"
+    );
+    assert_eq!(
+        a.num_terms(),
+        b.num_terms(),
+        "vocabulary size diverged between incremental and full rebuild"
+    );
+
+    // Doc keys carry the ledger alias, which differs per graph source, so compare
+    // the subject IRIs and their term counts — the parts that describe the corpus
+    // rather than which index it lives in.
+    let mut a_docs: Vec<(String, u32)> = a
+        .iter_doc_keys()
+        .map(|k| {
+            (
+                k.subject_iri.to_string(),
+                a.get_doc_meta(k).map(|m| m.doc_len).unwrap_or_default(),
+            )
+        })
+        .collect();
+    let mut b_docs: Vec<(String, u32)> = b
+        .iter_doc_keys()
+        .map(|k| {
+            (
+                k.subject_iri.to_string(),
+                b.get_doc_meta(k).map(|m| m.doc_len).unwrap_or_default(),
+            )
+        })
+        .collect();
+    a_docs.sort();
+    b_docs.sort();
+    assert_eq!(
+        a_docs, b_docs,
+        "incremental and full rebuild disagree on the indexed documents or their lengths"
+    );
+
+    // The mutated document must actually reflect the new text in both, otherwise
+    // the two could agree simply by both being stale.
+    assert!(
+        a_docs.iter().any(|(iri, _)| iri.ends_with("doc4")),
+        "the newly inserted document never reached the incremental index: {a_docs:?}"
+    );
+}
+
+/// The narrowing has to reduce the work the engine does, not merely the rows it
+/// hands back. `bm25_incremental_sync_matches_full_resync` pins correctness,
+/// `it_bm25_sync_scoping.rs` pins that the sync path really takes this branch,
+/// and the `scope_tests` unit tests pin the shape of the generated clause and
+/// every condition that declines it.
+///
+/// This one is deliberately none of those: it is a **characterization test of
+/// the query engine**, and it passes with this PR's source reverted, because it
+/// hand-builds the `values` clause. Keep it anyway — it is what would catch a
+/// future engine change that turned a `values` binding into a post-filter over a
+/// full scan, quietly removing the reason for scoping at all. It does not
+/// belong to this PR's guard set; the two tests named above are that.
+///
+/// Measured against a corpus large enough that a full scan cannot be mistaken
+/// for a narrow one, on an **indexed** ledger because that is what the sync
+/// path meets in practice: novelty holds only commits since the last index
+/// build, and everything older is in leaflets that a bound subject can seek
+/// into. Fuel on the indexed corpus is flat in corpus size when scoped and
+/// linear when not.
+#[tokio::test]
+async fn scoped_indexing_query_narrows_the_indexed_scan() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/fuel:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+
+    const CORPUS: usize = 400;
+    let docs: Vec<_> = (0..CORPUS)
+        .map(|i| {
+            json!({
+                "@id": format!("ex:doc{i}"),
+                "@type": "ex:Doc",
+                "ex:title": format!("document number {i} with some filler text")
+            })
+        })
+        .collect();
+    fluree
+        .insert(
+            ledger0,
+            &json!({ "@context": { "ex":"http://example.org/" }, "@graph": docs }),
+        )
+        .await
+        .unwrap();
+
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+
+    let full = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+
+    // The same clause `scope_indexing_query_to_subjects` builds: the single
+    // object-form select variable bound to the affected IRIs, as full IRIs.
+    let mut scoped = full.clone();
+    scoped.as_object_mut().unwrap().insert(
+        "values".to_string(),
+        json!(["?x", [{ "@id": "http://example.org/doc7" }]]),
+    );
+
+    // Strip the flat 1.000 `QUERY_FLOOR_MICRO_FUEL` charged at query entry —
+    // it is the same for both and would otherwise dominate the comparison.
+    let work = |v: Option<f64>| v.expect("tracked query reported no fuel") - 1.0;
+
+    let full_work = work(
+        support::query_jsonld_tracked(&fluree, &ledger, &full)
+            .await
+            .expect("full indexing query failed")
+            .fuel,
+    );
+    let scoped_work = work(
+        support::query_jsonld_tracked(&fluree, &ledger, &scoped)
+            .await
+            .expect("scoped indexing query failed")
+            .fuel,
+    );
+
+    // One subject out of 400 measures ~270x at the time of writing. The bound
+    // is deliberately loose: it pins the order of magnitude, so it survives
+    // unrelated changes to the fuel schedule but fails outright if the
+    // narrowing stops reaching the scan.
+    assert!(
+        scoped_work * 20.0 < full_work,
+        "scoping one subject out of {CORPUS} did not narrow the indexed scan: \
+         scoped {scoped_work} vs full {full_work} (fuel above the query floor)"
+    );
+}

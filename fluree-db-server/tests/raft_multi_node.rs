@@ -832,6 +832,29 @@ async fn concurrent_writes_across_all_nodes() {
             .wait_for_names(node.node_id, ledger, &expected_refs, DEFAULT_TIMEOUT)
             .await;
     }
+
+    // Every node applied every one of these submissions, but only the
+    // node a client actually proposed through has a local waiter. A
+    // node that tracked something per applied entry would sit at
+    // CLUSTER_SIZE * PER_NODE here — the follower leak this design
+    // replaces. All submissions have completed, so even the proposing
+    // nodes are back to zero.
+    for node in &cluster.nodes {
+        let integration = node
+            ._state
+            .raft
+            .as_ref()
+            .expect("test node always has raft integration");
+        assert_eq!(
+            integration.waiter_map.len(),
+            0,
+            "node {} tracks {} waiters after {} completed submissions; \
+             a node must track only its own in-flight proposals",
+            node.node_id,
+            integration.waiter_map.len(),
+            CLUSTER_SIZE as usize * PER_NODE,
+        );
+    }
 }
 
 /// A write through node A is visible from a query against node B
