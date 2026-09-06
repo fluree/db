@@ -5,33 +5,42 @@
 //! reads, the R2RML query path, and the snapshot-pinned/incremental scan
 //! surface — against an actual Iceberg table on the local filesystem.
 //!
-//! Runs in CI against the COMMITTED fixture `tests/fixtures/iceberg/silver/
-//! people` — a real pyiceberg-written two-snapshot table (5 rows:
-//! alice..erin; snapshot 1 = 3 rows, snapshot 2 = +2). The fixture's metadata
-//! carries the ABSOLUTE paths it was written under (`file:///tmp/...`), so
-//! reading it from a checkout also proves the relocated-table location remap:
-//! the provider infers `metadata.location → configured table_location` and
-//! rewrites every manifest file reference.
+//! Runs in CI against COMMITTED fixtures under `tests/fixtures/iceberg/silver/`,
+//! real pyiceberg-written tables:
 //!
-//! Regenerate the fixture (needs `pip install "pyiceberg[sql-sqlite,pyarrow]"`):
+//! - `people` — two snapshots, 5 rows (alice..erin; snapshot 1 = 3 rows,
+//!   snapshot 2 = +2).
+//! - `people_backlog` — five 600-row appends whose first THREE snapshots have
+//!   been expired, leaving only the two newest. That is the shape a materialize
+//!   source is in once its watermark has fallen out of the source table's
+//!   snapshot retention: a full read is forced, and no retained snapshot names a
+//!   checkpoint anywhere near the start of the backlog.
+//!
+//! The fixtures' metadata carries the ABSOLUTE paths they were written under
+//! (`file:///tmp/...`), so reading them from a checkout also proves the
+//! relocated-table location remap: the provider infers `metadata.location →
+//! configured table_location` and rewrites every manifest file reference.
+//!
+//! Regenerate the fixtures (needs `pip install "pyiceberg[sql-sqlite,pyarrow]"`):
 //!
 //! ```bash
 //! python3 scripts/local/write_local_iceberg_table.py /tmp/fluree-local-iceberg
 //! cp -r /tmp/fluree-local-iceberg/silver/people fluree-db-api/tests/fixtures/iceberg/silver/people
+//! cp -r /tmp/fluree-local-iceberg/silver/people_backlog fluree-db-api/tests/fixtures/iceberg/silver/people_backlog
 //! ```
 //!
-//! `FLUREE_LOCAL_ICEBERG_TABLE=file:///path/to/table` overrides the fixture to
-//! run against any table with the same shape.
+//! `FLUREE_LOCAL_ICEBERG_TABLE=file:///path/to/table` overrides the `people`
+//! fixture to run those tests against any table with the same shape.
 //!
 //! Local tables are fail-closed behind `FLUREE_ICEBERG_LOCAL_ROOTS` (see
-//! `fluree_db_iceberg::local_guard`), so the test sets that allowlist to the
-//! table's own directory before touching the stack — which also keeps it
-//! honest: a read that escaped the table directory would be refused here just
-//! as it would in a deployment.
+//! `fluree_db_iceberg::local_guard`), so each test allowlists the fixtures
+//! directory before touching the stack — which also keeps it honest: a read
+//! that escaped the fixtures directory would be refused here just as it would
+//! in a deployment.
 
 #![cfg(all(feature = "iceberg", feature = "native"))]
 
-use fluree_db_api::{FlureeBuilder, FlureeR2rmlProvider, R2rmlCreateConfig};
+use fluree_db_api::{ApiError, FlureeBuilder, FlureeR2rmlProvider, R2rmlCreateConfig};
 use futures::TryStreamExt;
 
 const PEOPLE_R2RML: &str = r#"
@@ -70,18 +79,38 @@ fn table_location() -> String {
     )
 }
 
-/// Allowlist the table's own directory, as a deployment would. Must run before
-/// anything builds Iceberg storage — the guard captures the roots on first use.
-fn allow_table_root(location: &str) {
-    let root = location.strip_prefix("file://").unwrap_or(location);
+/// The committed expired-history fixture — see the module doc.
+fn backlog_table_location() -> String {
+    format!(
+        "file://{}/tests/fixtures/iceberg/silver/people_backlog",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+/// Allowlist the fixtures directory (every table this file reads lives under it),
+/// plus the override table's directory when one is set. Must run before anything
+/// builds Iceberg storage — the guard captures the roots on first use — and every
+/// test in this binary must install the SAME value, because the first to touch the
+/// guard decides for all of them.
+fn allow_fixture_roots() {
+    let mut roots = vec![format!(
+        "{}/tests/fixtures/iceberg",
+        env!("CARGO_MANIFEST_DIR")
+    )];
+    if let Ok(loc) = std::env::var("FLUREE_LOCAL_ICEBERG_TABLE") {
+        let loc = loc.trim();
+        if !loc.is_empty() {
+            roots.push(loc.strip_prefix("file://").unwrap_or(loc).to_string());
+        }
+    }
     // SAFETY: set at the top of the test, before any storage or scan is built.
-    std::env::set_var("FLUREE_ICEBERG_LOCAL_ROOTS", root);
+    std::env::set_var("FLUREE_ICEBERG_LOCAL_ROOTS", roots.join(":"));
 }
 
 #[tokio::test]
 async fn local_table_end_to_end() {
     let location = table_location();
-    allow_table_root(&location);
+    allow_fixture_roots();
     let fluree = FlureeBuilder::memory().build_memory();
 
     // 1. Register the graph source: Direct mode, file:// location, inline
@@ -236,7 +265,7 @@ async fn local_table_profiles_through_the_scan() {
     use fluree_db_stats::ValueKind;
 
     let location = table_location();
-    allow_table_root(&location);
+    allow_fixture_roots();
     let fluree = FlureeBuilder::memory().build_memory();
     let config = R2rmlCreateConfig::new_direct("local-people-profile", &location, PEOPLE_R2RML)
         .with_mapping_media_type("text/turtle");
@@ -315,4 +344,181 @@ async fn local_table_profiles_through_the_scan() {
     assert!(none.columns.is_empty(), "{:?}", none.columns);
     assert_eq!(none.skipped.len(), 2);
     assert!(none.snapshot_id.is_some(), "still pinned to a snapshot");
+}
+
+/// The expired-history backlog, drained through the real state ledger in bounded
+/// passes.
+///
+/// This is the composition no unit test crosses, and both production surprises in
+/// this feature's history were composition failures: a checkpoint walk that needed
+/// intact history on precisely the tables that had none, and a budget whose
+/// arithmetic was correct and too large to ever engage. The loop below crosses every
+/// seam at once. The ceiling the builder configured sizes the budget; the first pass
+/// cuts, finds no retained snapshot to checkpoint at, and records a cursor instead;
+/// later passes resume above it; the complete pass advances the snapshot and retires
+/// the cursor; and the poll after that is an ordinary empty incremental scan.
+///
+/// Assumes `FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS` and
+/// `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW` are unset, as they are in CI.
+#[tokio::test]
+async fn an_expired_history_table_drains_in_bounded_passes() {
+    allow_fixture_roots();
+    let location = backlog_table_location();
+
+    // File-backed so the indexer drains novelty between passes, with a ceiling
+    // chosen so the derived budget lands between one and two 600-row commits: the
+    // 3,000-row table then drains in three passes of 1200, 1200 and 600 rows.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .with_indexing_thresholds(64 * 1024, 500 * 1024)
+        .build()
+        .expect("file-backed fluree with a background indexer");
+    let indexer = fluree
+        .indexer_handle()
+        .expect("file builder starts background indexing")
+        .clone();
+
+    let mapping = PEOPLE_R2RML.replace("silver.people", "silver.people_backlog");
+    let config = R2rmlCreateConfig::new_direct("backlog", &location, &mapping)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create backlog graph source");
+    let (gs, table, target) = (
+        "backlog:main",
+        "silver.people_backlog",
+        "backlog_native:main",
+    );
+    const STATE: &str = "fluree_materialize_state:main";
+
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let budget = provider.full_pass_row_budget();
+    assert!(
+        (601..=1200).contains(&budget),
+        "the budget derived from the configured ceiling must cut inside the second \
+         commit, or the pass layout below is wrong: budget={budget}"
+    );
+    let head = provider
+        .current_snapshot_id(gs, table)
+        .await
+        .expect("current snapshot")
+        .expect("fixture has snapshots");
+
+    // (rows this pass, cursor after it, snapshot watermark after it). Sequence
+    // numbers are the fixture's: commits 1..=5, so the cuts land at 2 and 4.
+    let expected = [
+        (1200, Some(2), None),
+        (1200, Some(4), None),
+        (600, None, Some(head)),
+    ];
+    for (pass, (rows, cursor, watermark)) in expected.into_iter().enumerate() {
+        // One poll as the tracking worker runs it: a target the novelty ceiling
+        // deferred is retried once the indexer has drained what deferred it. The
+        // point of this test is that each RETRY resumes where the last pass got to.
+        let mut attempts = 0;
+        let result = loop {
+            attempts += 1;
+            match fluree
+                .materialize_r2rml_graph_source(gs, target, false)
+                .await
+            {
+                Ok(r) => break r,
+                Err(ApiError::MaterializePartial { detail, .. }) if attempts < 50 => {
+                    eprintln!("pass {}: deferred ({detail}); draining novelty", pass + 1);
+                    indexer.wait_for_idle(target).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("pass {} failed: {e}", pass + 1),
+            }
+        };
+        eprintln!(
+            "pass {}: rows_read={} incremental={} to={:?}",
+            pass + 1,
+            result.rows_read,
+            result.incremental,
+            result.to_snapshot_id
+        );
+        assert!(
+            !result.incremental,
+            "an expired watermark forces a full read"
+        );
+        assert_eq!(
+            result.rows_read,
+            rows,
+            "pass {} read the wrong prefix",
+            pass + 1
+        );
+        assert_eq!(
+            fluree
+                .materialize_sequence_cursor(STATE, gs, target, table)
+                .await
+                .expect("read cursor"),
+            cursor,
+            "cursor after pass {}",
+            pass + 1
+        );
+        assert_eq!(
+            fluree
+                .materialize_watermark(STATE, gs, target, table)
+                .await
+                .expect("read watermark"),
+            watermark,
+            "snapshot watermark after pass {} — it must not move until the drain completes",
+            pass + 1
+        );
+        // Let the indexer drain the target before the next pass so the next commit
+        // has headroom; the retry loop above covers the case where it has not.
+        indexer.wait_for_idle(target).await;
+    }
+
+    // Steady state: the watermark resolves, the window is empty, nothing commits.
+    let idle = fluree
+        .materialize_r2rml_graph_source(gs, target, false)
+        .await
+        .expect("steady-state poll");
+    assert!(
+        idle.incremental,
+        "with the watermark at the head the poll is incremental"
+    );
+    assert_eq!(idle.rows_read, 0);
+    assert!(!idle.committed, "an empty fresh window commits nothing");
+
+    // Every row of every commit landed exactly once, including the rows either
+    // side of each cut — the seams are where a resume that repeats or skips a
+    // commit would show.
+    let query = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": target,
+        "select": ["?name"],
+        "where": {"@id": "?s", "ex:name": "?name"},
+        "limit": 10_000,
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .expect("query the materialized target");
+    let names: std::collections::BTreeSet<String> = rows
+        .as_array()
+        .expect("array result")
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect();
+    assert_eq!(
+        names.len(),
+        3000,
+        "3,000 distinct people across three passes"
+    );
+    for edge in [
+        "person-0001",
+        "person-1200",
+        "person-1201",
+        "person-2400",
+        "person-2401",
+        "person-3000",
+    ] {
+        assert!(names.iter().any(|n| n.contains(edge)), "missing {edge}");
+    }
 }
