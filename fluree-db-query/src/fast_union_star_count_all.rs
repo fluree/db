@@ -258,22 +258,27 @@ impl SubjectSelfLoopCountStreamV6 {
     }
 }
 
+// These helpers return once per subject group. Keep their success slots small
+// without changing QueryError's layout for every other query operator. An error
+// allocates only on the exceptional path and is unboxed at the partition boundary.
+type GroupResult = std::result::Result<Option<(u64, u64)>, Box<QueryError>>;
+
 /// A `(subject, count)` group stream in ascending subject order — either the base
 /// metadata iterator (HEAD) or the overlay-merging cursor stream (novelty/time
 /// travel). Lets the union/extra merge helpers serve both lanes.
 trait SubjectCountGroups {
-    fn next_subject_group(&mut self) -> Result<Option<(u64, u64)>>;
+    fn next_subject_group(&mut self) -> GroupResult;
 }
 impl SubjectCountGroups for PsotSubjectCountIter<'_> {
     #[inline]
-    fn next_subject_group(&mut self) -> Result<Option<(u64, u64)>> {
-        self.next_group()
+    fn next_subject_group(&mut self) -> GroupResult {
+        self.next_group().map_err(Box::new)
     }
 }
 impl SubjectCountGroups for CursorSubjectCountStream {
     #[inline]
-    fn next_subject_group(&mut self) -> Result<Option<(u64, u64)>> {
-        self.next_group()
+    fn next_subject_group(&mut self) -> GroupResult {
+        self.next_group().map_err(Box::new)
     }
 }
 
@@ -283,7 +288,7 @@ impl SubjectCountGroups for CursorSubjectCountStream {
 fn next_union_group<T: SubjectCountGroups>(
     iters: &mut [T],
     cur: &mut [Option<(u64, u64)>],
-) -> Result<Option<(u64, u64)>> {
+) -> GroupResult {
     if cur.iter().all(std::option::Option::is_none) {
         return Ok(None);
     }
@@ -306,7 +311,7 @@ fn next_union_group<T: SubjectCountGroups>(
 fn next_extra_product_group<T: SubjectCountGroups>(
     iters: &mut [T],
     cur: &mut [Option<(u64, u64)>],
-) -> Result<Option<(u64, u64)>> {
+) -> GroupResult {
     loop {
         if cur.iter().any(std::option::Option::is_none) {
             return Ok(None);
@@ -375,21 +380,21 @@ fn merge_union_constraint_count_range(
         e_cur.push(it.next_group()?);
     }
 
-    let mut u = next_union_group(&mut u_iters, &mut u_cur)?;
-    let mut e = next_extra_product_group(&mut e_iters, &mut e_cur)?;
+    let mut u = next_union_group(&mut u_iters, &mut u_cur).map_err(|err| *err)?;
+    let mut e = next_extra_product_group(&mut e_iters, &mut e_cur).map_err(|err| *err)?;
     let mut total: u128 = 0;
     while let (Some((us, usum)), Some((es, eprod))) = (u, e) {
         if us < es {
-            u = next_union_group(&mut u_iters, &mut u_cur)?;
+            u = next_union_group(&mut u_iters, &mut u_cur).map_err(|err| *err)?;
             continue;
         }
         if es < us {
-            e = next_extra_product_group(&mut e_iters, &mut e_cur)?;
+            e = next_extra_product_group(&mut e_iters, &mut e_cur).map_err(|err| *err)?;
             continue;
         }
         total = total.saturating_add((usum as u128).saturating_mul(eprod as u128));
-        u = next_union_group(&mut u_iters, &mut u_cur)?;
-        e = next_extra_product_group(&mut e_iters, &mut e_cur)?;
+        u = next_union_group(&mut u_iters, &mut u_cur).map_err(|err| *err)?;
+        e = next_extra_product_group(&mut e_iters, &mut e_cur).map_err(|err| *err)?;
     }
     Ok(total)
 }
@@ -515,23 +520,23 @@ fn merge_union_constraint_count_range_overlay(
         e_cur.push(s.next_group()?);
     }
 
-    let mut u = next_union_group(&mut u_streams, &mut u_cur)?;
-    let mut e = next_extra_product_group(&mut e_streams, &mut e_cur)?;
+    let mut u = next_union_group(&mut u_streams, &mut u_cur).map_err(|err| *err)?;
+    let mut e = next_extra_product_group(&mut e_streams, &mut e_cur).map_err(|err| *err)?;
     let mut total: u128 = 0;
     while let (Some((us, usum)), Some((es, eprod))) = (u, e) {
         if us < es {
-            u = next_union_group(&mut u_streams, &mut u_cur)?;
+            u = next_union_group(&mut u_streams, &mut u_cur).map_err(|err| *err)?;
             continue;
         }
         if es < us {
-            e = next_extra_product_group(&mut e_streams, &mut e_cur)?;
+            e = next_extra_product_group(&mut e_streams, &mut e_cur).map_err(|err| *err)?;
             continue;
         }
         if us >= lo && us < hi {
             total = total.saturating_add((usum as u128).saturating_mul(eprod as u128));
         }
-        u = next_union_group(&mut u_streams, &mut u_cur)?;
-        e = next_extra_product_group(&mut e_streams, &mut e_cur)?;
+        u = next_union_group(&mut u_streams, &mut u_cur).map_err(|err| *err)?;
+        e = next_extra_product_group(&mut e_streams, &mut e_cur).map_err(|err| *err)?;
     }
     Ok(total)
 }
@@ -939,4 +944,53 @@ fn count_union_star(
         e_cur = next_extra_product()?;
     }
     Ok(Some(total.min(u64::MAX as u128) as u64))
+}
+
+#[cfg(test)]
+mod group_result_tests {
+    use super::*;
+    use fluree_db_core::storage::residency::{FetchKind, NeedFetch};
+    use fluree_db_core::{ContentId, ContentKind};
+
+    struct MissingGroup(Option<QueryError>);
+    impl SubjectCountGroups for MissingGroup {
+        fn next_subject_group(&mut self) -> GroupResult {
+            Err(Box::new(self.0.take().expect("one failing read")))
+        }
+    }
+
+    #[test]
+    fn group_errors_preserve_typed_residency_misses() {
+        for union in [true, false] {
+            let cid = ContentId::new(ContentKind::IndexLeaf, b"missing group leaf");
+            let miss = NeedFetch::new(cid.clone(), FetchKind::IndexLeaf);
+            let expected = miss.to_string();
+            let error = QueryError::from_io("group leaf", miss.into_io_error());
+            let mut streams = [MissingGroup(Some(error))];
+            let mut current = [Some((7, 2))];
+            let result = if union {
+                next_union_group(&mut streams, &mut current)
+            } else {
+                next_extra_product_group(&mut streams, &mut current)
+            };
+            // This is the same conversion performed at the partition boundary.
+            let err = *result.expect_err("the source must fail");
+            assert_eq!(err.to_string(), expected);
+            assert!(!err.can_demote_in_expression());
+            assert!(!err.demotes_to_unbound_in_extend());
+            match err {
+                QueryError::NeedFetch(miss) => {
+                    assert_eq!(miss.cid, cid);
+                    assert_eq!(miss.kind, FetchKind::IndexLeaf);
+                }
+                other => panic!("lost typed residency miss: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn group_results_keep_successful_returns_small() {
+        assert!(std::mem::size_of::<GroupResult>() <= 32);
+    }
 }
