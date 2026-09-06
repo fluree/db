@@ -1778,8 +1778,7 @@ impl BackgroundIndexerWorker {
                         let gc_config = crate::gc::CleanGarbageConfig {
                             max_old_indexes: Some(self.config.gc_max_old_indexes),
                             min_time_garbage_mins: Some(self.config.gc_min_time_mins),
-                            // `None` takes the derived default of
-                            // `max_old_indexes * DEFAULT_HARD_MAX_MULTIPLE`.
+                            // `None` sets no ceiling: the age guard always holds.
                             hard_max_old_indexes: self.config.gc_hard_max_old_indexes,
                             artifact_cache_dir: Some(self.config.artifact_cache_dir()),
                         };

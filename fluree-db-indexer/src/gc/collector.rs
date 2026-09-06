@@ -216,6 +216,10 @@ fn current_timestamp_ms() -> i64 {
 /// Age is determined by the garbage record's `created_at_ms` field. A record
 /// with no timestamp predates the field and is treated as past the window.
 ///
+/// An optional `hard_max_old_indexes` ceiling overrides the age check for
+/// versions past it. See [`CleanGarbageConfig::hard_max_old_indexes`] for what
+/// that costs a query still reading one of those versions.
+///
 /// # Roots with no garbage manifest
 ///
 /// A root written before the manifest write became unconditional can carry
@@ -237,20 +241,15 @@ pub async fn clean_garbage(
     let min_age_mins = config
         .min_time_garbage_mins
         .unwrap_or(DEFAULT_MIN_TIME_GARBAGE_MINS);
-    // Past this many retained old versions the age guard is overridden — see
-    // `CleanGarbageConfig::hard_max_old_indexes`.
+    // Chain positions at or beyond this are collected regardless of record age;
+    // `None` means the age guard is never overridden. The chain is newest-first,
+    // so a larger position is an older version and the ceiling cuts the oldest
+    // tail. See `CleanGarbageConfig::hard_max_old_indexes` for the reader cost.
     //
-    // Deliberately NOT clamped up to `max_old_indexes`. An earlier revision did
-    // that, to stop a misconfigured ceiling collecting inside the retention
-    // target, but the retention target is already enforced one level up: the
-    // loop below starts at `keep_count`, so no value of this can reach a version
-    // the retention promise covers. The clamp could not change any observable
-    // behaviour — mutation-testing it removed broke nothing — so it is gone
-    // rather than kept as a guard that reads as load-bearing and is not.
-    let hard_max_old_indexes = config.hard_max_old_indexes.map_or_else(
-        || max_old_indexes.saturating_mul(super::DEFAULT_HARD_MAX_MULTIPLE as usize),
-        |v| v as usize,
-    );
+    // Deliberately not clamped up to `max_old_indexes`: the retention target is
+    // enforced by the loop bound below, which starts at `keep_count`, so no
+    // value here can reach a version the retention promise covers.
+    let hard_keep = config.hard_max_old_indexes.map(|v| 1 + v as usize);
     let min_age_ms = min_age_mins as i64 * 60 * 1000;
     let now_ms = current_timestamp_ms();
     let started = std::time::Instant::now();
@@ -274,10 +273,6 @@ pub async fn clean_garbage(
     // Retention: keep current + max_old_indexes
     // With max_old_indexes=5, keep_count=6 (indices 0..5)
     let keep_count = 1 + max_old_indexes;
-    // Chain positions at or beyond this are collected regardless of record age.
-    // Because the chain is newest-first, a LARGER index means an OLDER version, so
-    // this cuts the oldest tail and always leaves the newest `hard_keep` intact.
-    let hard_keep = 1 + hard_max_old_indexes;
 
     if index_chain.len() <= keep_count {
         // Not enough indexes to trigger GC
@@ -307,28 +302,30 @@ pub async fn clean_garbage(
     let mut deleted_count = 0;
     let mut indexes_cleaned = 0;
     let mut unnameable_indexes = 0;
+    let mut age_guard_overridden = 0;
 
     for i in (keep_count..index_chain.len()).rev() {
         let manifest_entry = &index_chain[i - 1];
         let entry_to_delete = &index_chain[i];
 
-        // The age guard protects concurrent readers, but it is a delay, not a
-        // bound: at a fast publish rate the versions inside the window outnumber
-        // `max_old_indexes` without limit and their history dominates the disk.
-        // Past `hard_keep` the disk wins — losing a concurrent read is
-        // recoverable by retry, running out of space is not, because GC itself
-        // has to write in order to free anything.
+        // The age guard is a delay, not a bound: at a fast publish rate the
+        // versions inside the window outnumber `max_old_indexes` without limit.
+        // Past an operator-set ceiling the versions go regardless of age, which
+        // can release artifacts a query that started against one of them is
+        // still reading. That is the ceiling's documented cost, so each override
+        // is counted and reported in the result rather than left at debug level.
         //
         // Expressed as a zero age floor rather than as a skip of the check, so
         // that the OTHER reasons `release_manifest_nodes` stops the walk — an
         // unreadable or unparseable manifest — still stop it. Only the age
         // reason is overridden.
-        let age_floor_ms = if i >= hard_keep {
+        let past_ceiling = matches!(hard_keep, Some(hk) if i >= hk);
+        let age_floor_ms = if past_ceiling {
             tracing::debug!(
                 t = manifest_entry.t,
                 chain_position = i,
                 hard_keep,
-                "Past hard retention ceiling, collecting regardless of age"
+                "Past retention ceiling, collecting regardless of age"
             );
             0
         } else {
@@ -391,6 +388,9 @@ pub async fn clean_garbage(
             );
         } else {
             indexes_cleaned += 1;
+            if past_ceiling {
+                age_guard_overridden += 1;
+            }
         }
     }
 
@@ -399,6 +399,7 @@ pub async fn clean_garbage(
             indexes_cleaned = indexes_cleaned,
             nodes_deleted = deleted_count,
             unnameable_indexes = unnameable_indexes,
+            age_guard_overridden = age_guard_overridden,
             retained_count = keep_count,
             "Garbage collection complete"
         );
@@ -407,6 +408,7 @@ pub async fn clean_garbage(
     Ok(CleanGarbageResult {
         indexes_cleaned,
         nodes_deleted: deleted_count,
+        age_guard_overridden,
     })
 }
 
@@ -893,9 +895,9 @@ mod tests {
     /// publishing faster than the guard accumulates versions without bound, since
     /// `max_old_indexes` is ANDed with the age check and so bounds nothing.
     ///
-    /// Note the sibling test above pins the complement: with the DEFAULT ceiling
-    /// (`max_old_indexes * 4`) this same chain is left alone, so the guard still
-    /// governs everything inside the ceiling.
+    /// Note the sibling test above pins the complement: with no ceiling set,
+    /// which is the default, this same chain is left alone, so the guard governs
+    /// everything unless an operator opts in.
     #[tokio::test]
     async fn test_hard_ceiling_collects_despite_recent_garbage() {
         let storage = MemoryStorage::new();
@@ -955,6 +957,10 @@ mod tests {
         assert_eq!(
             result.indexes_cleaned, 1,
             "the ceiling must override the age guard"
+        );
+        assert_eq!(
+            result.age_guard_overridden, 1,
+            "the override must be reported, not silent"
         );
 
         // The oldest root is gone; the retained newest ones survive.
@@ -1087,6 +1093,42 @@ mod tests {
         assert!(
             counts.iter().all(|&c| c <= keep_count),
             "roots must never exceed the retention target once GC runs; \
+             every 5th generation: {:?}",
+            every_fifth(&counts)
+        );
+    }
+
+    /// Production's regime — a live 30-minute age guard and fresh garbage
+    /// records — with no ceiling set, which is the default. Every version is
+    /// inside the guard, so GC must leave all of them alone. That is the
+    /// reader-safety property the guard exists for: a query that started
+    /// against any of these versions can still read it. The default
+    /// configuration must never trade that away, so this fails if a default
+    /// ceiling is ever derived again.
+    ///
+    /// Deleting GC leaves this green, deliberately: it pins the absence of an
+    /// override, and GC doing nothing is exactly the required behaviour.
+    #[tokio::test]
+    async fn repeated_publish_under_a_live_age_guard_retains_everything_by_default() {
+        const GENERATIONS: usize = 40;
+        const MAX_OLD: u32 = 2;
+
+        let counts = publish_then_gc(
+            GENERATIONS,
+            current_timestamp_ms,
+            CleanGarbageConfig {
+                max_old_indexes: Some(MAX_OLD),
+                min_time_garbage_mins: Some(30),
+                hard_max_old_indexes: None,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            *counts.last().unwrap(),
+            GENERATIONS,
+            "without a ceiling the age guard must hold every version; \
              every 5th generation: {:?}",
             every_fifth(&counts)
         );

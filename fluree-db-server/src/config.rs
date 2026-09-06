@@ -432,20 +432,21 @@ pub struct ServerConfig {
 
     /// Minimum age in minutes before an index version can be GC'd (default 30)
     ///
-    /// Protects concurrent readers of an older version. Note this is ANDed with
-    /// `--gc-max-old-indexes`, so the slower of the two wins.
+    /// Protects queries that started against an older version. This is ANDed
+    /// with `--gc-max-old-indexes`, so the slower of the two wins.
     #[arg(long, env = "FLUREE_GC_MIN_TIME_MINS")]
     pub gc_min_time_mins: Option<u32>,
 
     /// Retained old index versions past which the age guard is overridden and
-    /// versions are collected regardless of age (default: 4x max-old-indexes)
+    /// versions are collected regardless of age (default: unset, no ceiling)
     ///
-    /// This is the only setting that bounds index-history DISK use. Because the
-    /// two above are ANDed, a ledger publishing faster than the age guard
-    /// accumulates versions without limit and `--gc-max-old-indexes` bounds
-    /// nothing; only a count can bound bytes. Lower it if index history is
-    /// outgrowing the volume, accepting that a concurrent read of a collected
-    /// version fails and must retry.
+    /// Because the two above are ANDed, a ledger publishing faster than the age
+    /// guard accumulates versions without limit and `--gc-max-old-indexes`
+    /// bounds nothing. Set this to cap the chain anyway. Past the ceiling GC
+    /// releases artifacts a query still reading an older version may need, so
+    /// set it well above the number of versions published during your longest
+    /// query. It bounds versions, not bytes: size it from observed per-version
+    /// disk use.
     #[arg(long, env = "FLUREE_GC_HARD_MAX_OLD_INDEXES")]
     pub gc_hard_max_old_indexes: Option<u32>,
 
@@ -1388,5 +1389,55 @@ mod raft_validation_tests {
         cfg.storage_path = None;
         cfg.validate()
             .expect("missing storage_path should skip the disjoint check");
+    }
+}
+
+#[cfg(test)]
+mod gc_retention_flag_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// First hop of the env → `ServerConfig` → `FlureeBuilder` →
+    /// `IndexerConfig` path: the flags parse, the ceiling is unset unless
+    /// asked for, and each flag carries its documented env name.
+    #[test]
+    fn gc_retention_flags_parse_and_name_their_env_vars() {
+        let cfg = ServerConfig::try_parse_from([
+            "fluree-server",
+            "--gc-max-old-indexes",
+            "3",
+            "--gc-min-time-mins",
+            "45",
+            "--gc-hard-max-old-indexes",
+            "12",
+        ])
+        .expect("flags parse");
+        assert_eq!(cfg.gc_max_old_indexes, Some(3));
+        assert_eq!(cfg.gc_min_time_mins, Some(45));
+        assert_eq!(cfg.gc_hard_max_old_indexes, Some(12));
+
+        let unset = ServerConfig::try_parse_from(["fluree-server"]).expect("no flags parse");
+        assert_eq!(unset.gc_hard_max_old_indexes, None, "the ceiling is opt-in");
+
+        let cmd = ServerConfig::command();
+        let env_of = |id: &str| {
+            cmd.get_arguments()
+                .find(|a| a.get_id() == id)
+                .unwrap_or_else(|| panic!("{id} is a ServerConfig arg"))
+                .get_env()
+                .map(|e| e.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            env_of("gc_max_old_indexes").as_deref(),
+            Some("FLUREE_GC_MAX_OLD_INDEXES")
+        );
+        assert_eq!(
+            env_of("gc_min_time_mins").as_deref(),
+            Some("FLUREE_GC_MIN_TIME_MINS")
+        );
+        assert_eq!(
+            env_of("gc_hard_max_old_indexes").as_deref(),
+            Some("FLUREE_GC_HARD_MAX_OLD_INDEXES")
+        );
     }
 }

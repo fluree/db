@@ -184,15 +184,15 @@ pub struct IndexerConfig {
     pub gc_min_time_mins: u32,
 
     /// Retained old index versions past which `gc_min_time_mins` is overridden
-    /// and versions are collected regardless of age. `None` derives
-    /// `gc_max_old_indexes * 4`.
+    /// and versions are collected regardless of age. `None` (the default) sets
+    /// no ceiling.
     ///
-    /// Needed because the two thresholds above are ANDed, so the age guard always
-    /// wins under a fast publish rate and `gc_max_old_indexes` then bounds
-    /// nothing: retention becomes "however many versions fit in the guard", which
-    /// is unbounded in bytes. Only a count can bound bytes. See
-    /// [`crate::gc::CleanGarbageConfig::hard_max_old_indexes`] for the reader
-    /// trade-off this accepts.
+    /// Exists because the two thresholds above are ANDed, so under a fast
+    /// publish rate the age guard always wins and `gc_max_old_indexes` bounds
+    /// nothing. Overriding the guard can release artifacts a query that started
+    /// against an older version still needs, and the ceiling bounds versions
+    /// rather than bytes; see
+    /// [`crate::gc::CleanGarbageConfig::hard_max_old_indexes`].
     pub gc_hard_max_old_indexes: Option<u32>,
 
     /// How often the worker re-sweeps for ledgers whose indexing has stalled.
@@ -689,6 +689,12 @@ impl IndexerConfig {
         self
     }
 
+    /// Builder method to set the GC version ceiling; `None` removes it.
+    pub fn with_gc_hard_max_old_indexes(mut self, ceiling: Option<u32>) -> Self {
+        self.gc_hard_max_old_indexes = ceiling;
+        self
+    }
+
     /// Builder method to set the run-sort memory budget.
     ///
     /// For bulk imports of 1 GB+, use 1–2 GB (e.g., `1024 * 1024 * 1024`).
@@ -780,9 +786,20 @@ mod tests {
     fn test_gc_config_builders() {
         let config = IndexerConfig::default()
             .with_gc_max_old_indexes(10)
-            .with_gc_min_time_mins(60);
+            .with_gc_min_time_mins(60)
+            .with_gc_hard_max_old_indexes(Some(40));
         assert_eq!(config.gc_max_old_indexes, 10);
         assert_eq!(config.gc_min_time_mins, 60);
+        assert_eq!(config.gc_hard_max_old_indexes, Some(40));
+
+        // The ceiling is opt-in: no preset derives one.
+        for preset in [
+            IndexerConfig::default(),
+            IndexerConfig::small(),
+            IndexerConfig::large(),
+        ] {
+            assert_eq!(preset.gc_hard_max_old_indexes, None);
+        }
     }
 
     #[test]
