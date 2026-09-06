@@ -511,6 +511,13 @@ impl FullReadCut {
 /// rows, and returns the sequence of the commit the budget ran out in. The whole
 /// of that commit is kept: a cut INSIDE a commit leaves the target in a state no
 /// snapshot names, and an unnameable state cannot be checkpointed.
+///
+/// DEPENDS ON `mor_guard` failing closed. A row-budgeted prefix is only sound
+/// because the planner refuses merge-on-read delete files: a delete file with a
+/// sequence ABOVE the cut that targets data files at or below it would be applied
+/// by a later pass against rows this pass already committed as live. If MoR
+/// delete support ever lands, this cut must keep the deletes that target its
+/// prefix, or decline.
 fn full_read_prefix(tasks: &[fluree_db_iceberg::scan::FileScanTask], max_rows: i64) -> FullReadCut {
     if max_rows <= 0 {
         return FullReadCut::Disabled;
@@ -558,6 +565,38 @@ fn full_read_prefix(tasks: &[fluree_db_iceberg::scan::FileScanTask], max_rows: i
     // Unreachable: `total > max_rows` guarantees the accumulator crosses the
     // budget above. Typed as the harmless outcome rather than a panic.
     FullReadCut::PlanFits
+}
+
+/// How a bounded full read records the prefix it applied.
+#[derive(Debug, PartialEq, Eq)]
+enum FullReadRoute {
+    /// A retained snapshot names the prefix: report it as the scan's `to`, so the
+    /// caller's existing watermark write lands there and the next pass is an
+    /// ordinary incremental scan from it.
+    Checkpoint(i64),
+    /// Nothing retained short of the head names the prefix: persist the cut as a
+    /// SEQUENCE cursor and let the next pass resume above it.
+    Cursor,
+}
+
+/// Choose between the two, given the newest retained ancestor at or below the cut.
+///
+/// The cursor is the fallback, and it is what lets the bound take its FIRST step
+/// on the tables it was written for. A table whose watermark has expired has, by
+/// definition, lost its old snapshots, so the cut — which lands near the start of
+/// the backlog — usually sits below every retained one and `checkpoint` is `None`.
+/// Falling through to an unbounded read there was the livelock: the read exceeds
+/// the novelty ceiling, defers, records nothing, and repeats. Recording the cut as
+/// a cursor instead costs nothing — the prefix is already whole commits — and the
+/// cursor route needs no snapshot at all.
+///
+/// The head is never a checkpoint: reporting `to` as the watermark while the
+/// target holds a prefix would claim rows that were never applied.
+fn route_full_read_cut(checkpoint: Option<i64>, to_snapshot_id: i64) -> FullReadRoute {
+    match checkpoint {
+        Some(id) if id != to_snapshot_id => FullReadRoute::Checkpoint(id),
+        _ => FullReadRoute::Cursor,
+    }
 }
 
 /// How far a sequence-bounded pass gets through the tasks above its cursor.
@@ -1886,57 +1925,61 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 let cut = full_read_prefix(&plan.tasks, budget_rows);
                 match cut {
                     FullReadCut::Cut(cut_seq) => {
-                        match metadata.snapshot_at_or_before_sequence(to_snapshot_id, cut_seq) {
-                            Ok(Some(checkpoint)) if checkpoint.snapshot_id != to_snapshot_id => {
-                                let kept: Vec<_> = plan
-                                    .tasks
-                                    .into_iter()
-                                    .filter(|t| {
-                                        t.data_sequence_number.is_some_and(|s| s <= cut_seq)
-                                    })
-                                    .collect();
+                        // The prefix is the same either way; only how it is RECORDED
+                        // differs. `Err` from the walk can only mean `to` itself failed
+                        // to resolve, which the lookup above rules out — and the cursor
+                        // route needs no snapshot, so it is folded into "nothing
+                        // nameable" rather than aborting a read that can still make
+                        // progress.
+                        let checkpoint = metadata
+                            .snapshot_at_or_before_sequence(to_snapshot_id, cut_seq)
+                            .ok()
+                            .flatten()
+                            .map(|s| s.snapshot_id);
+                        let files_total = plan.files_selected;
+                        let kept: Vec<_> = plan
+                            .tasks
+                            .into_iter()
+                            .filter(|t| t.data_sequence_number.is_some_and(|s| s <= cut_seq))
+                            .collect();
+                        match route_full_read_cut(checkpoint, to_snapshot_id) {
+                            FullReadRoute::Checkpoint(checkpoint_id) => {
                                 info!(
                                     to_snapshot_id,
-                                    checkpoint_snapshot_id = checkpoint.snapshot_id,
+                                    checkpoint_snapshot_id = checkpoint_id,
                                     checkpoint_sequence = cut_seq,
                                     files_this_pass = kept.len(),
-                                    files_total = plan.files_selected,
+                                    files_total,
+                                    budget_rows,
                                     "materialize: full read bounded to a commit prefix; \
-                             the watermark will checkpoint short of the head"
+                                     the watermark will checkpoint short of the head"
                                 );
                                 // Reporting the checkpoint as this scan's `to` is what
                                 // makes the caller's existing watermark write land there —
                                 // no new vocabulary, and the crash-safety ordering
                                 // (watermark after data) is unchanged.
-                                to_snapshot_id = checkpoint.snapshot_id;
-                                kept
+                                to_snapshot_id = checkpoint_id;
                             }
-                            // No nameable checkpoint short of the head: read it whole.
-                            // Better an expensive honest read than a watermark pointing
-                            // somewhere the data does not correspond to — but SAY SO,
-                            // because an unbounded read over the novelty ceiling cannot
-                            // commit, and what cannot commit writes no watermark and so
-                            // repeats forever.
-                            outcome => {
-                                warn!(
+                            // No retained snapshot names the cut. This is the FIRST pass
+                            // on every table whose history has expired — the shape this
+                            // bound exists for — and it used to fall through to the
+                            // unbounded read. The cursor is what the next pass resumes
+                            // from instead; see `route_full_read_cut`.
+                            FullReadRoute::Cursor => {
+                                info!(
                                     to_snapshot_id,
-                                    cut_sequence = cut_seq,
+                                    to_sequence = cut_seq,
+                                    files_this_pass = kept.len(),
+                                    files_total,
                                     budget_rows,
-                                    estimated_rows = plan.estimated_row_count,
-                                    files = plan.files_selected,
-                                    reason = match outcome {
-                                        Ok(None) => "no retained snapshot names the cut",
-                                        Ok(Some(_)) => "the only nameable checkpoint is the head",
-                                        Err(_) => "the checkpoint walk failed",
-                                    },
-                                    "materialize: full read could NOT be bounded — reading the \
-                                 whole table. If this window exceeds the novelty ceiling it \
-                                 cannot commit, and an uncommitted window writes no watermark, \
-                                 so this repeats on every poll"
+                                    "materialize: full read bounded to a commit prefix; no \
+                                     retained snapshot names it, so the pass records a \
+                                     sequence cursor and the snapshot watermark stays put"
                                 );
-                                plan.tasks
+                                to_sequence = Some(cut_seq);
                             }
                         }
+                        kept
                     }
                     // Not every decline is news: `PlanFits` is the healthy small read
                     // and `Disabled` is a deliberate choice. The other two mean an
@@ -5468,6 +5511,24 @@ mod tests {
         assert_eq!(
             super::sequence_prefix_cut(&tasks, 0, 40),
             Some(SeqCut::Prefix(10))
+        );
+    }
+
+    /// The route decision, on its own. `None` — the only answer an expired-history
+    /// table can give — must become a cursor, never an unbounded read.
+    #[test]
+    fn an_unnameable_cut_becomes_a_cursor_and_a_retained_one_a_checkpoint() {
+        use super::FullReadRoute;
+        assert_eq!(super::route_full_read_cut(None, 7), FullReadRoute::Cursor);
+        assert_eq!(
+            super::route_full_read_cut(Some(6), 7),
+            FullReadRoute::Checkpoint(6)
+        );
+        // The head is never a checkpoint: a watermark at `to` while the target
+        // holds a prefix claims rows that were never applied.
+        assert_eq!(
+            super::route_full_read_cut(Some(7), 7),
+            FullReadRoute::Cursor
         );
     }
 
