@@ -69,11 +69,18 @@ impl TriplesMap {
         self
     }
 
-    /// Get the table name if this is a table-based logical table
+    /// The logical table's name: the `rr:tableName`, or for an `rr:sqlQuery`
+    /// its deterministic alias — so every consumer keyed on table names (the
+    /// scan operator, provider caches, `find_maps_for_table`) treats a query
+    /// exactly like a table. A provider that can run SQL resolves the alias
+    /// back to the query text through [`Self::sql_query`].
     pub fn table_name(&self) -> Option<&str> {
-        match &self.logical_table {
-            LogicalTable::TableName(name) => Some(name),
-        }
+        self.logical_table.name()
+    }
+
+    /// The `rr:sqlQuery` text, when this map is query-backed.
+    pub fn sql_query(&self) -> Option<&str> {
+        self.logical_table.sql_query_text()
     }
 
     /// Get all columns referenced by this TriplesMap
@@ -171,6 +178,41 @@ impl TriplesMap {
     /// reading any POM or parent column for it is wasted I/O. Use this instead of
     /// `columns_for_predicate(None)` (which projects every POM column) when the
     /// pattern has no object variable.
+    /// Whether `other` reads the same rows and mints the same subject from
+    /// them: the same logical table and the same subject template, column
+    /// or constant (its classes aside).
+    pub fn same_source_row(&self, other: &TriplesMap) -> bool {
+        let (a, b) = (&self.subject_map, &other.subject_map);
+        self.logical_table == other.logical_table
+            && a.template == b.template
+            && a.template_columns == b.template_columns
+            && a.column == b.column
+            && a.constant == b.constant
+            && a.term_type == b.term_type
+    }
+
+    /// The object map of the first predicate-object map naming `predicate`
+    /// as a constant — the one the projection path materializes under a
+    /// predicate filter (`columns_for_predicate`); a second map for the same
+    /// predicate is not read there either.
+    pub fn object_map_for(&self, predicate: &str) -> Option<&super::term_map::ObjectMap> {
+        self.predicate_object_maps
+            .iter()
+            .find(|pom| pom.predicate_map.as_constant() == Some(predicate))
+            .map(|pom| &pom.object_map)
+    }
+
+    /// Whether the two maps mint `predicate` alike — from the same rows,
+    /// the same subject and the same object map — and so the same triples,
+    /// which an RDF graph holds once.
+    pub fn mints_alike(&self, other: &TriplesMap, predicate: &str) -> bool {
+        self.same_source_row(other)
+            && matches!(
+                (self.object_map_for(predicate), other.object_map_for(predicate)),
+                (Some(a), Some(b)) if a == b
+            )
+    }
+
     pub fn subject_columns(&self) -> Vec<&str> {
         let mut columns: Vec<&str> = self
             .subject_map
@@ -259,15 +301,23 @@ impl TriplesMap {
 /// Logical table source
 ///
 /// Defines where the tabular data comes from.
-/// For Iceberg graph sources, only table names are supported (not SQL queries).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Iceberg graph sources accept only table names; SQL graph sources also
+/// accept `rr:sqlQuery`, which is scanned as a derived table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LogicalTable {
     /// `rr:tableName` - direct table reference
     ///
     /// Table names are normalized to dot notation: "namespace.table"
     TableName(String),
-    // Note: rr:sqlQuery is explicitly NOT supported for Iceberg graph sources
+    /// `rr:sqlQuery` - a SQL SELECT used as the logical table. `alias` is a
+    /// deterministic name derived from the query text, used wherever a table
+    /// name is expected.
+    SqlQuery { sql: String, alias: String },
 }
+
+/// Prefix of every `rr:sqlQuery` alias, so a provider without SQL support can
+/// recognize and refuse one.
+pub const SQL_QUERY_ALIAS_PREFIX: &str = "sqlQuery:";
 
 impl LogicalTable {
     /// Create a table name logical table
@@ -275,10 +325,46 @@ impl LogicalTable {
         LogicalTable::TableName(name.into())
     }
 
-    /// Get the table name if this is a table-based logical table
+    /// Create a query-backed logical table.
+    pub fn sql_query(sql: impl Into<String>) -> Self {
+        let sql = sql.into();
+        let alias = Self::alias_for_query(&sql);
+        LogicalTable::SqlQuery { sql, alias }
+    }
+
+    fn alias_for_query(sql: &str) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        sql.trim().hash(&mut h);
+        format!("{SQL_QUERY_ALIAS_PREFIX}{:016x}", h.finish())
+    }
+
+    /// Whether `name` is an `rr:sqlQuery` alias rather than a real table.
+    pub fn is_sql_query_alias(name: &str) -> bool {
+        name.starts_with(SQL_QUERY_ALIAS_PREFIX)
+    }
+
+    /// The table name or query alias.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            LogicalTable::TableName(name) => Some(name),
+            LogicalTable::SqlQuery { alias, .. } => Some(alias),
+        }
+    }
+
+    /// The query text for a query-backed logical table.
+    pub fn sql_query_text(&self) -> Option<&str> {
+        match self {
+            LogicalTable::TableName(_) => None,
+            LogicalTable::SqlQuery { sql, .. } => Some(sql),
+        }
+    }
+
+    /// The `rr:tableName`, or `None` for a query-backed logical table.
     pub fn as_table_name(&self) -> Option<&str> {
         match self {
             LogicalTable::TableName(name) => Some(name),
+            LogicalTable::SqlQuery { .. } => None,
         }
     }
 
@@ -473,6 +559,53 @@ mod tests {
 
         let cols = extract_template_columns("{a}{b}{c}");
         assert_eq!(cols, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn mints_alike_needs_same_rows_subject_and_object_map() {
+        use super::super::{ObjectMap, PredicateMap, RefObjectMap};
+        const LABEL: &str = "http://example.org/label";
+        let pom = |om: ObjectMap| PredicateObjectMap {
+            predicate_map: PredicateMap::constant(LABEL),
+            object_map: om,
+        };
+        let base = || {
+            TriplesMap::new("<#A>", "customers")
+                .with_subject_template("http://example.org/customer/{id}")
+                .with_class("http://example.org/A")
+        };
+        let a = base().with_predicate_object(pom(ObjectMap::column("name")));
+
+        // Classes aside, the same rows, subject and object map.
+        let b = TriplesMap::new("<#B>", "customers")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_class("http://example.org/B")
+            .with_predicate_object(pom(ObjectMap::column("name")));
+        assert!(a.mints_alike(&b, LABEL));
+        assert!(b.mints_alike(&a, LABEL));
+
+        // Another column, a datatype, a template or a reference derive the
+        // value differently.
+        for om in [
+            ObjectMap::column("nickname"),
+            ObjectMap::column_typed("name", "http://www.w3.org/2001/XMLSchema#string"),
+            ObjectMap::template("{name}", vec!["name".into()]),
+            ObjectMap::RefObjectMap(RefObjectMap::new("<#Parent>", "name", "id")),
+        ] {
+            assert!(!a.mints_alike(&base().with_predicate_object(pom(om)), LABEL));
+        }
+        // Other rows or another subject.
+        let other_table = TriplesMap::new("<#C>", "profiles")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_predicate_object(pom(ObjectMap::column("name")));
+        assert!(!a.mints_alike(&other_table, LABEL));
+        let other_subject = base()
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(ObjectMap::column("name")));
+        assert!(!a.mints_alike(&other_subject, LABEL));
+        // A predicate one side lacks.
+        assert!(!a.mints_alike(&base(), LABEL));
+        assert!(!a.mints_alike(&b, "http://example.org/other"));
     }
 
     #[test]

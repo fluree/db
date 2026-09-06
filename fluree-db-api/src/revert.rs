@@ -301,17 +301,25 @@ impl crate::Fluree {
             None => return Ok((current_head_t, current_head_id)),
         };
 
-        let content_store = self.content_store(branch_id);
-        let publisher = self.publisher()?;
-        let (receipt, new_state) = staged.apply(&content_store, publisher).await?;
-
-        if let Some(guard) = write_guard {
-            let needs_reindex = new_state.should_reindex(&self.index_config);
-            self.finalize_commit(guard, new_state, receipt.t, needs_reindex)
-                .await?;
+        match write_guard {
+            // Cached-handle path: the staged base was cloned from the locked
+            // cache, so detach the slot for the apply window — otherwise the
+            // revert commit's dictionary `make_mut`s deep-clone against the
+            // cache's co-held Arcs. Shielded + evict-on-failure semantics
+            // live in the shared helper.
+            Some(guard) => {
+                let receipt = self.apply_staged_detached(guard, staged).await?;
+                Ok((receipt.t, receipt.commit_id))
+            }
+            // No manager: the build loaded fresh state with no shared cache
+            // to detach or finalize.
+            None => {
+                let content_store = self.content_store(branch_id);
+                let publisher = self.publisher()?;
+                let (receipt, _new_state) = staged.apply(&content_store, publisher).await?;
+                Ok((receipt.t, receipt.commit_id))
+            }
         }
-
-        Ok((receipt.t, receipt.commit_id))
     }
 
     /// Resolve `selection` against `branch`'s current state, walk the DAG,

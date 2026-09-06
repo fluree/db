@@ -27,7 +27,7 @@ use fluree_db_consensus::raft::nameservice::RaftNameService;
 use fluree_db_consensus::raft::state_machine::{
     BodyKind, Command as SmCommand, NewLedger, QueueSubmission, RefKey, Response, StagedHead,
 };
-use fluree_db_consensus::raft::state_machine_adapter::StateMachineAdapter;
+use fluree_db_consensus::raft::state_machine_adapter::{NameServiceObserver, StateMachineAdapter};
 use fluree_db_consensus::raft::storage::memory::MemoryRaftStorage;
 use fluree_db_consensus::raft::{ClusterNode, NodeId, TypeConfig};
 use fluree_db_nameservice::{
@@ -86,7 +86,7 @@ fn cid(seed: u8) -> ContentId {
 async fn single_node_create_ledger_round_trip() {
     let storage = Arc::new(MemoryRaftStorage::new());
     let log = LogAdapter::new(Arc::clone(&storage));
-    let sm = StateMachineAdapter::new(Arc::clone(&storage));
+    let sm = StateMachineAdapter::new(Arc::clone(&storage), NameServiceObserver::new());
 
     // Tight timing so the test doesn't dawdle.
     let config = Config {
@@ -130,7 +130,7 @@ async fn single_node_create_ledger_round_trip() {
 async fn single_node_raft_index_publisher_round_trip() {
     let storage = Arc::new(MemoryRaftStorage::new());
     let log = LogAdapter::new(Arc::clone(&storage));
-    let sm = StateMachineAdapter::new(Arc::clone(&storage));
+    let sm = StateMachineAdapter::new(Arc::clone(&storage), NameServiceObserver::new());
     let shared_state = sm.shared_state();
 
     let config = Config {
@@ -252,7 +252,10 @@ async fn single_node_apply_emits_commit_event_on_bus() {
     let storage = Arc::new(MemoryRaftStorage::new());
     let event_bus = Arc::new(LedgerEventBus::new(16));
     let log = LogAdapter::new(Arc::clone(&storage));
-    let sm = StateMachineAdapter::new(Arc::clone(&storage)).with_event_bus(Arc::clone(&event_bus));
+    let sm = StateMachineAdapter::new(
+        Arc::clone(&storage),
+        NameServiceObserver::new().with_event_bus(Arc::clone(&event_bus)),
+    );
 
     let config = Config {
         cluster_name: "single-node-event-bus".into(),
@@ -354,7 +357,10 @@ async fn single_node_ledger_lifecycle_round_trip() {
     let storage = Arc::new(MemoryRaftStorage::new());
     let bus = Arc::new(LedgerEventBus::new(16));
     let log = LogAdapter::new(Arc::clone(&storage));
-    let sm = StateMachineAdapter::new(Arc::clone(&storage)).with_event_bus(Arc::clone(&bus));
+    let sm = StateMachineAdapter::new(
+        Arc::clone(&storage),
+        NameServiceObserver::new().with_event_bus(Arc::clone(&bus)),
+    );
     let shared_state = sm.shared_state();
 
     let config = Config {
@@ -450,7 +456,10 @@ async fn single_node_branch_lifecycle_round_trip() {
     let storage = Arc::new(MemoryRaftStorage::new());
     let bus = Arc::new(LedgerEventBus::new(16));
     let log = LogAdapter::new(Arc::clone(&storage));
-    let sm = StateMachineAdapter::new(Arc::clone(&storage)).with_event_bus(Arc::clone(&bus));
+    let sm = StateMachineAdapter::new(
+        Arc::clone(&storage),
+        NameServiceObserver::new().with_event_bus(Arc::clone(&bus)),
+    );
     let shared_state = sm.shared_state();
 
     let config = Config {
@@ -596,7 +605,7 @@ async fn single_node_branch_lifecycle_round_trip() {
 async fn single_node_status_config_round_trip_normalizes_ledger_id() {
     let storage = Arc::new(MemoryRaftStorage::new());
     let log = LogAdapter::new(Arc::clone(&storage));
-    let sm = StateMachineAdapter::new(Arc::clone(&storage));
+    let sm = StateMachineAdapter::new(Arc::clone(&storage), NameServiceObserver::new());
     let shared_state = sm.shared_state();
 
     let config = Config {

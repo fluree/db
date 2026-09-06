@@ -604,6 +604,11 @@ impl crate::Fluree {
                 .await?;
         }
 
+        // No cache detach here (unlike merge/revert's `apply_staged_detached`):
+        // the replay base is a direct storage load (`self.ledger(&source_id)`),
+        // never a clone of the cached state, so the cache co-holds none of the
+        // dictionaries the replay's `make_mut`s extend — the state threads
+        // owned through the loop. This install performs no dictionary work.
         if let Some(guard) = write_guard {
             let needs_reindex = final_state.should_reindex(&self.index_config);
             let commit_t = final_state.t();

@@ -105,7 +105,11 @@ macro_rules! view_context_config {
         // (`operator.rs`), so it would return zero rows for every
         // policy-enforced query. Do not "upgrade" this.
         let __index_provider = $crate::FlureeIndexProvider::new($self);
-        let $cfg = ContextConfig {
+        #[allow(
+            unused_mut,
+            reason = "vector_provider is set inside cfg(feature = \"vector\")"
+        )]
+        let mut $cfg = ContextConfig {
             tracker: Some($tracker),
             cancellation: $options.cancellation.clone(),
             policy_enforcer: __db.policy_enforcer().cloned(),
@@ -128,6 +132,12 @@ macro_rules! view_context_config {
             trust_fk_refs: $options.trust_fk_refs,
             ..Default::default()
         };
+        // The same provider answers `f:queryVector` when the embedded HNSW
+        // index is compiled in.
+        #[cfg(feature = "vector")]
+        {
+            $cfg.vector_provider = Some(&__index_provider);
+        }
     };
 }
 

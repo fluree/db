@@ -28,6 +28,13 @@ Idempotent transactions that replace values for supplied predicates:
 - Idempotent operations
 - Synchronization patterns
 
+### [Sync (graph synchronization)](sync.md)
+
+Whole-graph replacement that commits only the delta:
+- Retracts what the payload omits, asserts what it adds
+- Identical payload → no commit
+- Dry run and empty-payload safety rails
+
 ### [Update (WHERE/DELETE/INSERT)](update-where-delete-insert.md)
 
 Targeted updates to existing data:
@@ -215,6 +222,7 @@ POST /upsert?ledger=mydb:main
 - **Insert** (`POST /insert`) — add triples (JSON-LD or Turtle)
 - **Update** (`POST /update`) — WHERE/DELETE/INSERT (JSON-LD) or SPARQL UPDATE
 - **Upsert** (`POST /upsert`) — replace values for the predicates you supply (JSON-LD, Turtle, TriG)
+- **Sync** (`POST /sync`) — make one named graph's contents exactly the payload, committing only the delta (JSON-LD)
 
 ## Transaction Validation
 

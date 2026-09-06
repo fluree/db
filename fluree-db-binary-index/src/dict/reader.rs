@@ -8,12 +8,12 @@
 //! the global LRU cache (respecting the customer's memory budget). Without
 //! a cache, leaves are read directly from disk on each lookup.
 
+use fluree_db_core::clock::Instant;
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use super::branch::DictBranch;
 use super::reverse_leaf::ReverseLeaf;
@@ -416,12 +416,63 @@ impl DictTreeReader {
         Ok(results)
     }
 
+    /// Residency-mode leaf load: no filesystem and no sync→async bridge —
+    /// serve the global cache, then the content store's residency tier
+    /// (`resolve_cached_bytes`), surfacing a typed
+    /// [`crate::read::need_fetch::NeedFetch`] miss (recorded in the store's
+    /// miss register) for an async caller to fetch and retry. Kept free of
+    /// `Instant::now()` timing stamps, which trap on wasm32.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    fn load_leaf_resident(
+        &self,
+        cs: &Arc<dyn ContentStore>,
+        remote_cids: &HashMap<String, ContentId>,
+        address: &str,
+    ) -> io::Result<Arc<[u8]>> {
+        use crate::read::need_fetch::{resident_or_need_fetch, FetchKind};
+        let cid = remote_cids.get(address).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("dict tree: no CID mapping for leaf {address}"),
+            )
+        })?;
+        if let Some(cache) = &self.global_cache {
+            let cache_key = xxhash_rust::xxh3::xxh3_128(address.as_bytes());
+            if let Some(bytes) = cache.get_dict_leaf(cache_key) {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(bytes);
+            }
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+            // Residency invariant: resolve residency BEFORE entering the
+            // cache's loader closure — loader errors are shared as
+            // `Arc<io::Error>` and re-wrapped, which keeps the typed miss
+            // only via the rewrap helper's best effort.
+            let bytes = resident_or_need_fetch(cs.as_ref(), cid, FetchKind::DictLeaf)?;
+            cache.try_get_or_load_dict_leaf(cache_key, move || Ok(bytes))
+        } else {
+            resident_or_need_fetch(cs.as_ref(), cid, FetchKind::DictLeaf)
+        }
+    }
+
     /// Load leaf bytes from the configured source.
     ///
     /// For `LocalFiles` with a global cache: uses the cache (keyed by
     /// `xxh3_128(cas_address)`) to avoid repeated disk reads.
     /// Without a cache: reads directly from disk.
+    ///
+    /// Residency-mode stores (miss-register-bearing `CasOnDemand` sources)
+    /// divert to [`Self::load_leaf_resident`] before any filesystem probe or
+    /// timing stamp.
     fn load_leaf(&self, address: &str) -> io::Result<Arc<[u8]>> {
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if let LeafSource::CasOnDemand {
+            cs, remote_cids, ..
+        } = &self.leaf_source
+        {
+            if cs.miss_register().is_some() {
+                return self.load_leaf_resident(cs, remote_cids, address);
+            }
+        }
         fn read_disk_cached_leaf(
             disk_cache_dir: Option<&PathBuf>,
             cid: &ContentId,

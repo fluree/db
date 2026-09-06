@@ -261,8 +261,15 @@ async fn poll_remote_import(
             }
             Some("running" | "awaiting-upload") => {}
             other => {
+                // `other` is `Option<&str>`; Debug-printing it rendered the
+                // Rust container — `unexpected remote import status:
+                // Some("weird")`. Show the status the way the server sent it,
+                // and fall back to the raw JSON when the field is absent or
+                // isn't a string (`null`, a number, an object) so the message
+                // still names what arrived.
+                let shown = other.map_or_else(|| status["status"].to_string(), ToString::to_string);
                 return Err(CliError::Remote(format!(
-                    "unexpected remote import status: {other:?}"
+                    "unexpected remote import status: {shown}"
                 )));
             }
         }
@@ -853,6 +860,13 @@ async fn run_bulk_import(
         "\n\nAbout ledger '{}':\nImported {:.1}M flakes in {:.2}s ({:.2} M flakes/s) across {} commits (t={})",
         ledger, total_m, secs, mflakes_per_sec, result.t, result.t
     );
+    if result.duplicates_removed > 0 {
+        println!(
+            "Collapsed {} duplicate statement(s); the index holds {} distinct flakes",
+            format_with_commas(result.duplicates_removed),
+            format_with_commas(result.flake_count - result.duplicates_removed)
+        );
+    }
 
     if let Some(ref summary) = result.summary {
         if !summary.top_classes.is_empty() {

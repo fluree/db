@@ -2026,8 +2026,8 @@ async fn merge_shacl_opts_unit_test() {
 
     let view = fluree.db(ledger_id).await.unwrap();
     let resolved = view.resolved_config().expect("resolved config");
-    let shacl =
-        config_resolver::merge_shacl_opts(resolved, None).expect("shacl config should be present");
+    let shacl = config_resolver::merge_shacl_opts(resolved, None, None)
+        .expect("shacl config should be present");
 
     assert!(shacl.enabled, "SHACL should be enabled");
     assert_eq!(
@@ -3451,5 +3451,634 @@ async fn anonymous_request_unenforced_despite_config_default_allow_false() {
         names,
         vec!["Alice".to_string(), "Bob".to_string()],
         "anonymous requests remain unenforced regardless of config default-allow"
+    );
+}
+
+// =============================================================================
+// Reasoning defaults: mode spelling, `f:schemaSource`, and the SPARQL path
+// =============================================================================
+//
+// `reasoning_defaults_apply` above covers one config shape on the JSON-LD
+// connection path, which resolves config while building its view. These
+// cover the path that does not: a view built by `GraphDb::from_ledger_state`
+// and queried with `Fluree::query`, which reaches query preparation carrying
+// no resolved config. That is the crate-level shape of fluree/db#1577 —
+// every test below fails without `complete_config_defaults`.
+//
+// They also widen the config surface along the three dimensions a real
+// config varies in: the mode written as an uppercase IRI (`f:RDFS`), an
+// `f:schemaSource` GraphRef naming the default graph, and the SPARQL
+// front-end.
+
+/// Seed the subProperty ontology + data, then write a reasoning config.
+///
+/// `extra_stmts` carries any additional statements on
+/// `<urn:config:reasoning>` the caller needs.
+async fn seed_reasoning_defaults_with(
+    ledger_id: &str,
+    modes_stmt: &str,
+    extra_stmts: &str,
+) -> fluree_db_api::Fluree {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, ledger_id);
+
+    let result = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+                },
+                "@graph": [
+                    {"@id": "ex:childName", "rdfs:subPropertyOf": {"@id": "ex:name"}},
+                    {"@id": "ex:alice", "ex:childName": "Alice"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:reasoningDefaults <urn:config:reasoning> .
+            {modes_stmt}
+            {extra_stmts}
+        }}
+    "
+    );
+    fluree
+        .stage_owned(result.ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write");
+
+    fluree
+}
+
+/// An `f:schemaSource` block: a `f:GraphRef` whose nested `f:graphSource`
+/// selects the ledger's default graph.
+const SCHEMA_SOURCE_DEFAULT_GRAPH: &str = r"
+            <urn:config:reasoning> f:schemaSource <urn:config:reasoning:source> .
+            <urn:config:reasoning:source> rdf:type f:GraphRef .
+            <urn:config:reasoning:source> f:graphSource <urn:config:reasoning:source:graph> .
+            <urn:config:reasoning:source:graph> f:graphSelector f:defaultGraph .";
+
+/// Run the JSON-LD query that the RDFS subProperty expansion should answer.
+///
+/// Deliberately goes through `GraphDb::from_ledger_state` + `Fluree::query`
+/// rather than `query_connection`: that pair is the crate's documented
+/// quickstart path (see the `lib.rs` module docs), and it is the one that
+/// hands query preparation a view with no resolved config — the same shape
+/// the ledger-scoped server routes build, and the shape that made
+/// fluree/db#1577 reproduce. Routing these through `query_connection`
+/// instead would make every assertion below pass with or without the fix.
+async fn entailed_names_jsonld(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> serde_json::Value {
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?v",
+        "where": {"@id": "ex:alice", "ex:name": "?v"}
+    });
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state);
+    let result = fluree.query(&db, &query).await.expect("query");
+    result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld")
+}
+
+/// Run the same query as SPARQL, over the same bare view.
+async fn entailed_names_sparql(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    prologue: &str,
+) -> Vec<serde_json::Value> {
+    let sparql = format!(
+        "{prologue}PREFIX ex: <http://example.org/>
+         SELECT ?v WHERE {{ ex:alice ex:name ?v }}"
+    );
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state);
+    let result = fluree.query(&db, &sparql).await.expect("sparql query");
+    let json = result
+        .to_sparql_json(&ledger_state.snapshot)
+        .expect("to_sparql_json");
+    support::normalize_sparql_bindings(&json)
+}
+
+/// Mode names are matched case-insensitively once the namespace prefix is
+/// stripped, so the uppercase IRI `f:RDFS` names the same mode as `f:rdfs`.
+#[tokio::test]
+async fn reasoning_modes_uppercase_iri_engages() {
+    let ledger_id = "it/config-reasoning-uppercase-mode:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:RDFS .",
+        "",
+    )
+    .await;
+
+    assert_eq!(
+        entailed_names_jsonld(&fluree, ledger_id).await,
+        json!(["Alice"]),
+        "`f:reasoningModes f:RDFS` should engage RDFS reasoning"
+    );
+}
+
+/// Config defaults reach the SPARQL front-end, not only JSON-LD.
+#[tokio::test]
+async fn reasoning_defaults_apply_on_sparql_path() {
+    let ledger_id = "it/config-reasoning-sparql:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        "",
+    )
+    .await;
+
+    let bindings = entailed_names_sparql(&fluree, ledger_id, "").await;
+    assert_eq!(
+        bindings.len(),
+        1,
+        "config RDFS defaults should apply on the SPARQL path, got {bindings:?}"
+    );
+    assert_eq!(bindings[0]["v"]["value"], json!("Alice"));
+}
+
+/// An `f:schemaSource` naming the default graph resolves to the graph the
+/// ontology already lives in, so it neither adds nor removes entailments.
+#[tokio::test]
+async fn reasoning_defaults_with_default_graph_schema_source_engage() {
+    let ledger_id = "it/config-reasoning-schema-source:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        SCHEMA_SOURCE_DEFAULT_GRAPH,
+    )
+    .await;
+
+    assert_eq!(
+        entailed_names_jsonld(&fluree, ledger_id).await,
+        json!(["Alice"]),
+        "an `f:schemaSource` selecting the default graph should not suppress reasoning"
+    );
+}
+
+/// All three dimensions at once — uppercase mode IRI, `f:schemaSource`,
+/// SPARQL — with a pragma control that leaves the mode source as the only
+/// difference between the two queries.
+#[tokio::test]
+async fn config_reasoning_matches_pragma_reasoning() {
+    let ledger_id = "it/config-reasoning-combined:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:RDFS .",
+        SCHEMA_SOURCE_DEFAULT_GRAPH,
+    )
+    .await;
+
+    // Control: the same query with the modes supplied per-query instead.
+    let with_pragma = entailed_names_sparql(&fluree, ledger_id, "# PRAGMA reasoning: rdfs\n").await;
+    assert_eq!(
+        with_pragma.len(),
+        1,
+        "pragma control should entail, got {with_pragma:?}"
+    );
+
+    let without_pragma = entailed_names_sparql(&fluree, ledger_id, "").await;
+    assert_eq!(
+        without_pragma.len(),
+        1,
+        "config defaults should entail without the pragma, got {without_pragma:?}"
+    );
+    assert_eq!(without_pragma[0]["v"]["value"], json!("Alice"));
+}
+
+// =============================================================================
+// Config defaults vs. an explicit view-level reasoning wrapper
+// =============================================================================
+//
+// Config supplies *defaults*. A caller who attaches reasoning to the view has
+// made a decision, and `with_reasoning_precedence` overwrites `reasoning`
+// outright, so applying config defaults after the caller would discard that
+// decision with no way to recover it: `effective_reasoning` arbitrates only
+// between the wrapper and the query's own modes, never against a wrapper that
+// was already thrown away.
+//
+// Both directions are pinned, so a guard that simply stops applying config
+// cannot pass.
+
+/// Run the entailment query against a caller-built view.
+async fn entailed_names_for_view(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    view: &fluree_db_api::GraphDb,
+) -> serde_json::Value {
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?v",
+        "where": {"@id": "ex:alice", "ex:name": "?v"}
+    });
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let result = fluree.query(view, &query).await.expect("query");
+    result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld")
+}
+
+/// A caller who turns reasoning off keeps it off, even though the ledger
+/// configures `f:reasoningModes f:rdfs`.
+#[tokio::test]
+async fn explicit_view_reasoning_none_survives_config_defaults() {
+    let ledger_id = "it/config-reasoning-explicit-none:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        "",
+    )
+    .await;
+
+    // The documented quickstart shape: load a view, then attach reasoning.
+    let view = fluree
+        .db(ledger_id)
+        .await
+        .expect("db")
+        .with_reasoning(fluree_db_query::ir::reasoning::ReasoningModes::none());
+
+    assert_eq!(
+        entailed_names_for_view(&fluree, ledger_id, &view).await,
+        json!([]),
+        "an explicit `with_reasoning(none())` must not be overwritten by config defaults"
+    );
+}
+
+/// The converse: a caller who turns reasoning on keeps it on, even though the
+/// ledger configures `f:reasoningModes f:none`. Without this, a guard that
+/// merely stopped applying config would look correct.
+#[tokio::test]
+async fn explicit_view_reasoning_on_survives_config_none() {
+    let ledger_id = "it/config-reasoning-explicit-on:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:none .",
+        "",
+    )
+    .await;
+
+    let view = fluree
+        .db(ledger_id)
+        .await
+        .expect("db")
+        .with_reasoning(fluree_db_query::ir::reasoning::ReasoningModes::rdfs());
+
+    assert_eq!(
+        entailed_names_for_view(&fluree, ledger_id, &view).await,
+        json!(["Alice"]),
+        "an explicit `with_reasoning(rdfs())` must survive a config default of `f:none`"
+    );
+}
+
+/// Control: with no wrapper attached, the ledger's config still governs.
+/// This is the fluree/db#1577 behavior, and the guard above must not weaken it.
+#[tokio::test]
+async fn config_defaults_still_apply_without_an_explicit_wrapper() {
+    let ledger_id = "it/config-reasoning-no-wrapper:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        "",
+    )
+    .await;
+
+    let view = fluree.db(ledger_id).await.expect("db");
+
+    assert_eq!(
+        entailed_names_for_view(&fluree, ledger_id, &view).await,
+        json!(["Alice"]),
+        "config defaults must still apply to a view the caller left alone"
+    );
+}
+
+// =============================================================================
+// Transaction-requested SHACL validation mode (opts.validationMode)
+// =============================================================================
+
+/// Shared setup for the validation-mode override tests: a ledger with a
+/// minCount shape on ex:Person and a config graph carrying the given SHACL
+/// group body (caller supplies the `<urn:config:shacl>` triples).
+#[cfg(feature = "shacl")]
+async fn seed_shacl_mode_ledger(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    shacl_group_trig: &str,
+) -> fluree_db_api::LedgerState {
+    let ledger = genesis_ledger(fluree, ledger_id);
+    let result = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "sh": "http://www.w3.org/ns/shacl#",
+                    "ex": "http://example.org/",
+                    "xsd": "http://www.w3.org/2001/XMLSchema#"
+                },
+                "@id": "ex:PersonShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Person"},
+                "sh:property": [{
+                    "sh:path": {"@id": "ex:name"},
+                    "sh:minCount": 1
+                }]
+            }),
+        )
+        .await
+        .expect("shape insert");
+
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:shaclDefaults <urn:config:shacl> .
+            {shacl_group_trig}
+        }}
+    "
+    );
+    fluree
+        .stage_owned(result.ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write")
+        .ledger
+}
+
+/// A violating transaction document (ex:Person without ex:name).
+#[cfg(feature = "shacl")]
+fn violating_person() -> serde_json::Value {
+    json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:nameless",
+        "@type": "ex:Person"
+    })
+}
+
+/// Under the default override control (`f:OverrideAll`), a transaction may
+/// soften a configured `Reject` posture to warn-and-commit for itself only —
+/// the standing posture still rejects other writers.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_txn_validation_mode_softens_reject_under_default_override() {
+    use fluree_db_core::ledger_config::ValidationMode;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_shacl_mode_ledger(
+        &fluree,
+        "it/shacl-mode-soften:main",
+        "<urn:config:shacl> f:shaclEnabled true .",
+    )
+    .await;
+
+    // Without the opt: configured Reject applies.
+    let err = fluree
+        .insert(ledger.clone(), &violating_person())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "configured reject posture must reject: {err:?}"
+    );
+
+    // With opts.validationMode = warn: commits (findings logged, not fatal).
+    let opts = fluree_db_transact::TxnOpts {
+        validation_mode: Some(ValidationMode::Warn),
+        ..Default::default()
+    };
+    fluree
+        .stage_owned(ledger)
+        .txn_opts(opts)
+        .insert(&violating_person())
+        .execute()
+        .await
+        .expect("warn-mode request under default override control must commit");
+}
+
+/// `f:overrideControl f:OverrideNone` pins the configured posture: a
+/// transaction-requested warn is denied and the write still rejects.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_txn_validation_mode_denied_by_override_none() {
+    use fluree_db_core::ledger_config::ValidationMode;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_shacl_mode_ledger(
+        &fluree,
+        "it/shacl-mode-pinned:main",
+        r"<urn:config:shacl> f:shaclEnabled true .
+          <urn:config:shacl> f:overrideControl f:OverrideNone .",
+    )
+    .await;
+
+    let opts = fluree_db_transact::TxnOpts {
+        validation_mode: Some(ValidationMode::Warn),
+        ..Default::default()
+    };
+    let err = fluree
+        .stage_owned(ledger)
+        .txn_opts(opts)
+        .insert(&violating_person())
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "OverrideNone must pin the configured reject posture: {err:?}"
+    );
+}
+
+/// The shapes-exist heuristic (shapes present, NO config graph) fails closed:
+/// a transaction-requested warn does NOT soften it.
+///
+/// This path never reaches `merge_shacl_opts`, so it consults no
+/// `f:overrideControl` and no identity. Honoring the request here would let
+/// anyone who can write downgrade enforcement on every ledger that has shapes
+/// but no `#config` graph — the back-compat default — with the violations
+/// reduced to a log line.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_heuristic_without_config_ignores_requested_warn_mode() {
+    use fluree_db_core::ledger_config::ValidationMode;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "it/shacl-heuristic-no-config:main");
+    // Shapes, deliberately with no config graph written afterwards.
+    let result = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "sh": "http://www.w3.org/ns/shacl#",
+                    "ex": "http://example.org/"
+                },
+                "@id": "ex:PersonShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Person"},
+                "sh:property": [{
+                    "sh:path": {"@id": "ex:name"},
+                    "sh:minCount": 1
+                }]
+            }),
+        )
+        .await
+        .expect("shape insert");
+
+    // Baseline: the heuristic enforces without any opt.
+    let err = fluree
+        .insert(result.ledger.clone(), &violating_person())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "shapes-exist heuristic must reject: {err:?}"
+    );
+
+    // The same write asking for warn is still rejected — no config group
+    // exists to permit the override, so the request is not honored.
+    let opts = fluree_db_transact::TxnOpts {
+        validation_mode: Some(ValidationMode::Warn),
+        ..Default::default()
+    };
+    let err = fluree
+        .stage_owned(result.ledger)
+        .txn_opts(opts)
+        .insert(&violating_person())
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "requested warn must NOT soften the ungated no-config heuristic: {err:?}"
+    );
+}
+
+/// Strengthening needs no permission: on a warn-mode ledger, a transaction
+/// may request reject for itself even under `f:OverrideNone`.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_txn_validation_mode_reject_strengthens_warn() {
+    use fluree_db_core::ledger_config::ValidationMode;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_shacl_mode_ledger(
+        &fluree,
+        "it/shacl-mode-strengthen:main",
+        r"<urn:config:shacl> f:shaclEnabled true .
+          <urn:config:shacl> f:validationMode f:ValidationWarn .
+          <urn:config:shacl> f:overrideControl f:OverrideNone .",
+    )
+    .await;
+
+    // Configured warn: the violation commits.
+    let result = fluree
+        .insert(ledger.clone(), &violating_person())
+        .await
+        .expect("warn posture commits violations");
+
+    // Requested reject: strengthening is always honored.
+    let opts = fluree_db_transact::TxnOpts {
+        validation_mode: Some(ValidationMode::Reject),
+        ..Default::default()
+    };
+    let err = fluree
+        .stage_owned(result.ledger)
+        .txn_opts(opts)
+        .insert(&json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:nameless2",
+            "@type": "ex:Person"
+        }))
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "requested reject must strengthen a warn posture: {err:?}"
+    );
+}
+
+// =============================================================================
+// Config resolution is cached on the read path; a config change must still win
+// =============================================================================
+
+/// Reads resolve config through the marker-keyed cache the write path uses.
+/// This pins the invalidation contract from the outside: a commit to the config
+/// graph advances `config_write_t`, so the next read over the new state must
+/// miss and re-resolve rather than serve the previous config.
+///
+/// Not a pin for the cache itself, which passes with or without it. It is the
+/// guard against a wrong key: anything that kept serving the first config after
+/// a config write, keying on the ledger alone, say, fails here.
+#[tokio::test]
+async fn config_change_is_visible_to_the_next_read() {
+    let ledger_id = "it/config-cache-invalidation:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        "",
+    )
+    .await;
+
+    assert_eq!(
+        entailed_names_jsonld(&fluree, ledger_id).await,
+        json!(["Alice"]),
+        "first read: the rdfs config governs"
+    );
+
+    // Flip the configured default to `none` in a new commit.
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        GRAPH <{config_iri}> {{
+            <urn:config:reasoning> f:reasoningModes f:none .
+        }}
+    "
+    );
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("rewrite config");
+
+    assert_eq!(
+        entailed_names_jsonld(&fluree, ledger_id).await,
+        json!([]),
+        "second read: the config write must invalidate what the first read cached"
     );
 }

@@ -414,6 +414,19 @@ fn catalog() -> Vec<Case> {
             known_divergence: None,
             sparql: "SELECT ?o (COUNT(?s) AS ?c) WHERE { ?s bsbm:productType ?o } GROUP BY ?o ORDER BY DESC(?c) LIMIT 10",
         },
+        // detect_group_by_object_star_topk (GroupByObjectStarTopKOperator) —
+        // GROUP BY ?o top-k with a same-subject filter star (#1652 case 1:
+        // COUNT must carry the filter predicates' bag multiplicity, not just
+        // subject existence). Churn renames five labels, so in the overlay
+        // condition the subject->multiplicity map must be overlay-correct.
+        // LIMIT exceeds the five product types; count ties make only the row
+        // SET stable (compared unordered).
+        Case {
+            name: "group_by_object_star_topk",
+            ordered: false,
+            known_divergence: None,
+            sparql: "SELECT ?o (COUNT(?s) AS ?c) WHERE { ?s bsbm:productType ?o . ?s bsbm:label ?l } GROUP BY ?o ORDER BY DESC(?c) LIMIT 10",
+        },
         // detect_stats_count_by_predicate — FD-3 fixed (PR-1 L2): now counted
         // exactly from POST leaf directories (base), or declined to the generic
         // pipeline (overlay/novelty), never from StatsView estimates. Enforced.

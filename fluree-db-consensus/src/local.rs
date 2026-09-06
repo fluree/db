@@ -149,6 +149,9 @@ impl Committer for LocalCommitter {
                 TransactionBody::JsonLdInsert(json) => staged.insert(json),
                 TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
                 TransactionBody::JsonLdUpdate(json) => staged.update(json),
+                TransactionBody::JsonLdGraphSync { graph_iri, body } => {
+                    staged.sync_graph(graph_iri.as_str(), body)
+                }
                 TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
                 TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
                     staged.upsert_turtle(text.as_str())
@@ -331,6 +334,9 @@ impl Committer for LocalCommitter {
                 .into_iter()
                 .map(|(k, v)| (k, Base64Bytes(v)))
                 .collect(),
+            // The staged bundle carries every blob it resolved; a gap it
+            // could not resolve is not distinguished here yet.
+            missing_blobs: Vec::new(),
         };
 
         let response = self
@@ -367,10 +373,32 @@ impl SubmissionLookup for LocalCommitter {
 
 /// Map a transaction-pipeline error into a [`SubmissionError`], preserving
 /// the HTTP status so the caller can render an accurate response.
+///
+/// Novelty refusals keep their identity through the flattening — the server
+/// needs to tell them apart from other failures (and from each other) to
+/// answer 503 + `err:db/NoveltyAtMax` + `Retry-After` for the drainable
+/// cases and 413 + `err:db/NoveltyDeltaTooLarge` for a delta that can never
+/// fit. The split mirrors the commit check (`current + delta >= max`): a
+/// delta at or above the ceiling fails even against drained novelty.
 pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
-    SubmissionError::Execution {
-        status: err.status_code(),
-        message: err.to_string(),
+    match &err {
+        ApiError::Transact(fluree_db_api::TransactError::NoveltyWouldExceed {
+            delta_bytes,
+            max_bytes,
+            ..
+        }) if delta_bytes >= max_bytes => SubmissionError::NoveltyDeltaTooLarge {
+            message: err.to_string(),
+        },
+        ApiError::Transact(
+            fluree_db_api::TransactError::NoveltyAtMax
+            | fluree_db_api::TransactError::NoveltyWouldExceed { .. },
+        ) => SubmissionError::NoveltyBackpressure {
+            message: err.to_string(),
+        },
+        _ => SubmissionError::Execution {
+            status: err.status_code(),
+            message: err.to_string(),
+        },
     }
 }
 

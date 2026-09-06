@@ -108,10 +108,13 @@ pub async fn populate_class_cache(
         return Ok(());
     }
 
+    // Key on the graph this ref reads, so classes resolved in one graph are never
+    // consulted for a decision about another.
+    let g_id = db.g_id;
     let class_map = lookup_subject_classes(subjects, db).await?;
 
     for (subject, classes) in class_map {
-        policy_ctx.cache_subject_classes(subject, classes);
+        policy_ctx.cache_subject_classes(g_id, subject, classes);
     }
 
     Ok(())

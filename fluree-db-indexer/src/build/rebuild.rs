@@ -573,6 +573,7 @@ where
                     subject_count: subject_dicts[ci].len(),
                     string_count: string_dicts[ci].len() as u64,
                     types_map_path: Some(types_path),
+                    duplicates_removed: 0,
                 });
             }
 
@@ -797,6 +798,7 @@ where
                 total_remapped: 0,
                 remap_elapsed: std::time::Duration::from_millis(total_remap_ms as u64),
                 build_elapsed: std::time::Duration::from_millis(total_build_ms as u64),
+                duplicates_removed: 0,
             };
 
             tracing::info!(
@@ -980,6 +982,12 @@ where
                     properties: Some(properties),
                     classes: root_classes,
                     graphs: Some(final_graphs),
+                    // A full rebuild walks the entire commit chain from
+                    // genesis, feeding every record — asserts and retracts,
+                    // including facts later retracted — through the stats
+                    // hook, so the historical tag sets cover every `t` the
+                    // ledger has ever had.
+                    historical_since_t: Some(0),
                 }
             };
 
@@ -1127,6 +1135,7 @@ where
                 total_commit_size,
                 total_asserts,
                 total_retracts,
+                saw_list_meta: shared.saw_list_meta,
                 db_stats: Some(db_stats),
                 db_schema,
                 sketch_ref,

@@ -102,13 +102,27 @@ pub(crate) fn late_materialized_object_binding(
             t: Some(t),
             op,
         }),
+        // Every string-dictionary datatype shares one `o_key` — the interned
+        // lexical form — so the datatype is the whole of a string literal's
+        // term identity, and `EncodedLit` can only carry it as a
+        // `DatatypeDictId`. Only `xsd:string`, `rdf:langString` and
+        // `@fulltext` have a reserved one. The other XSD string subtypes
+        // (`xsd:anyURI`, `xsd:token`, `xsd:normalizedString`, `xsd:language`,
+        // `xsd:base64Binary`, `xsd:hexBinary`) and every customer-defined
+        // datatype are numbered per ledger, so encoding them meant borrowing
+        // `xsd:string`'s id — which made `"abc"`, `"abc"^^xsd:anyURI` and
+        // `"abc"^^ex:custom` one term (#1729). They stay materialized instead
+        // and carry their exact datatype `Sid` on `Binding::Lit`, the same
+        // rule the temporal subtypes below already follow.
         DecodeKind::StringDict => {
             let (dt_id, lang_id) = if ot.is_lang_string() {
                 (DatatypeDictId::LANG_STRING.as_u16(), ot.payload())
-            } else if o_type == OType::FULLTEXT.as_u16() {
+            } else if ot == OType::FULLTEXT {
                 (DatatypeDictId::FULL_TEXT.as_u16(), 0)
-            } else {
+            } else if ot == OType::XSD_STRING {
                 (DatatypeDictId::STRING.as_u16(), 0)
+            } else {
+                return None;
             };
             Some(Binding::EncodedLit {
                 o_kind: ObjKind::LEX_ID.as_u8(),
@@ -462,5 +476,106 @@ mod tests {
             } if o_kind == ObjKind::DATE_TIME.as_u8()
                 && dt_id == DatatypeDictId::DATE_TIME.as_u16()
         ));
+    }
+
+    /// The three string-dictionary datatypes with a reserved `DatatypeDictId`
+    /// keep their encoded form, and each gets its own id — the encoded triple
+    /// is the whole of the term's identity.
+    #[test]
+    fn late_materialized_object_binding_keeps_reserved_string_datatypes_encoded() {
+        for (o_type, want_dt, want_lang) in [
+            (OType::XSD_STRING, DatatypeDictId::STRING, 0),
+            (OType::FULLTEXT, DatatypeDictId::FULL_TEXT, 0),
+            (OType::lang_string(3), DatatypeDictId::LANG_STRING, 3),
+        ] {
+            let binding =
+                late_materialized_object_binding(o_type.as_u16(), 42, 5, 0, u32::MAX, None)
+                    .unwrap_or_else(|| panic!("{o_type:?} should stay encoded"));
+            assert!(
+                matches!(
+                    binding,
+                    Binding::EncodedLit { o_kind, o_key: 42, dt_id, lang_id, .. }
+                        if o_kind == ObjKind::LEX_ID.as_u8()
+                            && dt_id == want_dt.as_u16()
+                            && lang_id == want_lang
+                ),
+                "{o_type:?}"
+            );
+        }
+    }
+
+    /// Every other string-dictionary datatype has only a per-ledger id, which
+    /// `EncodedLit` cannot carry — encoding one meant borrowing `xsd:string`'s
+    /// id and losing the term's identity (#1729). They stay materialized, so
+    /// the caller decodes and attaches the exact datatype `Sid`.
+    #[test]
+    fn late_materialized_object_binding_leaves_other_string_datatypes_materialized() {
+        for o_type in [
+            OType::XSD_ANY_URI,
+            OType::XSD_TOKEN,
+            OType::XSD_NORMALIZED_STRING,
+            OType::XSD_LANGUAGE,
+            OType::XSD_BASE64_BINARY,
+            OType::XSD_HEX_BINARY,
+            OType::customer_datatype(DatatypeDictId::RESERVED_COUNT),
+        ] {
+            assert_eq!(
+                OType::from_u16(o_type.as_u16()).decode_kind(),
+                DecodeKind::StringDict,
+                "{o_type:?} is expected to be a string-dictionary type"
+            );
+            assert!(
+                late_materialized_object_binding(o_type.as_u16(), 42, 5, 0, u32::MAX, None)
+                    .is_none(),
+                "{o_type:?} must not borrow another datatype's dictionary id"
+            );
+        }
+    }
+
+    /// The decode lane and the probe-substitution mirror
+    /// ([`crate::binding::is_string_dict_term`]) have to agree on what the
+    /// string-dictionary lane is, or a literal is one term to the join and
+    /// another to equality.
+    #[test]
+    fn the_two_string_dict_relations_agree() {
+        use crate::binding::is_string_dict_term;
+
+        for o_type in [OType::XSD_STRING, OType::FULLTEXT, OType::lang_string(1)] {
+            let b = late_materialized_object_binding(o_type.as_u16(), 1, 1, 0, u32::MAX, None)
+                .unwrap_or_else(|| panic!("{o_type:?} should stay encoded"));
+            assert!(is_string_dict_term(&b), "encoded {o_type:?}");
+        }
+        // What the decode lane declines arrives materialized, and the mirror
+        // recognizes it there.
+        for dt in [fluree_vocab::xsd_names::ANY_URI, "custom"] {
+            let lit = Binding::lit(
+                FlakeValue::String("abc".to_string()),
+                Sid::new(fluree_vocab::namespaces::XSD, dt),
+            );
+            assert!(is_string_dict_term(&lit), "materialized {dt}");
+        }
+        // Numerics are outside the lane on both sides — the join stays lenient
+        // across their subtypes.
+        let n =
+            late_materialized_object_binding(OType::XSD_INTEGER.as_u16(), 1, 1, 0, u32::MAX, None)
+                .expect("xsd:integer stays encoded");
+        assert!(!is_string_dict_term(&n));
+        assert!(!is_string_dict_term(&Binding::lit(
+            FlakeValue::Long(1),
+            Sid::new(
+                fluree_vocab::namespaces::XSD,
+                fluree_vocab::xsd_names::INTEGER
+            ),
+        )));
+        // …including one a cast builds string-backed. `xsd:float(?o)` yields a
+        // `String` value under `xsd:float`, and constraining a probe with it
+        // would narrow a join that never touches the string dictionary.
+        assert!(!is_string_dict_term(&Binding::lit(
+            FlakeValue::String("1.5".to_string()),
+            Sid::new(
+                fluree_vocab::namespaces::XSD,
+                fluree_vocab::xsd_names::FLOAT
+            ),
+        )));
     }
 }

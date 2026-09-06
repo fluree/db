@@ -366,7 +366,7 @@ fn base_predicate_o_type(
     for leaf in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
         let handle = store
             .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         for entry in &handle.dir().entries {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
@@ -424,7 +424,7 @@ fn collect_post_desc_topk(
     for leaf in leaves.iter().rev() {
         let handle = store
             .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
 
         // Collect this leaf's candidate rows in descending order.
@@ -580,7 +580,7 @@ fn collect_post_desc_topk_overlay(
     for leaf in leaves.iter().rev() {
         let handle = store
             .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
 
         let mut leaf_base: Vec<OvRow> = Vec::new(); // DESC by (o_key, o_i, s_id)

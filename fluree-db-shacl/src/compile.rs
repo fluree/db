@@ -69,8 +69,20 @@ pub struct PropertyShape {
     pub severity: Severity,
     /// Human-readable name
     pub name: Option<String>,
+    /// `sh:description` — human-readable documentation for this property.
+    /// Annotation only: validation never reads it.
+    pub description: Option<String>,
+    /// `sh:order` — the position a consumer should render this property in,
+    /// ascending. Annotation only.
+    pub order: Option<f64>,
+    /// `sh:defaultValue` — advisory only. Fluree never materializes it: a
+    /// default is a statement about presentation, not about what the graph
+    /// holds, and inventing the triple would make validation self-fulfilling.
+    pub default_value: Option<FlakeValue>,
     /// Human-readable message for violations
     pub message: Option<String>,
+    /// `sh:sparql` constraints declared on this property shape
+    pub sparql_constraints: Vec<Arc<crate::sparql::SparqlConstraint>>,
 }
 
 /// A compiled node shape
@@ -90,10 +102,15 @@ pub struct CompiledShape {
     pub severity: Severity,
     /// Human-readable name
     pub name: Option<String>,
+    /// `sh:description` — human-readable documentation for this shape.
+    /// Annotation only: validation never reads it.
+    pub description: Option<String>,
     /// Human-readable message for violations
     pub message: Option<String>,
     /// Whether this shape is deactivated (sh:deactivated true)
     pub deactivated: bool,
+    /// `sh:sparql` constraints declared on this node shape
+    pub sparql_constraints: Vec<Arc<crate::sparql::SparqlConstraint>>,
 }
 
 impl CompiledShape {
@@ -117,6 +134,28 @@ pub struct ShapeCompiler {
     shapes: HashMap<ShapeId, ShapeData>,
     /// Collected property shape data by property shape ID
     property_shapes: HashMap<ShapeId, PropertyShapeData>,
+    /// `sh:sparql` attachments: shape subject → constraint nodes
+    sparql_attach: HashMap<Sid, Vec<Sid>>,
+    /// `sh:select` texts by subject (constraint nodes)
+    sparql_selects: HashMap<Sid, Vec<String>>,
+    /// `sh:message` strings by subject — consulted for constraint nodes,
+    /// which live outside the shape / property-shape maps
+    messages_by_subject: HashMap<Sid, Vec<String>>,
+    /// `sh:deactivated true` subjects (for constraint nodes)
+    deactivated_subjects: HashSet<Sid>,
+    /// `sh:prefixes` references by subject (constraint node → ontology nodes)
+    prefixes_refs: HashMap<Sid, Vec<Sid>>,
+    /// `sh:declare` references (ontology node → declaration nodes)
+    declares: HashMap<Sid, Vec<Sid>>,
+    /// `sh:prefix` strings by declaration node
+    decl_prefix: HashMap<Sid, String>,
+    /// `sh:namespace` values by declaration node
+    decl_namespace: HashMap<Sid, String>,
+    /// `owl:imports` edges (followed for `sh:prefixes` resolution)
+    owl_imports: HashMap<Sid, Vec<Sid>>,
+    /// Built `sh:sparql` constraints by attachment subject (filled by
+    /// `build_sparql_constraints`, consumed by `finalize`)
+    built_sparql: HashMap<Sid, Vec<Arc<crate::sparql::SparqlConstraint>>>,
 }
 
 /// Intermediate representation during compilation
@@ -148,6 +187,7 @@ struct ShapeData {
     xone_shapes: Vec<Sid>,
     severity: Severity,
     name: Option<String>,
+    description: Option<String>,
     message: Option<String>,
     deactivated: bool,
 }
@@ -162,6 +202,11 @@ struct PropertyShapeData {
     constraints: Vec<Constraint>,
     severity: Severity,
     name: Option<String>,
+    description: Option<String>,
+    /// sh:order — the position a consumer should render this property in.
+    order: Option<f64>,
+    /// sh:defaultValue — advisory; validation never applies it.
+    default_value: Option<FlakeValue>,
     message: Option<String>,
     /// sh:flags for pattern constraint (combined during finalize)
     pattern_flags: Option<String>,
@@ -191,6 +236,16 @@ impl ShapeCompiler {
         Self {
             shapes: HashMap::new(),
             property_shapes: HashMap::new(),
+            sparql_attach: HashMap::new(),
+            sparql_selects: HashMap::new(),
+            messages_by_subject: HashMap::new(),
+            deactivated_subjects: HashSet::new(),
+            prefixes_refs: HashMap::new(),
+            declares: HashMap::new(),
+            decl_prefix: HashMap::new(),
+            decl_namespace: HashMap::new(),
+            owl_imports: HashMap::new(),
+            built_sparql: HashMap::new(),
         }
     }
 
@@ -276,6 +331,16 @@ impl ShapeCompiler {
             predicates::SEVERITY,
             predicates::MESSAGE,
             predicates::NAME,
+            predicates::DESCRIPTION,
+            predicates::ORDER,
+            predicates::DEFAULT_VALUE,
+            // SPARQL-based constraints
+            predicates::SPARQL,
+            predicates::SELECT,
+            predicates::PREFIXES,
+            predicates::DECLARE,
+            predicates::PREFIX,
+            predicates::NAMESPACE,
         ];
 
         // Query each input graph for all SHACL predicates, accumulating into
@@ -290,6 +355,27 @@ impl ShapeCompiler {
 
                 for flake in flakes {
                     compiler.process_flake(&flake)?;
+                }
+            }
+
+            // owl:imports edges — followed when resolving `sh:prefixes`
+            // (per spec, prefix declarations are collected over the imports
+            // closure of the referenced ontology).
+            let owl_imports = Sid::new(fluree_vocab::namespaces::OWL, "imports");
+            let flakes = db
+                .range(
+                    IndexType::Psot,
+                    RangeTest::Eq,
+                    RangeMatch::predicate(owl_imports),
+                )
+                .await?;
+            for flake in &flakes {
+                if let FlakeValue::Ref(target) = &flake.o {
+                    compiler
+                        .owl_imports
+                        .entry(flake.s.clone())
+                        .or_default()
+                        .push(target.clone());
                 }
             }
 
@@ -355,7 +441,102 @@ impl ShapeCompiler {
         }
 
         compiler.apply_implicit_class_targets(&class_typed);
+        compiler.build_sparql_constraints();
         compiler.finalize()
+    }
+
+    /// Assemble `sh:sparql` constraints from the raw predicate data collected
+    /// during the flake scan: resolve `sh:prefixes` (over the `owl:imports`
+    /// closure) into a PREFIX header and parse + pre-binding-check each
+    /// `sh:select`. Parse or structure problems compile into the constraint
+    /// and surface — as a validation failure — only when the owning shape
+    /// fires.
+    fn build_sparql_constraints(&mut self) {
+        if self.sparql_attach.is_empty() {
+            return;
+        }
+
+        let attach: Vec<(Sid, Vec<Sid>)> = self
+            .sparql_attach
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        for (subject, constraint_nodes) in attach {
+            for cnode in constraint_nodes {
+                let messages = self
+                    .messages_by_subject
+                    .get(&cnode)
+                    .cloned()
+                    .unwrap_or_default();
+                let deactivated = self.deactivated_subjects.contains(&cnode);
+                let selects = self.sparql_selects.get(&cnode);
+                let constraint = match selects.map(Vec::as_slice) {
+                    Some([select]) => crate::sparql::build_constraint(
+                        cnode.clone(),
+                        select,
+                        &self.prefix_header_for(&cnode),
+                        messages,
+                        deactivated,
+                    ),
+                    Some(_) => crate::sparql::invalid_constraint(
+                        cnode.clone(),
+                        messages,
+                        deactivated,
+                        "sh:sparql constraint node has multiple sh:select values".to_string(),
+                    ),
+                    None => crate::sparql::invalid_constraint(
+                        cnode.clone(),
+                        messages,
+                        deactivated,
+                        "sh:sparql constraint node has no sh:select query".to_string(),
+                    ),
+                };
+                self.built_sparql
+                    .entry(subject.clone())
+                    .or_default()
+                    .push(Arc::new(constraint));
+            }
+        }
+    }
+
+    /// PREFIX declarations for one constraint node: the union of `sh:declare`
+    /// entries on every `sh:prefixes` ontology, followed through `owl:imports`
+    /// (cycle-safe). First declaration of a prefix wins.
+    fn prefix_header_for(&self, cnode: &Sid) -> String {
+        use std::collections::VecDeque;
+        use std::fmt::Write as _;
+
+        let mut header = String::new();
+        let Some(roots) = self.prefixes_refs.get(cnode) else {
+            return header;
+        };
+
+        let mut queue: VecDeque<Sid> = roots.iter().cloned().collect();
+        let mut visited: HashSet<Sid> = roots.iter().cloned().collect();
+        let mut declared: HashSet<&str> = HashSet::new();
+
+        while let Some(node) = queue.pop_front() {
+            if let Some(decls) = self.declares.get(&node) {
+                for decl in decls {
+                    if let (Some(prefix), Some(ns)) =
+                        (self.decl_prefix.get(decl), self.decl_namespace.get(decl))
+                    {
+                        if declared.insert(prefix.as_str()) {
+                            let _ = writeln!(header, "PREFIX {prefix}: <{ns}>");
+                        }
+                    }
+                }
+            }
+            if let Some(imports) = self.owl_imports.get(&node) {
+                for imp in imports {
+                    if visited.insert(imp.clone()) {
+                        queue.push_back(imp.clone());
+                    }
+                }
+            }
+        }
+        header
     }
 
     /// Add an implicit-class target to every compiled shape that is also
@@ -854,6 +1035,13 @@ impl ShapeCompiler {
                         ps.deactivated = *v;
                     }
                     self.get_or_create_shape(&flake.s).deactivated = *v;
+                    // Also tracked by subject for sh:sparql constraint nodes,
+                    // which live outside the shape maps.
+                    if *v {
+                        self.deactivated_subjects.insert(flake.s.clone());
+                    } else {
+                        self.deactivated_subjects.remove(&flake.s);
+                    }
                 }
             }
             name if name == predicates::SEVERITY => {
@@ -874,6 +1062,12 @@ impl ShapeCompiler {
                     } else if let Some(ns) = self.shapes.get_mut(&flake.s) {
                         ns.message = Some(msg.clone());
                     }
+                    // Also tracked by subject for sh:sparql constraint nodes,
+                    // which live outside the shape maps.
+                    self.messages_by_subject
+                        .entry(flake.s.clone())
+                        .or_default()
+                        .push(msg.clone());
                 }
             }
             name if name == predicates::NAME => {
@@ -883,6 +1077,87 @@ impl ShapeCompiler {
                     } else if let Some(ns) = self.shapes.get_mut(&flake.s) {
                         ns.name = Some(n.clone());
                     }
+                }
+            }
+            // Annotation properties. They constrain nothing — validation never
+            // reads them — but they are what a schema generator has to work
+            // with, so they are compiled rather than dropped.
+            name if name == predicates::DESCRIPTION => {
+                if let FlakeValue::String(d) = &flake.o {
+                    if let Some(ps) = self.property_shapes.get_mut(&flake.s) {
+                        ps.description = Some(d.clone());
+                    } else if let Some(ns) = self.shapes.get_mut(&flake.s) {
+                        ns.description = Some(d.clone());
+                    }
+                }
+            }
+            name if name == predicates::ORDER => {
+                // `sh:order` is a decimal in the spec; accept any numeric form
+                // and keep it as f64 so mixed integer/decimal orders compare.
+                let order = match &flake.o {
+                    FlakeValue::Long(n) => Some(*n as f64),
+                    FlakeValue::Double(n) => Some(*n),
+                    FlakeValue::Decimal(d) => d.to_string().parse::<f64>().ok(),
+                    _ => None,
+                };
+                if let Some(order) = order {
+                    if let Some(ps) = self.property_shapes.get_mut(&flake.s) {
+                        ps.order = Some(order);
+                    }
+                }
+            }
+            name if name == predicates::DEFAULT_VALUE => {
+                if let Some(ps) = self.property_shapes.get_mut(&flake.s) {
+                    ps.default_value = Some(flake.o.clone());
+                }
+            }
+
+            // SPARQL-based constraints (sh:sparql → sh:SPARQLConstraint node).
+            // Raw data is collected by subject here; whether a subject is a
+            // node shape, property shape, or constraint node is resolved in
+            // `build_sparql_constraints` once all flakes are seen.
+            name if name == predicates::SPARQL => {
+                if let FlakeValue::Ref(constraint_node) = &flake.o {
+                    self.sparql_attach
+                        .entry(flake.s.clone())
+                        .or_default()
+                        .push(constraint_node.clone());
+                }
+            }
+            name if name == predicates::SELECT => {
+                if let FlakeValue::String(text) = &flake.o {
+                    self.sparql_selects
+                        .entry(flake.s.clone())
+                        .or_default()
+                        .push(text.clone());
+                }
+            }
+            name if name == predicates::PREFIXES => {
+                if let FlakeValue::Ref(ontology) = &flake.o {
+                    self.prefixes_refs
+                        .entry(flake.s.clone())
+                        .or_default()
+                        .push(ontology.clone());
+                }
+            }
+            name if name == predicates::DECLARE => {
+                if let FlakeValue::Ref(decl) = &flake.o {
+                    self.declares
+                        .entry(flake.s.clone())
+                        .or_default()
+                        .push(decl.clone());
+                }
+            }
+            name if name == predicates::PREFIX => {
+                if let FlakeValue::String(p) = &flake.o {
+                    self.decl_prefix.insert(flake.s.clone(), p.clone());
+                }
+            }
+            name if name == predicates::NAMESPACE => {
+                // sh:namespace is an xsd:anyURI literal, which arrives as a
+                // string value.
+                if let FlakeValue::String(ns) = &flake.o {
+                    self.decl_namespace.insert(flake.s.clone(), ns.clone());
                 }
             }
 
@@ -912,6 +1187,8 @@ impl ShapeCompiler {
         let Self {
             shapes,
             property_shapes: ps_map,
+            built_sparql,
+            ..
         } = self;
 
         let mut compiled = Vec::new();
@@ -966,7 +1243,14 @@ impl ShapeCompiler {
                             value_structural_constraints,
                             severity: ps_data.severity,
                             name: ps_data.name.clone(),
+                            description: ps_data.description.clone(),
+                            order: ps_data.order,
+                            default_value: ps_data.default_value.clone(),
                             message: ps_data.message.clone(),
+                            sparql_constraints: built_sparql
+                                .get(ps_id)
+                                .cloned()
+                                .unwrap_or_default(),
                         });
                     }
                 }
@@ -1035,12 +1319,14 @@ impl ShapeCompiler {
             let mut node_constraints = data.node_constraints.clone();
             let mut message = data.message.clone();
             let mut name = data.name.clone();
+            let mut description = data.description.clone();
             let mut severity = data.severity;
             if let Some(own_ps) = ps_map.get(id) {
                 if own_ps.path.is_none() {
                     node_constraints.extend(build_constraints_from_ps_data(own_ps));
                     message = message.or_else(|| own_ps.message.clone());
                     name = name.or_else(|| own_ps.name.clone());
+                    description = description.or_else(|| own_ps.description.clone());
                     // sh:severity routes to the path-less entry too (the
                     // metadata arms prefer the property-shape map).
                     if severity == Severity::Violation {
@@ -1048,6 +1334,15 @@ impl ShapeCompiler {
                     }
                 }
             }
+
+            // sh:sparql on this subject: node-level unless the subject is a
+            // path-bearing property shape (then it already rode along on the
+            // PropertyShape entry above — attaching both would double-fire).
+            let sparql_constraints = if ps_map.get(id).is_some_and(|own| own.path.is_some()) {
+                Vec::new()
+            } else {
+                built_sparql.get(id).cloned().unwrap_or_default()
+            };
 
             compiled.push(CompiledShape {
                 id: id.clone(),
@@ -1057,8 +1352,10 @@ impl ShapeCompiler {
                 structural_constraints,
                 severity,
                 name,
+                description,
                 message,
                 deactivated: data.deactivated,
+                sparql_constraints,
             });
         }
 

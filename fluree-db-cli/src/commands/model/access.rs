@@ -242,6 +242,11 @@ async fn run_enable(
     let write_id = format!("{policy_class}/write");
     replace_nodes(&mode, &graph, &[&view_id, &write_id], &[]).await?;
     println!("\nPolicies transacted to '{dataset}'.");
+    if connected.is_some() {
+        if let crate::context::LedgerMode::Local { fluree, alias } = &mode {
+            warn_governed_virtual_sources(fluree, alias, class).await;
+        }
+    }
 
     if let (Some(space_id), Some(remote_name)) = (space, remote) {
         attach_grant(
@@ -368,6 +373,37 @@ fn resolve_policy_class(
              (as it was enabled), or --policy-class <iri>"
                 .into(),
         )),
+    }
+}
+
+/// A `--connected` gate compiles to `f:query`, which a virtual (Iceberg / SQL)
+/// graph source cannot evaluate — it denies the class there. Name every
+/// registered source governed by this model so the author is not surprised.
+async fn warn_governed_virtual_sources(fluree: &fluree_db_api::Fluree, model: &str, class: &str) {
+    fn canonical(id: &str) -> String {
+        if id.contains(':') {
+            id.to_string()
+        } else {
+            format!("{id}:main")
+        }
+    }
+    let Ok(records) = fluree.nameservice().all_graph_source_records().await else {
+        return;
+    };
+    let target = canonical(model);
+    for record in records.iter().filter(|r| !r.retracted) {
+        let governed = serde_json::from_str::<Value>(&record.config)
+            .ok()
+            .and_then(|c| c.get("model").and_then(|m| m.as_str()).map(canonical))
+            .is_some_and(|m| m == target);
+        if governed {
+            eprintln!(
+                "warning: graph source '{}' is governed by this model, and a --connected \
+                 gate compiles to f:query, which a virtual source cannot evaluate: {class} \
+                 instances will be hidden there. Use a static read profile for sources.",
+                record.graph_source_id
+            );
+        }
     }
 }
 

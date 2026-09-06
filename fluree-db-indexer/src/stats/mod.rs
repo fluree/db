@@ -68,6 +68,9 @@ pub struct StatsSummary {
     pub properties: Option<Vec<fluree_db_core::PropertyStatEntry>>,
 }
 
+/// Roll the per-graph property stats up into the ledger-wide, SID-keyed
+/// `IndexStats.properties` view, resolving each `p_id` to a SID through `trie`
+/// and `resolve_predicate_iri`.
 pub fn aggregate_property_entries_from_graphs<F>(
     graphs: &[GraphStatsEntry],
     trie: &PrefixTrie,
@@ -76,12 +79,38 @@ pub fn aggregate_property_entries_from_graphs<F>(
 where
     F: FnMut(u32) -> Option<String>,
 {
+    aggregate_property_entries_by_sid(graphs, |p_id| {
+        let iri = resolve_predicate_iri(p_id).unwrap_or_default();
+        match trie.longest_match(&iri) {
+            Some((code, prefix_len)) => (code, iri[prefix_len..].to_string()),
+            None => (0u16, iri),
+        }
+    })
+}
+
+/// The same roll-up for a caller that already holds each predicate's SID — the
+/// import builds a `predicate_sids` table as it goes, so it never needs the IRI
+/// round trip.
+///
+/// This is the only place the index-build side fills
+/// [`PropertyStatEntry::observed_datatypes`]. That field is fail-closed: an
+/// unfilled one reads as "unknown" and silently declines the equijoin-filter
+/// fold rather than breaking a query, which is exactly the failure mode a
+/// second copy of this loop would hide. One producer, one test.
+pub fn aggregate_property_entries_by_sid<F>(
+    graphs: &[GraphStatsEntry],
+    mut resolve_predicate_sid: F,
+) -> Vec<PropertyStatEntry>
+where
+    F: FnMut(u32) -> (u16, String),
+{
     struct PropAgg {
         count: u64,
         ndv_values: u64,
         ndv_subjects: u64,
         last_modified_t: i64,
         datatypes: Vec<(u8, u64)>,
+        historical_datatypes: Vec<u8>,
     }
 
     let mut agg: std::collections::HashMap<u32, PropAgg> = std::collections::HashMap::new();
@@ -93,11 +122,14 @@ where
                 ndv_subjects: 0,
                 last_modified_t: 0,
                 datatypes: Vec::new(),
+                historical_datatypes: Vec::new(),
             });
             e.count += p.count;
             e.ndv_values = e.ndv_values.max(p.ndv_values);
             e.ndv_subjects = e.ndv_subjects.max(p.ndv_subjects);
             e.last_modified_t = e.last_modified_t.max(p.last_modified_t);
+            e.historical_datatypes
+                .extend_from_slice(&p.historical_datatypes);
             for &(dt, cnt) in &p.datatypes {
                 if let Some(existing) = e.datatypes.iter_mut().find(|(d, _)| *d == dt) {
                     existing.1 += cnt;
@@ -109,18 +141,18 @@ where
     }
 
     agg.into_iter()
-        .map(|(p_id, pa)| {
-            let iri = resolve_predicate_iri(p_id).unwrap_or_default();
-            let (ns, name) = match trie.longest_match(&iri) {
-                Some((code, prefix_len)) => (code, iri[prefix_len..].to_string()),
-                None => (0u16, iri),
-            };
+        .map(|(p_id, mut pa)| {
+            let (ns, name) = resolve_predicate_sid(p_id);
+            pa.historical_datatypes.sort_unstable();
+            pa.historical_datatypes.dedup();
             PropertyStatEntry {
                 sid: (ns, name),
                 count: pa.count,
                 ndv_values: pa.ndv_values,
                 ndv_subjects: pa.ndv_subjects,
                 last_modified_t: pa.last_modified_t,
+                observed_datatypes: PropertyStatEntry::tags_of(&pa.datatypes),
+                historical_datatypes: pa.historical_datatypes,
                 datatypes: pa.datatypes,
             }
         })
@@ -193,5 +225,63 @@ mod tests {
         let artifacts = Box::new(hook).finalize();
 
         assert_eq!(artifacts.summary.flake_count, 0);
+    }
+
+    /// The index-build aggregate has to carry the datatype tags across the
+    /// graph roll-up. An empty `observed_datatypes` here is not a failure the
+    /// query path can see — it reads as "unknown" and quietly declines the
+    /// equijoin-filter fold — so nothing downstream would go red if this
+    /// producer stopped filling it. This is the pin.
+    #[test]
+    fn aggregate_carries_the_observed_datatype_tags_across_graphs() {
+        use fluree_db_core::{GraphPropertyStatEntry, GraphStatsEntry};
+
+        let graph = |g_id, datatypes: Vec<(u8, u64)>, historical: Vec<u8>| GraphStatsEntry {
+            g_id,
+            flakes: 1,
+            size: 10,
+            properties: vec![GraphPropertyStatEntry {
+                p_id: 7,
+                count: datatypes.iter().map(|&(_, c)| c).sum(),
+                ndv_values: 1,
+                ndv_subjects: 1,
+                last_modified_t: 1,
+                observed_datatypes: PropertyStatEntry::tags_of(&datatypes),
+                historical_datatypes: historical,
+                datatypes,
+            }],
+            classes: None,
+        };
+        // Tag 1 in one graph, tag 3 in another: the roll-up has to end up with
+        // both, so the fold's "does this predicate carry literals?" question is
+        // answered over the whole ledger and not one graph of it. The
+        // historical sets carry a tag (9) that no current count mentions —
+        // a literal deleted in some earlier window — and the roll-up must
+        // keep it, or a time-travel read loses its coverage.
+        let graphs = vec![
+            graph(0, vec![(1, 2)], vec![1, 9]),
+            graph(1, vec![(3, 5)], vec![3]),
+        ];
+
+        let entries = aggregate_property_entries_by_sid(&graphs, |p_id| (10, format!("p{p_id}")));
+
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.sid, (10, "p7".to_string()));
+        assert_eq!(
+            entry.observed_datatypes,
+            vec![1, 3],
+            "the index-build aggregate dropped the datatype tags it rolled up"
+        );
+        assert_eq!(
+            entry.observed_datatypes,
+            PropertyStatEntry::tags_of(&entry.datatypes),
+            "the tag set and the breakdown it summarizes disagree"
+        );
+        assert_eq!(
+            entry.historical_datatypes,
+            vec![1, 3, 9],
+            "the roll-up lost a historical tag its current counts no longer mention"
+        );
     }
 }

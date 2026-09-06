@@ -161,6 +161,84 @@ async fn exists_test() {
     assert!(result.is_err(), "Non-existent ledger should not be found");
 }
 
+/// `ledger_exists` is a nameservice lookup, and the contract has two
+/// edges that a caller can mistake for "the ledger is missing".
+///
+/// Pinned here on file storage — the backend this was reported against
+/// — because the create → commit → exists("x:main") sequence was once
+/// claimed to return `false`. It does not; it returns `true` immediately
+/// after create, in both id forms. What a caller *can* hit is an id the
+/// parser rejects, which is an `Err`, and `.unwrap_or(false)` turns that
+/// into a phantom "does not exist".
+#[tokio::test]
+async fn ledger_exists_on_file_storage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().as_ref())
+        .build()
+        .expect("file-backed engine");
+
+    assert!(!fluree.ledger_exists("x").await.unwrap());
+    assert!(!fluree.ledger_exists("x:main").await.unwrap());
+
+    // Registered synchronously at create, before any commit.
+    fluree.create_ledger("x").await.unwrap();
+    assert!(fluree.ledger_exists("x").await.unwrap());
+    assert!(fluree.ledger_exists("x:main").await.unwrap());
+
+    // Still true after a commit.
+    let ledger = fluree.ledger("x").await.unwrap();
+    let txn = json!({
+        "@context": support::default_context(),
+        "@graph": [{
+            "@id": "https://ns.flur.ee/me",
+            "https://schema.org/name": "Me"
+        }]
+    });
+    fluree.insert(ledger, &txn).await.unwrap();
+    assert!(fluree.ledger_exists("x").await.unwrap());
+    assert!(fluree.ledger_exists("x:main").await.unwrap());
+
+    // Unknown name: a clean false.
+    assert!(!fluree.ledger_exists("y").await.unwrap());
+    assert!(!fluree.ledger_exists("x:feature").await.unwrap());
+
+    // The trap: an id the parser rejects is an *error*, not absence.
+    // A wrapper doing `.unwrap_or(false)` would report this ledger —
+    // which exists — as missing.
+    assert!(
+        fluree.ledger_exists("x:main:extra").await.is_err(),
+        "a malformed id must be an Err, so callers cannot mistake it for absence",
+    );
+
+    // A soft drop keeps the RECORD but not the ledger: `exists` is a
+    // query-path question, and on the query path a retracted record reads
+    // identically to not-found. Tombstoning backends (the raft nameservice)
+    // keep serving the record so admin tooling can read the flag; answering
+    // `true` here is what let a dropped ledger keep loading and serving
+    // queries on those backends.
+    fluree
+        .drop_ledger("x", fluree_db_api::DropMode::Soft)
+        .await
+        .unwrap();
+    assert!(
+        !fluree.ledger_exists("x:main").await.unwrap(),
+        "a retracted ledger must read as absent on the query path",
+    );
+
+    // ...but it is a SOFT drop: the record itself survives, carrying the
+    // flag, which is what distinguishes it from a hard drop.
+    let record = fluree
+        .nameservice()
+        .lookup("x:main")
+        .await
+        .unwrap()
+        .expect("a soft drop keeps the nameservice record");
+    assert!(
+        record.retracted,
+        "the surviving record must be marked retracted",
+    );
+}
+
 /// Integration test for basic query functionality
 #[tokio::test]
 async fn query_integration_test() {

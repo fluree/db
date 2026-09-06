@@ -163,6 +163,15 @@ pub enum QueryError {
     #[error("Policy error: {0}")]
     Policy(String),
 
+    /// A sync read needed CAS bytes that are not resident (wasm/residency
+    /// read tier). Typed so io-preserving frames can catch it without
+    /// string matching — the store-level miss register
+    /// ([`fluree_db_core::storage::residency::MissRegister`]) is the
+    /// load-bearing carrier; this variant is belt-and-braces where the
+    /// `io::Error` survives (mirrors the `FuelLimitExceeded` precedent).
+    #[error("{0}")]
+    NeedFetch(fluree_db_core::storage::residency::NeedFetch),
+
     /// Query mode not yet supported with binary indexes
     #[error("Unsupported mode: {0}")]
     UnsupportedMode(String),
@@ -245,6 +254,9 @@ impl QueryError {
             .and_then(|inner| inner.downcast_ref::<fluree_db_core::FuelExceededError>())
         {
             return Self::FuelLimitExceeded(fe.clone());
+        }
+        if let Some(nf) = fluree_db_core::storage::residency::NeedFetch::from_io_error(&err) {
+            return Self::NeedFetch(nf.clone());
         }
         Self::Internal(format!("{context}: {err}"))
     }

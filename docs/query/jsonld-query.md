@@ -85,6 +85,43 @@ Specifies what to return in results. The shape of `select` determines the shape 
 
 The array value is the selection spec — `"*"` for all forward properties, `"@id"` for the subject IRI, `"@type"` (equivalently `"rdf:type"`) for the subject's types, individual property names (`"schema:name"`), or nested object forms for sub-selections. Add `"depth": N` at the query top level to bound auto-expansion of unselected references.
 
+**Ordering and paging inside an expansion.** A nested selection's value may be an object instead of an array, adding `orderBy`, `limit` and `offset` around its `select`:
+
+```json
+{
+  "select": {
+    "?person": [
+      "@id",
+      "schema:name",
+      {
+        "schema:knows": {
+          "select": ["@id", "schema:name", "schema:age"],
+          "orderBy": [["desc", "schema:age"]],
+          "limit": 3
+        }
+      }
+    ]
+  },
+  "where": { "@id": "?person", "@type": "schema:Person" }
+}
+```
+
+These bound how many values **each subject** shows, which is a different question from how many rows the query returns — the top-level `limit` bounds people, this one bounds each person's friends. There is no way to express it in the `where` clause.
+
+| Key | Meaning |
+|-----|---------|
+| `select` | The selection spec, exactly as in the array form. Optional: omit it for a literal-valued property, which has nothing to expand. |
+| `orderBy` | Sort keys, most significant first. A property name, or `["desc", name]`. `"@value"` (equivalently `"@id"`) sorts by the value itself — the literal for a literal-valued property, the subject IRI for an expanded node. |
+| `limit` / `offset` | Applied **after** ordering, so they cut a stable window. |
+
+A key with several values sorts by its first. Values missing the sort key sort last in ascending order, so the ones that have it are the ones a `limit` keeps. Values that cannot be compared (objects without the key, mixed types) keep their relative order.
+
+```json
+{ "select": { "?person": [{ "ex:tag": { "orderBy": ["@value"], "limit": 5 } }] } }
+```
+
+Reverse selections (`@reverse`) do not accept these yet.
+
 **Mixed array** — combine flat variables and subject expansions in one row, in any order. Each object is an independent expansion with its own root and selection spec:
 
 ```json
@@ -601,8 +638,23 @@ Provide initial bindings:
 ```json
 {
   "where": [
-    ["values", "?name", ["Alice", "Bob", "Carol"]],
+    ["values", ["?name", ["Alice", "Bob", "Carol"]]],
     { "@id": "?person", "ex:name": "?name" }
+  ]
+}
+```
+
+`values` takes exactly one argument, the `[vars, rows]` pair. Bind several
+variables together by making `vars` a list and each row a list of the same
+length; IRI cells are written `{"@id": "..."}`:
+
+```json
+{
+  "where": [
+    ["values", [["?person", "?name"], [
+      [{"@id": "ex:alice"}, "Alice"],
+      [{"@id": "ex:bob"}, "Bob"]
+    ]]]
   ]
 }
 ```
@@ -1114,6 +1166,20 @@ Arithmetic operators accept two or more arguments. With multiple arguments, they
 - `(/ ?x ?y ...)` - Division
 - `(- ?x)` - Unary negation (single argument)
 - `(abs ?x)` - Absolute value
+
+`(- ?a ?b)` also subtracts two temporal values of the same kind — two
+`xsd:dateTime`s, two `xsd:date`s or two `xsd:time`s — yielding the elapsed time
+as an `xsd:dayTimeDuration`:
+
+```json
+["bind", "?elapsed", "(- ?end ?start)"]
+```
+
+The result is signed, and subtraction is the only operator defined over two
+temporal operands (shifting by a duration is the other form). This is an extension beyond the SPARQL
+standard; see [Date/Time Arithmetic](sparql.md#datetime-arithmetic) for the full
+semantics and portability caveat, which apply identically here — both query
+surfaces lower to the same expression IR.
 
 ### List Value Functions
 

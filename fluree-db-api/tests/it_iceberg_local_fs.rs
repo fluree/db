@@ -227,3 +227,92 @@ async fn local_table_end_to_end() {
 
     eprintln!("local iceberg end-to-end: all assertions passed");
 }
+
+/// The lake face of the stats kernel: the same table, profiled through the
+/// scan the virtual graph reads, pinned to its current snapshot.
+#[tokio::test]
+async fn local_table_profiles_through_the_scan() {
+    use fluree_db_api::profile::ProfileRequest;
+    use fluree_db_stats::ValueKind;
+
+    let location = table_location();
+    allow_table_root(&location);
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct("local-people-profile", &location, PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create local-file graph source");
+    let gs = "local-people-profile:main";
+
+    // Every column, no grouping.
+    let all = fluree
+        .profile_table(
+            gs,
+            "silver.people",
+            &ProfileRequest::columns(Vec::<String>::new()),
+        )
+        .await
+        .expect("profile all columns");
+    assert!(all.snapshot_id.is_some(), "pinned to a snapshot");
+    assert!(all.skipped.is_empty(), "{:?}", all.skipped);
+    let names: Vec<&str> = all.columns.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["id", "name", "score", "active"]);
+
+    let id = &all.columns[0].summary;
+    assert_eq!(id.count, 5);
+    assert_eq!(id.distinct, 5);
+    assert!(id.distinct_is_exact);
+    assert!(id.key_candidate, "{id:?}");
+    assert_eq!(id.kinds.get(&ValueKind::Int), Some(&5));
+
+    let name = &all.columns[1].summary;
+    let text = name.text.as_ref().expect("text summary");
+    assert_eq!(text.min.as_deref(), Some("alice"));
+    assert!(name.top_values.iter().any(|v| v.value == "erin"));
+
+    let score = &all.columns[2].summary;
+    let num = score.numeric.as_ref().expect("numeric summary");
+    assert_eq!(num.count, score.count - score.null_count);
+    assert!(num.p50.is_some());
+
+    let active = &all.columns[3].summary;
+    assert!(active.distinct <= 2);
+    assert!(active.top_values_exact);
+
+    // One column grouped by another, plus a column that does not exist.
+    let grouped = fluree
+        .profile_table(
+            gs,
+            "silver.people",
+            &ProfileRequest::columns(["score", "nope"]).group_by(["active"]),
+        )
+        .await
+        .expect("grouped profile");
+    assert_eq!(grouped.skipped.len(), 1);
+    assert_eq!(grouped.skipped[0].name, "nope");
+    assert_eq!(grouped.columns.len(), 1);
+    let g = grouped.columns[0].grouped.as_ref().expect("grouped");
+    assert!(g.group_count >= 1 && g.group_count <= 2, "{g:?}");
+    assert_eq!(g.total.count, 5);
+    assert_eq!(
+        g.groups.iter().map(|x| x.summary.count).sum::<u64>() + g.ungrouped,
+        5
+    );
+
+    // Every named column unknown: an empty projection reads the whole
+    // table, so the scan is skipped rather than run for nothing. The
+    // report still says what was asked for and what was not there.
+    let none = fluree
+        .profile_table(
+            gs,
+            "silver.people",
+            &ProfileRequest::columns(["nope", "also-nope"]),
+        )
+        .await
+        .expect("profile with no known columns");
+    assert!(none.columns.is_empty(), "{:?}", none.columns);
+    assert_eq!(none.skipped.len(), 2);
+    assert!(none.snapshot_id.is_some(), "still pinned to a snapshot");
+}

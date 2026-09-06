@@ -363,6 +363,42 @@ pub fn read_indexing_thresholds(config_dir: &Path) -> IndexingThresholds {
     }
 }
 
+/// The `[doc]` table of the config file: model endpoints for `fluree doc`.
+///
+/// An absent section reads as unconfigured — the pipeline then runs
+/// deterministic and offline, which is the documented behavior for a machine
+/// with nothing set up. A section that is present but malformed is an error:
+/// someone configured a model on purpose, and silently running without it
+/// would look like success.
+pub fn read_doc_config(config_dir: &Path) -> CliResult<fluree_db_doc::DocConfig> {
+    let Some((path, format)) = detect_config_file(config_dir) else {
+        return Ok(fluree_db_doc::DocConfig::default());
+    };
+    let content = fs::read_to_string(&path)
+        .map_err(|e| CliError::Config(format!("{}: {e}", path.display())))?;
+    let bad = |e: String| CliError::Config(format!("{}: [doc] section: {e}", path.display()));
+    match format {
+        ConfigFileFormat::Toml => {
+            let doc: toml::Value = toml::from_str(&content)
+                .map_err(|e| CliError::Config(format!("{}: {e}", path.display())))?;
+            match doc.get("doc").cloned() {
+                Some(v) => v
+                    .try_into()
+                    .map_err(|e: toml::de::Error| bad(e.to_string())),
+                None => Ok(fluree_db_doc::DocConfig::default()),
+            }
+        }
+        ConfigFileFormat::JsonLd => {
+            let doc: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|e| CliError::Config(format!("{}: {e}", path.display())))?;
+            match doc.get("doc").cloned() {
+                Some(v) => serde_json::from_value(v).map_err(|e| bad(e.to_string())),
+                None => Ok(fluree_db_doc::DocConfig::default()),
+            }
+        }
+    }
+}
+
 /// Prefix map type: prefix -> IRI namespace
 pub type PrefixMap = std::collections::HashMap<String, String>;
 

@@ -13,7 +13,7 @@ nameservice = ["fluree-db-nameservice"]
 
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
-fluree-db-nameservice = { path = "../fluree-db-nameservice", optional = true }
+fluree-db-nameservice = { path = "../fluree-db-nameservice", optional = true, default-features = false }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }

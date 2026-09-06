@@ -1,0 +1,87 @@
+[package]
+name = "fluree-raft-core"
+description = "Application-agnostic Raft substrate: durable log/snapshot storage, node identity, and rendezvous ownership"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No `fluree-db-*` dependencies, by design: this crate is the generic
+# half of what used to live in `fluree-db-consensus::raft`, and every
+# consumer (the nameservice group today; workflow / entity-resolution
+# groups next) instantiates it against its own state machine.
+#
+# `openraft` is gated behind the `raft` feature. Without it the storage
+# traits (opaque `Vec<u8>` payloads), node/group identity, and rendezvous
+# ownership all compile on their own — which is what keeps monolithic
+# Fluree builds from linking openraft.
+
+[features]
+default = []
+# Gates `openraft` and the adapters built on it (log storage, HTTP
+# transport, membership admin, leader forwarding). Off by default so
+# consumers that only want the storage traits, node/group identity, or
+# rendezvous ownership — and monolithic Fluree builds, which reach this
+# crate through `fluree-db-consensus` for `http::is_hop_by_hop` — do not
+# compile or link openraft.
+raft = ["dep:openraft", "dep:axum", "dep:reqwest", "dep:http-body-util", "dep:tokio-util", "dep:serde_json"]
+# Conformance fixture for `AppStateMachine` implementations. Separate
+# from `raft` so it can be enabled as a dev-dependency by consumers
+# without shipping the fixture in their release builds.
+testing = ["raft"]
+# Replicated key/value fragment (`kv`). Independent of `raft`: it is
+# pure state plus a pure reduction, so a consumer can depend on the
+# semantics without linking openraft.
+kv = []
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Wire and on-disk encoding for log entries, vote, and snapshot
+# metadata in the filesystem backend.
+postcard = { workspace = true }
+
+# `tokio::fs` + `AsyncWriteExt` for the filesystem backend's
+# write-fsync-rename discipline.
+tokio = { workspace = true }
+
+# Deterministic, fixed-seed hash for rendezvous ownership. Every node
+# must agree on hash values, so this cannot be `std`'s randomly-seeded
+# `DefaultHasher`. xxh64 is stable across releases of the crate.
+xxhash-rust = { workspace = true, features = ["xxh64"] }
+
+# Gated behind `raft` — only the openraft-facing adapters need these.
+# Pinned to a current release line; bumping should be tracked alongside
+# any state-machine / storage-format changes.
+openraft = { version = "0.9", optional = true, features = [
+    "serde",
+    "storage-v2",
+    "single-term-leader",
+] }
+# HTTP server for the inter-node RPC layer; consumers nest the returned
+# `axum::Router` under whatever path they want.
+axum = { workspace = true, optional = true }
+# HTTP client for the same layer, and for follower->leader forwarding.
+reqwest = { workspace = true, optional = true }
+# The propose relay's wire (`/propose` + `forward::propose_via_leader`):
+# JSON both ways, because application RESPONSES never ride the log and
+# may carry `serde_json::Value` state postcard cannot decode.
+serde_json = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+# `CancellationToken` for the leader-task lifecycle.
+tokio-util = { version = "0.7", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tempfile = "3.19"
+axum = { workspace = true }
+tokio-util = { version = "0.7" }
+xxhash-rust = { workspace = true, features = ["xxh64"] }
+
+[lints]
+workspace = true

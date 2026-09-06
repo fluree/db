@@ -40,12 +40,14 @@ impl DocsIndex {
 
         for path in DocsAssets::iter() {
             let p = path.as_ref();
+            // Belt-and-braces: since the derive gained `#[include = "*.md"]`
+            // and the `book/`/hidden-dir excludes (embed.rs), these two
+            // filters can no longer be the thing standing between a stray
+            // asset and the index — the embed itself excludes them. Kept so
+            // the index stays correct even if the derive's filters loosen.
             if !p.ends_with(".md") {
                 continue;
             }
-            // Skip the mdBook build output and any hidden directory (e.g. a
-            // `.llms-staging/` scratch tree) — mdBook ignores dot-prefixed
-            // entries, so we do too, to avoid indexing duplicate pages.
             if p.starts_with("book/") || p.split('/').any(|seg| seg.starts_with('.')) {
                 continue;
             }

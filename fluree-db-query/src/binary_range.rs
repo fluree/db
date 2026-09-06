@@ -793,7 +793,7 @@ fn binary_range_eq_v3(
     // Correctness fallback: merge untranslated overlay flakes (including retracts),
     // resolve per-fact lifecycles (latest-op-wins), then apply RangeOptions.
     flakes.extend(untranslated);
-    let mut resolved = resolve_latest_ops_keep_asserts(flakes, index);
+    let mut resolved = fluree_db_core::range::resolve_current_flakes(flakes, index);
     resolved.retain(|f| flake_matches_range_eq(f, match_val));
 
     if let Some(bounds) = &opts.object_bounds {
@@ -818,47 +818,6 @@ fn binary_range_eq_v3(
 #[inline]
 fn resolve_sid(s_id: u64, view: &BinaryGraphView) -> std::io::Result<Sid> {
     view.resolve_subject_sid(s_id)
-}
-
-/// Resolve fact lifecycles (latest op wins) and drop retracts.
-///
-/// Used as a correctness fallback when some overlay flakes cannot be translated
-/// into V3 `OverlayOp`s (e.g., missing dict novelty). The input should include
-/// both cursor output flakes (asserts) and raw overlay flakes (asserts/retracts).
-fn resolve_latest_ops_keep_asserts(mut flakes: Vec<Flake>, index: IndexType) -> Vec<Flake> {
-    let cmp = index.comparator();
-    flakes.sort_by(cmp);
-
-    if flakes.len() < 2 {
-        return flakes.into_iter().filter(|f| f.op).collect();
-    }
-
-    let mut out: Vec<Flake> = Vec::with_capacity(flakes.len());
-    let mut i = 0usize;
-    while i < flakes.len() {
-        let mut best = i;
-        i += 1;
-
-        while i < flakes.len() && same_fact_identity(&flakes[best], &flakes[i]) {
-            let cand = &flakes[i];
-            let cur = &flakes[best];
-            if cand.t > cur.t || (cand.t == cur.t && !cand.op && cur.op) {
-                best = i;
-            }
-            i += 1;
-        }
-
-        if flakes[best].op {
-            out.push(flakes[best].clone());
-        }
-    }
-
-    out
-}
-
-#[inline]
-fn same_fact_identity(a: &Flake, b: &Flake) -> bool {
-    a.s == b.s && a.p == b.p && a.o == b.o && a.dt == b.dt && a.m == b.m
 }
 
 /// Batched lookup for ref-valued predicate objects across many subjects (V3).
@@ -1084,8 +1043,15 @@ fn apply_raw_overlay_deltas_to_batched_refs(
             None => {
                 subj_entry.insert(class_sid, (flake.t, flake.op));
             }
-            Some(&(t0, _op0)) => {
-                if flake.t > t0 {
+            Some(&(t0, op0)) => {
+                // Newest op wins; at equal `t` the retraction does. Taking
+                // `>` alone let whichever flake the walk happened to yield
+                // first win the tie — and on this lane, which decides
+                // class-based policy grants, the direction it failed was
+                // open: a same-`t` assert+retract of a class left the class
+                // granted. Same rule as `resolve_current_flakes` and
+                // `resolve_overlay_ops`.
+                if flake.t > t0 || (flake.t == t0 && !flake.op && op0) {
                     subj_entry.insert(class_sid, (flake.t, flake.op));
                 }
             }
@@ -1102,10 +1068,28 @@ fn apply_raw_overlay_deltas_to_batched_refs(
                 vec.retain(|c| c != class_sid);
             }
         }
+        // A subject whose overlay flakes are all retractions would otherwise
+        // be left holding an empty vector, which reads as "present with no
+        // classes". `lookup_subject_classes` documents that subjects with no
+        // `rdf:type` assertions are absent from the map, and its per-subject
+        // fallback enforces that — so don't diverge from it here.
+        if vec.is_empty() {
+            out.remove(subj);
+        }
     }
 }
 
 /// Overlay-only fallback for batched ref lookup when no PSOT branch exists.
+///
+/// The overlay is a log: an `rdf:type` asserted and then retracted inside the
+/// same novelty window has both flakes here. Filtering the walk to asserts
+/// would report a class that was revoked — and since this function's caller
+/// serves policy `rdf:type` lookups, that means a class-based grant surviving
+/// its own revocation until the first index build. So retractions are kept and
+/// the merged set goes through
+/// [`apply_raw_overlay_deltas_to_batched_refs`] — the same latest-op-wins rule
+/// this function's two sibling paths already apply, rather than a third
+/// variant of it.
 #[allow(clippy::too_many_arguments)]
 fn batched_refs_overlay_only(
     store: &Arc<BinaryIndexStore>,
@@ -1119,8 +1103,9 @@ fn batched_refs_overlay_only(
     let effective_to_t = opts.to_t.unwrap_or_else(|| store.max_t());
     let subject_set: HashSet<&Sid> = subjects.iter().collect();
 
-    let mut out: HashMap<Sid, Vec<Sid>> = HashMap::new();
-
+    // Gate on the two components that narrow the walk; the delta helper
+    // applies the `to_t` and ref-object filters itself.
+    let mut raw_overlay: Vec<Flake> = Vec::new();
     overlay.for_each_overlay_flake(
         g_id,
         IndexType::Psot,
@@ -1129,24 +1114,14 @@ fn batched_refs_overlay_only(
         true,
         effective_to_t,
         &mut |flake| {
-            if !flake.op {
-                return;
-            }
-            if !subject_set.contains(&flake.s) {
-                return;
-            }
-            if flake.p != *predicate {
-                return;
-            }
-            // No translation needed: we can inspect the FlakeValue directly.
-            // Only include IRI-ref object values.
-            if let FlakeValue::Ref(ref class_sid) = flake.o {
-                out.entry(flake.s.clone())
-                    .or_default()
-                    .push(class_sid.clone());
+            if flake.p == *predicate && subject_set.contains(&flake.s) {
+                raw_overlay.push(flake.clone());
             }
         },
     );
+
+    let mut out: HashMap<Sid, Vec<Sid>> = HashMap::new();
+    apply_raw_overlay_deltas_to_batched_refs(&mut out, &raw_overlay, predicate, effective_to_t);
 
     for classes in out.values_mut() {
         classes.sort();
@@ -1429,7 +1404,7 @@ fn binary_range_bounded_v3(
 
     // Correctness fallback: merge raw overlay flakes, resolve lifecycles, then apply options.
     flakes.extend(raw_overlay);
-    let mut resolved = resolve_latest_ops_keep_asserts(flakes, IndexType::Spot);
+    let mut resolved = fluree_db_core::range::resolve_current_flakes(flakes, IndexType::Spot);
 
     // Re-apply subject bounds: start_bound.s <= s < end_bound.s.
     resolved.retain(|f| f.s >= start_bound.s && f.s < end_bound.s);
@@ -1484,7 +1459,7 @@ fn overlay_only_flakes_bounded(
     );
 
     // Resolve lifecycles (latest op wins) and drop retracts.
-    let mut resolved = resolve_latest_ops_keep_asserts(flakes, index);
+    let mut resolved = fluree_db_core::range::resolve_current_flakes(flakes, index);
 
     // Apply options after lifecycle resolution.
     if let Some(ref bounds) = opts.object_bounds {
@@ -1501,11 +1476,41 @@ fn overlay_only_flakes_bounded(
     Ok(resolved)
 }
 
-/// Overlay-only results when no branch exists for the requested order.
+/// Overlay-only results when the persisted index cannot contribute a row.
 ///
-/// Collects flakes directly from the overlay provider, applies match filtering
-/// and options (offset/limit). Used at genesis or before first indexing when
-/// no persisted branch exists for the requested sort order.
+/// Reached whenever a bound component of `match_val` has no persisted id
+/// (a novelty-only subject, predicate, or object), or no branch manifest
+/// exists for `(g_id, order)`.
+///
+/// That second trigger is broader than "genesis / pre-first-index":
+/// `branch_for_order` is keyed per graph AND order, and the bulk-import path
+/// emits SPOT unconditionally while skipping PSOT/POST/OPST when the order
+/// produced no run files (`index_build.rs`'s empty-run-dir early return),
+/// so a graph with zero rows at the indexed `t` lands here for three of the
+/// four orders. Falling back is still correct: the orders that go missing
+/// are exactly the zero-row ones, so there are no persisted rows to drop.
+/// The converse does NOT hold — SPOT can be `Some` with an empty branch —
+/// so nothing here may treat "this order resolved" as "this graph is
+/// indexed".
+///
+/// The overlay is a **log**, not a current-state view: an assert at `t=2`
+/// and its retraction at `t=3` both sit in novelty. So retractions are kept
+/// through the walk and the whole matching set is lifecycle-resolved by
+/// `resolve_current_flakes` — the shared rule, hashing the full
+/// `(s, p, o, dt, m)` identity, which the bounded twin and the untranslated
+/// fallback also use and which the cursor path mirrors in
+/// `resolve_overlay_ops`. Filtering to `op == true` inside the walk instead
+/// silently resurrects every fact whose assert AND retract both live in
+/// novelty.
+///
+/// `object_bounds` stays IN the walk: a retraction that can cancel an assert
+/// carries the same `o` by construction (the fact identity requires it), so
+/// the bound is true for both halves or false for both, and pruning early is
+/// equivalent to pruning survivors while collecting and cloning less. The
+/// `offset`/`limit` pair cannot move in with it — they count survivors, and
+/// the retraction that cancels an already-counted assert can arrive after
+/// the count is reached. `for_each_overlay_flake` walks the graph's whole
+/// overlay regardless, so no early exit would shorten the traversal anyway.
 fn overlay_only_flakes(
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
@@ -1518,9 +1523,6 @@ fn overlay_only_flakes(
     let limit = opts.flake_limit.or(opts.limit).unwrap_or(usize::MAX);
     let offset = opts.offset.unwrap_or(0);
 
-    // Use Cell for early-exit: once we've collected offset+limit, stop cloning.
-    let mut skipped = 0usize;
-    let mut collected = 0usize;
     let mut flakes = Vec::new();
 
     overlay.for_each_overlay_flake(
@@ -1531,17 +1533,9 @@ fn overlay_only_flakes(
         true,
         effective_to_t,
         &mut |flake| {
-            // Early exit: already have enough results.
-            if collected >= limit {
-                return;
-            }
-
-            // Only include asserts (op=true).
-            if !flake.op {
-                return;
-            }
-
-            // Filter by match components.
+            // Filter by match components. A retraction carries the same
+            // subject/predicate/object as the assert it cancels, so these
+            // gates keep both halves of a fact together.
             if let Some(ref s_sid) = match_val.s {
                 if flake.s != *s_sid {
                     return;
@@ -1568,23 +1562,153 @@ fn overlay_only_flakes(
                 }
             }
 
-            // Apply object bounds (same as persisted path).
+            // Object bounds are a pure function of `o`, which a fact and its
+            // retraction share, so this prunes whole facts rather than
+            // splitting one — see the note above.
             if let Some(ref bounds) = opts.object_bounds {
                 if !bounds.matches(&flake.o) {
                     return;
                 }
             }
 
-            // Apply offset.
-            if skipped < offset {
-                skipped += 1;
-                return;
-            }
-
+            // Keep both asserts and retracts; resolve lifecycles below.
             flakes.push(flake.clone());
-            collected += 1;
         },
     );
 
-    Ok(flakes)
+    let mut resolved = fluree_db_core::range::resolve_current_flakes(flakes, index);
+
+    // Counting options apply to the resolved current state, not to the log.
+    if offset > 0 && !resolved.is_empty() {
+        let n = offset.min(resolved.len());
+        resolved.drain(0..n);
+    }
+    if resolved.len() > limit {
+        resolved.truncate(limit);
+    }
+
+    Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(name: &str) -> Sid {
+        Sid::new(100, name)
+    }
+
+    /// The latest-op-wins rule `batched_refs_overlay_only` delegates to.
+    ///
+    /// Its overlay walk is a log, so an `rdf:type` asserted and retracted in
+    /// the same novelty window arrives as both flakes. Filtering to asserts
+    /// (what that function used to do) reports a revoked class — and its
+    /// caller serves policy `rdf:type` lookups, so a class-based grant would
+    /// outlive its own revocation until the first index build.
+    #[test]
+    fn batched_ref_deltas_drop_a_retracted_class() {
+        let rdf_type = s("type");
+        let type_flake = |subject: &str, class: &str, t: i64, op: bool| {
+            Flake::new(
+                s(subject),
+                rdf_type.clone(),
+                FlakeValue::Ref(s(class)),
+                Sid::new(0, ""),
+                t,
+                op,
+                None,
+            )
+        };
+
+        let mut out: HashMap<Sid, Vec<Sid>> = HashMap::new();
+        apply_raw_overlay_deltas_to_batched_refs(
+            &mut out,
+            &[
+                // Revoked in the same window.
+                type_flake("alice", "Admin", 2, true),
+                type_flake("alice", "Admin", 3, false),
+                // Still held.
+                type_flake("alice", "Person", 2, true),
+                // Revoked, then granted again.
+                type_flake("bob", "Admin", 2, true),
+                type_flake("bob", "Admin", 3, false),
+                type_flake("bob", "Admin", 4, true),
+            ],
+            &rdf_type,
+            10,
+        );
+
+        let classes = |subject: &str| -> Vec<String> {
+            let mut v: Vec<String> = out
+                .get(&s(subject))
+                .map(|cs| cs.iter().map(|c| c.name_str().to_string()).collect())
+                .unwrap_or_default();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            classes("alice"),
+            vec!["Person".to_string()],
+            "a revoked class must not be reported"
+        );
+        assert_eq!(
+            classes("bob"),
+            vec!["Admin".to_string()],
+            "a re-granted class comes back"
+        );
+    }
+
+    /// The equal-`t` tie on the policy lane, and the map-shape contract.
+    ///
+    /// `t > t0` alone let whichever flake the walk yielded first win a tie,
+    /// and the direction it failed was open: a same-`t` assert+retract left
+    /// the class granted. And a subject whose overlay flakes are all
+    /// retractions must be ABSENT from the map, not present with an empty
+    /// vector — `lookup_subject_classes` documents that, and its per-subject
+    /// fallback enforces it.
+    #[test]
+    fn batched_ref_deltas_tie_and_map_shape() {
+        let rdf_type = s("type");
+        let type_flake = |subject: &str, class: &str, t: i64, op: bool| {
+            Flake::new(
+                s(subject),
+                rdf_type.clone(),
+                FlakeValue::Ref(s(class)),
+                Sid::new(0, ""),
+                t,
+                op,
+                None,
+            )
+        };
+
+        // Assert-first and retract-first orderings must agree.
+        for flip in [false, true] {
+            let mut raw = vec![
+                type_flake("carol", "Admin", 2, true),
+                type_flake("carol", "Admin", 2, false),
+            ];
+            if flip {
+                raw.reverse();
+            }
+            let mut out: HashMap<Sid, Vec<Sid>> = HashMap::new();
+            apply_raw_overlay_deltas_to_batched_refs(&mut out, &raw, &rdf_type, 10);
+            assert!(
+                !out.contains_key(&s("carol")),
+                "same-t assert+retract must revoke, and leave no empty entry (flip={flip})"
+            );
+        }
+
+        // Retraction-only overlay for a subject: absent, not empty.
+        let mut out: HashMap<Sid, Vec<Sid>> = HashMap::new();
+        apply_raw_overlay_deltas_to_batched_refs(
+            &mut out,
+            &[type_flake("dave", "Admin", 3, false)],
+            &rdf_type,
+            10,
+        );
+        assert!(
+            !out.contains_key(&s("dave")),
+            "a subject with no surviving class must not appear in the map"
+        );
+    }
 }

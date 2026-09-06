@@ -6,6 +6,11 @@ use std::process;
 pub const EXIT_SUCCESS: i32 = 0;
 pub const EXIT_ERROR: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
+/// `fluree verify`: provenance-only problems — state and every replication
+/// path are intact, so a gate that only cares about replication may proceed.
+pub const EXIT_VERIFY_PROVENANCE: i32 = 3;
+/// `fluree verify`: the commit chain or index root is broken.
+pub const EXIT_VERIFY_CHAIN: i32 = 4;
 
 /// Unified error type for CLI operations.
 pub enum CliError {
@@ -70,6 +75,15 @@ impl fmt::Display for CliError {
 impl fmt::Debug for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
+    }
+}
+
+impl From<fluree_db_doc::DocError> for CliError {
+    fn from(e: fluree_db_doc::DocError) -> Self {
+        match e {
+            fluree_db_doc::DocError::Config(m) => CliError::Config(m),
+            other => CliError::Input(other.to_string()),
+        }
     }
 }
 

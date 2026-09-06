@@ -89,6 +89,16 @@ struct ClassMembershipCtx<'a> {
     /// Current RDFS hierarchy for always-on entailment: property paths and
     /// pair constraints traverse `p` plus its subproperties.
     hierarchy: Option<&'a SchemaHierarchy>,
+    /// Lowering-time IRI resolver override for `sh:sparql` constraint
+    /// queries. Staging passes the staged namespace registry so a constraint
+    /// over a namespace the in-flight transaction introduced matches its
+    /// staged data; `None` falls back to the data snapshot's registry.
+    iri_encoder: Option<&'a (dyn fluree_db_query::parse::IriEncoder + Sync)>,
+    /// Cooperative cancellation for `sh:sparql` constraint queries. Carries
+    /// the request deadline AND the per-query memory ceiling — the ceiling is
+    /// only installed when a cancellation is present, so without one a
+    /// constraint body runs unbounded. `None` outside a request scope.
+    cancellation: Option<&'a fluree_db_core::QueryCancellation>,
 }
 
 /// SHACL validation engine
@@ -111,6 +121,9 @@ pub struct ShaclEngine {
     membership_g_ids: Vec<GraphId>,
     /// Per-transaction memo of resolved `sh:class` membership verdicts.
     class_cache: ClassMembershipCache,
+    /// Cooperative cancellation handed to `sh:sparql` constraint queries.
+    /// See [`ShaclEngine::with_cancellation`].
+    cancellation: Option<fluree_db_core::QueryCancellation>,
 }
 
 impl ShaclEngine {
@@ -123,6 +136,7 @@ impl ShaclEngine {
             hierarchy: None,
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
+            cancellation: None,
         }
     }
 
@@ -136,6 +150,7 @@ impl ShaclEngine {
             hierarchy: Some(hierarchy),
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
+            cancellation: None,
         }
     }
 
@@ -149,6 +164,7 @@ impl ShaclEngine {
             hierarchy,
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
+            cancellation: None,
         }
     }
 
@@ -218,6 +234,7 @@ impl ShaclEngine {
             hierarchy,
             membership_g_ids: Vec::new(),
             class_cache: Mutex::new(HashMap::new()),
+            cancellation: None,
         })
     }
 
@@ -228,6 +245,25 @@ impl ShaclEngine {
     /// data lives in a different graph.
     pub fn with_membership_graphs(mut self, g_ids: Vec<GraphId>) -> Self {
         self.membership_g_ids = g_ids;
+        self
+    }
+
+    /// Attach the request's cooperative cancellation handle, bounding
+    /// `sh:sparql` constraint queries.
+    ///
+    /// `sh:sparql` is the first SHACL construct whose reach is not
+    /// structurally limited to the focus node: pre-binding `$this` constrains
+    /// where the query STARTS, not how much of the graph its body walks. A
+    /// constraint runs once per focus node, so without a handle here a single
+    /// validation pass has no deadline and — because
+    /// `execute_prepared_into` installs the per-query memory ceiling only
+    /// when a cancellation is present — no memory ceiling either.
+    ///
+    /// Callers inside a request scope should always set this. Fuel is carried
+    /// separately, on the `GraphDbRef`'s tracker.
+    #[must_use]
+    pub fn with_cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
+        self.cancellation = Some(cancellation);
         self
     }
 
@@ -272,6 +308,7 @@ impl ShaclEngine {
         focus_node: &Sid,
         node_types: &[Sid],
         cross_ledger: Option<CrossLedgerMembership<'_>>,
+        iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
     ) -> Result<ValidationReport> {
         let mut results = Vec::new();
 
@@ -339,6 +376,8 @@ impl ShaclEngine {
             cache: &self.class_cache,
             cross_ledger,
             hierarchy: self.hierarchy.as_ref(),
+            iri_encoder,
+            cancellation: self.cancellation.as_ref(),
         };
         let active = ActiveShapeChecks::default();
         for shape in applicable_shapes {
@@ -368,7 +407,8 @@ impl ShaclEngine {
         node_types: &[Sid],
     ) -> Result<ValidationReport> {
         let db = GraphDbRef::new(snapshot, g_id, &NoOverlay, snapshot.t);
-        self.validate_node(db, focus_node, node_types, None).await
+        self.validate_node(db, focus_node, node_types, None, None)
+            .await
     }
 
     /// Validate all focus nodes targeted by shapes
@@ -384,6 +424,19 @@ impl ShaclEngine {
         db: GraphDbRef<'_>,
         cross_ledger: Option<CrossLedgerMembership<'_>>,
     ) -> Result<ValidationReport> {
+        self.validate_all_with_membership_and_encoder(db, cross_ledger, None)
+            .await
+    }
+
+    /// [`Self::validate_all_with_membership`] with an optional lowering-time
+    /// IRI resolver override for `sh:sparql` constraint queries (see
+    /// [`ClassMembershipCtx::iri_encoder`]).
+    pub async fn validate_all_with_membership_and_encoder(
+        &self,
+        db: GraphDbRef<'_>,
+        cross_ledger: Option<CrossLedgerMembership<'_>>,
+        iri_encoder: Option<&(dyn fluree_db_query::parse::IriEncoder + Sync)>,
+    ) -> Result<ValidationReport> {
         let mut all_results = Vec::new();
 
         // Collect all shapes for logical constraint resolution
@@ -394,6 +447,8 @@ impl ShaclEngine {
             cache: &self.class_cache,
             cross_ledger,
             hierarchy: self.hierarchy.as_ref(),
+            iri_encoder,
+            cancellation: self.cancellation.as_ref(),
         };
         // Class-target focus nodes are constant across the shape loop (same
         // `db`, same hierarchy), so memoize them per class: several shapes
@@ -577,7 +632,9 @@ impl ShaclEngine {
                 .collect();
 
             // Validate this node against applicable shapes
-            let report = self.validate_node(db, subject, &node_types, None).await?;
+            let report = self
+                .validate_node(db, subject, &node_types, None, None)
+                .await?;
             all_results.extend(report.results);
         }
 
@@ -587,48 +644,6 @@ impl ShaclEngine {
             conforms,
             results: all_results,
         })
-    }
-
-    /// Validate staged changes, returning an error if validation fails
-    ///
-    /// This is a convenience wrapper around `validate_staged` that converts
-    /// validation failures into errors, suitable for use in transaction staging.
-    pub async fn validate_staged_or_error(
-        &self,
-        db: GraphDbRef<'_>,
-        modified_subjects: &HashSet<Sid>,
-    ) -> Result<()> {
-        let report = self.validate_staged(db, modified_subjects).await?;
-
-        // Enforcement rejects on violations only — spec-level `conforms`
-        // is also false for warnings/infos, which must not block a commit.
-        if report.violation_count() == 0 {
-            Ok(())
-        } else {
-            // Build detailed error messages (limit to first 10 to avoid huge errors)
-            let details: Vec<String> = report
-                .results
-                .iter()
-                .filter(|r| r.severity == Severity::Violation)
-                .take(10)
-                .map(|r| {
-                    if let Some(ref path) = r.result_path {
-                        format!(
-                            "Node {}: property {}: {}",
-                            r.focus_node, path.name, r.message
-                        )
-                    } else {
-                        format!("Node {}: {}", r.focus_node, r.message)
-                    }
-                })
-                .collect();
-
-            Err(crate::error::ShaclError::ValidationFailed {
-                violation_count: report.violation_count(),
-                warning_count: report.warning_count(),
-                details,
-            })
-        }
     }
 }
 
@@ -796,6 +811,25 @@ fn validate_shape<'a>(
             )
             .await?;
             results.extend(constraint_results);
+        }
+
+        // SPARQL-based constraints (sh:sparql) on the node shape: each runs
+        // its SELECT with $this pre-bound; every solution is a violation.
+        for constraint in &shape.sparql_constraints {
+            let sparql_results = crate::sparql::validate_sparql_constraint(
+                db,
+                focus_node,
+                constraint,
+                None,
+                shape.severity,
+                &shape.id,
+                crate::sparql::SparqlConstraintCtx {
+                    iri_encoder: class_ctx.and_then(|c| c.iri_encoder),
+                    cancellation: class_ctx.and_then(|c| c.cancellation),
+                },
+            )
+            .await?;
+            results.extend(sparql_results);
         }
 
         active.lock().remove(&guard_key);
@@ -1775,6 +1809,29 @@ async fn validate_property_shape<'a>(
             graph_id: None,
         });
         return Ok(results);
+    }
+
+    // SPARQL-based constraints (sh:sparql) on this property shape: each runs
+    // its SELECT with $this pre-bound; solutions are violations. Runs before
+    // value-node collection since the query is independent of the path's
+    // value nodes (the shape's predicate path only backs sh:resultPath when
+    // the solution doesn't bind ?path).
+    for constraint in &prop_shape.sparql_constraints {
+        results.extend(
+            crate::sparql::validate_sparql_constraint(
+                db,
+                focus_node,
+                constraint,
+                prop_shape.path.as_predicate(),
+                prop_shape.severity,
+                &prop_shape.id,
+                crate::sparql::SparqlConstraintCtx {
+                    iri_encoder: class_ctx.and_then(|c| c.iri_encoder),
+                    cancellation: class_ctx.and_then(|c| c.cancellation),
+                },
+            )
+            .await?,
+        );
     }
 
     // Get all value nodes reached by this property shape's path on the focus node.
@@ -3045,15 +3102,6 @@ impl FocusNode {
     }
 }
 
-impl std::fmt::Display for FocusNode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FocusNode::Node(sid) => write!(f, "{}{}", sid.namespace_code, sid.name),
-            FocusNode::Literal(lit) => write!(f, "{}", lit.value),
-        }
-    }
-}
-
 /// Individual validation result
 #[derive(Debug, Clone)]
 pub struct ValidationResult {
@@ -3164,8 +3212,10 @@ mod tests {
             structural_constraints: vec![],
             severity: Severity::Violation,
             name: None,
+            description: None,
             message: None,
             deactivated: false,
+            sparql_constraints: vec![],
         };
 
         let key = ShaclCacheKey::new("test", 1);
@@ -3226,8 +3276,10 @@ mod tests {
             structural_constraints: vec![],
             severity: Severity::Violation,
             name: None,
+            description: None,
             message: None,
             deactivated: false,
+            sparql_constraints: vec![],
         };
 
         let key = ShaclCacheKey::new("test", 1);

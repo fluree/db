@@ -41,6 +41,11 @@ pub const SK_META: &str = "meta";
 pub const SK_HEAD: &str = "head";
 pub const SK_INDEX: &str = "index";
 pub const SK_CONFIG: &str = "config";
+// NOTE: `NameServiceLookup::heads` range-scans `SK_HEAD..=SK_INDEX` to fetch
+// both ref items in one Query. A new sort key landing lexically between them
+// is read and discarded (`find_item_by_sk` matches exactly, so the result
+// cannot be corrupted) — but it costs RCU on every head read. Keep new keys
+// outside that range where practical.
 pub const SK_STATUS: &str = "status";
 
 // ── Meta item attributes ────────────────────────────────────────────────────
