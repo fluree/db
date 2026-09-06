@@ -267,8 +267,16 @@ The nameservice stores the current index root CID (`index_head_id`) and its wate
 
 Old index snapshots are retained for time-travel safety and concurrent query safety. Cleanup is performed by the binary index garbage collector, governed by:
 
-- `IndexerConfig.gc_max_old_indexes`
-- `IndexerConfig.gc_min_time_mins`
+- `IndexerConfig.gc_max_old_indexes` (`--gc-max-old-indexes` / `FLUREE_GC_MAX_OLD_INDEXES`, default 5): old versions to retain.
+- `IndexerConfig.gc_min_time_mins` (`--gc-min-time-mins` / `FLUREE_GC_MIN_TIME_MINS`, default 30): minimum age before a version can be collected.
+
+Both must be satisfied, so the slower of the two wins. Under a sustained publish rate that is the age guard: a ledger publishing every few seconds holds far more than `gc_max_old_indexes` versions inside the 30-minute window, and the count bounds nothing. Retention becomes "however many versions fit in the window", which grows with publish rate and per-version size. Every one of those versions is still reachable and still on disk.
+
+- `IndexerConfig.gc_hard_max_old_indexes` (`--gc-hard-max-old-indexes` / `FLUREE_GC_HARD_MAX_OLD_INDEXES`, unset by default): a ceiling past which versions are collected regardless of age.
+
+The ceiling is opt-in because the age guard is what protects a query that started against an older version: until the guard expires, that version's leaves are still in storage. Past the ceiling they are released regardless, and a query still reading them fails or reads a torn version. Set it well above the number of versions the ledger publishes during your longest query. Each GC pass reports how many versions it collected past the ceiling (`age_guard_overridden` in the completion log line), so an override that is firing is visible at the default log level.
+
+It is a bound on versions, not bytes. What a retained version costs varies by orders of magnitude between ledgers — one deployment measured ~7.7 GiB per version on one ledger and ~3.3 GiB on another — so size the ceiling from the per-version disk use you observe, and expect `objects/history` to hold roughly `versions × per-version bytes` at the ceiling.
 
 The collector reclaims artifacts by *name*. Each index root carries a garbage manifest listing what the previous version replaced, and the collector walks the prev-index chain releasing exactly those. It therefore reaches only artifacts that some manifest records.
 
