@@ -1813,3 +1813,189 @@ async fn sync_without_indexed_changes_advances_watermark_without_resync() {
         "an untouched index must keep its documents"
     );
 }
+
+/// The complement of the test above: advancing the watermark on an empty
+/// change set is only sound when the tracked property set is *total*, and a
+/// wildcard select makes it anything but.
+///
+/// `select {"?x": ["*"]}` observes every property of the document, yet the
+/// dependency extractor can only name the ones it can see — here just
+/// `rdf:type` from the `where`. A commit that changes `ex:title` therefore
+/// touches no tracked property, the change set comes back empty, and the
+/// watermark-advance branch would record the index as current at a `t` whose
+/// change it never indexed. Every later sync starts above that `t`, so the
+/// staleness is permanent and `is_valid_at` vouches for it.
+///
+/// The sync must instead notice that its dependencies are incomplete and take
+/// the full rebuild. `was_full_resync` pins the routing; the term check pins
+/// the outcome that matters.
+#[tokio::test]
+async fn sync_with_wildcard_select_rebuilds_instead_of_advancing_past_the_change() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/wildcard:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["*"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("wildcard", ledger_id, query))
+        .await
+        .unwrap();
+    assert_eq!(created.doc_count, 1);
+
+    // Touch a property the wildcard covers and no explicit dependency names.
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "ex:title":"quokka" } ]
+    });
+    let ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "a wildcard select cannot be tracked incrementally; the sync must rebuild"
+    );
+    assert_eq!(synced.new_watermark, ledger2.t());
+
+    let after = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        after.term_idx("quokka").is_some(),
+        "the new title never reached the index: the sync advanced past it"
+    );
+}
+
+/// A nested projection indexes text from *another* subject, so the flake that
+/// changes the document is not on the document. `affected_subjects` attributes
+/// a flake to its own subject, and the old extractor did not even see the
+/// nested predicate — either way the change set is empty and the index goes
+/// stale. Same required outcome as the wildcard case: rebuild.
+#[tokio::test]
+async fn sync_with_nested_projection_rebuilds_when_the_referenced_subject_changes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/nested:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ {
+            "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document",
+            "ex:author": { "@id":"ex:author1", "ex:name":"Ada" }
+        } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:title", { "ex:author": ["ex:name"] }] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("nested", ledger_id, query))
+        .await
+        .unwrap();
+    assert_eq!(created.doc_count, 1);
+    let before = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        before.term_idx("ada").is_some(),
+        "the nested author name should be part of the document text"
+    );
+
+    // Change the author, not the document.
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:author1", "ex:name":"Grace" } ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "a nested projection cannot be tracked incrementally; the sync must rebuild"
+    );
+
+    let after = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        after.term_idx("grace").is_some(),
+        "the author's new name never reached the document that projects it"
+    );
+}
+
+/// A variable predicate observes every property, so the tracked set cannot be
+/// total. Here the changed property happens to be tracked anyway, which is why
+/// the index ends up correct on either path — the routing is the assertion.
+#[tokio::test]
+async fn sync_with_variable_predicate_always_rebuilds() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/varpred:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [
+            { "@id":"?x", "@type":"ex:Doc" },
+            { "@id":"?x", "?p":"?v" }
+        ],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("varpred", ledger_id, query))
+        .await
+        .unwrap();
+    // `doc_count` reports result rows, and `?p ?v` yields one row per property
+    // of the document, so count documents in the index instead.
+    let before = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(before.num_docs(), 1);
+
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "ex:title":"quokka" } ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "a variable predicate cannot be tracked incrementally; the sync must rebuild"
+    );
+    let after = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(after.term_idx("quokka").is_some());
+}

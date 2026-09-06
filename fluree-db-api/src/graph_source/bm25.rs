@@ -1097,8 +1097,38 @@ impl crate::Fluree {
             .and_then(|r| r.commit_head_id.clone())
             .ok_or_else(|| crate::ApiError::NotFound("No commit head for ledger".to_string()))?;
 
-        // 5. Compile property deps for this ledger's namespace
-        let compiled_deps = CompiledPropertyDeps::compile(&index.property_deps, |iri: &str| {
+        // 5. Decide whether this query can be synced incrementally at all.
+        //
+        // The walk below attributes each commit to the documents it changed by
+        // predicate and by subject. That is sound only when the analysis can
+        // enumerate every predicate the query observes and every one of them
+        // sits on the document subject. Shapes it cannot vouch for — `*`,
+        // nested projections, variable predicates, reverse terms, patterns on
+        // a second subject — take the full rebuild, the one path that is
+        // correct for any shape. Recomputed from the stored config rather than
+        // read off the snapshot so the verdict and the predicate set come from
+        // the same analysis, and so an index built by an older extractor is
+        // judged by the current one.
+        let analysis = PropertyDeps::analyze(&query);
+        if let Some(reason) = &analysis.incomplete {
+            warn!(
+                graph_source_id = %graph_source_id,
+                old_watermark = old_watermark,
+                ledger_t = ledger_t,
+                reason = %reason,
+                "Indexing query cannot be tracked incrementally; running a full resync. \
+                 Name the indexed properties explicitly in the select and root every \
+                 where pattern at the document variable to sync incrementally"
+            );
+            return self.resync_bm25_index(graph_source_id).await;
+        }
+
+        // Compile against the ledger at `ledger_t`. An IRI that fails to encode
+        // is dropped, and that is sound only because namespaces are append-only
+        // and this snapshot is the newest: any predicate with a flake in
+        // `(old_watermark, ledger_t]` is in the namespace table by now. Do not
+        // "fix" this to compile against the watermark-time db.
+        let compiled_deps = CompiledPropertyDeps::compile(&analysis.deps, |iri: &str| {
             ledger.snapshot.encode_iri(iri)
         });
 
@@ -1122,11 +1152,12 @@ impl crate::Fluree {
         //
         // This is a DETERMINATE answer, not a failure to work one out: the walk
         // above completed, and `affected_subjects` reported that none of the
-        // commits touched a property the index depends on. Queries whose shape
-        // cannot be narrowed at all never reach here — they decline earlier, and
-        // declining is what routes those to a full resync. So an empty set here
-        // means the index is already correct as of `ledger_t`, and the only work
-        // owed is to record that.
+        // commits touched a property the index depends on. Queries whose
+        // dependencies cannot be tracked completely never reach here: step 5
+        // declined them to a full resync, so for every query that does reach
+        // here the tracked set is total. An empty set therefore means the index
+        // is already correct as of `ledger_t`, and the only work owed is to
+        // record that.
         //
         // It used to fall back to a full resync, and on an append-heavy ledger
         // whose writes mostly miss the indexed properties that is pathological

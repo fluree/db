@@ -36,7 +36,7 @@ use std::collections::HashSet;
 #[cfg(feature = "vector")]
 use std::sync::Arc;
 #[cfg(feature = "vector")]
-use tracing::info;
+use tracing::{info, warn};
 
 // =============================================================================
 // Vector Index Creation
@@ -399,7 +399,7 @@ impl crate::Fluree {
     /// falling back to full resync if needed.
     pub async fn sync_vector_index(&self, graph_source_id: &str) -> Result<VectorSyncResult> {
         use fluree_db_core::trace_commits_by_id;
-        use fluree_db_query::bm25::CompiledPropertyDeps;
+        use fluree_db_query::bm25::{CompiledPropertyDeps, PropertyDeps};
         use fluree_db_query::vector::usearch::deserialize;
         use futures::StreamExt;
 
@@ -476,12 +476,32 @@ impl crate::Fluree {
             .and_then(|r| r.commit_head_id.clone())
             .ok_or_else(|| crate::ApiError::NotFound("No commit head for ledger".to_string()))?;
 
-        // 5. Compile property deps for this ledger's namespace
-        // Convert VectorPropertyDeps to PropertyDeps for compilation
-        let bm25_property_deps = index.property_deps.query_deps.clone();
-        let compiled_deps = CompiledPropertyDeps::compile(&bm25_property_deps, |iri: &str| {
-            ledger.snapshot.encode_iri(iri)
-        });
+        // 5. Decide whether this query can be synced incrementally at all —
+        //    the same gate, for the same reasons, as step 5 of
+        //    `sync_bm25_index`. The embedding property is a dependency whether
+        //    or not the query selects it, exactly as `VectorPropertyDeps::from_query`
+        //    records it at build time.
+        let analysis = PropertyDeps::analyze(&query);
+        if let Some(reason) = &analysis.incomplete {
+            warn!(
+                graph_source_id = %graph_source_id,
+                old_watermark = old_watermark,
+                ledger_t = ledger_t,
+                reason = %reason,
+                "Indexing query cannot be tracked incrementally; running a full resync. \
+                 Name the indexed properties explicitly in the select and root every \
+                 where pattern at the document variable to sync incrementally"
+            );
+            return self.resync_vector_index(graph_source_id).await;
+        }
+        let mut query_deps = analysis.deps;
+        query_deps.add(index.property_deps.embedding_property.clone());
+
+        // Compiled against the ledger at `ledger_t`, and sound for the reason
+        // given at the matching step in `sync_bm25_index`: namespaces are
+        // append-only, so a predicate with a flake in the window encodes here.
+        let compiled_deps =
+            CompiledPropertyDeps::compile(&query_deps, |iri: &str| ledger.snapshot.encode_iri(iri));
 
         // 6. Trace commits and collect affected subjects. Branch-aware
         //    store so the walk can resolve pre-fork ancestors when the
@@ -503,9 +523,10 @@ impl crate::Fluree {
         // same fix, as the BM25 path in `bm25.rs` — see the long comment there for
         // the production incident that motivated it. An empty set here is the walk
         // succeeding and reporting no indexed property was touched, not a failure
-        // to determine one, so the index is already correct as of `ledger_t` and
-        // rebuilding it is pure waste. Vector rebuilds are dearer than BM25 ones,
-        // because a resync re-embeds every document.
+        // to determine one — step 5 already declined every query whose
+        // dependencies cannot be tracked — so the index is already correct as of
+        // `ledger_t` and rebuilding it is pure waste. Vector rebuilds are dearer
+        // than BM25 ones, because a resync re-embeds every document.
         if affected_sids.is_empty() {
             index.watermark.update(&source_ledger_alias, ledger_t);
             let new_index_id = self
