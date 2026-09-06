@@ -396,7 +396,7 @@ fn parse_query_ast_internal(
     Ok((query, select_mode))
 }
 
-fn normalize_context_value(context_val: &JsonValue) -> JsonValue {
+pub(crate) fn normalize_context_value(context_val: &JsonValue) -> JsonValue {
     if let JsonValue::Object(map) = context_val {
         if let Some(base) = map.get("@base") {
             if !map.contains_key("@vocab") {
