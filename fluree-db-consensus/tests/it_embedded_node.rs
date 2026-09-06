@@ -319,6 +319,75 @@ async fn the_wait_ceiling_bounds_a_live_submission_and_reports_it_unknown() {
     .await;
 }
 
+/// A ceiling shorter than the probe must wake a live waiter on its own.
+/// Hold the ledger write lock so completion cannot race the ceiling, and
+/// release it after the caller times out to prove the queued write still
+/// commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_wait_ceiling_bounds_a_submission_before_its_next_probe() {
+    use fluree_db_consensus::raft::state_machine::RefKey;
+
+    let (integration, fluree, node, _dirs) = stand_up(14, |config| {
+        config
+            .with_submit_wait(Duration::from_secs(10), 1)
+            .with_submit_max_wait(Duration::from_millis(20))
+    })
+    .await;
+    let ledger_id = "embedded/short-ceiling:main";
+    fluree
+        .create_ledger("embedded/short-ceiling")
+        .await
+        .expect("create ledger");
+    let handle = fluree
+        .ledger_manager()
+        .expect("ledger manager")
+        .get_or_load(ledger_id)
+        .await
+        .expect("load ledger");
+    let guard = handle.lock_for_write().await;
+    let committer = Arc::clone(&node.committer);
+    let mut submission =
+        tokio::spawn(async move { committer.transact(bulk_request(ledger_id, 1)).await });
+
+    eventually("the blocked submission is queued", async || {
+        integration
+            .shared_state
+            .read()
+            .await
+            .queues
+            .get(&RefKey::new("embedded/short-ceiling", "main"))
+            .is_some_and(|queue| !queue.is_empty())
+    })
+    .await;
+
+    // Allow scheduling slack, but stay well below the 10-second probe.
+    let result = tokio::time::timeout(Duration::from_secs(1), &mut submission).await;
+    drop(guard);
+    let err = result
+        .expect("the 20 ms ceiling must wake the waiter before its 10 s probe")
+        .expect("submission task")
+        .expect_err("a blocked worker must reach the ceiling");
+    assert!(
+        matches!(err, fluree_db_consensus::SubmissionError::Execution { status: 504, ref message }
+            if message.contains("outcome is unknown")),
+        "ceiling must report a 504 with the outcome unknown: {err:?}"
+    );
+
+    let ns: Arc<dyn NameServiceLookup> = integration.nameservice();
+    eventually(
+        "the timed-out write commits after the lock is released",
+        async || {
+            ns.lookup(ledger_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.commit_t >= 1)
+        },
+    )
+    .await;
+    node.shutdown().await;
+}
+
 /// The entry leaves the replicated queue under the state lock, but its
 /// terminal apply resolves the waiter only after that lock drops. A probe
 /// that reads in between sees the entry gone while the receipt is moments

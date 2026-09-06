@@ -107,6 +107,8 @@ The split keeps the log encoding small (the heavy receipt fields don't replicate
 
 The leader's `QueuedTransactor` parks on its waiter ticket in probe intervals (default 8 s; `EmbeddedRaftConfig::with_submit_wait`). A probe that fires is a check, not a verdict: while the entry is still in the replicated per-branch queue and the cluster has a leader, the submission is alive and the wait continues without spending a retry attempt. Only a probe that finds the entry gone, or the node leaderless, spends an attempt on the idempotent re-propose path. A ceiling on total parked time (default 10 minutes; `with_submit_max_wait`) backstops a worker that never finishes, and reports the outcome as unknown rather than failed, because the commit may still land.
 
+Each waiter sleep is capped at the remaining ceiling budget, so a shorter ceiling takes effect before the next scheduled probe. An already-ready receipt still wins; a missing entry retains its outcome grace and retry handling.
+
 Two consequences of that shape:
 
 - The entry leaves the queue under the state lock, but the waiter resolves in the observer's effects, after the lock drops. A probe can see the entry gone a moment before the receipt lands, so a gone-entry probe waits a short grace on the ticket before spending an attempt.

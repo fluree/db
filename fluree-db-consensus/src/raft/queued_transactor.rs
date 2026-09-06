@@ -248,7 +248,12 @@ impl QueuedTransactor {
                     // entry first gets `GONE_ENTRY_GRACE` for its outcome
                     // to land.
                     loop {
-                        match ticket.wait(self.wait_timeout).await {
+                        // The ceiling must wake a live waiter even when it
+                        // falls before the next probe. Keep polling the ticket
+                        // at zero remaining time so an already-ready outcome
+                        // still wins over the ceiling.
+                        let remaining = self.max_wait.saturating_sub(parked_since.elapsed());
+                        match ticket.wait(self.wait_timeout.min(remaining)).await {
                             Ok(outcome) => return Ok(SubmissionOutcome::Waiter(outcome)),
                             Err(WaitError::Displaced) => break,
                             Err(WaitError::TimedOut) => {
