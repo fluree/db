@@ -372,6 +372,21 @@ An R2RML graph source is *virtual* — every query re-reads the underlying table
    map that carries it. A second predicate-object map for the same predicate
    on the same map is not materialized there; give it its own triples map
    (same table and subject template) if both values must come back.
+6. **Named-graph routing is a subset of R2RML, refused outside it:** a subject
+   map may carry one `rr:graph <iri>`, or one `rr:graphMap` with exactly one of
+   `rr:template`, `rr:column` or `rr:constant`; `rr:defaultGraph` names the
+   default graph, as in the spec. A mapping outside that subset fails to load
+   with an error naming the construct, rather than placing rows in the default
+   graph unannounced: several graph maps on one term map (cumulative in R2RML),
+   a graph map on a predicate-object map, a graph that is not an IRI, a graph
+   map with no value source or more than one, or an `rr:termType` other than
+   `rr:IRI`. Only
+   [materialization into a native ledger](iceberg.md#materialization-into-a-native-ledger)
+   honors the graph map today. The
+   [native twin](iceberg.md#materializing-a-native-twin) builder refuses a
+   mapping that carries one, since it would place every triple in the default
+   graph and its parity gate would not notice; the virtual query path still
+   reads everything from the default graph (tracked in #1607).
 
 ## Troubleshooting
 
