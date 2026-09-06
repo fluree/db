@@ -341,15 +341,29 @@ impl<'a, S: IcebergStorage> ScanPlanner<'a, S> {
                 estimated_row_count += data_file.record_count;
 
                 // Create file scan task with schema for correct field ID mapping
+                let eff_seq = effective_sequence_number(
+                    entry.sequence_number,
+                    manifest_entry.sequence_number,
+                );
                 let task = FileScanTask::for_whole_file_with_schema(
                     data_file,
                     projected_field_ids.clone(),
                     self.config.filter.clone(),
                     Arc::clone(&schema_arc),
-                );
+                )
+                // Same contract as `SendScanPlanner::plan_scan_for_snapshot`: every
+                // task carries its commit sequence, and the plan is in commit order,
+                // so a consumer can checkpoint or resume by sequence from either
+                // planner.
+                .with_data_sequence_number(eff_seq);
                 tasks.push(task);
             }
         }
+        tasks.sort_by(|a, b| {
+            a.data_sequence_number
+                .cmp(&b.data_sequence_number)
+                .then_with(|| a.data_file.file_path.cmp(&b.data_file.file_path))
+        });
 
         tracing::info!(
             files_selected,
