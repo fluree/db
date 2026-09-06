@@ -85,17 +85,33 @@ impl TriplesMap {
 
     /// Get all columns referenced by this TriplesMap
     ///
-    /// Includes columns from subject template and all object maps.
+    /// Every column a row must carry for the map to produce what it describes:
+    /// the subject (template or `rr:column`), the graph map when there is one,
+    /// and every predicate-object map. A scan projected to this set reads
+    /// nothing the map does not use, and a schema check over it catches a
+    /// column the map names but the table lacks.
     pub fn referenced_columns(&self) -> Vec<&str> {
         let mut columns: Vec<&str> = Vec::new();
 
-        // Subject template columns
+        // Subject template columns, or the rr:column subject
         columns.extend(
             self.subject_map
                 .template_columns
                 .iter()
                 .map(std::string::String::as_str),
         );
+        if let Some(ref col) = self.subject_map.column {
+            columns.push(col.as_str());
+        }
+
+        // Graph map columns: a graph template with a column the table lacks
+        // would route every row to the default graph, with nothing to say so.
+        if let Some(gm) = &self.subject_map.graph_map {
+            columns.extend(gm.template_columns.iter().map(std::string::String::as_str));
+            if let Some(ref col) = gm.column {
+                columns.push(col.as_str());
+            }
+        }
 
         // Predicate-object map columns
         for pom in &self.predicate_object_maps {
@@ -664,6 +680,34 @@ mod tests {
 
         let cols = tm.referenced_columns();
         assert_eq!(cols, vec!["code", "id", "name"]);
+    }
+
+    #[test]
+    fn referenced_columns_covers_subject_column_and_graph_map() {
+        use super::super::{ObjectMap, PredicateMap, PredicateObjectMap};
+
+        // An rr:column subject and a graph template: a scan projected to
+        // `referenced_columns()` must read both, or the subject is skipped and
+        // the row routes to the default graph.
+        let mut tm = TriplesMap::new("<#Test>", "test.table");
+        tm.subject_map = SubjectMap::column("uri");
+        tm.subject_map.graph_map =
+            Some(GraphMap::template("http://example.org/g/{tenant}/{region}"));
+        tm.predicate_object_maps = vec![PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://example.org/name"),
+            object_map: ObjectMap::column("name"),
+        }];
+        assert_eq!(
+            tm.referenced_columns(),
+            vec!["name", "region", "tenant", "uri"]
+        );
+
+        tm.subject_map.graph_map = Some(GraphMap::column("graph_iri"));
+        assert_eq!(tm.referenced_columns(), vec!["graph_iri", "name", "uri"]);
+
+        // A constant graph reads no column.
+        tm.subject_map.graph_map = Some(GraphMap::constant("http://example.org/g"));
+        assert_eq!(tm.referenced_columns(), vec!["name", "uri"]);
     }
 
     #[test]
