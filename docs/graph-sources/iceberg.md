@@ -611,7 +611,7 @@ target. The materializer enforces what it can and documents the rest:
 - **A full read is bounded and resumable.** When a source falls back to a full
   read — first run, a watermark expired by the source's snapshot retention, or a
   window containing an `overwrite`/`delete` — the pass reads a commit-ordered
-  prefix sized to the novelty ceiling (`FLUREE_MATERIALIZE_MAX_ROWS_PER_FULL_PASS`,
+  prefix sized to the novelty ceiling (`FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS`,
   derived from `reindex_max_bytes` by default) and records where it stopped: at a
   retained snapshot when one names the prefix, otherwise as a commit-sequence
   cursor (`urn:fluree:materialize#appliedSequence`), which survives snapshot
@@ -619,6 +619,17 @@ target. The materializer enforces what it can and documents the rest:
   point the snapshot watermark advances and the cursor is retired. Without the
   bound, a full read too large to commit deferred on every poll and never made
   progress.
+- **An incremental backlog is bounded too.** A window is only committed whole,
+  so a window whose flakes exceed the target's novelty ceiling is deferred on
+  every poll, writes no watermark, and grows by one poll each time — until the
+  stored snapshot falls out of the source's retention and the job degrades to a
+  full read of the whole table to recover a backlog that was a few snapshots
+  wide. So an unpinned incremental window over the same per-pass budget (sized
+  from each snapshot's `added-records` summary, so no manifest is read to
+  decide) stops at the last snapshot the budget covers, keeping that snapshot
+  whole, and advances the watermark to it. The next poll resumes from there.
+  A window with an `overwrite`/`delete` anywhere in it is not cut: it full-reads
+  the head regardless, and that read subsumes every prefix.
 - **A window's working memory is budgeted, not unbounded.** The pass retains one
   node per distinct subject in the window; a window whose estimated accumulator
   exceeds `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` (default 1024; `0` disables)

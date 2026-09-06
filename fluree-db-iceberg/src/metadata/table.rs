@@ -59,6 +59,28 @@ pub struct TableMetadata {
     pub properties: HashMap<String, String>,
 }
 
+/// The outcome of [`TableMetadata::cap_window_by_rows`].
+///
+/// Typed rather than `Option` so a consumer can say WHICH reason left a window
+/// unbounded. An over-budget window that is read whole cannot commit under the
+/// ceiling the budget was derived from, and an uncommitted window writes no
+/// watermark — so a silent decline is an invisible livelock, and the log has to
+/// be able to name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowCap {
+    /// Read to `to_id`: the window fits the budget, or the cap does not apply
+    /// (`max_rows == 0`, or no `from_id` to take a prefix after).
+    Whole,
+    /// Stop at this snapshot; everything after it waits for the next pass.
+    Capped(i64),
+    /// This snapshot carries no `added-records` summary, so the window cannot be
+    /// sized and no cut is known to be safe. Read whole.
+    Unsized(i64),
+    /// The window is a single commit and over budget: there is no boundary short
+    /// of `to_id` to stop at. Read whole.
+    SingleCommit,
+}
+
 impl TableMetadata {
     /// Parse metadata from JSON bytes.
     pub fn from_json(json: &[u8]) -> crate::error::Result<Self> {
@@ -168,6 +190,84 @@ impl TableMetadata {
                 }
             }
         }
+    }
+
+    /// Where an incremental consumer should stop reading `(from_id, to_id]` so
+    /// that one pass stays near `max_rows`: at `to_id` when the window fits,
+    /// else at the last snapshot the budget covers.
+    ///
+    /// Sized from each snapshot's `added-records` summary — the rows an
+    /// added-files scan of that snapshot reads — so the decision needs no
+    /// manifest I/O and is testable without a backend. A `replace` (compaction)
+    /// counts its rewritten rows, which the scan then excludes by sequence, so
+    /// the estimate only ever errs toward a smaller pass.
+    ///
+    /// **Why bound an incremental window at all.** A pass only advances the
+    /// watermark when its whole window commits, and a window whose flakes exceed
+    /// the target's novelty ceiling never can: it is deferred, nothing is
+    /// recorded, and the next poll re-reads a window one poll wider. Once that
+    /// window outgrows the source's snapshot retention the watermark stops
+    /// resolving and every poll becomes a full read of the whole table. Capping
+    /// each pass keeps the watermark moving, which keeps it inside retention.
+    ///
+    /// The snapshot the budget runs out in is kept WHOLE: a cut inside a commit
+    /// would leave the target in a state no snapshot names, and an unnameable
+    /// state cannot be resumed from. So a pass may exceed `max_rows` by up to
+    /// one snapshot, and a consumer sizes the budget with that margin. Capping
+    /// only ever moves the end EARLIER than `to_id`, never later, so nothing is
+    /// skipped: the next pass resumes from where this one stopped.
+    ///
+    /// Errors propagate from [`Self::snapshot_window`] (unknown / expired /
+    /// non-ancestor); the caller's full-read fallback owns those.
+    pub fn cap_window_by_rows(
+        &self,
+        from_id: Option<i64>,
+        to_id: i64,
+        max_rows: i64,
+    ) -> crate::error::Result<WindowCap> {
+        if max_rows <= 0 || from_id.is_none() {
+            return Ok(WindowCap::Whole);
+        }
+        let window = self.snapshot_window(from_id, to_id)?;
+        // Size the whole window first: a window that fits is never split, and a
+        // snapshot that cannot be sized anywhere in it means no cut is known to
+        // be safe — the same rule the full-read cut applies to a task without a
+        // commit sequence.
+        let mut total = 0i64;
+        for s in &window {
+            let Some(added) = s.added_records() else {
+                return Ok(WindowCap::Unsized(s.snapshot_id));
+            };
+            total = total.saturating_add(added);
+        }
+        if total <= max_rows {
+            return Ok(WindowCap::Whole);
+        }
+        // `snapshot_window` is NEWEST-first; walk it oldest-first so the prefix
+        // kept is the one adjacent to `from_id`. Taking the newest instead would
+        // skip everything between the watermark and the chosen end — data loss,
+        // not a performance bug.
+        let mut rows = 0i64;
+        for s in window.iter().rev() {
+            rows = rows.saturating_add(s.added_records().unwrap_or(0));
+            if rows >= max_rows {
+                if s.snapshot_id != to_id {
+                    return Ok(WindowCap::Capped(s.snapshot_id));
+                }
+                // The budget ran out inside the head. Stopping there is the whole
+                // window with extra bookkeeping, so stop at the boundary just
+                // below it instead — a smaller pass than asked for, and still
+                // forward progress — unless the window IS the head, in which
+                // case there is no boundary to stop at.
+                return Ok(match window.get(1) {
+                    Some(below_head) => WindowCap::Capped(below_head.snapshot_id),
+                    None => WindowCap::SingleCommit,
+                });
+            }
+        }
+        // Unreachable: `total > max_rows` guarantees the accumulator crosses the
+        // budget above. Typed as the harmless outcome rather than a panic.
+        Ok(WindowCap::Whole)
     }
 
     /// The newest ancestor of `to_id` whose sequence number is at or below
@@ -597,6 +697,134 @@ mod tests {
         assert!(m.snapshot_window(Some(99), 3).is_err());
         // unknown `to` -> error
         assert!(m.snapshot_window(Some(1), 42).is_err());
+    }
+
+    /// A snapshot that appended `rows` rows, as a writer records it.
+    fn appended(id: i64, parent: Option<i64>, seq: i64, rows: i64) -> crate::metadata::Snapshot {
+        let mut s = snap(id, parent, seq, Some("append"));
+        s.summary
+            .insert("added-records".to_string(), rows.to_string());
+        s
+    }
+
+    /// A backlog over budget is advanced in bounded steps, taking the OLDEST
+    /// snapshots first. Taking the newest instead would skip everything between
+    /// `from` and the chosen end — silent data loss, and the reason the direction
+    /// is asserted rather than assumed.
+    #[test]
+    fn cap_window_by_rows_takes_the_oldest_prefix() {
+        // 1 <- 2 <- 3 <- 4 <- 5, 100 rows each; watermark at 1, so the window is
+        // (1, 5] = 400 rows.
+        let meta = meta_with(vec![
+            appended(1, None, 1, 100),
+            appended(2, Some(1), 2, 100),
+            appended(3, Some(2), 3, 100),
+            appended(4, Some(3), 4, 100),
+            appended(5, Some(4), 5, 100),
+        ]);
+
+        // Budget 150: snapshot 2 fits, the budget runs out inside 3, and 3 is
+        // kept whole -> stop at 3, NOT at 5, and never skipping 2.
+        assert_eq!(
+            meta.cap_window_by_rows(Some(1), 5, 150).unwrap(),
+            WindowCap::Capped(3)
+        );
+        // Budget 100 -> one snapshot at a time.
+        assert_eq!(
+            meta.cap_window_by_rows(Some(1), 5, 100).unwrap(),
+            WindowCap::Capped(2)
+        );
+        // Successive passes converge on the head rather than stalling short of it.
+        assert_eq!(
+            meta.cap_window_by_rows(Some(3), 5, 150).unwrap(),
+            WindowCap::Capped(4)
+        );
+        assert_eq!(
+            meta.cap_window_by_rows(Some(4), 5, 150).unwrap(),
+            WindowCap::Whole
+        );
+    }
+
+    /// The budget running out INSIDE the head is not "read it whole": that is the
+    /// unbounded pass with extra bookkeeping, and on a source whose commits are
+    /// each near the budget it would mean the bound never engages. Stop at the
+    /// boundary just below the head instead — unless there is none.
+    #[test]
+    fn cap_window_by_rows_stops_below_a_head_it_cannot_fit() {
+        let meta = meta_with(vec![
+            appended(1, None, 1, 100),
+            appended(2, Some(1), 2, 100),
+            appended(3, Some(2), 3, 100),
+        ]);
+        // (1, 3] = 200 rows against a budget of 150: 2 fits, the budget runs out
+        // in the head, so the pass stops at 2 and the next one reads 3 alone.
+        assert_eq!(
+            meta.cap_window_by_rows(Some(1), 3, 150).unwrap(),
+            WindowCap::Capped(2)
+        );
+        // One commit wide and over budget: nothing short of the head to stop at.
+        assert_eq!(
+            meta.cap_window_by_rows(Some(2), 3, 50).unwrap(),
+            WindowCap::SingleCommit
+        );
+    }
+
+    #[test]
+    fn cap_window_by_rows_is_whole_when_it_cannot_help() {
+        let meta = meta_with(vec![
+            appended(1, None, 1, 100),
+            appended(2, Some(1), 2, 100),
+            appended(3, Some(2), 3, 100),
+        ]);
+        let whole = |from, to, budget| meta.cap_window_by_rows(from, to, budget).unwrap();
+
+        // Window already fits — exactly on the budget counts as fitting, so a
+        // healthy source whose window matches the budget is never split.
+        assert_eq!(whole(Some(1), 3, 500), WindowCap::Whole);
+        assert_eq!(whole(Some(1), 3, 200), WindowCap::Whole);
+        // Disabled.
+        assert_eq!(whole(Some(1), 3, 0), WindowCap::Whole);
+        // An initial full read has no prefix to take — a partial "full" read
+        // would look complete while missing rows.
+        assert_eq!(whole(None, 3, 1), WindowCap::Whole);
+        // from == to: empty window, nothing to cap.
+        assert_eq!(whole(Some(3), 3, 1), WindowCap::Whole);
+    }
+
+    /// A snapshot without `added-records` cannot be sized, and a cut placed
+    /// without knowing the sizes is a guess. Decline, and name the snapshot so
+    /// the log can say why the window went unbounded.
+    #[test]
+    fn cap_window_by_rows_declines_an_unsized_snapshot() {
+        let meta = meta_with(vec![
+            appended(1, None, 1, 100),
+            appended(2, Some(1), 2, 100),
+            snap(3, Some(2), 3, Some("append")),
+            appended(4, Some(3), 4, 100),
+        ]);
+        assert_eq!(
+            meta.cap_window_by_rows(Some(1), 4, 150).unwrap(),
+            WindowCap::Unsized(3)
+        );
+    }
+
+    /// An expired ancestor must still ERROR rather than silently capping to
+    /// something arbitrary — the caller falls back to a full re-read, and that
+    /// decision has to stay with the caller.
+    #[test]
+    fn cap_window_by_rows_propagates_an_unwalkable_window() {
+        let expired = meta_with(vec![
+            appended(3, Some(2), 3, 100),
+            appended(4, Some(3), 4, 100),
+        ]);
+        assert!(expired.cap_window_by_rows(Some(1), 4, 50).is_err());
+
+        // `from` is not an ancestor: the rollback/branch case.
+        let orphan = meta_with(vec![
+            appended(7, None, 7, 100),
+            appended(8, Some(7), 8, 100),
+        ]);
+        assert!(orphan.cap_window_by_rows(Some(1), 8, 50).is_err());
     }
 
     /// The checkpoint walk must survive an EXPIRED ancestor, because the tables
