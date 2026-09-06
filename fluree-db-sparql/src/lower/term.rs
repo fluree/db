@@ -19,7 +19,7 @@ use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
-use fluree_vocab::namespaces::{FLUREE_DB, XSD};
+use fluree_vocab::namespaces::{EMPTY, FLUREE_DB, XSD};
 use fluree_vocab::{fluree, xsd, xsd_names};
 use std::sync::Arc;
 
@@ -261,15 +261,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             ),
             LiteralValue::Typed { value, datatype } => {
                 let fv = self.lower_typed_literal(value, datatype)?;
-                // Resolve the datatype IRI to its canonical SID via the
-                // encoder. For custom (unencoded) datatypes the encoder
-                // returns None — fall back to `xsd:string`, matching
-                // the storage-side fallback in `term_to_binding`.
                 let dt_iri = self.expand_iri(datatype)?;
-                let dt_sid = self
-                    .encoder
-                    .encode_iri_strict(&dt_iri)
-                    .unwrap_or_else(|| Sid::new(XSD, xsd_names::STRING));
+                let dt_sid = self.datatype_sid(&dt_iri);
                 (fv, DatatypeConstraint::Explicit(dt_sid))
             }
             LiteralValue::Integer(i) => (
@@ -461,6 +454,25 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         expand_iri_with(&self.prefixes, self.base.as_deref(), iri)
     }
 
+    /// Resolve a typed literal's datatype IRI to the Sid that names it in
+    /// term-identity positions (triple-pattern constraints, VALUES rows).
+    ///
+    /// A registered namespace resolves to its canonical Sid. An IRI whose
+    /// canonical prefix is NOT registered on this ledger resolves to the
+    /// EMPTY-namespace full-IRI Sid — the same form the storage side's
+    /// non-strict `encode_iri` produces, and the form the JSON-LD query
+    /// surface already uses (`fluree-db-query/src/parse/lower.rs`). Ingest
+    /// registers every namespace it stores, so no stored term can carry a
+    /// datatype in an unregistered namespace: the EMPTY-namespace Sid
+    /// matches nothing, which is the spec answer for a term that does not
+    /// exist. (The previous `xsd:string` fallback made
+    /// `"a"^^ex:NoSuchType` match every plain-string `"a"` row — #1686.)
+    fn datatype_sid(&self, dt_iri: &str) -> Sid {
+        self.encoder
+            .encode_iri(dt_iri)
+            .unwrap_or_else(|| Sid::new(EMPTY, dt_iri))
+    }
+
     /// Convert a SPARQL term to a Binding (for VALUES rows).
     pub(super) fn term_to_binding(&mut self, term: &SparqlTerm) -> Result<Binding> {
         match term {
@@ -512,13 +524,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     // Bind the DECLARED datatype: Binding::Lit equality
                     // includes the datatype, so labeling every typed literal
                     // xsd:string made VALUES constants like
-                    // "…"^^xsd:integer unable to match stored values.
+                    // "…"^^xsd:integer unable to match stored values. An
+                    // unregistered datatype resolves to the match-nothing
+                    // EMPTY-namespace Sid (see `datatype_sid`), keeping this
+                    // site in lockstep with triple-pattern constraints.
                     let dt_sid = if dt_iri == fluree::EMBEDDING_VECTOR {
                         Sid::new(FLUREE_DB, "vector")
-                    } else if let Some(sid) = self.encoder.encode_iri_strict(&dt_iri) {
-                        sid
                     } else {
-                        Sid::new(XSD, xsd_names::STRING)
+                        self.datatype_sid(&dt_iri)
                     };
                     Ok(Binding::lit(fv, dt_sid))
                 }

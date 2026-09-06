@@ -465,7 +465,7 @@ fn boundary_leaf_pid_extent(
 ) -> Result<Option<(u16, u64)>> {
     let handle = store
         .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-        .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+        .map_err(|e| QueryError::from_io("leaf open", e))?;
     let entries = &handle.dir().entries;
     let mut indices = (0..entries.len()).collect::<Vec<_>>();
     if last {
@@ -509,7 +509,7 @@ fn count_numeric_compare_in_leaf_slice(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
@@ -860,7 +860,7 @@ fn count_rows_matching_encoded_filters_in_leaf_slice(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
@@ -972,7 +972,7 @@ fn count_rows_for_predicate_lang_psot(
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
 
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
@@ -1364,7 +1364,7 @@ fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Res
     for leaf_entry in &branch.leaves[leaf_range] {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         for (idx, entry) in handle.dir().entries.iter().enumerate() {
             if entry.row_count == 0 || entry.o_type_const != Some(numbig.as_u16()) {
                 continue;
@@ -1840,7 +1840,7 @@ fn count_literal_rows_psot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u6
     for leaf_entry in &branch.leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 {
@@ -1930,7 +1930,7 @@ fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Res
     for leaf_entry in leaves {
         let handle = store
             .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::Internal(format!("leaf open: {e}")))?;
+            .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
         for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 {
@@ -1985,6 +1985,8 @@ mod tests {
             ndv_values: 0,
             ndv_subjects: 0,
             last_modified_t: 1,
+            observed_datatypes: fluree_db_core::PropertyStatEntry::tags_of(&datatypes),
+            historical_datatypes: vec![],
             datatypes,
         }
     }
@@ -2003,6 +2005,7 @@ mod tests {
                 properties,
                 classes: None,
             }]),
+            historical_since_t: None,
         }
     }
 
@@ -2060,6 +2063,7 @@ mod tests {
             properties: None,
             classes: None,
             graphs: None,
+            historical_since_t: None,
         };
         assert_eq!(count_literal_rows_from_stats(&no_graphs, 0), None);
     }

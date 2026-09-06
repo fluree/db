@@ -231,7 +231,7 @@ impl From<SubmissionState> for SubmissionStateResponse {
 impl From<OperationReceipt> for OperationDetailResponse {
     fn from(receipt: OperationReceipt) -> Self {
         match receipt {
-            OperationReceipt::Transaction(r) => Self::Transaction(r.into()),
+            OperationReceipt::Transaction(r) => Self::Transaction((*r).into()),
             OperationReceipt::Revert(r) => Self::Revert(r.into()),
             OperationReceipt::Merge(r) => Self::Merge(r.into()),
             OperationReceipt::Rebase(r) => Self::Rebase(r.into()),
@@ -363,7 +363,7 @@ mod tests {
             commit_id: commit_id.clone(),
             t: 42,
             tally: None,
-            receipt: Some(Box::new(OperationReceipt::Transaction(
+            receipt: Some(Box::new(OperationReceipt::Transaction(Box::new(
                 TransactionReceipt {
                     idempotency_key: Some(IdempotencyKey::new("client-key-42").expect("fits cap")),
                     commit: CommitReceipt {
@@ -376,7 +376,7 @@ mod tests {
                     tally: None,
                     cypher_return: None,
                 },
-            ))),
+            )))),
         }))
     }
 

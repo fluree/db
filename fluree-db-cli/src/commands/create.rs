@@ -860,6 +860,13 @@ async fn run_bulk_import(
         "\n\nAbout ledger '{}':\nImported {:.1}M flakes in {:.2}s ({:.2} M flakes/s) across {} commits (t={})",
         ledger, total_m, secs, mflakes_per_sec, result.t, result.t
     );
+    if result.duplicates_removed > 0 {
+        println!(
+            "Collapsed {} duplicate statement(s); the index holds {} distinct flakes",
+            format_with_commas(result.duplicates_removed),
+            format_with_commas(result.flake_count - result.duplicates_removed)
+        );
+    }
 
     if let Some(ref summary) = result.summary {
         if !summary.top_classes.is_empty() {

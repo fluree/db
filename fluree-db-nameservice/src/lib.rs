@@ -268,6 +268,8 @@ pub enum GraphSourceType {
     R2rml,
     /// Apache Iceberg table
     Iceberg,
+    /// R2RML mapping over tables reached through a SQL endpoint
+    Sql,
     /// Unknown/custom graph source type
     Unknown(String),
 }
@@ -279,7 +281,9 @@ impl GraphSourceType {
             GraphSourceType::Bm25 | GraphSourceType::Vector | GraphSourceType::Geo => {
                 GraphSourceKind::Index
             }
-            GraphSourceType::R2rml | GraphSourceType::Iceberg => GraphSourceKind::Mapped,
+            GraphSourceType::R2rml | GraphSourceType::Iceberg | GraphSourceType::Sql => {
+                GraphSourceKind::Mapped
+            }
             GraphSourceType::Unknown(_) => GraphSourceKind::Index, // default assumption
         }
     }
@@ -295,6 +299,7 @@ impl GraphSourceType {
             GraphSourceType::Geo => "f:GeoIndex".to_string(),
             GraphSourceType::R2rml => "f:R2rmlMapping".to_string(),
             GraphSourceType::Iceberg => "f:IcebergMapping".to_string(),
+            GraphSourceType::Sql => "f:SqlMapping".to_string(),
             GraphSourceType::Unknown(s) => s.clone(),
         }
     }
@@ -311,12 +316,14 @@ impl GraphSourceType {
             "f:GeoIndex" => GraphSourceType::Geo,
             "f:R2rmlMapping" => GraphSourceType::R2rml,
             "f:IcebergMapping" => GraphSourceType::Iceberg,
+            "f:SqlMapping" => GraphSourceType::Sql,
             // Full IRI forms
             ns_types::BM25_INDEX => GraphSourceType::Bm25,
             ns_types::HNSW_INDEX => GraphSourceType::Vector,
             ns_types::GEO_INDEX => GraphSourceType::Geo,
             ns_types::R2RML_MAPPING => GraphSourceType::R2rml,
             ns_types::ICEBERG_MAPPING => GraphSourceType::Iceberg,
+            ns_types::SQL_MAPPING => GraphSourceType::Sql,
             _ => GraphSourceType::Unknown(s.to_string()),
         }
     }

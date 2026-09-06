@@ -107,4 +107,4 @@ This pattern is why Fluree Memory is practical to use with an agent: a small, ra
 | Embedding search | paid + latency | high for paraphrase | usually no |
 | Stuff-it-all-in-CLAUDE.md | free | context blow-up | yes |
 
-For developer memory — where the agent knows the words for what it's looking for — BM25 is a very good fit. If you later want semantic recall, Fluree DB itself ships a [vector search](../../docs/indexing-and-search/vector-search.md) feature that the memory store could layer on.
+For developer memory — where the agent knows the words for what it's looking for — BM25 is a very good fit. If you later want semantic recall, Fluree DB itself ships a [vector search](../../indexing-and-search/vector-search.md) feature that the memory store could layer on.

@@ -37,10 +37,27 @@ pub struct StatsView {
     /// `properties` map remains the primary source for the query planner.
     pub graph_properties: HashMap<GraphId, HashMap<RuntimePredicateId, GraphPropertyStatData>>,
     /// Property SID -> whether every object of this property is a node/IRI ref
-    /// (all datatype tags are [`ValueTypeTag::JSON_LD_ID`]). Derived from the
-    /// current-state (novelty-merged) per-datatype breakdown. Used by the
-    /// equijoin-filter fold to soundly rewrite `FILTER(?x = ?y)` into a join
-    /// only when value-equality coincides with term-equality (true for nodes).
+    /// (all datatype tags are [`ValueTypeTag::JSON_LD_ID`]). Derived from
+    /// [`crate::index_stats::PropertyStatEntry::observed_datatypes`], the tag set that is monotone
+    /// under retraction — not from the `datatypes` counts, which novelty merges
+    /// as a blind ±1 delta log and can therefore under-report. Used by the
+    /// equijoin-filter fold to rewrite `FILTER(?x = ?y)` into a join only when
+    /// value-equality coincides with term-equality (true for nodes).
+    ///
+    /// A `true` here is a soundness licence, so it is only ever allowed to be
+    /// conservative: a property that has carried a literal reads `false` until a
+    /// reindex genuinely removes the tag from the base index.
+    ///
+    /// That holds for a current-state read. It does not hold by itself for time
+    /// travel: the base index's tag set is current state *as of the publish*,
+    /// so a predicate whose literals were legitimately deleted before that
+    /// publish carries no literal tag, and a query at an earlier `t` — which
+    /// can still see those literals — would read `true`. A builder serving a
+    /// read below the published index `t` has to substitute the persisted
+    /// `historical_datatypes` set (sound for every `t` at or above
+    /// `IndexStats::historical_since_t`) for `observed_datatypes` first — or,
+    /// below that boundary, clear it so the flag falls back to "unknown";
+    /// `fluree-db-query`'s `cached_stats_view_for_db` is the one that does.
     pub property_ref_only: HashMap<Sid, bool>,
     /// Property IRI -> ref-only flag (see [`Self::property_ref_only`]).
     pub property_ref_only_by_iri: HashMap<Arc<str>, bool>,
@@ -71,8 +88,18 @@ pub struct GraphPropertyStatData {
     pub ndv_values: u64,
     /// Estimated number of distinct subjects using this property (from HLL)
     pub ndv_subjects: u64,
-    /// Per-datatype flake counts
+    /// Per-datatype flake counts. Estimates: on the query path these are
+    /// novelty-merged as a blind ±1 delta log, so a spurious retraction can
+    /// drop a tag whose data still exists. Sum them; never read them as a set.
     pub datatypes: Vec<(ValueTypeTag, u64)>,
+    /// The datatype tags this property carries in this graph — the set
+    /// consumers must read instead of `datatypes` when the answer gates a
+    /// rewrite (scan narrowing to an exact datatype). Sourced from
+    /// [`crate::index_stats::GraphPropertyStatEntry::observed_datatypes`],
+    /// which is monotone under retraction within the novelty window and
+    /// substituted with the historical set (or cleared) for reads below the
+    /// published index `t`. Empty means "unknown": fail closed.
+    pub observed_datatypes: Vec<ValueTypeTag>,
 }
 
 /// Statistics for a single property.
@@ -121,6 +148,7 @@ impl StatsView {
                         size_of::<RuntimePredicateId>()
                             + size_of::<GraphPropertyStatData>()
                             + data.datatypes.len() * size_of::<(ValueTypeTag, u64)>()
+                            + data.observed_datatypes.len() * size_of::<ValueTypeTag>()
                     })
                     .sum::<usize>()
             })
@@ -167,12 +195,17 @@ impl StatsView {
                     },
                 );
                 // Ref-only iff every observed object datatype is a node/IRI ref.
-                // Empty datatypes (unknown) => not provably ref-only.
-                let ref_only = !entry.datatypes.is_empty()
+                // Read the *observed tag set*, never the `datatypes` counts: the
+                // counts are novelty-merged as a blind ±1 delta log, so a
+                // retraction of a fact that was never asserted can zero out a
+                // literal tag and make a mixed property read as all-ref. The tag
+                // set is monotone under retraction, so it cannot. Empty
+                // (unknown) => not provably ref-only.
+                let ref_only = !entry.observed_datatypes.is_empty()
                     && entry
-                        .datatypes
+                        .observed_datatypes
                         .iter()
-                        .all(|&(dt, _)| dt == ValueTypeTag::JSON_LD_ID.as_u8());
+                        .all(|&dt| dt == ValueTypeTag::JSON_LD_ID.as_u8());
                 view.property_ref_only.insert(sid, ref_only);
             }
         }
@@ -197,6 +230,11 @@ impl StatsView {
                                 .datatypes
                                 .iter()
                                 .map(|&(dt, c)| (ValueTypeTag::from_u8(dt), c))
+                                .collect(),
+                            observed_datatypes: p_entry
+                                .observed_datatypes
+                                .iter()
+                                .map(|&dt| ValueTypeTag::from_u8(dt))
                                 .collect(),
                         },
                     );
@@ -559,6 +597,59 @@ mod tests {
     use super::*;
     use crate::index_stats::{ClassStatEntry, PropertyStatEntry};
 
+    fn entry_with(datatypes: Vec<(u8, u64)>, observed_datatypes: Vec<u8>) -> IndexStats {
+        IndexStats {
+            flakes: 1,
+            size: 10,
+            properties: Some(vec![PropertyStatEntry {
+                sid: (1, "p".to_string()),
+                count: 1,
+                ndv_values: 1,
+                ndv_subjects: 1,
+                last_modified_t: 1,
+                datatypes,
+                observed_datatypes,
+                historical_datatypes: vec![],
+            }]),
+            classes: None,
+            graphs: None,
+            historical_since_t: None,
+        }
+    }
+
+    /// The ref-only flag is a soundness licence for the equijoin-filter fold, so
+    /// it reads the observed-tag set — monotone under retraction — and not the
+    /// `datatypes` counts, which the novelty merge can drive to zero for a tag
+    /// whose data is still there.
+    #[test]
+    fn ref_only_reads_the_observed_tag_set_not_the_counts() {
+        let ref_tag = ValueTypeTag::JSON_LD_ID.as_u8();
+        let int_tag = ValueTypeTag::INTEGER.as_u8();
+        let p = Sid::new(1, "p");
+
+        // Counts say all-ref; the tag set remembers a literal. Not ref-only.
+        let stats = entry_with(vec![(ref_tag, 5)], vec![int_tag, ref_tag]);
+        assert_eq!(
+            StatsView::from_db_stats(&stats).is_property_ref_only(&p),
+            Some(false)
+        );
+
+        // Both agree it is all-ref.
+        let stats = entry_with(vec![(ref_tag, 5)], vec![ref_tag]);
+        assert_eq!(
+            StatsView::from_db_stats(&stats).is_property_ref_only(&p),
+            Some(true)
+        );
+
+        // No observed tags at all is "unknown", which must fail closed even
+        // when the counts would have said all-ref.
+        let stats = entry_with(vec![(ref_tag, 5)], vec![]);
+        assert_eq!(
+            StatsView::from_db_stats(&stats).is_property_ref_only(&p),
+            Some(false)
+        );
+    }
+
     #[test]
     fn test_empty_stats() {
         let stats = IndexStats {
@@ -567,6 +658,7 @@ mod tests {
             properties: None,
             classes: None,
             graphs: None,
+            historical_since_t: None,
         };
         let view = StatsView::from_db_stats(&stats);
         assert!(!view.has_property_stats());
@@ -585,9 +677,12 @@ mod tests {
                 ndv_subjects: 45,
                 last_modified_t: 10,
                 datatypes: vec![],
+                observed_datatypes: vec![],
+                historical_datatypes: vec![],
             }]),
             classes: None,
             graphs: None,
+            historical_since_t: None,
         };
         let view = StatsView::from_db_stats(&stats);
         assert!(view.has_property_stats());
@@ -930,6 +1025,7 @@ mod tests {
                 properties: vec![],
             }]),
             graphs: None,
+            historical_since_t: None,
         };
         let view = StatsView::from_db_stats(&stats);
         assert!(view.has_class_stats());

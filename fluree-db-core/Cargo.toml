@@ -64,6 +64,28 @@ libc = "0.2"
 tokio = { workspace = true }
 postcard = { workspace = true }
 tempfile = "3"
+# wasm_cache unit tests run on native (the module is cfg(test) there).
+lru = { workspace = true }
 
 [lints]
 workspace = true
+
+# wasm32: disk_cache compiles (std::fs stubs + tokio::sync::broadcast); reads
+# behave as misses at runtime. Only the wasm-supported tokio features.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", default-features = false, features = ["sync"] }
+# Clock sources for the `clock` shim module (std::time re-exports on native;
+# performance.now()/Date.now() via wasm-bindgen here). Already in the wasm
+# graph via ulid, so this adds no new transitive deps.
+web-time = "1"
+# Backing store for `wasm_cache` (the moka stand-in).
+lru = { workspace = true }
+# Central JS-randomness unification for the whole wasm graph (feature
+# unification applies per-target): rand/rand_core need getrandom/js; the
+# uuid consumers on wasm are the query layer's UUID()/STRUUID() functions
+# and fluree-db-policy (moka, whose uuid dep motivated the first cut of
+# this comment, is native-only). Declared once here since core is in
+# every wasm graph.
+getrandom = { version = "0.2", features = ["js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+uuid = { version = "1", default-features = false, features = ["js"] }

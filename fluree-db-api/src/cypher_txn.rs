@@ -509,6 +509,16 @@ impl Fluree {
         let assert_count = txn.pending.iter().map(|p| p.assert_count).sum();
         let retract_count = txn.pending.iter().map(|p| p.retract_count).sum();
 
+        // No cache detach here (unlike the autocommit/branch-op flows): the
+        // dictionary `make_mut`s for this flow run per-statement at *stage*
+        // time (`pend_stage_result` → `finalize_state`), outside any lock and
+        // while the cache must stay readable for the transaction's lifetime —
+        // by publish time `txn.state` is fully built and this window does no
+        // dictionary work. The per-statement deep-clone that remains (base
+        // shared with `txn.state` itself, plus the cache for the first
+        // statement) needs owned state threading through the stage path, not
+        // a commit-window detach.
+        //
         // Capture indexing signals + tally before `txn.state` is moved into
         // finalize_commit (which triggers background reindex when needed).
         let needs_reindex = txn.state.should_reindex(&index_config);

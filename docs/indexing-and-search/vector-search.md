@@ -539,6 +539,8 @@ let sync_result = fluree.sync_vector_index("doc-embeddings:main").await?;
 println!("Upserted: {}, Removed: {}", sync_result.upserted, sync_result.removed);
 ```
 
+Sync is incremental only when the indexing query's dependencies can be tracked completely; the shape rules are the same as for [BM25 syncing](bm25.md#syncing). Outside that shape every sync re-embeds the whole corpus, and the decline is logged at `warn` with the reason. Within it, a window that touches none of the tracked properties (the embedding property is always one of them) advances the watermark without re-embedding anything.
+
 #### Full Resync
 
 Rebuild the entire index from scratch:
@@ -730,7 +732,7 @@ Factors that shift the crossover:
 - **Best for**: Multi-million-vector datasets, strict latency requirements at any size, and query shapes the flat-scan fast path doesn't serve; note HNSW results are eventually consistent (the index lags the ledger until it refreshes)
 - **Complexity**: O(log n) approximate nearest neighbor
 - **Space**: ~1.5x embedding size + IRI mapping overhead
-- **Updates**: Incremental via affected-subject tracking
+- **Updates**: Incremental via affected-subject tracking, for indexing queries whose dependencies can be tracked completely (see [Sync Updates](#sync-updates))
 
 #### Tuning parameters
 

@@ -381,6 +381,12 @@ Committed data is durable:
 - Replicated (if configured)
 - Immutable
 
+A transaction that has started committing runs to completion even if the
+client disconnects mid-request: the server finishes the write and the data
+is committed, the client just never sees the receipt. A client that times
+out or drops the connection should therefore re-query (or retry
+idempotently) rather than assume the write was lost.
+
 ## Error Handling
 
 ### Validation Errors
@@ -441,7 +447,7 @@ For bulk imports:
 For initial ledger bootstraps (large Turtle datasets), prefer the Rust bulk import API which
 streams commits and builds multi-order binary indexes:
 
-- [Using Fluree as a Rust library → Bulk import Turtle chunks](../getting-started/rust-api.md#bulk-import-turtle-chunks-high-throughput)
+- [Using Fluree as a Rust library → Bulk import Turtle chunks](../getting-started/rust-api.md#bulk-import-high-throughput)
 
 See [Indexing Side-Effects](indexing-side-effects.md) for details.
 

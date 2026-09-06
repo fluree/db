@@ -216,6 +216,10 @@ fn current_timestamp_ms() -> i64 {
 /// Age is determined by the garbage record's `created_at_ms` field. A record
 /// with no timestamp predates the field and is treated as past the window.
 ///
+/// An optional `hard_max_old_indexes` ceiling overrides the age check for
+/// versions past it. See [`CleanGarbageConfig::hard_max_old_indexes`] for what
+/// that costs a query still reading one of those versions.
+///
 /// # Roots with no garbage manifest
 ///
 /// A root written before the manifest write became unconditional can carry
@@ -237,6 +241,15 @@ pub async fn clean_garbage(
     let min_age_mins = config
         .min_time_garbage_mins
         .unwrap_or(DEFAULT_MIN_TIME_GARBAGE_MINS);
+    // Chain positions at or beyond this are collected regardless of record age;
+    // `None` means the age guard is never overridden. The chain is newest-first,
+    // so a larger position is an older version and the ceiling cuts the oldest
+    // tail. See `CleanGarbageConfig::hard_max_old_indexes` for the reader cost.
+    //
+    // Deliberately not clamped up to `max_old_indexes`: the retention target is
+    // enforced by the loop bound below, which starts at `keep_count`, so no
+    // value here can reach a version the retention promise covers.
+    let hard_keep = config.hard_max_old_indexes.map(|v| 1 + v as usize);
     let min_age_ms = min_age_mins as i64 * 60 * 1000;
     let now_ms = current_timestamp_ms();
     let started = std::time::Instant::now();
@@ -289,10 +302,35 @@ pub async fn clean_garbage(
     let mut deleted_count = 0;
     let mut indexes_cleaned = 0;
     let mut unnameable_indexes = 0;
+    let mut age_guard_overridden = 0;
 
     for i in (keep_count..index_chain.len()).rev() {
         let manifest_entry = &index_chain[i - 1];
         let entry_to_delete = &index_chain[i];
+
+        // The age guard is a delay, not a bound: at a fast publish rate the
+        // versions inside the window outnumber `max_old_indexes` without limit.
+        // Past an operator-set ceiling the versions go regardless of age, which
+        // can release artifacts a query that started against one of them is
+        // still reading. That is the ceiling's documented cost, so each override
+        // is counted and reported in the result rather than left at debug level.
+        //
+        // Expressed as a zero age floor rather than as a skip of the check, so
+        // that the OTHER reasons `release_manifest_nodes` stops the walk — an
+        // unreadable or unparseable manifest — still stop it. Only the age
+        // reason is overridden.
+        let past_ceiling = matches!(hard_keep, Some(hk) if i >= hk);
+        let age_floor_ms = if past_ceiling {
+            tracing::debug!(
+                t = manifest_entry.t,
+                chain_position = i,
+                hard_keep,
+                "Past retention ceiling, collecting regardless of age"
+            );
+            0
+        } else {
+            min_age_ms
+        };
 
         // Manifest from the newer entry lists nodes from entry_to_delete
         // that were replaced when manifest_entry was built.
@@ -304,7 +342,7 @@ pub async fn clean_garbage(
                     manifest_entry.t,
                     config.artifact_cache_dir.as_deref(),
                     now_ms,
-                    min_age_ms,
+                    age_floor_ms,
                 )
                 .await
                 {
@@ -350,6 +388,9 @@ pub async fn clean_garbage(
             );
         } else {
             indexes_cleaned += 1;
+            if past_ceiling {
+                age_guard_overridden += 1;
+            }
         }
     }
 
@@ -358,6 +399,7 @@ pub async fn clean_garbage(
             indexes_cleaned = indexes_cleaned,
             nodes_deleted = deleted_count,
             unnameable_indexes = unnameable_indexes,
+            age_guard_overridden = age_guard_overridden,
             retained_count = keep_count,
             "Garbage collection complete"
         );
@@ -366,22 +408,15 @@ pub async fn clean_garbage(
     Ok(CleanGarbageResult {
         indexes_cleaned,
         nodes_deleted: deleted_count,
+        age_guard_overridden,
     })
 }
 
-/// Walk the prev-index chain using `ContentStore::get` (CID-based).
+/// Collect the whole prev-index chain, newest root first, reading storage
+/// directly.
 ///
-/// Returns entries in order from newest to oldest.
-///
-/// **Tolerant behavior**: if a prev_index link points at a root that no longer
-/// exists — the normal result of a prior GC truncating the chain — the walk
-/// stops gracefully there rather than returning an error, which is what makes
-/// GC idempotent.
-///
-/// A root that *does* exist but cannot be read propagates the error instead.
-/// Returning a short chain would be indistinguishable from a genuinely short
-/// one, and callers that decide which artifacts are unreferenced would treat
-/// everything past the unreadable root as garbage.
+/// See [`PrevIndexChainWalk::next_entry`] for how the walk ends, and prefer
+/// the walk itself where each root can be consumed and dropped.
 pub(crate) async fn walk_prev_index_chain_cs(
     store: &dyn ContentStore,
     current_root_id: &ContentId,
@@ -411,61 +446,118 @@ pub(crate) async fn walk_prev_index_chain_cs_cached(
     current_root_id: &ContentId,
     cache_dir: Option<&Path>,
 ) -> Result<Vec<IndexChainEntry>> {
+    let mut walk = PrevIndexChainWalk::new(store, current_root_id, cache_dir);
     let mut chain = Vec::new();
-    let mut current_id = current_root_id.clone();
 
-    loop {
+    while let Some(entry) = walk.next_entry().await? {
+        chain.push(entry);
+    }
+
+    Ok(chain)
+}
+
+/// A prev-index chain walk in progress, newest root first.
+///
+/// Yields one root at a time. A caller that reduces each root to a summary —
+/// the storage sweep's reachable CID set, say — then holds one decoded root
+/// rather than the whole chain, which on a long chain is the difference
+/// between a bounded working set and one that grows with the ledger's index
+/// history.
+pub(crate) struct PrevIndexChainWalk<'a> {
+    store: &'a dyn ContentStore,
+    cache_dir: Option<&'a Path>,
+    /// The root to read next, or `None` once the chain has ended.
+    next_id: Option<ContentId>,
+    /// Whether any root has been yielded, which decides how an unreadable
+    /// root is interpreted.
+    yielded: bool,
+}
+
+impl<'a> PrevIndexChainWalk<'a> {
+    pub(crate) fn new(
+        store: &'a dyn ContentStore,
+        head_id: &ContentId,
+        cache_dir: Option<&'a Path>,
+    ) -> Self {
+        Self {
+            store,
+            cache_dir,
+            next_id: Some(head_id.clone()),
+            yielded: false,
+        }
+    }
+
+    /// The next root in the chain, or `None` at its end.
+    ///
+    /// **Tolerant behavior**: if a prev_index link points at a root that no
+    /// longer exists — the normal result of a prior GC truncating the chain —
+    /// the walk ends gracefully rather than returning an error, which is what
+    /// makes GC idempotent. A root that *does* exist but cannot be read
+    /// propagates the error instead: a short chain would be
+    /// indistinguishable from a genuinely short one, and callers deciding
+    /// which artifacts are unreferenced would treat everything past the
+    /// unreadable root as garbage.
+    ///
+    /// A `cache_dir` weakens that ending. A cached copy of a released root
+    /// reads back, so the walk never learns storage has dropped it and
+    /// continues into a chain the collector already truncated. Callers that
+    /// must not act on a released root have to establish existence
+    /// themselves — see `gc::sweep::chain_cas_ids`, which reads a failed
+    /// expansion plus an absent root as the ending this walk missed.
+    pub(crate) async fn next_entry(&mut self) -> Result<Option<IndexChainEntry>> {
+        let Some(current_id) = self.next_id.take() else {
+            return Ok(None);
+        };
+
         let read_started = std::time::Instant::now();
-        let bytes = match get_cached_or_remote(store, &current_id, cache_dir).await {
-            Ok(b) => b,
-            Err(e) => {
-                if chain.is_empty() {
-                    return Err(e);
-                }
-                // A *released* root is the normal end of a walk: GC truncates
-                // the chain from the oldest end, leaving the retained
-                // boundary's prev_index dangling. Any other read failure is
-                // not an ending — it is a root whose contents could not be
-                // seen, and a caller deciding what is unreferenced would treat
-                // everything beyond it as garbage. Distinguish by existence,
-                // since the disk-cache path stringifies the error and loses
-                // its kind. If existence cannot be established either, treat
-                // the root as present and propagate.
-                if store.has(&current_id).await.unwrap_or(true) {
-                    return Err(e);
-                }
-                tracing::debug!(
-                    root_id = %current_id,
-                    "prev_index released by prior GC, chain ends here"
-                );
-                break;
-            }
+        let bytes = match get_cached_or_remote(self.store, &current_id, self.cache_dir).await {
+            Ok(bytes) => bytes,
+            Err(e) => return self.end_of_chain_or_error(&current_id, e).await,
         };
         tracing::trace!(
             root_id = %current_id,
             bytes = bytes.len(),
             elapsed_ms = read_started.elapsed().as_millis() as u64,
-            from_cache_enabled = cache_dir.is_some(),
+            from_cache_enabled = self.cache_dir.is_some(),
             "GC loaded prev-index root"
         );
 
         let (t, prev_index_id, garbage_id, root) = parse_chain_fields(&bytes)?;
+        self.next_id = prev_index_id;
+        self.yielded = true;
 
-        let next_id = prev_index_id;
-        chain.push(IndexChainEntry {
+        Ok(Some(IndexChainEntry {
             t,
             root_id: current_id,
             garbage_id,
             root,
-        });
-
-        match next_id {
-            Some(id) => current_id = id,
-            None => break,
-        }
+        }))
     }
 
-    Ok(chain)
+    /// Whether a root that would not read ends the chain or fails the walk.
+    ///
+    /// A *released* root is the normal end: GC truncates from the oldest end,
+    /// leaving the retained boundary's prev_index dangling. Distinguish by
+    /// existence, since the disk-cache path stringifies the error and loses
+    /// its kind. If existence cannot be established either, treat the root as
+    /// present and propagate. The head is never an ending — a walk that could
+    /// not read its first root saw nothing at all.
+    async fn end_of_chain_or_error(
+        &self,
+        root_id: &ContentId,
+        error: crate::error::IndexerError,
+    ) -> Result<Option<IndexChainEntry>> {
+        if !self.yielded || self.store.has(root_id).await.unwrap_or(true) {
+            return Err(error);
+        }
+
+        tracing::debug!(
+            root_id = %root_id,
+            "prev_index released by prior GC, chain ends here"
+        );
+
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -793,6 +885,408 @@ mod tests {
         assert!(store.has(&cid1).await.unwrap());
         assert!(store.has(&cid2).await.unwrap());
         assert!(store.has(&cid3).await.unwrap());
+    }
+
+    /// The hard ceiling overrides the age guard.
+    ///
+    /// Same fixture as `test_clean_garbage_respects_time_threshold` — a garbage
+    /// record only 5 minutes old against a 30-minute guard — but with the ceiling
+    /// set low enough that the oldest version is past it. Without this, a ledger
+    /// publishing faster than the guard accumulates versions without bound, since
+    /// `max_old_indexes` is ANDed with the age check and so bounds nothing.
+    ///
+    /// Note the sibling test above pins the complement: with no ceiling set,
+    /// which is the default, this same chain is left alone, so the guard governs
+    /// everything unless an operator opts in.
+    #[tokio::test]
+    async fn test_hard_ceiling_collects_despite_recent_garbage() {
+        let storage = MemoryStorage::new();
+
+        let (cid1, addr1) = cid_and_addr(ContentKind::IndexRoot, b"hard_root1");
+        let (cid2, addr2) = cid_and_addr(ContentKind::IndexRoot, b"hard_root2");
+        let (cid3, addr3) = cid_and_addr(ContentKind::IndexRoot, b"hard_root3");
+        let (garb_cid2, garb_addr2) = cid_and_addr(ContentKind::GarbageRecord, b"hard_garb2");
+
+        // 5 minutes old: well inside the 30-minute guard.
+        let recent_ts = current_timestamp_ms() - (5 * 60 * 1000);
+
+        let root1 = minimal_fir6(1, None, None);
+        let root2 = minimal_fir6(
+            2,
+            Some(BinaryPrevIndexRef {
+                t: 1,
+                id: cid1.clone(),
+            }),
+            Some(BinaryGarbageRef {
+                id: garb_cid2.clone(),
+            }),
+        );
+        let root3 = minimal_fir6(
+            3,
+            Some(BinaryPrevIndexRef {
+                t: 2,
+                id: cid2.clone(),
+            }),
+            None,
+        );
+
+        let garbage2 = format!(
+            r#"{{"ledger_id": "{LEDGER}", "t": 2, "garbage": ["old"], "created_at_ms": {recent_ts}}}"#
+        );
+
+        storage.write_bytes(&addr1, &root1).await.unwrap();
+        storage.write_bytes(&addr2, &root2).await.unwrap();
+        storage.write_bytes(&addr3, &root3).await.unwrap();
+        storage
+            .write_bytes(&garb_addr2, garbage2.as_bytes())
+            .await
+            .unwrap();
+
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(1),
+            min_time_garbage_mins: Some(30),
+            // keep_count = 2, hard_keep = 2, so the oldest entry (chain index 2)
+            // is at the ceiling and collected despite the recent record.
+            hard_max_old_indexes: Some(1),
+            ..Default::default()
+        };
+
+        let store = test_store(&storage);
+        let result = clean_garbage(&store, &cid3, config).await.unwrap();
+
+        assert_eq!(
+            result.indexes_cleaned, 1,
+            "the ceiling must override the age guard"
+        );
+        assert_eq!(
+            result.age_guard_overridden, 1,
+            "the override must be reported, not silent"
+        );
+
+        // The oldest root is gone; the retained newest ones survive.
+        assert!(!store.has(&cid1).await.unwrap(), "oldest root collected");
+        assert!(store.has(&cid2).await.unwrap());
+        assert!(store.has(&cid3).await.unwrap());
+    }
+
+    /// Directory prefix under which this store writes index roots, taken from a
+    /// real derived address so it cannot drift from the write path.
+    ///
+    /// An earlier version of the harness below listed
+    /// `"test:main/main/index/roots/"`, which never matched the stored
+    /// `fluree:memory://test/main/index/roots/…` addresses: every generation
+    /// counted zero roots and every bound held vacuously, with GC deleted
+    /// outright. The harness now refuses a zero count.
+    fn roots_prefix() -> String {
+        let (_, addr) = cid_and_addr(ContentKind::IndexRoot, b"prefix-probe");
+        let dir_end = addr.rfind('/').expect("root address has a directory") + 1;
+        addr[..dir_end].to_string()
+    }
+
+    /// Publish `generations` index versions, running GC after each exactly as
+    /// the orchestrator does, and return how many root objects the store holds
+    /// after every generation.
+    ///
+    /// Each generation's garbage record is stamped `garbage_ts()` and names one
+    /// superseded leaf, which is what a real build records.
+    async fn publish_then_gc(
+        generations: usize,
+        garbage_ts: impl Fn() -> i64,
+        config: CleanGarbageConfig,
+    ) -> Vec<usize> {
+        let storage = MemoryStorage::new();
+        let store = test_store(&storage);
+        let prefix = roots_prefix();
+
+        let mut prev: Option<(i64, ContentId)> = None;
+        let mut counts = Vec::with_capacity(generations);
+
+        for gen in 1..=generations {
+            let t = gen as i64;
+            let (root_cid, root_addr) =
+                cid_and_addr(ContentKind::IndexRoot, format!("root{gen}").as_bytes());
+
+            let garbage_ref = if prev.is_some() {
+                let (g_cid, g_addr) =
+                    cid_and_addr(ContentKind::GarbageRecord, format!("garb{gen}").as_bytes());
+                let (dead_cid, dead_addr) =
+                    cid_and_addr(ContentKind::IndexLeaf, format!("leaf{gen}").as_bytes());
+                storage
+                    .write_bytes(&dead_addr, b"superseded")
+                    .await
+                    .unwrap();
+                let ts = garbage_ts();
+                let body = format!(
+                    r#"{{"ledger_id": "{LEDGER}", "t": {t}, "garbage": ["{dead_cid}"], "created_at_ms": {ts}}}"#
+                );
+                storage.write_bytes(&g_addr, body.as_bytes()).await.unwrap();
+                Some(BinaryGarbageRef { id: g_cid })
+            } else {
+                None
+            };
+
+            let bytes = minimal_fir6(
+                t,
+                prev.as_ref().map(|(pt, pid)| BinaryPrevIndexRef {
+                    t: *pt,
+                    id: pid.clone(),
+                }),
+                garbage_ref,
+            );
+            storage.write_bytes(&root_addr, &bytes).await.unwrap();
+
+            clean_garbage(&store, &root_cid, config.clone())
+                .await
+                .unwrap();
+
+            let roots = storage.list_prefix(&prefix).await.unwrap().len();
+            // The current root is always present, so zero means the harness is
+            // not observing the store at all — see `roots_prefix`.
+            assert!(
+                roots >= 1,
+                "generation {gen}: no roots observed under {prefix}"
+            );
+            counts.push(roots);
+            prev = Some((t, root_cid));
+        }
+        counts
+    }
+
+    fn every_fifth(counts: &[usize]) -> Vec<(usize, usize)> {
+        counts
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 5 == 4)
+            .map(|(i, c)| (i + 1, *c))
+            .collect()
+    }
+
+    /// Baseline: with no age guard in play, repeated publish-then-GC settles at
+    /// exactly `1 + max_old_indexes` roots. This passes on `main` too — it pins
+    /// the truncation loop, not the ceiling — and gives the two tests below a
+    /// known-good shape to differ from. Deleting GC fails it at 40 roots.
+    #[tokio::test]
+    async fn repeated_publish_then_gc_keeps_root_count_bounded() {
+        const GENERATIONS: usize = 40;
+        const MAX_OLD: u32 = 2;
+        // A day old: past any age guard.
+        let old_ts = current_timestamp_ms() - (24 * 60 * 60 * 1000);
+
+        let counts = publish_then_gc(
+            GENERATIONS,
+            || old_ts,
+            CleanGarbageConfig {
+                max_old_indexes: Some(MAX_OLD),
+                min_time_garbage_mins: Some(0),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let keep_count = 1 + MAX_OLD as usize;
+        assert_eq!(
+            *counts.last().unwrap(),
+            keep_count,
+            "roots should settle at 1 + max_old_indexes; every 5th generation: {:?}",
+            every_fifth(&counts)
+        );
+        assert!(
+            counts.iter().all(|&c| c <= keep_count),
+            "roots must never exceed the retention target once GC runs; \
+             every 5th generation: {:?}",
+            every_fifth(&counts)
+        );
+    }
+
+    /// Production's regime — a live 30-minute age guard and fresh garbage
+    /// records — with no ceiling set, which is the default. Every version is
+    /// inside the guard, so GC must leave all of them alone. That is the
+    /// reader-safety property the guard exists for: a query that started
+    /// against any of these versions can still read it. The default
+    /// configuration must never trade that away, so this fails if a default
+    /// ceiling is ever derived again.
+    ///
+    /// Deleting GC leaves this green, deliberately: it pins the absence of an
+    /// override, and GC doing nothing is exactly the required behaviour.
+    #[tokio::test]
+    async fn repeated_publish_under_a_live_age_guard_retains_everything_by_default() {
+        const GENERATIONS: usize = 40;
+        const MAX_OLD: u32 = 2;
+
+        let counts = publish_then_gc(
+            GENERATIONS,
+            current_timestamp_ms,
+            CleanGarbageConfig {
+                max_old_indexes: Some(MAX_OLD),
+                min_time_garbage_mins: Some(30),
+                hard_max_old_indexes: None,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            *counts.last().unwrap(),
+            GENERATIONS,
+            "without a ceiling the age guard must hold every version; \
+             every 5th generation: {:?}",
+            every_fifth(&counts)
+        );
+    }
+
+    /// The same regime with a ceiling set: past it the age guard is overridden,
+    /// so roots stay at exactly `1 + hard_max_old_indexes` instead of growing
+    /// with every publish. This is the defect the ceiling exists for,
+    /// reproduced. Removing the override — which is what `main` does — fails it
+    /// with all 40 roots retained; deleting GC fails it the same way.
+    #[tokio::test]
+    async fn repeated_publish_then_gc_bounded_with_a_live_age_guard() {
+        const GENERATIONS: usize = 40;
+        const MAX_OLD: u32 = 2;
+        const HARD_MAX_OLD: u32 = 8;
+
+        let counts = publish_then_gc(
+            GENERATIONS,
+            current_timestamp_ms,
+            CleanGarbageConfig {
+                max_old_indexes: Some(MAX_OLD),
+                min_time_garbage_mins: Some(30),
+                hard_max_old_indexes: Some(HARD_MAX_OLD),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let hard_keep = 1 + HARD_MAX_OLD as usize;
+        assert_eq!(
+            *counts.last().unwrap(),
+            hard_keep,
+            "roots must be pinned at the ceiling under a live age guard; \
+             every 5th generation: {:?}",
+            every_fifth(&counts)
+        );
+        assert!(
+            counts.iter().all(|&c| c <= hard_keep),
+            "roots must never exceed the ceiling; every 5th generation: {:?}",
+            every_fifth(&counts)
+        );
+    }
+
+    /// **The retention promise outranks the ceiling.** Even at the most hostile
+    /// setting — `hard_max_old_indexes: Some(0)`, i.e. "override the age guard
+    /// everywhere" — the newest `1 + max_old_indexes` versions must survive.
+    ///
+    /// The previous version of this test was VACUOUS and is worth recording as a
+    /// warning. It used `max_old_indexes: Some(5)` against a 3-entry chain, so
+    /// `index_chain.len() <= keep_count` returned early and the retention loop
+    /// never ran at all. It asserted `indexes_cleaned == 0` and passed because
+    /// nothing was attempted, not because anything was protected — it stayed
+    /// green with the ceiling logic removed entirely.
+    ///
+    /// This version makes the chain LONGER than `keep_count`, so the loop runs
+    /// and both halves are observable: the two eligible versions are collected
+    /// despite fresh garbage records (the ceiling working), and the two retained
+    /// ones survive (the retention promise holding). Lowering the loop's start
+    /// from `keep_count` to `0` fails this.
+    #[tokio::test]
+    async fn test_hard_ceiling_never_collects_inside_retention_target() {
+        let storage = MemoryStorage::new();
+
+        // Chain newest-first once walked: [root4, root3, root2, root1].
+        // max_old_indexes = 1 -> keep_count = 2, so root4/root3 are retained and
+        // root2/root1 are gc-eligible.
+        let (cid1, addr1) = cid_and_addr(ContentKind::IndexRoot, b"floor_root1");
+        let (cid2, addr2) = cid_and_addr(ContentKind::IndexRoot, b"floor_root2");
+        let (cid3, addr3) = cid_and_addr(ContentKind::IndexRoot, b"floor_root3");
+        let (cid4, addr4) = cid_and_addr(ContentKind::IndexRoot, b"floor_root4");
+        let (garb_cid2, garb_addr2) = cid_and_addr(ContentKind::GarbageRecord, b"floor_garb2");
+        let (garb_cid3, garb_addr3) = cid_and_addr(ContentKind::GarbageRecord, b"floor_garb3");
+
+        // Every record is 5 minutes old against a 30-minute guard, so nothing
+        // here is collectable unless the ceiling overrides the age check.
+        let recent_ts = current_timestamp_ms() - (5 * 60 * 1000);
+
+        let root1 = minimal_fir6(1, None, None);
+        let root2 = minimal_fir6(
+            2,
+            Some(BinaryPrevIndexRef {
+                t: 1,
+                id: cid1.clone(),
+            }),
+            Some(BinaryGarbageRef {
+                id: garb_cid2.clone(),
+            }),
+        );
+        let root3 = minimal_fir6(
+            3,
+            Some(BinaryPrevIndexRef {
+                t: 2,
+                id: cid2.clone(),
+            }),
+            Some(BinaryGarbageRef {
+                id: garb_cid3.clone(),
+            }),
+        );
+        let root4 = minimal_fir6(
+            4,
+            Some(BinaryPrevIndexRef {
+                t: 3,
+                id: cid3.clone(),
+            }),
+            None,
+        );
+        let garbage2 = format!(
+            r#"{{"ledger_id": "{LEDGER}", "t": 2, "garbage": [], "created_at_ms": {recent_ts}}}"#
+        );
+        let garbage3 = format!(
+            r#"{{"ledger_id": "{LEDGER}", "t": 3, "garbage": [], "created_at_ms": {recent_ts}}}"#
+        );
+
+        storage.write_bytes(&addr1, &root1).await.unwrap();
+        storage.write_bytes(&addr2, &root2).await.unwrap();
+        storage.write_bytes(&addr3, &root3).await.unwrap();
+        storage.write_bytes(&addr4, &root4).await.unwrap();
+        storage
+            .write_bytes(&garb_addr2, garbage2.as_bytes())
+            .await
+            .unwrap();
+        storage
+            .write_bytes(&garb_addr3, garbage3.as_bytes())
+            .await
+            .unwrap();
+
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(1),
+            min_time_garbage_mins: Some(30),
+            // The most hostile setting: override the age guard everywhere.
+            hard_max_old_indexes: Some(0),
+            ..Default::default()
+        };
+
+        let store = test_store(&storage);
+        clean_garbage(&store, &cid4, config).await.unwrap();
+
+        // Retained: the newest keep_count = 2. These must survive whatever the
+        // ceiling says — this is the half a wrong loop bound would break.
+        assert!(
+            store.has(&cid4).await.unwrap(),
+            "the current root must never be collected"
+        );
+        assert!(
+            store.has(&cid3).await.unwrap(),
+            "the retention target promises max_old_indexes=1 old version; the \
+             ceiling must not reach inside it"
+        );
+        // Eligible: collected despite garbage records well inside the age guard,
+        // which is the ceiling doing its job. Without it both would survive.
+        assert!(
+            !store.has(&cid2).await.unwrap(),
+            "past the ceiling, age must not protect an eligible version"
+        );
+        assert!(
+            !store.has(&cid1).await.unwrap(),
+            "past the ceiling, age must not protect an eligible version"
+        );
     }
 
     #[tokio::test]

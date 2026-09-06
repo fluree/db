@@ -38,6 +38,7 @@ use crate::ir::triple::TriplePattern;
 use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::inline::{extend_schema, InlineOperator};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::sort::SortSpec;
 use crate::temporal_mode::TemporalMode;
 use crate::var_registry::VarId;
 
@@ -318,7 +319,7 @@ pub struct DatasetOperator {
     /// T1.3: an `ORDER BY … LIMIT` top-k directive, applied per member like
     /// `row_budget`. Per-member top-k is sound — the outer sort merges the members'
     /// partial top-k into the global one.
-    topk: Option<(VarId, usize, bool)>,
+    topk: Option<(Vec<SortSpec>, usize)>,
 }
 
 impl DatasetOperator {
@@ -347,8 +348,8 @@ impl DatasetOperator {
         if let Some(budget) = self.row_budget {
             member.set_row_budget(budget);
         }
-        if let Some((sort_var, k, ascending)) = self.topk {
-            member.set_topk(sort_var, k, ascending);
+        if let Some((ordering, k)) = &self.topk {
+            member.set_topk(ordering, *k);
         }
     }
 
@@ -409,6 +410,36 @@ pub(crate) fn stamp_provenance(
         .collect::<Result<Vec<_>>>()?;
 
     Batch::new(schema, stamped_columns).map_err(|e| QueryError::Internal(e.to_string()))
+}
+
+/// Stamp `batch` in the ledger a cross-ledger SERVICE body executes against,
+/// when the context arms per-scan provenance (`scan_provenance_ledger`); a
+/// pass-through everywhere else. For binding producers that are not wrapped
+/// by a `DatasetOperator` (property paths) but emit target-encoded `Sid`s.
+pub(crate) fn stamp_if_armed(batch: Batch, ctx: &ExecutionContext<'_>) -> Result<Batch> {
+    match &ctx.scan_provenance_ledger {
+        Some(ledger_id) => stamp_provenance(batch, ledger_id, ctx),
+        None => Ok(batch),
+    }
+}
+
+/// Stamp a parent row's raw `Sid`s in the REQUESTER's ledger (the context's
+/// active snapshot) before it seeds a body that executes against another
+/// ledger. Inside such a body every reference is namespace-neutral; a
+/// requester-encoded `Sid` copied into a body column (`BIND(?parent AS ?x)`)
+/// would otherwise be decoded through the target's table at the boundary.
+/// An undecodable `Sid` is left as is.
+pub(crate) fn stamp_seed_row(row: Vec<Binding>, ctx: &ExecutionContext<'_>) -> Vec<Binding> {
+    let requester: Arc<str> = Arc::from(ctx.active_snapshot.ledger_id.as_str());
+    row.into_iter()
+        .map(|b| match b {
+            Binding::Sid { sid, .. } => match ctx.active_snapshot.decode_sid(&sid) {
+                Some(iri) => Binding::iri_match(iri, sid, Arc::clone(&requester)),
+                None => Binding::sid(sid),
+            },
+            other => other,
+        })
+        .collect()
 }
 
 /// Stamp a single binding with ledger provenance.
@@ -509,13 +540,13 @@ impl Operator for DatasetOperator {
         }
     }
 
-    fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
+    fn set_topk(&mut self, ordering: &[SortSpec], k: usize) {
         // T1.3: record ORDER BY … LIMIT top-k; applied per member like the row
         // budget. Per-member top-k is sound — the outer sort merges the members'
         // partial top-k into the global one (same reasoning as `GraphOperator`'s
         // per-partition top-k). Switch-gated.
         if crate::r2rml::dataset_budget_enabled() {
-            self.topk = Some((sort_var, k, ascending));
+            self.topk = Some((ordering.to_vec(), k));
         }
     }
 
@@ -541,15 +572,24 @@ impl Operator for DatasetOperator {
         match ctx.active_graphs() {
             ActiveGraphs::Single => {
                 // Single-graph mode: build one operator, open with parent
-                // context directly. No fanout, no provenance stamping.
+                // context directly. No fanout; provenance stamping only when
+                // the context demands it — a cross-ledger SERVICE subtree sets
+                // `scan_provenance_ledger` so raw target-encoded `Sid`s never
+                // escape a scan (they would be re-decoded against the
+                // requester's namespace table the moment an intra-body join
+                // substitutes them into a pattern; issue #1665). Everywhere
+                // else the flag is `None` and this lane is unchanged.
                 let mut inner = self.builder.build()?;
                 self.apply_member_directives(inner.as_mut());
                 inner.open(ctx).await?;
+                self.needs_provenance = ctx.scan_provenance_ledger.is_some();
                 self.members.push(DatasetMember {
                     operator: inner,
-                    ledger_id: Arc::from(""),
+                    ledger_id: ctx
+                        .scan_provenance_ledger
+                        .clone()
+                        .unwrap_or_else(|| Arc::from("")),
                 });
-                self.needs_provenance = false;
             }
             ActiveGraphs::Many(graphs) => {
                 // Pre-scan: determine whether graphs span multiple ledgers
@@ -860,8 +900,13 @@ mod tests {
         fn set_row_budget(&mut self, budget: usize) {
             *self.budget.lock().unwrap() = Some(budget);
         }
-        fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
-            *self.topk.lock().unwrap() = Some((sort_var, k, ascending));
+        fn set_topk(&mut self, ordering: &[SortSpec], k: usize) {
+            let primary = &ordering[0];
+            *self.topk.lock().unwrap() = Some((
+                primary.var,
+                k,
+                matches!(primary.direction, crate::sort::SortDirection::Ascending),
+            ));
         }
     }
 
@@ -931,7 +976,7 @@ mod tests {
     #[tokio::test]
     async fn dataset_forwards_topk_to_member() {
         let (mut op, (_budget, topk)) = recorder_dataset();
-        op.set_topk(VarId(3), 5, false);
+        op.set_topk(&[SortSpec::desc(VarId(3))], 5);
         open_and_drain(&mut op).await;
         assert_eq!(*topk.lock().unwrap(), Some((VarId(3), 5, false)));
     }

@@ -218,7 +218,7 @@ async fn delete_old_snapshots(storage: &dyn Storage, graph_source_id: &str, cids
 /// Default snapshot retention for BM25 manifests.
 /// Uses the same default as index GC (`gc_max_old_indexes` + 1 for current).
 fn snapshot_retention() -> usize {
-    (fluree_db_indexer::DEFAULT_MAX_OLD_INDEXES as usize) + 1
+    (crate::wasm_compat::DEFAULT_MAX_OLD_INDEXES as usize) + 1
 }
 
 // =============================================================================
@@ -1097,8 +1097,38 @@ impl crate::Fluree {
             .and_then(|r| r.commit_head_id.clone())
             .ok_or_else(|| crate::ApiError::NotFound("No commit head for ledger".to_string()))?;
 
-        // 5. Compile property deps for this ledger's namespace
-        let compiled_deps = CompiledPropertyDeps::compile(&index.property_deps, |iri: &str| {
+        // 5. Decide whether this query can be synced incrementally at all.
+        //
+        // The walk below attributes each commit to the documents it changed by
+        // predicate and by subject. That is sound only when the analysis can
+        // enumerate every predicate the query observes and every one of them
+        // sits on the document subject. Shapes it cannot vouch for — `*`,
+        // nested projections, variable predicates, reverse terms, patterns on
+        // a second subject — take the full rebuild, the one path that is
+        // correct for any shape. Recomputed from the stored config rather than
+        // read off the snapshot so the verdict and the predicate set come from
+        // the same analysis, and so an index built by an older extractor is
+        // judged by the current one.
+        let analysis = PropertyDeps::analyze(&query);
+        if let Some(reason) = &analysis.incomplete {
+            warn!(
+                graph_source_id = %graph_source_id,
+                old_watermark = old_watermark,
+                ledger_t = ledger_t,
+                reason = %reason,
+                "Indexing query cannot be tracked incrementally; running a full resync. \
+                 Name the indexed properties explicitly in the select and root every \
+                 where pattern at the document variable to sync incrementally"
+            );
+            return self.resync_bm25_index(graph_source_id).await;
+        }
+
+        // Compile against the ledger at `ledger_t`. An IRI that fails to encode
+        // is dropped, and that is sound only because namespaces are append-only
+        // and this snapshot is the newest: any predicate with a flake in
+        // `(old_watermark, ledger_t]` is in the namespace table by now. Do not
+        // "fix" this to compile against the watermark-time db.
+        let compiled_deps = CompiledPropertyDeps::compile(&analysis.deps, |iri: &str| {
             ledger.snapshot.encode_iri(iri)
         });
 
@@ -1118,15 +1148,62 @@ impl crate::Fluree {
             affected_sids.extend(subjects);
         }
 
-        // If no subjects affected, fall back to full resync
+        // Nothing the index covers changed in this window.
+        //
+        // This is a DETERMINATE answer, not a failure to work one out: the walk
+        // above completed, and `affected_subjects` reported that none of the
+        // commits touched a property the index depends on. Queries whose
+        // dependencies cannot be tracked completely never reach here: step 5
+        // declined them to a full resync, so for every query that does reach
+        // here the tracked set is total. An empty set therefore means the index
+        // is already correct as of `ledger_t`, and the only work owed is to
+        // record that.
+        //
+        // It used to fall back to a full resync, and on an append-heavy ledger
+        // whose writes mostly miss the indexed properties that is pathological
+        // rather than merely wasteful. Measured on a deployment indexing
+        // `as:content`/`as:name`/`as:summary`/`as:preferredUsername` while the
+        // write volume was observations carrying only `sosa:` properties: 23 full
+        // index rebuilds in 10 minutes across 4 ledgers, one of them triggered by
+        // a ONE-commit window (`old_watermark=15194 ledger_t=15195`) over a
+        // 15,000-commit ledger. It also feeds back — a rebuild is slow, the ledger
+        // advances while it runs, so the next window is wider and rebuilds again.
+        // Resident memory reached 23.5 GiB of non-reclaimable anon against a 6 GiB
+        // index-cache bound, and the process was OOM-killed three times.
+        //
+        // The watermark is advanced and PERSISTED rather than left alone. Leaving
+        // it is cheaper per pass but never converges: every later sync re-walks a
+        // commit range that grows without bound, which on a busy ledger becomes
+        // thousands of commit reads per sync — a slower version of the same
+        // problem. Persisting costs one index serialization, which is O(index) and
+        // bounded, and skips exactly the expensive half of a resync: the full
+        // ledger re-query and rebuild.
         if affected_sids.is_empty() {
-            warn!(
+            index.watermark.update(&source_ledger_alias, ledger_t);
+            let new_snapshot_id = self.write_bm25_snapshot(graph_source_id, &index).await?;
+            let mut manifest = manifest;
+            manifest.append(Bm25SnapshotEntry::new(ledger_t, new_snapshot_id.clone()));
+            let removed = manifest.trim(snapshot_retention());
+            self.publish_bm25_manifest(graph_source_id, &manifest, ledger_t)
+                .await?;
+            if let Some(storage) = self.admin_storage() {
+                delete_old_snapshots(storage, graph_source_id, &removed).await;
+            }
+            info!(
                 graph_source_id = %graph_source_id,
                 old_watermark = old_watermark,
                 ledger_t = ledger_t,
-                "No affected subjects detected, falling back to full resync"
+                "No indexed properties changed in this window; advancing watermark without a resync"
             );
-            return self.resync_bm25_index(graph_source_id).await;
+            return Ok(Bm25SyncResult {
+                graph_source_id: graph_source_id.to_string(),
+                upserted: 0,
+                removed: 0,
+                affected_subjects: 0,
+                old_watermark,
+                new_watermark: ledger_t,
+                was_full_resync: false,
+            });
         }
 
         // 7. Convert affected Sids to IRIs

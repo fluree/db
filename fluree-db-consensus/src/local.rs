@@ -373,10 +373,32 @@ impl SubmissionLookup for LocalCommitter {
 
 /// Map a transaction-pipeline error into a [`SubmissionError`], preserving
 /// the HTTP status so the caller can render an accurate response.
+///
+/// Novelty refusals keep their identity through the flattening — the server
+/// needs to tell them apart from other failures (and from each other) to
+/// answer 503 + `err:db/NoveltyAtMax` + `Retry-After` for the drainable
+/// cases and 413 + `err:db/NoveltyDeltaTooLarge` for a delta that can never
+/// fit. The split mirrors the commit check (`current + delta >= max`): a
+/// delta at or above the ceiling fails even against drained novelty.
 pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
-    SubmissionError::Execution {
-        status: err.status_code(),
-        message: err.to_string(),
+    match &err {
+        ApiError::Transact(fluree_db_api::TransactError::NoveltyWouldExceed {
+            delta_bytes,
+            max_bytes,
+            ..
+        }) if delta_bytes >= max_bytes => SubmissionError::NoveltyDeltaTooLarge {
+            message: err.to_string(),
+        },
+        ApiError::Transact(
+            fluree_db_api::TransactError::NoveltyAtMax
+            | fluree_db_api::TransactError::NoveltyWouldExceed { .. },
+        ) => SubmissionError::NoveltyBackpressure {
+            message: err.to_string(),
+        },
+        _ => SubmissionError::Execution {
+            status: err.status_code(),
+            message: err.to_string(),
+        },
     }
 }
 

@@ -20,7 +20,7 @@ use fluree_db_core::{
 };
 
 use crate::binary_range::BinaryRangeProvider;
-use fluree_db_spatial::SpatialIndexProvider;
+use fluree_db_binary_index::wasm_compat::SpatialIndexProvider;
 use fluree_vocab::namespaces::{FLUREE_DB, JSON_LD, OGC_GEO, RDF, XSD};
 use fluree_vocab::{geo_names, xsd_names};
 use rustc_hash::FxHashMap;
@@ -41,7 +41,12 @@ pub fn query_memory_budget_bytes() -> usize {
                 return n; // explicit override; 0 disables the guard
             }
         }
+        // 8 GiB on 64-bit; wasm32 usize is 32-bit, and browser wasm memory
+        // tops out at 4 GiB — use 1 GiB there. SEAM(wasm): budgets are usize.
+        #[cfg(not(target_arch = "wasm32"))]
         const FALLBACK: usize = 8 * 1024 * 1024 * 1024; // 8 GiB
+        #[cfg(target_arch = "wasm32")]
+        const FALLBACK: usize = 1024 * 1024 * 1024; // 1 GiB
         match detect_container_memory_bytes() {
             Some(total) => total / 100 * 78,
             None => FALLBACK,
@@ -115,9 +120,9 @@ fn detect_container_memory_bytes() -> Option<usize> {
         }
     }
     if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
-        if let Ok(n) = s.trim().parse::<usize>() {
-            if n < (1usize << 62) {
-                return Some(n);
+        if let Ok(n) = s.trim().parse::<u64>() {
+            if n < (1u64 << 62) {
+                return Some(usize::try_from(n).unwrap_or(usize::MAX));
             }
         }
     }
@@ -190,8 +195,28 @@ pub type FulltextProviders = HashMap<(GraphId, u32, u16), Arc<FulltextArena>>;
 ///
 /// Scoping: contexts that swap the overlay (`with_graph_ref`) start a fresh
 /// memo, mirroring `const_sid_cache`; same-overlay derivations share it.
-pub type TranslatedOverlayCache =
-    Arc<Mutex<FxHashMap<(u64, GraphId, IndexType), Arc<crate::binary_scan::TranslatedOverlayOps>>>>;
+///
+/// The key's `OverlayWalkScope` distinguishes the whole-overlay product from
+/// the subject-/predicate-bounded ones a bound-term scan builds instead, so the
+/// two never alias. Only `Whole` products are actually inserted: a bounded
+/// walk is a sub-microsecond seek even uncached, and per-row join probes bind
+/// a distinct subject per left row — memoizing bounded products would grow
+/// this map by one entry per probed subject for the execution's lifetime with
+/// no eviction. The scope stays in the key as a type-level guard against a
+/// future bounded insert aliasing the whole product.
+pub type TranslatedOverlayCache = Arc<
+    Mutex<
+        FxHashMap<
+            (
+                u64,
+                GraphId,
+                IndexType,
+                crate::binary_scan::OverlayWalkScope,
+            ),
+            Arc<crate::binary_scan::TranslatedOverlayOps>,
+        >,
+    >,
+>;
 
 /// Execution context providing access to database and query state.
 ///
@@ -364,6 +389,21 @@ pub struct ExecutionContext<'a> {
     /// SIDs — encoded in the original namespace space — can be decoded
     /// correctly (see `reencode_sid` in `build_match_val_for_snapshot`).
     pub original_snapshot: &'a LedgerSnapshot,
+    /// When set, every scan boundary in this context stamps its output rows'
+    /// `Binding::Sid`s to `Binding::IriMatch` decoded in this ledger (the
+    /// single-graph lane of `DatasetOperator` honors it — the multi-graph lane
+    /// already stamps its members unconditionally).
+    ///
+    /// Set ONLY by the cross-ledger `SERVICE` path (`service.rs`), where the
+    /// subtree executes against a foreign snapshot: raw scan `Sid`s there are
+    /// target-encoded, but the scan layer's pattern-constant contract decodes
+    /// constant SIDs against `original_snapshot` (see [`reencode_sid`]) — so a
+    /// target-encoded `Sid` substituted back into a pattern by an intra-body
+    /// join is decoded through the wrong namespace table. Stamping at the scan
+    /// boundary keeps every binding in the subtree namespace-neutral, exactly
+    /// as the multi-ledger dataset lane does. `None` everywhere else: the
+    /// common paths pay one `Option` check per scan open.
+    pub scan_provenance_ledger: Option<Arc<str>>,
     /// Per-query memo: constant filter operands → internal subject id, so a
     /// `<const> != ?var` FILTER resolves the constant once, not per row.
     pub const_sid_cache: ConstSidCache,
@@ -455,6 +495,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             reasoning_active: false,
             original_snapshot: snapshot,
+            scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
@@ -512,6 +553,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: db.eager,
             reasoning_active: false,
             original_snapshot: db.snapshot,
+            scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
@@ -573,6 +615,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: db.eager,
             reasoning_active: false,
             original_snapshot: db.snapshot,
+            scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
@@ -623,6 +666,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             reasoning_active: false,
             original_snapshot: snapshot,
+            scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
@@ -672,6 +716,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             reasoning_active: false,
             original_snapshot: snapshot,
+            scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
@@ -723,6 +768,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: false,
             reasoning_active: false,
             original_snapshot: snapshot,
+            scan_provenance_ledger: None,
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
@@ -1322,6 +1368,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
+            scan_provenance_ledger: self.scan_provenance_ledger.clone(),
             const_sid_cache: self.const_sid_cache.clone(),
             lang_tag_cache: self.lang_tag_cache.clone(),
             r2rml_parent_memo: self.r2rml_parent_memo.clone(),
@@ -1382,6 +1429,7 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
+            scan_provenance_ledger: self.scan_provenance_ledger.clone(),
             const_sid_cache: self.const_sid_cache.clone(),
             lang_tag_cache: self.lang_tag_cache.clone(),
             r2rml_parent_memo: self.r2rml_parent_memo.clone(),
@@ -1438,6 +1486,11 @@ impl<'a> ExecutionContext<'a> {
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
+            // A fresh per-graph scope: dataset members are stamped at the
+            // member boundary by their owning `DatasetOperator`, and the
+            // cross-ledger SERVICE path re-arms this explicitly on the
+            // context it builds (`service.rs`).
+            scan_provenance_ledger: None,
             // This per-graph context switches to `graph`'s own store/snapshot
             // (see `binary_store`/`active_snapshot` above) while clearing
             // `multi_ledger`, so the single-ledger const→s_id fast path DOES run

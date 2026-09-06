@@ -12,7 +12,7 @@ use fluree_db_core::temporal::{CalendarField, DateTime as FlureeDateTime, Tempor
 use fluree_db_core::value_id::{ObjKey, ObjKind};
 use std::sync::Arc;
 
-use super::helpers::{check_arity, parse_datetime_from_binding};
+use super::helpers::{binding_is_temporal, check_arity, parse_datetime_from_binding};
 use super::value::ComparableValue;
 use crate::parse::UnresolvedDatatypeConstraint;
 
@@ -133,29 +133,24 @@ pub fn eval_tz<R: RowAccess>(
     check_arity(args, 1, "TZ")?;
     if let Expression::Var(var_id) = &args[0] {
         match row.get(*var_id) {
-            Some(binding) => {
-                let has_tz = has_timezone_info(binding);
-                match parse_datetime_from_binding(binding, ctx) {
-                    Some(dt) => {
-                        if !has_tz {
-                            // No timezone info in the original value
-                            Ok(Some(ComparableValue::String(Arc::from(""))))
-                        } else {
-                            let total_secs = dt.offset().local_minus_utc();
-                            if total_secs == 0 {
-                                Ok(Some(ComparableValue::String(Arc::from("Z"))))
-                            } else {
-                                let hours = total_secs / 3600;
-                                let mins = (total_secs.abs() % 3600) / 60;
-                                let sign = if total_secs >= 0 { '+' } else { '-' };
-                                let tz_str = format!("{}{:02}:{:02}", sign, hours.abs(), mins);
-                                Ok(Some(ComparableValue::String(Arc::from(tz_str))))
-                            }
-                        }
-                    }
-                    None => Ok(None),
-                }
+            // Fluree normalizes temporal values to UTC and does not persist the
+            // source offset: the binary index stores an instant and nothing
+            // else, so by the time a value is indexed its original offset is
+            // gone. Reporting the offset would therefore answer "-08:00" while
+            // a value sat in novelty and "Z" once a background reindex moved
+            // it — the same query returning a different string with no write in
+            // between, which a caller cannot predict or control.
+            //
+            // Answering UTC unconditionally is what makes the two lanes agree.
+            // It is a deliberate deviation from SPARQL 1.1 §17.4.5.9, which
+            // expects the source offset; the two W3C tests that pin that
+            // (functions/tz-01, functions/timezone-01) are registered as
+            // not-supported in `testsuite-sparql/tests/registers/mod.rs`.
+            Some(binding) if binding_is_temporal(binding, ctx) => {
+                Ok(Some(ComparableValue::String(Arc::from("Z"))))
             }
+            // Not a temporal value: a type error, which demotes to unbound.
+            Some(_) => Ok(None),
             None => Ok(None),
         }
     } else {
@@ -173,26 +168,16 @@ pub fn eval_timezone<R: RowAccess>(
     check_arity(args, 1, "TIMEZONE")?;
     if let Expression::Var(var_id) = &args[0] {
         match row.get(*var_id) {
-            Some(binding) => {
-                let has_tz = has_timezone_info(binding);
-                match parse_datetime_from_binding(binding, ctx) {
-                    Some(dt) => {
-                        if !has_tz {
-                            // No timezone → unbound per W3C
-                            return Ok(None);
-                        }
-                        let total_secs = dt.offset().local_minus_utc();
-                        let duration = format_day_time_duration(total_secs);
-                        Ok(Some(ComparableValue::TypedLiteral {
-                            val: fluree_db_core::FlakeValue::String(duration),
-                            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
-                                "http://www.w3.org/2001/XMLSchema#dayTimeDuration",
-                            ))),
-                        }))
-                    }
-                    None => Ok(None),
-                }
+            // UTC for every stored temporal — see the note in `eval_tz`.
+            Some(binding) if binding_is_temporal(binding, ctx) => {
+                Ok(Some(ComparableValue::TypedLiteral {
+                    val: fluree_db_core::FlakeValue::String(format_day_time_duration(0)),
+                    dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+                        "http://www.w3.org/2001/XMLSchema#dayTimeDuration",
+                    ))),
+                }))
             }
+            Some(_) => Ok(None),
             None => Ok(None),
         }
     } else {
@@ -203,17 +188,6 @@ pub fn eval_timezone<R: RowAccess>(
 }
 
 /// Check if a datetime binding carries explicit timezone information.
-fn has_timezone_info(binding: &crate::binding::Binding) -> bool {
-    use crate::binding::Binding;
-    match binding {
-        Binding::Lit {
-            val: fluree_db_core::FlakeValue::DateTime(dt),
-            ..
-        } => dt.tz_offset().is_some(),
-        _ => false,
-    }
-}
-
 /// Format seconds as xsd:dayTimeDuration: "PT0S", "-PT8H", "PT5H30M", etc.
 fn format_day_time_duration(total_secs: i32) -> String {
     if total_secs == 0 {

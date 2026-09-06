@@ -18,8 +18,11 @@ use super::value::ComparableValue;
 /// consulting the binary store's datatype dictionary. Returns `None` for
 /// datatype ids that aren't pinned to a well-known Sid (the caller then
 /// resolves those via `store.dt_sids()`).
+///
+/// `DATATYPE(?v)` and join probe substitution ask the same question of an
+/// `EncodedLit` — what datatype is this literal? — so they share the answer.
 #[inline]
-fn reserved_datatype_sid(dt_id: DatatypeDictId) -> Option<Sid> {
+pub(crate) fn reserved_datatype_sid(dt_id: DatatypeDictId) -> Option<Sid> {
     let dts = &*WELL_KNOWN_DATATYPES;
     let sid = match dt_id {
         DatatypeDictId::ID => &dts.id_type,
@@ -230,7 +233,12 @@ pub fn eval_same_term<R: RowAccess>(
 
     let v1 = args[0].eval_to_comparable(row, ctx)?;
     let v2 = args[1].eval_to_comparable(row, ctx)?;
-    let same = matches!((v1, v2), (Some(a), Some(b)) if a == b);
+    let same = match (v1, v2) {
+        (Some(a), Some(b)) => {
+            a == b || super::compare::resource_iri_eq(&a, &b, ctx).unwrap_or(false)
+        }
+        _ => false,
+    };
     Ok(Some(ComparableValue::Bool(same)))
 }
 

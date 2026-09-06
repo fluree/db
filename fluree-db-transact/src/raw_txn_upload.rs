@@ -42,18 +42,23 @@
 //! per-ledger prefix and releases them itself, so a prefix sweep that only
 //! knows about commit-referenced CIDs would delete live queue entries.
 
-use crate::error::{Result, TransactError};
+use crate::error::Result;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::error::TransactError;
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::task::JoinHandle;
 
 /// A raw-txn upload in flight or completed.
 ///
 /// See module docs for the lifecycle contract.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct PendingRawTxnUpload {
     handle: Option<JoinHandle<Result<ContentId>>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl PendingRawTxnUpload {
     /// Spawn the upload on the current Tokio runtime.
     ///
@@ -87,6 +92,7 @@ impl PendingRawTxnUpload {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for PendingRawTxnUpload {
     fn drop(&mut self) {
         // Cancel an upload still in flight. A blob that already landed stays
@@ -97,10 +103,56 @@ impl Drop for PendingRawTxnUpload {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Debug for PendingRawTxnUpload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingRawTxnUpload")
             .field("pending", &self.handle.is_some())
+            .finish()
+    }
+}
+
+/// wasm32 twin: single-threaded, no ambient tokio runtime — `tokio::spawn`
+/// would panic and there is no latency-overlap to win anyway. The upload is
+/// deferred as data and runs inside [`finish`](Self::finish); nothing is
+/// stored before that, so `abort` and `Drop` have nothing to release.
+#[cfg(target_arch = "wasm32")]
+pub struct PendingRawTxnUpload {
+    deferred: Option<(Arc<dyn ContentStore>, serde_json::Value)>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl PendingRawTxnUpload {
+    /// Defer the upload (same signature as the native spawn; see type docs).
+    pub fn spawn(content_store: Arc<dyn ContentStore>, txn_json: serde_json::Value) -> Self {
+        Self {
+            deferred: Some((content_store, txn_json)),
+        }
+    }
+
+    /// Run the upload now and return the resulting ContentId.
+    pub async fn finish(mut self) -> Result<ContentId> {
+        let (store, txn_json) = self
+            .deferred
+            .take()
+            .expect("deferred inputs present until finish/abort");
+        let bytes = serde_json::to_vec(&txn_json)?;
+        let cid = store.put(ContentKind::Txn, &bytes).await?;
+        tracing::info!(raw_txn_bytes = bytes.len(), "raw txn stored");
+        Ok(cid)
+    }
+
+    /// Nothing has been stored yet; just drop the deferred inputs.
+    pub async fn abort(mut self) {
+        self.deferred = None;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl std::fmt::Debug for PendingRawTxnUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRawTxnUpload")
+            .field("pending", &self.deferred.is_some())
             .finish()
     }
 }

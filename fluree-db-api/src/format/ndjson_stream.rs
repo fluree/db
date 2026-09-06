@@ -154,6 +154,7 @@ mod tests {
         let enforcement = fluree_db_core::PolicyEnforcement {
             enforced: true,
             denies_all_data: true,
+            unevaluable_policies: Vec::new(),
         };
         let v = parse(&end_record(0, Some(7), None, None, Some(&enforcement)));
         assert_eq!(

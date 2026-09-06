@@ -822,7 +822,32 @@ pub enum UnresolvedForwardItem {
         /// Predicate IRI (expanded)
         predicate: String,
         sub_spec: Option<Box<UnresolvedNestedSelectSpec>>,
+        /// Ordering and paging for this property's values.
+        modifiers: Option<Box<UnresolvedNestedModifiers>>,
     },
+}
+
+/// Ordering and paging for one property's values, before IRI encoding.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct UnresolvedNestedModifiers {
+    pub order: Vec<UnresolvedNestedOrderKey>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+impl UnresolvedNestedModifiers {
+    /// Whether this would change anything.
+    pub fn is_noop(&self) -> bool {
+        self.order.is_empty() && self.offset.is_none() && self.limit.is_none()
+    }
+}
+
+/// One sort key for [`UnresolvedNestedModifiers`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnresolvedNestedOrderKey {
+    /// Predicate IRI (expanded). `None` orders by the value itself.
+    pub predicate: Option<String>,
+    pub descending: bool,
 }
 
 /// Hydration spec (unresolved).

@@ -2,6 +2,11 @@
 /target/
 **/target/
 
+# fluree-db-wasm npm package build output (wasm-bindgen glue, tsc output)
+/fluree-db-wasm/js/pkg/
+/fluree-db-wasm/js/dist/
+/fluree-db-wasm/js/node_modules/
+
 # mdBook build output
 /docs/book/
 
@@ -45,3 +50,6 @@ SEPARATION_PLAN.md
 
 # Cursor editor config — local only
 /.cursor/
+
+# Per-test staged copies of Iceberg fixtures (it_iceberg_local_fs.rs); TempDir cleans up, this catches a killed run.
+fluree-db-api/tests/fixtures/iceberg/.tmp*

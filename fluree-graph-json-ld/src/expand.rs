@@ -642,7 +642,15 @@ fn expand_node_internal(
                 let expanded_values =
                     parse_node_value(v, entry.as_ref(), &context_with_types, &key_idx, strict)?;
 
-                if !expanded_values.is_empty() {
+                // A key whose values expand to nothing is dropped — EXCEPT
+                // `@list`: `{"@list": []}` is a value, the empty list, which
+                // denotes the IRI rdf:nil. Dropping the key here turned
+                // `[{"@list": []}]` into `[{}]` — a spurious blank node
+                // downstream instead of the rdf:nil triple (issue #1694
+                // twin). This branch is how an array-position `{"@list": …}`
+                // item expands (it routes through `expand_node_internal`
+                // rather than `parse_node_value`'s `@list` arm).
+                if !expanded_values.is_empty() || expanded_key == "@list" {
                     // Check for @reverse
                     if let Some(ref e) = entry {
                         if e.reverse.is_some() {
@@ -851,6 +859,27 @@ mod tests {
         // Without external context mapping, https://schema.org stays as https
         assert_eq!(obj["@type"], json!(["https://schema.org/Movie"]));
         assert!(obj.contains_key("https://schema.org/name"));
+    }
+
+    /// An empty `@list` survives expansion in every spelling. The
+    /// array-position item routes through `expand_node_internal`, whose
+    /// drop-empty-keys rule used to strip the `@list` key — `[{"@list": []}]`
+    /// expanded to `[{}]`, which downstream stored a spurious blank node
+    /// instead of the `rdf:nil` the empty list denotes (issue #1694 twin).
+    #[test]
+    fn test_expand_empty_list_keeps_list_key() {
+        for doc in [
+            json!({"@id": "http://example.org/s", "http://example.org/p": {"@list": []}}),
+            json!({"@id": "http://example.org/s", "http://example.org/p": [{"@list": []}]}),
+        ] {
+            let result = node(&doc, &ParsedContext::new()).unwrap();
+            let obj = result.as_object().unwrap();
+            assert_eq!(
+                obj["http://example.org/p"],
+                json!([{"@list": []}]),
+                "empty @list must expand to itself, not vanish: {result}"
+            );
+        }
     }
 
     #[test]
