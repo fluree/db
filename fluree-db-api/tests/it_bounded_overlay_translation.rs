@@ -320,8 +320,8 @@ async fn named_graphs_stay_isolated() {
     let seed = json!({
         "@context": ctx(),
         "insert": [
-            ["graph", G1, {"@id": "ex:shared-subject", "ex:colour": "original", "ex:tag": "keep"}],
-            ["graph", G2, {"@id": "ex:shared-subject", "ex:colour": "original", "ex:tag": "keep"}]
+            ["graph", G1, {"@id": "ex:shared-subject", "ex:colour": "original", "ex:tag": "keep", "ex:edge": {"@id": "ex:target"}}],
+            ["graph", G2, {"@id": "ex:shared-subject", "ex:colour": "original", "ex:tag": "keep", "ex:edge": {"@id": "ex:target"}}]
         ]
     });
     let ledger = fluree
@@ -340,7 +340,7 @@ async fn named_graphs_stay_isolated() {
         "@context": ctx(),
         "from": G1,
         "where": {"@id": "ex:shared-subject", "ex:colour": "?c"},
-        "delete": [["graph", G1, {"@id": "ex:shared-subject", "ex:colour": "?c"}]]
+        "delete": [["graph", G1, {"@id": "ex:shared-subject", "ex:colour": "?c", "ex:edge": {"@id": "ex:target"}}]]
     });
     fluree.update(ledger, &update).await.expect("retract in g1");
 
@@ -374,6 +374,23 @@ async fn named_graphs_stay_isolated() {
         g2.iter().any(|s| s.contains("original")),
         "g1 retraction leaked into g2: {g2:?}"
     );
+    // Object-only incoming scans use an OPST novelty window and must apply
+    // the same per-graph cancellation as the subject windows above.
+    for (graph, expected_rows) in [(G1, 0), (G2, 1)] {
+        let q = json!({
+            "@context": ctx(),
+            "from": format!("{LEDGER}#{graph}"),
+            "select": ["?s", "?p"],
+            "where": {"@id": "?s", "?p": {"@id": "ex:target"}}
+        });
+        let out = fluree
+            .query_connection(&q)
+            .await
+            .expect("incoming graph query");
+        let view = fluree.ledger(LEDGER).await.expect("ledger");
+        let rows = rows_to_pairs(&out.to_jsonld(&view.snapshot).expect("jsonld"));
+        assert_eq!(rows.len(), expected_rows, "{graph}: {rows:?}");
+    }
 }
 
 /// Time travel: a query pinned to `t` before the retraction must still see the
@@ -890,4 +907,121 @@ async fn warm_whole_product_short_circuits_and_respects_epoch() {
         "a cache hit was recorded at a fresh epoch — warm key must include the overlay epoch: {:?}",
         after_spans.iter().map(|s| &s.fields).collect::<Vec<_>>()
     );
+}
+
+/// Q11's incoming-reference branch must seek by object without losing the
+/// retraction of an indexed edge. Pin the cold path as well as its results:
+/// correctness alone also passes with the old whole-novelty translation.
+#[tokio::test]
+async fn incoming_reference_seek_keeps_base_overlay_lifecycle() {
+    let (fluree, _dir) = new_fluree().await;
+    let ledger = fluree.create_ledger(LEDGER).await.expect("create");
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ctx(), "@graph": [
+                    {"@id":"ex:target", "@type":"ex:Target"},
+                    {"@id":"ex:keep", "ex:p":{"@id":"ex:target"}},
+                    {"@id":"ex:drop", "ex:p":{"@id":"ex:target"}},
+                    {"@id":"ex:other", "ex:p":{"@id":"ex:another"}}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    fluree
+        .reindex(LEDGER, ReindexOptions::default())
+        .await
+        .expect("index");
+    let before = indexed_view(&fluree).await;
+    let mut inserts = (0..80)
+        .map(|i| {
+            json!({
+                "@id":format!("ex:noise{i}"), "ex:p":{"@id":"ex:another"}
+            })
+        })
+        .collect::<Vec<_>>();
+    inserts.push(json!({"@id":"ex:added", "ex:q":{"@id":"ex:target"}}));
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context":ctx(),
+                "delete":{"@id":"ex:drop", "ex:p":{"@id":"ex:target"}},
+                "insert":inserts
+            }),
+        )
+        .await
+        .expect("overlay");
+    let view = indexed_view(&fluree).await;
+    assert!(
+        view.t > view.snapshot.t,
+        "fixture must retain trailing novelty"
+    );
+    let query = "SELECT ?s ?p WHERE { ?s ?p <http://example.org/target> } ORDER BY ?s ?p";
+    let (spans, guard) = span_capture::init_test_tracing();
+    let result = fluree
+        .query(&view, QueryInput::Sparql(query))
+        .await
+        .expect("incoming");
+    let cold = rows_to_pairs(&result.to_jsonld(&view.snapshot).expect("rows"));
+    assert_eq!(cold.len(), 2, "{cold:?}");
+    assert!(cold.iter().any(|r| r.contains("added")), "{cold:?}");
+    assert!(cold.iter().any(|r| r.contains("keep")), "{cold:?}");
+    assert!(!cold.iter().any(|r| r.contains("drop")), "{cold:?}");
+    assert!(
+        spans.find_spans("overlay_translate").iter().any(|s| {
+            s.fields.get("bounded").map(String::as_str) == Some("true")
+                && s.fields.get("cache_hit").map(String::as_str) == Some("false")
+        }),
+        "incoming reference did not use a cold bounded translation"
+    );
+    drop(guard);
+    // Binding the predicate too must narrow to its reference-object window,
+    // not translate all 80 unrelated pending edges for that predicate.
+    let bound_query = "SELECT ?s WHERE { ?s <http://example.org/p> <http://example.org/target> }";
+    let (bound_spans, bound_guard) = span_capture::init_test_tracing();
+    let bound_result = fluree
+        .query(&view, QueryInput::Sparql(bound_query))
+        .await
+        .expect("bound incoming");
+    let bound_rows = rows_to_pairs(&bound_result.to_jsonld(&view.snapshot).expect("bound rows"));
+    assert_eq!(bound_rows.len(), 1, "{bound_rows:?}");
+    assert!(bound_rows[0].contains("keep"), "{bound_rows:?}");
+    assert!(
+        bound_spans.find_spans("overlay_translate").iter().any(|s| {
+            s.fields.get("cache_hit").map(String::as_str) == Some("false")
+                && s.fields.get("ops_len").map(String::as_str) == Some("1")
+        }),
+        "predicate+reference translation must contain only the cancelling retraction"
+    );
+    drop(bound_guard);
+    // An intervening whole-graph query must not change the incoming seek's
+    // results on the same frozen view (it may populate a different index cache).
+    fluree
+        .query(
+            &view,
+            QueryInput::Sparql("SELECT ?s ?p ?o WHERE { ?s ?p ?o }"),
+        )
+        .await
+        .expect("warm scan");
+    let warm = fluree
+        .query(&view, QueryInput::Sparql(query))
+        .await
+        .expect("warm incoming");
+    assert_eq!(
+        cold,
+        rows_to_pairs(&warm.to_jsonld(&view.snapshot).expect("warm rows"))
+    );
+    // A view pinned before the update must retain the old edge, not the new one.
+    let historical = fluree
+        .query(&before, QueryInput::Sparql(query))
+        .await
+        .expect("old view");
+    let old = rows_to_pairs(&historical.to_jsonld(&before.snapshot).expect("old rows"));
+    assert_eq!(old.len(), 2, "{old:?}");
+    assert!(old.iter().any(|r| r.contains("drop")), "{old:?}");
+    assert!(!old.iter().any(|r| r.contains("added")), "{old:?}");
 }
