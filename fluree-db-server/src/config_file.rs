@@ -137,6 +137,13 @@ pub struct IndexingFileConfig {
     pub indexer_catchup_interval_secs: Option<u64>,
     /// Keep BM25 full-text indexes current automatically.
     pub bm25_auto_sync: Option<bool>,
+    /// Old index versions to retain before GC.
+    pub gc_max_old_indexes: Option<u32>,
+    /// Minimum age in minutes before an index version can be collected.
+    pub gc_min_time_mins: Option<u32>,
+    /// Version ceiling past which the age guard is overridden. Unset means no
+    /// ceiling.
+    pub gc_hard_max_old_indexes: Option<u32>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -443,6 +450,9 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "reindex_min_bytes",
     "reindex_max_bytes",
     "indexer_catchup_interval_secs",
+    "gc_max_old_indexes",
+    "gc_min_time_mins",
+    "gc_hard_max_old_indexes",
     "events_auth_mode",
     "events_auth_audience",
     "events_auth_trusted_issuers",
@@ -620,6 +630,21 @@ pub fn apply_to_server_config(
         if is_default("indexer_catchup_interval_secs") {
             if let Some(v) = idx.indexer_catchup_interval_secs {
                 config.indexer_catchup_interval_secs = v;
+            }
+        }
+        if is_default("gc_max_old_indexes") {
+            if let Some(v) = idx.gc_max_old_indexes {
+                config.gc_max_old_indexes = Some(v);
+            }
+        }
+        if is_default("gc_min_time_mins") {
+            if let Some(v) = idx.gc_min_time_mins {
+                config.gc_min_time_mins = Some(v);
+            }
+        }
+        if is_default("gc_hard_max_old_indexes") {
+            if let Some(v) = idx.gc_hard_max_old_indexes {
+                config.gc_hard_max_old_indexes = Some(v);
             }
         }
     }
@@ -1070,6 +1095,9 @@ ttl_ms = 200
 enabled = true
 reindex_min_bytes = 200000
 reindex_max_bytes = 2000000
+gc_max_old_indexes = 3
+gc_min_time_mins = 45
+gc_hard_max_old_indexes = 12
 
 [server.auth.events]
 mode = "required"
@@ -1097,6 +1125,9 @@ default_policy_class = "ex:DefaultPolicy"
         assert_eq!(idx.enabled, Some(true));
         assert_eq!(idx.reindex_min_bytes, Some(200_000));
         assert_eq!(idx.reindex_max_bytes, Some(2_000_000));
+        assert_eq!(idx.gc_max_old_indexes, Some(3));
+        assert_eq!(idx.gc_min_time_mins, Some(45));
+        assert_eq!(idx.gc_hard_max_old_indexes, Some(12));
 
         let auth = server.auth.unwrap();
         let events = auth.events.unwrap();
@@ -1154,6 +1185,9 @@ default_policy_class = "ex:DefaultPolicy"
                 indexer_catchup_interval_secs: None,
                 reindex_max_bytes: Some(1_000_000),
                 bm25_auto_sync: None,
+                gc_max_old_indexes: Some(5),
+                gc_min_time_mins: None,
+                gc_hard_max_old_indexes: None,
             }),
             ..Default::default()
         };
@@ -1166,6 +1200,9 @@ default_policy_class = "ex:DefaultPolicy"
                 indexer_catchup_interval_secs: None,
                 reindex_max_bytes: None, // should NOT override
                 bm25_auto_sync: None,
+                gc_max_old_indexes: None, // should NOT override
+                gc_min_time_mins: None,
+                gc_hard_max_old_indexes: Some(40),
             }),
             ..Default::default()
         };
@@ -1182,6 +1219,9 @@ default_policy_class = "ex:DefaultPolicy"
         // indexing thresholds NOT overridden (overlay had None)
         assert_eq!(idx.reindex_min_bytes, Some(100_000));
         assert_eq!(idx.reindex_max_bytes, Some(1_000_000));
+        // GC retention merges per field the same way
+        assert_eq!(idx.gc_max_old_indexes, Some(5));
+        assert_eq!(idx.gc_hard_max_old_indexes, Some(40));
     }
 
     #[test]

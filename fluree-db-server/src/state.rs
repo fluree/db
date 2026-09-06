@@ -538,6 +538,12 @@ async fn build_direct_fluree(
             .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes);
         builder = builder
             .with_indexing_thresholds(config.reindex_min_bytes, max_bytes)
+            // GC retention only matters when this process runs the indexer.
+            .with_gc_settings(
+                config.gc_max_old_indexes,
+                config.gc_min_time_mins,
+                config.gc_hard_max_old_indexes,
+            )
             .with_indexer_catchup_interval(std::time::Duration::from_secs(
                 config.indexer_catchup_interval_secs,
             ));
