@@ -513,3 +513,82 @@ async fn journal_barriers_recover_external_acknowledgments_and_interrupted_repla
     assert!(replay_chain(&records, LEDGER, "fixture-generation-1", &mut target).is_err());
     assert_eq!(before.0, DeclaredFrontier::capture(root.path()).0);
 }
+
+#[tokio::test]
+async fn journal_ledger_rebuilds_real_transactions_against_external_ack_oracle() {
+    use fluree_db_api::local_journal_ledger::JournalLedger;
+    let root = tempfile::tempdir().unwrap();
+    let controller = tempfile::tempdir().unwrap();
+    let ledger =
+        JournalLedger::initialize(root.path().into(), LEDGER.into(), "adapter-oracle-1".into())
+            .await
+            .unwrap();
+    let mut oracle = AckOracle {
+        commits: Vec::new(),
+        expected_rows: json!([]),
+    };
+    for (marker, value) in [("ack-one", 10), ("ack-two", 20)] {
+        let body = mutation(marker, value);
+        let ack = ledger
+            .transact(TxnType::Upsert, &body)
+            .await
+            .unwrap()
+            .unwrap();
+        let commit_bytes = ledger.content(&ack.commit.commit_id).await.unwrap();
+        let decoded = read_commit(&commit_bytes).unwrap();
+        assert_eq!(decoded.txn.as_ref(), Some(&ack.raw_txn_id));
+        let raw_bytes = ledger.content(&ack.raw_txn_id).await.unwrap();
+        assert_eq!(raw_bytes, serde_json::to_vec(&body).unwrap());
+        oracle.commits.push(AcknowledgedCommit {
+            t: ack.commit.t,
+            commit_id: ack.commit.commit_id,
+            commit_bytes,
+            raw_id: ack.raw_txn_id,
+            raw_bytes,
+        });
+        oracle.expected_rows.as_array_mut().unwrap().push(json!([
+            format!("ex:{marker}"),
+            marker,
+            value
+        ]));
+        oracle.persist(&controller.path().join("acks.json"));
+    }
+    drop(ledger);
+    std::fs::remove_dir_all(root.path().join(".fluree-wal/data")).unwrap();
+    std::fs::create_dir(root.path().join(".fluree-wal/data")).unwrap();
+    // All expectations come from the external controller. Read the recovered
+    // database directly through the adapter, without exporting an ordinary image.
+    let oracle: AckOracle =
+        serde_json::from_slice(&std::fs::read(controller.path().join("acks.json")).unwrap())
+            .unwrap();
+    for _ in 0..2 {
+        let ledger = JournalLedger::open(root.path().into()).await.unwrap();
+        let head = ledger.head().await.unwrap().unwrap();
+        let latest = oracle.commits.last().unwrap();
+        assert_eq!(head.id.as_ref(), Some(&latest.commit_id));
+        assert_eq!(head.t, latest.t);
+        for (i, ack) in oracle.commits.iter().enumerate() {
+            let bytes = ledger.content(&ack.commit_id).await.unwrap();
+            assert_eq!(bytes, ack.commit_bytes);
+            assert!(ack.commit_id.verify(&bytes));
+            let decoded = read_commit(&bytes).unwrap();
+            assert_eq!(decoded.t, ack.t);
+            assert_eq!(decoded.txn.as_ref(), Some(&ack.raw_id));
+            assert_eq!(
+                decoded.parents,
+                if i == 0 {
+                    vec![]
+                } else {
+                    vec![oracle.commits[i - 1].commit_id.clone()]
+                }
+            );
+            assert_eq!(ledger.content(&ack.raw_id).await.unwrap(), ack.raw_bytes);
+        }
+        let query = json!({"@context":{"ex":"http://example.org/recovery/"},
+            "select":["?id","?marker","?value"],
+            "where":{"@id":"?id","ex:marker":"?marker","ex:value":"?value"}});
+        let mut rows = ledger.query(&query).await.unwrap();
+        rows.as_array_mut().unwrap().sort_by_key(Value::to_string);
+        assert_eq!(rows, oracle.expected_rows);
+    }
+}

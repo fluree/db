@@ -214,6 +214,17 @@ impl LocalRoot {
         &self.manifest.generation
     }
 
+    /// Health-gated accepted head for database cache coherence. This checks the
+    /// coordinator even when a query needs no file reads. It grants no write or
+    /// filesystem-path capability.
+    pub fn accepted_head(&self) -> Result<Option<Vec<u8>>> {
+        let state = self.coordinator.lock();
+        if state.poisoned {
+            return Err(Error::Poisoned);
+        }
+        Ok(state.head.as_ref().map(|(_, bytes)| bytes.clone()))
+    }
+
     /// Read after completed recovery. The returned bytes do not outlive an mmap or
     /// a raw-path capability; ordinary storage handles remain fenced even now.
     pub fn read_bytes(&self, key: &str) -> Result<Vec<u8>> {

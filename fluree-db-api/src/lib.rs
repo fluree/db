@@ -78,6 +78,8 @@ mod ledger;
 pub mod ledger_info;
 #[cfg(all(feature = "experimental-local-journal", unix))]
 pub mod local_journal_acceptance;
+#[cfg(all(feature = "experimental-local-journal", unix))]
+pub mod local_journal_ledger;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod materialize;
 #[cfg(feature = "iceberg")]

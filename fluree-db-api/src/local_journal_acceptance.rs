@@ -1,5 +1,6 @@
 //! Experimental validation for a narrow, unindexed linear commit chain.
-//! No Fluree constructor or HTTP transaction path uses this validator yet.
+//! Used by the limited `local_journal_ledger` adapter. Ordinary Fluree constructors
+//! and HTTP transaction paths do not enable the experimental journal.
 use fluree_db_core::local_journal::{AcceptanceValidator, AcceptanceView, Error, Result};
 use fluree_db_core::{
     commit::codec::read_commit, content_path, ledger_id::split_ledger_id, ContentId, ContentKind,

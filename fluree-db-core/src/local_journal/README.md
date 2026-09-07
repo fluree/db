@@ -113,8 +113,25 @@ available again. Failed recovery/installation leaves it blocked. Complete record
 whose original response failed may recover; reconcile their identity before retrying.
 This is not submission-level exactly-once delivery or automatic retry of CREATE.
 
-No real LedgerState installer or transaction endpoint is connected yet. The linear
-validator walks/hashes complete history on every acceptance and the payload codec
+The API's feature-gated `local_journal_ledger::JournalLedger` now connects real
+JSON-LD insert/upsert/WHERE staging to this coordinator. It journals exact raw and
+commit bytes, materializes, and installs the real LedgerState before returning a
+receipt. A private query/cache gate also checks coordinator health for memory-only
+reads. Recovery revalidates database semantics and rebuilds LedgerState directly
+from journal-covered bytes before clearing the root's unavailable flag. Cancelling
+an awaiting write cannot release its gate while the blocking flush/install runs.
+Independent adapter opens refresh their cached state when the accepted head changes.
+
+This is a trusted embedded adapter for an empty, unindexed, unsigned default-graph
+ledger. It exposes no general storage, nameservice, Fluree or cached-view handles.
+Named/config graph writes are rejected; Cypher, indexing/import, lifecycle, policy
+contexts, encryption and cluster entrypoints are not exposed. Raw transaction JSON
+is always recorded; the adapter's 10 MB novelty backpressure limit also applies.
+Head identity and immutable content reads support response-loss reconciliation;
+recovery does not automatically resubmit requests or provide submission deduplication.
+Ordinary constructors/CLI/server transaction paths still do not enable WAL.
+
+The linear validator walks/hashes complete history on every acceptance and the payload codec
 uses JSON byte arrays. Both are correctness prototypes with substantial overhead;
 cache validated dependency closure and choose an efficient codec before performance
 acceptance. No benchmark gain follows from these tests alone.
@@ -134,8 +151,8 @@ whole valid suffix cannot be detected by the surviving checksums alone; the exte
 acknowledgment oracle detects it. Recovery of a deleted/truncated only durable copy
 needs independent persistence. SHA-256 here is integrity checking, not authentication.
 
-Before enabling ordinary transactions, finish the Fluree staging/state-installation
-adapter, read/cache integration, mutation-path coverage, and ownership qualification.
+Before enabling ordinary transactions, extend the limited adapter's transaction and
+mutation-path coverage, and finish ownership qualification.
 Coordinate or reject import, push, index heads, configuration/lifecycle and GC.
 Explicitly reject unsupported encryption, mixed backends, clusters, and oversized
 transactions before effects.
@@ -168,4 +185,13 @@ then measure an actually integrated WAL with the same Cypher workload.
 ```
 cargo test -p fluree-db-core --features experimental-local-journal local_journal --lib
 cargo test -p fluree-db-api --features experimental-local-journal --test grp_ledger it_file_recovery_oracle
+cargo test -p fluree-db-api --features experimental-local-journal --lib local_journal_ledger
 ```
+
+Adapter tests execute real writes/queries through the owned root, discard all
+materialized files and recover exact externally acknowledged chains/raw bytes,
+preserve generated subjects across replay, and exercise no-ops, cloned concurrent
+writers, independent caches, failed installation, cancellation after durable flush,
+unsupported semantics, and process death/takeover. SIGKILL is a process-interruption
+test; the kernel page cache survives it. Neither that test nor erased materialized
+files establishes device power-loss behavior.

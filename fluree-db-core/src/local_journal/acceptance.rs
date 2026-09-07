@@ -8,6 +8,23 @@ use std::collections::{BTreeMap, BTreeSet};
 /// The core layer cannot interpret an opaque nameservice head or validate policies.
 pub trait AcceptanceValidator {
     fn validate(&self, view: &AcceptanceView<'_>) -> Result<()>;
+
+    /// Revalidate database semantics during a root's recovery installation hook.
+    /// The root has already checked framing, generation and head continuity.
+    /// Each record can depend only on its own bytes or preceding records.
+    fn validate_recovered(&self, records: &[Record]) -> Result<()> {
+        let mut accepted = BTreeMap::new();
+        for record in records {
+            self.validate(&AcceptanceView {
+                transition: &record.transition,
+                accepted: &accepted,
+            })?;
+            for object in &record.transition.objects {
+                accepted.insert(object.key.clone(), object.bytes.clone());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Only bytes carried by this candidate or an earlier accepted journal record.
@@ -37,7 +54,7 @@ pub(super) struct Coordinator<I> {
     pub poisoned: bool,
     ledger: String,
     generation: String,
-    head: Option<(String, Vec<u8>)>,
+    pub(super) head: Option<(String, Vec<u8>)>,
     objects: BTreeMap<String, Vec<u8>>,
     pub last: Option<Receipt>,
 }
