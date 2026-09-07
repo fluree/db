@@ -57,6 +57,8 @@ pub mod index_schema;
 pub mod index_stats;
 pub mod ledger_config;
 pub mod ledger_id;
+#[cfg(all(feature = "experimental-local-journal", unix))]
+pub mod local_journal;
 pub mod namespaces;
 pub mod nonempty;
 pub mod ns_encoding;

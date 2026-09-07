@@ -7,6 +7,9 @@
 //! deliberately invalid images. It does not establish that the production write
 //! path actually creates that frontier. A syscall-level fault model is still a
 //! prerequisite to claiming a future WAL is crash safe.
+//! The experimental `journal` submodule below instead derives journal loss images
+//! from intercepted real file writes/syncs. Its materializer is test-only; neither
+//! test family enables the production transaction WAL or proves device power loss.
 
 #![cfg(feature = "native")]
 
@@ -29,6 +32,10 @@ use std::sync::Arc;
 
 const LEDGER: &str = "recovery-oracle:main";
 const HEAD_PATH: &str = "ns@v2/recovery-oracle/main.json";
+
+#[cfg(all(feature = "experimental-local-journal", unix))]
+#[path = "support/journal_recovery.rs"]
+mod journal;
 
 /// The generic nameservice requires StorageList; FileStorage exposes the same
 /// operation through StorageRead. Keep that adapter in the fixture, leaving
@@ -303,6 +310,8 @@ struct Fixture {
     orphan_id: ContentId,
     orphan_bytes: Vec<u8>,
     last_body: Value,
+    #[cfg(all(feature = "experimental-local-journal", unix))]
+    first_frontier: DeclaredFrontier,
 }
 
 async fn fixture() -> Fixture {
@@ -322,6 +331,8 @@ async fn fixture() -> Fixture {
         .await
         .unwrap();
     let ack1 = AcknowledgedCommit::capture(&fluree, &first.receipt, &first_body).await;
+    #[cfg(all(feature = "experimental-local-journal", unix))]
+    let first_frontier = DeclaredFrontier::capture(root.path());
 
     // Build before another connection wins; apply afterwards. This must reach
     // real file CAS and leave a valid, persisted losing commit blob behind.
@@ -423,6 +434,8 @@ async fn fixture() -> Fixture {
         orphan_id,
         orphan_bytes,
         last_body,
+        #[cfg(all(feature = "experimental-local-journal", unix))]
+        first_frontier,
     }
 }
 

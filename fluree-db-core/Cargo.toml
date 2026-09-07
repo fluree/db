@@ -12,6 +12,8 @@ description = "Runtime-agnostic core library for Fluree DB queries"
 default = []
 native = ["tokio", "moka", "dashmap", "fs2", "dep:rand"]
 credential = ["dep:fluree-db-credential"]
+# Journal codec/I/O experiments only; does not enable WAL transaction storage.
+experimental-local-journal = ["native"]
 
 [dependencies]
 fluree-vocab = { path = "../fluree-vocab" }

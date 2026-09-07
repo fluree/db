@@ -1,0 +1,301 @@
+//! Real journal I/O + external database ACK oracle. Ordinary transactions supply
+//! exact test payloads only: their file snapshots are NOT assumed durable in our
+//! crash image. Reconstructed databases start empty and get all bytes via replay.
+use super::*;
+use fluree_db_core::local_journal::{
+    replay_chain, Error, FileIo, Journal, JournalIo, Object, Record, ReplayTarget, Transition,
+};
+use std::cell::RefCell;
+use std::io;
+use std::rc::Rc;
+
+#[derive(Default)]
+struct Tape {
+    barriers: Vec<Vec<u8>>,
+    writes: Vec<(u64, Vec<u8>)>,
+    fail_next_flush: bool,
+}
+
+struct TracedFile {
+    file: FileIo,
+    path: PathBuf,
+    tape: Rc<RefCell<Tape>>,
+}
+
+impl JournalIo for TracedFile {
+    fn len(&mut self) -> io::Result<u64> {
+        self.file.len()
+    }
+    fn read_at(&mut self, offset: u64, out: &mut [u8]) -> io::Result<usize> {
+        self.file.read_at(offset, out)
+    }
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
+        // Force short writes through the same production retry loop.
+        let n = self.file.write_at(offset, &bytes[..bytes.len().min(113)])?;
+        self.tape
+            .borrow_mut()
+            .writes
+            .push((offset, bytes[..n].to_vec()));
+        Ok(n)
+    }
+    fn sync_all(&mut self) -> io::Result<()> {
+        if std::mem::take(&mut self.tape.borrow_mut().fail_next_flush) {
+            return Err(io::ErrorKind::Other.into());
+        }
+        self.file.sync_all()?;
+        self.tape
+            .borrow_mut()
+            .barriers
+            .push(std::fs::read(&self.path)?);
+        Ok(())
+    }
+}
+
+/// Only used in private fresh temp directories; this is not the future production
+/// path/symlink/ownership/checkpoint implementation. Atomic head rename is last.
+struct Target<'a> {
+    root: &'a Path,
+    remaining_operations: Option<usize>,
+}
+impl Target<'_> {
+    fn cut(&mut self) -> fluree_db_core::local_journal::Result<()> {
+        if let Some(remaining) = &mut self.remaining_operations {
+            if *remaining == 0 {
+                return Err(Error::Io(io::ErrorKind::Other.into()));
+            }
+            *remaining -= 1;
+        }
+        Ok(())
+    }
+}
+impl ReplayTarget for Target<'_> {
+    fn read_head(&mut self, key: &str) -> fluree_db_core::local_journal::Result<Option<Vec<u8>>> {
+        match std::fs::read(self.root.join(key)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+    fn put_immutable(&mut self, object: &Object) -> fluree_db_core::local_journal::Result<()> {
+        self.cut()?;
+        let path = self.root.join(&object.key);
+        match std::fs::read(&path) {
+            Ok(bytes) if bytes == object.bytes => return Ok(()),
+            Ok(_) => return Err(Error::Invalid("existing immutable object differs")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let staging = path.with_extension("journal-test-tmp");
+        std::fs::write(&staging, &object.bytes)?;
+        std::fs::rename(staging, path)?;
+        Ok(())
+    }
+    fn publish_head(
+        &mut self,
+        key: &str,
+        expected: Option<&[u8]>,
+        bytes: &[u8],
+    ) -> fluree_db_core::local_journal::Result<()> {
+        self.cut()?;
+        if self.read_head(key)?.as_deref() != expected {
+            return Err(Error::Invalid("unexpected head during test replay"));
+        }
+        let path = self.root.join(key);
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let staging = path.with_extension("journal-test-tmp");
+        std::fs::write(&staging, bytes)?;
+        std::fs::rename(staging, path)?;
+        Ok(())
+    }
+}
+
+fn records_from_image(image: &[u8]) -> fluree_db_core::local_journal::Result<Vec<Record>> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal");
+    std::fs::write(&path, image).unwrap();
+    Journal::open(FileIo::open(&path)?).map(|(_, records)| records)
+}
+
+fn transition(before: Option<&DeclaredFrontier>, after: &DeclaredFrontier) -> Transition {
+    Transition {
+        ledger: LEDGER.into(),
+        generation: "fixture-generation-1".into(),
+        head_key: HEAD_PATH.into(),
+        expected_head: before.map(|s| s.0[Path::new(HEAD_PATH)].clone()),
+        resulting_head: after.0[Path::new(HEAD_PATH)].clone(),
+        objects: after
+            .0
+            .iter()
+            .filter(|(key, bytes)| {
+                key.as_path() != Path::new(HEAD_PATH)
+                    && before.and_then(|s| s.0.get(*key)) != Some(*bytes)
+            })
+            .map(|(key, bytes)| Object {
+                key: key.to_str().unwrap().into(),
+                bytes: bytes.clone(),
+            })
+            .collect(),
+    }
+}
+
+#[tokio::test]
+async fn journal_barriers_recover_external_acknowledgments_and_interrupted_replay() {
+    let fixture = fixture().await;
+    let controller = tempfile::tempdir().unwrap();
+    let journal_dir = tempfile::tempdir().unwrap();
+    let path = journal_dir.path().join("journal");
+    let tape = Rc::new(RefCell::new(Tape::default()));
+    let file = TracedFile {
+        file: FileIo::create_new(&path).unwrap(),
+        path: path.clone(),
+        tape: tape.clone(),
+    };
+    let mut journal = Journal::create(file, [42; 16]).unwrap();
+    let first = transition(None, &fixture.first_frontier);
+    let second = transition(Some(&fixture.first_frontier), &fixture.frontier);
+    let ack1 = journal.append_and_sync(&first).unwrap();
+    let ack2 = journal.append_and_sync(&second).unwrap();
+    // Record the test's expected acknowledged outcomes outside the fault image
+    // only after both actual journal barriers returned successfully.
+    fixture.oracle.persist(&controller.path().join("acks.json"));
+    assert_eq!(tape.borrow().barriers.len(), 3);
+    let durable = tape.borrow().barriers.last().unwrap().clone();
+    assert_eq!(durable.len() as u64, ack2.end);
+    let records = records_from_image(&durable).unwrap();
+    assert_eq!(records[0].receipt, ack1);
+    assert_eq!(records[1].receipt, ack2);
+    let oracle: AckOracle =
+        serde_json::from_slice(&std::fs::read(controller.path().join("acks.json")).unwrap())
+            .unwrap();
+
+    // Cut before each materialization operation, then replay to completion twice.
+    let operations = records
+        .iter()
+        .map(|r| r.transition.objects.len())
+        .sum::<usize>()
+        + 1;
+    for cut in 0..=operations {
+        let root = tempfile::tempdir().unwrap();
+        let mut target = Target {
+            root: root.path(),
+            remaining_operations: Some(cut),
+        };
+        let result = replay_chain(&records, LEDGER, "fixture-generation-1", &mut target);
+        assert_eq!(result.is_ok(), cut == operations);
+        target.remaining_operations = None;
+        replay_chain(&records, LEDGER, "fixture-generation-1", &mut target).unwrap();
+        oracle.check(root.path()).await.unwrap();
+        let before = DeclaredFrontier::capture(root.path());
+        replay_chain(&records, LEDGER, "fixture-generation-1", &mut target).unwrap();
+        oracle.check(root.path()).await.unwrap();
+        assert_eq!(before.0, DeclaredFrontier::capture(root.path()).0);
+    }
+
+    // A later append fails to flush. Synthesize loss/tears from that actual write
+    // stream, retaining the last completed barrier. Partial tails must fail closed.
+    let mut pending = second.clone();
+    pending.expected_head = Some(second.resulting_head.clone());
+    pending.resulting_head = b"unacknowledged-test-head".to_vec();
+    pending.objects.clear();
+    tape.borrow_mut().fail_next_flush = true;
+    assert!(journal.append_and_sync(&pending).is_err());
+    assert!(matches!(
+        journal.append_and_sync(&pending),
+        Err(Error::Poisoned)
+    ));
+    let volatile = std::fs::read(&path).unwrap();
+    assert_eq!(records_from_image(&durable).unwrap(), records);
+    for cut in [
+        durable.len() + 1,
+        durable.len().midpoint(volatile.len()),
+        volatile.len() - 1,
+    ] {
+        assert!(records_from_image(&volatile[..cut]).is_err());
+    }
+    // Complete uncertain outcomes are retained, not silently treated as absent.
+    assert_eq!(records_from_image(&volatile).unwrap().len(), 3);
+
+    // The external oracle catches a missing required raw object even if a caller
+    // incorrectly supplies an otherwise valid journal bundle. Closure validation
+    // remains mandatory at the future transaction acceptance boundary.
+    let mut incomplete = records.clone();
+    let raw = &oracle.commits.last().unwrap().raw_id;
+    let raw_key = content_path(ContentKind::Txn, LEDGER, &raw.digest_hex());
+    let mut removed = 0;
+    for r in &mut incomplete {
+        r.transition.objects.retain(|o| {
+            if o.key == raw_key {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+    assert_eq!(removed, 1);
+    let root = tempfile::tempdir().unwrap();
+    replay_chain(
+        &incomplete,
+        LEDGER,
+        "fixture-generation-1",
+        &mut Target {
+            root: root.path(),
+            remaining_operations: None,
+        },
+    )
+    .unwrap();
+    assert!(oracle.check(root.path()).await.is_err());
+
+    // Checksums alone cannot detect loss of a whole valid suffix. Such loss
+    // violates the successful-sync contract and is caught by the external ACK
+    // oracle, not inferred from a still-valid surviving journal prefix.
+    let truncated = records_from_image(&tape.borrow().barriers[1]).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    replay_chain(
+        &truncated,
+        LEDGER,
+        "fixture-generation-1",
+        &mut Target {
+            root: root.path(),
+            remaining_operations: None,
+        },
+    )
+    .unwrap();
+    assert!(oracle.check(root.path()).await.is_err());
+
+    // Resume from an intermediate published head, then restore a missing object
+    // even when the final head was already installed.
+    let root = tempfile::tempdir().unwrap();
+    let mut target = Target {
+        root: root.path(),
+        remaining_operations: None,
+    };
+    replay_chain(&records[..1], LEDGER, "fixture-generation-1", &mut target).unwrap();
+    replay_chain(&records, LEDGER, "fixture-generation-1", &mut target).unwrap();
+    oracle.check(root.path()).await.unwrap();
+    std::fs::remove_file(root.path().join(&raw_key)).unwrap();
+    replay_chain(&records, LEDGER, "fixture-generation-1", &mut target).unwrap();
+    oracle.check(root.path()).await.unwrap();
+    std::fs::write(root.path().join(&raw_key), b"corrupted required bytes").unwrap();
+    assert!(replay_chain(&records, LEDGER, "fixture-generation-1", &mut target).is_err());
+
+    // Reject wrong generation or unrelated head before creating any objects.
+    let root = tempfile::tempdir().unwrap();
+    let mut target = Target {
+        root: root.path(),
+        remaining_operations: None,
+    };
+    assert!(replay_chain(&records, LEDGER, "different-generation", &mut target).is_err());
+    assert!(DeclaredFrontier::capture(root.path()).0.is_empty());
+    let mut broken_chain = records.clone();
+    broken_chain[1].transition.expected_head = Some(b"CAS loser".to_vec());
+    assert!(replay_chain(&broken_chain, LEDGER, "fixture-generation-1", &mut target).is_err());
+    assert!(DeclaredFrontier::capture(root.path()).0.is_empty());
+    target
+        .publish_head(HEAD_PATH, None, b"stale-or-foreign-head")
+        .unwrap();
+    let before = DeclaredFrontier::capture(root.path());
+    assert!(replay_chain(&records, LEDGER, "fixture-generation-1", &mut target).is_err());
+    assert_eq!(before.0, DeclaredFrontier::capture(root.path()).0);
+}
