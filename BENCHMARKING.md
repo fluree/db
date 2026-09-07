@@ -134,20 +134,27 @@ on-demand):
    against the committed baseline via the `bench-baseline` bin. **Time and peak
    memory enforce only when the baseline's `host_class` matches the runner's**
    (see [Baselines](#baselines-capture--compare) for why). Today's committed
-   baseline is `host_class=local` and the runner is `ci-ubuntu-latest`, so the
+   baseline is `host_class=local` and the runner is `ci-cd-large-8core`, so the
    step passes `--allow-host-mismatch` and both metrics annotate rather than
    gate; **phase-share drift enforces regardless of host class.** The nightly
-   `bench-gate` runs the same compare over a larger sample.
+   `bench-gate` runs the same subset and sampling profile after workspace smoke tests.
 
-   The job costs ~30 minutes, so it is gated on a `bench-paths` job that skips it
+   All three benchmark jobs use `ci-cd-large` (8 cores / 32 GB), Rust 1.97.0,
+   and `host_class=ci-cd-large-8core`. Keep their runner and host-class settings
+   aligned; changing hardware requires a newly captured baseline. They retain
+   the normal release optimization profile. The two selected binaries build in
+   one Cargo invocation; benchmark measurements still execute sequentially.
+
+   The job previously took 12–14 minutes on the standard runner; a `bench-paths`
+   job skips it
    when a PR touches nothing perf-relevant (engine crates, bench crates,
    `bench-baselines/`, `regression-budget.json`, `Cargo.toml`/`Cargo.lock`, or the
    CI/bench workflows). The list errs inclusive: a false positive costs one bench
    run, a false negative lets a regression through.
 
 3. **CI-class capture (`bench.yml` `bench-capture`, `workflow_dispatch`).**
-   Captures the cheap subset on `ubuntu-latest` (`host_class=ci-ubuntu-latest`)
-   and uploads it as an artifact. Committing it plus dropping
+   Captures the cheap subset on `ci-cd-large` (8 cores / 32 GB), tagged with
+   `host_class=ci-cd-large-8core`, and uploads it as an artifact. Committing it plus dropping
    `--allow-host-mismatch` from the compare step lands a real per-PR gate. The
    `capture_samples` dispatch input controls how many repeat runs are folded into
    one median + MAD — use ≥ 5 for a baseline meant to gate, since without a noise
@@ -311,7 +318,7 @@ portable of the two signals in the blocking position.
 So the gate runs in two phases:
 
 - **Phase 1 (today).** The committed `guardrails-pre.json` is `host_class=local`,
-  CI runs as `ci-ubuntu-latest`, the classes don't match, and the compare step
+  CI runs as `ci-cd-large-8core`, the classes don't match, and the compare step
   passes `--allow-host-mismatch` so both absolute metrics annotate without
   gating. The job still earns its keep: the annotations surface real movement on
   the PR that caused it, share drift gates for any bench that records phases, and
@@ -324,7 +331,7 @@ deliberately coarse and deliberately not a promise: an M1 and an M4 both derive
 `macos-aarch64` and their absolute numbers are not interchangeable. A class is a
 claim *a human makes* that two machines' numbers may be compared, so any host
 whose numbers are meant to gate should set `FLUREE_BENCH_HOST_CLASS` explicitly
-(`ci-ubuntu-latest`, `bench-m8gd`, …) rather than inherit the default.
+(`ci-cd-large-8core`, `bench-m8gd`, …) rather than inherit the default.
 
 Two ways to reach phase 2:
 
@@ -342,7 +349,7 @@ Two ways to reach phase 2:
    # 3. Drop `--allow-host-mismatch` from ci.yml's and bench.yml's compare steps.
    ```
 
-   The replaced file's `host_class=ci-ubuntu-latest` then matches CI and its
+   The replaced file's `host_class=ci-cd-large-8core` then matches CI and its
    noise floor absorbs runner flap, so both metrics enforce. (Keeping the
    `-ci` suffix instead would work only if you also repoint every
    `--baseline` path; one rename is the smaller change.)

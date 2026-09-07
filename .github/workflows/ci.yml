@@ -19,6 +19,8 @@ env:
   # every compiling job below installs it via `rui314/setup-mold`.
   RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
+# Save dependency caches on main; PRs restore them without filling the cache
+# quota with copies that other PRs and main cannot reuse.
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -45,24 +47,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clippy
         run: cargo clippy --all --all-features --all-targets -- -D warnings
 
   test:
-    runs-on: ubuntu-latest
+    # 8 cores / 32 GB: the workspace compile and nextest run are the CI critical path.
+    runs-on: ci-cd-large
     # Backstop so a hung/deadlocked test can never hold a runner for the full
     # 6h default again. Per-test kills are handled by `slow-timeout` in
     # `.config/nextest.toml`; this is the job-level safety net.
     timeout-minutes: 45
     steps:
-      - name: Free disk space
+      - name: Runner capacity
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
+          nproc
+          free -h
+          df -h /
 
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.97.0
@@ -70,6 +72,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
@@ -105,6 +108,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: "testsuite-sparql -> target"
 
       - name: Format
@@ -171,6 +175,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: |
             fluree-sql-bridge -> target
             . -> target
@@ -225,7 +230,7 @@ jobs:
         run: cargo test -p fluree-db-api --features sql,native --test it_sql_pushdown_lane --test it_sql_graph_source live_bridge
 
   bench-paths:
-    # Cost gate for bench-compare below, which is a ~30-minute job. GitHub's
+    # Cost gate for bench-compare below, which recently took 12–14 minutes. GitHub's
     # `paths:` filter is workflow-scoped and the rest of this workflow must run
     # on every PR, so the filter lives here as a job output instead. Kept in
     # ci.yml (rather than split into its own workflow) so the perf gate stays
@@ -274,14 +279,14 @@ jobs:
     # implicit: comparing absolute numbers across host classes is a refusal by
     # default, and a job that wants the annotations has to say so.
     #
-    # Why not gate on memory now: shared ubuntu-latest runners flap, and a
+    # Why not gate on memory now: shared hosted runners vary, and a
     # tracking allocator's peak moves with allocator behaviour, page size, and
     # background load. The ±2.2% cross-machine figure this gate was first built
     # on is one measurement between two specific machines, not a portability
     # result — gating on it would fail unrelated PRs with no obvious cause, and
     # it would be the LESS portable of the two signals doing the blocking.
     #
-    # Capture a ci-ubuntu-latest baseline (bench.yml's workflow_dispatch capture
+    # Capture a ci-cd-large-8core baseline (bench.yml's workflow_dispatch capture
     # job) and commit it, and both metrics flip to enforcing automatically —
     # no code change. See BENCHMARKING.md, "Baselines: capture & compare".
     #
@@ -289,7 +294,7 @@ jobs:
     # needs no `--only`. Full workspace + medium: nightly.
     needs: bench-paths
     if: needs.bench-paths.outputs.run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ci-cd-large
     timeout-minutes: 30
     env:
       FLUREE_BENCH_PROFILE: quick
@@ -297,41 +302,40 @@ jobs:
       # CI-class marker. The committed baseline is host_class=local, so this
       # mismatch is what makes both metrics advisory today.
       # (FLUREE_BENCH_RUNNER_CLASS is still read as the pre-rename spelling.)
-      FLUREE_BENCH_HOST_CLASS: ci-ubuntu-latest
+      FLUREE_BENCH_HOST_CLASS: ci-cd-large-8core
     steps:
-      - name: Free disk space
+      - name: Runner capacity
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
+          nproc
+          free -h
+          df -h /
 
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Clear stale sidecars first: rust-cache persists target/ across runs, and
       # compare must not merge a mem number from a bench not rerun this session
       # (review item 10), nor a corpus block from a run that never read that
-      # corpus. Then run the two cheap benches (writes criterion timings + fresh
-      # sidecars).
+      # corpus. Clear Criterion's cached comparisons too: rust-cache prunes
+      # sample.json, leaving dangling comparisons. One Cargo invocation builds
+      # both binaries in parallel, then measures them sequentially.
       - name: Run cheap benches (tiny, quick)
         run: |
-          rm -rf target/fluree-bench-mem target/fluree-bench-meta
-          cargo bench -p fluree-db-api --bench query_overlay_matrix
-          cargo bench -p fluree-db-api --bench query_hot_bsbm
+          rm -rf target/criterion target/fluree-bench-mem target/fluree-bench-meta
+          cargo bench -p fluree-db-api --bench query_overlay_matrix --bench query_hot_bsbm
 
       # Compare against the committed baseline. Exit 1 on any breach of a metric
       # the host-class match makes enforcing, 2 on a refusal to compare.
       #
       # --allow-host-mismatch is the phase-1 posture and nothing else: the
       # committed baseline is host_class=local, this runner is
-      # ci-ubuntu-latest, and without the flag the job would refuse outright.
-      # DROP THIS FLAG once a ci-ubuntu-latest baseline is committed (bench.yml's
+      # ci-cd-large-8core, and without the flag the job would refuse outright.
+      # DROP THIS FLAG once a ci-cd-large-8core baseline is committed (bench.yml's
       # bench-capture job) — the flag is what stands between annotations and a
       # real gate. Phase-share drift enforces either way.
       - name: Compare against committed baseline
@@ -365,6 +369,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: |
             . -> target
             wasm-probe -> target
@@ -419,6 +424,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@v4
         with:
           node-version: 22
