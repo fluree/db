@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "policy_transport_regression.rs"]
+mod policy_transport_regression;
+
 async fn post_policy_request(
     app: &axum::Router,
     uri: &str,

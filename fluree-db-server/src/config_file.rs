@@ -1079,6 +1079,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn policy_authorities_load_from_toml_and_cli_overrides_the_whole_list() {
+        use clap::{CommandFactory, FromArgMatches};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fluree.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [server.auth.data]
+            mode = "required"
+            audience = "file-audience"
+            trusted_issuers = ["did:key:file"]
+            policy_authorities = ["did:key:file"]
+        "#,
+        )
+        .unwrap();
+        let section = load_config(&path).unwrap().server.unwrap();
+        for (args, authorities, audience) in [
+            (vec!["fluree-server"], vec!["did:key:file"], "file-audience"),
+            (
+                vec![
+                    "fluree-server",
+                    "--data-auth-policy-authority",
+                    "did:key:cli-1",
+                    "--data-auth-policy-authority",
+                    "did:key:cli-2",
+                    "--data-auth-audience",
+                    "cli-audience",
+                ],
+                vec!["did:key:cli-1", "did:key:cli-2"],
+                "cli-audience",
+            ),
+        ] {
+            let matches = ServerConfig::command().try_get_matches_from(args).unwrap();
+            let mut config = ServerConfig::from_arg_matches(&matches).unwrap();
+            apply_to_server_config(&section, &mut config, &matches);
+            let data = config.data_auth();
+            assert_eq!(data.policy_authorities, authorities);
+            assert_eq!(data.audience.as_deref(), Some(audience));
+            assert_eq!(data.trusted_issuers, ["did:key:file"]);
+            assert!(data.validate().is_ok());
+        }
+    }
+
+    #[test]
     fn test_load_toml_with_server_section() {
         let toml = r#"
 [[remotes]]

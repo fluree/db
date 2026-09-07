@@ -45,15 +45,47 @@ pub struct DataPrincipal {
     pub expires_unix: u64,
     /// Policy selection constructed from verified claims and server configuration.
     pub policy_authorization: fluree_db_api::PolicyAuthorization,
+    /// True only when a verified policy authority supplied fluree.policy.
+    pub delegated_policy: bool,
 }
 
 impl DataPrincipal {
     pub fn can_read(&self, ledger_id: &str) -> bool {
-        self.read_all || self.read_ledgers.contains(ledger_id)
+        let allowed = self.read_all || self.read_ledgers.contains(ledger_id);
+        self.audit_scope(ledger_id, "read", allowed);
+        allowed
     }
 
     pub fn can_write(&self, ledger_id: &str) -> bool {
-        self.write_all || self.write_ledgers.contains(ledger_id)
+        let allowed = self.write_all || self.write_ledgers.contains(ledger_id);
+        self.audit_scope(ledger_id, "write", allowed);
+        allowed
+    }
+
+    /// Request/statement-level evidence of the authority used for a scope
+    /// check, not a claim that subsequent per-fact policy enforcement allowed
+    /// the operation. Disabled unless this tracing target is enabled at DEBUG.
+    fn audit_scope(&self, ledger_id: &str, action: &str, allowed: bool) {
+        let opts = self.policy_authorization.options();
+        let mode = if self.delegated_policy {
+            "delegated"
+        } else if opts.policy_class.is_some() {
+            "server-default"
+        } else if self.identity.is_some() {
+            "identity"
+        } else {
+            "scope-only"
+        };
+        tracing::debug!(
+            target: "fluree_db_server::authorization",
+            issuer = %self.issuer,
+            effective_identity = ?opts.identity,
+            authorization_mode = mode,
+            ledger = ledger_id,
+            action,
+            scope_allowed = allowed,
+            "data authorization scope check"
+        );
     }
 }
 
@@ -204,6 +236,7 @@ fn build_principal(
 ) -> DataPrincipal {
     DataPrincipal {
         policy_authorization,
+        delegated_policy: payload.fluree_policy.is_some(),
         issuer: payload.iss.clone(),
         subject: payload.sub.clone(),
         identity: payload.resolve_identity(),

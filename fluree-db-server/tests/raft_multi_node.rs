@@ -22,7 +22,7 @@ use fluree_db_consensus::raft::admin::{
 use fluree_db_consensus::raft::liveness_monitor::LivenessConfig;
 use fluree_db_consensus::NodeId;
 use fluree_db_server::raft::{RaftBootstrapConfig, RaftIntegration};
-use fluree_db_server::{AppState, FlureeServerBuilder};
+use fluree_db_server::{AppState, FlureeServerBuilder, ServerConfig};
 use reqwest::StatusCode;
 use serde_json::json;
 use tempfile::TempDir;
@@ -120,6 +120,14 @@ impl TestCluster {
     /// monitor-driven demotion path pass sub-second thresholds so
     /// the demote / promote windows close inside the test budget.
     async fn spawn_with_liveness(count: u64, liveness_config: LivenessConfig) -> Self {
+        Self::spawn_with_config(count, liveness_config, ServerConfig::default()).await
+    }
+
+    async fn spawn_with_config(
+        count: u64,
+        liveness_config: LivenessConfig,
+        config: ServerConfig,
+    ) -> Self {
         assert!(count >= 1, "cluster must have at least one node");
 
         // Single shared data directory across all nodes — the
@@ -155,6 +163,7 @@ impl TestCluster {
                     raft_listener,
                     shared_data_tmp.path(),
                     liveness_config.clone(),
+                    config.clone(),
                 )
                 .await,
             );
@@ -535,6 +544,7 @@ async fn spawn_node(
     raft_listener: TcpListener,
     shared_data_path: &std::path::Path,
     liveness_config: LivenessConfig,
+    mut config: ServerConfig,
 ) -> TestNode {
     let public_addr = public_listener.local_addr().expect("public local_addr");
     let raft_addr = raft_listener.local_addr().expect("raft local_addr");
@@ -556,7 +566,8 @@ async fn spawn_node(
     // the index roots in shared storage current — the alternative
     // (indexing off) leaves the follower's query path hunting for
     // index roots that nobody has built.
-    let server = FlureeServerBuilder::file(shared_data_path)
+    config.storage_path = Some(shared_data_path.to_path_buf());
+    let server = FlureeServerBuilder::for_config(config)
         .listen_addr(public_addr)
         .cors_enabled(false)
         .with_raft(Arc::clone(&integration), raft_addr)
@@ -599,6 +610,149 @@ async fn spawn_node(
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delegated_policy_survives_follower_forwarding_and_the_raft_command_queue() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    let key = SigningKey::from_bytes(&[210; 32]);
+    let issuer = fluree_db_credential::did_from_pubkey(&key.verifying_key().to_bytes());
+    let audience = "raft-policy-test";
+    let cluster = TestCluster::spawn_with_config(
+        3,
+        LivenessConfig::default(),
+        ServerConfig {
+            data_auth_mode: fluree_db_server::config::DataAuthMode::Optional,
+            data_auth_trusted_issuers: vec![issuer.clone()],
+            data_auth_policy_authorities: vec![issuer.clone()],
+            data_auth_audience: Some(audience.into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    cluster.bootstrap().await;
+    let follower = cluster.pick_follower().await;
+    let leader = cluster.current_leader().await.unwrap();
+    let ledger = "raft:delegation";
+    cluster.create_ledger(follower, ledger).await;
+    cluster
+        .insert_subject(follower, ledger, "alice", "Alice")
+        .await;
+    let header = URL_SAFE_NO_PAD.encode(json!({
+        "alg": "EdDSA", "jwk": {"kty": "OKP", "crv": "Ed25519", "x": URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())}
+    }).to_string());
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300;
+    for allow in [false, true] {
+        let payload = URL_SAFE_NO_PAD.encode(json!({
+            "iss": issuer, "aud": audience, "exp": exp,
+            "sub": "http://example.org/application-user",
+            "fluree.ledger.read.ledgers": [ledger], "fluree.ledger.write.ledgers": [ledger],
+            "fluree.policy": {"policy": [
+                {"f:action": "f:view", "f:allow": true},
+                {"f:action": "f:modify", "f:allow": allow, "f:exMessage": "Delegated Raft write denied."}
+            ], "default-allow": false}
+        }).to_string());
+        let signing_input = format!("{header}.{payload}");
+        let token = format!(
+            "{signing_input}.{}",
+            URL_SAFE_NO_PAD.encode(key.sign(signing_input.as_bytes()).to_bytes())
+        );
+        let idempotency_key = if allow {
+            "delegated-raft-allow"
+        } else {
+            "delegated-raft-deny"
+        };
+        let response = cluster.client.post(format!("{}/v1/fluree/insert/{ledger}", cluster.public_url(follower)))
+            .bearer_auth(&token).header("idempotency-key", idempotency_key)
+            .header("fluree-policy", r#"[{"f:allow":true}]"#)
+            .json(&json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob",
+                "opts": {"identity": "http://example.org/manager", "policy": [{"f:allow": true}], "default-allow": true}
+            })).send().await.unwrap();
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        if allow {
+            assert_eq!(status, StatusCode::OK, "{body}");
+        } else {
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert!(
+                body.to_string().contains("Delegated Raft write denied"),
+                "{body}"
+            );
+        }
+        // This route submits a serialized TransactionRequest to the replicated
+        // command queue. Observe its terminal result through a different node.
+        let response = cluster
+            .client
+            .get(format!(
+                "{}/v1/fluree/submissions/{idempotency_key}/{ledger}",
+                cluster.public_url(leader)
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            body["state"],
+            if allow { "committed" } else { "failed" },
+            "{body}"
+        );
+        for node in &cluster.nodes {
+            cluster
+                .wait_for_names(
+                    node.node_id,
+                    ledger,
+                    if allow { &["Alice", "Bob"] } else { &["Alice"] },
+                    DEFAULT_TIMEOUT,
+                )
+                .await;
+        }
+    }
+
+    #[cfg(feature = "graphql")]
+    for node in [leader, follower] {
+        // The runtime Raft check must protect both ingress nodes, including
+        // anonymous callers on an intentionally optional-auth server.
+        let url = format!("{}/v1/fluree/graphql/{ledger}", cluster.public_url(node));
+        let response = cluster
+            .client
+            .post(&url)
+            .json(&json!({"query": "mutation { createPerson(input: {name: \"Eve\"}) { id } }"}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        assert!(
+            body.to_string()
+                .contains("GraphQL mutations are not supported in Raft mode"),
+            "{body}"
+        );
+        let response = cluster
+            .client
+            .post(&url)
+            .json(&json!({"query": "{ __typename }"}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("errors").is_none(), "{body}");
+        cluster
+            .wait_for_names(node, ledger, &["Alice", "Bob"], DEFAULT_TIMEOUT)
+            .await;
+    }
+}
 
 /// Diagnostic: single-node cluster, post directly to the leader.
 /// Confirms the test harness produces a working HTTP path before the

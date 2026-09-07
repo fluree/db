@@ -36,7 +36,7 @@ The application must separately authorize every ledger/action requested. One con
 A gateway can place its selected policies in the existing signed data bearer token. The receiver must both trust the token issuer for ordinary data authentication and explicitly permit that issuer to select policies:
 
 ```toml
-[auth.data]
+[server.auth.data]
 mode = "required"
 audience = "fluree-production"
 trusted_issuers = ["did:key:<gateway-signing-key>"]
@@ -68,8 +68,18 @@ The signature covers the selection and its ledger/action scopes, audience, and e
 
 This same selection is used by JSON-LD, SPARQL, Cypher, GraphQL, streaming queries, multi-query aliases, transaction routes, push ingestion, and Bolt sessions. Query source and envelope options cannot replace it. The token authorizes a uniform selection over its signed scopes, not a map of different policy sets per ledger.
 
+Storage-proxy endpoints reject tokens containing `fluree.policy`, including tokens with storage scopes, because that surface does not implement delegated policy selection. Use data-query endpoints for delegated access and separate replication credentials for storage access. GraphQL mutations return HTTP 501 on Raft-enabled servers; submit writes through transaction endpoints. GraphQL reads remain available.
+
+## Authorization logging
+
+Enable `RUST_LOG=fluree_db_server::authorization=debug` to record bearer-token scope checks. Each event includes `issuer`, `effective_identity`, `authorization_mode` (`delegated`, `server-default`, `identity`, or `scope-only`), `ledger`, `action`, and `scope_allowed`. Add this target to your existing log filter to retain other logging, for example `RUST_LOG=info,fluree_db_server::authorization=debug`.
+
+These events describe the credential's ledger/action scope decision. Subsequent policy evaluation can still filter results or reject a write. A request may check multiple sources or perform several scope checks; the events are not a count of completed requests. Signed request-body authentication uses its signing identity separately. The events omit tokens, inline policies, and policy-variable values. They are disabled at the default info level; enabling them adds log formatting and output work per scope check.
+
 ## Cost and migration
 
-The HTTP token is verified once through the existing verification path. Policy authorization adds claim parsing, an issuer allowlist check, and request-level option normalization. It adds no ledger lookup, second token verification, per-fact work, network request, or Raft proposal. Policy construction and enforcement remain separate costs. The embedded query builder clones caller JSON once when binding a context; large inline policy documents also increase token and normalization cost. No latency benchmark is claimed here.
+The HTTP token is verified once through the existing verification path. Policy authorization adds claim parsing, an issuer allowlist check, and request-level option normalization. It adds no ledger lookup, second token verification, per-fact work, network request, or Raft proposal. A follower forwards the bearer credential and the leader verifies it before submitting the selected governance through the replicated command queue. Policy construction and enforcement remain separate costs. The embedded query builder clones caller JSON once when binding a context; large inline policy documents also increase token and normalization cost.
+
+To measure request binding locally, run `cargo bench -p fluree-db-api --features credential --bench policy_authorization`. The benchmark compares ordinary and delegated claims selecting the same policy class, with simple and multiple-source requests. It reports latency and allocation bytes, including tracking-allocator overhead. It excludes signature verification, issuer lookup, networking, and database policy evaluation, so its results describe normalization cost rather than end-to-end query latency. Set `CRITERION_HOME` to choose the results directory.
 
 Applications that relied on policy-free identities to override policy headers must migrate to explicit contexts. Embedded applications construct typed contexts after resolving user grants. HTTP gateways issue scoped tokens and configure the receiving server's issuer, policy-authority, and audience settings. Preserve the selected governance through queued writes and credential forwarding. Cluster transport authentication is configured independently of policy delegation.

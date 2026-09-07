@@ -780,6 +780,8 @@ fluree-server \
 
 > **JWKS support**: When `--jwks-issuer` is configured, storage proxy endpoints accept RS256 OIDC tokens in addition to Ed25519 JWS tokens. The `--jwks-issuer` flag is shared with data, admin, and events endpoints — a single flag enables OIDC across all endpoint groups.
 
+Storage proxy rejects tokens containing a signed `fluree.policy` context. Delegated policy selection is supported by the data API, not storage-proxy endpoints. Use separate replication credentials for storage access; see [Trusted policy authorization](../security/policy-authorization.md).
+
 ## Complete Configuration Examples
 
 ### Development (Memory Storage)

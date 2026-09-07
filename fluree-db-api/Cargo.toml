@@ -596,6 +596,11 @@ name = "it_values_object_bounds"
 workspace = true
 
 [[bench]]
+name = "policy_authorization"
+harness = false
+required-features = ["credential"]
+
+[[bench]]
 name = "annotation_hydration"
 harness = false
 

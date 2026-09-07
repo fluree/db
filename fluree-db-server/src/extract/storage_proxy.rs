@@ -107,8 +107,15 @@ impl FromRequestParts<Arc<AppState>> for StorageProxyBearer {
 fn build_principal(
     payload: &fluree_db_credential::jwt_claims::EventsTokenPayload,
     issuer: String,
-) -> StorageProxyPrincipal {
-    StorageProxyPrincipal {
+) -> Result<StorageProxyPrincipal, ServerError> {
+    // This surface does not carry the full authorization context into block
+    // filtering. Never accept a token and silently discard its restrictions.
+    if payload.fluree_policy.is_some() {
+        return Err(ServerError::unauthorized(
+            "Signed policy delegation is not supported by storage proxy endpoints",
+        ));
+    }
+    Ok(StorageProxyPrincipal {
         issuer,
         subject: payload.sub.clone(),
         identity: payload.resolve_identity(),
@@ -119,7 +126,7 @@ fn build_principal(
             .unwrap_or_default()
             .into_iter()
             .collect(),
-    }
+    })
 }
 
 /// Verify token and build principal (embedded JWK only — non-oidc builds)
@@ -159,7 +166,7 @@ fn verify_token(
     }
 
     // 6. Build principal
-    let principal = build_principal(&payload, verified.did);
+    let principal = build_principal(&payload, verified.did)?;
     Ok(StorageProxyBearer(principal))
 }
 
@@ -213,7 +220,7 @@ async fn verify_token(
     }
 
     // 4. Build principal — use verified.issuer as the authoritative identity
-    let principal = build_principal(&verified.payload, verified.issuer);
+    let principal = build_principal(&verified.payload, verified.issuer)?;
     Ok(StorageProxyBearer(principal))
 }
 

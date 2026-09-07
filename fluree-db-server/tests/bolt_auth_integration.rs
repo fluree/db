@@ -31,14 +31,23 @@ const BOLT_4_4: [u8; 4] = [0, 0, 4, 4];
 // ---------------------------------------------------------------------
 
 async fn auth_server(mode: DataAuthMode) -> (TempDir, Arc<AppState>, std::net::SocketAddr) {
+    auth_server_with_config(ServerConfig {
+        data_auth_mode: mode,
+        data_auth_insecure_accept_any_issuer: true,
+        ..Default::default()
+    })
+    .await
+}
+
+async fn auth_server_with_config(
+    config: ServerConfig,
+) -> (TempDir, Arc<AppState>, std::net::SocketAddr) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cfg = ServerConfig {
         cors_enabled: false,
         indexing_enabled: false,
         storage_path: Some(tmp.path().to_path_buf()),
-        data_auth_mode: mode,
-        data_auth_insecure_accept_any_issuer: true,
-        ..Default::default()
+        ..config
     };
     let telemetry = TelemetryConfig::with_server_config(&cfg);
     let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState"));
@@ -52,7 +61,7 @@ async fn auth_server(mode: DataAuthMode) -> (TempDir, Arc<AppState>, std::net::S
 async fn http_insert(state: &Arc<AppState>, uri: &str, body: serde_json::Value) {
     // Seeding always presents a write-scoped token: required-mode servers
     // demand it, Optional-mode servers verify-and-allow it.
-    let token = seed_token(uri);
+    let token = seed_token(uri, state.config.data_auth_audience.as_deref());
     let resp = build_router(Arc::clone(state))
         .oneshot(
             Request::builder()
@@ -74,16 +83,19 @@ async fn http_insert(state: &Arc<AppState>, uri: &str, body: serde_json::Value) 
 
 /// A seeding token whose write scope covers the ledger named in `uri`.
 /// No `fluree.identity` claim: seeding must not resolve a policy context.
-fn seed_token(uri: &str) -> String {
+fn seed_token(uri: &str, audience: Option<&str>) -> String {
     let ledger = uri.strip_prefix("/v1/fluree/insert/").unwrap_or("");
     let key = signing_key();
-    let claims = serde_json::json!({
+    let mut claims = serde_json::json!({
         "iss": did_from_pubkey(&key.verifying_key().to_bytes()),
         "exp": now_secs() + 3600,
         "iat": now_secs(),
         "fluree.ledger.read.all": true,
         "fluree.ledger.write.ledgers": [ledger],
     });
+    if let Some(audience) = audience {
+        claims["aud"] = serde_json::json!(audience);
+    }
     create_jws(&claims, &key)
 }
 
@@ -652,4 +664,91 @@ async fn identity_derived_policy_filters_bolt_reads() {
     let mut c = BoltClient::ready_54(addr, auth_map("none", None, None)).await;
     let rows = c.query_rows(q, ledger).await;
     assert_eq!(rows.len(), 3);
+}
+
+#[tokio::test]
+async fn delegated_bolt_sessions_enforce_grants_scopes_and_reauthentication() {
+    let key = signing_key();
+    let issuer = did_from_pubkey(&key.verifying_key().to_bytes());
+    let audience = "bolt-policy-test";
+    let (_tmp, state, addr) = auth_server_with_config(ServerConfig {
+        data_auth_mode: DataAuthMode::Required,
+        data_auth_insecure_accept_any_issuer: true,
+        data_auth_audience: Some(audience.into()),
+        data_auth_policy_authorities: vec![issuer.clone()],
+        ..Default::default()
+    })
+    .await;
+    let ledger = "boltauth:delegation";
+    seed_ledger(&state, ledger).await;
+    http_insert(
+        &state,
+        &format!("/v1/fluree/insert/{ledger}"),
+        serde_json::json!({
+            "@context": {"f": "https://ns.flur.ee/db#"},
+            "insert": [
+                {"@id": "reader", "@type": ["f:AccessPolicy", "http://example.org/ReaderClass"],
+                 "f:action": {"@id": "f:view"}, "f:query": {"@type": "@json", "@value": {
+                    "@context": {}, "where": {"@id": "?$this", "name": "Alice"}
+                 }}},
+                {"@id": "deny-write", "@type": ["f:AccessPolicy", "http://example.org/ReaderClass"],
+                 "f:action": {"@id": "f:modify"}, "f:allow": false,
+                 "f:exMessage": "Delegated reader cannot write."},
+                {"@id": "manager", "@type": ["f:AccessPolicy", "http://example.org/ManagerClass"],
+                 "f:action": [{"@id": "f:view"}, {"@id": "f:modify"}], "f:allow": true}
+            ]
+        }),
+    )
+    .await;
+    let mut claims = serde_json::json!({
+        "iss": issuer, "aud": audience, "exp": now_secs() + 300,
+        "sub": "https://app.example/users/no-local-assignments",
+        "fluree.ledger.read.ledgers": [ledger], "fluree.ledger.write.ledgers": [ledger],
+        "fluree.policy": {"policy-class": ["http://example.org/ReaderClass"], "default-allow": false}
+    });
+    let token = create_jws(&claims, &key);
+    let mut c = BoltClient::ready_54(addr, auth_map("bearer", None, Some(&token))).await;
+    let query = "MATCH (n:Person) RETURN n.name ORDER BY n.name";
+    assert_eq!(
+        c.query_rows(query, ledger).await,
+        vec![vec![Value::from("Alice")]]
+    );
+    let failure = c.run("CREATE (:Person {name: 'Eve'})", ledger).await;
+    failure.assert_failure_code("Neo.DatabaseError.General.UnknownError");
+    assert!(
+        failure
+            .metadata()
+            .get_str("message")
+            .unwrap()
+            .contains("Delegated reader cannot write"),
+        "{failure:?}"
+    );
+    c.send(msg::RESET, vec![]).await;
+    c.recv().await.assert_success();
+    c.send(msg::LOGOFF, vec![]).await;
+    c.recv().await.assert_success();
+
+    claims["fluree.policy"]["policy-class"] =
+        serde_json::json!(["http://example.org/ManagerClass"]);
+    let token = create_jws(&claims, &key);
+    c.logon(auth_map("bearer", None, Some(&token)))
+        .await
+        .assert_success();
+    assert_eq!(c.query_rows(query, ledger).await.len(), 2);
+    c.query_rows("CREATE (:Person {name: 'Eve'})", ledger).await;
+    assert_eq!(c.query_rows(query, ledger).await.len(), 3);
+    c.run(query, "out-of-scope:main")
+        .await
+        .assert_failure_code("Neo.ClientError.Database.DatabaseNotFound");
+
+    // Accept-any-issuer is deliberately insufficient for policy delegation.
+    let other_key = SigningKey::from_bytes(&[8; 32]);
+    claims["iss"] = serde_json::json!(did_from_pubkey(&other_key.verifying_key().to_bytes()));
+    let token = create_jws(&claims, &other_key);
+    let mut invalid = BoltClient::connect(addr, BOLT_5_4).await;
+    invalid.hello(MapValue::new()).await.assert_success();
+    invalid
+        .logon(auth_map("bearer", None, Some(&token)))
+        .await
+        .assert_failure_code("Neo.ClientError.Security.Unauthorized");
 }
