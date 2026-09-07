@@ -60,7 +60,7 @@ async fn configured_model_policy_controls_delegated_reads_and_writes() {
     ] {
         let app = setup_policy_ledger(app.clone(), ledger).await;
         let config = format!(
-            r#"
+            r"
             @prefix f: <https://ns.flur.ee/db#> .
             @prefix ex: <http://example.org/> .
             GRAPH <urn:fluree:{ledger}#config> {{
@@ -70,7 +70,7 @@ async fn configured_model_policy_controls_delegated_reads_and_writes() {
                 <urn:cfg:ref> a f:GraphRef ; f:graphSource <urn:cfg:source> .
                 <urn:cfg:source> f:ledger <{model}> ;
                     f:graphSelector <http://example.org/model-policies> .
-            }}"#
+            }}"
         );
         let (status, result) = post_policy_request(
             &app,
@@ -508,14 +508,14 @@ async fn signed_policy_context_requires_authority_scope_and_valid_signature() {
         match label {
             "issuer" => {
                 invalid["iss"] =
-                    serde_json::json!(did_from_pubkey(&ordinary.verifying_key().to_bytes()))
+                    serde_json::json!(did_from_pubkey(&ordinary.verifying_key().to_bytes()));
             }
             "null-context" => invalid["fluree.policy"] = JsonValue::Null,
             "audience" => invalid["aud"] = serde_json::json!("another-server"),
             "expired" => invalid["exp"] = serde_json::json!(now_secs() - 120),
             "future" => invalid["nbf"] = serde_json::json!(now_secs() + 300),
             "ledger" => {
-                invalid["fluree.ledger.read.ledgers"] = serde_json::json!(["elsewhere:main"])
+                invalid["fluree.ledger.read.ledgers"] = serde_json::json!(["elsewhere:main"]);
             }
             "action" => {
                 invalid
@@ -772,7 +772,7 @@ async fn dataset_options_and_envelope_defaults_cannot_replace_authority() {
     assert!(
         result
             .get("errors")
-            .is_none_or(|e| e.as_object().is_some_and(|o| o.is_empty())),
+            .is_none_or(|e| e.as_object().is_some_and(serde_json::Map::is_empty)),
         "{result}"
     );
     assert_eq!(

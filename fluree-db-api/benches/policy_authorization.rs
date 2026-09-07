@@ -90,7 +90,7 @@ fn bench_authorization(c: &mut Criterion) {
             serde_json::from_str::<EventsTokenPayload>(claims).unwrap()
         });
         parse.bench_function(*mode, |b| {
-            b.iter(|| serde_json::from_str::<EventsTokenPayload>(black_box(claims)).unwrap())
+            b.iter(|| serde_json::from_str::<EventsTokenPayload>(black_box(claims)).unwrap());
         });
     }
     parse.finish();
@@ -119,7 +119,7 @@ fn bench_authorization(c: &mut Criterion) {
             request.clone()
         });
         binding.bench_with_input(BenchmarkId::new("clone", shape), &request, |b, q| {
-            b.iter(|| black_box(q).clone())
+            b.iter(|| black_box(q).clone());
         });
         memory(
             &format!("policy_request_binding/clone_and_bind/{shape}"),
@@ -137,7 +137,7 @@ fn bench_authorization(c: &mut Criterion) {
                     let mut q = black_box(q).clone();
                     auth.apply_to_jsonld(&mut q).unwrap();
                     q
-                })
+                });
             },
         );
         binding.finish();
@@ -148,7 +148,7 @@ fn bench_authorization(c: &mut Criterion) {
                 bind_request(claims, &request)
             });
             full.bench_with_input(BenchmarkId::new(*mode, shape), &request, |b, q| {
-                b.iter(|| bind_request(black_box(claims), black_box(q)))
+                b.iter(|| bind_request(black_box(claims), black_box(q)));
             });
         }
         full.finish();
