@@ -29,47 +29,7 @@ async fn count(ledger: &JournalLedger, query: &str) -> i64 {
         .unwrap()
 }
 
-const WRITES: &[(&str, &str)] = &[
-    (
-        "arango__single_edge_write",
-        include_str!("fixtures/cypher/arango__single_edge_write.cypher"),
-    ),
-    (
-        "arango__single_vertex_write",
-        include_str!("fixtures/cypher/arango__single_vertex_write.cypher"),
-    ),
-    (
-        "arango__unwind_range_vertex_write",
-        include_str!("fixtures/cypher/arango__unwind_range_vertex_write.cypher"),
-    ),
-    (
-        "create__edge",
-        include_str!("fixtures/cypher/create__edge.cypher"),
-    ),
-    (
-        "create__pattern",
-        include_str!("fixtures/cypher/create__pattern.cypher"),
-    ),
-    (
-        "create__vertex",
-        include_str!("fixtures/cypher/create__vertex.cypher"),
-    ),
-    (
-        "create__vertex_big",
-        include_str!("fixtures/cypher/create__vertex_big.cypher"),
-    ),
-    (
-        "update__vertex_on_property",
-        include_str!("fixtures/cypher/update__vertex_on_property.cypher"),
-    ),
-];
-const OBSERVE: &[&str] = &[
-    "MATCH (n) RETURN count(n)",
-    "MATCH (n:User) RETURN count(n)",
-    "MATCH (n:L1) RETURN count(n)",
-    "MATCH ()-[r]->() RETURN count(r)",
-    "MATCH (n:User {id:1}) RETURN n.id, n.age, n.property",
-];
+use super::super::fixtures::{OBSERVE, WRITES};
 
 #[tokio::test]
 async fn frozen_eight_writes_match_ordinary_semantics_and_external_recovery_oracle() {

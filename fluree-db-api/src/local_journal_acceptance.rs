@@ -44,7 +44,7 @@ struct Head {
     #[serde(rename = "f:configMeta")]
     config_meta: Option<Value>,
     #[serde(rename = "f:ledgerIndex")]
-    index: Option<Value>,
+    index: Option<HeadIndex>,
     #[serde(rename = "f:defaultContextCid")]
     context_cid: Option<String>,
     #[serde(rename = "f:configCid")]
@@ -63,7 +63,16 @@ struct Ledger {
     id: String,
 }
 
-fn head(bytes: &[u8], ledger: &str, branch: &str, key: &str) -> Result<Head> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeadIndex {
+    #[serde(rename = "f:cid")]
+    cid: String,
+    #[serde(rename = "f:t")]
+    t: i64,
+}
+
+fn head(bytes: &[u8], ledger: &str, branch: &str, key: &str, indexed: bool) -> Result<Head> {
     let head: Head = serde_json::from_slice(bytes)
         .map_err(|_| Error::Invalid("unsupported journal head encoding"))?;
     if head.ledger.id != ledger
@@ -75,11 +84,11 @@ fn head(bytes: &[u8], ledger: &str, branch: &str, key: &str) -> Result<Head> {
         || head.context != serde_json::json!({"f": fluree_vocab::fluree::DB})
         || head.status != "ready"
         || head.status_v.unwrap_or(1) != 1
-        || head.config_v.unwrap_or(0) != 0
+        || head.config_v.unwrap_or(0) != i64::from(indexed && head.context_cid.is_some())
         || head.status_meta.is_some()
         || head.config_meta.is_some()
-        || head.index.is_some()
-        || head.context_cid.is_some()
+        || (!indexed && head.index.is_some())
+        || (!indexed && head.context_cid.is_some())
         || head.config_cid.is_some()
         || head.source_branch.is_some()
         || head.branch_point.is_some()
@@ -88,6 +97,15 @@ fn head(bytes: &[u8], ledger: &str, branch: &str, key: &str) -> Result<Head> {
         return Err(Error::Invalid(
             "unsupported indexed/configured/branched journal head",
         ));
+    }
+    if let Some(index) = &head.index {
+        let id: ContentId = index
+            .cid
+            .parse()
+            .map_err(|_| Error::Invalid("invalid index CID"))?;
+        if id.content_kind() != Some(ContentKind::IndexRoot) || index.t <= 0 || index.t > head.t {
+            return Err(Error::Invalid("invalid fixed index time/kind"));
+        }
     }
     Ok(head)
 }
@@ -114,107 +132,147 @@ fn content<'a>(
 
 impl AcceptanceValidator for LinearCommitValidator {
     fn validate(&self, view: &AcceptanceView<'_>) -> Result<()> {
-        let t = view.transition;
-        let (ledger, branch) =
-            split_ledger_id(&t.ledger).map_err(|_| Error::Invalid("invalid journal ledger"))?;
-        if t.head_key != format!("ns@v2/{ledger}/{branch}.json") {
-            return Err(Error::Invalid("noncanonical journal head key"));
-        }
-        let new = head(&t.resulting_head, &ledger, &branch, &t.head_key)?;
-        let new_id: ContentId = new
-            .commit
-            .parse()
-            .map_err(|_| Error::Invalid("invalid head CID"))?;
-        let old = t
-            .expected_head
-            .as_deref()
-            .map(|bytes| head(bytes, &ledger, &branch, &t.head_key))
-            .transpose()?;
-        if let Some(old) = &old {
-            if new.t
-                != old
-                    .t
-                    .checked_add(1)
-                    .ok_or(Error::Invalid("transaction time overflow"))?
-            {
-                return Err(Error::Invalid(
-                    "journal commit must advance exactly one transaction",
-                ));
-            }
-            let static_fields = |bytes: &[u8]| -> Result<Value> {
-                let mut value: Value =
-                    serde_json::from_slice(bytes).map_err(|_| Error::Invalid("head JSON"))?;
-                let map = value.as_object_mut().ok_or(Error::Invalid("head object"))?;
-                map.remove("f:t");
-                map.remove("f:commitCid");
-                Ok(value)
-            };
-            if static_fields(t.expected_head.as_ref().unwrap())?
-                != static_fields(&t.resulting_head)?
-            {
-                return Err(Error::Invalid(
-                    "journal commit changes lifecycle/configuration fields",
-                ));
-            }
-        }
-        let mut required = BTreeSet::new();
-        let mut visited = BTreeSet::new();
-        let mut id = new_id;
-        let mut expected_t = new.t;
-        loop {
-            if !visited.insert(id.to_string()) {
-                return Err(Error::Invalid("cyclic journal commit chain"));
-            }
-            let bytes = content(view, &id, ContentKind::Commit, &mut required)?;
-            // The existing v4 CID verifies the full blob. Older commit formats
-            // have different identity rules and are outside this initial scope.
-            if bytes.get(4) != Some(&4) {
-                return Err(Error::Invalid("journal validator requires v4 commit bytes"));
-            }
-            let commit =
-                read_commit(bytes).map_err(|_| Error::Invalid("invalid journal commit bytes"))?;
-            if commit.t != expected_t
-                || commit.t < 0
-                || commit.parents.len() > 1
-                || commit.txn_signature.is_some()
-                || !commit.commit_signatures.is_empty()
-            {
-                return Err(Error::Invalid("unsupported commit time/merge/signatures"));
-            }
-            if visited.len() == 1 {
-                if let Some(old) = &old {
-                    let parent: ContentId = old
-                        .commit
-                        .parse()
-                        .map_err(|_| Error::Invalid("invalid prior head CID"))?;
-                    if commit.parents != [parent] {
-                        return Err(Error::Invalid("commit parent is not the accepted head"));
-                    }
-                }
-            }
-            if let Some(raw) = commit.txn {
-                content(view, &raw, ContentKind::Txn, &mut required)?;
-            }
-            match commit.parents.into_iter().next() {
-                Some(parent) => {
-                    id = parent;
-                    expected_t = expected_t
-                        .checked_sub(1)
-                        .ok_or(Error::Invalid("invalid ancestor time"))?;
-                }
-                None if expected_t <= 1 => break,
-                None => return Err(Error::Invalid("missing genesis ancestry")),
-            }
-        }
-        // No unrelated objects, config/index heads, CAS losers or side effects.
-        if t.objects
-            .iter()
-            .any(|object| !required.contains(&object.key))
+        validate_linear(view, None)
+    }
+}
+
+pub(crate) struct LinearBaseline {
+    pub id: ContentId,
+    pub t: i64,
+}
+
+/// Validate the same closed head shape, with an explicit fixed index exception.
+pub(crate) fn indexed_head(bytes: &[u8], ledger_id: &str, key: &str) -> Result<()> {
+    let (ledger, branch) =
+        split_ledger_id(ledger_id).map_err(|_| Error::Invalid("invalid ledger"))?;
+    if key != format!("ns@v2/{ledger}/{branch}.json") {
+        return Err(Error::Invalid("noncanonical checkpoint head key"));
+    }
+    head(bytes, &ledger, &branch, key, true)?;
+    Ok(())
+}
+
+pub(crate) fn validate_linear(
+    view: &AcceptanceView<'_>,
+    baseline: Option<&LinearBaseline>,
+) -> Result<()> {
+    let t = view.transition;
+    let (ledger, branch) =
+        split_ledger_id(&t.ledger).map_err(|_| Error::Invalid("invalid journal ledger"))?;
+    if t.head_key != format!("ns@v2/{ledger}/{branch}.json") {
+        return Err(Error::Invalid("noncanonical journal head key"));
+    }
+    let new = head(
+        &t.resulting_head,
+        &ledger,
+        &branch,
+        &t.head_key,
+        baseline.is_some(),
+    )?;
+    let new_id: ContentId = new
+        .commit
+        .parse()
+        .map_err(|_| Error::Invalid("invalid head CID"))?;
+    let old = t
+        .expected_head
+        .as_deref()
+        .map(|bytes| head(bytes, &ledger, &branch, &t.head_key, baseline.is_some()))
+        .transpose()?;
+    if let Some(old) = &old {
+        if new.t
+            != old
+                .t
+                .checked_add(1)
+                .ok_or(Error::Invalid("transaction time overflow"))?
         {
             return Err(Error::Invalid(
-                "object outside supported commit dependency closure",
+                "journal commit must advance exactly one transaction",
             ));
         }
-        Ok(())
+        let static_fields = |bytes: &[u8]| -> Result<Value> {
+            let mut value: Value =
+                serde_json::from_slice(bytes).map_err(|_| Error::Invalid("head JSON"))?;
+            let map = value.as_object_mut().ok_or(Error::Invalid("head object"))?;
+            map.remove("f:t");
+            map.remove("f:commitCid");
+            Ok(value)
+        };
+        if static_fields(t.expected_head.as_ref().unwrap())? != static_fields(&t.resulting_head)? {
+            return Err(Error::Invalid(
+                "journal commit changes lifecycle/configuration fields",
+            ));
+        }
     }
+    let mut required = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut id = new_id;
+    let mut expected_t = new.t;
+    loop {
+        if let Some(baseline) = baseline {
+            if id == baseline.id {
+                if expected_t != baseline.t || visited.is_empty() {
+                    return Err(Error::Invalid("invalid checkpoint ancestry boundary"));
+                }
+                break;
+            }
+            if expected_t <= baseline.t {
+                return Err(Error::Invalid(
+                    "commit chain does not reach verified checkpoint",
+                ));
+            }
+        }
+        if !visited.insert(id.to_string()) {
+            return Err(Error::Invalid("cyclic journal commit chain"));
+        }
+        let bytes = content(view, &id, ContentKind::Commit, &mut required)?;
+        // The existing v4 CID verifies the full blob. Older commit formats
+        // have different identity rules and are outside this initial scope.
+        if bytes.get(4) != Some(&4) {
+            return Err(Error::Invalid("journal validator requires v4 commit bytes"));
+        }
+        let commit =
+            read_commit(bytes).map_err(|_| Error::Invalid("invalid journal commit bytes"))?;
+        if commit.t != expected_t
+            || commit.t < 0
+            || commit.parents.len() > 1
+            || commit.txn_signature.is_some()
+            || !commit.commit_signatures.is_empty()
+        {
+            return Err(Error::Invalid("unsupported commit time/merge/signatures"));
+        }
+        if visited.len() == 1 {
+            if let Some(old) = &old {
+                let parent: ContentId = old
+                    .commit
+                    .parse()
+                    .map_err(|_| Error::Invalid("invalid prior head CID"))?;
+                if commit.parents != [parent] {
+                    return Err(Error::Invalid("commit parent is not the accepted head"));
+                }
+            }
+        }
+        if let Some(raw) = commit.txn {
+            content(view, &raw, ContentKind::Txn, &mut required)?;
+        }
+        match commit.parents.into_iter().next() {
+            Some(parent) => {
+                id = parent;
+                expected_t = expected_t
+                    .checked_sub(1)
+                    .ok_or(Error::Invalid("invalid ancestor time"))?;
+            }
+            None if expected_t <= 1 && baseline.is_none() => break,
+            None => return Err(Error::Invalid("missing genesis ancestry")),
+        }
+    }
+    // No unrelated objects, config/index heads, CAS losers or side effects.
+    if t.objects
+        .iter()
+        .any(|object| !required.contains(&object.key))
+    {
+        return Err(Error::Invalid(
+            "object outside supported commit dependency closure",
+        ));
+    }
+    Ok(())
 }

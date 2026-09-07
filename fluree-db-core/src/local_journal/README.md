@@ -117,9 +117,9 @@ read-only checkpoint handle and tail records to the trusted state-installation h
 A retained checkpoint handle keeps the exclusive root lease alive. It does not grant
 coordinator health or permit cached queries to bypass their operation gate. Legacy
 `recover_with` hooks and validators without explicit checkpoint support reject v2
-roots. The current JSON-LD/Cypher adapter therefore **cannot yet open a checkpoint
-root**; indexed source inventory, semantic validation and binary-index attachment
-are the next integration slice. Core tests use opaque synthetic baselines.
+roots. The JSON-LD/Cypher adapter now explicitly validates and loads supported indexed
+checkpoints. Opaque core checkpoints without that semantic proof still fail closed.
+Core tests use opaque synthetic baselines; API tests use actual native imports.
 
 Bootstrap tests interrupt every instrumented completed file/directory/publication
 operation and reopen twice, requiring either the exact baseline or a fenced error.
@@ -175,9 +175,9 @@ from journal-covered bytes before clearing the root's unavailable flag. Cancelli
 an awaiting write cannot release its gate while the blocking flush/install runs.
 Independent adapter opens refresh their cached state when the accepted head changes.
 
-This is a trusted embedded adapter for an empty, unindexed, unsigned default-graph
-ledger. It exposes no general storage, nameservice, Fluree or cached-view handles.
-Named/config graph writes are rejected; indexing/import, lifecycle, policy
+This is a trusted embedded adapter for an unsigned default-graph ledger, initialized
+empty or bootstrapped from a quiescent private ordinary file source with a fixed index. It exposes no general storage, nameservice, Fluree or cached-view handles.
+Named/config graph writes are rejected; online index publication, lifecycle, policy
 contexts, encryption and cluster entrypoints are not exposed. Raw transaction JSON
 is always recorded; the adapter's 10 MB novelty backpressure limit also applies.
 Head identity and immutable content reads support response-loss reconciliation;
@@ -229,6 +229,57 @@ The bootstrap checkpoint does not provide truncation, rotation, online GC, submi
 group commit, transaction overlap, or remote preparation. At capacity it stops;
 it does not remove recovery bytes. A subsequent checkpoint/retirement protocol and
 storage qualification are required before an unrestricted WAL mode.
+
+## Indexed adapter bootstrap
+
+`JournalLedger::bootstrap(destination, source, ledger, generation)` pins the exact
+main and separate index nameservice bytes, applies the ordinary effective-index merge
+rule, and preserves both source records in the checkpoint. It verifies full v4
+commit/raw ancestry, the effective index root, all expanded index artifacts (including
+transaction-metadata branches and annotation leaves), every retained previous index
+root and each referenced garbage manifest. Missing historical dependencies fail;
+there is no history pruning or GC. Garbage manifests are retained as metadata, not
+instructions to copy obsolete objects that no retained root needs.
+
+Native import publishes a static default-context blob. The adapter preserves its CID,
+exact bytes and config watermark, allowing only string-valued absolute IRI mappings
+and optional `@vocab`. It rejects broader/scoped/remote context forms, configuration
+metadata and user named graphs. The reserved transaction-metadata index graph is
+preserved; configuration-graph routing is rejected. Source heads are rechecked after
+copying and before ready publication. This requires a quiescent private source and
+is not a live migration protocol.
+
+Recovery builds a semantic baseline proof bound to the exact checkpoint digest.
+Subsequent writes validate their journal tail down to that baseline instead of decoding
+the imported history again. Tail validation still walks prior tail commits; it is not
+a general accepted-head proof cache. Bootstrap/startup verify the full baseline and
+currently decode full commit bodies, one object at a time. Core copying uses its
+fixed buffer, but the API content-store interface buffers one source object; this is
+not a constant-memory end-to-end import and has not been sized on the medium dataset.
+
+The factored index attachment helper accepts the private read-only checkpoint/journal
+store, restores dictionary watermarks and namespaces, populates novelty IDs and
+attaches binary providers and annotation content access. Private temporary cache files
+are disposable and hold no recovery authority. Store handles retain both root and
+cache lifetimes. Static context metadata is installed in the private memory staging
+engine so ordinary Cypher lowering/probes use the same IRI mapping; accepted data
+still comes only from the supplied owned LedgerState. Queries use the context and
+JSON-LD writes inherit it when they have no explicit context; raw provenance remains
+the original request.
+
+A namespace-introducing commit conservatively reattaches the binary store before ACK.
+The pre-existing provider fallback could scan new namespace data but returned no rows
+for a bound join in the indexed regression. Reattachment fixes that adapter path and
+preserves unresolved-outcome handling on failure; its extra cost is unmeasured.
+
+Tests compare the exact eight archived Cypher writes with ordinary Fluree using a
+native-imported binary index and sealed annotation arenas (the CLI's follow-up reindex).
+They remove the source and all target materialization, reopen twice, and compare exact
+external acknowledgments, raw text/parameters, generated identities, reads and
+relationship properties. Actual dictionary/leaf corruption, missing annotation leaves
+and previous roots, source-head changes, unsupported metadata, new namespaces,
+context inheritance and failed indexed installation are covered. The imported index
+stays fixed; this is not the original medium index-on benchmark or a latency result.
 
 ## Verification
 

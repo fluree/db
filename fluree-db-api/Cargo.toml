@@ -9,7 +9,7 @@ repository.workspace = true
 
 [features]
 default = ["native"]
-experimental-local-journal = ["native", "fluree-db-core/experimental-local-journal"]
+experimental-local-journal = ["native", "fluree-db-core/experimental-local-journal", "dep:tempfile"]
 native = ["fluree-db-nameservice/native", "fluree-db-core/native", "fluree-db-query/native", "fluree-db-connection/native", "dep:sysinfo"]
 # Enable AWS-backed storage support (S3, storage-backed nameservice,
 # vended-credential minting).
@@ -127,6 +127,8 @@ reqwest = { workspace = true, optional = true }
 
 # System memory detection for import memory budget auto-sizing (native only)
 sysinfo = { workspace = true, optional = true }
+
+tempfile = { version = "3.19", optional = true }
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

@@ -1,15 +1,17 @@
 //! Bounded experimental WAL adapter for trusted, local JSON-LD and Cypher transactions.
 //!
-//! One unindexed, unsigned ledger per root; no indexing/import, lifecycle,
-//! credentials, policy context, configuration or cluster API. This is an embedded
+//! One unsigned default-graph ledger per root, initialized empty or bootstrapped
+//! from a quiescent local indexed source. The imported index stays fixed; no index
+//! publication, lifecycle/configuration changes, credentials, policy context or
+//! cluster API. Static imported IRI mappings are preserved. This is an embedded
 //! root-authority experiment, not a server backend. No underlying Fluree, cache,
 //! staged state or writable storage handle escapes. Raw transaction JSON is always
-//! journaled. This adapter rejects core checkpoint roots until indexed baseline
-//! loading is connected. The 64 MiB journal has no reclamation yet.
+//! journaled. The 64 MiB journal has no reclamation yet.
 use crate::{Fluree, FlureeBuilder, GraphDb, IndexConfig, LedgerState, StageResult, TxnOpts};
 use async_trait::async_trait;
 use fluree_db_core::local_journal::{
-    AcceptanceValidator, Error as JournalError, LocalRoot, Object, Receipt, Record, Transition,
+    AcceptanceValidator, Checkpoint, Error as JournalError, LocalRoot, Object, Receipt, Record,
+    Transition,
 };
 use fluree_db_core::{
     content_path, ledger_id::split_ledger_id, ContentId, ContentKind, ContentStore,
@@ -20,17 +22,34 @@ use serde_json::{json, Value};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-use crate::local_journal_acceptance::LinearCommitValidator;
+use crate::local_journal_acceptance::{validate_linear, LinearCommitValidator};
 
 mod cypher;
+#[cfg(test)]
+mod fixtures;
+mod indexed;
 
-struct AdapterValidator;
-impl AcceptanceValidator for AdapterValidator {
+struct AdapterValidator<'a> {
+    proof: Option<&'a indexed::Proof>,
+}
+impl AcceptanceValidator for AdapterValidator<'_> {
+    fn validate_checkpoint(
+        &self,
+        checkpoint: &Checkpoint,
+    ) -> fluree_db_core::local_journal::Result<()> {
+        self.proof
+            .ok_or(JournalError::Invalid("missing verified baseline proof"))?
+            .check(checkpoint)
+    }
     fn validate(
         &self,
         view: &fluree_db_core::local_journal::AcceptanceView<'_>,
     ) -> fluree_db_core::local_journal::Result<()> {
-        LinearCommitValidator.validate(view)?;
+        if let Some(proof) = self.proof {
+            validate_linear(view, Some(&proof.linear))?;
+        } else {
+            LinearCommitValidator.validate(view)?;
+        }
         let record = ns_record(
             &view.transition.ledger,
             Some(&view.transition.resulting_head),
@@ -86,12 +105,14 @@ pub struct CypherOutcome {
 struct Cache {
     state: Option<LedgerState>,
     head: Option<Vec<u8>>,
+    proof: Option<Arc<indexed::Proof>>,
 }
 struct Inner {
     owner: Arc<LocalRoot>,
     cache: Arc<Mutex<Cache>>,
     // Only the pure staging and explicit-view query entrypoints are used.
     engine: Fluree,
+    cache_dir: Arc<tempfile::TempDir>,
 }
 
 /// Clones share the write/query gate. Independent opens also check the accepted
@@ -121,8 +142,15 @@ impl JournalLedger {
             cache: Arc::new(Mutex::new(Cache {
                 state: None,
                 head: None,
+                proof: None,
             })),
             engine: FlureeBuilder::memory().without_indexing().build_memory(),
+            cache_dir: Arc::new(
+                tempfile::Builder::new()
+                    .prefix("fluree-journal-index-")
+                    .tempdir()
+                    .map_err(JournalError::from)?,
+            ),
         }));
         ledger.recover().await?;
         Ok(ledger)
@@ -139,19 +167,76 @@ impl JournalLedger {
     async fn restore(&self, mut cache: OwnedMutexGuard<Cache>) -> Result<OwnedMutexGuard<Cache>> {
         let owner = self.0.owner.clone();
         let runtime = tokio::runtime::Handle::current();
+        let cache_dir = self.0.cache_dir.clone();
+        let inner = self.0.clone();
         Ok(tokio::task::spawn_blocking(move || {
             // Keep the gate through cancellation and through failed installation.
             cache.state = None;
-            owner.recover_with(|records| {
-                AdapterValidator.validate_recovered(records)?;
-                let (record, head) = recovered_head(owner.ledger(), records)?;
-                let store = RecoveryStore::new(owner.ledger(), records);
-                // RecoveryStore is memory-only, never reenters the root mutex.
-                let state = runtime
-                    .block_on(LedgerState::load_with_store(store, record))
+            cache.proof = None;
+            owner.recover_with_checkpoint(|records, checkpoint| {
+                let store = RecoveryStore::new(
+                    owner.ledger(),
+                    records,
+                    checkpoint.clone(),
+                    cache_dir.clone(),
+                );
+                let proof = checkpoint
+                    .as_deref()
+                    .map(|checkpoint| {
+                        runtime
+                            .block_on(indexed::Proof::load(checkpoint, &store))
+                            .map(Arc::new)
+                    })
+                    .transpose()?;
+                AdapterValidator {
+                    proof: proof.as_deref(),
+                }
+                .validate_recovered_from(records, checkpoint.as_deref())?;
+                let (record, head) =
+                    recovered_head(owner.ledger(), records, checkpoint.as_deref())?;
+                // The store never reenters the root mutex and retains the root/cache leases.
+                let mut state = runtime
+                    .block_on(LedgerState::load_with_store(store.clone(), record))
                     .map_err(|_| {
                         JournalError::Invalid("journal ledger state reconstruction failed")
                     })?;
+                runtime
+                    .block_on(crate::ledger_manager::load_and_attach_binary_store_from(
+                        Arc::new(store),
+                        &mut state,
+                        cache_dir.path(),
+                        None,
+                    ))
+                    .map_err(|_| {
+                        JournalError::Invalid("journal indexed state attachment failed")
+                    })?;
+                if let Some(context) = proof.as_ref().and_then(|p| p.context.as_ref()) {
+                    // Normal Cypher staging resolves context through its Fluree
+                    // helper. Seed only derived metadata in the private memory
+                    // engine; accepted data/state still comes exclusively from
+                    // the owned checkpoint and journal.
+                    runtime
+                        .block_on(async {
+                            if inner
+                                .engine
+                                .nameservice()
+                                .lookup(owner.ledger())
+                                .await?
+                                .is_none()
+                            {
+                                inner.engine.create_ledger(owner.ledger()).await?;
+                            }
+                            inner
+                                .engine
+                                .set_default_context(owner.ledger(), context)
+                                .await?;
+                            Ok::<_, crate::ApiError>(())
+                        })
+                        .map_err(|_| {
+                            JournalError::Invalid("private staging context installation failed")
+                        })?;
+                }
+                cache.proof = proof;
                 cache.state = Some(state);
                 cache.head = head;
                 Ok(())
@@ -192,10 +277,20 @@ impl JournalLedger {
         let cache = self.ready().await?;
         let state = cache.state.as_ref().expect("ready state");
         let config = index_config();
+        let effective = transaction_context(
+            body,
+            cache.proof.as_deref().and_then(|p| p.context.as_ref()),
+        );
         let staged = self
             .0
             .engine
-            .stage_transaction(state.clone(), kind, body, TxnOpts::default(), Some(&config))
+            .stage_transaction(
+                state.clone(),
+                kind,
+                &effective,
+                TxnOpts::default(),
+                Some(&config),
+            )
             .await?;
         self.accept_staged(cache, staged, kind, body, before_install)
             .await
@@ -275,23 +370,54 @@ impl JournalLedger {
                 },
             ],
         };
+        let runtime = tokio::runtime::Handle::current();
+        let cache_dir = self.0.cache_dir.clone();
         // The blocking task owns the cache gate through append, sync and install,
         // even if the awaiting request is dropped or its task is aborted.
         Ok(Some(
             tokio::task::spawn_blocking(move || {
                 let mut committed = None;
-                let journal = owner.accept_with(&transition, &AdapterValidator, |_, _| {
-                    before_install()?;
-                    let (receipt, mut state) = staged
-                        .finalize_state()
-                        .map_err(|_| JournalError::Invalid("journal state finalization failed"))?;
-                    state.ns_record =
-                        Some(ns_record(owner.ledger(), Some(&transition.resulting_head))?);
-                    cache.state = Some(state);
-                    cache.head = Some(transition.resulting_head.clone());
-                    committed = Some(receipt);
-                    Ok(())
-                })?;
+                let proof = cache.proof.clone();
+                let journal = owner.accept_with(
+                    &transition,
+                    &AdapterValidator {
+                        proof: proof.as_deref(),
+                    },
+                    |_, _| {
+                        before_install()?;
+                        let (receipt, mut state) = staged.finalize_state().map_err(|_| {
+                            JournalError::Invalid("journal state finalization failed")
+                        })?;
+                        state.ns_record =
+                            Some(ns_record(owner.ledger(), Some(&transition.resulting_head))?);
+                        // The existing provider's namespace fallback handles
+                        // scans but not every bound/join path for a new namespace.
+                        // Reattach from our verified store before ACK. This rare
+                        // reload is intentionally conservative; optimizing it is
+                        // separate from the fixed-index correctness boundary.
+                        if crate::ns_helpers::binary_store_missing_snapshot_namespaces(&state) {
+                            let store = state.snapshot.content_store.clone().ok_or(
+                                JournalError::Invalid("missing owned indexed content store"),
+                            )?;
+                            runtime
+                                .block_on(crate::ledger_manager::load_and_attach_binary_store_from(
+                                    store,
+                                    &mut state,
+                                    cache_dir.path(),
+                                    None,
+                                ))
+                                .map_err(|_| {
+                                    JournalError::Invalid(
+                                        "post-commit indexed namespace attachment failed",
+                                    )
+                                })?;
+                        }
+                        cache.state = Some(state);
+                        cache.head = Some(transition.resulting_head.clone());
+                        committed = Some(receipt);
+                        Ok(())
+                    },
+                )?;
                 Ok::<_, JournalError>(AcceptedCommit {
                     commit: committed.expect("successful acceptance installed state"),
                     journal,
@@ -306,7 +432,8 @@ impl JournalLedger {
     pub async fn query(&self, query: &Value) -> Result<Value> {
         let cache = self.ready().await?;
         let state = cache.state.as_ref().expect("ready state");
-        let view = GraphDb::from_ledger_state(state);
+        let view = GraphDb::from_ledger_state(state)
+            .with_default_context(cache.proof.as_ref().and_then(|p| p.context.clone()));
         let result = self.0.engine.query(&view, query).await?;
         let value = result
             .to_jsonld(&state.snapshot)
@@ -350,6 +477,28 @@ impl JournalLedger {
 #[path = "local_journal_ledger/tests.rs"]
 mod tests;
 
+fn transaction_context<'a>(
+    body: &'a Value,
+    context: Option<&Value>,
+) -> std::borrow::Cow<'a, Value> {
+    let Some(context) = context else {
+        return std::borrow::Cow::Borrowed(body);
+    };
+    if body.is_array() {
+        return std::borrow::Cow::Owned(json!({"@context": context, "@graph": body}));
+    }
+    if body
+        .as_object()
+        .is_some_and(|map| !map.contains_key("@context"))
+    {
+        let mut effective = body.clone();
+        effective["@context"] = context.clone();
+        std::borrow::Cow::Owned(effective)
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    }
+}
+
 fn index_config() -> IndexConfig {
     IndexConfig {
         reindex_min_bytes: 1_000_000,
@@ -367,6 +516,14 @@ fn ns_record(
     if let Some(bytes) = bytes {
         let head: Value =
             serde_json::from_slice(bytes).map_err(|_| JournalError::Invalid("invalid head"))?;
+        record.default_context = head
+            .get("f:defaultContextCid")
+            .and_then(Value::as_str)
+            .map(|s| {
+                s.parse()
+                    .map_err(|_| JournalError::Invalid("invalid context CID"))
+            })
+            .transpose()?;
         record.commit_t = head["f:t"]
             .as_i64()
             .ok_or(JournalError::Invalid("invalid head time"))?;
@@ -378,28 +535,49 @@ fn ns_record(
                 .map_err(|_| JournalError::Invalid("invalid head CID"))?,
         );
     }
+    if let Some(bytes) = bytes {
+        let head: Value =
+            serde_json::from_slice(bytes).map_err(|_| JournalError::Invalid("invalid head"))?;
+        if let Some(index) = indexed::parse_index(&head)? {
+            record.index_head_id = Some(index.cid);
+            record.index_t = index.t;
+        }
+    }
     Ok(record)
 }
 
 fn recovered_head(
     ledger: &str,
     records: &[Record],
+    checkpoint: Option<&Checkpoint>,
 ) -> fluree_db_core::local_journal::Result<(NsRecord, Option<Vec<u8>>)> {
-    let head = records.last().map(|r| r.transition.resulting_head.clone());
+    let head = records
+        .last()
+        .map(|r| r.transition.resulting_head.clone())
+        .or_else(|| checkpoint.map(|c| c.head().bytes.clone()));
     Ok((ns_record(ledger, head.as_deref())?, head))
 }
 
-/// Only validated journal bytes, used inside the recovery install hook. No file
+/// Validated journal/checkpoint bytes, used inside the recovery install hook. No raw file
 /// paths, writable adapter, asynchronous upload, or arbitrary orphan dependencies.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct RecoveryStore {
     ledger: String,
     objects: Arc<BTreeMap<String, Vec<u8>>>,
+    checkpoint: Option<Arc<Checkpoint>>,
+    _cache_dir: Arc<tempfile::TempDir>,
 }
 impl RecoveryStore {
-    fn new(ledger: &str, records: &[Record]) -> Self {
+    fn new(
+        ledger: &str,
+        records: &[Record],
+        checkpoint: Option<Arc<Checkpoint>>,
+        cache_dir: Arc<tempfile::TempDir>,
+    ) -> Self {
         Self {
             ledger: ledger.into(),
+            checkpoint,
+            _cache_dir: cache_dir,
             objects: Arc::new(
                 records
                     .iter()
@@ -413,25 +591,47 @@ impl RecoveryStore {
             ),
         }
     }
-    fn bytes(&self, id: &ContentId) -> fluree_db_core::Result<&Vec<u8>> {
+    fn bytes(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
         let kind = id
             .content_kind()
             .ok_or_else(|| fluree_db_core::Error::storage("unknown content kind"))?;
-        self.objects
-            .get(&content_path(kind, &self.ledger, &id.digest_hex()))
-            .filter(|bytes| id.verify(bytes))
-            .ok_or_else(|| {
-                fluree_db_core::Error::storage("required journal content absent or invalid")
-            })
+        let key = content_path(kind, &self.ledger, &id.digest_hex());
+        let bytes = match self.objects.get(&key) {
+            Some(bytes) => Some(bytes.clone()),
+            None => self
+                .checkpoint
+                .as_ref()
+                .map(|c| c.read(&key))
+                .transpose()
+                .map_err(|e| fluree_db_core::Error::storage(e.to_string()))?
+                .flatten(),
+        }
+        .ok_or_else(|| {
+            fluree_db_core::Error::storage("required journal/checkpoint content absent")
+        })?;
+        if !id.verify(&bytes) {
+            return Err(fluree_db_core::Error::storage(
+                "journal/checkpoint CID mismatch",
+            ));
+        }
+        Ok(bytes)
     }
 }
+impl std::fmt::Debug for RecoveryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryStore")
+            .field("ledger", &self.ledger)
+            .finish_non_exhaustive()
+    }
+}
+
 #[async_trait]
 impl ContentStore for RecoveryStore {
     async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
         Ok(self.bytes(id).is_ok())
     }
     async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
-        self.bytes(id).cloned()
+        self.bytes(id)
     }
     async fn put(&self, _: ContentKind, _: &[u8]) -> fluree_db_core::Result<ContentId> {
         Err(fluree_db_core::Error::storage(

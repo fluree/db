@@ -885,10 +885,9 @@ pub(crate) async fn load_and_attach_binary_store(
         Some(r) => r,
         None => return Ok(None),
     };
-    let index_cid = match record.index_head_id.as_ref() {
-        Some(cid) => cid.clone(),
-        None => return Ok(None),
-    };
+    if record.index_head_id.is_none() {
+        return Ok(None);
+    }
 
     // Branch-aware store: walks branch ancestry on read miss so a fresh
     // branch can read leaf/branch/history blobs written under the source
@@ -898,6 +897,24 @@ pub(crate) async fn load_and_attach_binary_store(
     let cs: Arc<dyn ContentStore> =
         fluree_db_nameservice::branched_content_store_for_record(backend, nameservice, record)
             .await?;
+    load_and_attach_binary_store_from(cs, state, cache_dir, leaflet_cache).await
+}
+
+/// Attach all binary dictionaries/providers from an explicitly owned content store.
+/// The caller supplies the store's ownership, validation and operation-health gate.
+pub(crate) async fn load_and_attach_binary_store_from(
+    cs: Arc<dyn ContentStore>,
+    state: &mut LedgerState,
+    cache_dir: &std::path::Path,
+    leaflet_cache: Option<Arc<LeafletCache>>,
+) -> std::result::Result<Option<Arc<BinaryIndexStore>>, ApiError> {
+    let Some(index_cid) = state
+        .ns_record
+        .as_ref()
+        .and_then(|r| r.index_head_id.clone())
+    else {
+        return Ok(None);
+    };
     let bytes = cs
         .get(&index_cid)
         .await

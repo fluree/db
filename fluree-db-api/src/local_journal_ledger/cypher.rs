@@ -161,7 +161,8 @@ impl JournalLedger {
     pub async fn query_cypher(&self, cypher: &str, params: Option<&ParamMap>) -> Result<Value> {
         let cache = self.ready().await?;
         let state = cache.state.as_ref().expect("ready state");
-        let view = GraphDb::from_ledger_state(state);
+        let view = GraphDb::from_ledger_state(state)
+            .with_default_context(cache.proof.as_ref().and_then(|p| p.context.clone()));
         let result = self
             .0
             .engine

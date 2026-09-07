@@ -420,7 +420,7 @@ async fn replay_preserves_generated_subjects_without_reexecuting_input() {
 }
 
 #[tokio::test]
-async fn checkpoint_roots_fail_closed_until_indexed_adapter_support_is_connected() {
+async fn opaque_checkpoint_roots_cannot_open_as_empty_ledgers() {
     use fluree_db_core::local_journal::{CheckpointEntry, CheckpointSpec};
     let dir = tempfile::tempdir().unwrap();
     let baseline = CheckpointSpec {
@@ -448,23 +448,22 @@ async fn checkpoint_roots_fail_closed_until_indexed_adapter_support_is_connected
         |_| Ok(()),
     )
     .unwrap();
-    for _ in 0..2 {
-        assert!(matches!(
-            JournalLedger::open(dir.path().into()).await,
-            Err(Error::Journal(JournalError::Invalid(
-                "recovery hook does not support checkpoint baselines"
-            )))
-        ));
-    }
-    assert_eq!(
-        owner.accepted_head().unwrap(),
-        Some(b"existing-baseline".to_vec())
-    );
+    assert!(matches!(
+        JournalLedger::open(dir.path().into()).await,
+        Err(Error::Journal(JournalError::Invalid(
+            "missing source head provenance"
+        )))
+    ));
+    assert!(matches!(owner.accepted_head(), Err(JournalError::Poisoned)));
+    assert!(matches!(
+        JournalLedger::open(dir.path().into()).await,
+        Err(Error::Journal(JournalError::Poisoned))
+    ));
     drop(owner);
     assert!(matches!(
         JournalLedger::open(dir.path().into()).await,
         Err(Error::Journal(JournalError::Invalid(
-            "recovery hook does not support checkpoint baselines"
+            "missing source head provenance"
         )))
     ));
 }

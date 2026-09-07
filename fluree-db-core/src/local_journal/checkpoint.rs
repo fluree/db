@@ -64,10 +64,17 @@ pub struct Checkpoint {
     path: PathBuf,
     descriptor: Descriptor,
     entries: BTreeMap<String, usize>,
+    digest: [u8; 32],
     _directory_lock: Arc<File>,
 }
 
 impl Checkpoint {
+    /// Exact manifest identity, including the unique root and baseline binding.
+    /// Trusted embeddings may bind cached semantic validation to this digest.
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
     pub fn head(&self) -> &Object {
         &self.descriptor.baseline.head
     }
@@ -184,6 +191,7 @@ impl Checkpoint {
                 path,
                 descriptor,
                 entries,
+                digest: digest(&encoded),
                 _directory_lock: lease,
             }),
             digest(&encoded),
@@ -217,6 +225,7 @@ impl Checkpoint {
         let checkpoint = Arc::new(Self {
             path,
             entries: inventory(&descriptor),
+            digest: hash,
             descriptor,
             _directory_lock: lease,
         });
