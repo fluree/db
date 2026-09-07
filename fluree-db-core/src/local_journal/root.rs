@@ -1,5 +1,9 @@
-//! Exclusive startup coordinator. No transaction write adapter is exposed yet.
-use super::{replay_chain, Error, FileIo, Journal, Object, ReplayTarget, Result};
+//! Exclusive root with serialized journal acceptance and recovery.
+use super::acceptance::{AcceptanceTarget, Coordinator};
+use super::{
+    replay_chain, AcceptanceValidator, AcceptanceView, Error, FileIo, Journal, Object, Receipt,
+    Record, ReplayTarget, Result, Transition,
+};
 use crate::root_access::{reject_journal_ancestor, JOURNAL_DIR};
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -27,12 +31,13 @@ struct Manifest {
     generation: String,
 }
 
-/// A recovered, read-only local root. All opens for a canonical root in this
+/// A recovered local root with serialized acceptance. All opens for a canonical root in this
 /// process share this owner. A competing process (including ordinary file mode)
 /// is refused. The final Arc holds both the root and journal locks through reads.
 ///
-/// This is NOT a Fluree transaction backend. There is deliberately no write,
-/// delete, indexing, raw local-path, encryption, or custom-backend adapter.
+/// This is NOT a Fluree transaction backend. Acceptance requires a trusted semantic
+/// validator and state-installation hook. There is no general StorageWrite, delete,
+/// indexing, raw local-path, encryption, or custom-backend adapter.
 /// Call these blocking open methods on a blocking thread in async applications.
 /// Only local Unix filesystems with working advisory directory locks are in scope.
 /// Never rename/replace roots, ancestors, journal files, or lock inodes while open;
@@ -40,7 +45,7 @@ struct Manifest {
 pub struct LocalRoot {
     path: PathBuf,
     manifest: Manifest,
-    _journal: Journal<FileIo>,
+    coordinator: Mutex<Coordinator<FileIo>>,
     _directory_lock: File,
 }
 
@@ -87,7 +92,7 @@ impl LocalRoot {
         let owner = Arc::new(Self {
             path: path.clone(),
             manifest,
-            _journal: journal,
+            coordinator: Mutex::new(Coordinator::restored(journal, &[], ledger, generation)?),
             _directory_lock: directory,
         });
         registry.retain(|_, owner| owner.strong_count() > 0);
@@ -102,6 +107,9 @@ impl LocalRoot {
         let path = std::fs::canonicalize(root)?;
         let mut registry = OWNERS.lock();
         if let Some(owner) = registry.get(&path).and_then(Weak::upgrade) {
+            if owner.coordinator.lock().poisoned {
+                return Err(Error::Poisoned);
+            }
             return Ok(owner);
         }
         let directory = lock_root(&path)?;
@@ -126,22 +134,13 @@ impl LocalRoot {
         if manifest.version != 1 || manifest.ledger.is_empty() || manifest.generation.is_empty() {
             return Err(Error::Invalid("unsupported journal root format"));
         }
-        let journal_path = checked_path(&control, JOURNAL, false)?;
-        // Bind the root manifest to this exact journal generation before replay.
-        let header = {
-            let mut file = File::open(&journal_path)?;
-            let mut header = [0; super::HEADER];
-            file.read_exact(&mut header)?;
-            header
-        };
-        if header[8..24] != manifest.identity {
-            return Err(Error::Invalid("root/journal generation mismatch"));
-        }
-        let (journal, records) = Journal::open(FileIo::open(&journal_path)?)?;
+        let (journal, records) = open_journal(&control, &manifest.identity)?;
         let data = checked_path(&control, DATA, false)?;
         if !std::fs::metadata(&data)?.is_dir() {
             return Err(Error::Invalid("missing journal data directory"));
         }
+        let coordinator =
+            Coordinator::restored(journal, &records, &manifest.ledger, &manifest.generation)?;
         let mut target = FileTarget { root: &data };
         replay_chain(
             &records,
@@ -152,12 +151,60 @@ impl LocalRoot {
         let owner = Arc::new(Self {
             path: path.clone(),
             manifest,
-            _journal: journal,
+            coordinator: Mutex::new(coordinator),
             _directory_lock: directory,
         });
         registry.retain(|_, owner| owner.strong_count() > 0);
         registry.insert(path, Arc::downgrade(&owner));
         Ok(owner)
+    }
+
+    /// Serialize CAS validation, semantic validation, flush, materialization and
+    /// the trusted state-installation hook. A receipt returns only after all steps
+    /// succeed. Neither validator nor hook may reenter this root or publish an external response.
+    /// This is an embedding seam, not a raw HTTP/Fluree transaction entry point.
+    pub fn accept_with(
+        &self,
+        transition: &Transition,
+        validator: &impl AcceptanceValidator,
+        install: impl FnOnce(&AcceptanceView<'_>, &Receipt) -> Result<()>,
+    ) -> Result<Receipt> {
+        let mut state = self.coordinator.lock();
+        let data = self.path.join(JOURNAL_DIR).join(DATA);
+        state.accept(
+            transition,
+            validator,
+            &mut FileTarget { root: &data },
+            install,
+        )
+    }
+
+    /// Reconcile an unknown outcome under the same root lock. Complete accepted
+    /// records may recover even when the prior call returned an error. Install
+    /// restored application state before making reads/acceptance available again.
+    /// The hook must not reenter this root. Torn/corrupt journals still fail closed.
+    pub fn recover_with(&self, install: impl FnOnce(&[Record]) -> Result<()>) -> Result<()> {
+        let mut state = self.coordinator.lock();
+        state.poisoned = true;
+        drop(state.journal.take());
+        let control = self.path.join(JOURNAL_DIR);
+        let (journal, records) = open_journal(&control, &self.manifest.identity)?;
+        let restored = Coordinator::restored(
+            journal,
+            &records,
+            &self.manifest.ledger,
+            &self.manifest.generation,
+        )?;
+        let data = control.join(DATA);
+        replay_chain(
+            &records,
+            &self.manifest.ledger,
+            &self.manifest.generation,
+            &mut FileTarget { root: &data },
+        )?;
+        install(&records)?;
+        *state = restored;
+        Ok(())
     }
 
     pub fn ledger(&self) -> &str {
@@ -170,6 +217,10 @@ impl LocalRoot {
     /// Read after completed recovery. The returned bytes do not outlive an mmap or
     /// a raw-path capability; ordinary storage handles remain fenced even now.
     pub fn read_bytes(&self, key: &str) -> Result<Vec<u8>> {
+        let state = self.coordinator.lock();
+        if state.poisoned {
+            return Err(Error::Poisoned);
+        }
         data_key(key)?;
         Ok(std::fs::read(checked_path(
             &self.path.join(JOURNAL_DIR).join(DATA),
@@ -177,6 +228,17 @@ impl LocalRoot {
             false,
         )?)?)
     }
+}
+
+fn open_journal(control: &Path, identity: &[u8; 16]) -> Result<(Journal<FileIo>, Vec<Record>)> {
+    let path = checked_path(control, JOURNAL, false)?;
+    let mut file = File::open(&path)?;
+    let mut header = [0; super::HEADER];
+    file.read_exact(&mut header)?;
+    if &header[8..24] != identity {
+        return Err(Error::Invalid("root/journal generation mismatch"));
+    }
+    Journal::open(FileIo::open(&path)?)
 }
 
 fn lock_root(path: &Path) -> Result<File> {
@@ -256,6 +318,28 @@ fn atomic_write(path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
 
 struct FileTarget<'a> {
     root: &'a Path,
+}
+
+impl AcceptanceTarget for FileTarget<'_> {
+    fn preflight(&mut self, transition: &Transition) -> Result<()> {
+        data_key(&transition.head_key)?;
+        checked_path(self.root, &transition.head_key, false)?;
+        for object in &transition.objects {
+            data_key(&object.key)?;
+            let path = checked_path(self.root, &object.key, false)?;
+            match std::fs::read(path) {
+                Ok(bytes) if bytes == object.bytes => {}
+                Ok(_) => {
+                    return Err(Error::Invalid(
+                        "immutable materialized bytes differ before acceptance",
+                    ))
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

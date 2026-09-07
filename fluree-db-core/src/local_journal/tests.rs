@@ -326,3 +326,203 @@ fn native_file_roundtrip_exclusive_owner_and_corruption() {
     std::fs::write(&path, image).unwrap();
     assert!(Journal::open(FileIo::open(&path).unwrap()).is_err());
 }
+
+struct CheckContent;
+#[test]
+fn coordinator_capacity_is_definite_rejection_but_partial_write_is_unresolved() {
+    use super::acceptance::Coordinator;
+    let io = FaultIo::default();
+    let mut coordinator = Coordinator::restored(
+        Journal::create(io.clone(), [24; 16]).unwrap(),
+        &[],
+        "test:main",
+        "generation-1",
+    )
+    .unwrap();
+    let mut target = Materialized::default();
+    coordinator.journal.as_mut().unwrap().end = MAX_JOURNAL_BYTES - 1;
+    assert!(matches!(
+        coordinator.accept(&transition(1), &CheckContent, &mut target, |_, _| panic!(
+            "capacity install"
+        )),
+        Err(Error::Capacity)
+    ));
+    assert!(!coordinator.poisoned);
+    assert_eq!(io.0.borrow().barriers.len(), 1);
+    coordinator.journal.as_mut().unwrap().end = HEADER as u64;
+    io.0.borrow_mut().write_budget = Some(7);
+    assert!(matches!(
+        coordinator.accept(&transition(1), &CheckContent, &mut target, |_, _| panic!(
+            "partial write install"
+        )),
+        Err(Error::AcceptanceUnresolved { durable: None, .. })
+    ));
+    assert!(coordinator.poisoned);
+    assert!(target.head.is_none());
+}
+impl super::AcceptanceValidator for CheckContent {
+    fn validate(&self, view: &super::AcceptanceView<'_>) -> Result<()> {
+        let key = format!("objects/{}", view.transition.resulting_head[0]);
+        if view.content(&key).is_none() {
+            return Err(Error::Invalid("missing required content"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct Materialized {
+    head: Option<Vec<u8>>,
+    objects: std::collections::BTreeMap<String, Vec<u8>>,
+    remaining: Option<usize>,
+}
+impl Materialized {
+    fn operation(&mut self) -> Result<()> {
+        if let Some(remaining) = &mut self.remaining {
+            if *remaining == 0 {
+                return Err(Error::Io(io::ErrorKind::Other.into()));
+            }
+            *remaining -= 1;
+        }
+        Ok(())
+    }
+}
+impl super::ReplayTarget for Materialized {
+    fn read_head(&mut self, _: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.head.clone())
+    }
+    fn put_immutable(&mut self, object: &Object) -> Result<()> {
+        self.operation()?;
+        self.objects
+            .insert(object.key.clone(), object.bytes.clone());
+        Ok(())
+    }
+    fn publish_head(&mut self, _: &str, expected: Option<&[u8]>, bytes: &[u8]) -> Result<()> {
+        self.operation()?;
+        assert_eq!(self.head.as_deref(), expected);
+        self.head = Some(bytes.to_vec());
+        Ok(())
+    }
+}
+impl super::acceptance::AcceptanceTarget for Materialized {
+    fn preflight(&mut self, _: &Transition) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn coordinator_rejects_stale_and_incomplete_candidates_before_append() {
+    use super::acceptance::Coordinator;
+    let io = FaultIo::default();
+    let mut coordinator = Coordinator::restored(
+        Journal::create(io.clone(), [21; 16]).unwrap(),
+        &[],
+        "test:main",
+        "generation-1",
+    )
+    .unwrap();
+    let mut target = Materialized::default();
+    let mut missing = transition(1);
+    missing.objects.clear();
+    assert!(coordinator
+        .accept(&missing, &CheckContent, &mut target, |_, _| panic!(
+            "must not install"
+        ))
+        .is_err());
+    assert_eq!(io.0.borrow().barriers.len(), 1);
+    let receipt = coordinator
+        .accept(
+            &transition(1),
+            &CheckContent,
+            &mut target,
+            |view, receipt| {
+                assert_eq!(
+                    io.0.borrow().barriers.last().unwrap().len() as u64,
+                    receipt.end
+                );
+                assert!(view.content("objects/1").is_some());
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(target.head, Some(vec![1]));
+    let writes = io.0.borrow().writes.len();
+    assert!(matches!(
+        coordinator.accept(&transition(1), &CheckContent, &mut target, |_, _| panic!(
+            "CAS loser"
+        )),
+        Err(Error::Conflict)
+    ));
+    assert_eq!(writes, io.0.borrow().writes.len());
+    assert_eq!(coordinator.last, Some(receipt));
+    assert!(!coordinator.poisoned);
+}
+
+#[test]
+fn coordinator_uncertain_flush_never_materializes_or_installs() {
+    use super::acceptance::Coordinator;
+    for persists in [false, true] {
+        let io = FaultIo::default();
+        let mut coordinator = Coordinator::restored(
+            Journal::create(io.clone(), [22; 16]).unwrap(),
+            &[],
+            "test:main",
+            "generation-1",
+        )
+        .unwrap();
+        let mut target = Materialized::default();
+        coordinator
+            .accept(&transition(1), &CheckContent, &mut target, |_, _| Ok(()))
+            .unwrap();
+        io.0.borrow_mut().fail_flush = Some(persists);
+        assert!(coordinator
+            .accept(&transition(2), &CheckContent, &mut target, |_, _| panic!(
+                "uncertain flush cannot install"
+            ))
+            .is_err());
+        assert_eq!(target.head, Some(vec![1]));
+        assert!(!target.objects.contains_key("objects/2"));
+        assert!(coordinator.poisoned);
+        assert!(matches!(
+            coordinator.accept(&transition(2), &CheckContent, &mut target, |_, _| Ok(())),
+            Err(Error::Poisoned)
+        ));
+        let (_, records) = Journal::open(io.crash()).unwrap();
+        assert_eq!(records.len(), if persists { 2 } else { 1 });
+        super::replay_chain(&records, "test:main", "generation-1", &mut target).unwrap();
+        assert_eq!(target.head, Some(vec![if persists { 2 } else { 1 }]));
+    }
+}
+
+#[test]
+fn coordinator_materialization_and_install_failures_leave_recoverable_unknown_outcomes() {
+    use super::acceptance::Coordinator;
+    for cut in 0..=2 {
+        let io = FaultIo::default();
+        let mut coordinator = Coordinator::restored(
+            Journal::create(io.clone(), [23; 16]).unwrap(),
+            &[],
+            "test:main",
+            "generation-1",
+        )
+        .unwrap();
+        let mut target = Materialized {
+            remaining: Some(cut),
+            ..Materialized::default()
+        };
+        assert!(coordinator
+            .accept(&transition(1), &CheckContent, &mut target, |_, _| {
+                assert_eq!(cut, 2, "install ran before all materialization operations");
+                Err(Error::Invalid("injected installation failure"))
+            })
+            .is_err());
+        assert!(coordinator.poisoned);
+        assert!(coordinator.last.is_none()); // no completed outcome receipt
+        let (_, records) = Journal::open(io.crash()).unwrap();
+        assert_eq!(records.len(), 1); // durable accepted bytes still recover
+        target.remaining = None;
+        super::replay_chain(&records, "test:main", "generation-1", &mut target).unwrap();
+        assert_eq!(target.head, Some(vec![1]));
+        assert_eq!(target.objects["objects/1"], vec![1; 17]);
+    }
+}

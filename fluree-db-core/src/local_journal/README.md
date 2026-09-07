@@ -1,7 +1,9 @@
 # Experimental journal foundation
 
 Enabled only by `experimental-local-journal` on Unix. **This feature does not turn
-on database WAL persistence.** Transaction acknowledgments remain unchanged.
+on WAL for ordinary Fluree transactions.** Their acknowledgments remain unchanged.
+The experimental owner can now accept exact transitions through a trusted embedding
+interface; no CLI/server/Fluree transaction adapter calls it yet.
 Ordinary Unix file opens now acquire a shared root lease and reject managed roots,
 including when journal support is not compiled. The format is experimental and not yet a
 supported database storage format.
@@ -53,10 +55,10 @@ or old-layout migration is implemented.
 
 `LocalRoot::open` acquires the root lock, validates the manifest/journal generation,
 validates the whole journal, and completes exact atomic materialization before
-returning a read-only owner. Canonical-path aliases share one ready `Arc` in-process;
+returning an owner. Canonical-path aliases share one ready `Arc` in-process;
 another process is refused until the final owner drops or dies. The owner exposes
-byte reads only; there is no transaction, local-path/mmap, nameservice, or indexer
-adapter yet. Recovery stages immutable objects and renames them into place, rejects
+byte reads and the `accept_with` embedding seam; there is no Fluree transaction,
+local-path/mmap, nameservice, or indexer adapter yet. Recovery stages immutable objects and renames them into place, rejects
 conflicting bytes/symlink paths, and publishes the head last. Individual replay writes
 omit fsync because the complete journal is retained; this is not a checkpoint.
 
@@ -74,7 +76,48 @@ live. Arbitrary filesystem access and old binaries that ignore the marker cannot
 fenced; do not run mixed versions. This is a cooperative local filesystem boundary,
 not a security sandbox for hostile symlink routing through unrelated roots.
 Interrupted initialization without a valid manifest fails closed and retains its
-files for inspection. No transaction could have been accepted through this owner.
+files for inspection. No transition could have been accepted before successful initialization.
+
+## Serialized acceptance and reconciliation
+
+`accept_with` holds the shared owner's mutex through expected-head/generation checks,
+semantic validation, filesystem preflight, journal append/sync, immutable materialization,
+head publication, and the state-installation hook. Only then does it advance completed
+state and return a receipt. Readers take the same mutex, so no owner reader crosses
+an incomplete installation. Same-base concurrent candidates have one CAS winner;
+the loser writes no journal record or object.
+
+`AcceptanceView` exposes only candidate bytes and objects in the retained accepted
+journal. A merely readable file is not a durable prerequisite. Immutable key changes,
+head/object collisions, reserved paths and file/directory collisions are rejected.
+The bounded journal's object bytes are retained in memory for this prototype.
+
+`AcceptanceValidator` and the installation hook are **trusted embedding interfaces**.
+The core cannot interpret an opaque nameservice head or prove policy/query semantics;
+callers must not supply arbitrary validators through a transaction request. The API's
+`LinearCommitValidator` verifies a closed ns@v2 head shape, exact v4 commit CIDs,
+linear transaction/parent continuity, and every referenced raw transaction CID.
+It walks all ancestry to genesis and rejects unrelated candidate objects, indices,
+configuration/lifecycle changes, branches/merges and commit/transaction signatures.
+It does not validate policies or remote preparation; staging must do that.
+
+Definite CAS/validation/capacity rejections remain distinct from
+`AcceptanceUnresolved`. An I/O error after append begins is unresolved and blocks the
+owner. If the flush succeeded but materialization/installation failed, that error
+includes the durable journal receipt. A panic after append begins also leaves the
+owner blocked. Installation hooks must not reenter the owner or send a response.
+
+`recover_with` retains the root lock, reopens/verifies the bound journal, replays exact
+accepted bytes, and calls a recovery-state installation hook before making the owner
+available again. Failed recovery/installation leaves it blocked. Complete records
+whose original response failed may recover; reconcile their identity before retrying.
+This is not submission-level exactly-once delivery or automatic retry of CREATE.
+
+No real LedgerState installer or transaction endpoint is connected yet. The linear
+validator walks/hashes complete history on every acceptance and the payload codec
+uses JSON byte arrays. Both are correctness prototypes with substantial overhead;
+cache validated dependency closure and choose an efficient codec before performance
+acceptance. No benchmark gain follows from these tests alone.
 
 ## Failure model and limits
 
@@ -91,11 +134,11 @@ whole valid suffix cannot be detected by the surviving checksums alone; the exte
 acknowledgment oracle detects it. Recovery of a deleted/truncated only durable copy
 needs independent persistence. SHA-256 here is integrity checking, not authentication.
 
-Before transaction integration, finish qualifying ownership and add CAS reservation
-before journal acceptance, complete required-content validation, and state
-installation before ACK. Coordinate or reject every mutation path, including import,
-push, index heads, configuration/lifecycle and GC. Explicitly reject unsupported
-encryption, mixed backends, clusters, and oversized transactions before effects.
+Before enabling ordinary transactions, finish the Fluree staging/state-installation
+adapter, read/cache integration, mutation-path coverage, and ownership qualification.
+Coordinate or reject import, push, index heads, configuration/lifecycle and GC.
+Explicitly reject unsupported encryption, mixed backends, clusters, and oversized
+transactions before effects.
 
 This slice has no checkpoint, truncation, rotation, online GC, submission idempotency,
 group commit, transaction overlap, or remote preparation. At capacity it stops;

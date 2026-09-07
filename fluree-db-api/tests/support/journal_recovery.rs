@@ -189,6 +189,171 @@ fn transition(before: Option<&DeclaredFrontier>, after: &DeclaredFrontier) -> Tr
 }
 
 #[tokio::test]
+async fn accepted_commits_validate_closure_before_flush_and_reconcile_failed_installation() {
+    use fluree_db_api::local_journal_acceptance::LinearCommitValidator;
+    use fluree_db_core::local_journal::LocalRoot;
+    let fixture = fixture().await;
+    let root = tempfile::tempdir().unwrap();
+    let owner = LocalRoot::initialize(root.path(), LEDGER, "fixture-generation-1").unwrap();
+    let first = transition(None, &fixture.first_frontier);
+    let mut second = transition(Some(&fixture.first_frontier), &fixture.frontier);
+    // The original fixture intentionally retains a CAS-loser object. This scope
+    // permits only required dependencies, so remove it from the valid candidate.
+    let loser_key = content_path(ContentKind::Commit, LEDGER, &fixture.loser_id.digest_hex());
+    second.objects.retain(|object| object.key != loser_key);
+    let journal_path = root.path().join(".fluree-wal/journal");
+    let data = root.path().join(".fluree-wal/data");
+    owner
+        .accept_with(&first, &LinearCommitValidator, |_, receipt| {
+            assert_eq!(std::fs::metadata(&journal_path).unwrap().len(), receipt.end);
+            assert_eq!(
+                std::fs::read(data.join(HEAD_PATH)).unwrap(),
+                first.resulting_head
+            );
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&first.resulting_head)));
+    let before = std::fs::read(&journal_path).unwrap();
+    let raw_key = content_path(
+        ContentKind::Txn,
+        LEDGER,
+        &fixture.oracle.commits[1].raw_id.digest_hex(),
+    );
+    let mut missing = second.clone();
+    missing.objects.retain(|object| object.key != raw_key);
+    // Even an identical readable orphan is not an accepted durable prerequisite.
+    let orphan_raw = data.join(&raw_key);
+    std::fs::create_dir_all(orphan_raw.parent().unwrap()).unwrap();
+    std::fs::write(&orphan_raw, &fixture.oracle.commits[1].raw_bytes).unwrap();
+    assert!(owner
+        .accept_with(&missing, &LinearCommitValidator, |_, _| panic!(
+            "missing raw accepted"
+        ))
+        .is_err());
+    let mut corrupt = second.clone();
+    let commit_key = content_path(
+        ContentKind::Commit,
+        LEDGER,
+        &fixture.oracle.commits[1].commit_id.digest_hex(),
+    );
+    corrupt
+        .objects
+        .iter_mut()
+        .find(|o| o.key == commit_key)
+        .unwrap()
+        .bytes[10] ^= 1;
+    assert!(owner
+        .accept_with(&corrupt, &LinearCommitValidator, |_, _| panic!(
+            "bad CID accepted"
+        ))
+        .is_err());
+    let mut unsupported = second.clone();
+    let mut head: Value = serde_json::from_slice(&unsupported.resulting_head).unwrap();
+    head["f:status"] = json!("retracted");
+    unsupported.resulting_head = serde_json::to_vec(&head).unwrap();
+    assert!(owner
+        .accept_with(&unsupported, &LinearCommitValidator, |_, _| panic!(
+            "lifecycle accepted"
+        ))
+        .is_err());
+    let unfiltered = transition(Some(&fixture.first_frontier), &fixture.frontier);
+    assert!(owner
+        .accept_with(&unfiltered, &LinearCommitValidator, |_, _| panic!(
+            "CAS loser object accepted"
+        ))
+        .is_err());
+    let mut duplicate = second.clone();
+    duplicate.resulting_head = [b"{\"f:t\":123,".as_slice(), &second.resulting_head[1..]].concat();
+    assert!(owner
+        .accept_with(&duplicate, &LinearCommitValidator, |_, _| panic!(
+            "duplicate field accepted"
+        ))
+        .is_err());
+    assert_eq!(std::fs::read(&journal_path).unwrap(), before);
+    assert_eq!(owner.read_bytes(HEAD_PATH).unwrap(), first.resulting_head);
+    owner
+        .accept_with(&second, &LinearCommitValidator, |_, _| Ok(()))
+        .unwrap();
+    // Persist independent expected outcomes only after successful installation.
+    let controller = tempfile::tempdir().unwrap();
+    fixture.oracle.persist(&controller.path().join("acks.json"));
+    let oracle: AckOracle =
+        serde_json::from_slice(&std::fs::read(controller.path().join("acks.json")).unwrap())
+            .unwrap();
+    let image = tempfile::tempdir().unwrap();
+    for key in fixture
+        .frontier
+        .0
+        .keys()
+        .filter(|key| key.to_str().unwrap() != loser_key)
+    {
+        let bytes = owner.read_bytes(key.to_str().unwrap()).unwrap();
+        let path = image.path().join(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    oracle.check(image.path()).await.unwrap();
+
+    let mut third_head: Value = serde_json::from_slice(&second.resulting_head).unwrap();
+    third_head["f:t"] = json!(3);
+    third_head["f:commitCid"] = json!(fixture.orphan_id.to_string());
+    let third = Transition {
+        ledger: LEDGER.into(),
+        generation: "fixture-generation-1".into(),
+        head_key: HEAD_PATH.into(),
+        expected_head: Some(second.resulting_head.clone()),
+        resulting_head: serde_json::to_vec(&third_head).unwrap(),
+        objects: vec![Object {
+            key: content_path(ContentKind::Commit, LEDGER, &fixture.orphan_id.digest_hex()),
+            bytes: fixture.orphan_bytes.clone(),
+        }],
+    };
+    assert!(matches!(
+        owner.accept_with(&third, &LinearCommitValidator, |_, _| Err(Error::Invalid(
+            "injected state installation failure"
+        ))),
+        Err(Error::AcceptanceUnresolved {
+            durable: Some(_),
+            ..
+        })
+    ));
+    assert!(matches!(owner.read_bytes(HEAD_PATH), Err(Error::Poisoned)));
+    owner
+        .recover_with(|records| {
+            assert_eq!(records.len(), 3);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(owner.read_bytes(HEAD_PATH).unwrap(), third.resulting_head);
+    for ack in &oracle.commits {
+        assert_eq!(
+            owner
+                .read_bytes(&content_path(
+                    ContentKind::Commit,
+                    LEDGER,
+                    &ack.commit_id.digest_hex()
+                ))
+                .unwrap(),
+            ack.commit_bytes
+        );
+        assert_eq!(
+            owner
+                .read_bytes(&content_path(
+                    ContentKind::Txn,
+                    LEDGER,
+                    &ack.raw_id.digest_hex()
+                ))
+                .unwrap(),
+            ack.raw_bytes
+        );
+    }
+    assert!(matches!(
+        owner.accept_with(&third, &LinearCommitValidator, |_, _| Ok(())),
+        Err(Error::Conflict)
+    ));
+}
+
+#[tokio::test]
 async fn journal_barriers_recover_external_acknowledgments_and_interrupted_replay() {
     let fixture = fixture().await;
     let controller = tempfile::tempdir().unwrap();

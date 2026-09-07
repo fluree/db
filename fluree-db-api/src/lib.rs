@@ -76,6 +76,8 @@ mod inline_ontology;
 mod inline_shapes;
 mod ledger;
 pub mod ledger_info;
+#[cfg(all(feature = "experimental-local-journal", unix))]
+pub mod local_journal_acceptance;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod materialize;
 #[cfg(feature = "iceberg")]

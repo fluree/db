@@ -22,6 +22,99 @@ fn append_fixture(root: &Path) {
     }
 }
 
+struct SyntheticValidator;
+impl super::super::AcceptanceValidator for SyntheticValidator {
+    fn validate(&self, _: &super::super::AcceptanceView<'_>) -> Result<()> {
+        Ok(())
+    }
+}
+fn candidate(n: u8) -> Transition {
+    Transition {
+        ledger: "test:main".into(),
+        generation: "g1".into(),
+        head_key: "ns/head".into(),
+        expected_head: None,
+        resulting_head: vec![n],
+        objects: vec![Object {
+            key: format!("objects/{n}"),
+            bytes: vec![n],
+        }],
+    }
+}
+
+#[test]
+fn concurrent_acceptance_has_one_cas_winner_and_no_loser_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = LocalRoot::initialize(root.path(), "test:main", "g1").unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let joins: Vec<_> = (1..=2)
+        .map(|n| {
+            let owner = owner.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                owner.accept_with(&candidate(n), &SyntheticValidator, |_, _| Ok(()))
+            })
+        })
+        .collect();
+    let results: Vec<_> = joins.into_iter().map(|j| j.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, Err(Error::Conflict)))
+            .count(),
+        1
+    );
+    let winner = owner.read_bytes("ns/head").unwrap()[0];
+    assert!(owner
+        .read_bytes(&format!("objects/{}", 3 - winner))
+        .is_err());
+    drop(owner);
+    let (_, records) =
+        Journal::open(FileIo::open(&root.path().join(JOURNAL_DIR).join(JOURNAL)).unwrap()).unwrap();
+    assert_eq!(records.len(), 1);
+}
+
+#[test]
+fn installation_panic_blocks_shared_reads_until_explicit_reconciliation() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = LocalRoot::initialize(root.path(), "test:main", "g1").unwrap();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        owner.accept_with(&candidate(1), &SyntheticValidator, |_, _| {
+            panic!("injected install panic")
+        })
+    }));
+    assert!(panic.is_err());
+    assert!(matches!(owner.read_bytes("ns/head"), Err(Error::Poisoned)));
+    assert!(matches!(LocalRoot::open(root.path()), Err(Error::Poisoned)));
+    assert!(owner
+        .recover_with(|_| Err(Error::Invalid("reinstall failed")))
+        .is_err());
+    assert!(matches!(owner.read_bytes("ns/head"), Err(Error::Poisoned)));
+    let journal_path = root.path().join(JOURNAL_DIR).join(JOURNAL);
+    let bytes = std::fs::read(&journal_path).unwrap();
+    let mut wrong_generation = bytes.clone();
+    wrong_generation[8] ^= 1;
+    std::fs::write(&journal_path, wrong_generation).unwrap();
+    assert!(owner
+        .recover_with(|_| panic!("wrong journal generation installed"))
+        .is_err());
+    std::fs::write(&journal_path, bytes).unwrap();
+    owner
+        .recover_with(|records| {
+            assert_eq!(records.len(), 1);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(owner.read_bytes("ns/head").unwrap(), vec![1]);
+    // Re-transacting the stale candidate would be a conflict, not a duplicate.
+    assert!(matches!(
+        owner.accept_with(&candidate(1), &SyntheticValidator, |_, _| Ok(())),
+        Err(Error::Conflict)
+    ));
+}
+
 #[tokio::test]
 async fn root_owner_recovers_before_reads_and_fences_every_ordinary_file_surface() {
     let parent = tempfile::tempdir().unwrap();

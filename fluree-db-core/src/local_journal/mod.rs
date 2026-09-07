@@ -26,6 +26,8 @@ use std::io;
 
 mod file;
 pub use file::FileIo;
+mod acceptance;
+pub use acceptance::{AcceptanceValidator, AcceptanceView};
 mod root;
 pub use root::LocalRoot;
 #[cfg(test)]
@@ -49,6 +51,15 @@ pub enum Error {
     Capacity,
     #[error("journal writer poisoned; reopen and reconcile the unknown outcome")]
     Poisoned,
+    #[error("journal expected head does not match the accepted head")]
+    Conflict,
+    #[error("acceptance unresolved; recover and reconcile before retrying: {cause}")]
+    AcceptanceUnresolved {
+        /// Present when the journal flush succeeded but later completion failed.
+        durable: Option<Receipt>,
+        #[source]
+        cause: Box<Error>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
