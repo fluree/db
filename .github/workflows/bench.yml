@@ -75,20 +75,23 @@ jobs:
       - name: Reconcile workspace [[bench]] entries with regression-budget.json
         run: cargo test -p fluree-bench-support --test workspace_reconcile
 
-      # Build all benches in release. Heavy on cold cache; rust-cache
-      # makes subsequent runs cheap.
+      # Select every explicit benchmark target. Bare `cargo bench --workspace`
+      # also builds libraries/binaries as libtest benchmark harnesses under fat
+      # LTO, even though this workspace has no inline #[bench] functions.
+      # The per-PR nextest job already runs the unit and integration tests.
+      # Enable the GraphQL bench's required feature explicitly.
       - name: Build benches
         id: build-benches
         # Leave time for rust-cache's post step even if a cold build times out.
         timeout-minutes: 45
-        run: cargo bench --workspace --no-run
+        run: cargo bench --workspace --bench '*' --features fluree-db-api/graphql --no-run
 
       # Smoke-run every bench's scenarios at `tiny` scale via criterion's
       # `--test` mode (one iteration per scenario, no statistics collected).
       # Catches benches that compile but panic at runtime (bad SPARQL,
       # broken setup, missing API surface).
       - name: Smoke-run benches at tiny scale
-        run: cargo bench --workspace -- --test
+        run: cargo bench --workspace --bench '*' --features fluree-db-api/graphql --no-fail-fast -- --test
 
       # Real per-bench compare of the captured subset against the committed
       # baseline even if an unrelated bench fails its smoke test. Do not start

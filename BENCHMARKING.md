@@ -126,9 +126,13 @@ on-demand):
      asserts every `[[bench]]` declared in a workspace member's `Cargo.toml`
      has a matching entry in `regression-budget.json`, and vice versa. A
      missing or stale entry fails with a message naming the `crate/bench` pair.
-   - **Smoke.** `cargo bench --workspace -- --test` runs each bench's
-     scenarios once at `tiny` scale — catches benches that compile but panic
-     at runtime (bad SPARQL, broken setup, missing API surface).
+   - **Smoke.** `cargo bench --workspace --bench '*' --features fluree-db-api/graphql --no-fail-fast -- --test`
+     runs each explicit benchmark's scenarios once at `tiny` scale, catching
+     runtime failures (bad SPARQL, broken setup, missing API surface).
+     The quoted target glob includes all declared benches without also building
+     every library/binary's libtest harness under fat LTO. Unit and integration
+     tests run in the per-PR nextest job. All benchmark binaries are attempted
+     even if an earlier one fails.
 2. **Per-PR compare (`ci.yml` `bench-compare`).** Runs the cheap subset
    (`query_overlay_matrix` + `query_hot_bsbm`) at `tiny`/`quick` and compares
    against the committed baseline via the `bench-baseline` bin. **Time and peak
