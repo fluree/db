@@ -752,6 +752,7 @@ pub struct FromQueryBuilder<'a> {
     core: QueryCore<'a>,
     policy: Option<Arc<PolicyContext>>,
     connection_opts: Option<GovernanceOptions>,
+    authorization: Option<&'a crate::PolicyAuthorization>,
 }
 
 impl<'a> FromQueryBuilder<'a> {
@@ -762,6 +763,7 @@ impl<'a> FromQueryBuilder<'a> {
             core: QueryCore::new(),
             policy: None,
             connection_opts: None,
+            authorization: None,
         }
     }
 
@@ -878,6 +880,12 @@ impl<'a> FromQueryBuilder<'a> {
     /// Only available on `FromQueryBuilder` — for view/dataset queries,
     /// policy is applied at the view level (Tier 1).
     pub fn policy(mut self, ctx: PolicyContext) -> Self {
+        if self.authorization.is_some() {
+            self.core.errors.push(BuilderError::Conflict {
+                field: "authorization",
+                message: "authorization cannot be combined with a prebuilt policy context".into(),
+            });
+        }
         self.policy = Some(Arc::new(ctx));
         self
     }
@@ -898,6 +906,40 @@ impl<'a> FromQueryBuilder<'a> {
         self
     }
 
+    /// Bind this request to host-verified policy selection. Caller JSON options,
+    /// source overrides and connection options cannot replace this selection.
+    /// The host must separately authorize every ledger named by the request.
+    pub fn authorization(mut self, authorization: &'a crate::PolicyAuthorization) -> Self {
+        if self.policy.is_some() {
+            self.core.errors.push(BuilderError::Conflict {
+                field: "authorization",
+                message: "authorization cannot be combined with a prebuilt policy context".into(),
+            });
+        }
+        self.authorization = Some(authorization);
+        self
+    }
+
+    fn prepare_authorization(&mut self) -> Result<Option<JsonValue>> {
+        let Some(authorization) = self.authorization else {
+            return Ok(None);
+        };
+        self.connection_opts = Some(
+            authorization.constrain_options(
+                self.connection_opts
+                    .as_ref()
+                    .unwrap_or(&GovernanceOptions::default()),
+            ),
+        );
+        if let Some(QueryInput::JsonLd(json)) = self.core.input {
+            let mut json = json.clone();
+            authorization.apply_to_jsonld(&mut json)?;
+            Ok(Some(json))
+        } else {
+            Ok(None)
+        }
+    }
+
     // --- Terminal operations ---
 
     /// Validate builder configuration without executing.
@@ -914,16 +956,21 @@ impl<'a> FromQueryBuilder<'a> {
     ///
     /// Resolves ledgers from the query body's `from` / `FROM` clauses,
     /// applies policy if set, and executes.
-    pub async fn execute(self) -> Result<QueryResult> {
+    pub async fn execute(mut self) -> Result<QueryResult> {
         let errs = self.core.validate();
         if !errs.is_empty() {
             return Err(ApiError::Builder(BuilderErrors(errs)));
         }
 
+        let authorized_json = self.prepare_authorization()?;
         let mut core = self.core;
         let r2rml = core.r2rml.take();
         let execution = core.execution.clone();
         let input = core.input.take().unwrap();
+        let input = authorized_json
+            .as_ref()
+            .map(QueryInput::JsonLd)
+            .unwrap_or(input);
         // SPARQL policy via connection opts (multi-query aliases): SPARQL has
         // no body opts, so the merged envelope/sub opts arrive here. Takes
         // precedence over `.policy()`; for JSON-LD input it's a no-op.
@@ -1022,6 +1069,7 @@ impl<'a> FromQueryBuilder<'a> {
             return Err(ApiError::Builder(BuilderErrors(errs)));
         }
 
+        let authorized_json = self.prepare_authorization()?;
         let r2rml = self.core.r2rml.take();
         let execution = self.core.execution.clone();
         let format_config = self
@@ -1030,6 +1078,10 @@ impl<'a> FromQueryBuilder<'a> {
             .take()
             .unwrap_or_else(|| self.core.default_format());
         let input = self.core.input.take().unwrap();
+        let input = authorized_json
+            .as_ref()
+            .map(QueryInput::JsonLd)
+            .unwrap_or(input);
         // Top-intercept a virtual-dataset subgraph crawl (JSON-LD only) BEFORE
         // the main query runs, so it is routed through R2RML rather than native
         // hydration (which returns `[]`). `as_jsonld()` borrows `input` (Copy),
@@ -1186,6 +1238,7 @@ impl<'a> FromQueryBuilder<'a> {
             return Err(ApiError::Builder(BuilderErrors(errs)));
         }
 
+        let authorized_json = self.prepare_authorization()?;
         let r2rml = self.core.r2rml.take();
         let execution = self.core.execution.clone();
         let format_config = self
@@ -1194,6 +1247,10 @@ impl<'a> FromQueryBuilder<'a> {
             .take()
             .unwrap_or_else(|| self.core.default_format());
         let input = self.core.input.take().unwrap();
+        let input = authorized_json
+            .as_ref()
+            .map(QueryInput::JsonLd)
+            .unwrap_or(input);
         // Top-intercept a virtual-dataset subgraph crawl (JSON-LD only) BEFORE
         // the main query runs; serialize the expanded documents to a string to
         // match this terminal's return type.
@@ -1371,11 +1428,18 @@ impl<'a> FromQueryBuilder<'a> {
             return Err(TrackedErrorResponse::new(400, msg, None));
         }
 
+        let authorized_json = self
+            .prepare_authorization()
+            .map_err(|e| TrackedErrorResponse::new(400, e.to_string(), None))?;
         let r2rml = self.core.r2rml.take();
         let format_config = self.core.format.take();
         let tracking = self.core.tracking.take();
         let execution = self.core.execution.clone();
         let input = self.core.input.take().unwrap();
+        let input = authorized_json
+            .as_ref()
+            .map(QueryInput::JsonLd)
+            .unwrap_or(input);
         // Top-intercept a virtual-dataset subgraph crawl (JSON-LD only) BEFORE
         // dispatching the tracked query. The crawl has no fuel/policy/time stats,
         // so it returns a 200 response with empty tracking. Boxed like the

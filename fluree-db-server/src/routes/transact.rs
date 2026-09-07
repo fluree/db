@@ -234,44 +234,27 @@ struct PreparedTransaction {
 /// Injects header-derived options, applies bearer-identity / policy-class
 /// defaults to the body's opts (which the rest of the pipeline reads),
 /// then extracts the tracking and policy options from the finalized body.
-async fn prepare_transaction_body(
-    state: &AppState,
-    ledger_id: &str,
+fn prepare_transaction_body(
     mut body: JsonValue,
     headers: &FlureeHeaders,
-    author: Option<&str>,
-) -> PreparedTransaction {
+) -> Result<PreparedTransaction> {
     inject_headers_into_txn(&mut body, headers);
 
-    let default_policy_class = state.config.data_auth().default_policy_class.clone();
-    crate::routes::policy_auth::apply_auth_identity_to_opts(
-        state,
-        ledger_id,
-        &mut body,
-        author,
-        default_policy_class.as_deref(),
-    )
-    .await;
+    crate::routes::policy_auth::apply_authorization_to_opts(&mut body, headers)?;
 
     let tracking = tracking_options_from_body(&body);
-    let governance = GovernanceOptions::from_json(&body).unwrap_or_default();
+    let governance =
+        GovernanceOptions::from_json(&body).map_err(|e| ServerError::bad_request(e.to_string()))?;
 
-    PreparedTransaction {
+    Ok(PreparedTransaction {
         body,
         tracking,
         governance,
-    }
+    })
 }
 
-/// Resolve the effective identity for a transaction.
-///
-/// Prefers the (possibly-impersonated) `opts.identity` so the commit records
-/// who the transaction was executed AS; falls back to the bearer-derived
-/// author. The original bearer identity that authorized the request is
-/// captured separately in the impersonation audit log emitted by
-/// `apply_auth_identity_to_opts` — commits stay attributable to the policy
-/// subject responsible for the data change, while the audit trail captures
-/// the operator who performed the action.
+/// Use the policy subject selected by verified authority for commit provenance,
+/// falling back to the authenticated author when no subject was selected.
 fn effective_did<'a>(
     governance: &'a GovernanceOptions,
     author: Option<&'a str>,
@@ -623,6 +606,12 @@ async fn update_local(
 
     // Extract credential (consumes the request body)
     let mut credential = MaybeCredential::extract(request).await?;
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.as_ref(),
+        &credential,
+    )?;
 
     // W3C SPARQL Protocol: rewrite form-encoded `update=...` to sparql-update
     maybe_rewrite_form_encoded_update(&mut credential);
@@ -781,6 +770,12 @@ async fn update_ledger_local(
         Err(e) => return Err(e),
     };
     let mut credential = MaybeCredential::extract(request).await?;
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.as_ref(),
+        &credential,
+    )?;
 
     // W3C SPARQL Protocol: rewrite form-encoded `update=...` to sparql-update
     maybe_rewrite_form_encoded_update(&mut credential);
@@ -931,6 +926,12 @@ async fn insert_local(
         Err(e) => return Err(e),
     };
     let credential = MaybeCredential::extract(request).await?;
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.as_ref(),
+        &credential,
+    )?;
 
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
 
@@ -1078,6 +1079,12 @@ async fn upsert_local(
         Err(e) => return Err(e),
     };
     let credential = MaybeCredential::extract(request).await?;
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.as_ref(),
+        &credential,
+    )?;
 
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
 
@@ -1235,6 +1242,12 @@ async fn sync_local(
     let query_params = extract_query_params(&request);
     let headers = FlureeHeaders::from_headers(request.headers())?;
     let credential = MaybeCredential::extract(request).await?;
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.as_ref(),
+        &credential,
+    )?;
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
 
     let span = create_request_span(
@@ -1296,14 +1309,7 @@ async fn sync_local(
             // state, inline shapes / unique properties), so a restricted
             // writer sees policy-filtered counts and a run that would fail
             // policy / SHACL / uniqueness fails here too.
-            let prepared = prepare_transaction_body(
-                &state,
-                &ledger_id,
-                body_json,
-                &headers,
-                author.as_deref(),
-            )
-            .await;
+            let prepared = prepare_transaction_body(body_json, &headers)?;
             let txn_opts = txn_opts_from_body(&prepared.body, &span)?;
             let handle = state
                 .fluree
@@ -1414,6 +1420,12 @@ async fn insert_ledger_local(
         Err(e) => return Err(e),
     };
     let credential = MaybeCredential::extract(request).await?;
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.as_ref(),
+        &credential,
+    )?;
 
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
 
@@ -1562,6 +1574,12 @@ async fn upsert_ledger_local(
         Err(e) => return Err(e),
     };
     let credential = MaybeCredential::extract(request).await?;
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.as_ref(),
+        &credential,
+    )?;
 
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
 
@@ -1772,8 +1790,7 @@ async fn execute_transaction(
         ));
     }
     let idempotency_key = extract_idempotency_key(&credential.headers)?;
-    let prepared_transaction =
-        prepare_transaction_body(state, ledger_id, body, headers, author).await;
+    let prepared_transaction = prepare_transaction_body(body, headers)?;
 
     let span = tracing::debug_span!(
         "transact_execute",
@@ -1905,7 +1922,7 @@ async fn execute_turtle_transaction(
     turtle: &str,
     credential: &MaybeCredential,
     headers: &FlureeHeaders,
-    author: Option<&str>,
+    _author: Option<&str>,
 ) -> Result<Response> {
     let is_trig = credential.is_trig();
 
@@ -1957,13 +1974,7 @@ async fn execute_turtle_transaction(
         // header-only path the SPARQL UPDATE route uses. The consensus layer
         // builds the PolicyContext from this governance against the staged
         // ledger state and enforces f:modify on the write.
-        let effective_identity = crate::routes::policy_auth::resolve_sparql_identity(
-            state,
-            ledger_id,
-            author,
-            headers.identity.as_deref(),
-        )
-        .await;
+        let effective_identity = headers.identity.clone();
 
         let policy_values_map = match headers.policy_values_map() {
             Ok(v) => v,
@@ -2046,16 +2057,9 @@ async fn execute_cypher_transact(
     let tx_id = compute_tx_id_sparql(body);
     let (cypher, params) = fluree_db_api::extract_cypher_envelope(body);
 
-    // Resolve the effective identity (impersonation-aware) and build policy
+    // Use the verified effective identity and build policy
     // options from headers, same as the SPARQL UPDATE path.
-    let bearer_identity = effective_author(credential, bearer);
-    let effective_identity = crate::routes::policy_auth::resolve_sparql_identity(
-        state,
-        ledger_id,
-        bearer_identity.as_deref(),
-        headers.identity.as_deref(),
-    )
-    .await;
+    let effective_identity = headers.identity.clone();
     let policy_values_map = headers.policy_values_map().inspect_err(|_| {
         set_span_error_code(span, "error:BadRequest");
     })?;
@@ -2287,18 +2291,8 @@ async fn execute_sparql_update_request(
         }
     };
 
-    // Resolve the effective identity honoring the root-impersonation semantic.
-    // For SPARQL UPDATE, impersonation is driven by the `fluree-identity`
-    // header (there is no body-level opts block); the remaining policy inputs
-    // come from the policy-class / policy / policy-values headers.
-    let bearer_identity = effective_author(credential, bearer);
-    let effective_identity = crate::routes::policy_auth::resolve_sparql_identity(
-        state,
-        &ledger_id,
-        bearer_identity.as_deref(),
-        headers.identity.as_deref(),
-    )
-    .await;
+    // Policy headers have already been bound to verified authorization.
+    let effective_identity = headers.identity.clone();
 
     let policy_values_map = match headers.policy_values_map() {
         Ok(v) => v,

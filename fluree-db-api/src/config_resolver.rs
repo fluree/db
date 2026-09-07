@@ -369,12 +369,15 @@ pub fn merge_policy_opts(
             "Query-time policy override denied by config override control — applying config defaults"
         );
 
-        // Config wins outright, including over an explicit request value.
-        if let Some(default_allow) = policy.default_allow {
-            merged.default_allow = Some(default_allow);
-        }
-        if let Some(ref classes) = policy.policy_class {
-            merged.policy_class = Some(classes.clone());
+        // Denying an override must clear *all* caller-selected grants, even
+        // fields for which config has no replacement. Inline required grants
+        // and policy-values can otherwise weaken the configured policy set.
+        merged.policy_class = policy.policy_class.clone();
+        merged.policy = None;
+        merged.policy_values = None;
+        merged.default_allow = policy.default_allow;
+        if !merged.has_any_policy_inputs() {
+            merged.policy = Some(serde_json::json!([]));
         }
         return merged;
     }
@@ -2679,6 +2682,45 @@ mod tests {
             merge_policy_opts(&resolved, &opts, None).default_allow,
             Some(false)
         );
+    }
+
+    #[test]
+    fn denied_override_clears_inline_classes_values_and_permissive_defaults() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:employee".into()),
+            policy_class: Some(vec!["ex:Manager".into()]),
+            policy: Some(serde_json::json!([{"f:required": true, "f:allow": true}])),
+            policy_values: Some(std::collections::HashMap::from([(
+                "?$identity".into(),
+                serde_json::json!({"@id": "did:key:manager"}),
+            )])),
+            default_allow: Some(true),
+        };
+        let merged = merge_policy_opts(&resolved, &opts, None);
+        assert_eq!(merged.identity, opts.identity);
+        assert!(
+            merged.policy_class.is_none()
+                && merged.policy.is_none()
+                && merged.policy_values.is_none()
+        );
+        assert!(!merged.effective_default_allow());
+        let anonymous = merge_policy_opts(
+            &resolved,
+            &GovernanceOptions {
+                default_allow: Some(true),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(anonymous.has_any_policy_inputs());
+        assert!(!anonymous.effective_default_allow());
     }
 
     // --- merge_reasoning ---

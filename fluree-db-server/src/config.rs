@@ -85,7 +85,9 @@ pub struct DataAuthConfig {
     pub audience: Option<String>,
     /// Trusted issuer did:key identifiers for Bearer tokens
     pub trusted_issuers: Vec<String>,
-    /// Default policy class IRI (optional). Applied when request does not specify one.
+    /// Verified issuers allowed to select policies via the signed fluree.policy claim.
+    pub policy_authorities: Vec<String>,
+    /// Default policy class IRI for authenticated requests without delegated policies.
     pub default_policy_class: Option<String>,
     /// DANGEROUS: Accept any valid signature regardless of issuer.
     /// Only for development/testing.
@@ -97,6 +99,10 @@ pub struct DataAuthConfig {
 impl DataAuthConfig {
     /// Validate configuration at startup
     pub fn validate(&self) -> Result<(), String> {
+        if !self.policy_authorities.is_empty() && self.audience.as_deref().is_none_or(str::is_empty)
+        {
+            return Err("data policy authorities require --data-auth-audience".to_string());
+        }
         if self.mode == DataAuthMode::Required
             && self.trusted_issuers.is_empty()
             && !self.has_jwks_issuers
@@ -620,6 +626,14 @@ pub struct ServerConfig {
     )]
     pub data_auth_trusted_issuers: Vec<String>,
 
+    /// Issuer allowed to select policies in signed fluree.policy claims (repeatable).
+    /// Also requires ordinary issuer trust and --data-auth-audience.
+    #[arg(
+        long = "data-auth-policy-authority",
+        env = "FLUREE_DATA_AUTH_POLICY_AUTHORITIES"
+    )]
+    pub data_auth_policy_authorities: Vec<String>,
+
     /// Default policy class IRI for data API requests (optional)
     #[arg(long, env = "FLUREE_DATA_AUTH_DEFAULT_POLICY_CLASS")]
     pub data_auth_default_policy_class: Option<String>,
@@ -908,6 +922,7 @@ impl Default for ServerConfig {
             data_auth_mode: DataAuthMode::None,
             data_auth_audience: None,
             data_auth_trusted_issuers: Vec::new(),
+            data_auth_policy_authorities: Vec::new(),
             data_auth_default_policy_class: None,
             data_auth_insecure_accept_any_issuer: false,
             // JWKS defaults
@@ -1011,6 +1026,7 @@ impl ServerConfig {
             mode: self.data_auth_mode,
             audience: self.data_auth_audience.clone(),
             trusted_issuers: self.data_auth_trusted_issuers.clone(),
+            policy_authorities: self.data_auth_policy_authorities.clone(),
             default_policy_class: self.data_auth_default_policy_class.clone(),
             insecure_accept_any_issuer: self.data_auth_insecure_accept_any_issuer,
             has_jwks_issuers: self.has_jwks_issuers(),
@@ -1439,5 +1455,24 @@ mod gc_retention_flag_tests {
             env_of("gc_hard_max_old_indexes").as_deref(),
             Some("FLUREE_GC_HARD_MAX_OLD_INDEXES")
         );
+    }
+}
+
+#[cfg(test)]
+mod policy_authority_tests {
+    use super::*;
+
+    #[test]
+    fn policy_authorities_require_an_audience_even_with_development_issuer_trust() {
+        let mut config = DataAuthConfig {
+            policy_authorities: vec!["did:key:gateway".into()],
+            insecure_accept_any_issuer: true,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        config.audience = Some(String::new());
+        assert!(config.validate().is_err());
+        config.audience = Some("production-data".into());
+        assert!(config.validate().is_ok());
     }
 }

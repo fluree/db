@@ -60,12 +60,29 @@ fn create_jws(claims: &JsonValue, signing_key: &SigningKey) -> String {
 fn identity_token(signing_key: &SigningKey, identity: &str, ledger: &str) -> String {
     let claims = serde_json::json!({
         "iss": did_from_pubkey(&signing_key.verifying_key().to_bytes()),
+        "aud": "fluree-policy-test",
         "exp": now_secs() + 3600,
         "iat": now_secs(),
         "fluree.identity": identity,
         "fluree.ledger.read.ledgers": [ledger],
     });
     create_jws(&claims, signing_key)
+}
+
+fn delegated_token(identity: &str, ledger: &str, policy: JsonValue) -> String {
+    let key = SigningKey::from_bytes(&[200; 32]);
+    create_jws(
+        &serde_json::json!({
+            "iss": did_from_pubkey(&key.verifying_key().to_bytes()),
+            "aud": "fluree-policy-test",
+            "exp": now_secs() + 300,
+            "fluree.identity": identity,
+            "fluree.ledger.read.ledgers": [ledger],
+            "fluree.ledger.write.ledgers": [ledger],
+            "fluree.policy": policy,
+        }),
+        &key,
+    )
 }
 
 async fn policy_test_state() -> (TempDir, Arc<AppState>) {
@@ -76,6 +93,12 @@ async fn policy_test_state() -> (TempDir, Arc<AppState>) {
         storage_path: Some(tmp.path().to_path_buf()),
         data_auth_mode: DataAuthMode::Optional,
         data_auth_insecure_accept_any_issuer: true,
+        data_auth_audience: Some("fluree-policy-test".into()),
+        data_auth_policy_authorities: vec![did_from_pubkey(
+            &SigningKey::from_bytes(&[200; 32])
+                .verifying_key()
+                .to_bytes(),
+        )],
         ..Default::default()
     };
     let telemetry = TelemetryConfig::with_server_config(&cfg);
@@ -245,7 +268,7 @@ async fn setup_policy_ledger(app: axum::Router, ledger: &str) -> axum::Router {
 ///
 /// The query selects `?name` and `?class` for all `ex:Document` subjects.
 /// `default-allow` is controlled by the caller. No `opts.identity` — the
-/// server injects it from the Bearer token via `force_query_auth_opts`.
+/// server binds it from the verified Bearer token.
 async fn query_docs(
     app: axum::Router,
     ledger: &str,
@@ -414,18 +437,9 @@ async fn identity_without_policy_class_default_allow_false_denies_all() {
     );
 }
 
-/// An identity with no subject node in the ledger must be allowed when
-/// `default-allow: true` is set.
-///
-/// Rationale: `default-allow: true` is an explicit admin opt-in that applies to
-/// every requester not specifically restricted by a policy — including unknown
-/// identities. A common pattern is an application layer in front of the DB that
-/// handles authorization itself and uses credential-signed writes only so that
-/// Fluree records *who* transacted for provenance. In that setup a first-time DID
-/// must be able to transact without being pre-provisioned, and reads must follow
-/// the same opt-in. Callers who want fail-closed behavior set `default-allow: false`.
+/// Caller default-allow cannot give an unknown authenticated identity access.
 #[tokio::test]
-async fn unknown_identity_allowed_with_default_allow_true() {
+async fn unknown_identity_cannot_choose_default_allow_true() {
     let (_tmp, state) = policy_test_state().await;
     let app = setup_policy_ledger(build_router(state), "policy5:main").await;
 
@@ -442,7 +456,7 @@ async fn unknown_identity_allowed_with_default_allow_true() {
     let names = names_from_results(&json);
     assert_eq!(
         names.len(),
-        3,
+        0,
         "unknown identity + default-allow:true must see all documents; got: {names:?}"
     );
 }
@@ -582,19 +596,9 @@ async fn property_level_deny_hides_ex_content_field() {
     );
 }
 
-/// A **known** identity subject (exists in the ledger) with no `f:policyClass` and
-/// `default-allow: true` should see all documents.
-///
-/// This validates the `FoundNoPolicies` path: the identity subject node is present in the
-/// ledger (so it is not `NotFound`), but it carries no policy class binding. With no
-/// restrictions and `default_allow = true`, access is granted to everything.
-///
-/// Contrast with `unknown_identity_allowed_with_default_allow_true` which uses an
-/// identity that has NO subject node at all (`NotFound`) — that path also now honors
-/// `default_allow`, so both tests succeed for the same reason: empty restrictions +
-/// permissive default.
+/// A local identity record with no policies does not confer delegation authority.
 #[tokio::test]
-async fn known_identity_no_policy_class_default_allow_true_allows_all() {
+async fn unassigned_identity_cannot_choose_default_allow_true() {
     let (_tmp, state) = policy_test_state().await;
     let app = setup_policy_ledger(build_router(state), "policy7:main").await;
 
@@ -630,21 +634,12 @@ async fn known_identity_no_policy_class_default_allow_true_allows_all() {
     let names = names_from_results(&json);
     assert_eq!(
         names.len(),
-        3,
-        "known identity with no policyClass + default-allow:true must see all 3 docs; got: {names:?}"
+        0,
+        "known identity with no policyClass + default-allow:true cannot grant itself access; got: {names:?}"
     );
 }
 
-// ── Root-bearer impersonation tests ──────────────────────────────────────────
-//
-// These exercise the "service-account impersonation" pattern: a bearer
-// identity that has no `f:policyClass` on the target ledger may delegate to a
-// body- or header-supplied target identity for policy testing. The check is
-// performed via `fluree_db_api::identity_has_no_policies` — only the
-// `FoundNoPolicies` outcome enables impersonation.
-
-/// Insert a registered identity subject with no `f:policyClass` so it qualifies
-/// as a root-equivalent (FoundNoPolicies) identity for impersonation.
+/// Register an identity without policy assignments to exercise delegation boundaries.
 async fn register_root_identity(app: &axum::Router, ledger: &str, identity_iri: &str) {
     let tx = serde_json::json!({
         "@context": { "ex": "http://example.org/" },
@@ -669,8 +664,8 @@ async fn register_root_identity(app: &axum::Router, ledger: &str, identity_iri: 
     );
 }
 
-/// Query as `bearer_identity`, requesting impersonation as `target_identity`
-/// via body `opts.identity`. Server should honor when bearer is root.
+/// Query with a bearer token and a conflicting body `opts.identity`.
+/// The verified token's policy selection must govern the result.
 async fn query_docs_as(
     app: axum::Router,
     ledger: &str,
@@ -705,16 +700,19 @@ async fn query_docs_as(
     json_body(resp).await
 }
 
-/// A root bearer (no f:policyClass) can impersonate the employee identity and
-/// receives the employee's filtered view (public + internal docs only).
+/// An explicitly trusted issuer can select employee classes for an app identity.
+/// Conflicting request identity is ignored.
 #[tokio::test]
-async fn root_bearer_can_impersonate_employee_via_body_opts() {
+async fn policy_authority_can_delegate_employee_access() {
     let (_tmp, state) = policy_test_state().await;
     let app = setup_policy_ledger(build_router(state), "imp1:main").await;
     register_root_identity(&app, "imp1:main", "http://example.org/svc-bearer").await;
 
-    let signing_key = SigningKey::from_bytes(&[10u8; 32]);
-    let token = identity_token(&signing_key, "http://example.org/svc-bearer", "imp1:main");
+    let token = delegated_token(
+        "http://example.org/svc-bearer",
+        "imp1:main",
+        serde_json::json!({"policy-class": ["http://example.org/EmployeeClass"]}),
+    );
 
     let (status, json) =
         query_docs_as(app, "imp1:main", &token, "http://example.org/employee-user").await;
@@ -724,7 +722,7 @@ async fn root_bearer_can_impersonate_employee_via_body_opts() {
     assert_eq!(
         names.len(),
         2,
-        "impersonating employee should see exactly 2 docs; got: {names:?}"
+        "delegated employee access should see exactly 2 docs; got: {names:?}"
     );
     assert!(names.contains(&"Public Post"));
     assert!(names.contains(&"Internal Memo"));
@@ -760,19 +758,17 @@ async fn restricted_bearer_cannot_impersonate_manager() {
     assert!(!names.contains(&"Executive Salaries"));
 }
 
-/// Root bearer impersonates via the `fluree-identity` HTTP header on a SPARQL
-/// query; result set matches the impersonated identity's policy.
+/// Signed selection also governs SPARQL, regardless of caller identity headers.
 #[tokio::test]
-async fn root_bearer_can_impersonate_via_sparql_header() {
+async fn policy_authority_can_delegate_sparql_access() {
     let (_tmp, state) = policy_test_state().await;
     let app = setup_policy_ledger(build_router(state), "imp3:main").await;
     register_root_identity(&app, "imp3:main", "http://example.org/svc-bearer-sparql").await;
 
-    let signing_key = SigningKey::from_bytes(&[12u8; 32]);
-    let token = identity_token(
-        &signing_key,
+    let token = delegated_token(
         "http://example.org/svc-bearer-sparql",
         "imp3:main",
+        serde_json::json!({"policy-class": ["http://example.org/PublicClass"]}),
     );
 
     let sparql = "PREFIX ex: <http://example.org/> \
@@ -808,7 +804,7 @@ async fn root_bearer_can_impersonate_via_sparql_header() {
     assert_eq!(
         names.len(),
         1,
-        "impersonated public-user should see 1 doc via SPARQL; got: {names:?}"
+        "delegated public access should see 1 doc via SPARQL; got: {names:?}"
     );
     assert_eq!(names[0], "Public Post");
 }
@@ -897,21 +893,12 @@ fn jsonld_select_names(json: &JsonValue) -> Vec<&str> {
         .collect()
 }
 
-/// Helper: build a root bearer token (identity has no f:policyClass on the
-/// ledger, so it qualifies for the impersonation gate when needed).
-async fn root_bearer(app: &axum::Router, ledger: &str, key_byte: u8, identity: &str) -> String {
-    register_root_identity(app, ledger, identity).await;
-    let signing_key = SigningKey::from_bytes(&[key_byte; 32]);
-    identity_token(&signing_key, identity, ledger)
-}
-
 /// Inline JSON-LD policy supplied via `opts.policy` filters results to public
 /// documents only — verifies the `--policy` flag's body-opts transport.
 #[tokio::test]
 async fn inline_policy_via_body_opts_filters_to_public() {
     let (_tmp, state) = policy_test_state().await;
     let app = setup_policy_ledger(build_router(state), "inline1:main").await;
-    let token = root_bearer(&app, "inline1:main", 20, "http://example.org/inline-svc").await;
 
     // Inline policy: only documents with classification = "public" are visible.
     let inline_policy = serde_json::json!([
@@ -938,6 +925,12 @@ async fn inline_policy_via_body_opts_filters_to_public() {
             {"@id": "?doc", "schema:name": "?name"}
         ]
     });
+
+    let token = delegated_token(
+        "http://example.org/inline-svc",
+        "inline1:main",
+        body["opts"].clone(),
+    );
 
     let req = Request::builder()
         .method("POST")
@@ -1237,14 +1230,12 @@ async fn comma_separated_policy_class_header() {
 // ── Write-policy enforcement tests ───────────────────────────────────────────
 //
 // These validate the end-to-end policy path for transactions:
-//   bearer identity → `apply_auth_identity_to_opts`
-//   → `fluree_db_api::build_policy_context`
-//   → `TxBuilder.policy(ctx)` → `Fluree::transact_tracked_with_policy`
+//   verified bearer → authorization binding → consensus governance
+//   → `fluree_db_api::build_transact_policy_context` → policy-enforced commit
 //
-// Covers JSON-LD `/v1/fluree/update`, SPARQL UPDATE, and the impersonation
-// gate's behavior on writes. The setup installs a required `f:modify` gate on
-// the employee class (denies modifying `ex:content` unless the target doc's
-// classification is "internal") and a blanket `f:allow: true` modify policy on
+// Covers JSON-LD `/v1/fluree/update`, SPARQL UPDATE, and explicit delegation
+// on writes. The setup denies employee modifications to `ex:content`
+// and installs a blanket `f:allow: true` modify policy on
 // the manager class, so both the denial and the allow paths exercise real
 // policy evaluation rather than a no-policy fallthrough.
 
@@ -1252,6 +1243,7 @@ async fn comma_separated_policy_class_header() {
 fn identity_token_rw(signing_key: &SigningKey, identity: &str, ledger: &str) -> String {
     let claims = serde_json::json!({
         "iss": did_from_pubkey(&signing_key.verifying_key().to_bytes()),
+        "aud": "fluree-policy-test",
         "exp": now_secs() + 3600,
         "iat": now_secs(),
         "fluree.identity": identity,
@@ -1400,19 +1392,19 @@ async fn manager_bearer_update_allowed() {
     );
 }
 
-/// A root bearer (no `f:policyClass`) impersonating the employee identity via
-/// `opts.identity` is rejected. Policy enforcement follows the impersonated
-/// identity, not the bearer's own unrestricted service-account identity —
-/// impersonation doesn't bypass policy, it tests under the target's view.
+/// Grant-derived employee classes enforce modify restrictions on the write path.
 #[tokio::test]
-async fn root_bearer_impersonating_employee_update_denied() {
+async fn delegated_employee_write_enforces_modify_policy() {
     let (_tmp, state) = policy_test_state().await;
     let app = setup_policy_ledger(build_router(state), "wpol3:main").await;
     add_modify_policies(&app, "wpol3:main").await;
     register_root_identity(&app, "wpol3:main", "http://example.org/svc-writer").await;
 
-    let signing_key = SigningKey::from_bytes(&[32u8; 32]);
-    let token = identity_token_rw(&signing_key, "http://example.org/svc-writer", "wpol3:main");
+    let token = delegated_token(
+        "http://example.org/svc-writer",
+        "wpol3:main",
+        serde_json::json!({"policy-class": ["http://example.org/EmployeeClass"]}),
+    );
 
     let mut body = modify_public_doc_content_body();
     body.as_object_mut().unwrap().insert(
@@ -1435,7 +1427,7 @@ async fn root_bearer_impersonating_employee_update_denied() {
     assert_eq!(
         status,
         StatusCode::BAD_REQUEST,
-        "impersonated employee write must be rejected; got body: {json}"
+        "delegated employee write must be rejected; got body: {json}"
     );
     let err_msg = json
         .get("error")
@@ -2024,7 +2016,7 @@ async fn query_docs_tri_state(
 /// identity the server injects from the Bearer token.
 ///
 /// This is the seam the API-layer tests can't reach — `FlureeHeaders`, the
-/// header→opts injection, and `force_query_auth_opts` all sit between the wire
+/// header→opts injection, and authorization binding all sit between the wire
 /// and `merge_policy_opts`. Before the tri-state change this returned `[]`.
 #[tokio::test]
 async fn config_default_allow_true_applies_to_bearer_identity_over_http() {
@@ -2192,3 +2184,6 @@ async fn enforcement_signal_follows_configured_default_allow() {
         "no policies and no permissive default: no data flake could return; got: {json}"
     );
 }
+
+#[path = "policy_authorization_regression.rs"]
+mod policy_authorization_regression;

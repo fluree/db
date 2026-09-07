@@ -61,17 +61,12 @@ const CODE_TOKEN_EXPIRED: &str = "Neo.ClientError.Security.TokenExpired";
 /// `principal: None` is an anonymous session (allowed outside Required
 /// mode, mirroring the HTTP extractor); scope checks then allow all.
 struct SessionAuth {
-    /// Policy identity (`fluree.identity ?? sub`) for governance wiring.
-    identity: Option<String>,
     principal: Option<DataPrincipal>,
 }
 
 impl SessionAuth {
     fn anonymous() -> Self {
-        Self {
-            identity: None,
-            principal: None,
-        }
+        Self { principal: None }
     }
 
     /// Bolt sessions outlive the login-time `exp` validation; statements
@@ -94,15 +89,13 @@ impl SessionAuth {
             .is_none_or(|p| p.can_write(ledger_id))
     }
 
-    /// Governance for statements in this session. Bolt has no header
-    /// channel for policy knobs (policy-class, default-allow) by design:
-    /// policy derives entirely from the identity's in-ledger bindings
-    /// (plus the ledger's `#config` defaults, merged downstream).
+    /// Reuse the login-time verified policy selection; statements cannot supply
+    /// policy options. Ledger/action scope and expiry are checked per statement.
     fn governance(&self) -> fluree_db_api::GovernanceOptions {
-        fluree_db_api::GovernanceOptions {
-            identity: self.identity.clone(),
-            ..Default::default()
-        }
+        self.principal
+            .as_ref()
+            .map(|p| p.policy_authorization.options().clone())
+            .unwrap_or_default()
     }
 }
 
@@ -376,7 +369,6 @@ async fn authenticate(state: &AppState, auth: &AuthRequest) -> Result<SessionAut
         .await
         .map_err(|e| RunFailure::new(CODE_UNAUTHORIZED, e.to_string()))?;
     Ok(SessionAuth {
-        identity: principal.identity.clone(),
         principal: Some(principal),
     })
 }

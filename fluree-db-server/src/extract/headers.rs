@@ -32,6 +32,9 @@ pub struct FlureeHeaders {
     /// Raw HTTP headers (for telemetry/tracing)
     pub raw: HeaderMap,
 
+    /// Host-verified policy selection. Never populated by HTTP header parsing.
+    pub policy_authorization: Option<fluree_db_api::PolicyAuthorization>,
+
     /// Ledger alias from header (lower precedence than path)
     pub ledger: Option<String>,
 
@@ -86,6 +89,7 @@ impl Default for FlureeHeaders {
     fn default() -> Self {
         Self {
             raw: HeaderMap::new(),
+            policy_authorization: None,
             ledger: None,
             identity: None,
             policy: None,

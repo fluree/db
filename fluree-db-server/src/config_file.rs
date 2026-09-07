@@ -177,6 +177,7 @@ pub struct AuthEndpointFileConfig {
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct DataAuthFileConfig {
+    pub policy_authorities: Option<Vec<String>>,
     pub mode: Option<String>,
     pub audience: Option<String>,
     pub trusted_issuers: Option<Vec<String>>,
@@ -459,6 +460,7 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "data_auth_mode",
     "data_auth_audience",
     "data_auth_trusted_issuers",
+    "data_auth_policy_authorities",
     "data_auth_default_policy_class",
     "admin_auth_mode",
     "admin_auth_trusted_issuers",
@@ -688,6 +690,11 @@ pub fn apply_to_server_config(
             if is_default("data_auth_trusted_issuers") {
                 if let Some(ref v) = data.trusted_issuers {
                     config.data_auth_trusted_issuers = v.clone();
+                }
+            }
+            if is_default("data_auth_policy_authorities") {
+                if let Some(ref v) = data.policy_authorities {
+                    config.data_auth_policy_authorities = v.clone();
                 }
             }
             if is_default("data_auth_default_policy_class") {

@@ -82,6 +82,17 @@ async fn push_ledger_local(
         governance.policy_class = Some(headers.policy_class.clone());
     }
 
+    // Push has no signed body credential. Its verified bearer selects policy;
+    // inline/header grants cannot replace it, just as on ordinary writes.
+    if let Some(principal) = &bearer {
+        governance = principal
+            .policy_authorization
+            .constrain_options(&GovernanceOptions {
+                default_allow: headers.default_allow,
+                ..Default::default()
+            });
+    }
+
     let idempotency_key = extract_idempotency_key(&headers.raw)?;
 
     let bytes = axum::body::to_bytes(request.into_body(), 50 * 1024 * 1024)

@@ -637,3 +637,122 @@ async fn jsonld_ask_and_where_together_fails_closed() {
         }
     }
 }
+
+/// Every terminal applies the trusted selection after untrusted JSON/source
+/// options. A positive public-property query prevents deny-all false positives.
+#[tokio::test]
+async fn trusted_authorization_binds_all_builder_terminals() {
+    use fluree_db_api::{GovernanceOptions, PolicyAuthorization};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = "policy/trusted:main";
+    seed_people_with_ssn(&fluree, ledger).await;
+    let authorization = PolicyAuthorization::from_trusted_options(GovernanceOptions {
+        policy: Some(json!([{
+            "f:required": true, "f:action": "f:view", "f:allow": false,
+            "f:onProperty": [{"@id": "http://schema.org/ssn"}]
+        }])),
+        default_allow: Some(true),
+        ..Default::default()
+    });
+    let query = json!({
+        "from": {"@id": ledger, "policy": {"default-allow": true}},
+        "opts": {"policy": [{"f:required": true, "f:allow": true}], "default-allow": true},
+        "select": ["?value"],
+        "where": {"@id": "?s", "http://schema.org/ssn": "?value"}
+    });
+    assert_eq!(
+        fluree
+            .query_from()
+            .jsonld(&query)
+            .authorization(&authorization)
+            .execute_formatted()
+            .await
+            .unwrap(),
+        json!([])
+    );
+    let text = fluree
+        .query_from()
+        .authorization(&authorization)
+        .jsonld(&query)
+        .execute_formatted_string()
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        json!([])
+    );
+    let tracked = fluree
+        .query_from()
+        .jsonld(&query)
+        .authorization(&authorization)
+        .execute_tracked()
+        .await
+        .unwrap();
+    assert_eq!(tracked.result, json!([]));
+    let raw = fluree
+        .query_from()
+        .jsonld(&query)
+        .authorization(&authorization)
+        .execute()
+        .await
+        .unwrap();
+    let loaded = fluree.ledger(ledger).await.unwrap();
+    assert_eq!(raw.to_jsonld(&loaded.snapshot).unwrap(), json!([]));
+    let mut public = query.clone();
+    public["where"] = json!({"@id": "?s", "http://schema.org/name": "?value"});
+    assert!(!fluree
+        .query_from()
+        .jsonld(&public)
+        .authorization(&authorization)
+        .execute_formatted()
+        .await
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let sparql =
+        format!("SELECT ?value FROM <{ledger}> WHERE {{ ?s <http://schema.org/ssn> ?value }}");
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .authorization(&authorization)
+        .connection_opts(GovernanceOptions {
+            default_allow: Some(true),
+            ..Default::default()
+        })
+        .execute_formatted()
+        .await
+        .unwrap();
+    assert_eq!(result.pointer("/results/bindings").unwrap(), &json!([]));
+    let deny = PolicyAuthorization::from_trusted_options(GovernanceOptions::default());
+    assert_eq!(
+        fluree
+            .query_from()
+            .jsonld(&public)
+            .authorization(&deny)
+            .execute_formatted()
+            .await
+            .unwrap(),
+        json!([])
+    );
+    assert!(fluree
+        .query_from()
+        .jsonld(&query)
+        .authorization(&authorization)
+        .policy(fluree_db_api::PolicyContext::new(
+            fluree_db_api::PolicyWrapper::root(),
+            None
+        ))
+        .validate()
+        .is_err());
+    assert!(fluree
+        .query_from()
+        .jsonld(&query)
+        .policy(fluree_db_api::PolicyContext::new(
+            fluree_db_api::PolicyWrapper::root(),
+            None
+        ))
+        .authorization(&authorization)
+        .validate()
+        .is_err());
+}

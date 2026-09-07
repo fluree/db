@@ -547,6 +547,7 @@ Protect query/transaction endpoints (including `/v1/fluree/query/{ledger...}`,
 | `--data-auth-mode`                 | `FLUREE_DATA_AUTH_MODE`                 | `none`  |
 | `--data-auth-audience`             | `FLUREE_DATA_AUTH_AUDIENCE`             | None    |
 | `--data-auth-trusted-issuer`       | `FLUREE_DATA_AUTH_TRUSTED_ISSUERS`      | None    |
+| `--data-auth-policy-authority`     | `FLUREE_DATA_AUTH_POLICY_AUTHORITIES`  | None    |
 | `--data-auth-default-policy-class` | `FLUREE_DATA_AUTH_DEFAULT_POLICY_CLASS` | None    |
 
 Modes:
@@ -561,6 +562,12 @@ Bearer token scopes:
 - **Write**: `fluree.ledger.write.all=true` or `fluree.ledger.write.ledgers=[...]`
 
 Back-compat: `fluree.storage.*` claims imply **read** scope for data endpoints.
+
+Application gateways may select policies through the signed `fluree.policy`
+claim only when the verified issuer is also a configured policy authority.
+This repeatable setting requires a nonempty data-auth audience; it does not
+replace ordinary issuer trust. See [Trusted policy authorization](../security/policy-authorization.md)
+for the TOML configuration, claim format, and embedded SDK equivalent.
 
 ```bash
 fluree-server \

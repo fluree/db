@@ -43,6 +43,8 @@ pub struct DataPrincipal {
     /// redundant there; long-lived transports (Bolt sessions) re-check it
     /// before each statement.
     pub expires_unix: u64,
+    /// Policy selection constructed from verified claims and server configuration.
+    pub policy_authorization: fluree_db_api::PolicyAuthorization,
 }
 
 impl DataPrincipal {
@@ -160,12 +162,48 @@ pub(crate) async fn verify_data_principal(
         return Err(ServerError::unauthorized("token authorizes no resources"));
     }
 
-    Ok(build_principal(&payload))
+    let options = if let Some(policy) = &payload.fluree_policy {
+        if !config.policy_authorities.contains(&issuer)
+            || config.audience.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(ServerError::unauthorized(
+                "Issuer is not a configured policy authority",
+            ));
+        }
+        fluree_db_api::GovernanceOptions {
+            identity: payload.resolve_identity(),
+            policy_class: policy.policy_class.clone(),
+            policy: policy.policy.clone(),
+            policy_values: policy.policy_values.clone(),
+            default_allow: policy.default_allow,
+        }
+    } else {
+        // A trusted issuer can issue a scope-only service credential (no
+        // identity or policy class). Preserve that explicit coarse-access
+        // contract; it still cannot select arbitrary policies via request
+        // options, and mandatory ledger configuration remains authoritative.
+        let scope_only =
+            payload.resolve_identity().is_none() && config.default_policy_class.is_none();
+        fluree_db_api::GovernanceOptions {
+            identity: payload.resolve_identity(),
+            policy_class: config.default_policy_class.map(|c| vec![c]),
+            default_allow: scope_only.then_some(true),
+            ..Default::default()
+        }
+    };
+    Ok(build_principal(
+        &payload,
+        fluree_db_api::PolicyAuthorization::from_trusted_options(options),
+    ))
 }
 
 /// Build a `DataPrincipal` from verified claims.
-fn build_principal(payload: &EventsTokenPayload) -> DataPrincipal {
+fn build_principal(
+    payload: &EventsTokenPayload,
+    policy_authorization: fluree_db_api::PolicyAuthorization,
+) -> DataPrincipal {
     DataPrincipal {
+        policy_authorization,
         issuer: payload.iss.clone(),
         subject: payload.sub.clone(),
         identity: payload.resolve_identity(),

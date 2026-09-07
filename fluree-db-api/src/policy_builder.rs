@@ -507,21 +507,12 @@ async fn build_policy_context_from_opts_inner(
     Ok(PolicyContext::new(wrapper, identity_sid))
 }
 
-/// Returns `true` iff `identity_iri` exists as a subject in the ledger but has
-/// **no** `f:policyClass` assignments — meaning no policy restrictions apply to
-/// that identity.
+/// Returns `true` iff `identity_iri` exists as a subject in the default policy
+/// graph but has no `f:policyClass` assignments there.
 ///
-/// This is the predicate used to decide whether a bearer-authenticated identity
-/// may impersonate another identity via `opts.identity` for policy testing.
-/// The semantics are:
-///
-/// - `FoundNoPolicies` → `true`: the identity is known and unrestricted, so it
-///   may delegate / impersonate.
-/// - `FoundWithPolicies` → `false`: the identity is itself policy-constrained
-///   and must not be allowed to bypass its own constraints by acting as another
-///   identity.
-/// - `NotFound` → `false`: an unknown identity must not gain impersonation
-///   rights regardless of `default_allow`.
+/// This describes local assignments only. It does not prove unrestricted
+/// access or confer authority to impersonate: configured/model policies and
+/// default-deny may still apply. Hosts must establish delegation separately.
 pub async fn identity_has_no_policies(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
@@ -555,9 +546,8 @@ pub async fn identity_has_no_policies(
 /// carries restrictions. `default_allow` governs access in all three cases — the
 /// "not found" / "found-no-policies" distinction is about SID availability, not gating.
 ///
-/// A separate predicate, [`identity_has_no_policies`], uses this enum to gate
-/// impersonation (only `FoundNoPolicies` qualifies); that gate is orthogonal to
-/// `default_allow`.
+/// [`identity_has_no_policies`] exposes the local-assignment distinction for
+/// inspection. It is not an authorization or delegation check.
 enum IdentityLookupResult {
     /// The identity IRI cannot be resolved (unregistered namespace) or has no subject
     /// node in this ledger. No identity SID is available to bind `?$identity`.

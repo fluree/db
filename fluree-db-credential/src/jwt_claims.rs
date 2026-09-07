@@ -93,6 +93,39 @@ pub struct EventsTokenPayload {
     /// Identity for policy resolution
     #[serde(rename = "fluree.identity")]
     pub fluree_identity: Option<String>,
+
+    /// Application-selected policies. This claim conveys authority only when
+    /// the receiving server explicitly trusts the verified issuer to select
+    /// policies. Ledger/action scopes, audience and expiry still apply.
+    #[serde(
+        rename = "fluree.policy",
+        default,
+        deserialize_with = "deserialize_delegated_policy"
+    )]
+    pub fluree_policy: Option<DelegatedPolicy>,
+}
+
+/// Signed policy selection for a trusted application gateway.
+/// Identity comes from `fluree.identity` / `sub`; this selection applies uniformly
+/// to the token's authorized ledger/action scopes. Unknown fields are rejected.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct DelegatedPolicy {
+    pub policy_class: Option<Vec<String>>,
+    pub policy: Option<serde_json::Value>,
+    pub policy_values: Option<std::collections::HashMap<String, serde_json::Value>>,
+    pub default_allow: Option<bool>,
+}
+
+// Missing means ordinary authentication; a present null/malformed context must
+// not silently fall back to a scope-only service credential.
+fn deserialize_delegated_policy<'de, D>(
+    deserializer: D,
+) -> Result<Option<DelegatedPolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    DelegatedPolicy::deserialize(deserializer).map(Some)
 }
 
 /// Error type for JWT claims validation
@@ -414,6 +447,7 @@ mod tests {
             ledger_write_all: None,
             ledger_write_ledgers: None,
             fluree_identity: None,
+            fluree_policy: None,
         }
     }
 
@@ -789,6 +823,7 @@ mod tests {
             ledger_write_all: None,
             ledger_write_ledgers: None,
             fluree_identity: Some("did:key:z6MkTest".to_string()),
+            fluree_policy: None,
         }
     }
 
