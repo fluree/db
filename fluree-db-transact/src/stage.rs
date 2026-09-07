@@ -2839,14 +2839,45 @@ fn lower_where_patterns(
         .map_err(|e| TransactError::Parse(format!("WHERE pattern lowering: {e}")))
 }
 
-/// Generate a unique transaction ID for blank node skolemization
+/// Process-scoped blank-node identity allocator. The random ULID namespace
+/// provides probabilistic separation of independently started processes; the
+/// counter guarantees uniqueness within this process even when requests arrive
+/// on the same clock tick or time moves back. Forking/cloning initialized process
+/// state does not create a new namespace.
+struct TxnIdGenerator {
+    namespace: u128,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl TxnIdGenerator {
+    const fn new(namespace: u128) -> Self {
+        Self {
+            namespace,
+            next: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn generate(&self) -> String {
+        use std::sync::atomic::Ordering;
+
+        // Relaxed suffices: only allocation uniqueness is shared. Never wrap
+        // the counter and silently reuse a previously committed identity.
+        let sequence = self
+            .next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .expect("transaction identity counter exhausted");
+        format!("{:032x}{sequence:016x}", self.namespace)
+    }
+}
+
+/// Generate an opaque unique transaction ID for blank node skolemization.
+/// The surrounding `fdb-{txn_id}-{solution}-{label}` format is unchanged.
 pub fn generate_txn_id() -> String {
-    use fluree_db_core::clock::SystemTime;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{now:x}")
+    // The existing ULID dependency uses web-time and JS randomness on wasm.
+    // Generate entropy once, outside the per-transaction allocation path.
+    static GENERATOR: once_cell::sync::Lazy<TxnIdGenerator> =
+        once_cell::sync::Lazy::new(|| TxnIdGenerator::new(ulid::Ulid::new().into()));
+    GENERATOR.generate()
 }
 
 /// Convert a Binding to a (FlakeValue, datatype Sid) pair for flake generation
@@ -3673,6 +3704,62 @@ mod tests {
     use fluree_db_core::{FlakeValue, LedgerSnapshot, MemoryStorage, Sid};
     use fluree_db_novelty::Novelty;
     use fluree_db_query::parse::{UnresolvedTerm, UnresolvedTriplePattern};
+
+    #[test]
+    fn txn_id_generator_unique_with_fixed_namespace() {
+        // No advancing clock or random source is needed between calls. The
+        // old timestamp-only allocator merged requests on a shared clock tick.
+        let generator = TxnIdGenerator::new(0x1234);
+        let ids: HashSet<_> = (0..4096).map(|_| generator.generate()).collect();
+        assert_eq!(ids.len(), 4096);
+        assert!(ids
+            .iter()
+            .all(|id| id.len() == 48 && id.bytes().all(|b| b.is_ascii_hexdigit())));
+    }
+
+    #[test]
+    fn txn_id_generator_unique_across_namespaces() {
+        // Model independently seeded process lifetimes whose counters overlap.
+        let first = TxnIdGenerator::new(0x1234);
+        let second = TxnIdGenerator::new(0x5678);
+        let ids: HashSet<_> = (0..1024)
+            .flat_map(|_| [first.generate(), second.generate()])
+            .collect();
+        assert_eq!(ids.len(), 2048);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn txn_id_generator_unique_under_concurrency() {
+        let generator = Arc::new(TxnIdGenerator::new(0x1234));
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let generator = Arc::clone(&generator);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    (0..1024).map(|_| generator.generate()).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let ids: HashSet<_> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().expect("identity worker panicked"))
+            .collect();
+        assert_eq!(ids.len(), 8192);
+    }
+
+    #[test]
+    #[should_panic(expected = "transaction identity counter exhausted")]
+    fn txn_id_generator_does_not_wrap() {
+        let generator = TxnIdGenerator {
+            namespace: 0x1234,
+            next: std::sync::atomic::AtomicU64::new(u64::MAX - 1),
+        };
+        generator.generate();
+        generator.generate();
+    }
 
     /// Helper to create an UnresolvedPattern::Triple for WHERE clauses in tests
     fn where_triple(s: UnresolvedTerm, p: &str, o: UnresolvedTerm) -> UnresolvedPattern {

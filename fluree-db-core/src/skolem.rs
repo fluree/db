@@ -51,14 +51,16 @@
 //! | minter | shape | first `-` after `fdb-` |
 //! |---|---|---|
 //! | bulk import (here) | `d` + 13 base36 + `-` + label | offset 14 |
-//! | staged transaction | `{nanos:x}` + `-` + solution + `-` + label | offset 16 |
+//! | staged transaction | 32 hex namespace + 16 hex counter + `-` + solution + `-` + label | offset 48 |
+//! | legacy staged transaction | `{nanos:x}` + `-` + solution + `-` + label | normally offset 16 |
 //! | SPARQL `BNODE()` | hyphenated UUIDv4 | offset 8 |
 //!
 //! The offsets are structural, not coincidental: `BNODE()` emits RFC-4122 text,
-//! whose first hyphen is always at offset 8; the staged-transaction key is
-//! nanoseconds-since-epoch in hex, which is 16 digits for every wall clock
-//! between 2004-11 and 2154-07. A staged key could only reach offset 14 on a
-//! host whose clock reads within about four days of 1970-01-01.
+//! whose first hyphen is always at offset 8; newly staged transaction keys have
+//! a fixed width of 48 hex digits. Older timestamp-derived keys remain valid
+//! opaque identities. Those keys have 16 hex digits for wall clocks between
+//! 2004-11 and 2154-07; their first hyphen could reach offset 14 only on a host
+//! whose clock reads within about four days of 1970-01-01.
 
 use xxhash_rust::xxh64::Xxh64;
 
@@ -259,7 +261,13 @@ mod tests {
 
     #[test]
     fn split_doc_scope_rejects_the_other_minters() {
-        // Staged transaction: `fdb-{nanos:x}-{solution}-{label}`.
+        // Staged transaction: fixed-width namespace + counter, including a
+        // namespace starting with the import scope marker. Keep legacy keys too.
+        assert_eq!(
+            split_doc_scope("fdb-d123456789abcdef0123456789abcdef0000000000000001-0-b0"),
+            None
+        );
+        // Legacy staged transaction: `fdb-{nanos:x}-{solution}-{label}`.
         assert_eq!(split_doc_scope("fdb-1857f4a2b9c3d0e1-0-b0"), None);
         // SPARQL BNODE(): `fdb-{uuid}`.
         assert_eq!(
@@ -299,7 +307,7 @@ mod tests {
         }
     }
 
-    // Structural disjointness from the other two `fdb-` minters, expressed as
+    // Structural disjointness from the other `fdb-` minters, expressed as
     // the offset of the first `-` after the `fdb-` prefix (see module docs).
     #[test]
     fn first_hyphen_offset_distinguishes_the_minters() {
@@ -307,8 +315,11 @@ mod tests {
         assert_eq!(import.find('-'), None, "a scope contains no hyphen");
         assert_eq!(import.len(), 14, "so the first hyphen lands at offset 14");
 
-        let staged = format!("{:x}", 1_750_000_000_000_000_000u64);
-        assert_eq!(staged.len(), 16, "nanos-since-epoch is 16 hex digits");
+        let staged = "d123456789abcdef0123456789abcdef0000000000000001";
+        assert_eq!(staged.len(), 48, "namespace plus counter is 48 hex digits");
+
+        let legacy_staged = format!("{:x}", 1_750_000_000_000_000_000u64);
+        assert_eq!(legacy_staged.len(), 16, "legacy timestamp is 16 hex digits");
 
         let bnode = "67e55044-10b1-426f-9247-bb680e5fe0c8";
         assert_eq!(bnode.find('-'), Some(8), "uuid hyphen is at offset 8");

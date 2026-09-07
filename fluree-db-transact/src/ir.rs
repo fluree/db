@@ -668,7 +668,7 @@ pub struct TxnOpts {
 
     /// Skolemization id override for blank-node minting in this transaction.
     ///
-    /// When set, staging uses this id instead of a generated timestamp in the
+    /// When set, staging uses this id instead of a generated opaque id in the
     /// `fdb-{txn_id}-{solution}-{label}` skolem key, making created-entity
     /// Sids reconstructible by the caller (Cypher `CREATE … RETURN n`
     /// resolves the created node from the id it supplied). Must be unique per
