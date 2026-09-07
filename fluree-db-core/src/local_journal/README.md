@@ -114,7 +114,7 @@ whose original response failed may recover; reconcile their identity before retr
 This is not submission-level exactly-once delivery or automatic retry of CREATE.
 
 The API's feature-gated `local_journal_ledger::JournalLedger` now connects real
-JSON-LD insert/upsert/WHERE staging to this coordinator. It journals exact raw and
+JSON-LD insert/upsert/WHERE and Cypher staging to this coordinator. It journals exact raw and
 commit bytes, materializes, and installs the real LedgerState before returning a
 receipt. A private query/cache gate also checks coordinator health for memory-only
 reads. Recovery revalidates database semantics and rebuilds LedgerState directly
@@ -124,12 +124,27 @@ Independent adapter opens refresh their cached state when the accepted head chan
 
 This is a trusted embedded adapter for an empty, unindexed, unsigned default-graph
 ledger. It exposes no general storage, nameservice, Fluree or cached-view handles.
-Named/config graph writes are rejected; Cypher, indexing/import, lifecycle, policy
+Named/config graph writes are rejected; indexing/import, lifecycle, policy
 contexts, encryption and cluster entrypoints are not exposed. Raw transaction JSON
 is always recorded; the adapter's 10 MB novelty backpressure limit also applies.
 Head identity and immutable content reads support response-loss reconciliation;
 recovery does not automatically resubmit requests or provide submission deduplication.
 Ordinary constructors/CLI/server transaction paths still do not enable WAL.
+
+`transact_cypher` accepts one statement plus parameters, including the existing
+single-write, conditional MERGE and sequential multi-clause staging paths. All
+probes run under the adapter gate. It rejects semicolon-separated scripts before
+effects. RETURN rows are prepared in a private transient view before append and
+exposed only after successful state installation (or a healthy no-op). Raw provenance
+is `{"cypher": original_text, "params": map}` with absent parameters recorded as `{}`.
+`query_cypher` formats its response under the same health-gated query lock. Existing
+Cypher syntax limitations and the `FLUREE_CYPHER_ALLOW_FULL_SCAN` opt-in still apply.
+
+Tests retain the eight exact write statements and hashes from the archived durable
+Cypher suite. They compare against ordinary Fluree on a small unindexed fixture,
+then check external receipts, parameter bytes, entity IDs and rows after erasing all
+materialized files. This is workload compatibility/recovery coverage, not the full
+medium Pokec benchmark or an indexed performance comparison.
 
 The linear validator walks/hashes complete history on every acceptance and the payload codec
 uses JSON byte arrays. Both are correctness prototypes with substantial overhead;

@@ -1,0 +1,14 @@
+{
+  "source": "benchmark-db/runs/durable-cypher-20260907/raw/release-review/original-suite-release/frozen/queries",
+  "purpose": "Exact eight write statements from the phase-0 35-query suite; small-fixture correctness tests only.",
+  "sha256": {
+    "arango__single_edge_write.cypher": "3a3d9eebc145537a4e64a5e77150a1a6aaf5051c9378f12189d50e32bf53d9f3",
+    "arango__single_vertex_write.cypher": "4b2e666a04012a164f379f22f7cbfa9e1df8caa64273b887b38247d621e31cab",
+    "arango__unwind_range_vertex_write.cypher": "517684b466910cf2642e35a7067c3d6cea966dcabcadcb45ec81f63a9f72dddd",
+    "create__edge.cypher": "1e29226c9cf275595bf161018d53ee4d0826ed7f25faca1d762ad08bb2887394",
+    "create__pattern.cypher": "ef1dfae11591d2995a8f1bd92c40859fc83f173f75f01ae04d6860aaeb4e2e6d",
+    "create__vertex.cypher": "efe29cc5e81ea67867bbb2b786ca75b4d21f4348fc8dc16f5350f1c7a895f019",
+    "create__vertex_big.cypher": "047b7f62f64f5262beb508c6f3399364175581903e5ccedd342b9c6d8bb7170b",
+    "update__vertex_on_property.cypher": "b65251103f6f10754943f6a6eb10233b6395afb26709836e0c3d464a68cd68bf"
+  }
+}

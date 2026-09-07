@@ -1,11 +1,11 @@
-//! Bounded experimental WAL adapter for trusted, local JSON-LD transactions.
+//! Bounded experimental WAL adapter for trusted, local JSON-LD and Cypher transactions.
 //!
 //! One unindexed, unsigned ledger per root; no indexing/import, lifecycle,
 //! credentials, policy context, configuration or cluster API. This is an embedded
 //! root-authority experiment, not a server backend. No underlying Fluree, cache,
 //! staged state or writable storage handle escapes. Raw transaction JSON is always
 //! journaled. The 64 MiB journal has no checkpoint/reclamation yet.
-use crate::{Fluree, FlureeBuilder, GraphDb, IndexConfig, LedgerState, TxnOpts};
+use crate::{Fluree, FlureeBuilder, GraphDb, IndexConfig, LedgerState, StageResult, TxnOpts};
 use async_trait::async_trait;
 use fluree_db_core::local_journal::{
     AcceptanceValidator, Error as JournalError, LocalRoot, Object, Receipt, Record, Transition,
@@ -20,6 +20,8 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::local_journal_acceptance::LinearCommitValidator;
+
+mod cypher;
 
 struct AdapterValidator;
 impl AcceptanceValidator for AdapterValidator {
@@ -70,6 +72,14 @@ pub struct AcceptedCommit {
     pub commit: CommitReceipt,
     pub journal: Receipt,
     pub raw_txn_id: ContentId,
+}
+
+/// One statement's accepted commit (None for a no-op) and optional Cypher RETURN.
+/// Rows are prepared privately but exposed only after durable state installation.
+#[derive(Debug)]
+pub struct CypherOutcome {
+    pub commit: Option<AcceptedCommit>,
+    pub result: Option<Value>,
 }
 
 struct Cache {
@@ -178,21 +188,32 @@ impl JournalLedger {
         body: &Value,
         before_install: impl FnOnce() -> fluree_db_core::local_journal::Result<()> + Send + 'static,
     ) -> Result<Option<AcceptedCommit>> {
-        let mut cache = self.ready().await?;
+        let cache = self.ready().await?;
         let state = cache.state.as_ref().expect("ready state");
-        let expected = state.head_commit_id.as_ref().map(|id| RefValue {
-            id: Some(id.clone()),
-            t: state.t(),
-        });
-        let config = IndexConfig {
-            reindex_min_bytes: 1_000_000,
-            reindex_max_bytes: 10_000_000,
-        };
+        let config = index_config();
         let staged = self
             .0
             .engine
             .stage_transaction(state.clone(), kind, body, TxnOpts::default(), Some(&config))
             .await?;
+        self.accept_staged(cache, staged, kind, body, before_install)
+            .await
+    }
+
+    async fn accept_staged(
+        &self,
+        mut cache: OwnedMutexGuard<Cache>,
+        staged: StageResult,
+        kind: TxnType,
+        body: &Value,
+        before_install: impl FnOnce() -> fluree_db_core::local_journal::Result<()> + Send + 'static,
+    ) -> Result<Option<AcceptedCommit>> {
+        let state = cache.state.as_ref().expect("ready state");
+        let expected = state.head_commit_id.as_ref().map(|id| RefValue {
+            id: Some(id.clone()),
+            t: state.t(),
+        });
+        let config = index_config();
         if !staged.graph_delta.is_empty()
             || staged.view.staged_flakes().iter().any(|f| f.g.is_some())
         {
@@ -327,6 +348,13 @@ impl JournalLedger {
 #[cfg(test)]
 #[path = "local_journal_ledger/tests.rs"]
 mod tests;
+
+fn index_config() -> IndexConfig {
+    IndexConfig {
+        reindex_min_bytes: 1_000_000,
+        reindex_max_bytes: 10_000_000,
+    }
+}
 
 fn ns_record(
     ledger: &str,
