@@ -7,6 +7,8 @@ mod it_branch;
 mod it_drop_ledger;
 #[path = "it_drop_named_graph.rs"]
 mod it_drop_named_graph;
+#[path = "it_file_recovery_oracle.rs"]
+mod it_file_recovery_oracle;
 #[path = "it_ledger_info_named_graphs.rs"]
 mod it_ledger_info_named_graphs;
 #[path = "it_ledger_lifecycle.rs"]
