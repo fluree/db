@@ -3,7 +3,8 @@
 Enabled only by `experimental-local-journal` on Unix. **This feature does not turn
 on WAL for ordinary Fluree transactions.** Their acknowledgments remain unchanged.
 The experimental owner can now accept exact transitions through a trusted embedding
-interface; no CLI/server/Fluree transaction adapter calls it yet.
+interface; the limited embedded JSON-LD/Cypher adapter calls it, while ordinary
+CLI/server persistence remains unchanged.
 Ordinary Unix file opens now acquire a shared root lease and reject managed roots,
 including when journal support is not compiled. The format is experimental and not yet a
 supported database storage format.
@@ -57,8 +58,8 @@ or old-layout migration is implemented.
 validates the whole journal, and completes exact atomic materialization before
 returning an owner. Canonical-path aliases share one ready `Arc` in-process;
 another process is refused until the final owner drops or dies. The owner exposes
-byte reads and the `accept_with` embedding seam; there is no Fluree transaction,
-local-path/mmap, nameservice, or indexer adapter yet. Recovery stages immutable objects and renames them into place, rejects
+byte reads and the `accept_with` embedding seam. It exposes no general
+local-path/mmap, nameservice, or indexer adapter. Recovery stages immutable objects and renames them into place, rejects
 conflicting bytes/symlink paths, and publishes the head last. Individual replay writes
 omit fsync because the complete journal is retained; this is not a checkpoint.
 
@@ -78,6 +79,58 @@ not a security sandbox for hostile symlink routing through unrelated roots.
 Interrupted initialization without a valid manifest fails closed and retains its
 files for inspection. No transition could have been accepted before successful initialization.
 
+## Durable bootstrap checkpoint (core embedding only)
+
+`LocalRoot::bootstrap` creates a v2 root from a pinned `CheckpointSpec` in an existing
+empty directory. It does not convert ordinary files in place. A spec lists the exact
+baseline head and strictly sorted object keys, byte lengths and SHA-256 hashes.
+The core treats these as opaque bytes: the trusted callback must verify Fluree CIDs,
+complete dependencies, supported configuration and an unchanged pinned source head.
+A hash inventory alone is not a database-semantic proof.
+
+Objects are streamed with a 64 KiB buffer into `.fluree-wal/checkpoint/objects`.
+Each completed object is hash/length checked and file-synced; all created directories
+are then synced from children to parents. The checkpoint descriptor binds the root
+identity, ledger, generation, exact baseline head and inventory. Its bytes are
+file-synced, atomically published and directory-synced before journal initialization.
+The journal identity derives from the root identity and exact descriptor digest.
+Only after validation and journal initialization does the ready v2 root manifest
+publish. Errors retain the fenced partial generation; there is no in-place resume,
+automatic deletion, hard-link sharing, or journal retirement.
+
+The inventory is bounded to 100,000 objects and 16 MiB encoded descriptor bytes;
+keys to 1,024 bytes, baseline head to 64 KiB, each object to 1 GiB, and total content
+to 1 TiB. Startup rechecks every inventory object with bounded streaming memory.
+Explicit reads allocate at most one bounded object and recheck its hash/length.
+Baseline bytes never enter the coordinator's journal-object map. The journal's
+existing 16 MiB encoded-record and 64 MiB total limits still apply to later writes.
+
+The coordinator starts at the checkpoint head, so a synthetic genesis or stale
+first transition fails CAS. Checkpoint immutable-key and file/directory collisions
+are rejected. Missing head materialization is reconstructed from the verified
+baseline before tail replay. A conflicting existing head fails closed. Startup also
+syncs the control directory before returning, covering an earlier initializer that
+failed after ready-manifest rename but before its directory sync.
+
+`recover_with_checkpoint` revalidates the baseline and journal, then supplies a
+read-only checkpoint handle and tail records to the trusted state-installation hook.
+A retained checkpoint handle keeps the exclusive root lease alive. It does not grant
+coordinator health or permit cached queries to bypass their operation gate. Legacy
+`recover_with` hooks and validators without explicit checkpoint support reject v2
+roots. The current JSON-LD/Cypher adapter therefore **cannot yet open a checkpoint
+root**; indexed source inventory, semantic validation and binary-index attachment
+are the next integration slice. Core tests use opaque synthetic baselines.
+
+Bootstrap tests interrupt every instrumented completed file/directory/publication
+operation and reopen twice, requiring either the exact baseline or a fenced error.
+They also cover missing/corrupt/symlinked dependencies, source-byte mismatch,
+semantic-hook rejection, journal/manifest binding, immutable collisions, retained
+ownership, baseline plus externally recorded tail receipts after erased
+materialization, and unresolved installation followed by damaged-baseline recovery.
+These are filesystem interruption tests, not simulated device-cache loss or physical
+power-loss qualification. A generated object larger than the journal cap exercises
+streaming bootstrap without putting the baseline in a journal frame.
+
 ## Serialized acceptance and reconciliation
 
 `accept_with` holds the shared owner's mutex through expected-head/generation checks,
@@ -87,8 +140,8 @@ state and return a receipt. Readers take the same mutex, so no owner reader cros
 an incomplete installation. Same-base concurrent candidates have one CAS winner;
 the loser writes no journal record or object.
 
-`AcceptanceView` exposes only candidate bytes and objects in the retained accepted
-journal. A merely readable file is not a durable prerequisite. Immutable key changes,
+`AcceptanceView` exposes candidate bytes, objects in the retained accepted
+journal, and explicitly verified checkpoint prerequisites through `read_content`. A merely readable file is not a durable prerequisite. Immutable key changes,
 head/object collisions, reserved paths and file/directory collisions are rejected.
 The bounded journal's object bytes are retained in memory for this prototype.
 
@@ -172,9 +225,9 @@ Coordinate or reject import, push, index heads, configuration/lifecycle and GC.
 Explicitly reject unsupported encryption, mixed backends, clusters, and oversized
 transactions before effects.
 
-This slice has no checkpoint, truncation, rotation, online GC, submission idempotency,
+The bootstrap checkpoint does not provide truncation, rotation, online GC, submission idempotency,
 group commit, transaction overlap, or remote preparation. At capacity it stops;
-it does not remove recovery bytes. A durable checkpoint/retirement protocol and
+it does not remove recovery bytes. A subsequent checkpoint/retirement protocol and
 storage qualification are required before an unrestricted WAL mode.
 
 ## Verification

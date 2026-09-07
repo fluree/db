@@ -1,4 +1,5 @@
-//! Experimental local journal foundation. No transaction path uses this module.
+//! Experimental local journal foundation for explicitly opted-in embeddings.
+//! Ordinary transaction persistence does not enable this module.
 //!
 //! One owner appends exact, opaque transitions and obtains a receipt only after
 //! `sync_all` succeeds. This receipt proves journal persistence under the I/O
@@ -17,7 +18,7 @@
 //! accidental damage, not malicious modification or loss of a whole valid suffix.
 //! Shared-block damage is detected when it changes a retained frame, but cannot be
 //! repaired here. `LocalRoot` adds owned startup replay and atomic materialization;
-//! power-loss qualification, sealing, checkpoints, and transaction integration remain.
+//! power-loss qualification, sealing, checkpoint retirement, and full integration remain.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,6 +29,8 @@ mod file;
 pub use file::FileIo;
 mod acceptance;
 pub use acceptance::{AcceptanceValidator, AcceptanceView};
+mod checkpoint;
+pub use checkpoint::{Checkpoint, CheckpointEntry, CheckpointSpec};
 mod root;
 pub use root::LocalRoot;
 #[cfg(test)]
@@ -105,23 +108,28 @@ impl Transition {
         if self.ledger.is_empty() || self.generation.is_empty() || self.resulting_head.is_empty() {
             return Err(Error::Invalid("missing transition identity/head"));
         }
-        let valid_key = |key: &str| {
-            !key.is_empty()
-                && !key.contains(['\\', '\0', ':'])
-                && key.split('/').all(|part| !matches!(part, "" | "." | ".."))
-        };
         let mut keys = BTreeSet::new();
         keys.insert(self.head_key.as_str());
-        if !valid_key(&self.head_key)
+        if validate_key(&self.head_key).is_err()
             || self
                 .objects
                 .iter()
-                .any(|o| !valid_key(&o.key) || !keys.insert(&o.key))
+                .any(|o| validate_key(&o.key).is_err() || !keys.insert(&o.key))
         {
             return Err(Error::Invalid("unsafe or duplicate storage key"));
         }
         Ok(())
     }
+}
+
+fn validate_key(key: &str) -> Result<()> {
+    if key.is_empty()
+        || key.contains(['\\', '\0', ':'])
+        || key.split('/').any(|part| matches!(part, "" | "." | ".."))
+    {
+        return Err(Error::Invalid("unsafe storage key"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

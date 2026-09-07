@@ -1,5 +1,6 @@
 //! Exclusive root with serialized journal acceptance and recovery.
 use super::acceptance::{AcceptanceTarget, Coordinator};
+use super::checkpoint::{self, Checkpoint, CheckpointEntry, CheckpointSpec};
 use super::{
     replay_chain, AcceptanceValidator, AcceptanceView, Error, FileIo, Journal, Object, Receipt,
     Record, ReplayTarget, Result, Transition,
@@ -29,6 +30,8 @@ struct Manifest {
     identity: [u8; 16],
     ledger: String,
     generation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<[u8; 32]>,
 }
 
 /// A recovered local root with serialized acceptance. All opens for a canonical root in this
@@ -46,7 +49,8 @@ pub struct LocalRoot {
     path: PathBuf,
     manifest: Manifest,
     coordinator: Mutex<Coordinator<FileIo>>,
-    _directory_lock: File,
+    checkpoint: Option<Arc<Checkpoint>>,
+    _directory_lock: Arc<File>,
 }
 
 impl LocalRoot {
@@ -59,7 +63,7 @@ impl LocalRoot {
         }
         let path = std::fs::canonicalize(root)?;
         let mut registry = OWNERS.lock();
-        let directory = lock_root(&path)?;
+        let directory = Arc::new(lock_root(&path)?);
         reject_journal_ancestor(&path)?;
         if std::fs::read_dir(&path)?.next().is_some() {
             return Err(Error::Invalid(
@@ -79,6 +83,7 @@ impl LocalRoot {
             identity: rand::random(),
             ledger: ledger.into(),
             generation: generation.into(),
+            checkpoint: None,
         };
         let journal = Journal::create(
             FileIo::create_new(&control.join(JOURNAL))?,
@@ -93,8 +98,122 @@ impl LocalRoot {
             path: path.clone(),
             manifest,
             coordinator: Mutex::new(Coordinator::restored(journal, &[], ledger, generation)?),
+            checkpoint: None,
             _directory_lock: directory,
         });
+        registry.retain(|_, owner| owner.strong_count() > 0);
+        registry.insert(path, Arc::downgrade(&owner));
+        Ok(owner)
+    }
+
+    /// Bootstrap an immutable baseline into an EXISTING EMPTY directory. Copies
+    /// use a fixed-size buffer, verify inventory hashes, and sync all files and
+    /// containing directories before publishing the ready v2 root manifest.
+    /// The trusted validator must verify baseline semantics/dependency closure and
+    /// a pinned unchanged source head. No API transaction adapter uses this yet.
+    /// A failed bootstrap retains the fenced generation; do not retry in place.
+    pub fn bootstrap<R: Read>(
+        root: &Path,
+        ledger: &str,
+        generation: &str,
+        baseline: CheckpointSpec,
+        source: impl FnMut(&CheckpointEntry) -> Result<R>,
+        validate: impl FnOnce(&Checkpoint) -> Result<()>,
+    ) -> Result<Arc<Self>> {
+        Self::bootstrap_steps(
+            root,
+            ledger,
+            generation,
+            baseline,
+            source,
+            validate,
+            &mut |_| Ok(()),
+        )
+    }
+
+    fn bootstrap_steps<R: Read>(
+        root: &Path,
+        ledger: &str,
+        generation: &str,
+        baseline: CheckpointSpec,
+        source: impl FnMut(&CheckpointEntry) -> Result<R>,
+        validate: impl FnOnce(&Checkpoint) -> Result<()>,
+        step: &mut impl FnMut(&'static str) -> Result<()>,
+    ) -> Result<Arc<Self>> {
+        if ledger.is_empty() || generation.is_empty() || ledger.len() + generation.len() > 1024 {
+            return Err(Error::Invalid("invalid root ledger/generation"));
+        }
+        checkpoint::validate_spec(&baseline)?;
+        let path = std::fs::canonicalize(root)?;
+        let directory = Arc::new(lock_root(&path)?);
+        reject_journal_ancestor(&path)?;
+        if std::fs::read_dir(&path)?.next().is_some() {
+            return Err(Error::Invalid(
+                "journal initialization requires an empty root",
+            ));
+        }
+        for ancestor in path.ancestors() {
+            File::open(ancestor)?.sync_all()?;
+        }
+        let control = path.join(JOURNAL_DIR);
+        std::fs::create_dir(&control)?;
+        step("fence created")?;
+        directory.sync_all()?;
+        step("fence synced")?;
+        let mut manifest = Manifest {
+            version: 2,
+            identity: rand::random(),
+            ledger: ledger.into(),
+            generation: generation.into(),
+            checkpoint: None,
+        };
+        let (checkpoint, hash) = Checkpoint::create(
+            &control,
+            checkpoint::Binding {
+                identity: manifest.identity,
+                ledger,
+                generation,
+            },
+            baseline,
+            directory.clone(),
+            source,
+            step,
+        )?;
+        validate(&checkpoint)?;
+        step("baseline validated")?;
+        manifest.checkpoint = Some(hash);
+        // Bind the journal to BOTH this root identity and exact checkpoint bytes.
+        let journal = Journal::create(
+            FileIo::create_new(&control.join(JOURNAL))?,
+            journal_identity(&manifest),
+        )?;
+        step("journal initialized")?;
+        std::fs::create_dir(control.join(DATA))?;
+        File::open(&control)?.sync_all()?;
+        step("data directory synced")?;
+        let coordinator =
+            Coordinator::restored_from(journal, &[], ledger, generation, Some(checkpoint.clone()))?;
+        replay_from(
+            &[],
+            &manifest,
+            Some(&checkpoint),
+            &mut FileTarget {
+                root: &control.join(DATA),
+            },
+        )?;
+        let encoded =
+            serde_json::to_vec(&manifest).map_err(|_| Error::Invalid("manifest encoding"))?;
+        atomic_write_steps(&control.join(FORMAT), &encoded, step)?;
+        let owner = Arc::new(Self {
+            path: path.clone(),
+            manifest,
+            coordinator: Mutex::new(coordinator),
+            checkpoint: Some(checkpoint),
+            _directory_lock: directory,
+        });
+        // Long copies and source validation must not hold the process-wide
+        // registry mutex. The exclusive directory lease protects this root.
+        let mut registry = OWNERS.lock();
         registry.retain(|_, owner| owner.strong_count() > 0);
         registry.insert(path, Arc::downgrade(&owner));
         Ok(owner)
@@ -112,7 +231,7 @@ impl LocalRoot {
             }
             return Ok(owner);
         }
-        let directory = lock_root(&path)?;
+        let directory = Arc::new(lock_root(&path)?);
         // Nested roots must not bypass another journal owner's boundary.
         if let Some(parent) = path.parent() {
             reject_journal_ancestor(parent)?;
@@ -131,27 +250,38 @@ impl LocalRoot {
         }
         let manifest: Manifest = serde_json::from_slice(&bytes)
             .map_err(|_| Error::Invalid("missing/invalid journal manifest"))?;
-        if manifest.version != 1 || manifest.ledger.is_empty() || manifest.generation.is_empty() {
+        if !matches!(
+            (manifest.version, manifest.checkpoint),
+            (1, None) | (2, Some(_))
+        ) || manifest.ledger.is_empty()
+            || manifest.generation.is_empty()
+            || manifest.ledger.len() + manifest.generation.len() > 1024
+        {
             return Err(Error::Invalid("unsupported journal root format"));
         }
-        let (journal, records) = open_journal(&control, &manifest.identity)?;
+        let checkpoint = open_checkpoint(&control, &manifest, directory.clone())?;
+        let (journal, records) = open_journal(&control, &journal_identity(&manifest))?;
         let data = checked_path(&control, DATA, false)?;
         if !std::fs::metadata(&data)?.is_dir() {
             return Err(Error::Invalid("missing journal data directory"));
         }
-        let coordinator =
-            Coordinator::restored(journal, &records, &manifest.ledger, &manifest.generation)?;
-        let mut target = FileTarget { root: &data };
-        replay_chain(
+        let coordinator = Coordinator::restored_from(
+            journal,
             &records,
             &manifest.ledger,
             &manifest.generation,
-            &mut target,
+            checkpoint.clone(),
         )?;
+        let mut target = FileTarget { root: &data };
+        replay_from(&records, &manifest, checkpoint.as_deref(), &mut target)?;
+        // A previous initializer may have failed after ready-manifest rename but
+        // before directory sync. Establish that entry before accepting new writes.
+        File::open(&control)?.sync_all()?;
         let owner = Arc::new(Self {
             path: path.clone(),
             manifest,
             coordinator: Mutex::new(coordinator),
+            checkpoint,
             _directory_lock: directory,
         });
         registry.retain(|_, owner| owner.strong_count() > 0);
@@ -184,25 +314,44 @@ impl LocalRoot {
     /// restored application state before making reads/acceptance available again.
     /// The hook must not reenter this root. Torn/corrupt journals still fail closed.
     pub fn recover_with(&self, install: impl FnOnce(&[Record]) -> Result<()>) -> Result<()> {
+        if self.checkpoint.is_some() {
+            return Err(Error::Invalid(
+                "recovery hook does not support checkpoint baselines",
+            ));
+        }
+        self.recover_with_checkpoint(|records, _| install(records))
+    }
+
+    /// Checkpoint-aware recovery hook. Revalidates the entire baseline before
+    /// replay; the hook must validate database semantics and install baseline plus
+    /// tail state before success. The read-only handle may be retained by an index
+    /// store; it retains ownership but does not replace operation health gating.
+    pub fn recover_with_checkpoint(
+        &self,
+        install: impl FnOnce(&[Record], Option<Arc<Checkpoint>>) -> Result<()>,
+    ) -> Result<()> {
         let mut state = self.coordinator.lock();
         state.poisoned = true;
         drop(state.journal.take());
         let control = self.path.join(JOURNAL_DIR);
-        let (journal, records) = open_journal(&control, &self.manifest.identity)?;
-        let restored = Coordinator::restored(
+        let checkpoint = open_checkpoint(&control, &self.manifest, self._directory_lock.clone())?;
+        let (journal, records) = open_journal(&control, &journal_identity(&self.manifest))?;
+        let restored = Coordinator::restored_from(
             journal,
             &records,
             &self.manifest.ledger,
             &self.manifest.generation,
+            checkpoint.clone(),
         )?;
         let data = control.join(DATA);
-        replay_chain(
+        replay_from(
             &records,
-            &self.manifest.ledger,
-            &self.manifest.generation,
+            &self.manifest,
+            checkpoint.as_deref(),
             &mut FileTarget { root: &data },
         )?;
-        install(&records)?;
+        File::open(&control)?.sync_all()?;
+        install(&records, checkpoint)?;
         *state = restored;
         Ok(())
     }
@@ -233,12 +382,69 @@ impl LocalRoot {
             return Err(Error::Poisoned);
         }
         data_key(key)?;
+        if let Some(checkpoint) = &self.checkpoint {
+            if let Some(bytes) = checkpoint.read(key)? {
+                return Ok(bytes);
+            }
+        }
         Ok(std::fs::read(checked_path(
             &self.path.join(JOURNAL_DIR).join(DATA),
             key,
             false,
         )?)?)
     }
+}
+
+fn journal_identity(manifest: &Manifest) -> [u8; 16] {
+    let Some(checkpoint) = manifest.checkpoint else {
+        return manifest.identity;
+    };
+    let mut binding = b"FLWAL-checkpoint-v2".to_vec();
+    binding.extend_from_slice(&manifest.identity);
+    binding.extend_from_slice(&checkpoint);
+    super::digest(&binding)[..16].try_into().unwrap()
+}
+
+fn open_checkpoint(
+    control: &Path,
+    manifest: &Manifest,
+    lease: Arc<File>,
+) -> Result<Option<Arc<Checkpoint>>> {
+    manifest
+        .checkpoint
+        .map(|hash| {
+            Checkpoint::open(
+                control,
+                checkpoint::Binding {
+                    identity: manifest.identity,
+                    ledger: &manifest.ledger,
+                    generation: &manifest.generation,
+                },
+                hash,
+                lease,
+            )
+        })
+        .transpose()
+}
+
+fn replay_from(
+    records: &[Record],
+    manifest: &Manifest,
+    checkpoint: Option<&Checkpoint>,
+    target: &mut impl ReplayTarget,
+) -> Result<()> {
+    if let Some(checkpoint) = checkpoint {
+        let head = checkpoint.head();
+        let current = target.read_head(&head.key)?;
+        if current.is_none() {
+            // Baseline head is itself durable in the verified checkpoint. Missing
+            // materialization can therefore be rebuilt before replaying the tail.
+            target.publish_head(&head.key, None, &head.bytes)?;
+        } else if records.is_empty() && current.as_deref() != Some(&head.bytes) {
+            return Err(Error::Invalid("materialized head outside checkpoint"));
+        }
+    }
+    replay_chain(records, &manifest.ledger, &manifest.generation, target)
 }
 
 fn open_journal(control: &Path, identity: &[u8; 16]) -> Result<(Journal<FileIo>, Vec<Record>)> {
@@ -261,7 +467,7 @@ fn lock_root(path: &Path) -> Result<File> {
     Ok(directory)
 }
 
-fn data_key(key: &str) -> Result<()> {
+pub(super) fn data_key(key: &str) -> Result<()> {
     if key.split('/').any(|part| part == JOURNAL_DIR) {
         return Err(Error::Invalid("journal control path is reserved"));
     }
@@ -271,7 +477,7 @@ fn data_key(key: &str) -> Result<()> {
 /// Refuse traversal and symlinks, including final-component symlinks. The owner
 /// excludes cooperative writers; hostile external filesystem mutations are outside
 /// this prototype's contract (there is no descriptor-relative openat sandbox).
-fn checked_path(root: &Path, key: &str, create_parents: bool) -> Result<PathBuf> {
+pub(super) fn checked_path(root: &Path, key: &str, create_parents: bool) -> Result<PathBuf> {
     let key = Path::new(key);
     if key.as_os_str().is_empty() || key.components().any(|c| !matches!(c, Component::Normal(_))) {
         return Err(Error::Invalid("invalid materialization key"));
@@ -327,6 +533,34 @@ fn atomic_write(path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
     result
 }
 
+/// Bootstrap publication seam. A failure preserves all recovery artifacts.
+/// Hooks model interruption at completed filesystem operations, not device loss.
+pub(super) fn atomic_write_steps(
+    path: &Path,
+    bytes: &[u8],
+    step: &mut impl FnMut(&'static str) -> Result<()>,
+) -> Result<()> {
+    let temporary = path
+        .parent()
+        .unwrap()
+        .join(format!(".wal-bootstrap-{:032x}", rand::random::<u128>()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    step("manifest created")?;
+    file.write_all(bytes)?;
+    step("manifest written")?;
+    file.sync_all()?;
+    step("manifest synced")?;
+    std::fs::rename(&temporary, path)?;
+    step("manifest published")?;
+    File::open(path.parent().unwrap())?.sync_all()?;
+    step("manifest directory synced")?;
+    Ok(())
+}
+
 struct FileTarget<'a> {
     root: &'a Path,
 }
@@ -353,6 +587,8 @@ impl AcceptanceTarget for FileTarget<'_> {
     }
 }
 
+#[cfg(test)]
+mod checkpoint_tests;
 #[cfg(test)]
 mod tests;
 impl ReplayTarget for FileTarget<'_> {

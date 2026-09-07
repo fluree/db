@@ -4,7 +4,8 @@
 //! credentials, policy context, configuration or cluster API. This is an embedded
 //! root-authority experiment, not a server backend. No underlying Fluree, cache,
 //! staged state or writable storage handle escapes. Raw transaction JSON is always
-//! journaled. The 64 MiB journal has no checkpoint/reclamation yet.
+//! journaled. This adapter rejects core checkpoint roots until indexed baseline
+//! loading is connected. The 64 MiB journal has no reclamation yet.
 use crate::{Fluree, FlureeBuilder, GraphDb, IndexConfig, LedgerState, StageResult, TxnOpts};
 use async_trait::async_trait;
 use fluree_db_core::local_journal::{

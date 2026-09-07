@@ -418,3 +418,53 @@ async fn replay_preserves_generated_subjects_without_reexecuting_input() {
         Some(second.commit.commit_id)
     );
 }
+
+#[tokio::test]
+async fn checkpoint_roots_fail_closed_until_indexed_adapter_support_is_connected() {
+    use fluree_db_core::local_journal::{CheckpointEntry, CheckpointSpec};
+    let dir = tempfile::tempdir().unwrap();
+    let baseline = CheckpointSpec {
+        head: Object {
+            key: "ns/head".into(),
+            bytes: b"existing-baseline".to_vec(),
+        },
+        objects: vec![CheckpointEntry {
+            key: "baseline/object".into(),
+            length: 0,
+            // SHA-256 of the empty byte string.
+            sha256: [
+                0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+                0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+                0x78, 0x52, 0xb8, 0x55,
+            ],
+        }],
+    };
+    let owner = LocalRoot::bootstrap(
+        dir.path(),
+        "adapter:main",
+        "test-1",
+        baseline,
+        |_| Ok(std::io::empty()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            JournalLedger::open(dir.path().into()).await,
+            Err(Error::Journal(JournalError::Invalid(
+                "recovery hook does not support checkpoint baselines"
+            )))
+        ));
+    }
+    assert_eq!(
+        owner.accepted_head().unwrap(),
+        Some(b"existing-baseline".to_vec())
+    );
+    drop(owner);
+    assert!(matches!(
+        JournalLedger::open(dir.path().into()).await,
+        Err(Error::Journal(JournalError::Invalid(
+            "recovery hook does not support checkpoint baselines"
+        )))
+    ));
+}

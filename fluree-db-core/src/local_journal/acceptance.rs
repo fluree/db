@@ -1,6 +1,9 @@
 //! Serialized acceptance shared by the owned file backend and fault tests.
+use super::Checkpoint;
 use super::{Error, Journal, JournalIo, Object, Receipt, Record, ReplayTarget, Result, Transition};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// Trusted database-layer semantic validation. Implementations must verify the
 /// entire supported dependency closure, content identities and head semantics.
@@ -9,15 +12,37 @@ use std::collections::{BTreeMap, BTreeSet};
 pub trait AcceptanceValidator {
     fn validate(&self, view: &AcceptanceView<'_>) -> Result<()>;
 
+    /// Explicit opt-in for a checkpoint-aware embedding. Validate its complete
+    /// supported baseline semantics before accepting any dependent transition.
+    fn validate_checkpoint(&self, _checkpoint: &Checkpoint) -> Result<()> {
+        Err(Error::Invalid(
+            "validator does not support checkpoint baselines",
+        ))
+    }
+
     /// Revalidate database semantics during a root's recovery installation hook.
     /// The root has already checked framing, generation and head continuity.
     /// Each record can depend only on its own bytes or preceding records.
     fn validate_recovered(&self, records: &[Record]) -> Result<()> {
+        self.validate_recovered_from(records, None)
+    }
+
+    /// Recovery with explicit durable baseline prerequisites. Legacy validators
+    /// fail closed rather than silently installing an empty baseline.
+    fn validate_recovered_from(
+        &self,
+        records: &[Record],
+        checkpoint: Option<&Checkpoint>,
+    ) -> Result<()> {
+        if let Some(checkpoint) = checkpoint {
+            self.validate_checkpoint(checkpoint)?;
+        }
         let mut accepted = BTreeMap::new();
         for record in records {
             self.validate(&AcceptanceView {
                 transition: &record.transition,
                 accepted: &accepted,
+                checkpoint,
             })?;
             for object in &record.transition.objects {
                 accepted.insert(object.key.clone(), object.bytes.clone());
@@ -27,13 +52,15 @@ pub trait AcceptanceValidator {
     }
 }
 
-/// Only bytes carried by this candidate or an earlier accepted journal record.
+/// Only candidate, accepted journal, or explicitly verified checkpoint bytes.
 /// Arbitrary readable files cannot become durable prerequisites through this view.
 pub struct AcceptanceView<'a> {
     pub transition: &'a Transition,
     accepted: &'a BTreeMap<String, Vec<u8>>,
+    checkpoint: Option<&'a Checkpoint>,
 }
 impl AcceptanceView<'_> {
+    /// Borrow journal-covered bytes only; use read_content for checkpoint prerequisites.
     pub fn content(&self, key: &str) -> Option<&[u8]> {
         self.transition
             .objects
@@ -41,6 +68,18 @@ impl AcceptanceView<'_> {
             .find(|o| o.key == key)
             .map(|o| o.bytes.as_slice())
             .or_else(|| self.accepted.get(key).map(Vec::as_slice))
+    }
+    pub fn checkpoint(&self) -> Option<&Checkpoint> {
+        self.checkpoint
+    }
+
+    pub fn read_content(&self, key: &str) -> Result<Option<Cow<'_, [u8]>>> {
+        if let Some(bytes) = self.content(key) {
+            return Ok(Some(Cow::Borrowed(bytes)));
+        }
+        self.checkpoint.map_or(Ok(None), |checkpoint| {
+            checkpoint.read(key).map(|bytes| bytes.map(Cow::Owned))
+        })
     }
 }
 
@@ -57,6 +96,7 @@ pub(super) struct Coordinator<I> {
     pub(super) head: Option<(String, Vec<u8>)>,
     objects: BTreeMap<String, Vec<u8>>,
     pub last: Option<Receipt>,
+    checkpoint: Option<Arc<Checkpoint>>,
 }
 
 impl<I: JournalIo> Coordinator<I> {
@@ -66,14 +106,27 @@ impl<I: JournalIo> Coordinator<I> {
         ledger: &str,
         generation: &str,
     ) -> Result<Self> {
+        Self::restored_from(journal, records, ledger, generation, None)
+    }
+
+    pub fn restored_from(
+        journal: Journal<I>,
+        records: &[Record],
+        ledger: &str,
+        generation: &str,
+        checkpoint: Option<Arc<Checkpoint>>,
+    ) -> Result<Self> {
         let mut this = Self {
             journal: Some(journal),
             poisoned: false,
             ledger: ledger.into(),
             generation: generation.into(),
-            head: None,
+            head: checkpoint
+                .as_ref()
+                .map(|c| (c.head().key.clone(), c.head().bytes.clone())),
             objects: BTreeMap::new(),
             last: None,
+            checkpoint,
         };
         for record in records {
             this.check_transition(&record.transition)?;
@@ -110,6 +163,18 @@ impl<I: JournalIo> Coordinator<I> {
         {
             return Err(Error::Invalid("immutable key/head conflict"));
         }
+        if let Some(checkpoint) = &self.checkpoint {
+            if checkpoint.entry(&t.head_key).is_some()
+                || t.objects.iter().any(|o| {
+                    checkpoint.entry(&o.key).is_some_and(|entry| {
+                        entry.length != o.bytes.len() as u64
+                            || entry.sha256 != super::digest(&o.bytes)
+                    })
+                })
+            {
+                return Err(Error::Invalid("checkpoint immutable key conflict"));
+            }
+        }
         let keys: BTreeSet<_> = std::iter::once(t.head_key.as_str())
             .chain(t.objects.iter().map(|o| o.key.as_str()))
             .collect();
@@ -122,6 +187,10 @@ impl<I: JournalIo> Coordinator<I> {
                 let parent = &key[..i];
                 if keys.contains(parent)
                     || self.objects.contains_key(parent)
+                    || self
+                        .checkpoint
+                        .as_ref()
+                        .is_some_and(|c| c.entry(parent).is_some())
                     || self.head.as_ref().is_some_and(|(head, _)| head == parent)
                 {
                     return Err(Error::Invalid("journal key is another key's parent"));
@@ -129,10 +198,14 @@ impl<I: JournalIo> Coordinator<I> {
             }
             let prefix = format!("{key}/");
             if self
-                .objects
-                .range(prefix.clone()..)
-                .next()
-                .is_some_and(|(old, _)| old.starts_with(&prefix))
+                .checkpoint
+                .as_ref()
+                .is_some_and(|c| c.has_descendant(key))
+                || self
+                    .objects
+                    .range(prefix.clone()..)
+                    .next()
+                    .is_some_and(|(old, _)| old.starts_with(&prefix))
             {
                 return Err(Error::Invalid("journal key replaces an existing directory"));
             }
@@ -164,7 +237,11 @@ impl<I: JournalIo> Coordinator<I> {
         let view = AcceptanceView {
             transition: t,
             accepted: &self.objects,
+            checkpoint: self.checkpoint.as_deref(),
         };
+        if let Some(checkpoint) = &self.checkpoint {
+            validator.validate_checkpoint(checkpoint)?;
+        }
         validator.validate(&view)?;
         target.preflight(t)?;
         if target.read_head(&t.head_key)?.as_deref() != t.expected_head.as_deref() {
