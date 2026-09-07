@@ -355,6 +355,8 @@ pub async fn execute_where_streaming<'a>(
     // pattern-form deletes (`DELETE WHERE { <s> ?p ?o }`). A single compound
     // pattern (UNION/OPTIONAL/subquery) still carries interior join
     // decisions and keeps the stats-driven planning.
+    let probe_enabled = tracing::enabled!(target: "fluree::txn_stage_probe", tracing::Level::DEBUG);
+    let stats_started = probe_enabled.then(fluree_db_core::clock::Instant::now);
     let single_triple = patterns.len() == 1 && matches!(patterns[0], Pattern::Triple(_));
     let stats = if single_triple {
         None
@@ -362,6 +364,8 @@ pub async fn execute_where_streaming<'a>(
         let binary_store = ExecutionContext::extract_binary_store(db.snapshot);
         stats_cache::cached_stats_view_for_db(db, binary_store.as_ref(), false)
     };
+    let stats_elapsed = stats_started.map(|start| start.elapsed());
+    let plan_started = probe_enabled.then(fluree_db_core::clock::Instant::now);
 
     let mut ctx = ExecutionContext::from_graph_db_ref(db, vars).with_strict_bind_errors();
     if let Some(ds) = dataset {
@@ -376,7 +380,20 @@ pub async fn execute_where_streaming<'a>(
     let planning = temporal_mode::PlanningContext::current()
         .with_multi_default_graph(dataset.is_some_and(|ds| ds.default_graphs().len() >= 2));
     let mut operator = build_where_operators_seeded(None, patterns, stats, None, &planning)?;
+    let plan_elapsed = plan_started.map(|start| start.elapsed());
+    let open_started = probe_enabled.then(fluree_db_core::clock::Instant::now);
     operator.open(&ctx).await?;
+    if let Some(start) = open_started {
+        tracing::debug!(
+            target: "fluree::txn_stage_probe",
+            pattern_count = patterns.len(),
+            single_triple,
+            stats_ms = stats_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
+            plan_ms = plan_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
+            operator_open_ms = start.elapsed().as_secs_f64() * 1000.0,
+            "transaction WHERE prepare phase timings"
+        );
+    }
     Ok(WhereCursor {
         inner: CursorInner::Operator(Box::new(WhereCursorOperator {
             operator,

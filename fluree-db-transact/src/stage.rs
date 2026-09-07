@@ -14,6 +14,7 @@ use crate::generate::{infer_datatype, FlakeAccumulator, FlakeGenerator};
 use crate::ir::InlineValues;
 use crate::ir::{GraphMgmtOp, GraphSel, GraphTarget, TemplateTerm, TripleTemplate, Txn, TxnType};
 use crate::namespace::NamespaceRegistry;
+use fluree_db_core::clock::Instant;
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
 use fluree_db_core::query_bounds::RangeTest;
@@ -39,6 +40,7 @@ use fluree_db_sparql::ast::{
 use fluree_db_sparql::lower_sparql;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::Instrument;
 
 #[cfg(feature = "shacl")]
@@ -621,6 +623,11 @@ pub async fn stage(
         delete_count = txn.delete_templates.len()
     );
     async move {
+        // Explicit wall-time probes for builds without OTEL span export. Keep
+        // clock reads and events off unless this dedicated target is enabled.
+        let probe_enabled =
+            tracing::enabled!(target: "fluree::txn_stage_probe", tracing::Level::DEBUG);
+        let stage_started = probe_enabled.then(Instant::now);
         tracing::info!("starting transaction staging");
 
         // 1. Check backpressure - reject early if novelty is at max
@@ -744,6 +751,7 @@ pub async fn stage(
             retraction_count = tracing::field::Empty,
             assertion_count = tracing::field::Empty,
         );
+        let where_started = probe_enabled.then(Instant::now);
         let stream_stats = async {
             let stats = stream_where_into_accumulator(
                 &ledger,
@@ -754,6 +762,7 @@ pub async fn stage(
                 &reverse_graph,
                 &mut acc,
                 options.policy_ctx,
+                probe_enabled,
             )
             .await?;
             let span = tracing::Span::current();
@@ -764,6 +773,7 @@ pub async fn stage(
         }
         .instrument(where_span)
         .await?;
+        let where_elapsed = where_started.map(|start| start.elapsed());
 
         // Per SPARQL 1.1 Update §3.1.3: INSERT/DELETE templates are instantiated
         // once per WHERE solution, so a WHERE that matches zero solutions is a
@@ -879,6 +889,7 @@ pub async fn stage(
         // explicit-IRI metadata cascade (LPG mode opt-in) are tracked
         // as follow-ups in the plan.
         let lpg_edge_lifecycle = txn.opts.lpg_edge_lifecycle.unwrap_or(false);
+        let cascade_started = probe_enabled.then(Instant::now);
         let cascade = cascade_attachment_retracts(
             &flakes,
             &ledger,
@@ -887,6 +898,7 @@ pub async fn stage(
             lpg_edge_lifecycle,
         )
         .await?;
+        let cascade_elapsed = cascade_started.map(|start| start.elapsed());
         if !cascade.is_empty() {
             // Dedup cascade retracts against retracts already in
             // `flakes` (e.g. a same-txn by-id annotation retract that
@@ -968,6 +980,8 @@ pub async fn stage(
         // arena / hydration paths will. A malformed (multi-target) net
         // bundle is rejected here rather than corrupting downstream
         // `EdgeKey::from_reifies_facts`.
+        let attachment_started = probe_enabled.then(Instant::now);
+        let attachment_subject_count;
         {
             use fluree_db_core::comparator::IndexType;
             use fluree_db_core::edge::EdgeKey;
@@ -985,6 +999,7 @@ pub async fn stage(
                     touched.push(f.s.clone());
                 }
             }
+            attachment_subject_count = touched.len();
 
             if !touched.is_empty() {
                 let to_t = ledger.t();
@@ -1061,6 +1076,7 @@ pub async fn stage(
                 }
             }
         }
+        let attachment_elapsed = attachment_started.map(|start| start.elapsed());
 
         // Charge 1 micro-fuel per staged flake. Matches query-side scan fuel,
         // which also charges per flake without filtering schema flakes.
@@ -1092,6 +1108,24 @@ pub async fn stage(
         let total_flakes = flakes.len();
         let assertions = flakes.iter().filter(|f| f.op).count();
         let retractions = total_flakes - assertions;
+
+        if let Some(start) = stage_started {
+            tracing::debug!(
+                target: "fluree::txn_stage_probe",
+                ledger_id = ledger.ledger_id(),
+                base_t = ledger.t(),
+                index_t = ledger.index_t(),
+                novelty_bytes = ledger.novelty.size,
+                stage_ms = start.elapsed().as_secs_f64() * 1000.0,
+                where_ms = where_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
+                cascade_ms = cascade_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
+                attachment_validation_ms = attachment_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
+                attachment_subject_count,
+                binding_rows = stream_stats.total_binding_rows,
+                flake_count = total_flakes,
+                "transaction staging phase timings"
+            );
+        }
 
         tracing::info!(
             flake_count = total_flakes,
@@ -2222,7 +2256,9 @@ async fn stream_where_into_accumulator(
     reverse_graph: &HashMap<Sid, GraphId>,
     acc: &mut FlakeAccumulator,
     view_policy: Option<&PolicyContext>,
+    probe_enabled: bool,
 ) -> Result<WhereStreamStats> {
+    let setup_started = probe_enabled.then(Instant::now);
     // Lower transaction WHERE clause to query patterns.
     //
     // - JSON-LD updates: `txn.where_patterns` is an UnresolvedPattern list, lowered here using the
@@ -2482,6 +2518,10 @@ async fn stream_where_into_accumulator(
     // Open the streaming WHERE cursor. For empty patterns it emits one
     // empty-schema/empty-len batch then EOF, mirroring the eager API's
     // `vec![Batch::empty(...)]` behavior.
+    let setup_elapsed = setup_started.map(|start| start.elapsed());
+    // This includes stats construction, planning and operator.open. Cursor
+    // consumption is timed separately below, including the final EOF poll.
+    let open_started = probe_enabled.then(Instant::now);
     let mut cursor = fluree_db_query::execute_where_streaming(
         base_db,
         &txn.vars,
@@ -2490,12 +2530,23 @@ async fn stream_where_into_accumulator(
     )
     .await
     .map_err(TransactError::Query)?;
+    let open_elapsed = open_started.map(|start| start.elapsed());
 
     let mut total_binding_rows: u64 = 0;
     let mut retraction_count: usize = 0;
     let mut assertion_count: usize = 0;
+    let mut next_elapsed = Duration::ZERO;
+    let mut materialize_elapsed = Duration::ZERO;
+    let mut delete_elapsed = Duration::ZERO;
+    let mut insert_elapsed = Duration::ZERO;
 
-    while let Some(batch) = cursor.next_batch().await.map_err(TransactError::Query)? {
+    loop {
+        let next_started = probe_enabled.then(Instant::now);
+        let batch = cursor.next_batch().await.map_err(TransactError::Query)?;
+        if let Some(start) = next_started {
+            next_elapsed += start.elapsed();
+        }
+        let Some(batch) = batch else { break };
         // Blank nodes in INSERT templates are fresh per WHERE solution
         // (SPARQL 1.1 Update §3.1.3); give this batch its global solution
         // offset so retractions and assertions of the same row agree.
@@ -2504,8 +2555,12 @@ async fn stream_where_into_accumulator(
 
         // Per-batch shape: project → materialize in place → generate →
         // hydrate (retractions only) → push. Batch drops at end of iter.
+        let materialize_started = probe_enabled.then(Instant::now);
         let batch = batch.project_owned(template_vars);
         let batch = materialize_encoded_bindings_for_txn(ledger, batch)?;
+        if let Some(start) = materialize_started {
+            materialize_elapsed += start.elapsed();
+        }
 
         // Per-batch `delete_gen` span. Nested under `where_exec`. Fields:
         // `template_count` (stable per txn), `retraction_count` (per-batch
@@ -2515,6 +2570,7 @@ async fn stream_where_into_accumulator(
             template_count = txn.delete_templates.len(),
             retraction_count = tracing::field::Empty,
         );
+        let delete_started = probe_enabled.then(Instant::now);
         let retractions = {
             let _g = delete_span.enter();
             let mut r = generator.generate_retractions(&txn.delete_templates, &batch)?;
@@ -2532,6 +2588,9 @@ async fn stream_where_into_accumulator(
         };
         retraction_count += retractions.len();
         acc.push_retractions(retractions);
+        if let Some(start) = delete_started {
+            delete_elapsed += start.elapsed();
+        }
 
         if !pure_delete {
             // Per-batch `insert_gen` span. Nested under `where_exec`.
@@ -2540,6 +2599,7 @@ async fn stream_where_into_accumulator(
                 template_count = txn.insert_templates.len(),
                 assertion_count = tracing::field::Empty,
             );
+            let insert_started = probe_enabled.then(Instant::now);
             let assertions = {
                 let _g = insert_span.enter();
                 let a = generator.generate_assertions(&txn.insert_templates, &batch)?;
@@ -2548,9 +2608,30 @@ async fn stream_where_into_accumulator(
             };
             assertion_count += assertions.len();
             acc.push_assertions(assertions);
+            if let Some(start) = insert_started {
+                insert_elapsed += start.elapsed();
+            }
         }
     }
     cursor.close();
+
+    if probe_enabled {
+        tracing::debug!(
+            target: "fluree::txn_stage_probe",
+            ledger_id = ledger.ledger_id(),
+            base_t = ledger.t(),
+            index_t = ledger.index_t(),
+            pattern_count = query_patterns.len(),
+            binding_rows = total_binding_rows,
+            setup_ms = setup_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
+            open_ms = open_elapsed.unwrap_or_default().as_secs_f64() * 1000.0,
+            next_ms = next_elapsed.as_secs_f64() * 1000.0,
+            materialize_ms = materialize_elapsed.as_secs_f64() * 1000.0,
+            delete_hydrate_ms = delete_elapsed.as_secs_f64() * 1000.0,
+            insert_ms = insert_elapsed.as_secs_f64() * 1000.0,
+            "transaction WHERE phase timings"
+        );
+    }
 
     Ok(WhereStreamStats {
         total_binding_rows,
