@@ -41,8 +41,8 @@ jobs:
     #   - A `[[bench]]` is declared in Cargo.toml without a matching
     #     entry in `regression-budget.json` (or vice versa).
     #
-    # A cold cache must compile the whole workspace's benches in release
-    # (consensus / search-service / search-httpd and their heavy deps);
+    # A cold cache must compile all explicit workspace benchmarks and their
+    # dependencies in release.
     # Use 8 cores / 32 GB and allow cold builds 60 minutes. The previous
     # 4-core job repeatedly timed out during compilation at 45 minutes.
     runs-on: ci-cd-large

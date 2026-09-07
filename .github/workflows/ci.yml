@@ -291,7 +291,7 @@ jobs:
     # no code change. See BENCHMARKING.md, "Baselines: capture & compare".
     #
     # The committed baseline contains exactly this cheap subset, so `compare`
-    # needs no `--only`. Full workspace + medium: nightly.
+    # needs no `--only`. Full workspace benchmark smoke runs nightly at tiny.
     needs: bench-paths
     if: needs.bench-paths.outputs.run == 'true'
     runs-on: ci-cd-large
