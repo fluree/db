@@ -43,6 +43,7 @@ pub trait AcceptanceValidator {
                 transition: &record.transition,
                 accepted: &accepted,
                 checkpoint,
+                frontier: None,
             })?;
             for object in &record.transition.objects {
                 accepted.insert(object.key.clone(), object.bytes.clone());
@@ -52,14 +53,55 @@ pub trait AcceptanceValidator {
     }
 }
 
+/// Opaque identity of an exact journal prefix. This is NOT a semantic proof or
+/// an acknowledgment. Trusted embeddings may bind their own validation to it.
+/// The receipt digest chains back to the root-specific journal header, including
+/// the checkpoint binding. Head and generation are also compared explicitly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptanceFrontier {
+    ledger: String,
+    generation: String,
+    checkpoint: Option<[u8; 32]>,
+    head: Option<Object>,
+    receipt: Receipt,
+}
+impl AcceptanceFrontier {
+    pub fn head(&self) -> Option<&[u8]> {
+        self.head.as_ref().map(|h| h.bytes.as_slice())
+    }
+}
+
 /// Only candidate, accepted journal, or explicitly verified checkpoint bytes.
 /// Arbitrary readable files cannot become durable prerequisites through this view.
 pub struct AcceptanceView<'a> {
     pub transition: &'a Transition,
     accepted: &'a BTreeMap<String, Vec<u8>>,
     checkpoint: Option<&'a Checkpoint>,
+    frontier: Option<AcceptanceFrontier>,
 }
 impl AcceptanceView<'_> {
+    /// Present only in live serialized acceptance. Full recovery validation
+    /// deliberately supplies no reusable prefix identity.
+    pub fn frontier(&self) -> Option<&AcceptanceFrontier> {
+        self.frontier.as_ref()
+    }
+
+    /// Identity after this candidate and receipt. Use only in the owner's install
+    /// hook, after semantic validation and successful flush. A later failure still
+    /// leaves the owner unavailable: this value alone never proves acceptance.
+    pub fn frontier_after(&self, receipt: &Receipt) -> AcceptanceFrontier {
+        AcceptanceFrontier {
+            ledger: self.transition.ledger.clone(),
+            generation: self.transition.generation.clone(),
+            checkpoint: self.checkpoint.map(Checkpoint::digest),
+            head: Some(Object {
+                key: self.transition.head_key.clone(),
+                bytes: self.transition.resulting_head.clone(),
+            }),
+            receipt: receipt.clone(),
+        }
+    }
+
     /// Borrow journal-covered bytes only; use read_content for checkpoint prerequisites.
     pub fn content(&self, key: &str) -> Option<&[u8]> {
         self.transition
@@ -133,6 +175,22 @@ impl<I: JournalIo> Coordinator<I> {
             this.advance(&record.transition, record.receipt.clone());
         }
         Ok(this)
+    }
+
+    pub(super) fn frontier(&self) -> Result<AcceptanceFrontier> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        Ok(AcceptanceFrontier {
+            ledger: self.ledger.clone(),
+            generation: self.generation.clone(),
+            checkpoint: self.checkpoint.as_deref().map(Checkpoint::digest),
+            head: self.head.as_ref().map(|(key, bytes)| Object {
+                key: key.clone(),
+                bytes: bytes.clone(),
+            }),
+            receipt: self.journal.as_ref().ok_or(Error::Poisoned)?.receipt(),
+        })
     }
 
     fn check_transition(&self, t: &Transition) -> Result<()> {
@@ -239,6 +297,7 @@ impl<I: JournalIo> Coordinator<I> {
             transition: t,
             accepted: &self.objects,
             checkpoint: self.checkpoint.as_deref(),
+            frontier: Some(self.frontier()?),
         };
         if let Some(checkpoint) = &self.checkpoint {
             validator.validate_checkpoint(checkpoint)?;

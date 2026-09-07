@@ -483,6 +483,7 @@ fn coordinator_uncertain_flush_never_materializes_or_installs() {
         assert_eq!(target.head, Some(vec![1]));
         assert!(!target.objects.contains_key("objects/2"));
         assert!(coordinator.poisoned);
+        assert!(matches!(coordinator.frontier(), Err(Error::Poisoned)));
         assert!(matches!(
             coordinator.accept(&transition(2), &CheckContent, &mut target, |_, _| Ok(())),
             Err(Error::Poisoned)
@@ -525,4 +526,54 @@ fn coordinator_materialization_and_install_failures_leave_recoverable_unknown_ou
         assert_eq!(target.head, Some(vec![1]));
         assert_eq!(target.objects["objects/1"], vec![1; 17]);
     }
+}
+
+#[test]
+fn frontier_binds_root_and_advances_only_with_healthy_acceptance() {
+    use super::acceptance::Coordinator;
+    let io = FaultIo::default();
+    let mut c = Coordinator::restored(
+        Journal::create(io.clone(), [81; 16]).unwrap(),
+        &[],
+        "test:main",
+        "generation-1",
+    )
+    .unwrap();
+    let other = Coordinator::restored(
+        Journal::create(FaultIo::default(), [82; 16]).unwrap(),
+        &[],
+        "test:main",
+        "generation-1",
+    )
+    .unwrap();
+    let before = c.frontier().unwrap();
+    assert_ne!(before, other.frontier().unwrap());
+    let mut target = Materialized::default();
+    let mut next = None;
+    c.accept(&transition(1), &CheckContent, &mut target, |v, r| {
+        assert_eq!(v.frontier(), Some(&before));
+        next = Some(v.frontier_after(r));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(Some(c.frontier().unwrap()), next);
+    let mut failed = None;
+    assert!(c
+        .accept(&transition(2), &CheckContent, &mut target, |v, r| {
+            failed = Some(v.frontier_after(r));
+            Err(Error::Invalid("install cut"))
+        })
+        .is_err());
+    assert!(matches!(c.frontier(), Err(Error::Poisoned)));
+    let (journal, records) = Journal::open(io.crash()).unwrap();
+    struct Recovery;
+    impl AcceptanceValidator for Recovery {
+        fn validate(&self, v: &AcceptanceView<'_>) -> Result<()> {
+            assert!(v.frontier().is_none());
+            CheckContent.validate(v)
+        }
+    }
+    Recovery.validate_recovered(&records).unwrap();
+    let recovered = Coordinator::restored(journal, &records, "test:main", "generation-1").unwrap();
+    assert_eq!(Some(recovered.frontier().unwrap()), failed);
 }

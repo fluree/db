@@ -156,19 +156,23 @@ pub(crate) fn validate_linear(
     view: &AcceptanceView<'_>,
     baseline: Option<&LinearBaseline>,
 ) -> Result<()> {
+    validate_linear_from(view, baseline.is_some(), baseline)
+}
+
+/// A private embedding may stop at a separately validated accepted prefix while
+/// retaining the original indexed/unindexed head restrictions.
+pub(crate) fn validate_linear_from(
+    view: &AcceptanceView<'_>,
+    indexed: bool,
+    baseline: Option<&LinearBaseline>,
+) -> Result<()> {
     let t = view.transition;
     let (ledger, branch) =
         split_ledger_id(&t.ledger).map_err(|_| Error::Invalid("invalid journal ledger"))?;
     if t.head_key != format!("ns@v2/{ledger}/{branch}.json") {
         return Err(Error::Invalid("noncanonical journal head key"));
     }
-    let new = head(
-        &t.resulting_head,
-        &ledger,
-        &branch,
-        &t.head_key,
-        baseline.is_some(),
-    )?;
+    let new = head(&t.resulting_head, &ledger, &branch, &t.head_key, indexed)?;
     let new_id: ContentId = new
         .commit
         .parse()
@@ -176,7 +180,7 @@ pub(crate) fn validate_linear(
     let old = t
         .expected_head
         .as_deref()
-        .map(|bytes| head(bytes, &ledger, &branch, &t.head_key, baseline.is_some()))
+        .map(|bytes| head(bytes, &ledger, &branch, &t.head_key, indexed))
         .transpose()?;
     if let Some(old) = &old {
         if new.t

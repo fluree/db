@@ -250,9 +250,17 @@ copying and before ready publication. This requires a quiescent private source a
 is not a live migration protocol.
 
 Recovery builds a semantic baseline proof bound to the exact checkpoint digest.
-Subsequent writes validate their journal tail down to that baseline instead of decoding
-the imported history again. Tail validation still walks prior tail commits; it is not
-a general accepted-head proof cache. Bootstrap/startup verify the full baseline and
+Live writes reuse a private process-local proof of the accepted prefix. It binds the
+root-specific journal receipt/digest, generation, exact head and checkpoint digest.
+Each candidate still checks its exact parent/time, dependency bytes/CIDs, default-graph
+restriction and unchanged configuration/index fields. Candidate closure excludes
+unrelated re-supplied ancestor objects; older raw dependencies remain hash-checked.
+Proof extends only inside validated, successfully flushed state installation. The
+cache gate and owner health prevent reuse after uncertain flush or installation
+failure. Independent adapter caches compare the entire frontier and fully recover
+before using changed state. The opaque core frontier alone is neither semantic proof
+nor an acknowledgment. Full recovery views deliberately expose no reusable frontier.
+Bootstrap/startup verify the full baseline and
 currently decode full commit bodies, one object at a time. Core copying uses its
 fixed buffer, but the API content-store interface buffers one source object; this is
 not a constant-memory end-to-end import. A separate embedded medium diagnostic

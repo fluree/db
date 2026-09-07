@@ -28,7 +28,7 @@ use std::io;
 mod file;
 pub use file::FileIo;
 mod acceptance;
-pub use acceptance::{AcceptanceValidator, AcceptanceView};
+pub use acceptance::{AcceptanceFrontier, AcceptanceValidator, AcceptanceView};
 mod checkpoint;
 pub use checkpoint::{Checkpoint, CheckpointEntry, CheckpointSpec};
 mod root;

@@ -28,9 +28,11 @@ mod cypher;
 #[cfg(test)]
 mod fixtures;
 mod indexed;
+mod prefix;
 
 struct AdapterValidator<'a> {
     proof: Option<&'a indexed::Proof>,
+    prefix: Option<&'a prefix::ValidatedPrefix>,
 }
 impl AcceptanceValidator for AdapterValidator<'_> {
     fn validate_checkpoint(
@@ -45,7 +47,13 @@ impl AcceptanceValidator for AdapterValidator<'_> {
         &self,
         view: &fluree_db_core::local_journal::AcceptanceView<'_>,
     ) -> fluree_db_core::local_journal::Result<()> {
-        if let Some(proof) = self.proof {
+        if let Some(prefix) = self.prefix {
+            crate::local_journal_acceptance::validate_linear_from(
+                view,
+                self.proof.is_some(),
+                prefix.boundary(view)?,
+            )?;
+        } else if let Some(proof) = self.proof {
             validate_linear(view, Some(&proof.linear))?;
         } else {
             LinearCommitValidator.validate(view)?;
@@ -106,6 +114,7 @@ struct Cache {
     state: Option<LedgerState>,
     head: Option<Vec<u8>>,
     proof: Option<Arc<indexed::Proof>>,
+    prefix: Option<Arc<prefix::ValidatedPrefix>>,
 }
 struct Inner {
     owner: Arc<LocalRoot>,
@@ -143,6 +152,7 @@ impl JournalLedger {
                 state: None,
                 head: None,
                 proof: None,
+                prefix: None,
             })),
             engine: FlureeBuilder::memory().without_indexing().build_memory(),
             cache_dir: Arc::new(
@@ -173,7 +183,8 @@ impl JournalLedger {
             // Keep the gate through cancellation and through failed installation.
             cache.state = None;
             cache.proof = None;
-            owner.recover_with_checkpoint(|records, checkpoint| {
+            cache.prefix = None;
+            owner.recover_with_frontier(|records, checkpoint, frontier| {
                 let store = RecoveryStore::new(
                     owner.ledger(),
                     records,
@@ -190,6 +201,7 @@ impl JournalLedger {
                     .transpose()?;
                 AdapterValidator {
                     proof: proof.as_deref(),
+                    prefix: None,
                 }
                 .validate_recovered_from(records, checkpoint.as_deref())?;
                 let (record, head) =
@@ -236,6 +248,10 @@ impl JournalLedger {
                             JournalError::Invalid("private staging context installation failed")
                         })?;
                 }
+                cache.prefix = Some(Arc::new(prefix::ValidatedPrefix::after_validation(
+                    frontier.clone(),
+                    owner.ledger(),
+                )?));
                 cache.proof = proof;
                 cache.state = Some(state);
                 cache.head = head;
@@ -248,8 +264,9 @@ impl JournalLedger {
 
     async fn ready(&self) -> Result<OwnedMutexGuard<Cache>> {
         let cache = self.0.cache.clone().lock_owned().await;
-        let head = self.accepted_head().await?;
-        if cache.state.is_none() || cache.head != head {
+        let owner = self.0.owner.clone();
+        let frontier = tokio::task::spawn_blocking(move || owner.accepted_frontier()).await??;
+        if cache.state.is_none() || cache.prefix.as_ref().is_none_or(|p| !p.matches(&frontier)) {
             self.restore(cache).await
         } else {
             Ok(cache)
@@ -379,12 +396,14 @@ impl JournalLedger {
             tokio::task::spawn_blocking(move || {
                 let mut committed = None;
                 let proof = cache.proof.clone();
+                let prefix = cache.prefix.clone();
                 let journal = owner.accept_with(
                     &transition,
                     &AdapterValidator {
                         proof: proof.as_deref(),
+                        prefix: prefix.as_deref(),
                     },
-                    |_, _| {
+                    |view, journal_receipt| {
                         before_install()?;
                         let (receipt, mut state) = staged.finalize_state().map_err(|_| {
                             JournalError::Invalid("journal state finalization failed")
@@ -413,6 +432,10 @@ impl JournalLedger {
                                     )
                                 })?;
                         }
+                        cache.prefix = Some(Arc::new(prefix::ValidatedPrefix::after_validation(
+                            view.frontier_after(journal_receipt),
+                            owner.ledger(),
+                        )?));
                         cache.state = Some(state);
                         cache.head = Some(transition.resulting_head.clone());
                         committed = Some(receipt);

@@ -330,6 +330,19 @@ impl LocalRoot {
         &self,
         install: impl FnOnce(&[Record], Option<Arc<Checkpoint>>) -> Result<()>,
     ) -> Result<()> {
+        self.recover_with_frontier(|records, checkpoint, _| install(records, checkpoint))
+    }
+
+    /// Recovery installation with the exact restored prefix identity. The
+    /// embedding must fully validate records/checkpoint before caching a proof.
+    pub fn recover_with_frontier(
+        &self,
+        install: impl FnOnce(
+            &[Record],
+            Option<Arc<Checkpoint>>,
+            &super::AcceptanceFrontier,
+        ) -> Result<()>,
+    ) -> Result<()> {
         let mut state = self.coordinator.lock();
         state.poisoned = true;
         drop(state.journal.take());
@@ -351,7 +364,7 @@ impl LocalRoot {
             &mut FileTarget { root: &data },
         )?;
         File::open(&control)?.sync_all()?;
-        install(&records, checkpoint)?;
+        install(&records, checkpoint, &restored.frontier()?)?;
         *state = restored;
         Ok(())
     }
@@ -361,6 +374,11 @@ impl LocalRoot {
     }
     pub fn generation(&self) -> &str {
         &self.manifest.generation
+    }
+
+    /// Health-gated exact prefix identity for a trusted embedding's cache.
+    pub fn accepted_frontier(&self) -> Result<super::AcceptanceFrontier> {
+        self.coordinator.lock().frontier()
     }
 
     /// Health-gated accepted head for database cache coherence. This checks the
