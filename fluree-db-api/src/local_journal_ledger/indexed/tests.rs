@@ -296,6 +296,39 @@ async fn indexed_frozen_cypher_corpus_preserves_annotations_and_external_acknowl
         .query_cypher("MATCH (n) RETURN n ORDER BY n", None)
         .await
         .unwrap();
+    let endpoints = ledger
+        .query_cypher("MATCH (a)-[:TempEdge]->(b) RETURN a,b", None)
+        .await
+        .unwrap();
+    for pair in rows(&endpoints) {
+        for endpoint in pair.as_array().unwrap() {
+            assert!(
+                rows(&before).contains(&json!([endpoint])),
+                "missing endpoint {endpoint}"
+            );
+        }
+    }
+    let view = GraphDb::from_ledger_state(&state);
+    let ordinary_nodes = source
+        .query_cypher(&view, "MATCH (n) RETURN n ORDER BY n")
+        .await
+        .unwrap()
+        .to_cypher_json_async(view.as_graph_db_ref())
+        .await
+        .unwrap();
+    let ordinary_endpoints = source
+        .query_cypher(&view, "MATCH (a)-[:TempEdge]->(b) RETURN a,b")
+        .await
+        .unwrap()
+        .to_cypher_json_async(view.as_graph_db_ref())
+        .await
+        .unwrap();
+    for pair in rows(&ordinary_endpoints) {
+        for endpoint in pair.as_array().unwrap() {
+            assert!(rows(&ordinary_nodes).contains(&json!([endpoint])));
+        }
+    }
+    drop(view);
     let before_edges = ledger
         .query_cypher("MATCH ()-[r]->() RETURN r ORDER BY r", None)
         .await
@@ -326,6 +359,21 @@ async fn indexed_frozen_cypher_corpus_preserves_annotations_and_external_acknowl
         assert_eq!(cache.state.as_ref().unwrap().snapshot.t, imported.t);
     }
     drop((ledger, state, source));
+    // Ordinary file recovery must preserve the same complete node identities.
+    let reopened = FlureeBuilder::file(source_dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let view = reopened.db("indexed-cypher:main").await.unwrap();
+    let recovered_nodes = reopened
+        .query_cypher(&view, "MATCH (n) RETURN n ORDER BY n")
+        .await
+        .unwrap()
+        .to_cypher_json_async(view.as_graph_db_ref())
+        .await
+        .unwrap();
+    assert_eq!(recovered_nodes, ordinary_nodes);
+    drop((view, reopened));
     source_dir.close().unwrap();
     let acks: Vec<Value> =
         serde_json::from_slice(&std::fs::read(controller.path().join("acks.json")).unwrap())

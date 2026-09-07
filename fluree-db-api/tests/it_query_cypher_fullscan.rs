@@ -645,3 +645,135 @@ async fn distinct_predicate_stats_shortcut_matches_pipeline_after_incremental() 
         "COUNT(DISTINCT ?p) stats shortcut vs pipeline: {folded} vs {truth}"
     );
 }
+
+#[tokio::test]
+async fn bare_created_endpoints_remain_nodes_after_edge_deletion() {
+    std::env::set_var("FLUREE_CYPHER_ALLOW_FULL_SCAN", "1");
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    for (i, statement) in [
+        "CREATE (a)-[:TempEdge]->(b)",
+        "CREATE ()<-[:TempEdge]-()",
+        "CREATE (a {})-[:TempEdge]->(b {absent:null})",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("it/cypher:endpoint-{i}");
+        let state = genesis_ledger(&fluree, &ledger_id);
+        let state = fluree
+            .transact_cypher(state, statement)
+            .await
+            .unwrap()
+            .ledger;
+        let db = graphdb_from_ledger(&state);
+        let endpoints = fluree
+            .query_cypher(&db, "MATCH (a)-[:TempEdge]->(b) RETURN a,b")
+            .await
+            .unwrap()
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .unwrap();
+        let nodes = fluree
+            .query_cypher(&db, "MATCH (n) RETURN n ORDER BY n")
+            .await
+            .unwrap()
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .unwrap();
+        let row = endpoints["results"][0]["data"][0]["row"]
+            .as_array()
+            .unwrap();
+        let actual: std::collections::BTreeSet<_> = nodes["results"][0]["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["row"][0].as_str().unwrap())
+            .collect();
+        let expected: std::collections::BTreeSet<_> =
+            row.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(actual, expected, "{statement}");
+        let state = fluree
+            .transact_cypher(state, "MATCH (a)-[r:TempEdge]->(b) DELETE r")
+            .await
+            .unwrap()
+            .ledger;
+        rebuild_and_publish_index(&fluree, &ledger_id).await;
+        for db in [
+            graphdb_from_ledger(&state),
+            fluree.db(&ledger_id).await.unwrap(),
+        ] {
+            let after = fluree
+                .query_cypher(&db, "MATCH (n) RETURN n ORDER BY n")
+                .await
+                .unwrap()
+                .to_cypher_json_async(db.as_graph_db_ref())
+                .await
+                .unwrap();
+            assert_eq!(
+                after, nodes,
+                "edge deletion must retain both endpoint identities"
+            );
+            let labels = fluree
+                .query_cypher(&db, "MATCH (n) RETURN labels(n)")
+                .await
+                .unwrap()
+                .to_cypher_json_async(db.as_graph_db_ref())
+                .await
+                .unwrap();
+            for row in labels["results"][0]["data"].as_array().unwrap() {
+                assert_eq!(row["row"], json!([[]]));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn imported_bare_nodes_and_endpoints_are_enumerated() {
+    std::env::set_var("FLUREE_CYPHER_ALLOW_FULL_SCAN", "1");
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    let ledger_id = "it/cypher:imported-bare";
+    let objects = fluree_db_api::cypher_import::cypher_to_jsonld(
+        "CREATE (); CREATE (a {})<-[:E]-(b {absent:null});",
+        &fluree_db_api::cypher_import::CypherImportOptions::default(),
+    )
+    .unwrap();
+    let node_ids: std::collections::BTreeSet<_> = objects
+        .iter()
+        .filter(|v| v["@type"] == fluree_vocab::fluree::NODE)
+        .map(|v| v["@id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(node_ids.len(), 3);
+    let state = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({"@graph":objects}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    for db in [
+        graphdb_from_ledger(&state),
+        fluree.db(ledger_id).await.unwrap(),
+    ] {
+        let nodes = fluree
+            .query_cypher(&db, "MATCH (n) RETURN n ORDER BY n")
+            .await
+            .unwrap()
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .unwrap();
+        let actual: std::collections::BTreeSet<_> = nodes["results"][0]["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["row"][0].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(actual, node_ids);
+        let edges = fluree
+            .query_cypher(&db, "MATCH (a)-[:E]->(b) RETURN a,b")
+            .await
+            .unwrap();
+        assert_eq!(edges.row_count(), 1);
+    }
+}

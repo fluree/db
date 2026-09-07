@@ -157,6 +157,7 @@ async fn observations(e: &Engine, requests: &Value) -> Result<Value> {
     let mut values = Vec::new();
     for text in [
         "MATCH (n) RETURN count(n)",
+        "MATCH (n) RETURN n ORDER BY n",
         "MATCH (n:User) RETURN count(n)",
         "MATCH (n:L1) RETURN count(n)",
         "MATCH ()-[r]->() RETURN count(r)",
@@ -170,6 +171,31 @@ async fn observations(e: &Engine, requests: &Value) -> Result<Value> {
         "MATCH ()-[r:TempEdge]->() RETURN r ORDER BY r",
     ] {
         values.push(json!({"text":text,"rows":rows(&e.query(text,None).await?)}));
+    }
+    // Endpoint membership is an independent correctness gate: ordinary/WAL
+    // parity alone previously hid fresh object-only nodes missing from scans.
+    let all_nodes = values
+        .iter()
+        .find(|v| v["text"] == "MATCH (n) RETURN n ORDER BY n")
+        .unwrap()["rows"]
+        .as_array()
+        .unwrap();
+    let node_ids: std::collections::BTreeSet<_> =
+        all_nodes.iter().map(|r| r[0].as_str().unwrap()).collect();
+    assert_eq!(node_ids.len(), all_nodes.len(), "duplicate node identity");
+    let pairs = values
+        .iter()
+        .find(|v| v["text"] == "MATCH (a)-[:TempEdge]->(b) RETURN a,b ORDER BY a,b")
+        .unwrap()["rows"]
+        .as_array()
+        .unwrap();
+    for pair in pairs {
+        for id in pair.as_array().unwrap() {
+            assert!(
+                node_ids.contains(id.as_str().unwrap()),
+                "relationship endpoint missing from node scan: {id}"
+            );
+        }
     }
     for request in requests
         .as_array()

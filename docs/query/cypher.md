@@ -675,7 +675,13 @@ here to stay:
 - **Nodes are durable subjects, not opaque LPG nodes.** `labels(n)` are
   `rdf:type` assertions; node identity is the subject's stored name (a plain
   name by default, a full IRI in `@vocab` mode — see
-  [Names, and opting into IRIs](#names-and-opting-into-iris)).
+  [Names, and opting into IRIs](#names-and-opting-into-iris)). Fresh Cypher
+  nodes with no asserted labels or properties receive a hidden `db:Node` type,
+  including relationship endpoints and nodes with empty/null-only property maps.
+  They appear in opted-in node scans and survive deletion of their incident edges;
+  `labels(n)` hides the marker. Cypher bulk import uses the same rule. This does
+  not retroactively add markers to older data or make arbitrary object-only RDF
+  references into described subjects.
 - **Relationships are edge annotations.** `-[r:T]->` reifies the base triple
   `(s, p, o)` into a reifier node (the edge identity) — the same RDF 1.2 model
   SPARQL exposes via the `{| … |}` annotation tail and `rdf:reifies <<( s p o )>>`

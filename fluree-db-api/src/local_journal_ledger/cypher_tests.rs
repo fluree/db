@@ -125,10 +125,8 @@ async fn frozen_eight_writes_match_ordinary_semantics_and_external_recovery_orac
             .sync_all()
             .unwrap();
     }
-    // Use labeled counts for independent expectations: bare MATCH enumerates
-    // subjects and the existing engine omits the object-only unlabeled sink of
-    // create__pattern. The differential OBSERVE check above preserves that
-    // existing behavior rather than changing Cypher semantics in the WAL patch.
+    // Independent counts plus exact endpoint membership prevent shared read/write bugs
+    // from passing solely through ordinary/WAL parity.
     assert_eq!(count(&ledger, "MATCH (n:L1) RETURN count(n)").await, 101);
     assert_eq!(
         count(&ledger, "MATCH (n:UserTemp) RETURN count(n)").await,
@@ -143,6 +141,15 @@ async fn frozen_eight_writes_match_ordinary_semantics_and_external_recovery_orac
         .query_cypher("MATCH (a)-[r]->(b) RETURN a, r, b ORDER BY r", None)
         .await
         .unwrap();
+    let nodes = rows(&node_ids);
+    for edge in rows(&edges) {
+        for endpoint in [&edge[0], &edge[2]] {
+            assert!(
+                nodes.contains(&json!([endpoint])),
+                "endpoint omitted from node scan: {endpoint}"
+            );
+        }
+    }
     drop(ledger);
     std::fs::remove_dir_all(dir.path().join(".fluree-wal/data")).unwrap();
     std::fs::create_dir(dir.path().join(".fluree-wal/data")).unwrap();
@@ -388,4 +395,89 @@ async fn returning_multiple_created_nodes_and_zero_match_return_are_consistent()
     );
     actual.sort_by_key(Value::to_string);
     assert_eq!(actual, returned);
+}
+
+#[tokio::test]
+async fn bare_endpoints_survive_relationship_deletion_and_recovery() {
+    if std::env::var_os("FLUREE_WAL_ENDPOINT_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "local_journal_ledger::cypher::tests::bare_endpoints_survive_relationship_deletion_and_recovery", "--nocapture"])
+            .env("FLUREE_WAL_ENDPOINT_CHILD", "1")
+            .env("FLUREE_CYPHER_ALLOW_FULL_SCAN", "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let (dir, ledger) = initialized().await;
+    ledger
+        .transact_cypher(
+            "CREATE ()-[:E]->(), ()<-[:E]-(), (a {})-[:E]->(b {absent:null})",
+            None,
+        )
+        .await
+        .unwrap();
+    let before = ledger
+        .query_cypher("MATCH (n) RETURN n ORDER BY n", None)
+        .await
+        .unwrap();
+    let endpoints = ledger
+        .query_cypher("MATCH (a)-[:E]->(b) RETURN a,b", None)
+        .await
+        .unwrap();
+    let actual: std::collections::BTreeSet<_> = rows(&before)
+        .iter()
+        .map(|v| v[0].as_str().unwrap().to_owned())
+        .collect();
+    let expected: std::collections::BTreeSet<_> = rows(&endpoints)
+        .iter()
+        .flat_map(|v| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s.as_str().unwrap().to_owned())
+        })
+        .collect();
+    assert_eq!(actual.len(), 6);
+    assert_eq!(actual, expected);
+    let ack = ledger
+        .transact_cypher("MATCH (a)-[r:E]->(b) DELETE r", None)
+        .await
+        .unwrap()
+        .commit
+        .unwrap();
+    let bytes = ledger.content(&ack.commit.commit_id).await.unwrap();
+    let raw = ledger.content(&ack.raw_txn_id).await.unwrap();
+    assert_eq!(
+        ledger
+            .query_cypher("MATCH (n) RETURN n ORDER BY n", None)
+            .await
+            .unwrap(),
+        before
+    );
+    drop(ledger);
+    for _ in 0..2 {
+        std::fs::remove_dir_all(dir.path().join(".fluree-wal/data")).unwrap();
+        std::fs::create_dir(dir.path().join(".fluree-wal/data")).unwrap();
+        let recovered = JournalLedger::open(dir.path().into()).await.unwrap();
+        assert_eq!(
+            recovered
+                .query_cypher("MATCH (n) RETURN n ORDER BY n", None)
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            count(&recovered, "MATCH ()-[r:E]->() RETURN count(r)").await,
+            0
+        );
+        assert_eq!(
+            recovered.content(&ack.commit.commit_id).await.unwrap(),
+            bytes
+        );
+        assert_eq!(recovered.content(&ack.raw_txn_id).await.unwrap(), raw);
+    }
 }

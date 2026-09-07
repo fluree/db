@@ -1649,13 +1649,6 @@ impl<'a> CypherLowering<'a> {
     fn lower_create_part(&mut self, part: &PatternPart) -> Result<(), LowerCypherError> {
         let head_subj = self.node_subject(&part.head);
         self.lower_node_create(&part.head, head_subj.clone())?;
-        // An isolated fresh node with no labels and no properties (`CREATE ()`
-        // / `CREATE (n)`) still needs a triple to exist as an RDF subject —
-        // mark it with the system node class (hidden from `labels()`).
-        // Relationship endpoints are anchored by the edge and need no marker.
-        if part.tail.is_empty() && self.is_fresh_bare_node(&part.head) {
-            self.push_node_marker(head_subj.clone());
-        }
 
         let mut prev_subj = head_subj;
         let mut prev_node = &part.head;
@@ -1674,6 +1667,7 @@ impl<'a> CypherLowering<'a> {
         n: &NodePattern,
         subj: TemplateTerm,
     ) -> Result<(), LowerCypherError> {
+        let start = self.insert_templates.len();
         // Labels — emit (n, rdf:type, label_iri).
         let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
         for Label { name, .. } in &n.labels {
@@ -1688,6 +1682,13 @@ impl<'a> CypherLowering<'a> {
         // Inline properties — emit (n, prop, value).
         if let Some(props) = &n.props {
             self.emit_property_triples(&subj, props)?;
+        }
+        // A newly created node must exist independently of its incident edges.
+        // In particular, an object-only endpoint is absent from subject scans,
+        // and deleting its last edge must not delete the node. Empty/null-only
+        // property maps also emit no triples and need the hidden marker.
+        if self.insert_templates.len() == start && self.is_fresh_node(n) {
+            self.push_node_marker(subj);
         }
         Ok(())
     }
@@ -1942,14 +1943,13 @@ impl<'a> CypherLowering<'a> {
         Ok(terms)
     }
 
-    /// Whether a CREATE node is freshly minted (not a MATCH-bound reference)
-    /// and carries no labels or inline properties.
-    fn is_fresh_bare_node(&self, n: &NodePattern) -> bool {
+    /// Whether a CREATE node is freshly minted rather than a MATCH-bound reference.
+    fn is_fresh_node(&self, n: &NodePattern) -> bool {
         let bound = n
             .var
             .as_ref()
             .is_some_and(|v| self.bound_vars.contains(&v.name));
-        !bound && n.labels.is_empty() && n.props.is_none()
+        !bound
     }
 
     /// Assert the `db:Node` existence marker for a bare created node.

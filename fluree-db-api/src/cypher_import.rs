@@ -362,40 +362,47 @@ impl CypherImporter {
             vars.insert(var.name.clone(), id.clone());
         }
 
-        if !node.labels.is_empty() || node.props.is_some() {
-            let mut obj = Map::new();
-            obj.insert("@id".to_string(), Value::String(id.clone()));
-            match node.labels.len() {
-                0 => {}
-                1 => {
-                    obj.insert(
-                        "@type".to_string(),
-                        Value::String(self.name(&node.labels[0].name)),
-                    );
-                }
-                _ => {
-                    obj.insert(
-                        "@type".to_string(),
-                        Value::Array(
-                            node.labels
-                                .iter()
-                                .map(|l| Value::String(self.name(&l.name)))
-                                .collect(),
-                        ),
-                    );
-                }
+        let mut obj = Map::new();
+        obj.insert("@id".to_string(), Value::String(id.clone()));
+        match node.labels.len() {
+            0 => {}
+            1 => {
+                obj.insert(
+                    "@type".to_string(),
+                    Value::String(self.name(&node.labels[0].name)),
+                );
             }
-            if let Some(props) = &node.props {
-                for (key, expr) in &props.entries {
-                    if let Some(v) = literal_json(expr, line, key)? {
-                        obj.insert(self.name(key), v);
-                    }
-                }
+            _ => {
+                obj.insert(
+                    "@type".to_string(),
+                    Value::Array(
+                        node.labels
+                            .iter()
+                            .map(|l| Value::String(self.name(&l.name)))
+                            .collect(),
+                    ),
+                );
             }
-            write_ndjson_line(&Value::Object(obj), out)?;
-            *count += 1;
-            self.stats.nodes += 1;
         }
+        if let Some(props) = &node.props {
+            for (key, expr) in &props.entries {
+                if let Some(v) = literal_json(expr, line, key)? {
+                    obj.insert(self.name(key), v);
+                }
+            }
+        }
+        // Match the transaction path: every fresh node must have an RDF
+        // assertion, including bare endpoints and empty/null-only maps.
+        if obj.len() == 1 {
+            obj.insert(
+                "@type".to_string(),
+                Value::String(fluree_vocab::fluree::NODE.to_string()),
+            );
+        }
+        write_ndjson_line(&Value::Object(obj), out)?;
+        *count += 1;
+        self.stats.nodes += 1;
+
         Ok(id)
     }
 

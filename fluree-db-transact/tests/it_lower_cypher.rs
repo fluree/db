@@ -168,13 +168,13 @@ fn create_bare_node_asserts_existence_marker() {
 }
 
 #[test]
-fn create_bare_pattern_needs_no_marker() {
-    // `CREATE ()-[:TempEdge]->()` — the edge anchors both endpoints:
-    // 1 base edge + 3 reifier bundle triples, no markers.
+fn create_bare_pattern_marks_both_endpoints() {
+    // Both endpoints must survive node scans and deletion of their edge:
+    // 2 node markers + 1 base edge + 3 reifier bundle triples.
     let txn = lower("CREATE ()-[:TempEdge]->()");
     assert_eq!(
         txn.insert_templates.len(),
-        4,
+        6,
         "templates: {:?}",
         txn.insert_templates
     );
