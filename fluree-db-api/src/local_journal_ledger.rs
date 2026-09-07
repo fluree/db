@@ -205,7 +205,7 @@ impl JournalLedger {
                         Arc::new(store),
                         &mut state,
                         cache_dir.path(),
-                        None,
+                        Some(Arc::clone(inner.engine.leaflet_cache())),
                     ))
                     .map_err(|_| {
                         JournalError::Invalid("journal indexed state attachment failed")
@@ -372,6 +372,7 @@ impl JournalLedger {
         };
         let runtime = tokio::runtime::Handle::current();
         let cache_dir = self.0.cache_dir.clone();
+        let leaflet_cache = Arc::clone(self.0.engine.leaflet_cache());
         // The blocking task owns the cache gate through append, sync and install,
         // even if the awaiting request is dropped or its task is aborted.
         Ok(Some(
@@ -404,7 +405,7 @@ impl JournalLedger {
                                     store,
                                     &mut state,
                                     cache_dir.path(),
-                                    None,
+                                    Some(leaflet_cache),
                                 ))
                                 .map_err(|_| {
                                     JournalError::Invalid(

@@ -649,3 +649,7 @@ fluree-db-transact = { path = "../fluree-db-transact" }
 tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time", "io-util"] }
 # Executor for `wasm_compat::spawn_detached` (browser event loop).
 wasm-bindgen-futures = "0.4"
+
+[[example]]
+name = "journal_diagnostic"
+required-features = ["experimental-local-journal"]

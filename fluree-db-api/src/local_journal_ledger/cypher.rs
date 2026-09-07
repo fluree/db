@@ -34,13 +34,16 @@ impl JournalLedger {
                 JournalError::Invalid("journal Cypher requires exactly one statement").into(),
             );
         }
+        let started = std::time::Instant::now();
         let cache = self.ready().await?;
         let state = cache.state.as_ref().expect("ready state");
         let (staged, kind, result) = self.stage_cypher(state, &statements[0], params).await?;
+        let staged_at = std::time::Instant::now();
         let raw = json!({"cypher": cypher, "params": params.cloned().unwrap_or_default()});
         let commit = self
             .accept_staged(cache, staged, kind, &raw, before_install)
             .await?;
+        tracing::debug!(target: "fluree::journal_probe", t = commit.as_ref().map(|c| c.commit.t), stage_us = staged_at.duration_since(started).as_micros() as u64, accept_total_us = staged_at.elapsed().as_micros() as u64, "journal Cypher phases");
         Ok(CypherOutcome { commit, result })
     }
 

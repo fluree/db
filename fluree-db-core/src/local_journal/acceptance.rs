@@ -233,6 +233,7 @@ impl<I: JournalIo> Coordinator<I> {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
+        let started = std::time::Instant::now();
         self.check_transition(t)?;
         let view = AcceptanceView {
             transition: t,
@@ -250,6 +251,7 @@ impl<I: JournalIo> Coordinator<I> {
                 "materialized head differs from accepted head",
             ));
         }
+        let validated = std::time::Instant::now();
         // Any panic/error from here leaves the owner unavailable until recovery.
         self.poisoned = true;
         let journal = self.journal.as_mut().ok_or(Error::Poisoned)?;
@@ -268,12 +270,16 @@ impl<I: JournalIo> Coordinator<I> {
                 });
             }
         };
+        let flushed = std::time::Instant::now();
         let finish = (|| {
             for object in &t.objects {
                 target.put_immutable(object)?;
             }
             target.publish_head(&t.head_key, t.expected_head.as_deref(), &t.resulting_head)?;
-            install(&view, &receipt)
+            let materialized = std::time::Instant::now();
+            install(&view, &receipt)?;
+            tracing::debug!(target: "fluree::journal_probe", sequence = receipt.sequence, validate_us = validated.duration_since(started).as_micros() as u64, materialize_us = materialized.duration_since(flushed).as_micros() as u64, install_us = materialized.elapsed().as_micros() as u64, "journal acceptance phases");
+            Ok(())
         })();
         if let Err(cause) = finish {
             return Err(Error::AcceptanceUnresolved {

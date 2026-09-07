@@ -357,6 +357,7 @@ impl<I: JournalIo> Journal<I> {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
+        let started = std::time::Instant::now();
         transition.validate()?;
         // A capped serializer avoids allocating an unbounded encoded payload.
         let mut payload = CappedPayload(Vec::new());
@@ -375,9 +376,12 @@ impl<I: JournalIo> Journal<I> {
         frame.extend_from_slice(&payload);
         let hash = digest(&frame);
         frame.extend_from_slice(&hash);
+        let encoded = std::time::Instant::now();
         self.poisoned = true;
         write_all(&mut self.io, self.end, &frame)?;
+        let written = std::time::Instant::now();
         self.io.sync_all()?;
+        tracing::debug!(target: "fluree::journal_probe", sequence, frame_bytes = frame.len(), encode_us = encoded.duration_since(started).as_micros() as u64, append_us = written.duration_since(encoded).as_micros() as u64, flush_us = written.elapsed().as_micros() as u64, "journal flush phases");
         self.end += frame_len as u64;
         self.sequence = sequence;
         self.digest = hash;

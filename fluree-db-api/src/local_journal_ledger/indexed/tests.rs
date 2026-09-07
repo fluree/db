@@ -1,5 +1,21 @@
 use super::*;
 
+fn assert_shared_cache(state: &LedgerState, ledger: &JournalLedger) {
+    let store = state
+        .binary_store
+        .as_ref()
+        .unwrap()
+        .0
+        .downcast_ref::<fluree_db_binary_index::BinaryIndexStore>()
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        store
+            .leaflet_cache()
+            .expect("indexed reads need a bounded shared cache"),
+        ledger.0.engine.leaflet_cache()
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_import_bootstrap_reads_writes_and_recovers_indexed_state() {
     let source_dir = tempfile::tempdir().unwrap();
@@ -43,7 +59,7 @@ ex:two a ex:User ; ex:value 20 .
     );
     {
         let cache = ledger.ready().await.unwrap();
-        assert!(cache.state.as_ref().unwrap().binary_store.is_some());
+        assert_shared_cache(cache.state.as_ref().unwrap(), &ledger);
         assert_eq!(
             cache
                 .state
@@ -79,6 +95,10 @@ ex:two a ex:User ; ex:value 20 .
         ledger.query(&bound).await.unwrap(),
         json!([["new:three", "new string"]])
     );
+    assert_shared_cache(
+        ledger.ready().await.unwrap().state.as_ref().unwrap(),
+        &ledger,
+    );
     let commit_bytes = ledger.content(&accepted.commit.commit_id).await.unwrap();
     drop(ledger);
     drop(source);
@@ -89,6 +109,10 @@ ex:two a ex:User ; ex:value 20 .
         std::fs::remove_dir_all(target_dir.path().join(".fluree-wal/data")).unwrap();
         std::fs::create_dir(target_dir.path().join(".fluree-wal/data")).unwrap();
         let ledger = JournalLedger::open(target_dir.path().into()).await.unwrap();
+        assert_shared_cache(
+            ledger.ready().await.unwrap().state.as_ref().unwrap(),
+            &ledger,
+        );
         assert_eq!(
             ledger.query(&query).await.unwrap(),
             json!([["ex:one", 11], ["ex:two", 20]])

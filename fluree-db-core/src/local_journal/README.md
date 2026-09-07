@@ -255,13 +255,18 @@ the imported history again. Tail validation still walks prior tail commits; it i
 a general accepted-head proof cache. Bootstrap/startup verify the full baseline and
 currently decode full commit bodies, one object at a time. Core copying uses its
 fixed buffer, but the API content-store interface buffers one source object; this is
-not a constant-memory end-to-end import and has not been sized on the medium dataset.
+not a constant-memory end-to-end import. A separate embedded medium diagnostic
+qualifies this fixed-index path; it does not enable the original index-on benchmark.
 
 The factored index attachment helper accepts the private read-only checkpoint/journal
 store, restores dictionary watermarks and namespaces, populates novelty IDs and
 attaches binary providers and annotation content access. Private temporary cache files
 are disposable and hold no recovery authority. Store handles retain both root and
-cache lifetimes. Static context metadata is installed in the private memory staging
+cache lifetimes. Both initial/recovery attachment and namespace reattachment use the
+private engine's bounded shared leaflet/dictionary cache, with the ordinary memory-based
+budget. Omitting this cache caused repeated dictionary file reads and minutes of
+medium readback in the first diagnostic; a regression asserts the actual attachment
+retains this cache across new-namespace writes and recovery. Static context metadata is installed in the private memory staging
 engine so ordinary Cypher lowering/probes use the same IRI mapping; accepted data
 still comes only from the supplied owned LedgerState. Queries use the context and
 JSON-LD writes inherit it when they have no explicit context; raw provenance remains
