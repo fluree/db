@@ -71,6 +71,26 @@ pub enum StoredBigValue {
 }
 
 impl StoredBigValue {
+    /// The value's dedup key, normalized the way [`NumBigArena::get_or_insert_bigdec`]
+    /// keys it: a BigDecimal has its trailing zeros stripped so `1.5` and
+    /// `1.50` map to one repr, whatever scale the entry was persisted under
+    /// (legacy pre-normalization arenas keep the original scale on disk).
+    /// Two entries — in one arena or across arenas — denote the same term iff
+    /// their normalized reprs are equal.
+    pub fn normalized_repr(&self) -> NumBigRepr {
+        match self {
+            Self::BigInt(bytes) => NumBigRepr::BigIntBytes(bytes.clone()),
+            Self::BigDec { unscaled, scale } => {
+                let bd = BigDecimal::new(BigInt::from_signed_bytes_le(unscaled), *scale);
+                let (norm_unscaled, norm_scale) = bd.normalized().as_bigint_and_exponent();
+                NumBigRepr::BigDecBytes {
+                    unscaled: norm_unscaled.to_signed_bytes_le(),
+                    scale: norm_scale,
+                }
+            }
+        }
+    }
+
     /// Reconstruct a `FlakeValue` from the stored bytes.
     pub fn to_flake_value(&self) -> fluree_db_core::value::FlakeValue {
         use fluree_db_core::value::FlakeValue;
@@ -398,20 +418,12 @@ pub fn read_numbig_arena_from_bytes(data: &[u8]) -> io::Result<NumBigArena> {
                     unscaled: unscaled_bytes.to_vec(),
                     scale,
                 };
-                let bd = BigDecimal::new(BigInt::from_signed_bytes_le(unscaled_bytes), scale);
-                let normalized = bd.normalized();
-                let (norm_unscaled, norm_scale) = normalized.as_bigint_and_exponent();
-                let norm_repr = NumBigRepr::BigDecBytes {
-                    unscaled: norm_unscaled.to_signed_bytes_le(),
-                    scale: norm_scale,
+                let stored = StoredBigValue::BigDec {
+                    unscaled: unscaled_bytes.to_vec(),
+                    scale,
                 };
-                arena.push_stored(
-                    StoredBigValue::BigDec {
-                        unscaled: unscaled_bytes.to_vec(),
-                        scale,
-                    },
-                    [raw_repr, norm_repr],
-                );
+                let norm_repr = stored.normalized_repr();
+                arena.push_stored(stored, [raw_repr, norm_repr]);
             }
             _ => {
                 return Err(io::Error::new(

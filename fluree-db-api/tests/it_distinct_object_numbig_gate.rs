@@ -1,5 +1,6 @@
-//! Regression pin: the whole-graph `COUNT(DISTINCT ?o)` fast path must decline
-//! a graph whose objects include a NumBig arena handle.
+//! Regression pin: the whole-graph `COUNT(DISTINCT ?o)` fast path must count
+//! a graph whose objects include a NumBig arena handle exactly — from the
+//! arenas, without declining to the general pipeline.
 //!
 //! `SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE { ?s ?p ?o }` is answered from OPST
 //! leaflet directory metadata by grouping on the 10-byte lead `o_type(2) +
@@ -27,12 +28,12 @@
 
 #![cfg(feature = "native")]
 
-#[path = "support/span_capture.rs"]
-mod span_capture;
+mod support;
 
 use fluree_db_api::{set_fast_paths_disabled, FlureeBuilder};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::io::Write;
+use support::span_capture;
 use tempfile::TempDir;
 
 /// Operator label the whole-graph distinct-object count stamps.
@@ -126,6 +127,17 @@ const F_BIGINT_CROSS: &str = r#"
 <http://ex/s2> <http://ex/p2> "170141183460469231731687303715884105999"^^<http://www.w3.org/2001/XMLSchema#integer> .
 "#;
 
+/// Decimals, a string and a small integer under ONE predicate: the predicate's
+/// POST leaflet carries an `o_type` column and straddles the NumBig range, so
+/// its live handles must be decoded rather than read from `lead_group_count`.
+const F_MIXED_PRED: &str = r#"
+<http://ex/s1> <http://ex/p1> "1.1000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/s2> <http://ex/p1> "2.2000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://ex/s3> <http://ex/p1> "alpha" .
+<http://ex/s4> <http://ex/p1> 7 .
+<http://ex/s5> <http://ex/p2> "2.2000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+"#;
+
 /// `xsd:integer` within `i64`: an inline, value-faithful `o_key`.
 const F_INT_CROSS: &str = r#"
 <http://ex/s1> <http://ex/p1> "514"^^<http://www.w3.org/2001/XMLSchema#integer> .
@@ -144,8 +156,8 @@ const F_STR_CROSS: &str = r#"
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Routing {
-    /// The graph holds NumBig objects within the cap: the operator proceeds and
-    /// the exact branch is what answers the arena slice.
+    /// The graph holds NumBig objects: the operator proceeds and the exact
+    /// branch is what answers the arena slice.
     ExactBranch,
     /// No NumBig object anywhere: the operator proceeds from directory metadata
     /// alone and the exact branch must not run — it would be pure added cost.
@@ -207,6 +219,12 @@ const CASES: &[Case] = &[
         name: "overflow xsd:integer across two predicates",
         ttl: F_BIGINT_CROSS,
         truth: 2,
+        routing: Routing::ExactBranch,
+    },
+    Case {
+        name: "decimals, string and integer under one predicate",
+        ttl: F_MIXED_PRED,
+        truth: 4,
         routing: Routing::ExactBranch,
     },
     Case {
@@ -367,8 +385,8 @@ async fn distinct_object_count_declines_numbig_object_keys() {
         let took_exact = sites.iter().any(|s| s == EXACT_SITE);
         if !did_proceed {
             failures.push(format!(
-                "{}: expected `{OBJECT_SITE}` to proceed — every fixture here is \
-                 within the exact branch's row cap [proceeded: {sites:?}]",
+                "{}: expected `{OBJECT_SITE}` to proceed — the exact branch has \
+                 no row cap, so nothing here may decline [proceeded: {sites:?}]",
                 case.name
             ));
         }
@@ -534,22 +552,21 @@ async fn distinct_object_count_declines_numbig_object_keys() {
         }
     }
 
-    // ---- Phase 4: the rollout cap still declines --------------------------
-    // Above the cap the whole count falls to the general pipeline. That bound
-    // is a rollout guard on a new read path rather than a crossover — the
-    // fallback is measured slower at every size — but it has to actually work,
-    // or the cap is decoration.
+    // ---- Phase 4: the kill switch still declines --------------------------
+    // With the entries cap set and exceeded the whole count falls to the
+    // general pipeline. There is no default cap — declining is the slow
+    // outcome — but the switch has to actually work, or it is decoration.
     {
         let (_db, _data, fluree, ledger_id) = build_indexed(F_LOSS3, "over-cap").await;
         let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
-        // The 3-and-3 fixture holds 6 NumBig rows; a cap of 1 puts it over.
-        std::env::set_var("FLUREE_NUMBIG_EXACT_MAX_ROWS", "1");
+        // The 3-and-3 fixture holds 6 arena entries; a cap of 1 puts it over.
+        std::env::set_var("FLUREE_NUMBIG_EXACT_MAX_ENTRIES", "1");
         let (store, tracing_guard) = span_capture::init_test_tracing();
         set_fast_paths_disabled(false);
         let got = scalar(&run(&fluree, &ledger, Q_COUNT).await);
         let sites = proceeded(&store, 0);
         drop(tracing_guard);
-        std::env::remove_var("FLUREE_NUMBIG_EXACT_MAX_ROWS");
+        std::env::remove_var("FLUREE_NUMBIG_EXACT_MAX_ENTRIES");
 
         if got != "6" {
             failures.push(format!(
@@ -565,9 +582,100 @@ async fn distinct_object_count_declines_numbig_object_keys() {
         }
     }
 
+    // ---- Phase 5: arenas keep retracted values ----------------------------
+    // A full rebuild replays retractions through the arena insert path and an
+    // incremental build carries arenas forward, so both leave handles with no
+    // live row. The exact branch must count only handles POST still holds —
+    // and must notice from directory metadata alone that an arena is not
+    // fully live.
+    {
+        let (_db, _data, fluree, ledger_id) = build_indexed(F_LIFECYCLE, "liveness").await;
+        let ctx = json!({"ex": "http://ex/", "xsd": "http://www.w3.org/2001/XMLSchema#"});
+
+        // Retract 5.5 (p1 only: the term is gone) and p2's 9.9 (the term
+        // survives under p1). Union 8 → 7; both arenas keep a stale handle.
+        let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
+        fluree
+            .update(
+                ledger,
+                &json!({
+                    "@context": ctx,
+                    "delete": [
+                        {"@id": "ex:a1", "ex:p1": {"@value": "5.5000", "@type": "xsd:decimal"}},
+                        {"@id": "ex:b1", "ex:p2": {"@value": "9.9000", "@type": "xsd:decimal"}},
+                    ]
+                }),
+            )
+            .await
+            .expect("retract two decimals");
+        support::rebuild_and_publish_index(&fluree, &ledger_id).await;
+        check_liveness(&fluree, &ledger_id, "7", "after rebuild", &mut failures).await;
+
+        // Retract every remaining p2 value: p2's arena has no live handle at
+        // all, and the incremental build carries it forward unchanged.
+        let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
+        fluree
+            .update(
+                ledger,
+                &json!({
+                    "@context": ctx,
+                    "delete": [
+                        {"@id": "ex:b2", "ex:p2": {"@value": "1.1000", "@type": "xsd:decimal"}},
+                        {"@id": "ex:b3", "ex:p2": {"@value": "2.2000", "@type": "xsd:decimal"}},
+                        {"@id": "ex:b4", "ex:p2": {"@value": "3.3000", "@type": "xsd:decimal"}},
+                    ]
+                }),
+            )
+            .await
+            .expect("retract p2");
+        support::build_and_publish_index(&fluree, &ledger_id).await;
+        check_liveness(&fluree, &ledger_id, "4", "after incremental", &mut failures).await;
+    }
+
     assert!(
         failures.is_empty(),
         "distinct-object NumBig gate failures:\n  {}",
         failures.join("\n  ")
     );
+}
+
+/// Fast lane and general pipeline must both answer `truth`, and the fast lane
+/// must have taken the exact branch — a decline here would pass on the answer
+/// alone while silently losing the lane.
+async fn check_liveness(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    truth: &str,
+    when: &str,
+    failures: &mut Vec<String>,
+) {
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let (store, tracing_guard) = span_capture::init_test_tracing();
+    set_fast_paths_disabled(false);
+    let fast = scalar(&run(fluree, &ledger, Q_COUNT).await);
+    let sites = proceeded(&store, 0);
+    drop(tracing_guard);
+    set_fast_paths_disabled(true);
+    let generic = scalar(&run(fluree, &ledger, Q_COUNT).await);
+    set_fast_paths_disabled(false);
+
+    if fast != truth {
+        failures.push(format!(
+            "{when}: fast lane COUNT(DISTINCT ?o) = {fast}, expected {truth} \
+             (generic {generic}) [proceeded: {sites:?}]"
+        ));
+    }
+    if generic != truth {
+        failures.push(format!(
+            "{when}: generic pipeline = {generic}, expected {truth}"
+        ));
+    }
+    for site in [OBJECT_SITE, EXACT_SITE] {
+        if !sites.iter().any(|s| s == site) {
+            failures.push(format!(
+                "{when}: expected `{site}` to proceed on the reindexed ledger \
+                 [proceeded: {sites:?}]"
+            ));
+        }
+    }
 }

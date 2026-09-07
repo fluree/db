@@ -1958,6 +1958,18 @@ impl BinaryIndexStore {
     }
 
     /// Reverse subject lookup by namespace parts (avoids IRI construction).
+    /// Every NumBig arena held for `g_id`, keyed by predicate. Arenas are
+    /// loaded whole at store open, so iterating them touches no storage.
+    pub fn numbig_arenas(
+        &self,
+        g_id: GraphId,
+    ) -> impl Iterator<Item = (u32, &crate::arena::numbig::NumBigArena)> + '_ {
+        self.graph_indexes
+            .get(&g_id)
+            .into_iter()
+            .flat_map(|gi| gi.numbig.iter().map(|(p_id, arena)| (*p_id, arena)))
+    }
+
     /// Find the NumBig arena handle for an already-indexed big numeric value
     /// (overflow `xsd:integer` / typed `xsd:decimal`) under `(g_id, p_id)`.
     ///
