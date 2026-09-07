@@ -13,9 +13,13 @@ on:
     - cron: "0 7 * * *" # 07:00 UTC daily
   workflow_dispatch:
     inputs:
+      capture_baseline:
+        description: Also capture a replacement baseline artifact
+        type: boolean
+        default: false
       capture_samples:
         description: >-
-          Repeat runs to fold into the captured baseline. 1 is a single
+          Repeat runs (1–10) to fold into the captured baseline. 1 is a single
           measurement with no noise estimate; >= 5 records a median + MAD, which
           is what a baseline intended to GATE on shared runners needs — the
           compare gate widens each budget to 3*MAD/median, and shared-runner
@@ -61,7 +65,7 @@ jobs:
           free -h
           df -h /
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
@@ -113,12 +117,13 @@ jobs:
     # On-demand CI-class baseline capture (review item 1c). Captures the cheap
     # subset on ci-cd-large with runner_class=ci-cd-large-8core and uploads the
     # JSON as an artifact. Committing it to bench-baselines/ is a human follow-up
-    # — once a ci-* baseline lands, the per-PR compare's TIME half enforces
+    # — once a ci-* baseline lands, time and memory comparisons enforce
     # automatically (runner classes match). workflow_dispatch only (not on the
     # nightly schedule) to avoid the extra cost every night.
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.capture_baseline
     runs-on: ci-cd-large
-    timeout-minutes: 30
+    # Up to ten sequential tiny+small passes, plus a cold build.
+    timeout-minutes: 90
     env:
       FLUREE_BENCH_PROFILE: quick
       FLUREE_BENCH_SCALE: tiny
@@ -130,7 +135,7 @@ jobs:
           free -h
           df -h /
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
@@ -146,14 +151,16 @@ jobs:
       # MAD. Passes must NOT be parallelised and the sidecars are cleared each
       # time: a sample has to be an independent measurement of the same thing.
       - name: Capture cheap subset (CI-class)
+        env:
+          CAPTURE_SAMPLES: ${{ inputs.capture_samples || '1' }}
         run: |
-          samples="${{ github.event.inputs.capture_samples || '1' }}"
+          samples="$CAPTURE_SAMPLES"
           # `seq 1 0` runs zero passes, so a 0 (or any non-number) would produce
           # no baseline at all while the job still reported success. Fail loudly
           # instead — a capture job that captures nothing is worse than one that
           # errors, because the artifact step would then upload nothing quietly.
-          if ! [[ "$samples" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::capture_samples must be a positive integer, got '$samples'"
+          if ! [[ "$samples" =~ ^([1-9]|10)$ ]]; then
+            echo "::error::capture_samples must be an integer from 1 to 10, got '$samples'"
             exit 1
           fi
           rm -f bench-baselines/guardrails-pre-ci.json
@@ -170,7 +177,7 @@ jobs:
           done
 
       - name: Upload CI-class baseline artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: guardrails-pre-ci-baseline
           path: bench-baselines/guardrails-pre-ci.json

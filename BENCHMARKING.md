@@ -152,15 +152,18 @@ on-demand):
    The job previously took 12–14 minutes on the standard runner; a `bench-paths`
    job skips it
    when a PR touches nothing perf-relevant (engine crates, bench crates,
-   `bench-baselines/`, `regression-budget.json`, `Cargo.toml`/`Cargo.lock`, or the
-   CI/bench workflows). The list errs inclusive: a false positive costs one bench
-   run, a false negative lets a regression through.
+   `bench-baselines/`, `regression-budget.json`, Cargo manifests/lockfiles,
+   the Rust toolchain, `.cargo/` settings, or workflow/scripts under `.github/`).
+   The list errs inclusive: a false positive costs one bench run, a false
+   negative lets a regression through.
 
 3. **CI-class capture (`bench.yml` `bench-capture`, `workflow_dispatch`).**
-   Captures the cheap subset on `ci-cd-large` (8 cores / 32 GB), tagged with
+   Enable the `capture_baseline` dispatch checkbox to run this additional job;
+   ordinary manual runs only run the nightly checks. Captures the cheap subset
+   on `ci-cd-large` (8 cores / 32 GB), tagged with
    `host_class=ci-cd-large-8core`, and uploads it as an artifact. Committing it plus dropping
    `--allow-host-mismatch` from the compare step lands a real per-PR gate. The
-   `capture_samples` dispatch input controls how many repeat runs are folded into
+   `capture_samples` dispatch input (1–10) controls how many repeat runs are folded into
    one median + MAD — use ≥ 5 for a baseline meant to gate, since without a noise
    estimate the budget has to absorb shared-runner flap on its own.
 
@@ -347,7 +350,7 @@ Two ways to reach phase 2:
 
    ```bash
    # 1. Run bench.yml's workflow_dispatch `bench-capture` job with
-   #    capture_samples: 5, and download the artifact.
+   #    capture_baseline: true and capture_samples: 5, and download the artifact.
    # 2. REPLACE the committed baseline — do not add it alongside:
    mv guardrails-pre-ci.json bench-baselines/guardrails-pre.json
    # 3. Drop `--allow-host-mismatch` from ci.yml's and bench.yml's compare steps.
