@@ -2750,6 +2750,26 @@ GRAPH <http://example.org/graphs/g1> {
 /// after its first post-import write.
 #[tokio::test]
 async fn incremental_index_over_import_preserves_property_stats() {
+    // The default-graph planner reads aggregate properties, whereas the
+    // incremental carry-forward reads per-graph properties. Both must retain
+    // the imported NDV estimates when no persisted HLL registers exist.
+    let name_ndv = |snapshot: &fluree_db_core::LedgerSnapshot| {
+        let sid = snapshot
+            .encode_iri("http://schema.org/name")
+            .expect("schema:name SID");
+        let prop = snapshot
+            .stats
+            .as_ref()
+            .and_then(|stats| stats.properties.as_ref())
+            .and_then(|props| {
+                props.iter().find(|p| {
+                    p.sid.0 == sid.namespace_code && p.sid.1.as_str() == sid.name.as_ref()
+                })
+            })
+            .expect("aggregate schema:name stats");
+        (prop.ndv_values, prop.ndv_subjects)
+    };
+
     let db_dir = tempfile::tempdir().expect("db tmpdir");
     let data_dir = tempfile::tempdir().expect("data tmpdir");
 
@@ -2784,6 +2804,8 @@ ex:bob a ex:User ;
     // Post-import writes: net-zero churn on schema:age (retract+assert) and
     // a brand-new predicate.
     let ledger = fluree.ledger(ledger_id).await.expect("load after import");
+    let imported_name_ndv = name_ndv(&ledger.snapshot);
+    assert_eq!(imported_name_ndv, (2, 2), "imported name cardinalities");
     let ctx = json!({"ex": "http://example.org/ns/", "schema": "http://schema.org/"});
     let ledger = fluree
         .update(
@@ -2847,6 +2869,154 @@ ex:bob a ex:User ;
             .iter()
             .map(|p| (p.p_id, p.ndv_values))
             .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        name_ndv(&db.snapshot),
+        imported_name_ndv,
+        "aggregate NDV must preserve the same imported floor as per-graph stats"
+    );
+
+    // A fallback-seeded sketch now exists but cannot reconstruct the imported
+    // HLL registers. The next incremental must still apply the base floor to
+    // aggregate estimates, even though loading that sketch succeeds.
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("load incremental head");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "@id": "ex:dan", "@type": "ex:User", "ex:brandnew": 8
+            }),
+        )
+        .await
+        .expect("second post-import write");
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let second = fluree.db(ledger_id).await.expect("second incremental view");
+    assert_eq!(
+        name_ndv(&second.snapshot),
+        imported_name_ndv,
+        "a fallback-seeded sketch must not reset aggregate NDV on the next index"
+    );
+
+    // Model an upgrade from a root published before the aggregate-floor fix.
+    // Its per-graph estimates and fallback-seeded sketch survived, but the
+    // aggregate estimate for an untouched imported predicate was zero.
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("lookup indexed ledger")
+        .expect("indexed ledger record");
+    let store = fluree.content_store(ledger_id);
+    let root_bytes = store
+        .get(record.index_head_id.as_ref().expect("current root CID"))
+        .await
+        .expect("read current root");
+    let mut damaged_root =
+        fluree_db_binary_index::IndexRoot::decode(&root_bytes).expect("decode current root");
+    assert!(
+        damaged_root.sketch_ref.is_some(),
+        "upgrade fixture must include the fallback-seeded sketch"
+    );
+    let name_sid = second
+        .snapshot
+        .encode_iri("http://schema.org/name")
+        .expect("schema:name SID");
+    let name_p_id = damaged_root
+        .predicate_sids
+        .iter()
+        .position(|(ns, name)| {
+            *ns == name_sid.namespace_code && name.as_str() == name_sid.name.as_ref()
+        })
+        .expect("schema:name predicate ID") as u32;
+    let stats = damaged_root.stats.as_mut().expect("root stats");
+    let graph_name = stats
+        .graphs
+        .as_ref()
+        .expect("root graph stats")
+        .iter()
+        .find(|g| g.g_id == 0)
+        .expect("root default graph")
+        .properties
+        .iter()
+        .find(|p| p.p_id == name_p_id)
+        .expect("per-graph schema:name stats");
+    assert_eq!(
+        (graph_name.ndv_values, graph_name.ndv_subjects),
+        imported_name_ndv,
+        "upgrade fixture must retain the imported graph floor"
+    );
+    let aggregate_name = stats
+        .properties
+        .as_mut()
+        .expect("aggregate root stats")
+        .iter_mut()
+        .find(|p| p.sid.0 == name_sid.namespace_code && p.sid.1.as_str() == name_sid.name.as_ref())
+        .expect("aggregate schema:name stats");
+    aggregate_name.ndv_values = 0;
+    aggregate_name.ndv_subjects = 0;
+    let damaged_id = store
+        .put(
+            fluree_db_core::ContentKind::IndexRoot,
+            &damaged_root.encode(),
+        )
+        .await
+        .expect("store damaged root with production codec");
+    fluree
+        .nameservice_mode()
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_index_allow_equal(ledger_id, damaged_root.index_t, &damaged_id)
+        .await
+        .expect("publish historical damaged root");
+
+    // Reopen to rule out a healthy root retained in the writer's live caches.
+    let upgraded = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("reopen damaged root after upgrade");
+    let ledger = upgraded.ledger(ledger_id).await.expect("load damaged root");
+    assert_eq!(name_ndv(&ledger.snapshot), (0, 0), "read damaged aggregate");
+    upgraded
+        .insert(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "@id": "ex:erin", "@type": "ex:User", "ex:brandnew": 9
+            }),
+        )
+        .await
+        .expect("post-upgrade write");
+    support::build_and_publish_index(&upgraded, ledger_id).await;
+    let repaired = upgraded.db(ledger_id).await.expect("repaired index view");
+    assert_eq!(
+        name_ndv(&repaired.snapshot),
+        imported_name_ndv,
+        "next incremental must repair a previously published damaged aggregate"
+    );
+    let repaired_record = upgraded
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("lookup repaired ledger")
+        .expect("repaired ledger record");
+    let repaired_bytes = store
+        .get(
+            repaired_record
+                .index_head_id
+                .as_ref()
+                .expect("repaired root CID"),
+        )
+        .await
+        .expect("read repaired root");
+    let repaired_root =
+        fluree_db_binary_index::IndexRoot::decode(&repaired_bytes).expect("decode repaired root");
+    assert_eq!(
+        repaired_root.prev_index.as_ref().map(|prev| &prev.id),
+        Some(&damaged_id),
+        "repair must build from the published damaged root"
     );
 }
 

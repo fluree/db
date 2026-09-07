@@ -2285,18 +2285,6 @@ pub async fn incremental_index(
         let db_stats = {
             use fluree_db_core::index_stats as is;
 
-            let properties = crate::stats::aggregate_property_entries_from_graphs(
-                &id_stats_result.graphs,
-                &trie,
-                |p_id| {
-                    novelty
-                        .shared
-                        .predicates
-                        .resolve(p_id)
-                        .map(ToString::to_string)
-                },
-            );
-
             // Class-property attribution: build full ClassStatEntry with property usage.
             //
             // Strategy:
@@ -2322,6 +2310,21 @@ pub async fn incremental_index(
                     }
                 }
             }
+
+            // Aggregate the finalized estimates: the planner reads root-level
+            // properties, so aggregating before the floor above would retain
+            // delta-only NDV there while per-graph stats preserve the base.
+            let properties = crate::stats::aggregate_property_entries_from_graphs(
+                &final_graphs,
+                &trie,
+                |p_id| {
+                    novelty
+                        .shared
+                        .predicates
+                        .resolve(p_id)
+                        .map(ToString::to_string)
+                },
+            );
 
             let has_class_changes =
                 !class_count_deltas.is_empty() || !novelty_subject_class_deltas.is_empty();
