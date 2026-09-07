@@ -294,6 +294,9 @@ fn sweep_orphaned_staging_files(
             continue;
         };
         for entry in entries.flatten() {
+            if entry.file_name() == ".fluree-wal" {
+                continue;
+            }
             if budget == 0 {
                 sweep.truncated = true;
                 return sweep;
@@ -495,6 +498,8 @@ fn create_new_in_place(path: &Path, bytes: &[u8], policy: &WritePolicy) -> std::
 /// File-based storage backed by `tokio::fs`.
 #[derive(Debug, Clone)]
 pub struct FileStorage {
+    #[cfg(unix)]
+    root_access: Arc<crate::root_access::RootAccess>,
     /// Base directory for index files
     base_path: std::path::PathBuf,
     /// When a write is reported complete. Applies to source-of-truth content;
@@ -524,6 +529,8 @@ impl FileStorage {
     /// startup paths call [`Self::sweep_orphaned_staging`] explicitly.
     pub fn new(base_path: impl Into<std::path::PathBuf>) -> Self {
         Self {
+            #[cfg(unix)]
+            root_access: Arc::new(crate::root_access::RootAccess::default()),
             base_path: base_path.into(),
             durability: Durability::from_env(),
             fsyncs: Arc::new(AtomicU64::new(0)),
@@ -619,10 +626,15 @@ impl FileStorage {
     /// and nothing waits on the result.
     pub fn sweep_orphaned_staging(&self) -> Option<tokio::task::JoinHandle<()>> {
         let budget = Self::sweep_budget_from_env()?;
+        if let Err(error) = self.ensure_ordinary_access() {
+            tracing::warn!(%error, "staging sweep refused by storage root fence");
+            return None;
+        }
         if !claim_sweep(&self.base_path) {
             return None;
         }
         let base = self.base_path.clone();
+        let storage = self.clone();
         // A RECURSIVE `read_dir` IS BLOCKING I/O, AND THIS IS CALLED FROM
         // ASYNC STARTUP (`create_async_connection`, and the API's async
         // client builds), so running it on the caller would park a runtime
@@ -632,7 +644,10 @@ impl FileStorage {
         // #1620 asked for the walk to be bounded *or* backgrounded; it is
         // worth being both.
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => Some(handle.spawn_blocking(move || Self::run_sweep(&base, budget))),
+            Ok(handle) => Some(handle.spawn_blocking(move || {
+                let _storage = storage; // lease survives cancellation of startup
+                Self::run_sweep(&base, budget);
+            })),
             // No runtime: a plain synchronous caller (`create_sync_connection`),
             // which can afford to block on its own thread.
             Err(_) => {
@@ -717,6 +732,18 @@ impl FileStorage {
         &self.base_path
     }
 
+    /// Fallible ordinary-mode open/fence check, without journal recovery. On Unix
+    /// this retains a shared root-directory lock across clones and refuses roots
+    /// containing an experimental journal marker, even without the journal feature.
+    /// The path/ancestors must not be renamed, replaced or retargeted while in use.
+    pub fn ensure_ordinary_access(&self) -> Result<()> {
+        #[cfg(unix)]
+        self.root_access
+            .ensure(&self.base_path)
+            .map_err(|e| crate::error::Error::storage(e.to_string()))?;
+        Ok(())
+    }
+
     /// Extract the path portion from a Fluree address.
     ///
     /// Handles formats like:
@@ -753,6 +780,7 @@ impl FileStorage {
 
         // Disallow absolute paths and path traversal.
         if p.is_absolute()
+            || p.components().any(|c| c.as_os_str() == ".fluree-wal")
             || p.components().any(|c| {
                 matches!(
                     c,
@@ -765,6 +793,7 @@ impl FileStorage {
             )));
         }
 
+        self.ensure_ordinary_access()?;
         Ok(self.base_path.join(p))
     }
 }
@@ -837,7 +866,9 @@ impl StorageRead for FileStorage {
         let requested = range.end - range.start;
         let offset = range.start;
         let address = address.to_owned();
+        let storage = self.clone();
         tokio::task::spawn_blocking(move || {
+            let _storage = storage;
             let file = std::fs::File::open(&path).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     crate::error::Error::not_found(format!("{}: {}", address, path.display()))
@@ -968,7 +999,7 @@ impl StorageRead for FileStorage {
         let path_prefix = Self::extract_path_from_address(prefix).unwrap_or(prefix);
 
         // Get the directory to list from and the file prefix to match
-        let full_path = self.base_path.join(path_prefix);
+        let full_path = self.resolve_relative_path(path_prefix)?;
         let (list_dir, file_prefix) = if full_path.is_dir() {
             (full_path, String::new())
         } else {
@@ -1006,6 +1037,9 @@ impl StorageRead for FileStorage {
             while let Some(entry) = entries.next_entry().await.map_err(|e| {
                 crate::error::Error::io(format!("Failed to read entry in {}: {}", dir.display(), e))
             })? {
+                if entry.file_name() == ".fluree-wal" {
+                    continue;
+                }
                 let path = entry.path();
                 let file_type = entry.file_type().await.map_err(|e| {
                     crate::error::Error::io(format!(
@@ -1104,7 +1138,9 @@ impl FileStorage {
 
         // One blocking hop for mkdir + stage + rename, rather than one per
         // `tokio::fs` call.
+        let storage = self.clone();
         tokio::task::spawn_blocking(move || {
+            let _storage = storage;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     crate::error::Error::io(format!(
@@ -1130,7 +1166,9 @@ impl FileStorage {
     /// the file sees it complete.
     async fn blocking_insert(&self, path: PathBuf, bytes: Vec<u8>) -> StorageExtResult<bool> {
         let policy = self.policy(self.durability);
+        let storage = self.clone();
         tokio::task::spawn_blocking(move || {
+            let _storage = storage;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     StorageExtError::io(format!("mkdir {}: {}", parent.display(), e))
@@ -1156,7 +1194,9 @@ impl FileStorage {
         &self,
         path: PathBuf,
     ) -> StorageExtResult<(Option<Vec<u8>>, LockedFile)> {
+        let storage = self.clone();
         tokio::task::spawn_blocking(move || {
+            let _storage = storage;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     StorageExtError::io(format!("mkdir {}: {}", parent.display(), e))
@@ -1217,7 +1257,9 @@ impl FileStorage {
         new_bytes: Vec<u8>,
     ) -> StorageExtResult<()> {
         let policy = self.policy(self.durability);
+        let storage = self.clone();
         tokio::task::spawn_blocking(move || {
+            let _storage = storage;
             write_atomic(&locked.path, &new_bytes, &policy)
                 .map_err(|e| StorageExtError::io(format!("write {}: {}", locked.path.display(), e)))
             // lock released when `locked._lock_file` is dropped
@@ -1272,6 +1314,23 @@ impl StorageCas for FileStorage {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_build_fences_journal_roots_without_the_experimental_feature() {
+        use crate::{StorageCas, StorageRead, StorageWrite};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".fluree-wal")).unwrap();
+        let storage = super::FileStorage::new(dir.path());
+        assert!(storage.read_bytes("x").await.is_err());
+        assert!(storage.exists("x").await.is_err());
+        assert!(storage.list_prefix("").await.is_err());
+        assert!(storage.write_bytes("x", b"bad").await.is_err());
+        assert!(storage.insert("x", b"bad").await.is_err());
+        assert!(storage.delete("x").await.is_err());
+        assert!(storage.resolve_local_path("x").is_none());
+        assert!(storage.sweep_orphaned_staging().is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
     use super::*;
     use std::io::Write;
     use std::time::{Duration, SystemTime};

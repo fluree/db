@@ -1,8 +1,9 @@
 # Experimental journal foundation
 
 Enabled only by `experimental-local-journal` on Unix. **This feature does not turn
-on database WAL persistence.** Existing storage, transaction acknowledgments, and
-CLI/server behavior are unchanged. The format is experimental and not yet a
+on database WAL persistence.** Transaction acknowledgments remain unchanged.
+Ordinary Unix file opens now acquire a shared root lease and reject managed roots,
+including when journal support is not compiled. The format is experimental and not yet a
 supported database storage format.
 
 ## Implemented boundary
@@ -36,8 +37,44 @@ records, and syncs the validated stream before allowing further appends.
 access. It checks the head chain and supplied generation before materialization,
 checks/installs immutable objects through `ReplayTarget`, and publishes the final
 head last. It can resume from any head in that chain and rechecks objects even when
-the final head is already installed. The API oracle supplies a **test-only** target;
-there is no production materializer yet. Multi-ledger dispatch is not implemented.
+the final head is already installed. The API oracle supplies a test-only target;
+`LocalRoot` now also supplies an owned atomic file materializer. Multi-ledger
+dispatch is not implemented.
+
+## Root ownership and startup
+
+`LocalRoot::initialize` accepts only an existing empty directory. It exclusively
+locks the directory inode, syncs existing ancestors, creates/syncs the `.fluree-wal`
+fence, initializes the journal, and durably publishes a manifest bound to its identity.
+Managed materialized data lives under `.fluree-wal/data`, preserving the journal's
+relative storage keys behind a reserved path. Ordinary storage/listing/sweeping
+cannot enter that reserved namespace from a wider root. No populated-root conversion
+or old-layout migration is implemented.
+
+`LocalRoot::open` acquires the root lock, validates the manifest/journal generation,
+validates the whole journal, and completes exact atomic materialization before
+returning a read-only owner. Canonical-path aliases share one ready `Arc` in-process;
+another process is refused until the final owner drops or dies. The owner exposes
+byte reads only; there is no transaction, local-path/mmap, nameservice, or indexer
+adapter yet. Recovery stages immutable objects and renames them into place, rejects
+conflicting bytes/symlink paths, and publishes the head last. Individual replay writes
+omit fsync because the complete journal is retained; this is not a checkpoint.
+
+`FileStorage::new` stays free of I/O. Its first access acquires and retains a shared
+directory lease; this may create an absent empty ordinary root, including on a read.
+The nearest existing ancestor is leased before creation to prevent initialization
+races. FileStorage clones and its blocking I/O workers retain that lease. Ordinary
+builders/connections, all FileNameService trait entrypoints, remote tracking operations,
+range/local-path access, and startup sweeps check the fence. These checks are present
+without the experimental feature. New directory locking requirements and startup
+overhead need qualification on Linux and network filesystems before integration.
+
+Roots/ancestors must not be renamed/replaced or symlinks retargeted while handles
+live. Arbitrary filesystem access and old binaries that ignore the marker cannot be
+fenced; do not run mixed versions. This is a cooperative local filesystem boundary,
+not a security sandbox for hostile symlink routing through unrelated roots.
+Interrupted initialization without a valid manifest fails closed and retains its
+files for inspection. No transaction could have been accepted through this owner.
 
 ## Failure model and limits
 
@@ -54,9 +91,8 @@ whole valid suffix cannot be detected by the surviving checksums alone; the exte
 acknowledgment oracle detects it. Recovery of a deleted/truncated only durable copy
 needs independent persistence. SHA-256 here is integrity checking, not authentication.
 
-Before transaction integration, provide durable root ownership/format fencing,
-startup recovery before all access, CAS reservation before journal acceptance,
-complete required-content validation, and production atomic materialization/state
+Before transaction integration, finish qualifying ownership and add CAS reservation
+before journal acceptance, complete required-content validation, and state
 installation before ACK. Coordinate or reject every mutation path, including import,
 push, index heads, configuration/lifecycle and GC. Explicitly reject unsupported
 encryption, mixed backends, clusters, and oversized transactions before effects.

@@ -140,6 +140,20 @@ impl FileNameService {
         }
     }
 
+    fn ensure_ordinary_access(&self, identifiers: &[&str]) -> Result<()> {
+        if identifiers
+            .iter()
+            .any(|id| id.split('/').any(|part| part == ".fluree-wal"))
+        {
+            return Err(NameServiceError::storage(
+                "journal control path is reserved",
+            ));
+        }
+        self.storage
+            .ensure_ordinary_access()
+            .map_err(|e| NameServiceError::storage(e.to_string()))
+    }
+
     /// Build a `fluree:file://` address for the main ns record.
     fn ns_address(ledger_name: &str, branch: &str) -> String {
         format!("fluree:file://{NS_VERSION}/{ledger_name}/{branch}.json")
@@ -226,6 +240,9 @@ impl FileNameService {
             while let Some(entry) = dir_entries.next_entry().await.map_err(|e| {
                 NameServiceError::storage(format!("Failed to read directory entry: {e}"))
             })? {
+                if entry.file_name() == ".fluree-wal" {
+                    continue;
+                }
                 let path = entry.path();
 
                 if path.is_dir() {
@@ -479,6 +496,7 @@ impl FileNameService {
 #[async_trait]
 impl crate::NameServiceLookup for FileNameService {
     async fn lookup(&self, ledger_id: &str) -> Result<Option<NsRecord>> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         // A graph-source record is not a ledger (#1369). `load_record` reports it
         // as Ok(None) so the caller can fall back to the graph-source path.
@@ -486,11 +504,13 @@ impl crate::NameServiceLookup for FileNameService {
     }
 
     async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         self.load_heads(&ledger_name, &branch).await
     }
 
     async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+        self.ensure_ordinary_access(&[ledger_name])?;
         let ledger_dir = self.storage.base_path().join(NS_VERSION).join(ledger_name);
         let mut records = Vec::new();
 
@@ -512,6 +532,7 @@ impl crate::NameServiceLookup for FileNameService {
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
+        self.ensure_ordinary_access(&[])?;
         let ns_dir = self.storage.base_path().join(NS_VERSION);
         let mut records = Vec::new();
 
@@ -550,6 +571,7 @@ impl crate::BranchLifecycle for FileNameService {
         source_branch: &str,
         at_commit: Option<(ContentId, i64)>,
     ) -> Result<()> {
+        self.ensure_ordinary_access(&[ledger_name, new_branch, source_branch])?;
         let address = Self::ns_address(ledger_name, new_branch);
         let normalized_id = format_ledger_id(ledger_name, new_branch);
 
@@ -630,6 +652,7 @@ impl crate::BranchLifecycle for FileNameService {
     }
 
     async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
 
         // Read the record to find the parent before purging
@@ -678,6 +701,7 @@ impl crate::BranchLifecycle for FileNameService {
     }
 
     async fn reset_head(&self, ledger_id: &str, snapshot: crate::NsRecordSnapshot) -> Result<()> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
 
@@ -706,6 +730,7 @@ impl crate::BranchLifecycle for FileNameService {
         ledger_id: &str,
         since_t: i64,
     ) -> Result<Option<Vec<(i64, ContentId)>>> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let path = self.commits_path(&ledger_name, &branch);
 
@@ -750,6 +775,7 @@ impl crate::BranchLifecycle for FileNameService {
     }
 
     async fn prune_commit_index(&self, ledger_id: &str, up_to_t: i64) -> Result<()> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let path = self.commits_path(&ledger_name, &branch);
 
@@ -799,6 +825,7 @@ struct CommitIndexEntry {
 #[async_trait]
 impl LedgerLifecycle for FileNameService {
     async fn init(&self, ledger_id: &str) -> Result<()> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
         let normalized_address = format_ledger_id(&ledger_name, &branch);
@@ -839,6 +866,7 @@ impl LedgerLifecycle for FileNameService {
     }
 
     async fn retract(&self, ledger_id: &str) -> Result<()> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
 
@@ -864,6 +892,7 @@ impl LedgerLifecycle for FileNameService {
     }
 
     async fn purge(&self, ledger_id: &str) -> Result<()> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         // First retract (updates status, fires event)
         self.retract(ledger_id).await?;
         // Then remove the NS file so the alias can be reused
@@ -887,6 +916,7 @@ impl CommitPublisher for FileNameService {
         commit_t: i64,
         commit_id: &ContentId,
     ) -> Result<()> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
         let ledger_name_c = ledger_name.clone();
@@ -969,6 +999,7 @@ impl IndexPublisher for FileNameService {
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::index_address(&ledger_name, &branch);
         let cid_str = index_id.to_string();
@@ -1006,6 +1037,7 @@ impl AdminPublisher for FileNameService {
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::index_address(&ledger_name, &branch);
         let cid_str = index_id.to_string();
@@ -1050,6 +1082,7 @@ impl GraphSourcePublisher for FileNameService {
         config: &str,
         dependencies: &[String],
     ) -> Result<()> {
+        self.ensure_ordinary_access(&[name, branch])?;
         let address = Self::ns_address(name, branch);
         let name_c = name.to_string();
         let branch_c = branch.to_string();
@@ -1101,6 +1134,7 @@ impl GraphSourcePublisher for FileNameService {
         index_id: &ContentId,
         index_t: i64,
     ) -> Result<()> {
+        self.ensure_ordinary_access(&[name, branch])?;
         let address = Self::index_address(name, branch);
         let cid_str = index_id.to_string();
         let name_c = name.to_string();
@@ -1133,6 +1167,7 @@ impl GraphSourcePublisher for FileNameService {
     }
 
     async fn retract_graph_source(&self, name: &str, branch: &str) -> Result<()> {
+        self.ensure_ordinary_access(&[name, branch])?;
         let address = Self::ns_address(name, branch);
         self.storage
             .compare_and_swap(&address, |bytes| {
@@ -1159,6 +1194,7 @@ impl GraphSourceLookup for FileNameService {
         &self,
         graph_source_id: &str,
     ) -> Result<Option<GraphSourceRecord>> {
+        self.ensure_ordinary_access(&[graph_source_id])?;
         let (name, branch) = split_ledger_id(graph_source_id)?;
 
         // First check if it's a graph source record
@@ -1170,6 +1206,7 @@ impl GraphSourceLookup for FileNameService {
     }
 
     async fn lookup_any(&self, resource_id: &str) -> Result<NsLookupResult> {
+        self.ensure_ordinary_access(&[resource_id])?;
         let (name, branch) = split_ledger_id(resource_id)?;
         let main_path = self.ns_path(&name, &branch);
 
@@ -1193,6 +1230,7 @@ impl GraphSourceLookup for FileNameService {
     }
 
     async fn all_graph_source_records(&self) -> Result<Vec<GraphSourceRecord>> {
+        self.ensure_ordinary_access(&[])?;
         let ns_dir = self.storage.base_path().join(NS_VERSION);
 
         if !ns_dir.exists() {
@@ -1212,6 +1250,9 @@ impl GraphSourceLookup for FileNameService {
             while let Some(entry) = dir_entries.next_entry().await.map_err(|e| {
                 NameServiceError::storage(format!("Failed to read directory entry: {e}"))
             })? {
+                if entry.file_name() == ".fluree-wal" {
+                    continue;
+                }
                 let path = entry.path();
 
                 if path.is_dir() {
@@ -1259,6 +1300,7 @@ impl GraphSourceLookup for FileNameService {
 #[async_trait]
 impl RefLookup for FileNameService {
     async fn get_ref(&self, ledger_id: &str, kind: RefKind) -> Result<Option<RefValue>> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         match kind {
             RefKind::CommitHead => {
@@ -1321,6 +1363,7 @@ impl RefPublisher for FileNameService {
         expected: Option<&RefValue>,
         new: &RefValue,
     ) -> Result<CasResult> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let expected_clone = expected.cloned();
         let new_clone = new.clone();
@@ -1518,6 +1561,7 @@ impl RefPublisher for FileNameService {
 #[async_trait]
 impl StatusLookup for FileNameService {
     async fn get_status(&self, ledger_id: &str) -> Result<Option<StatusValue>> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
 
@@ -1535,6 +1579,7 @@ impl StatusPublisher for FileNameService {
         expected: Option<&StatusValue>,
         new: &StatusValue,
     ) -> Result<StatusCasResult> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
 
@@ -1592,6 +1637,7 @@ impl StatusPublisher for FileNameService {
 #[async_trait]
 impl ConfigLookup for FileNameService {
     async fn get_config(&self, ledger_id: &str) -> Result<Option<ConfigValue>> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
 
@@ -1609,6 +1655,7 @@ impl ConfigPublisher for FileNameService {
         expected: Option<&ConfigValue>,
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
+        self.ensure_ordinary_access(&[ledger_id])?;
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let address = Self::ns_address(&ledger_name, &branch);
 

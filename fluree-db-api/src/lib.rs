@@ -1186,6 +1186,7 @@ fn build_local_storage_from_config(
                 .as_ref()
                 .ok_or_else(|| ApiError::config("File storage requires filePath"))?;
             let storage = FileStorage::new(path.as_ref());
+            storage.ensure_ordinary_access()?;
             // Address-identifier storages are opened at client build — that
             // is startup, so the startup sweep of crash-orphaned staging
             // files is taken here explicitly.
@@ -2253,6 +2254,7 @@ impl FlureeBuilder {
             .ok_or_else(|| ApiError::config("File storage requires a path"))?;
 
         let storage = FileStorage::new(&path);
+        storage.ensure_ordinary_access()?;
         // Building the instance is startup: reclaim staging files a crash
         // left behind. Explicit here rather than a side effect of `new`, and
         // once per base path per process — the nameservice below shares this
@@ -2421,6 +2423,7 @@ impl FlureeBuilder {
             .ok_or_else(|| ApiError::config("File storage requires a path"))?;
 
         let file_storage = FileStorage::new(&path);
+        file_storage.ensure_ordinary_access()?;
         // Startup sweep, before the encryption wrapper hides the concrete
         // storage. Staging debris is on-disk state, not content, so the
         // sweep is the same for an encrypted tree.
@@ -3207,6 +3210,7 @@ impl FlureeBuilder {
                 .clone();
 
             let file_storage = FileStorage::new(path.as_ref());
+            file_storage.ensure_ordinary_access()?;
             // Client build is startup: take the explicit sweep of
             // crash-orphaned staging files here, where startup is known.
             file_storage.sweep_orphaned_staging();

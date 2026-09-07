@@ -199,6 +199,7 @@ fn create_sync_connection(config: ConnectionConfig) -> Result<ConnectionHandle> 
                     })?;
                 let storage = FileStorage::new(path.as_ref())
                     .with_durability(Durability::resolve(config.index_storage.durability));
+                storage.ensure_ordinary_access()?;
                 // Opening a connection is startup, and startup is the layer
                 // that knows it: reclaiming staging files a crash left behind
                 // is an explicit action here, not a side effect of holding a
@@ -240,6 +241,7 @@ async fn create_async_connection(config: ConnectionConfig) -> Result<ConnectionH
                     })?;
                 let storage = FileStorage::new(path.as_ref())
                     .with_durability(Durability::resolve(config.index_storage.durability));
+                storage.ensure_ordinary_access()?;
                 // Opening a connection is startup, and startup is the layer
                 // that knows it: reclaiming staging files a crash left behind
                 // is an explicit action here, not a side effect of holding a

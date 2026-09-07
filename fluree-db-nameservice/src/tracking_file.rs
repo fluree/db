@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 /// `{base_path}/ns-sync/remotes/{remote}/{address_encoded}.json`
 #[derive(Debug)]
 pub struct FileTrackingStore {
+    storage: fluree_db_core::FileStorage,
     base_path: PathBuf,
 }
 
@@ -27,6 +28,7 @@ impl FileTrackingStore {
     /// state goes into `{base_path}/ns-sync/` (outside `ns@v2/`).
     pub fn new(base_path: impl AsRef<Path>) -> Self {
         Self {
+            storage: fluree_db_core::FileStorage::new(base_path.as_ref()),
             base_path: base_path.as_ref().to_path_buf(),
         }
     }
@@ -99,7 +101,12 @@ impl RemoteTrackingStore for FileTrackingStore {
         let path_clone = path.clone();
         let parent_span = tracing::Span::current();
 
+        let storage = self.storage.clone();
+        storage
+            .ensure_ordinary_access()
+            .map_err(|e| NameServiceError::storage(e.to_string()))?;
         tokio::task::spawn_blocking(move || {
+            let _storage = storage;
             let _guard = parent_span.enter();
             match std::fs::read_to_string(&path_clone) {
                 Ok(contents) => {
@@ -123,7 +130,12 @@ impl RemoteTrackingStore for FileTrackingStore {
         let json = serde_json::to_string_pretty(record)?;
         let parent_span = tracing::Span::current();
 
+        let storage = self.storage.clone();
+        storage
+            .ensure_ordinary_access()
+            .map_err(|e| NameServiceError::storage(e.to_string()))?;
         tokio::task::spawn_blocking(move || {
+            let _storage = storage;
             let _guard = parent_span.enter();
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -160,7 +172,12 @@ impl RemoteTrackingStore for FileTrackingStore {
         let dir = self.remote_dir(remote);
         let parent_span = tracing::Span::current();
 
+        let storage = self.storage.clone();
+        storage
+            .ensure_ordinary_access()
+            .map_err(|e| NameServiceError::storage(e.to_string()))?;
         tokio::task::spawn_blocking(move || {
+            let _storage = storage;
             let _guard = parent_span.enter();
             let entries = match std::fs::read_dir(&dir) {
                 Ok(entries) => entries,
@@ -221,7 +238,12 @@ impl RemoteTrackingStore for FileTrackingStore {
         let path = self.record_path(remote, ledger_id);
         let parent_span = tracing::Span::current();
 
+        let storage = self.storage.clone();
+        storage
+            .ensure_ordinary_access()
+            .map_err(|e| NameServiceError::storage(e.to_string()))?;
         tokio::task::spawn_blocking(move || {
+            let _storage = storage;
             let _guard = parent_span.enter();
             match std::fs::remove_file(&path) {
                 Ok(()) => Ok(()),
@@ -246,6 +268,18 @@ mod tests {
 
     fn origin() -> RemoteName {
         RemoteName::new("origin")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tracking_refuses_a_journal_root_before_file_effects() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".fluree-wal")).unwrap();
+        let store = FileTrackingStore::new(dir.path());
+        assert!(store.get_tracking(&origin(), "test:main").await.is_err());
+        assert!(store.list_tracking(&origin()).await.is_err());
+        assert!(store.remove_tracking(&origin(), "test:main").await.is_err());
+        assert!(!dir.path().join("ns-sync").exists());
     }
 
     #[test]

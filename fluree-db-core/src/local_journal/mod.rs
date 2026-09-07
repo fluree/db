@@ -16,8 +16,8 @@
 //! already durable bytes; the directory entry was durably created. Checksums detect
 //! accidental damage, not malicious modification or loss of a whole valid suffix.
 //! Shared-block damage is detected when it changes a retained frame, but cannot be
-//! repaired here. Power-loss qualification, sealing, root ownership, checkpoints,
-//! and production replay/materialization remain integration work.
+//! repaired here. `LocalRoot` adds owned startup replay and atomic materialization;
+//! power-loss qualification, sealing, checkpoints, and transaction integration remain.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -26,6 +26,8 @@ use std::io;
 
 mod file;
 pub use file::FileIo;
+mod root;
+pub use root::LocalRoot;
 #[cfg(test)]
 mod tests;
 

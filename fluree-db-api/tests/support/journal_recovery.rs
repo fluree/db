@@ -117,6 +117,55 @@ fn records_from_image(image: &[u8]) -> fluree_db_core::local_journal::Result<Vec
     Journal::open(FileIo::open(&path)?).map(|(_, records)| records)
 }
 
+#[tokio::test]
+async fn root_startup_replays_real_commits_and_refuses_ordinary_api_and_nameservice_access() {
+    use fluree_db_core::local_journal::LocalRoot;
+    use fluree_db_nameservice::{BranchLifecycle, NameServiceLookup, StatusLookup};
+    let fixture = fixture().await;
+    let root = tempfile::tempdir().unwrap();
+    drop(LocalRoot::initialize(root.path(), LEDGER, "fixture-generation-1").unwrap());
+    // Offline fixture injection, not a supported transaction API. The owner has
+    // been dropped; all replay data is placed only in the durable journal.
+    let (mut journal, _) =
+        Journal::open(FileIo::open(&root.path().join(".fluree-wal/journal")).unwrap()).unwrap();
+    let first = transition(None, &fixture.first_frontier);
+    let second = transition(Some(&fixture.first_frontier), &fixture.frontier);
+    journal.append_and_sync(&first).unwrap();
+    journal.append_and_sync(&second).unwrap();
+    drop(journal);
+    let owner = LocalRoot::open(root.path()).unwrap();
+    assert!(
+        FlureeBuilder::file(root.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .is_err()
+    );
+    let ns = fluree_db_nameservice::file::FileNameService::new(root.path());
+    assert!(ns.lookup(LEDGER).await.is_err());
+    assert!(ns.all_records().await.is_err());
+    assert!(ns.get_status(LEDGER).await.is_err());
+    assert!(ns.prune_commit_index(LEDGER, 1).await.is_err());
+    assert!(ns.drop_branch(LEDGER).await.is_err());
+
+    // No normal Fluree/WAL adapter is exposed yet. Export ONLY the recovered
+    // owner's bytes into a fresh ordinary test image to exercise the independent
+    // full query oracle. Never bypass the managed root's fence to query it.
+    let image = tempfile::tempdir().unwrap();
+    for key in fixture.frontier.0.keys() {
+        let bytes = owner.read_bytes(key.to_str().unwrap()).unwrap();
+        let path = image.path().join(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    fixture.oracle.check(image.path()).await.unwrap();
+    drop(owner);
+    let reopened = LocalRoot::open(root.path()).unwrap();
+    assert_eq!(
+        reopened.read_bytes(HEAD_PATH).unwrap(),
+        second.resulting_head
+    );
+}
+
 fn transition(before: Option<&DeclaredFrontier>, after: &DeclaredFrontier) -> Transition {
     Transition {
         ledger: LEDGER.into(),

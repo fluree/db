@@ -71,6 +71,8 @@ pub mod prefix_trie;
 pub mod query_bounds;
 pub mod range;
 pub mod range_provider;
+#[cfg(all(feature = "native", unix))]
+pub(crate) mod root_access;
 pub mod runtime_small_dicts;
 pub mod schema_hierarchy;
 pub mod serde;
