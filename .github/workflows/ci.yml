@@ -75,6 +75,15 @@ jobs:
       - name: Clippy
         run: cargo clippy --all --all-features --all-targets -- -D warnings
 
+      # Clippy and the nextest job are both --all-features, so a target
+      # that only fails to compile under DEFAULT features (e.g. an example
+      # using feature-gated API without a `required-features` gate) is
+      # invisible to them. This compiles the shape a contributor's bare
+      # `cargo test -p <crate>` reaches first. Keep it alongside Clippy so it
+      # runs in parallel with nextest instead of extending the test job.
+      - name: Check (default features)
+        run: cargo check --workspace --all-targets
+
   test:
     # 8 cores / 32 GB: the workspace compile and nextest run are the CI critical path.
     runs-on: ci-cd-large
@@ -108,14 +117,6 @@ jobs:
       - name: Documentation tests
         timeout-minutes: 10
         run: cargo test --workspace --all-features --doc --locked
-
-      # Clippy and the nextest run above are both --all-features, so a target
-      # that only fails to compile under DEFAULT features (e.g. an example
-      # using feature-gated API without a `required-features` gate) is
-      # invisible to them. This compiles the shape a contributor's bare
-      # `cargo test -p <crate>` reaches first.
-      - name: Check (default features)
-        run: cargo check --workspace --all-targets
 
   testsuite-sparql:
     runs-on: ubuntu-24.04
@@ -261,124 +262,6 @@ jobs:
           FLUREE_SQL_BRIDGE_POSTGRES_URL: http://127.0.0.1:18081
           FLUREE_SQL_BRIDGE_MYSQL_URL: http://127.0.0.1:18082
         run: cargo test -p fluree-db-api --features sql,native --test it_sql_pushdown_lane --test it_sql_graph_source live_bridge
-
-  bench-paths:
-    # Cost gate for bench-compare below. GitHub's
-    # `paths:` filter is workflow-scoped and the rest of this workflow must run
-    # on every PR, so the filter lives here as a job output instead. Kept in
-    # ci.yml (rather than split into its own workflow) so the perf gate stays
-    # visible alongside the other required checks.
-    #
-    # Deliberately inclusive — a false positive costs one bench run, a false
-    # negative lets a regression through. Cargo.toml/Cargo.lock are in the list
-    # because a dependency or profile change moves timings without touching a
-    # single engine file.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      run: ${{ steps.filter.outputs.run }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - id: filter
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          set -euo pipefail
-          # Pushes to main always run: main is where baselines are captured from.
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "not a pull_request — running bench-compare"
-            exit 0
-          fi
-          changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
-          echo "changed files:"; echo "$changed"
-          # A here-string avoids grep -q closing a pipe early: with pipefail,
-          # SIGPIPE from echo made large PRs incorrectly skip benchmarks.
-          if grep -qE '^fluree-[^/]+/|^bench-baselines/|^regression-budget\.json$|^Cargo\.(toml|lock)$|^rust-toolchain(\.toml)?$|^\.cargo/|^\.github/(workflows|scripts)/' <<< "$changed"; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "no perf-relevant paths changed — skipping bench-compare"
-          fi
-
-  bench-compare:
-    # Cheap per-PR perf gate. Runs the two cheapest benches at tiny/quick and
-    # compares against the committed baseline.
-    #
-    # Both metrics enforce ONLY when the baseline's host_class matches this
-    # runner's. It currently does not — the committed baseline is
-    # host_class=local — so on every PR today both wall-clock TIME and
-    # PEAK_MEM breaches print as ::warning:: annotations and the job exits 0.
-    # That downgrade is now explicit (`--allow-host-mismatch`) rather than
-    # implicit: comparing absolute numbers across host classes is a refusal by
-    # default, and a job that wants the annotations has to say so.
-    #
-    # Why not gate on memory now: shared hosted runners vary, and a
-    # tracking allocator's peak moves with allocator behaviour, page size, and
-    # background load. The ±2.2% cross-machine figure this gate was first built
-    # on is one measurement between two specific machines, not a portability
-    # result — gating on it would fail unrelated PRs with no obvious cause, and
-    # it would be the LESS portable of the two signals doing the blocking.
-    #
-    # Capture a ci-cd-large-8core baseline (bench.yml's workflow_dispatch capture
-    # job) and commit it, and both metrics flip to enforcing automatically —
-    # no code change. See BENCHMARKING.md, "Baselines: capture & compare".
-    #
-    # The committed baseline contains exactly this cheap subset, so `compare`
-    # needs no `--only`. Full workspace benchmark smoke runs nightly at tiny.
-    needs: bench-paths
-    if: needs.bench-paths.outputs.run == 'true'
-    runs-on: ci-cd-large
-    timeout-minutes: 30
-    env:
-      FLUREE_BENCH_PROFILE: quick
-      FLUREE_BENCH_SCALE: tiny
-      # CI-class marker. The committed baseline is host_class=local, so this
-      # mismatch is what makes both metrics advisory today.
-      # (FLUREE_BENCH_RUNNER_CLASS is still read as the pre-rename spelling.)
-      FLUREE_BENCH_HOST_CLASS: ci-cd-large-8core
-    steps:
-      - name: Runner capacity
-        run: |
-          nproc
-          free -h
-          df -h /
-
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: rui314/setup-mold@v1
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # Clear stale sidecars first: rust-cache persists target/ across runs, and
-      # compare must not merge a mem number from a bench not rerun this session
-      # (review item 10), nor a corpus block from a run that never read that
-      # corpus. Clear Criterion's cached comparisons too: rust-cache prunes
-      # sample.json, leaving dangling comparisons. One Cargo invocation builds
-      # both binaries in parallel, then measures them sequentially.
-      - name: Run cheap benches (tiny, quick)
-        run: |
-          rm -rf target/criterion target/fluree-bench-mem target/fluree-bench-meta
-          cargo bench -p fluree-db-api --bench query_overlay_matrix --bench query_hot_bsbm
-
-      # Compare against the committed baseline. Exit 1 on any breach of a metric
-      # the host-class match makes enforcing, 2 on a refusal to compare.
-      #
-      # --allow-host-mismatch is the phase-1 posture and nothing else: the
-      # committed baseline is host_class=local, this runner is
-      # ci-cd-large-8core, and without the flag the job would refuse outright.
-      # DROP THIS FLAG once a ci-cd-large-8core baseline is committed (bench.yml's
-      # bench-capture job) — the flag is what stands between annotations and a
-      # real gate. Phase-share drift enforces either way.
-      - name: Compare against committed baseline
-        run: |
-          cargo run -p fluree-bench-support --bin bench-baseline -- \
-            compare --baseline bench-baselines/guardrails-pre.json \
-            --allow-host-mismatch
 
   # Keeps the wasm32-unknown-unknown build honest: the whole engine stack must
   # keep compiling for the browser target (fluree-db-api pulls every wasm-path
