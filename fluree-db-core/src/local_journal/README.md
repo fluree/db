@@ -321,7 +321,12 @@ Proof extends only inside validated, successfully flushed state installation. Th
 cache gate and owner health prevent reuse after uncertain flush or installation
 failure. Independent adapter caches compare the entire frontier and fully recover
 before using changed state. The opaque core frontier alone is neither semantic proof
-nor an acknowledgment. Full recovery views deliberately expose no reusable frontier.
+nor an acknowledgment. Full recovery views deliberately expose no reusable frontier. The API's ordered
+recovery pass starts from a verified checkpoint (or genesis), checks each record's
+CID, raw dependencies, exact predecessor head, static fields and default-graph shape,
+then advances a private boundary for that pass. It does not repeatedly walk ancestors
+already validated earlier in the same pass. Live cached prefixes are refused; failure
+discards the private state, and a retry revalidates every record from the beginning.
 Bootstrap/startup verify the full baseline and
 currently decode full commit bodies, one object at a time. Core copying uses its
 fixed buffer, but the API content-store interface buffers one source object; this is

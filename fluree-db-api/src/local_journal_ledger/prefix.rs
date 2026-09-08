@@ -193,6 +193,64 @@ mod tests {
         assert_eq!(target.head().await.unwrap().unwrap().t, 2);
     }
     #[tokio::test]
+    async fn ordered_recovery_revalidates_every_record_and_discards_failed_passes() {
+        let (_dir, _ledger, original) = records().await;
+        let validator = AdapterValidator {
+            proof: None,
+            prefix: None,
+        };
+        validator.validate_recovered(&original).unwrap();
+        assert!(validator.validate_recovered(&original[1..]).is_err());
+        let mut reordered = original.clone();
+        reordered.swap(0, 1);
+        assert!(validator.validate_recovered(&reordered).is_err());
+        for position in 0..original.len() {
+            let valid = &original[position].transition;
+            let mut missing_raw = valid.clone();
+            missing_raw.objects.retain(|o| !o.key.contains("/txn/"));
+            let mut damaged = valid.clone();
+            damaged.objects[0].bytes.push(0);
+            let mut changed_config = valid.clone();
+            let mut head: Value = serde_json::from_slice(&valid.resulting_head).unwrap();
+            head["f:configV"] = json!(1);
+            changed_config.resulting_head = serde_json::to_vec(&head).unwrap();
+            for bad in [
+                missing_raw,
+                damaged,
+                changed_config,
+                altered(valid, |c| c.parents.clear()),
+                altered(valid, |c| c.t += 1),
+                altered(valid, |c| {
+                    c.flakes[0].g = Some(fluree_db_core::Sid::new(0, "urn:graph"))
+                }),
+            ] {
+                let mut records = original.clone();
+                records[position].transition = bad;
+                // Genesis already has no parent, so clearing it is not corruption.
+                if position == 0 && records[0].transition == original[0].transition {
+                    continue;
+                }
+                assert!(
+                    validator.validate_recovered(&records).is_err(),
+                    "record {position}"
+                );
+                // The same adapter must start over, never reuse a partial failed pass.
+                validator.validate_recovered(&original).unwrap();
+            }
+        }
+        let mut delayed = original.clone();
+        let raw = delayed[0]
+            .transition
+            .objects
+            .iter()
+            .position(|o| o.key.contains("/txn/"))
+            .unwrap();
+        let object = delayed[0].transition.objects.remove(raw);
+        delayed.last_mut().unwrap().transition.objects.push(object);
+        assert!(validator.validate_recovered(&delayed).is_err());
+    }
+
+    #[tokio::test]
     async fn stale_foreign_and_recovery_prefixes_fail_closed_and_ready_self_refreshes() {
         let (_source, source, rs) = records().await;
         let (_d, l) = ledger().await;

@@ -33,6 +33,7 @@ mod indexed;
 mod indexing;
 pub use indexing::IndexInput;
 mod prefix;
+mod recovery;
 
 struct AdapterValidator<'a> {
     proof: Option<&'a indexed::Proof>,
@@ -46,6 +47,13 @@ impl AcceptanceValidator for AdapterValidator<'_> {
         self.proof
             .ok_or(JournalError::Invalid("missing verified baseline proof"))?
             .check(checkpoint)
+    }
+    fn validate_recovered_from(
+        &self,
+        records: &[Record],
+        checkpoint: Option<&Checkpoint>,
+    ) -> fluree_db_core::local_journal::Result<()> {
+        recovery::validate(self, records, checkpoint)
     }
     fn validate(
         &self,
@@ -62,6 +70,14 @@ impl AcceptanceValidator for AdapterValidator<'_> {
         } else {
             LinearCommitValidator.validate(view)?;
         }
+        Self::validate_body(view).map(|_| ())
+    }
+}
+impl AdapterValidator<'_> {
+    fn validate_body(
+        view: &fluree_db_core::local_journal::AcceptanceView<'_>,
+    ) -> fluree_db_core::local_journal::Result<crate::local_journal_acceptance::LinearBaseline>
+    {
         let record = ns_record(
             &view.transition.ledger,
             Some(&view.transition.resulting_head),
@@ -82,7 +98,10 @@ impl AcceptanceValidator for AdapterValidator<'_> {
                 "journal adapter supports only default-graph writes",
             ));
         }
-        Ok(())
+        Ok(crate::local_journal_acceptance::LinearBaseline {
+            id,
+            t: record.commit_t,
+        })
     }
 }
 
