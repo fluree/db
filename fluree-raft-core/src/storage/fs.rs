@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! <root>/
+//!   log_start      # zero/one-based origin, persisted before first append
 //!   vote           # postcard-serialized Vote
 //!   committed      # postcard-serialized LogId (absent when None)
 //!   last_purged    # postcard-serialized LogId (absent when never purged)
@@ -68,6 +69,32 @@ async fn fsync_dir(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Make every directory entry we create durable, including a newly created
+/// storage root. Syncing only `log/` does not persist its name in the root,
+/// nor a newly created root's name in its parent. This is startup-only work.
+async fn create_dir_all_durable(path: &Path) -> Result<(), StorageError> {
+    let path = std::path::absolute(path).map_err(|e| io_err("absolute storage directory", e))?;
+    let mut existing = path.as_path();
+    while !fs::try_exists(existing)
+        .await
+        .map_err(|e| io_err("inspect storage directory", e))?
+    {
+        existing = existing
+            .parent()
+            .ok_or_else(|| StorageError::io("storage directory has no existing ancestor"))?;
+    }
+    fs::create_dir_all(&path)
+        .await
+        .map_err(|e| io_err("create storage directory", e))?;
+    for directory in path.ancestors() {
+        fsync_dir(directory).await?;
+        if directory == existing {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// Durably write `bytes` to a temp file and rename it over `path`,
 /// but leave the parent-directory fsync (which makes the rename
 /// itself durable) to the caller. The file *contents* are synced
@@ -124,17 +151,24 @@ fn parse_entry_filename(name: &str) -> Option<u64> {
 /// Filesystem-backed implementation of [`RaftLogStore`].
 pub struct FsRaftLogStore {
     root: PathBuf,
+    start: std::sync::OnceLock<u64>,
 }
 
 impl FsRaftLogStore {
-    /// Open or create the log store rooted at `root`. Creates the
-    /// directory tree if missing.
+    /// Open or create the log store rooted at `root`. Creates durable
+    /// directories and reconciles incomplete tails before returning. Missing
+    /// known-committed history is an error, never a reason to discard it.
+    /// The caller must exclusively own this root and finish opening before
+    /// starting Raft I/O.
     pub async fn open(root: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let root = root.into();
-        fs::create_dir_all(root.join("log"))
-            .await
-            .map_err(|e| io_err("create log dir", e))?;
-        Ok(Self { root })
+        create_dir_all_durable(&root.join("log")).await?;
+        let store = Self {
+            root,
+            start: std::sync::OnceLock::new(),
+        };
+        store.repair_on_open().await?;
+        Ok(store)
     }
 
     fn log_dir(&self) -> PathBuf {
@@ -181,7 +215,13 @@ impl FsRaftLogStore {
     async fn read_entry(&self, index: u64) -> Result<Option<LogEntry>, StorageError> {
         match read_if_exists(&self.entry_path(index)).await? {
             Some(bytes) => {
-                let entry = postcard::from_bytes(&bytes).map_err(|e| ser_err("decode entry", e))?;
+                let entry: LogEntry =
+                    postcard::from_bytes(&bytes).map_err(|e| ser_err("decode entry", e))?;
+                if entry.log_id.index != index {
+                    return Err(StorageError::corruption(
+                        "entry index does not match filename",
+                    ));
+                }
                 Ok(Some(entry))
             }
             None => Ok(None),
@@ -203,6 +243,9 @@ impl FsRaftLogStore {
 #[async_trait]
 impl RaftLogStore for FsRaftLogStore {
     async fn append(&self, entries: &[LogEntry]) -> Result<(), StorageError> {
+        if let Some(first) = entries.first() {
+            self.ensure_start(first.log_id.index).await?;
+        }
         // Each entry's contents are fsync'd before its rename; the
         // renames are made durable by a single directory fsync at the
         // end, so a batch of N pays N+1 fsyncs rather than 2N. A crash
@@ -222,12 +265,12 @@ impl RaftLogStore for FsRaftLogStore {
     }
 
     async fn read_range(&self, range: Range<u64>) -> Result<Vec<LogEntry>, StorageError> {
-        let indices = self.list_entry_indices().await?;
+        // Use the same contiguous extent advertised by log_state, including
+        // requests starting beyond a gap or before the durable purge boundary.
+        let (_, indices) = self.live_extent().await?;
         let mut entries = Vec::new();
         for idx in indices.into_iter().filter(|i| range.contains(i)) {
-            if let Some(entry) = self.read_entry(idx).await? {
-                entries.push(entry);
-            }
+            entries.push(self.required_entry(idx).await?);
         }
         Ok(entries)
     }
@@ -293,44 +336,7 @@ impl RaftLogStore for FsRaftLogStore {
     }
 
     async fn log_state(&self) -> Result<LogState, StorageError> {
-        let last_purged = self.read_last_purged().await?;
-        let purged_cutoff = last_purged.map(|p| p.index);
-        let indices = self.list_entry_indices().await?;
-        // `last_log` is the top of the contiguous run of entries above
-        // `last_purged`. Two orphan sources make this a contiguous
-        // scan rather than a plain max:
-        //   - indices <= cutoff (a `purge_through` that crashed between
-        //     marker write and deletion) — filtered out by the cutoff;
-        //   - a gap anywhere from `cutoff + 1` up (an `append` batch
-        //     that crashed before its final directory fsync, leaving
-        //     renames durable out of order) — the scan is anchored at
-        //     `cutoff + 1` (or index 1 with nothing purged) and stops
-        //     at the first missing index, so openraft never sees a
-        //     `last_log` past a hole. A gap at the very front (the
-        //     first expected index absent) yields `None`. Entries
-        //     beyond the gap are orphans that recovery re-appends over.
-        let first_expected = purged_cutoff.map_or(1, |c| c + 1);
-        let last_index = indices
-            .iter()
-            .copied()
-            .filter(|&idx| purged_cutoff.is_none_or(|c| idx > c))
-            .scan(first_expected, |expected, idx| {
-                if idx == *expected {
-                    *expected += 1;
-                    Some(idx)
-                } else {
-                    None // gap (at the anchor or in the tail) — stop the run
-                }
-            })
-            .last();
-        let last_log = match last_index {
-            Some(idx) => self.read_entry(idx).await?.map(|e| e.log_id),
-            None => None,
-        };
-        Ok(LogState {
-            last_purged,
-            last_log,
-        })
+        self.live_extent().await.map(|(state, _)| state)
     }
 
     async fn save_vote(&self, vote: &Vote) -> Result<(), StorageError> {
@@ -395,9 +401,7 @@ impl FsRaftSnapshotStore {
     /// directory tree if missing.
     pub async fn open(root: impl Into<PathBuf>) -> Result<Self, StorageError> {
         let root = root.into();
-        fs::create_dir_all(root.join("snapshots"))
-            .await
-            .map_err(|e| io_err("create snapshot dir", e))?;
+        create_dir_all_durable(&root.join("snapshots")).await?;
         Ok(Self { root })
     }
 
@@ -1134,3 +1138,10 @@ mod tests {
         assert_eq!(data, vec![99]);
     }
 }
+
+#[cfg(test)]
+#[path = "fs_recovery_tests.rs"]
+mod recovery_tests;
+
+#[path = "fs_log_recovery.rs"]
+mod log_recovery;

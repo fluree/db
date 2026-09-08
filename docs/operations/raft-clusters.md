@@ -83,6 +83,15 @@ Writes follow a four-stage path inside the cluster. Only one of the four is tied
 
 Two things are load-bearing here. **Only the leader can propose log entries**, but the heavy work of staging (parsing, policy evaluation, writing the blob) must happen *before* the head moves — so proposal and staging are decoupled, which keeps the openraft commit path free of blocking work, makes idempotent retries cheap (the second `EnqueueCommand` with the same idempotency key hits the cache and skips staging), and lets a leader change abandon in-flight stages without losing the queue. And **the blob never passes through consensus**: the log carries a CID, and the node that staged the commit is the one that wrote the bytes. Distributing staging across nodes is what lets that scale — were staging leader-only, the leader would be the write bottleneck for the whole cluster and the narrow log would buy nothing.
 
+### Filesystem performance qualification
+
+Shared filesystem payload storage with per-node durable Raft logs is the primary
+throughput target for the current durability work. The standalone experimental
+journal is a different acceptance path and must not be enabled on a Raft server.
+See [filesystem Raft durability and throughput](../design/filesystem-raft-durability.md)
+for the hardening, storage boundaries and qualification sequence. S3 compatibility
+remains required; its latency is outside this optimization target.
+
 ### Storage layering
 
 | Layer                          | Scope            | Backed by                                                                | Notes                                                                                                                                              |

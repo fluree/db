@@ -110,3 +110,25 @@ fn raft_enabled_rejects_proxy_storage() {
         .expect_err("raft + proxy storage should error");
     assert!(err.contains("proxy"), "got: {err}");
 }
+
+#[cfg(all(feature = "experimental-local-journal", unix))]
+#[test]
+fn local_acceptance_journal_cannot_bypass_raft() {
+    let mut config = ServerConfig {
+        raft_enabled: true,
+        raft_node_id: Some(1),
+        raft_storage_path: Some("/tmp/raft-node-log".into()),
+        raft_listen_addr: Some("127.0.0.1:9090".parse().unwrap()),
+        storage_path: Some("/tmp/shared-payloads".into()),
+        ..Default::default()
+    };
+    config
+        .validate()
+        .expect("ordinary file-backed Raft remains supported with both features compiled");
+    config.journal_root = Some("/tmp/standalone-authority".into());
+    config.journal_index_path = Some("/tmp/standalone-indexes".into());
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .contains("does not support Raft"));
+}

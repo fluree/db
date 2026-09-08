@@ -21,6 +21,7 @@ use fluree_db_consensus::raft::admin::{
 };
 use fluree_db_consensus::raft::liveness_monitor::LivenessConfig;
 use fluree_db_consensus::NodeId;
+use fluree_db_nameservice::NameServiceLookup;
 use fluree_db_server::raft::{RaftBootstrapConfig, RaftIntegration};
 use fluree_db_server::{AppState, FlureeServerBuilder};
 use reqwest::StatusCode;
@@ -123,7 +124,7 @@ impl TestCluster {
         assert!(count >= 1, "cluster must have at least one node");
 
         // Single shared data directory across all nodes — the
-        // commit worker (leader-only) writes blobs here; every node
+        // branch-owning commit worker writes blobs here; every node
         // (leader + followers) reads them back. The raft log itself
         // stays per-node so each node has its own persisted state.
         let shared_data_tmp = TempDir::new().expect("shared data tempdir");
@@ -906,6 +907,32 @@ async fn leader_failover_resumes_writes() {
         .wait_for_names(old_leader, ledger, &["Dave"], DEFAULT_TIMEOUT)
         .await;
 
+    // Keep an external oracle for the exact accepted identity and source bytes,
+    // not just an equivalent query answer after another node takes over.
+    let old_node = cluster
+        .nodes
+        .iter()
+        .find(|n| n.node_id == old_leader)
+        .unwrap();
+    let accepted = old_node
+        ._state
+        .raft
+        .as_ref()
+        .unwrap()
+        .nameservice()
+        .lookup(ledger)
+        .await
+        .unwrap()
+        .unwrap();
+    let accepted_cid = accepted.commit_head_id.clone().unwrap();
+    let accepted_bytes = old_node
+        ._state
+        .fluree
+        .content_store(&accepted.ledger_id)
+        .get(&accepted_cid)
+        .await
+        .unwrap();
+
     cluster.shutdown_node(old_leader).await;
 
     // emerge within a few election timeouts. Waiting for *every*
@@ -918,6 +945,33 @@ async fn leader_failover_resumes_writes() {
     let new_leader = cluster
         .wait_for_leader_change(old_leader, DEFAULT_TIMEOUT)
         .await;
+
+    for node in cluster.nodes.iter().filter(|n| n.is_alive()) {
+        cluster
+            .wait_for_names(node.node_id, ledger, &["Dave"], DEFAULT_TIMEOUT)
+            .await;
+        let recovered = node
+            ._state
+            .raft
+            .as_ref()
+            .unwrap()
+            .nameservice()
+            .lookup(ledger)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.commit_head_id, Some(accepted_cid.clone()));
+        assert_eq!(recovered.commit_t, accepted.commit_t);
+        assert_eq!(
+            node._state
+                .fluree
+                .content_store(&accepted.ledger_id)
+                .get(&accepted_cid)
+                .await
+                .unwrap(),
+            accepted_bytes
+        );
+    }
 
     // Resume writes through a surviving non-leader to also exercise
     // the new leader's forward path.

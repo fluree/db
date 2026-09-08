@@ -676,3 +676,86 @@ async fn single_node_status_config_round_trip_normalizes_ledger_id() {
 
     raft.shutdown().await.unwrap();
 }
+
+/// Rebuild both adapters from file storage on each restart. The memory-backed
+/// round trips cannot expose a file-log origin or durable replay regression.
+#[tokio::test]
+async fn file_backed_raft_replays_acknowledged_commands_across_restarts() {
+    use fluree_db_consensus::raft::storage::fs::FsRaftStorage;
+    let dir = tempfile::TempDir::new().unwrap();
+    for round in 0..3 {
+        let storage = Arc::new(FsRaftStorage::open(dir.path()).await.unwrap());
+        let log = LogAdapter::new(Arc::clone(&storage));
+        let sm = StateMachineAdapter::open(Arc::clone(&storage), NameServiceObserver::new())
+            .await
+            .unwrap();
+        let state = sm.shared_state();
+        let config = Config {
+            cluster_name: "durable-restart".into(),
+            election_timeout_min: 150,
+            election_timeout_max: 300,
+            heartbeat_interval: 50,
+            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(10_000),
+            ..Config::default()
+        };
+        let raft = Raft::new(
+            1,
+            Arc::new(config.validate().unwrap()),
+            StubFactory,
+            log,
+            sm,
+        )
+        .await
+        .unwrap();
+        if round == 0 {
+            raft.initialize(BTreeMap::from([(1, ClusterNode::default())]))
+                .await
+                .unwrap();
+        }
+        raft.wait(Some(Duration::from_secs(5)))
+            .state(ServerState::Leader, "restart election")
+            .await
+            .unwrap();
+        let name = format!("durable/db-{round}");
+        let reply = raft
+            .client_write(SmCommand::CreateLedger(NewLedger {
+                ledger_id: name.clone(),
+                branch: "main".into(),
+                created_at_millis: 1000 + round,
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(reply.data, Response::Created { .. }));
+        for previous in 0..=round {
+            assert!(
+                state
+                    .read()
+                    .await
+                    .ledgers
+                    .contains_key(&format!("durable/db-{previous}")),
+                "acknowledged command lost on restart"
+            );
+        }
+        if round == 1 {
+            // The final restart must recover from a real durable snapshot with
+            // its log prefix removed, not accidentally replay surviving files.
+            raft.trigger().snapshot().await.unwrap();
+            let metrics = raft
+                .wait(Some(Duration::from_secs(5)))
+                .metrics(
+                    |m| m.snapshot.is_some_and(|id| id.index >= reply.log_id.index),
+                    "durable snapshot",
+                )
+                .await
+                .unwrap();
+            let snapshot = metrics.snapshot.unwrap();
+            raft.trigger().purge_log(snapshot.index).await.unwrap();
+            raft.wait(Some(Duration::from_secs(5)))
+                .purged(Some(snapshot), "durable log purge")
+                .await
+                .unwrap();
+        }
+        raft.shutdown().await.unwrap();
+        drop(raft);
+    }
+}
