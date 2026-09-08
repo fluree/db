@@ -1,4 +1,4 @@
-//! Durable but unpublished index prerequisites. Never a database visibility path.
+//! Durable private index prerequisites and journal-authorized publication.
 use super::*;
 use crate::local_journal::AcceptanceFrontier;
 
@@ -18,7 +18,7 @@ pub struct IndexBuildPin {
 /// This is NOT an accepted index, a checkpoint publication or a semantic proof
 /// that can bypass publication validation. The active head and journal are untouched.
 /// There is deliberately no reopen-by-directory or automatic orphan promotion API.
-/// Losing this handle requires a fresh build; staged files remain for inspection.
+/// Losing an unpublished handle requires a fresh build; staged files remain for inspection.
 pub struct PreparedIndex {
     pin: IndexBuildPin,
     checkpoint: Arc<Checkpoint>,
@@ -165,10 +165,15 @@ impl PreparedIndex {
     /// are allowed; the input frontier remains fixed. This grants no publication
     /// authority: publication must revalidate under its own acceptance gate.
     pub fn verify_for(&self, owner: &Arc<LocalRoot>) -> Result<()> {
+        owner.accepted_frontier()?;
+        self.verified_checkpoint(owner)?;
+        Ok(())
+    }
+
+    fn verified_checkpoint(&self, owner: &Arc<LocalRoot>) -> Result<Arc<Checkpoint>> {
         if !Arc::ptr_eq(owner, &self.pin.owner) {
             return Err(Error::Invalid("foreign prepared index owner"));
         }
-        owner.accepted_frontier()?;
         self.validate_location()?;
         Checkpoint::open(
             &self.build_path,
@@ -180,10 +185,12 @@ impl PreparedIndex {
             },
             self.checkpoint.digest(),
             owner._directory_lock.clone(),
-        )?;
-        Ok(())
+        )
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+mod publication;
+pub(super) use publication::open_indexes;

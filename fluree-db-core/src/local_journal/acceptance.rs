@@ -12,6 +12,19 @@ use std::sync::Arc;
 pub trait AcceptanceValidator {
     fn validate(&self, view: &AcceptanceView<'_>) -> Result<()>;
 
+    /// Explicit opt-in for index-only publication. Validate index CIDs/closure,
+    /// built-through ancestry, monotonic index progress and preservation of the
+    /// latest commit/configuration fields. Legacy embeddings reject this kind.
+    fn validate_index_publication(
+        &self,
+        _view: &AcceptanceView<'_>,
+        _index: &Checkpoint,
+    ) -> Result<()> {
+        Err(Error::Invalid(
+            "validator does not support index publication",
+        ))
+    }
+
     /// Explicit opt-in for a checkpoint-aware embedding. Validate its complete
     /// supported baseline semantics before accepting any dependent transition.
     fn validate_checkpoint(&self, _checkpoint: &Checkpoint) -> Result<()> {
@@ -34,20 +47,57 @@ pub trait AcceptanceValidator {
         records: &[Record],
         checkpoint: Option<&Checkpoint>,
     ) -> Result<()> {
+        self.validate_recovered_with_indexes(records, checkpoint, &[])
+    }
+
+    /// Validate each publication using only its own verified build and preceding
+    /// accepted prerequisites. Index handles are in journal publication order.
+    fn validate_recovered_with_indexes(
+        &self,
+        records: &[Record],
+        checkpoint: Option<&Checkpoint>,
+        indexes: &[Arc<Checkpoint>],
+    ) -> Result<()> {
         if let Some(checkpoint) = checkpoint {
             self.validate_checkpoint(checkpoint)?;
         }
         let mut accepted = BTreeMap::new();
+        let mut published = Vec::new();
+        let mut candidates = indexes.iter();
         for record in records {
-            self.validate(&AcceptanceView {
+            let index = if record.transition.index_publication.is_some() {
+                let c = candidates
+                    .next()
+                    .ok_or(Error::Invalid("missing recovery index prerequisites"))?;
+                if !c.matches_publication(&record.transition) {
+                    return Err(Error::Invalid("recovery index binding"));
+                }
+                Some(c.clone())
+            } else {
+                None
+            };
+            let view = AcceptanceView {
                 transition: &record.transition,
                 accepted: &accepted,
                 checkpoint,
+                indexes: &published,
+                index: index.as_deref(),
                 frontier: None,
-            })?;
+            };
+            if let Some(index) = &index {
+                self.validate_index_publication(&view, index)?;
+            } else {
+                self.validate(&view)?;
+            }
             for object in &record.transition.objects {
                 accepted.insert(object.key.clone(), object.bytes.clone());
             }
+            if let Some(index) = index {
+                published.push(index);
+            }
+        }
+        if candidates.next().is_some() {
+            return Err(Error::Invalid("unreferenced recovery index"));
         }
         Ok(())
     }
@@ -81,6 +131,8 @@ pub struct AcceptanceView<'a> {
     pub transition: &'a Transition,
     accepted: &'a BTreeMap<String, Vec<u8>>,
     checkpoint: Option<&'a Checkpoint>,
+    indexes: &'a [Arc<Checkpoint>],
+    index: Option<&'a Checkpoint>,
     frontier: Option<AcceptanceFrontier>,
 }
 impl AcceptanceView<'_> {
@@ -123,9 +175,17 @@ impl AcceptanceView<'_> {
         if let Some(bytes) = self.content(key) {
             return Ok(Some(Cow::Borrowed(bytes)));
         }
-        self.checkpoint.map_or(Ok(None), |checkpoint| {
-            checkpoint.read(key).map(|bytes| bytes.map(Cow::Owned))
-        })
+        for index in self
+            .index
+            .into_iter()
+            .chain(self.indexes.iter().rev().map(Arc::as_ref))
+            .chain(self.checkpoint)
+        {
+            if let Some(bytes) = index.read(key)? {
+                return Ok(Some(Cow::Owned(bytes)));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -143,6 +203,8 @@ pub(super) struct Coordinator<I> {
     objects: BTreeMap<String, Vec<u8>>,
     pub last: Option<Receipt>,
     checkpoint: Option<Arc<Checkpoint>>,
+    pub(super) indexes: Vec<Arc<Checkpoint>>,
+    frontiers: BTreeMap<[u8; 32], Object>,
 }
 
 impl<I: JournalIo> Coordinator<I> {
@@ -162,6 +224,21 @@ impl<I: JournalIo> Coordinator<I> {
         generation: &str,
         checkpoint: Option<Arc<Checkpoint>>,
     ) -> Result<Self> {
+        Self::restored_with_indexes(journal, records, ledger, generation, checkpoint, &[])
+    }
+
+    pub(super) fn restored_with_indexes(
+        journal: Journal<I>,
+        records: &[Record],
+        ledger: &str,
+        generation: &str,
+        checkpoint: Option<Arc<Checkpoint>>,
+        indexes: &[Arc<Checkpoint>],
+    ) -> Result<Self> {
+        let mut frontiers = BTreeMap::new();
+        if let Some(c) = &checkpoint {
+            frontiers.insert(journal.origin, c.head().clone());
+        }
         let mut this = Self {
             journal: Some(journal),
             poisoned: false,
@@ -173,10 +250,26 @@ impl<I: JournalIo> Coordinator<I> {
             objects: BTreeMap::new(),
             last: None,
             checkpoint,
+            indexes: Vec::new(),
+            frontiers,
         };
+        let mut candidates = indexes.iter();
         for record in records {
-            this.check_transition(&record.transition)?;
-            this.advance(&record.transition, record.receipt.clone());
+            let index = if record.transition.index_publication.is_some() {
+                Some(
+                    candidates
+                        .next()
+                        .ok_or(Error::Invalid("missing index prerequisites"))?
+                        .clone(),
+                )
+            } else {
+                None
+            };
+            this.check_transition(&record.transition, index.as_deref())?;
+            this.advance(&record.transition, record.receipt.clone(), index);
+        }
+        if candidates.next().is_some() {
+            return Err(Error::Invalid("unreferenced index prerequisites"));
         }
         Ok(this)
     }
@@ -197,8 +290,16 @@ impl<I: JournalIo> Coordinator<I> {
         })
     }
 
-    fn check_transition(&self, t: &Transition) -> Result<()> {
+    fn check_transition(&self, t: &Transition, index: Option<&Checkpoint>) -> Result<()> {
         t.validate()?;
+        match (&t.index_publication, index) {
+            (None, None) => {}
+            (Some(p), Some(c))
+                if c.matches_publication(t)
+                    && self.frontiers.get(&p.input_prefix) == Some(&p.input_head)
+                    && !self.indexes.iter().any(|old| old.digest() == p.manifest) => {}
+            _ => return Err(Error::Invalid("index publication prefix/prerequisites")),
+        }
         if t.ledger != self.ledger || t.generation != self.generation {
             return Err(Error::Invalid("acceptance ledger/generation"));
         }
@@ -225,7 +326,29 @@ impl<I: JournalIo> Coordinator<I> {
         {
             return Err(Error::Invalid("immutable key/head conflict"));
         }
-        if let Some(checkpoint) = &self.checkpoint {
+        let sources: Vec<_> = self
+            .checkpoint
+            .iter()
+            .map(Arc::as_ref)
+            .chain(self.indexes.iter().map(Arc::as_ref))
+            .chain(index)
+            .collect();
+        if let Some(index) = index {
+            for e in index.entries() {
+                if self
+                    .objects
+                    .get(&e.key)
+                    .is_some_and(|b| b.len() as u64 != e.length || super::digest(b) != e.sha256)
+                    || sources.iter().any(|c| {
+                        c.entry(&e.key)
+                            .is_some_and(|old| old.length != e.length || old.sha256 != e.sha256)
+                    })
+                {
+                    return Err(Error::Invalid("index immutable key conflict"));
+                }
+            }
+        }
+        for checkpoint in &sources {
             if checkpoint.entry(&t.head_key).is_some()
                 || t.objects.iter().any(|o| {
                     checkpoint.entry(&o.key).is_some_and(|entry| {
@@ -239,6 +362,11 @@ impl<I: JournalIo> Coordinator<I> {
         }
         let keys: BTreeSet<_> = std::iter::once(t.head_key.as_str())
             .chain(t.objects.iter().map(|o| o.key.as_str()))
+            .chain(
+                index
+                    .into_iter()
+                    .flat_map(|c| c.entries().iter().map(|e| e.key.as_str())),
+            )
             .collect();
         for key in &keys {
             if key.split('/').any(|part| part == ".fluree-wal") {
@@ -249,20 +377,14 @@ impl<I: JournalIo> Coordinator<I> {
                 let parent = &key[..i];
                 if keys.contains(parent)
                     || self.objects.contains_key(parent)
-                    || self
-                        .checkpoint
-                        .as_ref()
-                        .is_some_and(|c| c.entry(parent).is_some())
+                    || sources.iter().any(|c| c.entry(parent).is_some())
                     || self.head.as_ref().is_some_and(|(head, _)| head == parent)
                 {
                     return Err(Error::Invalid("journal key is another key's parent"));
                 }
             }
             let prefix = format!("{key}/");
-            if self
-                .checkpoint
-                .as_ref()
-                .is_some_and(|c| c.has_descendant(key))
+            if sources.iter().any(|c| c.has_descendant(key))
                 || self
                     .objects
                     .range(prefix.clone()..)
@@ -275,14 +397,24 @@ impl<I: JournalIo> Coordinator<I> {
         Ok(())
     }
 
-    fn advance(&mut self, t: &Transition, receipt: Receipt) {
+    fn advance(&mut self, t: &Transition, receipt: Receipt, index: Option<Arc<Checkpoint>>) {
         for Object { key, bytes } in &t.objects {
             self.objects
                 .entry(key.clone())
                 .or_insert_with(|| bytes.clone());
         }
         self.head = Some((t.head_key.clone(), t.resulting_head.clone()));
+        self.frontiers.insert(
+            receipt.digest,
+            Object {
+                key: t.head_key.clone(),
+                bytes: t.resulting_head.clone(),
+            },
+        );
         self.last = Some(receipt);
+        if let Some(index) = index {
+            self.indexes.push(index);
+        }
     }
 
     pub fn accept(
@@ -292,21 +424,38 @@ impl<I: JournalIo> Coordinator<I> {
         target: &mut impl AcceptanceTarget,
         install: impl FnOnce(&AcceptanceView<'_>, &Receipt) -> Result<()>,
     ) -> Result<Receipt> {
+        self.accept_index(t, validator, target, install, None)
+    }
+
+    pub(super) fn accept_index(
+        &mut self,
+        t: &Transition,
+        validator: &impl AcceptanceValidator,
+        target: &mut impl AcceptanceTarget,
+        install: impl FnOnce(&AcceptanceView<'_>, &Receipt) -> Result<()>,
+        index: Option<Arc<Checkpoint>>,
+    ) -> Result<Receipt> {
         if self.poisoned {
             return Err(Error::Poisoned);
         }
         let started = std::time::Instant::now();
-        self.check_transition(t)?;
+        self.check_transition(t, index.as_deref())?;
         let view = AcceptanceView {
             transition: t,
             accepted: &self.objects,
             checkpoint: self.checkpoint.as_deref(),
+            indexes: &self.indexes,
+            index: index.as_deref(),
             frontier: Some(self.frontier()?),
         };
         if let Some(checkpoint) = &self.checkpoint {
             validator.validate_checkpoint(checkpoint)?;
         }
-        validator.validate(&view)?;
+        if let Some(index) = &index {
+            validator.validate_index_publication(&view, index)?;
+        } else {
+            validator.validate(&view)?;
+        }
         target.preflight(t)?;
         if target.read_head(&t.head_key)?.as_deref() != t.expected_head.as_deref() {
             self.poisoned = true;
@@ -350,7 +499,7 @@ impl<I: JournalIo> Coordinator<I> {
                 cause: Box::new(cause),
             });
         }
-        self.advance(t, receipt.clone());
+        self.advance(t, receipt.clone(), index);
         self.poisoned = false;
         Ok(receipt)
     }

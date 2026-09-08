@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 #[derive(Clone, Default)]
-struct FaultIo(Rc<RefCell<State>>);
+pub(super) struct FaultIo(Rc<RefCell<State>>);
 #[derive(Default)]
 struct State {
     volatile: Vec<u8>,
@@ -17,15 +17,18 @@ struct State {
 }
 
 impl FaultIo {
-    fn from_image(image: Vec<u8>) -> Self {
+    pub(super) fn from_image(image: Vec<u8>) -> Self {
         Self(Rc::new(RefCell::new(State {
             volatile: image.clone(),
             durable: image,
             ..State::default()
         })))
     }
-    fn crash(&self) -> Self {
+    pub(super) fn crash(&self) -> Self {
         Self::from_image(self.0.borrow().durable.clone())
+    }
+    pub(super) fn fail_next_flush(&self, persists: bool) {
+        self.0.borrow_mut().fail_flush = Some(persists);
     }
 }
 
@@ -84,6 +87,7 @@ impl JournalIo for FaultIo {
 
 fn transition(n: u8) -> Transition {
     Transition {
+        index_publication: None,
         ledger: "test:main".into(),
         generation: "generation-1".into(),
         head_key: "ns/test/main.json".into(),

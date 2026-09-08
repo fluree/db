@@ -13,6 +13,7 @@ fn commit(owner: &Arc<LocalRoot>, n: u8) -> Result<Receipt> {
 }
 fn transition(owner: &Arc<LocalRoot>, n: u8) -> Transition {
     Transition {
+        index_publication: None,
         ledger: "index:main".into(),
         generation: "g1".into(),
         head_key: "ns/head".into(),

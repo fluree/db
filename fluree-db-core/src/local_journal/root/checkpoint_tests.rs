@@ -68,6 +68,7 @@ fn bootstrap(path: &Path) -> Arc<LocalRoot> {
 }
 fn transition(n: u8) -> Transition {
     Transition {
+        index_publication: None,
         ledger: "test:main".into(),
         generation: "g1".into(),
         head_key: "ns/head".into(),

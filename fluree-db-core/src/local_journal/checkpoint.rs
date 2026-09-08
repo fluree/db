@@ -100,6 +100,22 @@ impl Checkpoint {
             .next()
             .is_some_and(|(k, _)| k.starts_with(&prefix))
     }
+    pub(super) fn matches_publication(&self, t: &super::Transition) -> bool {
+        t.index_publication.as_ref().is_some_and(|p| {
+            self.digest == p.manifest
+                && self.descriptor.index_build == Some(p.input_prefix)
+                && self.head() == &p.input_head
+                && self.ledger() == t.ledger
+                && self.generation() == t.generation
+                && self
+                    .path
+                    .parent()
+                    .and_then(|d| d.file_name())
+                    .and_then(|s| s.to_str())
+                    == Some(p.build.as_str())
+        })
+    }
+
     /// Read a single inventory object, verifying it again before returning bytes.
     /// Unknown keys return None; missing/corrupt listed objects are errors.
     pub fn read(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -115,6 +131,26 @@ impl Checkpoint {
         Ok(Some(bytes))
     }
     fn open_object(&self, entry: &CheckpointEntry) -> Result<File> {
+        // Published builds live deeper than the bootstrap checkpoint. Recheck
+        // every managed ancestor on retained-handle reads, too.
+        if self.descriptor.index_build.is_some() {
+            let root = self
+                .path
+                .ancestors()
+                .nth(4)
+                .ok_or(Error::Invalid("index build ancestry"))?;
+            let relative = self
+                .path
+                .strip_prefix(root)
+                .map_err(|_| Error::Invalid("index build ancestry"))?;
+            checked_path(
+                root,
+                relative
+                    .to_str()
+                    .ok_or(Error::Invalid("index build path"))?,
+                false,
+            )?;
+        }
         // Recheck the managed directory as well as all relative key components.
         let objects = checked_path(&self.path, OBJECTS, false)?;
         let file = File::open(checked_path(&objects, &entry.key, false)?)?;

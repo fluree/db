@@ -8,6 +8,7 @@ fn append_fixture(root: &Path) {
     for n in 1..=2 {
         journal
             .append_and_sync(&Transition {
+                index_publication: None,
                 ledger: "test:main".into(),
                 generation: "g1".into(),
                 head_key: "ns/head".into(),
@@ -30,6 +31,7 @@ impl super::super::AcceptanceValidator for SyntheticValidator {
 }
 fn candidate(n: u8) -> Transition {
     Transition {
+        index_publication: None,
         ledger: "test:main".into(),
         generation: "g1".into(),
         head_key: "ns/head".into(),

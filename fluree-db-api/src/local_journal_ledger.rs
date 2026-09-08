@@ -371,6 +371,7 @@ impl JournalLedger {
         head["f:commitCid"] = json!(commit_id.to_string());
         let owner = self.0.owner.clone();
         let transition = Transition {
+            index_publication: None,
             ledger: owner.ledger().into(),
             generation: owner.generation().into(),
             head_key: key,
