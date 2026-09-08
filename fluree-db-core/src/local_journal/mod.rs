@@ -89,35 +89,6 @@ pub struct Object {
     pub bytes: Vec<u8>,
 }
 
-/// A journal-authorized reference to a durable private build. The input prefix
-/// must already belong to this root's accepted history. This is format data,
-/// not a caller-constructible acceptance capability; use LocalRoot::publish_index.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IndexPublication {
-    pub build: String,
-    pub manifest: [u8; 32],
-    pub input_prefix: [u8; 32],
-    pub input_head: Object,
-}
-impl IndexPublication {
-    fn validate(&self) -> Result<()> {
-        if self.build.len() != 32
-            || !self
-                .build
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(Error::Invalid("invalid index build reference"));
-        }
-        validate_key(&self.input_head.key)?;
-        if self.input_head.bytes.is_empty() || self.input_head.bytes.len() > 65536 {
-            return Err(Error::Invalid("invalid index publication input head"));
-        }
-        Ok(())
-    }
-}
-
 /// An opaque accepted transition; this layer deliberately has no nameservice
 /// dependency. The owner must verify generation, CAS, content identities and the
 /// complete dependency closure BEFORE calling append. No encryption is provided.
@@ -130,21 +101,10 @@ pub struct Transition {
     pub expected_head: Option<Vec<u8>>,
     pub resulting_head: Vec<u8>,
     pub objects: Vec<Object>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub index_publication: Option<IndexPublication>,
 }
 
 impl Transition {
     fn validate(&self) -> Result<()> {
-        if let Some(index) = &self.index_publication {
-            index.validate()?;
-            if !self.objects.is_empty()
-                || self.expected_head.is_none()
-                || index.input_head.key != self.head_key
-            {
-                return Err(Error::Invalid("invalid index publication transition"));
-            }
-        }
         if self.ledger.is_empty() || self.generation.is_empty() || self.resulting_head.is_empty() {
             return Err(Error::Invalid("missing transition identity/head"));
         }
@@ -253,7 +213,6 @@ pub struct Journal<I> {
     end: u64,
     sequence: u64,
     digest: [u8; HASH],
-    origin: [u8; HASH],
     poisoned: bool,
 }
 
@@ -311,7 +270,6 @@ impl<I: JournalIo> Journal<I> {
             end: HEADER as u64,
             sequence: 0,
             digest: hash,
-            origin: hash,
             poisoned: false,
         })
     }
@@ -337,7 +295,6 @@ impl<I: JournalIo> Journal<I> {
             end: HEADER as u64,
             sequence: 0,
             digest: digest(&header[..24]),
-            origin: digest(&header[..24]),
             poisoned: false,
         };
         let mut records = Vec::new();

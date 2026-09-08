@@ -167,11 +167,6 @@ pub(crate) fn validate_linear_from(
     baseline: Option<&LinearBaseline>,
 ) -> Result<()> {
     let t = view.transition;
-    if t.index_publication.is_some() {
-        return Err(Error::Invalid(
-            "index publication requires its own validator",
-        ));
-    }
     let (ledger, branch) =
         split_ledger_id(&t.ledger).map_err(|_| Error::Invalid("invalid journal ledger"))?;
     if t.head_key != format!("ns@v2/{ledger}/{branch}.json") {

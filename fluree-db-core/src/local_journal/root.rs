@@ -269,14 +269,12 @@ impl LocalRoot {
         if !std::fs::metadata(&data)?.is_dir() {
             return Err(Error::Invalid("missing journal data directory"));
         }
-        let indexes = index_build::open_indexes(&path, &manifest, &records, directory.clone())?;
-        let coordinator = Coordinator::restored_with_indexes(
+        let coordinator = Coordinator::restored_from(
             journal,
             &records,
             &manifest.ledger,
             &manifest.generation,
             checkpoint.clone(),
-            &indexes,
         )?;
         let mut target = FileTarget { root: &data };
         replay_from(&records, &manifest, checkpoint.as_deref(), &mut target)?;
@@ -349,47 +347,18 @@ impl LocalRoot {
             &super::AcceptanceFrontier,
         ) -> Result<()>,
     ) -> Result<()> {
-        self.recover_with_indexes(|records, checkpoint, indexes, frontier| {
-            if !indexes.is_empty() {
-                return Err(Error::Invalid(
-                    "recovery hook does not support index publications",
-                ));
-            }
-            install(records, checkpoint, frontier)
-        })
-    }
-
-    /// Publication-aware recovery. The hook must fully validate every index and
-    /// commit in journal order and install the final database before returning.
-    /// Retained handles keep the root lease alive; queries still need owner health.
-    pub fn recover_with_indexes(
-        &self,
-        install: impl FnOnce(
-            &[Record],
-            Option<Arc<Checkpoint>>,
-            &[Arc<Checkpoint>],
-            &super::AcceptanceFrontier,
-        ) -> Result<()>,
-    ) -> Result<()> {
         let mut state = self.coordinator.lock();
         state.poisoned = true;
         drop(state.journal.take());
         let control = self.path.join(JOURNAL_DIR);
         let checkpoint = open_checkpoint(&control, &self.manifest, self._directory_lock.clone())?;
         let (journal, records) = open_journal(&control, &journal_identity(&self.manifest))?;
-        let indexes = index_build::open_indexes(
-            &self.path,
-            &self.manifest,
-            &records,
-            self._directory_lock.clone(),
-        )?;
-        let restored = Coordinator::restored_with_indexes(
+        let restored = Coordinator::restored_from(
             journal,
             &records,
             &self.manifest.ledger,
             &self.manifest.generation,
             checkpoint.clone(),
-            &indexes,
         )?;
         let data = control.join(DATA);
         replay_from(
@@ -399,7 +368,7 @@ impl LocalRoot {
             &mut FileTarget { root: &data },
         )?;
         File::open(&control)?.sync_all()?;
-        install(&records, checkpoint, &indexes, &restored.frontier()?)?;
+        install(&records, checkpoint, &restored.frontier()?)?;
         *state = restored;
         Ok(())
     }
@@ -435,7 +404,7 @@ impl LocalRoot {
             return Err(Error::Poisoned);
         }
         data_key(key)?;
-        for checkpoint in state.indexes.iter().rev().chain(self.checkpoint.iter()) {
+        if let Some(checkpoint) = &self.checkpoint {
             if let Some(bytes) = checkpoint.read(key)? {
                 return Ok(bytes);
             }

@@ -294,7 +294,7 @@ and previous roots, source-head changes, unsupported metadata, new namespaces,
 context inheritance and failed indexed installation are covered. The imported index
 stays fixed; this is not the original medium index-on benchmark or a latency result.
 
-## Private durable index builds
+## Private durable index builds (publication still deferred)
 
 `LocalRoot::pin_index_build` captures a healthy accepted frontier while the embedding
 holds its LedgerState gate. The opaque `IndexBuildPin` retains root ownership without
@@ -313,14 +313,13 @@ index bytes stay outside the journal's 16 MiB record and 64 MiB total limits.
 with per-read checks and no raw-path capability. It retains its original input while
 newer commits proceed. Neither preparation nor verification changes the accepted
 head, journal or database read view. This is not a publication receipt or reusable
-semantic proof. Publication validates under the acceptance gate as described below;
-the database embedding must preserve newer commits.
+semantic proof. Publication must validate under the acceptance gate and preserve
+newer commits; that operation is not implemented yet.
 
 Failures leave private files for inspection and permit a fresh-directory retry.
-Restart ignores unreferenced staged files, including complete or corrupt abandoned
-builds. Only an accepted journal publication authorizes reopening a build. There is
-no arbitrary reopen-by-path, orphan promotion, cleanup or retirement API. Losing an
-unpublished handle requires rebuilding. There is no cumulative disk-growth bound across repeated abandoned
+Restart ignores staged files, including complete or corrupt abandoned builds. There
+is no reopen-by-path, promotion, cleanup or retirement API. Losing a handle requires
+rebuilding. There is no cumulative disk-growth bound across repeated abandoned
 builds, so this seam remains for controlled experiments. Streaming bounds the copy;
 an embedding's semantic validation or ContentStore may still buffer one object.
 
@@ -328,49 +327,8 @@ Tests cover every instrumented staging cut with repeated restart/retry, newer co
 during copy, concurrent builders, an object larger than the journal limit, source and
 manifest corruption, symlinked paths, foreign owners, purpose/prefix binding, and
 unresolved-writer recovery. The indexed API fixture also copies an actual validated
-native index while a real newer transaction commits. No Fluree indexer trigger or
-active Fluree index pointer is connected by this slice.
-
-## Journal-authorized index publication (core only)
-
-`LocalRoot::publish_index` reopens and physically verifies a `PreparedIndex` for the
-same owner, then merges against the latest accepted head under the coordinator gate.
-The trusted embedding must hold its database-state gate, preserve commit/configuration
-fields and newer novelty, and explicitly implement `validate_index_publication` to
-check index CIDs, dependency closure, built-through ancestry and monotonic progress.
-The default validator rejects publications. Callbacks must not reenter the root.
-
-The distinct optional `index_publication` record field contains a private build ID,
-manifest digest, exact input-prefix digest and input head. Publication has no inline
-objects and uses normal latest-head CAS. The coordinator requires the input prefix
-and head to occur in this root's accepted history (including a checkpoint's empty
-journal prefix), rejects duplicate manifests and immutable/path collisions, flushes
-the journal, materializes the head and calls installation before making the new
-index readable through the owner or returning a receipt. An uncertain append/flush
-or failed installation leaves the owner unavailable until explicit recovery.
-
-Startup opens only builds named by journal records and checks all their physical
-prerequisites and prefix lineage before replay. `recover_with_indexes` provides the
-baseline, records and verified index stores to the embedding's validation/installation
-hook. `validate_recovered_with_indexes` validates in journal order: preceding indexes
-and the current publication's candidate are visible, future builds are not. Legacy
-recovery hooks reject journals containing publications. Ordinary records still omit
-the new field; older strict decoders reject publication records instead of silently
-ignoring them. This experimental format has no downgrade/migration guarantee.
-
-Publication tests use synthetic opaque heads, including an older build published
-after newer commits, exact receipts across repeated root reopen, every publication
-frame cut, both outcomes of failed flush, failed/panicking installation, missing or
-corrupt prerequisites, forged prefixes, symlinks and stale/conflicting publications.
-These test core ordering and durability mechanics, not Fluree index semantics.
-The API adapter still rejects publication: actual index construction, semantic
-validation, state attachment and server/index-trigger integration remain next work.
-
-This correctness prototype physically rehashes the complete build under the owner
-gate on publication, retains earlier accepted indexes, and keeps an accepted-prefix
-head map bounded by the journal's existing cap. Publication latency and sustained
-memory/disk costs have not been measured. No artifact retirement, orphan cleanup,
-transaction overlap, group flush or cluster protocol is introduced.
+native index while a real newer transaction commits. No indexer trigger or active
+index pointer is connected by this slice.
 
 ## Verification
 

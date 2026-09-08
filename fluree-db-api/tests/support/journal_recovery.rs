@@ -168,7 +168,6 @@ async fn root_startup_replays_real_commits_and_refuses_ordinary_api_and_nameserv
 
 fn transition(before: Option<&DeclaredFrontier>, after: &DeclaredFrontier) -> Transition {
     Transition {
-        index_publication: None,
         ledger: LEDGER.into(),
         generation: "fixture-generation-1".into(),
         head_key: HEAD_PATH.into(),
@@ -299,7 +298,6 @@ async fn accepted_commits_validate_closure_before_flush_and_reconcile_failed_ins
     third_head["f:t"] = json!(3);
     third_head["f:commitCid"] = json!(fixture.orphan_id.to_string());
     let third = Transition {
-        index_publication: None,
         ledger: LEDGER.into(),
         generation: "fixture-generation-1".into(),
         head_key: HEAD_PATH.into(),
