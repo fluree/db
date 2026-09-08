@@ -32,6 +32,8 @@ struct Manifest {
     generation: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     checkpoint: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epoch: Option<[u8; 16]>,
 }
 
 /// A recovered local root with serialized acceptance. All opens for a canonical root in this
@@ -84,6 +86,7 @@ impl LocalRoot {
             ledger: ledger.into(),
             generation: generation.into(),
             checkpoint: None,
+            epoch: None,
         };
         let journal = Journal::create(
             FileIo::create_new(&control.join(JOURNAL))?,
@@ -166,6 +169,7 @@ impl LocalRoot {
             ledger: ledger.into(),
             generation: generation.into(),
             checkpoint: None,
+            epoch: None,
         };
         let (checkpoint, hash) = Checkpoint::create(
             &control,
@@ -251,17 +255,18 @@ impl LocalRoot {
         let manifest: Manifest = serde_json::from_slice(&bytes)
             .map_err(|_| Error::Invalid("missing/invalid journal manifest"))?;
         if !matches!(
-            (manifest.version, manifest.checkpoint),
-            (1, None) | (2, Some(_))
+            (manifest.version, manifest.checkpoint, manifest.epoch),
+            (1, None, None) | (2, Some(_), None) | (3, Some(_), Some(_))
         ) || manifest.ledger.is_empty()
             || manifest.generation.is_empty()
             || manifest.ledger.len() + manifest.generation.len() > 1024
         {
             return Err(Error::Invalid("unsupported journal root format"));
         }
-        let checkpoint = open_checkpoint(&control, &manifest, directory.clone())?;
-        let (journal, records) = open_journal(&control, &journal_identity(&manifest))?;
-        let data = checked_path(&control, DATA, false)?;
+        let active = active_control(&control, &manifest)?;
+        let checkpoint = open_checkpoint(&active, &manifest, directory.clone())?;
+        let (journal, records) = open_journal(&active, &journal_identity(&manifest))?;
+        let data = checked_path(&active, DATA, false)?;
         if !std::fs::metadata(&data)?.is_dir() {
             return Err(Error::Invalid("missing journal data directory"));
         }
@@ -300,7 +305,7 @@ impl LocalRoot {
         install: impl FnOnce(&AcceptanceView<'_>, &Receipt) -> Result<()>,
     ) -> Result<Receipt> {
         let mut state = self.coordinator.lock();
-        let data = self.path.join(JOURNAL_DIR).join(DATA);
+        let data = active_control(&self.path.join(JOURNAL_DIR), &self.manifest)?.join(DATA);
         state.accept(
             transition,
             validator,
@@ -347,8 +352,9 @@ impl LocalRoot {
         state.poisoned = true;
         drop(state.journal.take());
         let control = self.path.join(JOURNAL_DIR);
-        let checkpoint = open_checkpoint(&control, &self.manifest, self._directory_lock.clone())?;
-        let (journal, records) = open_journal(&control, &journal_identity(&self.manifest))?;
+        let active = active_control(&control, &self.manifest)?;
+        let checkpoint = open_checkpoint(&active, &self.manifest, self._directory_lock.clone())?;
+        let (journal, records) = open_journal(&active, &journal_identity(&self.manifest))?;
         let restored = Coordinator::restored_from(
             journal,
             &records,
@@ -356,7 +362,7 @@ impl LocalRoot {
             &self.manifest.generation,
             checkpoint.clone(),
         )?;
-        let data = control.join(DATA);
+        let data = active.join(DATA);
         replay_from(
             &records,
             &self.manifest,
@@ -406,12 +412,21 @@ impl LocalRoot {
             }
         }
         Ok(std::fs::read(checked_path(
-            &self.path.join(JOURNAL_DIR).join(DATA),
+            &active_control(&self.path.join(JOURNAL_DIR), &self.manifest)?.join(DATA),
             key,
             false,
         )?)?)
     }
 }
+
+fn active_control(control: &Path, manifest: &Manifest) -> Result<PathBuf> {
+    match manifest.epoch {
+        Some(epoch) => checked_path(control, &format!("epochs/{}", hex::encode(epoch)), false),
+        None => Ok(control.to_path_buf()),
+    }
+}
+
+mod retirement;
 
 fn journal_identity(manifest: &Manifest) -> [u8; 16] {
     let Some(checkpoint) = manifest.checkpoint else {

@@ -18,7 +18,8 @@
 //! accidental damage, not malicious modification or loss of a whole valid suffix.
 //! Shared-block damage is detected when it changes a retained frame, but cannot be
 //! repaired here. `LocalRoot` adds owned startup replay and atomic materialization;
-//! power-loss qualification, sealing, checkpoint retirement, and full integration remain.
+//! offline checkpoint retirement is available under exclusive ownership. Online
+//! rotation, power-loss qualification and broader integration remain.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

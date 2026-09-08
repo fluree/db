@@ -648,6 +648,12 @@ async fn configured_branched_or_mutable_context_sources_are_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn indexed_install_failure_blocks_cached_reads_and_recovers_new_namespace() {
+    for offline_checkpoint in [false, true] {
+        indexed_install_failure_recovery(offline_checkpoint).await;
+    }
+}
+
+async fn indexed_install_failure_recovery(offline_checkpoint: bool) {
     let (source_dir, _source, _) = source_fixture().await;
     let target = tempfile::tempdir().unwrap();
     let ledger = JournalLedger::bootstrap(
@@ -682,7 +688,18 @@ async fn indexed_install_failure_blocks_cached_reads_and_recovers_new_namespace(
         ledger.head().await,
         Err(Error::Journal(JournalError::Poisoned))
     ));
-    ledger.recover().await.unwrap();
+    let ledger = if offline_checkpoint {
+        // No successful transaction response exists. Offline maintenance must
+        // retain the durable unknown outcome, not roll back or execute it again.
+        drop(ledger);
+        JournalLedger::checkpoint_offline(target.path().into())
+            .await
+            .unwrap();
+        JournalLedger::open(target.path().into()).await.unwrap()
+    } else {
+        ledger.recover().await.unwrap();
+        ledger
+    };
     assert_eq!(ledger.query(&query).await.unwrap(), json!([["new:one"]]));
     let head = ledger.head().await.unwrap().unwrap();
     assert_eq!(head.t, 2);
@@ -694,4 +711,147 @@ async fn indexed_install_failure_blocks_cached_reads_and_recovers_new_namespace(
         ledger.content(commit.txn.as_ref().unwrap()).await.unwrap(),
         serde_json::to_vec(&body).unwrap()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn offline_checkpoint_preserves_history_and_index_without_materialization() {
+    let (source_dir, source, imported) = source_fixture().await;
+    let target = tempfile::tempdir().unwrap();
+    let mut ledger = JournalLedger::bootstrap(
+        target.path().into(),
+        source_dir.path().into(),
+        "fault:main".into(),
+        "retirement".into(),
+    )
+    .await
+    .unwrap();
+    drop(source);
+    source_dir.close().unwrap();
+    let original_head: Value =
+        serde_json::from_slice(&ledger.accepted_head().await.unwrap().unwrap()).unwrap();
+    let retained_index = original_head["f:ledgerIndex"].clone();
+    let query = json!({"select":["?v"],"where":{"@id":"ex:one","ex:value":"?v"}});
+    let mut history = Vec::new();
+    for value in 2..=5 {
+        let ack = ledger
+            .transact(TxnType::Upsert, &json!({"@id":"ex:one","ex:value":value}))
+            .await
+            .unwrap()
+            .unwrap();
+        history.push((
+            ack.commit.commit_id.clone(),
+            ledger.content(&ack.commit.commit_id).await.unwrap(),
+        ));
+        history.push((
+            ack.raw_txn_id.clone(),
+            ledger.content(&ack.raw_txn_id).await.unwrap(),
+        ));
+        let cypher = format!("CREATE (:CheckpointProbe {{value: {value}}})");
+        let ack = ledger
+            .transact_cypher(&cypher, None)
+            .await
+            .unwrap()
+            .commit
+            .unwrap();
+        history.push((
+            ack.commit.commit_id.clone(),
+            ledger.content(&ack.commit.commit_id).await.unwrap(),
+        ));
+        history.push((
+            ack.raw_txn_id.clone(),
+            ledger.content(&ack.raw_txn_id).await.unwrap(),
+        ));
+        let head = ledger.accepted_head().await.unwrap().unwrap();
+        assert!(JournalLedger::checkpoint_offline(target.path().into())
+            .await
+            .is_err());
+        assert_eq!(ledger.query(&query).await.unwrap(), json!([[value]]));
+        drop(ledger);
+        JournalLedger::checkpoint_offline(target.path().into())
+            .await
+            .unwrap();
+        let control = target.path().join(".fluree-wal");
+        assert!(!control.join("journal").exists());
+        assert!(!control.join("checkpoint").exists());
+        let epochs: Vec<_> = std::fs::read_dir(control.join("epochs"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(epochs.len(), 1);
+        // The newly selected journal contains only its identity/header; all exact
+        // history is now in the checkpoint. This is a capacity reset, not history GC.
+        assert_eq!(
+            std::fs::metadata(epochs[0].join("journal")).unwrap().len(),
+            56
+        );
+        for _ in 0..2 {
+            std::fs::remove_dir_all(epochs[0].join("data")).unwrap();
+            std::fs::create_dir(epochs[0].join("data")).unwrap();
+            let recovered = JournalLedger::open(target.path().into()).await.unwrap();
+            assert_eq!(recovered.accepted_head().await.unwrap().unwrap(), head);
+            assert_eq!(recovered.query(&query).await.unwrap(), json!([[value]]));
+            assert_eq!(
+                rows(
+                    &recovered
+                        .query_cypher(
+                            "MATCH (n:CheckpointProbe) RETURN n.value ORDER BY n.value",
+                            None
+                        )
+                        .await
+                        .unwrap()
+                ),
+                (2..=value).map(|n| json!([n])).collect::<Vec<_>>()
+            );
+            let cache = recovered.ready().await.unwrap();
+            assert_eq!(
+                cache
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .ns_record
+                    .as_ref()
+                    .unwrap()
+                    .index_t,
+                imported.t
+            );
+            drop(cache);
+            let current: Value = serde_json::from_slice(&head).unwrap();
+            assert_eq!(current["f:ledgerIndex"], retained_index);
+            for (id, bytes) in &history {
+                assert_eq!(&recovered.content(id).await.unwrap(), bytes);
+            }
+        }
+        ledger = JournalLedger::open(target.path().into()).await.unwrap();
+    }
+    drop(ledger);
+    // Corrupt a retained raw payload after retirement: neither open nor another
+    // checkpoint may use disposable materialization to hide the lost authority.
+    let control = target.path().join(".fluree-wal");
+    let active = std::fs::read_dir(control.join("epochs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let (raw_id, _) = history.last().unwrap();
+    let raw = active.join("checkpoint/objects").join(content_path(
+        ContentKind::Txn,
+        "fault:main",
+        &raw_id.digest_hex(),
+    ));
+    let original = std::fs::read(&raw).unwrap();
+    let mut corrupt = original.clone();
+    corrupt[0] ^= 1;
+    std::fs::write(&raw, &corrupt).unwrap();
+    let manifest = std::fs::read(control.join("format.json")).unwrap();
+    assert!(JournalLedger::open(target.path().into()).await.is_err());
+    assert!(JournalLedger::checkpoint_offline(target.path().into())
+        .await
+        .is_err());
+    assert_eq!(
+        std::fs::read(control.join("format.json")).unwrap(),
+        manifest
+    );
+    std::fs::write(&raw, &original).unwrap();
+    assert!(JournalLedger::open(target.path().into()).await.is_ok());
 }

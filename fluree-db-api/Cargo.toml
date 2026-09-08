@@ -658,3 +658,7 @@ required-features = ["experimental-local-journal"]
 [[example]]
 name = "journal_bootstrap"
 required-features = ["experimental-local-journal"]
+
+[[example]]
+name = "journal_checkpoint"
+required-features = ["experimental-local-journal"]

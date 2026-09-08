@@ -1,4 +1,4 @@
-//! Fixed imported index bootstrap. No index publication or checkpoint retirement.
+//! Indexed bootstrap and offline checkpoint retirement; no index advancement.
 use super::*;
 use crate::local_journal_acceptance::{indexed_head, LinearBaseline};
 use fluree_db_core::local_journal::{
@@ -384,6 +384,77 @@ impl Proof {
 }
 
 impl JournalLedger {
+    /// Offline checkpoint/retirement for an indexed local journal root. Every
+    /// server, query and index handle must be closed. Retains the original index
+    /// and all commit/raw history; no new index is built or awaited. On failure,
+    /// reopen to reconcile the selected generation before retrying maintenance.
+    pub async fn checkpoint_offline(root: PathBuf) -> Result<()> {
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || -> JResult<()> {
+            LocalRoot::checkpoint_offline(
+                &root,
+                |records, checkpoint, head| {
+                    let checkpoint = checkpoint.ok_or(JournalError::Invalid(
+                        "offline checkpoint requires an indexed baseline",
+                    ))?;
+                    let ledger = checkpoint.ledger().to_string();
+                    let cache_dir = Arc::new(tempfile::tempdir()?);
+                    let store =
+                        RecoveryStore::new(&ledger, records, Some(checkpoint.clone()), cache_dir);
+                    let proof = runtime.block_on(Proof::load(&checkpoint, &store))?;
+                    AdapterValidator {
+                        proof: Some(&proof),
+                        prefix: None,
+                    }
+                    .validate_recovered_from(records, Some(&checkpoint))?;
+                    // Preserve exact accepted head and its retained baseline index.
+                    // The immutable source provenance now describes this checkpoint.
+                    let pin = Pin {
+                        main: head.bytes.clone(),
+                        index: None,
+                    };
+                    if pin.head(&ledger)? != head {
+                        return Err(JournalError::Invalid("noncanonical checkpoint head"));
+                    }
+                    let (_, inventory) =
+                        runtime.block_on(verify_baseline(&store, &ledger, &head))?;
+                    let metadata: BTreeMap<_, _> = pin
+                        .metadata()
+                        .into_iter()
+                        .map(|o| (o.key, o.bytes))
+                        .collect();
+                    let mut objects: Vec<_> = inventory
+                        .values()
+                        .map(|a| a.entry.clone())
+                        .chain(
+                            metadata
+                                .iter()
+                                .map(|(key, bytes)| entry(key.clone(), bytes)),
+                        )
+                        .collect();
+                    objects.sort_by(|a, b| a.key.cmp(&b.key));
+                    Ok((
+                        CheckpointSpec { head, objects },
+                        move |entry: &CheckpointEntry| {
+                            let bytes = match metadata.get(&entry.key) {
+                                Some(bytes) => bytes.clone(),
+                                None => store.bytes(&inventory[&entry.key].id).map_err(|_| {
+                                    JournalError::Invalid("checkpoint source read failed")
+                                })?,
+                            };
+                            Ok(Cursor::new(bytes))
+                        },
+                    ))
+                },
+                // The complete CID closure was semantically validated above;
+                // core copies exactly that inventory and verifies every byte/hash.
+                |_| Ok(()),
+            )
+        })
+        .await??;
+        Ok(())
+    }
+
     /// Copy a quiescent private ordinary FILE source into a fresh empty owned root.
     /// Only unsigned default-graph ledgers with fully retained index history and
     /// optional static imported IRI mappings are supported. Preserve the source;

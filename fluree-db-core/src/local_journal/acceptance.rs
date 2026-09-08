@@ -142,6 +142,10 @@ pub(super) struct Coordinator<I> {
 }
 
 impl<I: JournalIo> Coordinator<I> {
+    pub(super) fn clear_checkpoint_for_retirement(&mut self) {
+        self.checkpoint = None;
+    }
+
     pub fn restored(
         journal: Journal<I>,
         records: &[Record],

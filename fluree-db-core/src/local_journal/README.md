@@ -2,9 +2,10 @@
 
 Enabled only by `experimental-local-journal` on Unix. **This feature does not turn
 on WAL for ordinary Fluree transactions.** Their acknowledgments remain unchanged.
-The experimental owner can now accept exact transitions through a trusted embedding
-interface; the limited embedded JSON-LD/Cypher adapter calls it, while ordinary
-CLI/server persistence remains unchanged.
+The experimental owner accepts exact transitions through a trusted embedding.
+The opt-in ordinary API/server bridge uses the same journal owner; simply compiling
+this feature does not select that backend. It supports a single unsigned default-graph
+local ledger, with independent asynchronous indexing.
 Ordinary Unix file opens now acquire a shared root lease and reject managed roots,
 including when journal support is not compiled. The format is experimental and not yet a
 supported database storage format.
@@ -49,7 +50,8 @@ dispatch is not implemented.
 `LocalRoot::initialize` accepts only an existing empty directory. It exclusively
 locks the directory inode, syncs existing ancestors, creates/syncs the `.fluree-wal`
 fence, initializes the journal, and durably publishes a manifest bound to its identity.
-Managed materialized data lives under `.fluree-wal/data`, preserving the journal's
+Managed materialized data lives under `.fluree-wal/data` (or the active v3 epoch's
+`data` directory after offline retirement), preserving the journal's
 relative storage keys behind a reserved path. Ordinary storage/listing/sweeping
 cannot enter that reserved namespace from a wider root. No populated-root conversion
 or old-layout migration is implemented.
@@ -96,7 +98,8 @@ file-synced, atomically published and directory-synced before journal initializa
 The journal identity derives from the root identity and exact descriptor digest.
 Only after validation and journal initialization does the ready v2 root manifest
 publish. Errors retain the fenced partial generation; there is no in-place resume,
-automatic deletion, hard-link sharing, or journal retirement.
+automatic deletion or hard-link sharing. Advancing a successfully bootstrapped root
+uses the separate offline checkpoint protocol below.
 
 The inventory is bounded to 100,000 objects and 16 MiB encoded descriptor bytes;
 keys to 1,024 bytes, baseline head to 64 KiB, each object to 1 GiB, and total content
@@ -130,6 +133,63 @@ materialization, and unresolved installation followed by damaged-baseline recove
 These are filesystem interruption tests, not simulated device-cache loss or physical
 power-loss qualification. A generated object larger than the journal cap exercises
 streaming bootstrap without putting the baseline in a journal frame.
+
+## Offline checkpoint advancement and retirement
+
+`JournalLedger::checkpoint_offline(root)` is an explicit maintenance operation for
+an indexed standalone WAL root. Stop the server and close every root, database,
+query, cache and index-input handle first. A live owner or retained checkpoint
+lease rejects maintenance. This operation is never called by transaction acceptance
+and never builds, awaits or advances an index.
+
+The API validates the selected checkpoint and accepted journal tail, then verifies
+the complete dependency closure at the exact recovered head. It retains the original
+index pointer, all commit ancestry, required raw payloads and static context. It copies
+those bytes into a new immutable checkpoint; it does not re-execute transactions.
+
+Core writes the replacement under `.fluree-wal/epochs/<32-lowercase-hex>/`:
+
+1. Copy/hash-check/file-sync every prerequisite and sync checkpoint directories.
+2. Create/sync a fresh journal bound to the new checkpoint and sync its directory.
+3. Atomically replace and directory-sync the root `format.json` selecting that epoch.
+4. Only then remove the old checkpoint/journal/materialization and obsolete epochs.
+
+The v3 root manifest selects the checkpoint, journal and disposable `data` directory
+together. V1/v2 roots remain readable and can be advanced; older binaries reject v3.
+If copying, publication or retirement fails, reopen to reconcile the selected exact
+head before retrying maintenance. A successfully returned checkpoint is not needed
+for an already accepted transaction to survive an interruption. Both sides of the
+manifest switch contain that same accepted history. A retry removes unselected epoch
+and manifest-temporary files; it never truncates the selected journal or falls back
+past corrupt required content. Reclamation requires a successful retry after errors.
+
+Experimental command (run from a build with this feature):
+
+```sh
+cargo run -p fluree-db-api --features experimental-local-journal \
+  --example journal_checkpoint -- /path/to/stopped-journal-root
+```
+
+The command reopens and prints the selected head after maintenance. Before
+resubmitting any transaction whose original response was lost, reconcile its outcome
+against the accepted chain. Checkpoint errors are maintenance errors, not a reason
+to retransact previously accepted work.
+
+This resets the journal to its 56-byte header and clears the retained journal-object
+prefix on reopen. It **does not** bound total database history, index novelty, recovery
+cost or maintenance duration. All commit/raw history and the retained baseline index
+remain required. The 64-MiB journal cap and checkpoint inventory/object limits still
+apply; there is no automatic threshold, online rotation, GC or disk-space reservation.
+Copying temporarily needs space for old and new generations. The API currently
+buffers source objects and the journal tail; this is not constant-memory compaction.
+
+Tests cover full-capacity rejection followed by checkpoint and continued acceptance,
+every instrumented operation cut for initial/repeated rotation, both pre-directory-sync
+manifest outcomes, SIGKILL at eight boundaries, exact indexed JSON-LD/Cypher and raw-byte
+recovery, retained-reader exclusion, and corruption refusal. The HTTP corpus also
+reopens after two offline checkpoints with new index outputs and materialized data
+removed. These are local process/filesystem tests, not physical power-loss or Linux
+block-device fault qualification. No new latency improvement is claimed by retirement.
 
 ## Serialized acceptance and reconciliation
 
@@ -227,10 +287,10 @@ Coordinate or reject import, push, index heads, configuration/lifecycle and GC.
 Explicitly reject unsupported encryption, mixed backends, clusters, and oversized
 transactions before effects.
 
-The bootstrap checkpoint does not provide truncation, rotation, online GC, submission idempotency,
-group commit, transaction overlap, or remote preparation. At capacity it stops;
-it does not remove recovery bytes. A subsequent checkpoint/retirement protocol and
-storage qualification are required before an unrestricted WAL mode.
+At capacity the writer stops without removing recovery bytes. The explicit offline
+checkpoint above restores journal capacity. Automatic online rotation, GC, submission
+idempotency, group commit, transaction overlap and remote preparation are not provided.
+Storage/lifecycle qualification and bounded recovery remain required before unrestricted use.
 
 ## Indexed adapter bootstrap
 
@@ -327,8 +387,9 @@ The effective query index is separate from the immutable transaction-head fields
 Later transactions preserve the adopted index in their in-memory record without
 changing the journal's baseline index pointer. Restart reconstructs from the retained
 bootstrap plus exact journal commits, even if every new index output has disappeared.
-The baseline's durable prerequisites remain required. This does not introduce new
-checkpoint retirement, index discovery/publication on restart, or automated rebuilding.
+The baseline's durable prerequisites remain required. Index adoption itself does not
+retire recovery bytes, discover/publish indexes on restart, or automate rebuilding.
+Offline checkpoint maintenance retains that baseline index unchanged.
 
 FileStorage already selects PageCache durability for derived kinds. The new bridge
 preserves that policy, and an actual index-build test asserts zero artifact fsyncs.

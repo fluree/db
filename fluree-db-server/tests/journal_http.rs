@@ -373,11 +373,29 @@ async fn ordinary_and_journal_http_corpus_background_indexing_and_crash_recovery
     let b: Value = serde_json::from_slice(&std::fs::read(&wal).unwrap()).unwrap();
     assert_eq!(a["observations"], b["observations"]);
     assert_eq!(b["acks"].as_array().unwrap().len(), 8);
-    for _ in 0..2 {
+    for checkpoint in [false, true, true] {
+        // Child processes are stopped. Exercise the same external HTTP oracle
+        // after both the first checkpoint and a subsequent generation retirement.
+        if checkpoint {
+            JournalLedger::checkpoint_offline(wal_dir.path().into())
+                .await
+                .unwrap();
+        }
         for item in std::fs::read_dir(outputs.path()).unwrap() {
             std::fs::remove_dir_all(item.unwrap().path()).unwrap();
         }
-        let material = wal_dir.path().join(".fluree-wal/data");
+        let control = wal_dir.path().join(".fluree-wal");
+        let active = if checkpoint {
+            let epochs: Vec<_> = std::fs::read_dir(control.join("epochs"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            assert_eq!(epochs.len(), 1);
+            epochs[0].clone()
+        } else {
+            control
+        };
+        let material = active.join("data");
         std::fs::remove_dir_all(&material).unwrap();
         std::fs::create_dir(&material).unwrap();
         child(wal_dir.path(), outputs.path(), &wal, "wal", "verify");
