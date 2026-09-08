@@ -16,6 +16,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, LazyLock, Weak};
 
+mod index_build;
+pub use index_build::{IndexBuildPin, PreparedIndex};
+
 static OWNERS: LazyLock<Mutex<BTreeMap<PathBuf, Weak<LocalRoot>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 const FORMAT: &str = "format.json";
@@ -173,6 +176,7 @@ impl LocalRoot {
                 identity: manifest.identity,
                 ledger,
                 generation,
+                index_build: None,
             },
             baseline,
             directory.clone(),
@@ -437,6 +441,7 @@ fn open_checkpoint(
                     identity: manifest.identity,
                     ledger: &manifest.ledger,
                     generation: &manifest.generation,
+                    index_build: None,
                 },
                 hash,
                 lease,

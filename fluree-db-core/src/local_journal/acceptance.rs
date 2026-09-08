@@ -66,6 +66,10 @@ pub struct AcceptanceFrontier {
     receipt: Receipt,
 }
 impl AcceptanceFrontier {
+    pub(super) fn prefix_digest(&self) -> [u8; 32] {
+        self.receipt.digest
+    }
+
     pub fn head(&self) -> Option<&[u8]> {
         self.head.as_ref().map(|h| h.bytes.as_slice())
     }
