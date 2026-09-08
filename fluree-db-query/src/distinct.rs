@@ -6,12 +6,13 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
-use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
+use crate::object_binding::{equality_norm, normalize_for_key_cow, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use hashbrown::HashMap;
 use rustc_hash::{FxBuildHasher, FxHasher};
+use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -174,24 +175,32 @@ impl Operator for DistinctOperator {
             }
 
             let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+            // Reused across rows: a duplicate row costs a hash and a probe, no
+            // allocation; only rows that survive are copied into an owned key.
+            let mut scratch: Vec<Cow<'_, Binding>> = Vec::with_capacity(num_cols);
 
             for row_idx in 0..batch.len() {
                 if self.norm.is_some() {
                     let (store, gv) = EqualityNorm::parts(&self.norm);
                     // Normalize decoded bindings to encoded form so mixed
                     // representations of the same value dedup (encoded
-                    // bindings pass through untouched).
-                    let signature: RowSignature = (0..num_cols)
-                        .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), store, gv))
-                        .collect();
+                    // bindings pass through untouched, borrowed).
+                    scratch.clear();
+                    scratch.extend((0..num_cols).map(|col| {
+                        normalize_for_key_cow(batch.get_by_col(row_idx, col), store, gv)
+                    }));
+                    // `Cow` hashes as the binding it wraps, so this equals the
+                    // stored `Vec<Binding>` hash the map recomputes on rehash.
                     let mut h = FxHasher::default();
-                    signature.hash(&mut h);
+                    scratch.hash(&mut h);
                     let hash = h.finish();
-                    let entry = self
-                        .seen
-                        .raw_entry_mut()
-                        .from_hash(hash, |sig| *sig == signature);
+                    let entry = self.seen.raw_entry_mut().from_hash(hash, |sig| {
+                        sig.len() == scratch.len()
+                            && sig.iter().zip(&scratch).all(|(a, b)| a == b.as_ref())
+                    });
                     if let hashbrown::hash_map::RawEntryMut::Vacant(v) = entry {
+                        let signature: RowSignature =
+                            scratch.iter().map(|b| b.as_ref().clone()).collect();
                         v.insert_hashed_nocheck(hash, signature, ());
                         for (col_idx, col) in columns.iter_mut().enumerate() {
                             col.push(batch.get_by_col(row_idx, col_idx).clone());

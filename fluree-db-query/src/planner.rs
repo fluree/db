@@ -1850,6 +1850,7 @@ pub fn reorder_patterns(
             stats,
             &mut result,
             &seed_anchor_vars,
+            &deferred,
             &mut placed_indices,
         ) || try_place_expander(
             &mut expanders,
@@ -2084,11 +2085,15 @@ fn demote_disconnected_class_anchors(
 ///      search source emits its result IDs/IriMatch bindings before plain
 ///      triples consume them;
 ///   2. **estimated cardinality** — the primary signal;
-///   3. **unlocked object→subject hash scan** — among EQUAL-cardinality starts
+///   3. **unlocked deferred FILTER** — among EQUAL-cardinality starts only,
+///      prefer the one whose new variables let a still-pending FILTER run (see
+///      [`unlocks_deferred_filter`]): a filter can only drop rows, so it shrinks
+///      the stream every later probe has to pay for;
+///   4. **unlocked object→subject hash scan** — among EQUAL-cardinality starts
 ///      only, prefer the one that keeps the LARGER predicate hash-able rather
 ///      than forward-joining over a big intermediate (the BSBM-BI bowtie: 46× on
 ///      BI-1's F2);
-///   4. **original position** — stable final tie-break.
+///   5. **original position** — stable final tie-break.
 fn rank_seed_candidates(
     i: usize,
     j: usize,
@@ -2096,6 +2101,7 @@ fn rank_seed_candidates(
     bound_vars: &HashSet<VarId>,
     stats: Option<&StatsView>,
     has_bound: bool,
+    deferred: &[DeferredPattern],
 ) -> std::cmp::Ordering {
     let search_priority = |pattern: &Pattern| match pattern {
         Pattern::IndexSearch(_)
@@ -2120,14 +2126,115 @@ fn rank_seed_candidates(
                 .partial_cmp(&cj.row_count())
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
-        // 3. Equal-cardinality only: keep the larger predicate hash-able.
+        // 3. Equal-cardinality only: let a pending FILTER run as early as possible.
+        .then_with(|| {
+            let fi = unlocks_deferred_filter(&remaining[i], bound_vars, deferred);
+            let fj = unlocks_deferred_filter(&remaining[j], bound_vars, deferred);
+            fj.cmp(&fi)
+        })
+        // 4. Equal-cardinality only: keep the larger predicate hash-able.
         .then_with(|| {
             let bi = unlocked_object_hash_scan(i, remaining, bound_vars, stats);
             let bj = unlocked_object_hash_scan(j, remaining, bound_vars, stats);
             bj.cmp(&bi)
         })
-        // 4. Stable: original position.
+        // 5. Stable: original position.
         .then_with(|| remaining[i].orig_index.cmp(&remaining[j].orig_index))
+}
+
+/// Tie-break signal for join ordering: would placing `candidate` make a
+/// still-deferred FILTER that *pins* one of its new variables ready to run?
+///
+/// Among candidates the cost model cannot separate, the one whose new
+/// variable feeds an equality or a two-sided range filter shrinks the stream
+/// before the remaining probes pay for it. BSBM Explore Q5: the candidate
+/// product's three bound-subject probes all estimate ~1 row, but two of them
+/// feed `±k` windows that discard ~97% of candidates; original position put
+/// the unfiltered `rdfs:label` probe first, so every candidate paid for a label
+/// lookup the filters then threw away (~25% of the query at 10M products).
+///
+/// Only pinning filters qualify (see [`filter_pins_var`]). A one-sided bound
+/// is not a reliable reducer: BSBM Q7's `?date > now` keeps half the offers,
+/// and hoisting its probe ahead of `?offer :vendor ?vendor` delayed the
+/// selective `?vendor :country <DE>` existence check behind it — measured +15%
+/// on Q7 at 100M. BIND, VALUES and the order-sensitive deferred forms never count, and
+/// `candidate` must contribute one of the filter's variables (a filter that
+/// is already ready was drained earlier).
+fn unlocks_deferred_filter(
+    candidate: &RankedPattern,
+    bound_vars: &HashSet<VarId>,
+    deferred: &[DeferredPattern],
+) -> bool {
+    let produced: HashSet<VarId> = candidate.pattern.produced_vars().into_iter().collect();
+    if produced.is_empty() {
+        return false;
+    }
+    deferred.iter().any(|dp| {
+        let Pattern::Filter(expr) = &dp.pattern else {
+            return false;
+        };
+        dp.required_vars
+            .iter()
+            .all(|v| produced.contains(v) || bound_vars.contains(v))
+            && produced
+                .iter()
+                .any(|v| dp.required_vars.contains(v) && filter_pins_var(expr, *v))
+    })
+}
+
+/// Does `expr` pin `v` to a point or a bounded interval — `?v = e`, `?v IN
+/// (...)`, or both a lower and an upper bound on `?v` across the conjuncts of
+/// an AND (a `(lo < ?v < hi)` sandwich included) — with every comparand free
+/// of `v`? One-sided bounds, negations and other predicates do not pin.
+fn filter_pins_var(expr: &Expression, v: VarId) -> bool {
+    fn visit(expr: &Expression, v: VarId, lower: &mut bool, upper: &mut bool, eq: &mut bool) {
+        let Expression::Call { func, args } = expr else {
+            return;
+        };
+        let is_v = |e: &Expression| matches!(e, Expression::Var(x) if *x == v);
+        let free_of_v = |e: &Expression| !e.referenced_vars().contains(&v);
+        match func {
+            Function::And => {
+                for arg in args {
+                    visit(arg, v, lower, upper, eq);
+                }
+            }
+            Function::In if args.first().is_some_and(is_v) && args[1..].iter().all(free_of_v) => {
+                *eq = true;
+            }
+            Function::Eq | Function::Lt | Function::Le | Function::Gt | Function::Ge => {
+                if args.len() == 3 && is_v(&args[1]) && free_of_v(&args[0]) && free_of_v(&args[2]) {
+                    match func {
+                        Function::Eq => *eq = true,
+                        _ => {
+                            *lower = true;
+                            *upper = true;
+                        }
+                    }
+                    return;
+                }
+                if args.len() != 2 {
+                    return;
+                }
+                let var_on_left = match (&args[0], &args[1]) {
+                    (a, other) if is_v(a) && free_of_v(other) => true,
+                    (other, b) if is_v(b) && free_of_v(other) => false,
+                    _ => return,
+                };
+                match (func, var_on_left) {
+                    (Function::Eq, _) => *eq = true,
+                    (Function::Lt | Function::Le, true) | (Function::Gt | Function::Ge, false) => {
+                        *upper = true;
+                    }
+                    _ => *lower = true,
+                }
+            }
+            _ => {}
+        }
+    }
+    let (mut lower, mut upper, mut eq) = (false, false, false);
+    visit(expr, v, &mut lower, &mut upper, &mut eq);
+    eq || (lower && upper)
 }
 
 /// A broad RDF-star annotation *sidecar* triple: `?ann f:reifiesSubject ?s` or
@@ -2192,6 +2299,7 @@ fn try_place_source(
     stats: Option<&StatsView>,
     result: &mut Vec<Pattern>,
     anchor_vars: &HashSet<VarId>,
+    deferred: &[DeferredPattern],
     placed: &mut HashSet<usize>,
 ) -> bool {
     if remaining.is_empty() {
@@ -2202,9 +2310,9 @@ fn try_place_source(
     let base_pool = connected_or_fallback_pool(remaining, bound_vars);
     let pool = demote_disconnected_class_anchors(base_pool, remaining, bound_vars, anchor_vars);
 
-    let best_idx = pool
-        .into_iter()
-        .min_by(|&i, &j| rank_seed_candidates(i, j, remaining, bound_vars, stats, has_bound));
+    let best_idx = pool.into_iter().min_by(|&i, &j| {
+        rank_seed_candidates(i, j, remaining, bound_vars, stats, has_bound, deferred)
+    });
 
     if let Some(idx) = best_idx {
         let rp = remaining.remove(idx);
@@ -2704,6 +2812,172 @@ mod tests {
             matches!(&ordered[1], Pattern::Triple(tp)
                 if matches!(&tp.p, Ref::Sid(sid) if sid.name.as_ref() == "signatureDblpName")),
             "v4.1.2 stats must reorder identically: {ordered:?}"
+        );
+    }
+
+    /// BSBM Explore Q5 after the shared-feature join: three bound-subject
+    /// probes on the candidate product all estimate ~1 row. The two whose
+    /// objects feed a pending range FILTER must run before the unfiltered
+    /// `label` probe, so the filter discards candidates before the label
+    /// lookup pays for them. Original position alone put `label` first.
+    #[test]
+    fn deferred_filter_breaks_bound_subject_probe_ties() {
+        let mut stats = StatsView::default();
+        for name in ["label", "numeric1", "numeric2"] {
+            stats.properties.insert(
+                Sid::new(100, name),
+                PropertyStatData {
+                    count: 10_000,
+                    ndv_values: 2_000,
+                    ndv_subjects: 10_000,
+                },
+            );
+        }
+        let product = VarId(0);
+        let window = |v: VarId, lo: i64, hi: i64| {
+            Expression::and(vec![
+                Expression::gt(Expression::Var(v), Expression::Const(FlakeValue::Long(lo))),
+                Expression::lt(Expression::Var(v), Expression::Const(FlakeValue::Long(hi))),
+            ])
+        };
+        let patterns = vec![
+            Pattern::Triple(make_pattern(product, "label", VarId(1))),
+            Pattern::Triple(make_pattern(product, "numeric1", VarId(2))),
+            Pattern::Filter(window(VarId(2), -120, 120)),
+            Pattern::Triple(make_pattern(product, "numeric2", VarId(3))),
+            Pattern::Filter(window(VarId(3), -170, 170)),
+        ];
+        let bound: HashSet<VarId> = [product].into_iter().collect();
+        let ordered = reorder_patterns(&patterns, Some(&stats), &bound);
+        let shape: Vec<String> = ordered
+            .iter()
+            .map(|p| match p {
+                Pattern::Triple(tp) => match &tp.p {
+                    Ref::Sid(sid) => sid.name.to_string(),
+                    _ => "?".to_string(),
+                },
+                Pattern::Filter(_) => "filter".to_string(),
+                _ => "?".to_string(),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            ["numeric1", "filter", "numeric2", "filter", "label"],
+            "filter-bearing probes go first among equal-cardinality candidates"
+        );
+    }
+
+    /// A one-sided bound does not pull its probe forward: BSBM Q7's
+    /// `?date > now` keeps half the offers, and hoisting `validTo` ahead of
+    /// the probe that unlocks the selective `?vendor :country <DE>` check cost
+    /// 15% on that query. Original position stands.
+    #[test]
+    fn one_sided_filter_keeps_original_probe_order() {
+        let mut stats = StatsView::default();
+        for name in ["price", "vendor", "validTo"] {
+            stats.properties.insert(
+                Sid::new(100, name),
+                PropertyStatData {
+                    count: 10_000,
+                    ndv_values: 2_000,
+                    ndv_subjects: 10_000,
+                },
+            );
+        }
+        let offer = VarId(0);
+        let patterns = vec![
+            Pattern::Triple(make_pattern(offer, "price", VarId(1))),
+            Pattern::Triple(make_pattern(offer, "vendor", VarId(2))),
+            Pattern::Triple(make_pattern(offer, "validTo", VarId(3))),
+            Pattern::Filter(Expression::gt(
+                Expression::Var(VarId(3)),
+                Expression::Const(FlakeValue::Long(20_080_620)),
+            )),
+        ];
+        let bound: HashSet<VarId> = [offer].into_iter().collect();
+        let ordered = reorder_patterns(&patterns, Some(&stats), &bound);
+        let first = match &ordered[0] {
+            Pattern::Triple(tp) => match &tp.p {
+                Ref::Sid(sid) => sid.name.to_string(),
+                _ => "?".to_string(),
+            },
+            _ => "?".to_string(),
+        };
+        assert_eq!(
+            first, "price",
+            "one-sided filter must not reorder: {ordered:?}"
+        );
+        assert!(filter_pins_var(
+            &Expression::and(vec![
+                Expression::gt(
+                    Expression::Var(VarId(3)),
+                    Expression::Const(FlakeValue::Long(1))
+                ),
+                Expression::lt(
+                    Expression::Var(VarId(3)),
+                    Expression::Const(FlakeValue::Long(9))
+                ),
+            ]),
+            VarId(3)
+        ));
+        assert!(filter_pins_var(
+            &Expression::eq(
+                Expression::Var(VarId(3)),
+                Expression::Const(FlakeValue::Long(1))
+            ),
+            VarId(3)
+        ));
+        assert!(!filter_pins_var(
+            &Expression::gt(
+                Expression::Var(VarId(3)),
+                Expression::Const(FlakeValue::Long(1))
+            ),
+            VarId(3)
+        ));
+    }
+
+    /// The FILTER tie-break is exactly that — a tie-break. A cheaper probe
+    /// still runs before a filtered but more expensive one.
+    #[test]
+    fn deferred_filter_tie_break_never_overrides_cardinality() {
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(100, "label"),
+            PropertyStatData {
+                count: 10_000,
+                ndv_values: 2_000,
+                ndv_subjects: 10_000,
+            },
+        );
+        stats.properties.insert(
+            Sid::new(100, "tag"),
+            PropertyStatData {
+                count: 50_000,
+                ndv_values: 2_000,
+                ndv_subjects: 10_000,
+            },
+        );
+        let product = VarId(0);
+        let patterns = vec![
+            Pattern::Triple(make_pattern(product, "tag", VarId(2))),
+            Pattern::Filter(Expression::and(vec![
+                Expression::gt(
+                    Expression::Var(VarId(2)),
+                    Expression::Const(FlakeValue::Long(0)),
+                ),
+                Expression::lt(
+                    Expression::Var(VarId(2)),
+                    Expression::Const(FlakeValue::Long(120)),
+                ),
+            ])),
+            Pattern::Triple(make_pattern(product, "label", VarId(1))),
+        ];
+        let bound: HashSet<VarId> = [product].into_iter().collect();
+        let ordered = reorder_patterns(&patterns, Some(&stats), &bound);
+        assert!(
+            matches!(&ordered[0], Pattern::Triple(tp)
+                if matches!(&tp.p, Ref::Sid(sid) if sid.name.as_ref() == "label")),
+            "the ~1-row probe must still run before the ~5-row filtered probe: {ordered:?}"
         );
     }
 

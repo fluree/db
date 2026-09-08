@@ -439,6 +439,10 @@ name = "it_query_sparql_indexed"
 path = "tests/it_query_sparql_indexed.rs"
 
 [[test]]
+name = "it_range_semijoin"
+path = "tests/it_range_semijoin.rs"
+
+[[test]]
 name = "it_rebuild_fetch_counts"
 path = "tests/it_rebuild_fetch_counts.rs"
 
