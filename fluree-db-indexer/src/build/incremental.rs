@@ -2285,18 +2285,6 @@ pub async fn incremental_index(
         let db_stats = {
             use fluree_db_core::index_stats as is;
 
-            let properties = crate::stats::aggregate_property_entries_from_graphs(
-                &id_stats_result.graphs,
-                &trie,
-                |p_id| {
-                    novelty
-                        .shared
-                        .predicates
-                        .resolve(p_id)
-                        .map(ToString::to_string)
-                },
-            );
-
             // Class-property attribution: build full ClassStatEntry with property usage.
             //
             // Strategy:
@@ -2322,6 +2310,23 @@ pub async fn incremental_index(
                     }
                 }
             }
+
+            // The planner reads this roll-up, not the per-graph entries, so it
+            // must be taken AFTER the floor: rolled up before it, a seeded
+            // property (empty registers) published ndv 0 and every
+            // bound-subject probe on it was estimated at the 10-row fallback —
+            // one write to a bulk-imported ledger made BSBM Q5 4x slower.
+            let properties = crate::stats::aggregate_property_entries_from_graphs(
+                &final_graphs,
+                &trie,
+                |p_id| {
+                    novelty
+                        .shared
+                        .predicates
+                        .resolve(p_id)
+                        .map(ToString::to_string)
+                },
+            );
 
             let has_class_changes =
                 !class_count_deltas.is_empty() || !novelty_subject_class_deltas.is_empty();
