@@ -190,7 +190,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                         _ => crate::GovernanceOptions::default(),
                     };
                     if opts.has_any_policy_inputs() {
-                        return self.graph.fluree.wrap_policy(db, &opts, None).await;
+                        return self.graph.fluree.wrap_policy(db, &opts).await;
                     }
                     return Ok(db);
                 }

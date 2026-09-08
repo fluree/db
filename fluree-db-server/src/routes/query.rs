@@ -2664,7 +2664,7 @@ async fn execute_cypher_ledger(
     let view = if qc_opts.has_any_policy_inputs() {
         state
             .fluree
-            .wrap_policy(view, &qc_opts, None)
+            .wrap_policy(view, &qc_opts)
             .await
             .map_err(ServerError::Api)?
     } else {

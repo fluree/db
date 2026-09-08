@@ -297,7 +297,7 @@ async fn policy_defaults_apply() {
     //    empty opts → config's defaultAllow and policyClass should be applied
     let resolved = view.resolved_config().expect("resolved config");
     let empty_opts = GovernanceOptions::default();
-    let merged = config_resolver::merge_policy_opts(resolved, &empty_opts, None);
+    let merged = config_resolver::merge_policy_opts(resolved, &empty_opts);
     assert_eq!(
         merged.default_allow,
         Some(false),
@@ -617,7 +617,7 @@ async fn override_control_none_blocks() {
         default_allow: Some(true),
         ..Default::default()
     };
-    let merged = config_resolver::merge_policy_opts(resolved, &opts_with_override, None);
+    let merged = config_resolver::merge_policy_opts(resolved, &opts_with_override);
     assert_eq!(
         merged.default_allow,
         Some(false),
@@ -674,14 +674,17 @@ async fn override_control_identity_restricted() {
         "override_control should be IdentityRestricted"
     );
 
-    // Test actual gating behavior via merge_policy_opts
-    let opts = GovernanceOptions {
+    // Test actual gating behavior via merge_policy_opts. The identity that
+    // gates the override is the auth-layer-verified `server_identity`.
+    let opts_as = |server_identity: Option<&str>| GovernanceOptions {
         default_allow: Some(true),
+        server_identity: server_identity.map(str::to_string),
         ..Default::default()
     };
 
     // Admin identity → override permitted (opts.default_allow=true passes through)
-    let merged_admin = config_resolver::merge_policy_opts(resolved, &opts, Some("did:key:admin"));
+    let merged_admin =
+        config_resolver::merge_policy_opts(resolved, &opts_as(Some("did:key:admin")));
     assert_eq!(
         merged_admin.default_allow,
         Some(true),
@@ -689,7 +692,7 @@ async fn override_control_identity_restricted() {
     );
 
     // Unknown identity → override denied (config.default_allow=false applied)
-    let merged_user = config_resolver::merge_policy_opts(resolved, &opts, Some("did:key:user"));
+    let merged_user = config_resolver::merge_policy_opts(resolved, &opts_as(Some("did:key:user")));
     assert_eq!(
         merged_user.default_allow,
         Some(false),
@@ -697,11 +700,24 @@ async fn override_control_identity_restricted() {
     );
 
     // No identity → override denied (config.default_allow=false applied)
-    let merged_none = config_resolver::merge_policy_opts(resolved, &opts, None);
+    let merged_none = config_resolver::merge_policy_opts(resolved, &opts_as(None));
     assert_eq!(
         merged_none.default_allow,
         Some(false),
         "no identity should be denied override"
+    );
+
+    // The allow-listed DID carried only as the policy `identity` (what a
+    // caller can write into `opts`) must not satisfy the allow-list.
+    let identity_only = GovernanceOptions {
+        identity: Some("did:key:admin".into()),
+        ..opts_as(None)
+    };
+    let merged_identity_only = config_resolver::merge_policy_opts(resolved, &identity_only);
+    assert_eq!(
+        merged_identity_only.default_allow,
+        Some(false),
+        "opts.identity alone must not authorize an override"
     );
 }
 

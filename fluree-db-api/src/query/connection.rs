@@ -40,7 +40,8 @@ impl Fluree {
         if qc_opts.has_any_policy_inputs() {
             self.build_dataset_view_with_policy(spec, qc_opts).await
         } else {
-            self.build_dataset_view(spec).await
+            self.build_dataset_view_as(spec, qc_opts.server_identity.as_deref())
+                .await
         }
     }
 
@@ -76,7 +77,8 @@ impl Fluree {
         let dataset = if qc_opts.has_any_policy_inputs() {
             self.build_dataset_view_with_policy(spec, qc_opts).await
         } else {
-            self.build_dataset_view(spec).await
+            self.build_dataset_view_as(spec, qc_opts.server_identity.as_deref())
+                .await
         };
         dataset.map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))
     }
@@ -1067,13 +1069,16 @@ impl Fluree {
         // Per-source policy takes precedence
         if let Some(policy_override) = &source.policy_override {
             if policy_override.has_policy() {
-                let opts = policy_override.to_query_connection_options();
-                return self.wrap_policy(view, &opts, None).await;
+                let mut opts = policy_override.to_query_connection_options();
+                // The override comes from the request body; the verified
+                // identity that gates config overrides is request-level.
+                opts.server_identity = global_opts.server_identity.clone();
+                return self.wrap_policy(view, &opts).await;
             }
         }
         // Fall back to global policy if present
         if global_opts.has_any_policy_inputs() {
-            self.wrap_policy(view, global_opts, None).await
+            self.wrap_policy(view, global_opts).await
         } else {
             Ok(view)
         }

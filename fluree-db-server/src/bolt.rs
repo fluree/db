@@ -587,7 +587,7 @@ async fn try_execute_txn_run(
     let view = if governance.has_any_policy_inputs() {
         state
             .fluree
-            .wrap_policy(view, &governance, None)
+            .wrap_policy(view, &governance)
             .await
             .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     } else {
@@ -664,7 +664,7 @@ async fn execute_read(
     let view = if governance.has_any_policy_inputs() {
         state
             .fluree
-            .wrap_policy(view, &governance, None)
+            .wrap_policy(view, &governance)
             .await
             .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     } else {

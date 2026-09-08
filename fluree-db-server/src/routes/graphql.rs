@@ -264,7 +264,7 @@ async fn policy_view(
     if opts.has_any_policy_inputs() {
         state
             .fluree
-            .wrap_policy(view, &opts, None)
+            .wrap_policy(view, &opts)
             .await
             .map_err(ServerError::Api)
     } else {

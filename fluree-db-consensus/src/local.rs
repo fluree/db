@@ -492,7 +492,7 @@ pub(crate) async fn resolve_cypher_under_lock(
             let probe_state = ledger_handle.snapshot().await.to_ledger_state();
             let probe = GraphDb::from_ledger_state(&probe_state);
             let probe = if governance.has_any_policy_inputs() {
-                fluree.wrap_policy(probe, governance, None).await?
+                fluree.wrap_policy(probe, governance).await?
             } else {
                 probe
             };

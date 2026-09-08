@@ -331,8 +331,9 @@ pub fn configured_fulltext_properties_for_indexer(
 
 /// Merge config policy defaults with query-time opts.
 ///
-/// `server_identity` is the auth-layer-verified identity (NOT `opts.identity`
-/// which is the user-settable policy evaluation context).
+/// Override control is checked against `opts.server_identity`, the
+/// auth-layer-verified identity, never against `opts.identity`, which is the
+/// user-settable policy evaluation context.
 ///
 /// Algorithm:
 /// 1. No config policy → return opts unchanged
@@ -346,11 +347,7 @@ pub fn configured_fulltext_properties_for_indexer(
 /// never spoke, so config governs; `Some(v)` is an explicit request value and
 /// survives, because the only thing entitled to overrule an explicit caller
 /// value is override control saying so.
-pub fn merge_policy_opts(
-    resolved: &ResolvedConfig,
-    opts: &GovernanceOptions,
-    server_identity: Option<&str>,
-) -> GovernanceOptions {
+pub fn merge_policy_opts(resolved: &ResolvedConfig, opts: &GovernanceOptions) -> GovernanceOptions {
     let policy = match &resolved.policy {
         Some(p) => p,
         None => return opts.clone(),
@@ -358,6 +355,7 @@ pub fn merge_policy_opts(
 
     // Does the query specify any policy inputs?
     let query_has_policy = opts.has_any_policy_inputs();
+    let server_identity = opts.server_identity.as_deref();
     let override_denied =
         query_has_policy && !policy.override_control.permits_override(server_identity);
 
@@ -2355,7 +2353,7 @@ mod tests {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, None);
+        let merged = merge_policy_opts(&resolved, &opts);
         assert_eq!(merged.identity.as_deref(), Some("did:key:alice"));
     }
 
@@ -2370,7 +2368,7 @@ mod tests {
             ..Default::default()
         };
         let opts = GovernanceOptions::default();
-        let merged = merge_policy_opts(&resolved, &opts, None);
+        let merged = merge_policy_opts(&resolved, &opts);
         assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
             merged.policy_class.as_deref(),
@@ -2392,7 +2390,7 @@ mod tests {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, None);
+        let merged = merge_policy_opts(&resolved, &opts);
         // Query opts kept because AllowAll permits override
         assert_eq!(merged.identity.as_deref(), Some("did:key:alice"));
     }
@@ -2410,9 +2408,10 @@ mod tests {
         };
         let opts = GovernanceOptions {
             identity: Some("did:key:alice".into()),
+            server_identity: Some("did:key:alice".into()),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, Some("did:key:alice"));
+        let merged = merge_policy_opts(&resolved, &opts);
         // Config defaults applied despite query specifying identity
         assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
@@ -2435,9 +2434,10 @@ mod tests {
         };
         let opts = GovernanceOptions {
             identity: Some("did:key:user".into()),
+            server_identity: Some("did:key:admin".into()),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, Some("did:key:admin"));
+        let merged = merge_policy_opts(&resolved, &opts);
         // Server identity is admin → override permitted
         assert_eq!(merged.identity.as_deref(), Some("did:key:user"));
     }
@@ -2457,9 +2457,10 @@ mod tests {
         };
         let opts = GovernanceOptions {
             identity: Some("did:key:user".into()),
+            server_identity: Some("did:key:non-admin".into()),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, Some("did:key:non-admin"));
+        let merged = merge_policy_opts(&resolved, &opts);
         // Server identity is not admin → override denied
         assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
@@ -2490,7 +2491,7 @@ mod tests {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, None);
+        let merged = merge_policy_opts(&resolved, &opts);
         assert_eq!(merged.identity.as_deref(), Some("did:key:alice"));
         assert_eq!(
             merged.default_allow,
@@ -2517,7 +2518,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            merge_policy_opts(&open_config, &deny, None).default_allow,
+            merge_policy_opts(&open_config, &deny).default_allow,
             Some(false)
         );
 
@@ -2535,7 +2536,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            merge_policy_opts(&closed_config, &allow, None).default_allow,
+            merge_policy_opts(&closed_config, &allow).default_allow,
             Some(true)
         );
     }
@@ -2555,7 +2556,7 @@ mod tests {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, None);
+        let merged = merge_policy_opts(&resolved, &opts);
         assert_eq!(merged.default_allow, None);
         assert!(
             !merged.effective_default_allow(),
@@ -2571,10 +2572,7 @@ mod tests {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
-        assert_eq!(
-            merge_policy_opts(&resolved, &opts, None).default_allow,
-            None
-        );
+        assert_eq!(merge_policy_opts(&resolved, &opts).default_allow, None);
     }
 
     /// `Some(false)` is the fail-closed value, not a request to switch
@@ -2621,7 +2619,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            merge_policy_opts(&resolved, &opts, None).default_allow,
+            merge_policy_opts(&resolved, &opts).default_allow,
             Some(false),
             "config f:defaultAllow true must not clobber an explicit request false"
         );
@@ -2654,7 +2652,7 @@ mod tests {
              the config-defaults path"
         );
         assert_eq!(
-            merge_policy_opts(&resolved, &opts, None).default_allow,
+            merge_policy_opts(&resolved, &opts).default_allow,
             Some(false)
         );
     }
@@ -2676,7 +2674,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            merge_policy_opts(&resolved, &opts, None).default_allow,
+            merge_policy_opts(&resolved, &opts).default_allow,
             Some(false)
         );
     }

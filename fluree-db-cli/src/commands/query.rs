@@ -884,7 +884,7 @@ pub async fn run(
 
             let view = if policy.is_set() {
                 let opts = policy.to_options().map_err(CliError::Usage)?;
-                fluree.wrap_policy(view, &opts, None).await?
+                fluree.wrap_policy(view, &opts).await?
             } else {
                 view
             };
@@ -1469,7 +1469,7 @@ async fn run_cypher_query(
     };
     let view = if policy.is_set() {
         let opts = policy.to_options().map_err(CliError::Usage)?;
-        fluree.wrap_policy(view, &opts, None).await?
+        fluree.wrap_policy(view, &opts).await?
     } else {
         view
     };

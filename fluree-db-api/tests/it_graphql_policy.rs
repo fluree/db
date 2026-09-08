@@ -60,7 +60,7 @@ async fn restricted_view(
         ..GovernanceOptions::default()
     };
     fluree
-        .wrap_policy(root_view(ledger), &opts, None)
+        .wrap_policy(root_view(ledger), &opts)
         .await
         .expect("policy view")
 }
