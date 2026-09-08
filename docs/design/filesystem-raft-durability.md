@@ -130,3 +130,25 @@ observer between their HTTP network factory and `with_peer_activity` to obtain
 this transport-based detection. Without that observer, the legacy lag-only
 fallback remains. This does not diagnose an application worker that hangs while
 its Raft transport continues answering normally.
+
+## Submission identity under concurrency
+
+The concurrency-16 NFS qualification exposed a separate receipt-correlation bug:
+identical envelopes can share a CID, while a CID-keyed single-waiter map displaced
+callers and could attach a receipt to the wrong idempotency key. Timestamps are
+optional and must never be treated as submission identity.
+
+Each new queued envelope now carries a random 256-bit `submission_nonce`. This
+metadata is ignored by transaction execution and excluded from every operation's
+canonical idempotency body hash. Legacy JSON envelopes without it still decode;
+older readers ignore the additional struct field. This also gives orphan cleanup
+exclusive ownership of the new attempt's blob instead of deleting another pending
+submission with identical content. Raft command and snapshot formats are unchanged.
+
+Waiter interests additionally include branch and idempotency identity. Duplicate
+callers joining one queue entry receive the same outcome; distinct keys cannot
+cross-wire receipts. Unkeyed identical submissions each retain a separate queue
+entry. A short synchronous mutex makes binding and cancellation atomic without
+holding a lock during I/O or awaiting transaction work. Followers still retain no
+unsolicited outcomes. Qualification must compare every receipt to its replicated
+idempotency result, not only check that it names an existing unique commit.

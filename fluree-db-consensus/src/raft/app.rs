@@ -240,8 +240,10 @@ impl NameServiceObserver {
         match resolution {
             WaiterResolution::Bind {
                 request_cid,
+                ref_key,
+                idempotency,
                 queue_id,
-            } => waiters.bind(&request_cid, queue_id),
+            } => waiters.bind_submission(&request_cid, &ref_key, idempotency.as_ref(), queue_id),
             WaiterResolution::Applied {
                 queue_id,
                 commit_id,
@@ -400,6 +402,8 @@ pub enum WaiterResolution {
     /// the whole reason a follower's waiter map stays empty.
     Bind {
         request_cid: ContentId,
+        ref_key: RefKey,
+        idempotency: Option<crate::IdempotencyCacheKey>,
         queue_id: u64,
     },
     /// `ApplyHead` advanced the head — wake the parked transactor
@@ -433,6 +437,8 @@ fn waiter_resolution_for(cmd: &Command, response: &Response) -> Option<WaiterRes
             Response::Enqueued { queue_id, .. } | Response::InFlight { queue_id, .. },
         ) => Some(WaiterResolution::Bind {
             request_cid: args.request_cid.clone(),
+            ref_key: RefKey::new(&args.ledger_id, &args.branch),
+            idempotency: args.idempotency.clone(),
             queue_id: *queue_id,
         }),
         (

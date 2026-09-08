@@ -1474,3 +1474,86 @@ async fn idle_worker_loss_is_detected_without_log_traffic() {
         node.shutdown().await;
     }
 }
+
+/// A CAS envelope can be byte-identical for distinct submissions. The HTTP
+/// receipt must still belong to that submission's replicated idempotency key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identical_concurrent_cypher_submissions_keep_receipt_identity() {
+    let mut cluster = TestCluster::spawn(CLUSTER_SIZE).await;
+    cluster.bootstrap().await;
+    let ledger = "raft:identical";
+    cluster
+        .create_ledger(cluster.nodes[0].node_id, ledger)
+        .await;
+    let url = cluster.nodes[0].public_url.clone();
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+    let mut handles = Vec::new();
+    for i in 0..16 {
+        let client = cluster.client.clone();
+        let url = url.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            let key = format!("identical-{i}");
+            barrier.wait().await;
+            let response = client
+                .post(format!("{url}/v1/fluree/update/{ledger}"))
+                .header("content-type", "application/cypher")
+                .header("idempotency-key", &key)
+                .body(r#"{"cypher":"CREATE ()","params":{}}"#)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap();
+            assert!(status.is_success(), "{key}: {status}: {body}");
+            (key, body)
+        }));
+    }
+    let mut receipts = BTreeSet::new();
+    for handle in handles {
+        let (key, receipt) = handle.await.unwrap();
+        let hash = receipt["commit"]["hash"].as_str().expect("commit receipt");
+        assert!(
+            receipts.insert(hash.to_owned()),
+            "distinct CREATE reused a receipt"
+        );
+        let status: serde_json::Value = cluster
+            .client
+            .get(format!("{url}/v1/fluree/submissions/{key}/{ledger}"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["state"], "committed", "{status}");
+        assert_eq!(
+            status["commit_id"], hash,
+            "receipt was assigned to the wrong key: {key}"
+        );
+        assert_eq!(status["t"], receipt["t"]);
+        let retry: serde_json::Value = cluster
+            .client
+            .post(format!("{url}/v1/fluree/update/{ledger}"))
+            .header("content-type", "application/cypher")
+            .header("idempotency-key", &key)
+            .body(r#"{"cypher":"CREATE ()","params":{}}"#)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            retry["commit"]["hash"], hash,
+            "retry changed receipt identity"
+        );
+    }
+    for node in &mut cluster.nodes {
+        node.shutdown().await;
+    }
+}

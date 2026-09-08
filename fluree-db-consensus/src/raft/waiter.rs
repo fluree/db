@@ -18,7 +18,9 @@
 //! node then buffers an outcome nobody will ever collect.
 //!
 //! So interest is armed **before** proposing, keyed by the submission's
-//! `request_cid` — which the proposer knows and the command carries.
+//! envelope, branch, and idempotency identity, all carried by the command.
+//! Content identity alone is insufficient: distinct submissions may have
+//! identical envelopes, including absent or identical timestamps.
 //! When this node applies that `EnqueueCommand`, the adapter binds the
 //! interest to the `queue_id` the state machine just assigned. Because
 //! the binding happens during apply, it strictly precedes any later
@@ -42,9 +44,10 @@
 
 use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::state_machine::{PoisonReason, RefKey};
-use dashmap::DashMap;
+use crate::IdempotencyCacheKey;
 use fluree_db_core::ContentId;
-use std::sync::{Arc, OnceLock};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::oneshot;
 
 /// Outcome the state-machine adapter sends back through the channel
@@ -59,7 +62,7 @@ use tokio::sync::oneshot;
 ///
 /// `Aborted` covers every way the entry left the queue without a
 /// head advance (poison + admin preemption).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum WaiterOutcome {
     Applied(AppliedReceipt),
     Aborted(AbortReason),
@@ -91,58 +94,37 @@ pub enum AbortReason {
     Poisoned(PoisonReason),
 }
 
-/// A waiter whose `queue_id` is not known yet.
-struct Interest {
+/// Exact correlation identity available before the queue assigns an ID.
+/// Content addressing identifies bytes, not a unique submission.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct InterestKey {
+    request_cid: ContentId,
     ref_key: RefKey,
-    sender: oneshot::Sender<WaiterOutcome>,
-    /// Set by [`WaiterMap::bind`]; lets the ticket clean up the right
-    /// entry on drop without knowing in advance which map it landed in.
-    bound: Arc<OnceLock<u64>>,
+    idempotency: Option<IdempotencyCacheKey>,
 }
 
-/// A waiter bound to a `queue_id`, awaiting its terminal apply.
 struct Waiter {
     ref_key: RefKey,
     sender: oneshot::Sender<WaiterOutcome>,
-    /// The `Arc` this waiter's ticket holds. Both maps are keyed by
-    /// something a second submission can collide on — `request_cid` for
-    /// interests, `queue_id` for waiters — so a displaced ticket must
-    /// compare identity before removing, or its `Drop` deletes the
-    /// entry that displaced it.
     bound: Arc<OnceLock<u64>>,
 }
 
-/// Handle a proposer holds while it waits.
-///
-/// Dropping it removes whichever entry the waiter currently occupies,
-/// so abandoning a submission — timeout, cancellation, a panic on the
-/// propose path — cannot leave anything behind.
+/// Handle owned by one local proposer. Cancellation removes only this handle.
 pub struct WaiterTicket {
     map: Arc<WaiterMap>,
-    request_cid: ContentId,
+    key: InterestKey,
     bound: Arc<OnceLock<u64>>,
     receiver: Option<oneshot::Receiver<WaiterOutcome>>,
 }
 
-/// Why a wait ended without an outcome.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WaitError {
-    /// No terminal apply arrived in time. The ticket stays valid — the
-    /// waiter is still bound, so a retry that rejoins the same queue
-    /// entry can await it again.
     TimedOut,
-    /// Another submission bound to this `queue_id` and took the slot,
-    /// or the waiter was drained. Retry under the idempotency key.
+    /// The sender was abandoned without a terminal outcome.
     Displaced,
 }
 
 impl WaiterTicket {
-    /// Await the terminal outcome, giving up after `timeout`.
-    ///
-    /// Takes `&mut self` and borrows the receiver rather than consuming
-    /// it, so a timed-out ticket can be awaited again: the retry loop
-    /// re-proposes the same `request_cid`, rejoins the same queue entry
-    /// (`InFlight`), and waits on the binding it already has.
     pub async fn wait(&mut self, timeout: std::time::Duration) -> Result<WaiterOutcome, WaitError> {
         let Some(rx) = self.receiver.as_mut() else {
             return Err(WaitError::Displaced);
@@ -150,16 +132,13 @@ impl WaiterTicket {
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(outcome)) => Ok(outcome),
             Ok(Err(_)) => {
-                // Sender dropped: displaced by a later bind, or drained.
                 self.receiver = None;
                 Err(WaitError::Displaced)
             }
-            Err(_elapsed) => Err(WaitError::TimedOut),
+            Err(_) => Err(WaitError::TimedOut),
         }
     }
 
-    /// The `queue_id` this ticket bound to, once the local node has
-    /// applied the enqueue. `None` until then.
     pub fn queue_id(&self) -> Option<u64> {
         self.bound.get().copied()
     }
@@ -167,39 +146,36 @@ impl WaiterTicket {
 
 impl Drop for WaiterTicket {
     fn drop(&mut self) {
-        // Remove only this ticket's own entry. A displaced ticket still
-        // names the slot it briefly held — the same `queue_id`, or the
-        // same `request_cid` — so removing by key alone would delete the
-        // binding the *current* holder is waiting on, and its outcome
-        // would be dropped on the floor when the terminal apply lands.
-        // The `bound` `Arc` is shared between a ticket and whichever
-        // entry it owns, so pointer identity settles it.
-        match self.bound.get() {
-            Some(queue_id) => {
-                self.map
-                    .waiters
-                    .remove_if(queue_id, |_, w| Arc::ptr_eq(&w.bound, &self.bound));
+        // Binding and cancellation use the same short synchronous lock, so
+        // cancellation cannot fall between removal of an interest and insertion
+        // of its bound waiter. Never hold this lock across an await.
+        let mut state = self.map.state.lock().unwrap();
+        if let Some(id) = self.bound.get() {
+            if let Some(waiters) = state.waiters.get_mut(id) {
+                waiters.retain(|w| !Arc::ptr_eq(&w.bound, &self.bound));
+                if waiters.is_empty() {
+                    state.waiters.remove(id);
+                }
             }
-            None => {
-                self.map
-                    .interests
-                    .remove_if(&self.request_cid, |_, i| Arc::ptr_eq(&i.bound, &self.bound));
+        } else if let Some(interests) = state.interests.get_mut(&self.key) {
+            interests.retain(|w| !Arc::ptr_eq(&w.bound, &self.bound));
+            if interests.is_empty() {
+                state.interests.remove(&self.key);
             }
         }
     }
 }
 
-/// Per-process registry of local proposers awaiting terminal applies.
-///
-/// Held by the state-machine adapter and shared with the transactor via
-/// `Arc`. Only entries a *local* proposer armed are ever tracked, so a
-/// follower's map stays empty no matter how much the cluster commits.
+#[derive(Default)]
+struct WaiterState {
+    interests: HashMap<InterestKey, VecDeque<Waiter>>,
+    waiters: HashMap<u64, Vec<Waiter>>,
+}
+
+/// Local proposer interests only. Followers retain no unsolicited outcomes.
 #[derive(Default)]
 pub struct WaiterMap {
-    /// `request_cid` → armed interest, before a `queue_id` exists.
-    interests: DashMap<ContentId, Interest>,
-    /// `queue_id` → bound waiter.
-    waiters: DashMap<u64, Waiter>,
+    state: Mutex<WaiterState>,
 }
 
 impl WaiterMap {
@@ -207,119 +183,144 @@ impl WaiterMap {
         Self::default()
     }
 
-    /// Arm interest in the submission identified by `request_cid`,
-    /// **before** proposing it.
-    ///
-    /// Arming first is what closes the race: by the time this node
-    /// applies the enqueue there is already somewhere to bind, so no
-    /// terminal apply can arrive with nowhere to go.
-    pub fn arm(self: &Arc<Self>, request_cid: ContentId, ref_key: RefKey) -> WaiterTicket {
+    pub fn arm_submission(
+        self: &Arc<Self>,
+        request_cid: ContentId,
+        ref_key: RefKey,
+        idempotency: Option<IdempotencyCacheKey>,
+    ) -> WaiterTicket {
+        let key = InterestKey {
+            request_cid,
+            ref_key: ref_key.clone(),
+            idempotency,
+        };
         let (sender, receiver) = oneshot::channel();
         let bound = Arc::new(OnceLock::new());
-        self.interests.insert(
-            request_cid.clone(),
-            Interest {
+        self.state
+            .lock()
+            .unwrap()
+            .interests
+            .entry(key.clone())
+            .or_default()
+            .push_back(Waiter {
                 ref_key,
                 sender,
                 bound: Arc::clone(&bound),
-            },
-        );
+            });
         WaiterTicket {
             map: Arc::clone(self),
-            request_cid,
+            key,
             bound,
             receiver: Some(receiver),
         }
     }
 
-    /// Bind an armed interest to the `queue_id` the state machine
-    /// assigned. Called by the adapter when *this node* applies the
-    /// matching `EnqueueCommand`.
-    ///
-    /// No-op when no local proposer armed this `request_cid` — which is
-    /// the ordinary case on every follower, and the reason a follower's
-    /// map never grows.
-    ///
-    /// A duplicate submission joining an in-flight entry (`InFlight`)
-    /// binds to the same `queue_id` and displaces the earlier waiter,
-    /// whose receiver then errors; the caller retries under its
-    /// idempotency key.
-    pub fn bind(&self, request_cid: &ContentId, queue_id: u64) {
-        let Some((_, interest)) = self.interests.remove(request_cid) else {
+    /// Bind using the identity of the command that actually applied.
+    /// Keyed duplicates share one queue entry and all receive its outcome.
+    /// Unkeyed identical submissions each create an entry: bind one equivalent
+    /// interest per apply, never collapse them into one transaction.
+    pub fn bind_submission(
+        &self,
+        request_cid: &ContentId,
+        ref_key: &RefKey,
+        idempotency: Option<&IdempotencyCacheKey>,
+        queue_id: u64,
+    ) {
+        let key = InterestKey {
+            request_cid: request_cid.clone(),
+            ref_key: ref_key.clone(),
+            idempotency: idempotency.cloned(),
+        };
+        let mut state = self.state.lock().unwrap();
+        let Some(interests) = state.interests.get_mut(&key) else {
             return;
         };
-        // Publish before inserting: a ticket dropped concurrently must
-        // find the waiter entry rather than the (now absent) interest.
-        let _ = interest.bound.set(queue_id);
-        self.waiters.insert(
-            queue_id,
-            Waiter {
-                ref_key: interest.ref_key,
-                sender: interest.sender,
-                bound: interest.bound,
-            },
-        );
+        let bound: Vec<_> = if idempotency.is_some() {
+            interests.drain(..).collect()
+        } else {
+            interests.pop_front().into_iter().collect()
+        };
+        if interests.is_empty() {
+            state.interests.remove(&key);
+        }
+        let waiters = state.waiters.entry(queue_id).or_default();
+        for interest in bound {
+            let _ = interest.bound.set(queue_id);
+            waiters.push(interest);
+        }
     }
 
-    /// Resolve `queue_id` with the head advance the worker landed.
-    ///
-    /// Dropped when no local waiter is bound — on a follower that is
-    /// every terminal apply.
     pub fn resolve_applied(&self, queue_id: u64, receipt: AppliedReceipt) {
         self.resolve_with(queue_id, WaiterOutcome::Applied(receipt));
     }
 
-    /// Resolve `queue_id` with an abort outcome. Same "no waiter, no
-    /// work" rule as [`Self::resolve_applied`].
     pub fn resolve_aborted(&self, queue_id: u64, reason: AbortReason) {
         self.resolve_with(queue_id, WaiterOutcome::Aborted(reason));
     }
 
     fn resolve_with(&self, queue_id: u64, outcome: WaiterOutcome) {
-        if let Some((_, waiter)) = self.waiters.remove(&queue_id) {
-            let _ = waiter.sender.send(outcome);
+        let waiters = self.state.lock().unwrap().waiters.remove(&queue_id);
+        if let Some(waiters) = waiters {
+            for waiter in waiters {
+                let _ = waiter.sender.send(outcome.clone());
+            }
         }
     }
 
-    /// Abort every waiter bound to `ref_key`. Called when head-mutating
-    /// admin commands (Drop / Purge / ResetHead) clear the queue.
-    ///
-    /// Unbound interests are left alone: their `EnqueueCommand` has not
-    /// applied yet, so it will land against the post-clear state and
-    /// resolve on its own terms.
     pub fn abort_all_for_branch(&self, ref_key: &RefKey, reason: AbortReason) {
-        let ids: Vec<u64> = self
-            .waiters
-            .iter()
-            .filter(|entry| &entry.value().ref_key == ref_key)
-            .map(|entry| *entry.key())
-            .collect();
-        for queue_id in ids {
-            self.resolve_aborted(queue_id, reason.clone());
-        }
+        let mut state = self.state.lock().unwrap();
+        state.waiters.retain(|_, waiters| {
+            if waiters.first().is_some_and(|w| &w.ref_key == ref_key) {
+                for waiter in waiters.drain(..) {
+                    let _ = waiter.sender.send(WaiterOutcome::Aborted(reason.clone()));
+                }
+                false
+            } else {
+                true
+            }
+        });
     }
 
-    /// Abandon every local waiter, bound or not.
-    ///
-    /// Called on install_snapshot: the state machine has been replaced
-    /// wholesale, so neither a bound waiter's entry nor an armed
-    /// interest's pending enqueue can be trusted to exist in the new
-    /// state.
     pub fn drain_all_with(&self, reason: AbortReason) {
-        let ids: Vec<u64> = self.waiters.iter().map(|entry| *entry.key()).collect();
-        for queue_id in ids {
-            self.resolve_aborted(queue_id, reason.clone());
+        let mut state = self.state.lock().unwrap();
+        for (_, waiters) in state.waiters.drain() {
+            for waiter in waiters {
+                let _ = waiter.sender.send(WaiterOutcome::Aborted(reason.clone()));
+            }
         }
-        let cids: Vec<ContentId> = self.interests.iter().map(|e| e.key().clone()).collect();
-        for cid in cids {
-            if let Some((_, interest)) = self.interests.remove(&cid) {
+        for (_, interests) in state.interests.drain() {
+            for interest in interests {
                 let _ = interest.sender.send(WaiterOutcome::Aborted(reason.clone()));
             }
         }
     }
 
-    /// Arm and bind in one step, for tests that exercise the resolve
-    /// path directly rather than running a real propose.
+    #[cfg(test)]
+    pub fn arm(self: &Arc<Self>, request_cid: ContentId, ref_key: RefKey) -> WaiterTicket {
+        self.arm_submission(request_cid, ref_key, None)
+    }
+
+    // Existing single-interest fixtures do not need to spell out correlation.
+    #[cfg(test)]
+    pub fn bind(&self, request_cid: &ContentId, queue_id: u64) {
+        let key = self
+            .state
+            .lock()
+            .unwrap()
+            .interests
+            .keys()
+            .find(|k| &k.request_cid == request_cid)
+            .cloned();
+        if let Some(key) = key {
+            self.bind_submission(
+                request_cid,
+                &key.ref_key,
+                key.idempotency.as_ref(),
+                queue_id,
+            );
+        }
+    }
+
     #[cfg(test)]
     pub fn arm_bound(
         self: &Arc<Self>,
@@ -332,10 +333,10 @@ impl WaiterMap {
         ticket
     }
 
-    /// Number of tracked entries — armed interests plus bound waiters.
-    /// Tests only; not part of the public contract.
     pub fn len(&self) -> usize {
-        self.interests.len() + self.waiters.len()
+        let state = self.state.lock().unwrap();
+        state.interests.values().map(VecDeque::len).sum::<usize>()
+            + state.waiters.values().map(Vec::len).sum::<usize>()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -530,64 +531,89 @@ mod tests {
         assert_eq!(map.len(), 0);
     }
 
-    /// A duplicate submission that joins an in-flight entry displaces
-    /// the earlier waiter; its receiver errors and the caller retries
-    /// under its idempotency key.
-    #[tokio::test]
-    async fn binding_a_second_interest_to_one_queue_id_displaces_the_first() {
-        let map = Arc::new(WaiterMap::new());
-        let mut first = map.arm(cid(11), key("db", "main"));
-        map.bind(&cid(11), 5);
-        let mut second = map.arm(cid(12), key("db", "main"));
-        map.bind(&cid(12), 5);
-
-        assert!(
-            matches!(
-                first.wait(std::time::Duration::from_millis(50)).await,
-                Err(WaitError::Displaced)
-            ),
-            "displaced waiter must report it",
-        );
-
-        // The displaced ticket is bound to the same `queue_id` as the
-        // ticket that displaced it. Its cleanup must not take the live
-        // binding with it, or the current holder's outcome is dropped
-        // on the floor and it times out on a commit that applied.
-        drop(first);
-        assert_eq!(map.len(), 1, "second's binding must survive first's drop");
-
-        map.resolve_applied(5, receipt());
-        assert!(matches!(
-            second
-                .wait(std::time::Duration::from_secs(5))
-                .await
-                .expect("current waiter resolved"),
-            WaiterOutcome::Applied(_)
-        ));
+    fn idem(value: &str) -> IdempotencyCacheKey {
+        IdempotencyCacheKey::new("db:main", crate::IdempotencyKey::new(value).unwrap())
     }
 
-    /// Same identity rule on the interests map: re-arming a
-    /// `request_cid` before either ticket binds displaces the first,
-    /// whose drop must leave the second's armed interest in place —
-    /// otherwise nothing is left to bind when the enqueue applies and
-    /// the terminal apply has nowhere to go.
+    async fn assert_t(ticket: &mut WaiterTicket, expected: i64) {
+        match ticket
+            .wait(std::time::Duration::from_secs(1))
+            .await
+            .unwrap()
+        {
+            WaiterOutcome::Applied(AppliedReceipt::Minimal { commit_t, .. }) => {
+                assert_eq!(commit_t, expected);
+            }
+            outcome => panic!("unexpected {outcome:?}"),
+        }
+    }
+
+    fn receipt_at(t: i64) -> AppliedReceipt {
+        AppliedReceipt::Minimal {
+            commit_id: cid(t as u8),
+            commit_t: t,
+        }
+    }
+
     #[tokio::test]
-    async fn dropping_a_displaced_interest_leaves_the_live_one_armed() {
+    async fn identical_envelopes_with_distinct_keys_receive_their_own_receipts() {
         let map = Arc::new(WaiterMap::new());
-        let first = map.arm(cid(21), key("db", "main"));
-        let mut second = map.arm(cid(21), key("db", "main"));
+        let branch = key("db", "main");
+        let a = idem("a");
+        let b = idem("b");
+        let mut first = map.arm_submission(cid(1), branch.clone(), Some(a.clone()));
+        let mut second = map.arm_submission(cid(1), branch.clone(), Some(b.clone()));
+        // Apply in reverse arm order; byte identity must not cross-wire receipts.
+        map.bind_submission(&cid(1), &branch, Some(&b), 2);
+        map.bind_submission(&cid(1), &branch, Some(&a), 1);
+        map.resolve_applied(2, receipt_at(22));
+        map.resolve_applied(1, receipt_at(11));
+        assert_t(&mut first, 11).await;
+        assert_t(&mut second, 22).await;
+        assert!(map.is_empty());
+    }
 
-        drop(first);
-        assert_eq!(map.len(), 1, "second's interest must survive first's drop");
+    #[tokio::test]
+    async fn duplicate_key_waiters_fan_out_and_cancellation_does_not_displace_peers() {
+        let map = Arc::new(WaiterMap::new());
+        let branch = key("db", "main");
+        let id = idem("a");
+        let mut first = map.arm_submission(cid(1), branch.clone(), Some(id.clone()));
+        let abandoned = map.arm_submission(cid(1), branch.clone(), Some(id.clone()));
+        let mut second = map.arm_submission(cid(1), branch.clone(), Some(id.clone()));
+        drop(abandoned);
+        map.bind_submission(&cid(1), &branch, Some(&id), 1);
+        // A retry may serialize different transient context but join the same queue ID.
+        let mut third = map.arm_submission(cid(2), branch.clone(), Some(id.clone()));
+        map.bind_submission(&cid(2), &branch, Some(&id), 1);
+        let abandoned = map.arm_submission(cid(3), branch.clone(), Some(id.clone()));
+        map.bind_submission(&cid(3), &branch, Some(&id), 1);
+        drop(abandoned);
+        assert_eq!(map.len(), 3);
+        map.resolve_applied(1, receipt_at(11));
+        assert_t(&mut first, 11).await;
+        assert_t(&mut second, 11).await;
+        assert_t(&mut third, 11).await;
+        assert!(map.is_empty());
+    }
 
-        map.bind(&cid(21), 9);
-        map.resolve_applied(9, receipt());
-        assert!(matches!(
-            second
-                .wait(std::time::Duration::from_secs(5))
-                .await
-                .expect("current interest bound and resolved"),
-            WaiterOutcome::Applied(_)
-        ));
+    #[tokio::test]
+    async fn identical_unkeyed_requests_are_not_coalesced_and_branches_are_isolated() {
+        let map = Arc::new(WaiterMap::new());
+        let branch = key("db", "main");
+        let other = key("db", "other");
+        let mut a = map.arm_submission(cid(1), branch.clone(), None);
+        let mut b = map.arm_submission(cid(1), branch.clone(), None);
+        let mut c = map.arm_submission(cid(1), other.clone(), None);
+        map.bind_submission(&cid(1), &other, None, 3);
+        map.bind_submission(&cid(1), &branch, None, 1);
+        map.bind_submission(&cid(1), &branch, None, 2);
+        map.resolve_applied(1, receipt_at(11));
+        map.resolve_applied(2, receipt_at(22));
+        map.resolve_applied(3, receipt_at(33));
+        assert_t(&mut a, 11).await;
+        assert_t(&mut b, 22).await;
+        assert_t(&mut c, 33).await;
+        assert!(map.is_empty());
     }
 }

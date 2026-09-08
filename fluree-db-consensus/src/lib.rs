@@ -385,6 +385,17 @@ pub enum QueuedRequest {
 }
 
 impl QueuedRequest {
+    #[cfg(feature = "raft")]
+    pub(crate) fn set_submission_nonce(&mut self, nonce: [u8; 32]) {
+        match self {
+            Self::Transact(v) => v.submission_nonce = Some(nonce),
+            Self::Push(v) => v.submission_nonce = Some(nonce),
+            Self::Revert(v) => v.submission_nonce = Some(nonce),
+            Self::Merge(v) => v.submission_nonce = Some(nonce),
+            Self::Rebase(v) => v.submission_nonce = Some(nonce),
+        }
+    }
+
     /// Encode the envelope for content-addressed storage. The leader
     /// writes these bytes to CAS; the resulting `ContentId` becomes
     /// the `request_cid` in `QueueSubmission`.
@@ -431,14 +442,27 @@ impl QueuedRequest {
             QueuedRequest::Transact(t) => canonical_json_bytes(&t.body),
             // Push / Revert / Merge / Rebase envelopes carry only stable
             // fields (content-addressed commit ids, selection / strategy
-            // descriptors, branch names), so hashing the full envelope is
-            // equivalent to hashing the canonical body.
-            QueuedRequest::Push(p) => canonical_json_bytes(p),
-            QueuedRequest::Revert(r) => canonical_json_bytes(r),
-            QueuedRequest::Merge(m) => canonical_json_bytes(m),
-            QueuedRequest::Rebase(r) => canonical_json_bytes(r),
+            // descriptors, branch names), so the body is the envelope payload with
+            // only the per-attempt ownership nonce removed.
+            QueuedRequest::Push(p) => canonical_envelope_body_bytes(p),
+            QueuedRequest::Revert(r) => canonical_envelope_body_bytes(r),
+            QueuedRequest::Merge(m) => canonical_envelope_body_bytes(m),
+            QueuedRequest::Rebase(r) => canonical_envelope_body_bytes(r),
         }
     }
+}
+
+/// Normalize transient ownership metadata on non-transact envelopes too.
+#[cfg(feature = "raft")]
+fn canonical_envelope_body_bytes<T: Serialize>(
+    value: &T,
+) -> Result<Vec<u8>, QueuedRequestCodecError> {
+    let mut json = serde_json::to_value(value)?;
+    if let Some(object) = json.as_object_mut() {
+        object.remove("submission_nonce");
+    }
+    let canonical = crate::raft::state_machine::CanonicalValue::from(&json);
+    Ok(serde_json::to_vec(&canonical)?)
 }
 
 /// Serialize `value` to order-canonical bytes: project it through a
@@ -459,6 +483,10 @@ fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, QueuedReques
 /// and are rehydrated worker-side — they do not travel through CAS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedTransact {
+    /// Per-attempt ownership identity. Absent in legacy envelopes; excluded
+    /// from the idempotency body hash and all transaction semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_nonce: Option<[u8; 32]>,
     pub body: TransactionBody,
     pub txn_opts: TxnOpts,
     pub commit_opts: CommitOptsRequest,
@@ -483,6 +511,10 @@ pub struct QueuedTransact {
 /// the server can't recompute them via `ContentId::new(...)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedPush {
+    /// Per-attempt ownership identity. Absent in legacy envelopes; excluded
+    /// from the idempotency body hash and all transaction semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_nonce: Option<[u8; 32]>,
     pub commit_cids: Vec<CommitId>,
     pub blobs: HashMap<String, Vec<u8>>,
     pub governance: GovernanceOptions,
@@ -494,6 +526,10 @@ pub struct QueuedPush {
 /// don't duplicate them in the envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedRevert {
+    /// Per-attempt ownership identity. Absent in legacy envelopes; excluded
+    /// from the idempotency body hash and all transaction semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_nonce: Option<[u8; 32]>,
     pub selection: RevertSelection,
     pub strategy: ConflictStrategy,
 }
@@ -505,6 +541,10 @@ pub struct QueuedRevert {
 /// source's parent branch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedMerge {
+    /// Per-attempt ownership identity. Absent in legacy envelopes; excluded
+    /// from the idempotency body hash and all transaction semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_nonce: Option<[u8; 32]>,
     pub source_branch: String,
     pub target_branch: Option<String>,
     pub strategy: ConflictStrategy,
@@ -515,6 +555,10 @@ pub struct QueuedMerge {
 /// replayed commits).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedRebase {
+    /// Per-attempt ownership identity. Absent in legacy envelopes; excluded
+    /// from the idempotency body hash and all transaction semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_nonce: Option<[u8; 32]>,
     pub strategy: ConflictStrategy,
 }
 

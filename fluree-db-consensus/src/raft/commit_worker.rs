@@ -628,6 +628,7 @@ impl Worker {
         transact: QueuedTransact,
     ) -> Result<StagedOutcome, WorkerError> {
         let QueuedTransact {
+            submission_nonce: _,
             body,
             txn_opts,
             commit_opts,
@@ -801,6 +802,7 @@ impl Worker {
         use fluree_db_api::GuardedStagedCommit;
 
         let QueuedRevert {
+            submission_nonce: _,
             selection,
             strategy,
         } = revert;
@@ -880,6 +882,7 @@ impl Worker {
     /// catches up with the head we're about to publish.
     async fn process_push(&self, push: QueuedPush) -> Result<StagedOutcome, WorkerError> {
         let QueuedPush {
+            submission_nonce: _,
             commit_cids,
             blobs,
             governance,
@@ -955,6 +958,7 @@ impl Worker {
         use fluree_db_api::GuardedStagedCommit;
 
         let QueuedMerge {
+            submission_nonce: _,
             source_branch,
             target_branch,
             strategy,
@@ -1046,7 +1050,10 @@ impl Worker {
     /// pre-rebase head so the queue entry completes without
     /// observable mutation.
     async fn process_rebase(&self, rebase: QueuedRebase) -> Result<StagedOutcome, WorkerError> {
-        let QueuedRebase { strategy } = rebase;
+        let QueuedRebase {
+            submission_nonce: _,
+            strategy,
+        } = rebase;
         let ledger_name = self.ref_key.ledger_name.clone();
         let branch = self.ref_key.branch.clone();
         let StagedRebase {
@@ -1739,6 +1746,7 @@ mod tests {
 
     fn sample_transact_envelope() -> QueuedRequest {
         QueuedRequest::Transact(Box::new(QueuedTransact {
+            submission_nonce: None,
             body: TransactionBody::JsonLdInsert(json!({"@id": "ex:s", "ex:p": "ex:o"})),
             txn_opts: TxnOpts::default(),
             commit_opts: CommitOptsRequest::default(),
@@ -1749,10 +1757,72 @@ mod tests {
 
     fn sample_push_envelope() -> QueuedRequest {
         QueuedRequest::Push(Box::new(QueuedPush {
+            submission_nonce: None,
             commit_cids: vec![cid(5)],
             blobs: HashMap::new(),
             governance: GovernanceOptions::default(),
         }))
+    }
+
+    #[test]
+    fn submission_nonce_preserves_legacy_decode_and_body_identity_for_every_operation() {
+        let envelopes = vec![
+            sample_transact_envelope(),
+            sample_push_envelope(),
+            QueuedRequest::Revert(crate::QueuedRevert {
+                submission_nonce: None,
+                selection: fluree_db_api::RevertSelection::single(fluree_db_api::CommitRef::T(1)),
+                strategy: Default::default(),
+            }),
+            QueuedRequest::Merge(crate::QueuedMerge {
+                submission_nonce: None,
+                source_branch: "source".into(),
+                target_branch: Some("main".into()),
+                strategy: Default::default(),
+            }),
+            QueuedRequest::Rebase(crate::QueuedRebase {
+                submission_nonce: None,
+                strategy: Default::default(),
+            }),
+        ];
+        for mut envelope in envelopes {
+            let legacy = envelope.to_bytes().unwrap();
+            assert!(!String::from_utf8_lossy(&legacy).contains("submission_nonce"));
+            let body = envelope.canonical_body_bytes().unwrap();
+            let decoded = QueuedRequest::from_bytes(&legacy).unwrap();
+            assert_eq!(decoded.canonical_body_bytes().unwrap(), body);
+            envelope.set_submission_nonce([1; 32]);
+            let first = envelope.to_bytes().unwrap();
+            envelope.set_submission_nonce([2; 32]);
+            let second = envelope.to_bytes().unwrap();
+            assert_ne!(first, second);
+            for bytes in [first, second] {
+                assert_eq!(
+                    QueuedRequest::from_bytes(&bytes)
+                        .unwrap()
+                        .canonical_body_bytes()
+                        .unwrap(),
+                    body
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn releasing_one_attempt_preserves_an_identical_pending_envelope() {
+        use fluree_db_core::storage::{ContentStore, MemoryContentStore};
+        let store = MemoryContentStore::new();
+        let mut envelope = sample_transact_envelope();
+        envelope.set_submission_nonce([1; 32]);
+        let first = store
+            .put(ContentKind::Txn, &envelope.to_bytes().unwrap())
+            .await
+            .unwrap();
+        envelope.set_submission_nonce([2; 32]);
+        let bytes = envelope.to_bytes().unwrap();
+        let second = store.put(ContentKind::Txn, &bytes).await.unwrap();
+        store.release(&first).await.unwrap();
+        assert_eq!(store.get(&second).await.unwrap(), bytes);
     }
 
     #[test]

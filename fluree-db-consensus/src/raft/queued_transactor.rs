@@ -171,7 +171,7 @@ impl QueuedTransactor {
     ///   adapter's release channel.
     /// - `IdempotencyHit`/`IdempotencyFailed`: the cached record
     ///   points at a *prior* submission's envelope (unique
-    ///   timestamps per attempt mean retries hash to distinct
+    ///   ownership nonces per attempt mean retries hash to distinct
     ///   `request_cid`s). The freshly-written envelope for this
     ///   retry is unreferenced and released here.
     async fn submit_and_await(
@@ -182,6 +182,7 @@ impl QueuedTransactor {
     ) -> Result<SubmissionOutcome, SubmissionError> {
         let request_cid = args.request_cid.clone();
         let full_ledger_id = format!("{}:{}", args.ledger_id, args.branch);
+        let idempotency = args.idempotency.clone();
         let cmd = SmCommand::EnqueueCommand(args);
         let attempts_allowed = if retry_eligible { self.max_retries } else { 1 };
         // Arm interest *before* proposing. The queue_id does not exist
@@ -189,7 +190,9 @@ impl QueuedTransactor {
         // applies the enqueue and binds it — which is what lets a fast
         // worker's ApplyHead find a waiter, and what keeps followers
         // from tracking anything at all. Dropped on every return path.
-        let mut ticket = self.waiter_map.arm(request_cid.clone(), ref_key.clone());
+        let mut ticket =
+            self.waiter_map
+                .arm_submission(request_cid.clone(), ref_key.clone(), idempotency);
         let parked_since = std::time::Instant::now();
         for attempt in 0..attempts_allowed {
             let timer = crate::raft::timing::start();
@@ -254,8 +257,8 @@ impl QueuedTransactor {
                     // former-leader case is covered too: `ApplyHead`
                     // replicates to every node, so a waiter bound here
                     // resolves when the new leader's worker finishes it.
-                    // Displaced (a duplicate submission took the slot)
-                    // and a timeout that finds the entry gone are handled
+                    // An abandoned sender and a timeout that finds the
+                    // entry gone are handled
                     // the same: retry if eligible, error otherwise. A gone
                     // entry first gets `GONE_ENTRY_GRACE` for its outcome
                     // to land.
@@ -293,12 +296,15 @@ impl QueuedTransactor {
                     // The cached record points at the *original*
                     // submission's request_cid; the envelope we just
                     // wrote to CAS for this retry is unreferenced —
-                    // its timestamps differ from the cached one's,
+                    // its ownership nonce differs from the cached one's,
                     // so its content id won't dedup against the
                     // existing blob. Release it before returning so
                     // every idempotent retry doesn't leak one CAS
-                    // object per attempt.
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
+                    // object per attempt. An internal re-proposal reuses
+                    // the original envelope, which the cache still owns.
+                    if request_cid != record.request_cid {
+                        self.release_envelope(&full_ledger_id, &request_cid).await;
+                    }
                     return Ok(SubmissionOutcome::Cached(record));
                 }
                 SmResponse::IdempotencyFailed { record } => {
@@ -306,7 +312,9 @@ impl QueuedTransactor {
                     // record references the original envelope; the
                     // retry's envelope is orphaned and must be
                     // released.
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
+                    if request_cid != record.request_cid {
+                        self.release_envelope(&full_ledger_id, &request_cid).await;
+                    }
                     return Ok(SubmissionOutcome::CachedFailure(record));
                 }
                 SmResponse::BodyHashMismatch => {
@@ -453,7 +461,7 @@ impl QueuedTransactor {
         &self,
         ledger_name: String,
         branch: String,
-        envelope: QueuedRequest,
+        mut envelope: QueuedRequest,
         body_kind: BodyKind,
         idempotency_key: Option<&IdempotencyKey>,
     ) -> Result<SubmissionOutcome, SubmissionError> {
@@ -462,6 +470,10 @@ impl QueuedTransactor {
         let idempotency_cache_key =
             idempotency_key.map(|k| IdempotencyCacheKey::new(full_ledger_id.clone(), k.clone()));
 
+        // A timestamp is optional and is not a unique ownership token. A
+        // fresh nonce keeps this attempt's envelope distinct from every other
+        // pending/cached submission, so orphan release cannot delete theirs.
+        envelope.set_submission_nonce(rand::random());
         let bytes = envelope
             .to_bytes()
             .map_err(|e| SubmissionError::Execution {
@@ -578,6 +590,7 @@ impl Committer for QueuedTransactor {
         let mut commit_opts_request = CommitOptsRequest::from(&commit_opts);
         commit_opts_request.raw_txn_id = raw_txn_id;
         let envelope = QueuedRequest::Transact(Box::new(QueuedTransact {
+            submission_nonce: None,
             body,
             txn_opts,
             commit_opts: commit_opts_request,
@@ -631,6 +644,7 @@ impl Committer for QueuedTransactor {
         } = request;
 
         let envelope = QueuedRequest::Revert(QueuedRevert {
+            submission_nonce: None,
             selection,
             strategy,
         });
@@ -699,6 +713,7 @@ impl Committer for QueuedTransactor {
         };
 
         let envelope = QueuedRequest::Merge(QueuedMerge {
+            submission_nonce: None,
             source_branch: source_branch.clone(),
             target_branch,
             strategy,
@@ -747,7 +762,10 @@ impl Committer for QueuedTransactor {
             strategy,
         } = request;
 
-        let envelope = QueuedRequest::Rebase(QueuedRebase { strategy });
+        let envelope = QueuedRequest::Rebase(QueuedRebase {
+            submission_nonce: None,
+            strategy,
+        });
         let outcome = self
             .enqueue_and_await(
                 ledger_name,
@@ -822,6 +840,7 @@ impl Committer for QueuedTransactor {
         }
 
         let envelope = QueuedRequest::Push(Box::new(QueuedPush {
+            submission_nonce: None,
             commit_cids,
             blobs,
             governance,
