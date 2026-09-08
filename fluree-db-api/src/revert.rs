@@ -26,8 +26,9 @@ use crate::rebase::ConflictStrategy;
 use fluree_db_core::commit::{TxnMetaEntry, TxnMetaValue};
 use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::{
-    collect_dag_cids, load_commit_by_id, load_commit_envelope_by_id, trace_commits_by_id,
-    BranchedContentStore, CommitId, ConflictKey, ContentStore, NonEmpty,
+    collect_dag_cids, load_commit_by_id, load_commit_envelope_by_id,
+    trace_first_parent_commits_by_id, BranchedContentStore, CommitId, ConflictKey, ContentStore,
+    NonEmpty,
 };
 use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecordSnapshot;
@@ -765,7 +766,7 @@ async fn compute_conflict_keys<C: ContentStore + Clone + 'static>(
 ) -> Result<Vec<ConflictKey>> {
     // stop_at_t = oldest_t - 1 → include every commit with t >= oldest_t.
     let stop = oldest_t.saturating_sub(1);
-    let stream = trace_commits_by_id(store.clone(), head_id.clone(), stop);
+    let stream = trace_first_parent_commits_by_id(store.clone(), head_id.clone(), stop);
     futures::pin_mut!(stream);
 
     let mut reverted_keys: FxHashSet<ConflictKey> = FxHashSet::default();

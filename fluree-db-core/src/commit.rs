@@ -465,8 +465,12 @@ async fn load_commit_envelope_with_version<C: ContentStore + ?Sized>(
 /// Walk a commit DAG from a head CID, collecting `(t, ContentId)` pairs for
 /// all commits with `t > stop_at_t`, sorted by `t` descending.
 ///
-/// Each commit is visited exactly once. This is the building block for
-/// [`trace_commit_envelopes_by_id`] and [`trace_commits_by_id`].
+/// Each commit is visited exactly once, across **all** parent edges. This is
+/// the building block for [`trace_commit_envelopes_by_id`] and
+/// [`trace_commits_by_id`], and the right walk for reachability questions.
+/// It is the wrong walk for materializing state: `t` values from different
+/// branches share a numeric range but not a clock. Use
+/// [`collect_first_parent_cids`] for that.
 pub async fn collect_dag_cids<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
@@ -633,6 +637,70 @@ async fn walk_dag<C: ContentStore + ?Sized>(
     Ok((result, split_mode))
 }
 
+/// First-parent walk backing [`collect_first_parent_cids`] and
+/// [`collect_first_parent_cids_with_split_mode`].
+///
+/// Follows `parents[0]` only. On this lineage `t` is contiguous and strictly
+/// decreasing, so the result is already in reverse-topological order without
+/// a sort. A merge commit is visited (it carries the folded delta of the
+/// branch it merged); the merged branch's own commits are not.
+async fn walk_first_parent<C: ContentStore + ?Sized>(
+    store: &C,
+    head_id: &ContentId,
+    stop_at_t: i64,
+    capture_split_mode: bool,
+) -> Result<(Vec<(i64, ContentId)>, crate::ns_encoding::NsSplitMode)> {
+    let mut result = Vec::new();
+    let mut split_mode = crate::ns_encoding::NsSplitMode::default();
+    let mut next = Some(head_id.clone());
+
+    while let Some(cid) = next {
+        let envelope = load_commit_envelope_by_id(store, &cid).await?;
+        if envelope.t <= stop_at_t {
+            break;
+        }
+        if capture_split_mode {
+            if let Some(mode) = envelope.ns_split_mode {
+                split_mode = mode;
+            }
+        }
+        next = envelope.parent_ids().next().cloned();
+        result.push((envelope.t, cid));
+    }
+
+    Ok((result, split_mode))
+}
+
+/// Walk a branch's first-parent lineage from a head CID, collecting
+/// `(t, ContentId)` pairs for all commits with `t > stop_at_t`, newest first.
+///
+/// This is the walk for **materializing a branch's state**: loading novelty,
+/// building an index, replaying commits, or computing what a branch changed
+/// since a point on its own timeline. A merge commit already carries the
+/// folded flakes of the branch it merged, so its first-parent lineage is
+/// self-contained; descending into merge parents would replay the source
+/// branch's commits a second time, stamped with `t` values from *that*
+/// branch's clock. Use [`collect_dag_cids`] only for reachability questions
+/// (common ancestors, blob copying, packing, verification).
+pub async fn collect_first_parent_cids<C: ContentStore + ?Sized>(
+    store: &C,
+    head_id: &ContentId,
+    stop_at_t: i64,
+) -> Result<Vec<(i64, ContentId)>> {
+    let (cids, _split_mode) = walk_first_parent(store, head_id, stop_at_t, false).await?;
+    Ok(cids)
+}
+
+/// Like [`collect_first_parent_cids`], and also return the authoritative
+/// `NsSplitMode` for the lineage (see [`collect_dag_cids_with_split_mode`]).
+pub async fn collect_first_parent_cids_with_split_mode<C: ContentStore + ?Sized>(
+    store: &C,
+    head_id: &ContentId,
+    stop_at_t: i64,
+) -> Result<(Vec<(i64, ContentId)>, crate::ns_encoding::NsSplitMode)> {
+    walk_first_parent(store, head_id, stop_at_t, true).await
+}
+
 /// Stream commit envelopes from head backwards in reverse-topological order.
 ///
 /// Walks the commit DAG, yielding `(ContentId, CommitEnvelope)` pairs ordered
@@ -684,12 +752,36 @@ pub fn trace_commit_envelopes_by_id<C: ContentStore + Clone + 'static>(
 /// Stream commits from head backwards in reverse-topological order.
 ///
 /// Walks the commit DAG, yielding full [`Commit`] values ordered by
-/// descending `t`. Each commit is yielded exactly once. Handles merge
-/// commits with multiple parents.
+/// descending `t`. Each commit is yielded exactly once, across all parent
+/// edges. For state materialization use [`trace_first_parent_commits_by_id`].
 pub fn trace_commits_by_id<C: ContentStore + Clone + 'static>(
     store: C,
     head_id: ContentId,
     stop_at_t: i64,
+) -> impl Stream<Item = Result<Commit>> {
+    commits_stream(store, head_id, stop_at_t, false)
+}
+
+/// Stream commits along a branch's first-parent lineage, newest first.
+///
+/// The streaming counterpart of [`collect_first_parent_cids`]: yields full
+/// [`Commit`] values for every commit with `t > stop_at_t` on the lineage,
+/// never descending into merge parents.
+pub fn trace_first_parent_commits_by_id<C: ContentStore + Clone + 'static>(
+    store: C,
+    head_id: ContentId,
+    stop_at_t: i64,
+) -> impl Stream<Item = Result<Commit>> {
+    commits_stream(store, head_id, stop_at_t, true)
+}
+
+/// Shared body of the two commit streams: collect the CID list up front
+/// (DAG or first-parent), then load one full commit per yielded item.
+fn commits_stream<C: ContentStore + Clone + 'static>(
+    store: C,
+    head_id: ContentId,
+    stop_at_t: i64,
+    first_parent_only: bool,
 ) -> impl Stream<Item = Result<Commit>> {
     stream::unfold(
         None::<std::result::Result<std::vec::IntoIter<(i64, ContentId)>, ()>>,
@@ -700,10 +792,17 @@ pub fn trace_commits_by_id<C: ContentStore + Clone + 'static>(
                 let mut iter = match state {
                     Some(Ok(iter)) => iter,
                     Some(Err(())) => return None,
-                    None => match collect_dag_cids(&store, &head_id, stop_at_t).await {
-                        Ok(cids) => cids.into_iter(),
-                        Err(e) => return Some((Err(e), Some(Err(())))),
-                    },
+                    None => {
+                        let collected = if first_parent_only {
+                            collect_first_parent_cids(&store, &head_id, stop_at_t).await
+                        } else {
+                            collect_dag_cids(&store, &head_id, stop_at_t).await
+                        };
+                        match collected {
+                            Ok(cids) => cids.into_iter(),
+                            Err(e) => return Some((Err(e), Some(Err(())))),
+                        }
+                    }
                 };
 
                 let (_t, cid) = iter.next()?;
@@ -1523,5 +1622,95 @@ mod tests {
                 pair[1].t
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // First-parent walk tests
+    // -------------------------------------------------------------------------
+
+    /// Fixture shared by the first-parent tests:
+    ///   shared:   c1
+    ///   branch_a: c1 <- a2 <- a3
+    ///   branch_b: c1 <- b2
+    ///   merge:    m4 with parents [a3, b2]
+    /// Returns (m4, [c1, a2, a3], [b2]).
+    #[cfg(feature = "credential")]
+    async fn merge_fixture(
+        store: &MemoryContentStore,
+    ) -> (ContentId, Vec<ContentId>, Vec<ContentId>) {
+        let shared = store_chain(store, 1, 1, None, 1).await;
+        let branch_a = store_chain(store, 2, 2, Some(shared[0].clone()), 100).await;
+        let branch_b = store_chain(store, 2, 1, Some(shared[0].clone()), 200).await;
+        let merge_commit = Commit::new(4, vec![])
+            .with_merge_parents(vec![branch_a.last().unwrap().clone(), branch_b[0].clone()]);
+        let merge_id = store_commit(store, &merge_commit).await;
+        let mut lineage_a = shared;
+        lineage_a.extend(branch_a);
+        (merge_id, lineage_a, branch_b)
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn test_collect_first_parent_cids_skips_merge_parent() {
+        let store = MemoryContentStore::new();
+        let (merge_id, lineage_a, branch_b) = merge_fixture(&store).await;
+
+        let walked = collect_first_parent_cids(&store, &merge_id, 0)
+            .await
+            .unwrap();
+        let ts: Vec<i64> = walked.iter().map(|(t, _)| *t).collect();
+        assert_eq!(ts, vec![4, 3, 2, 1], "newest first, contiguous t");
+        let cids: Vec<&ContentId> = walked.iter().map(|(_, c)| c).collect();
+        assert_eq!(cids[0], &merge_id);
+        assert_eq!(cids[1], &lineage_a[2]);
+        assert_eq!(cids[2], &lineage_a[1]);
+        assert_eq!(cids[3], &lineage_a[0]);
+        assert!(
+            !cids.contains(&&branch_b[0]),
+            "the merged branch's own commit must not be visited"
+        );
+
+        // The DAG walk sees the same head and one more commit.
+        let dag = collect_dag_cids(&store, &merge_id, 0).await.unwrap();
+        assert_eq!(dag.len(), 5);
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn test_collect_first_parent_cids_stop_at_t() {
+        let store = MemoryContentStore::new();
+        let (merge_id, _, _) = merge_fixture(&store).await;
+
+        let walked = collect_first_parent_cids(&store, &merge_id, 2)
+            .await
+            .unwrap();
+        let ts: Vec<i64> = walked.iter().map(|(t, _)| *t).collect();
+        assert_eq!(ts, vec![4, 3]);
+
+        let none = collect_first_parent_cids(&store, &merge_id, 4)
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn test_trace_first_parent_commits_by_id_streams_lineage() {
+        use futures::StreamExt;
+
+        let store = MemoryContentStore::new();
+        let (merge_id, _, _) = merge_fixture(&store).await;
+
+        let commits: Vec<Commit> = trace_first_parent_commits_by_id(store.clone(), merge_id, 0)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let ts: Vec<i64> = commits.iter().map(|c| c.t).collect();
+        assert_eq!(ts, vec![4, 3, 2, 1]);
+        // Only the merge commit has two parents; nothing from branch_b streamed.
+        assert_eq!(commits[0].parents.len(), 2);
+        assert!(commits[1..].iter().all(|c| c.parents.len() <= 1));
     }
 }

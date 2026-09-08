@@ -10,7 +10,7 @@ use fluree_db_core::{
     range_with_overlay, ConflictKey, ContentId, Flake, IndexType, RangeMatch, RangeOptions,
     RangeTest, DEFAULT_GRAPH_ID,
 };
-use fluree_db_core::{trace_commits_by_id, Commit};
+use fluree_db_core::{trace_first_parent_commits_by_id, Commit};
 use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecordSnapshot;
 use fluree_db_novelty::compute_delta_keys;
@@ -859,7 +859,7 @@ async fn scan_branch_commits<C: fluree_db_core::ContentStore + Clone + 'static>(
     stop_at_t: i64,
     source_delta: &FxHashSet<ConflictKey>,
 ) -> Result<Vec<CommitSummary>> {
-    let stream = trace_commits_by_id(store, head_id, stop_at_t);
+    let stream = trace_first_parent_commits_by_id(store, head_id, stop_at_t);
     futures::pin_mut!(stream);
 
     let mut summaries = Vec::new();

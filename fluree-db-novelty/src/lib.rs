@@ -44,10 +44,11 @@ mod stats;
 
 pub use attachments::{AttachmentNovelty, ForwardRow, ReverseRow};
 pub use commit::{
-    collect_dag_cids, collect_dag_cids_with_split_mode, find_common_ancestor, load_commit_by_id,
-    load_commit_envelope_by_id, trace_commit_envelopes_by_id, trace_commits_by_id, Commit,
-    CommitEnvelope, CommonAncestor, TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES,
-    MAX_TXN_META_ENTRIES,
+    collect_dag_cids, collect_dag_cids_with_split_mode, collect_first_parent_cids,
+    collect_first_parent_cids_with_split_mode, find_common_ancestor, load_commit_by_id,
+    load_commit_envelope_by_id, trace_commit_envelopes_by_id, trace_commits_by_id,
+    trace_first_parent_commits_by_id, Commit, CommitEnvelope, CommonAncestor, TxnMetaEntry,
+    TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
 };
 pub use commit_flakes::{
     generate_commit_flakes, iso_to_epoch_ms_opt, stamp_graph_on_commit_flakes,

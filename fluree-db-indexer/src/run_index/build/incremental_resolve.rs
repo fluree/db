@@ -1195,14 +1195,15 @@ async fn walk_commit_chain_since(
         );
     }
 
-    // Fallback: DAG-aware serial traversal (handles merge commits with multiple
-    // parents). One envelope round-trip per commit to chase parent pointers.
-    let dag = fluree_db_core::collect_dag_cids(cs, head_id, from_t)
+    // Fallback: serial first-parent traversal. One envelope round-trip per
+    // commit to chase the parent pointer. A merge commit already carries its
+    // folded delta, so the merged branch's own commits are not visited.
+    let dag = fluree_db_core::collect_first_parent_cids(cs, head_id, from_t)
         .await
         .map_err(|e| IncrementalResolveError::CommitChain(e.to_string()))?;
     let dag_collect_ms = walk_started.elapsed().as_millis() as u64;
 
-    // collect_dag_cids returns (t, cid) sorted by t descending; reverse for chronological order.
+    // collect_first_parent_cids returns (t, cid) sorted by t descending; reverse for chronological order.
     let mut commits = Vec::with_capacity(dag.len());
     let mut cumulative_bytes: usize = 0;
     let fetch_started = Instant::now();
