@@ -152,3 +152,19 @@ entry. A short synchronous mutex makes binding and cancellation atomic without
 holding a lock during I/O or awaiting transaction work. Followers still retain no
 unsolicited outcomes. Qualification must compare every receipt to its replicated
 idempotency result, not only check that it names an existing unique commit.
+
+## Envelope cleanup and cancellation
+
+Envelope ownership lasts across internal proposal retries. Once an enqueue may
+have accepted a CID, a later rejection or leader change cannot authorize deleting
+it. Queue/cache lifecycle handles known referenced envelopes. A fresh duplicate
+that joins an existing request has its own nonce/CID; release those unused bytes
+only when the submission finishes, since an internal retry may still enqueue them.
+Canonical body encoding completes before the envelope upload.
+
+Cancellation or a fatal Raft error can leave an unknown proposal outcome. Retain
+those bytes rather than risk deleting a committed request. Cancellation removes
+local waiter interest, not replicated work. This is deliberately conservative:
+ambiguous unreferenced uploads and failed release calls can leave orphan objects;
+there is no general bounded orphan collector in this PR. Such a collector needs
+replicated reachability or safe ownership leases and is separate follow-up work.

@@ -155,30 +155,45 @@ impl QueuedTransactor {
     /// Envelope release rules:
     ///
     /// - State-machine rejections (`BodyHashMismatch`, `QueueFull`,
-    ///   `LedgerNotFound`, `LedgerRetracted`, unexpected variants):
-    ///   the propose was applied to a deterministic rejection, so
-    ///   the envelope is genuinely orphaned and released here.
+    ///   `LedgerNotFound`, `LedgerRetracted`): release only if no earlier
+    ///   proposal in this call may have referenced the envelope.
     /// - Raft-layer pre-commit errors (`ForwardToLeader`,
     ///   `ChangeMembershipError`): the propose never entered the
-    ///   replicated log; release.
+    ///   replicated log; the same earlier-proposal rule applies.
     /// - Raft-layer `Fatal`: ambiguous — the entry may have committed
     ///   to a majority before this node's loop crashed. Don't
-    ///   release: a worker on the new leader may still need to read
-    ///   the envelope. The idempotency-key eviction path sweeps it
-    ///   later if the entry never actually committed.
-    /// - `Enqueued`/`InFlight`: the envelope is owned by the queue;
-    ///   eviction / admin clear releases it via the state-machine
-    ///   adapter's release channel.
-    /// - `IdempotencyHit`/`IdempotencyFailed`: the cached record
-    ///   points at a *prior* submission's envelope (unique
-    ///   ownership nonces per attempt mean retries hash to distinct
-    ///   `request_cid`s). The freshly-written envelope for this
-    ///   retry is unreferenced and released here.
+    ///   release: a worker on the new leader may still need the envelope.
+    ///   Cancellation during a proposal is likewise ambiguous; retain the
+    ///   bytes. Unreferenced ambiguous submissions need future orphan GC.
+    /// - `Enqueued`: ownership passes to the replicated queue/cache. A later
+    ///   rejected internal retry must not release that envelope.
+    /// - Fresh `InFlight` and cached duplicates: their distinct envelope is
+    ///   unreferenced. Release only when this call finishes, because an
+    ///   internal retry may still propose it if the original entry disappears.
     async fn submit_and_await(
         &self,
         args: QueueSubmission,
         ref_key: RefKey,
         retry_eligible: bool,
+    ) -> Result<SubmissionOutcome, SubmissionError> {
+        let request_cid = args.request_cid.clone();
+        let full_ledger_id = format_ledger_id(&args.ledger_id, &args.branch);
+        let mut may_be_referenced = false;
+        let result = self
+            .propose_and_await(args, ref_key, retry_eligible, &mut may_be_referenced)
+            .await;
+        if !may_be_referenced {
+            self.release_envelope(&full_ledger_id, &request_cid).await;
+        }
+        result
+    }
+
+    async fn propose_and_await(
+        &self,
+        args: QueueSubmission,
+        ref_key: RefKey,
+        retry_eligible: bool,
+        may_be_referenced: &mut bool,
     ) -> Result<SubmissionOutcome, SubmissionError> {
         let request_cid = args.request_cid.clone();
         let full_ledger_id = format!("{}:{}", args.ledger_id, args.branch);
@@ -209,19 +224,9 @@ impl QueuedTransactor {
             }
             let response = match proposed {
                 Ok(response) => response,
-                // `ForwardToLeader` and `ChangeMembershipError` reject
-                // the propose before it enters the replicated log, so
-                // the envelope is genuinely orphaned and safe to
-                // release. `Fatal` is ambiguous: the entry may have
-                // committed to a majority before this node's local
-                // raft loop crashed, in which case some other node's
-                // worker is going to read the envelope. Leaving it in
-                // CAS is correct — the idempotency-key eviction path
-                // sweeps it later if the entry never actually
-                // committed, but releasing here would race against a
-                // worker on the new leader trying to read it.
+                // These API errors reject only this proposal. An earlier
+                // attempt in this call may already own the envelope.
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::Execution {
                         status: 503,
                         message: "raft node is not the leader; retry against the current leader"
@@ -229,13 +234,13 @@ impl QueuedTransactor {
                     });
                 }
                 Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::Execution {
                         status: 500,
                         message: format!("unexpected ChangeMembershipError on EnqueueCommand: {e}"),
                     });
                 }
                 Err(RaftError::Fatal(f)) => {
+                    *may_be_referenced = true;
                     return Err(SubmissionError::Execution {
                         status: 503,
                         message: format!(
@@ -245,6 +250,9 @@ impl QueuedTransactor {
                     });
                 }
             };
+            if matches!(&response.data, SmResponse::Enqueued { .. }) {
+                *may_be_referenced = true;
+            }
             match response.data {
                 SmResponse::Enqueued { .. } | SmResponse::InFlight { .. } => {
                     // The adapter bound the ticket while applying this
@@ -293,40 +301,20 @@ impl QueuedTransactor {
                     }
                 }
                 SmResponse::IdempotencyHit { record } => {
-                    // The cached record points at the *original*
-                    // submission's request_cid; the envelope we just
-                    // wrote to CAS for this retry is unreferenced —
-                    // its ownership nonce differs from the cached one's,
-                    // so its content id won't dedup against the
-                    // existing blob. Release it before returning so
-                    // every idempotent retry doesn't leak one CAS
-                    // object per attempt. An internal re-proposal reuses
-                    // the original envelope, which the cache still owns.
-                    if request_cid != record.request_cid {
-                        self.release_envelope(&full_ledger_id, &request_cid).await;
-                    }
+                    *may_be_referenced |= request_cid == record.request_cid;
                     return Ok(SubmissionOutcome::Cached(record));
                 }
                 SmResponse::IdempotencyFailed { record } => {
-                    // Same as `IdempotencyHit`: the cached failure
-                    // record references the original envelope; the
-                    // retry's envelope is orphaned and must be
-                    // released.
-                    if request_cid != record.request_cid {
-                        self.release_envelope(&full_ledger_id, &request_cid).await;
-                    }
+                    *may_be_referenced |= request_cid == record.request_cid;
                     return Ok(SubmissionOutcome::CachedFailure(record));
                 }
                 SmResponse::BodyHashMismatch => {
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::KeyCollision);
                 }
                 SmResponse::QueueFull { .. } => {
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::Overloaded);
                 }
                 SmResponse::LedgerNotFound { ledger_id } => {
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::Execution {
                         status: 404,
                         message: format!("ledger not found: {ledger_id}"),
@@ -338,14 +326,14 @@ impl QueuedTransactor {
                     // purge + re-create. 410 Gone matches the
                     // semantics — the resource existed, the client
                     // shouldn't retry with the same alias.
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::Execution {
                         status: 410,
                         message: format!("ledger retracted: {ledger_id}"),
                     });
                 }
                 other => {
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
+                    // Unknown responses cannot prove the envelope is unused.
+                    *may_be_referenced = true;
                     return Err(SubmissionError::Execution {
                         status: 500,
                         message: format!(
@@ -474,6 +462,7 @@ impl QueuedTransactor {
         // fresh nonce keeps this attempt's envelope distinct from every other
         // pending/cached submission, so orphan release cannot delete theirs.
         envelope.set_submission_nonce(rand::random());
+        let body_cid = Self::canonical_body_cid(&envelope)?;
         let bytes = envelope
             .to_bytes()
             .map_err(|e| SubmissionError::Execution {
@@ -502,7 +491,6 @@ impl QueuedTransactor {
             );
         }
 
-        let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();
         let args = QueueSubmission {
             ledger_id: ledger_name,
@@ -1246,6 +1234,264 @@ fn submission_error_from_abort(reason: AbortReason) -> SubmissionError {
 mod tests {
     use super::*;
     use crate::raft::state_machine::{PoisonReason, QueueEntry};
+
+    async fn ownership_fixture() -> (
+        tempfile::TempDir,
+        crate::raft::integration::RaftIntegration,
+        Arc<QueuedTransactor>,
+    ) {
+        use crate::raft::integration::{RaftBootstrapConfig, RaftIntegration};
+        let dir = tempfile::tempdir().unwrap();
+        let integration = RaftIntegration::bootstrap(RaftBootstrapConfig::new(1, dir.path()))
+            .await
+            .unwrap();
+        integration
+            .raft
+            .initialize(std::collections::BTreeMap::from([(
+                1,
+                crate::raft::ClusterNode::default(),
+            )]))
+            .await
+            .unwrap();
+        integration
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .state(openraft::ServerState::Leader, "ownership fixture leader")
+            .await
+            .unwrap();
+        for ledger in ["test/a", "test/b"] {
+            integration
+                .raft
+                .client_write(SmCommand::CreateLedger(
+                    crate::raft::state_machine::NewLedger {
+                        ledger_id: ledger.into(),
+                        branch: "main".into(),
+                        created_at_millis: 1,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let fluree = Arc::new(fluree_db_api::FlureeBuilder::memory().build_memory());
+        let transactor = Arc::new(
+            QueuedTransactor::new(
+                integration.raft.clone(),
+                fluree,
+                integration.waiter_map.clone(),
+                integration.shared_state.clone(),
+            )
+            .with_max_wait(Duration::from_millis(50)),
+        );
+        (dir, integration, transactor)
+    }
+
+    async fn stored_submission(
+        transactor: &QueuedTransactor,
+        ledger: &str,
+        bytes: &[u8],
+    ) -> QueueSubmission {
+        let full = format!("{ledger}:main");
+        let request_cid = transactor
+            .fluree
+            .content_store(&full)
+            .put(ContentKind::Txn, bytes)
+            .await
+            .unwrap();
+        QueueSubmission {
+            ledger_id: ledger.into(),
+            branch: "main".into(),
+            idempotency: Some(IdempotencyCacheKey::new(
+                full,
+                IdempotencyKey::new("same-key").unwrap(),
+            )),
+            request_cid,
+            body_cid: ContentId::new(ContentKind::Txn, b"same-body"),
+            body_kind: BodyKind::JsonLdInsert,
+            applied_at_millis: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_envelopes_are_released_without_touching_queued_or_cached_owners() {
+        use crate::raft::state_machine::StagedHead;
+        let (_dir, integration, transactor) = ownership_fixture().await;
+        // Identical keys in distinct ledgers must have independent ownership.
+        for ledger in ["test/a", "test/b"] {
+            let original = stored_submission(&transactor, ledger, b"original").await;
+            let ref_key = RefKey::new(ledger, "main");
+            assert!(transactor
+                .submit_and_await(original.clone(), ref_key.clone(), true)
+                .await
+                .is_err());
+            let store = transactor.fluree.content_store(&format!("{ledger}:main"));
+            assert_eq!(store.get(&original.request_cid).await.unwrap(), b"original");
+            let duplicate = stored_submission(&transactor, ledger, b"duplicate").await;
+            // No worker: both calls reach the wait ceiling while the original
+            // stays queued. Only the duplicate's unused bytes may be released.
+            assert!(transactor
+                .submit_and_await(duplicate.clone(), ref_key.clone(), true)
+                .await
+                .is_err());
+            assert!(store.get(&duplicate.request_cid).await.is_err());
+            assert_eq!(store.get(&original.request_cid).await.unwrap(), b"original");
+            let queue_id = integration.shared_state.read().await.queues[&ref_key][0].queue_id;
+            integration
+                .raft
+                .client_write(SmCommand::ApplyHead(StagedHead {
+                    ledger_id: ledger.into(),
+                    branch: "main".into(),
+                    queue_id,
+                    commit_id: ContentId::new(ContentKind::Commit, b"committed"),
+                    commit_t: 1,
+                    applied_at_millis: 3,
+                    tally: None,
+                    flake_count: 0,
+                }))
+                .await
+                .unwrap();
+            let cached = stored_submission(&transactor, ledger, b"cached retry").await;
+            assert!(matches!(
+                transactor
+                    .submit_and_await(cached.clone(), ref_key.clone(), true)
+                    .await
+                    .unwrap(),
+                SubmissionOutcome::Cached(_)
+            ));
+            assert!(store.get(&cached.request_cid).await.is_err());
+            // An internal re-proposal uses the original CID: the cached owner
+            // must survive that terminal return too.
+            assert!(matches!(
+                transactor
+                    .submit_and_await(original.clone(), ref_key, true)
+                    .await
+                    .unwrap(),
+                SubmissionOutcome::Cached(_)
+            ));
+            assert_eq!(store.get(&original.request_cid).await.unwrap(), b"original");
+        }
+        assert_eq!(integration.waiter_map.len(), 0);
+        integration.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_retains_accepted_envelope_and_rejection_releases_unused_envelope() {
+        let (_dir, integration, transactor) = ownership_fixture().await;
+        let original = stored_submission(&transactor, "test/a", b"cancelled caller").await;
+        let args = original.clone();
+        let submitter = transactor.clone();
+        let task = tokio::spawn(async move {
+            submitter
+                .submit_and_await(args, RefKey::new("test/a", "main"), true)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if integration
+                    .shared_state
+                    .read()
+                    .await
+                    .queues
+                    .get(&RefKey::new("test/a", "main"))
+                    .is_some_and(|q| !q.is_empty())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert_eq!(integration.waiter_map.len(), 0);
+        assert_eq!(
+            transactor
+                .fluree
+                .content_store("test/a:main")
+                .get(&original.request_cid)
+                .await
+                .unwrap(),
+            b"cancelled caller"
+        );
+        let rejected = stored_submission(&transactor, "missing", b"rejected").await;
+        assert!(transactor
+            .submit_and_await(rejected.clone(), RefKey::new("missing", "main"), true)
+            .await
+            .is_err());
+        assert!(transactor
+            .fluree
+            .content_store("missing:main")
+            .get(&rejected.request_cid)
+            .await
+            .is_err());
+        integration.raft.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_retry_preserves_prior_queue_ownership() {
+        use crate::raft::integration::{RaftBootstrapConfig, RaftIntegration};
+        let (_dir, integration, transactor) = ownership_fixture().await;
+        let original =
+            stored_submission(&transactor, "test/a", b"accepted before leadership loss").await;
+        let response = integration
+            .raft
+            .client_write(SmCommand::EnqueueCommand(original.clone()))
+            .await
+            .unwrap();
+        assert!(matches!(response.data, SmResponse::Enqueued { .. }));
+
+        // An uninitialized node gives a deterministic ForwardToLeader response.
+        // Seed the ownership learned from the actual successful enqueue above
+        // to exercise the same rejection path as a later internal proposal.
+        let follower_dir = tempfile::tempdir().unwrap();
+        let follower = RaftIntegration::bootstrap(RaftBootstrapConfig::new(2, follower_dir.path()))
+            .await
+            .unwrap();
+        let retry = QueuedTransactor::new(
+            follower.raft.clone(),
+            transactor.fluree.clone(),
+            follower.waiter_map.clone(),
+            follower.shared_state.clone(),
+        );
+        let mut may_be_referenced = true;
+        let result = retry
+            .propose_and_await(
+                original.clone(),
+                RefKey::new("test/a", "main"),
+                true,
+                &mut may_be_referenced,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(SubmissionError::Execution { status: 503, .. })
+        ));
+        assert!(may_be_referenced);
+        assert_eq!(
+            retry
+                .fluree
+                .content_store("test/a:main")
+                .get(&original.request_cid)
+                .await
+                .unwrap(),
+            b"accepted before leadership loss"
+        );
+        let fresh = stored_submission(&retry, "test/a", b"never accepted").await;
+        assert!(matches!(
+            retry
+                .submit_and_await(fresh.clone(), RefKey::new("test/a", "main"), true)
+                .await,
+            Err(SubmissionError::Execution { status: 503, .. })
+        ));
+        assert!(retry
+            .fluree
+            .content_store("test/a:main")
+            .get(&fresh.request_cid)
+            .await
+            .is_err());
+        follower.raft.shutdown().await.unwrap();
+        integration.raft.shutdown().await.unwrap();
+    }
 
     #[test]
     fn a_probe_timeout_on_a_live_entry_keeps_waiting() {
