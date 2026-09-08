@@ -107,3 +107,26 @@ WAL around it is unnecessary. Its current per-entry file syncs and per-batch dir
 sync remain the baseline; an append-oriented backend would be a separate measured
 optimization. Durable shared payload storage is still required before proposing
 references to those payloads.
+
+## Low-traffic worker loss
+
+The controlled three-node NFS qualification exposed a separate liveness defect:
+with the default 1000-entry healthy-lag window, losing the owner of an idle or
+lightly used branch did not make it worker-ineligible. The quorum retained the
+queue and prior accepted data, but new requests timed out until that node returned.
+
+Standard `RaftIntegration::bootstrap` now observes successful responses from the
+existing per-group Raft HTTP transport, including idle heartbeats. The leader's
+monitor combines those responses with replication lag: no responses for the
+configured `unreachable_after` (15 seconds by default) can trigger a replicated
+worker-eligibility change even at zero lag. New monitor instances receive a fresh
+grace period. Promotion requires fresh responses throughout the recovery window
+and acceptable replication lag. No extra health RPCs or log flushes are introduced
+on the transaction path. Eligibility changes still require Raft consensus; a
+minority cannot independently reassign work.
+
+Custom integrations built using `RaftIntegration::new` must share a `PeerActivity`
+observer between their HTTP network factory and `with_peer_activity` to obtain
+this transport-based detection. Without that observer, the legacy lag-only
+fallback remains. This does not diagnose an application worker that hangs while
+its Raft transport continues answering normally.

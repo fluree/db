@@ -215,7 +215,8 @@ impl EmbeddedRaftNode {
             Arc::clone(&integration.raft),
             integration.shared_state.clone(),
         )
-        .with_config(config.liveness);
+        .with_config(config.liveness)
+        .with_peer_activity(integration.peer_activity.clone());
         let extra = config.extra_leader_tasks;
         let leader_watcher =
             spawn_leader_watcher(Arc::clone(&integration.raft), integration.id, move || {

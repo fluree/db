@@ -51,9 +51,10 @@ use openraft::raft::{
 };
 use openraft::{AnyError, Raft};
 use serde::{de::DeserializeOwned, Serialize};
+use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const PATH_APPEND_ENTRIES: &str = "/append-entries";
 /// Client-write relay: a follower posts a command here on the LEADER's
@@ -156,6 +157,30 @@ impl Default for HttpClientConfig {
 // Factory + per-peer client
 // ============================================================================
 
+/// Successful Raft RPC responses observed by one group's network factory.
+/// Heartbeats update this even when no new log entries are being replicated.
+#[derive(Debug, Default)]
+pub struct PeerActivity {
+    responses: Mutex<HashMap<NodeId, Instant>>,
+}
+
+impl PeerActivity {
+    pub fn last_response(&self, peer: NodeId) -> Option<Instant> {
+        self.responses
+            .lock()
+            .expect("peer activity lock")
+            .get(&peer)
+            .copied()
+    }
+
+    fn record_response(&self, peer: NodeId) {
+        self.responses
+            .lock()
+            .expect("peer activity lock")
+            .insert(peer, Instant::now());
+    }
+}
+
 /// Factory for per-peer [`HttpRaftNetwork`] instances.
 ///
 /// Holds a shared `reqwest::Client` so all per-peer instances reuse a
@@ -163,6 +188,7 @@ impl Default for HttpClientConfig {
 pub struct HttpRaftNetworkFactory<C> {
     client: reqwest::Client,
     config: RaftTransportConfig,
+    peer_activity: Option<Arc<PeerActivity>>,
     /// `C` appears only in the trait impl, never in a field.
     _config: PhantomData<C>,
 }
@@ -173,6 +199,7 @@ impl<C> Clone for HttpRaftNetworkFactory<C> {
         Self {
             client: self.client.clone(),
             config: self.config.clone(),
+            peer_activity: self.peer_activity.clone(),
             _config: PhantomData,
         }
     }
@@ -193,8 +220,16 @@ impl<C> HttpRaftNetworkFactory<C> {
         Ok(Self {
             client,
             config,
+            peer_activity: None,
             _config: PhantomData,
         })
+    }
+
+    /// Observe successful RPC responses without issuing extra health requests.
+    /// Use a separate observer for each Raft group.
+    pub fn with_peer_activity(mut self, activity: Arc<PeerActivity>) -> Self {
+        self.peer_activity = Some(activity);
+        self
     }
 
     /// Construct from an externally-built client. Use when the
@@ -204,6 +239,7 @@ impl<C> HttpRaftNetworkFactory<C> {
         Self {
             client: client.0,
             config,
+            peer_activity: None,
             _config: PhantomData,
         }
     }
@@ -258,6 +294,7 @@ impl<C: FlureeRaftConfig> RaftNetworkFactory<C> for HttpRaftNetworkFactory<C> {
             client: self.client.clone(),
             config: self.config.clone(),
             target,
+            peer_activity: self.peer_activity.clone(),
             base_url: node.raft_addr.trim_end_matches('/').to_string(),
             _config: PhantomData,
         }
@@ -270,6 +307,7 @@ pub struct HttpRaftNetwork<C> {
     client: reqwest::Client,
     config: RaftTransportConfig,
     target: NodeId,
+    peer_activity: Option<Arc<PeerActivity>>,
     base_url: String,
     _config: PhantomData<C>,
 }
@@ -343,6 +381,11 @@ impl<C> HttpRaftNetwork<C> {
             ))))
         })?;
 
+        if outcome.is_ok() {
+            if let Some(activity) = &self.peer_activity {
+                activity.record_response(self.target);
+            }
+        }
         outcome
             .map_err(|w| RPCError::RemoteError(RemoteError::new(self.target, into_raft_error(w))))
     }
@@ -808,6 +851,83 @@ mod tests {
             mismatch,
         )));
         round_trip(&outcome);
+    }
+
+    #[tokio::test]
+    async fn peer_activity_requires_a_successful_decoded_rpc_response() {
+        let ok: Result<AppendEntriesResponse<NodeId>, Fatal<NodeId>> =
+            Ok(AppendEntriesResponse::Success);
+        let fatal: Result<AppendEntriesResponse<NodeId>, Fatal<NodeId>> = Err(Fatal::Stopped);
+        let ok_bytes = postcard::to_allocvec(&ok).unwrap();
+        let fatal_bytes = postcard::to_allocvec(&fatal).unwrap();
+        let app = Router::new()
+            .route(
+                "/ok",
+                post(move || {
+                    let bytes = ok_bytes.clone();
+                    async move { bytes }
+                }),
+            )
+            .route(
+                "/fatal",
+                post(move || {
+                    let bytes = fatal_bytes.clone();
+                    async move { bytes }
+                }),
+            )
+            .route("/malformed", post(|| async { vec![255u8] }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let activity = Arc::new(PeerActivity::default());
+        let factory = HttpRaftNetworkFactory::<()>::new(
+            RaftTransportConfig::default(),
+            &HttpClientConfig::default(),
+        )
+        .unwrap()
+        .with_peer_activity(Arc::clone(&activity));
+        let cloned = factory.clone();
+        let network = HttpRaftNetwork::<()> {
+            client: cloned.client,
+            config: cloned.config,
+            peer_activity: cloned.peer_activity,
+            target: 2,
+            base_url: format!("http://{addr}"),
+            _config: PhantomData,
+        };
+        assert!(activity.last_response(2).is_none());
+        let response = network
+            .post::<(), AppendEntriesResponse<NodeId>, std::convert::Infallible, Fatal<NodeId>>(
+                "/ok",
+                &(),
+                Duration::from_secs(1),
+                RaftError::Fatal,
+            )
+            .await;
+        assert!(response.is_ok());
+        let recorded = activity.last_response(2);
+        assert!(recorded.is_some());
+        assert!(activity.last_response(3).is_none());
+        for path in ["/fatal", "/malformed", "/missing"] {
+            let response = network
+                .post::<(), AppendEntriesResponse<NodeId>, std::convert::Infallible, Fatal<NodeId>>(
+                    path,
+                    &(),
+                    Duration::from_secs(1),
+                    RaftError::Fatal,
+                )
+                .await;
+            assert!(response.is_err());
+            assert_eq!(
+                activity.last_response(2),
+                recorded,
+                "failed RPC must not refresh liveness"
+            );
+        }
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]

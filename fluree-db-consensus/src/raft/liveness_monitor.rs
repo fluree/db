@@ -125,6 +125,8 @@ struct PeerTracker {
     /// Last `LogId` observed for this peer in the leader's
     /// replication metrics.
     last_observed_log: Option<LogId<NodeId>>,
+    first_contact_sample: Option<Instant>,
+    last_contact_observed: Option<Instant>,
     /// Wall-clock when this peer first showed unhealthy lag
     /// (its match log stuck while the leader's log grew past it).
     /// `None` while the peer is currently advancing on schedule.
@@ -167,6 +169,8 @@ impl PeerTracker {
     fn for_eligible_peer() -> Self {
         Self {
             last_observed_log: None,
+            first_contact_sample: None,
+            last_contact_observed: None,
             unreachable_since: None,
             recovering_since: None,
             last_proposed: None,
@@ -183,6 +187,8 @@ impl PeerTracker {
     fn for_ineligible_peer() -> Self {
         Self {
             last_observed_log: None,
+            first_contact_sample: None,
+            last_contact_observed: None,
             unreachable_since: None,
             recovering_since: None,
             last_proposed: Some(EligibilityProposal::Demote),
@@ -200,6 +206,7 @@ pub struct LivenessMonitor {
     raft: Arc<Raft<TypeConfig>>,
     shared_state: SharedState,
     config: LivenessConfig,
+    peer_activity: Option<Arc<fluree_raft_core::network::PeerActivity>>,
 }
 
 impl LivenessMonitor {
@@ -208,7 +215,18 @@ impl LivenessMonitor {
             raft,
             shared_state,
             config: LivenessConfig::default(),
+            peer_activity: None,
         }
+    }
+
+    /// Supplement replication distance with successful heartbeat/RPC responses.
+    /// `None` preserves the legacy lag-only behavior for custom transports.
+    pub fn with_peer_activity(
+        mut self,
+        activity: Option<Arc<fluree_raft_core::network::PeerActivity>>,
+    ) -> Self {
+        self.peer_activity = activity;
+        self
     }
 
     /// Override the threshold tuning.
@@ -299,6 +317,9 @@ impl LivenessMonitor {
                 self.config.max_healthy_lag,
                 now,
             );
+            if let Some(activity) = &self.peer_activity {
+                record_peer_contact(tracker, activity.last_response(peer_id), now, &self.config);
+            }
             let Some(proposal) = next_eligibility_proposal(tracker, now, &self.config) else {
                 continue;
             };
@@ -440,6 +461,32 @@ fn record_replication_progress(
         tracker.unreachable_since.get_or_insert(now);
         tracker.recovering_since = None;
     }
+}
+
+/// A missing peer can be fully caught up, or only one enqueue behind. Log
+/// distance alone therefore cannot detect loss of a branch owner. Use responses
+/// from the existing Raft RPCs, with a fresh grace period on monitor startup.
+fn record_peer_contact(
+    tracker: &mut PeerTracker,
+    last_response: Option<Instant>,
+    now: Instant,
+    config: &LivenessConfig,
+) {
+    let first = *tracker.first_contact_sample.get_or_insert(now);
+    let recent = last_response.filter(|seen| *seen >= first);
+    let last_seen = recent.unwrap_or(first);
+    if now.saturating_duration_since(last_seen) >= config.unreachable_after {
+        let since = tracker.unreachable_since.get_or_insert(last_seen);
+        *since = (*since).min(last_seen);
+        tracker.recovering_since = None;
+    } else if tracker.last_proposed == Some(EligibilityProposal::Demote)
+        && (recent.is_none() || last_response <= tracker.last_contact_observed)
+    {
+        // One stale response must not count as sustained recovery. Require
+        // fresh contact on each monitor sample through the recovery window.
+        tracker.recovering_since = None;
+    }
+    tracker.last_contact_observed = last_response;
 }
 
 /// Read the tracker's accumulated timers and the hysteresis flag,
@@ -594,6 +641,109 @@ mod tests {
             (None, _) => {}
         }
         proposal
+    }
+
+    #[test]
+    fn missing_heartbeat_demotes_at_zero_or_small_log_lag() {
+        let cfg = fast_config();
+        for leader_index in [5, 6] {
+            let t0 = Instant::now();
+            let mut tracker = PeerTracker::for_eligible_peer();
+            record_replication_progress(
+                &mut tracker,
+                Some(log_id(1, 5)),
+                Some(leader_index),
+                cfg.max_healthy_lag,
+                t0,
+            );
+            record_peer_contact(&mut tracker, Some(t0), t0, &cfg);
+            let later = t0 + cfg.unreachable_after;
+            record_replication_progress(
+                &mut tracker,
+                Some(log_id(1, 5)),
+                Some(leader_index),
+                cfg.max_healthy_lag,
+                later,
+            );
+            assert!(
+                tracker.unreachable_since.is_none(),
+                "lag-only detection misses this failure"
+            );
+            record_peer_contact(&mut tracker, Some(t0), later, &cfg);
+            assert_eq!(
+                next_eligibility_proposal(&tracker, later, &cfg),
+                Some(EligibilityProposal::Demote)
+            );
+        }
+    }
+
+    #[test]
+    fn live_idle_peer_is_not_demoted_and_new_monitor_gets_grace() {
+        let cfg = fast_config();
+        let t0 = Instant::now();
+        let mut tracker = PeerTracker::for_eligible_peer();
+        for i in 0..5 {
+            let now = t0 + cfg.unreachable_after * i;
+            record_replication_progress(
+                &mut tracker,
+                Some(log_id(1, 5)),
+                Some(5),
+                cfg.max_healthy_lag,
+                now,
+            );
+            record_peer_contact(&mut tracker, Some(now), now, &cfg);
+            assert_eq!(next_eligibility_proposal(&tracker, now, &cfg), None);
+        }
+        let mut fresh = PeerTracker::for_eligible_peer();
+        let now = t0 + cfg.unreachable_after * 10;
+        record_peer_contact(&mut fresh, Some(t0), now, &cfg);
+        assert_eq!(next_eligibility_proposal(&fresh, now, &cfg), None);
+        record_peer_contact(&mut fresh, Some(t0), now + cfg.unreachable_after, &cfg);
+        assert_eq!(
+            next_eligibility_proposal(&fresh, now + cfg.unreachable_after, &cfg),
+            Some(EligibilityProposal::Demote)
+        );
+    }
+
+    #[test]
+    fn promotion_requires_sustained_new_responses() {
+        let cfg = fast_config();
+        let t0 = Instant::now();
+        let mut tracker = PeerTracker::for_ineligible_peer();
+        for i in 0..4 {
+            let now = t0 + cfg.live_after * i;
+            record_replication_progress(
+                &mut tracker,
+                Some(log_id(1, 5)),
+                Some(5),
+                cfg.max_healthy_lag,
+                now,
+            );
+            record_peer_contact(&mut tracker, Some(t0), now, &cfg);
+            assert_ne!(
+                next_eligibility_proposal(&tracker, now, &cfg),
+                Some(EligibilityProposal::Promote)
+            );
+        }
+        for i in 0..=3 {
+            let now = t0 + cfg.unreachable_after * 2 + Duration::from_millis(10) * i;
+            record_replication_progress(
+                &mut tracker,
+                Some(log_id(1, 5)),
+                Some(5),
+                cfg.max_healthy_lag,
+                now,
+            );
+            record_peer_contact(&mut tracker, Some(now), now, &cfg);
+            assert_eq!(
+                next_eligibility_proposal(&tracker, now, &cfg),
+                if i == 3 {
+                    Some(EligibilityProposal::Promote)
+                } else {
+                    None
+                }
+            );
+        }
     }
 
     #[test]

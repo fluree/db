@@ -1423,3 +1423,54 @@ fn spawn_log_progress(
         }
     })
 }
+
+/// No artificial write stream and the production 1000-entry healthy-lag window:
+/// a fully caught-up dead worker must still be replaced using heartbeat evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn idle_worker_loss_is_detected_without_log_traffic() {
+    use fluree_db_consensus::raft::{ownership::owner, state_machine::RefKey};
+    let config = LivenessConfig {
+        sample_interval: Duration::from_millis(50),
+        unreachable_after: Duration::from_secs(1),
+        live_after: Duration::from_millis(500),
+        ..LivenessConfig::default()
+    };
+    let mut cluster = TestCluster::spawn_with_liveness(3, config).await;
+    cluster.bootstrap().await;
+    let leader = cluster.current_leader().await.unwrap();
+    let voters: BTreeSet<NodeId> = (1..=3).collect();
+    let (key, target) = (0..100)
+        .find_map(|i| {
+            let key = RefKey::new(format!("sparse-{i}"), "main");
+            let target = owner(&key, &voters).unwrap();
+            (target != leader).then_some((key, target))
+        })
+        .unwrap();
+    let ledger = key.ledger_id();
+    cluster.create_ledger(leader, &ledger).await;
+    cluster
+        .insert_subject(leader, &ledger, "before", "Before")
+        .await;
+    for node in &cluster.nodes {
+        cluster
+            .wait_for_names(node.node_id, &ledger, &["Before"], DEFAULT_TIMEOUT)
+            .await;
+    }
+    // Healthy idle peers keep answering heartbeats despite stationary log indexes.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(read_eligible_voters(&cluster, leader).await, voters);
+    cluster.shutdown_node(target).await;
+    // No create/progress-loop/transaction is submitted to force replication lag.
+    wait_for_voter_demoted(&cluster, leader, target, Duration::from_secs(5)).await;
+    cluster
+        .insert_subject(leader, &ledger, "after", "After")
+        .await;
+    for node in cluster.nodes.iter().filter(|n| n.is_alive()) {
+        cluster
+            .wait_for_names(node.node_id, &ledger, &["After", "Before"], DEFAULT_TIMEOUT)
+            .await;
+    }
+    for node in &mut cluster.nodes {
+        node.shutdown().await;
+    }
+}

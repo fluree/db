@@ -128,6 +128,7 @@ pub struct RaftIntegration {
     /// where the predecessor registry lives, and the marker file
     /// under the raft storage root that records a completed replay.
     adoption: Option<AdoptionPaths>,
+    pub(crate) peer_activity: Option<Arc<fluree_raft_core::network::PeerActivity>>,
 }
 
 /// Where a configured file-registry adoption reads from and how it
@@ -210,7 +211,19 @@ impl RaftIntegration {
             release_rx: Arc::new(Mutex::new(Some(release_rx))),
             ledger_manager,
             adoption: None,
+            peer_activity: None,
         }
+    }
+
+    /// Attach the per-group RPC observer used by a custom network factory.
+    /// `bootstrap` wires this automatically; custom integrations should attach
+    /// it to detect worker loss even when replication lag is zero or small.
+    pub fn with_peer_activity(
+        mut self,
+        activity: Arc<fluree_raft_core::network::PeerActivity>,
+    ) -> Self {
+        self.peer_activity = Some(activity);
+        self
     }
 
     /// Fill the state-machine adapter's late-binding ledger-cache
@@ -285,10 +298,12 @@ impl RaftIntegration {
 
         let http_client = raft_network::build_client(&config.network_config.http_client)?;
         let network_config = config.network_config.clone();
+        let peer_activity = Arc::new(fluree_raft_core::network::PeerActivity::default());
         let factory = HttpRaftNetworkFactory::with_client(
             http_client.clone(),
             config.network_config.transport,
-        );
+        )
+        .with_peer_activity(Arc::clone(&peer_activity));
 
         let raft = Raft::new(config.node_id, raft_cfg, factory, log, sm).await?;
 
@@ -308,6 +323,7 @@ impl RaftIntegration {
             },
             release_rx,
         );
+        integration.peer_activity = Some(peer_activity);
         integration.adoption = adoption;
         Ok(integration)
     }
