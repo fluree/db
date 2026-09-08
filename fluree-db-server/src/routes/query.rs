@@ -2320,6 +2320,7 @@ pub(crate) fn sparql_qc_opts(
         },
         policy: headers.policy.clone(),
         policy_values: policy_values_map,
+        server_identity: None,
         default_allow: headers.default_allow,
     })
 }
@@ -2649,6 +2650,7 @@ async fn execute_cypher_ledger(
         },
         policy: headers.policy.clone(),
         policy_values: policy_values_map,
+        server_identity: None,
         default_allow: headers.default_allow,
     };
 

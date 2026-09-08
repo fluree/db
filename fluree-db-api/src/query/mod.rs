@@ -39,6 +39,17 @@ pub struct QueryExecutionOptions {
     /// stringified child value never equals the parent key — is treated as
     /// dangling, so the templated IRI may not resolve to a real parent subject.
     pub trust_fk_refs: bool,
+    /// Auth-layer-verified identity of the caller, used only for
+    /// `f:overrideControl` (`f:IdentityRestricted`) checks on the query path.
+    ///
+    /// Query routes parse [`crate::GovernanceOptions`] from the request JSON
+    /// inside the API, and the reasoning / datalog override gate has no
+    /// governance struct at all, so this is how the verified identity travels
+    /// from the request boundary to those checks. The API stamps it onto every
+    /// `GovernanceOptions` it parses and reads it at the reasoning choke point.
+    /// Same contract as `GovernanceOptions::server_identity`: set by an auth
+    /// layer, never derived from the request body or headers.
+    pub server_identity: Option<String>,
     lifecycle_guard: Option<Arc<dyn Send + Sync + 'static>>,
 }
 
@@ -46,6 +57,8 @@ impl fmt::Debug for QueryExecutionOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QueryExecutionOptions")
             .field("cancellation", &self.cancellation)
+            .field("trust_fk_refs", &self.trust_fk_refs)
+            .field("server_identity", &self.server_identity)
             .field("has_lifecycle_guard", &self.lifecycle_guard.is_some())
             .finish()
     }
@@ -68,6 +81,14 @@ impl QueryExecutionOptions {
     /// crawl/browse path.
     pub fn with_trust_fk_refs(mut self, trust: bool) -> Self {
         self.trust_fk_refs = trust;
+        self
+    }
+
+    /// Attach the auth-layer-verified caller identity for override control.
+    /// See [`QueryExecutionOptions::server_identity`]. Only an auth layer
+    /// should call this.
+    pub fn with_server_identity(mut self, identity: impl Into<String>) -> Self {
+        self.server_identity = Some(identity.into());
         self
     }
 

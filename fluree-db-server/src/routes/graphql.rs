@@ -252,6 +252,7 @@ async fn policy_view(
         policy_class: (!headers.policy_class.is_empty()).then(|| headers.policy_class.clone()),
         policy: headers.policy.clone(),
         policy_values: headers.policy_values_map()?,
+        server_identity: None,
         default_allow: headers.default_allow,
     };
 

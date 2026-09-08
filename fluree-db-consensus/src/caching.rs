@@ -677,9 +677,11 @@ impl<C: Committer> CachingCommitter<C> {
 /// moka cache.
 ///
 /// Determinism notes:
-/// - Scalar fields (`identity`, `default_allow`) and the
-///   length-prefixed string list (`policy_class`) hash to stable
-///   bytes for a given input.
+/// - Scalar fields (`identity`, `server_identity`, `default_allow`)
+///   and the length-prefixed string list (`policy_class`) hash to
+///   stable bytes for a given input. `server_identity` is included
+///   because two verified bearers impersonating the same target share
+///   an `identity` yet may resolve `f:overrideControl` differently.
 /// - `policy_values` keys are sorted before iteration so HashMap
 ///   iteration order doesn't perturb the digest.
 /// - `policy` and individual `policy_values` entries are
@@ -692,6 +694,14 @@ impl<C: Committer> CachingCommitter<C> {
 fn hash_governance(hasher: &mut Sha256, governance: &GovernanceOptions) {
     hasher.update(b"gov");
     match governance.identity.as_deref() {
+        Some(identity) => {
+            hasher.update([1u8]);
+            hasher.update((identity.len() as u64).to_le_bytes());
+            hasher.update(identity.as_bytes());
+        }
+        None => hasher.update([0u8]),
+    }
+    match governance.server_identity.as_deref() {
         Some(identity) => {
             hasher.update([1u8]);
             hasher.update((identity.len() as u64).to_le_bytes());
@@ -2136,6 +2146,56 @@ mod tests {
             .await
             .expect_err("retry with same body but different identity must collide");
 
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_collision_with_different_server_identity_errors() {
+        // `server_identity` is the auth-layer-verified DID that
+        // `f:overrideControl` gates on. Two submissions with the same
+        // body and the same policy `identity` can still resolve
+        // override control differently when the verified bearer
+        // differs (root impersonation of a shared target), so it must
+        // be part of the digest — including the None / Some edge.
+        let (_fluree, committer, ledger_id) = setup().await;
+        let body = sample_insert("alice");
+
+        // None vs Some.
+        let key = IdempotencyKey::new("01J5COLLIDE003").expect("test key fits cap");
+        committer
+            .transact(request(&ledger_id, Some(key.as_str()), body.clone()))
+            .await
+            .expect("first submission to succeed");
+        let mut req = request(&ledger_id, Some(key.as_str()), body.clone());
+        req.governance.server_identity = Some("did:example:admin".into());
+        let err = committer
+            .transact(req)
+            .await
+            .expect_err("retry with same body but a verified identity must collide");
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+
+        // Some(a) vs Some(b) with every other governance field equal. A
+        // verified identity alone is not a policy input, so the first
+        // submission commits without a policy context.
+        let key = IdempotencyKey::new("01J5COLLIDE004").expect("test key fits cap");
+        let mut first = request(&ledger_id, Some(key.as_str()), body.clone());
+        first.governance.server_identity = Some("did:example:root-a".into());
+        committer
+            .transact(first)
+            .await
+            .expect("first submission to succeed");
+        let mut second = request(&ledger_id, Some(key.as_str()), body);
+        second.governance.server_identity = Some("did:example:root-b".into());
+        let err = committer
+            .transact(second)
+            .await
+            .expect_err("retry with same body but different verified identity must collide");
         assert!(
             matches!(err, SubmissionError::KeyCollision),
             "expected KeyCollision, got {err:?}"

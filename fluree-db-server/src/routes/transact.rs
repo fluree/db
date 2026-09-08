@@ -1982,6 +1982,7 @@ async fn execute_turtle_transaction(
             },
             policy: headers.policy.clone(),
             policy_values: policy_values_map,
+            server_identity: None,
             default_allow: headers.default_allow,
         };
 
@@ -2068,6 +2069,7 @@ async fn execute_cypher_transact(
         },
         policy: headers.policy.clone(),
         policy_values: policy_values_map,
+        server_identity: None,
         default_allow: headers.default_allow,
     };
 
@@ -2317,6 +2319,7 @@ async fn execute_sparql_update_request(
         },
         policy: headers.policy.clone(),
         policy_values: policy_values_map,
+        server_identity: None,
         default_allow: headers.default_allow,
     };
 
