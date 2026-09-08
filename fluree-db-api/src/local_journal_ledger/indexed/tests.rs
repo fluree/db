@@ -24,11 +24,11 @@ async fn native_import_bootstrap_reads_writes_and_recovers_indexed_state() {
     let input = input_dir.path().join("people.ttl");
     std::fs::write(
         &input,
-        r#"
+        r"
 @prefix ex: <http://example.org/wal/> .
 ex:one a ex:User ; ex:value 10 ; ex:friend ex:two .
 ex:two a ex:User ; ex:value 20 .
-"#,
+",
     )
     .unwrap();
     let source = FlureeBuilder::file(source_dir.path().to_string_lossy().to_string())

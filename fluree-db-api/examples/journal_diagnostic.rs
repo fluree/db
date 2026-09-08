@@ -33,7 +33,7 @@ fn config() -> IndexConfig {
 }
 enum Engine {
     Wal(JournalLedger),
-    Ordinary(Fluree, LedgerHandle),
+    Ordinary(Box<Fluree>, LedgerHandle),
 }
 impl Engine {
     async fn open(mode: &str, root: &Path) -> Result<Self> {
@@ -44,7 +44,7 @@ impl Engine {
                     .without_indexing()
                     .build()?;
                 let h = f.ledger_cached(LEDGER).await?;
-                Self::Ordinary(f, h)
+                Self::Ordinary(Box::new(f), h)
             }
             _ => return Err("mode must be ordinary or wal".into()),
         })

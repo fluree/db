@@ -221,7 +221,7 @@ mod tests {
                 altered(valid, |c| c.parents.clear()),
                 altered(valid, |c| c.t += 1),
                 altered(valid, |c| {
-                    c.flakes[0].g = Some(fluree_db_core::Sid::new(0, "urn:graph"))
+                    c.flakes[0].g = Some(fluree_db_core::Sid::new(0, "urn:graph"));
                 }),
             ] {
                 let mut records = original.clone();
@@ -318,13 +318,13 @@ mod tests {
             json!({"f:cid":ContentId::new(ContentKind::IndexRoot,b"unsupported"),"f:t":1});
         bad_index.resulting_head = serde_json::to_vec(&h).unwrap();
         let mut missing = altered(t, |c| {
-            c.txn = Some(ContentId::new(ContentKind::Txn, b"missing"))
+            c.txn = Some(ContentId::new(ContentKind::Txn, b"missing"));
         });
         missing.objects.retain(|o| !o.key.contains("/txn/"));
         let bad_parent = altered(t, |c| c.parents.clear());
         let bad_time = altered(t, |c| c.t += 1);
         let bad_graph = altered(t, |c| {
-            c.flakes[0].g = Some(fluree_db_core::Sid::new(0, "urn:graph"))
+            c.flakes[0].g = Some(fluree_db_core::Sid::new(0, "urn:graph"));
         });
         let mut bad_bytes = t.clone();
         bad_bytes.objects[0].bytes.push(0);
