@@ -422,10 +422,29 @@ impl crate::Fluree {
             }
         };
 
-        // Best-effort: copy source's index into the target namespace
-        // (and, for fast-forward, publish the index ref too). Errors
-        // here only warn — the target can rebuild from commits.
-        if let Some((index_cid, index_t)) = source_index_for_publish {
+        // Best-effort: copy source's index artifacts into the target
+        // namespace. Errors here only warn — the target can rebuild from
+        // commits.
+        //
+        // The source's index ROOT is deliberately not published as the
+        // target's. A root carries `graph_iris`, the g_id → IRI table the
+        // registry is re-seeded from, and those IRIs are branch-qualified:
+        // slot 1 is `urn:fluree:{ledger}:{branch}#txn-meta` and slot 2
+        // `…#config`. Publishing the source's root therefore relabels the
+        // target's reserved slots with the SOURCE branch's names, and since
+        // the config graph is resolved by slot (`CONFIG_GRAPH_ID = 2`), the
+        // target reads the source's empty config and reports itself
+        // ungoverned — while its real config is displaced to a user slot.
+        // The flakes are untouched (queries resolve by slot, so data and
+        // txn-meta still read correctly); it is the label table that is
+        // wrong, which is worse for being invisible to a data query.
+        //
+        // Leaving the target's own index ref alone costs a rebuild from
+        // commits — the same cost as any un-indexed write — and keeps the
+        // registry the target created for itself. Adopting the root would
+        // need its `graph_iris` rewritten to the target's before publish;
+        // that is the optimisation, not the fix.
+        if let Some((index_cid, _index_t)) = source_index_for_publish {
             if let Err(e) = self
                 .copy_index_to_branch(&source_ledger_id, &target_id, &index_cid)
                 .await
@@ -434,14 +453,6 @@ impl crate::Fluree {
                     %e, source = %source_ledger_id, target = %target_id,
                     "failed to copy index during merge; target will rebuild from commits"
                 );
-            } else if fast_forward {
-                if let Err(e) = self
-                    .publisher()?
-                    .publish_index(&target_id, index_t, &index_cid)
-                    .await
-                {
-                    tracing::warn!(%e, "failed to publish index for merged target");
-                }
             }
         }
 

@@ -748,3 +748,158 @@ async fn merge_explicit_target_matches_parent() {
     let names = query_all_names(&fluree, "mydb:main").await;
     assert_eq!(names, vec!["Alice", "Bob"]);
 }
+
+// =============================================================================
+// Fast-forward merge keeps the target's own graph registry
+// =============================================================================
+
+/// The `f:defaultAllow` value a ledger's attached config resolves to, read
+/// the way the engine reads it: by the config graph's fixed slot.
+async fn resolved_default_allow(fluree: &support::MemoryFluree, ledger_id: &str) -> Option<bool> {
+    let view = fluree.db(ledger_id).await.unwrap();
+    view.ledger_config()
+        .and_then(|config| config.policy.as_ref())
+        .and_then(|policy| policy.default_allow)
+}
+
+/// Build and publish a real index root for `ledger_id`. The branch's
+/// pre-fork commits live in its source's namespace, so the rebuild needs
+/// the branch-aware store rather than the flat one the shared helper uses.
+async fn index_branch(fluree: &support::MemoryFluree, ledger_id: &str) {
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .unwrap()
+        .expect("branch is registered");
+    let store = fluree.branched_content_store(ledger_id).await.unwrap();
+    let built = fluree_db_indexer::rebuild_index_from_commits(
+        store,
+        ledger_id,
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("branch index rebuild");
+    fluree
+        .publisher()
+        .unwrap()
+        .publish_index(ledger_id, built.index_t, &built.root_id)
+        .await
+        .unwrap();
+}
+
+/// A fast-forward merge must not publish the source's index root as the
+/// target's. An index root carries `graph_iris`, the slot → IRI table the
+/// registry is re-seeded from, and those IRIs are branch-qualified: slot 1
+/// is `urn:fluree:{ledger}:{branch}#txn-meta`, slot 2 `…#config`. Adopting
+/// the branch's root relabelled main's reserved slots with the branch's
+/// names, and because the config graph is resolved by slot, main read the
+/// branch's empty config and reported itself ungoverned while its real
+/// config sat in a user slot. Data queries resolve by slot too, so they
+/// kept working — the corruption was only visible through the registry.
+#[tokio::test]
+async fn merge_fast_forward_keeps_target_graph_registry_and_config() {
+    use fluree_db_core::graph_registry::config_graph_iri;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let main_ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    // Govern main.
+    let config_iri = config_graph_iri("mydb:main");
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:policyDefaults <urn:config:policy> .
+            <urn:config:policy> f:defaultAllow false .
+        }}
+    "
+    );
+    fluree
+        .stage_owned(main_ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write");
+    assert_eq!(
+        resolved_default_allow(&fluree, "mydb:main").await,
+        Some(false),
+        "main is governed before the branch exists"
+    );
+
+    // Fork from an unindexed main, so the branch seeds its own registry
+    // under its own name, then give it a commit and a real index root.
+    fluree
+        .create_branch("mydb", "feature", None, None)
+        .await
+        .unwrap();
+    let feature_ledger = fluree.ledger("mydb:feature").await.unwrap();
+    fluree
+        .insert(
+            feature_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:bob", "ex:name": "Bob"}]
+            }),
+        )
+        .await
+        .unwrap();
+    index_branch(&fluree, "mydb:feature").await;
+
+    // Precondition for the regression: the branch's root labels its
+    // reserved slots with the BRANCH's IRIs. Without this the publish
+    // would be harmless and the assertions below vacuous.
+    let feature = fluree.ledger("mydb:feature").await.unwrap();
+    assert_eq!(
+        feature.snapshot.graph_registry.iri_for_graph_id(1),
+        Some("urn:fluree:mydb:feature#txn-meta")
+    );
+    assert_eq!(
+        feature.snapshot.graph_registry.iri_for_graph_id(2),
+        Some("urn:fluree:mydb:feature#config")
+    );
+
+    let report = fluree
+        .merge_branch("mydb", "feature", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(report.fast_forward, "main never advanced: {report:?}");
+
+    let main = fluree.ledger("mydb:main").await.unwrap();
+    assert_eq!(
+        main.snapshot.graph_registry.iri_for_graph_id(1),
+        Some("urn:fluree:mydb:main#txn-meta"),
+        "slot 1 must stay main's txn-meta, not the branch's"
+    );
+    assert_eq!(
+        main.snapshot.graph_registry.iri_for_graph_id(2),
+        Some("urn:fluree:mydb:main#config"),
+        "slot 2 must stay main's config — it is resolved by slot"
+    );
+    assert_eq!(
+        resolved_default_allow(&fluree, "mydb:main").await,
+        Some(false),
+        "main must still resolve its own config after the merge"
+    );
+
+    // And the merge still delivered the data.
+    assert_eq!(
+        query_all_names(&fluree, "mydb:main").await,
+        vec!["Alice", "Bob"]
+    );
+}
