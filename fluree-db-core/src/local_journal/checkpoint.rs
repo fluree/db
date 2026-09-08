@@ -43,7 +43,6 @@ pub(super) struct Binding<'a> {
     pub identity: [u8; 16],
     pub ledger: &'a str,
     pub generation: &'a str,
-    pub index_build: Option<[u8; 32]>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -54,8 +53,6 @@ struct Descriptor {
     ledger: String,
     generation: String,
     baseline: CheckpointSpec,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    index_build: Option<[u8; 32]>,
 }
 
 /// Verified, read-only prerequisite store for a trusted database embedding. No
@@ -146,7 +143,6 @@ impl Checkpoint {
             ledger: binding.ledger.into(),
             generation: binding.generation.into(),
             baseline: spec,
-            index_build: binding.index_build,
         };
         // Cap encoding too: no unbounded serialized inventory allocation.
         let mut encoded = BoundedManifest(Vec::new());
@@ -222,7 +218,6 @@ impl Checkpoint {
             || descriptor.identity != binding.identity
             || descriptor.ledger != binding.ledger
             || descriptor.generation != binding.generation
-            || descriptor.index_build != binding.index_build
         {
             return Err(Error::Invalid("checkpoint generation binding"));
         }

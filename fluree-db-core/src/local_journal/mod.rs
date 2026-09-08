@@ -32,7 +32,7 @@ pub use acceptance::{AcceptanceFrontier, AcceptanceValidator, AcceptanceView};
 mod checkpoint;
 pub use checkpoint::{Checkpoint, CheckpointEntry, CheckpointSpec};
 mod root;
-pub use root::{IndexBuildPin, LocalRoot, PreparedIndex};
+pub use root::LocalRoot;
 #[cfg(test)]
 mod tests;
 

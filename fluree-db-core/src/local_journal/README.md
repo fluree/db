@@ -294,42 +294,6 @@ and previous roots, source-head changes, unsupported metadata, new namespaces,
 context inheritance and failed indexed installation are covered. The imported index
 stays fixed; this is not the original medium index-on benchmark or a latency result.
 
-## Private durable index builds (publication still deferred)
-
-`LocalRoot::pin_index_build` captures a healthy accepted frontier while the embedding
-holds its LedgerState gate. The opaque `IndexBuildPin` retains root ownership without
-holding the acceptance mutex. `prepare` copies a strictly sorted inventory to a fresh
-`.fluree-wal/index-builds/<random>/checkpoint` directory using the checkpoint format's
-64 KiB stream buffer, hash/length checks and file/directory syncs. The trusted
-validator must check index CIDs, complete dependencies and the built-through input.
-
-The build descriptor binds the root identity, ledger/generation, exact input head and
-journal prefix digest. Its optional `index_build` field distinguishes staged builds
-from bootstrap checkpoints; ordinary descriptors omit it. A staged descriptor cannot
-be opened as a bootstrap checkpoint. The same inventory/object/total limits apply;
-index bytes stay outside the journal's 16 MiB record and 64 MiB total limits.
-
-`PreparedIndex` exposes listed bytes and physical revalidation for the same owner,
-with per-read checks and no raw-path capability. It retains its original input while
-newer commits proceed. Neither preparation nor verification changes the accepted
-head, journal or database read view. This is not a publication receipt or reusable
-semantic proof. Publication must validate under the acceptance gate and preserve
-newer commits; that operation is not implemented yet.
-
-Failures leave private files for inspection and permit a fresh-directory retry.
-Restart ignores staged files, including complete or corrupt abandoned builds. There
-is no reopen-by-path, promotion, cleanup or retirement API. Losing a handle requires
-rebuilding. There is no cumulative disk-growth bound across repeated abandoned
-builds, so this seam remains for controlled experiments. Streaming bounds the copy;
-an embedding's semantic validation or ContentStore may still buffer one object.
-
-Tests cover every instrumented staging cut with repeated restart/retry, newer commits
-during copy, concurrent builders, an object larger than the journal limit, source and
-manifest corruption, symlinked paths, foreign owners, purpose/prefix binding, and
-unresolved-writer recovery. The indexed API fixture also copies an actual validated
-native index while a real newer transaction commits. No indexer trigger or active
-index pointer is connected by this slice.
-
 ## Verification
 
 Core tests use the production append/recovery code with a deterministic I/O model:

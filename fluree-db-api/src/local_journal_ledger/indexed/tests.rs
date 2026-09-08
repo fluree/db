@@ -75,59 +75,11 @@ ex:two a ex:User ; ex:value 20 .
     // A second attachment replaces the owner's checkpoint handle; the first
     // adapter's proof remains valid because it binds the exact manifest digest.
     drop(JournalLedger::open(target_dir.path().into()).await.unwrap());
-    // Exercise private durable staging with a real, semantically validated
-    // imported index. A newer transaction must proceed while its files copy.
-    let mut baseline = None;
-    ledger
-        .0
-        .owner
-        .recover_with_checkpoint(|_, cp| {
-            baseline = cp;
-            Ok(())
-        })
-        .unwrap();
-    let baseline = baseline.unwrap();
-    let cache = ledger.ready().await.unwrap();
-    let pin = ledger.0.owner.pin_index_build().unwrap();
-    let pinned = pin.frontier().clone();
-    drop(cache);
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-    let build = tokio::task::spawn_blocking(move || {
-        let mut started = Some(started_tx);
-        pin.prepare(
-            baseline.entries().to_vec(),
-            |e| {
-                if let Some(started) = started.take() {
-                    started.send(()).unwrap();
-                    resume_rx.recv().unwrap();
-                }
-                Ok(std::io::Cursor::new(baseline.read(&e.key)?.unwrap()))
-            },
-            |staged| {
-                // This test duplicates a previously validated native index, so its
-                // exact inventory and head provide the semantic equivalence check.
-                assert_eq!(staged.head(), baseline.head());
-                assert_eq!(staged.entries(), baseline.entries());
-                Ok(())
-            },
-        )
-        .unwrap()
-    });
-    started_rx.await.unwrap();
     let accepted = ledger
         .transact(TxnType::Upsert, &json!({"@id":"ex:one","ex:value":11}))
         .await
         .unwrap()
         .unwrap();
-    let after_commit = ledger.0.owner.accepted_frontier().unwrap();
-    resume_tx.send(()).unwrap();
-    let prepared = build.await.unwrap();
-    assert_eq!(prepared.frontier(), &pinned);
-    assert_ne!(prepared.frontier(), &after_commit);
-    prepared.verify_for(&ledger.0.owner).unwrap();
-    assert_eq!(ledger.0.owner.accepted_frontier().unwrap(), after_commit);
-    drop(prepared);
     assert_eq!(
         ledger.query(&query).await.unwrap(),
         json!([["ex:one", 11], ["ex:two", 20]])
