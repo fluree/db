@@ -7,6 +7,7 @@ use fluree_db_core::local_journal::{
 use fluree_db_core::{FileStorage, StorageBackend, StorageRead};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io::Cursor;
 

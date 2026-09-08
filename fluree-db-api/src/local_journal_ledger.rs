@@ -1,8 +1,9 @@
 //! Bounded experimental WAL adapter for trusted, local JSON-LD and Cypher transactions.
 //!
 //! One unsigned default-graph ledger per root, initialized empty or bootstrapped
-//! from a quiescent local indexed source. The imported index stays fixed; no index
-//! publication, lifecycle/configuration changes, credentials, policy context or
+//! from a quiescent local indexed source. Independent index inputs and background
+//! in-memory adoption are supported; no automatic index publication/triggers,
+//! lifecycle/configuration changes, credentials, policy context or
 //! cluster API. Static imported IRI mappings are preserved. This is an embedded
 //! root-authority experiment, not a server backend. No underlying Fluree, cache,
 //! staged state or writable storage handle escapes. Raw transaction JSON is always
@@ -19,7 +20,7 @@ use fluree_db_core::{
 use fluree_db_nameservice::{NsRecord, RefValue};
 use fluree_db_transact::{CommitOpts, CommitReceipt, TxnType};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::local_journal_acceptance::{validate_linear, LinearCommitValidator};
@@ -28,6 +29,8 @@ mod cypher;
 #[cfg(test)]
 mod fixtures;
 mod indexed;
+mod indexing;
+pub use indexing::IndexInput;
 mod prefix;
 
 struct AdapterValidator<'a> {
@@ -111,6 +114,8 @@ pub struct CypherOutcome {
 }
 
 struct Cache {
+    committed: Option<RecoveryStore>,
+    index_storage: Option<Arc<dyn ContentStore>>,
     state: Option<LedgerState>,
     head: Option<Vec<u8>>,
     proof: Option<Arc<indexed::Proof>>,
@@ -150,6 +155,8 @@ impl JournalLedger {
             owner,
             cache: Arc::new(Mutex::new(Cache {
                 state: None,
+                committed: None,
+                index_storage: None,
                 head: None,
                 proof: None,
                 prefix: None,
@@ -182,6 +189,8 @@ impl JournalLedger {
         Ok(tokio::task::spawn_blocking(move || {
             // Keep the gate through cancellation and through failed installation.
             cache.state = None;
+            cache.committed = None;
+            cache.index_storage = None;
             cache.proof = None;
             cache.prefix = None;
             owner.recover_with_frontier(|records, checkpoint, frontier| {
@@ -207,6 +216,7 @@ impl JournalLedger {
                 let (record, head) =
                     recovered_head(owner.ledger(), records, checkpoint.as_deref())?;
                 // The store never reenters the root mutex and retains the root/cache leases.
+                cache.committed = Some(store.clone());
                 let mut state = runtime
                     .block_on(LedgerState::load_with_store(store.clone(), record))
                     .map_err(|_| {
@@ -408,8 +418,15 @@ impl JournalLedger {
                         let (receipt, mut state) = staged.finalize_state().map_err(|_| {
                             JournalError::Invalid("journal state finalization failed")
                         })?;
-                        state.ns_record =
-                            Some(ns_record(owner.ledger(), Some(&transition.resulting_head))?);
+                        // The journal head describes transaction authority. Preserve the
+                        // independently adopted query index in the effective in-memory record.
+                        let mut record =
+                            ns_record(owner.ledger(), Some(&transition.resulting_head))?;
+                        if let Some(effective) = state.ns_record.as_ref() {
+                            record.index_head_id = effective.index_head_id.clone();
+                            record.index_t = effective.index_t;
+                        }
+                        state.ns_record = Some(record);
                         // The existing provider's namespace fallback handles
                         // scans but not every bound/join path for a new namespace.
                         // Reattach from our verified store before ACK. This rare
@@ -436,6 +453,11 @@ impl JournalLedger {
                             view.frontier_after(journal_receipt),
                             owner.ledger(),
                         )?));
+                        // Extend the persistent read-only view only after successful state
+                        // installation. Detached index inputs keep their exact old prefix.
+                        let mut committed_store = cache.committed.clone().expect("ready content");
+                        committed_store.extend(&transition.objects);
+                        cache.committed = Some(committed_store);
                         cache.state = Some(state);
                         cache.head = Some(transition.resulting_head.clone());
                         committed = Some(receipt);
@@ -587,7 +609,7 @@ fn recovered_head(
 #[derive(Clone)]
 struct RecoveryStore {
     ledger: String,
-    objects: Arc<BTreeMap<String, Vec<u8>>>,
+    objects: imbl::OrdMap<String, Arc<Vec<u8>>>,
     checkpoint: Option<Arc<Checkpoint>>,
     _cache_dir: Arc<tempfile::TempDir>,
 }
@@ -602,17 +624,21 @@ impl RecoveryStore {
             ledger: ledger.into(),
             checkpoint,
             _cache_dir: cache_dir,
-            objects: Arc::new(
-                records
-                    .iter()
-                    .flat_map(|r| {
-                        r.transition
-                            .objects
-                            .iter()
-                            .map(|o| (o.key.clone(), o.bytes.clone()))
-                    })
-                    .collect(),
-            ),
+            objects: records
+                .iter()
+                .flat_map(|r| {
+                    r.transition
+                        .objects
+                        .iter()
+                        .map(|o| (o.key.clone(), Arc::new(o.bytes.clone())))
+                })
+                .collect(),
+        }
+    }
+    fn extend(&mut self, objects: &[Object]) {
+        for o in objects {
+            self.objects
+                .insert(o.key.clone(), Arc::new(o.bytes.clone()));
         }
     }
     fn bytes(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
@@ -621,7 +647,7 @@ impl RecoveryStore {
             .ok_or_else(|| fluree_db_core::Error::storage("unknown content kind"))?;
         let key = content_path(kind, &self.ledger, &id.digest_hex());
         let bytes = match self.objects.get(&key) {
-            Some(bytes) => Some(bytes.clone()),
+            Some(bytes) => Some(bytes.as_ref().clone()),
             None => self
                 .checkpoint
                 .as_ref()

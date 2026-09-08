@@ -143,6 +143,13 @@ fn rows(value: &Value) -> Vec<Value> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn indexed_frozen_cypher_corpus_preserves_annotations_and_external_acknowledgments() {
+    indexed_corpus(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn independent_indexes_preserve_cypher_annotations_and_recover_without_outputs() {
+    indexed_corpus(true).await;
+}
+async fn indexed_corpus(adopt: bool) {
     use crate::local_journal_ledger::fixtures::{OBSERVE, WRITES};
     use std::io::Write;
     if std::env::var_os("FLUREE_WAL_INDEXED_CORPUS_CHILD").is_none() {
@@ -241,6 +248,11 @@ async fn indexed_frozen_cypher_corpus_preserves_annotations_and_external_acknowl
         vec![json!([7])]
     );
     let mut state = source.ledger("indexed-cypher:main").await.unwrap();
+    let index_dir = tempfile::tempdir().unwrap();
+    let index_output = FlureeBuilder::file(index_dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
     let mut acks = Vec::new();
     for (i, (name, statement)) in WRITES.iter().enumerate() {
         let params =
@@ -261,6 +273,18 @@ async fn indexed_frozen_cypher_corpus_preserves_annotations_and_external_acknowl
             .await
             .unwrap();
         state = normal.ledger;
+        if adopt {
+            let input = ledger.index_input().await.unwrap();
+            let outputs = index_output.content_store("indexed-cypher:main");
+            let result = fluree_db_indexer::build_index_for_record(
+                input.with_index_storage(outputs.clone()),
+                input.record(),
+                input.configure_indexer(fluree_db_indexer::IndexerConfig::default()),
+            )
+            .await
+            .unwrap();
+            assert!(ledger.adopt_index(&result.root_id, outputs).await.unwrap());
+        }
         assert_eq!(
             result.result.as_ref().map(|v| rows(v).len()),
             normal_return.as_ref().map(|v| rows(v).len()),
@@ -344,21 +368,23 @@ async fn indexed_frozen_cypher_corpus_preserves_annotations_and_external_acknowl
     );
     {
         let cache = ledger.ready().await.unwrap();
-        assert_eq!(
-            cache
-                .state
-                .as_ref()
-                .unwrap()
-                .ns_record
-                .as_ref()
-                .unwrap()
-                .index_head_id
-                .as_ref(),
-            Some(root_id)
-        );
-        assert_eq!(cache.state.as_ref().unwrap().snapshot.t, imported.t);
+        let current = cache.state.as_ref().unwrap();
+        if adopt {
+            assert_ne!(
+                current.ns_record.as_ref().unwrap().index_head_id.as_ref(),
+                Some(root_id)
+            );
+            assert_eq!(current.snapshot.t, current.t());
+        } else {
+            assert_eq!(
+                current.ns_record.as_ref().unwrap().index_head_id.as_ref(),
+                Some(root_id)
+            );
+            assert_eq!(current.snapshot.t, imported.t);
+        }
     }
-    drop((ledger, state, source));
+    drop((ledger, state, source, index_output));
+    index_dir.close().unwrap();
     // Ordinary file recovery must preserve the same complete node identities.
     let reopened = FlureeBuilder::file(source_dir.path().to_string_lossy().to_string())
         .without_indexing()

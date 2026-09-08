@@ -176,8 +176,10 @@ an awaiting write cannot release its gate while the blocking flush/install runs.
 Independent adapter opens refresh their cached state when the accepted head changes.
 
 This is a trusted embedded adapter for an unsigned default-graph ledger, initialized
-empty or bootstrapped from a quiescent private ordinary file source with a fixed index. It exposes no general storage, nameservice, Fluree or cached-view handles.
-Named/config graph writes are rejected; online index publication, lifecycle, policy
+empty or bootstrapped from a quiescent private ordinary file source. The durable
+baseline index stays fixed; independent in-memory index adoption is described below.
+It exposes no general storage, nameservice, Fluree or cached-view handles.
+Named/config graph writes are rejected; durable index publication, lifecycle, policy
 contexts, encryption and cluster entrypoints are not exposed. Raw transaction JSON
 is always recorded; the adapter's 10 MB novelty backpressure limit also applies.
 Head identity and immutable content reads support response-loss reconciliation;
@@ -293,6 +295,54 @@ relationship properties. Actual dictionary/leaf corruption, missing annotation l
 and previous roots, source-head changes, unsupported metadata, new namespaces,
 context inheritance and failed indexed installation are covered. The imported index
 stays fixed; this is not the original medium index-on benchmark or a latency result.
+
+## Independent background indexing in the experimental adapter
+
+The coupled index staging/publication experiments were reverted. There is no index
+publication record in the transaction journal, no local-owner-bound build capability,
+and no index flush/validation under the transaction coordinator.
+
+`JournalLedger::index_input` captures the adapter's last installed accepted record,
+a persistent read-only content map and an immutable novelty handle. It does not
+refresh/recover the owner to obtain newer data from independently opened adapters.
+Subsequent reads never acquire the transaction/cache gate. `with_index_storage`
+connects the existing `build_index_for_record` indexer to separate artifact storage:
+only derived kinds may be written, while commit/raw/configuration reads always come
+from the captured accepted prefix. `configure_indexer` supplies attachment events
+from the pinned novelty with the existing Authoritative/Augment coverage rules.
+Content store implementations provide local or remote I/O; this adds no remote
+transport, credentials, publication service or background scheduling loop.
+
+`adopt_index` is an explicit background operation for a trusted indexer's output.
+It reads/hashes the artifact closure, reconstructs state at the captured current
+commit using the new index, and attaches dictionaries/providers outside the gate.
+A final `try_lock` checks that neither commit head nor active index changed, then
+swaps state. A busy gate or raced update returns false for later background retry;
+failed/cancelled work leaves transaction acceptance intact. Destruction of replaced
+state occurs after releasing the gate. There is no index-related I/O or await in
+the final swap. Index workers remain trusted for semantic correctness, as with
+ordinary IndexPublisher; hashes alone do not prove index equivalence to commits.
+
+The effective query index is separate from the immutable transaction-head fields.
+Later transactions preserve the adopted index in their in-memory record without
+changing the journal's baseline index pointer. Restart reconstructs from the retained
+bootstrap plus exact journal commits, even if every new index output has disappeared.
+The baseline's durable prerequisites remain required. This does not introduce new
+checkpoint retirement, index discovery/publication on restart, or automated rebuilding.
+
+FileStorage already selects PageCache durability for derived kinds. The new bridge
+preserves that policy, and an actual index-build test asserts zero artifact fsyncs.
+Tests pause real index output writes and adoption reads while transactions complete,
+exercise failed/cancelled/busy/raced adoption, reject corrupt leaves and prohibited
+writes, and replay the eight frozen Cypher cases with fresh index adoption, annotations
+and recovery after deleting all new outputs. This is correctness validation on small
+fixtures, not the original HTTP benchmark or a production backend integration.
+
+Input maps structurally share accepted bytes using the workspace's existing imbl
+collection. Retained index inputs/stores and loaded index caches still consume memory;
+sustained indexing costs, background retry policy and resource reclamation are not
+qualified. The next integration connects existing transaction/server paths and
+background notifications before rerunning the original medium HTTP/index-on suite.
 
 ## Verification
 
