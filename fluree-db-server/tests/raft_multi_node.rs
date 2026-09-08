@@ -625,7 +625,7 @@ async fn single_node_round_trip_via_http() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn happy_path_follower_forwards_to_leader() {
     init_test_tracing();
-    let cluster = TestCluster::spawn(CLUSTER_SIZE).await;
+    let mut cluster = TestCluster::spawn(CLUSTER_SIZE).await;
     cluster.bootstrap().await;
 
     let follower = cluster.pick_follower().await;
@@ -643,6 +643,10 @@ async fn happy_path_follower_forwards_to_leader() {
         cluster
             .wait_for_names(node.node_id, ledger, &["Alice", "Bob"], DEFAULT_TIMEOUT)
             .await;
+    }
+    // Stop replication before TempDir removes the log files.
+    for node in &mut cluster.nodes {
+        node.shutdown().await;
     }
 }
 

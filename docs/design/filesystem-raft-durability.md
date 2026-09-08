@@ -90,3 +90,20 @@ Throughput must improve without weakening durable acknowledgment, losing exact
 accepted identities/raw bytes, increasing unbounded replay/queue growth, or coupling
 indexing to transaction completion. Numeric targets for the Raft optimization should
 be pinned against its own measured baseline; the standalone benchmark is context.
+
+## Optional phase diagnostics
+
+Enable `RUST_LOG=info,fluree_raft_timing=debug` for a separate diagnostic run.
+The target records durations for shared queued-envelope writes, enqueue proposals,
+worker attempts, staging/persistence, shared commit blobs, head proposals and each
+node's Raft append batch. Disabled diagnostics avoid clocks and identity formatting.
+The phases nest and overlap across nodes; do not sum their medians into request
+latency. `ok` means the instrumented Rust call returned `Ok`, which does not by
+itself prove the state machine accepted a transaction. Early errors or cancellation
+can omit inner phase records. Use HTTP receipts and recovery checks as the oracle.
+
+The Raft log already serves as a write-ahead log for replicated decisions. A second
+WAL around it is unnecessary. Its current per-entry file syncs and per-batch directory
+sync remain the baseline; an append-oriented backend would be a separate measured
+optimization. Durable shared payload storage is still required before proposing
+references to those payloads.

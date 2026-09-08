@@ -192,7 +192,19 @@ impl QueuedTransactor {
         let mut ticket = self.waiter_map.arm(request_cid.clone(), ref_key.clone());
         let parked_since = std::time::Instant::now();
         for attempt in 0..attempts_allowed {
-            let response = match self.raft.client_write(cmd.clone()).await {
+            let timer = crate::raft::timing::start();
+            let proposed = self.raft.client_write(cmd.clone()).await;
+            if timer.is_some() {
+                crate::raft::timing::record(
+                    timer,
+                    "enqueue_proposal",
+                    &full_ledger_id,
+                    &request_cid.to_string(),
+                    0,
+                    proposed.is_ok(),
+                );
+            }
+            let response = match proposed {
                 Ok(response) => response,
                 // `ForwardToLeader` and `ChangeMembershipError` reject
                 // the propose before it enters the replicated log, so
@@ -456,6 +468,7 @@ impl QueuedTransactor {
                 status: 500,
                 message: format!("QueuedRequest encode failed: {e}"),
             })?;
+        let timer = crate::raft::timing::start();
         let request_cid = self
             .fluree
             .content_store(&full_ledger_id)
@@ -465,6 +478,17 @@ impl QueuedTransactor {
                 status: 500,
                 message: format!("QueuedRequest CAS write failed: {e}"),
             })?;
+
+        if timer.is_some() {
+            crate::raft::timing::record(
+                timer,
+                "shared_envelope",
+                &full_ledger_id,
+                &request_cid.to_string(),
+                bytes.len(),
+                true,
+            );
+        }
 
         let body_cid = Self::canonical_body_cid(&envelope)?;
         let retry_eligible = idempotency_cache_key.is_some();

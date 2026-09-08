@@ -147,3 +147,5 @@ pub(crate) fn current_millis() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+mod timing;

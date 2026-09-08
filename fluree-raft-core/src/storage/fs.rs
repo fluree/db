@@ -243,6 +243,8 @@ impl FsRaftLogStore {
 #[async_trait]
 impl RaftLogStore for FsRaftLogStore {
     async fn append(&self, entries: &[LogEntry]) -> Result<(), StorageError> {
+        let timer = tracing::enabled!(target: "fluree_raft_timing", tracing::Level::DEBUG)
+            .then(std::time::Instant::now);
         if let Some(first) = entries.first() {
             self.ensure_start(first.log_id.index).await?;
         }
@@ -260,6 +262,10 @@ impl RaftLogStore for FsRaftLogStore {
         }
         if !entries.is_empty() {
             fsync_dir(&self.log_dir()).await?;
+        }
+        if let Some(timer) = timer {
+            tracing::debug!(target: "fluree_raft_timing", phase = "raft_append", entries = entries.len(),
+                elapsed_us = timer.elapsed().as_micros() as u64, "raft_phase");
         }
         Ok(())
     }

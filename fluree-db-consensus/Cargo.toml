@@ -80,3 +80,7 @@ tempfile = "3.19"
 
 [lints]
 workspace = true
+
+[[example]]
+name = "raft_fixture_adopt"
+required-features = ["raft"]

@@ -332,6 +332,22 @@ impl Worker {
     }
 
     async fn try_advance_head(&self, entry: &QueueEntry) -> Result<(), WorkerError> {
+        let timer = crate::raft::timing::start();
+        let result = self.advance_head_timed(entry).await;
+        if timer.is_some() {
+            crate::raft::timing::record(
+                timer,
+                "worker_attempt",
+                &self.ref_key.ledger_id(),
+                &entry.queue_id.to_string(),
+                0,
+                result.is_ok(),
+            );
+        }
+        result
+    }
+
+    async fn advance_head_timed(&self, entry: &QueueEntry) -> Result<(), WorkerError> {
         let envelope = self.load_envelope(entry).await?;
         // The state machine doesn't introspect the envelope at enqueue
         // time, so the inline discriminator could disagree with what
@@ -339,6 +355,7 @@ impl Worker {
         // process under a kind the queue didn't declare.
         check_envelope_kind(entry.body_kind, &envelope)?;
 
+        let stage_timer = crate::raft::timing::start();
         let StagedOutcome { receipt, install } = match envelope {
             QueuedRequest::Transact(transact) => self.stage_and_persist(*transact).await?,
             QueuedRequest::Push(push) => self.process_push(*push).await?,
@@ -346,6 +363,16 @@ impl Worker {
             QueuedRequest::Merge(merge) => self.process_merge(merge).await?,
             QueuedRequest::Rebase(rebase) => self.process_rebase(rebase).await?,
         };
+        if stage_timer.is_some() {
+            crate::raft::timing::record(
+                stage_timer,
+                "stage_and_persist",
+                &self.ref_key.ledger_id(),
+                &entry.queue_id.to_string(),
+                0,
+                true,
+            );
+        }
         let commit_id = receipt.commit_id().clone();
         let commit_t = receipt.commit_t();
 
@@ -527,6 +554,7 @@ impl Worker {
         staged: &fluree_db_transact::StagedCommit,
         op: &str,
     ) -> Result<(), WorkerError> {
+        let timer = crate::raft::timing::start();
         let content_store = self.staging.fluree.content_store(ledger_id);
         for (cid, bytes) in &staged.referenced_bytes {
             content_store
@@ -534,10 +562,26 @@ impl Worker {
                 .await
                 .map_err(|e| stage_failure(&format!("{op} referenced blob write failed: {e}")))?;
         }
-        content_store
+        let result = content_store
             .put_with_id(commit_cid, &staged.commit_bytes)
             .await
-            .map_err(|e| stage_failure(&format!("{op} commit blob write failed: {e}")))
+            .map_err(|e| stage_failure(&format!("{op} commit blob write failed: {e}")));
+        if timer.is_some() {
+            crate::raft::timing::record(
+                timer,
+                "shared_commit_blobs",
+                ledger_id,
+                &commit_cid.to_string(),
+                staged.commit_bytes.len()
+                    + staged
+                        .referenced_bytes
+                        .values()
+                        .map(Vec::len)
+                        .sum::<usize>(),
+                result.is_ok(),
+            );
+        }
+        result
     }
 
     /// Install staged ledger state through the held write guard
@@ -1081,12 +1125,23 @@ impl Worker {
         commit_t: i64,
     ) -> Result<(), WorkerError> {
         let full_ledger_id = self.ref_key.ledger_id();
-        match self
+        let timer = crate::raft::timing::start();
+        let proposed = self
             .publishing
             .commits
             .publish_commit(&full_ledger_id, commit_t, &commit_id)
-            .await
-        {
+            .await;
+        if timer.is_some() {
+            crate::raft::timing::record(
+                timer,
+                "head_proposal",
+                &full_ledger_id,
+                &commit_id.to_string(),
+                0,
+                proposed.is_ok(),
+            );
+        }
+        match proposed {
             Ok(()) => Ok(()),
             // Terminal classifications from the publisher (notably
             // the leader-forwarded apply_staged_commit) route into
