@@ -1042,6 +1042,15 @@ fn finalize_state_with_base(
         }
     }
 
+    // Keep the cached record coherent with the accepted commit. Index and
+    // configuration fields still describe the independently loaded metadata;
+    // advancing the commit head requires no nameservice read or index work.
+    let mut ns_record = base.ns_record;
+    if let Some(record) = ns_record.as_mut() {
+        record.commit_head_id = Some(commit_cid.clone());
+        record.commit_t = new_t;
+    }
+
     let new_state = LedgerState {
         snapshot,
         novelty: new_novelty,
@@ -1053,7 +1062,7 @@ fn finalize_state_with_base(
         runtime_small_dicts,
         head_commit_id: Some(commit_cid.clone()),
         head_index_id: base.head_index_id,
-        ns_record: base.ns_record,
+        ns_record,
         binary_store: base.binary_store,
         spatial_indexes: base.spatial_indexes,
         head_temporal,

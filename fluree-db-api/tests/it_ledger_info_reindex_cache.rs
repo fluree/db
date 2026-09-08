@@ -101,3 +101,82 @@ async fn ledger_info_cache_busts_on_reindex_allow_equal() {
         "expected indexId to change after allow-equal reindex; got same indexId.\ninfo1={info1}\ninfo2={info2}"
     );
 }
+
+/// The HTTP metadata route builds from the cached state. Its commit metadata
+/// must advance immediately even while the independently maintained index lags.
+#[tokio::test]
+async fn cached_ledger_info_tracks_commits_without_waiting_for_indexing() {
+    use fluree_db_api::ledger_info::{build_ledger_info_for_connection, LedgerInfoOptions};
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let ledger_id = "it/cached-commit-info:main";
+    let initial = fluree.create_ledger(ledger_id).await.unwrap();
+    fluree
+        .insert(initial, &json!({"@id": "seed", "name": "seed"}))
+        .await
+        .unwrap();
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .unwrap();
+    let handle = fluree.ledger_cached(ledger_id).await.unwrap();
+    let indexed = handle.snapshot().await.to_ledger_state();
+    assert_eq!(indexed.t(), 1);
+    assert_eq!(indexed.index_t(), 1);
+    let baseline_record = indexed.ns_record.unwrap();
+
+    for n in 2..=3 {
+        let tx = json!({"@id": format!("node-{n}"), "name": format!("name-{n}")});
+        let result = fluree.stage(&handle).insert(&tx).execute().await.unwrap();
+        let receipt = result.receipt;
+        assert_eq!(receipt.t, n);
+        let cached = handle.snapshot().await.to_ledger_state();
+        assert_eq!(cached.t(), n);
+        assert_eq!(cached.index_t(), 1, "indexing is deliberately not running");
+        assert_eq!(cached.head_commit_id.as_ref(), Some(&receipt.commit_id));
+
+        let info =
+            build_ledger_info_for_connection(&fluree, &cached, None, LedgerInfoOptions::default())
+                .await
+                .unwrap();
+        assert_eq!(info["commitId"], receipt.commit_id.to_string());
+        assert_eq!(info["ledger"]["commit-t"], n, "cached metadata: {info}");
+        assert_eq!(info["ledger"]["index-t"], 1);
+        assert_eq!(info["nameservice"]["f:t"], n);
+        assert_eq!(
+            info["nameservice"]["f:ledgerCommit"]["@id"],
+            receipt.commit_id.to_string()
+        );
+
+        // All unrelated nameservice fields, especially the independent index
+        // pointer, retain the loaded record's values.
+        let mut expected = baseline_record.clone();
+        expected.commit_t = n;
+        expected.commit_head_id = Some(receipt.commit_id);
+        assert_eq!(cached.ns_record.as_ref(), Some(&expected));
+    }
+
+    // A later background-equivalent index adoption cannot revert commit metadata.
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .unwrap();
+    fluree
+        .refresh(ledger_id, fluree_db_api::RefreshOpts::default())
+        .await
+        .unwrap();
+    let caught_up = handle.snapshot().await.to_ledger_state();
+    assert_eq!(caught_up.index_t(), 3);
+    assert_eq!(caught_up.t(), 3);
+    let info =
+        build_ledger_info_for_connection(&fluree, &caught_up, None, LedgerInfoOptions::default())
+            .await
+            .unwrap();
+    assert_eq!(info["ledger"]["commit-t"], 3);
+    assert_eq!(info["ledger"]["index-t"], 3);
+    assert_eq!(info["nameservice"]["f:t"], 3);
+}
