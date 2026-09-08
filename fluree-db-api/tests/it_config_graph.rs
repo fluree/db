@@ -8,7 +8,7 @@
 use crate::support;
 use crate::support::genesis_ledger;
 use fluree_db_api::config_resolver;
-use fluree_db_api::{FlureeBuilder, GovernanceOptions};
+use fluree_db_api::{FlureeBuilder, GovernanceOptions, QueryExecutionOptions};
 use serde_json::json;
 
 /// Build the config graph IRI for a canonical ledger id.
@@ -4096,5 +4096,187 @@ async fn config_change_is_visible_to_the_next_read() {
         entailed_names_jsonld(&fluree, ledger_id).await,
         json!([]),
         "second read: the config write must invalidate what the first read cached"
+    );
+}
+
+// =============================================================================
+// f:IdentityRestricted override control, end to end on the query path
+// =============================================================================
+//
+// The identity `f:overrideControl` gates on is the auth-layer-verified
+// `QueryExecutionOptions::server_identity`, threaded from the request boundary
+// through query preparation. Nothing a caller writes in the body can stand in
+// for it. These drive the whole path and assert on the result shape: config
+// says `f:reasoningModes f:rdfs`, the query says `"reasoning": "none"`, so an
+// entailed row means the override was denied and no row means it was allowed.
+
+const REASONING_OVERRIDE_ADMIN_ONLY: &str = r"
+            <urn:config:reasoning> f:overrideControl <urn:config:oc> .
+            <urn:config:oc> f:controlMode f:IdentityRestricted .
+            <urn:config:oc> f:allowedIdentities <did:key:admin> .";
+
+fn reasoning_none_query(
+    ledger_id: Option<&str>,
+    opts: Option<serde_json::Value>,
+) -> serde_json::Value {
+    let mut query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?v",
+        "where": {"@id": "ex:alice", "ex:name": "?v"},
+        "reasoning": "none"
+    });
+    if let Some(ledger_id) = ledger_id {
+        query["from"] = json!(ledger_id);
+    }
+    if let Some(opts) = opts {
+        query["opts"] = opts;
+    }
+    query
+}
+
+/// Single-view path: the documented quickstart shape, over a bare view.
+async fn entailed_names_as(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    server_identity: Option<&str>,
+) -> serde_json::Value {
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state);
+    let mut options = QueryExecutionOptions::new();
+    if let Some(id) = server_identity {
+        options = options.with_server_identity(id);
+    }
+    let result = fluree
+        .query_with_options(&db, &reasoning_none_query(None, None), options)
+        .await
+        .expect("query");
+    result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld")
+}
+
+/// Connection (`from`) path, where the body's `opts` are parsed into
+/// `GovernanceOptions` inside the API.
+async fn entailed_names_connection_as(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    opts: Option<serde_json::Value>,
+    server_identity: Option<&str>,
+) -> serde_json::Value {
+    let mut options = QueryExecutionOptions::new();
+    if let Some(id) = server_identity {
+        options = options.with_server_identity(id);
+    }
+    let result = fluree
+        .query_connection_with_options(&reasoning_none_query(Some(ledger_id), opts), options)
+        .await
+        .expect("connection query");
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld")
+}
+
+#[tokio::test]
+async fn reasoning_override_identity_restricted_end_to_end() {
+    let ledger_id = "it/config-reasoning-identity-e2e:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        REASONING_OVERRIDE_ADMIN_ONLY,
+    )
+    .await;
+
+    assert_eq!(
+        entailed_names_as(&fluree, ledger_id, Some("did:key:admin")).await,
+        json!([]),
+        "the allow-listed verified identity may turn reasoning off"
+    );
+    assert_eq!(
+        entailed_names_as(&fluree, ledger_id, Some("did:key:other")).await,
+        json!(["Alice"]),
+        "a verified identity outside the allow-list is denied; config's rdfs wins"
+    );
+    assert_eq!(
+        entailed_names_as(&fluree, ledger_id, None).await,
+        json!(["Alice"]),
+        "an anonymous request is denied; config's rdfs wins"
+    );
+}
+
+/// The allow-listed DID written into the body as the policy `identity` is not
+/// a verified identity and must not unlock the override. `default-allow: true`
+/// keeps the policy wrap from hiding the row, so an empty result can only mean
+/// the override was permitted.
+#[tokio::test]
+async fn reasoning_override_ignores_body_identity() {
+    let ledger_id = "it/config-reasoning-identity-body:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        REASONING_OVERRIDE_ADMIN_ONLY,
+    )
+    .await;
+    let body_opts = json!({"identity": "did:key:admin", "default-allow": true});
+
+    assert_eq!(
+        entailed_names_connection_as(&fluree, ledger_id, Some(body_opts.clone()), None).await,
+        json!(["Alice"]),
+        "opts.identity naming the allow-listed DID must not authorize the override"
+    );
+    // Control: the same body with the verified identity present is permitted,
+    // so the assertion above is about the identity's provenance, not the body.
+    assert_eq!(
+        entailed_names_connection_as(&fluree, ledger_id, Some(body_opts), Some("did:key:admin"))
+            .await,
+        json!([]),
+        "the verified identity alongside the same body is permitted"
+    );
+    assert_eq!(
+        entailed_names_connection_as(&fluree, ledger_id, None, Some("did:key:admin")).await,
+        json!([]),
+        "connection path: the verified identity alone is permitted"
+    );
+}
+
+/// SPARQL shares the IR with JSON-LD; the pragma is the query-time override.
+#[tokio::test]
+async fn reasoning_override_identity_restricted_sparql() {
+    let ledger_id = "it/config-reasoning-identity-sparql:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        REASONING_OVERRIDE_ADMIN_ONLY,
+    )
+    .await;
+    let sparql = "# PRAGMA reasoning: none\nPREFIX ex: <http://example.org/>\n\
+                  SELECT ?v WHERE { ex:alice ex:name ?v }";
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state);
+
+    let rows = |result: fluree_db_api::QueryResult| {
+        let json = result
+            .to_sparql_json(&ledger_state.snapshot)
+            .expect("to_sparql_json");
+        support::normalize_sparql_bindings(&json)
+    };
+
+    let admin = fluree
+        .query_with_options(
+            &db,
+            sparql,
+            QueryExecutionOptions::new().with_server_identity("did:key:admin"),
+        )
+        .await
+        .expect("sparql as admin");
+    assert!(
+        rows(admin).is_empty(),
+        "the allow-listed verified identity may turn reasoning off (SPARQL)"
+    );
+
+    let anon = fluree
+        .query_with_options(&db, sparql, QueryExecutionOptions::new())
+        .await
+        .expect("sparql anonymous");
+    assert_eq!(
+        rows(anon).len(),
+        1,
+        "an anonymous SPARQL request is denied; config's rdfs wins"
     );
 }

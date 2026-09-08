@@ -1089,12 +1089,12 @@ impl Fluree {
     ///
     /// `server_identity` is the auth-layer-verified identity that
     /// `f:overrideControl` gates on. It is not `opts.identity`, which is the
-    /// caller-settable policy evaluation context. This is the one place the
-    /// identity reaches the config merges, so threading it from the request
-    /// boundary is a change to the two callers of
-    /// `apply_reasoning_to_executable`, not to this function. Until that is
-    /// done both pass `None`, under which `f:IdentityRestricted` denies every
-    /// override, the same as `f:OverrideNone`.
+    /// caller-settable policy evaluation context. On the query path it
+    /// travels as `QueryExecutionOptions::server_identity` from the request
+    /// boundary through `build_executable_for_view` /
+    /// `build_executable_for_dataset` to here. `None` is anonymous, which
+    /// `f:IdentityRestricted` denies; entry points with no execution options
+    /// (the CLI, internal probes) are anonymous by design.
     pub(crate) async fn complete_config_defaults(
         &self,
         view: &GraphDb,

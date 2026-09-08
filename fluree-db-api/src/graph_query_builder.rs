@@ -182,13 +182,16 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
                     // unfiltered. Gated on the request carrying a policy input, the
                     // same rule `apply_source_or_global_policy` uses: a request with
                     // none is unrestricted, exactly as for a native ledger.
-                    let opts = match self.core.input.as_ref() {
+                    let mut opts = match self.core.input.as_ref() {
                         Some(crate::view::QueryInput::JsonLd(json)) => {
                             crate::GovernanceOptions::from_json(json)
                                 .map_err(|e| ApiError::query(e.to_string()))?
                         }
                         _ => crate::GovernanceOptions::default(),
                     };
+                    // The body never carries the verified identity; it rides
+                    // the builder's execution options from the auth layer.
+                    opts.server_identity = self.core.execution.server_identity.clone();
                     if opts.has_any_policy_inputs() {
                         return self.graph.fluree.wrap_policy(db, &opts).await;
                     }

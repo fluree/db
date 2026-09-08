@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::query::helpers::{
     charge_query_floor, extract_sparql_dataset_spec, parse_and_validate_sparql, parse_dataset_spec,
-    tracked_query_tracker,
+    parse_dataset_spec_as, tracked_query_tracker,
 };
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
@@ -112,7 +112,8 @@ impl Fluree {
         query_json: &JsonValue,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let (spec, qc_opts) = parse_dataset_spec(query_json)?;
+        let (spec, qc_opts) =
+            parse_dataset_spec_as(query_json, options.server_identity.as_deref())?;
 
         if spec.is_empty() {
             return Err(ApiError::query(
@@ -151,7 +152,8 @@ impl Fluree {
         r2rml: Option<(&dyn R2rmlProvider, &dyn R2rmlTableProvider)>,
         options: QueryExecutionOptions,
     ) -> Result<(QueryResult, Option<DataSetDb>)> {
-        let (spec, qc_opts) = parse_dataset_spec(query_json)?;
+        let (spec, qc_opts) =
+            parse_dataset_spec_as(query_json, options.server_identity.as_deref())?;
 
         if spec.is_empty() {
             return Err(ApiError::query(
@@ -212,7 +214,8 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let (spec, qc_opts) = parse_dataset_spec(query_json)?;
+        let (spec, qc_opts) =
+            parse_dataset_spec_as(query_json, options.server_identity.as_deref())?;
 
         if spec.is_empty() {
             return Err(ApiError::query(
@@ -296,9 +299,10 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, qc_opts) = parse_dataset_spec(query_json).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
+        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_deref())
+            .map_err(|e| {
+                crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
+            })?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(
@@ -444,9 +448,10 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, qc_opts) = parse_dataset_spec(query_json).map_err(|e| {
-            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-        })?;
+        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_deref())
+            .map_err(|e| {
+                crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
+            })?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(
@@ -630,6 +635,7 @@ impl Fluree {
     /// Multi-ledger dataset specs are rejected — explain is single-ledger
     /// (consistent with [`Fluree::explain`] taking a `GraphDb`).
     pub async fn explain_connection(&self, query_json: &JsonValue) -> Result<JsonValue> {
+        // Explain carries no execution options: anonymous for override control.
         let (spec, qc_opts) = parse_dataset_spec(query_json)?;
 
         if spec.is_empty() {

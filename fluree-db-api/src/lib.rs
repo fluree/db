@@ -4398,7 +4398,11 @@ impl Fluree {
         };
         parsed.limit = None;
 
-        let executable = self.build_executable_for_view(probe_view, &parsed).await?;
+        // A delete-target existence probe is internal bookkeeping, not a caller
+        // request: it runs anonymous for override control by design.
+        let executable = self
+            .build_executable_for_view(probe_view, &parsed, None)
+            .await?;
         let batches = self
             .execute_view_internal(
                 probe_view,
