@@ -435,7 +435,7 @@ impl crate::Fluree {
             flakes: inverted,
             namespace_delta,
             graph_delta,
-        } = collect_from_commits(commits, |f| f.invert_at(0));
+        } = collect_from_commits(commits, |f| f.invert());
 
         // Acquire state under the ledger write lock when a manager is
         // available, serializing with regular transactions. Without a

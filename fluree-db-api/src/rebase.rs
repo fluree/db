@@ -800,7 +800,7 @@ impl crate::Fluree {
                     .into_iter()
                     .map(|flake| Flake {
                         op: false,
-                        t: 0, // overwritten by commit
+                        t: 0, // restamped by StagedLedger::new
                         ..flake
                     }),
             );

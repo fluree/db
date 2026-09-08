@@ -4,7 +4,7 @@
 //! Used by the merge and revert paths to bundle multiple source commits into
 //! a single new commit. The two paths differ only in how each commit's
 //! flakes are transformed before they're appended (identity for merge,
-//! `flake.invert_at(0)` for revert), so the loop body — and especially the
+//! `flake.invert()` for revert), so the loop body — and especially the
 //! `or_insert` semantics for the namespace and graph deltas — is shared.
 
 use fluree_db_core::{Commit, Flake};
@@ -29,7 +29,8 @@ pub(crate) struct CollectedCommitData {
 ///
 /// `flake_transform` is applied to every flake before it's appended. Use
 /// [`std::convert::identity`] to keep flakes as-is (merge), or
-/// `|f| f.invert_at(0)` to flip assertions ⇄ retractions (revert).
+/// `|f| f.invert()` to flip assertions ⇄ retractions (revert). Flake `t`
+/// is not a concern here: `StagedLedger::new` restamps every staged flake.
 pub(crate) fn collect_from_commits<I, F>(commits: I, mut flake_transform: F) -> CollectedCommitData
 where
     I: IntoIterator<Item = Commit>,

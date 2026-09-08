@@ -652,6 +652,10 @@ pub async fn build_commit(
     //    caller's responsibility; the value to stash in
     //    `expected_head_ref` is passed in.)
     let new_t = base.t() + 1;
+    debug_assert!(
+        flakes.iter().all(|f| f.t == new_t),
+        "staged flakes must carry the commit t (StagedLedger::new stamps them)"
+    );
     let flake_count = flakes.len();
 
     // Capture namespace delta once:
