@@ -14,11 +14,18 @@ use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::{collect_dag_cids, load_commit_by_id, CommonAncestor};
 use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore};
 use fluree_db_ledger::{LedgerState, StagedLedger};
-use fluree_db_nameservice::{NsRecord, NsRecordSnapshot};
+use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefValue};
 use fluree_db_novelty::compute_delta_keys;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
 use serde::Serialize;
 use tracing::Instrument;
+
+/// CAS attempts a fast-forward merge makes before reporting contention.
+///
+/// Matches the bulk importer's budget: both are a single ref advance
+/// competing only with other writers to the same branch head, and both would
+/// rather surface contention than spin.
+const FF_MERGE_CAS_RETRIES: usize = 5;
 
 /// Output of [`Fluree::prepare_merge`].
 ///
@@ -353,9 +360,64 @@ impl crate::Fluree {
             },
             None => {
                 // Fast-forward: advance target's HEAD to the source's head.
-                self.publisher()?
-                    .publish_commit(&target_id, new_head_t, &new_head_id)
-                    .await?;
+                //
+                // A ref-level fast-forward, NOT `publish_commit`. On a
+                // queue-backed nameservice (the raft data plane)
+                // `publish_commit`'s contract is "apply the staged queue
+                // front", and a fast-forward stages nothing on the target —
+                // so it failed with "per-branch queue is empty — nothing
+                // staged for this branch" on exactly the merges that need no
+                // work. The general path below stages a merge commit, which
+                // is why a DIVERGENT merge succeeded while a clean
+                // fast-forwardable one did not: the easier the merge, the
+                // surer the failure.
+                //
+                // `fast_forward_commit` carries the same strictly-newer
+                // semantics (`new.t > current.t`) that the file/S3
+                // nameservices give `publish_commit`, and every nameservice
+                // implements it via `RefPublisher` — the same reasoning, and
+                // the same call, that bulk import already uses in
+                // `publish_import_commit_head`.
+                let new_ref = RefValue {
+                    id: Some(new_head_id.clone()),
+                    t: new_head_t,
+                };
+                match self
+                    .publisher()?
+                    .fast_forward_commit(&target_id, &new_ref, FF_MERGE_CAS_RETRIES)
+                    .await?
+                {
+                    CasResult::Updated => {}
+                    // Idempotent re-run: the head is already exactly where
+                    // this merge wanted to put it.
+                    CasResult::Conflict { actual }
+                        if actual.as_ref().is_some_and(|a| {
+                            a.t == new_head_t && a.id.as_ref() == Some(&new_head_id)
+                        }) => {}
+                    CasResult::Conflict { actual } => {
+                        return Err(ApiError::internal(match actual.as_ref() {
+                            // `fast_forward_commit` reports the same
+                            // `Conflict` when its retry budget runs out with
+                            // the fast-forward still valid — contention, not
+                            // divergence.
+                            None => format!(
+                                "fast-forward merge into {target_id} gave up after contended \
+                                 CAS attempts: head is still unborn, wanted t={new_head_t}"
+                            ),
+                            Some(a) if a.t < new_head_t => format!(
+                                "fast-forward merge into {target_id} gave up after contended \
+                                 CAS attempts: head is at t={}, wanted t={new_head_t}",
+                                a.t
+                            ),
+                            Some(a) => format!(
+                                "fast-forward merge into {target_id} found a diverged head: \
+                                 head is t={} id={:?}, wanted t={new_head_t} id={new_head_id} \
+                                 — re-run the merge so it recomputes against the new head",
+                                a.t, a.id
+                            ),
+                        }));
+                    }
+                }
                 (new_head_t, new_head_id)
             }
         };
