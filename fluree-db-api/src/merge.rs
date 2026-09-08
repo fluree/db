@@ -14,18 +14,11 @@ use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::{collect_dag_cids, load_commit_by_id, CommonAncestor};
 use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore};
 use fluree_db_ledger::{LedgerState, StagedLedger};
-use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefValue};
+use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefKind, RefValue};
 use fluree_db_novelty::compute_delta_keys;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
 use serde::Serialize;
 use tracing::Instrument;
-
-/// CAS attempts a fast-forward merge makes before reporting contention.
-///
-/// Matches the bulk importer's budget: both are a single ref advance
-/// competing only with other writers to the same branch head, and both would
-/// rather surface contention than spin.
-const FF_MERGE_CAS_RETRIES: usize = 5;
 
 /// Output of [`Fluree::prepare_merge`].
 ///
@@ -142,10 +135,32 @@ impl crate::Fluree {
             let source_id = staged.source_id.clone();
             let target_id = staged.target_id.clone();
             let target_snapshot = staged.rollback_snapshot.clone();
+            let published_head = staged.new_head_id.clone();
 
             match self.apply_merge(staged).await {
                 Ok(report) => Ok(report),
                 Err(e) => {
+                    // Roll back only a head this merge advanced. A failure
+                    // before the publish — a fast-forward CAS that lost to a
+                    // concurrent writer included — leaves the target's head
+                    // to that writer; forcing the snapshot back over it
+                    // would orphan their commit.
+                    let head_is_ours = self
+                        .nameservice()
+                        .lookup(&target_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|r| r.commit_head_id.as_ref() == Some(&published_head));
+                    if !head_is_ours {
+                        tracing::warn!(
+                            source = %source_id,
+                            target = %target_id,
+                            error = %e,
+                            "merge failed before its head was published; nothing to roll back"
+                        );
+                        return Err(e);
+                    }
                     tracing::warn!(
                         source = %source_id,
                         target = %target_id,
@@ -324,8 +339,8 @@ impl crate::Fluree {
             conflict_count,
             strategy,
             commits_copied,
-            current_head_t: _,
-            current_head_id: _,
+            current_head_t,
+            current_head_id,
             new_head_t,
             new_head_id,
             commit,
@@ -361,30 +376,35 @@ impl crate::Fluree {
             None => {
                 // Fast-forward: advance target's HEAD to the source's head.
                 //
-                // A ref-level fast-forward, NOT `publish_commit`. On a
-                // queue-backed nameservice (the raft data plane)
-                // `publish_commit`'s contract is "apply the staged queue
-                // front", and a fast-forward stages nothing on the target —
-                // so it failed with "per-branch queue is empty — nothing
-                // staged for this branch" on exactly the merges that need no
-                // work. The general path below stages a merge commit, which
-                // is why a DIVERGENT merge succeeded while a clean
-                // fast-forwardable one did not: the easier the merge, the
-                // surer the failure.
+                // A ref-level CAS, NOT `publish_commit`. On a queue-backed
+                // nameservice (the raft data plane) `publish_commit`'s
+                // contract is "apply the staged queue front", and a
+                // fast-forward stages nothing on the target — so it failed
+                // with "per-branch queue is empty — nothing staged for this
+                // branch" on exactly the merges that need no work. The
+                // general path above stages a merge commit, which is why a
+                // DIVERGENT merge succeeded while a clean fast-forwardable
+                // one did not: the easier the merge, the surer the failure.
                 //
-                // `fast_forward_commit` carries the same strictly-newer
-                // semantics (`new.t > current.t`) that the file/S3
-                // nameservices give `publish_commit`, and every nameservice
-                // implements it via `RefPublisher` — the same reasoning, and
-                // the same call, that bulk import already uses in
-                // `publish_import_commit_head`.
+                // The CAS expects the head `prepare_merge` computed the
+                // fast-forward against. Fast-forward is an ancestry claim
+                // ("the target head is the common ancestor"), and a retrying
+                // `fast_forward_commit` only checks `t`-ordering: a commit
+                // that landed on the target after preparation would be
+                // silently orphaned by a source head with a larger `t`. The
+                // general path gets the same guard from its write lock and
+                // `expected_head_ref`; this is the fast-forward twin.
+                let expected = RefValue {
+                    id: current_head_id.clone(),
+                    t: current_head_t,
+                };
                 let new_ref = RefValue {
                     id: Some(new_head_id.clone()),
                     t: new_head_t,
                 };
                 match self
                     .publisher()?
-                    .fast_forward_commit(&target_id, &new_ref, FF_MERGE_CAS_RETRIES)
+                    .compare_and_set_ref(&target_id, RefKind::CommitHead, Some(&expected), &new_ref)
                     .await?
                 {
                     CasResult::Updated => {}
@@ -395,27 +415,15 @@ impl crate::Fluree {
                             a.t == new_head_t && a.id.as_ref() == Some(&new_head_id)
                         }) => {}
                     CasResult::Conflict { actual } => {
-                        return Err(ApiError::internal(match actual.as_ref() {
-                            // `fast_forward_commit` reports the same
-                            // `Conflict` when its retry budget runs out with
-                            // the fast-forward still valid — contention, not
-                            // divergence.
-                            None => format!(
-                                "fast-forward merge into {target_id} gave up after contended \
-                                 CAS attempts: head is still unborn, wanted t={new_head_t}"
-                            ),
-                            Some(a) if a.t < new_head_t => format!(
-                                "fast-forward merge into {target_id} gave up after contended \
-                                 CAS attempts: head is at t={}, wanted t={new_head_t}",
-                                a.t
-                            ),
-                            Some(a) => format!(
-                                "fast-forward merge into {target_id} found a diverged head: \
-                                 head is t={} id={:?}, wanted t={new_head_t} id={new_head_id} \
-                                 — re-run the merge so it recomputes against the new head",
-                                a.t, a.id
-                            ),
-                        }));
+                        let moved_to = actual.as_ref().map_or_else(
+                            || "an unknown head".to_string(),
+                            |a| format!("t={} id={:?}", a.t, a.id),
+                        );
+                        return Err(ApiError::BranchConflict(format!(
+                            "fast-forward merge into {target_id} lost a race: the head moved \
+                             from t={current_head_t} to {moved_to} while the merge was being \
+                             prepared — re-run the merge so it recomputes against the new head"
+                        )));
                     }
                 }
                 (new_head_t, new_head_id)
