@@ -1,6 +1,6 @@
 use super::*;
 use fluree_db_core::storage::{FileStorage, StorageContentStore};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 
@@ -41,6 +41,8 @@ struct Paused {
     entered: Notify,
     resume: Notify,
     fail: bool,
+    deny_roots: AtomicBool,
+    root_reads: AtomicUsize,
 }
 impl Paused {
     fn new(store: Arc<dyn ContentStore>, get: bool, put: bool, fail: bool) -> Arc<Self> {
@@ -51,6 +53,8 @@ impl Paused {
             entered: Notify::new(),
             resume: Notify::new(),
             fail,
+            deny_roots: AtomicBool::new(false),
+            root_reads: AtomicUsize::new(0),
         })
     }
     async fn pause(&self, flag: &AtomicBool) -> fluree_db_core::Result<()> {
@@ -70,6 +74,14 @@ impl ContentStore for Paused {
         self.store.has(id).await
     }
     async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+        if id.content_kind() == Some(ContentKind::IndexRoot) {
+            self.root_reads.fetch_add(1, Ordering::SeqCst);
+            if self.deny_roots.load(Ordering::SeqCst) {
+                return Err(fluree_db_core::Error::storage(
+                    "index root unavailable after adoption",
+                ));
+            }
+        }
         self.pause(&self.pause_get).await?;
         self.store.get(id).await
     }
@@ -178,7 +190,7 @@ async fn adoption_io_is_detached_races_retry_and_restart_needs_no_new_index() {
     );
     let before = std::fs::read(dir.path().join(".fluree-wal/journal")).unwrap();
     assert!(ledger
-        .adopt_index(&built.root_id, cs.clone())
+        .adopt_index(&built.root_id, pause.clone())
         .await
         .unwrap());
     assert_eq!(
@@ -195,9 +207,26 @@ async fn adoption_io_is_detached_races_retry_and_restart_needs_no_new_index() {
     );
     assert_eq!(value(&ledger).await, json!([[3]]));
     assert!(fresh.content().get(&third.commit.commit_id).await.is_err());
+    // An adopted index must not be reloaded for a namespace-only commit.
+    // Fail any new root read; normal transaction reads of indexed data remain
+    // available. The old reload workaround would fail after its durable append.
+    let roots_before = pause.root_reads.load(Ordering::SeqCst);
+    pause.deny_roots.store(true, Ordering::SeqCst);
+    let before_state = ledger.ready().await.unwrap().state.clone().unwrap();
     let fourth = ledger.transact(TxnType::Insert, &json!({
         "@id":"http://late.example/new", "http://late.example/friend":{"@id":"http://example.org/one"}, "http://late.example/label":"late string"
     })).await.unwrap().unwrap();
+    assert_eq!(pause.root_reads.load(Ordering::SeqCst), roots_before);
+    let after_state = ledger.ready().await.unwrap().state.clone().unwrap();
+    assert!(
+        Arc::ptr_eq(
+            &before_state.binary_store.as_ref().unwrap().0,
+            &after_state.binary_store.as_ref().unwrap().0,
+        ),
+        "namespace-only commit must retain the loaded index"
+    );
+    drop(before_state);
+    drop(after_state);
     let bound = json!({"select":["?id","?label"],"where":{"@id":"?id","http://late.example/friend":{"@id":"http://example.org/one"},"http://late.example/label":"?label"}});
     let expected_bound = json!([["http://late.example/new", "late string"]]);
     assert_eq!(ledger.query(&bound).await.unwrap(), expected_bound);

@@ -2613,6 +2613,14 @@ pub fn subject_probe_lane_plan(
     if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
         return Ok(ProbeLanePlan::Decline);
     }
+    // The store may encode a post-index namespace as an uncompressed SID.
+    // An empty overlay seek with that SID does not prove the predicate absent.
+    // Probes require a persisted p_id; otherwise let the snapshot-aware scan
+    // match novelty, without reloading or mutating the shared index store.
+    if store.sid_to_p_id(pred_sid).is_none() {
+        tracing::debug!("subject probe: predicate exists only in novelty; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
     let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
     else {
         tracing::debug!("subject probe: overlay flake translation failed; declining");
@@ -2620,10 +2628,6 @@ pub fn subject_probe_lane_plan(
     };
     if ops.is_empty() {
         return Ok(ProbeLanePlan::Clean);
-    }
-    if store.sid_to_p_id(pred_sid).is_none() {
-        tracing::debug!("subject probe: predicate exists only in novelty; declining");
-        return Ok(ProbeLanePlan::Decline);
     }
     if store
         .branch_for_order(ctx.binary_g_id, RunSortOrder::Psot)
@@ -2660,6 +2664,14 @@ pub fn object_probe_lane_plan(
     if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
         return Ok(ProbeLanePlan::Decline);
     }
+    // The store may encode a post-index namespace as an uncompressed SID.
+    // An empty overlay seek with that SID does not prove the predicate absent.
+    // Probes require a persisted p_id; otherwise let the snapshot-aware scan
+    // match novelty, without reloading or mutating the shared index store.
+    if store.sid_to_p_id(pred_sid).is_none() {
+        tracing::debug!("object probe: predicate exists only in novelty; declining");
+        return Ok(ProbeLanePlan::Decline);
+    }
     let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
     else {
         tracing::debug!("object probe: overlay flake translation failed; declining");
@@ -2667,10 +2679,6 @@ pub fn object_probe_lane_plan(
     };
     if ops.is_empty() {
         return Ok(ProbeLanePlan::Clean);
-    }
-    if store.sid_to_p_id(pred_sid).is_none() {
-        tracing::debug!("object probe: predicate exists only in novelty; declining");
-        return Ok(ProbeLanePlan::Decline);
     }
     if store
         .branch_for_order(ctx.binary_g_id, RunSortOrder::Opst)
@@ -2710,6 +2718,12 @@ pub fn star_probe_lane_plan(
     }
     let mut merged: Vec<fluree_db_binary_index::read::types::OverlayOp> = Vec::new();
     for pred_sid in pred_sids {
+        // Check before the overlay seek: a store-normalized SID may predate
+        // the snapshot's namespace allocation (see subject_probe_lane_plan).
+        if store.sid_to_p_id(pred_sid).is_none() {
+            tracing::debug!("star probe: predicate exists only in novelty; declining");
+            return Ok(ProbeLanePlan::Decline);
+        }
         let Some(ops) =
             cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
         else {
@@ -2718,10 +2732,6 @@ pub fn star_probe_lane_plan(
         };
         if ops.is_empty() {
             continue;
-        }
-        if store.sid_to_p_id(pred_sid).is_none() {
-            tracing::debug!("star probe: predicate exists only in novelty; declining");
-            return Ok(ProbeLanePlan::Decline);
         }
         merged.extend_from_slice(&ops);
     }

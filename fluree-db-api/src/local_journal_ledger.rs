@@ -397,9 +397,6 @@ impl JournalLedger {
                 },
             ],
         };
-        let runtime = tokio::runtime::Handle::current();
-        let cache_dir = self.0.cache_dir.clone();
-        let leaflet_cache = Arc::clone(self.0.engine.leaflet_cache());
         // The blocking task owns the cache gate through append, sync and install,
         // even if the awaiting request is dropped or its task is aborted.
         Ok(Some(
@@ -427,28 +424,9 @@ impl JournalLedger {
                             record.index_t = effective.index_t;
                         }
                         state.ns_record = Some(record);
-                        // The existing provider's namespace fallback handles
-                        // scans but not every bound/join path for a new namespace.
-                        // Reattach from our verified store before ACK. This rare
-                        // reload is intentionally conservative; optimizing it is
-                        // separate from the fixed-index correctness boundary.
-                        if crate::ns_helpers::binary_store_missing_snapshot_namespaces(&state) {
-                            let store = state.snapshot.content_store.clone().ok_or(
-                                JournalError::Invalid("missing owned indexed content store"),
-                            )?;
-                            runtime
-                                .block_on(crate::ledger_manager::load_and_attach_binary_store_from(
-                                    store,
-                                    &mut state,
-                                    cache_dir.path(),
-                                    Some(leaflet_cache),
-                                ))
-                                .map_err(|_| {
-                                    JournalError::Invalid(
-                                        "post-commit indexed namespace attachment failed",
-                                    )
-                                })?;
-                        }
+                        // Keep the already loaded index. Post-commit namespace changes
+                        // are resolved through the snapshot fallback; acknowledgment must
+                        // never reload derived artifacts or wait for index storage.
                         cache.prefix = Some(Arc::new(prefix::ValidatedPrefix::after_validation(
                             view.frontier_after(journal_receipt),
                             owner.ledger(),

@@ -411,3 +411,99 @@ async fn cached_handle_query_after_new_namespace_commit_still_works() {
 
     assert_eq!(jsonld, json!([["b:thing2", "Thing 2"]]));
 }
+
+// Predicate probes must not treat an empty seek in the OLD store's namespace
+// space as proof that a newly allocated predicate is absent from novelty.
+// Exercise the shared ordinary persistence/install paths, not only the WAL adapter.
+async fn new_namespace_joins_without_index_reload(cached: bool) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/ns-new-after-index-joins:main";
+    let initial = fluree.create_ledger(ledger_id).await.unwrap();
+    fluree
+        .insert(
+            initial,
+            &json!({
+                "@id":"http://example.org/one", "http://example.org/value":1
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .unwrap();
+    let handle = fluree.ledger_cached(ledger_id).await.unwrap();
+    let before = handle.snapshot().await.to_ledger_state();
+    let before_store = before.binary_store.clone().unwrap();
+    let body = json!({"@graph":[
+        {"@id":"http://late.example/new", "http://late.example/friend":{"@id":"http://example.org/one"}, "http://late.example/label":"late string"},
+        {"@id":"http://late.example/other", "http://late.example/label":"other string"}
+    ]});
+    let current = if cached {
+        fluree.stage(&handle).insert(&body).execute().await.unwrap();
+        handle.snapshot().await.to_ledger_state()
+    } else {
+        fluree.insert(before, &body).await.unwrap().ledger
+    };
+    assert!(std::sync::Arc::ptr_eq(
+        &before_store.0,
+        &current.binary_store.as_ref().unwrap().0
+    ));
+    assert_eq!(current.index_t(), 1);
+    assert_eq!(current.t(), 2);
+    let store = extract_binary_store_ref(&current.binary_store).unwrap();
+    assert!(store
+        .namespace_codes()
+        .values()
+        .all(|p| p != "http://late.example/"));
+
+    let star = json!({
+        "select":["?id","?label"],
+        "where":{"@id":"?id", "http://late.example/friend":{"@id":"http://example.org/one"}, "http://late.example/label":"?label"}
+    });
+    let expected = json!([["http://late.example/new", "late string"]]);
+    for state in [&current, &handle.snapshot().await.to_ledger_state()] {
+        let rows = support::query_jsonld_formatted(&fluree, state, &star)
+            .await
+            .unwrap();
+        assert_eq!(rows, expected);
+        let sparql = "SELECT ?s ?label WHERE { VALUES ?s { <http://late.example/new> } ?s <http://late.example/label> ?label . ?s <http://late.example/friend> ?friend . ?friend <http://example.org/value> 1 . }";
+        let rows = support::query_sparql(&fluree, state, sparql)
+            .await
+            .unwrap()
+            .to_jsonld_async(state.as_graph_db_ref(0))
+            .await
+            .unwrap();
+        assert_eq!(rows, expected);
+    }
+    // The same accepted facts survive a cold load, and a later independently
+    // built index must not change the answer.
+    let reloaded = fluree.ledger(ledger_id).await.unwrap();
+    assert_eq!(
+        support::query_jsonld_formatted(&fluree, &reloaded, &star)
+            .await
+            .unwrap(),
+        expected
+    );
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .unwrap();
+    let reindexed = fluree.ledger(ledger_id).await.unwrap();
+    assert_eq!(
+        support::query_jsonld_formatted(&fluree, &reindexed, &star)
+            .await
+            .unwrap(),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn owned_commit_preserves_new_namespace_joins_without_index_reload() {
+    new_namespace_joins_without_index_reload(false).await;
+}
+
+#[tokio::test]
+async fn cached_commit_preserves_new_namespace_joins_without_index_reload() {
+    new_namespace_joins_without_index_reload(true).await;
+}
