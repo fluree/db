@@ -1643,7 +1643,7 @@ impl BinaryScanOperator {
     /// own `overlay_window_for_range` and row filters remain the correctness
     /// backstop, exactly as they are for the whole-overlay product.
     ///
-    /// A bound OBJECT is deliberately NOT used to narrow, even on OPST — but
+    /// Literal objects are deliberately NOT used to narrow, even on OPST — but
     /// not because of cross-type numeric identity: `FlakeValue`'s `Ord` (and
     /// `PartialEq`) route both-numeric comparisons through `numeric_cmp`
     /// ("a number is a number", value.rs), so `Long(5)` and `Double(5.0)`
@@ -1660,7 +1660,8 @@ impl BinaryScanOperator {
     ///   NaN and falls back to discriminant order, so run contiguity is not
     ///   unconditional), and on the scan filter's match set never exceeding
     ///   the comparator's equal-value run. Subject/predicate brackets compare
-    ///   `Sid`s only and need none of that reasoning.
+    ///   `Sid`s only and need none of that reasoning. Reference objects use
+    ///   that same exact Sid ordering in `bounded_ref_object_walk` below.
     ///
     /// The walk order is a property of the bracketed term, NOT of `self.index`:
     /// the *set* of novelty flakes for a subject is the same however it is
@@ -1714,6 +1715,49 @@ impl BinaryScanOperator {
             return Some(bracket(p.clone(), p.clone(), IndexType::Psot));
         }
         None
+    }
+
+    /// Reference values form an exact, contiguous run in OPST order, or
+    /// within one predicate in POST order. Keep every datatype, subject,
+    /// timestamp and metadata value in that run so a base assertion never
+    /// loses its cancelling overlay op.
+    /// Literal objects keep the existing whole-graph fallback: their scan
+    /// match semantics can exceed a single comparator equality class.
+    fn bounded_ref_object_walk(
+        object: Option<&FlakeValue>,
+        predicate: Option<&Sid>,
+    ) -> Option<BoundedOverlayWalk> {
+        let FlakeValue::Ref(sid) = object? else {
+            return None;
+        };
+        Some(BoundedOverlayWalk {
+            // POST leads with predicate, then object value/datatype; OPST
+            // leads with object value/datatype. Both brackets span all dt
+            // values before subject/history, so neither splits a fact key.
+            index: if predicate.is_some() {
+                IndexType::Post
+            } else {
+                IndexType::Opst
+            },
+            first: Flake::new(
+                Sid::min(),
+                predicate.cloned().unwrap_or_else(Sid::min),
+                FlakeValue::Ref(sid.clone()),
+                Sid::min(),
+                i64::MIN,
+                false,
+                None,
+            ),
+            rhs: Flake::new(
+                Sid::max(),
+                predicate.cloned().unwrap_or_else(Sid::max),
+                FlakeValue::Ref(sid.clone()),
+                Sid::max(),
+                i64::MAX,
+                true,
+                Some(FlakeMeta::max()),
+            ),
+        })
     }
 
     async fn open_overlay_only_fallback(
@@ -2393,7 +2437,15 @@ impl Operator for BinaryScanOperator {
             // transaction and every query, and the bound term is only applied
             // afterwards by `overlay_window_for_range` — a binary search over an
             // array that cost O(novelty) to build (fluree/db#1722).
-            let bounded = Self::bounded_overlay_walk(&s_sid, &p_sid);
+            // A subject stays the leading bound for per-row probes. With no
+            // subject, use both predicate and reference object when available:
+            // translating a whole predicate discards the selective object bound.
+            let bounded = if s_sid.is_none() {
+                Self::bounded_ref_object_walk(self.bound_o.as_ref(), p_sid.as_ref())
+            } else {
+                None
+            }
+            .or_else(|| Self::bounded_overlay_walk(&s_sid, &p_sid));
 
             let translate_span = tracing::debug_span!(
                 "overlay_translate",
@@ -4210,6 +4262,85 @@ mod bounded_overlay_walk_tests {
         assert!(!walk(&n, None, i64::MAX).is_empty(), "fixture non-empty");
     }
 
+    #[test]
+    fn reference_object_window_preserves_complete_fact_histories() {
+        let mut novelty = Novelty::new(0);
+        let graphs = HashMap::new();
+        let target = FlakeValue::Ref(sid(100, "target"));
+        for t in 1..=6 {
+            let mut flakes = Vec::new();
+            for i in 0..30 {
+                // Adjacent reference values, repeated facts, different
+                // predicates and list positions all share the same window.
+                let object = match i % 3 {
+                    0 => target.clone(),
+                    1 => FlakeValue::Ref(sid(100, "target-next")),
+                    _ => FlakeValue::Long(i),
+                };
+                flakes.push(Flake::new(
+                    sid(101, &format!("s{i}")),
+                    sid(102, &format!("p{}", i % 4)),
+                    object,
+                    sid(103, &format!("dt{}", i % 2)),
+                    t,
+                    t % 2 == 1,
+                    Some(FlakeMeta::with_index((i % 3) as i32)),
+                ));
+            }
+            novelty.apply_commit(flakes, t, &graphs).expect("commit");
+        }
+        let bound = BinaryScanOperator::bounded_ref_object_walk(Some(&target), None)
+            .expect("reference bracket");
+        assert_eq!(bound.index, IndexType::Opst);
+        let events = |flakes: Vec<Flake>| {
+            sorted(flakes)
+                .into_iter()
+                .map(|f| {
+                    let (t, op) = (f.t, f.op);
+                    (f, t, op) // Flake equality alone intentionally ignores t/op.
+                })
+                .collect::<Vec<_>>()
+        };
+        for to_t in [1, 2, 3, 6, i64::MAX] {
+            let expected = walk(&novelty, None, to_t)
+                .into_iter()
+                .filter(|f| f.o == target)
+                .collect();
+            assert_eq!(events(walk(&novelty, Some(&bound), to_t)), events(expected));
+        }
+        // A predicate+reference bracket uses POST, including its complete
+        // datatype range. This must be the intersection, not either whole run.
+        for predicate in [sid(102, "p0"), sid(102, "p3"), sid(102, "absent")] {
+            let bound =
+                BinaryScanOperator::bounded_ref_object_walk(Some(&target), Some(&predicate))
+                    .unwrap();
+            assert_eq!(bound.index, IndexType::Post);
+            for to_t in [1, 2, 3, 6, i64::MAX] {
+                let expected = walk(&novelty, None, to_t)
+                    .into_iter()
+                    .filter(|f| f.o == target && f.p == predicate)
+                    .collect();
+                assert_eq!(events(walk(&novelty, Some(&bound), to_t)), events(expected));
+            }
+        }
+        let missing = FlakeValue::Ref(sid(100, "absent"));
+        let bound = BinaryScanOperator::bounded_ref_object_walk(Some(&missing), None).unwrap();
+        assert!(walk(&novelty, Some(&bound), i64::MAX).is_empty());
+    }
+
+    #[test]
+    fn object_window_does_not_narrow_literal_match_semantics() {
+        for value in [
+            FlakeValue::Long(5),
+            FlakeValue::Double(5.0),
+            FlakeValue::Double(f64::NAN),
+            FlakeValue::String("5".into()),
+        ] {
+            assert!(BinaryScanOperator::bounded_ref_object_walk(Some(&value), None).is_none());
+        }
+        assert!(BinaryScanOperator::bounded_ref_object_walk(None, None).is_none());
+    }
+
     /// The bracket must not be sensitive to a bound object: on SPOT with a bound
     /// subject the window still holds every predicate/object for that subject,
     /// so an object-typed pattern can never lose a novelty retraction.
@@ -4540,8 +4671,15 @@ mod tests {
         let walk = BinaryScanOperator::bounded_overlay_walk(&Some(s), &None)
             .expect("bound subject must produce a bracketed walk");
         assert_pinned("bounded_overlay_walk (subject bracket)", &walk.rhs);
-        let walk = BinaryScanOperator::bounded_overlay_walk(&None, &Some(p))
+        let walk = BinaryScanOperator::bounded_overlay_walk(&None, &Some(p.clone()))
             .expect("bound predicate must produce a bracketed walk");
         assert_pinned("bounded_overlay_walk (predicate bracket)", &walk.rhs);
+
+        let object = FlakeValue::Ref(Sid::new(7, "target"));
+        for predicate in [None, Some(&p)] {
+            let walk = BinaryScanOperator::bounded_ref_object_walk(Some(&object), predicate)
+                .expect("reference must produce a bracketed walk");
+            assert_pinned("bounded_ref_object_walk", &walk.rhs);
+        }
     }
 }
