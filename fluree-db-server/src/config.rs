@@ -1381,6 +1381,7 @@ mod journal_validation_tests {
     #[test]
     fn journal_requires_both_paths() {
         let mut config = journal_config();
+        config.validate().expect("standalone journal configuration");
         config.journal_index_path = None;
         assert!(config.validate().unwrap_err().contains("supplied together"));
         config.journal_index_path = Some("/indexes".into());
@@ -1393,7 +1394,10 @@ mod journal_validation_tests {
         for mode in ["proxy", "connection", "peer"] {
             let mut config = journal_config();
             match mode {
-                "proxy" => config.storage_access_mode = StorageAccessMode::Proxy,
+                "proxy" => {
+                    config.server_role = ServerRole::Peer;
+                    config.storage_access_mode = StorageAccessMode::Proxy;
+                }
                 "connection" => config.connection_config = Some("/connection.json".into()),
                 "peer" => config.server_role = ServerRole::Peer,
                 _ => unreachable!(),
@@ -1401,7 +1405,7 @@ mod journal_validation_tests {
             assert!(
                 config
                     .validate()
-                    .unwrap_err()
+                    .expect_err(mode)
                     .contains("standalone direct local storage"),
                 "{mode}"
             );
