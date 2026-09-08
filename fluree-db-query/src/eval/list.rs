@@ -35,7 +35,7 @@ fn resolve_arg_binding<R: RowAccess>(
     }
 }
 
-/// Resolve an argument to a node/ref `Sid` (for `MakeRel` / `MakePath`).
+/// Resolve a node or predicate argument to a `Sid` (for `MakeRel` / `MakePath`).
 fn arg_to_sid<R: RowAccess>(
     arg: &Expression,
     row: &R,
@@ -44,6 +44,16 @@ fn arg_to_sid<R: RowAccess>(
     let Some(b) = resolve_arg_binding(arg, row, Some(ctx))? else {
         return Ok(None);
     };
+    // A fully indexed wildcard hop leaves its predicate encoded. It belongs
+    // to the predicate dictionary, not the subject dictionary used below.
+    if let Binding::EncodedPid { p_id } = b {
+        let Some(store) = ctx.binary_store.as_ref() else {
+            return Ok(None);
+        };
+        return store.predicate_sid(p_id).map(Some).ok_or_else(|| {
+            QueryError::dictionary_lookup(format!("resolve predicate SID: unknown p_id={p_id}"))
+        });
+    }
     super::metadata::binding_subject_sid(&b, ctx)
 }
 

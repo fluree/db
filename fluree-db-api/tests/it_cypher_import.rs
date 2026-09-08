@@ -267,3 +267,107 @@ fn conflicting_match_key_sets_error() {
         "{err:?}"
     );
 }
+
+/// Fully indexed untyped hops carry encoded predicate IDs. Relationship values
+/// must survive that representation just as they do while data is in novelty.
+#[cfg(feature = "native")]
+#[tokio::test]
+async fn indexed_untyped_relationship_values_preserve_count_type_and_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let input_dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap();
+    let script = r#"
+CREATE (:User {id: 1, name: "a"});
+CREATE (:User {id: 2, name: "b"});
+CREATE (:User {id: 3, name: "c"});
+MATCH (n:User {id: 1}), (m:User {id: 2}) CREATE (n)-[:Friend]->(m);
+MATCH (n:User {id: 2}), (m:User {id: 1}) CREATE (n)-[:Friend]->(m);
+MATCH (n:User {id: 2}), (m:User {id: 3}) CREATE (n)-[:Follows]->(m);
+"#;
+    let objects = cypher_to_jsonld(script, &CypherImportOptions::default()).unwrap();
+    let input = input_dir.path().join("seed.jsonld");
+    std::fs::write(
+        &input,
+        serde_json::to_vec(&json!({"@graph": objects})).unwrap(),
+    )
+    .unwrap();
+    let ledger_id = "it/cypher-import:indexed-rel-values";
+    let imported = fluree
+        .create(ledger_id)
+        .import(&input)
+        .threads(1)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .unwrap();
+    assert!(
+        !imported.has_annotations,
+        "fixture must use unreified base edges"
+    );
+
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    assert!(
+        ledger.snapshot.range_provider.is_some(),
+        "fixture must use binary indexes"
+    );
+    assert_eq!(ledger.snapshot.t, ledger.t());
+    assert!(ledger.novelty.is_empty());
+    assert_eq!(
+        ledger.novelty.epoch, 0,
+        "fixture must exercise late materialization"
+    );
+    let db = graphdb_from_ledger(&ledger);
+
+    // Anonymous/typed control shapes already worked; neither labels nor literal
+    // properties may contribute to the untyped relationship count.
+    for (query, expected) in [
+        ("MATCH ()-->() RETURN count(*)", 3),
+        ("MATCH ()-[r:Friend]->() RETURN count(r)", 2),
+        ("MATCH ()-[r]->() RETURN count(r)", 3),
+    ] {
+        let rows = fluree
+            .query_cypher(&db, query)
+            .await
+            .unwrap()
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .unwrap();
+        assert_eq!(rows, json!([[expected]]), "{query}");
+    }
+    let rows = fluree.query_cypher(&db,
+        "MATCH ()-[r]->() RETURN type(r), id(startNode(r)), id(endNode(r)) ORDER BY type(r), id(startNode(r))")
+        .await.unwrap().to_jsonld_async(db.as_graph_db_ref()).await.unwrap();
+    assert_eq!(
+        rows,
+        json!([
+            ["Follows", "User/2", "User/3"],
+            ["Friend", "User/1", "User/2"],
+            ["Friend", "User/2", "User/1"]
+        ])
+    );
+
+    // Frozen benchgraph cycle shape returns both relationship values themselves.
+    let cycle = fluree
+        .query_cypher(
+            &db,
+            "MATCH (n:User {id: 1})-[e1]->(m)-[e2]->(n) RETURN e1, m, e2",
+        )
+        .await
+        .unwrap()
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .unwrap();
+    let rows = cycle["results"][0]["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{cycle}");
+    assert!(
+        !rows[0]["row"][0].is_null(),
+        "first relationship value: {cycle}"
+    );
+    assert!(
+        !rows[0]["row"][2].is_null(),
+        "second relationship value: {cycle}"
+    );
+}
