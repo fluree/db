@@ -14,8 +14,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use fluree_db_api::{
-    ApiError, Base64Bytes, Fluree, GovernanceOptions, GraphDb, LedgerHandle, LedgerManager,
-    PolicyContext, PushCommitsRequest, RefreshOpts, TransactError,
+    ApiError, Base64Bytes, Fluree, GovernanceOptions, GraphDb, LedgerHandle, PolicyContext,
+    PushCommitsRequest, RefreshOpts, TransactError,
 };
 use fluree_db_ledger::IndexConfig;
 use std::sync::Arc;
@@ -71,15 +71,6 @@ impl LocalCommitter {
             index_config,
         }
     }
-
-    fn ledger_manager(&self) -> Result<&Arc<LedgerManager>, SubmissionError> {
-        self.fluree
-            .ledger_manager()
-            .ok_or_else(|| SubmissionError::Execution {
-                status: 500,
-                message: "LedgerManager is not configured on the Fluree instance".into(),
-            })
-    }
 }
 
 #[async_trait]
@@ -93,14 +84,14 @@ impl Committer for LocalCommitter {
             ledger_id,
             body,
             txn_opts,
-            commit_opts,
+            mut commit_opts,
             tracking,
             governance,
         } = request;
 
         let ledger_handle = self
-            .ledger_manager()?
-            .get_or_load(&ledger_id)
+            .fluree
+            .ledger_cached(&ledger_id)
             .await
             .map_err(execution_failure)?;
 
@@ -170,6 +161,17 @@ impl Committer for LocalCommitter {
                     }
                 }
             };
+            // CommitOpts::clone intentionally drops pending upload handles. Resolve
+            // this one once before cloning for attempts; retain its CID on retries.
+            // The upload still overlaps policy/Cypher preparation above.
+            if let Some(pending) = commit_opts.raw_txn_upload.take() {
+                commit_opts.raw_txn_id = Some(
+                    pending
+                        .finish()
+                        .await
+                        .map_err(|e| execution_failure(e.into()))?,
+                );
+            }
             let mut builder = staged
                 .txn_opts(txn_opts.clone())
                 .commit_opts(commit_opts.clone())

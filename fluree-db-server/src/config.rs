@@ -390,6 +390,20 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_STORAGE_PATH")]
     pub storage_path: Option<PathBuf>,
 
+    /// Persist unsigned transaction payloads as well as signed envelopes.
+    #[arg(long, default_value_t = false)]
+    pub record_raw_transactions: bool,
+
+    /// Existing single-ledger experimental WAL root (requires a separate index directory).
+    #[cfg(all(feature = "experimental-local-journal", unix))]
+    #[arg(long, requires = "journal_index_path")]
+    pub journal_root: Option<PathBuf>,
+
+    /// Existing directory for disposable, independently published index outputs.
+    #[cfg(all(feature = "experimental-local-journal", unix))]
+    #[arg(long, requires = "journal_root")]
+    pub journal_index_path: Option<PathBuf>,
+
     /// Path to a JSON-LD connection configuration file.
     ///
     /// When provided, the server builds the storage and nameservice backend
@@ -873,6 +887,11 @@ impl Default for ServerConfig {
             profile: None,
             listen_addr: server_defaults::DEFAULT_LISTEN_ADDR.parse().unwrap(),
             storage_path: None,
+            record_raw_transactions: false,
+            #[cfg(all(feature = "experimental-local-journal", unix))]
+            journal_root: None,
+            #[cfg(all(feature = "experimental-local-journal", unix))]
+            journal_index_path: None,
             connection_config: None,
             iceberg_local_roots: None,
             cors_enabled: server_defaults::DEFAULT_CORS_ENABLED,
@@ -1090,6 +1109,27 @@ impl ServerConfig {
 
     /// Validate all configuration at startup
     pub fn validate(&self) -> Result<(), String> {
+        #[cfg(all(feature = "experimental-local-journal", unix))]
+        {
+            if self.journal_root.is_some() != self.journal_index_path.is_some() {
+                return Err("journal root and index directory must be supplied together".into());
+            }
+            if self.journal_root.is_some() {
+                if self.is_proxy_storage_mode()
+                    || self.connection_config.is_some()
+                    || self.server_role == ServerRole::Peer
+                {
+                    return Err(
+                        "experimental journal requires standalone direct local storage".into(),
+                    );
+                }
+                #[cfg(feature = "raft")]
+                if self.raft_enabled {
+                    return Err("experimental journal does not support Raft".into());
+                }
+            }
+        }
+
         // Validate JWKS issuer configs (parse early to catch format errors)
         #[cfg(feature = "oidc")]
         {

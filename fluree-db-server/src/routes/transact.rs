@@ -33,7 +33,7 @@ use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::{
-    with_index_request_correlation, ApiError, CommitOpts, Fluree, GovernanceOptions,
+    with_index_request_correlation, ApiError, CommitOpts, GovernanceOptions,
     IndexRequestCorrelation, LedgerHandle, PolicyStats, TrackingOptions, TrackingTally, TxnOpts,
     TxnType,
 };
@@ -287,15 +287,20 @@ fn effective_did<'a>(
 fn build_commit_opts(
     did: Option<&str>,
     credential: &MaybeCredential,
-    fluree: &Fluree,
+    state: &AppState,
     handle: &LedgerHandle,
 ) -> CommitOpts {
     let mut commit_opts = match did {
         Some(d) => CommitOpts::default().identity(d.to_string()),
         None => CommitOpts::default(),
     };
-    if let Some(raw_txn) = raw_txn_from_credential(credential) {
-        let content_store = fluree.content_store(handle.id());
+    let record_raw = state.config.record_raw_transactions;
+    #[cfg(all(feature = "experimental-local-journal", unix))]
+    let record_raw = record_raw || state.config.journal_root.is_some();
+    let raw_txn = raw_txn_from_credential(credential)
+        .or_else(|| record_raw.then(|| raw_txn_value(&credential.body)));
+    if let Some(raw_txn) = raw_txn {
+        let content_store = state.fluree.content_store(handle.id());
         commit_opts = commit_opts.with_raw_txn_spawned(content_store, raw_txn);
     }
     commit_opts
@@ -387,6 +392,20 @@ fn raw_txn_from_credential(credential: &MaybeCredential) -> Option<JsonValue> {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
     Some(JsonValue::String(format!("base64:{b64}")))
+}
+
+fn raw_txn_value(raw: &[u8]) -> JsonValue {
+    if let Ok(value) = serde_json::from_slice(raw) {
+        return value;
+    }
+    if let Ok(text) = std::str::from_utf8(raw) {
+        return JsonValue::String(text.to_string());
+    }
+    use base64::Engine as _;
+    JsonValue::String(format!(
+        "base64:{}",
+        base64::engine::general_purpose::STANDARD.encode(raw)
+    ))
 }
 
 /// Extract query params from request URI before consuming the request
@@ -1802,7 +1821,7 @@ async fn execute_transaction(
         };
 
         let did = effective_did(&prepared_transaction.governance, author);
-        let mut commit_opts = build_commit_opts(did, credential, &state.fluree, &handle);
+        let mut commit_opts = build_commit_opts(did, credential, state, &handle);
 
         // `opts.eventTime`: caller-supplied event time for this commit
         // (backdated historical loads). Validated for RFC 3339 shape at the
@@ -1985,12 +2004,8 @@ async fn execute_turtle_transaction(
             default_allow: headers.default_allow,
         };
 
-        let commit_opts = build_commit_opts(
-            effective_identity.as_deref(),
-            credential,
-            &state.fluree,
-            &handle,
-        );
+        let commit_opts =
+            build_commit_opts(effective_identity.as_deref(), credential, state, &handle);
 
         // Tracking is header-driven and applies to every format.
         let tracking = tracking_from_headers(headers);
@@ -2083,12 +2098,7 @@ async fn execute_cypher_transact(
         .ledger_cached(ledger_id)
         .await
         .map_err(ServerError::Api)?;
-    let commit_opts = build_commit_opts(
-        effective_identity.as_deref(),
-        credential,
-        &state.fluree,
-        &handle,
-    );
+    let commit_opts = build_commit_opts(effective_identity.as_deref(), credential, state, &handle);
     let tracking = tracking_from_headers(headers);
 
     // A multi-clause statement runs through the sequential write driver
@@ -2320,12 +2330,7 @@ async fn execute_sparql_update_request(
         default_allow: headers.default_allow,
     };
 
-    let commit_opts = build_commit_opts(
-        effective_identity.as_deref(),
-        credential,
-        &state.fluree,
-        &handle,
-    );
+    let commit_opts = build_commit_opts(effective_identity.as_deref(), credential, state, &handle);
 
     // The query is parsed and lowered inside the consensus layer, under the
     // ledger write lock — so namespace allocation shares the staging

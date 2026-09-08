@@ -562,6 +562,22 @@ async fn build_direct_fluree(
             .with_novelty_thresholds(config.reindex_min_bytes, max_bytes);
     }
 
+    #[cfg(all(feature = "experimental-local-journal", unix))]
+    if let Some(root) = &config.journal_root {
+        if nameservice.is_some() {
+            return Err(fluree_db_api::ApiError::config(
+                "journal cannot use an external transaction nameservice",
+            ));
+        }
+        let indexes = config
+            .journal_index_path
+            .clone()
+            .ok_or_else(|| fluree_db_api::ApiError::config("journal index directory missing"))?;
+        let fluree = Arc::new(builder.build_local_journal(root.clone(), indexes).await?);
+        let handle = spawn_leaflet_cache_stats_logger(&fluree);
+        return Ok((fluree, handle));
+    }
+
     let fluree = match nameservice {
         Some(ns) => Arc::new(builder.build_client_with_nameservice(ns).await?),
         None => Arc::new(builder.build_client().await?),

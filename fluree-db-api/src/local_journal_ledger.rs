@@ -25,6 +25,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::local_journal_acceptance::{validate_linear, LinearCommitValidator};
 
+pub(crate) mod backend;
 mod cypher;
 #[cfg(test)]
 mod fixtures;
@@ -325,7 +326,7 @@ impl JournalLedger {
 
     async fn accept_staged(
         &self,
-        mut cache: OwnedMutexGuard<Cache>,
+        cache: OwnedMutexGuard<Cache>,
         staged: StageResult,
         kind: TxnType,
         body: &Value,
@@ -364,6 +365,20 @@ impl JournalLedger {
         )
         .await
         .map_err(crate::ApiError::from)?;
+        self.accept_built(cache, staged, raw_id, raw, before_install, |_| {})
+            .await
+            .map(|(accepted, _)| Some(accepted))
+    }
+
+    async fn accept_built(
+        &self,
+        mut cache: OwnedMutexGuard<Cache>,
+        staged: fluree_db_transact::StagedCommit,
+        raw_id: ContentId,
+        raw: Vec<u8>,
+        before_install: impl FnOnce() -> fluree_db_core::local_journal::Result<()> + Send + 'static,
+        installed: impl FnOnce(&mut Cache) + Send + 'static,
+    ) -> Result<(AcceptedCommit, LedgerState)> {
         if !staged.referenced_bytes.is_empty() {
             return Err(JournalError::Invalid("unsupported deferred commit payloads").into());
         }
@@ -399,57 +414,60 @@ impl JournalLedger {
         };
         // The blocking task owns the cache gate through append, sync and install,
         // even if the awaiting request is dropped or its task is aborted.
-        Ok(Some(
-            tokio::task::spawn_blocking(move || {
-                let mut committed = None;
-                let proof = cache.proof.clone();
-                let prefix = cache.prefix.clone();
-                let journal = owner.accept_with(
-                    &transition,
-                    &AdapterValidator {
-                        proof: proof.as_deref(),
-                        prefix: prefix.as_deref(),
-                    },
-                    |view, journal_receipt| {
-                        before_install()?;
-                        let (receipt, mut state) = staged.finalize_state().map_err(|_| {
-                            JournalError::Invalid("journal state finalization failed")
-                        })?;
-                        // The journal head describes transaction authority. Preserve the
-                        // independently adopted query index in the effective in-memory record.
-                        let mut record =
-                            ns_record(owner.ledger(), Some(&transition.resulting_head))?;
-                        if let Some(effective) = state.ns_record.as_ref() {
-                            record.index_head_id = effective.index_head_id.clone();
-                            record.index_t = effective.index_t;
-                        }
-                        state.ns_record = Some(record);
-                        // Keep the already loaded index. Post-commit namespace changes
-                        // are resolved through the snapshot fallback; acknowledgment must
-                        // never reload derived artifacts or wait for index storage.
-                        cache.prefix = Some(Arc::new(prefix::ValidatedPrefix::after_validation(
-                            view.frontier_after(journal_receipt),
-                            owner.ledger(),
-                        )?));
-                        // Extend the persistent read-only view only after successful state
-                        // installation. Detached index inputs keep their exact old prefix.
-                        let mut committed_store = cache.committed.clone().expect("ready content");
-                        committed_store.extend(&transition.objects);
-                        cache.committed = Some(committed_store);
-                        cache.state = Some(state);
-                        cache.head = Some(transition.resulting_head.clone());
-                        committed = Some(receipt);
-                        Ok(())
-                    },
-                )?;
-                Ok::<_, JournalError>(AcceptedCommit {
+        Ok(tokio::task::spawn_blocking(move || {
+            let mut committed = None;
+            let mut installed_state = None;
+            let proof = cache.proof.clone();
+            let prefix = cache.prefix.clone();
+            let journal = owner.accept_with(
+                &transition,
+                &AdapterValidator {
+                    proof: proof.as_deref(),
+                    prefix: prefix.as_deref(),
+                },
+                |view, journal_receipt| {
+                    before_install()?;
+                    let (receipt, mut state) = staged
+                        .finalize_state()
+                        .map_err(|_| JournalError::Invalid("journal state finalization failed"))?;
+                    // The journal head describes transaction authority. Preserve the
+                    // independently adopted query index in the effective in-memory record.
+                    let mut record = ns_record(owner.ledger(), Some(&transition.resulting_head))?;
+                    if let Some(effective) = state.ns_record.as_ref() {
+                        record.index_head_id = effective.index_head_id.clone();
+                        record.index_t = effective.index_t;
+                    }
+                    state.ns_record = Some(record);
+                    // Keep the already loaded index. Post-commit namespace changes
+                    // are resolved through the snapshot fallback; acknowledgment must
+                    // never reload derived artifacts or wait for index storage.
+                    cache.prefix = Some(Arc::new(prefix::ValidatedPrefix::after_validation(
+                        view.frontier_after(journal_receipt),
+                        owner.ledger(),
+                    )?));
+                    // Extend the persistent read-only view only after successful state
+                    // installation. Detached index inputs keep their exact old prefix.
+                    let mut committed_store = cache.committed.clone().expect("ready content");
+                    committed_store.extend(&transition.objects);
+                    cache.committed = Some(committed_store);
+                    installed_state = Some(state.clone());
+                    cache.state = Some(state);
+                    cache.head = Some(transition.resulting_head.clone());
+                    installed(&mut cache);
+                    committed = Some(receipt);
+                    Ok(())
+                },
+            )?;
+            Ok::<_, JournalError>((
+                AcceptedCommit {
                     commit: committed.expect("successful acceptance installed state"),
                     journal,
                     raw_txn_id: raw_id,
-                })
-            })
-            .await??,
-        ))
+                },
+                installed_state.expect("installed state"),
+            ))
+        })
+        .await??)
     }
 
     /// Materialized JSON results only: no cached GraphDb/overlay escapes the gate.

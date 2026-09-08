@@ -654,3 +654,7 @@ wasm-bindgen-futures = "0.4"
 [[example]]
 name = "journal_diagnostic"
 required-features = ["experimental-local-journal"]
+
+[[example]]
+name = "journal_bootstrap"
+required-features = ["experimental-local-journal"]

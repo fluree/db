@@ -3066,6 +3066,8 @@ impl FlureeBuilder {
         }
 
         Fluree {
+            #[cfg(all(feature = "experimental-local-journal", unix))]
+            journal: None,
             config,
             backend,
             nameservice_mode: nameservice,
@@ -3385,6 +3387,8 @@ impl FlureeBuilder {
 /// re-opening storage.
 #[derive(Clone)]
 pub struct Fluree {
+    #[cfg(all(feature = "experimental-local-journal", unix))]
+    journal: Option<Arc<local_journal_ledger::backend::JournalConnection>>,
     /// Connection configuration
     config: ConnectionConfig,
     /// Storage backend (managed or permanent).
@@ -3455,6 +3459,8 @@ impl Fluree {
     ) -> Self {
         let leaflet_cache = make_leaflet_cache(&config);
         Self {
+            #[cfg(all(feature = "experimental-local-journal", unix))]
+            journal: None,
             config,
             backend,
             nameservice_mode: nameservice,
@@ -3480,6 +3486,8 @@ impl Fluree {
     ) -> Self {
         let leaflet_cache = make_leaflet_cache(&config);
         Self {
+            #[cfg(all(feature = "experimental-local-journal", unix))]
+            journal: None,
             config,
             backend: StorageBackend::Managed(Arc::new(storage)),
             nameservice_mode: nameservice,
@@ -4638,6 +4646,11 @@ impl Fluree {
     /// `FlureeBuilder::without_ledger_caching()`, returns an ephemeral
     /// handle that wraps a fresh load.
     pub async fn ledger_cached(&self, ledger_id: &str) -> Result<LedgerHandle> {
+        #[cfg(all(feature = "experimental-local-journal", unix))]
+        if let Some(journal) = &self.journal {
+            journal.check_health()?;
+        }
+
         match &self.ledger_manager {
             Some(mgr) => mgr.get_or_load(ledger_id).await,
             None => {

@@ -3042,6 +3042,12 @@ impl crate::Fluree {
                 .map_err(fluree_db_transact::TransactError::from)?;
         }
 
+        #[cfg(all(feature = "experimental-local-journal", unix))]
+        if let Some(journal) = &self.journal {
+            return journal
+                .commit(view, ns_registry, index_config, commit_opts)
+                .await;
+        }
         let content_store = self.content_store(view.db().ledger_id.as_str());
         let publisher = self.publisher()?;
         let (receipt, ledger) = commit_txn(

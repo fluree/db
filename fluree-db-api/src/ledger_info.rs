@@ -518,6 +518,19 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
     context: Option<&JsonValue>,
     options: LedgerInfoOptions,
 ) -> Result<JsonValue> {
+    let store = fluree_db_core::content_store_for(storage.clone(), ledger.ledger_id());
+    build_ledger_info_from_store(ledger, &store, Some(storage), context, options).await
+}
+
+// Content-addressed backends need no managed/admin storage capability to report
+// ledger metadata. The optional path-based manifest is only a pre-index fallback.
+async fn build_ledger_info_from_store(
+    ledger: &LedgerState,
+    store: &dyn fluree_db_core::ContentStore,
+    storage: Option<&dyn fluree_db_core::StorageRead>,
+    context: Option<&JsonValue>,
+    options: LedgerInfoOptions,
+) -> Result<JsonValue> {
     // Build the IRI compactor for stats decoding
     let parsed_context = context
         .map(|c| ParsedContext::parse(None, c).unwrap_or_default())
@@ -588,14 +601,16 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
             .unwrap_or_else(|_| ledger.snapshot.ledger_id.replace(':', "/"));
         let manifest_addr_primary =
             format!("fluree:file://{alias_prefix}/stats/pre-index-stats.json");
-        if let Ok(bytes) = storage.read_bytes(&manifest_addr_primary).await {
-            match parse_pre_index_manifest(&bytes) {
-                Ok(graphs) => {
-                    tracing::debug!(graphs = graphs.len(), "loaded pre-index stats manifest");
-                    stats.graphs = Some(graphs);
-                }
-                Err(e) => {
-                    tracing::warn!("failed to parse pre-index stats manifest: {}", e);
+        if let Some(storage) = storage {
+            if let Ok(bytes) = storage.read_bytes(&manifest_addr_primary).await {
+                match parse_pre_index_manifest(&bytes) {
+                    Ok(graphs) => {
+                        tracing::debug!(graphs = graphs.len(), "loaded pre-index stats manifest");
+                        stats.graphs = Some(graphs);
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to parse pre-index stats manifest: {}", e);
+                    }
                 }
             }
         }
@@ -625,7 +640,7 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
     // 4. Commit section (ALWAYS include, even if None). Dynamic JSON-LD document
     // (or `{"error":…}` on load failure), so kept as `JsonValue`.
     let commit = if let Some(head_cid) = &ledger.head_commit_id {
-        match build_commit_jsonld(storage, head_cid, &ledger.snapshot.ledger_id).await {
+        match build_commit_jsonld(store, head_cid, &ledger.snapshot.ledger_id).await {
             Ok(commit_json) => commit_json,
             Err(e) => json!({ "error": format!("{}", e) }),
         }
@@ -872,13 +887,12 @@ fn build_graph_scoped_stats(
 // ============================================================================
 
 /// Build commit JSON-LD block.
-async fn build_commit_jsonld<S: Storage + Clone>(
-    storage: &S,
+async fn build_commit_jsonld(
+    store: &dyn fluree_db_core::ContentStore,
     head_id: &fluree_db_core::ContentId,
     alias: &str,
 ) -> Result<JsonValue> {
-    let store = fluree_db_core::content_store_for(storage.clone(), alias);
-    let commit = load_commit_by_id(&store, head_id)
+    let commit = load_commit_by_id(store, head_id)
         .await
         .map_err(|e| LedgerInfoError::CommitLoad(e.to_string()))?;
 
@@ -2318,6 +2332,28 @@ fn merge_virtual_into_native(mut native: LedgerInfo, virt: LedgerInfo) -> Ledger
     native
 }
 
+/// Build metadata for an already loaded ledger using the connection's content
+/// store. Managed backends also retain the optional pre-index manifest fallback.
+pub async fn build_ledger_info_for_connection(
+    fluree: &Fluree,
+    ledger: &LedgerState,
+    context: Option<&JsonValue>,
+    options: LedgerInfoOptions,
+) -> Result<JsonValue> {
+    let storage = fluree.backend().admin_storage_cloned();
+    let store = fluree.content_store(ledger.ledger_id());
+    build_ledger_info_from_store(
+        ledger,
+        store.as_ref(),
+        storage
+            .as_ref()
+            .map(|s| s as &dyn fluree_db_core::StorageRead),
+        context,
+        options,
+    )
+    .await
+}
+
 impl<'a> LedgerInfoBuilder<'a> {
     /// Create a new builder (called by `Fluree::ledger_info()`).
     pub(crate) fn new(fluree: &'a Fluree, ledger_id: String) -> Self {
@@ -2447,16 +2483,9 @@ impl<'a> LedgerInfoBuilder<'a> {
                 // is served from manifest-backed counts. Bypasses the response cache
                 // (hybrids are rare); reuses the same native builder the cache path
                 // uses below.
-                let storage = self
-                    .fluree
-                    .backend()
-                    .admin_storage_cloned()
-                    .ok_or_else(|| {
-                        ApiError::config("ledger_info requires a managed storage backend")
-                    })?;
-                let native_json = build_ledger_info_with_options(
+                let native_json = build_ledger_info_for_connection(
+                    self.fluree,
                     &ledger,
-                    &storage,
                     self.context,
                     self.options.clone(),
                 )
@@ -2543,15 +2572,8 @@ impl<'a> LedgerInfoBuilder<'a> {
                 }
             }
 
-            let storage = self
-                .fluree
-                .backend()
-                .admin_storage_cloned()
-                .ok_or_else(|| {
-                    ApiError::config("ledger_info requires a managed storage backend")
-                })?;
             let json =
-                build_ledger_info_with_options(&ledger, &storage, self.context, self.options)
+                build_ledger_info_for_connection(self.fluree, &ledger, self.context, self.options)
                     .await
                     .map_err(|e| ApiError::internal(format!("ledger_info failed: {e}")))?;
 
@@ -2562,12 +2584,7 @@ impl<'a> LedgerInfoBuilder<'a> {
             return Ok(json);
         }
 
-        let storage = self
-            .fluree
-            .backend()
-            .admin_storage_cloned()
-            .ok_or_else(|| ApiError::config("ledger_info requires a managed storage backend"))?;
-        build_ledger_info_with_options(&ledger, &storage, self.context, self.options)
+        build_ledger_info_for_connection(self.fluree, &ledger, self.context, self.options)
             .await
             .map_err(|e| ApiError::internal(format!("ledger_info failed: {e}")))
     }

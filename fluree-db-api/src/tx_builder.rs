@@ -2013,6 +2013,10 @@ impl Fluree {
         ledger: &LedgerHandle,
         mut core: TransactCore<'_>,
     ) -> Result<Option<(LedgerWriteGuard, fluree_db_transact::StagedCommit)>> {
+        #[cfg(all(feature = "experimental-local-journal", unix))]
+        if let Some(journal) = &self.journal {
+            journal.check_health()?;
+        }
         core.validate().map_err(ApiError::Builder)?;
 
         let index_config = core
@@ -2154,6 +2158,10 @@ impl Fluree {
         ledger: &LedgerHandle,
         mut core: TransactCore<'_>,
     ) -> Result<TransactResultRef> {
+        #[cfg(all(feature = "experimental-local-journal", unix))]
+        if let Some(journal) = &self.journal {
+            journal.check_health()?;
+        }
         core.validate().map_err(ApiError::Builder)?;
 
         let index_config = core
@@ -2232,7 +2240,12 @@ impl Fluree {
         let op = core.operation.take().unwrap(); // safe: validate checks
         let op_plan = OpPlan::from_op(op)?;
         let txn_opts = core.txn_opts;
-        let commit_opts_base = core.commit_opts;
+        let mut commit_opts_base = core.commit_opts;
+        // CommitOpts::clone cannot carry an upload task. Resolve an explicitly
+        // supplied payload once and preserve its content ID across retries.
+        if let Some(pending) = commit_opts_base.raw_txn_upload.take() {
+            commit_opts_base.raw_txn_id = Some(pending.finish().await?);
+        }
         let tracker_ref = tracker.is_enabled().then_some(&tracker);
 
         const MAX_RETRIES: usize = 16;
@@ -2399,6 +2412,35 @@ mod tests {
     // ========================================================================
     // Integration tests
     // ========================================================================
+
+    #[tokio::test]
+    async fn cached_builder_preserves_explicit_raw_upload() {
+        let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+        fluree.create_ledger("raw-upload").await.unwrap();
+        let handle = fluree.ledger_cached("raw-upload").await.unwrap();
+        let store = fluree.content_store(handle.id());
+        let raw = json!({"original": "explicit provenance"});
+        let body = json!({"@id": "urn:one", "urn:value": 1});
+        let result = fluree
+            .stage(&handle)
+            .insert(&body)
+            .commit_opts(CommitOpts::default().with_raw_txn_spawned(store.clone(), raw.clone()))
+            .execute()
+            .await
+            .unwrap();
+        let bytes = store.get(&result.receipt.commit_id).await.unwrap();
+        let commit = fluree_db_core::commit::codec::read_commit(&bytes).unwrap();
+        let bytes = store
+            .get(
+                &commit
+                    .txn
+                    .expect("explicit payload must survive optimistic option cloning"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<JsonValue>(&bytes).unwrap(), raw);
+        fluree.disconnect().await;
+    }
 
     #[tokio::test]
     async fn test_owned_builder_insert() {

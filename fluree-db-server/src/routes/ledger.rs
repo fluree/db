@@ -761,16 +761,9 @@ pub async fn info(
             opts.include_property_estimates = enabled;
         }
 
-        let admin_storage = state
-            .fluree
-            .backend()
-            .admin_storage_cloned()
-            .ok_or_else(|| {
-                ServerError::internal("ledger_info requires a managed storage backend")
-            })?;
-        let mut info = fluree_db_api::ledger_info::build_ledger_info_with_options(
+        let mut info = fluree_db_api::ledger_info::build_ledger_info_for_connection(
+            &state.fluree,
             &ledger_state,
-            &admin_storage,
             None,
             opts,
         )
