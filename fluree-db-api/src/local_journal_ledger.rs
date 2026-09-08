@@ -1,13 +1,14 @@
 //! Bounded experimental WAL adapter for trusted, local JSON-LD and Cypher transactions.
 //!
 //! One unsigned default-graph ledger per root, initialized empty or bootstrapped
-//! from a quiescent local indexed source. Independent index inputs and background
-//! in-memory adoption are supported; no automatic index publication/triggers,
-//! lifecycle/configuration changes, credentials, policy context or
-//! cluster API. Static imported IRI mappings are preserved. This is an embedded
-//! root-authority experiment, not a server backend. No underlying Fluree, cache,
-//! staged state or writable storage handle escapes. Raw transaction JSON is always
-//! journaled. The 64 MiB journal has no reclamation yet.
+//! from a quiescent local indexed source. The opt-in server bridge reuses ordinary
+//! staging and background indexing; transaction acceptance never waits for index
+//! construction or adoption. Static imported IRI mappings are preserved.
+//!
+//! Lifecycle/configuration changes, credentials, policy context and cluster
+//! acceptance are unsupported. Source dependencies and recorded raw transactions
+//! are journaled before acknowledgment. The journal is bounded at 64 MiB; exclusive
+//! offline checkpoint retirement restores capacity. Online rotation is not provided.
 use crate::{Fluree, FlureeBuilder, GraphDb, IndexConfig, LedgerState, StageResult, TxnOpts};
 use async_trait::async_trait;
 use fluree_db_core::local_journal::{

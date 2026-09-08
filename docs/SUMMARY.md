@@ -110,6 +110,7 @@
   - [Storage traits](design/storage-traits.md)
   - [Raft substrate (`fluree-raft-core`)](design/raft-core.md)
   - [Raft command queue and replicated state machine](design/raft-command-queue.md)
+  - [Filesystem Raft durability and qualification](design/filesystem-raft-durability.md)
 
 - [HTTP API (fluree-db-server)](api/README.md)
   - [Overview](api/overview.md)

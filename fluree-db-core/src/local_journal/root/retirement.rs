@@ -216,14 +216,13 @@ mod tests {
                 .unwrap();
         }
     }
+    type CheckpointSource = Box<dyn FnMut(&CheckpointEntry) -> Result<Cursor<Vec<u8>>>>;
+
     pub(super) fn prepare(
         records: &[Record],
         checkpoint: Option<Arc<Checkpoint>>,
         head: Object,
-    ) -> Result<(
-        CheckpointSpec,
-        impl FnMut(&CheckpointEntry) -> Result<Cursor<Vec<u8>>>,
-    )> {
+    ) -> Result<(CheckpointSpec, CheckpointSource)> {
         let mut bytes = BTreeMap::new();
         if let Some(checkpoint) = checkpoint {
             for entry in checkpoint.entries() {
@@ -245,7 +244,7 @@ mod tests {
             .collect();
         Ok((
             CheckpointSpec { head, objects },
-            move |e: &CheckpointEntry| Ok(Cursor::new(bytes[&e.key].clone())),
+            Box::new(move |e: &CheckpointEntry| Ok(Cursor::new(bytes[&e.key].clone()))),
         ))
     }
     fn erase_caches(path: &Path) {
@@ -369,7 +368,7 @@ mod tests {
             .unwrap();
             assert!(steps.contains(&"replacement selected durably"));
             assert!(steps.contains(&"retired path removed"));
-            for cut in 0..steps.len() {
+            for (cut, step) in steps.iter().enumerate() {
                 let dir = tempfile::tempdir().unwrap();
                 setup(dir.path());
                 let mut at = 0;
@@ -387,7 +386,7 @@ mod tests {
                         }
                     },
                 );
-                assert!(result.is_err(), "cut {cut} {}", steps[cut]);
+                assert!(result.is_err(), "cut {cut} {step}");
                 verify(dir.path(), 2);
                 verify(dir.path(), 2);
                 LocalRoot::checkpoint_offline(dir.path(), prepare, |_| Ok(())).unwrap();

@@ -1366,6 +1366,60 @@ fn shellexpand(path: &str) -> String {
     path.to_string()
 }
 
+#[cfg(all(test, feature = "experimental-local-journal", unix))]
+mod journal_validation_tests {
+    use super::*;
+
+    fn journal_config() -> ServerConfig {
+        ServerConfig {
+            journal_root: Some("/journal".into()),
+            journal_index_path: Some("/indexes".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn journal_requires_both_paths() {
+        let mut config = journal_config();
+        config.journal_index_path = None;
+        assert!(config.validate().unwrap_err().contains("supplied together"));
+        config.journal_index_path = Some("/indexes".into());
+        config.journal_root = None;
+        assert!(config.validate().unwrap_err().contains("supplied together"));
+    }
+
+    #[test]
+    fn journal_rejects_external_storage_and_peer_roles() {
+        for mode in ["proxy", "connection", "peer"] {
+            let mut config = journal_config();
+            match mode {
+                "proxy" => config.storage_access_mode = StorageAccessMode::Proxy,
+                "connection" => config.connection_config = Some("/connection.json".into()),
+                "peer" => config.server_role = ServerRole::Peer,
+                _ => unreachable!(),
+            }
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .contains("standalone direct local storage"),
+                "{mode}"
+            );
+        }
+    }
+
+    #[cfg(feature = "raft")]
+    #[test]
+    fn compiled_together_does_not_allow_journal_raft_acceptance() {
+        let mut config = journal_config();
+        config.raft_enabled = true;
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "experimental journal does not support Raft"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "raft"))]
 mod raft_validation_tests {
     use super::*;
