@@ -366,7 +366,10 @@ ledger config, graph-source mappings — and to nameservice records. Index nodes
 dictionaries, sketches and annotation arenas are always written page-cache: they
 are written at much higher volume than commits and can be rebuilt from the commit
 chain, so flushing them would cost throughput on the busiest path for no
-durability gain.
+durability gain. They are flushed once, as a batch, at the end of each index
+build and before the pointer that names them is published, so an index pointer
+never names files that did not reach the device. That cost lands on the
+indexer, not on the transaction path.
 
 Turning durability off is reasonable for bulk imports (restartable from the
 source data), CI, and benchmarks. It is not a safe default for a ledger you

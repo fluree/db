@@ -346,6 +346,18 @@ pub trait StorageWrite: Debug + Send + Sync {
     /// This is idempotent: deleting a non-existent object succeeds.
     /// Only returns an error for actual failures (network, permissions, etc).
     async fn delete(&self, address: &str) -> Result<()>;
+
+    /// Make every write this storage reported complete short of the device
+    /// durable now.
+    ///
+    /// Backends whose writes are durable on return (object stores, memory)
+    /// have nothing to do and keep the default. `FileStorage` writes derived
+    /// content at page-cache durability and flushes it here, so a caller
+    /// about to publish a pointer to that content can put the content on the
+    /// device first without paying a flush per object on the write path.
+    async fn sync(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -494,6 +506,10 @@ impl StorageWrite for Arc<dyn Storage> {
     async fn delete(&self, address: &str) -> Result<()> {
         self.as_ref().delete(address).await
     }
+
+    async fn sync(&self) -> Result<()> {
+        self.as_ref().sync().await
+    }
 }
 
 #[async_trait]
@@ -631,6 +647,13 @@ pub trait ContentStore: Debug + Send + Sync {
         }
         Ok(full[start..end].to_vec())
     }
+
+    /// Make every write this store reported complete short of the device
+    /// durable now; see [`StorageWrite::sync`]. Call it before publishing a
+    /// pointer to content written through this store.
+    async fn sync(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // Blanket `ContentStore` impl for `Arc<dyn ContentStore>`, so callers can pass
@@ -640,6 +663,10 @@ pub trait ContentStore: Debug + Send + Sync {
 impl ContentStore for Arc<dyn ContentStore> {
     async fn has(&self, id: &ContentId) -> Result<bool> {
         self.as_ref().has(id).await
+    }
+
+    async fn sync(&self) -> Result<()> {
+        self.as_ref().sync().await
     }
 
     async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
@@ -790,6 +817,10 @@ pub fn candidate_addresses(method: &str, ledger_id: &str, id: &ContentId) -> Vec
 
 #[async_trait]
 impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
+    async fn sync(&self) -> Result<()> {
+        self.storage.sync().await
+    }
+
     async fn has(&self, id: &ContentId) -> Result<bool> {
         let address = self.cid_to_address(id)?;
         if self.storage.exists(&address).await? {
@@ -1170,6 +1201,12 @@ impl Debug for BranchedContentStore {
 
 #[async_trait]
 impl ContentStore for BranchedContentStore {
+    /// Writes only ever land in the branch's own store; parents are read
+    /// fallbacks.
+    async fn sync(&self) -> Result<()> {
+        self.branch_store.sync().await
+    }
+
     async fn has(&self, id: &ContentId) -> Result<bool> {
         if self.branch_store.has(id).await? {
             return Ok(true);

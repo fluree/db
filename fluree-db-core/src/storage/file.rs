@@ -514,6 +514,10 @@ pub struct FileStorage {
     /// Which log this handle owns when the root is shared by several
     /// processes. See [`Self::with_wal_owner`].
     wal_owner: Option<Arc<str>>,
+    /// Derived content written since the last [`StorageWrite::sync`], as
+    /// root-relative keys. Shared across clones. Empty under
+    /// [`Durability::PageCache`], where nothing is ever flushed.
+    unflushed: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 /// What the WAL resolved to for one root.
@@ -548,6 +552,7 @@ impl FileStorage {
             fsyncs: Arc::new(AtomicU64::new(0)),
             wal: Arc::new(OnceLock::new()),
             wal_owner: None,
+            unflushed: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -1289,6 +1294,34 @@ impl StorageWrite for FileStorage {
             .await
     }
 
+    /// Flush the derived content written since the last call, file by file
+    /// plus the directories between them and the root. Source-of-truth
+    /// content never waits here: it is durable when its write returns, in
+    /// the log or on the device.
+    async fn sync(&self) -> Result<()> {
+        let keys: Vec<String> = {
+            let mut pending = self
+                .unflushed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut keys: Vec<String> = std::mem::take(&mut *pending);
+            keys.sort_unstable();
+            keys.dedup();
+            keys
+        };
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let base = self.base_path.clone();
+        let fsyncs = Arc::clone(&self.fsyncs);
+        tokio::task::spawn_blocking(move || {
+            wal::flush_keys(&base, &keys, &fsyncs)
+                .map_err(|e| crate::error::Error::io(format!("flush derived content: {e}")))
+        })
+        .await
+        .map_err(|e| crate::error::Error::io(format!("sync join: {e}")))?
+    }
+
     async fn delete(&self, address: &str) -> Result<()> {
         let (key, path) = self.resolve_key(address)?;
         let storage = self.clone();
@@ -1337,8 +1370,18 @@ impl ContentAddressedWrite for FileStorage {
         bytes: &[u8],
     ) -> Result<ContentWriteResult> {
         let address = content_address(STORAGE_METHOD_FILE, kind, ledger_id, content_hash_hex);
-        self.write_bytes_durable(&address, bytes, self.durability_for(kind))
+        let durability = self.durability_for(kind);
+        self.write_bytes_durable(&address, bytes, durability)
             .await?;
+        // Derived content on a durable instance is flushed later, by `sync`,
+        // in one batch before the pointer that names it is published.
+        if durability == Durability::PageCache && self.durability != Durability::PageCache {
+            let (key, _) = self.resolve_key(&address)?;
+            self.unflushed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(key);
+        }
         Ok(ContentWriteResult {
             address,
             content_hash: content_hash_hex.to_string(),
@@ -2959,6 +3002,54 @@ mod wal_tests {
         drop(held);
         assert!(insert.await.unwrap().unwrap());
         assert_eq!(storage.read_bytes(HEAD).await.unwrap(), b"initial");
+    }
+
+    /// Index output is written page-cache and flushed once, in a batch, by
+    /// `sync`: nothing on the write path, every file and directory after.
+    #[tokio::test]
+    async fn derived_content_is_flushed_by_sync_not_by_its_write() {
+        for durability in [Durability::Journal, Durability::Sync] {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = FileStorage::new(dir.path()).with_durability(durability);
+            for i in 0..3u8 {
+                storage
+                    .content_write_bytes_with_hash(
+                        ContentKind::IndexLeaf,
+                        "l:main",
+                        &format!("{i:0>64}"),
+                        &[i],
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                storage.fsyncs_issued(),
+                0,
+                "{durability:?}: no flush on write"
+            );
+            storage.sync().await.unwrap();
+            let after = storage.fsyncs_issued();
+            assert!(
+                after > 3,
+                "{durability:?}: three files and at least their directory, got {after}"
+            );
+            storage.sync().await.unwrap();
+            assert_eq!(
+                storage.fsyncs_issued(),
+                after,
+                "{durability:?}: nothing left to flush"
+            );
+        }
+
+        // Under page-cache durability nothing is ever flushed, sync included.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::PageCache);
+        storage
+            .content_write_bytes_with_hash(ContentKind::IndexLeaf, "l:main", &"a".repeat(64), b"x")
+            .await
+            .unwrap();
+        storage.sync().await.unwrap();
+        assert_eq!(storage.fsyncs_issued(), 0);
     }
 
     /// The log's directory is neither content nor staging debris.

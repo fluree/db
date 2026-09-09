@@ -861,6 +861,11 @@ where
             self.index.delete(address).await
         }
     }
+
+    async fn sync(&self) -> std::result::Result<(), fluree_db_core::Error> {
+        self.commit.sync().await?;
+        self.index.sync().await
+    }
 }
 
 #[async_trait]
@@ -1042,6 +1047,11 @@ impl StorageWrite for AddressIdentifierResolverStorage {
     /// Deletes always go to the default storage
     async fn delete(&self, address: &str) -> std::result::Result<(), fluree_db_core::Error> {
         self.default.delete(address).await
+    }
+
+    /// Writes only ever went to the default storage, so that is what flushes.
+    async fn sync(&self) -> std::result::Result<(), fluree_db_core::Error> {
+        self.default.sync().await
     }
 }
 

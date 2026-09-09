@@ -475,7 +475,7 @@ fn fsync_dir(path: &Path, fsyncs: &AtomicU64) -> io::Result<()> {
 /// Flush the files named by `keys` and every directory between them and the
 /// root. Missing files were deleted after being logged, which is fine: the
 /// directory flush makes the unlink durable.
-fn flush_keys(base: &Path, keys: &[String], fsyncs: &AtomicU64) -> io::Result<()> {
+pub(super) fn flush_keys(base: &Path, keys: &[String], fsyncs: &AtomicU64) -> io::Result<()> {
     let mut dirs = BTreeSet::new();
     for key in keys {
         let path = base.join(key);
