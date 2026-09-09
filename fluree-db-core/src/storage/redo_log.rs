@@ -22,7 +22,7 @@ use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -529,7 +529,7 @@ fn read_opt(path: &Path) -> io::Result<Option<Vec<u8>>> {
 /// write. Replay takes it too: a writer in per-write mode on the same root
 /// may be publishing the same head, and a replayed transition must not land
 /// on top of a newer one.
-fn key_lock(path: &Path) -> io::Result<File> {
+pub(super) fn key_lock(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -850,6 +850,9 @@ impl RedoLog {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Again under the mutex: the append this one waited behind may have
+        // poisoned the log, and its sequence number must not be reused.
+        self.refuse_if_unavailable()?;
         let seq = inner.next_seq;
         if inner.active.is_none() {
             let segment = self.open_segment(&mut inner, seq)?;
@@ -859,7 +862,13 @@ impl RedoLog {
         let (full, in_flight) = {
             let segment = inner.active.as_mut().expect("opened above");
             let start = segment.len;
-            if let Err(e) = segment.file.write_all(&frame) {
+            // Always write at the frame boundary the log knows about, never
+            // at wherever an earlier, failed write left the cursor.
+            let written = segment
+                .file
+                .seek(SeekFrom::Start(start))
+                .and_then(|_| segment.file.write_all(&frame));
+            if let Err(e) = written {
                 // Nothing acknowledged depends on the bytes that may have
                 // landed; cut back to the last frame boundary. If even
                 // that fails the file's state is unknown.
@@ -998,7 +1007,10 @@ impl RedoLog {
         let mut kept = Vec::new();
         let mut removed = false;
         for segment in closed {
-            if segment.in_flight.load(Ordering::Acquire) > 0 {
+            // Segments are retired oldest first and only as a contiguous
+            // prefix: a segment kept for an unfinished write keeps every
+            // later one too, or replay would find a hole in the sequence.
+            if !kept.is_empty() || segment.in_flight.load(Ordering::Acquire) > 0 {
                 kept.push(segment);
                 continue;
             }
@@ -1358,5 +1370,105 @@ mod tests {
         drop(lock);
         thread.join().unwrap();
         assert_eq!(std::fs::read(base.join("head.json")).unwrap(), b"recovered");
+    }
+
+    fn rotate_now(log: &RedoLog) {
+        let mut inner = log.inner.lock().unwrap();
+        log.rotate(&mut inner).unwrap();
+    }
+
+    /// A segment kept for an unfinished write keeps every later segment
+    /// too: retiring one in the middle would leave a sequence hole that
+    /// replay must refuse.
+    #[test]
+    fn retirement_keeps_a_contiguous_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.hold_segments();
+        let first = log
+            .append(
+                Op::Write {
+                    key: "first",
+                    bytes: b"one",
+                },
+                true,
+            )
+            .unwrap();
+        rotate_now(&log);
+        let second = log
+            .append(
+                Op::Write {
+                    key: "second",
+                    bytes: b"two",
+                },
+                true,
+            )
+            .unwrap();
+        write_page_cache(&dir.path().join("second"), b"two").unwrap();
+        drop(second);
+        rotate_now(&log);
+        let third = log
+            .append(
+                Op::Write {
+                    key: "third",
+                    bytes: b"three",
+                },
+                true,
+            )
+            .unwrap();
+        let closed = std::mem::take(&mut log.inner.lock().unwrap().closed);
+        log.retire(closed).unwrap();
+        assert_eq!(
+            segment_paths(&log.dir).unwrap().len(),
+            3,
+            "nothing behind the held segment goes"
+        );
+        log.simulate_crash();
+        drop(first);
+        drop(third);
+        let _reopened = owned(dir.path());
+        assert_eq!(std::fs::read(dir.path().join("third")).unwrap(), b"three");
+    }
+
+    /// A short write followed by an error is rolled back to the frame
+    /// boundary, cursor included, so the next append continues the stream
+    /// rather than leaving a hole that ends replay.
+    #[test]
+    fn a_short_write_is_rolled_back_to_the_frame_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.hold_segments();
+        drop(
+            log.append(
+                Op::Write {
+                    key: "first",
+                    bytes: b"one",
+                },
+                true,
+            )
+            .unwrap(),
+        );
+        {
+            let mut inner = log.inner.lock().unwrap();
+            let segment = inner.active.as_mut().unwrap();
+            segment.file.write_all(b"FR").unwrap();
+            segment.file.set_len(segment.len).unwrap();
+        }
+        drop(
+            log.append(
+                Op::Write {
+                    key: "after",
+                    bytes: b"acknowledged",
+                },
+                true,
+            )
+            .unwrap(),
+        );
+        log.simulate_crash();
+        let _reopened = owned(dir.path());
+        assert_eq!(
+            std::fs::read(dir.path().join("after")).unwrap(),
+            b"acknowledged"
+        );
     }
 }

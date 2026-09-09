@@ -1429,6 +1429,12 @@ impl FileStorage {
                     StorageExtError::io(format!("mkdir {}: {}", parent.display(), e))
                 })?;
             }
+            // The same sidecar lock a compare-and-swap on this key holds and
+            // replay takes: between the link and the record no other writer
+            // may advance the file, or the log would carry their transition
+            // ahead of the creation it builds on.
+            let _key_lock = redo_log::key_lock(&path)
+                .map_err(|e| StorageExtError::io(format!("lock {}: {}", path.display(), e)))?;
             let created = create_new_atomic(&path, &bytes, &policy)
                 .map_err(|e| StorageExtError::io(format!("write {}: {}", path.display(), e)))?;
             if created {
@@ -2937,6 +2943,31 @@ mod journal_tests {
         std::fs::remove_file(dir.path().join("ns@v2/ledger/main.json")).unwrap();
         let storage = journaled(dir.path());
         assert_eq!(storage.read_bytes(HEAD).await.unwrap(), b"winner");
+    }
+
+    /// An insert holds the key's sidecar lock from the link to the record,
+    /// so a compare-and-swap on the same key cannot slip its transition into
+    /// the log ahead of the creation it builds on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_insert_waits_for_a_held_cas_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = journaled(dir.path());
+        let path = storage.resolve_path(HEAD).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let held = std::fs::File::create(path.with_extension("lock")).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+
+        let inserter = storage.clone();
+        let insert = tokio::spawn(async move { inserter.insert(HEAD, b"initial").await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !insert.is_finished(),
+            "the insert must wait for the key's lock"
+        );
+        assert!(!path.exists(), "and must not have linked its file");
+        drop(held);
+        assert!(insert.await.unwrap().unwrap());
+        assert_eq!(storage.read_bytes(HEAD).await.unwrap(), b"initial");
     }
 
     /// The log's directory is neither content nor staging debris.
