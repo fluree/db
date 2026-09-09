@@ -3927,6 +3927,145 @@ async fn shacl_txn_validation_mode_denied_by_override_none() {
     );
 }
 
+/// SHACL group: only `did:key:remediator` may soften the posture.
+#[cfg(feature = "shacl")]
+const SHACL_OVERRIDE_REMEDIATOR_ONLY: &str = r"<urn:config:shacl> f:shaclEnabled true .
+          <urn:config:shacl> f:overrideControl <urn:config:oc> .
+          <urn:config:oc> f:controlMode f:IdentityRestricted .
+          <urn:config:oc> f:allowedIdentities <did:key:remediator> .";
+
+/// A warn-mode write of the violating document by the given verified
+/// identity, optionally under a policy context.
+#[cfg(feature = "shacl")]
+async fn warn_mode_insert_as(
+    fluree: &fluree_db_api::Fluree,
+    ledger: fluree_db_api::LedgerState,
+    server_identity: Option<&str>,
+    policy: Option<fluree_db_api::PolicyContext>,
+) -> fluree_db_api::Result<()> {
+    use fluree_db_core::ledger_config::ValidationMode;
+
+    let opts = fluree_db_transact::TxnOpts {
+        validation_mode: Some(ValidationMode::Warn),
+        ..Default::default()
+    };
+    let mut builder = fluree
+        .stage_owned(ledger)
+        .txn_opts(opts)
+        .server_identity(server_identity.map(str::to_string));
+    if let Some(ctx) = policy {
+        builder = builder.policy(ctx);
+    }
+    builder
+        .insert(&violating_person())
+        .execute()
+        .await
+        .map(|_| ())
+}
+
+/// The policy-wrapped staging path reports the violation as an HTTP-shaped
+/// error; the plain path keeps the transact variant. Both are the rejection.
+#[cfg(feature = "shacl")]
+fn assert_shacl_rejected(result: fluree_db_api::Result<()>, what: &str) {
+    let err = result.expect_err(what);
+    let rejected = match &err {
+        fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_)) => {
+            true
+        }
+        fluree_db_api::ApiError::Http { status, message } => {
+            *status == 400 && message.contains("SHACL validation failed")
+        }
+        _ => false,
+    };
+    assert!(rejected, "{what}: expected a SHACL rejection, got {err:?}");
+}
+
+/// An identity-restricted SHACL override is gated on the builder-supplied
+/// verified identity: the allow-listed one may soften, others and anonymous
+/// callers may not.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_txn_validation_mode_identity_restricted_end_to_end() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_shacl_mode_ledger(
+        &fluree,
+        "it/shacl-mode-identity:main",
+        SHACL_OVERRIDE_REMEDIATOR_ONLY,
+    )
+    .await;
+
+    warn_mode_insert_as(&fluree, ledger.clone(), Some("did:key:remediator"), None)
+        .await
+        .expect("the allow-listed verified identity may soften the posture");
+    assert_shacl_rejected(
+        warn_mode_insert_as(&fluree, ledger.clone(), Some("did:key:other"), None).await,
+        "a verified identity outside the allow-list is denied",
+    );
+    assert_shacl_rejected(
+        warn_mode_insert_as(&fluree, ledger, None, None).await,
+        "an anonymous request is denied",
+    );
+}
+
+/// The gate must read the verified identity, never the policy context's.
+/// With no auth layer, the policy identity is whatever the caller wrote into
+/// `opts.identity`, so a policy context for the allow-listed DID without a
+/// verified identity must not soften the posture.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_txn_validation_mode_ignores_policy_identity() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_shacl_mode_ledger(
+        &fluree,
+        "it/shacl-mode-policy-identity:main",
+        SHACL_OVERRIDE_REMEDIATOR_ONLY,
+    )
+    .await;
+
+    // A policy context whose identity is the allow-listed DID, as the API
+    // builds it from caller-supplied governance. `default_allow: true` keeps
+    // the write policy from rejecting the flakes, so the only thing that can
+    // refuse the write is SHACL.
+    let remediator_policy = || async {
+        fluree_db_api::build_transact_policy_context(
+            &fluree,
+            &ledger.snapshot,
+            ledger.novelty.as_ref(),
+            Some(ledger.novelty.as_ref()),
+            ledger.t(),
+            &GovernanceOptions {
+                identity: Some("did:key:remediator".into()),
+                default_allow: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("build policy context")
+        .expect("identity is a policy input")
+    };
+
+    assert_shacl_rejected(
+        warn_mode_insert_as(
+            &fluree,
+            ledger.clone(),
+            None,
+            Some(remediator_policy().await),
+        )
+        .await,
+        "a policy context naming the allow-listed DID must not soften the posture",
+    );
+    // Control: the same policy context plus the verified identity is permitted,
+    // so the rejection above is about provenance, not about the policy.
+    warn_mode_insert_as(
+        &fluree,
+        ledger.clone(),
+        Some("did:key:remediator"),
+        Some(remediator_policy().await),
+    )
+    .await
+    .expect("the verified identity alongside the same policy context is permitted");
+}
+
 /// The shapes-exist heuristic (shapes present, NO config graph) fails closed:
 /// a transaction-requested warn does NOT soften it.
 ///

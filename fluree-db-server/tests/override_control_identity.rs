@@ -419,3 +419,133 @@ async fn unverified_identity_does_not_authorize_transact_override() {
          {status} {json}"
     );
 }
+
+// =============================================================================
+// Transact-time SHACL override control (`opts.validationMode`)
+// =============================================================================
+
+/// A shape every `ex:Person` violates without an `ex:name`, plus a SHACL
+/// config that rejects by default and lets only `did:key:admin` soften it.
+const SHACL_CONFIG_TRIG: &str = r#"
+@prefix f: <https://ns.flur.ee/db#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ex: <http://example.org/> .
+
+ex:PersonShape rdf:type sh:NodeShape ;
+    sh:targetClass ex:Person ;
+    sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+
+# The allow-listed DID exists as a subject, as a policy identity would. The
+# old gate decoded the policy context's identity and so only ever matched
+# an IRI the ledger knew; without this the unverified-identity regression
+# test below could not tell the old gate from the new one.
+<did:key:admin> ex:name "Admin" .
+
+GRAPH <urn:fluree:overridectl:main#config> {
+    <urn:overridectl:config> rdf:type f:LedgerConfig .
+    <urn:overridectl:config> f:shaclDefaults <urn:overridectl:shacl> .
+    <urn:overridectl:shacl> f:shaclEnabled true .
+    <urn:overridectl:shacl> f:overrideControl <urn:overridectl:oc> .
+    <urn:overridectl:oc> f:controlMode f:IdentityRestricted .
+    <urn:overridectl:oc> f:allowedIdentities <did:key:admin> .
+}
+"#;
+
+/// A violating write that asks to soften the posture to warn-and-commit.
+/// `default-allow: true` keeps the policy wrap a bearer identity triggers
+/// from being the reason the write fails.
+fn warn_mode_violating_insert(subject: &str, extra_opts: JsonValue) -> String {
+    let mut opts = json!({"validationMode": "warn", "default-allow": true});
+    if let (Some(base), Some(extra)) = (opts.as_object_mut(), extra_opts.as_object()) {
+        base.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    json!({
+        "@context": {"ex": "http://example.org/"},
+        "insert": {"@id": subject, "@type": "ex:Person"},
+        "opts": opts
+    })
+    .to_string()
+}
+
+fn assert_shacl_rejected(status: StatusCode, json: &JsonValue, what: &str) {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {json}");
+    assert!(
+        json.to_string().contains("SHACL validation failed"),
+        "{what}: expected a SHACL rejection, got {json}"
+    );
+}
+
+/// The SHACL gate reads the verified identity the route recorded, so the
+/// allow-listed bearer may soften the posture for its own write and a
+/// non-listed bearer may not.
+#[tokio::test]
+async fn allow_listed_bearer_may_soften_shacl_posture() {
+    let (_tmp, app) = seeded_app_with(DataAuthMode::Required, SHACL_CONFIG_TRIG).await;
+
+    let auth = (
+        "authorization",
+        format!("Bearer {}", bearer(Some(ADMIN), true)),
+    );
+    let (status, json) = insert(
+        &app,
+        warn_mode_violating_insert("ex:nameless1", json!({})),
+        &[auth],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the allow-listed verified identity may soften the posture: {json}"
+    );
+
+    let auth = (
+        "authorization",
+        format!("Bearer {}", bearer(Some(OTHER), true)),
+    );
+    let (status, json) = insert(
+        &app,
+        warn_mode_violating_insert("ex:nameless2", json!({})),
+        &[auth],
+    )
+    .await;
+    assert_shacl_rejected(
+        status,
+        &json,
+        "a verified identity outside the allow-list is denied",
+    );
+}
+
+/// With no auth layer, the allow-listed DID in `opts.identity` or the
+/// `fluree-identity` header becomes the policy identity, but it is not a
+/// verified one: the softening request is denied and the write is rejected.
+/// This is the regression test for the gate reading the policy context.
+#[tokio::test]
+async fn unverified_identity_does_not_soften_shacl_posture() {
+    let (_tmp, app) = seeded_app_with(DataAuthMode::None, SHACL_CONFIG_TRIG).await;
+
+    let (status, json) = insert(
+        &app,
+        warn_mode_violating_insert("ex:nameless1", json!({"identity": ADMIN})),
+        &[],
+    )
+    .await;
+    assert_shacl_rejected(
+        status,
+        &json,
+        "opts.identity naming the allow-listed DID must not soften the posture",
+    );
+
+    let header = ("fluree-identity", ADMIN.to_string());
+    let (status, json) = insert(
+        &app,
+        warn_mode_violating_insert("ex:nameless2", json!({})),
+        &[header],
+    )
+    .await;
+    assert_shacl_rejected(
+        status,
+        &json,
+        "a fluree-identity header naming the allow-listed DID must not soften the posture",
+    );
+}

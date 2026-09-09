@@ -180,6 +180,9 @@ impl Committer for LocalCommitter {
             if let Some(policy) = policy_ctx {
                 builder = builder.policy(policy);
             }
+            // The verified identity rides governance from the route; the
+            // SHACL override gate reads it from here, not from the policy.
+            builder = builder.server_identity(governance.server_identity.clone());
 
             match builder.execute().await {
                 Ok(result) => {

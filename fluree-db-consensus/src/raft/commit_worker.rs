@@ -674,6 +674,9 @@ impl Worker {
         if let Some(policy) = policy_ctx {
             builder = builder.policy(policy);
         }
+        // The verified identity rides governance from the accepting node; the
+        // SHACL override gate reads it from here, not from the policy.
+        builder = builder.server_identity(governance.server_identity.clone());
 
         let Some((write_guard, staged_commit)) = builder
             .build_commit()

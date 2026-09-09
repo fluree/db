@@ -476,7 +476,7 @@ impl<'a> TransactCore<'a> {
         }
     }
 
-    pub(crate) fn set_pre_built_txn(&mut self, txn: Txn) {
+    pub(crate) fn set_pre_built_txn(&mut self, mut txn: Txn) {
         if self.operation.is_some() || self.pre_built_txn.is_some() || self.pending_sparql.is_some()
         {
             self.errors.push(BuilderError::Conflict {
@@ -484,6 +484,9 @@ impl<'a> TransactCore<'a> {
                 message: "Transaction operation already set; cannot set pre-built txn".to_string(),
             });
         } else {
+            // A pre-built `Txn` carries its own opts; the verified identity is
+            // builder-level context and must reach the gate either way.
+            txn.opts.server_identity = self.txn_opts.server_identity.clone();
             self.pre_built_txn = Some(txn);
         }
     }
@@ -491,15 +494,38 @@ impl<'a> TransactCore<'a> {
     /// Attach a follow-up `Txn` to stage into the same commit after the primary
     /// (per-row relationship `MERGE … ON MATCH SET`). Requires the primary
     /// `pre_built_txn` to be set first.
-    pub(crate) fn set_pre_built_txn_followup(&mut self, txn: Txn) {
+    pub(crate) fn set_pre_built_txn_followup(&mut self, mut txn: Txn) {
         if self.pre_built_txn.is_none() {
             self.errors.push(BuilderError::Conflict {
                 field: "operation",
                 message: "follow-up txn requires a primary pre-built txn".to_string(),
             });
         } else {
+            txn.opts.server_identity = self.txn_opts.server_identity.clone();
             self.pre_built_txn_followup = Some(txn);
         }
+    }
+
+    /// Record the auth-layer-verified caller identity on the transaction
+    /// options and on any pre-built `Txn` already attached, so the SHACL
+    /// override gate sees it regardless of the order the builder was driven.
+    pub(crate) fn set_server_identity(&mut self, identity: Option<String>) {
+        if let Some(txn) = self.pre_built_txn.as_mut() {
+            txn.opts.server_identity = identity.clone();
+        }
+        if let Some(txn) = self.pre_built_txn_followup.as_mut() {
+            txn.opts.server_identity = identity.clone();
+        }
+        self.txn_opts.server_identity = identity;
+    }
+
+    /// Replace the transaction options, keeping a previously recorded
+    /// verified identity unless the new options carry their own.
+    pub(crate) fn set_txn_opts(&mut self, mut opts: TxnOpts) {
+        if opts.server_identity.is_none() {
+            opts.server_identity = self.txn_opts.server_identity.take();
+        }
+        self.txn_opts = opts;
     }
 
     pub(crate) fn set_sparql_update(&mut self, sparql: &'a str) {
@@ -696,9 +722,11 @@ impl<'a> OwnedTransactBuilder<'a> {
 
     // -- Option setters --
 
-    /// Set transaction options (author, context, etc.).
+    /// Set transaction options (author, context, etc.). A verified identity
+    /// recorded earlier with [`Self::server_identity`] is kept unless `opts`
+    /// carries its own.
     pub fn txn_opts(mut self, opts: TxnOpts) -> Self {
-        self.core.txn_opts = opts;
+        self.core.set_txn_opts(opts);
         self
     }
 
@@ -723,6 +751,20 @@ impl<'a> OwnedTransactBuilder<'a> {
     /// Set policy enforcement for the transaction.
     pub fn policy(mut self, ctx: PolicyContext) -> Self {
         self.core.policy = Some(ctx);
+        self
+    }
+
+    /// Record the auth-layer-verified caller identity, the value the SHACL
+    /// group's `f:overrideControl` gates `opts.validationMode` on.
+    ///
+    /// This is distinct from the policy context: the policy identity may be
+    /// a caller-supplied `opts.identity`, and it never authorizes an
+    /// override. Only an auth layer should call this — the server does so
+    /// from the verified bearer / credential DID; an embedding application
+    /// that verifies identities itself is the auth layer for its deployment.
+    /// Left unset, identity-restricted overrides are denied.
+    pub fn server_identity(mut self, identity: Option<String>) -> Self {
+        self.core.set_server_identity(identity);
         self
     }
 
@@ -1244,9 +1286,11 @@ impl<'a> RefTransactBuilder<'a> {
 
     // -- Option setters --
 
-    /// Set transaction options (author, context, etc.).
+    /// Set transaction options (author, context, etc.). A verified identity
+    /// recorded earlier with [`Self::server_identity`] is kept unless `opts`
+    /// carries its own.
     pub fn txn_opts(mut self, opts: TxnOpts) -> Self {
-        self.core.txn_opts = opts;
+        self.core.set_txn_opts(opts);
         self
     }
 
@@ -1271,6 +1315,20 @@ impl<'a> RefTransactBuilder<'a> {
     /// Set policy enforcement for the transaction.
     pub fn policy(mut self, ctx: PolicyContext) -> Self {
         self.core.policy = Some(ctx);
+        self
+    }
+
+    /// Record the auth-layer-verified caller identity, the value the SHACL
+    /// group's `f:overrideControl` gates `opts.validationMode` on.
+    ///
+    /// This is distinct from the policy context: the policy identity may be
+    /// a caller-supplied `opts.identity`, and it never authorizes an
+    /// override. Only an auth layer should call this — the server does so
+    /// from the verified bearer / credential DID; an embedding application
+    /// that verifies identities itself is the auth layer for its deployment.
+    /// Left unset, identity-restricted overrides are denied.
+    pub fn server_identity(mut self, identity: Option<String>) -> Self {
+        self.core.set_server_identity(identity);
         self
     }
 
