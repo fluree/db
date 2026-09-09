@@ -38,17 +38,26 @@ Each setting group may include an `f:overrideControl` field controlling whether 
 
 ### Identity verification
 
-Override identity is the **server-verified request identity** (canonical DID string), not a user-supplied query parameter. Specifically:
+Override identity is the **auth-layer-verified request identity**, never a value the caller writes into a request. In the code it is the `VerifiedIdentity` type, which has a single constructor; the only places that call it are the server's auth boundaries. The server establishes it from:
 
-- With the `credential` feature: the DID from the verified JWS `kid` header
-- With server auth middleware: the DID mapped from an OAuth token
-- A caller **cannot** become an allowed identity by setting `"opts": {"identity": "..."}` in query JSON — that field is for policy evaluation context, not override authorization
-- Anonymous requests (no verified identity) are always denied by `f:IdentityRestricted`
+- With the `credential` feature: the DID of a verified JWS credential
+- With bearer tokens (including OAuth/OIDC tokens the server accepts): the `fluree.identity` claim, falling back to `sub`, of a verified token
+- Bolt sessions: the identity claim inside the session's verified token
+- MCP tools: the authenticated MCP principal
+
+What does **not** count, in any server mode:
+
+- `"opts": {"identity": "..."}` in query or transaction JSON, and the `fluree-identity` header. Both are policy evaluation context. In unauthenticated server modes they become the policy identity, but override control never consults the policy identity, so no request can satisfy an allow-list there.
+- Under root-bearer impersonation, policy evaluation uses the impersonated target while override control uses the bearer's own verified DID.
+- Anonymous requests (no verified identity) are always denied by `f:IdentityRestricted`.
+- CLI requests are always anonymous for override purposes: the CLI has no auth layer, so its `--identity` and policy flags only set the policy identity.
+
+An application embedding the Rust API is the auth layer for its deployment. It supplies the identity it has verified through `GovernanceOptions::server_identity`, `QueryExecutionOptions::with_server_identity`, and the transact builders' `server_identity` setter; left unset, identity-restricted overrides are denied.
 
 ### Query-time vs transact-time overrides
 
-- **Query-time overrides** (reasoning modes, policy opts): identity is the **query caller**
-- **Transact-time overrides** (SHACL mode, validation settings): identity is the **transaction signer**
+- **Query-time overrides** (reasoning modes, datalog settings, policy opts): the verified identity of the query request. It travels as `QueryExecutionOptions::server_identity` from the request boundary through query preparation, and the API stamps it onto the governance it parses from the request body, including per-source policy overrides.
+- **Transact-time overrides** (SHACL `validationMode`, policy defaults on writes): the verified identity of the transaction request, recorded on the stage builder and carried through consensus. It is never derived from the transaction's policy context.
 
 ## Monotonicity: per-graph can only tighten
 
@@ -143,10 +152,13 @@ log); it does not fail the transaction. The request can never toggle
 | `warn` | OverrideNone | `reject` (any) | **reject** | Strengthening is always free |
 
 The identity checked is the auth-layer-verified one (bearer / credential
-DID), not the user-settable `opts.identity`. Typical use: a remediation
-agent whose corrective writes transiently violate shapes gets per-write
-softening — under `IdentityRestricted`, only that agent — without flipping
-the graph's standing posture for every other writer.
+DID), not the user-settable `opts.identity` or the `fluree-identity` header,
+in every server mode: with no auth layer in play no request can satisfy an
+allow-list, and an embedded caller must set the builder's `server_identity`
+rather than rely on a policy context. Typical use: a remediation agent whose
+corrective writes transiently violate shapes gets per-write softening — under
+`IdentityRestricted`, only that agent — without flipping the graph's standing
+posture for every other writer.
 
 ### Transact (`f:transactDefaults`)
 
