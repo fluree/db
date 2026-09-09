@@ -52,8 +52,8 @@ pub async fn compute_delta_keys<C: ContentStore + Clone + 'static>(
 /// must treat the same triple in two graphs as two distinct facts, and must
 /// keep language-tagged strings and list positions apart, so `g`, `lang`,
 /// and `i` are all part of the key.
-#[derive(PartialEq, Eq, Hash)]
-struct FactKey {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FactKey {
     g: Option<Sid>,
     s: Sid,
     p: Sid,
@@ -64,7 +64,8 @@ struct FactKey {
 }
 
 impl FactKey {
-    fn of(flake: &Flake) -> Self {
+    /// The identity of `flake`'s fact, independent of `t` and `op`.
+    pub fn of(flake: &Flake) -> Self {
         Self {
             g: flake.g.clone(),
             s: flake.s.clone(),

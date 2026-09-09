@@ -906,3 +906,46 @@ async fn merge_keeps_value_source_replaced_and_restored() {
         vec!["Alice", "Bob"]
     );
 }
+
+/// Take-source retracts the target's values under each conflict key. When
+/// both sides made the identical change, the source's assert is a no-op
+/// (already asserted) and an unfiltered retract would wipe the value both
+/// sides agree on.
+#[tokio::test]
+async fn merge_take_source_keeps_value_both_sides_asserted() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let main = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .update(dev, &replace_name("ex:alice", "C"))
+        .await
+        .unwrap();
+    fluree
+        .update(main, &replace_name("ex:alice", "C"))
+        .await
+        .unwrap();
+
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::TakeSource)
+        .await
+        .unwrap();
+    assert_eq!(report.conflict_count, 1);
+
+    assert_eq!(query_all_names(&fluree, "mydb:main").await, vec!["C"]);
+}
