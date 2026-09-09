@@ -87,9 +87,9 @@ Two things are load-bearing here. **Only the leader can propose log entries**, b
 
 | Layer                          | Scope            | Backed by                                                                | Notes                                                                                                                                              |
 | ------------------------------ | ---------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Raft log + vote + snapshots    | Per node         | Local disk at `--raft-storage-path`                                       | Postcard-encoded, atomic writes (write-to-temp → fsync → rename → fsync parent). Losing this directory on one node is recoverable as long as a quorum survives. |
+| Raft log + vote + snapshots    | Per node         | Local disk at `--raft-storage-path`                                       | Entries append to segments under `log/` with one flush per batch; the committed watermark is rewritten in place with one flush; vote, purge marker and snapshots use atomic writes (write-to-temp → fsync → rename → fsync parent). Losing this directory on one node is recoverable as long as a quorum survives. |
 | Replicated state machine       | Per node, in-memory | `NameServiceState` (branch heads, ledger registry, idempotency cache, per-branch queues) | Persisted via openraft snapshots into `--raft-storage-path/snapshots/`. Restored on restart so log replay starts at `last_applied + 1`. |
-| Ledger CAS (commit blobs, envelopes, index artifacts) | Cluster-wide | Whatever `--connection-config` / `--storage-path` resolves to (S3, file, memory) | Must be reachable **read-write** from every node: whichever node owns a branch writes its commit blobs, the leader writes index artifacts, every node reads. |
+| Ledger CAS (commit blobs, envelopes, index artifacts) | Cluster-wide | Whatever `--connection-config` / `--storage-path` resolves to (S3, file, memory) | Must be reachable **read-write** from every node: whichever node owns a branch writes its commit blobs, the leader writes index artifacts, every node reads. On a file root each node journals its writes under a log of its own (`.fluree-redo/owners/node-<id>/`), flushed on every write; any node applies a stopped node's unflushed tail when it opens the root or misses a file. See [Storage durability](storage.md#the-redo-log). |
 
 `--raft-storage-path` and `--storage-path` must point at **disjoint** filesystem subtrees. Validation rejects overlapping paths at startup because the Raft log/snapshot tree and the ledger CAS each manage their own layout; overlapping them lets either side blow away the other's files on compaction and tends to surface only after a restart corrupts state.
 
@@ -249,6 +249,8 @@ The Raft log and snapshot encodings (postcard for `Command`, `Response`, and `Na
 4. Trigger a leadership transfer (stop and restart the current leader); upgrade and restart it.
 
 Skipping versions is not supported. The safe path is N → N+1; for larger jumps, do them sequentially.
+
+The Raft log's on-disk layout changed in v4.3 from one file per entry to append-only segments. A node folds its existing entry files into a segment the first time the new binary opens `--raft-storage-path`; the fold keeps the contiguous run above the purge cutoff, exactly what the old layout reported, and needs no operator action. It is per node, so it rolls with the upgrade above. An older binary cannot read segments; downgrading a node means restoring its `--raft-storage-path` from before the upgrade, or letting it rejoin as a fresh node and take a snapshot from the leader.
 
 ## Admin HTTP surface
 
