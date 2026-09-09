@@ -1304,7 +1304,11 @@ impl StorageWrite for FileStorage {
     /// content never waits here: it is durable when its write returns, in
     /// the log or on the device.
     async fn sync(&self) -> Result<()> {
-        let _one_at_a_time = self.flushing.lock().await;
+        // The guard travels into the blocking task below: cancelling this
+        // future must not release the barrier while the flush is still
+        // running, or a later caller would see nothing pending and return
+        // before its files were on the device.
+        let one_at_a_time = Arc::clone(&self.flushing).lock_owned().await;
         let keys: Vec<String> = {
             let mut pending = self
                 .unflushed
@@ -1322,6 +1326,7 @@ impl StorageWrite for FileStorage {
         let fsyncs = Arc::clone(&self.fsyncs);
         let unflushed = Arc::clone(&self.unflushed);
         tokio::task::spawn_blocking(move || {
+            let _one_at_a_time = one_at_a_time;
             match wal::flush_keys(&base, &keys, &fsyncs) {
                 Ok(()) => Ok(()),
                 Err(e) => {
@@ -3029,7 +3034,7 @@ mod wal_tests {
     /// `sync`: nothing on the write path, every file and directory after.
     #[tokio::test]
     async fn derived_content_is_flushed_by_sync_not_by_its_write() {
-        for durability in [Durability::Journal, Durability::Sync] {
+        for durability in [Durability::Wal, Durability::Sync] {
             let dir = tempfile::tempdir().unwrap();
             let storage = FileStorage::new(dir.path()).with_durability(durability);
             for i in 0..3u8 {
@@ -3116,6 +3121,71 @@ mod wal_tests {
         assert!(
             second.is_err(),
             "a second sync returned before the first flushed anything: {second:?}"
+        );
+    }
+
+    /// Cancelling a `sync` must not release the barrier while its flush is
+    /// still running on the blocking pool: the guard rides with the flush.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_sync_keeps_its_barrier_until_the_flush_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        let result = storage
+            .content_write_bytes_with_hash(
+                ContentKind::IndexLeaf,
+                "l:main",
+                &"a".repeat(64),
+                b"leaf",
+            )
+            .await
+            .unwrap();
+        let path = storage.resolve_path(&result.address).unwrap();
+        let sentinel = storage
+            .content_write_bytes_with_hash(
+                ContentKind::IndexLeaf,
+                "l:main",
+                &"b".repeat(64),
+                b"sentinel",
+            )
+            .await
+            .unwrap();
+        let sentinel_path = storage.resolve_path(&sentinel.address).unwrap();
+        std::fs::remove_file(&sentinel_path).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &sentinel_path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let first_storage = storage.clone();
+        let first = tokio::spawn(async move { first_storage.sync().await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !storage.unflushed.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first sync drained the batch");
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let second =
+            tokio::time::timeout(std::time::Duration::from_millis(100), storage.sync()).await;
+        let unblock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // The detached flush reaches the device node, fails, and returns
+        // its batch to the queue.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while storage.unflushed.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the failed batch came back");
+        drop(unblock);
+        assert!(
+            second.is_err(),
+            "a sync returned while the cancelled caller's flush was still running: {second:?}"
         );
     }
 
