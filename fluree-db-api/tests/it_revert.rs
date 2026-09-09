@@ -604,3 +604,43 @@ async fn revert_records_reverted_commit_ids_in_txn_meta() {
         other => panic!("expected string-valued reverts entry, got {other:?}"),
     }
 }
+
+/// Reverting a range folds every inverted commit into ONE commit at ONE `t`.
+/// A value the range replaced and then restored must net to "unchanged",
+/// not to a same-`t` assert+retract pair that resolves to "gone".
+#[tokio::test]
+async fn revert_range_nets_replace_and_restore() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let replace = |name: &str| {
+        json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "where": {"@id": "ex:alice", "ex:name": "?old"},
+            "delete": {"@id": "ex:alice", "ex:name": "?old"},
+            "insert": {"@id": "ex:alice", "ex:name": name}
+        })
+    };
+
+    let r1 = fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap();
+    let r2 = fluree.update(r1.ledger, &replace("B")).await.unwrap();
+    let r3 = fluree.update(r2.ledger, &replace("Alice")).await.unwrap();
+    assert_eq!(query_all_names(&fluree, "mydb:main").await, vec!["Alice"]);
+
+    // r1..r3 reverts {r2, r3}: Alice -> B -> Alice, net unchanged.
+    let report = fluree
+        .revert_range(
+            "mydb",
+            "main",
+            CommitRef::Exact(r1.receipt.commit_id.clone()),
+            CommitRef::Exact(r3.receipt.commit_id.clone()),
+            ConflictStrategy::TakeSource,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.reverted_commits.len(), 2);
+
+    assert_eq!(query_all_names(&fluree, "mydb:main").await, vec!["Alice"]);
+}

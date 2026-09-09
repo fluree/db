@@ -1,24 +1,38 @@
-//! Accumulate flakes and `namespace_delta` / `graph_delta` from a sequence
-//! of commits into one [`CollectedCommitData`].
+//! Fold a sequence of commits into the flakes and `namespace_delta` /
+//! `graph_delta` of ONE new commit.
 //!
 //! Used by the merge and revert paths to bundle multiple source commits into
-//! a single new commit. The two paths differ only in how each commit's
-//! flakes are transformed before they're appended (identity for merge,
-//! `flake.invert()` for revert), so the loop body — and especially the
-//! `or_insert` semantics for the namespace and graph deltas — is shared.
+//! a single commit. Because that commit lands at a single `t`, and novelty
+//! resolves a same-`t` assert and retract of one fact as "retracted", the
+//! range's flakes are **netted per fact** first: a fact the range asserted,
+//! retracted, and asserted again folds to one assert; a fact it replaced and
+//! then restored folds to nothing. The netting contract is
+//! [`NetChangeAccumulator`]'s.
 
 use fluree_db_core::{Commit, Flake};
+use fluree_db_novelty::NetChangeAccumulator;
 use std::collections::HashMap;
 
 /// Flakes and metadata accumulated from a sequence of commits.
 #[derive(Default)]
 pub(crate) struct CollectedCommitData {
-    /// All flakes from the input commits, in order, after `flake_transform`.
+    /// The range's net change, one flake per surviving fact. Unordered.
     pub(crate) flakes: Vec<Flake>,
     /// Union of namespace deltas; earlier commits win on key collisions.
     pub(crate) namespace_delta: HashMap<u16, String>,
     /// Union of graph deltas; earlier commits win on key collisions.
     pub(crate) graph_delta: HashMap<u16, String>,
+}
+
+/// Which direction the new commit applies the range in.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Fold {
+    /// Apply the commits as they were (merge): the newest commit's flakes
+    /// are the newest change.
+    Replay,
+    /// Apply the commits' inverses (revert): undoing the range means the
+    /// oldest commit's inverse is applied last, so it is the newest change.
+    Undo,
 }
 
 /// Fold `commits` into a [`CollectedCommitData`].
@@ -27,19 +41,16 @@ pub(crate) struct CollectedCommitData {
 /// commits take precedence on namespace and graph delta keys (matches the
 /// historical `or_insert` semantics in `merge.rs::collect_commit_data`).
 ///
-/// `flake_transform` is applied to every flake before it's appended. Use
-/// [`std::convert::identity`] to keep flakes as-is (merge), or
-/// `|f| f.invert()` to flip assertions ⇄ retractions (revert). Flake `t`
-/// is not a concern here: `StagedLedger::new` restamps every staged flake.
-pub(crate) fn collect_from_commits<I, F>(commits: I, mut flake_transform: F) -> CollectedCommitData
+/// Flake `t` is not a concern here: `StagedLedger::new` restamps every
+/// staged flake.
+pub(crate) fn collect_from_commits<I>(commits: I, fold: Fold) -> CollectedCommitData
 where
     I: IntoIterator<Item = Commit>,
-    F: FnMut(Flake) -> Flake,
 {
     let mut data = CollectedCommitData::default();
+    let mut ordered: Vec<Vec<Flake>> = Vec::new();
     for commit in commits {
-        data.flakes
-            .extend(commit.flakes.into_iter().map(&mut flake_transform));
+        ordered.push(commit.flakes);
         for (code, prefix) in commit.namespace_delta {
             data.namespace_delta.entry(code).or_insert(prefix);
         }
@@ -47,5 +58,28 @@ where
             data.graph_delta.entry(g_id).or_insert(iri);
         }
     }
+
+    // The accumulator wants the range newest-change-first. For a replay
+    // that is the newest commit, last flake first. For an undo the inverse
+    // of the oldest commit is applied last, so the oldest commit's inverse
+    // comes first and each commit's own flakes keep their order.
+    let mut acc = NetChangeAccumulator::default();
+    match fold {
+        Fold::Replay => {
+            for flakes in ordered.iter().rev() {
+                for flake in flakes.iter().rev() {
+                    acc.push_newest_first(flake);
+                }
+            }
+        }
+        Fold::Undo => {
+            for flakes in &ordered {
+                for flake in flakes {
+                    acc.push_newest_first(&flake.invert());
+                }
+            }
+        }
+    }
+    data.flakes = acc.finish();
     data
 }

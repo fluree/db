@@ -18,7 +18,7 @@
 //!   rejected — only `Abort`, `TakeSource`, and `TakeBranch` make sense for
 //!   revert.
 
-use crate::commit_data::{collect_from_commits, CollectedCommitData};
+use crate::commit_data::{collect_from_commits, CollectedCommitData, Fold};
 use crate::error::{ApiError, Result};
 use crate::ledger_manager::GuardedStagedCommit;
 use crate::ledger_view::{CommitRef, LedgerView};
@@ -425,9 +425,10 @@ impl crate::Fluree {
         let conflict_count = conflict_keys.len();
         let rollback_snapshot = NsRecordSnapshot::from_record(&branch_record);
         // Load reverted commits oldest-first then fold via the shared
-        // accumulator: invert each flake's `op` (assertion ⇄ retraction) and
-        // accumulate `namespace_delta`/`graph_delta` with earlier-wins
-        // semantics, matching the merge path's `collect_commit_data`.
+        // accumulator: invert each flake's `op` (assertion ⇄ retraction),
+        // net per fact, and accumulate `namespace_delta`/`graph_delta` with
+        // earlier-wins semantics, matching the merge path's
+        // `collect_commit_data`.
         let mut commits = Vec::with_capacity(plan.ordered_commits.len());
         for commit_id in plan.ordered_commits.iter().rev() {
             commits.push(load_commit_by_id(&branch_store, commit_id).await?);
@@ -436,7 +437,7 @@ impl crate::Fluree {
             flakes: inverted,
             namespace_delta,
             graph_delta,
-        } = collect_from_commits(commits, |f| f.invert());
+        } = collect_from_commits(commits, Fold::Undo);
 
         // Acquire state under the ledger write lock when a manager is
         // available, serializing with regular transactions. Without a

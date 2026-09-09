@@ -4,7 +4,7 @@
 //! merges (target HEAD is the common ancestor) and general merges with
 //! conflict resolution strategies.
 
-use crate::commit_data::{collect_from_commits, CollectedCommitData};
+use crate::commit_data::{collect_from_commits, CollectedCommitData, Fold};
 use crate::error::{ApiError, Result};
 use crate::ledger_manager::GuardedStagedCommit;
 use crate::rebase::ConflictStrategy;
@@ -700,11 +700,12 @@ impl crate::Fluree {
     }
 }
 
-/// Collect all flakes, namespace deltas, and graph deltas from commits
+/// Collect the net flakes, namespace deltas, and graph deltas from commits
 /// between `head_id` and `stop_at_t` (exclusive). Walks the first-parent
-/// lineage newest-first (a merge commit on the source already carries the
-/// folded flakes of whatever it merged) then folds via [`collect_from_commits`] in oldest-first order so that
-/// earlier commits win on namespace and graph delta key collisions.
+/// lineage (a merge commit on the source already carries the folded flakes
+/// of whatever it merged) then folds via [`collect_from_commits`] in
+/// oldest-first order so that earlier commits win on namespace and graph
+/// delta key collisions.
 async fn collect_commit_data(
     store: &impl ContentStore,
     head_id: &ContentId,
@@ -715,5 +716,5 @@ async fn collect_commit_data(
     for (_, cid) in dag.iter().rev() {
         commits.push(load_commit_by_id(store, cid).await?);
     }
-    Ok(collect_from_commits(commits, std::convert::identity))
+    Ok(collect_from_commits(commits, Fold::Replay))
 }
