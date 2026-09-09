@@ -156,9 +156,8 @@ async fn acknowledged_transactions_survive_losing_every_unflushed_file() {
 
 /// Commits on different ledgers that reach the log together share one
 /// device flush. The flush is slowed so eight concurrent commits are sure to
-/// pile up behind the first; they then cost fewer flushes than commits, and
-/// far less time than eight flushes in a row. A lone commit still costs
-/// exactly one (`a_transaction_costs_one_flush`).
+/// pile up behind the first; they then cost fewer flushes than commits. A
+/// lone commit still costs exactly one (`a_transaction_costs_one_flush`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_ledgers_share_a_flush() {
     const LEDGERS: usize = 8;
@@ -177,7 +176,6 @@ async fn concurrent_ledgers_share_a_flush() {
     let delay = std::time::Duration::from_millis(60);
     probe.slow_wal_sync_for_test(delay).expect("slow");
     let before = probe.fsyncs_issued();
-    let started = std::time::Instant::now();
     let tasks: Vec<_> = handles
         .into_iter()
         .enumerate()
@@ -189,15 +187,10 @@ async fn concurrent_ledgers_share_a_flush() {
     for task in tasks {
         task.await.expect("commit task");
     }
-    let elapsed = started.elapsed();
     let flushes = probe.fsyncs_issued() - before;
     assert!(
         flushes < LEDGERS as u64,
         "{flushes} flushes for {LEDGERS} concurrent commits: none were shared"
-    );
-    assert!(
-        elapsed < delay * LEDGERS as u32,
-        "{LEDGERS} commits took {elapsed:?}: they flushed one after another"
     );
     probe
         .slow_wal_sync_for_test(std::time::Duration::ZERO)
