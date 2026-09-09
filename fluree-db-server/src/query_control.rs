@@ -54,9 +54,12 @@ struct ServerQueryControl {
     options: QueryExecutionOptions,
 }
 
-fn query_execution_control(timeout_ms: u64) -> ServerQueryControl {
+fn query_execution_control(timeout_ms: u64, server_identity: Option<&str>) -> ServerQueryControl {
     let cancellation = QueryCancellation::new();
     let mut options = QueryExecutionOptions::new().with_cancellation(cancellation.clone());
+    if let Some(identity) = server_identity {
+        options = options.with_server_identity(identity);
+    }
 
     if timeout_ms != 0 {
         let timer_cancellation = cancellation.clone();
@@ -82,13 +85,18 @@ fn query_execution_control(timeout_ms: u64) -> ServerQueryControl {
 /// existing builder call sites simple while still sharing one cancellation
 /// handle across all query execution performed for the request.
 ///
+/// The options also carry the request's auth-layer-verified identity
+/// (`server_identity`), installed by [`run_query_task`], so every query the
+/// request performs is gated on it by `f:overrideControl`.
+///
 /// The `timeout_ms` fallback is used only when this is called outside a
 /// [`run_query_task`] scope. Inside that scope, the already-installed
 /// request-scoped options win and this argument is intentionally ignored.
+/// Outside it the options are anonymous.
 pub(crate) fn current_query_execution_options(timeout_ms: u64) -> QueryExecutionOptions {
     QUERY_EXECUTION_OPTIONS
         .try_with(Clone::clone)
-        .unwrap_or_else(|_| query_execution_control(timeout_ms).options)
+        .unwrap_or_else(|_| query_execution_control(timeout_ms, None).options)
 }
 
 /// Run server query work in a spawned task that can outlive the HTTP/MCP waiter.
@@ -97,8 +105,14 @@ pub(crate) fn current_query_execution_options(timeout_ms: u64) -> QueryExecution
 /// disconnect guard signals `ClientDisconnected` on the same handle installed in
 /// [`QueryExecutionOptions`]. The spawned query task can then observe that signal
 /// at cooperative cancellation checkpoints.
+///
+/// `server_identity` is the request's auth-layer-verified identity (the
+/// credential DID or bearer identity, see `routes::query::effective_identity`),
+/// never a header or body value. It is installed in the request-scoped options
+/// so `f:overrideControl` checks on every query the task runs see it.
 pub(crate) async fn run_query_task<T, Fut, Build>(
     timeout_ms: u64,
+    server_identity: Option<String>,
     build: Build,
 ) -> Result<T, ServerError>
 where
@@ -106,7 +120,7 @@ where
     Fut: Future<Output = Result<T, ServerError>> + Send + 'static,
     Build: FnOnce() -> Fut,
 {
-    let control = query_execution_control(timeout_ms);
+    let control = query_execution_control(timeout_ms, server_identity.as_deref());
     let mut disconnect_guard = QueryDisconnectGuard::new(control.cancellation.clone());
     let options = control.options;
 
@@ -137,7 +151,7 @@ mod tests {
         let (reason_tx, reason_rx) = oneshot::channel();
 
         let waiter = tokio::spawn(async move {
-            run_query_task(0, || async move {
+            run_query_task(0, None, || async move {
                 let cancellation = current_query_execution_options(0)
                     .cancellation
                     .expect("server query task has cancellation handle");
@@ -169,7 +183,7 @@ mod tests {
     async fn completed_query_does_not_signal_client_disconnect() {
         let (handle_tx, handle_rx) = oneshot::channel();
 
-        let result: Result<(), ServerError> = run_query_task(0, || async move {
+        let result: Result<(), ServerError> = run_query_task(0, None, || async move {
             let cancellation = current_query_execution_options(0)
                 .cancellation
                 .expect("server query task has cancellation handle");
@@ -188,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_signals_timeout_to_query_task() {
         let reason = timeout(Duration::from_secs(1), async {
-            run_query_task(1, || async move {
+            run_query_task(1, None, || async move {
                 let cancellation = current_query_execution_options(0)
                     .cancellation
                     .expect("server query task has cancellation handle");

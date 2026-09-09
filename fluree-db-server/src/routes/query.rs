@@ -570,7 +570,9 @@ pub async fn query(
         None, // tenant_id not yet supported
         Some(input_format),
     );
-    crate::query_control::run_query_task(state.config.query_timeout_ms, move || async move {
+    let timeout_ms = state.config.query_timeout_ms;
+    let server_identity = effective_identity(&credential, &bearer);
+    crate::query_control::run_query_task(timeout_ms, server_identity, move || async move {
     async move {
     let span = tracing::Span::current();
 
@@ -971,7 +973,9 @@ pub async fn query_ledger(
         None, // tenant_id not yet supported
         Some(input_format),
     );
-    crate::query_control::run_query_task(state.config.query_timeout_ms, move || async move {
+    let timeout_ms = state.config.query_timeout_ms;
+    let server_identity = effective_identity(&credential, &bearer);
+    crate::query_control::run_query_task(timeout_ms, server_identity, move || async move {
     async move {
     let span = tracing::Span::current();
 
@@ -1032,6 +1036,7 @@ pub async fn query_ledger(
             &ledger,
             &sparql,
             identity.as_deref(),
+            bearer_identity.as_deref(),
             delimited,
             &headers,
             params.default_context,
@@ -1075,6 +1080,7 @@ pub async fn query_ledger(
             &ledger,
             &cypher,
             identity.as_deref(),
+            bearer_identity.as_deref(),
             &headers,
             &span,
         )
@@ -2306,8 +2312,13 @@ async fn execute_query_proxy(
     Ok((HeaderMap::new(), Json(result)).into_response())
 }
 
+/// Governance for a SPARQL request: `identity` is the resolved policy identity
+/// (impersonation-aware, may come from the `fluree-identity` header), while
+/// `server_identity` is the auth-layer-verified one (`effective_identity`)
+/// that `f:overrideControl` gates on.
 pub(crate) fn sparql_qc_opts(
     identity: Option<&str>,
+    server_identity: Option<&str>,
     headers: &FlureeHeaders,
 ) -> Result<fluree_db_api::GovernanceOptions> {
     let policy_values_map = headers.policy_values_map()?;
@@ -2320,7 +2331,7 @@ pub(crate) fn sparql_qc_opts(
         },
         policy: headers.policy.clone(),
         policy_values: policy_values_map,
-        server_identity: None,
+        server_identity: server_identity.map(String::from),
         default_allow: headers.default_allow,
     })
 }
@@ -2625,11 +2636,14 @@ fn pattern_reads_default_graph(pattern: &fluree_db_sparql::ast::GraphPattern) ->
     }
 }
 
+/// `identity` is the resolved policy identity; `server_identity` is the
+/// auth-layer-verified one that `f:overrideControl` gates on.
 async fn execute_cypher_ledger(
     state: &AppState,
     ledger_id: &str,
     cypher: &str,
     identity: Option<&str>,
+    server_identity: Option<&str>,
     headers: &FlureeHeaders,
     span: &tracing::Span,
 ) -> Result<Response> {
@@ -2650,7 +2664,7 @@ async fn execute_cypher_ledger(
         },
         policy: headers.policy.clone(),
         policy_values: policy_values_map,
-        server_identity: None,
+        server_identity: server_identity.map(String::from),
         default_allow: headers.default_allow,
     };
 
@@ -2673,7 +2687,12 @@ async fn execute_cypher_ledger(
 
     let result = state
         .fluree
-        .query_cypher_with_params(&view, &cypher, params.as_ref())
+        .query_cypher_with_options(
+            &view,
+            &cypher,
+            params.as_ref(),
+            &query_execution_options(state),
+        )
         .await
         .map_err(|e| {
             set_span_error_code(span, "error:InvalidQuery");
@@ -2707,11 +2726,15 @@ async fn execute_cypher_ledger(
 }
 
 /// Execute a SPARQL query against a specific ledger and return result
+/// `identity` is the resolved policy identity; `server_identity` is the
+/// auth-layer-verified one that `f:overrideControl` gates on.
+#[allow(clippy::too_many_arguments)]
 async fn execute_sparql_ledger(
     state: &AppState,
     ledger_id: &str,
     sparql: &str,
     identity: Option<&str>,
+    server_identity: Option<&str>,
     delimited: Option<DelimitedFormat>,
     headers: &FlureeHeaders,
     use_default_context: bool,
@@ -2751,7 +2774,7 @@ async fn execute_sparql_ledger(
         // Build GovernanceOptions from the resolved identity plus header-supplied
         // policy fields. SPARQL has no body `opts` block, so headers are the only
         // transport for `policy-class`, `policy`, `policy-values`, and `default-allow`.
-        let qc_opts = sparql_qc_opts(identity, headers).inspect_err(|e| {
+        let qc_opts = sparql_qc_opts(identity, server_identity, headers).inspect_err(|e| {
             set_span_error_code(&span, "error:BadRequest");
             tracing::warn!(error = %e, "invalid fluree-policy-values header");
         })?;
@@ -2929,7 +2952,10 @@ async fn execute_sparql_ledger(
                 let dataset = if qc_opts.has_any_policy_inputs() {
                     state.fluree.build_dataset_view_with_policy(&spec, &qc_opts).await
                 } else {
-                    state.fluree.build_dataset_view(&spec).await
+                    state
+                        .fluree
+                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_deref())
+                        .await
                 }
                 .map_err(ServerError::Api)?;
                 let response = dataset
@@ -2982,7 +3008,10 @@ async fn execute_sparql_ledger(
                 let dataset = if qc_opts.has_any_policy_inputs() {
                     state.fluree.build_dataset_view_with_policy(&spec, &qc_opts).await
                 } else {
-                    state.fluree.build_dataset_view(&spec).await
+                    state
+                        .fluree
+                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_deref())
+                        .await
                 }
                 .map_err(ServerError::Api)?;
                 let xml = dataset
@@ -3014,7 +3043,10 @@ async fn execute_sparql_ledger(
                 let dataset = if qc_opts.has_any_policy_inputs() {
                     state.fluree.build_dataset_view_with_policy(&spec, &qc_opts).await
                 } else {
-                    state.fluree.build_dataset_view(&spec).await
+                    state
+                        .fluree
+                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_deref())
+                        .await
                 }
                 .map_err(ServerError::Api)?;
                 let xml = dataset
@@ -3058,7 +3090,10 @@ async fn execute_sparql_ledger(
                 let dataset = if qc_opts.has_any_policy_inputs() {
                     state.fluree.build_dataset_view_with_policy(&spec, &qc_opts).await
                 } else {
-                    state.fluree.build_dataset_view(&spec).await
+                    state
+                        .fluree
+                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_deref())
+                        .await
                 }
                 .map_err(ServerError::Api)?;
                 let result = dataset
@@ -3081,7 +3116,10 @@ async fn execute_sparql_ledger(
             let dataset = if qc_opts.has_any_policy_inputs() {
                 state.fluree.build_dataset_view_with_policy(&spec, &qc_opts).await
             } else {
-                state.fluree.build_dataset_view(&spec).await
+                state
+                        .fluree
+                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_deref())
+                        .await
             }
             .map_err(ServerError::Api)?;
             let result = dataset
@@ -4027,7 +4065,9 @@ pub async fn multi_query(
         Some("multi-query"),
     );
 
-    crate::query_control::run_query_task(state.config.query_timeout_ms, move || async move {
+    let timeout_ms = state.config.query_timeout_ms;
+    let server_identity = effective_identity(&credential, &bearer);
+    crate::query_control::run_query_task(timeout_ms, server_identity, move || async move {
         async move {
             let span = tracing::Span::current();
             tracing::info!(status = "start", "multi-query request received");

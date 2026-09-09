@@ -158,13 +158,21 @@ async fn stream_query_connection_inner(
             fluree_db_sparql::parse_sparql(&sparql).ast.as_ref(),
         );
 
+        // Unpoliced (see above), but the auth-layer-verified identity still
+        // gates `f:overrideControl` on the ledgers' reasoning defaults.
+        let identity = effective_identity(&credential, &bearer);
+        let plan_options = plan_options_as(identity.as_deref());
+        let governance = fluree_db_api::GovernanceOptions {
+            server_identity: identity,
+            ..Default::default()
+        };
         let dataset = fluree
-            .build_stream_dataset_for_sparql(&sparql, &fluree_db_api::GovernanceOptions::default())
+            .build_stream_dataset_for_sparql(&sparql, &governance)
             .await
             .map_err(ServerError::Api)?;
         let input = OwnedStreamQuery::Sparql(sparql);
         let plan = fluree
-            .plan_stream_query_dataset(&dataset, &input)
+            .plan_stream_query_dataset_with_options(&dataset, &input, &plan_options)
             .await
             .map_err(ServerError::Api)?;
         (
@@ -203,6 +211,7 @@ async fn stream_query_connection_inner(
         }
         enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
         let identity = effective_identity(&credential, &bearer);
+        let plan_options = plan_options_as(identity.as_deref());
         crate::routes::policy_auth::apply_auth_identity_to_opts(
             state.as_ref(),
             &ledger_id,
@@ -223,12 +232,12 @@ async fn stream_query_connection_inner(
 
         let tracker = stream_tracker(Some(&query_json));
         let dataset = fluree
-            .build_stream_dataset(&query_json)
+            .build_stream_dataset_with_options(&query_json, &plan_options)
             .await
             .map_err(ServerError::Api)?;
         let input = OwnedStreamQuery::JsonLd(query_json);
         let plan = fluree
-            .plan_stream_query_dataset(&dataset, &input)
+            .plan_stream_query_dataset_with_options(&dataset, &input, &plan_options)
             .await
             .map_err(ServerError::Api)?;
         (StreamPlan::Dataset { dataset, plan }, tracker)
@@ -288,6 +297,7 @@ async fn stream_query_inner(
         // (bearer/header), the server default policy class, and the
         // `Fluree-Policy*` / `Fluree-Default-Allow` headers.
         let bearer_identity = effective_identity(&credential, &bearer);
+        let plan_options = plan_options_as(bearer_identity.as_deref());
         let identity = crate::routes::policy_auth::resolve_sparql_identity(
             state.as_ref(),
             &ledger,
@@ -295,7 +305,11 @@ async fn stream_query_inner(
             headers.identity.as_deref(),
         )
         .await;
-        let qc_opts = crate::routes::query::sparql_qc_opts(identity.as_deref(), &headers)?;
+        let qc_opts = crate::routes::query::sparql_qc_opts(
+            identity.as_deref(),
+            bearer_identity.as_deref(),
+            &headers,
+        )?;
 
         // Detect FROM/FROM NAMED dataset clauses.
         let parsed = fluree_db_sparql::parse_sparql(&sparql);
@@ -351,7 +365,7 @@ async fn stream_query_inner(
                 .map_err(ServerError::Api)?;
             let input = OwnedStreamQuery::Sparql(sparql);
             let plan = fluree
-                .plan_stream_query_dataset(&dataset, &input)
+                .plan_stream_query_dataset_with_options(&dataset, &input, &plan_options)
                 .await
                 .map_err(ServerError::Api)?;
             (
@@ -365,7 +379,7 @@ async fn stream_query_inner(
             let plan = {
                 let graph = GraphDb::from_ledger_state(&ledger_state);
                 fluree
-                    .plan_stream_query(&graph, &input)
+                    .plan_stream_query_with_options(&graph, &input, &plan_options)
                     .await
                     .map_err(ServerError::Api)?
             };
@@ -400,6 +414,7 @@ async fn stream_query_inner(
         }
         enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
         let identity = effective_identity(&credential, &bearer);
+        let plan_options = plan_options_as(identity.as_deref());
         crate::routes::policy_auth::apply_auth_identity_to_opts(
             state.as_ref(),
             &ledger,
@@ -437,12 +452,12 @@ async fn stream_query_inner(
             warn_headers =
                 crate::routes::query::jsonld_dataset_semantics_warning_headers(&query_json);
             let dataset = fluree
-                .build_stream_dataset(&query_json)
+                .build_stream_dataset_with_options(&query_json, &plan_options)
                 .await
                 .map_err(ServerError::Api)?;
             let input = OwnedStreamQuery::JsonLd(query_json);
             let plan = fluree
-                .plan_stream_query_dataset(&dataset, &input)
+                .plan_stream_query_dataset_with_options(&dataset, &input, &plan_options)
                 .await
                 .map_err(ServerError::Api)?;
             (StreamPlan::Dataset { dataset, plan }, tracker)
@@ -452,7 +467,7 @@ async fn stream_query_inner(
             let plan = {
                 let graph = GraphDb::from_ledger_state(&ledger_state);
                 fluree
-                    .plan_stream_query(&graph, &input)
+                    .plan_stream_query_with_options(&graph, &input, &plan_options)
                     .await
                     .map_err(ServerError::Api)?
             };
@@ -467,6 +482,19 @@ async fn stream_query_inner(
 }
 
 /// Spawn the producer for a resolved plan and assemble the NDJSON streaming
+/// Planning-time execution options carrying the auth-layer-verified identity
+/// that `f:overrideControl` gates on. The streaming handlers run outside a
+/// `run_query_task` scope, so the request-scoped options are not installed;
+/// planning only reads `server_identity`, and the cancellation-bearing options
+/// are attached separately in `finish_stream`.
+fn plan_options_as(server_identity: Option<&str>) -> fluree_db_api::QueryExecutionOptions {
+    let options = fluree_db_api::QueryExecutionOptions::new();
+    match server_identity {
+        Some(id) => options.with_server_identity(id),
+        None => options,
+    }
+}
+
 /// response (cancellation/disconnect guard + heartbeat). Shared by the
 /// ledger-scoped and connection-scoped handlers.
 fn finish_stream(

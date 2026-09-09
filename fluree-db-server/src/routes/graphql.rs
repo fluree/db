@@ -65,7 +65,8 @@ pub async fn graphql_ledger_tail(
     // client disconnect cancels the whole fan-out, not one field of it.
     let timeout_ms = state.config.query_timeout_ms;
     let limits = graphql_limits(&state);
-    crate::query_control::run_query_task(timeout_ms, move || {
+    let server_identity = crate::routes::query::effective_identity(&credential, &bearer);
+    crate::query_control::run_query_task(timeout_ms, server_identity, move || {
         async move {
             authorize_read(&state, &ledger, &bearer, &credential)?;
             let request = parse_request(&params, &credential, limits)?;
@@ -252,7 +253,8 @@ async fn policy_view(
         policy_class: (!headers.policy_class.is_empty()).then(|| headers.policy_class.clone()),
         policy: headers.policy.clone(),
         policy_values: headers.policy_values_map()?,
-        server_identity: None,
+        // The verified bearer/credential DID, not the impersonation target.
+        server_identity: bearer_identity,
         default_allow: headers.default_allow,
     };
 
