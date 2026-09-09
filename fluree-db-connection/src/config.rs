@@ -436,7 +436,7 @@ fn parse_storage_node(graph: &ConfigGraph, node: &JsonValue) -> Result<StorageCo
             None => None,
             Some(v) => Some(Durability::from_mode_name(&v).ok_or_else(|| {
                 ConnectionError::invalid_config(format!(
-                    "Unknown storage durability '{v}': expected 'sync' or 'page-cache'"
+                    "Unknown storage durability '{v}': expected 'journal', 'sync' or 'page-cache'"
                 ))
             })?),
         };
@@ -812,7 +812,7 @@ impl StorageConfig {
                     })?;
                     config.durability = Some(Durability::from_mode_name(s).ok_or_else(|| {
                         ConnectionError::invalid_config(format!(
-                            "Unknown storage durability '{s}': expected 'sync' or 'page-cache'"
+                            "Unknown storage durability '{s}': expected 'journal', 'sync' or 'page-cache'"
                         ))
                     })?);
                 }

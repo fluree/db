@@ -351,13 +351,15 @@ Every write is atomic: bytes are staged alongside the destination and moved into
 place, so a reader never observes a partially written file, and an interrupted
 write leaves nothing at the final name.
 
-Whether an acknowledged write survives the machine *losing power* is controlled
-by the storage node's `durability` property, or by `FLUREE_STORAGE_FSYNC`:
+Whether an acknowledged write survives the machine *losing power*, and what a
+commit pays for that, is controlled by the storage node's `durability` property,
+or by `FLUREE_STORAGE_FSYNC`:
 
-| Mode | Acknowledged when | Survives |
-|---|---|---|
-| `sync` (default) | bytes and directory entry flushed to the device | process death and power loss |
-| `page-cache` | bytes reach the OS page cache | process death only |
+| Mode | Acknowledged when | Survives | Flushes per commit |
+|---|---|---|---|
+| `journal` (default) | the write is in the root's redo log and the log is flushed | process death and power loss | one |
+| `sync` | bytes and directory entry flushed to the device | process death and power loss | two per file: six for a commit with a recorded transaction |
+| `page-cache` | bytes reach the OS page cache | process death only | none |
 
 This applies to the writes that are the source of truth — commits, transactions,
 ledger config, graph-source mappings — and to nameservice records. Index nodes,
@@ -369,6 +371,35 @@ durability gain.
 Turning durability off is reasonable for bulk imports (restartable from the
 source data), CI, and benchmarks. It is not a safe default for a ledger you
 intend to keep.
+
+#### The redo log
+
+Under `journal`, every source-of-truth write is first appended to a log under
+`<root>/.fluree-redo/` and the file itself is written page-cache. Content writes
+append without flushing; the head publication that ends a commit appends and
+flushes, and that one flush covers everything appended before it. A background
+thread flushes the files a closed log segment covered and removes the segment,
+so the log only ever holds the recent tail. Opening the root replays what is
+left — the connection and builder paths do this before anything reads — and a
+clean shutdown leaves no segments at all.
+
+The files on disk remain the database. The log adds nothing another version of
+Fluree needs to understand: after a clean shutdown, or after any start of a
+journaling binary, the root reads exactly as it did under `sync`. The one rule
+for downgrading is therefore *start the journaling binary once after a crash*
+before pointing an older binary at the root, so the tail is applied.
+
+One process owns a root's log at a time. A second handle on the same root — a
+second process, or a network mount shared by several nodes — cannot take the
+lock and flushes each write itself, exactly as `sync` does, with a warning at
+startup. Raft clusters pin `sync` for their shared payload root for this reason.
+Where the filesystem refuses advisory locks the same fallback applies. The log
+is Unix-only.
+
+A write larger than 256 MiB bypasses the log and is flushed directly. Records
+in a segment that was flushed before a later segment was opened cannot tear, so
+damage there fails the open with the segment named; a torn final frame is
+discarded, since acknowledgment follows the flush and could not have covered it.
 
 > **macOS note.** `sync` on macOS issues `F_FULLFSYNC`, a full drive-cache
 > barrier that is far more expensive than the equivalent `fsync` on Linux —

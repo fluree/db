@@ -4,6 +4,7 @@
 //! using `tokio::fs` for async I/O. This module is only compiled on non-WASM
 //! targets with the `native` feature enabled.
 
+use super::redo_log::{self, Acquire, Op, RedoLog, REDO_DIR};
 use crate::error::Result;
 use crate::{
     content_address, CasAction, CasOutcome, ContentAddressedWrite, ContentKind, ContentWriteResult,
@@ -12,7 +13,7 @@ use crate::{
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub use super::Durability;
 
@@ -304,7 +305,10 @@ fn sweep_orphaned_staging_files(
                 continue;
             };
             if file_type.is_dir() {
-                dirs.push(entry.path());
+                // The redo log stages nothing this sweep should touch.
+                if entry.file_name() != REDO_DIR {
+                    dirs.push(entry.path());
+                }
                 continue;
             }
             if !file_type.is_file() {
@@ -504,6 +508,17 @@ pub struct FileStorage {
     /// Device flushes issued so far. Shared across clones, which address the
     /// same directory and so are the same storage. See [`Self::fsyncs_issued`].
     fsyncs: Arc<AtomicU64>,
+    /// The root's redo log under [`Durability::Journal`], attached on the
+    /// first write or by [`Self::recover_redo_log`]. Shared across clones.
+    redo: Arc<OnceLock<RedoAttach>>,
+}
+
+/// What journaling resolved to for one root.
+#[derive(Debug)]
+enum RedoAttach {
+    Log(Arc<RedoLog>),
+    /// The log could not be owned; writes flush per file instead.
+    Fallback,
 }
 
 impl FileStorage {
@@ -512,21 +527,23 @@ impl FileStorage {
     /// The base path should be the ledger's data directory containing the ledger
     /// subdirectories (e.g. `mydb/main/index/...`).
     ///
-    /// Durability defaults to [`Durability::Sync`], overridable for this
+    /// Durability defaults to [`Durability::Journal`], overridable for this
     /// process by [`Durability::ENV_VAR`] or per instance by
     /// [`Self::with_durability`].
     ///
     /// Constructing a storage touches nothing on disk. In particular it does
-    /// **not** reclaim orphaned staging files: unlinking is a startup
-    /// decision, and only the startup layer knows it is starting up. A test
-    /// or a tool that constructs a `FileStorage` on a directory it does not
-    /// own must not mutate that directory — the connection and builder
-    /// startup paths call [`Self::sweep_orphaned_staging`] explicitly.
+    /// **not** reclaim orphaned staging files or replay a redo log: both are
+    /// startup decisions, and only the startup layer knows it is starting up.
+    /// A test or a tool that constructs a `FileStorage` on a directory it does
+    /// not own must not mutate that directory — the connection and builder
+    /// startup paths call [`Self::sweep_orphaned_staging`] and
+    /// [`Self::recover_redo_log`] explicitly.
     pub fn new(base_path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             base_path: base_path.into(),
             durability: Durability::from_env(),
             fsyncs: Arc::new(AtomicU64::new(0)),
+            redo: Arc::new(OnceLock::new()),
         }
     }
 
@@ -682,13 +699,147 @@ impl FileStorage {
     }
 
     /// Device flushes issued by this storage since it was constructed, counting
-    /// both the staged file and its parent directory.
+    /// both the staged file and its parent directory, and under
+    /// [`Durability::Journal`] every flush of the root's redo log, including
+    /// the background ones that retire its segments.
     ///
     /// Stays at zero under [`Durability::PageCache`] and for derived content in
-    /// either mode. Exposed because a flush leaves no trace in the bytes on
+    /// any mode. Exposed because a flush leaves no trace in the bytes on
     /// disk, so this is the only way to tell a durable write from a cheap one.
     pub fn fsyncs_issued(&self) -> u64 {
-        self.fsyncs.load(Ordering::Relaxed)
+        let own = self.fsyncs.load(Ordering::Relaxed);
+        match self.redo.get() {
+            Some(RedoAttach::Log(log)) => own + log.fsyncs_issued(),
+            _ => own,
+        }
+    }
+
+    /// The durability writes actually get. [`Durability::Journal`] reads as
+    /// [`Durability::Sync`] once this root's log turned out to be unavailable.
+    pub fn effective_durability(&self) -> Durability {
+        match (self.durability, self.redo.get()) {
+            (Durability::Journal, Some(RedoAttach::Fallback)) => Durability::Sync,
+            (durability, _) => durability,
+        }
+    }
+
+    /// Replay the redo log an earlier run left under this root, if any, so
+    /// state acknowledged before a crash is on disk before the first read.
+    ///
+    /// A startup action like [`Self::sweep_orphaned_staging`]: the connection
+    /// and builder paths call it, constructing a handle never does. Blocking.
+    /// Replays under any durability setting, so an operator who switched back
+    /// to per-write flushing after a crash still sees the acknowledged tail.
+    /// Leaves no trace on a root that never journaled.
+    pub fn recover_redo_log(&self) -> Result<()> {
+        if self.durability == Durability::Journal {
+            self.attach_redo(false).map(|_| ())
+        } else {
+            // Replay and let go: this handle is not going to journal.
+            RedoLog::acquire(&self.base_path, false)
+                .map(drop)
+                .map_err(|e| Self::recovery_error(&self.base_path, e))
+        }
+    }
+
+    fn recovery_error(base: &Path, e: std::io::Error) -> crate::error::Error {
+        crate::error::Error::storage(format!(
+            "redo log recovery failed for {}: {e}",
+            base.display()
+        ))
+    }
+
+    /// Own this root's redo log, replaying what an earlier run left behind.
+    ///
+    /// `None` means writes flush per file instead: journaling is off for this
+    /// handle, another process holds the log, the filesystem cannot support
+    /// it, or (with `create` false) there is no log to speak of. Blocking, so
+    /// the write paths call it from their blocking hop.
+    fn attach_redo(&self, create: bool) -> Result<Option<Arc<RedoLog>>> {
+        if self.durability != Durability::Journal {
+            return Ok(None);
+        }
+        let attached = match self.redo.get() {
+            Some(attach) => attach,
+            None => {
+                let attach = match RedoLog::acquire(&self.base_path, create)
+                    .map_err(|e| Self::recovery_error(&self.base_path, e))?
+                {
+                    Acquire::Log(log) => RedoAttach::Log(log),
+                    Acquire::Absent => return Ok(None),
+                    Acquire::Busy => {
+                        tracing::warn!(
+                            root = %self.base_path.display(),
+                            "another process holds this root's redo log; this handle flushes per write instead"
+                        );
+                        RedoAttach::Fallback
+                    }
+                    Acquire::Unsupported(e) => {
+                        tracing::warn!(
+                            root = %self.base_path.display(),
+                            error = %e,
+                            "redo log unavailable here; this handle flushes per write instead"
+                        );
+                        RedoAttach::Fallback
+                    }
+                };
+                // A racing clone may have attached first; either way the root
+                // has one answer from here on.
+                self.redo.get_or_init(|| attach)
+            }
+        };
+        Ok(match attached {
+            RedoAttach::Log(log) => Some(Arc::clone(log)),
+            RedoAttach::Fallback => None,
+        })
+    }
+
+    /// How a write of `len` bytes lands under `durability`: the log it is
+    /// appended to first, if any, and the policy the file is then written with.
+    /// A record too large for the log is flushed directly instead.
+    fn write_plan(
+        &self,
+        durability: Durability,
+        len: usize,
+    ) -> Result<(WritePolicy, Option<Arc<RedoLog>>)> {
+        if durability != Durability::Journal {
+            return Ok((self.policy(durability), None));
+        }
+        if len <= redo_log::MAX_RECORD_BYTES {
+            if let Some(log) = self.attach_redo(true)? {
+                return Ok((self.policy(Durability::PageCache), Some(log)));
+            }
+        }
+        Ok((self.policy(Durability::Sync), None))
+    }
+
+    /// Flush everything the redo log under `root` still covers and retire its
+    /// segments, so the root reads the same to a binary that knows nothing
+    /// about the log. The shutdown hook for a journaling process; dropping the
+    /// last handle does the same, but a handle a background task still holds
+    /// would keep the log open until that task ends. Blocking. A root this
+    /// process is not journaling is left alone.
+    pub fn checkpoint_redo_log(root: impl AsRef<Path>) -> Result<bool> {
+        redo_log::checkpoint_root(root.as_ref()).map_err(|e| Self::recovery_error(root.as_ref(), e))
+    }
+
+    /// Abandon the redo log without flushing, as a crash would, so a test can
+    /// reopen the root and exercise replay within one process.
+    #[doc(hidden)]
+    pub fn simulate_crash_for_test(&self) {
+        if let Some(RedoAttach::Log(log)) = self.redo.get() {
+            log.simulate_crash();
+        }
+    }
+
+    /// Keep redo segments until close, so a test that crashes the log finds
+    /// its records still there however slowly it runs. Attaches the log.
+    #[doc(hidden)]
+    pub fn hold_redo_segments_for_test(&self) -> Result<()> {
+        if let Some(log) = self.attach_redo(true)? {
+            log.hold_segments();
+        }
+        Ok(())
     }
 
     /// Durability for a write of `kind`.
@@ -740,28 +891,36 @@ impl FileStorage {
     /// Handles both raw file paths and Fluree address format.
     /// Address format: `fluree:file://path/to/file.json`
     fn resolve_path(&self, address: &str) -> Result<std::path::PathBuf> {
-        if let Some(path) = Self::extract_path_from_address(address) {
-            return self.resolve_relative_path(path);
-        }
-        // Simple case: just a node ID, look for it as a .json file
-        self.resolve_relative_path(&format!("{address}.json"))
+        self.resolve_key(address).map(|(_, path)| path)
+    }
+
+    /// Resolve an address to the root-relative key the redo log records and
+    /// the file path it names.
+    fn resolve_key(&self, address: &str) -> Result<(String, std::path::PathBuf)> {
+        let key = match Self::extract_path_from_address(address) {
+            Some(path) => path.to_owned(),
+            // Simple case: just a node ID, look for it as a .json file
+            None => format!("{address}.json"),
+        };
+        let path = self.resolve_relative_path(&key)?;
+        Ok((key, path))
     }
 
     fn resolve_relative_path(&self, path: &str) -> Result<std::path::PathBuf> {
         use std::path::Component;
         let p = std::path::Path::new(path);
 
-        // Disallow absolute paths and path traversal.
+        // Disallow absolute paths, path traversal, and the log's own directory.
         if p.is_absolute()
             || p.components().any(|c| {
                 matches!(
                     c,
                     Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
+                ) || c.as_os_str() == REDO_DIR
             })
         {
             return Err(crate::error::Error::storage(format!(
-                "Invalid storage path '{path}': must be a relative path without '..'"
+                "Invalid storage path '{path}': must be a relative path without '..' or '{REDO_DIR}'"
             )));
         }
 
@@ -1016,7 +1175,10 @@ impl StorageRead for FileStorage {
                 })?;
 
                 if file_type.is_dir() {
-                    dirs_to_visit.push(path);
+                    // Log segments are not content and never carry an address.
+                    if entry.file_name() != REDO_DIR {
+                        dirs_to_visit.push(path);
+                    }
                 } else if file_type.is_file() {
                     // A staging file left by an interrupted write is not
                     // content and must not be handed out as an address.
@@ -1048,17 +1210,31 @@ impl StorageWrite for FileStorage {
     }
 
     async fn delete(&self, address: &str) -> Result<()> {
-        let path = self.resolve_path(address)?;
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            // Idempotent: not found is OK
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(crate::error::Error::io(format!(
-                "Failed to delete {}: {}",
-                path.display(),
-                e
-            ))),
-        }
+        let (key, path) = self.resolve_key(address)?;
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let (_, log) = storage.write_plan(storage.durability, 0)?;
+            if let Some(log) = &log {
+                // Ordered after the writes it undoes, so replay cannot bring
+                // the file back. Covered by the next flush, which is no weaker
+                // than an unlink that was never followed by a directory flush.
+                log.append(Op::Delete { key: &key }, false).map_err(|e| {
+                    crate::error::Error::io(format!("redo log append for {key}: {e}"))
+                })?;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                // Idempotent: not found is OK
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(crate::error::Error::io(format!(
+                    "Failed to delete {}: {}",
+                    path.display(),
+                    e
+                ))),
+            }
+        })
+        .await
+        .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
     }
 }
 
@@ -1097,14 +1273,16 @@ impl FileStorage {
         bytes: &[u8],
         durability: Durability,
     ) -> Result<()> {
-        let path = self.resolve_path(address)?;
+        let (key, path) = self.resolve_key(address)?;
         let bytes = bytes.to_vec();
         let for_err = path.clone();
-        let policy = self.policy(durability);
+        let storage = self.clone();
 
-        // One blocking hop for mkdir + stage + rename, rather than one per
-        // `tokio::fs` call.
+        // One blocking hop for mkdir + log + stage + rename, rather than one
+        // per `tokio::fs` call. Attaching the log may replay, so that is in
+        // here too.
         tokio::task::spawn_blocking(move || {
+            let (policy, log) = storage.write_plan(durability, bytes.len())?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     crate::error::Error::io(format!(
@@ -1113,6 +1291,19 @@ impl FileStorage {
                         e
                     ))
                 })?;
+            }
+            if let Some(log) = &log {
+                // Logged before it lands, and not flushed: the head
+                // publication that follows flushes the log, and a crash
+                // before then leaves an unreferenced file at worst.
+                log.append(
+                    Op::Write {
+                        key: &key,
+                        bytes: &bytes,
+                    },
+                    false,
+                )
+                .map_err(|e| crate::error::Error::io(format!("redo log append for {key}: {e}")))?;
             }
             // Overwrites if present, which is idempotent for content-addressed
             // writes: the address is derived from these bytes.
@@ -1128,13 +1319,38 @@ impl FileStorage {
     ///
     /// Stages the bytes and links them into place, so a caller that observes
     /// the file sees it complete.
-    async fn blocking_insert(&self, path: PathBuf, bytes: Vec<u8>) -> StorageExtResult<bool> {
-        let policy = self.policy(self.durability);
+    async fn blocking_insert(
+        &self,
+        key: String,
+        path: PathBuf,
+        bytes: Vec<u8>,
+    ) -> StorageExtResult<bool> {
+        let storage = self.clone();
         tokio::task::spawn_blocking(move || {
+            let (policy, log) = storage
+                .write_plan(storage.durability, bytes.len())
+                .map_err(|e| StorageExtError::io(e.to_string()))?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     StorageExtError::io(format!("mkdir {}: {}", parent.display(), e))
                 })?;
+            }
+            if let Some(log) = &log {
+                // Only a creation is logged; an existing file answers `false`
+                // as before. Flushed here: an insert is a lifecycle event
+                // (a ledger coming into existence) with nothing after it to
+                // flush on its behalf.
+                if path.exists() {
+                    return Ok(false);
+                }
+                log.append(
+                    Op::Insert {
+                        key: &key,
+                        bytes: &bytes,
+                    },
+                    true,
+                )
+                .map_err(|e| StorageExtError::io(format!("redo log append for {key}: {e}")))?;
             }
 
             create_new_atomic(&path, &bytes, &policy)
@@ -1154,6 +1370,7 @@ impl FileStorage {
     /// element to release the lock.
     async fn blocking_locked_read(
         &self,
+        key: String,
         path: PathBuf,
     ) -> StorageExtResult<(Option<Vec<u8>>, LockedFile)> {
         tokio::task::spawn_blocking(move || {
@@ -1197,6 +1414,7 @@ impl FileStorage {
             Ok((
                 current,
                 LockedFile {
+                    key,
                     path,
                     _lock_file: lock_file,
                 },
@@ -1210,14 +1428,36 @@ impl FileStorage {
     ///
     /// Writes `new_bytes` to a temp file and renames into place while the
     /// flock from `blocking_locked_read` is still held. The lock is released
-    /// when the `LockedFile` guard is dropped at the end.
+    /// when the `LockedFile` guard is dropped at the end. `expected` is what
+    /// the read under that lock returned, so the log can replay the transition
+    /// only against the state it was made from.
     async fn blocking_locked_write(
         &self,
         locked: LockedFile,
+        expected: Option<Vec<u8>>,
         new_bytes: Vec<u8>,
     ) -> StorageExtResult<()> {
-        let policy = self.policy(self.durability);
+        let storage = self.clone();
         tokio::task::spawn_blocking(move || {
+            let (policy, log) = storage
+                .write_plan(storage.durability, new_bytes.len())
+                .map_err(|e| StorageExtError::io(e.to_string()))?;
+            if let Some(log) = &log {
+                // The one flush a commit pays. It lands before the file does,
+                // so a head on disk always has its log record — and every
+                // content append before it — on disk too.
+                log.append(
+                    Op::Cas {
+                        key: &locked.key,
+                        expected: expected.as_deref(),
+                        new: &new_bytes,
+                    },
+                    true,
+                )
+                .map_err(|e| {
+                    StorageExtError::io(format!("redo log append for {}: {e}", locked.key))
+                })?;
+            }
             write_atomic(&locked.path, &new_bytes, &policy)
                 .map_err(|e| StorageExtError::io(format!("write {}: {}", locked.path.display(), e)))
             // lock released when `locked._lock_file` is dropped
@@ -1232,6 +1472,7 @@ impl FileStorage {
 /// The lock is released when this struct is dropped (the `_lock_file` field's
 /// `Drop` impl calls `flock(LOCK_UN)`).
 struct LockedFile {
+    key: String,
     path: PathBuf,
     _lock_file: std::fs::File,
 }
@@ -1239,10 +1480,10 @@ struct LockedFile {
 #[async_trait]
 impl StorageCas for FileStorage {
     async fn insert(&self, address: &str, bytes: &[u8]) -> StorageExtResult<bool> {
-        let path = self
-            .resolve_path(address)
+        let (key, path) = self
+            .resolve_key(address)
             .map_err(|e| StorageExtError::io(e.to_string()))?;
-        self.blocking_insert(path, bytes.to_vec()).await
+        self.blocking_insert(key, path, bytes.to_vec()).await
     }
 
     async fn compare_and_swap<T, F>(&self, address: &str, f: F) -> StorageExtResult<CasOutcome<T>>
@@ -1250,18 +1491,19 @@ impl StorageCas for FileStorage {
         F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError> + Send + Sync,
         T: Send,
     {
-        let path = self
-            .resolve_path(address)
+        let (key, path) = self
+            .resolve_key(address)
             .map_err(|e| StorageExtError::io(e.to_string()))?;
 
         // Phase 1: acquire lock + read (blocking)
-        let (current, locked) = self.blocking_locked_read(path).await?;
+        let (current, locked) = self.blocking_locked_read(key, path).await?;
 
         // Phase 2: call closure on async task
         match f(current.as_deref())? {
             CasAction::Write(new_bytes) => {
                 // Phase 3: write under same lock (blocking)
-                self.blocking_locked_write(locked, new_bytes).await?;
+                self.blocking_locked_write(locked, current, new_bytes)
+                    .await?;
                 Ok(CasOutcome::Written)
             }
             CasAction::Abort(t) => Ok(CasOutcome::Aborted(t)),
@@ -1287,9 +1529,9 @@ mod tests {
     /// parse, not on a constructed storage, so the test does not depend on the
     /// environment it runs in.
     #[test]
-    fn durability_defaults_to_sync() {
-        assert_eq!(Durability::default(), Durability::Sync);
-        assert_eq!(Durability::parse(None), Durability::Sync);
+    fn durability_defaults_to_journal() {
+        assert_eq!(Durability::default(), Durability::Journal);
+        assert_eq!(Durability::parse(None), Durability::Journal);
     }
 
     #[test]
@@ -1297,9 +1539,13 @@ mod tests {
         for v in ["0", "false", "off", "no", "OFF", " false "] {
             assert_eq!(Durability::parse(Some(v)), Durability::PageCache, "{v:?}");
         }
-        // Anything else keeps the safe setting rather than guessing.
-        for v in ["1", "true", "on", "", "nonsense"] {
+        // Per-write flushing has to be asked for by name.
+        for v in ["sync", "fsync", "direct", " SYNC "] {
             assert_eq!(Durability::parse(Some(v)), Durability::Sync, "{v:?}");
+        }
+        // Anything else keeps the safe setting rather than guessing.
+        for v in ["1", "true", "on", "", "nonsense", "journal", "wal"] {
+            assert_eq!(Durability::parse(Some(v)), Durability::Journal, "{v:?}");
         }
     }
 
@@ -1307,8 +1553,8 @@ mod tests {
     /// override a checked-in config file for one run without editing it.
     #[test]
     fn durability_precedence_is_env_then_config_then_default() {
-        use Durability::{PageCache, Sync};
-        assert_eq!(Durability::resolve_from(None, None), Sync);
+        use Durability::{Journal, PageCache, Sync};
+        assert_eq!(Durability::resolve_from(None, None), Journal);
         assert_eq!(Durability::resolve_from(None, Some(PageCache)), PageCache);
         assert_eq!(Durability::resolve_from(Some(Sync), Some(PageCache)), Sync);
         assert_eq!(
@@ -1319,7 +1565,9 @@ mod tests {
 
     #[test]
     fn durability_mode_names_parse_and_reject() {
-        use Durability::{PageCache, Sync};
+        use Durability::{Journal, PageCache, Sync};
+        assert_eq!(Durability::from_mode_name("journal"), Some(Journal));
+        assert_eq!(Durability::from_mode_name("WAL"), Some(Journal));
         assert_eq!(Durability::from_mode_name("sync"), Some(Sync));
         assert_eq!(Durability::from_mode_name(" SYNC "), Some(Sync));
         assert_eq!(Durability::from_mode_name("page-cache"), Some(PageCache));
@@ -1367,7 +1615,7 @@ mod tests {
     #[test]
     fn source_of_truth_content_follows_the_configured_durability() {
         let dir = tempfile::tempdir().unwrap();
-        for mode in [Durability::Sync, Durability::PageCache] {
+        for mode in [Durability::Journal, Durability::Sync, Durability::PageCache] {
             let storage = FileStorage::new(dir.path()).with_durability(mode);
             for kind in [ContentKind::Commit, ContentKind::Txn] {
                 assert_eq!(storage.durability_for(kind), mode, "{kind:?}");
@@ -2304,5 +2552,208 @@ mod tests {
             storage.read_byte_range("z/tiny.dict", 0..1).await.unwrap(),
             b"x"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod journal_tests {
+    use super::*;
+    use crate::{CasAction, CasOutcome, StorageCas, StorageRead, StorageWrite};
+
+    const TXN: &str = "fluree:file://ledger/txn/aaaa.bin";
+    const COMMIT: &str = "fluree:file://ledger/commit/bbbb.bin";
+    const HEAD: &str = "fluree:file://ns@v2/ledger/main.json";
+
+    fn journaled(dir: &Path) -> FileStorage {
+        let storage = FileStorage::new(dir).with_durability(Durability::Journal);
+        storage.recover_redo_log().unwrap();
+        storage
+    }
+
+    async fn publish(storage: &FileStorage, head: &[u8]) {
+        let head = head.to_vec();
+        let outcome = storage
+            .compare_and_swap(HEAD, |_| Ok(CasAction::Write::<()>(head.clone())))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CasOutcome::Written));
+    }
+
+    /// One commit: raw transaction, commit blob, head publication.
+    async fn commit(storage: &FileStorage, n: u8) {
+        storage.write_bytes(TXN, &[b'r', n]).await.unwrap();
+        storage.write_bytes(COMMIT, &[b'c', n]).await.unwrap();
+        publish(storage, &[b'h', n]).await;
+    }
+
+    fn redo_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir.join(REDO_DIR))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The point of the mode. A commit is three writes; per-write flushing
+    /// pays two flushes for each of them, the log pays one for the lot.
+    #[tokio::test]
+    async fn a_commit_costs_one_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = journaled(dir.path());
+        // The first write also creates the segment, which is its own cost.
+        commit(&storage, 1).await;
+        let before = storage.fsyncs_issued();
+        commit(&storage, 2).await;
+        assert_eq!(storage.fsyncs_issued() - before, 1);
+
+        // Same three writes with per-write flushing, as the control.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        commit(&storage, 1).await;
+        assert_eq!(storage.fsyncs_issued(), 6);
+    }
+
+    /// What the flush buys: after a crash that loses every file the page
+    /// cache held, replay rebuilds them from the log, then retires the log.
+    #[tokio::test]
+    async fn replay_restores_acknowledged_writes_after_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = journaled(dir.path());
+        storage.hold_redo_segments_for_test().unwrap();
+        commit(&storage, 1).await;
+        commit(&storage, 2).await;
+        storage.simulate_crash_for_test();
+        drop(storage);
+        for address in [TXN, COMMIT, HEAD] {
+            let path = FileStorage::new(dir.path()).resolve_path(address).unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+
+        let storage = journaled(dir.path());
+        assert_eq!(storage.read_bytes(TXN).await.unwrap(), b"r\x02");
+        assert_eq!(storage.read_bytes(COMMIT).await.unwrap(), b"c\x02");
+        assert_eq!(storage.read_bytes(HEAD).await.unwrap(), b"h\x02");
+        assert_eq!(redo_entries(dir.path()), ["LOCK"], "replay retires the log");
+    }
+
+    /// Replay applies records in order, so a delete cannot resurrect what it
+    /// removed, and a later write after the delete wins.
+    #[tokio::test]
+    async fn replay_keeps_write_and_delete_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = journaled(dir.path());
+        storage.hold_redo_segments_for_test().unwrap();
+        storage
+            .write_bytes("fluree:file://a.bin", b"a")
+            .await
+            .unwrap();
+        storage.delete("fluree:file://a.bin").await.unwrap();
+        storage
+            .write_bytes("fluree:file://b.bin", b"b1")
+            .await
+            .unwrap();
+        storage.delete("fluree:file://b.bin").await.unwrap();
+        storage
+            .write_bytes("fluree:file://b.bin", b"b2")
+            .await
+            .unwrap();
+        publish(&storage, b"h").await;
+        storage.simulate_crash_for_test();
+        drop(storage);
+        let _ = std::fs::remove_file(dir.path().join("b.bin"));
+
+        let storage = journaled(dir.path());
+        assert!(!storage.exists("fluree:file://a.bin").await.unwrap());
+        assert_eq!(
+            storage.read_bytes("fluree:file://b.bin").await.unwrap(),
+            b"b2"
+        );
+    }
+
+    /// A head that moved on — another process in per-write mode advanced it
+    /// after the crash — is left alone rather than rolled back by replay.
+    #[tokio::test]
+    async fn replay_does_not_roll_back_a_head_that_moved_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = journaled(dir.path());
+        storage.hold_redo_segments_for_test().unwrap();
+        publish(&storage, b"h1").await;
+        storage.simulate_crash_for_test();
+        drop(storage);
+
+        let other = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        publish(&other, b"h9").await;
+
+        let storage = journaled(dir.path());
+        assert_eq!(storage.read_bytes(HEAD).await.unwrap(), b"h9");
+    }
+
+    /// A clean close flushes everything and leaves no segments, so a binary
+    /// that has never heard of the log reads the root exactly as before.
+    #[tokio::test]
+    async fn clean_close_leaves_nothing_to_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = journaled(dir.path());
+        commit(&storage, 1).await;
+        drop(storage);
+        assert_eq!(redo_entries(dir.path()), ["LOCK"]);
+
+        let plain = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        assert_eq!(plain.read_bytes(HEAD).await.unwrap(), b"h\x01");
+        assert_eq!(plain.read_bytes(COMMIT).await.unwrap(), b"c\x01");
+    }
+
+    /// A root another process is journaling cannot be journaled twice. The
+    /// second handle keeps every guarantee by flushing each write itself.
+    #[tokio::test]
+    async fn second_owner_falls_back_to_per_write_flushing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(REDO_DIR)).unwrap();
+        let held = std::fs::File::create(dir.path().join(REDO_DIR).join("LOCK")).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+
+        let storage = journaled(dir.path());
+        assert_eq!(storage.effective_durability(), Durability::Sync);
+        storage.write_bytes(COMMIT, b"c").await.unwrap();
+        assert_eq!(
+            storage.fsyncs_issued(),
+            2,
+            "file and directory, as in sync mode"
+        );
+    }
+
+    /// Index output is rebuilt from commits and never goes through the log;
+    /// a root that only ever holds derived content gets no log at all.
+    #[tokio::test]
+    async fn derived_content_stays_off_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = journaled(dir.path());
+        storage
+            .content_write_bytes_with_hash(
+                ContentKind::IndexLeaf,
+                "l:main",
+                "ab".repeat(16).as_str(),
+                b"leaf",
+            )
+            .await
+            .unwrap();
+        assert_eq!(storage.fsyncs_issued(), 0);
+        assert!(!dir.path().join(REDO_DIR).exists());
+    }
+
+    /// The log's directory is neither content nor staging debris.
+    #[tokio::test]
+    async fn listing_and_addresses_keep_out_of_the_log_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = journaled(dir.path());
+        commit(&storage, 1).await;
+        let listed = storage.list_prefix("").await.unwrap();
+        assert!(!listed.is_empty());
+        assert!(listed.iter().all(|a| !a.contains(REDO_DIR)), "{listed:?}");
+        assert!(storage
+            .write_bytes(&format!("fluree:file://{REDO_DIR}/x.bin"), b"x")
+            .await
+            .is_err());
     }
 }

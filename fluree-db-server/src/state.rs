@@ -523,6 +523,12 @@ async fn build_direct_fluree(
     };
 
     // Server-level overrides take precedence over connection config defaults.
+    #[cfg(feature = "raft")]
+    if config.raft_enabled {
+        // Voters share one payload root over the network, so no process may
+        // own a redo log for it; each write flushes on its own, as before.
+        builder = builder.with_storage_durability(fluree_db_core::Durability::Sync);
+    }
     if let Some(max_mb) = config.cache_max_mb {
         builder = builder.cache_max_mb(max_mb);
     }

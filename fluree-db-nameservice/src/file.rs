@@ -135,9 +135,14 @@ struct GraphSourceIndexFileV2WithT {
 impl FileNameService {
     /// Create a new file-based nameservice
     pub fn new(base_path: impl Into<PathBuf>) -> Self {
-        Self {
-            storage: FileStorage::new(base_path),
-        }
+        Self::with_storage(FileStorage::new(base_path))
+    }
+
+    /// Share an already configured storage handle, so the nameservice
+    /// inherits its durability and, under the redo log, its ownership of the
+    /// root's log rather than opening the root a second time.
+    pub fn with_storage(storage: FileStorage) -> Self {
+        Self { storage }
     }
 
     /// Build a `fluree:file://` address for the main ns record.

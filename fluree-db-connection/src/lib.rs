@@ -204,6 +204,7 @@ fn create_sync_connection(config: ConnectionConfig) -> Result<ConnectionHandle> 
                 // is an explicit action here, not a side effect of holding a
                 // storage handle.
                 storage.sweep_orphaned_staging();
+                storage.recover_redo_log()?;
                 Ok(ConnectionHandle::File { config, storage })
             }
         }
@@ -245,6 +246,7 @@ async fn create_async_connection(config: ConnectionConfig) -> Result<ConnectionH
                 // is an explicit action here, not a side effect of holding a
                 // storage handle.
                 storage.sweep_orphaned_staging();
+                storage.recover_redo_log()?;
                 Ok(ConnectionHandle::File { config, storage })
             }
         }
