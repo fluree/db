@@ -721,6 +721,109 @@ async fn override_control_identity_restricted() {
     );
 }
 
+/// Query `ex:alice`'s name through a policy-wrapped view built from `opts`.
+async fn names_through_policy(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    opts: GovernanceOptions,
+) -> serde_json::Value {
+    let view = fluree.db(ledger_id).await.expect("db");
+    let view = fluree.wrap_policy(view, &opts).await.expect("wrap policy");
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?v",
+        "where": {"@id": "ex:alice", "ex:name": "?v"}
+    });
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    fluree
+        .query(&view, &query)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger_state.snapshot)
+        .expect("to_jsonld")
+}
+
+/// The same allow-list driven through `wrap_policy` and a real query. Config
+/// closes policy (`f:defaultAllow false`); a request asking to open it
+/// (`default_allow: true`) is honored only for the allow-listed verified
+/// identity, so the row is visible to it and hidden from everyone else.
+#[tokio::test]
+async fn policy_override_identity_restricted_end_to_end() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-identity-e2e:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:alice",
+                "ex:name": "Alice"
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:policyDefaults <urn:config:policy> .
+            <urn:config:policy> f:defaultAllow false .
+            <urn:config:policy> f:overrideControl <urn:config:oc> .
+            <urn:config:oc> f:controlMode f:IdentityRestricted .
+            <urn:config:oc> f:allowedIdentities <did:key:admin> .
+        }}
+    "
+    );
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write");
+
+    // Every request names a policy identity so a real policy context is
+    // built; with no identity at all there is nothing to enforce. The only
+    // thing that varies is the verified identity.
+    let opens_as = |server_identity: Option<&str>| GovernanceOptions {
+        identity: Some("did:key:user".into()),
+        default_allow: Some(true),
+        server_identity: server_identity.map(VerifiedIdentity::new),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        names_through_policy(&fluree, ledger_id, opens_as(Some("did:key:admin"))).await,
+        json!(["Alice"]),
+        "the allow-listed verified identity may open policy"
+    );
+    assert_eq!(
+        names_through_policy(&fluree, ledger_id, opens_as(Some("did:key:other"))).await,
+        json!([]),
+        "a verified identity outside the allow-list is denied; config's closed policy wins"
+    );
+    assert_eq!(
+        names_through_policy(&fluree, ledger_id, opens_as(None)).await,
+        json!([]),
+        "an anonymous request is denied; config's closed policy wins"
+    );
+    let identity_only = GovernanceOptions {
+        identity: Some("did:key:admin".into()),
+        ..opens_as(None)
+    };
+    assert_eq!(
+        names_through_policy(&fluree, ledger_id, identity_only).await,
+        json!([]),
+        "opts.identity naming the allow-listed DID must not open policy"
+    );
+}
+
 // =============================================================================
 // Test 9: override monotonicity
 // =============================================================================
@@ -4424,5 +4527,104 @@ async fn reasoning_override_identity_restricted_sparql() {
         rows(anon).len(),
         1,
         "an anonymous SPARQL request is denied; config's rdfs wins"
+    );
+}
+
+// =============================================================================
+// f:IdentityRestricted override control, end to end on the datalog path
+// =============================================================================
+
+/// Query-time rules are the datalog override. Config keeps datalog on but
+/// forbids query-time rules, so the rule survives only for the allow-listed
+/// verified identity, and only it derives the grandparent.
+#[tokio::test]
+async fn datalog_override_identity_restricted_end_to_end() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/config-datalog-identity-e2e:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {"@id": "ex:alice", "ex:parent": {"@id": "ex:bob"}},
+                    {"@id": "ex:bob", "ex:parent": {"@id": "ex:charlie"}}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:datalogDefaults <urn:config:datalog> .
+            <urn:config:datalog> f:datalogEnabled true .
+            <urn:config:datalog> f:allowQueryTimeRules false .
+            <urn:config:datalog> f:overrideControl <urn:config:oc> .
+            <urn:config:oc> f:controlMode f:IdentityRestricted .
+            <urn:config:oc> f:allowedIdentities <did:key:admin> .
+        }}
+    "
+    );
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write");
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?grandparent",
+        "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+        "reasoning": "datalog",
+        "rules": [{
+            "@context": {"ex": "http://example.org/"},
+            "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
+            "insert": {"@id": "?person", "ex:grandparent": {"@id": "?grandparent"}}
+        }]
+    });
+    async fn grandparents_as(
+        fluree: &fluree_db_api::Fluree,
+        ledger_id: &str,
+        query: &serde_json::Value,
+        server_identity: Option<&str>,
+    ) -> serde_json::Value {
+        let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+        let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state);
+        let mut options = QueryExecutionOptions::new();
+        if let Some(id) = server_identity {
+            options = options.with_server_identity(VerifiedIdentity::new(id));
+        }
+        fluree
+            .query_with_options(&db, query, options)
+            .await
+            .expect("query")
+            .to_jsonld(&ledger_state.snapshot)
+            .expect("to_jsonld")
+    }
+
+    assert_eq!(
+        grandparents_as(&fluree, ledger_id, &query, Some("did:key:admin")).await,
+        json!(["ex:charlie"]),
+        "the allow-listed verified identity may inject a query-time rule"
+    );
+    assert_eq!(
+        grandparents_as(&fluree, ledger_id, &query, Some("did:key:other")).await,
+        json!([]),
+        "a verified identity outside the allow-list has its rule stripped"
+    );
+    assert_eq!(
+        grandparents_as(&fluree, ledger_id, &query, None).await,
+        json!([]),
+        "an anonymous request has its rule stripped"
     );
 }

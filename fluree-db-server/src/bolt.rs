@@ -1126,6 +1126,30 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A session's token identity is auth-layer verified, so it gates
+    /// `f:overrideControl` as well as policy. Bolt has no request surface for
+    /// an override (no reasoning pragma, no policy or validation knobs), so
+    /// this wiring is the only observable part of the gate on this transport.
+    #[test]
+    fn session_governance_carries_the_verified_identity() {
+        let auth = SessionAuth {
+            identity: Some("did:key:admin".into()),
+            principal: None,
+        };
+        let governance = auth.governance();
+        assert_eq!(governance.identity.as_deref(), Some("did:key:admin"));
+        assert_eq!(
+            governance.server_identity,
+            Some(VerifiedIdentity::new("did:key:admin"))
+        );
+        assert_eq!(
+            crate::query_control::options_for_identity(governance.server_identity.as_ref())
+                .server_identity,
+            governance.server_identity
+        );
+        assert_eq!(SessionAuth::anonymous().governance().server_identity, None);
+    }
+
     #[test]
     fn scalar_cells_map_natively() {
         assert_eq!(cell_to_bolt(json!(42)), Value::Integer(42));
