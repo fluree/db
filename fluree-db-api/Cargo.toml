@@ -271,8 +271,8 @@ path = "tests/it_cached_handle_cow.rs"
 required-features = ["native"]
 
 [[test]]
-name = "it_redo_log"
-path = "tests/it_redo_log.rs"
+name = "it_wal"
+path = "tests/it_wal.rs"
 required-features = ["native"]
 
 # Own binary: installs a process-global tracing probe over overlay-translation

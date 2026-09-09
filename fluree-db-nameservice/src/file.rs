@@ -139,7 +139,7 @@ impl FileNameService {
     }
 
     /// Share an already configured storage handle, so the nameservice
-    /// inherits its durability and, under the redo log, its ownership of the
+    /// inherits its durability and, under the WAL, its ownership of the
     /// root's log rather than opening the root a second time.
     pub fn with_storage(storage: FileStorage) -> Self {
         Self { storage }

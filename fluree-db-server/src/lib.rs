@@ -531,7 +531,7 @@ impl FlureeServer {
         }
 
         // Last: stop the indexer, drop cached ledgers and retire the storage
-        // root's redo log, so a stop that was not a crash leaves nothing for
+        // root's WAL, so a stop that was not a crash leaves nothing for
         // the next start to replay and the root reads the same to any binary.
         if tokio::time::timeout(SHUTDOWN_GRACE, self.state.fluree.disconnect())
             .await
@@ -539,7 +539,7 @@ impl FlureeServer {
         {
             tracing::warn!(
                 grace_secs = SHUTDOWN_GRACE.as_secs(),
-                "storage did not finish closing; the next start replays its redo log"
+                "storage did not finish closing; the next start replays its WAL"
             );
         }
 

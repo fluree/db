@@ -1,4 +1,4 @@
-//! Per-root redo log behind [`Durability::Journal`](super::Durability::Journal).
+//! Per-root WAL behind [`Durability::Wal`](super::Durability::Wal).
 //!
 //! The files under a storage root stay the source of truth. This log is only
 //! the tail that has not yet been flushed to the device: a write appends one
@@ -29,12 +29,12 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 /// Directory under the storage root holding the lock and segments.
-pub(super) const REDO_DIR: &str = ".fluree-redo";
-/// Under `REDO_DIR`, one log directory per owner when several processes
+pub(super) const WAL_DIR: &str = ".fluree-wal";
+/// Under `WAL_DIR`, one log directory per owner when several processes
 /// share a root (a Raft cluster's payload store).
 const OWNERS_DIR: &str = "owners";
 const LOCK_FILE: &str = "LOCK";
-const SEGMENT_EXT: &str = "redo";
+const SEGMENT_EXT: &str = "wal";
 const SEGMENT_MAGIC: &[u8; 8] = b"FRDOSEG1";
 const SEGMENT_HEADER: usize = 16;
 const FRAME_MAGIC: &[u8; 4] = b"FRDO";
@@ -42,8 +42,9 @@ const FRAME_HEADER: usize = 4 + 4 + 8;
 const HASH: usize = 32;
 
 /// Largest single record the log accepts. A write above this bypasses the log
-/// and is flushed directly, so an enormous blob never stalls replay memory.
-pub(super) const MAX_RECORD_BYTES: usize = 256 * 1024 * 1024;
+/// and is flushed directly: past a few megabytes a flush costs bandwidth, not
+/// latency, and the log would only write the bytes twice and bloat replay.
+pub(super) const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 /// A segment is closed for flushing once it passes this size ...
 const ROTATE_BYTES: u64 = 8 * 1024 * 1024;
 /// ... or this age with any record in it, so replay after a crash stays short.
@@ -215,14 +216,14 @@ fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<D
     if bytes.len() < SEGMENT_HEADER || &bytes[..8] != SEGMENT_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "redo segment header is missing or unrecognized",
+            "WAL segment header is missing or unrecognized",
         ));
     }
     let first_seq = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
     if expected_first_seq.is_some_and(|expected| expected != first_seq) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "redo segment sequence does not continue the previous segment",
+            "WAL segment sequence does not continue the previous segment",
         ));
     }
     let mut ops = Vec::new();
@@ -285,7 +286,7 @@ struct Closed {
     in_flight: Arc<AtomicUsize>,
 }
 
-/// Returned by [`RedoLog::append`]; hold it until the file the record
+/// Returned by [`Wal::append`]; hold it until the file the record
 /// describes has been written, so the segment cannot be retired in between.
 #[must_use = "drop this only after the file the record describes is written"]
 pub(super) struct Appended {
@@ -305,10 +306,10 @@ struct Inner {
     next_segment: u64,
 }
 
-/// The redo log for one storage root. One per canonical root per process; the
+/// The WAL for one storage root. One per canonical root per process; the
 /// `LOCK` file keeps a second process out, and that process falls back to
 /// per-write flushing.
-pub(super) struct RedoLog {
+pub(super) struct Wal {
     base: PathBuf,
     dir: PathBuf,
     fsyncs: AtomicU64,
@@ -333,15 +334,15 @@ pub(super) struct RedoLog {
     fail_next_sync: AtomicBool,
 }
 
-impl std::fmt::Debug for RedoLog {
+impl std::fmt::Debug for Wal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RedoLog").field("dir", &self.dir).finish()
+        f.debug_struct("Wal").field("dir", &self.dir).finish()
     }
 }
 
 /// Outcome of trying to own a root's log.
 pub(super) enum Acquire {
-    Log(Arc<RedoLog>),
+    Log(Arc<Wal>),
     /// No log directory and the caller did not ask to create one.
     Absent,
     /// Another process holds the lock.
@@ -350,8 +351,8 @@ pub(super) enum Acquire {
     Unsupported(io::Error),
 }
 
-fn registry() -> &'static Mutex<HashMap<PathBuf, Weak<RedoLog>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<RedoLog>>>> = OnceLock::new();
+fn registry() -> &'static Mutex<HashMap<PathBuf, Weak<Wal>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Wal>>>> = OnceLock::new();
     REGISTRY.get_or_init(Default::default)
 }
 
@@ -365,8 +366,8 @@ pub(super) fn checkpoint_root(base: &Path) -> io::Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
-    let under = base.join(REDO_DIR);
-    let logs: Vec<Arc<RedoLog>> = registry()
+    let under = base.join(WAL_DIR);
+    let logs: Vec<Arc<Wal>> = registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
@@ -395,7 +396,7 @@ pub(super) fn replay_unowned(base: &Path) -> io::Result<usize> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e),
     };
-    let owners = base.join(REDO_DIR).join(OWNERS_DIR);
+    let owners = base.join(WAL_DIR).join(OWNERS_DIR);
     let entries = match std::fs::read_dir(&owners) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
@@ -435,7 +436,7 @@ pub(super) fn replay_unowned(base: &Path) -> io::Result<usize> {
             tracing::info!(
                 owner = %dir.display(),
                 records,
-                "applied the redo log of an owner that is no longer running"
+                "applied the WAL of an owner that is no longer running"
             );
         }
         applied += records;
@@ -455,7 +456,7 @@ fn validate_owner(owner: &str) -> io::Result<()> {
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "redo log owner must be 1-64 characters of [A-Za-z0-9._-] not starting with '.'",
+            "WAL owner must be 1-64 characters of [A-Za-z0-9._-] not starting with '.'",
         ));
     }
     Ok(())
@@ -509,7 +510,7 @@ fn write_page_cache(path: &Path, bytes: &[u8]) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_file_name(format!(
-        "{}.redo-replay.{}.tmp",
+        "{}.wal-replay.{}.tmp",
         path.file_name().unwrap_or_default().to_string_lossy(),
         std::process::id()
     ));
@@ -579,7 +580,7 @@ fn apply(base: &Path, op: &OwnedOp, touched: &mut Vec<String>) -> io::Result<()>
                 // file past this transition. Replaying it would roll back.
                 tracing::warn!(
                     key,
-                    "redo replay skipped a compare-and-swap whose file has moved on"
+                    "WAL replay skipped a compare-and-swap whose file has moved on"
                 );
             }
             touched.push(key.clone());
@@ -634,7 +635,7 @@ fn replay(base: &Path, dir: &Path, fsyncs: &AtomicU64) -> io::Result<(u64, u64, 
             // segment holds nothing acknowledged.
             tracing::warn!(
                 segment = %path.display(),
-                "redo segment has no valid header; removing it as never used"
+                "WAL segment has no valid header; removing it as never used"
             );
             std::fs::remove_file(path)?;
             fsync_dir(dir, fsyncs)?;
@@ -643,7 +644,7 @@ fn replay(base: &Path, dir: &Path, fsyncs: &AtomicU64) -> io::Result<(u64, u64, 
         let decoded = decode_segment(&bytes, next_seq).map_err(|e| {
             io::Error::new(
                 e.kind(),
-                format!("redo segment {} unreadable: {e}", path.display()),
+                format!("WAL segment {} unreadable: {e}", path.display()),
             )
         })?;
         if !decoded.clean && i != last {
@@ -653,7 +654,7 @@ fn replay(base: &Path, dir: &Path, fsyncs: &AtomicU64) -> io::Result<(u64, u64, 
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "redo segment {} is damaged before a later segment; move it aside to \
+                    "WAL segment {} is damaged before a later segment; move it aside to \
                      open without it (records after sequence {} in it are lost)",
                     path.display(),
                     decoded.next_seq
@@ -664,7 +665,7 @@ fn replay(base: &Path, dir: &Path, fsyncs: &AtomicU64) -> io::Result<(u64, u64, 
             tracing::info!(
                 segment = %path.display(),
                 replayed = decoded.ops.len(),
-                "redo log ends in a torn frame; discarding it as unacknowledged"
+                "WAL ends in a torn frame; discarding it as unacknowledged"
             );
         }
         for op in &decoded.ops {
@@ -678,7 +679,7 @@ fn replay(base: &Path, dir: &Path, fsyncs: &AtomicU64) -> io::Result<(u64, u64, 
             root = %base.display(),
             records,
             segments = segments.len(),
-            "replayed redo log after an unclean shutdown"
+            "replayed WAL after an unclean shutdown"
         );
     }
     flush_keys(base, &touched, fsyncs)?;
@@ -696,7 +697,7 @@ fn replay(base: &Path, dir: &Path, fsyncs: &AtomicU64) -> io::Result<(u64, u64, 
     Ok((next_seq.unwrap_or(1), next_segment, records))
 }
 
-impl RedoLog {
+impl Wal {
     /// Own the log for `base`, replaying any leftover segments first.
     ///
     /// With an `owner`, the log lives in its own directory under the root's
@@ -709,7 +710,7 @@ impl RedoLog {
     pub(super) fn acquire(base: &Path, owner: Option<&str>, create: bool) -> io::Result<Acquire> {
         if !cfg!(unix) {
             return Ok(Acquire::Unsupported(io::Error::other(
-                "the redo log needs directory fsync, which only Unix provides",
+                "the WAL needs directory fsync, which only Unix provides",
             )));
         }
         if let Some(owner) = owner {
@@ -724,8 +725,8 @@ impl RedoLog {
             Err(e) => return Err(e),
         };
         let dir = match owner {
-            Some(owner) => base.join(REDO_DIR).join(OWNERS_DIR).join(owner),
-            None => base.join(REDO_DIR),
+            Some(owner) => base.join(WAL_DIR).join(OWNERS_DIR).join(owner),
+            None => base.join(WAL_DIR),
         };
         let mut registry = registry()
             .lock()
@@ -770,7 +771,7 @@ impl RedoLog {
         }
         let fsyncs = AtomicU64::new(0);
         let (next_seq, next_segment, _) = replay(&base, &dir, &fsyncs)?;
-        let log = Arc::new(RedoLog {
+        let log = Arc::new(Wal {
             base,
             dir: dir.clone(),
             fsyncs,
@@ -792,12 +793,12 @@ impl RedoLog {
         let weak = Arc::downgrade(&log);
         let ticker = weak.clone();
         std::thread::Builder::new()
-            .name("fluree-redo-flush".into())
+            .name("fluree-wal-flush".into())
             .spawn(move || loop {
                 std::thread::sleep(TICK);
                 let Some(log) = ticker.upgrade() else { break };
                 if let Err(e) = log.tick() {
-                    tracing::warn!(error = %e, dir = %log.dir.display(), "redo log flush failed");
+                    tracing::warn!(error = %e, dir = %log.dir.display(), "WAL flush failed");
                 }
             })?;
         registry.insert(dir, weak);
@@ -810,11 +811,11 @@ impl RedoLog {
 
     fn refuse_if_unavailable(&self) -> io::Result<()> {
         if self.crashed.load(Ordering::Acquire) {
-            return Err(io::Error::other("redo log was abandoned (simulated crash)"));
+            return Err(io::Error::other("WAL was abandoned (simulated crash)"));
         }
         if self.poisoned.load(Ordering::Acquire) {
             return Err(io::Error::other(
-                "redo log refused after a failed flush: the durable boundary is unknown; \
+                "WAL refused after a failed flush: the durable boundary is unknown; \
                  restart to recover",
             ));
         }
@@ -828,7 +829,7 @@ impl RedoLog {
         tracing::error!(
             error = %error,
             dir = %self.dir.display(),
-            "redo log flush failed; refusing further writes until restart"
+            "WAL flush failed; refusing further writes until restart"
         );
         error
     }
@@ -950,7 +951,7 @@ impl RedoLog {
         tracing::trace!(
             segment = segment.id,
             bytes = segment.len,
-            "redo segment closed"
+            "WAL segment closed"
         );
         inner.closed.push(Closed {
             path: segment.path,
@@ -1102,13 +1103,13 @@ impl RedoLog {
     }
 }
 
-impl Drop for RedoLog {
+impl Drop for Wal {
     fn drop(&mut self) {
         if self.crashed.load(Ordering::Acquire) {
             return;
         }
         if let Err(e) = self.checkpoint() {
-            tracing::warn!(error = %e, dir = %self.dir.display(), "redo log checkpoint on close failed; the next open will replay it");
+            tracing::warn!(error = %e, dir = %self.dir.display(), "WAL checkpoint on close failed; the next open will replay it");
         }
         registry()
             .lock()
@@ -1207,8 +1208,8 @@ mod tests {
         assert!(decode_segment(&segment, Some(4)).is_err());
     }
 
-    fn owned(base: &Path) -> Arc<RedoLog> {
-        match RedoLog::acquire(base, Some("review"), true).unwrap() {
+    fn owned(base: &Path) -> Arc<Wal> {
+        match Wal::acquire(base, Some("review"), true).unwrap() {
             Acquire::Log(log) => log,
             _ => panic!("log unavailable"),
         }
@@ -1340,9 +1341,9 @@ mod tests {
             .unwrap(),
         );
         log.simulate_crash();
-        let owner_dir = dir.path().join(REDO_DIR).join("owners/review");
-        std::fs::write(owner_dir.join("00000002.redo"), []).unwrap();
-        std::fs::write(owner_dir.join("00000003.redo.tmp"), b"partial").unwrap();
+        let owner_dir = dir.path().join(WAL_DIR).join("owners/review");
+        std::fs::write(owner_dir.join("00000002.wal"), []).unwrap();
+        std::fs::write(owner_dir.join("00000003.wal.tmp"), b"partial").unwrap();
         let reopened = owned(dir.path());
         assert_eq!(std::fs::read(dir.path().join("first")).unwrap(), b"first");
         drop(
@@ -1356,7 +1357,7 @@ mod tests {
                 )
                 .unwrap(),
         );
-        assert!(!owner_dir.join("00000003.redo.tmp").exists());
+        assert!(!owner_dir.join("00000003.wal.tmp").exists());
     }
 
     /// Replay takes the same sidecar lock a live compare-and-swap holds, so
@@ -1366,7 +1367,7 @@ mod tests {
     fn replay_waits_for_a_live_cas_lock() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().to_path_buf();
-        let Acquire::Log(log) = RedoLog::acquire(&base, None, true).unwrap() else {
+        let Acquire::Log(log) = Wal::acquire(&base, None, true).unwrap() else {
             panic!()
         };
         log.hold_segments();
@@ -1388,7 +1389,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let replay_base = base.clone();
         let thread = std::thread::spawn(move || {
-            let recovered = RedoLog::acquire(&replay_base, None, false).is_ok();
+            let recovered = Wal::acquire(&replay_base, None, false).is_ok();
             tx.send(recovered).unwrap();
         });
         assert!(
@@ -1401,7 +1402,7 @@ mod tests {
         assert_eq!(std::fs::read(base.join("head.json")).unwrap(), b"recovered");
     }
 
-    fn rotate_now(log: &RedoLog) {
+    fn rotate_now(log: &Wal) {
         let mut inner = log.inner.lock().unwrap();
         log.rotate(&mut inner).unwrap();
     }
@@ -1458,7 +1459,7 @@ mod tests {
         assert_eq!(std::fs::read(dir.path().join("third")).unwrap(), b"three");
     }
 
-    fn append_file(log: &RedoLog, base: &Path, key: &str) {
+    fn append_file(log: &Wal, base: &Path, key: &str) {
         let guard = log
             .append(
                 Op::Write {

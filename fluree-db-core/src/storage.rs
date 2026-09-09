@@ -16,7 +16,7 @@
 /// flushes a commit costs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Durability {
-    /// Report complete once the write is in the storage root's redo log and
+    /// Report complete once the write is in the storage root's WAL and
     /// that log has been flushed. The file itself is written page-cache and
     /// flushed in the background; a restart replays the log first. Survives
     /// power loss. A head publication costs one flush regardless of how many
@@ -27,7 +27,7 @@ pub enum Durability {
     /// the log, or the filesystem refuses advisory locks — writes fall back to
     /// [`Self::Sync`] for the life of the handle.
     #[default]
-    Journal,
+    Wal,
     /// Report complete once the bytes and the directory entry naming them have
     /// been flushed to the device. Survives power loss; costs an fsync of the
     /// staged file and one of its parent directory per write.
@@ -52,7 +52,7 @@ impl Durability {
         matches!(self, Durability::Sync)
     }
 
-    /// Default read from [`Self::ENV_VAR`], falling back to [`Self::Journal`]
+    /// Default read from [`Self::ENV_VAR`], falling back to [`Self::Wal`]
     /// when unset or unrecognized.
     ///
     /// Read once per storage construction rather than per write, so tests set
@@ -96,11 +96,11 @@ impl Durability {
             // The per-write spelling is explicit: the truthy spellings (`1`,
             // `true`, `on`) mean "durable", and the durable default is the log.
             Some(v) if matches!(v.as_str(), "sync" | "fsync" | "direct") => Durability::Sync,
-            _ => Durability::Journal,
+            _ => Durability::Wal,
         }
     }
 
-    /// Parse a configuration mode name (`journal` / `sync` / `page-cache`).
+    /// Parse a configuration mode name (`wal` / `sync` / `page-cache`).
     ///
     /// Named modes rather than the environment variable's boolean: a config
     /// file is read to understand a deployment, and a name says what it does.
@@ -108,7 +108,7 @@ impl Durability {
     /// rather than silently pick a durability the operator did not ask for.
     pub fn from_mode_name(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-            "journal" | "wal" | "redo-log" => Some(Durability::Journal),
+            "wal" | "journal" => Some(Durability::Wal),
             "sync" | "fsync" => Some(Durability::Sync),
             "page-cache" | "pagecache" => Some(Durability::PageCache),
             _ => None,
@@ -119,9 +119,9 @@ impl Durability {
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod file;
 mod memory;
-#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
-mod redo_log;
 pub mod residency;
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+mod wal;
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use file::{FileStorage, STORAGE_METHOD_FILE};

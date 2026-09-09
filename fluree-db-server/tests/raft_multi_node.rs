@@ -1594,7 +1594,7 @@ fn source_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.file_name().is_some_and(|n| n == ".fluree-redo") {
+            if path.file_name().is_some_and(|n| n == ".fluree-wal") {
                 continue;
             }
             if path.is_dir() {
@@ -1627,7 +1627,7 @@ async fn every_node_journals_the_shared_root_under_its_own_log() {
             .insert_subject(node.node_id, ledger, &subject, &subject)
             .await;
     }
-    let owners = cluster._shared_data_tmp.path().join(".fluree-redo/owners");
+    let owners = cluster._shared_data_tmp.path().join(".fluree-wal/owners");
     for node in &cluster.nodes {
         let lock = owners.join(format!("node-{}", node.node_id)).join("LOCK");
         assert!(
@@ -1641,7 +1641,7 @@ async fn every_node_journals_the_shared_root_under_its_own_log() {
         !cluster
             ._shared_data_tmp
             .path()
-            .join(".fluree-redo/LOCK")
+            .join(".fluree-wal/LOCK")
             .exists(),
         "no node may journal the shared root as if it were alone on it"
     );
@@ -1668,9 +1668,9 @@ async fn a_survivors_miss_applies_the_stopped_workers_log() {
         .iter()
         .map(|n| {
             let probe = fluree_db_core::FileStorage::new(&shared)
-                .with_redo_owner(format!("node-{}", n.node_id));
+                .with_wal_owner(format!("node-{}", n.node_id));
             probe
-                .hold_redo_segments_for_test()
+                .hold_wal_segments_for_test()
                 .expect("attach to the node's log");
             (n.node_id, probe)
         })
@@ -1705,11 +1705,11 @@ async fn a_survivors_miss_applies_the_stopped_workers_log() {
         .collect();
     let mut workers = Vec::new();
     for (node_id, _) in &probes {
-        let dir = shared.join(format!(".fluree-redo/owners/node-{node_id}"));
+        let dir = shared.join(format!(".fluree-wal/owners/node-{node_id}"));
         let mentions = std::fs::read_dir(&dir)
             .expect("every node owns a log")
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".redo"))
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".wal"))
             .any(|e| {
                 let bytes = std::fs::read(e.path()).unwrap();
                 keys.iter()

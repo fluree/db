@@ -490,14 +490,14 @@ pub async fn build_fluree_with_nameservice(
 /// config. When `nameservice` is `Some`, it replaces the
 /// backend-implied nameservice. When `event_bus` is `Some`, it
 /// replaces Fluree's default per-instance bus.
-/// `redo_owner` names this process's redo log when the storage root is
+/// `wal_owner` names this process's WAL when the storage root is
 /// shared with other processes (a Raft cluster's payload store).
 async fn build_direct_fluree(
     config: &ServerConfig,
     nameservice: Option<fluree_db_api::NameServiceMode>,
     event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
     catchup_sweeps: CatchupSweeps,
-    redo_owner: Option<String>,
+    wal_owner: Option<String>,
 ) -> Result<(Arc<Fluree>, tokio::task::JoinHandle<()>), fluree_db_api::ApiError> {
     let mut builder = if let Some(ref path) = config.connection_config {
         // Connection config: build from JSON-LD (supports S3,
@@ -528,11 +528,11 @@ async fn build_direct_fluree(
     };
 
     // Server-level overrides take precedence over connection config defaults.
-    if let Some(owner) = redo_owner {
+    if let Some(owner) = wal_owner {
         // Voters share one payload root, so each node journals it under a
         // log of its own; an owned log flushes every payload before its
         // reference can be proposed.
-        builder = builder.with_storage_redo_owner(owner);
+        builder = builder.with_storage_wal_owner(owner);
     }
     if let Some(max_mb) = config.cache_max_mb {
         builder = builder.cache_max_mb(max_mb);

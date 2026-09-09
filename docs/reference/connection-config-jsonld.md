@@ -123,7 +123,7 @@ Not yet supported (parsed/ignored or absent):
 Supported:
 - `filePath`
 - `AES256Key` (supports `ConfigurationValue`)
-- `durability` — `"journal"` (default), `"sync"` or `"page-cache"`
+- `durability` — `"wal"` (default), `"sync"` or `"page-cache"`
 
 Notes:
 - Rust expects `AES256Key` to be **base64-encoded** and decode to exactly 32 bytes.
@@ -148,7 +148,7 @@ machine losing power.
 
 | Value | Meaning |
 |---|---|
-| `journal` (default) | Acknowledged once the write is in the root's redo log and the log is flushed; the file is written page-cache and flushed in the background, and a restart replays the log first. An acknowledged commit survives power loss at the cost of one flush per commit. Unix only; falls back to `sync` where the root is already owned by another process. |
+| `wal` (default) | Acknowledged once the write is in the root's WAL and the log is flushed; the file is written page-cache and flushed in the background, and a restart replays the log first. An acknowledged commit survives power loss at the cost of one flush per commit. Unix only; falls back to `sync` where the root is already owned by another process. |
 | `sync` | The bytes and the directory entry naming them are flushed to the device before the write is acknowledged. An acknowledged commit survives power loss. Two flushes per file. |
 | `page-cache` | Acknowledged once the bytes reach the OS page cache. Survives the process dying, but a power loss or kernel panic can lose acknowledged commits. |
 

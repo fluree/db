@@ -1192,7 +1192,7 @@ fn build_local_storage_from_config(
             // is startup, so the startup sweep of crash-orphaned staging
             // files is taken here explicitly.
             storage.sweep_orphaned_staging();
-            storage.recover_redo_log()?;
+            storage.recover_wal()?;
             if let Some(key_str) = storage_config.aes256_key.as_ref() {
                 let key = decode_encryption_key_base64(key_str.as_ref())?;
                 let encryption_key = EncryptionKey::new(key, 0);
@@ -1321,10 +1321,10 @@ pub struct FlureeBuilder {
     /// default). Connection-config builds carry it in the config instead.
     #[cfg(feature = "native")]
     storage_durability: Option<fluree_db_core::Durability>,
-    /// Owner of this process's redo log when the storage root is shared by
-    /// several processes. See `FileStorage::with_redo_owner`.
+    /// Owner of this process's WAL when the storage root is shared by
+    /// several processes. See `FileStorage::with_wal_owner`.
     #[cfg(feature = "native")]
-    storage_redo_owner: Option<String>,
+    storage_wal_owner: Option<String>,
     /// Optional encryption key (base64-encoded or raw 32 bytes)
     encryption_key: Option<[u8; 32]>,
     /// Optional ledger cache configuration (enables LedgerManager)
@@ -1582,7 +1582,7 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             storage_durability: None,
             #[cfg(feature = "native")]
-            storage_redo_owner: None,
+            storage_wal_owner: None,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -1605,7 +1605,7 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             storage_durability: None,
             #[cfg(feature = "native")]
-            storage_redo_owner: None,
+            storage_wal_owner: None,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -1682,7 +1682,7 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             storage_durability: None,
             #[cfg(feature = "native")]
-            storage_redo_owner: None,
+            storage_wal_owner: None,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -1896,7 +1896,7 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             storage_durability: None,
             #[cfg(feature = "native")]
-            storage_redo_owner: None,
+            storage_wal_owner: None,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -2005,7 +2005,7 @@ impl FlureeBuilder {
     /// Set when file-storage writes are reported complete.
     ///
     /// Applies to storage built from a path. The default is
-    /// [`Durability::Journal`](fluree_db_core::Durability::Journal); a
+    /// [`Durability::Wal`](fluree_db_core::Durability::Wal); a
     /// deployment whose root is shared by several writers, such as a Raft
     /// cluster on a network mount, pins [`Durability::Sync`](fluree_db_core::Durability::Sync)
     /// so no single process owns the root's log.
@@ -2017,10 +2017,10 @@ impl FlureeBuilder {
 
     /// Journal a storage root that other processes journal too, under a log
     /// this process owns. For a Raft cluster's shared payload store: each
-    /// node passes its own id. See `FileStorage::with_redo_owner`.
+    /// node passes its own id. See `FileStorage::with_wal_owner`.
     #[cfg(feature = "native")]
-    pub fn with_storage_redo_owner(mut self, owner: impl Into<String>) -> Self {
-        self.storage_redo_owner = Some(owner.into());
+    pub fn with_storage_wal_owner(mut self, owner: impl Into<String>) -> Self {
+        self.storage_wal_owner = Some(owner.into());
         self
     }
 
@@ -2032,8 +2032,8 @@ impl FlureeBuilder {
         if let Some(durability) = self.storage_durability {
             storage = storage.with_durability(durability);
         }
-        if let Some(owner) = &self.storage_redo_owner {
-            storage = storage.with_redo_owner(owner.clone());
+        if let Some(owner) = &self.storage_wal_owner {
+            storage = storage.with_wal_owner(owner.clone());
         }
         storage
     }
@@ -2322,9 +2322,9 @@ impl FlureeBuilder {
         // once per base path per process — the nameservice below shares this
         // tree and needs no sweep of its own.
         storage.sweep_orphaned_staging();
-        // Likewise the redo log: acknowledged writes a crash left unflushed
+        // Likewise the WAL: acknowledged writes a crash left unflushed
         // are applied before anything reads this tree.
-        storage.recover_redo_log()?;
+        storage.recover_wal()?;
         let nameservice = FileNameService::with_storage(storage.clone());
         let event_bus = self.resolve_event_bus();
         let notifying =
@@ -2492,7 +2492,7 @@ impl FlureeBuilder {
         // storage. Staging debris is on-disk state, not content, so the
         // sweep is the same for an encrypted tree.
         file_storage.sweep_orphaned_staging();
-        file_storage.recover_redo_log()?;
+        file_storage.recover_wal()?;
         let nameservice = FileNameService::with_storage(file_storage.clone());
         let encryption_key = EncryptionKey::new(key, 0);
         let key_provider = StaticKeyProvider::new(encryption_key);
@@ -3278,7 +3278,7 @@ impl FlureeBuilder {
             // Client build is startup: take the explicit sweep of
             // crash-orphaned staging files here, where startup is known.
             file_storage.sweep_orphaned_staging();
-            file_storage.recover_redo_log()?;
+            file_storage.recover_wal()?;
             let ns_storage = file_storage.clone();
             let base_storage: Arc<dyn Storage> = if let Some(key) = self.encryption_key {
                 let encryption_key = EncryptionKey::new(key, 0);
@@ -4787,21 +4787,20 @@ impl Fluree {
         // 3. Clear R2RML cache
         self.r2rml_cache.clear().await;
 
-        // 4. Retire the storage root's redo log, so the root reads the same
+        // 4. Retire the storage root's WAL, so the root reads the same
         //    to any binary. Dropping the last handle would do this too, but a
         //    background task may hold one for the life of the runtime.
         #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
         if let Some(path) = self.config.index_storage.path.clone() {
-            let checkpoint = tokio::task::spawn_blocking(move || {
-                FileStorage::checkpoint_redo_log(path.as_ref())
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r.map_err(|e| e.to_string()));
+            let checkpoint =
+                tokio::task::spawn_blocking(move || FileStorage::checkpoint_wal(path.as_ref()))
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r.map_err(|e| e.to_string()));
             if let Err(error) = checkpoint {
                 tracing::warn!(
                     error,
-                    "redo log checkpoint on disconnect failed; the next open will replay it"
+                    "WAL checkpoint on disconnect failed; the next open will replay it"
                 );
             }
         }

@@ -1,4 +1,4 @@
-//! The redo log seen from the API: a transaction costs one device flush, and
+//! The WAL seen from the API: a transaction costs one device flush, and
 //! everything acknowledged survives a crash that loses every file the page
 //! cache held. Unix only, like the log.
 
@@ -9,7 +9,7 @@ use fluree_db_core::{Durability, FileStorage};
 use serde_json::json;
 use std::path::Path;
 
-const LEDGER: &str = "it/redo-log:main";
+const LEDGER: &str = "it/wal:main";
 
 fn open(dir: &Path) -> Fluree {
     // Indexing publishes its own head pointer; keep the flush count to the
@@ -23,8 +23,8 @@ fn open(dir: &Path) -> Fluree {
 /// A second handle on the same root shares its log, so the counter it reports
 /// is the log's, whichever handle appended.
 fn probe(dir: &Path) -> FileStorage {
-    let storage = FileStorage::new(dir).with_durability(Durability::Journal);
-    storage.recover_redo_log().expect("attach");
+    let storage = FileStorage::new(dir).with_durability(Durability::Wal);
+    storage.recover_wal().expect("attach");
     storage
 }
 
@@ -94,7 +94,7 @@ async fn a_transaction_costs_one_flush() {
     let probe = FileStorage::new(dir.path()).with_durability(Durability::Sync);
     // A per-write handle counts only its own flushes, so count the files the
     // commit produced instead: no log directory, and the head in place.
-    assert!(!dir.path().join(".fluree-redo").exists());
+    assert!(!dir.path().join(".fluree-wal").exists());
     assert_eq!(probe.effective_durability(), Durability::Sync);
     fluree.disconnect().await;
 }
@@ -104,7 +104,7 @@ async fn acknowledged_transactions_survive_losing_every_unflushed_file() {
     let dir = tempfile::tempdir().unwrap();
     let probe = probe(dir.path());
     probe
-        .hold_redo_segments_for_test()
+        .hold_wal_segments_for_test()
         .expect("keep the log until the crash");
 
     let fluree = open(dir.path());
@@ -122,7 +122,7 @@ async fn acknowledged_transactions_survive_losing_every_unflushed_file() {
     drop(probe);
     for entry in std::fs::read_dir(dir.path()).unwrap() {
         let entry = entry.unwrap();
-        if entry.file_name() == ".fluree-redo" {
+        if entry.file_name() == ".fluree-wal" {
             continue;
         }
         if entry.file_type().unwrap().is_dir() {
@@ -146,7 +146,7 @@ async fn acknowledged_transactions_survive_losing_every_unflushed_file() {
     drop(fluree);
 
     // A clean close leaves the root readable by a binary without the log.
-    let mut names: Vec<_> = std::fs::read_dir(dir.path().join(".fluree-redo"))
+    let mut names: Vec<_> = std::fs::read_dir(dir.path().join(".fluree-wal"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
@@ -157,17 +157,17 @@ async fn acknowledged_transactions_survive_losing_every_unflushed_file() {
 /// Not a check: a measurement. Prints per-commit wall time for the durable
 /// modes so the log's saving can be read off the machine it runs on.
 ///
-/// `cargo test -p fluree-db-api --release --test it_redo_log -- --ignored --nocapture timing`
+/// `cargo test -p fluree-db-api --release --test it_wal -- --ignored --nocapture timing`
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn timing_journal_vs_sync() {
+async fn timing_wal_vs_sync() {
     use fluree_db_api::CommitOpts;
     use std::time::Instant;
 
     const WARM: usize = 10;
     const SAMPLES: usize = 200;
 
-    for (mode, durability) in [("journal", Durability::Journal), ("sync", Durability::Sync)] {
+    for (mode, durability) in [("wal", Durability::Wal), ("sync", Durability::Sync)] {
         for raw in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())

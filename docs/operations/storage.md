@@ -357,7 +357,7 @@ or by `FLUREE_STORAGE_FSYNC`:
 
 | Mode | Acknowledged when | Survives | Flushes per commit |
 |---|---|---|---|
-| `journal` (default) | the write is in the root's redo log and the log is flushed | process death and power loss | one |
+| `wal` (default) | the write is in the root's WAL and the log is flushed | process death and power loss | one |
 | `sync` | bytes and directory entry flushed to the device | process death and power loss | two per file: six for a commit with a recorded transaction |
 | `page-cache` | bytes reach the OS page cache | process death only | none |
 
@@ -372,10 +372,10 @@ Turning durability off is reasonable for bulk imports (restartable from the
 source data), CI, and benchmarks. It is not a safe default for a ledger you
 intend to keep.
 
-#### The redo log
+#### The write-ahead log
 
-Under `journal`, every source-of-truth write is first appended to a log under
-`<root>/.fluree-redo/` and the file itself is written page-cache. Content writes
+Under `wal`, every source-of-truth write is first appended to a log under
+`<root>/.fluree-wal/` and the file itself is written page-cache. Content writes
 append without flushing; the head publication that ends a commit appends and
 flushes, and that one flush covers everything appended before it. A background
 thread flushes the files a closed log segment covered and removes the segment,
@@ -385,8 +385,8 @@ clean shutdown leaves no segments at all.
 
 The files on disk remain the database. The log adds nothing another version of
 Fluree needs to understand: after a clean shutdown, or after any start of a
-journaling binary, the root reads exactly as it did under `sync`. The one rule
-for downgrading is therefore *start the journaling binary once after a crash*
+WAL-aware binary, the root reads exactly as it did under `sync`. The one rule
+for downgrading is therefore *start the WAL-aware binary once after a crash*
 before pointing an older binary at the root, so the tail is applied.
 
 One process owns a root's log at a time. A second handle on the same root
@@ -395,7 +395,7 @@ with a warning at startup. Where the filesystem refuses advisory locks the same
 fallback applies. The log is Unix-only.
 
 A Raft cluster's payload store is one root shared by every node, so each node
-journals it under a log of its own, at `<root>/.fluree-redo/owners/node-<id>/`.
+journals it under a log of its own, at `<root>/.fluree-wal/owners/node-<id>/`.
 An owned log flushes on every write: the head lives in Raft rather than in a
 file under the root, so nothing later would flush on a payload's behalf, and a
 payload must be durable before its reference is proposed. That is one flush per
@@ -403,7 +403,7 @@ payload instead of two. Any node applies a stopped node's unflushed tail when
 it opens the root or misses a file, so a payload survives the loss of the node
 that wrote it as long as the shared store does.
 
-A write larger than 256 MiB bypasses the log and is flushed directly. Records
+A write larger than 8 MiB bypasses the log and is flushed directly; past that size a flush costs bandwidth rather than latency, and the log would only write the bytes twice. Records
 in a segment that was flushed before a later segment was opened cannot tear, so
 damage there fails the open with the segment named; a torn final frame is
 discarded, since acknowledgment follows the flush and could not have covered it.
