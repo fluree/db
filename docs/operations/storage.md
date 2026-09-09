@@ -406,7 +406,7 @@ payload instead of two. Any node applies a stopped node's unflushed tail when
 it opens the root or misses a file, so a payload survives the loss of the node
 that wrote it as long as the shared store does.
 
-A write larger than 8 MiB bypasses the log and is flushed directly; past that size a flush costs bandwidth rather than latency, and the log would only write the bytes twice. Records
+A write larger than 8 MiB bypasses the log and is flushed directly, after the log's earlier records; past that size a flush costs bandwidth rather than latency, and the log would only write the bytes twice. Records
 in a segment that was flushed before a later segment was opened cannot tear, so
 damage there fails the open with the segment named; a torn final frame is
 discarded, since acknowledgment follows the flush and could not have covered it.

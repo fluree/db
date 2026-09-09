@@ -842,7 +842,9 @@ impl FileStorage {
 
     /// How a write of `len` bytes lands under `durability`: the log it is
     /// appended to first, if any, and the policy the file is then written with.
-    /// A record too large for the log is flushed directly instead.
+    /// A record too large for the log is flushed directly instead, after the
+    /// log's earlier appends: a head published that way must not become
+    /// durable ahead of the content it names.
     fn write_plan(
         &self,
         durability: Durability,
@@ -851,10 +853,13 @@ impl FileStorage {
         if durability != Durability::Wal {
             return Ok((self.policy(durability), None));
         }
-        if len <= wal::MAX_RECORD_BYTES {
-            if let Some(log) = self.attach_wal(true)? {
+        if let Some(log) = self.attach_wal(true)? {
+            if len <= wal::MAX_RECORD_BYTES {
                 return Ok((self.policy(Durability::PageCache), Some(log)));
             }
+            log.flush().map_err(|e| {
+                crate::error::Error::io(format!("WAL flush before an oversized write: {e}"))
+            })?;
         }
         Ok((self.policy(Durability::Sync), None))
     }

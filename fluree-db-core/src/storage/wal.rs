@@ -845,6 +845,25 @@ impl Wal {
         Ok(())
     }
 
+    /// Make every append so far durable. Closed segments were flushed when
+    /// they closed, so only the active one can still be dirty. A write too
+    /// large for the log pays its own fsync and calls this first, so nothing
+    /// it may name is left behind on a crash that keeps it.
+    pub(super) fn flush(&self) -> io::Result<()> {
+        self.refuse_if_unavailable()?;
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.refuse_if_unavailable()?;
+        match inner.active.as_mut() {
+            Some(segment) if segment.dirty => {
+                self.sync_segment(segment).map_err(|e| self.poison(e))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Append one record. With `sync`, the segment is flushed before returning,
     /// which also covers every earlier unflushed append. Hold the returned
     /// guard until the file the record describes is written.
@@ -1598,5 +1617,56 @@ mod tests {
             std::fs::read(dir.path().join("after")).unwrap(),
             b"acknowledged"
         );
+    }
+
+    /// A head too large for the log is flushed directly, but the content it
+    /// names may still sit in unflushed records. Publishing it has to flush
+    /// those first, or a crash keeps the head and loses what it points to.
+    #[tokio::test]
+    async fn an_oversized_head_flushes_the_appends_before_it() {
+        use crate::{CasAction, Durability, FileStorage, StorageCas, StorageRead, StorageWrite};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        storage.hold_wal_segments_for_test().unwrap();
+        let log = match Wal::acquire(dir.path(), None, true).unwrap() {
+            Acquire::Log(log) => log,
+            _ => panic!("log unavailable"),
+        };
+        let head = "fluree:file://head.json";
+        let payload = "fluree:file://payload.bin";
+        storage.insert(head, b"initial").await.unwrap();
+        storage.write_bytes(payload, b"payload").await.unwrap();
+        {
+            // Keep the idle-flush timer out of it: the publication itself
+            // must make the payload record durable.
+            let mut inner = log.inner.lock().unwrap();
+            let segment = inner.active.as_mut().unwrap();
+            assert!(segment.dirty);
+            segment.last_append = Instant::now() + Duration::from_secs(3600);
+        }
+        let before = log.fsyncs_issued();
+        let oversized = vec![b'x'; MAX_RECORD_BYTES + 1];
+        storage
+            .compare_and_swap(head, |_| Ok(CasAction::Write::<()>(oversized.clone())))
+            .await
+            .unwrap();
+        assert!(
+            log.fsyncs_issued() > before,
+            "an oversized head was published without flushing the log"
+        );
+        assert!(!log.inner.lock().unwrap().active.as_ref().unwrap().dirty);
+
+        // Power loss keeps the directly flushed head; the payload file never
+        // was flushed, and only its log record can bring it back.
+        log.simulate_crash();
+        std::fs::remove_file(dir.path().join("payload.bin")).unwrap();
+        let reopened = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        reopened.recover_wal().unwrap();
+        assert_eq!(
+            reopened.read_bytes(head).await.unwrap().len(),
+            oversized.len()
+        );
+        assert_eq!(reopened.read_bytes(payload).await.unwrap(), b"payload");
     }
 }
