@@ -7,6 +7,12 @@ on:
     branches: [main]
 
 # Superseded pushes to main should cancel stale CI just like PR updates do.
+# Cache note: `save-if: main` still fires on a cancelled main job, because
+# `cache-on-failure: true` makes rust-cache's post step run on any status.
+# A burst of merges can therefore save a partially built target dir under
+# the exact key; later main runs hit that key and skip saving until
+# Cargo.lock, the toolchain, or another keyed input changes. Degraded, not
+# cold: PRs still restore whatever was saved.
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
@@ -73,7 +79,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clippy
-        run: cargo clippy --all --all-features --all-targets -- -D warnings
+        run: cargo clippy --all --all-features --all-targets --locked -- -D warnings
 
       # Clippy and the nextest job are both --all-features, so a target
       # that only fails to compile under DEFAULT features (e.g. an example
@@ -82,7 +88,7 @@ jobs:
       # `cargo test -p <crate>` reaches first. Keep it alongside Clippy so it
       # runs in parallel with nextest instead of extending the test job.
       - name: Check (default features)
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --locked
 
   test:
     # 8 cores / 32 GB: the workspace compile and nextest run are the CI critical path.
@@ -110,7 +116,7 @@ jobs:
           tool: cargo-nextest
 
       - name: Test
-        run: cargo nextest run --workspace --all-features --no-fail-fast
+        run: cargo nextest run --workspace --all-features --no-fail-fast --locked
 
       # Nextest does not execute rustdoc examples. Reuse the all-feature build
       # above so public API examples cannot silently stop compiling or running.

@@ -39,7 +39,9 @@ env:
 
 jobs:
   bench-gate:
-    if: ${{ !inputs.compare_only }}
+    # `inputs` is empty on the nightly schedule; say so explicitly instead of
+    # relying on `!null`. Mirrors the bench-capture guard below.
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.compare_only }}
     # Failure modes:
     #   - A bench no longer compiles (real API regression).
     #   - A bench's `--test` mode panics or never returns.
