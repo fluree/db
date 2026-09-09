@@ -946,6 +946,17 @@ impl FileStorage {
         Ok(self.attach_wal(true)?.map(|log| log.key_stripe(key)))
     }
 
+    /// Delay every WAL device flush by `delay`, so a test can widen the
+    /// window in which concurrent commits pile up behind one flush.
+    /// Attaches the log.
+    #[doc(hidden)]
+    pub fn slow_wal_sync_for_test(&self, delay: std::time::Duration) -> Result<()> {
+        if let Some(log) = self.attach_wal(true)? {
+            log.slow_sync(delay);
+        }
+        Ok(())
+    }
+
     /// Durability for a write of `kind`.
     ///
     /// Derived content is recomputable from the commit chain, so it is never

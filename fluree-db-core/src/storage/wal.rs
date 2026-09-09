@@ -10,7 +10,10 @@
 //! `file.rs`: content writes append without flushing, and the head
 //! compare-and-swap appends *with* a flush, which covers every earlier append
 //! in the same file. A record is therefore durable no later than the next head
-//! publication or the next flusher tick.
+//! publication or the next flusher tick. Flushes are shared: appends that wait
+//! at the same time are covered by one device flush, led by the first of them
+//! (see [`Wal::wait_durable`]), so commits on many ledgers under one root cost
+//! a few flushes between them rather than one each.
 //!
 //! Recovery reads segments in order and applies each record in sequence. A torn
 //! final frame is discarded: acknowledgment follows the flush, and a flush
@@ -25,7 +28,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 /// Directory under the storage root holding the lock and segments.
@@ -288,6 +291,9 @@ struct Segment {
     id: u64,
     path: PathBuf,
     file: File,
+    /// A second handle on the same file, so a flush can run with `inner`
+    /// released while appends keep landing through `file`.
+    sync_fd: Arc<File>,
     len: u64,
     /// Keys whose files must be flushed before this segment can be retired.
     touched: Vec<String>,
@@ -295,7 +301,6 @@ struct Segment {
     /// is never retired while this is non-zero: the flush would miss the
     /// file and the record would be gone when the file finally lands.
     in_flight: Arc<AtomicUsize>,
-    dirty: bool,
     last_append: Instant,
     opened: Instant,
 }
@@ -326,6 +331,13 @@ struct Inner {
     closed: Vec<Closed>,
     next_seq: u64,
     next_segment: u64,
+    /// Every sequence number below this is on the device. Frames at or
+    /// above it are all in the active segment: a segment is flushed before
+    /// it is closed.
+    durable_end: u64,
+    /// A leader has released `inner` and is inside the device flush. Waiters
+    /// park until it publishes; the next one to wake leads the next flush.
+    flushing: bool,
 }
 
 /// The WAL for one storage root. One per canonical root per process; the
@@ -336,6 +348,9 @@ pub(super) struct Wal {
     dir: PathBuf,
     fsyncs: AtomicU64,
     inner: Mutex<Inner>,
+    /// Signalled whenever `durable_end` advances, a flush fails, or the log
+    /// is abandoned. Paired with `inner`.
+    flushed: Condvar,
     lock: Mutex<Option<File>>,
     crashed: AtomicBool,
     /// Test hook: keep every segment until close, so a test can crash the
@@ -355,6 +370,9 @@ pub(super) struct Wal {
     /// log rather than the handle: every handle on a root shares its log,
     /// so they share what orders it. See [`Self::key_stripe`].
     key_stripes: Vec<Arc<tokio::sync::Mutex<()>>>,
+    /// Test hook: milliseconds to sleep before each device flush, so a test
+    /// can widen the window in which appends pile up behind one.
+    slow_sync_ms: AtomicU64,
     /// Test hook: make the next flush report failure.
     #[cfg(test)]
     fail_next_sync: AtomicBool,
@@ -501,17 +519,45 @@ fn fsync_dir(path: &Path, fsyncs: &AtomicU64) -> io::Result<()> {
     Ok(())
 }
 
+/// Hand `file` to the drive. On Apple platforms `sync_all` is `F_FULLFSYNC`,
+/// which also flushes the drive's own cache, a cost that need only be paid
+/// once per batch: `fsync(2)` alone moves the file to the drive, and one
+/// full flush at the end of the batch commits everything handed over before
+/// it. Elsewhere `fsync(2)` is the flush.
+fn writeback(file: &File, fsyncs: &AtomicU64) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    file.sync_all()?;
+    fsyncs.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
 /// Flush the files named by `keys` and every directory between them and the
 /// root. Missing files were deleted after being logged, which is fine: the
-/// directory flush makes the unlink durable.
+/// directory flush makes the unlink durable. A key named more than once is
+/// flushed once; on Apple platforms the whole batch costs one drive flush.
 pub(super) fn flush_keys(base: &Path, keys: &[String], fsyncs: &AtomicU64) -> io::Result<()> {
+    let mut unique: Vec<&String> = keys.iter().collect();
+    unique.sort_unstable();
+    unique.dedup();
     let mut dirs = BTreeSet::new();
-    for key in keys {
+    // The full flush at the end goes to the last file, or failing any file
+    // to the last directory, so a file the drive refuses still fails the
+    // batch.
+    let mut last_file: Option<File> = None;
+    let mut last_dir: Option<File> = None;
+    for key in unique {
         let path = base.join(key);
         match File::open(&path) {
             Ok(file) => {
-                file.sync_all()?;
-                fsyncs.fetch_add(1, Ordering::Relaxed);
+                writeback(&file, fsyncs)?;
+                last_file = Some(file);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -525,10 +571,19 @@ pub(super) fn flush_keys(base: &Path, keys: &[String], fsyncs: &AtomicU64) -> io
         }
     }
     for dir in dirs {
-        match fsync_dir(&dir, fsyncs) {
-            Ok(()) => {}
+        match File::open(&dir) {
+            Ok(file) => {
+                writeback(&file, fsyncs)?;
+                last_dir = Some(file);
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
+        }
+    }
+    if cfg!(target_vendor = "apple") {
+        if let Some(file) = last_file.or(last_dir) {
+            file.sync_all()?;
+            fsyncs.fetch_add(1, Ordering::Relaxed);
         }
     }
     Ok(())
@@ -857,7 +912,10 @@ impl Wal {
                 closed: Vec::new(),
                 next_seq,
                 next_segment,
+                durable_end: next_seq,
+                flushing: false,
             }),
+            flushed: Condvar::new(),
             lock: Mutex::new(Some(lock)),
             crashed: AtomicBool::new(false),
             hold_segments: AtomicBool::new(false),
@@ -866,6 +924,7 @@ impl Wal {
             key_stripes: (0..KEY_STRIPES)
                 .map(|_| Arc::new(tokio::sync::Mutex::new(())))
                 .collect(),
+            slow_sync_ms: AtomicU64::new(0),
             #[cfg(test)]
             fail_next_sync: AtomicBool::new(false),
         });
@@ -928,39 +987,44 @@ impl Wal {
         error
     }
 
-    fn sync_segment(&self, segment: &mut Segment) -> io::Result<()> {
+    fn sync_file(&self, file: &File) -> io::Result<()> {
         #[cfg(test)]
         if self.fail_next_sync.swap(false, Ordering::AcqRel) {
             return Err(io::Error::other("injected flush failure"));
         }
-        segment.file.sync_all()?;
+        let slow = self.slow_sync_ms.load(Ordering::Relaxed);
+        if slow > 0 {
+            std::thread::sleep(Duration::from_millis(slow));
+        }
+        file.sync_all()?;
         self.fsyncs.fetch_add(1, Ordering::Relaxed);
-        segment.dirty = false;
         Ok(())
     }
 
-    /// Make every append so far durable. Closed segments were flushed when
-    /// they closed, so only the active one can still be dirty. A write too
-    /// large for the log pays its own fsync and calls this first, so nothing
-    /// it may name is left behind on a crash that keeps it.
+    /// Make every append so far durable. A write too large for the log pays
+    /// its own fsync and calls this first, so nothing it may name is left
+    /// behind on a crash that keeps it.
     pub(super) fn flush(&self) -> io::Result<()> {
         self.refuse_if_unavailable()?;
-        let mut inner = self
+        let inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.refuse_if_unavailable()?;
-        match inner.active.as_mut() {
-            Some(segment) if segment.dirty => {
-                self.sync_segment(segment).map_err(|e| self.poison(e))
-            }
-            _ => Ok(()),
-        }
+        let last = inner.next_seq - 1;
+        self.wait_durable(inner, last).map(drop)
     }
 
-    /// Append one record. With `sync`, the segment is flushed before returning,
-    /// which also covers every earlier unflushed append. Hold the returned
-    /// guard until the file the record describes is written.
+    /// Test hook: sleep this long before every device flush.
+    pub fn slow_sync(&self, delay: Duration) {
+        self.slow_sync_ms
+            .store(delay.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Append one record. With `sync`, returns once the record is on the
+    /// device; the flush that gets it there covers every earlier append, and
+    /// is shared with every other append waiting at the same time (see
+    /// [`Self::wait_durable`]). Hold the returned guard until the file the
+    /// record describes is written.
     pub(super) fn append(&self, op: Op<'_>, sync: bool) -> io::Result<Appended> {
         self.refuse_if_unavailable()?;
         let sync = sync || self.flush_every_append;
@@ -978,7 +1042,7 @@ impl Wal {
             inner.active = Some(segment);
         }
         let frame = encode_frame(seq, &payload);
-        let (full, in_flight) = {
+        let (full, appended) = {
             let segment = inner.active.as_mut().expect("opened above");
             let start = segment.len;
             // Always write at the frame boundary the log knows about, never
@@ -997,22 +1061,31 @@ impl Wal {
                 });
             }
             segment.len += frame.len() as u64;
-            segment.dirty = true;
             segment.last_append = Instant::now();
             segment.touched.push(op.key().to_owned());
-            if sync {
-                if let Err(e) = self.sync_segment(segment) {
-                    return Err(self.poison(e));
-                }
-            }
+            // Counted before any wait: the segment may close while this
+            // append waits for its flush, and retirement must still see the
+            // file it describes as outstanding.
             segment.in_flight.fetch_add(1, Ordering::AcqRel);
-            (segment.len >= ROTATE_BYTES, Arc::clone(&segment.in_flight))
+            (
+                segment.len >= ROTATE_BYTES,
+                Appended {
+                    in_flight: Arc::clone(&segment.in_flight),
+                    seq,
+                },
+            )
         };
+        // The frame is in the file, so its number is spent whether or not the
+        // flush succeeds; a failed flush poisons the log, so it is never
+        // reused.
         inner.next_seq = seq + 1;
         if full {
             self.rotate(&mut inner)?;
         }
-        Ok(Appended { in_flight, seq })
+        if sync {
+            drop(self.wait_durable(inner, seq)?);
+        }
+        Ok(appended)
     }
 
     /// Log that record `seq`, appended and flushed, was never materialized:
@@ -1032,6 +1105,78 @@ impl Wal {
                     self.poison(e)
                 }
             })
+    }
+
+    /// Park until `seq` is on the device.
+    ///
+    /// The first waiter to find no flush in progress leads one: it notes how
+    /// far the log had been written, releases `inner`, flushes, and publishes
+    /// that point as durable. Everyone whose frame landed before it looked is
+    /// covered by that one flush; whoever appended during it wakes, finds no
+    /// flush in progress, and leads the next. Two flushes are thus ever in
+    /// the pipeline, and a lone appender still pays exactly one.
+    fn wait_durable<'a>(
+        &'a self,
+        mut inner: MutexGuard<'a, Inner>,
+        seq: u64,
+    ) -> io::Result<MutexGuard<'a, Inner>> {
+        loop {
+            if inner.durable_end > seq {
+                return Ok(inner);
+            }
+            self.refuse_if_unavailable()?;
+            if inner.flushing {
+                inner = self
+                    .flushed
+                    .wait(inner)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            } else {
+                inner = self.lead_flush(inner)?;
+            }
+        }
+    }
+
+    fn lead_flush<'a>(
+        &'a self,
+        mut inner: MutexGuard<'a, Inner>,
+    ) -> io::Result<MutexGuard<'a, Inner>> {
+        // Sampled before the mutex is released: every frame below it was
+        // written before the flush starts, so the flush covers it. Frames
+        // that land during the flush may or may not be covered and are left
+        // for the next one.
+        let covered = inner.next_seq;
+        let fd = Arc::clone(
+            &inner
+                .active
+                .as_ref()
+                .expect("an unflushed frame is always in the active segment")
+                .sync_fd,
+        );
+        inner.flushing = true;
+        drop(inner);
+        let mut leading = Leading {
+            wal: self,
+            done: false,
+        };
+        let result = self.sync_file(&fd);
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        leading.done = true;
+        inner.flushing = false;
+        match result {
+            Ok(()) => {
+                inner.durable_end = inner.durable_end.max(covered);
+                self.flushed.notify_all();
+                Ok(inner)
+            }
+            Err(e) => {
+                let e = self.poison(e);
+                self.flushed.notify_all();
+                Err(e)
+            }
+        }
     }
 
     /// Create the next segment: header written and flushed under a temporary
@@ -1055,14 +1200,15 @@ impl Wal {
         self.fsyncs.fetch_add(1, Ordering::Relaxed);
         std::fs::rename(&tmp, &path)?;
         fsync_dir(&self.dir, &self.fsyncs)?;
+        let sync_fd = Arc::new(file.try_clone()?);
         Ok(Segment {
             id,
             path,
             file,
+            sync_fd,
             len: SEGMENT_HEADER as u64,
             touched: Vec::new(),
             in_flight: Arc::new(AtomicUsize::new(0)),
-            dirty: false,
             last_append: Instant::now(),
             opened: Instant::now(),
         })
@@ -1071,14 +1217,16 @@ impl Wal {
     /// Close the active segment so the flusher can retire it. Flushed first:
     /// the next segment's flushes do not cover this file.
     fn rotate(&self, inner: &mut Inner) -> io::Result<()> {
-        let Some(mut segment) = inner.active.take() else {
+        let Some(segment) = inner.active.take() else {
             return Ok(());
         };
-        if segment.dirty {
-            if let Err(e) = self.sync_segment(&mut segment) {
+        if inner.durable_end < inner.next_seq {
+            if let Err(e) = self.sync_file(&segment.file) {
                 inner.active = Some(segment);
                 return Err(self.poison(e));
             }
+            inner.durable_end = inner.next_seq;
+            self.flushed.notify_all();
         }
         tracing::trace!(
             segment = segment.id,
@@ -1103,21 +1251,24 @@ impl Wal {
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(segment) = inner.active.as_mut() {
-                let now = Instant::now();
-                if segment.dirty
-                    && now.duration_since(segment.last_append) >= LONE_APPEND_SYNC_AFTER
-                {
-                    if let Err(e) = self.sync_segment(segment) {
-                        return Err(self.poison(e));
-                    }
-                }
-                if !hold
-                    && !segment.touched.is_empty()
-                    && now.duration_since(segment.opened) >= ROTATE_AGE
-                {
-                    self.rotate(&mut inner)?;
-                }
+            let now = Instant::now();
+            let (idle, aged) = match inner.active.as_ref() {
+                Some(segment) => (
+                    now.duration_since(segment.last_append) >= LONE_APPEND_SYNC_AFTER,
+                    !segment.touched.is_empty() && now.duration_since(segment.opened) >= ROTATE_AGE,
+                ),
+                None => (false, false),
+            };
+            let unflushed = inner.durable_end < inner.next_seq;
+            // A leader inside the device flush is about to publish; closing
+            // or flushing the same file now would only flush it twice.
+            if inner.flushing {
+                // Wait for the next tick.
+            } else if !hold && aged {
+                self.rotate(&mut inner)?;
+            } else if unflushed && idle {
+                let last = inner.next_seq - 1;
+                drop(self.wait_durable(inner, last)?);
             }
         }
         if hold {
@@ -1223,6 +1374,13 @@ impl Wal {
     #[doc(hidden)]
     pub fn simulate_crash(&self) {
         self.crashed.store(true, Ordering::Release);
+        // Under the mutex, so a waiter cannot check and park in between.
+        drop(
+            self.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        self.flushed.notify_all();
         registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1233,6 +1391,31 @@ impl Wal {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take(),
         );
+    }
+}
+
+/// Held by a flush leader while `inner` is released. If the flush unwinds
+/// instead of returning, the followers parked on it must not stay parked:
+/// clear the flag, poison the log, and wake them to see it.
+struct Leading<'w> {
+    wal: &'w Wal,
+    done: bool,
+}
+
+impl Drop for Leading<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let mut inner = self
+            .wal
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.flushing = false;
+        drop(self.wal.poison(io::Error::other("flush leader unwound")));
+        drop(inner);
+        self.wal.flushed.notify_all();
     }
 }
 
@@ -1768,8 +1951,8 @@ mod tests {
             // Keep the idle-flush timer out of it: the publication itself
             // must make the payload record durable.
             let mut inner = log.inner.lock().unwrap();
+            assert!(inner.durable_end < inner.next_seq);
             let segment = inner.active.as_mut().unwrap();
-            assert!(segment.dirty);
             segment.last_append = Instant::now() + Duration::from_secs(3600);
         }
         let before = log.fsyncs_issued();
@@ -1787,6 +1970,10 @@ mod tests {
             "records were left to replay over a directly written head"
         );
         assert!(log.inner.lock().unwrap().active.is_none());
+        {
+            let inner = log.inner.lock().unwrap();
+            assert_eq!(inner.durable_end, inner.next_seq);
+        }
 
         // Power loss keeps the directly flushed head and the payload the
         // checkpoint put on the device ahead of it; nothing is replayed.
@@ -2094,6 +2281,178 @@ mod tests {
         assert!(
             storage.fsyncs_issued() > before,
             "sync returned with the log still dirty"
+        );
+    }
+
+    fn write(key: &str) -> Op<'_> {
+        Op::Write {
+            key,
+            bytes: b"payload",
+        }
+    }
+
+    /// Appends that wait at the same time share a device flush: the first to
+    /// look leads it, the rest are covered by it. Sixteen synced appends from
+    /// sixteen threads cost far fewer than sixteen flushes and far less than
+    /// sixteen flush delays. Restore the flush under the mutex and both
+    /// assertions fail.
+    #[test]
+    fn concurrent_synced_appends_share_a_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.hold_segments();
+        log.slow_sync(Duration::from_millis(40));
+        drop(log.append(write("warm"), true).unwrap());
+        let before = log.fsyncs_issued();
+        let started = Instant::now();
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let log = Arc::clone(&log);
+                std::thread::spawn(move || {
+                    let key = format!("key-{i}");
+                    log.append(write(&key), true).map(drop)
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap().unwrap();
+        }
+        let elapsed = started.elapsed();
+        let flushes = log.fsyncs_issued() - before;
+        assert!(flushes < 16, "{flushes} flushes for 16 concurrent appends");
+        assert!(
+            elapsed < Duration::from_millis(16 * 40),
+            "16 appends took {elapsed:?}: they waited one behind another"
+        );
+        {
+            let inner = log.inner.lock().unwrap();
+            assert_eq!(inner.durable_end, inner.next_seq);
+            assert!(!inner.flushing);
+        }
+    }
+
+    /// A failed flush fails every append that was waiting on it, leader and
+    /// followers alike: none may report durability the device refused.
+    /// Remove the poison in `lead_flush` and the followers lead their own
+    /// flush and return Ok.
+    #[test]
+    fn a_failed_group_flush_fails_every_waiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.hold_segments();
+        log.slow_sync(Duration::from_millis(40));
+        log.fail_next_sync.store(true, Ordering::Release);
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let log = Arc::clone(&log);
+                std::thread::spawn(move || {
+                    let key = format!("key-{i}");
+                    log.append(write(&key), true).map(drop)
+                })
+            })
+            .collect();
+        let errors: Vec<String> = threads
+            .into_iter()
+            .map(|t| {
+                t.join()
+                    .unwrap()
+                    .expect_err("every waiter fails")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            errors.iter().filter(|e| e.contains("injected")).count(),
+            1,
+            "exactly one waiter led the failed flush: {errors:?}"
+        );
+        assert!(
+            errors.iter().filter(|e| e.contains("failed flush")).count() == 7,
+            "followers see the poisoned log: {errors:?}"
+        );
+        assert!(!log.inner.lock().unwrap().flushing);
+    }
+
+    /// A frame that lands while a flush is in progress is not covered by it:
+    /// the flush may already have passed the frame's bytes. Its appender
+    /// leads the next flush as soon as the first ends. Sample the covered
+    /// point after the flush instead of before and this sees one flush.
+    #[test]
+    fn an_append_during_a_flush_waits_for_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.hold_segments();
+        drop(log.append(write("warm"), true).unwrap());
+        log.slow_sync(Duration::from_millis(120));
+        let before = log.fsyncs_issued();
+        let leader = {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || log.append(write("leader"), true).map(drop))
+        };
+        // Inside the leader's flush.
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(log.inner.lock().unwrap().flushing);
+        let started = Instant::now();
+        drop(log.append(write("late"), true).unwrap());
+        let late = started.elapsed();
+        leader.join().unwrap().unwrap();
+        assert_eq!(log.fsyncs_issued() - before, 2);
+        assert!(
+            late >= Duration::from_millis(120),
+            "the late append returned after {late:?}, before its own flush could have ended"
+        );
+    }
+
+    /// Closing a segment flushes it, which is a flush like any other: a
+    /// waiter whose frame is in the closed segment is released by it.
+    /// Remove the publish from `rotate` and the waiter never returns.
+    #[test]
+    fn a_rotation_releases_the_waiters_in_the_closed_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.hold_segments();
+        log.slow_sync(Duration::from_millis(200));
+        let leader = {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || log.append(write("leader"), true).map(drop))
+        };
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(log.inner.lock().unwrap().flushing);
+        let follower = {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || log.append(write("follower"), true).map(drop))
+        };
+        std::thread::sleep(Duration::from_millis(40));
+        log.slow_sync(Duration::ZERO);
+        rotate_now(&log);
+        let started = Instant::now();
+        follower.join().unwrap().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "the follower waited past the rotation that flushed its frame"
+        );
+        leader.join().unwrap().unwrap();
+        assert!(log.inner.lock().unwrap().active.is_none());
+    }
+
+    /// Retiring a segment flushes each file it touched once, however many
+    /// records named it. The head file of a busy ledger appears in every
+    /// commit's records; retiring the segment must not flush it per record.
+    #[test]
+    fn retirement_flushes_a_repeated_key_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let fsyncs = AtomicU64::new(0);
+        std::fs::write(dir.path().join("head"), b"h").unwrap();
+        std::fs::write(dir.path().join("blob"), b"b").unwrap();
+        let keys: Vec<String> = (0..50)
+            .flat_map(|_| ["head".to_string(), "blob".to_string()])
+            .collect();
+        flush_keys(dir.path(), &keys, &fsyncs).unwrap();
+        let flushes = fsyncs.load(Ordering::Relaxed);
+        // Two files, one directory, and on Apple platforms the one full
+        // flush that commits them all.
+        assert!(
+            flushes <= 4,
+            "{flushes} flushes to retire two files named 50 times each"
         );
     }
 }

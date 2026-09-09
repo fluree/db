@@ -357,7 +357,7 @@ or by `FLUREE_STORAGE_FSYNC`:
 
 | Mode | Acknowledged when | Survives | Flushes per commit |
 |---|---|---|---|
-| `wal` (default) | the write is in the root's WAL and the log is flushed | process death and power loss | one |
+| `wal` (default) | the write is in the root's WAL and the log is flushed | process death and power loss | at most one; commits that arrive together share it |
 | `sync` | bytes and directory entry flushed to the device | process death and power loss | two per file: six for a commit with a recorded transaction |
 | `page-cache` | bytes reach the OS page cache | process death only | none |
 
@@ -380,11 +380,20 @@ intend to keep.
 Under `wal`, every source-of-truth write is first appended to a log under
 `<root>/.fluree-wal/` and the file itself is written page-cache. Content writes
 append without flushing; the head publication that ends a commit appends and
-flushes, and that one flush covers everything appended before it. A background
-thread flushes the files a closed log segment covered and removes the segment,
-so the log only ever holds the recent tail. Opening the root replays what is
-left — the connection and builder paths do this before anything reads — and a
-clean shutdown leaves no segments at all.
+waits for a flush, and that one flush covers everything appended before it.
+Flushes are shared: the first publication to wait issues the device flush,
+and every publication that reaches the log while it runs — from any ledger
+under the root — is covered by it or by the one that starts the moment it
+ends. A lone commit still pays exactly one flush; sixteen ledgers committing
+at once pay a few between them, so throughput across ledgers is no longer
+bounded by one commit per device flush.
+
+A background thread flushes the files a closed log segment covered and removes
+the segment, so the log only ever holds the recent tail. That flush is one
+batch: each file the segment named is flushed once however many records named
+it, and on macOS the batch costs one drive-cache barrier rather than one per
+file. Opening the root replays what is left — the connection and builder paths
+do this before anything reads — and a clean shutdown leaves no segments at all.
 
 The files on disk remain the database. The log adds nothing another version of
 Fluree needs to understand: after a clean shutdown, or after any start of a
@@ -414,10 +423,12 @@ in a segment that was flushed before a later segment was opened cannot tear, so
 damage there fails the open with the segment named; a torn final frame is
 discarded, since acknowledgment follows the flush and could not have covered it.
 
-> **macOS note.** `sync` on macOS issues `F_FULLFSYNC`, a full drive-cache
+> **macOS note.** A flush on macOS issues `F_FULLFSYNC`, a full drive-cache
 > barrier that is far more expensive than the equivalent `fsync` on Linux —
-> measured here at ~4 ms versus ~0.08 ms. Local development on macOS may want
-> `FLUREE_STORAGE_FSYNC=0`; it is not representative of Linux production cost.
+> measured here at ~5 ms versus ~0.08 ms. Under `wal` a commit pays one such
+> barrier (shared when commits overlap); under `sync` it pays several. Local
+> development on macOS may want `FLUREE_STORAGE_FSYNC=0`; it is not
+> representative of Linux production cost.
 
 Because the staged file is moved into place, each write gives the destination a
 new inode. Ownership, permissions, ACLs and hard links applied to a *path* are
