@@ -2227,8 +2227,12 @@ impl Fluree {
 
         // Optimistic path: stage outside the lock against a snapshot, then
         // acquire the lock briefly for the commit. If the cached state
-        // moved between snapshot and lock, the stage is stale — retry
-        // against the latest state. Bounded to prevent livelock.
+        // moved between snapshot and lock, the stage is stale. Under
+        // steady contention that is the common case — the lock is FIFO and
+        // some commit is always in flight at snapshot time — so rather than
+        // restage optimistically again, every later attempt takes the lock
+        // first and stages under it, as the fast path does. Retries after
+        // that point are for commit conflicts that `refresh` heals.
         let op = core.operation.take().unwrap(); // safe: validate checks
         let op_plan = OpPlan::from_op(op)?;
         let txn_opts = core.txn_opts;
@@ -2237,28 +2241,44 @@ impl Fluree {
 
         const MAX_RETRIES: usize = 16;
         for attempt in 0..MAX_RETRIES {
-            let snap = ledger.snapshot().await;
-            let base_t = snap.t;
-            let base_head_id = snap.head_commit_id.clone();
-            let ledger_state = snap.to_ledger_state();
+            let (write_guard, stage_result, txn_type, commit_opts) = if attempt == 0 {
+                let snap = ledger.snapshot().await;
+                let base_t = snap.t;
+                let base_head_id = snap.head_commit_id.clone();
+                let ledger_state = snap.to_ledger_state();
 
-            let (stage_result, txn_type, commit_opts) = self
-                .stage_plan(
-                    &op_plan,
-                    ledger_state,
-                    txn_opts.clone(),
-                    &commit_opts_base,
-                    tracker_ref,
-                    &index_config,
-                )
-                .await?;
+                let (stage_result, txn_type, commit_opts) = self
+                    .stage_plan(
+                        &op_plan,
+                        ledger_state,
+                        txn_opts.clone(),
+                        &commit_opts_base,
+                        tracker_ref,
+                        &index_config,
+                    )
+                    .await?;
 
-            let write_guard = ledger.lock_for_write().await;
-            if write_guard.state().t() != base_t
-                || write_guard.state().head_commit_id.as_ref() != base_head_id.as_ref()
-            {
-                continue;
-            }
+                let write_guard = ledger.lock_for_write().await;
+                if write_guard.state().t() != base_t
+                    || write_guard.state().head_commit_id.as_ref() != base_head_id.as_ref()
+                {
+                    continue;
+                }
+                (write_guard, stage_result, txn_type, commit_opts)
+            } else {
+                let write_guard = ledger.lock_for_write().await;
+                let (stage_result, txn_type, commit_opts) = self
+                    .stage_plan(
+                        &op_plan,
+                        write_guard.clone_state(),
+                        txn_opts.clone(),
+                        &commit_opts_base,
+                        tracker_ref,
+                        &index_config,
+                    )
+                    .await?;
+                (write_guard, stage_result, txn_type, commit_opts)
+            };
 
             match self
                 .commit_and_finalize(
