@@ -518,6 +518,10 @@ pub struct FileStorage {
     /// root-relative keys. Shared across clones. Empty under
     /// [`Durability::PageCache`], where nothing is ever flushed.
     unflushed: Arc<std::sync::Mutex<Vec<String>>>,
+    /// One [`StorageWrite::sync`] at a time per root, so a caller whose
+    /// writes an earlier, still-running flush took waits for that flush
+    /// instead of returning before its files are on the device.
+    flushing: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// What the WAL resolved to for one root.
@@ -553,6 +557,7 @@ impl FileStorage {
             wal: Arc::new(OnceLock::new()),
             wal_owner: None,
             unflushed: Arc::new(std::sync::Mutex::new(Vec::new())),
+            flushing: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -1299,6 +1304,7 @@ impl StorageWrite for FileStorage {
     /// content never waits here: it is durable when its write returns, in
     /// the log or on the device.
     async fn sync(&self) -> Result<()> {
+        let _one_at_a_time = self.flushing.lock().await;
         let keys: Vec<String> = {
             let mut pending = self
                 .unflushed
@@ -1314,9 +1320,24 @@ impl StorageWrite for FileStorage {
         }
         let base = self.base_path.clone();
         let fsyncs = Arc::clone(&self.fsyncs);
+        let unflushed = Arc::clone(&self.unflushed);
         tokio::task::spawn_blocking(move || {
-            wal::flush_keys(&base, &keys, &fsyncs)
-                .map_err(|e| crate::error::Error::io(format!("flush derived content: {e}")))
+            match wal::flush_keys(&base, &keys, &fsyncs) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // The batch is still owed: a retry must flush it, and a
+                    // publish must not go ahead on a success that never was.
+                    let mut pending = unflushed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut owed = keys;
+                    owed.append(&mut pending);
+                    *pending = owed;
+                    Err(crate::error::Error::io(format!(
+                        "flush derived content: {e}"
+                    )))
+                }
+            }
         })
         .await
         .map_err(|e| crate::error::Error::io(format!("sync join: {e}")))?
@@ -3050,6 +3071,84 @@ mod wal_tests {
             .unwrap();
         storage.sync().await.unwrap();
         assert_eq!(storage.fsyncs_issued(), 0);
+    }
+
+    /// A second `sync` cannot return before a flush already in progress has
+    /// put the caller's files on the device: the first drained them, so the
+    /// second must wait for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_concurrent_sync_waits_for_the_flush_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        let result = storage
+            .content_write_bytes_with_hash(
+                ContentKind::IndexLeaf,
+                "l:main",
+                &"a".repeat(64),
+                b"leaf",
+            )
+            .await
+            .unwrap();
+        let path = storage.resolve_path(&result.address).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // A FIFO in the artifact's place holds the first flush at its open.
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let first_storage = storage.clone();
+        let first = tokio::spawn(async move { first_storage.sync().await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !storage.unflushed.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first sync drained the batch");
+        let second =
+            tokio::time::timeout(std::time::Duration::from_millis(100), storage.sync()).await;
+        // Release the held open; its flush of a FIFO then fails, harmlessly.
+        let unblock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let _ = first.await.unwrap();
+        drop(unblock);
+        assert!(
+            second.is_err(),
+            "a second sync returned before the first flushed anything: {second:?}"
+        );
+    }
+
+    /// A batch whose flush failed stays owed: the retry flushes it rather
+    /// than reporting a success the device never saw.
+    #[tokio::test]
+    async fn a_failed_sync_keeps_its_batch_for_the_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        let result = storage
+            .content_write_bytes_with_hash(
+                ContentKind::IndexLeaf,
+                "l:main",
+                &"a".repeat(64),
+                b"leaf",
+            )
+            .await
+            .unwrap();
+        let path = storage.resolve_path(&result.address).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &path).unwrap();
+        assert!(
+            storage.sync().await.is_err(),
+            "flushing a device node fails"
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"leaf").unwrap();
+        let before = storage.fsyncs_issued();
+        storage.sync().await.unwrap();
+        assert!(
+            storage.fsyncs_issued() > before,
+            "the retry must flush the file from the failed batch"
+        );
     }
 
     /// The log's directory is neither content nor staging debris.
