@@ -101,8 +101,24 @@ impl SessionAuth {
     fn governance(&self) -> fluree_db_api::GovernanceOptions {
         fluree_db_api::GovernanceOptions {
             identity: self.identity.clone(),
+            // The `fluree.identity` claim sits inside a verified token, so it
+            // is auth-layer verified and gates `f:overrideControl` too.
+            server_identity: self.identity.clone(),
             ..Default::default()
         }
+    }
+}
+
+/// Execution options for a session's Cypher reads: Bolt has no request-scoped
+/// cancellation, so the only control is the verified identity that
+/// `f:overrideControl` gates on.
+fn session_query_options(
+    governance: &fluree_db_api::GovernanceOptions,
+) -> fluree_db_api::QueryExecutionOptions {
+    let options = fluree_db_api::QueryExecutionOptions::new();
+    match governance.server_identity.as_deref() {
+        Some(id) => options.with_server_identity(id),
+        None => options,
     }
 }
 
@@ -595,7 +611,12 @@ async fn try_execute_txn_run(
     };
     let result = state
         .fluree
-        .query_cypher_with_params(&view, &run.query, params.as_ref())
+        .query_cypher_with_options(
+            &view,
+            &run.query,
+            params.as_ref(),
+            &session_query_options(&governance),
+        )
         .await
         .map_err(|e| RunFailure::new(CODE_SYNTAX, e.to_string()))?;
     let (columns, rows) = result
@@ -672,7 +693,12 @@ async fn execute_read(
     };
     let result = state
         .fluree
-        .query_cypher_with_params(&view, query, params.as_ref())
+        .query_cypher_with_options(
+            &view,
+            query,
+            params.as_ref(),
+            &session_query_options(&governance),
+        )
         .await
         .map_err(|e| RunFailure::new(CODE_SYNTAX, e.to_string()))?;
     let (columns, rows) = result

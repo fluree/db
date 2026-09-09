@@ -1,4 +1,5 @@
-//! `f:IdentityRestricted` override control over the real HTTP query route.
+//! `f:IdentityRestricted` override control over the real HTTP query and
+//! transact routes.
 //!
 //! The identity the allow-list is checked against is the auth-layer-verified
 //! one: the bearer token's `fluree.identity` (or `sub`), or a signed
@@ -96,7 +97,26 @@ fn bearer(identity: Option<&str>, write: bool) -> String {
     create_jws(&claims, &signing_key)
 }
 
+/// Fail-closed policy by default; only `did:key:admin` may override it.
+const POLICY_CONFIG_TRIG: &str = r"
+@prefix f: <https://ns.flur.ee/db#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+GRAPH <urn:fluree:overridectl:main#config> {
+    <urn:overridectl:config> rdf:type f:LedgerConfig .
+    <urn:overridectl:config> f:policyDefaults <urn:overridectl:policy> .
+    <urn:overridectl:policy> f:defaultAllow false .
+    <urn:overridectl:policy> f:overrideControl <urn:overridectl:oc> .
+    <urn:overridectl:oc> f:controlMode f:IdentityRestricted .
+    <urn:overridectl:oc> f:allowedIdentities <did:key:admin> .
+}
+";
+
 async fn seeded_app(mode: DataAuthMode) -> (TempDir, axum::Router) {
+    seeded_app_with(mode, CONFIG_TRIG).await
+}
+
+async fn seeded_app_with(mode: DataAuthMode, config_trig: &str) -> (TempDir, axum::Router) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cfg = ServerConfig {
         cors_enabled: false,
@@ -127,7 +147,7 @@ async fn seeded_app(mode: DataAuthMode) -> (TempDir, axum::Router) {
     // Seed with a write-scoped token that carries no identity, so no policy
     // context is built for the writes (they would otherwise be fail-closed).
     let seed_token = bearer(None, true);
-    for trig in [SEED_TRIG, CONFIG_TRIG] {
+    for trig in [SEED_TRIG, config_trig] {
         let resp = app
             .clone()
             .oneshot(
@@ -311,5 +331,91 @@ async fn unverified_identity_in_body_or_header_does_not_authorize_override() {
         bindings(&json),
         1,
         "a fluree-identity header must not authorize the override (SPARQL): {json}"
+    );
+}
+
+// =============================================================================
+// Transact-time policy override control
+// =============================================================================
+
+async fn insert(
+    app: &axum::Router,
+    body: String,
+    headers: &[(&str, String)],
+) -> (StatusCode, JsonValue) {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("/v1/fluree/insert/{LEDGER}"))
+        .header("content-type", "application/json");
+    for (k, v) in headers {
+        req = req.header(*k, v.as_str());
+    }
+    let resp = app
+        .clone()
+        .oneshot(req.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: JsonValue = serde_json::from_slice(&bytes).unwrap_or(JsonValue::Null);
+    (status, json)
+}
+
+/// A write that asks to open policy (`default-allow: true`) against a ledger
+/// whose config closes it. Config wins unless the override is permitted, and
+/// a closed policy with no grants rejects the write.
+fn open_policy_insert(subject: &str, opts: JsonValue) -> String {
+    json!({
+        "@context": {"ex": "http://example.org/"},
+        "insert": {"@id": subject, "ex:name": "Bob"},
+        "opts": opts
+    })
+    .to_string()
+}
+
+/// `merge_policy_opts` on the transact path reads the verified identity from
+/// the governance the route built, so the allow-listed bearer may open policy
+/// for its write and a non-listed one may not.
+#[tokio::test]
+async fn allow_listed_bearer_may_override_transact_policy_defaults() {
+    let (_tmp, app) = seeded_app_with(DataAuthMode::Required, POLICY_CONFIG_TRIG).await;
+    let opts = json!({"default-allow": true});
+
+    let auth = (
+        "authorization",
+        format!("Bearer {}", bearer(Some(ADMIN), true)),
+    );
+    let (status, json) = insert(&app, open_policy_insert("ex:bob", opts.clone()), &[auth]).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the allow-listed verified identity may open policy for its write: {json}"
+    );
+
+    let auth = (
+        "authorization",
+        format!("Bearer {}", bearer(Some(OTHER), true)),
+    );
+    let (status, json) = insert(&app, open_policy_insert("ex:carol", opts), &[auth]).await;
+    assert!(
+        status.is_client_error(),
+        "a verified identity outside the allow-list is denied; config's closed policy wins: \
+         {status} {json}"
+    );
+}
+
+/// With no auth layer, the allow-listed DID in `opts.identity` is not a
+/// verified identity: the override is denied and the closed policy rejects
+/// the write.
+#[tokio::test]
+async fn unverified_identity_does_not_authorize_transact_override() {
+    let (_tmp, app) = seeded_app_with(DataAuthMode::None, POLICY_CONFIG_TRIG).await;
+
+    let opts = json!({"identity": ADMIN, "default-allow": true});
+    let (status, json) = insert(&app, open_policy_insert("ex:bob", opts), &[]).await;
+    assert!(
+        status.is_client_error(),
+        "opts.identity naming the allow-listed DID must not authorize the override: \
+         {status} {json}"
     );
 }

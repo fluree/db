@@ -254,7 +254,12 @@ async fn prepare_transaction_body(
     .await;
 
     let tracking = tracking_options_from_body(&body);
-    let governance = GovernanceOptions::from_json(&body).unwrap_or_default();
+    let mut governance = GovernanceOptions::from_json(&body).unwrap_or_default();
+    // `author` is the auth-layer-verified identity (credential DID or bearer
+    // identity, see `effective_author`), which is what `f:overrideControl`
+    // gates on. Under root impersonation `identity` above carries the target;
+    // this stays the bearer. It is never read from the body.
+    governance.server_identity = author.map(String::from);
 
     PreparedTransaction {
         body,
@@ -1982,7 +1987,8 @@ async fn execute_turtle_transaction(
             },
             policy: headers.policy.clone(),
             policy_values: policy_values_map,
-            server_identity: None,
+            // Verified bearer/credential DID (`author`): what `f:overrideControl` gates on.
+            server_identity: author.map(String::from),
             default_allow: headers.default_allow,
         };
 
@@ -2069,7 +2075,8 @@ async fn execute_cypher_transact(
         },
         policy: headers.policy.clone(),
         policy_values: policy_values_map,
-        server_identity: None,
+        // Verified bearer/credential DID, not the impersonation target.
+        server_identity: bearer_identity.clone(),
         default_allow: headers.default_allow,
     };
 
@@ -2319,7 +2326,8 @@ async fn execute_sparql_update_request(
         },
         policy: headers.policy.clone(),
         policy_values: policy_values_map,
-        server_identity: None,
+        // Verified bearer/credential DID, not the impersonation target.
+        server_identity: bearer_identity.clone(),
         default_allow: headers.default_allow,
     };
 

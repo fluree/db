@@ -69,6 +69,8 @@ async fn push_ledger_local(
     let mut governance = GovernanceOptions {
         // Identity is non-spoofable: derived from bearer token (fluree.identity ?? sub).
         identity: bearer.as_ref().and_then(|p| p.identity.clone()),
+        // The same verified identity gates `f:overrideControl`.
+        server_identity: bearer.as_ref().and_then(|p| p.identity.clone()),
         // Allow client-provided inline policy and policy-values headers.
         policy: headers.policy.clone(),
         policy_values: headers.policy_values_map()?,
