@@ -1,3 +1,4 @@
+use fluree_db_core::VerifiedIdentity;
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
@@ -651,10 +652,10 @@ pub(crate) fn parse_dataset_spec(
 /// options are in scope so the stamp cannot be forgotten.
 pub(crate) fn parse_dataset_spec_as(
     query_json: &JsonValue,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
 ) -> Result<(DatasetSpec, GovernanceOptions)> {
     let (spec, mut qc_opts) = parse_dataset_spec(query_json)?;
-    qc_opts.server_identity = server_identity.map(str::to_string);
+    qc_opts.server_identity = server_identity.cloned();
     Ok((spec, qc_opts))
 }
 

@@ -13,6 +13,7 @@ use axum::extract::{Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use fluree_db_api::{GovernanceOptions, PushCommitsRequest, PushCommitsResponse, PushedHead};
 use fluree_db_consensus::PushRequest;
+use fluree_db_core::VerifiedIdentity;
 use std::sync::Arc;
 
 /// Push commits to a ledger (ledger in path tail).
@@ -70,7 +71,10 @@ async fn push_ledger_local(
         // Identity is non-spoofable: derived from bearer token (fluree.identity ?? sub).
         identity: bearer.as_ref().and_then(|p| p.identity.clone()),
         // The same verified identity gates `f:overrideControl`.
-        server_identity: bearer.as_ref().and_then(|p| p.identity.clone()),
+        server_identity: bearer
+            .as_ref()
+            .and_then(|p| p.identity.clone())
+            .map(VerifiedIdentity::new),
         // Allow client-provided inline policy and policy-values headers.
         policy: headers.policy.clone(),
         policy_values: headers.policy_values_map()?,

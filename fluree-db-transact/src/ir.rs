@@ -18,6 +18,7 @@
 //!   not match patterns.
 
 use fluree_db_core::DatatypeConstraint;
+use fluree_db_core::VerifiedIdentity;
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_novelty::TxnMetaEntry;
 use fluree_db_query::parse::UnresolvedPattern;
@@ -733,7 +734,7 @@ pub struct TxnOpts {
     /// identity-restricted list denies. It rides `TxnOpts` because that is
     /// what already reaches the validation gate alongside `validation_mode`.
     #[serde(skip)]
-    pub server_identity: Option<String>,
+    pub server_identity: Option<VerifiedIdentity>,
 
     /// Inline `f:enforceUnique` declarations for *this transaction only*.
     ///

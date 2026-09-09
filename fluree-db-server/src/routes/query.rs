@@ -9,6 +9,7 @@
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
 use crate::extract::{tracking_headers, FlureeHeaders, MaybeCredential, MaybeDataBearer};
+use fluree_db_core::VerifiedIdentity;
 // Note: NeedsRefresh is no longer used - replaced by FreshnessSource trait
 use crate::state::AppState;
 use crate::telemetry::{
@@ -279,11 +280,12 @@ pub(crate) fn is_sparql_request(
 pub(crate) fn effective_identity(
     credential: &MaybeCredential,
     bearer: &MaybeDataBearer,
-) -> Option<String> {
+) -> Option<VerifiedIdentity> {
     credential
         .did()
         .map(std::string::ToString::to_string)
         .or_else(|| bearer.0.as_ref().and_then(|p| p.identity.clone()))
+        .map(VerifiedIdentity::new)
 }
 
 /// Check if tracking is requested in query opts
@@ -1036,7 +1038,7 @@ pub async fn query_ledger(
             &ledger,
             &sparql,
             identity.as_deref(),
-            bearer_identity.as_deref(),
+            bearer_identity.as_ref(),
             delimited,
             &headers,
             params.default_context,
@@ -1080,7 +1082,7 @@ pub async fn query_ledger(
             &ledger,
             &cypher,
             identity.as_deref(),
-            bearer_identity.as_deref(),
+            bearer_identity.as_ref(),
             &headers,
             &span,
         )
@@ -2318,7 +2320,7 @@ async fn execute_query_proxy(
 /// that `f:overrideControl` gates on.
 pub(crate) fn sparql_qc_opts(
     identity: Option<&str>,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
     headers: &FlureeHeaders,
 ) -> Result<fluree_db_api::GovernanceOptions> {
     let policy_values_map = headers.policy_values_map()?;
@@ -2331,7 +2333,7 @@ pub(crate) fn sparql_qc_opts(
         },
         policy: headers.policy.clone(),
         policy_values: policy_values_map,
-        server_identity: server_identity.map(String::from),
+        server_identity: server_identity.cloned(),
         default_allow: headers.default_allow,
     })
 }
@@ -2643,7 +2645,7 @@ async fn execute_cypher_ledger(
     ledger_id: &str,
     cypher: &str,
     identity: Option<&str>,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
     headers: &FlureeHeaders,
     span: &tracing::Span,
 ) -> Result<Response> {
@@ -2664,7 +2666,7 @@ async fn execute_cypher_ledger(
         },
         policy: headers.policy.clone(),
         policy_values: policy_values_map,
-        server_identity: server_identity.map(String::from),
+        server_identity: server_identity.cloned(),
         default_allow: headers.default_allow,
     };
 
@@ -2734,7 +2736,7 @@ async fn execute_sparql_ledger(
     ledger_id: &str,
     sparql: &str,
     identity: Option<&str>,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
     delimited: Option<DelimitedFormat>,
     headers: &FlureeHeaders,
     use_default_context: bool,
@@ -2954,7 +2956,7 @@ async fn execute_sparql_ledger(
                 } else {
                     state
                         .fluree
-                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_deref())
+                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_ref())
                         .await
                 }
                 .map_err(ServerError::Api)?;
@@ -3010,7 +3012,7 @@ async fn execute_sparql_ledger(
                 } else {
                     state
                         .fluree
-                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_deref())
+                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_ref())
                         .await
                 }
                 .map_err(ServerError::Api)?;
@@ -3045,7 +3047,7 @@ async fn execute_sparql_ledger(
                 } else {
                     state
                         .fluree
-                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_deref())
+                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_ref())
                         .await
                 }
                 .map_err(ServerError::Api)?;
@@ -3092,7 +3094,7 @@ async fn execute_sparql_ledger(
                 } else {
                     state
                         .fluree
-                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_deref())
+                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_ref())
                         .await
                 }
                 .map_err(ServerError::Api)?;
@@ -3118,7 +3120,7 @@ async fn execute_sparql_ledger(
             } else {
                 state
                         .fluree
-                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_deref())
+                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_ref())
                         .await
             }
             .map_err(ServerError::Api)?;

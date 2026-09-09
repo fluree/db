@@ -1,4 +1,5 @@
 use fluree_db_api::{QueryCancellation, QueryCancellationReason, QueryExecutionOptions};
+use fluree_db_core::VerifiedIdentity;
 use std::future::Future;
 use tokio::task::AbortHandle;
 
@@ -54,11 +55,14 @@ struct ServerQueryControl {
     options: QueryExecutionOptions,
 }
 
-fn query_execution_control(timeout_ms: u64, server_identity: Option<&str>) -> ServerQueryControl {
+fn query_execution_control(
+    timeout_ms: u64,
+    server_identity: Option<&VerifiedIdentity>,
+) -> ServerQueryControl {
     let cancellation = QueryCancellation::new();
     let mut options = QueryExecutionOptions::new().with_cancellation(cancellation.clone());
     if let Some(identity) = server_identity {
-        options = options.with_server_identity(identity);
+        options = options.with_server_identity(identity.clone());
     }
 
     if timeout_ms != 0 {
@@ -112,7 +116,7 @@ pub(crate) fn current_query_execution_options(timeout_ms: u64) -> QueryExecution
 /// so `f:overrideControl` checks on every query the task runs see it.
 pub(crate) async fn run_query_task<T, Fut, Build>(
     timeout_ms: u64,
-    server_identity: Option<String>,
+    server_identity: Option<VerifiedIdentity>,
     build: Build,
 ) -> Result<T, ServerError>
 where
@@ -120,7 +124,7 @@ where
     Fut: Future<Output = Result<T, ServerError>> + Send + 'static,
     Build: FnOnce() -> Fut,
 {
-    let control = query_execution_control(timeout_ms, server_identity.as_deref());
+    let control = query_execution_control(timeout_ms, server_identity.as_ref());
     let mut disconnect_guard = QueryDisconnectGuard::new(control.cancellation.clone());
     let options = control.options;
 

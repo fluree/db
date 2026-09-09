@@ -13,6 +13,7 @@
 //!   and reported at `.execute()` / `.stage()` / `.validate()`.
 //! - **Composition**: Both builders share `TransactCore` for common fields.
 
+use fluree_db_core::VerifiedIdentity;
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
@@ -509,7 +510,7 @@ impl<'a> TransactCore<'a> {
     /// Record the auth-layer-verified caller identity on the transaction
     /// options and on any pre-built `Txn` already attached, so the SHACL
     /// override gate sees it regardless of the order the builder was driven.
-    pub(crate) fn set_server_identity(&mut self, identity: Option<String>) {
+    pub(crate) fn set_server_identity(&mut self, identity: Option<VerifiedIdentity>) {
         if let Some(txn) = self.pre_built_txn.as_mut() {
             txn.opts.server_identity = identity.clone();
         }
@@ -763,7 +764,7 @@ impl<'a> OwnedTransactBuilder<'a> {
     /// from the verified bearer / credential DID; an embedding application
     /// that verifies identities itself is the auth layer for its deployment.
     /// Left unset, identity-restricted overrides are denied.
-    pub fn server_identity(mut self, identity: Option<String>) -> Self {
+    pub fn server_identity(mut self, identity: Option<VerifiedIdentity>) -> Self {
         self.core.set_server_identity(identity);
         self
     }
@@ -1327,7 +1328,7 @@ impl<'a> RefTransactBuilder<'a> {
     /// from the verified bearer / credential DID; an embedding application
     /// that verifies identities itself is the auth layer for its deployment.
     /// Left unset, identity-restricted overrides are denied.
-    pub fn server_identity(mut self, identity: Option<String>) -> Self {
+    pub fn server_identity(mut self, identity: Option<VerifiedIdentity>) -> Self {
         self.core.set_server_identity(identity);
         self
     }

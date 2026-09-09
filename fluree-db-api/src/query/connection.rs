@@ -40,7 +40,7 @@ impl Fluree {
         if qc_opts.has_any_policy_inputs() {
             self.build_dataset_view_with_policy(spec, qc_opts).await
         } else {
-            self.build_dataset_view_as(spec, qc_opts.server_identity.as_deref())
+            self.build_dataset_view_as(spec, qc_opts.server_identity.as_ref())
                 .await
         }
     }
@@ -77,7 +77,7 @@ impl Fluree {
         let dataset = if qc_opts.has_any_policy_inputs() {
             self.build_dataset_view_with_policy(spec, qc_opts).await
         } else {
-            self.build_dataset_view_as(spec, qc_opts.server_identity.as_deref())
+            self.build_dataset_view_as(spec, qc_opts.server_identity.as_ref())
                 .await
         };
         dataset.map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))
@@ -112,8 +112,7 @@ impl Fluree {
         query_json: &JsonValue,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let (spec, qc_opts) =
-            parse_dataset_spec_as(query_json, options.server_identity.as_deref())?;
+        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())?;
 
         if spec.is_empty() {
             return Err(ApiError::query(
@@ -152,8 +151,7 @@ impl Fluree {
         r2rml: Option<(&dyn R2rmlProvider, &dyn R2rmlTableProvider)>,
         options: QueryExecutionOptions,
     ) -> Result<(QueryResult, Option<DataSetDb>)> {
-        let (spec, qc_opts) =
-            parse_dataset_spec_as(query_json, options.server_identity.as_deref())?;
+        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())?;
 
         if spec.is_empty() {
             return Err(ApiError::query(
@@ -214,8 +212,7 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let (spec, qc_opts) =
-            parse_dataset_spec_as(query_json, options.server_identity.as_deref())?;
+        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())?;
 
         if spec.is_empty() {
             return Err(ApiError::query(
@@ -299,10 +296,10 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_deref())
+        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())
             .map_err(|e| {
-                crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-            })?;
+            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
+        })?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(
@@ -448,10 +445,10 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_deref())
+        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())
             .map_err(|e| {
-                crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
-            })?;
+            crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
+        })?;
 
         if spec.is_empty() {
             return Err(crate::query::TrackedErrorResponse::new(

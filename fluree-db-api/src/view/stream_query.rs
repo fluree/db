@@ -126,7 +126,7 @@ impl Fluree {
         ensure_streamable(&parsed.output)?;
 
         let executable = self
-            .build_executable_for_view(db, &parsed, options.server_identity.as_deref())
+            .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
             .await?;
 
         Ok(StreamQueryPlan {
@@ -303,7 +303,7 @@ impl Fluree {
     ) -> Result<DataSetDb> {
         let (spec, qc_opts) = crate::query::helpers::parse_dataset_spec_as(
             query_json,
-            options.server_identity.as_deref(),
+            options.server_identity.as_ref(),
         )?;
         if spec.is_empty() {
             return Err(ApiError::query(
@@ -396,7 +396,7 @@ impl Fluree {
         ensure_streamable(&parsed.output)?;
 
         let executable = self
-            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_deref())
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await?;
         Ok(StreamDatasetPlan {
             vars,

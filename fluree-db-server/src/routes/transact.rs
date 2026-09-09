@@ -40,6 +40,7 @@ use fluree_db_api::{
 use fluree_db_consensus::{
     IdempotencyKey, SubmissionError, TransactionBody, TransactionReceipt, TransactionRequest,
 };
+use fluree_db_core::VerifiedIdentity;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -239,7 +240,7 @@ async fn prepare_transaction_body(
     ledger_id: &str,
     mut body: JsonValue,
     headers: &FlureeHeaders,
-    author: Option<&str>,
+    author: Option<&VerifiedIdentity>,
 ) -> PreparedTransaction {
     inject_headers_into_txn(&mut body, headers);
 
@@ -248,7 +249,7 @@ async fn prepare_transaction_body(
         state,
         ledger_id,
         &mut body,
-        author,
+        author.map(VerifiedIdentity::as_str),
         default_policy_class.as_deref(),
     )
     .await;
@@ -259,7 +260,7 @@ async fn prepare_transaction_body(
     // identity, see `effective_author`), which is what `f:overrideControl`
     // gates on. Under root impersonation `identity` above carries the target;
     // this stays the bearer. It is never read from the body.
-    governance.server_identity = author.map(String::from);
+    governance.server_identity = author.cloned();
 
     PreparedTransaction {
         body,
@@ -543,11 +544,12 @@ fn get_ledger_id(
 fn effective_author(
     credential: &MaybeCredential,
     bearer: Option<&crate::extract::DataPrincipal>,
-) -> Option<String> {
+) -> Option<VerifiedIdentity> {
     credential
         .did()
         .map(std::string::ToString::to_string)
         .or_else(|| bearer.and_then(|p| p.identity.clone()))
+        .map(VerifiedIdentity::new)
 }
 
 /// Enforce write authorization for a ledger according to `data_auth.mode`.
@@ -727,7 +729,7 @@ async fn update_local(
             None,
             body_json,
             &credential,
-            author.as_deref(),
+            author.as_ref(),
             &headers,
         )
         .await
@@ -892,7 +894,7 @@ async fn update_ledger_local(
             None,
             body_json,
             &credential,
-            author.as_deref(),
+            author.as_ref(),
             &headers,
         )
         .await
@@ -1002,7 +1004,7 @@ async fn insert_local(
                 &turtle,
                 &credential,
                 &headers,
-                author.as_deref(),
+                author.as_ref(),
             )
             .await;
         }
@@ -1039,7 +1041,7 @@ async fn insert_local(
             None,
             body_json,
             &credential,
-            author.as_deref(),
+            author.as_ref(),
             &headers,
         )
         .await
@@ -1149,7 +1151,7 @@ async fn upsert_local(
                 &turtle,
                 &credential,
                 &headers,
-                author.as_deref(),
+                author.as_ref(),
             )
             .await;
         }
@@ -1186,7 +1188,7 @@ async fn upsert_local(
             None,
             body_json,
             &credential,
-            author.as_deref(),
+            author.as_ref(),
             &headers,
         )
         .await
@@ -1306,7 +1308,7 @@ async fn sync_local(
                 &ledger_id,
                 body_json,
                 &headers,
-                author.as_deref(),
+                author.as_ref(),
             )
             .await;
             let txn_opts = txn_opts_from_body(&prepared.body, &span)?;
@@ -1361,7 +1363,7 @@ async fn sync_local(
             Some(&graph_iri),
             body_json,
             &credential,
-            author.as_deref(),
+            author.as_ref(),
             &headers,
         )
         .await
@@ -1472,7 +1474,7 @@ async fn insert_ledger_local(
                 &turtle,
                 &credential,
                 &headers,
-                author.as_deref(),
+                author.as_ref(),
             )
             .await;
         }
@@ -1509,7 +1511,7 @@ async fn insert_ledger_local(
             None,
             body_json,
             &credential,
-            author.as_deref(),
+            author.as_ref(),
             &headers,
         )
         .await
@@ -1620,7 +1622,7 @@ async fn upsert_ledger_local(
                 &turtle,
                 &credential,
                 &headers,
-                author.as_deref(),
+                author.as_ref(),
             )
             .await;
         }
@@ -1657,7 +1659,7 @@ async fn upsert_ledger_local(
             None,
             body_json,
             &credential,
-            author.as_deref(),
+            author.as_ref(),
             &headers,
         )
         .await
@@ -1763,7 +1765,7 @@ async fn execute_transaction(
     sync_graph: Option<&str>,
     body: JsonValue,
     credential: &MaybeCredential,
-    author: Option<&str>,
+    author: Option<&VerifiedIdentity>,
     headers: &FlureeHeaders,
 ) -> Result<Response> {
     // A Cypher envelope posted with a JSON Content-Type parses as valid JSON
@@ -1806,7 +1808,10 @@ async fn execute_transaction(
             }
         };
 
-        let did = effective_did(&prepared_transaction.governance, author);
+        let did = effective_did(
+            &prepared_transaction.governance,
+            author.map(VerifiedIdentity::as_str),
+        );
         let mut commit_opts = build_commit_opts(did, credential, &state.fluree, &handle);
 
         // `opts.eventTime`: caller-supplied event time for this commit
@@ -1910,7 +1915,7 @@ async fn execute_turtle_transaction(
     turtle: &str,
     credential: &MaybeCredential,
     headers: &FlureeHeaders,
-    author: Option<&str>,
+    author: Option<&VerifiedIdentity>,
 ) -> Result<Response> {
     let is_trig = credential.is_trig();
 
@@ -1965,7 +1970,7 @@ async fn execute_turtle_transaction(
         let effective_identity = crate::routes::policy_auth::resolve_sparql_identity(
             state,
             ledger_id,
-            author,
+            author.map(VerifiedIdentity::as_str),
             headers.identity.as_deref(),
         )
         .await;
@@ -1988,7 +1993,7 @@ async fn execute_turtle_transaction(
             policy: headers.policy.clone(),
             policy_values: policy_values_map,
             // Verified bearer/credential DID (`author`): what `f:overrideControl` gates on.
-            server_identity: author.map(String::from),
+            server_identity: author.cloned(),
             default_allow: headers.default_allow,
         };
 

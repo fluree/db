@@ -18,6 +18,7 @@
 //! their own handlers, so the benchmark-critical buffered path never pays for
 //! the streaming machinery.
 
+use fluree_db_core::VerifiedIdentity;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -161,7 +162,7 @@ async fn stream_query_connection_inner(
         // Unpoliced (see above), but the auth-layer-verified identity still
         // gates `f:overrideControl` on the ledgers' reasoning defaults.
         let identity = effective_identity(&credential, &bearer);
-        let plan_options = plan_options_as(identity.as_deref());
+        let plan_options = plan_options_as(identity.as_ref());
         let governance = fluree_db_api::GovernanceOptions {
             server_identity: identity,
             ..Default::default()
@@ -211,7 +212,7 @@ async fn stream_query_connection_inner(
         }
         enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
         let identity = effective_identity(&credential, &bearer);
-        let plan_options = plan_options_as(identity.as_deref());
+        let plan_options = plan_options_as(identity.as_ref());
         crate::routes::policy_auth::apply_auth_identity_to_opts(
             state.as_ref(),
             &ledger_id,
@@ -297,7 +298,7 @@ async fn stream_query_inner(
         // (bearer/header), the server default policy class, and the
         // `Fluree-Policy*` / `Fluree-Default-Allow` headers.
         let bearer_identity = effective_identity(&credential, &bearer);
-        let plan_options = plan_options_as(bearer_identity.as_deref());
+        let plan_options = plan_options_as(bearer_identity.as_ref());
         let identity = crate::routes::policy_auth::resolve_sparql_identity(
             state.as_ref(),
             &ledger,
@@ -307,7 +308,7 @@ async fn stream_query_inner(
         .await;
         let qc_opts = crate::routes::query::sparql_qc_opts(
             identity.as_deref(),
-            bearer_identity.as_deref(),
+            bearer_identity.as_ref(),
             &headers,
         )?;
 
@@ -414,7 +415,7 @@ async fn stream_query_inner(
         }
         enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
         let identity = effective_identity(&credential, &bearer);
-        let plan_options = plan_options_as(identity.as_deref());
+        let plan_options = plan_options_as(identity.as_ref());
         crate::routes::policy_auth::apply_auth_identity_to_opts(
             state.as_ref(),
             &ledger,
@@ -487,10 +488,12 @@ async fn stream_query_inner(
 /// `run_query_task` scope, so the request-scoped options are not installed;
 /// planning only reads `server_identity`, and the cancellation-bearing options
 /// are attached separately in `finish_stream`.
-fn plan_options_as(server_identity: Option<&str>) -> fluree_db_api::QueryExecutionOptions {
+fn plan_options_as(
+    server_identity: Option<&VerifiedIdentity>,
+) -> fluree_db_api::QueryExecutionOptions {
     let options = fluree_db_api::QueryExecutionOptions::new();
     match server_identity {
-        Some(id) => options.with_server_identity(id),
+        Some(id) => options.with_server_identity(id.clone()),
         None => options,
     }
 }

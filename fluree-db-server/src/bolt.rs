@@ -16,6 +16,7 @@
 //! because Bolt sessions outlive the single HTTP request the token
 //! verification model assumes.
 
+use fluree_db_core::VerifiedIdentity;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -103,7 +104,7 @@ impl SessionAuth {
             identity: self.identity.clone(),
             // The `fluree.identity` claim sits inside a verified token, so it
             // is auth-layer verified and gates `f:overrideControl` too.
-            server_identity: self.identity.clone(),
+            server_identity: self.identity.clone().map(VerifiedIdentity::new),
             ..Default::default()
         }
     }
@@ -116,8 +117,8 @@ fn session_query_options(
     governance: &fluree_db_api::GovernanceOptions,
 ) -> fluree_db_api::QueryExecutionOptions {
     let options = fluree_db_api::QueryExecutionOptions::new();
-    match governance.server_identity.as_deref() {
-        Some(id) => options.with_server_identity(id),
+    match governance.server_identity.as_ref() {
+        Some(id) => options.with_server_identity(id.clone()),
         None => options,
     }
 }

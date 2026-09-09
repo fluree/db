@@ -8,7 +8,7 @@
 use crate::support;
 use crate::support::genesis_ledger;
 use fluree_db_api::config_resolver;
-use fluree_db_api::{FlureeBuilder, GovernanceOptions, QueryExecutionOptions};
+use fluree_db_api::{FlureeBuilder, GovernanceOptions, QueryExecutionOptions, VerifiedIdentity};
 use serde_json::json;
 
 /// Build the config graph IRI for a canonical ledger id.
@@ -678,7 +678,7 @@ async fn override_control_identity_restricted() {
     // gates the override is the auth-layer-verified `server_identity`.
     let opts_as = |server_identity: Option<&str>| GovernanceOptions {
         default_allow: Some(true),
-        server_identity: server_identity.map(str::to_string),
+        server_identity: server_identity.map(VerifiedIdentity::new),
         ..Default::default()
     };
 
@@ -1988,8 +1988,11 @@ async fn datalog_override_control_identity_restricted() {
     );
 
     // Admin identity → override permitted
-    let admin = config_resolver::merge_datalog_opts(resolved, Some("did:key:admin"))
-        .expect("datalog config");
+    let admin = config_resolver::merge_datalog_opts(
+        resolved,
+        Some(&VerifiedIdentity::new("did:key:admin")),
+    )
+    .expect("datalog config");
     assert!(!admin.enabled, "config still says disabled");
     assert!(
         admin.override_allowed,
@@ -1997,8 +2000,11 @@ async fn datalog_override_control_identity_restricted() {
     );
 
     // Non-admin identity → override denied
-    let other = config_resolver::merge_datalog_opts(resolved, Some("did:key:other"))
-        .expect("datalog config");
+    let other = config_resolver::merge_datalog_opts(
+        resolved,
+        Some(&VerifiedIdentity::new("did:key:other")),
+    )
+    .expect("datalog config");
     assert!(
         !other.override_allowed,
         "non-admin identity → override denied"
@@ -3952,7 +3958,7 @@ async fn warn_mode_insert_as(
     let mut builder = fluree
         .stage_owned(ledger)
         .txn_opts(opts)
-        .server_identity(server_identity.map(str::to_string));
+        .server_identity(server_identity.map(VerifiedIdentity::new));
     if let Some(ctx) = policy {
         builder = builder.policy(ctx);
     }
@@ -4283,7 +4289,7 @@ async fn entailed_names_as(
     let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state);
     let mut options = QueryExecutionOptions::new();
     if let Some(id) = server_identity {
-        options = options.with_server_identity(id);
+        options = options.with_server_identity(VerifiedIdentity::new(id));
     }
     let result = fluree
         .query_with_options(&db, &reasoning_none_query(None, None), options)
@@ -4302,7 +4308,7 @@ async fn entailed_names_connection_as(
 ) -> serde_json::Value {
     let mut options = QueryExecutionOptions::new();
     if let Some(id) = server_identity {
-        options = options.with_server_identity(id);
+        options = options.with_server_identity(VerifiedIdentity::new(id));
     }
     let result = fluree
         .query_connection_with_options(&reasoning_none_query(Some(ledger_id), opts), options)
@@ -4400,7 +4406,8 @@ async fn reasoning_override_identity_restricted_sparql() {
         .query_with_options(
             &db,
             sparql,
-            QueryExecutionOptions::new().with_server_identity("did:key:admin"),
+            QueryExecutionOptions::new()
+                .with_server_identity(VerifiedIdentity::new("did:key:admin")),
         )
         .await
         .expect("sparql as admin");

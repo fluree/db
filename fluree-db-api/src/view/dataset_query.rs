@@ -12,6 +12,7 @@ use crate::{
     ApiError, ExecutableQuery, Fluree, QueryExecutionOptions, QueryResult, Result, Tracker,
     TrackingOptions,
 };
+use fluree_db_core::VerifiedIdentity;
 use fluree_db_query::execute::{
     execute_prepared, prepare_execution_with_config, ContextConfig, PrepareConfig,
 };
@@ -175,7 +176,7 @@ impl Fluree {
 
         // 2. Build executable with optional reasoning override from primary view
         let executable = self
-            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_deref())
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await?;
 
         // 4. Execute against merged dataset
@@ -282,7 +283,7 @@ impl Fluree {
 
         // 2. Build executable with optional reasoning override from primary view
         let executable = self
-            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_deref())
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await?;
 
         // 4. Execute against merged dataset
@@ -419,7 +420,7 @@ impl Fluree {
         // does: query preparation completes the ledger's config defaults, so
         // a fault in the config graph surfaces here and is not the caller's.
         let executable = self
-            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_deref())
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await
             .map_err(|e| {
                 let status = e.status_code();
@@ -543,7 +544,7 @@ impl Fluree {
         // does: query preparation completes the ledger's config defaults, so
         // a fault in the config graph surfaces here and is not the caller's.
         let executable = self
-            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_deref())
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await
             .map_err(|e| {
                 let status = e.status_code();
@@ -627,7 +628,7 @@ impl Fluree {
         &self,
         dataset: &DataSetDb,
         parsed: &fluree_db_query::ir::Query,
-        server_identity: Option<&str>,
+        server_identity: Option<&VerifiedIdentity>,
     ) -> Result<ExecutableQuery> {
         let mut executable = prepare_for_execution(parsed);
 

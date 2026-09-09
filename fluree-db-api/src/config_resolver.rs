@@ -20,6 +20,7 @@
 //! Identity gating happens at the request boundary (not here) because
 //! the server-verified identity is only available per-request.
 
+use fluree_db_core::VerifiedIdentity;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -355,7 +356,7 @@ pub fn merge_policy_opts(resolved: &ResolvedConfig, opts: &GovernanceOptions) ->
 
     // Does the query specify any policy inputs?
     let query_has_policy = opts.has_any_policy_inputs();
-    let server_identity = opts.server_identity.as_deref();
+    let server_identity = opts.server_identity.as_ref();
     let override_denied =
         query_has_policy && !policy.override_control.permits_override(server_identity);
 
@@ -363,7 +364,7 @@ pub fn merge_policy_opts(resolved: &ResolvedConfig, opts: &GovernanceOptions) ->
 
     if override_denied {
         tracing::warn!(
-            server_identity,
+            server_identity = ?server_identity,
             "Query-time policy override denied by config override control — applying config defaults"
         );
 
@@ -418,7 +419,7 @@ pub fn merge_policy_opts(resolved: &ResolvedConfig, opts: &GovernanceOptions) ->
 ///   - Denied → `Force`
 pub fn merge_reasoning(
     resolved: &ResolvedConfig,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
 ) -> Option<(Vec<String>, ReasoningModePrecedence)> {
     let reasoning = resolved.reasoning.as_ref()?;
     let modes = reasoning.modes.as_ref()?;
@@ -448,7 +449,7 @@ pub fn merge_reasoning(
 /// of these values.
 pub fn config_reasoning_budget(
     resolved: &ResolvedConfig,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
 ) -> Option<ConfigReasoningBudget> {
     let reasoning = resolved.reasoning.as_ref()?;
     if reasoning.max_facts.is_none() && reasoning.max_seconds.is_none() {
@@ -494,7 +495,7 @@ pub struct EffectiveShaclConfig {
 pub fn merge_shacl_opts(
     resolved: &ResolvedConfig,
     requested_mode: Option<ValidationMode>,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
 ) -> Option<EffectiveShaclConfig> {
     let shacl = resolved.shacl.as_ref()?;
     let config_mode = shacl.validation_mode.unwrap_or(ValidationMode::Reject);
@@ -508,7 +509,7 @@ pub fn merge_shacl_opts(
                 ValidationMode::Warn
             } else {
                 tracing::warn!(
-                    server_identity,
+                    server_identity = ?server_identity,
                     "Transaction-requested SHACL warn mode denied by config override control \
                      — keeping configured reject posture"
                 );
@@ -550,7 +551,7 @@ pub struct EffectiveDatalogConfig {
 /// when `false`, config settings are forced.
 pub fn merge_datalog_opts(
     resolved: &ResolvedConfig,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
 ) -> Option<EffectiveDatalogConfig> {
     let datalog = resolved.datalog.as_ref()?;
     let override_allowed = datalog.override_control.permits_override(server_identity);
@@ -2180,9 +2181,13 @@ mod tests {
         // OverrideNone: softening denied, configured posture kept.
         let cfg = resolved_with(OverrideControl::None);
         assert_eq!(
-            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), Some("did:key:alice"))
-                .unwrap()
-                .validation_mode,
+            merge_shacl_opts(
+                &cfg,
+                Some(ValidationMode::Warn),
+                Some(&VerifiedIdentity::new("did:key:alice"))
+            )
+            .unwrap()
+            .validation_mode,
             ValidationMode::Reject
         );
         // ...but strengthening a Warn posture never needs permission.
@@ -2207,15 +2212,23 @@ mod tests {
             allowed_identities: HashSet::from([std::sync::Arc::from("did:key:remediator")]),
         });
         assert_eq!(
-            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), Some("did:key:remediator"))
-                .unwrap()
-                .validation_mode,
+            merge_shacl_opts(
+                &cfg,
+                Some(ValidationMode::Warn),
+                Some(&VerifiedIdentity::new("did:key:remediator"))
+            )
+            .unwrap()
+            .validation_mode,
             ValidationMode::Warn
         );
         assert_eq!(
-            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), Some("did:key:intruder"))
-                .unwrap()
-                .validation_mode,
+            merge_shacl_opts(
+                &cfg,
+                Some(ValidationMode::Warn),
+                Some(&VerifiedIdentity::new("did:key:intruder"))
+            )
+            .unwrap()
+            .validation_mode,
             ValidationMode::Reject
         );
         assert_eq!(
@@ -2408,7 +2421,7 @@ mod tests {
         };
         let opts = GovernanceOptions {
             identity: Some("did:key:alice".into()),
-            server_identity: Some("did:key:alice".into()),
+            server_identity: Some(VerifiedIdentity::new("did:key:alice")),
             ..Default::default()
         };
         let merged = merge_policy_opts(&resolved, &opts);
@@ -2434,7 +2447,7 @@ mod tests {
         };
         let opts = GovernanceOptions {
             identity: Some("did:key:user".into()),
-            server_identity: Some("did:key:admin".into()),
+            server_identity: Some(VerifiedIdentity::new("did:key:admin")),
             ..Default::default()
         };
         let merged = merge_policy_opts(&resolved, &opts);
@@ -2457,7 +2470,7 @@ mod tests {
         };
         let opts = GovernanceOptions {
             identity: Some("did:key:user".into()),
-            server_identity: Some("did:key:non-admin".into()),
+            server_identity: Some(VerifiedIdentity::new("did:key:non-admin")),
             ..Default::default()
         };
         let merged = merge_policy_opts(&resolved, &opts);
@@ -2729,7 +2742,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (_modes, prec) = merge_reasoning(&resolved, Some("did:key:admin")).unwrap();
+        let (_modes, prec) =
+            merge_reasoning(&resolved, Some(&VerifiedIdentity::new("did:key:admin"))).unwrap();
         assert_eq!(prec, ReasoningModePrecedence::DefaultUnlessQueryOverrides);
     }
 
@@ -2745,7 +2759,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (_modes, prec) = merge_reasoning(&resolved, Some("did:key:user")).unwrap();
+        let (_modes, prec) =
+            merge_reasoning(&resolved, Some(&VerifiedIdentity::new("did:key:user"))).unwrap();
         assert_eq!(prec, ReasoningModePrecedence::Force);
     }
 
@@ -2833,12 +2848,12 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !config_reasoning_budget(&resolved, Some("did:key:admin"))
+            !config_reasoning_budget(&resolved, Some(&VerifiedIdentity::new("did:key:admin")))
                 .unwrap()
                 .force
         );
         assert!(
-            config_reasoning_budget(&resolved, Some("did:key:user"))
+            config_reasoning_budget(&resolved, Some(&VerifiedIdentity::new("did:key:user")))
                 .unwrap()
                 .force
         );

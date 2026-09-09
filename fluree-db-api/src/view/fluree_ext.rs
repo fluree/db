@@ -2,6 +2,7 @@
 //!
 //! Provides convenience methods on `Fluree` for loading and wrapping views.
 
+use fluree_db_core::VerifiedIdentity;
 use std::sync::Arc;
 
 use chrono::DateTime;
@@ -799,7 +800,7 @@ impl Fluree {
     /// let view = fluree.db("mydb:main").await?;
     /// let opts = GovernanceOptions {
     ///     identity: Some("did:example:user".into()),
-    ///     server_identity: Some("did:example:user".into()),
+    ///     server_identity: Some(VerifiedIdentity::new("did:example:user")),
     ///     ..Default::default()
     /// };
     /// let view = fluree.wrap_policy(view, &opts).await?;
@@ -1021,7 +1022,11 @@ impl Fluree {
     ///
     /// `server_identity` is the auth-layer-verified identity (NOT opts.identity).
     /// Pass `None` when no auth layer is present (Phase 1).
-    pub fn apply_config_reasoning(&self, view: GraphDb, server_identity: Option<&str>) -> GraphDb {
+    pub fn apply_config_reasoning(
+        &self,
+        view: GraphDb,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> GraphDb {
         let resolved = match &view.resolved_config {
             Some(r) => r,
             None => return view,
@@ -1066,7 +1071,11 @@ impl Fluree {
     ///
     /// Convenience wrapper that calls both `apply_config_reasoning` and
     /// `apply_config_datalog` in sequence.
-    pub fn apply_config_defaults(&self, view: GraphDb, server_identity: Option<&str>) -> GraphDb {
+    pub fn apply_config_defaults(
+        &self,
+        view: GraphDb,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> GraphDb {
         let view = self.apply_config_reasoning(view, server_identity);
         self.apply_config_datalog(view, server_identity)
     }
@@ -1098,7 +1107,7 @@ impl Fluree {
     pub(crate) async fn complete_config_defaults(
         &self,
         view: &GraphDb,
-        server_identity: Option<&str>,
+        server_identity: Option<&VerifiedIdentity>,
     ) -> Result<GraphDb> {
         let view = match view.resolved_config() {
             Some(_) => view.clone(),
@@ -1111,7 +1120,11 @@ impl Fluree {
     ///
     /// Stores resolved datalog config on the view. Enforcement happens
     /// at query execution time, not here.
-    pub fn apply_config_datalog(&self, view: GraphDb, server_identity: Option<&str>) -> GraphDb {
+    pub fn apply_config_datalog(
+        &self,
+        view: GraphDb,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> GraphDb {
         let resolved = match &view.resolved_config {
             Some(r) => r,
             None => return view,

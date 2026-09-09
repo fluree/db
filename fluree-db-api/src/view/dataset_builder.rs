@@ -8,6 +8,7 @@
 use crate::view::{DataSetDb, GraphDb};
 use crate::{dataset, time_resolve, ApiError, DatasetSpec, Fluree, GovernanceOptions, Result};
 use chrono::DateTime;
+use fluree_db_core::VerifiedIdentity;
 
 macro_rules! build_dataset_view_from_spec {
     (
@@ -131,7 +132,7 @@ impl Fluree {
     pub async fn build_dataset_view_as(
         &self,
         spec: &DatasetSpec,
-        server_identity: Option<&str>,
+        server_identity: Option<&VerifiedIdentity>,
     ) -> Result<DataSetDb> {
         build_dataset_view_from_spec!(
             self,
@@ -175,14 +176,14 @@ impl Fluree {
         &self,
         view: GraphDb,
         source: &dataset::GraphSource,
-        server_identity: Option<&str>,
+        server_identity: Option<&VerifiedIdentity>,
     ) -> Result<GraphDb> {
         if let Some(policy_override) = &source.policy_override {
             if policy_override.has_policy() {
                 let mut opts = policy_override.to_query_connection_options();
                 // The override comes from the request body; the verified
                 // identity that gates config overrides is request-level.
-                opts.server_identity = server_identity.map(str::to_string);
+                opts.server_identity = server_identity.cloned();
                 return self.wrap_policy(view, &opts).await;
             }
         }

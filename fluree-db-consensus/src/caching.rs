@@ -1074,6 +1074,7 @@ mod tests {
     use fluree_db_api::{
         CommitId, CommitRef, ConflictStrategy, FlureeBuilder, GovernanceOptions, TrackingOptions,
     };
+    use fluree_db_core::VerifiedIdentity;
     use fluree_db_transact::{CommitOpts, TxnOpts};
     use serde_json::{json, Value as JsonValue};
 
@@ -2170,7 +2171,7 @@ mod tests {
             .await
             .expect("first submission to succeed");
         let mut req = request(&ledger_id, Some(key.as_str()), body.clone());
-        req.governance.server_identity = Some("did:example:admin".into());
+        req.governance.server_identity = Some(VerifiedIdentity::new("did:example:admin"));
         let err = committer
             .transact(req)
             .await
@@ -2185,13 +2186,13 @@ mod tests {
         // submission commits without a policy context.
         let key = IdempotencyKey::new("01J5COLLIDE004").expect("test key fits cap");
         let mut first = request(&ledger_id, Some(key.as_str()), body.clone());
-        first.governance.server_identity = Some("did:example:root-a".into());
+        first.governance.server_identity = Some(VerifiedIdentity::new("did:example:root-a"));
         committer
             .transact(first)
             .await
             .expect("first submission to succeed");
         let mut second = request(&ledger_id, Some(key.as_str()), body);
-        second.governance.server_identity = Some("did:example:root-b".into());
+        second.governance.server_identity = Some(VerifiedIdentity::new("did:example:root-b"));
         let err = committer
             .transact(second)
             .await

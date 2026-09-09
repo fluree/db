@@ -13,6 +13,7 @@ use crate::{
     ApiError, ExecutableQuery, Fluree, QueryExecutionOptions, QueryResult, Result, Tracker,
     TrackingOptions,
 };
+use fluree_db_core::VerifiedIdentity;
 use fluree_db_query::execute::{
     execute_prepared, prepare_execution_with_config, ContextConfig, PrepareConfig,
 };
@@ -509,14 +510,8 @@ impl Fluree {
         maybe_wrap_for_graph_source(db, &mut parsed);
         guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
 
-        self.execute_cypher_ir(
-            db,
-            vars,
-            parsed,
-            parse_ms,
-            options.server_identity.as_deref(),
-        )
-        .await
+        self.execute_cypher_ir(db, vars, parsed, parse_ms, options.server_identity.as_ref())
+            .await
     }
 
     /// Execute an already-constructed Cypher read AST. Used by the
@@ -613,7 +608,7 @@ impl Fluree {
         vars: crate::VarRegistry,
         parsed: fluree_db_query::ir::Query,
         parse_ms: f64,
-        server_identity: Option<&str>,
+        server_identity: Option<&VerifiedIdentity>,
     ) -> Result<QueryResult> {
         let plan_start = fluree_db_core::clock::Instant::now();
         let executable = self
@@ -706,7 +701,7 @@ impl Fluree {
 
         // 2. Build executable with optional reasoning override
         let executable = self
-            .build_executable_for_view(db, &parsed, options.server_identity.as_deref())
+            .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
             .await?;
 
         // 4. Execute
@@ -900,16 +895,13 @@ impl Fluree {
         // ledger's config defaults, so a fault in the config graph surfaces
         // here; a blanket 400 would tell the caller their request was bad
         // when nothing about the request is.
-        let executable = Box::pin(self.build_executable_for_view(
-            db,
-            &parsed,
-            options.server_identity.as_deref(),
-        ))
-        .await
-        .map_err(|e| {
-            let status = e.status_code();
-            crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
-        })?;
+        let executable =
+            Box::pin(self.build_executable_for_view(db, &parsed, options.server_identity.as_ref()))
+                .await
+                .map_err(|e| {
+                    let status = e.status_code();
+                    crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
+                })?;
 
         // Execute with tracking
         let batches =
@@ -1059,7 +1051,7 @@ impl Fluree {
         })?;
 
         let executable = self
-            .build_executable_for_view(db, &parsed, options.server_identity.as_deref())
+            .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
             .await
             .map_err(|e| {
                 crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
@@ -1286,7 +1278,7 @@ impl Fluree {
     ) -> Result<(Vec<crate::Batch>, f64, f64)> {
         let plan_start = fluree_db_core::clock::Instant::now();
         let executable = self
-            .build_executable_for_view(db, parsed, options.server_identity.as_deref())
+            .build_executable_for_view(db, parsed, options.server_identity.as_ref())
             .await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1310,7 +1302,7 @@ impl Fluree {
         &self,
         db: &GraphDb,
         parsed: &fluree_db_query::ir::Query,
-        server_identity: Option<&str>,
+        server_identity: Option<&VerifiedIdentity>,
     ) -> Result<ExecutableQuery> {
         // Start with the standard executable
         let mut executable = prepare_for_execution(parsed);
@@ -1346,7 +1338,7 @@ impl Fluree {
         db: &GraphDb,
         executable: &mut ExecutableQuery,
         strip_query_rules: bool,
-        server_identity: Option<&str>,
+        server_identity: Option<&VerifiedIdentity>,
     ) -> Result<()> {
         let db = &self.complete_config_defaults(db, server_identity).await?;
 

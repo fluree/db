@@ -489,7 +489,7 @@ fn build_per_graph_shacl_policy(
     config: &LedgerConfig,
     graph_delta: &FxHashMap<u16, String>,
     requested_mode: Option<fluree_db_core::ledger_config::ValidationMode>,
-    request_identity: Option<&str>,
+    request_identity: Option<&fluree_db_core::VerifiedIdentity>,
 ) -> Option<HashMap<GraphId, fluree_db_transact::ShaclGraphPolicy>> {
     let mut map: HashMap<GraphId, fluree_db_transact::ShaclGraphPolicy> = HashMap::new();
 
@@ -642,7 +642,7 @@ pub(crate) struct StagedShaclContext<'a> {
     /// `None` (no auth layer: embedded callers without their own, the CLI,
     /// unauthenticated dev mode) passes `f:OverrideAll` and fails
     /// identity-restricted lists.
-    pub request_identity: Option<String>,
+    pub request_identity: Option<fluree_db_core::VerifiedIdentity>,
 
     /// `true` only on commit replay (graph-sync push), where the flakes being
     /// staged are already-committed history validated at origin. When the
@@ -973,7 +973,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
             c,
             gd,
             ctx.requested_validation_mode,
-            ctx.request_identity.as_deref(),
+            ctx.request_identity.as_ref(),
         ),
         (Some(c), None) => {
             // No graph context — apply ledger-wide posture to the default
@@ -983,7 +983,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
             let ledger_wide = config_resolver::merge_shacl_opts(
                 &config_resolver::resolve_effective_config(c, None),
                 ctx.requested_validation_mode,
-                ctx.request_identity.as_deref(),
+                ctx.request_identity.as_ref(),
             );
             match ledger_wide {
                 Some(cfg) if cfg.enabled => {

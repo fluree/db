@@ -32,6 +32,7 @@
 //! ```
 
 use fluree_db_core::ledger_id::{split_time_travel_suffix, LedgerIdTimeSpec};
+use fluree_db_core::VerifiedIdentity;
 use fluree_db_sparql::ast::{DatasetClause as SparqlDatasetClause, IriValue};
 
 /// Convert a SPARQL IriValue to a string for use as a ledger identifier.
@@ -811,7 +812,7 @@ pub struct GovernanceOptions {
     /// `None`, and identity-restricted overrides are then denied. An embedding
     /// application that verifies identities itself is the auth layer for that
     /// deployment and may set it.
-    pub server_identity: Option<String>,
+    pub server_identity: Option<VerifiedIdentity>,
     /// Tri-state default-allow: `None` means the caller did not say, so the
     /// ledger's configured `f:defaultAllow` may fill it in
     /// ([`crate::config_resolver::merge_policy_opts`]); `Some(v)` is an explicit
@@ -2738,7 +2739,7 @@ mod tests {
     #[test]
     fn server_identity_alone_is_not_a_policy_input() {
         assert!(!GovernanceOptions {
-            server_identity: Some("did:key:admin".into()),
+            server_identity: Some(VerifiedIdentity::new("did:key:admin")),
             ..Default::default()
         }
         .has_any_policy_inputs());

@@ -6,6 +6,7 @@
 use crate::mcp::auth::McpPrincipal;
 use crate::query_control::run_query_task;
 use crate::state::AppState;
+use fluree_db_core::VerifiedIdentity;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
@@ -195,13 +196,13 @@ impl FlureeToolService {
 
         // The identity comes from the authenticated MCP principal, so it is
         // auth-layer verified: it gates `f:overrideControl` as well as policy.
-        let server_identity = identity.clone();
+        let server_identity = identity.clone().map(VerifiedIdentity::new);
         let mut envelope = run_query_task(timeout_ms, server_identity, move || async move {
             let envelope = match identity.as_deref() {
                 Some(id) => {
                     let opts = fluree_db_api::GovernanceOptions {
                         identity: Some(id.to_string()),
-                        server_identity: Some(id.to_string()),
+                        server_identity: Some(VerifiedIdentity::new(id)),
                         ..Default::default()
                     };
                     let view = match t {

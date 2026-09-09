@@ -8,6 +8,7 @@ pub(crate) mod helpers;
 pub mod multi;
 pub mod nameservice_builder;
 
+use fluree_db_core::VerifiedIdentity;
 use serde_json::Value as JsonValue;
 use std::fmt;
 use std::sync::Arc;
@@ -49,7 +50,7 @@ pub struct QueryExecutionOptions {
     /// `GovernanceOptions` it parses and reads it at the reasoning choke point.
     /// Same contract as `GovernanceOptions::server_identity`: set by an auth
     /// layer, never derived from the request body or headers.
-    pub server_identity: Option<String>,
+    pub server_identity: Option<VerifiedIdentity>,
     lifecycle_guard: Option<Arc<dyn Send + Sync + 'static>>,
 }
 
@@ -87,8 +88,8 @@ impl QueryExecutionOptions {
     /// Attach the auth-layer-verified caller identity for override control.
     /// See [`QueryExecutionOptions::server_identity`]. Only an auth layer
     /// should call this.
-    pub fn with_server_identity(mut self, identity: impl Into<String>) -> Self {
-        self.server_identity = Some(identity.into());
+    pub fn with_server_identity(mut self, identity: VerifiedIdentity) -> Self {
+        self.server_identity = Some(identity);
         self
     }
 
