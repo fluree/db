@@ -476,25 +476,7 @@ pub async fn collect_dag_cids<C: ContentStore + ?Sized>(
     head_id: &ContentId,
     stop_at_t: i64,
 ) -> Result<Vec<(i64, ContentId)>> {
-    let (cids, _split_mode) = walk_dag(store, head_id, stop_at_t, false).await?;
-    Ok(cids)
-}
-
-/// Walk a commit DAG like [`collect_dag_cids`], and also return the
-/// authoritative `NsSplitMode` for the chain.
-///
-/// `NsSplitMode` is encoded only on the genesis commit; the returned value
-/// is taken from the genesis-most envelope observed during the walk. This
-/// lets the rebuild pipeline capture split-mode in the same pass that
-/// discovers parents, avoiding a second fetch-per-commit over the chain.
-///
-/// Callers that don't need `NsSplitMode` should use [`collect_dag_cids`].
-pub async fn collect_dag_cids_with_split_mode<C: ContentStore + ?Sized>(
-    store: &C,
-    head_id: &ContentId,
-    stop_at_t: i64,
-) -> Result<(Vec<(i64, ContentId)>, crate::ns_encoding::NsSplitMode)> {
-    walk_dag(store, head_id, stop_at_t, true).await
+    walk_dag(store, head_id, stop_at_t).await
 }
 
 /// Outcome of an envelope-only probe for a named graph's registration.
@@ -596,22 +578,16 @@ pub async fn first_t_where_graph_registered<C: ContentStore + ?Sized>(
     })
 }
 
-/// Shared DAG walk implementation backing [`collect_dag_cids`] and
-/// [`collect_dag_cids_with_split_mode`]. Envelope fetches use
+/// DAG walk backing [`collect_dag_cids`]. Envelope fetches use
 /// [`load_commit_envelope_by_id`] which issues byte-range requests.
-///
-/// `capture_split_mode=false` skips the NsSplitMode accumulator — the caller
-/// only wants the CID list.
 async fn walk_dag<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
     stop_at_t: i64,
-    capture_split_mode: bool,
-) -> Result<(Vec<(i64, ContentId)>, crate::ns_encoding::NsSplitMode)> {
+) -> Result<Vec<(i64, ContentId)>> {
     let mut result = Vec::new();
     let mut frontier = vec![head_id.clone()];
     let mut visited = std::collections::HashSet::new();
-    let mut split_mode = crate::ns_encoding::NsSplitMode::default();
 
     while let Some(cid) = frontier.pop() {
         if !visited.insert(cid.clone()) {
@@ -621,11 +597,6 @@ async fn walk_dag<C: ContentStore + ?Sized>(
         if envelope.t <= stop_at_t {
             continue;
         }
-        if capture_split_mode {
-            if let Some(mode) = envelope.ns_split_mode {
-                split_mode = mode;
-            }
-        }
         for parent_id in envelope.parent_ids() {
             frontier.push(parent_id.clone());
         }
@@ -634,7 +605,7 @@ async fn walk_dag<C: ContentStore + ?Sized>(
 
     // Sort by t descending (highest first = reverse-topological order).
     result.sort_by_key(|b| std::cmp::Reverse(b.0));
-    Ok((result, split_mode))
+    Ok(result)
 }
 
 /// First-parent walk backing [`collect_first_parent_cids`] and
@@ -644,11 +615,14 @@ async fn walk_dag<C: ContentStore + ?Sized>(
 /// decreasing, so the result is already in reverse-topological order without
 /// a sort. A merge commit is visited (it carries the folded delta of the
 /// branch it merged); the merged branch's own commits are not.
+///
+/// `NsSplitMode` is encoded only on the genesis commit; the returned value
+/// is the genesis-most one seen, captured in the same pass so the rebuild
+/// pipeline needs no second fetch per commit.
 async fn walk_first_parent<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
     stop_at_t: i64,
-    capture_split_mode: bool,
 ) -> Result<(Vec<(i64, ContentId)>, crate::ns_encoding::NsSplitMode)> {
     let mut result = Vec::new();
     let mut split_mode = crate::ns_encoding::NsSplitMode::default();
@@ -659,10 +633,8 @@ async fn walk_first_parent<C: ContentStore + ?Sized>(
         if envelope.t <= stop_at_t {
             break;
         }
-        if capture_split_mode {
-            if let Some(mode) = envelope.ns_split_mode {
-                split_mode = mode;
-            }
+        if let Some(mode) = envelope.ns_split_mode {
+            split_mode = mode;
         }
         next = envelope.parent_ids().next().cloned();
         result.push((envelope.t, cid));
@@ -687,18 +659,18 @@ pub async fn collect_first_parent_cids<C: ContentStore + ?Sized>(
     head_id: &ContentId,
     stop_at_t: i64,
 ) -> Result<Vec<(i64, ContentId)>> {
-    let (cids, _split_mode) = walk_first_parent(store, head_id, stop_at_t, false).await?;
+    let (cids, _split_mode) = walk_first_parent(store, head_id, stop_at_t).await?;
     Ok(cids)
 }
 
 /// Like [`collect_first_parent_cids`], and also return the authoritative
-/// `NsSplitMode` for the lineage (see [`collect_dag_cids_with_split_mode`]).
+/// `NsSplitMode` for the lineage.
 pub async fn collect_first_parent_cids_with_split_mode<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
     stop_at_t: i64,
 ) -> Result<(Vec<(i64, ContentId)>, crate::ns_encoding::NsSplitMode)> {
-    walk_first_parent(store, head_id, stop_at_t, true).await
+    walk_first_parent(store, head_id, stop_at_t).await
 }
 
 /// Stream commit envelopes from head backwards in reverse-topological order.
@@ -1591,21 +1563,10 @@ mod tests {
     #[cfg(feature = "credential")]
     #[tokio::test]
     async fn test_walk_commit_summaries_handles_merge_commit() {
-        // Build:
-        //   shared: c1
-        //   branch_a: c1 <- a2 <- a3
-        //   branch_b: c1 <- b2
-        //   merge:   m4 with parents [a3, b2]
         // walk_commit_summaries from m4 with stop_at_t = 0 should visit each of
         // {m4, a3, a2, b2, c1} exactly once → total = 5.
         let store = MemoryContentStore::new();
-        let shared = store_chain(&store, 1, 1, None, 1).await;
-        let branch_a = store_chain(&store, 2, 2, Some(shared[0].clone()), 100).await;
-        let branch_b = store_chain(&store, 2, 1, Some(shared[0].clone()), 200).await;
-
-        let merge_commit = Commit::new(4, vec![])
-            .with_merge_parents(vec![branch_a.last().unwrap().clone(), branch_b[0].clone()]);
-        let merge_id = store_commit(&store, &merge_commit).await;
+        let (merge_id, _, _) = merge_fixture(&store).await;
 
         let (summaries, total) = walk_commit_summaries(&store, &merge_id, 0, None)
             .await
