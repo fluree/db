@@ -153,3 +153,65 @@ async fn acknowledged_transactions_survive_losing_every_unflushed_file() {
     names.sort();
     assert_eq!(names, ["LOCK"]);
 }
+
+/// Not a check: a measurement. Prints per-commit wall time for the durable
+/// modes so the log's saving can be read off the machine it runs on.
+///
+/// `cargo test -p fluree-db-api --release --test it_redo_log -- --ignored --nocapture timing`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn timing_journal_vs_sync() {
+    use fluree_db_api::CommitOpts;
+    use std::time::Instant;
+
+    const WARM: usize = 10;
+    const SAMPLES: usize = 200;
+
+    for (mode, durability) in [("journal", Durability::Journal), ("sync", Durability::Sync)] {
+        for raw in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+                .without_indexing()
+                .with_storage_durability(durability)
+                .build()
+                .expect("build");
+            fluree.create_ledger(LEDGER).await.expect("create");
+            let handle = fluree.ledger_cached(LEDGER).await.expect("cache");
+            let store = fluree.content_store(handle.id());
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for n in 0..WARM + SAMPLES {
+                let body = json!({
+                    "@context": { "ex": "http://example.org/" },
+                    "@id": format!("ex:person-{n}"),
+                    "ex:name": format!("Person {n}"),
+                });
+                let opts = if raw {
+                    CommitOpts::default().with_raw_txn_spawned(store.clone(), body.clone())
+                } else {
+                    CommitOpts::default()
+                };
+                let started = Instant::now();
+                fluree
+                    .stage(&handle)
+                    .insert(&body)
+                    .commit_opts(opts)
+                    .execute()
+                    .await
+                    .expect("insert");
+                if n >= WARM {
+                    samples.push(started.elapsed());
+                }
+            }
+            samples.sort();
+            let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize];
+            let mean = samples.iter().sum::<std::time::Duration>() / samples.len() as u32;
+            println!(
+                "{mode:<8} raw={raw:<5} commits={SAMPLES} median={:?} p95={:?} mean={:?}",
+                at(0.5),
+                at(0.95),
+                mean
+            );
+            fluree.disconnect().await;
+        }
+    }
+}
