@@ -324,6 +324,10 @@ pub(super) struct RedoLog {
     /// Set after a flush failed. The durable boundary is then unknown, so no
     /// further append is accepted; a restart replays what is there.
     poisoned: AtomicBool,
+    /// One retirement at a time, from draining the closed segments to the
+    /// last unlink. Two retirements with separate batches could otherwise
+    /// remove a later segment while an earlier one was still held back.
+    retiring: Mutex<()>,
     /// Test hook: make the next flush report failure.
     #[cfg(test)]
     fail_next_sync: AtomicBool,
@@ -781,6 +785,7 @@ impl RedoLog {
             crashed: AtomicBool::new(false),
             hold_segments: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
+            retiring: Mutex::new(()),
             #[cfg(test)]
             fail_next_sync: AtomicBool::new(false),
         });
@@ -960,7 +965,7 @@ impl RedoLog {
             return Ok(());
         }
         let hold = self.hold_segments.load(Ordering::Acquire);
-        let closed = {
+        {
             let mut inner = self
                 .inner
                 .lock()
@@ -981,13 +986,11 @@ impl RedoLog {
                     self.rotate(&mut inner)?;
                 }
             }
-            if hold {
-                Vec::new()
-            } else {
-                std::mem::take(&mut inner.closed)
-            }
-        };
-        self.retire(closed).map(|_| ())
+        }
+        if hold {
+            return Ok(());
+        }
+        self.retire_closed().map(|_| ())
     }
 
     /// Stop the background thread from retiring segments until close.
@@ -996,30 +999,54 @@ impl RedoLog {
         self.hold_segments.store(true, Ordering::Release);
     }
 
-    /// Flush the files each closed segment covered, then remove the segment.
-    /// A segment with an append whose file is not yet written stays until
-    /// that write finishes; the flush would otherwise miss the file and
-    /// the record would be gone when it lands. Returns how many were kept.
-    fn retire(&self, closed: Vec<Closed>) -> io::Result<usize> {
+    /// Flush the files each closed segment covered, then remove the segment,
+    /// oldest first and only as a contiguous prefix. Retirement stops at the
+    /// first segment it cannot retire yet — an append whose file is not
+    /// written, or a flush that failed — and everything from there on goes
+    /// back to the queue in order, so no later segment is ever removed ahead
+    /// of an earlier one and replay never meets a hole. One retirement runs
+    /// at a time, from draining the queue to the last unlink. Returns how
+    /// many segments are still queued.
+    fn retire_closed(&self) -> io::Result<usize> {
+        let _one_at_a_time = self
+            .retiring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let closed = std::mem::take(
+            &mut self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .closed,
+        );
         if closed.is_empty() {
             return Ok(0);
         }
+        let mut pending = closed.into_iter();
         let mut kept = Vec::new();
         let mut removed = false;
-        for segment in closed {
-            // Segments are retired oldest first and only as a contiguous
-            // prefix: a segment kept for an unfinished write keeps every
-            // later one too, or replay would find a hole in the sequence.
-            if !kept.is_empty() || segment.in_flight.load(Ordering::Acquire) > 0 {
+        let mut failure = None;
+        for segment in pending.by_ref() {
+            if segment.in_flight.load(Ordering::Acquire) > 0 {
                 kept.push(segment);
-                continue;
+                break;
             }
-            flush_keys(&self.base, &segment.touched, &self.fsyncs)?;
-            std::fs::remove_file(&segment.path)?;
-            removed = true;
+            let retired = flush_keys(&self.base, &segment.touched, &self.fsyncs)
+                .and_then(|()| std::fs::remove_file(&segment.path));
+            match retired {
+                Ok(()) => removed = true,
+                Err(e) => {
+                    kept.push(segment);
+                    failure = Some(e);
+                    break;
+                }
+            }
         }
+        kept.extend(pending);
         if removed {
-            fsync_dir(&self.dir, &self.fsyncs)?;
+            if let Err(e) = fsync_dir(&self.dir, &self.fsyncs) {
+                failure.get_or_insert(e);
+            }
         }
         let waiting = kept.len();
         if waiting > 0 {
@@ -1030,7 +1057,10 @@ impl RedoLog {
             kept.append(&mut inner.closed);
             inner.closed = kept;
         }
-        Ok(waiting)
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(waiting),
+        }
     }
 
     /// Flush everything and leave no segments behind, so the root reads the
@@ -1040,15 +1070,14 @@ impl RedoLog {
     fn checkpoint(&self) -> io::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let closed = {
+            {
                 let mut inner = self
                     .inner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 self.rotate(&mut inner)?;
-                std::mem::take(&mut inner.closed)
-            };
-            if self.retire(closed)? == 0 || Instant::now() >= deadline {
+            }
+            if self.retire_closed()? == 0 || Instant::now() >= deadline {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -1416,8 +1445,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        let closed = std::mem::take(&mut log.inner.lock().unwrap().closed);
-        log.retire(closed).unwrap();
+        log.retire_closed().unwrap();
         assert_eq!(
             segment_paths(&log.dir).unwrap().len(),
             3,
@@ -1428,6 +1456,105 @@ mod tests {
         drop(third);
         let _reopened = owned(dir.path());
         assert_eq!(std::fs::read(dir.path().join("third")).unwrap(), b"three");
+    }
+
+    fn append_file(log: &RedoLog, base: &Path, key: &str) {
+        let guard = log
+            .append(
+                Op::Write {
+                    key,
+                    bytes: key.as_bytes(),
+                },
+                true,
+            )
+            .unwrap();
+        write_page_cache(&base.join(key), key.as_bytes()).unwrap();
+        drop(guard);
+    }
+
+    /// Retirements from the background thread and from a checkpoint cannot
+    /// interleave: each drains the queue and finishes under one lock, so a
+    /// held early segment holds every later one back for both.
+    #[test]
+    fn concurrent_retirements_keep_global_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.hold_segments();
+        let held = log
+            .append(
+                Op::Write {
+                    key: "first",
+                    bytes: b"one",
+                },
+                true,
+            )
+            .unwrap();
+        rotate_now(&log);
+        append_file(&log, dir.path(), "second");
+        rotate_now(&log);
+        append_file(&log, dir.path(), "third");
+        let racers: Vec<_> = (0..4)
+            .map(|_| {
+                let log = Arc::clone(&log);
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        log.retire_closed().unwrap();
+                    }
+                })
+            })
+            .collect();
+        for racer in racers {
+            racer.join().unwrap();
+        }
+        assert_eq!(
+            segment_paths(&log.dir).unwrap().len(),
+            3,
+            "nothing goes while the first segment is held"
+        );
+        drop(held);
+        log.retire_closed().unwrap();
+        assert_eq!(
+            segment_paths(&log.dir).unwrap().len(),
+            1,
+            "closed ones retired in order"
+        );
+        log.simulate_crash();
+        let _reopened = owned(dir.path());
+        assert_eq!(std::fs::read(dir.path().join("third")).unwrap(), b"third");
+    }
+
+    /// A retirement that fails keeps its segment and every later one queued;
+    /// once the cause is fixed the same retirement proceeds in order.
+    #[test]
+    fn a_failed_retirement_keeps_its_batch_queued() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.hold_segments();
+        append_file(&log, dir.path(), "first");
+        rotate_now(&log);
+        let path = dir.path().join("first");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &path).unwrap();
+        assert!(log.retire_closed().is_err(), "flushing a device node fails");
+        assert_eq!(
+            segment_paths(&log.dir).unwrap().len(),
+            1,
+            "the failed segment stays"
+        );
+        std::fs::remove_file(&path).unwrap();
+        write_page_cache(&path, b"first").unwrap();
+        append_file(&log, dir.path(), "second");
+        rotate_now(&log);
+        append_file(&log, dir.path(), "third");
+        log.retire_closed().unwrap();
+        assert_eq!(
+            segment_paths(&log.dir).unwrap().len(),
+            1,
+            "first and second retired in order"
+        );
+        log.simulate_crash();
+        let _reopened = owned(dir.path());
+        assert_eq!(std::fs::read(dir.path().join("third")).unwrap(), b"third");
     }
 
     /// A short write followed by an error is rolled back to the frame
