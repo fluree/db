@@ -103,6 +103,18 @@ pub(crate) fn current_query_execution_options(timeout_ms: u64) -> QueryExecution
         .unwrap_or_else(|_| query_execution_control(timeout_ms, None).options)
 }
 
+/// Execution options that carry only the auth-layer-verified identity, for
+/// paths that run outside a [`run_query_task`] scope (streaming planners, Bolt
+/// session reads) and attach their own cancellation elsewhere.
+pub(crate) fn options_for_identity(
+    server_identity: Option<&VerifiedIdentity>,
+) -> QueryExecutionOptions {
+    match server_identity {
+        Some(id) => QueryExecutionOptions::new().with_server_identity(id.clone()),
+        None => QueryExecutionOptions::new(),
+    }
+}
+
 /// Run server query work in a spawned task that can outlive the HTTP/MCP waiter.
 ///
 /// If the waiter future is dropped before the query task completes, the

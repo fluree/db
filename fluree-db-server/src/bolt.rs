@@ -110,19 +110,6 @@ impl SessionAuth {
     }
 }
 
-/// Execution options for a session's Cypher reads: Bolt has no request-scoped
-/// cancellation, so the only control is the verified identity that
-/// `f:overrideControl` gates on.
-fn session_query_options(
-    governance: &fluree_db_api::GovernanceOptions,
-) -> fluree_db_api::QueryExecutionOptions {
-    let options = fluree_db_api::QueryExecutionOptions::new();
-    match governance.server_identity.as_ref() {
-        Some(id) => options.with_server_identity(id.clone()),
-        None => options,
-    }
-}
-
 fn session_governance(auth: Option<&SessionAuth>) -> fluree_db_api::GovernanceOptions {
     auth.map(SessionAuth::governance).unwrap_or_default()
 }
@@ -616,7 +603,7 @@ async fn try_execute_txn_run(
             &view,
             &run.query,
             params.as_ref(),
-            &session_query_options(&governance),
+            &crate::query_control::options_for_identity(governance.server_identity.as_ref()),
         )
         .await
         .map_err(|e| RunFailure::new(CODE_SYNTAX, e.to_string()))?;
@@ -698,7 +685,7 @@ async fn execute_read(
             &view,
             query,
             params.as_ref(),
-            &session_query_options(&governance),
+            &crate::query_control::options_for_identity(governance.server_identity.as_ref()),
         )
         .await
         .map_err(|e| RunFailure::new(CODE_SYNTAX, e.to_string()))?;

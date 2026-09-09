@@ -3119,9 +3119,9 @@ async fn execute_sparql_ledger(
                 state.fluree.build_dataset_view_with_policy(&spec, &qc_opts).await
             } else {
                 state
-                        .fluree
-                        .build_dataset_view_as(&spec, qc_opts.server_identity.as_ref())
-                        .await
+                    .fluree
+                    .build_dataset_view_as(&spec, qc_opts.server_identity.as_ref())
+                    .await
             }
             .map_err(ServerError::Api)?;
             let result = dataset
