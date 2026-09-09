@@ -30,6 +30,9 @@ use std::time::{Duration, Instant};
 
 /// Directory under the storage root holding the lock and segments.
 pub(super) const REDO_DIR: &str = ".fluree-redo";
+/// Under `REDO_DIR`, one log directory per owner when several processes
+/// share a root (a Raft cluster's payload store).
+const OWNERS_DIR: &str = "owners";
 const LOCK_FILE: &str = "LOCK";
 const SEGMENT_EXT: &str = "redo";
 const SEGMENT_MAGIC: &[u8; 8] = b"FRDOSEG1";
@@ -297,6 +300,9 @@ pub(super) struct RedoLog {
     /// Test hook: keep every segment until close, so a test can crash the
     /// log with records still in it however slowly it runs.
     hold_segments: AtomicBool,
+    /// Owned logs flush every append: on a shared root nothing later flushes
+    /// on a payload's behalf, because the head lives in Raft, not in a file.
+    flush_every_append: bool,
 }
 
 impl std::fmt::Debug for RedoLog {
@@ -321,31 +327,110 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Weak<RedoLog>>> {
     REGISTRY.get_or_init(Default::default)
 }
 
-/// Flush and retire every segment of the log this process holds for `base`,
-/// if it holds one. The shutdown hook: a handle that is still referenced by
-/// some background task would otherwise keep its log until that task ends.
-/// Returns whether there was a live log to checkpoint.
+/// Flush and retire every segment of every log this process holds under
+/// `base`, the root's own and any owned ones. The shutdown hook: a handle
+/// that is still referenced by some background task would otherwise keep
+/// its log until that task ends. Returns whether there was a live log.
 pub(super) fn checkpoint_root(base: &Path) -> io::Result<bool> {
     let base = match std::fs::canonicalize(base) {
         Ok(base) => base,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
-    let log = registry()
+    let under = base.join(REDO_DIR);
+    let logs: Vec<Arc<RedoLog>> = registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&base)
-        .and_then(Weak::upgrade);
-    match log {
-        Some(log)
-            if !log.crashed.load(Ordering::Acquire)
-                && !log.hold_segments.load(Ordering::Acquire) =>
-        {
-            log.checkpoint()?;
-            Ok(true)
+        .iter()
+        .filter(|(dir, _)| dir.starts_with(&under))
+        .filter_map(|(_, log)| log.upgrade())
+        .collect();
+    let mut any = false;
+    for log in logs {
+        if log.crashed.load(Ordering::Acquire) || log.hold_segments.load(Ordering::Acquire) {
+            continue;
         }
-        _ => Ok(false),
+        log.checkpoint()?;
+        any = true;
     }
+    Ok(any)
+}
+
+/// Replay the logs of owners that are no longer running, if this root has
+/// owned logs at all. A dead node's acknowledged payloads may exist only in
+/// its log; any node opening the root, or missing a file, can apply them.
+/// Logs this process holds, or another live process holds, are skipped.
+/// Returns how many records were applied.
+pub(super) fn replay_unowned(base: &Path) -> io::Result<usize> {
+    let base = match std::fs::canonicalize(base) {
+        Ok(base) => base,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let owners = base.join(REDO_DIR).join(OWNERS_DIR);
+    let entries = match std::fs::read_dir(&owners) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut applied = 0;
+    for entry in entries {
+        let dir = entry?.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let live = registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&dir)
+            .and_then(Weak::upgrade)
+            .is_some_and(|log| !log.crashed.load(Ordering::Acquire));
+        if live {
+            continue;
+        }
+        let lock = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(LOCK_FILE))
+        {
+            Ok(lock) => lock,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        match lock.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        }
+        let (_, _, records) = replay(&base, &dir, &AtomicU64::new(0))?;
+        if records > 0 {
+            tracing::info!(
+                owner = %dir.display(),
+                records,
+                "applied the redo log of an owner that is no longer running"
+            );
+        }
+        applied += records;
+        // The lock drops here, so the owner can come back and reopen an
+        // already retired log.
+    }
+    Ok(applied)
+}
+
+fn validate_owner(owner: &str) -> io::Result<()> {
+    if owner.is_empty()
+        || owner.len() > 64
+        || !owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        || owner.starts_with('.')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "redo log owner must be 1-64 characters of [A-Za-z0-9._-] not starting with '.'",
+        ));
+    }
+    Ok(())
 }
 
 /// Flush a directory so the entries in it survive power loss. Unix only, as
@@ -480,8 +565,9 @@ fn segment_paths(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 }
 
 /// Replay every segment in `dir` onto `base`, flush what that touched, and
-/// remove the segments. Returns the next sequence number and segment id.
-fn replay(base: &Path, dir: &Path, fsyncs: &AtomicU64) -> io::Result<(u64, u64)> {
+/// remove the segments. Returns the next sequence number, the next segment
+/// id, and how many records were applied.
+fn replay(base: &Path, dir: &Path, fsyncs: &AtomicU64) -> io::Result<(u64, u64, usize)> {
     let segments = segment_paths(dir)?;
     let last = segments.len().saturating_sub(1);
     let mut next_seq = None;
@@ -539,20 +625,27 @@ fn replay(base: &Path, dir: &Path, fsyncs: &AtomicU64) -> io::Result<(u64, u64)>
         fsync_dir(dir, fsyncs)?;
     }
     let next_segment = segments.last().map_or(1, |(id, _)| id + 1);
-    Ok((next_seq.unwrap_or(1), next_segment))
+    Ok((next_seq.unwrap_or(1), next_segment, records))
 }
 
 impl RedoLog {
     /// Own the log for `base`, replaying any leftover segments first.
     ///
+    /// With an `owner`, the log lives in its own directory under the root's
+    /// log directory, so several processes can each journal one shared root,
+    /// and every append is flushed (see `flush_every_append`).
+    ///
     /// Blocking; call from a blocking context. With `create` false an absent
     /// log directory is reported rather than made, so a read-only open leaves
     /// no trace on a root that never journaled.
-    pub(super) fn acquire(base: &Path, create: bool) -> io::Result<Acquire> {
+    pub(super) fn acquire(base: &Path, owner: Option<&str>, create: bool) -> io::Result<Acquire> {
         if !cfg!(unix) {
             return Ok(Acquire::Unsupported(io::Error::other(
                 "the redo log needs directory fsync, which only Unix provides",
             )));
+        }
+        if let Some(owner) = owner {
+            validate_owner(owner)?;
         }
         if create {
             std::fs::create_dir_all(base)?;
@@ -562,20 +655,32 @@ impl RedoLog {
             Err(e) if e.kind() == io::ErrorKind::NotFound && !create => return Ok(Acquire::Absent),
             Err(e) => return Err(e),
         };
+        let dir = match owner {
+            Some(owner) => base.join(REDO_DIR).join(OWNERS_DIR).join(owner),
+            None => base.join(REDO_DIR),
+        };
         let mut registry = registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(log) = registry.get(&base).and_then(Weak::upgrade) {
+        if let Some(log) = registry.get(&dir).and_then(Weak::upgrade) {
             if !log.crashed.load(Ordering::Acquire) {
                 return Ok(Acquire::Log(log));
             }
         }
-        let dir = base.join(REDO_DIR);
         if !dir.exists() {
             if !create {
                 return Ok(Acquire::Absent);
             }
-            std::fs::create_dir(&dir)?;
+            std::fs::create_dir_all(&dir)?;
+            // Every new directory between the root and the log is flushed,
+            // deepest first, so the log is reachable after power loss.
+            let mut made = dir.as_path();
+            while made != base {
+                if let Err(e) = fsync_dir(made, &AtomicU64::new(0)) {
+                    return Ok(Acquire::Unsupported(e));
+                }
+                made = made.parent().expect("under base");
+            }
             if let Err(e) = fsync_dir(&base, &AtomicU64::new(0)) {
                 return Ok(Acquire::Unsupported(e));
             }
@@ -596,11 +701,12 @@ impl RedoLog {
             Err(e) => return Ok(Acquire::Unsupported(e)),
         }
         let fsyncs = AtomicU64::new(0);
-        let (next_seq, next_segment) = replay(&base, &dir, &fsyncs)?;
+        let (next_seq, next_segment, _) = replay(&base, &dir, &fsyncs)?;
         let log = Arc::new(RedoLog {
-            base: base.clone(),
-            dir,
+            base,
+            dir: dir.clone(),
             fsyncs,
+            flush_every_append: owner.is_some(),
             inner: Mutex::new(Inner {
                 active: None,
                 closed: Vec::new(),
@@ -622,7 +728,7 @@ impl RedoLog {
                     tracing::warn!(error = %e, dir = %log.dir.display(), "redo log flush failed");
                 }
             })?;
-        registry.insert(base, weak);
+        registry.insert(dir, weak);
         Ok(Acquire::Log(log))
     }
 
@@ -636,6 +742,7 @@ impl RedoLog {
         if self.crashed.load(Ordering::Acquire) {
             return Err(io::Error::other("redo log was abandoned (simulated crash)"));
         }
+        let sync = sync || self.flush_every_append;
         let payload = op.encode();
         let mut inner = self
             .inner
@@ -791,7 +898,7 @@ impl RedoLog {
         registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.base);
+            .remove(&self.dir);
         drop(
             self.lock
                 .lock()
@@ -812,7 +919,7 @@ impl Drop for RedoLog {
         registry()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.base);
+            .remove(&self.dir);
     }
 }
 

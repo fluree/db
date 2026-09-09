@@ -707,7 +707,7 @@ impl FlureeServerBuilder {
         let raft_nameservice = self
             .raft
             .as_ref()
-            .map(|(integration, _)| integration.nameservice());
+            .map(|(integration, _)| (integration.nameservice(), integration.id));
 
         // Build `Fluree` with the right nameservice for the
         // deployment mode. Raft mode wires `RaftNameService` so
@@ -730,7 +730,9 @@ impl FlureeServerBuilder {
             .as_ref()
             .map(|(integration, _)| std::sync::Arc::clone(&integration.event_bus));
         #[cfg(feature = "raft")]
-        let (fluree, cache_stats_handle) = if let Some(raft_ns) = raft_nameservice.as_ref() {
+        let (fluree, cache_stats_handle) = if let Some((raft_ns, node_id)) =
+            raft_nameservice.as_ref()
+        {
             // RaftNameService satisfies the full
             // `NameServicePublisher` surface (refs, admin reindex,
             // status / config push, graph-source publish / index /
@@ -738,7 +740,8 @@ impl FlureeServerBuilder {
             let publisher: std::sync::Arc<dyn fluree_db_nameservice::NameServicePublisher> =
                 raft_ns.clone();
             let ns_mode = fluree_db_api::NameServiceMode::ReadWrite(publisher);
-            state::build_fluree_with_nameservice(&self.config, ns_mode, raft_event_bus).await?
+            state::build_fluree_with_nameservice(&self.config, ns_mode, raft_event_bus, *node_id)
+                .await?
         } else {
             state::build_default_fluree(&self.config, raft_event_bus).await?
         };
@@ -769,6 +772,7 @@ impl FlureeServerBuilder {
                 let raft_ns = std::sync::Arc::clone(
                     raft_nameservice
                         .as_ref()
+                        .map(|(ns, _)| ns)
                         .expect("raft_nameservice present whenever self.raft is Some"),
                 );
                 let backend = state_inner.fluree.backend().clone();

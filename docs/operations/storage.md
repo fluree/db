@@ -389,12 +389,19 @@ journaling binary, the root reads exactly as it did under `sync`. The one rule
 for downgrading is therefore *start the journaling binary once after a crash*
 before pointing an older binary at the root, so the tail is applied.
 
-One process owns a root's log at a time. A second handle on the same root — a
-second process, or a network mount shared by several nodes — cannot take the
-lock and flushes each write itself, exactly as `sync` does, with a warning at
-startup. Raft clusters pin `sync` for their shared payload root for this reason.
-Where the filesystem refuses advisory locks the same fallback applies. The log
-is Unix-only.
+One process owns a root's log at a time. A second handle on the same root
+cannot take the lock and flushes each write itself, exactly as `sync` does,
+with a warning at startup. Where the filesystem refuses advisory locks the same
+fallback applies. The log is Unix-only.
+
+A Raft cluster's payload store is one root shared by every node, so each node
+journals it under a log of its own, at `<root>/.fluree-redo/owners/node-<id>/`.
+An owned log flushes on every write: the head lives in Raft rather than in a
+file under the root, so nothing later would flush on a payload's behalf, and a
+payload must be durable before its reference is proposed. That is one flush per
+payload instead of two. Any node applies a stopped node's unflushed tail when
+it opens the root or misses a file, so a payload survives the loss of the node
+that wrote it as long as the shared store does.
 
 A write larger than 256 MiB bypasses the log and is flushed directly. Records
 in a segment that was flushed before a later segment was opened cannot tear, so

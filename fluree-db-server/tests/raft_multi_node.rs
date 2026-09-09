@@ -1544,3 +1544,212 @@ fn spawn_log_progress(
         }
     })
 }
+
+/// Not a check: a measurement. Sequential inserts through the leader of a
+/// three-node cluster on local disk, per-request wall time, so a change to
+/// shared-payload durability can be read off this machine.
+///
+/// `cargo test -p fluree-db-server --features raft --release --test grp_raft -- --ignored --nocapture timing`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn timing_sequential_inserts_through_leader() {
+    const WARM: usize = 10;
+    const SAMPLES: usize = 100;
+
+    let cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+    let leader = cluster.current_leader().await.expect("leader");
+    let ledger = "raft:timing";
+    cluster.create_ledger(leader, ledger).await;
+
+    let mut samples = Vec::with_capacity(SAMPLES);
+    for n in 0..WARM + SAMPLES {
+        let started = std::time::Instant::now();
+        cluster
+            .insert_subject(leader, ledger, &format!("s{n}"), &format!("Name {n}"))
+            .await;
+        if n >= WARM {
+            samples.push(started.elapsed());
+        }
+    }
+    samples.sort();
+    let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize];
+    let mean = samples.iter().sum::<Duration>() / samples.len() as u32;
+    println!(
+        "raft-3 sequential inserts={SAMPLES} median={:?} p95={:?} mean={:?}",
+        at(0.5),
+        at(0.95),
+        mean
+    );
+}
+
+/// Files whose path goes through a `commit` or `txn` directory: the source of
+/// truth a node wrote to the shared root, as opposed to index output.
+fn source_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|n| n == ".fluree-redo") {
+                continue;
+            }
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path
+                .components()
+                .any(|c| c.as_os_str() == "commit" || c.as_os_str() == "txn")
+            {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Every node journals the shared payload root under its own log. Writes
+/// through every node leave one owned log per node; a node's payloads are
+/// on disk, and only its log directory carries its lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_node_journals_the_shared_root_under_its_own_log() {
+    let cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+    let ledger = "raft:owners";
+    cluster
+        .create_ledger(cluster.nodes[0].node_id, ledger)
+        .await;
+    for node in &cluster.nodes {
+        let subject = format!("via{}", node.node_id);
+        cluster
+            .insert_subject(node.node_id, ledger, &subject, &subject)
+            .await;
+    }
+    let owners = cluster._shared_data_tmp.path().join(".fluree-redo/owners");
+    for node in &cluster.nodes {
+        let lock = owners.join(format!("node-{}", node.node_id)).join("LOCK");
+        assert!(
+            lock.exists(),
+            "node {} received a write and must own a log at {}",
+            node.node_id,
+            lock.display()
+        );
+    }
+    assert!(
+        !cluster
+            ._shared_data_tmp
+            .path()
+            .join(".fluree-redo/LOCK")
+            .exists(),
+        "no node may journal the shared root as if it were alone on it"
+    );
+}
+
+/// A node's acknowledged payloads survive that node. The branch's commit
+/// worker is whichever voter the rendezvous hash picked, so the test finds
+/// it by the log that holds the commit keys, abandons that log as a crash
+/// would, stops the node, and removes every commit file from the shared
+/// root. A surviving node that never loaded the ledger misses those files,
+/// applies the stopped node's log, and serves the data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_survivors_miss_applies_the_stopped_workers_log() {
+    let mut cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+    let leader = cluster.current_leader().await.expect("leader");
+    let shared = cluster._shared_data_tmp.path().to_path_buf();
+
+    // Share every node's log through the process-wide registry: the same
+    // owner on the same root is the same log. Keep their segments so the
+    // records are still there to apply however slowly this test runs.
+    let probes: Vec<(NodeId, fluree_db_core::FileStorage)> = cluster
+        .nodes
+        .iter()
+        .map(|n| {
+            let probe = fluree_db_core::FileStorage::new(&shared)
+                .with_redo_owner(format!("node-{}", n.node_id));
+            probe
+                .hold_redo_segments_for_test()
+                .expect("attach to the node's log");
+            (n.node_id, probe)
+        })
+        .collect();
+
+    let ledger = "raft:survives";
+    cluster.create_ledger(leader, ledger).await;
+    cluster.insert_subject(leader, ledger, "ann", "Ann").await;
+    cluster.insert_subject(leader, ledger, "bo", "Bo").await;
+    cluster
+        .wait_for_names(leader, ledger, &["Ann", "Bo"], DEFAULT_TIMEOUT)
+        .await;
+
+    let commits: Vec<_> = source_files(&shared)
+        .into_iter()
+        .filter(|p| p.components().any(|c| c.as_os_str() == "commit"))
+        .collect();
+    assert!(
+        !commits.is_empty(),
+        "the worker wrote commits to the shared root"
+    );
+    // A log records each key verbatim, so the worker is the owner whose
+    // segments mention a commit key.
+    let keys: Vec<String> = commits
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&shared)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    let mut workers = Vec::new();
+    for (node_id, _) in &probes {
+        let dir = shared.join(format!(".fluree-redo/owners/node-{node_id}"));
+        let mentions = std::fs::read_dir(&dir)
+            .expect("every node owns a log")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".redo"))
+            .any(|e| {
+                let bytes = std::fs::read(e.path()).unwrap();
+                keys.iter()
+                    .any(|k| bytes.windows(k.len()).any(|w| w == k.as_bytes()))
+            });
+        if mentions {
+            workers.push(*node_id);
+        }
+    }
+    assert_eq!(
+        workers.len(),
+        1,
+        "exactly one node wrote the commits: {workers:?}"
+    );
+    let worker = workers[0];
+
+    let (_, probe) = probes.iter().find(|(id, _)| *id == worker).unwrap();
+    probe.simulate_crash_for_test();
+    let index = cluster
+        .nodes
+        .iter()
+        .position(|n| n.node_id == worker)
+        .expect("worker is a node");
+    cluster.nodes[index].shutdown().await;
+    for path in &commits {
+        std::fs::remove_file(path).expect("remove a payload the crash lost");
+    }
+
+    // A node that has not loaded the ledger, so its first read is a miss.
+    let survivor = cluster
+        .nodes
+        .iter()
+        .find(|n| n.node_id != worker && n.node_id != leader)
+        .map(|n| n.node_id)
+        .expect("three nodes leave one that is neither worker nor leader");
+    cluster
+        .wait_for_names(survivor, ledger, &["Ann", "Bo"], DEFAULT_TIMEOUT)
+        .await;
+    assert!(
+        commits.iter().all(|p| p.exists()),
+        "the survivor's miss applied the stopped worker's log and restored every commit"
+    );
+}

@@ -1321,6 +1321,10 @@ pub struct FlureeBuilder {
     /// default). Connection-config builds carry it in the config instead.
     #[cfg(feature = "native")]
     storage_durability: Option<fluree_db_core::Durability>,
+    /// Owner of this process's redo log when the storage root is shared by
+    /// several processes. See `FileStorage::with_redo_owner`.
+    #[cfg(feature = "native")]
+    storage_redo_owner: Option<String>,
     /// Optional encryption key (base64-encoded or raw 32 bytes)
     encryption_key: Option<[u8; 32]>,
     /// Optional ledger cache configuration (enables LedgerManager)
@@ -1577,6 +1581,8 @@ impl FlureeBuilder {
             novelty_thresholds: None,
             #[cfg(feature = "native")]
             storage_durability: None,
+            #[cfg(feature = "native")]
+            storage_redo_owner: None,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -1598,6 +1604,8 @@ impl FlureeBuilder {
             novelty_thresholds: None,
             #[cfg(feature = "native")]
             storage_durability: None,
+            #[cfg(feature = "native")]
+            storage_redo_owner: None,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -1673,6 +1681,8 @@ impl FlureeBuilder {
             novelty_thresholds: None,
             #[cfg(feature = "native")]
             storage_durability: None,
+            #[cfg(feature = "native")]
+            storage_redo_owner: None,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -1885,6 +1895,8 @@ impl FlureeBuilder {
             novelty_thresholds: None,
             #[cfg(feature = "native")]
             storage_durability: None,
+            #[cfg(feature = "native")]
+            storage_redo_owner: None,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -2003,15 +2015,27 @@ impl FlureeBuilder {
         self
     }
 
-    /// Apply the builder's durability, if one was chosen, to a storage built
-    /// from `storage_path`.
+    /// Journal a storage root that other processes journal too, under a log
+    /// this process owns. For a Raft cluster's shared payload store: each
+    /// node passes its own id. See `FileStorage::with_redo_owner`.
+    #[cfg(feature = "native")]
+    pub fn with_storage_redo_owner(mut self, owner: impl Into<String>) -> Self {
+        self.storage_redo_owner = Some(owner.into());
+        self
+    }
+
+    /// Apply the builder's durability and log owner, if chosen, to a storage
+    /// built from `storage_path`.
     #[cfg(feature = "native")]
     fn file_storage(&self, path: &str) -> FileStorage {
-        let storage = FileStorage::new(path);
-        match self.storage_durability {
-            Some(durability) => storage.with_durability(durability),
-            None => storage,
+        let mut storage = FileStorage::new(path);
+        if let Some(durability) = self.storage_durability {
+            storage = storage.with_durability(durability);
         }
+        if let Some(owner) = &self.storage_redo_owner {
+            storage = storage.with_redo_owner(owner.clone());
+        }
+        storage
     }
 
     pub fn without_indexing(mut self) -> Self {

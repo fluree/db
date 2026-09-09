@@ -511,6 +511,9 @@ pub struct FileStorage {
     /// The root's redo log under [`Durability::Journal`], attached on the
     /// first write or by [`Self::recover_redo_log`]. Shared across clones.
     redo: Arc<OnceLock<RedoAttach>>,
+    /// Which log this handle owns when the root is shared by several
+    /// processes. See [`Self::with_redo_owner`].
+    redo_owner: Option<Arc<str>>,
 }
 
 /// What journaling resolved to for one root.
@@ -544,6 +547,7 @@ impl FileStorage {
             durability: Durability::from_env(),
             fsyncs: Arc::new(AtomicU64::new(0)),
             redo: Arc::new(OnceLock::new()),
+            redo_owner: None,
         }
     }
 
@@ -698,6 +702,22 @@ impl FileStorage {
         self.durability
     }
 
+    /// Journal a root that other processes journal too, under a log of this
+    /// handle's own. For a Raft cluster's shared payload store: each node
+    /// passes its own id. An owned log flushes on every write, because the
+    /// head that would otherwise flush on a payload's behalf lives in Raft,
+    /// not in a file under this root; a payload is therefore durable before
+    /// its reference is proposed, at one flush instead of two. Any node
+    /// applies a stopped node's unflushed tail when it opens the root or
+    /// misses a file.
+    ///
+    /// Owner names are 1-64 characters of `[A-Za-z0-9._-]` not starting with
+    /// a dot; an invalid name makes the first write fail.
+    pub fn with_redo_owner(mut self, owner: impl Into<String>) -> Self {
+        self.redo_owner = Some(Arc::from(owner.into()));
+        self
+    }
+
     /// Device flushes issued by this storage since it was constructed, counting
     /// both the staged file and its parent directory, and under
     /// [`Durability::Journal`] every flush of the root's redo log, including
@@ -733,13 +753,32 @@ impl FileStorage {
     /// Leaves no trace on a root that never journaled.
     pub fn recover_redo_log(&self) -> Result<()> {
         if self.durability == Durability::Journal {
-            self.attach_redo(false).map(|_| ())
+            self.attach_redo(false)?;
         } else {
             // Replay and let go: this handle is not going to journal.
-            RedoLog::acquire(&self.base_path, false)
+            RedoLog::acquire(&self.base_path, self.redo_owner.as_deref(), false)
                 .map(drop)
-                .map_err(|e| Self::recovery_error(&self.base_path, e))
+                .map_err(|e| Self::recovery_error(&self.base_path, e))?;
         }
+        // A root several processes journal: apply what a stopped one left.
+        redo_log::replay_unowned(&self.base_path)
+            .map(drop)
+            .map_err(|e| Self::recovery_error(&self.base_path, e))
+    }
+
+    /// Apply the unflushed tail of any owner that is no longer running, for
+    /// a file that turned out to be missing. Only a shared root has owners,
+    /// so a standalone root pays one directory probe per miss and no more.
+    /// Returns whether anything was applied, so the caller can retry.
+    async fn replay_foreign_logs(&self) -> Result<bool> {
+        let base = self.base_path.clone();
+        tokio::task::spawn_blocking(move || {
+            redo_log::replay_unowned(&base)
+                .map(|records| records > 0)
+                .map_err(|e| Self::recovery_error(&base, e))
+        })
+        .await
+        .map_err(|e| crate::error::Error::io(format!("redo replay join: {e}")))?
     }
 
     fn recovery_error(base: &Path, e: std::io::Error) -> crate::error::Error {
@@ -762,8 +801,12 @@ impl FileStorage {
         let attached = match self.redo.get() {
             Some(attach) => attach,
             None => {
-                let attach = match RedoLog::acquire(&self.base_path, create)
-                    .map_err(|e| Self::recovery_error(&self.base_path, e))?
+                let attach = match RedoLog::acquire(
+                    &self.base_path,
+                    self.redo_owner.as_deref(),
+                    create,
+                )
+                .map_err(|e| Self::recovery_error(&self.base_path, e))?
                 {
                     Acquire::Log(log) => RedoAttach::Log(log),
                     Acquire::Absent => return Ok(None),
@@ -932,7 +975,15 @@ impl FileStorage {
 impl StorageRead for FileStorage {
     async fn read_bytes(&self, address: &str) -> Result<Vec<u8>> {
         let path = self.resolve_path(address)?;
-        let bytes = tokio::fs::read(&path).await.map_err(|e| {
+        let mut read = tokio::fs::read(&path).await;
+        if read
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            && self.replay_foreign_logs().await?
+        {
+            read = tokio::fs::read(&path).await;
+        }
+        let bytes = read.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 crate::error::Error::not_found(format!("{}: {}", address, path.display()))
             } else {
@@ -984,6 +1035,18 @@ impl StorageRead for FileStorage {
                 );
                 None
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // On a shared root a stopped owner's log may still hold this
+                // file. Applying it blocks, but only on a miss, and only when
+                // the root has owned logs at all.
+                match redo_log::replay_unowned(&self.base_path) {
+                    Ok(applied) if applied > 0 => std::fs::metadata(&path)
+                        .ok()
+                        .filter(|m| m.len() > 0)
+                        .map(|_| path),
+                    _ => None,
+                }
+            }
             Err(_) => None,
         }
     }
@@ -995,108 +1058,124 @@ impl StorageRead for FileStorage {
         }
         let requested = range.end - range.start;
         let offset = range.start;
-        let address = address.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::open(&path).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    crate::error::Error::not_found(format!("{}: {}", address, path.display()))
-                } else {
-                    crate::error::Error::io(format!("Failed to open {}: {}", path.display(), e))
+
+        /// One attempt; the caller retries once after applying a stopped
+        /// owner's log on a miss (see `replay_foreign_logs`).
+        async fn read_once(
+            path: PathBuf,
+            address: String,
+            offset: u64,
+            requested: u64,
+        ) -> Result<Vec<u8>> {
+            tokio::task::spawn_blocking(move || {
+                let file = std::fs::File::open(&path).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        crate::error::Error::not_found(format!("{}: {}", address, path.display()))
+                    } else {
+                        crate::error::Error::io(format!("Failed to open {}: {}", path.display(), e))
+                    }
+                })?;
+                // One stat off the open handle, serving both the zero-length guard
+                // and the clamp below: no extra syscall, and no window between the
+                // check and the read. `fstat` on a descriptor this thread owns does
+                // not fail in practice; if it ever did there would be nothing to
+                // size the read against, and saying so beats guessing a length.
+                let file_len = file
+                    .metadata()
+                    .map_err(|e| {
+                        crate::error::Error::io(format!("Failed to stat {}: {}", path.display(), e))
+                    })?
+                    .len();
+                // The fourth read path, held to the same rule as the other three:
+                // an empty file at a content address is debris, not content. A
+                // ranged read would otherwise stop at EOF and hand back an empty
+                // buffer — the "empty content" answer this whole change exists to
+                // replace with "absent". This arm is not hypothetical: once
+                // `resolve_local_path` refuses the debris, the leaflet reader
+                // falls through to `ContentStore::get_range`, which lands here for
+                // the very same file.
+                if file_len == 0 {
+                    tracing::warn!(
+                        address,
+                        path = %path.display(),
+                        "zero-length blob treated as absent on a ranged read (failed write \
+                         debris); it will be re-fetched or rebuilt. Delete it to reclaim the inode."
+                    );
+                    return Err(crate::error::Error::not_found(format!(
+                        "{}: {} (zero-length blob, treated as absent)",
+                        address,
+                        path.display()
+                    )));
                 }
-            })?;
-            // One stat off the open handle, serving both the zero-length guard
-            // and the clamp below: no extra syscall, and no window between the
-            // check and the read. `fstat` on a descriptor this thread owns does
-            // not fail in practice; if it ever did there would be nothing to
-            // size the read against, and saying so beats guessing a length.
-            let file_len = file
-                .metadata()
-                .map_err(|e| {
-                    crate::error::Error::io(format!("Failed to stat {}: {}", path.display(), e))
-                })?
-                .len();
-            // The fourth read path, held to the same rule as the other three:
-            // an empty file at a content address is debris, not content. A
-            // ranged read would otherwise stop at EOF and hand back an empty
-            // buffer — the "empty content" answer this whole change exists to
-            // replace with "absent". This arm is not hypothetical: once
-            // `resolve_local_path` refuses the debris, the leaflet reader
-            // falls through to `ContentStore::get_range`, which lands here for
-            // the very same file.
-            if file_len == 0 {
-                tracing::warn!(
-                    address,
-                    path = %path.display(),
-                    "zero-length blob treated as absent on a ranged read (failed write \
-                     debris); it will be re-fetched or rebuilt. Delete it to reclaim the inode."
-                );
-                return Err(crate::error::Error::not_found(format!(
-                    "{}: {} (zero-length blob, treated as absent)",
-                    address,
-                    path.display()
-                )));
-            }
-            // SIZE THE BUFFER FROM THE OBJECT, NOT FROM THE RANGE. The trait
-            // documents a ranged read as returning bytes that "may be shorter
-            // than requested if the object is smaller than `range.end`", and
-            // `mid..u64::MAX` is the established spelling of "read to the end"
-            // against it. Trusting the range's width made that spelling a
-            // `usize::MAX` allocation — a capacity-overflow panic that
-            // `spawn_blocking` caught and relabelled `Io("spawn_blocking
-            // failed: ...")`, so the one backend that could not serve the call
-            // was also the one that could not say why. The loops below already
-            // stop at EOF, so a range that fits reads exactly as before; this
-            // only stops the allocation from believing the caller.
-            let len = requested.min(file_len.saturating_sub(offset)) as usize;
-            let mut buf = vec![0u8; len];
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::FileExt;
-                let mut total = 0;
-                while total < len {
-                    let n = file
-                        .read_at(&mut buf[total..], offset + total as u64)
-                        .map_err(|e| {
+                // SIZE THE BUFFER FROM THE OBJECT, NOT FROM THE RANGE. The trait
+                // documents a ranged read as returning bytes that "may be shorter
+                // than requested if the object is smaller than `range.end`", and
+                // `mid..u64::MAX` is the established spelling of "read to the end"
+                // against it. Trusting the range's width made that spelling a
+                // `usize::MAX` allocation — a capacity-overflow panic that
+                // `spawn_blocking` caught and relabelled `Io("spawn_blocking
+                // failed: ...")`, so the one backend that could not serve the call
+                // was also the one that could not say why. The loops below already
+                // stop at EOF, so a range that fits reads exactly as before; this
+                // only stops the allocation from believing the caller.
+                let len = requested.min(file_len.saturating_sub(offset)) as usize;
+                let mut buf = vec![0u8; len];
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    let mut total = 0;
+                    while total < len {
+                        let n = file
+                            .read_at(&mut buf[total..], offset + total as u64)
+                            .map_err(|e| {
+                                crate::error::Error::io(format!(
+                                    "Failed to read range from {}: {}",
+                                    path.display(),
+                                    e
+                                ))
+                            })?;
+                        if n == 0 {
+                            break; // EOF
+                        }
+                        total += n;
+                    }
+                    buf.truncate(total);
+                }
+                #[cfg(not(unix))]
+                {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut file = file;
+                    file.seek(SeekFrom::Start(offset)).map_err(|e| {
+                        crate::error::Error::io(format!("Failed to seek {}: {}", path.display(), e))
+                    })?;
+                    let mut total = 0;
+                    while total < len {
+                        let n = file.read(&mut buf[total..]).map_err(|e| {
                             crate::error::Error::io(format!(
                                 "Failed to read range from {}: {}",
                                 path.display(),
                                 e
                             ))
                         })?;
-                    if n == 0 {
-                        break; // EOF
+                        if n == 0 {
+                            break; // EOF
+                        }
+                        total += n;
                     }
-                    total += n;
+                    buf.truncate(total);
                 }
-                buf.truncate(total);
+                Ok(buf)
+            })
+            .await
+            .map_err(|e| crate::error::Error::io(format!("spawn_blocking failed: {e}")))?
+        }
+
+        match read_once(path.clone(), address.to_owned(), offset, requested).await {
+            Err(crate::error::Error::NotFound(_)) if self.replay_foreign_logs().await? => {
+                read_once(path, address.to_owned(), offset, requested).await
             }
-            #[cfg(not(unix))]
-            {
-                use std::io::{Read, Seek, SeekFrom};
-                let mut file = file;
-                file.seek(SeekFrom::Start(offset)).map_err(|e| {
-                    crate::error::Error::io(format!("Failed to seek {}: {}", path.display(), e))
-                })?;
-                let mut total = 0;
-                while total < len {
-                    let n = file.read(&mut buf[total..]).map_err(|e| {
-                        crate::error::Error::io(format!(
-                            "Failed to read range from {}: {}",
-                            path.display(),
-                            e
-                        ))
-                    })?;
-                    if n == 0 {
-                        break; // EOF
-                    }
-                    total += n;
-                }
-                buf.truncate(total);
-            }
-            Ok(buf)
-        })
-        .await
-        .map_err(|e| crate::error::Error::io(format!("spawn_blocking failed: {e}")))?
+            first => first,
+        }
     }
 
     fn supports_ranged_reads(&self) -> bool {
@@ -1105,7 +1184,15 @@ impl StorageRead for FileStorage {
 
     async fn exists(&self, address: &str) -> Result<bool> {
         let path = self.resolve_path(address)?;
-        match tokio::fs::metadata(&path).await {
+        let mut metadata = tokio::fs::metadata(&path).await;
+        if metadata
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            && self.replay_foreign_logs().await?
+        {
+            metadata = tokio::fs::metadata(&path).await;
+        }
+        match metadata {
             // Zero length is absent here too, and the consistency is the point:
             // reporting `true` for a blob `read_bytes` then refuses to return is a
             // worse contract than either answer alone — a caller that checks before
@@ -2740,6 +2827,81 @@ mod journal_tests {
             .unwrap();
         assert_eq!(storage.fsyncs_issued(), 0);
         assert!(!dir.path().join(REDO_DIR).exists());
+    }
+
+    fn owned(dir: &Path, owner: &str) -> FileStorage {
+        let storage = FileStorage::new(dir)
+            .with_durability(Durability::Journal)
+            .with_redo_owner(owner);
+        storage.recover_redo_log().unwrap();
+        storage
+    }
+
+    /// Several processes on one root each own a log, and an owned log
+    /// flushes each write on its own: nothing later would.
+    #[tokio::test]
+    async fn owners_keep_separate_logs_and_flush_every_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = owned(dir.path(), "node-1");
+        let b = owned(dir.path(), "node-2");
+        a.write_bytes(TXN, b"from a").await.unwrap();
+        let before = a.fsyncs_issued();
+        a.write_bytes(COMMIT, b"from a").await.unwrap();
+        assert_eq!(a.fsyncs_issued() - before, 1, "one flush, for the log");
+        assert_eq!(b.read_bytes(TXN).await.unwrap(), b"from a");
+        b.write_bytes(HEAD, b"from b").await.unwrap();
+        assert_eq!(a.read_bytes(HEAD).await.unwrap(), b"from b");
+        let owners = dir.path().join(REDO_DIR).join("owners");
+        assert!(owners.join("node-1").join("LOCK").exists());
+        assert!(owners.join("node-2").join("LOCK").exists());
+        assert!(a.write_bytes("fluree:file://x.bin", b"x").await.is_ok());
+        assert!(FileStorage::new(dir.path())
+            .with_durability(Durability::Journal)
+            .with_redo_owner("../escape")
+            .write_bytes("fluree:file://y.bin", b"y")
+            .await
+            .is_err());
+    }
+
+    /// A node that stopped with records still in its log: another node
+    /// missing one of those files applies that log and finds the file.
+    #[tokio::test]
+    async fn another_owner_recovers_a_stopped_owners_tail_on_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = owned(dir.path(), "node-1");
+        a.hold_redo_segments_for_test().unwrap();
+        a.write_bytes(COMMIT, b"c").await.unwrap();
+        a.simulate_crash_for_test();
+        drop(a);
+        std::fs::remove_file(dir.path().join("ledger/commit/bbbb.bin")).unwrap();
+
+        let b = owned(dir.path(), "node-2");
+        assert!(b.exists(COMMIT).await.unwrap());
+        assert_eq!(b.read_bytes(COMMIT).await.unwrap(), b"c");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join(REDO_DIR).join("owners").join("node-1"))
+                .unwrap()
+                .count(),
+            1,
+            "the stopped owner's log was retired, leaving its lock file"
+        );
+    }
+
+    /// Opening the root applies stopped owners' logs too, under any
+    /// durability, so a per-write handle sees the acknowledged tail.
+    #[tokio::test]
+    async fn opening_a_shared_root_applies_stopped_owners_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = owned(dir.path(), "node-1");
+        a.hold_redo_segments_for_test().unwrap();
+        a.write_bytes(TXN, b"t").await.unwrap();
+        a.simulate_crash_for_test();
+        drop(a);
+        std::fs::remove_file(dir.path().join("ledger/txn/aaaa.bin")).unwrap();
+
+        let plain = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        plain.recover_redo_log().unwrap();
+        assert!(dir.path().join("ledger/txn/aaaa.bin").exists());
     }
 
     /// The log's directory is neither content nor staging debris.
