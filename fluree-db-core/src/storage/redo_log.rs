@@ -24,7 +24,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -270,6 +270,10 @@ struct Segment {
     len: u64,
     /// Keys whose files must be flushed before this segment can be retired.
     touched: Vec<String>,
+    /// Appends whose caller has not yet materialized the file. A segment
+    /// is never retired while this is non-zero: the flush would miss the
+    /// file and the record would be gone when the file finally lands.
+    in_flight: Arc<AtomicUsize>,
     dirty: bool,
     last_append: Instant,
     opened: Instant,
@@ -278,6 +282,20 @@ struct Segment {
 struct Closed {
     path: PathBuf,
     touched: Vec<String>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// Returned by [`RedoLog::append`]; hold it until the file the record
+/// describes has been written, so the segment cannot be retired in between.
+#[must_use = "drop this only after the file the record describes is written"]
+pub(super) struct Appended {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for Appended {
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct Inner {
@@ -303,6 +321,12 @@ pub(super) struct RedoLog {
     /// Owned logs flush every append: on a shared root nothing later flushes
     /// on a payload's behalf, because the head lives in Raft, not in a file.
     flush_every_append: bool,
+    /// Set after a flush failed. The durable boundary is then unknown, so no
+    /// further append is accepted; a restart replays what is there.
+    poisoned: AtomicBool,
+    /// Test hook: make the next flush report failure.
+    #[cfg(test)]
+    fail_next_sync: AtomicBool,
 }
 
 impl std::fmt::Debug for RedoLog {
@@ -501,6 +525,24 @@ fn read_opt(path: &Path) -> io::Result<Option<Vec<u8>>> {
     }
 }
 
+/// The sidecar lock a live compare-and-swap holds across its read and
+/// write. Replay takes it too: a writer in per-write mode on the same root
+/// may be publishing the same head, and a replayed transition must not land
+/// on top of a newer one.
+fn key_lock(path: &Path) -> io::Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    lock.lock_exclusive()?;
+    Ok(lock)
+}
+
 /// Apply one recovered record to the root. Every arm is idempotent, so a
 /// replay interrupted and restarted converges on the same files.
 fn apply(base: &Path, op: &OwnedOp, touched: &mut Vec<String>) -> io::Result<()> {
@@ -514,6 +556,7 @@ fn apply(base: &Path, op: &OwnedOp, touched: &mut Vec<String>) -> io::Result<()>
         }
         OwnedOp::Insert { key, bytes } => {
             let path = base.join(key);
+            let _lock = key_lock(&path)?;
             if read_opt(&path)?.is_none() {
                 write_page_cache(&path, bytes)?;
             }
@@ -521,6 +564,7 @@ fn apply(base: &Path, op: &OwnedOp, touched: &mut Vec<String>) -> io::Result<()>
         }
         OwnedOp::Cas { key, expected, new } => {
             let path = base.join(key);
+            let _lock = key_lock(&path)?;
             let current = read_opt(&path)?;
             if current.as_deref() == Some(new.as_slice()) {
                 // Already materialized before the crash.
@@ -558,6 +602,10 @@ fn segment_paths(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
             if let Ok(id) = stem.parse::<u64>() {
                 segments.push((id, entry.path()));
             }
+        } else if name.ends_with(&format!(".{SEGMENT_EXT}.tmp")) {
+            // A segment whose header never finished; nothing was ever
+            // appended to it, so nothing is lost.
+            std::fs::remove_file(entry.path())?;
         }
     }
     segments.sort();
@@ -576,6 +624,18 @@ fn replay(base: &Path, dir: &Path, fsyncs: &AtomicU64) -> io::Result<(u64, u64, 
     for (i, (_, path)) in segments.iter().enumerate() {
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
+        if i == last && (bytes.len() < SEGMENT_HEADER || &bytes[..8] != SEGMENT_MAGIC) {
+            // Creation interrupted before the header was written. A record
+            // is only ever appended after the header is durable, so this
+            // segment holds nothing acknowledged.
+            tracing::warn!(
+                segment = %path.display(),
+                "redo segment has no valid header; removing it as never used"
+            );
+            std::fs::remove_file(path)?;
+            fsync_dir(dir, fsyncs)?;
+            break;
+        }
         let decoded = decode_segment(&bytes, next_seq).map_err(|e| {
             io::Error::new(
                 e.kind(),
@@ -619,7 +679,11 @@ fn replay(base: &Path, dir: &Path, fsyncs: &AtomicU64) -> io::Result<(u64, u64, 
     }
     flush_keys(base, &touched, fsyncs)?;
     for (_, path) in &segments {
-        std::fs::remove_file(path)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
     if !segments.is_empty() {
         fsync_dir(dir, fsyncs)?;
@@ -716,6 +780,9 @@ impl RedoLog {
             lock: Mutex::new(Some(lock)),
             crashed: AtomicBool::new(false),
             hold_segments: AtomicBool::new(false),
+            poisoned: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_sync: AtomicBool::new(false),
         });
         let weak = Arc::downgrade(&log);
         let ticker = weak.clone();
@@ -736,12 +803,47 @@ impl RedoLog {
         self.fsyncs.load(Ordering::Relaxed)
     }
 
-    /// Append one record. With `sync`, the segment is flushed before returning,
-    /// which also covers every earlier unflushed append.
-    pub(super) fn append(&self, op: Op<'_>, sync: bool) -> io::Result<()> {
+    fn refuse_if_unavailable(&self) -> io::Result<()> {
         if self.crashed.load(Ordering::Acquire) {
             return Err(io::Error::other("redo log was abandoned (simulated crash)"));
         }
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "redo log refused after a failed flush: the durable boundary is unknown; \
+                 restart to recover",
+            ));
+        }
+        Ok(())
+    }
+
+    /// A flush failed, so what is durable is unknown. Refuse everything from
+    /// here on; the next open replays whatever did reach the device.
+    fn poison(&self, error: io::Error) -> io::Error {
+        self.poisoned.store(true, Ordering::Release);
+        tracing::error!(
+            error = %error,
+            dir = %self.dir.display(),
+            "redo log flush failed; refusing further writes until restart"
+        );
+        error
+    }
+
+    fn sync_segment(&self, segment: &mut Segment) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_next_sync.swap(false, Ordering::AcqRel) {
+            return Err(io::Error::other("injected flush failure"));
+        }
+        segment.file.sync_all()?;
+        self.fsyncs.fetch_add(1, Ordering::Relaxed);
+        segment.dirty = false;
+        Ok(())
+    }
+
+    /// Append one record. With `sync`, the segment is flushed before returning,
+    /// which also covers every earlier unflushed append. Hold the returned
+    /// guard until the file the record describes is written.
+    pub(super) fn append(&self, op: Op<'_>, sync: bool) -> io::Result<Appended> {
+        self.refuse_if_unavailable()?;
         let sync = sync || self.flush_every_append;
         let payload = op.encode();
         let mut inner = self
@@ -754,40 +856,57 @@ impl RedoLog {
             inner.active = Some(segment);
         }
         let frame = encode_frame(seq, &payload);
-        let full = {
+        let (full, in_flight) = {
             let segment = inner.active.as_mut().expect("opened above");
-            segment.file.write_all(&frame)?;
+            let start = segment.len;
+            if let Err(e) = segment.file.write_all(&frame) {
+                // Nothing acknowledged depends on the bytes that may have
+                // landed; cut back to the last frame boundary. If even
+                // that fails the file's state is unknown.
+                return Err(match segment.file.set_len(start) {
+                    Ok(()) => e,
+                    Err(_) => self.poison(e),
+                });
+            }
             segment.len += frame.len() as u64;
             segment.dirty = true;
             segment.last_append = Instant::now();
             segment.touched.push(op.key().to_owned());
             if sync {
-                segment.file.sync_all()?;
-                self.fsyncs.fetch_add(1, Ordering::Relaxed);
-                segment.dirty = false;
+                if let Err(e) = self.sync_segment(segment) {
+                    return Err(self.poison(e));
+                }
             }
-            segment.len >= ROTATE_BYTES
+            segment.in_flight.fetch_add(1, Ordering::AcqRel);
+            (segment.len >= ROTATE_BYTES, Arc::clone(&segment.in_flight))
         };
         inner.next_seq = seq + 1;
         if full {
             self.rotate(&mut inner)?;
         }
-        Ok(())
+        Ok(Appended { in_flight })
     }
 
+    /// Create the next segment: header written and flushed under a temporary
+    /// name, then renamed into place, so a crash can never leave a segment
+    /// whose header is missing or partial.
     fn open_segment(&self, inner: &mut Inner, first_seq: u64) -> io::Result<Segment> {
         let id = inner.next_segment;
         inner.next_segment += 1;
         let path = self.dir.join(format!("{id:08}.{SEGMENT_EXT}"));
+        let tmp = self.dir.join(format!("{id:08}.{SEGMENT_EXT}.tmp"));
         let mut file = OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
-            .open(&path)?;
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
         let mut header = SEGMENT_MAGIC.to_vec();
         header.extend_from_slice(&first_seq.to_le_bytes());
         file.write_all(&header)?;
         file.sync_all()?;
         self.fsyncs.fetch_add(1, Ordering::Relaxed);
+        std::fs::rename(&tmp, &path)?;
         fsync_dir(&self.dir, &self.fsyncs)?;
         Ok(Segment {
             id,
@@ -795,6 +914,7 @@ impl RedoLog {
             file,
             len: SEGMENT_HEADER as u64,
             touched: Vec::new(),
+            in_flight: Arc::new(AtomicUsize::new(0)),
             dirty: false,
             last_append: Instant::now(),
             opened: Instant::now(),
@@ -804,12 +924,14 @@ impl RedoLog {
     /// Close the active segment so the flusher can retire it. Flushed first:
     /// the next segment's flushes do not cover this file.
     fn rotate(&self, inner: &mut Inner) -> io::Result<()> {
-        let Some(segment) = inner.active.take() else {
+        let Some(mut segment) = inner.active.take() else {
             return Ok(());
         };
         if segment.dirty {
-            segment.file.sync_all()?;
-            self.fsyncs.fetch_add(1, Ordering::Relaxed);
+            if let Err(e) = self.sync_segment(&mut segment) {
+                inner.active = Some(segment);
+                return Err(self.poison(e));
+            }
         }
         tracing::trace!(
             segment = segment.id,
@@ -819,12 +941,13 @@ impl RedoLog {
         inner.closed.push(Closed {
             path: segment.path,
             touched: segment.touched,
+            in_flight: segment.in_flight,
         });
         Ok(())
     }
 
     fn tick(&self) -> io::Result<()> {
-        if self.crashed.load(Ordering::Acquire) {
+        if self.crashed.load(Ordering::Acquire) || self.poisoned.load(Ordering::Acquire) {
             return Ok(());
         }
         let hold = self.hold_segments.load(Ordering::Acquire);
@@ -838,9 +961,9 @@ impl RedoLog {
                 if segment.dirty
                     && now.duration_since(segment.last_append) >= LONE_APPEND_SYNC_AFTER
                 {
-                    segment.file.sync_all()?;
-                    self.fsyncs.fetch_add(1, Ordering::Relaxed);
-                    segment.dirty = false;
+                    if let Err(e) = self.sync_segment(segment) {
+                        return Err(self.poison(e));
+                    }
                 }
                 if !hold
                     && !segment.touched.is_empty()
@@ -855,7 +978,7 @@ impl RedoLog {
                 std::mem::take(&mut inner.closed)
             }
         };
-        self.retire(closed)
+        self.retire(closed).map(|_| ())
     }
 
     /// Stop the background thread from retiring segments until close.
@@ -865,29 +988,59 @@ impl RedoLog {
     }
 
     /// Flush the files each closed segment covered, then remove the segment.
-    fn retire(&self, closed: Vec<Closed>) -> io::Result<()> {
+    /// A segment with an append whose file is not yet written stays until
+    /// that write finishes; the flush would otherwise miss the file and
+    /// the record would be gone when it lands. Returns how many were kept.
+    fn retire(&self, closed: Vec<Closed>) -> io::Result<usize> {
         if closed.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
-        for segment in &closed {
+        let mut kept = Vec::new();
+        let mut removed = false;
+        for segment in closed {
+            if segment.in_flight.load(Ordering::Acquire) > 0 {
+                kept.push(segment);
+                continue;
+            }
             flush_keys(&self.base, &segment.touched, &self.fsyncs)?;
             std::fs::remove_file(&segment.path)?;
+            removed = true;
         }
-        fsync_dir(&self.dir, &self.fsyncs)
-    }
-
-    /// Flush everything and leave no segments behind, so the root reads the
-    /// same to a binary that knows nothing about the log.
-    fn checkpoint(&self) -> io::Result<()> {
-        let closed = {
+        if removed {
+            fsync_dir(&self.dir, &self.fsyncs)?;
+        }
+        let waiting = kept.len();
+        if waiting > 0 {
             let mut inner = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.rotate(&mut inner)?;
-            std::mem::take(&mut inner.closed)
-        };
-        self.retire(closed)
+            kept.append(&mut inner.closed);
+            inner.closed = kept;
+        }
+        Ok(waiting)
+    }
+
+    /// Flush everything and leave no segments behind, so the root reads the
+    /// same to a binary that knows nothing about the log. Waits briefly for
+    /// appends still materializing; anything still in flight after that is
+    /// left for the next open to replay.
+    fn checkpoint(&self) -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let closed = {
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.rotate(&mut inner)?;
+                std::mem::take(&mut inner.closed)
+            };
+            if self.retire(closed)? == 0 || Instant::now() >= deadline {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Abandon the log without flushing, as a crash would. The segments stay on
@@ -1011,5 +1164,199 @@ mod tests {
         let mut segment = SEGMENT_MAGIC.to_vec();
         segment.extend_from_slice(&5u64.to_le_bytes());
         assert!(decode_segment(&segment, Some(4)).is_err());
+    }
+
+    fn owned(base: &Path) -> Arc<RedoLog> {
+        match RedoLog::acquire(base, Some("review"), true).unwrap() {
+            Acquire::Log(log) => log,
+            _ => panic!("log unavailable"),
+        }
+    }
+
+    /// A record's segment cannot be retired while the file it describes is
+    /// still being written: the flush would miss the file and the record
+    /// would be gone when the file finally landed, unflushed.
+    #[test]
+    fn retirement_waits_for_the_file_the_record_describes() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        let payload = dir.path().join("payload");
+        let appended = log
+            .append(
+                Op::Write {
+                    key: "payload",
+                    bytes: b"acknowledged",
+                },
+                true,
+            )
+            .unwrap();
+        // The flusher runs between the append and the file write.
+        log.checkpoint().unwrap();
+        assert!(
+            segment_paths(&log.dir).unwrap().len() == 1,
+            "the segment stays while the write is in flight"
+        );
+        write_page_cache(&payload, b"acknowledged").unwrap();
+        drop(appended);
+        log.checkpoint().unwrap();
+        assert!(
+            segment_paths(&log.dir).unwrap().is_empty(),
+            "retired once the file exists"
+        );
+
+        // The same interleaving followed by a crash before the flush:
+        // replay still has the record because retirement waited.
+        let appended = log
+            .append(
+                Op::Write {
+                    key: "second",
+                    bytes: b"two",
+                },
+                true,
+            )
+            .unwrap();
+        log.checkpoint().unwrap();
+        write_page_cache(&dir.path().join("second"), b"two").unwrap();
+        drop(appended);
+        log.simulate_crash();
+        std::fs::remove_file(dir.path().join("second")).unwrap();
+        let _reopened = owned(dir.path());
+        assert_eq!(std::fs::read(dir.path().join("second")).unwrap(), b"two");
+    }
+
+    /// A failed flush leaves the durable boundary unknown. The log refuses
+    /// further appends rather than reuse a sequence a later open would read
+    /// as the end of the stream; a reopen replays what did land.
+    #[test]
+    fn a_failed_flush_refuses_further_appends_until_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.hold_segments();
+        drop(
+            log.append(
+                Op::Write {
+                    key: "first",
+                    bytes: b"first",
+                },
+                true,
+            )
+            .unwrap(),
+        );
+        log.fail_next_sync.store(true, Ordering::Release);
+        assert!(log
+            .append(
+                Op::Write {
+                    key: "failed",
+                    bytes: b"failed"
+                },
+                true
+            )
+            .is_err());
+        let refused = log
+            .append(
+                Op::Write {
+                    key: "after",
+                    bytes: b"after",
+                },
+                true,
+            )
+            .err()
+            .expect("poisoned log refuses");
+        assert!(refused.to_string().contains("failed flush"), "{refused}");
+        log.simulate_crash();
+        let reopened = owned(dir.path());
+        assert_eq!(std::fs::read(dir.path().join("first")).unwrap(), b"first");
+        // The reopened log accepts appends again.
+        drop(
+            reopened
+                .append(
+                    Op::Write {
+                        key: "after",
+                        bytes: b"after",
+                    },
+                    true,
+                )
+                .unwrap(),
+        );
+    }
+
+    /// A crash while the next segment was being created leaves either no
+    /// file or a temporary one, never a published segment without a header;
+    /// and an empty published file from an older layout is removed, not fatal.
+    #[test]
+    fn a_torn_new_segment_does_not_block_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.hold_segments();
+        drop(
+            log.append(
+                Op::Write {
+                    key: "first",
+                    bytes: b"first",
+                },
+                true,
+            )
+            .unwrap(),
+        );
+        log.simulate_crash();
+        let owner_dir = dir.path().join(REDO_DIR).join("owners/review");
+        std::fs::write(owner_dir.join("00000002.redo"), []).unwrap();
+        std::fs::write(owner_dir.join("00000003.redo.tmp"), b"partial").unwrap();
+        let reopened = owned(dir.path());
+        assert_eq!(std::fs::read(dir.path().join("first")).unwrap(), b"first");
+        drop(
+            reopened
+                .append(
+                    Op::Write {
+                        key: "next",
+                        bytes: b"next",
+                    },
+                    true,
+                )
+                .unwrap(),
+        );
+        assert!(!owner_dir.join("00000003.redo.tmp").exists());
+    }
+
+    /// Replay takes the same sidecar lock a live compare-and-swap holds, so
+    /// it cannot land a replayed head on top of one a per-write writer is
+    /// publishing at that moment.
+    #[test]
+    fn replay_waits_for_a_live_cas_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let Acquire::Log(log) = RedoLog::acquire(&base, None, true).unwrap() else {
+            panic!()
+        };
+        log.hold_segments();
+        write_page_cache(&base.join("head.json"), b"old").unwrap();
+        drop(
+            log.append(
+                Op::Cas {
+                    key: "head.json",
+                    expected: Some(b"old"),
+                    new: b"recovered",
+                },
+                true,
+            )
+            .unwrap(),
+        );
+        log.simulate_crash();
+        let lock = File::create(base.join("head.lock")).unwrap();
+        lock.lock_exclusive().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let replay_base = base.clone();
+        let thread = std::thread::spawn(move || {
+            let recovered = RedoLog::acquire(&replay_base, None, false).is_ok();
+            tx.send(recovered).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "replay must wait for the head's lock"
+        );
+        assert_eq!(std::fs::read(base.join("head.json")).unwrap(), b"old");
+        drop(lock);
+        thread.join().unwrap();
+        assert_eq!(std::fs::read(base.join("head.json")).unwrap(), b"recovered");
     }
 }

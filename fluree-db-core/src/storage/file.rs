@@ -1301,14 +1301,15 @@ impl StorageWrite for FileStorage {
         let storage = self.clone();
         tokio::task::spawn_blocking(move || {
             let (_, log) = storage.write_plan(storage.durability, 0)?;
-            if let Some(log) = &log {
+            let _appended = match &log {
                 // Ordered after the writes it undoes, so replay cannot bring
                 // the file back. Covered by the next flush, which is no weaker
                 // than an unlink that was never followed by a directory flush.
-                log.append(Op::Delete { key: &key }, false).map_err(|e| {
+                Some(log) => Some(log.append(Op::Delete { key: &key }, false).map_err(|e| {
                     crate::error::Error::io(format!("redo log append for {key}: {e}"))
-                })?;
-            }
+                })?),
+                None => None,
+            };
             match std::fs::remove_file(&path) {
                 Ok(()) => Ok(()),
                 // Idempotent: not found is OK
@@ -1379,19 +1380,25 @@ impl FileStorage {
                     ))
                 })?;
             }
-            if let Some(log) = &log {
-                // Logged before it lands, and not flushed: the head
-                // publication that follows flushes the log, and a crash
-                // before then leaves an unreferenced file at worst.
-                log.append(
-                    Op::Write {
-                        key: &key,
-                        bytes: &bytes,
-                    },
-                    false,
-                )
-                .map_err(|e| crate::error::Error::io(format!("redo log append for {key}: {e}")))?;
-            }
+            // Logged before it lands, and not flushed: the head publication
+            // that follows flushes the log, and a crash before then leaves an
+            // unreferenced file at worst. The guard keeps the record's segment
+            // from being retired until the file is written.
+            let _appended = match &log {
+                Some(log) => Some(
+                    log.append(
+                        Op::Write {
+                            key: &key,
+                            bytes: &bytes,
+                        },
+                        false,
+                    )
+                    .map_err(|e| {
+                        crate::error::Error::io(format!("redo log append for {key}: {e}"))
+                    })?,
+                ),
+                None => None,
+            };
             // Overwrites if present, which is idempotent for content-addressed
             // writes: the address is derived from these bytes.
             write_atomic(&path, &bytes, &policy).map_err(|e| {
@@ -1422,26 +1429,29 @@ impl FileStorage {
                     StorageExtError::io(format!("mkdir {}: {}", parent.display(), e))
                 })?;
             }
-            if let Some(log) = &log {
-                // Only a creation is logged; an existing file answers `false`
-                // as before. Flushed here: an insert is a lifecycle event
-                // (a ledger coming into existence) with nothing after it to
-                // flush on its behalf.
-                if path.exists() {
-                    return Ok(false);
+            let created = create_new_atomic(&path, &bytes, &policy)
+                .map_err(|e| StorageExtError::io(format!("write {}: {}", path.display(), e)))?;
+            if created {
+                if let Some(log) = &log {
+                    // The file decides the race, so only the caller whose
+                    // link won logs; replay then installs what won. Logged
+                    // after the file exists, and flushed here: an insert is
+                    // a lifecycle event (a ledger coming into existence)
+                    // with nothing after it to flush on its behalf.
+                    let _appended = log
+                        .append(
+                            Op::Insert {
+                                key: &key,
+                                bytes: &bytes,
+                            },
+                            true,
+                        )
+                        .map_err(|e| {
+                            StorageExtError::io(format!("redo log append for {key}: {e}"))
+                        })?;
                 }
-                log.append(
-                    Op::Insert {
-                        key: &key,
-                        bytes: &bytes,
-                    },
-                    true,
-                )
-                .map_err(|e| StorageExtError::io(format!("redo log append for {key}: {e}")))?;
             }
-
-            create_new_atomic(&path, &bytes, &policy)
-                .map_err(|e| StorageExtError::io(format!("write {}: {}", path.display(), e)))
+            Ok(created)
         })
         .await
         .map_err(|e| StorageExtError::io(format!("spawn_blocking join: {e}")))?
@@ -1529,22 +1539,25 @@ impl FileStorage {
             let (policy, log) = storage
                 .write_plan(storage.durability, new_bytes.len())
                 .map_err(|e| StorageExtError::io(e.to_string()))?;
-            if let Some(log) = &log {
-                // The one flush a commit pays. It lands before the file does,
-                // so a head on disk always has its log record — and every
-                // content append before it — on disk too.
-                log.append(
-                    Op::Cas {
-                        key: &locked.key,
-                        expected: expected.as_deref(),
-                        new: &new_bytes,
-                    },
-                    true,
-                )
-                .map_err(|e| {
-                    StorageExtError::io(format!("redo log append for {}: {e}", locked.key))
-                })?;
-            }
+            // The one flush a commit pays. It lands before the file does, so
+            // a head on disk always has its log record — and every content
+            // append before it — on disk too.
+            let _appended = match &log {
+                Some(log) => Some(
+                    log.append(
+                        Op::Cas {
+                            key: &locked.key,
+                            expected: expected.as_deref(),
+                            new: &new_bytes,
+                        },
+                        true,
+                    )
+                    .map_err(|e| {
+                        StorageExtError::io(format!("redo log append for {}: {e}", locked.key))
+                    })?,
+                ),
+                None => None,
+            };
             write_atomic(&locked.path, &new_bytes, &policy)
                 .map_err(|e| StorageExtError::io(format!("write {}: {}", locked.path.display(), e)))
             // lock released when `locked._lock_file` is dropped
@@ -2902,6 +2915,28 @@ mod journal_tests {
         let plain = FileStorage::new(dir.path()).with_durability(Durability::Sync);
         plain.recover_redo_log().unwrap();
         assert!(dir.path().join("ledger/txn/aaaa.bin").exists());
+    }
+
+    /// Two inserts race on one key: the file decides, and only the caller
+    /// whose link won logs a record, so replay installs what won.
+    #[tokio::test]
+    async fn only_the_winning_insert_is_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = journaled(dir.path());
+        storage.hold_redo_segments_for_test().unwrap();
+        assert!(storage.insert(HEAD, b"winner").await.unwrap());
+        let after_winner = storage.fsyncs_issued();
+        assert!(!storage.insert(HEAD, b"loser").await.unwrap());
+        assert_eq!(
+            storage.fsyncs_issued(),
+            after_winner,
+            "a losing insert appends and flushes nothing"
+        );
+        storage.simulate_crash_for_test();
+        drop(storage);
+        std::fs::remove_file(dir.path().join("ns@v2/ledger/main.json")).unwrap();
+        let storage = journaled(dir.path());
+        assert_eq!(storage.read_bytes(HEAD).await.unwrap(), b"winner");
     }
 
     /// The log's directory is neither content nor staging debris.

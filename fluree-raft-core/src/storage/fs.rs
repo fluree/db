@@ -431,6 +431,18 @@ impl Inner {
                 || &bytes[..8] != SEGMENT_MAGIC
                 || u64::from_le_bytes(bytes[8..16].try_into().unwrap()) != first
             {
+                if i == last {
+                    // Creation interrupted before the header landed. An entry
+                    // is only appended after the header is durable, so this
+                    // segment holds nothing acknowledged.
+                    warn!(
+                        segment = %path.display(),
+                        "raft log segment has no valid header; removing it as never used"
+                    );
+                    std::fs::remove_file(&path).map_err(|e| io_err("remove segment", e))?;
+                    fsync_dir_blocking(&self.log_dir)?;
+                    break;
+                }
                 return Err(StorageError::corruption(format!(
                     "raft log segment {} has a bad header",
                     path.display()
@@ -569,21 +581,26 @@ impl Inner {
         Ok(())
     }
 
+    /// Create the next segment: header written and flushed under a temporary
+    /// name, then renamed into place, so a crash can never leave a segment
+    /// whose header is missing or partial.
     fn start_segment(&mut self, first_index: u64) -> Result<(), StorageError> {
         use std::io::Write;
         let path = self.log_dir.join(segment_filename(first_index));
+        let tmp = self.log_dir.join(format!("{first_index:016x}.seg.tmp"));
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&path)
+            .open(&tmp)
             .map_err(|e| io_err("create segment", e))?;
         let mut header = SEGMENT_MAGIC.to_vec();
         header.extend_from_slice(&first_index.to_le_bytes());
         file.write_all(&header)
             .map_err(|e| io_err("write segment header", e))?;
         file.sync_all().map_err(|e| io_err("sync segment", e))?;
+        std::fs::rename(&tmp, &path).map_err(|e| io_err("publish segment", e))?;
         fsync_dir_blocking(&self.log_dir)?;
         self.segments.push(Segment {
             first_index,
@@ -619,6 +636,18 @@ impl Inner {
                     "append at index {first} does not continue the log at {last}"
                 )));
             }
+        }
+        // A segment holding only its header names a first index; if that is
+        // not the index being appended, it is a leftover (a truncation that
+        // emptied it, or a purge that outran it) and must go, or its entries
+        // would read as torn on the next open.
+        if let Some(seg) = self
+            .segments
+            .pop_if(|seg| seg.last_index.is_none() && seg.first_index != first)
+        {
+            self.active = None;
+            std::fs::remove_file(&seg.path).map_err(|e| io_err("remove segment", e))?;
+            fsync_dir_blocking(&self.log_dir)?;
         }
         let needs_segment = self
             .segments
@@ -732,15 +761,23 @@ impl Inner {
             removed = true;
         }
         self.active = None;
+        if cut.1 == SEGMENT_HEADER as u64 {
+            // Nothing of the segment survives the cut: remove it rather than
+            // keep a header naming an index the log may never return to.
+            let seg = self.segments.pop().expect("holds the cut");
+            std::fs::remove_file(&seg.path).map_err(|e| io_err("remove segment", e))?;
+            removed = true;
+        } else {
+            let file = self.active_file()?;
+            file.set_len(cut.1).map_err(|e| io_err("cut segment", e))?;
+            file.sync_all().map_err(|e| io_err("sync segment", e))?;
+            let seg = self.segments.last_mut().expect("holds the cut");
+            seg.len = cut.1;
+            seg.last_index = Some(from_index - 1);
+        }
         if removed {
             fsync_dir_blocking(&self.log_dir)?;
         }
-        let file = self.active_file()?;
-        file.set_len(cut.1).map_err(|e| io_err("cut segment", e))?;
-        file.sync_all().map_err(|e| io_err("sync segment", e))?;
-        let seg = self.segments.last_mut().expect("holds the cut");
-        seg.len = cut.1;
-        seg.last_index = (cut.1 > SEGMENT_HEADER as u64).then(|| from_index - 1);
         self.index.split_off(&from_index);
         Ok(())
     }
@@ -758,7 +795,13 @@ impl Inner {
         let mut removed = false;
         let mut kept = Vec::with_capacity(self.segments.len());
         for seg in self.segments.drain(..) {
-            if seg.last_index.is_some_and(|last| last <= log_id.index) {
+            // Whole segments at or below the marker go, and so does an empty
+            // one whose first index the marker has passed.
+            let obsolete = match seg.last_index {
+                Some(last) => last <= log_id.index,
+                None => seg.first_index <= log_id.index,
+            };
+            if obsolete {
                 std::fs::remove_file(&seg.path).map_err(|e| io_err("remove segment", e))?;
                 removed = true;
             } else {
@@ -1449,6 +1492,52 @@ mod tests {
             Err(err) => err,
         };
         assert!(matches!(err, StorageError::Corruption(_)), "{err:?}");
+    }
+
+    /// Truncating a segment to nothing and purging past it must not leave a
+    /// header naming an old index that a later append would silently fill
+    /// behind, only for the next open to read those entries as torn.
+    #[tokio::test]
+    async fn snapshot_after_truncation_preserves_new_entries() {
+        let dir = TempDir::new().unwrap();
+        let store = reopen(&dir).await;
+        store
+            .append(&(1..=10).map(|i| entry(1, i)).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        store.truncate_from(1).await.unwrap();
+        store.purge_through(LogId::new(2, 10)).await.unwrap();
+        store.append(&[entry(2, 11)]).await.unwrap();
+        assert_eq!(store.read_range(11..12).await.unwrap().len(), 1);
+        drop(store);
+        let store = reopen(&dir).await;
+        assert_eq!(store.read_range(11..12).await.unwrap().len(), 1);
+        assert_eq!(
+            store.log_state().await.unwrap().last_log,
+            Some(LogId::new(2, 11))
+        );
+    }
+
+    /// A crash while the next segment was being created leaves no published
+    /// segment without a header; an empty published file from an older
+    /// layout is removed rather than refusing the open.
+    #[tokio::test]
+    async fn a_torn_new_segment_does_not_block_recovery() {
+        let dir = TempDir::new().unwrap();
+        let store = reopen(&dir).await;
+        store.append(&[entry(1, 1)]).await.unwrap();
+        drop(store);
+        let log_dir = dir.path().join("log");
+        std::fs::write(log_dir.join(segment_filename(2)), []).unwrap();
+        std::fs::write(log_dir.join("0000000000000003.seg.tmp"), b"partial").unwrap();
+        let store = reopen(&dir).await;
+        assert_eq!(
+            store.log_state().await.unwrap().last_log,
+            Some(LogId::new(1, 1))
+        );
+        store.append(&[entry(1, 2)]).await.unwrap();
+        assert_eq!(store.read_range(0..100).await.unwrap().len(), 2);
+        assert!(!log_dir.join("0000000000000003.seg.tmp").exists());
     }
 
     /// The committed watermark alternates between two slots; a torn
