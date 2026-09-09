@@ -12,8 +12,8 @@
 //! values.
 
 use super::types::{ConstraintsArtifactWire, WireOrigin};
+use super::ResolveCtx;
 use super::{encode_system_iri, CrossLedgerError};
-use crate::Fluree;
 use fluree_db_core::{FlakeValue, IndexType, RangeMatch, RangeTest};
 use fluree_vocab::config_iris;
 
@@ -22,7 +22,7 @@ use fluree_vocab::config_iris;
 #[tracing::instrument(
     name = "cross_ledger.constraints.materialize",
     level = "debug",
-    skip(fluree),
+    skip(ctx),
     fields(
         model_ledger = canonical_model_ledger_id,
         graph_iri = graph_iri,
@@ -33,11 +33,11 @@ pub(super) async fn materialize_constraints(
     canonical_model_ledger_id: &str,
     graph_iri: &str,
     resolved_t: i64,
-    fluree: &Fluree,
+    ctx: &ResolveCtx<'_>,
 ) -> Result<ConstraintsArtifactWire, CrossLedgerError> {
     // 1. Open M at resolved_t.
-    let m_db = fluree
-        .load_graph_db_at_t(canonical_model_ledger_id, resolved_t)
+    let m_db = ctx
+        .open_model_db(canonical_model_ledger_id, resolved_t)
         .await
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),

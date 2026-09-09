@@ -16,14 +16,14 @@
 
 use super::types::{RulesArtifactWire, WireOrigin};
 use super::CrossLedgerError;
-use crate::Fluree;
+use super::ResolveCtx;
 use fluree_db_core::{FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest};
 use fluree_vocab::fluree::RULE;
 
 #[tracing::instrument(
     name = "cross_ledger.rules.materialize",
     level = "debug",
-    skip(fluree),
+    skip(ctx),
     fields(
         model_ledger = canonical_model_ledger_id,
         graph_iri = graph_iri,
@@ -34,10 +34,10 @@ pub(super) async fn materialize_rules(
     canonical_model_ledger_id: &str,
     graph_iri: &str,
     resolved_t: i64,
-    fluree: &Fluree,
+    ctx: &ResolveCtx<'_>,
 ) -> Result<RulesArtifactWire, CrossLedgerError> {
-    let m_db = fluree
-        .load_graph_db_at_t(canonical_model_ledger_id, resolved_t)
+    let m_db = ctx
+        .open_model_db(canonical_model_ledger_id, resolved_t)
         .await
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),

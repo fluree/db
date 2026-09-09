@@ -332,6 +332,17 @@ impl Fluree {
             });
         }
 
+        self.load_graph_db_historical(ledger_id, target_t).await
+    }
+
+    /// Open a ledger at a past `t` through the historical loader: no ledger
+    /// cache, so no cache lock is taken. [`Self::load_graph_db_at_t`] uses
+    /// this once it knows `t` is not the cached head.
+    pub(crate) async fn load_graph_db_historical(
+        &self,
+        ledger_id: &str,
+        target_t: i64,
+    ) -> Result<GraphDb> {
         let historical = self.ledger_view_at(ledger_id, target_t).await?;
         let mut view = GraphDb::from_historical(&historical);
 

@@ -750,8 +750,7 @@ pub(crate) async fn open_cross_ledger_shapes_model(
         return Ok(None);
     };
     let model_db = resolve_ctx
-        .fluree
-        .load_graph_db_at_t(&resolved.model_ledger_id, resolved.resolved_t)
+        .open_model_db(&resolved.model_ledger_id, resolved.resolved_t)
         .await
         .map_err(|e| {
             fluree_db_transact::TransactError::Parse(format!(
@@ -2533,7 +2532,8 @@ impl crate::Fluree {
         // Captured before `ledger` moves into staging, so a max-novelty
         // rejection can name the t the indexer should build to.
         let base_t = ledger.t();
-        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
+            .with_data_state(ledger.clone());
 
         #[cfg(feature = "shacl")]
         let staged = stage_with_config_shacl(
@@ -2675,7 +2675,8 @@ impl crate::Fluree {
         // Captured before `ledger` moves into staging, so a max-novelty
         // rejection can name the t the indexer should build to.
         let base_t = ledger.t();
-        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
+            .with_data_state(ledger.clone());
 
         #[cfg(feature = "shacl")]
         let staged = stage_with_config_shacl(
@@ -2904,7 +2905,8 @@ impl crate::Fluree {
         // Captured before `ledger` moves into staging; see the matching block
         // above.
         let base_t = ledger.t();
-        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
+            .with_data_state(ledger.clone());
 
         #[cfg(feature = "shacl")]
         let staged = stage_with_config_shacl(
@@ -3545,7 +3547,8 @@ impl crate::Fluree {
                 )))
             })?;
             let ledger_id_owned = ledger.ledger_id().to_string();
-            let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+            let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
+                .with_data_state(ledger.clone());
             let shapes = open_cross_ledger_shapes_model(config.as_ref(), &mut resolve_ctx)
                 .await
                 .map_err(ApiError::from)?;
