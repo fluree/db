@@ -246,6 +246,11 @@ pub async fn run(
 }
 
 /// Build a `PolicyContext` from `PolicyArgs` against a freshly-loaded ledger state.
+///
+/// The CLI has no auth layer, so the transact builders that take this context
+/// never get a `server_identity`: an `f:IdentityRestricted` override control
+/// (policy defaults, SHACL `validationMode`) denies CLI writes by design.
+///
 /// Returns `None` when no policy flags are set.
 pub async fn build_policy_ctx(
     fluree: &fluree_db_api::Fluree,
