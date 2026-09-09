@@ -751,10 +751,13 @@ impl FileStorage {
         self
     }
 
-    /// Device flushes issued by this storage since it was constructed, counting
+    /// Flush calls issued by this storage since it was constructed, counting
     /// both the staged file and its parent directory, and under
-    /// [`Durability::Wal`] every flush of the root's WAL, including
-    /// the background ones that retire its segments.
+    /// [`Durability::Wal`] every flush of the root's WAL, including the
+    /// background ones that retire its segments. On Apple platforms a
+    /// retirement batch hands each file to the drive with `fsync(2)` and
+    /// commits them with one `F_FULLFSYNC`; both count, though only the
+    /// latter is a drive-cache flush.
     ///
     /// Stays at zero under [`Durability::PageCache`] and for derived content in
     /// any mode. Exposed because a flush leaves no trace in the bytes on

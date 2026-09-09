@@ -384,9 +384,10 @@ waits for a flush, and that one flush covers everything appended before it.
 Flushes are shared: the first publication to wait issues the device flush,
 and every publication that reaches the log while it runs — from any ledger
 under the root — is covered by it or by the one that starts the moment it
-ends. A lone commit still pays exactly one flush; sixteen ledgers committing
-at once pay a few between them, so throughput across ledgers is no longer
-bounded by one commit per device flush.
+ends. A lone commit still pays one flush; sixteen ledgers committing at once
+pay a few between them, so throughput across ledgers is no longer bounded by
+one commit per device flush. Opening a new log segment, about once a second
+under load, costs two more flushes for its header and directory entry.
 
 A background thread flushes the files a closed log segment covered and removes
 the segment, so the log only ever holds the recent tail. That flush is one
