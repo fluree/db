@@ -688,19 +688,42 @@ pub async fn build_commit(
     // copies the whole snapshot, stats included — so an empty delta must
     // not touch it.
     if !ns_delta.is_empty() || !graph_delta.is_empty() {
-        let provider = if ns_delta.is_empty() {
-            None
-        } else {
-            Arc::make_mut(&mut base.snapshot).range_provider.take()
-        };
+        // The binary range provider holds the namespace table as its
+        // fallback, so with it attached — or merely alive — extending the
+        // table copies it. Take its parts, drop it, extend in place, and
+        // rebuild it over the extended table. A provider of another kind is
+        // put back as it was.
+        let mut rebuild: Option<Arc<BinaryIndexStore>> = None;
+        let mut put_back = None;
+        if !ns_delta.is_empty() {
+            if let Some(provider) = Arc::make_mut(&mut base.snapshot).range_provider.take() {
+                match provider.as_any().downcast_ref::<BinaryRangeProvider>() {
+                    Some(brp) => {
+                        let store = Arc::clone(brp.store());
+                        drop(provider);
+                        rebuild = Some(store);
+                    }
+                    None => put_back = Some(provider),
+                }
+            }
+        }
         let applied = Arc::make_mut(&mut base.snapshot).apply_envelope_deltas(
             &ns_delta,
             graph_delta.values().map(std::string::String::as_str),
         );
-        if let Some(provider) = provider {
+        if let Some(provider) = put_back {
             Arc::make_mut(&mut base.snapshot).range_provider = Some(provider);
         }
         applied?;
+        if let Some(store) = rebuild {
+            let provider = Arc::new(BinaryRangeProvider::new(
+                store,
+                Arc::clone(&base.dict_novelty),
+                Arc::clone(&base.runtime_small_dicts),
+                Some(base.snapshot.shared_namespaces()),
+            )) as Arc<dyn fluree_db_core::range_provider::RangeProvider>;
+            Arc::make_mut(&mut base.snapshot).range_provider = Some(provider);
+        }
     }
 
     // Resolve the commit's event time (`Commit.time`, the `@iso:` axis) and
