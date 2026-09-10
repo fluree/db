@@ -1,0 +1,4 @@
+# Organization-managed GitHub larger runner used by CI and benchmarks.
+self-hosted-runner:
+  labels:
+    - ci-cd-large

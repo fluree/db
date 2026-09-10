@@ -53,6 +53,9 @@ build = [
 ]
 
 [dist.github-custom-runners]
+# Use the larger Apple silicon runner (5-core/14GB) for release builds.
+# The default macos-14 runner (3-core/7GB) took ~3h for v4.2.0.
+aarch64-apple-darwin = "macos-14-xlarge"
 # Native ARM64 build on the org's larger hosted runner (8-core/32GB). The
 # default 4-core/16GB ubuntu-24.04-arm OOM'd at link time under fat LTO
 # (runner lost communication ~59min); 32GB gives ~2x headroom.

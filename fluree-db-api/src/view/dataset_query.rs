@@ -622,20 +622,33 @@ impl Fluree {
     ) -> Result<ExecutableQuery> {
         let mut executable = prepare_for_execution(parsed);
 
-        if let Some(primary) = dataset.primary() {
-            // Server-verified identity for `f:overrideControl`. `None` until
-            // the request boundary threads it through; see
-            // `complete_config_defaults`.
-            self.apply_reasoning_to_executable(
-                primary,
-                &mut executable,
-                dataset.any_non_root_policy(),
-                None,
-            )
-            .await?;
-        } else if dataset.any_non_root_policy() && !executable.reasoning.modes.rules.is_empty() {
-            tracing::debug!("stripping query-time datalog rules under non-root view policy");
-            executable.reasoning.modes.rules.clear();
+        // A history/changes dataset takes no config reasoning defaults: a
+        // from–to range has no single state to derive entailments against,
+        // and `reject_reasoning_in_history_mode` refuses any enabled mode.
+        // Applying `f:reasoningDefaults` here would trip that gate on every
+        // history query against a configured ledger (fluree/db#1806), so only
+        // a mode the query itself supplies reaches it.
+        match dataset.primary() {
+            Some(primary) if !dataset.is_history_mode() => {
+                // Server-verified identity for `f:overrideControl`. `None` until
+                // the request boundary threads it through; see
+                // `complete_config_defaults`.
+                self.apply_reasoning_to_executable(
+                    primary,
+                    &mut executable,
+                    dataset.any_non_root_policy(),
+                    None,
+                )
+                .await?;
+            }
+            _ => {
+                if dataset.any_non_root_policy() && !executable.reasoning.modes.rules.is_empty() {
+                    tracing::debug!(
+                        "stripping query-time datalog rules under non-root view policy"
+                    );
+                    executable.reasoning.modes.rules.clear();
+                }
+            }
         }
 
         Ok(executable)
@@ -1029,9 +1042,10 @@ fn query_error_to_api_error(err: fluree_db_query::QueryError) -> ApiError {
 /// at a single state and never persists them, so the two do not compose — the
 /// derived overlay would be computed against the latest state and silently
 /// dropped rather than applied at any point in the range. Config reasoning
-/// defaults are already not applied in history mode (see the dataset builder),
-/// so this only fires when a query explicitly asks for a mode. Fail loudly
-/// instead of returning results that silently omit entailments.
+/// defaults are not applied to history datasets (see
+/// `build_executable_for_dataset`), so this only fires when a query explicitly
+/// asks for a mode. Fail loudly instead of returning results that silently
+/// omit entailments.
 ///
 /// Mirrors the reasoning gate in `prepare_execution_with_config`
 /// (`executable.reasoning.modes.has_any_enabled()`); `"reasoning": "none"`
