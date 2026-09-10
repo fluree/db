@@ -33,6 +33,7 @@ use crate::sid::Sid;
 use fluree_vocab::namespaces::{EMPTY, OVERFLOW, USER_START};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 // ============================================================================
@@ -457,14 +458,24 @@ impl std::error::Error for NsAllocError {}
 /// operations go through this type to enforce uniqueness invariants.
 #[derive(Debug, Clone)]
 pub struct NamespaceCodes {
-    /// Prefix → code
+    /// A snapshot's tables, shared by refcount and never written: a
+    /// transaction's registry reads through them and keeps only what it adds
+    /// in the maps below. Absent for a registry built from scratch.
+    base: Option<SharedBase>,
+    /// Prefix → code, entries not in `base`
     prefix_to_code: HashMap<String, u16>,
-    /// Code → prefix
+    /// Code → prefix, entries not in `base`
     code_to_prefix: HashMap<u16, String>,
     /// Next allocatable code (≥ USER_START)
     next_code: u16,
     /// New allocations since last `take_delta()` (code → prefix)
     delta: HashMap<u16, String>,
+}
+
+#[derive(Debug, Clone)]
+struct SharedBase {
+    code_to_prefix: Arc<HashMap<u16, String>>,
+    prefix_to_code: Arc<HashMap<String, u16>>,
 }
 
 impl NamespaceCodes {
@@ -515,6 +526,7 @@ impl NamespaceCodes {
         let next_code = (max_code + 1).max(USER_START);
 
         Ok(Self {
+            base: None,
             prefix_to_code,
             code_to_prefix,
             next_code,
@@ -522,10 +534,44 @@ impl NamespaceCodes {
         })
     }
 
+    /// Layer over a snapshot's namespace tables, shared by refcount: nothing
+    /// is copied, and allocations land in this instance alone. The built-in
+    /// defaults are added on top where the snapshot lacks them, as
+    /// [`Self::new`] plus a merge would have it.
+    ///
+    /// Returns `Err` if a default conflicts with the snapshot's table, which
+    /// means the persisted namespace data is corrupt.
+    pub fn layered_over(
+        code_to_prefix: Arc<HashMap<u16, String>>,
+        prefix_to_code: Arc<HashMap<String, u16>>,
+    ) -> Result<Self, NsAllocError> {
+        let max_code = code_to_prefix
+            .keys()
+            .filter(|&&c| c < OVERFLOW)
+            .max()
+            .copied()
+            .unwrap_or(0);
+        let mut codes = Self {
+            base: Some(SharedBase {
+                code_to_prefix,
+                prefix_to_code,
+            }),
+            prefix_to_code: HashMap::new(),
+            code_to_prefix: HashMap::new(),
+            next_code: (max_code + 1).max(USER_START),
+            delta: HashMap::new(),
+        };
+        codes.merge_delta(&default_namespace_codes())?;
+        Ok(codes)
+    }
+
     /// Look up the code for a prefix.
     #[inline]
     pub fn get_code(&self, prefix: &str) -> Option<u16> {
-        self.prefix_to_code.get(prefix).copied()
+        self.prefix_to_code
+            .get(prefix)
+            .or_else(|| self.base.as_ref()?.prefix_to_code.get(prefix))
+            .copied()
     }
 
     /// Look up the prefix for a code.
@@ -533,6 +579,7 @@ impl NamespaceCodes {
     pub fn get_prefix(&self, code: u16) -> Option<&str> {
         self.code_to_prefix
             .get(&code)
+            .or_else(|| self.base.as_ref()?.code_to_prefix.get(&code))
             .map(std::string::String::as_str)
     }
 
@@ -546,7 +593,7 @@ impl NamespaceCodes {
     ///   happen in well-formed usage since we check prefix first)
     pub fn allocate_prefix(&mut self, prefix: &str) -> Result<u16, NsAllocError> {
         // Fast path: prefix already registered
-        if let Some(&code) = self.prefix_to_code.get(prefix) {
+        if let Some(code) = self.get_code(prefix) {
             return Ok(code);
         }
 
@@ -597,12 +644,12 @@ impl NamespaceCodes {
     pub fn merge_delta(&mut self, delta: &HashMap<u16, String>) -> Result<(), NsAllocError> {
         for (&code, prefix) in delta {
             // Check code → prefix direction
-            if let Some(existing) = self.code_to_prefix.get(&code) {
+            if let Some(existing) = self.get_prefix(code) {
                 if existing != prefix {
                     return Err(NsAllocError::CodeConflict {
                         code,
                         new_prefix: prefix.clone(),
-                        existing_prefix: existing.clone(),
+                        existing_prefix: existing.to_string(),
                     });
                 }
                 // Already registered with matching prefix — skip
@@ -610,7 +657,7 @@ impl NamespaceCodes {
             }
 
             // Check prefix → code direction
-            if let Some(&existing_code) = self.prefix_to_code.get(prefix.as_str()) {
+            if let Some(existing_code) = self.get_code(prefix.as_str()) {
                 if existing_code != code {
                     return Err(NsAllocError::PrefixConflict {
                         prefix: prefix.clone(),
@@ -647,12 +694,12 @@ impl NamespaceCodes {
     ) -> Result<(), NsAllocError> {
         for (&code, prefix) in delta {
             // Same conflict checks as merge_delta
-            if let Some(existing) = self.code_to_prefix.get(&code) {
+            if let Some(existing) = self.get_prefix(code) {
                 if existing != prefix {
                     return Err(NsAllocError::CodeConflict {
                         code,
                         new_prefix: prefix.clone(),
-                        existing_prefix: existing.clone(),
+                        existing_prefix: existing.to_string(),
                     });
                 }
                 // Already registered with matching prefix — record in delta only
@@ -661,7 +708,7 @@ impl NamespaceCodes {
                 continue;
             }
 
-            if let Some(&existing_code) = self.prefix_to_code.get(prefix.as_str()) {
+            if let Some(existing_code) = self.get_code(prefix.as_str()) {
                 if existing_code != code {
                     return Err(NsAllocError::PrefixConflict {
                         prefix: prefix.clone(),
@@ -702,25 +749,29 @@ impl NamespaceCodes {
         !self.delta.is_empty()
     }
 
-    /// Access the code → prefix map (for backwards compatibility with
-    /// code that expects `HashMap<u16, String>`).
-    pub fn code_to_prefix_map(&self) -> &HashMap<u16, String> {
-        &self.code_to_prefix
+    /// The code → prefix map, materialized. Cheap for a registry built from
+    /// scratch; copies the shared base for one layered over a snapshot.
+    pub fn code_to_prefix_map(&self) -> HashMap<u16, String> {
+        self.iter()
+            .map(|(code, prefix)| (code, prefix.to_string()))
+            .collect()
     }
 
-    /// Access the prefix → code map.
-    pub fn prefix_to_code_map(&self) -> &HashMap<String, u16> {
-        &self.prefix_to_code
+    /// The prefix → code map, materialized (see [`Self::code_to_prefix_map`]).
+    pub fn prefix_to_code_map(&self) -> HashMap<String, u16> {
+        self.iter()
+            .map(|(code, prefix)| (prefix.to_string(), code))
+            .collect()
     }
 
     /// Number of registered namespace codes.
     pub fn len(&self) -> usize {
-        self.code_to_prefix.len()
+        self.code_to_prefix.len() + self.base.as_ref().map_or(0, |b| b.code_to_prefix.len())
     }
 
     /// Whether no codes are registered.
     pub fn is_empty(&self) -> bool {
-        self.code_to_prefix.is_empty()
+        self.len() == 0
     }
 
     /// The next code that will be allocated.
@@ -728,10 +779,13 @@ impl NamespaceCodes {
         self.next_code
     }
 
-    /// Iterate over all registered `(code, prefix)` pairs.
+    /// Iterate over all registered `(code, prefix)` pairs. The layers are
+    /// disjoint: an entry is added locally only when the base lacks it.
     pub fn iter(&self) -> impl Iterator<Item = (u16, &str)> {
-        self.code_to_prefix
+        self.base
             .iter()
+            .flat_map(|b| b.code_to_prefix.iter())
+            .chain(self.code_to_prefix.iter())
             .map(|(&code, prefix)| (code, prefix.as_str()))
     }
 }
@@ -1449,5 +1503,65 @@ mod tests {
             let decoded = codes.decode_sid_strict(&sid).expect("decode must succeed");
             assert_eq!(decoded, iri, "encode/decode round-trip failed for {iri:?}");
         }
+    }
+
+    /// A registry layered over a snapshot copies nothing: lookups read
+    /// through the shared tables, defaults the snapshot lacks are added on
+    /// top, allocation continues above the snapshot's highest code, and a
+    /// conflicting default is reported rather than silently overwritten.
+    #[test]
+    fn layered_codes_read_through_shared_tables_without_copying() {
+        let mut base: HashMap<u16, String> = default_namespace_codes();
+        base.insert(USER_START, "http://a.example/".into());
+        base.insert(USER_START + 7, "http://b.example/".into());
+        let reverse: HashMap<String, u16> = base.iter().map(|(&c, p)| (p.clone(), c)).collect();
+        let base = Arc::new(base);
+        let reverse = Arc::new(reverse);
+        let mut codes = NamespaceCodes::layered_over(Arc::clone(&base), Arc::clone(&reverse))
+            .expect("defaults agree with the snapshot");
+        assert_eq!(
+            Arc::strong_count(&base),
+            2,
+            "the code table is shared, not copied"
+        );
+        assert_eq!(codes.len(), base.len());
+        assert_eq!(codes.get_code("http://b.example/"), Some(USER_START + 7));
+        assert_eq!(codes.get_prefix(USER_START), Some("http://a.example/"));
+        assert_eq!(
+            codes.allocate_prefix("http://a.example/").unwrap(),
+            USER_START
+        );
+        assert!(!codes.has_delta(), "an existing prefix allocates nothing");
+        let fresh = codes.allocate_prefix("http://c.example/").unwrap();
+        assert_eq!(fresh, USER_START + 8);
+        assert_eq!(
+            codes.delta().get(&fresh).map(String::as_str),
+            Some("http://c.example/")
+        );
+        assert_eq!(codes.iter().count(), base.len() + 1);
+        assert_eq!(
+            Arc::strong_count(&base),
+            2,
+            "allocating never copies the base"
+        );
+
+        // A snapshot missing a default gets it layered on top.
+        let (some_default, default_prefix) = default_namespace_codes().into_iter().next().unwrap();
+        let mut short = (*base).clone();
+        short.remove(&some_default);
+        let short_reverse: HashMap<String, u16> =
+            short.iter().map(|(&c, p)| (p.clone(), c)).collect();
+        let codes = NamespaceCodes::layered_over(Arc::new(short), Arc::new(short_reverse)).unwrap();
+        assert_eq!(
+            codes.get_prefix(some_default),
+            Some(default_prefix.as_str())
+        );
+
+        // A snapshot that contradicts a default is corrupt.
+        let mut wrong = (*base).clone();
+        wrong.insert(some_default, "http://not-the-default.example/".into());
+        let wrong_reverse: HashMap<String, u16> =
+            wrong.iter().map(|(&c, p)| (p.clone(), c)).collect();
+        assert!(NamespaceCodes::layered_over(Arc::new(wrong), Arc::new(wrong_reverse)).is_err());
     }
 }
