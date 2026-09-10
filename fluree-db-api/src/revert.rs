@@ -491,9 +491,15 @@ impl crate::Fluree {
             ApiError::internal(format!("Failed to build reverse graph during revert: {e}"))
         })?;
 
-        let view = StagedLedger::new(target_state, staged, &reverse_graph).map_err(|e| {
+        let mut view = StagedLedger::new(target_state, staged, &reverse_graph).map_err(|e| {
             ApiError::internal(format!("Failed to stage flakes during revert: {e}"))
         })?;
+
+        // Undoing a commit can remove a value a later shape requires. The
+        // inverted state is validated like any transaction producing it.
+        self.validate_branch_op_view(&mut view, &reverse_graph, &namespace_delta)
+            .await?
+            .into_result()?;
 
         let ns_registry = NamespaceRegistry::from_db(view.db());
         let mut commit_opts = CommitOpts::default().with_txn_meta(txn_meta);

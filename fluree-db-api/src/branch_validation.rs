@@ -38,16 +38,25 @@ impl BranchOpValidation {
     /// Turn a rejected outcome into the error a transaction producing the
     /// same state would return.
     pub(crate) fn into_result(self) -> Result<()> {
+        self.into_result_with(|report| report)
+    }
+
+    /// Like [`Self::into_result`], with `describe` wrapping the report in
+    /// the operation's own context (which commit a rebase stopped on, say).
+    pub(crate) fn into_result_with(self, describe: impl FnOnce(String) -> String) -> Result<()> {
         match self.report {
             None => Ok(()),
             #[cfg(feature = "shacl")]
-            Some(report) => Err(fluree_db_transact::TransactError::ShaclViolation(report).into()),
+            Some(report) => {
+                Err(fluree_db_transact::TransactError::ShaclViolation(describe(report)).into())
+            }
             // Without the feature no validator runs, so no report is ever
             // produced; keep the match total without naming a variant that
             // does not exist in this configuration.
             #[cfg(not(feature = "shacl"))]
             Some(report) => Err(crate::error::ApiError::internal(format!(
-                "SHACL violation reported without the shacl feature: {report}"
+                "SHACL violation reported without the shacl feature: {}",
+                describe(report)
             ))),
         }
     }

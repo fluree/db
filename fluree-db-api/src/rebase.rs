@@ -658,9 +658,22 @@ impl crate::Fluree {
             ApiError::internal(format!("Failed to build reverse graph during rebase: {e}"))
         })?;
 
-        let view = StagedLedger::new(state, flakes, &reverse_graph).map_err(|e| {
+        let mut view = StagedLedger::new(state, flakes, &reverse_graph).map_err(|e| {
             ApiError::internal(format!("Failed to stage flakes during rebase: {e}"))
         })?;
+
+        // A commit that conformed on the branch can violate a shape the
+        // source installed since the fork. Validate each replay against the
+        // state it lands on; the first violation aborts the whole rebase,
+        // which has published nothing yet, naming the commit it stopped on.
+        self.validate_branch_op_view(&mut view, &reverse_graph, &original_commit.namespace_delta)
+            .await?
+            .into_result_with(|report| {
+                format!(
+                    "replaying commit t={} would violate the source branch's shapes:\n{report}",
+                    original_commit.t
+                )
+            })?;
 
         let ns_registry = NamespaceRegistry::from_db(view.db());
         let commit_opts = CommitOpts::default()
