@@ -32,9 +32,13 @@ use fluree_db_core::db::{LedgerSnapshot, LedgerSnapshotMetadata};
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::ledger_config::LedgerConfig;
 use fluree_db_core::trace_commits_by_id;
-use fluree_db_core::{ledger_id::normalize_ledger_id, ContentId, ContentStore, StorageBackend};
+use fluree_db_core::{
+    ledger_id::normalize_ledger_id, ContentId, ContentStore, Sid, StorageBackend,
+};
 use fluree_db_ledger::{LedgerState, TypeErasedStore};
 use fluree_db_nameservice::NsRecord;
+use rustc_hash::FxHashSet;
+use std::collections::VecDeque;
 use tokio::sync::{oneshot, RwLock};
 
 use crate::error::{ApiError, Result};
@@ -198,6 +202,140 @@ struct LedgerHandleInner {
     /// Resolved-config cache, invalidated by the novelty config-write marker.
     /// Independent of `state` (see the lock-ordering note above).
     config_cache: RwLock<ConfigCacheEntry>,
+    /// The subjects the most recent commits touched, so a stage computed
+    /// against an earlier state can be re-based instead of redone (see
+    /// [`RecentCommits`]). Written and read only under the `state` write
+    /// lock; the mutex just satisfies the borrow checker.
+    recent_commits: parking_lot::Mutex<RecentCommits>,
+    write_paths: WritePathCounters,
+    /// Test hook: the next optimistic stage on this handle parks here after
+    /// staging and before taking the lock (see
+    /// [`LedgerHandle::gate_next_optimistic_stage_for_test`]).
+    stage_gate: parking_lot::Mutex<Option<StageGate>>,
+}
+
+/// A parked optimistic stage: tells the test it is parked, then waits to be
+/// released.
+pub(crate) struct StageGate {
+    parked: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::watch::Receiver<bool>,
+}
+
+impl StageGate {
+    pub(crate) async fn park(self) {
+        let StageGate {
+            parked,
+            mut release,
+        } = self;
+        let _ = parked.send(());
+        while !*release.borrow() {
+            if release.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
+/// One commit's footprint: where it sits in the chain and which subjects
+/// its flakes touched. `None` subjects means too many to keep (see
+/// [`MAX_FOOTPRINT_FLAKES`]): the commit is treated as touching everything.
+pub(crate) struct CommitFootprint {
+    pub t: i64,
+    pub parent: Option<ContentId>,
+    pub id: ContentId,
+    pub subjects: Option<Arc<FxHashSet<Sid>>>,
+}
+
+/// A commit with more flakes than this records no subject set. The ring
+/// would otherwise pin a bulk write's subjects for hundreds of commits, and
+/// a write that large is not what re-basing is for.
+pub(crate) const MAX_FOOTPRINT_FLAKES: usize = 100_000;
+
+/// Commits the ring remembers. Enough that a stage which lost the lock race
+/// a few times over is still re-basable; small enough to cost nothing.
+const RECENT_COMMITS: usize = 256;
+
+/// The footprints of the last commits, as one unbroken chain.
+///
+/// A stage computed against `(t0, head0)` can be committed over the current
+/// `(t1, head1)` when none of the commits in between touched anything it read
+/// or wrote. Answering that needs every one of those commits, so the ring
+/// keeps only a contiguous chain: a footprint that does not extend the last
+/// one (a reload, a recovery, a commit that went around this path) empties it,
+/// and a question the ring cannot answer completely is answered "unknown".
+#[derive(Default)]
+struct RecentCommits {
+    entries: VecDeque<CommitFootprint>,
+}
+
+impl RecentCommits {
+    fn push(&mut self, footprint: CommitFootprint) {
+        if let Some(back) = self.entries.back() {
+            if footprint.t != back.t + 1 || footprint.parent.as_ref() != Some(&back.id) {
+                self.entries.clear();
+            }
+        }
+        if self.entries.len() == RECENT_COMMITS {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(footprint);
+    }
+
+    /// The subjects touched by every commit after `(t0, head0)` up to and
+    /// including `(t1, head1)`, if the ring holds that whole chain and every
+    /// commit in it kept its subjects.
+    fn subjects_between(
+        &self,
+        t0: i64,
+        head0: Option<&ContentId>,
+        t1: i64,
+        head1: Option<&ContentId>,
+    ) -> Option<Vec<Arc<FxHashSet<Sid>>>> {
+        if t1 <= t0 {
+            return None;
+        }
+        let front_t = self.entries.front()?.t;
+        let first = usize::try_from(t0 + 1 - front_t).ok()?;
+        let last = usize::try_from(t1 - front_t).ok()?;
+        if last >= self.entries.len() {
+            return None;
+        }
+        let chain = self.entries.range(first..=last);
+        let (Some(oldest), Some(newest)) = (self.entries.get(first), self.entries.get(last)) else {
+            return None;
+        };
+        if oldest.parent.as_ref() != head0 || Some(&newest.id) != head1 {
+            return None;
+        }
+        chain.map(|f| f.subjects.as_ref().map(Arc::clone)).collect()
+    }
+}
+
+/// How a cached-handle write reached its commit, counted per handle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WritePathStats {
+    /// Staged against a snapshot the lock then confirmed unchanged.
+    pub direct: u64,
+    /// Staged against a snapshot the ledger moved past, and re-based over
+    /// the commits in between because none of them touched its subjects.
+    pub rebased: u64,
+    /// Staged against a snapshot the ledger moved past, and staged again
+    /// under the lock.
+    pub restaged: u64,
+}
+
+#[derive(Default)]
+struct WritePathCounters {
+    direct: AtomicU64,
+    rebased: AtomicU64,
+    restaged: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum WritePath {
+    Direct,
+    Rebased,
+    Restaged,
 }
 
 impl LedgerHandle {
@@ -215,8 +353,78 @@ impl LedgerHandle {
                 binary_store: RwLock::new(binary_store),
                 tier_width: AtomicUsize::new(fluree_db_novelty::DEFAULT_TIER_WIDTH),
                 config_cache: RwLock::new(ConfigCacheEntry::default()),
+                recent_commits: parking_lot::Mutex::new(RecentCommits::default()),
+                write_paths: WritePathCounters::default(),
+                stage_gate: parking_lot::Mutex::new(None),
             }),
         }
+    }
+
+    /// Park the next optimistic write on this handle between its stage and
+    /// its lock, so a test can commit something in between. The returned
+    /// receiver fires once that write is parked; sending `true` on the
+    /// returned sender releases it. One-shot: the gate is consumed by the
+    /// first write that reaches it.
+    #[doc(hidden)]
+    pub fn gate_next_optimistic_stage_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::watch::Sender<bool>,
+    ) {
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        *self.inner.stage_gate.lock() = Some(StageGate {
+            parked: parked_tx,
+            release: release_rx,
+        });
+        (parked_rx, release_tx)
+    }
+
+    pub(crate) fn take_stage_gate(&self) -> Option<StageGate> {
+        self.inner.stage_gate.lock().take()
+    }
+
+    /// How writes through this handle reached their commits so far.
+    pub fn write_path_stats(&self) -> WritePathStats {
+        let c = &self.inner.write_paths;
+        WritePathStats {
+            direct: c.direct.load(Ordering::Relaxed),
+            rebased: c.rebased.load(Ordering::Relaxed),
+            restaged: c.restaged.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn note_write_path(&self, path: WritePath) {
+        let c = &self.inner.write_paths;
+        match path {
+            WritePath::Direct => &c.direct,
+            WritePath::Rebased => &c.rebased,
+            WritePath::Restaged => &c.restaged,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Remember a commit just installed under the write lock.
+    pub(crate) fn record_commit(&self, footprint: CommitFootprint) {
+        self.inner.recent_commits.lock().push(footprint);
+    }
+
+    /// The subjects touched by every commit after `(t0, head0)` up to the
+    /// current `(t1, head1)`, or `None` when this handle does not know all
+    /// of them. Call under the write lock, so the answer describes the state
+    /// the caller is about to commit over.
+    pub(crate) fn subjects_committed_between(
+        &self,
+        t0: i64,
+        head0: Option<&ContentId>,
+        t1: i64,
+        head1: Option<&ContentId>,
+    ) -> Option<Vec<Arc<FxHashSet<Sid>>>> {
+        self.inner
+            .recent_commits
+            .lock()
+            .subjects_between(t0, head0, t1, head1)
     }
 
     /// Fetch the cached resolved config if it was resolved at `key` (the

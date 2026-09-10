@@ -412,6 +412,7 @@ impl Fluree {
             txn_meta,
             graph_delta,
             sync_graph: _,
+            scope: _,
         } = outcome.stage_result;
 
         let commit_opts = fluree_db_transact::CommitOpts::default()
