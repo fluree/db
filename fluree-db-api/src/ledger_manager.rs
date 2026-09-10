@@ -2204,51 +2204,40 @@ impl UpdatePlan {
         local_index_id: Option<&ContentId>,
         ns: &NsRecord,
     ) -> Self {
+        // An index the record names that the cached state has not installed.
+        // Valid whenever the record's index is newer than the local one: the
+        // index covers a prefix of commits, so it applies equally to a local
+        // state at, ahead of, or behind the record's commit head.
+        let index_advance = match (&ns.index_head_id, local_index_id) {
+            (Some(ns_idx), Some(local_idx))
+                if ns_idx != local_idx && ns.index_t > local_index_t =>
+            {
+                Some((ns_idx.clone(), ns.index_t))
+            }
+            (Some(ns_idx), None) if ns.index_t > local_index_t => {
+                Some((ns_idx.clone(), ns.index_t))
+            }
+            _ => None,
+        };
+
         if ns.commit_t == local_t {
-            // Commits are in sync - check if index advanced
-            match (&ns.index_head_id, local_index_id) {
-                (Some(ns_idx), Some(local_idx))
-                    if ns_idx != local_idx && ns.index_t > local_index_t =>
-                {
-                    // Index advanced, same commit_t
-                    UpdatePlan::IndexOnly {
-                        index_head_id: ns_idx.clone(),
-                        index_t: ns.index_t,
-                    }
-                }
-                (Some(ns_idx), None) if ns.index_t > local_index_t => {
-                    // Index appeared where there was none
-                    UpdatePlan::IndexOnly {
-                        index_head_id: ns_idx.clone(),
-                        index_t: ns.index_t,
-                    }
-                }
-                _ => UpdatePlan::Noop,
+            match index_advance {
+                Some((index_head_id, index_t)) => UpdatePlan::IndexOnly {
+                    index_head_id,
+                    index_t,
+                },
+                None => UpdatePlan::Noop,
             }
         } else if ns.commit_t > local_t && (ns.commit_t - local_t) <= MAX_INCREMENTAL_COMMITS {
             // Small gap — catch up incrementally
             let gap = ns.commit_t - local_t;
             match &ns.commit_head_id {
-                Some(cid) => {
-                    // Check if index also advanced
-                    let index_update = match (&ns.index_head_id, local_index_id) {
-                        (Some(ns_idx), Some(local_idx))
-                            if ns_idx != local_idx && ns.index_t > local_index_t =>
-                        {
-                            Some((ns_idx.clone(), ns.index_t))
-                        }
-                        (Some(ns_idx), None) if ns.index_t > local_index_t => {
-                            Some((ns_idx.clone(), ns.index_t))
-                        }
-                        _ => None,
-                    };
-                    UpdatePlan::CommitCatchUp {
-                        commit_head_id: cid.clone(),
-                        commit_t: ns.commit_t,
-                        gap,
-                        index_update,
-                    }
-                }
+                Some(cid) => UpdatePlan::CommitCatchUp {
+                    commit_head_id: cid.clone(),
+                    commit_t: ns.commit_t,
+                    gap,
+                    index_update: index_advance,
+                },
                 None => UpdatePlan::Reload,
             }
         } else if ns.commit_t > local_t {
@@ -2256,19 +2245,30 @@ impl UpdatePlan {
             UpdatePlan::Reload
         } else {
             // ns.commit_t < local_t: the record is older than the cached
-            // state. Routine under the raft commit worker — `notify` reads
-            // the record before taking the ledger's state lock, and the
-            // worker holds that lock's write side across the next chunk's
-            // stage + publish + install, so a reconciliation queued behind
-            // it wakes to a local state one commit newer than the record
-            // it fetched. Local is the fresher of the two; the next lookup
-            // catches the record up. Nothing to do.
-            tracing::debug!(
-                local_t = local_t,
-                ns_commit_t = ns.commit_t,
-                "nameservice record older than local state; ignoring"
-            );
-            UpdatePlan::Noop
+            // state on commits. Routine on a busy writer — `notify` reads
+            // the record before it reads the local metrics, so a commit
+            // that lands in between (or, under the raft commit worker, a
+            // whole chunk staged behind the state lock) leaves the local
+            // state a commit newer than the record. Local is the fresher
+            // of the two on commits, so there is nothing to catch up. An
+            // index the record names is still installed: skipping it here
+            // left the novelty uncleared while every subsequent commit saw
+            // an oversized novelty and re-triggered a build, and the next
+            // publish raced the same way.
+            match index_advance {
+                Some((index_head_id, index_t)) => UpdatePlan::IndexOnly {
+                    index_head_id,
+                    index_t,
+                },
+                None => {
+                    tracing::debug!(
+                        local_t = local_t,
+                        ns_commit_t = ns.commit_t,
+                        "nameservice record older than local state; ignoring"
+                    );
+                    UpdatePlan::Noop
+                }
+            }
         }
     }
 
@@ -2860,6 +2860,31 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_record_behind_on_commits_still_installs_its_newer_index() {
+        // A commit landed between the record lookup and the local metrics
+        // read: local t is one past the record, and the record names an
+        // index the cached state has not installed.
+        let local_idx = make_index_cid("index:2");
+        let ns_idx = make_index_cid("index:61");
+        let ns = make_ns_record(66, 61, Some(make_cid("commit:66")), Some(ns_idx.clone()));
+        let plan = UpdatePlan::plan(67, 2, Some(&local_idx), &ns);
+        assert_eq!(
+            plan,
+            UpdatePlan::IndexOnly {
+                index_head_id: ns_idx,
+                index_t: 61
+            }
+        );
+
+        // Same lag with no index advance stays a no-op.
+        let ns = make_ns_record(66, 2, Some(make_cid("commit:66")), Some(local_idx.clone()));
+        assert_eq!(
+            UpdatePlan::plan(67, 2, Some(&local_idx), &ns),
+            UpdatePlan::Noop
+        );
     }
 
     #[test]
