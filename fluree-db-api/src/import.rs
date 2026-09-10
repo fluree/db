@@ -111,6 +111,15 @@ async fn publish_import_commit_head(
 const IMPORT_PIPELINE_WAIT_LOG_THRESHOLD_MS: u128 = 50;
 const LOCAL_RECHUNK_EVENT_CHANNEL_CAPACITY: usize = 2;
 
+fn log_ttl_chunk(idx: usize, ttl: &str) {
+    tracing::debug!(
+        chunk_idx = idx,
+        chunk_text_len = ttl.len(),
+        starts_with = ttl.chars().take(200).collect::<String>(),
+        "about to parse chunk"
+    );
+}
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -4603,12 +4612,7 @@ where
                         };
 
                         let t = (idx + 1) as i64;
-                        tracing::debug!(
-                            chunk_idx = idx,
-                            chunk_text_len = ttl.len(),
-                            starts_with = &ttl[..ttl.len().min(200)],
-                            "about to parse chunk"
-                        );
+                        log_ttl_chunk(idx, &ttl);
                         // This arm streams a SINGLE local file, so every chunk
                         // belongs to the same document; `idx` is its sub-chunk
                         // index inside that document.
@@ -7275,6 +7279,34 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod logging_tests {
+    use super::log_ttl_chunk;
+
+    #[test]
+    fn unicode_chunk_logging_at_byte_200() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(tracing::Level::DEBUG));
+            for character in ['±', '界', '🦀'] {
+                let start = "<http://example.org/s> <http://example.org/p> \"";
+                let ttl = format!(
+                    "{start}{}{character} trailing text\" .\n",
+                    "a".repeat(199 - start.len())
+                );
+                assert!(!ttl.is_char_boundary(200));
+                log_ttl_chunk(0, &ttl);
+            }
+            for ttl in ["", "short ±界🦀", &"a".repeat(201), &"界".repeat(100)] {
+                log_ttl_chunk(0, ttl);
+            }
+        });
+    }
 }
 
 #[cfg(test)]

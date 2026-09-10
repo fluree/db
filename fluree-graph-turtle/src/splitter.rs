@@ -235,7 +235,7 @@ fn extract_prefix_block_from_bytes(buf: &[u8]) -> Result<(String, u64), SplitErr
     tracing::info!(
         prefix_len = prefix_text.len(),
         data_start,
-        prefix_first_500 = &prefix_text[..prefix_text.len().min(500)],
+        prefix_first_500 = prefix_text.chars().take(500).collect::<String>(),
         "prefix block extracted"
     );
 
@@ -991,7 +991,7 @@ impl StreamingTurtleReader {
             chunk_size_mb = chunk_size_bytes / (1024 * 1024),
             prefix_bytes = prefix_block.len(),
             data_start,
-            prefix_first_200 = &prefix_block[..prefix_block.len().min(200)],
+            prefix_first_200 = prefix_block.chars().take(200).collect::<String>(),
             "streaming reader: prefix extracted, spawning reader thread"
         );
 
@@ -2068,6 +2068,44 @@ ex:bob ex:name \"Bob\" .
     }
 
     // ---- StreamingTurtleReader tests ----
+
+    fn assert_unicode_prefix_logging(limit: usize) {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(tracing::Level::INFO));
+            for character in ['±', '界', '🦀'] {
+                let start = "@prefix ex: <http://example.org/";
+                // Put a multibyte character across the old byte cutoff.
+                let prefix = format!(
+                    "{start}{}{character}/> .\n",
+                    "a".repeat(limit - 1 - start.len())
+                );
+                assert!(!prefix.is_char_boundary(limit));
+                let data = "ex:alice ex:name \"Alice\" .\n";
+                let f = write_temp(&format!("{prefix}{data}"));
+                let mut reader = StreamingTurtleReader::new(f.path(), 64 * 1024, 2, None)
+                    .expect("Unicode prefix logging must not panic");
+                assert_eq!(reader.prefix_block(), prefix);
+                let (_, raw) = reader.recv_chunk().unwrap().unwrap();
+                assert_eq!(String::from_utf8(raw).unwrap(), data);
+                assert!(reader.recv_chunk().unwrap().is_none());
+                assert_eq!(reader.join().unwrap(), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn unicode_prefix_logging_at_byte_500() {
+        assert_unicode_prefix_logging(500);
+    }
+
+    #[test]
+    fn unicode_prefix_logging_at_byte_200() {
+        assert_unicode_prefix_logging(200);
+    }
 
     /// Helper: receive a chunk from the reader, prepend prefix, return full TTL text.
     fn recv_as_text(reader: &StreamingTurtleReader) -> Option<(usize, String)> {

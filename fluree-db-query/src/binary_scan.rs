@@ -3539,15 +3539,18 @@ fn resolve_string_v3(
     store: &BinaryIndexStore,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
 ) -> std::io::Result<u32> {
-    find_string_id_v3(value, store, dict_novelty)?.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "string not found in dict: {}",
-                &value[..value.len().min(50)]
-            ),
-        )
-    })
+    find_string_id_v3(value, store, dict_novelty)?.ok_or_else(|| string_not_found_error(value))
+}
+
+fn string_not_found_error(value: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!(
+            "string not found in dict: {}",
+            // A byte limit can split a UTF-8 character and panic while reporting the miss.
+            value.chars().take(50).collect::<String>()
+        ),
+    )
 }
 
 /// Convert a FlakeValue to `(OType, o_key)` in V3 encoding.
@@ -4504,6 +4507,46 @@ mod bounded_overlay_walk_tests {
 mod tests {
     use super::*;
     use fluree_db_core::{stats_view::GraphPropertyStatData, StatsView, ValueTypeTag};
+
+    #[test]
+    fn string_not_found_error_preserves_short_values_and_truncates_ascii() {
+        for (value, preview) in [
+            (String::new(), String::new()),
+            ("tolerance ±0.1".to_owned(), "tolerance ±0.1".to_owned()),
+            ("a".repeat(50), "a".repeat(50)),
+            ("a".repeat(51), "a".repeat(50)),
+        ] {
+            let error = string_not_found_error(&value);
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            assert_eq!(
+                error.to_string(),
+                format!("string not found in dict: {preview}")
+            );
+        }
+    }
+
+    #[test]
+    fn string_not_found_error_handles_multibyte_characters_at_truncation_boundary() {
+        // Byte 50 splits each of these UTF-8 characters. Formatting the
+        // dictionary miss must return an error rather than panic.
+        for character in ['±', '界', '🦀'] {
+            let preview = format!("{}{character}", "a".repeat(49));
+            let value = format!("{preview} trailing text");
+            let error = string_not_found_error(&value);
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            assert_eq!(
+                error.to_string(),
+                format!("string not found in dict: {preview}")
+            );
+        }
+
+        // Fewer than 50 characters can still exceed 50 bytes.
+        let value = "界".repeat(20);
+        assert_eq!(
+            string_not_found_error(&value).to_string(),
+            format!("string not found in dict: {value}")
+        );
+    }
 
     fn stats_with(
         datatypes: Vec<(ValueTypeTag, u64)>,
