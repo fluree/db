@@ -392,8 +392,8 @@ under load, costs two more flushes for its header and directory entry.
 A background thread flushes the files a closed log segment covered and removes
 the segment, so the log only ever holds the recent tail. That flush is one
 batch: each file the segment named is flushed once however many records named
-it, and on macOS the batch costs one drive-cache barrier rather than one per
-file. Opening the root replays what is left — the connection and builder paths
+it, and the batch is committed with one call rather than one per file: a
+filesystem sync on Linux, a drive-cache barrier on macOS. Opening the root replays what is left — the connection and builder paths
 do this before anything reads — and a clean shutdown leaves no segments at all.
 
 The files on disk remain the database. The log adds nothing another version of

@@ -261,6 +261,12 @@ fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<D
         let Some(header) = bytes.get(at..at + FRAME_HEADER) else {
             break false;
         };
+        if header[..4] == [0; 4] {
+            // The preallocated tail: nothing was ever written here. A frame
+            // whose first bytes never landed reads the same, and was never
+            // acknowledged either.
+            break true;
+        }
         if &header[..4] != FRAME_MAGIC {
             break false;
         }
@@ -525,13 +531,22 @@ fn fsync_dir(path: &Path, fsyncs: &AtomicU64) -> io::Result<()> {
     Ok(())
 }
 
-/// Hand `file` to the drive. On Apple platforms `sync_all` is `F_FULLFSYNC`,
-/// which also flushes the drive's own cache, a cost that need only be paid
-/// once per batch: `fsync(2)` alone moves the file to the drive, and one
-/// full flush at the end of the batch commits everything handed over before
-/// it. Elsewhere `fsync(2)` is the flush. A file the drive accepts from
-/// `fsync(2)` but refuses `F_FULLFSYNC` for (a device node, in tests) only
-/// fails the batch when it receives that final flush.
+/// Hand `file` to the drive as part of a batch that one call at the end
+/// commits, where the platform has such a call.
+///
+/// On Apple platforms `sync_all` is `F_FULLFSYNC`, which also flushes the
+/// drive's own cache, a cost that need only be paid once per batch: `fsync(2)`
+/// alone moves the file to the drive, and one full flush at the end commits
+/// everything handed over before it. A file the drive accepts from `fsync(2)`
+/// but refuses `F_FULLFSYNC` for (a device node, in tests) only fails the batch
+/// when it receives that final flush.
+///
+/// On Linux each `fsync(2)` is a journal commit of its own, so a batch of a
+/// few hundred retired files was a few hundred of them, issued one after
+/// another from the flusher thread while commits waited for the same device.
+/// `sync_file_range` starts the file's write-back without waiting, and one
+/// `syncfs` at the end waits for all of it and commits the journal once.
+/// Elsewhere `fsync(2)` is the flush.
 fn writeback(file: &File, fsyncs: &AtomicU64) -> io::Result<()> {
     #[cfg(target_vendor = "apple")]
     {
@@ -540,8 +555,29 @@ fn writeback(file: &File, fsyncs: &AtomicU64) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE) }
+            != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     file.sync_all()?;
+    fsyncs.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// The Linux batch commit: flush the filesystem holding `base` and wait.
+#[cfg(target_os = "linux")]
+fn syncfs(base: &Path, fsyncs: &AtomicU64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let dir = File::open(base)?;
+    if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     fsyncs.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -549,7 +585,8 @@ fn writeback(file: &File, fsyncs: &AtomicU64) -> io::Result<()> {
 /// Flush the files named by `keys` and every directory between them and the
 /// root. Missing files were deleted after being logged, which is fine: the
 /// directory flush makes the unlink durable. A key named more than once is
-/// flushed once; on Apple platforms the whole batch costs one drive flush.
+/// flushed once; on Apple platforms the whole batch costs one drive flush, on
+/// Linux one filesystem sync.
 pub(super) fn flush_keys(base: &Path, keys: &[String], fsyncs: &AtomicU64) -> io::Result<()> {
     let mut unique: Vec<&String> = keys.iter().collect();
     unique.sort_unstable();
@@ -558,14 +595,15 @@ pub(super) fn flush_keys(base: &Path, keys: &[String], fsyncs: &AtomicU64) -> io
     // The full flush at the end goes to the last file, or failing any file
     // to the last directory, so a file the drive refuses still fails the
     // batch.
-    let mut last_file: Option<File> = None;
-    let mut last_dir: Option<File> = None;
+    let mut barrier: Option<File> = None;
+    let mut any_file = false;
     for key in unique {
         let path = base.join(key);
         match File::open(&path) {
             Ok(file) => {
                 writeback(&file, fsyncs)?;
-                last_file = Some(file);
+                barrier = Some(file);
+                any_file = true;
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -579,25 +617,32 @@ pub(super) fn flush_keys(base: &Path, keys: &[String], fsyncs: &AtomicU64) -> io
         }
     }
     // Directories are flushed on Unix only, as `fsync_dir` does: elsewhere
-    // they cannot be opened as files, and the log is never enabled there.
-    if cfg!(unix) {
-        for dir in dirs {
-            match File::open(&dir) {
+    // they cannot be opened as files, and the log is never enabled there. On
+    // Linux the filesystem sync below covers them.
+    if cfg!(unix) && !cfg!(target_os = "linux") {
+        for dir in &dirs {
+            match File::open(dir) {
                 Ok(file) => {
                     writeback(&file, fsyncs)?;
-                    last_dir = Some(file);
+                    if barrier.is_none() {
+                        barrier = Some(file);
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
         }
     }
-    if cfg!(target_vendor = "apple") {
-        if let Some(file) = last_file.or(last_dir) {
-            file.sync_all()?;
-            fsyncs.fetch_add(1, Ordering::Relaxed);
-        }
+    #[cfg(target_vendor = "apple")]
+    if let Some(file) = &barrier {
+        file.sync_all()?;
+        fsyncs.fetch_add(1, Ordering::Relaxed);
     }
+    #[cfg(target_os = "linux")]
+    if any_file || !dirs.is_empty() {
+        syncfs(base, fsyncs)?;
+    }
+    let _ = (&barrier, any_file);
     Ok(())
 }
 
@@ -1014,7 +1059,9 @@ impl Wal {
         }
         #[cfg(not(test))]
         let _ = leading;
-        file.sync_all()?;
+        // Segments are preallocated, so a data-only flush covers every frame;
+        // where `sync_data` is the same call as `sync_all` nothing changes.
+        file.sync_data()?;
         self.fsyncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -1220,6 +1267,17 @@ impl Wal {
         let mut header = SEGMENT_MAGIC.to_vec();
         header.extend_from_slice(&first_seq.to_le_bytes());
         file.write_all(&header)?;
+        // Filled with zeros to its rotation size, so appending never grows
+        // the file: a flush then carries only data, which on Linux is a
+        // fraction of the cost of one that must also commit the inode.
+        // Replay reads the zero tail as the end of the segment.
+        let zeros = vec![0u8; 1 << 20];
+        let mut filled = header.len() as u64;
+        while filled < ROTATE_BYTES {
+            let chunk = (ROTATE_BYTES - filled).min(zeros.len() as u64) as usize;
+            file.write_all(&zeros[..chunk])?;
+            filled += chunk as u64;
+        }
         file.sync_all()?;
         self.fsyncs.fetch_add(1, Ordering::Relaxed);
         std::fs::rename(&tmp, &path)?;
