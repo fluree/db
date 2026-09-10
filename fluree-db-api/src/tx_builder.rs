@@ -2446,11 +2446,14 @@ impl Fluree {
         const MAX_RETRIES: usize = 16;
         for attempt in 0..MAX_RETRIES {
             let (write_guard, stage_result, txn_type, commit_opts) = if attempt == 0 {
+                let snapshot_started = std::time::Instant::now();
                 let snap = ledger.snapshot().await;
+                let snapshot_us = snapshot_started.elapsed().as_micros() as u64;
                 let base_t = snap.t;
                 let base_head_id = snap.head_commit_id.clone();
                 let ledger_state = snap.to_ledger_state();
 
+                let stage_started = std::time::Instant::now();
                 let (stage_result, txn_type, commit_opts) = self
                     .stage_plan(
                         &op_plan,
@@ -2461,11 +2464,22 @@ impl Fluree {
                         &index_config,
                     )
                     .await?;
+                let stage_us = stage_started.elapsed().as_micros() as u64;
                 if let Some(gate) = ledger.take_stage_gate() {
                     gate.park().await;
                 }
 
+                let lock_started = std::time::Instant::now();
                 let write_guard = ledger.lock_for_write().await;
+                tracing::debug!(
+                    target: "fluree::write_path",
+                    ledger = ledger.id(),
+                    base_t,
+                    snapshot_us,
+                    stage_us,
+                    lock_wait_us = lock_started.elapsed().as_micros() as u64,
+                    "staged"
+                );
                 let unchanged = write_guard.state().t() == base_t
                     && write_guard.state().head_commit_id.as_ref() == base_head_id.as_ref();
                 if unchanged {
