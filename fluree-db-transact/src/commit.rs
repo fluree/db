@@ -671,10 +671,24 @@ pub async fn build_commit(
 
     // Apply envelope deltas (namespace + graph) to the in-memory LedgerSnapshot.
     // This must happen before novelty apply so encode_iri() works for graph routing.
-    Arc::make_mut(&mut base.snapshot).apply_envelope_deltas(
+    //
+    // The range provider holds the namespace table as its fallback, so with it
+    // attached the extension below would copy the table. It is taken off for
+    // the extension and put back as it was; `finalize_state_with_base` rebuilds
+    // it over the extended table.
+    let provider = if ns_delta.is_empty() {
+        None
+    } else {
+        Arc::make_mut(&mut base.snapshot).range_provider.take()
+    };
+    let applied = Arc::make_mut(&mut base.snapshot).apply_envelope_deltas(
         &ns_delta,
         graph_delta.values().map(std::string::String::as_str),
-    )?;
+    );
+    if let Some(provider) = provider {
+        Arc::make_mut(&mut base.snapshot).range_provider = Some(provider);
+    }
+    applied?;
 
     // Resolve the commit's event time (`Commit.time`, the `@iso:` axis) and
     // the optional audit-axis receivedAt stamp. Validates monotonicity and
