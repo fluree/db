@@ -81,9 +81,9 @@ pub struct StagedMerge {
     /// `None` for fast-forward (the ref just advances to
     /// `new_head_*`).
     pub commit: Option<GuardedStagedCommit>,
-    /// Source's index ref (if any). Best-effort copy after the ref
-    /// advance so the target reuses the source's index. Only set for
-    /// fast-forward — general merge invalidates the source's index.
+    /// Source's index artifacts to copy best-effort after a general merge.
+    /// The root is never published as the target's index. Fast-forward
+    /// merges leave this unset and retain the target's own index.
     pub source_index_for_publish: Option<(ContentId, i64)>,
     /// Source ledger id used as the source for any best-effort
     /// post-apply index copy. Carried through so the apply path can
@@ -120,6 +120,17 @@ impl crate::Fluree {
     ///
     /// If `target_branch` is `None`, the source's parent branch (from its
     /// branch point) is used as the target.
+    ///
+    /// On a queue-backed nameservice, this direct API's fast-forward uses
+    /// a ref CAS through consensus, bypassing the per-branch work queue.
+    /// It can therefore overtake previously queued transactions. Server
+    /// merges submitted through `QueuedTransactor` remain queue-ordered.
+    /// If the target head changes after preparation, re-run the merge on
+    /// `BranchConflict` to recompute against that head.
+    ///
+    /// Fast-forward retains the target's index and replays the merged
+    /// commits on reads until indexing catches up; it does not adopt or
+    /// copy the source's index artifacts.
     pub async fn merge_branch(
         &self,
         ledger_name: &str,
@@ -500,11 +511,6 @@ impl crate::Fluree {
             .await?;
 
         let current_head_t = ancestor.map(|a| a.t).unwrap_or(0);
-        let source_index_for_publish = source_record
-            .index_head_id
-            .as_ref()
-            .map(|cid| (cid.clone(), source_record.index_t));
-
         Ok(StagedMerge {
             target: resolved_target.to_string(),
             source: source_branch.to_string(),
@@ -521,7 +527,7 @@ impl crate::Fluree {
             new_head_t: source_head_t,
             new_head_id: source_head_id,
             commit: None,
-            source_index_for_publish,
+            source_index_for_publish: None,
         })
     }
 
