@@ -6,7 +6,7 @@ use crate::binding::{Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::context::WellKnownDatatypes;
 use crate::error::{QueryError, Result};
-use crate::ir::{Expression, Function};
+use crate::ir::{CompareOp, Expression, Function};
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
 use fluree_db_core::temporal::CalendarField;
 use fluree_db_core::{FlakeValue, ObjKind};
@@ -64,6 +64,13 @@ struct CacheableBoolPredicate {
 pub struct PreparedBoolExpression {
     expr: Expression,
     cache_spec: Option<CacheableBoolPredicate>,
+    /// `?var = <const>` / `!=`: `compare::fast_eq_ne_for_iri_bindings` answers
+    /// this shape with a memoized constant resolution and a `u64` compare,
+    /// which is cheaper than probing the encoded-bool-predicate cache — over
+    /// ~4k distinct products BSBM Q5's `FILTER(<product> != ?product)` spent
+    /// more time thrashing the 256-entry LRU than comparing. Tried first; rows
+    /// it cannot decide still go through the cache.
+    iri_eq_op: Option<CompareOp>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,7 +172,12 @@ pub fn build_regex_with_flags(pattern: &str, flags: &str) -> Result<Regex> {
 impl PreparedBoolExpression {
     pub fn new(expr: Expression) -> Self {
         let cache_spec = analyze_cacheable_bool_predicate(&expr);
-        Self { expr, cache_spec }
+        let iri_eq_op = cache_spec.and(var_const_eq_shape(&expr));
+        Self {
+            expr,
+            cache_spec,
+            iri_eq_op,
+        }
     }
 
     pub fn expr(&self) -> &Expression {
@@ -181,6 +193,11 @@ impl PreparedBoolExpression {
         row: &R,
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<bool> {
+        if let (Some(op), Expression::Call { args, .. }) = (self.iri_eq_op, &self.expr) {
+            if let Some(pass) = super::compare::fast_eq_ne_for_iri_bindings(op, args, row, ctx)? {
+                return Ok(pass);
+            }
+        }
         if let Some(pass) =
             eval_cached_bool_predicate_with_spec(self.cache_spec.as_ref(), row, ctx, || {
                 self.expr.eval_to_bool_uncached(row, ctx)
@@ -253,6 +270,27 @@ fn eval_cached_bool_predicate_with_spec<R: RowAccess>(
         cache.borrow_mut().put(cache_key, pass);
     });
     Ok(Some(pass))
+}
+
+/// `Eq`/`Ne` between one variable and one variable-free operand — the shape
+/// [`super::compare::fast_eq_ne_for_iri_bindings`] decides for a
+/// resource-valued binding without materializing anything.
+fn var_const_eq_shape(expr: &Expression) -> Option<CompareOp> {
+    let Expression::Call { func, args } = expr else {
+        return None;
+    };
+    let op = match func {
+        Function::Eq => CompareOp::Eq,
+        Function::Ne => CompareOp::Ne,
+        _ => return None,
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    let is_var = |e: &Expression| matches!(e, Expression::Var(_));
+    let is_const = |e: &Expression| !is_var(e) && e.referenced_vars().is_empty();
+    ((is_var(&args[0]) && is_const(&args[1])) || (is_const(&args[0]) && is_var(&args[1])))
+        .then_some(op)
 }
 
 /// Cheap, hash-free variable-usage walk used to pre-filter cacheable predicates.

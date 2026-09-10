@@ -20,7 +20,7 @@ use crate::exists::ExistsOperator;
 use crate::filter::{contains_exists, FilterOperator};
 use crate::hash_join::HashJoinPlanner;
 use crate::ir::triple::{Ref, Term, TriplePattern};
-use crate::ir::{Expression, Pattern};
+use crate::ir::{CompareOp, Expression, Function, Pattern};
 use crate::join::NestedLoopJoinOperator;
 use crate::minus::MinusOperator;
 use crate::operator::inline::InlineOperator;
@@ -29,6 +29,7 @@ use crate::optional::{GroupedPatternOptionalBuilder, OptionalOperator, PlanTreeO
 use crate::planner::{analyze_property_join, is_property_join, reorder_patterns};
 use crate::property_join::PropertyJoinOperator;
 use crate::property_path::PropertyPathOperator;
+use crate::range_semijoin::{RangeSemiJoinCondition, RangeSemiJoinOperator};
 use crate::seed::EmptyOperator;
 use crate::semijoin::SemijoinOperator;
 use crate::subquery::SubqueryOperator;
@@ -1520,11 +1521,47 @@ fn build_sequential_join_block(
     // not 1 — otherwise a large object predicate falsely trips scan-ratio-too-high.
     let mut hash_planner = HashJoinPlanner::new(ctx.stats)
         .with_left_estimate(operator.as_ref().and_then(|o| o.estimated_rows()));
+    let mut dead_before_step = 0usize;
+    let mut folded = vec![false; triples.len()];
     for (k, tp) in triples.iter().enumerate() {
+        if folded[k] {
+            continue;
+        }
         hash_planner.before_step(tp, &bound);
         let mut vars_after: HashSet<VarId> = bound.clone();
         for v in tp.produced_vars() {
             vars_after.insert(v);
+        }
+
+        // Later `?s <p> ?v . FILTER(range on ?v)` pairs answered as a semi-join
+        // behind this step — see `RangeSemiJoinOperator`.
+        let folds = match base_vars.as_ref() {
+            Some(base) => collect_range_semijoin_folds(
+                tp,
+                k,
+                triples,
+                &folded,
+                &bound,
+                &vars_after,
+                base,
+                &pending_binds,
+                &pending_filters,
+                &pushdown.consumed_indices,
+                &pushdown.object_bounds,
+                ctx,
+                hash_planner.step_est(),
+            ),
+            None => Vec::new(),
+        };
+        for fold in &folds {
+            folded[fold.triple_idx] = true;
+        }
+        if !folds.is_empty() {
+            pending_filters.retain(|f| {
+                !folds
+                    .iter()
+                    .any(|x| x.filter_original_idx == f.original_idx)
+            });
         }
 
         // Build interleaved inline operators: eligible filters first, then binds
@@ -1547,7 +1584,9 @@ fn build_sequential_join_block(
             live.extend(
                 triples[k + 1..]
                     .iter()
-                    .flat_map(crate::ir::triple::TriplePattern::referenced_vars),
+                    .zip(&folded[k + 1..])
+                    .filter(|(_, folded)| !**folded)
+                    .flat_map(|(t, _)| t.referenced_vars()),
             );
             live.extend(
                 pending_filters
@@ -1571,18 +1610,45 @@ fn build_sequential_join_block(
             None
         };
 
+        // The join must still carry the folded filters' operands for the
+        // semi-join's re-check; the semi-join then trims them away.
+        let join_live: Option<Vec<VarId>> = live_vars.as_ref().map(|live| {
+            let mut vars = live.clone();
+            for fold in &folds {
+                for v in fold.condition.filter.referenced_vars() {
+                    if v != fold.condition.value_var && !vars.contains(&v) {
+                        vars.push(v);
+                    }
+                }
+            }
+            vars
+        });
+
         let emit = emit_mask_for_triple(tp, ctx.var_counts, ctx.protected_vars);
         let op = build_scan_or_join(
             operator,
             tp,
             &pushdown.object_bounds,
             inline_ops,
-            live_vars.as_deref(),
+            join_live.as_deref(),
             emit,
             ctx.group_by,
             ctx.planning,
             &hash_planner,
         );
+        let op: BoxedOperator = if folds.is_empty() {
+            op
+        } else {
+            let subject_var = folds[0].subject_var;
+            let conditions = folds.into_iter().map(|f| f.condition).collect();
+            Box::new(RangeSemiJoinOperator::new(
+                op,
+                subject_var,
+                conditions,
+                live_vars.as_deref(),
+                *ctx.planning,
+            ))
+        };
         bound.extend(op.schema().iter().copied());
         operator = Some(op);
 
@@ -1597,12 +1663,15 @@ fn build_sequential_join_block(
             );
             pending_binds = new_binds;
             pending_filters = new_filters;
-            operator =
-                if ctx.where_dedup_safe && pruned_vars.as_ref().is_some_and(|s| !s.is_empty()) {
-                    Some(Box::new(DistinctOperator::new(child)))
-                } else {
-                    Some(child)
-                };
+            let dead_after_step = pruned_vars.as_ref().map_or(0, HashSet::len);
+            operator = if ctx.where_dedup_safe
+                && early_dedup_needed(dead_before_step, dead_after_step, ctx.planning)
+            {
+                Some(Box::new(DistinctOperator::new(child)))
+            } else {
+                Some(child)
+            };
+            dead_before_step = dead_before_step.max(dead_after_step);
         }
     }
 
@@ -3136,6 +3205,7 @@ fn build_sequential_triple_chain(
     let mut seen_vars: HashSet<VarId> = bound_vars_from_operator(&operator);
     let mut hash_planner = HashJoinPlanner::new(ctx.stats)
         .with_left_estimate(operator.as_ref().and_then(|o| o.estimated_rows()));
+    let mut dead_before_step = 0usize;
     for (k, pattern) in triples.iter().enumerate() {
         hash_planner.before_step(pattern, &seen_vars);
         seen_vars.extend(pattern.produced_vars());
@@ -3162,8 +3232,8 @@ fn build_sequential_triple_chain(
         ));
 
         // Early dedup (sound because downstream is multiplicity-insensitive —
-        // see `where_dedup_safe`): if any variables seen so far are no longer
-        // live, collapse duplicates early to avoid downstream join blowups.
+        // see `where_dedup_safe`) where this step trimmed a variable that was
+        // still live before it — see `early_dedup_needed`.
         if ctx.where_dedup_safe {
             if let Some(live) = live_vars.as_ref() {
                 let live_set: HashSet<VarId> = live.iter().copied().collect();
@@ -3172,16 +3242,221 @@ fn build_sequential_triple_chain(
                     .copied()
                     .filter(|v| !live_set.contains(v))
                     .count();
-                if dead > 0 {
+                if early_dedup_needed(dead_before_step, dead, ctx.planning) {
                     if let Some(op) = operator.take() {
                         operator = Some(Box::new(DistinctOperator::new(op)));
                     }
                 }
+                dead_before_step = dead_before_step.max(dead);
             }
         }
     }
 
     Ok(operator.unwrap())
+}
+
+/// Whether a join step that leaves `dead_after` variables trimmed (`dead_before`
+/// of them by earlier steps) needs a `DistinctOperator` behind it.
+///
+/// Dead variables only accumulate, so `dead_after > dead_before` means this
+/// step dropped a variable that still distinguished rows — the only way a
+/// current-state step can introduce duplicates, since a step that keeps every
+/// variable it produces extends distinct input rows to distinct output rows
+/// (each fact is unique in the index). Re-deduplicating behind every later
+/// step re-hashed the whole intermediate for nothing (BSBM Q5's `rdfs:label`
+/// probe over its already-deduplicated candidates).
+///
+/// History mode keeps the cumulative rule: a ground step there can match once
+/// per `(t, op)` version, which `Binding` equality ignores.
+fn early_dedup_needed(dead_before: usize, dead_after: usize, planning: &PlanningContext) -> bool {
+    if planning.is_history() {
+        dead_after > 0
+    } else {
+        dead_after > dead_before
+    }
+}
+
+/// A later `?s <p> ?v . FILTER(range on ?v)` pair folded into a
+/// [`RangeSemiJoinOperator`] behind the step that binds `?s`.
+struct RangeSemiJoinFold {
+    triple_idx: usize,
+    filter_original_idx: usize,
+    subject_var: VarId,
+    condition: RangeSemiJoinCondition,
+}
+
+/// Below this many estimated driving rows the per-row probes stay cheaper
+/// than one walk of the predicate's range (as `MEMBERSHIP_JOIN_MIN_DRIVING`).
+const RANGE_SEMIJOIN_MIN_DRIVING: f64 = 256.0;
+
+/// Find the probes after step `k` that can be answered as a range semi-join
+/// behind it: `?s <p> ?v` where `?s` is bound by this step, `?v` is new and
+/// used by exactly one pending FILTER that is a range over `?v` with bounds
+/// computable from variables bound after this step, and nothing else reads
+/// `?v` (so the semi-join's keep/drop equals probe+filter+early-dedup under
+/// `where_dedup_safe`). Every fold shares one subject variable.
+#[allow(clippy::too_many_arguments)]
+fn collect_range_semijoin_folds(
+    step_tp: &TriplePattern,
+    k: usize,
+    triples: &[TriplePattern],
+    folded: &[bool],
+    bound_before: &HashSet<VarId>,
+    vars_after: &HashSet<VarId>,
+    base_vars: &HashSet<VarId>,
+    pending_binds: &[BindPattern],
+    pending_filters: &[FilterPattern],
+    pushdown_consumed: &[usize],
+    pushdown_bounds: &HashMap<VarId, ObjectBounds>,
+    ctx: &TriplePlanContext<'_>,
+    driving_est: Option<f64>,
+) -> Vec<RangeSemiJoinFold> {
+    if !ctx.where_dedup_safe || ctx.planning.is_history() {
+        return Vec::new();
+    }
+    if super::fast_paths_disabled() {
+        crate::fast_path_outcome::stamp_fast_path(
+            crate::range_semijoin::RANGE_SEMIJOIN_SITE,
+            crate::fast_path_outcome::FastPathOutcome::Fallback(
+                crate::fast_path_outcome::FastPathFallback::KillSwitch,
+            ),
+        );
+        return Vec::new();
+    }
+    let produced: HashSet<VarId> = step_tp.produced_vars().into_iter().collect();
+    if produced.is_empty() {
+        return Vec::new();
+    }
+    if let (Some(est), Some(stats)) = (driving_est, ctx.stats) {
+        let step_out_est =
+            est * crate::planner::estimate_triple_row_count(step_tp, bound_before, Some(stats));
+        if step_out_est < RANGE_SEMIJOIN_MIN_DRIVING {
+            return Vec::new();
+        }
+    }
+    let mut folds: Vec<RangeSemiJoinFold> = Vec::new();
+    let mut subject: Option<VarId> = None;
+    for (j, tj) in triples.iter().enumerate().skip(k + 1) {
+        if folded[j] || tj.dtc.is_some() || !tj.p_bound() {
+            continue;
+        }
+        let (Ref::Var(s), Term::Var(v)) = (&tj.s, &tj.o) else {
+            continue;
+        };
+        if !produced.contains(s)
+            || subject.is_some_and(|chosen| chosen != *s)
+            || vars_after.contains(v)
+            || base_vars.contains(v)
+        {
+            continue;
+        }
+        let read_elsewhere = triples
+            .iter()
+            .enumerate()
+            .any(|(i, t)| i != j && t.referenced_vars().contains(v))
+            || pending_binds
+                .iter()
+                .any(|b| b.var == *v || b.expr.referenced_vars().contains(v));
+        // Consumed constant filters are enforced by the scan/join we would
+        // remove. Keep that probe unless its bounds are carried by the fold.
+        if read_elsewhere || pushdown_bounds.contains_key(v) {
+            continue;
+        }
+        let mut readers = pending_filters.iter().filter(|f| {
+            !pushdown_consumed.contains(&f.original_idx) && f.expr.referenced_vars().contains(v)
+        });
+        let (Some(filter), None) = (readers.next(), readers.next()) else {
+            continue;
+        };
+        if !filter
+            .expr
+            .referenced_vars()
+            .iter()
+            .all(|x| x == v || vars_after.contains(x))
+        {
+            continue;
+        }
+        let Some((lower, upper)) = extract_correlated_range(&filter.expr, *v) else {
+            continue;
+        };
+        subject = Some(*s);
+        folds.push(RangeSemiJoinFold {
+            triple_idx: j,
+            filter_original_idx: filter.original_idx,
+            subject_var: *s,
+            condition: RangeSemiJoinCondition {
+                predicate: tj.p.clone(),
+                value_var: *v,
+                lower,
+                upper,
+                filter: filter.expr.clone(),
+            },
+        });
+    }
+    folds
+}
+
+type CorrelatedBound = Option<(Expression, bool)>;
+
+/// `expr` as a range over `v` — an AND of comparisons each between `v` and an
+/// expression not mentioning `v` — oriented as `v op bound`, at most one bound
+/// per side. Anything else (OR, NOT, a conjunct not about `v`, a chained
+/// comparison) is not a range and returns `None`.
+fn extract_correlated_range(
+    expr: &Expression,
+    v: VarId,
+) -> Option<(CorrelatedBound, CorrelatedBound)> {
+    let Expression::Call { func, args } = expr else {
+        return None;
+    };
+    match func {
+        Function::And => {
+            let mut lower: CorrelatedBound = None;
+            let mut upper: CorrelatedBound = None;
+            for arg in args {
+                let (lo, hi) = extract_correlated_range(arg, v)?;
+                if let Some(lo) = lo {
+                    if lower.replace(lo).is_some() {
+                        return None;
+                    }
+                }
+                if let Some(hi) = hi {
+                    if upper.replace(hi).is_some() {
+                        return None;
+                    }
+                }
+            }
+            (lower.is_some() || upper.is_some()).then_some((lower, upper))
+        }
+        Function::Lt | Function::Le | Function::Gt | Function::Ge | Function::Eq => {
+            if args.len() != 2 {
+                return None;
+            }
+            let (var_on_left, other) = match (&args[0], &args[1]) {
+                (Expression::Var(a), other) if *a == v => (true, other),
+                (other, Expression::Var(b)) if *b == v => (false, other),
+                _ => return None,
+            };
+            if other.referenced_vars().contains(&v) {
+                return None;
+            }
+            let op = match (func, var_on_left) {
+                (Function::Lt, true) | (Function::Gt, false) => CompareOp::Lt,
+                (Function::Le, true) | (Function::Ge, false) => CompareOp::Le,
+                (Function::Gt, true) | (Function::Lt, false) => CompareOp::Gt,
+                (Function::Ge, true) | (Function::Le, false) => CompareOp::Ge,
+                _ => CompareOp::Eq,
+            };
+            let inclusive = matches!(op, CompareOp::Le | CompareOp::Ge | CompareOp::Eq);
+            let bound = (other.clone(), inclusive);
+            Some(match op {
+                CompareOp::Lt | CompareOp::Le => (None, Some(bound)),
+                CompareOp::Gt | CompareOp::Ge => (Some(bound), None),
+                _ => (Some(bound.clone()), Some(bound)),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Build operators for a sequence of triple patterns
