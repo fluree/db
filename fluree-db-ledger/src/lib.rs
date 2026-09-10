@@ -698,11 +698,34 @@ impl LedgerState {
                 .collect();
 
             // Merge namespace codes: old entries not in new → carried forward.
-            // Only the absent ones are inserted; on a ledger with tens of
-            // thousands of namespaces this loop is the install's cost.
-            for (code, prefix) in self.snapshot.namespaces() {
-                if !merged_snapshot.namespaces().contains_key(code) {
-                    merged_snapshot.insert_namespace_code(*code, prefix.clone())?;
+            // The new root's table is what the old one was at the index
+            // point, and codes are only ever added, so the old table is a
+            // superset and the entries to carry are exactly the extras.
+            // Nothing to do when the sizes agree; otherwise only the old
+            // entries above the new table's highest code can be missing —
+            // which keeps this proportional to the post-index commits, not
+            // to a ledger's tens of thousands of namespaces.
+            let old_codes = self.snapshot.namespaces();
+            if old_codes.len() != merged_snapshot.namespaces().len() {
+                let new_max = merged_snapshot
+                    .namespaces()
+                    .keys()
+                    .copied()
+                    .max()
+                    .unwrap_or(0);
+                for (code, prefix) in old_codes {
+                    if *code > new_max && !merged_snapshot.namespaces().contains_key(code) {
+                        merged_snapshot.insert_namespace_code(*code, prefix.clone())?;
+                    }
+                }
+                // A table that still disagrees carries codes below the
+                // new maximum; take the slow path once rather than lose them.
+                if merged_snapshot.namespaces().len() != old_codes.len() {
+                    for (code, prefix) in old_codes {
+                        if !merged_snapshot.namespaces().contains_key(code) {
+                            merged_snapshot.insert_namespace_code(*code, prefix.clone())?;
+                        }
+                    }
                 }
             }
 

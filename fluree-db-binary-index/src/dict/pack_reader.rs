@@ -172,12 +172,36 @@ impl ForwardPackReader {
             })?;
         }
 
-        let reusable: std::collections::HashMap<&ContentId, &Arc<PackHandle>> = prev
-            .filter(|p| {
-                p.load_ctx.as_ref().is_some_and(|ctx| {
-                    ctx.expected_kind == expected_kind && ctx.expected_ns_code == expected_ns_code
-                })
+        let prev = prev.filter(|p| {
+            p.load_ctx.as_ref().is_some_and(|ctx| {
+                ctx.expected_kind == expected_kind && ctx.expected_ns_code == expected_ns_code
             })
+        });
+        // The routing table of a stream that received nothing since the
+        // previous root is the previous table entry for entry — the case
+        // for nearly every namespace of a ledger with many — and needs no
+        // matching at all. Compared in order rather than through a map so a
+        // ledger with tens of thousands of namespaces pays no allocation
+        // per stream.
+        if let Some(p) = prev {
+            let unchanged = p.packs.len() == refs.len()
+                && p.packs.iter().zip(refs).all(|(h, entry)| {
+                    h.cid.as_ref() == Some(&entry.pack_cid)
+                        && h.first_id == entry.first_id
+                        && h.last_id == entry.last_id
+                });
+            if unchanged {
+                return Ok(Self {
+                    packs: p.packs.clone(),
+                    load_ctx: Some(LoadContext {
+                        cs,
+                        expected_kind,
+                        expected_ns_code,
+                    }),
+                });
+            }
+        }
+        let reusable: std::collections::HashMap<&ContentId, &Arc<PackHandle>> = prev
             .map(|p| {
                 p.packs
                     .iter()
