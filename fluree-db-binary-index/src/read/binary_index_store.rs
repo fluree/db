@@ -380,6 +380,7 @@ impl BinaryIndexStore {
     ) -> io::Result<Self> {
         tracing::debug!("BinaryIndexStore::load_from_root_v6 starting");
         fluree_db_core::disk_cache::ensure_cache_dir(cache_dir)?;
+        let phase = std::time::Instant::now();
 
         // ── Dict loading ──────────────────────────────────────────────────────────────
         let dicts = build_dictionary_set(
@@ -390,6 +391,9 @@ impl BinaryIndexStore {
             prev.map(|p| &p.dicts),
         )
         .await?;
+
+        let dicts_us = phase.elapsed().as_micros() as u64;
+        let phase = std::time::Instant::now();
 
         // ── Per-graph specialty arenas ───────────────────────────────
         let mut per_graph_arenas = load_per_graph_arenas(
@@ -471,9 +475,12 @@ impl BinaryIndexStore {
             .map(|b| b.leaves.len())
             .sum();
         tracing::debug!(
+            target: "fluree::write_path",
             graphs = graph_indexes.len(),
             leaves = leaf_count,
-            "loaded V6 graph indexes"
+            dicts_us,
+            graphs_us = phase.elapsed().as_micros() as u64,
+            "store load phases"
         );
 
         let o_type_table = root.o_type_table.clone();

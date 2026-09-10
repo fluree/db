@@ -673,32 +673,15 @@ impl LedgerState {
             return Ok(());
         }
 
+        let phase = std::time::Instant::now();
         // Clear novelty up to new index_t
         let mut new_novelty = (*self.novelty).clone();
         new_novelty.clear_up_to(new_snapshot.t);
-
-        // Reset dict_novelty with new watermarks from the index root
-        let mut new_dict_novelty = DictNovelty::with_watermarks(
-            new_snapshot.subject_watermarks.clone(),
-            new_snapshot.string_watermark,
-        );
-        // Re-populate dict_novelty with any remaining novelty flakes (t > index_t)
-        // so overlay translation can resolve newly-introduced subject/string IDs.
         // Note: use `size > 0` not `is_empty()` — after clear_up_to the arena still
         // holds dead flakes, but `size` tracks only active bytes.
         let has_remaining_novelty = new_novelty.size > 0;
-        if has_remaining_novelty {
-            new_dict_novelty.populate_from_flakes_iter(
-                new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
-            );
-        }
-
-        let mut new_runtime_small_dicts = RuntimeSmallDicts::new();
-        if has_remaining_novelty {
-            new_runtime_small_dicts.populate_from_flakes_iter(
-                new_novelty.iter_flakes(fluree_db_core::IndexType::Post),
-            );
-        }
+        let novelty_us = phase.elapsed().as_micros() as u64;
+        let phase = std::time::Instant::now();
 
         // Preserve namespace codes and graph IRIs from commits still in novelty.
         // The new snapshot from the index root only has codes/IRIs up to index_t.
@@ -714,20 +697,72 @@ impl LedgerState {
                 .map(|(_, iri)| iri.to_string())
                 .collect();
 
-            // Merge namespace codes: old entries not in new → carried forward
+            // Merge namespace codes: old entries not in new → carried forward.
+            // Only the absent ones are inserted; on a ledger with tens of
+            // thousands of namespaces this loop is the install's cost.
             for (code, prefix) in self.snapshot.namespaces() {
-                merged_snapshot.insert_namespace_code(*code, prefix.clone())?;
+                if !merged_snapshot.namespaces().contains_key(code) {
+                    merged_snapshot.insert_namespace_code(*code, prefix.clone())?;
+                }
             }
 
             // Merge graph IRIs via apply_delta (idempotent — skips already-registered)
             merged_snapshot.graph_registry.apply_delta(&old_graph_iris);
         }
-
-        // Update state
+        // The old snapshot goes first: its range provider holds the
+        // dictionary novelty, and while it lives the retire below would copy
+        // the whole dictionary instead of trimming it in place.
         self.snapshot = Arc::new(merged_snapshot);
         self.novelty = Arc::new(new_novelty);
-        self.dict_novelty = Arc::new(new_dict_novelty);
-        self.runtime_small_dicts = Arc::new(new_runtime_small_dicts);
+        let merge_us = phase.elapsed().as_micros() as u64;
+        let phase = std::time::Instant::now();
+
+        // The dictionary novelty: drop what the indexed commits introduced and
+        // renumber the rest above the new watermarks. A dictionary that
+        // cannot be trimmed (a placeholder, a layer) is rebuilt from the
+        // remaining flakes.
+        let mut new_dict_novelty = Arc::clone(&self.dict_novelty);
+        let dict_shared = Arc::strong_count(&new_dict_novelty) > 1;
+        let retired = Arc::make_mut(&mut new_dict_novelty).retire_seen_through(
+            self.snapshot.t,
+            &self.snapshot.subject_watermarks,
+            self.snapshot.string_watermark,
+        );
+        let new_runtime_small_dicts = match retired {
+            Some(_) => Arc::clone(&self.runtime_small_dicts),
+            None => {
+                let mut rebuilt = DictNovelty::with_watermarks(
+                    self.snapshot.subject_watermarks.clone(),
+                    self.snapshot.string_watermark,
+                );
+                let mut runtime = RuntimeSmallDicts::new();
+                if has_remaining_novelty {
+                    rebuilt.populate_from_flakes_iter(
+                        self.novelty.iter_flakes(fluree_db_core::IndexType::Post),
+                    );
+                    runtime.populate_from_flakes_iter(
+                        self.novelty.iter_flakes(fluree_db_core::IndexType::Post),
+                    );
+                }
+                new_dict_novelty = Arc::new(rebuilt);
+                Arc::new(runtime)
+            }
+        };
+        tracing::debug!(
+            target: "fluree::write_path",
+            ledger_id = self.ledger_id(),
+            index_t = self.snapshot.t,
+            novelty_us,
+            merge_us,
+            retire_us = phase.elapsed().as_micros() as u64,
+            dict_shared,
+            ?retired,
+            "index install phases"
+        );
+
+        // Update state
+        self.dict_novelty = new_dict_novelty;
+        self.runtime_small_dicts = new_runtime_small_dicts;
         self.head_index_id = index_id.cloned();
 
         // Update ns_record
@@ -1651,6 +1686,70 @@ mod tests {
             .graph_registry
             .iter_entries()
             .any(|(_, iri)| iri == "http://example.org/graph/test"));
+    }
+
+    /// An index publish drops the dictionary entries the indexed commits
+    /// introduced, keeps the rest resolvable above the new watermarks, and
+    /// leaves the runtime dictionaries alone.
+    #[test]
+    fn apply_loaded_db_retires_indexed_dictionary_entries() {
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        snapshot.t = 1;
+        snapshot.string_watermark = 1;
+        let mut state = LedgerState::new(snapshot, Novelty::new(1));
+        let reverse_graph = state.snapshot.build_reverse_graph().unwrap_or_default();
+        let (s, p, dt) = (
+            Sid::new(0, "ex:s"),
+            Sid::new(0, "ex:p"),
+            Sid::new(2, "string"),
+        );
+        let flake = |o: &str, t: i64| {
+            Flake::new(
+                s.clone(),
+                p.clone(),
+                FlakeValue::String(o.to_string()),
+                dt.clone(),
+                t,
+                true,
+                None,
+            )
+        };
+        // Deliberately out of commit order: the retire keys on each entry's
+        // own commit, not on ids.
+        for (o, t) in [("b", 3), ("a", 2)] {
+            let flakes = vec![flake(o, t)];
+            Arc::make_mut(&mut state.dict_novelty).populate_from_flakes(&flakes);
+            Arc::make_mut(&mut state.novelty)
+                .apply_commit(flakes, t, &reverse_graph)
+                .unwrap();
+        }
+        assert_eq!(state.dict_novelty.strings.find_string("b"), Some(2));
+        assert_eq!(state.dict_novelty.strings.find_string("a"), Some(3));
+
+        // Index at t=2: it persisted "ex:s" (local id 1) and "a" (string 2).
+        let mut indexed = LedgerSnapshot::genesis("test:main");
+        indexed.t = 2;
+        indexed.subject_watermarks = vec![1];
+        indexed.string_watermark = 2;
+        state.apply_loaded_db(indexed, None).unwrap();
+
+        assert_eq!(state.dict_novelty.subjects.find_subject(0, "ex:s"), None);
+        assert_eq!(state.dict_novelty.strings.find_string("a"), None);
+        assert_eq!(
+            state.dict_novelty.strings.find_string("b"),
+            Some(3),
+            "kept above the new watermark"
+        );
+        assert_eq!(state.dict_novelty.strings.resolve_string(3), Some("b"));
+        assert_eq!(state.dict_novelty.strings.watermark(), 2);
+        assert_eq!(state.index_t(), 2);
+        assert_eq!(
+            state
+                .novelty
+                .iter_index(fluree_db_core::IndexType::Spot)
+                .count(),
+            1
+        );
     }
 
     #[test]

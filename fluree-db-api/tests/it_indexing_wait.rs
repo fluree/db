@@ -291,3 +291,96 @@ async fn an_index_publish_reuses_the_artifacts_of_the_store_it_replaces() {
         "an unchanged namespace table must be shared, not rebuilt"
     );
 }
+
+/// Publishes retire the dictionary entries the indexed commits introduced
+/// — with language-tagged strings, references and a retraction in the
+/// commits between the publishes, since those are what the index and the
+/// dictionary interpret differently — and reads still resolve everything.
+#[tokio::test]
+async fn publishes_retire_the_dictionary_entries_the_index_covers() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(path)
+        .with_indexing_thresholds(1_000_000, 10_000_000)
+        .build()
+        .expect("build file fluree");
+    let indexer = fluree
+        .indexer_handle()
+        .expect("file builder should start background indexing")
+        .clone();
+    let ledger_id = "it/publish-retire:main";
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let cached = fluree.ledger_cached(ledger_id).await.expect("cache ledger");
+
+    let publish = |tx: serde_json::Value| {
+        let fluree = &fluree;
+        let cached = &cached;
+        let indexer = &indexer;
+        async move {
+            let commit_t = fluree
+                .stage(cached)
+                .insert(&tx)
+                .execute()
+                .await
+                .expect("insert")
+                .receipt
+                .t;
+            match indexer.trigger(ledger_id, commit_t).await.wait().await {
+                fluree_db_api::IndexOutcome::Completed { .. } => {}
+                other => panic!("indexing did not complete: {other:?}"),
+            }
+            view_after_publish(cached, commit_t).await;
+        }
+    };
+    let round = |n: usize| {
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": (0..3).map(|i| json!({
+                "@id": format!("ex:thing-{n}-{i}"),
+                "ex:label": {"@value": format!("label {n} {i}"), "@language": "en"},
+                "ex:name": format!("name {n} {i}"),
+                "ex:knows": {"@id": format!("ex:friend-{n}-{i}")}
+            })).collect::<Vec<_>>()
+        })
+    };
+
+    publish(round(0)).await;
+    // Commits the second publish will persist: an insert and a retraction.
+    fluree
+        .stage(&cached)
+        .insert(&round(1))
+        .execute()
+        .await
+        .expect("insert");
+    fluree
+        .stage(&cached)
+        .sparql_update("PREFIX ex: <http://example.org/> DELETE WHERE { ex:thing-1-0 ex:name ?o }")
+        .execute()
+        .await
+        .expect("delete");
+    publish(round(2)).await;
+
+    // Everything is indexed now: the dictionary novelty holds nothing, and
+    // every entry resolves through the index.
+    let view = cached.snapshot().await;
+    assert_eq!(view.novelty.size, 0);
+    assert_eq!(view.dict_novelty.subjects.len(), 0, "retired subjects");
+    assert_eq!(view.dict_novelty.strings.len(), 0, "retired strings");
+    let state = view.to_ledger_state();
+    let rows = fluree
+        .query(
+            &fluree_db_api::GraphDb::from_ledger_state(&state),
+            "PREFIX ex: <http://example.org/> SELECT ?s ?l WHERE { ?s ex:label ?l }",
+        )
+        .await
+        .expect("query")
+        .to_sparql_json(&state.snapshot)
+        .expect("json")["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .len();
+    assert_eq!(rows, 9, "three rounds of three labelled things");
+}

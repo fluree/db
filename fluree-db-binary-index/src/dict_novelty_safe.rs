@@ -44,7 +44,7 @@ pub fn populate_dict_novelty_safe<'a>(
     let mut persisted_subjects: HashSet<(u16, &'a str)> = HashSet::new();
     let mut persisted_strings: HashSet<&'a str> = HashSet::new();
 
-    let mut subject = |dict_novelty: &mut DictNovelty, sid: &'a Sid| -> io::Result<()> {
+    let mut subject = |dict_novelty: &mut DictNovelty, sid: &'a Sid, t: i64| -> io::Result<()> {
         if dict_novelty
             .subjects
             .find_subject(sid.namespace_code, &sid.name)
@@ -62,15 +62,15 @@ pub fn populate_dict_novelty_safe<'a>(
         } else {
             dict_novelty
                 .subjects
-                .assign_or_lookup(sid.namespace_code, &sid.name);
+                .assign_or_lookup_at(sid.namespace_code, &sid.name, t);
         }
         Ok(())
     };
 
     for flake in flakes {
-        subject(dict_novelty, &flake.s)?;
+        subject(dict_novelty, &flake.s, flake.t)?;
         match &flake.o {
-            FlakeValue::Ref(sid) => subject(dict_novelty, sid)?,
+            FlakeValue::Ref(sid) => subject(dict_novelty, sid, flake.t)?,
             FlakeValue::String(s) | FlakeValue::Json(s) => {
                 if dict_novelty.strings.find_string(s).is_some()
                     || persisted_strings.contains(s.as_str())
@@ -84,7 +84,7 @@ pub fn populate_dict_novelty_safe<'a>(
                 if persisted {
                     persisted_strings.insert(s);
                 } else {
-                    dict_novelty.strings.assign_or_lookup(s);
+                    dict_novelty.strings.assign_or_lookup_at(s, flake.t);
                 }
             }
             _ => {}

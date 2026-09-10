@@ -768,10 +768,14 @@ impl LedgerHandle {
             let mut state = state_guard;
             let novelty_flakes_before = state.novelty.len();
 
-            // apply_loaded_db: validates, trims novelty, rebuilds dict_novelty
+            // apply_loaded_db: validates, trims novelty, retires the
+            // dictionary entries the indexed commits introduced.
+            let phase = Instant::now();
             state
                 .apply_loaded_db(db, Some(index_id))
                 .map_err(|e| ApiError::internal(format!("apply_loaded_db failed: {e}")))?;
+            let apply_us = phase.elapsed().as_micros() as u64;
+            let phase = Instant::now();
 
             // Sync namespace codes between store and snapshot (bimap validation).
             crate::ns_helpers::sync_store_and_snapshot_ns(
@@ -779,8 +783,11 @@ impl LedgerHandle {
                 Arc::make_mut(&mut state.snapshot),
             )?;
 
+            let sync_ns_us = phase.elapsed().as_micros() as u64;
+            let phase = Instant::now();
             let arc_store = Arc::new(store);
-            crate::runtime_dicts::reseed_runtime_small_dicts(&mut state, &arc_store);
+            crate::runtime_dicts::reseed_runtime_small_dicts_from_previous(&mut state, &arc_store);
+            let reseed_us = phase.elapsed().as_micros() as u64;
 
             // Build range_provider with the real dict_novelty (rebuilt by apply_loaded_db)
             let ns_fallback = Some(state.snapshot.shared_namespaces());
@@ -811,6 +818,10 @@ impl LedgerHandle {
                 index_t = state.index_t(),
                 novelty_flakes_before,
                 novelty_flakes_after = state.novelty.len(),
+                dict_entries = state.dict_novelty.subjects.len() + state.dict_novelty.strings.len(),
+                apply_us,
+                sync_ns_us,
+                reseed_us,
                 load_us,
                 wait_us,
                 install_us = install_started.elapsed().as_micros() as u64,
