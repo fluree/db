@@ -1793,6 +1793,11 @@ pub enum BranchAction {
         #[arg(long)]
         changes_after: Option<String>,
 
+        /// Skip SHACL validation of the merged state. Validation runs by
+        /// default and its outcome folds into `mergeable`.
+        #[arg(long)]
+        no_validate: bool,
+
         /// Emit the raw JSON preview instead of a human-readable summary
         #[arg(long)]
         json: bool,

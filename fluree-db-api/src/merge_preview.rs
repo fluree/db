@@ -20,6 +20,7 @@ use fluree_db_core::{
     ContentId, ContentStore, Flake,
 };
 use fluree_db_ledger::LedgerState;
+use fluree_db_ledger::StagedLedger;
 use fluree_db_novelty::{compute_delta_keys, compute_delta_keys_and_changes};
 use futures::{stream, StreamExt, TryStreamExt};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -101,6 +102,13 @@ pub struct MergePreviewOpts {
     /// previous response's [`ChangeSummary::next_cursor`]. Each page re-pays
     /// the full replay + netting cost. Requires `include_changes`.
     pub changes_after_subject: Option<String>,
+    /// When `true` (the default), stage the strategy-resolved change set on
+    /// the target and validate it against the target's SHACL configuration
+    /// and shapes, exactly as the merge would. The outcome is reported in
+    /// [`MergePreview::validation`] and folded into
+    /// [`MergePreview::mergeable`]. Costs a target-state load plus the
+    /// validation pass; set `false` for count-only previews.
+    pub include_validation: bool,
 }
 
 impl Default for MergePreviewOpts {
@@ -114,8 +122,22 @@ impl Default for MergePreviewOpts {
             include_changes: false,
             max_changes: Some(DEFAULT_MAX_CHANGES),
             changes_after_subject: None,
+            include_validation: true,
         }
     }
+}
+
+/// SHACL outcome of staging the merge's resolved change set on the target.
+#[derive(Clone, Debug, Serialize)]
+pub struct ValidationSummary {
+    /// `true` when the merged state conforms to the target's shapes under
+    /// its configured posture (warn-mode violations are logged, not
+    /// reported, matching the transaction path).
+    pub conforms: bool,
+    /// The violation report the merge would fail with. Present iff
+    /// `conforms` is `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
 }
 
 /// Common ancestor of source and target HEADs.
@@ -269,8 +291,17 @@ pub struct MergePreview {
     /// or when the caller opted out via [`MergePreviewOpts::include_conflicts`].
     pub conflicts: ConflictSummary,
 
-    /// Whether the selected strategy can be applied without aborting.
+    /// Whether the merge would go through: the selected strategy can be
+    /// applied without aborting, and the resulting state conforms to the
+    /// target's shapes when validation ran.
     pub mergeable: bool,
+
+    /// SHACL outcome for the resolved change set. Present iff
+    /// [`MergePreviewOpts::include_validation`] was set and the merge is
+    /// not a fast-forward (a fast-forward adopts commits already validated
+    /// when they were authored).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ValidationSummary>,
 
     /// Aggregate netted change set. Present iff
     /// [`MergePreviewOpts::include_changes`] was set.
@@ -480,24 +511,32 @@ impl crate::Fluree {
             && target_head.is_some()
             && ancestor.is_some();
         let need_changes = opts.include_changes;
+        // Validation stages the resolved change set on the target, so it
+        // needs the netted source delta too. A fast-forward adopts commits
+        // already validated when they were authored, so it is skipped.
+        let need_validation = opts.include_validation
+            && !fast_forward
+            && source_head.is_some()
+            && target_head.is_some()
+            && ancestor.is_some();
 
         let source_fut = async {
             match &source_head {
-                Some(s_head) if need_changes => {
-                    let (keys, net) = compute_delta_keys_and_changes(
+                Some(s_head) if need_changes || need_validation => {
+                    let (keys, net, ns_delta) = compute_delta_keys_and_changes(
                         source_store.clone(),
                         s_head.clone(),
                         stop_at_t,
                     )
                     .await?;
-                    Ok::<_, ApiError>((Some(keys), Some(net)))
+                    Ok::<_, ApiError>((Some(keys), Some(net), Some(ns_delta)))
                 }
                 Some(s_head) if need_conflicts => {
                     let keys =
                         compute_delta_keys(source_store.clone(), s_head.clone(), stop_at_t).await?;
-                    Ok((Some(keys), None))
+                    Ok((Some(keys), None, None))
                 }
-                _ => Ok((None, None)),
+                _ => Ok((None, None, None)),
             }
         };
         let target_fut = async {
@@ -510,10 +549,14 @@ impl crate::Fluree {
                 _ => Ok(None),
             }
         };
-        let ((source_delta, net_flakes), target_delta) = tokio::try_join!(source_fut, target_fut)?;
+        let ((source_delta, net_flakes, source_ns_delta), target_delta) =
+            tokio::try_join!(source_fut, target_fut)?;
 
         // ---- Conflicts (only if relevant). --------------------------------
-        let (conflict_keys, conflict_count, conflicts_truncated) =
+        // `all_conflict_keys` is the uncapped set: the cap bounds the
+        // response, not what the strategy resolves when validation stages
+        // the merge.
+        let (conflict_keys, all_conflict_keys, conflict_count, conflicts_truncated) =
             match (need_conflicts, &source_delta, &target_delta) {
                 (true, Some(s_delta), Some(t_delta)) => {
                     // Sort lexicographically by (s, p, g) so capped responses
@@ -522,6 +565,7 @@ impl crate::Fluree {
                     let mut keys: Vec<ConflictKey> =
                         s_delta.intersection(t_delta).cloned().collect();
                     keys.sort();
+                    let all = keys.clone();
                     let count = keys.len();
                     let truncated = match opts.max_conflict_keys {
                         Some(cap) if count > cap => {
@@ -530,9 +574,9 @@ impl crate::Fluree {
                         }
                         _ => false,
                     };
-                    (keys, count, truncated)
+                    (keys, all, count, truncated)
                 }
-                _ => (Vec::new(), 0, false),
+                _ => (Vec::new(), Vec::new(), 0, false),
             };
 
         // ---- Load states needed for IRI resolution. -----------------------
@@ -545,21 +589,28 @@ impl crate::Fluree {
             && net_flakes.as_ref().is_some_and(|n| !n.is_empty())
             && opts.max_changes != Some(0);
 
-        let (source_state, target_state) = if want_details {
-            let source_state_fut =
-                self.load_queryable_state_with_store(source_store.clone(), source_record.clone());
-            let target_state_fut = self
-                .load_queryable_state_with_store(target_branched.clone(), target_record.clone());
-            let (s, t) = tokio::try_join!(source_state_fut, target_state_fut)?;
-            (Some(s), Some(t))
-        } else if want_change_payload {
-            let s = self
-                .load_queryable_state_with_store(source_store.clone(), source_record.clone())
-                .await?;
-            (Some(s), None)
-        } else {
-            (None, None)
+        // Validation stages onto the target, so it needs the target side.
+        let want_source = want_details || want_change_payload;
+        let want_target = want_details || need_validation;
+        let source_state_fut = async {
+            if want_source {
+                self.load_queryable_state_with_store(source_store.clone(), source_record.clone())
+                    .await
+                    .map(Some)
+            } else {
+                Ok::<_, ApiError>(None)
+            }
         };
+        let target_state_fut = async {
+            if want_target {
+                self.load_queryable_state_with_store(target_branched.clone(), target_record.clone())
+                    .await
+                    .map(Some)
+            } else {
+                Ok::<_, ApiError>(None)
+            }
+        };
+        let (source_state, target_state) = tokio::try_join!(source_state_fut, target_state_fut)?;
 
         let conflicts = if !need_conflicts {
             ConflictSummary::empty()
@@ -589,6 +640,45 @@ impl crate::Fluree {
             }
         };
 
+        // ---- Validation (default on; skipped on fast-forward). -------------
+        // The same staging and validation the merge performs, minus the
+        // commit: resolve the netted source delta under the strategy, stage
+        // it on a clone of the target state, and run the branch-operation
+        // validator. Under `Abort` with conflicts the merge never reaches
+        // validation, so neither does the preview.
+        let validation = if need_validation
+            && (opts.conflict_strategy != ConflictStrategy::Abort || conflict_count == 0)
+        {
+            let target_state = target_state.as_ref().expect("loaded for validation");
+            let resolved = self
+                .apply_two_way_strategy(
+                    net_flakes.clone().unwrap_or_default(),
+                    &all_conflict_keys,
+                    &opts.conflict_strategy,
+                    target_state,
+                )
+                .await?;
+            let reverse_graph = target_state.snapshot.build_reverse_graph().map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to build reverse graph during merge preview: {e}"
+                ))
+            })?;
+            let mut view = StagedLedger::new(target_state.clone(), resolved, &reverse_graph)
+                .map_err(|e| {
+                    ApiError::internal(format!("Failed to stage flakes during merge preview: {e}"))
+                })?;
+            let ns_delta = source_ns_delta.unwrap_or_default();
+            let outcome = self
+                .validate_branch_op_view(&mut view, &reverse_graph, &ns_delta)
+                .await?;
+            Some(ValidationSummary {
+                conforms: outcome.conforms(),
+                report: outcome.report,
+            })
+        } else {
+            None
+        };
+
         // ---- Changes (only if requested). ----------------------------------
         let changes = if need_changes {
             // No compactor in stats-only mode even when conflict details
@@ -614,7 +704,8 @@ impl crate::Fluree {
             None
         };
 
-        let mergeable = opts.conflict_strategy != ConflictStrategy::Abort || conflicts.count == 0;
+        let mergeable = (opts.conflict_strategy != ConflictStrategy::Abort || conflicts.count == 0)
+            && validation.as_ref().is_none_or(|v| v.conforms);
 
         // ---- Invariants (debug-only). -------------------------------------
         debug_assert!(ahead.commits.len() <= ahead.count);
@@ -639,6 +730,7 @@ impl crate::Fluree {
             fast_forward,
             conflicts,
             mergeable,
+            validation,
             changes,
         })
     }

@@ -11,7 +11,9 @@
 #![cfg(feature = "shacl")]
 
 use crate::support;
-use fluree_db_api::{ApiError, CommitRef, ConflictStrategy, FlureeBuilder, TransactError};
+use fluree_db_api::{
+    ApiError, CommitRef, ConflictStrategy, FlureeBuilder, MergePreviewOpts, TransactError,
+};
 use fluree_db_core::graph_registry::config_graph_iri;
 use serde_json::json;
 
@@ -441,4 +443,130 @@ async fn revert_rejected_when_inverse_violates_shape() {
 
     assert_eq!(head_t(&fluree, "mydb:main").await, 4);
     assert_eq!(names(&fluree, "mydb:main").await, vec!["A", "Bob", "Carol"]);
+}
+
+// =============================================================================
+// Merge preview
+// =============================================================================
+
+/// Preview runs the same validation the merge runs. Where the merge would be
+/// rejected, the preview says so: `mergeable` is false and the report is the
+/// one the merge would fail with.
+#[tokio::test]
+async fn preview_reports_violation_where_merge_would_fail() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let main = seed_alice_with_shape(&fluree).await;
+
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .update(dev, &replace_name("ex:alice", "B"))
+        .await
+        .unwrap();
+    fluree
+        .update(main, &replace_name("ex:alice", "C"))
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                conflict_strategy: ConflictStrategy::TakeBoth,
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .expect("preview");
+    assert!(!preview.fast_forward);
+    assert_eq!(preview.conflicts.count, 1);
+    let validation = preview.validation.expect("validation runs by default");
+    assert!(!validation.conforms);
+    let report = validation
+        .report
+        .expect("a rejected preview carries the report");
+    assert!(
+        report.contains("MaxCountConstraintComponent"),
+        "report should name the constraint: {report}"
+    );
+    assert!(
+        !preview.mergeable,
+        "a merge that would be rejected is not mergeable"
+    );
+
+    // The merge agrees with the preview.
+    let err = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::TakeBoth)
+        .await
+        .expect_err("merge is rejected");
+    assert_shacl_violation(err, "merge after preview");
+}
+
+/// Where the merge conforms, the preview says so and stays mergeable.
+#[tokio::test]
+async fn preview_conforms_where_merge_would_succeed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let main = seed_alice_with_shape(&fluree).await;
+
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .update(dev, &replace_name("ex:alice", "B"))
+        .await
+        .unwrap();
+    fluree
+        .insert(main, &insert_name("ex:bob", "Bob"))
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with("mydb", "dev", None, MergePreviewOpts::default())
+        .await
+        .expect("preview");
+    assert!(!preview.fast_forward);
+    let validation = preview.validation.expect("validation runs by default");
+    assert!(validation.conforms);
+    assert!(validation.report.is_none());
+    assert!(preview.mergeable);
+
+    fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .expect("merge succeeds as previewed");
+}
+
+/// Opting out leaves the field absent and `mergeable` back to the
+/// strategy-only answer, for count-only previews.
+#[tokio::test]
+async fn preview_validation_can_be_skipped() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let main = seed_alice_with_shape(&fluree).await;
+
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .update(dev, &replace_name("ex:alice", "B"))
+        .await
+        .unwrap();
+    fluree
+        .update(main, &replace_name("ex:alice", "C"))
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_validation: false,
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .expect("preview");
+    assert!(preview.validation.is_none());
+    assert!(
+        preview.mergeable,
+        "strategy-only answer when validation is skipped"
+    );
 }
