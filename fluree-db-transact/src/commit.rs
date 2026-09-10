@@ -663,6 +663,11 @@ pub async fn build_commit(
         let _g = span.enter();
         override_ns_delta.unwrap_or_else(|| ns_registry.take_delta())
     };
+    let ns_split_mode = ns_registry.split_mode();
+    // The registry reads the snapshot's namespace tables through shared
+    // handles; released here so the delta below extends those tables in
+    // place instead of copying them.
+    drop(ns_registry);
 
     // Apply envelope deltas (namespace + graph) to the in-memory LedgerSnapshot.
     // This must happen before novelty apply so encode_iri() works for graph routing.
@@ -687,7 +692,7 @@ pub async fn build_commit(
     let head_commit_id = base.head_commit_id.clone();
     let ledger_id_for_publish = base.ledger_id().to_string();
     let ns_split_mode_for_genesis = if base.head_commit_id.is_none() {
-        Some(ns_registry.split_mode())
+        Some(ns_split_mode)
     } else {
         None
     };

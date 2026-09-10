@@ -561,7 +561,8 @@ impl NamespaceCodes {
             next_code: (max_code + 1).max(USER_START),
             delta: HashMap::new(),
         };
-        codes.merge_delta(&default_namespace_codes())?;
+        static DEFAULTS: LazyLock<HashMap<u16, String>> = LazyLock::new(default_namespace_codes);
+        codes.merge_delta(&DEFAULTS)?;
         Ok(codes)
     }
 
