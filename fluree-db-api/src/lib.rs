@@ -38,6 +38,7 @@ pub mod admin;
 pub mod block_fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
+mod branch_validation;
 mod commit_data;
 pub mod commit_transfer;
 pub mod config_resolver;

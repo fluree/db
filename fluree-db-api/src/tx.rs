@@ -793,7 +793,7 @@ pub(crate) async fn open_cross_ledger_shapes_model(
 /// SHACL targeting on D. Resolution is t-cached (GovernanceCache): an
 /// unchanged M head is an Arc clone, not a re-query.
 #[cfg(feature = "shacl")]
-async fn resolve_cross_ledger_schema_for_tx(
+pub(crate) async fn resolve_cross_ledger_schema_for_tx(
     ledger: &LedgerState,
     config: Option<&LedgerConfig>,
     ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
