@@ -2316,6 +2316,9 @@ pub async fn incremental_index(
             // property (empty registers) published ndv 0 and every
             // bound-subject probe on it was estimated at the 10-row fallback —
             // one write to a bulk-imported ledger made BSBM Q5 4x slower.
+            // The floor preserves the prior NDV estimate without restoring
+            // missing HLL registers. Follow-up: persist sketches during bulk
+            // import so incremental NDV merging includes the imported data.
             let properties = crate::stats::aggregate_property_entries_from_graphs(
                 &final_graphs,
                 &trie,
