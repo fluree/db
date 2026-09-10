@@ -24,7 +24,7 @@
 
 use std::sync::Mutex;
 
-use fluree_db_api::{Fluree, FlureeBuilder, LedgerHandle, RefreshOpts, ReindexOptions};
+use fluree_db_api::{Fluree, FlureeBuilder, LedgerHandle, ReindexOptions};
 use serde_json::json;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::Context;
@@ -179,15 +179,19 @@ async fn cached_handle_commits_uniquely_own_the_dictionaries() {
     assert_eq!(pre_index.len(), 5, "expected one probe per commit");
     assert_uniquely_owned(&pre_index, "before any index");
 
-    // --- Phase 2: publish an index and install it on the cached handle ----
+    // --- Phase 2: publish an index and reload the cached handle -----------
+    // Reindex evicts the cached ledger, including for same-t root repairs.
+    // Existing caller-held handles are not updated by that eviction; drop
+    // ours and reacquire the handle that subsequent cached writes use.
+    drop(handle);
     fluree
         .reindex(ledger_id, ReindexOptions::default())
         .await
         .expect("reindex");
-    fluree
-        .refresh(ledger_id, RefreshOpts::default())
+    let handle = fluree
+        .ledger_cached(ledger_id)
         .await
-        .expect("refresh the cached handle onto the new index");
+        .expect("reload the cached handle from the rebuilt index");
     // Hard assert, not a skip: if the index never reached the cached handle,
     // the phases below would silently re-test the pre-index case.
     assert!(

@@ -513,6 +513,49 @@ async fn explain_chain_count_distinct_inserts_early_dedup() {
     );
 }
 
+/// Count `DistinctOperator` nodes strictly below the `ProjectOperator` — the
+/// WHERE-level early-dedup insertions, excluding the outer `SELECT DISTINCT`.
+fn count_early_dedup_nodes(node: &serde_json::Value) -> usize {
+    if node["op"] == "ProjectOperator" {
+        return node["children"]
+            .as_array()
+            .map(|cs| cs.iter().map(|e| count_distinct_nodes(&e["node"])).sum())
+            .unwrap_or(0);
+    }
+    node["children"]
+        .as_array()
+        .map(|cs| cs.iter().map(|e| count_early_dedup_nodes(&e["node"])).sum())
+        .unwrap_or(0)
+}
+
+/// Early dedup is inserted only where a step trims a variable that was still
+/// live before it. The anchored chain plans as `ex:a1 ex:p1 ?b` (nothing dead:
+/// `?b` feeds the next hop), then `?b ex:p2 ?m` (`?b` dies — dedup), then
+/// `?m ex:p3 ?x` (both live and projected — no dedup). A current-state join
+/// step that keeps every variable it produces cannot duplicate an already
+/// distinct stream, so re-deduplicating behind it only re-hashed the whole
+/// intermediate (BSBM Q5's label probe behind its deduplicated candidates).
+#[tokio::test]
+async fn explain_chain_dedups_only_where_a_live_var_dies() {
+    let _env = HashJoinEnv::acquire();
+    let physical = chain_physical_plan(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT DISTINCT ?m ?x\n\
+         WHERE { ex:a1 ex:p1 ?b . ?b ex:p2 ?m . ?m ex:p3 ?x }",
+    )
+    .await;
+    assert_eq!(
+        count_early_dedup_nodes(&physical),
+        1,
+        "exactly one early dedup (after `?b` dies), none behind the all-live tail step: {physical}"
+    );
+    assert_eq!(
+        count_distinct_nodes(&physical),
+        2,
+        "the outer SELECT DISTINCT is the only other DistinctOperator: {physical}"
+    );
+}
+
 /// `MIN`/`MAX` are duplicate-insensitive without a DISTINCT modifier, so the
 /// same early dedup applies.
 #[tokio::test]

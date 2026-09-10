@@ -8,6 +8,8 @@ Unlike [background indexing](background-indexing.md) which incrementally updates
 
 Reindex publishes the new index root via `publish_index_allow_equal`, which means a reindex can produce a **new index root CID** even when `index_t` stays the same (same logical snapshot, different physical layout/config).
 
+After a successful publish, reindex evicts the calling instance's cached ledger. Subsequent loads use the rebuilt root and graph registry even when `index_t` is unchanged. Callers holding an existing ledger handle must reacquire it; caches in other serving instances must also reload the ledger.
+
 ## When to Reindex
 
 ### Common Use Cases

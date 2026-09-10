@@ -1,25 +1,29 @@
 name: Bench (nightly)
 
-# Bench smoke + reconcile. Runs on a nightly schedule (and on demand via
-# workflow_dispatch) — NOT per-PR. It compiles the whole workspace's benches
-# in release, which is the long pole and was never meant to gate every PR
-# (it had been wired into ci.yml by mistake). Per-PR coverage is preserved:
-# `clippy --all --all-features --all-targets` in ci.yml still compiles every
-# bench on every PR, so API/compile breakage is caught there; this nightly
-# adds the runtime smoke and the [[bench]] <-> regression-budget.json reconcile.
+# Benchmark execution runs nightly and on demand. Normal CI checks benchmark
+# compilation through Clippy; release builds and statistical measurements stay
+# off the PR critical path. Full smoke and subset comparison run independently.
 
 on:
   schedule:
     - cron: "0 7 * * *" # 07:00 UTC daily
   workflow_dispatch:
     inputs:
+      compare_only:
+        description: Only run the quick benchmark comparison (skip full smoke)
+        type: boolean
+        default: false
+      capture_baseline:
+        description: Also capture a replacement baseline artifact
+        type: boolean
+        default: false
       capture_samples:
         description: >-
-          Repeat runs to fold into the captured baseline. 1 is a single
+          Repeat runs (1–10) to fold into the captured baseline. 1 is a single
           measurement with no noise estimate; >= 5 records a median + MAD, which
           is what a baseline intended to GATE on shared runners needs — the
-          compare gate widens each budget to 3*MAD/median, and ubuntu-latest
-          flap is the whole reason the per-PR compare is advisory today.
+          compare gate widens each budget to 3*MAD/median, and shared-runner
+          variability is the whole reason time/memory comparison is advisory today.
         required: false
         default: "1"
 
@@ -35,39 +39,42 @@ env:
 
 jobs:
   bench-gate:
+    # `inputs` is empty on the nightly schedule; say so explicitly instead of
+    # relying on `!null`. Mirrors the bench-capture guard below.
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.compare_only }}
     # Failure modes:
     #   - A bench no longer compiles (real API regression).
     #   - A bench's `--test` mode panics or never returns.
     #   - A `[[bench]]` is declared in Cargo.toml without a matching
     #     entry in `regression-budget.json` (or vice versa).
     #
-    # A cold cache must compile the whole workspace's benches in release
-    # (consensus / search-service / search-httpd and their heavy deps);
-    # `timeout-minutes` caps the job so a genuinely hung bench fails fast.
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # A cold cache must compile all explicit workspace benchmarks and their
+    # dependencies in release.
+    # Use 8 cores / 32 GB and allow cold builds 60 minutes. The previous
+    # 4-core job repeatedly timed out during compilation at 45 minutes.
+    runs-on: ci-cd-large
+    timeout-minutes: 60
     env:
       FLUREE_BENCH_PROFILE: quick
       FLUREE_BENCH_SCALE: tiny
       # Baseline is host_class=local, so the nightly compare treats time and
       # memory as advisory until a ci-* baseline is committed (bench-capture).
       # (FLUREE_BENCH_RUNNER_CLASS is still read as the pre-rename spelling.)
-      FLUREE_BENCH_HOST_CLASS: ci-ubuntu-latest
+      FLUREE_BENCH_HOST_CLASS: ci-cd-large-8core
     steps:
-      - name: Free disk space
+      - name: Runner capacity
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
+          nproc
+          free -h
+          df -h /
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Reconcile first — failure here is fast (no compile needed) and
       # tells the contributor exactly which bench / budget entry is
@@ -75,63 +82,106 @@ jobs:
       - name: Reconcile workspace [[bench]] entries with regression-budget.json
         run: cargo test -p fluree-bench-support --test workspace_reconcile
 
-      # Build all benches in release. Heavy on cold cache; rust-cache
-      # makes subsequent runs cheap.
+      # Select every explicit benchmark target. Bare `cargo bench --workspace`
+      # also builds libraries/binaries as libtest benchmark harnesses under fat
+      # LTO, even though this workspace has no inline #[bench] functions.
+      # The per-PR nextest job already runs the unit and integration tests.
+      # Enable the GraphQL bench's required feature explicitly.
       - name: Build benches
-        run: cargo bench --workspace --no-run
+        id: build-benches
+        # Leave time for rust-cache's post step even if a cold build times out.
+        timeout-minutes: 45
+        run: cargo bench --workspace --bench '*' --features fluree-db-api/graphql --no-run
 
       # Smoke-run every bench's scenarios at `tiny` scale via criterion's
       # `--test` mode (one iteration per scenario, no statistics collected).
       # Catches benches that compile but panic at runtime (bad SPARQL,
       # broken setup, missing API surface).
       - name: Smoke-run benches at tiny scale
-        run: cargo bench --workspace -- --test
+        run: cargo bench --workspace --bench '*' --features fluree-db-api/graphql --no-fail-fast -- --test
 
-      # Real per-bench compare of the captured subset against the committed
-      # baseline (the nightly perf-regression gate). `if: always()` so it runs
-      # even when an unrelated workspace bench trips the smoke step above.
-      # Follow-up (ROADMAP.md §7 cost caveat): the full workspace compare at
-      # +medium against a phase post-baseline needs the 45-min cap raised or the
-      # workflow split, so it is deliberately NOT wired here yet.
-      - name: Compare captured subset against committed baseline
-        if: always()
+  bench-compare:
+    # Nightly and on demand. Run independently of the full benchmark build so
+    # comparison results are available sooner, even if a smoke benchmark fails.
+    runs-on: ci-cd-large
+    timeout-minutes: 30
+    env:
+      FLUREE_BENCH_PROFILE: quick
+      FLUREE_BENCH_SCALE: tiny
+      # CI-class marker. The committed baseline is host_class=local, so this
+      # mismatch is what makes both metrics advisory today.
+      # (FLUREE_BENCH_RUNNER_CLASS is still read as the pre-rename spelling.)
+      FLUREE_BENCH_HOST_CLASS: ci-cd-large-8core
+    steps:
+      - name: Runner capacity
         run: |
-          rm -rf target/fluree-bench-mem target/fluree-bench-meta
-          cargo bench -p fluree-db-api --bench query_overlay_matrix
-          cargo bench -p fluree-db-api --bench query_hot_bsbm
+          nproc
+          free -h
+          df -h /
+
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Clear stale sidecars first: rust-cache persists target/ across runs, and
+      # compare must not merge a mem number from a bench not rerun this session
+      # (review item 10), nor a corpus block from a run that never read that
+      # corpus. Clear Criterion's cached comparisons too: rust-cache prunes
+      # sample.json, leaving dangling comparisons. One Cargo invocation builds
+      # both binaries in parallel, then measures them sequentially.
+      - name: Run cheap benches (tiny, quick)
+        run: |
+          rm -rf target/criterion target/fluree-bench-mem target/fluree-bench-meta
+          cargo bench -p fluree-db-api --bench query_overlay_matrix --bench query_hot_bsbm
+
+      # Compare against the committed baseline. Exit 1 on any breach of a metric
+      # the host-class match makes enforcing, 2 on a refusal to compare.
+      #
+      # --allow-host-mismatch is the phase-1 posture and nothing else: the
+      # committed baseline is host_class=local, this runner is
+      # ci-cd-large-8core, and without the flag the job would refuse outright.
+      # DROP THIS FLAG once a ci-cd-large-8core baseline is committed (bench.yml's
+      # bench-capture job) — the flag is what stands between annotations and a
+      # real gate. Phase-share drift enforces either way.
+      - name: Compare against committed baseline
+        run: |
           cargo run -p fluree-bench-support --bin bench-baseline -- \
             compare --baseline bench-baselines/guardrails-pre.json \
             --allow-host-mismatch
 
   bench-capture:
     # On-demand CI-class baseline capture (review item 1c). Captures the cheap
-    # subset on ubuntu-latest with runner_class=ci-ubuntu-latest and uploads the
+    # subset on ci-cd-large with runner_class=ci-cd-large-8core and uploads the
     # JSON as an artifact. Committing it to bench-baselines/ is a human follow-up
-    # — once a ci-* baseline lands, the per-PR compare's TIME half enforces
+    # — once a ci-* baseline lands, time and memory comparisons enforce
     # automatically (runner classes match). workflow_dispatch only (not on the
     # nightly schedule) to avoid the extra cost every night.
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    if: github.event_name == 'workflow_dispatch' && inputs.capture_baseline
+    runs-on: ci-cd-large
+    # Up to ten sequential tiny+small passes, plus a cold build.
+    timeout-minutes: 90
     env:
       FLUREE_BENCH_PROFILE: quick
       FLUREE_BENCH_SCALE: tiny
-      FLUREE_BENCH_HOST_CLASS: ci-ubuntu-latest
+      FLUREE_BENCH_HOST_CLASS: ci-cd-large-8core
     steps:
-      - name: Free disk space
+      - name: Runner capacity
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
+          nproc
+          free -h
+          df -h /
 
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Same cheap subset and scales (tiny+small) as the committed baseline, so
       # the artifact is a drop-in ci-* replacement once a human commits it.
@@ -141,23 +191,24 @@ jobs:
       # MAD. Passes must NOT be parallelised and the sidecars are cleared each
       # time: a sample has to be an independent measurement of the same thing.
       - name: Capture cheap subset (CI-class)
+        env:
+          CAPTURE_SAMPLES: ${{ inputs.capture_samples || '1' }}
         run: |
-          samples="${{ github.event.inputs.capture_samples || '1' }}"
+          samples="$CAPTURE_SAMPLES"
           # `seq 1 0` runs zero passes, so a 0 (or any non-number) would produce
           # no baseline at all while the job still reported success. Fail loudly
           # instead — a capture job that captures nothing is worse than one that
           # errors, because the artifact step would then upload nothing quietly.
-          if ! [[ "$samples" =~ ^[1-9][0-9]*$ ]]; then
-            echo "::error::capture_samples must be a positive integer, got '$samples'"
+          if ! [[ "$samples" =~ ^([1-9]|10)$ ]]; then
+            echo "::error::capture_samples must be an integer from 1 to 10, got '$samples'"
             exit 1
           fi
           rm -f bench-baselines/guardrails-pre-ci.json
           for pass in $(seq 1 "$samples"); do
             echo "::group::capture pass $pass/$samples"
-            rm -rf target/fluree-bench-mem target/fluree-bench-meta
+            rm -rf target/criterion target/fluree-bench-mem target/fluree-bench-meta
             for scale in tiny small; do
-              FLUREE_BENCH_SCALE=$scale cargo bench -p fluree-db-api --bench query_overlay_matrix
-              FLUREE_BENCH_SCALE=$scale cargo bench -p fluree-db-api --bench query_hot_bsbm
+              FLUREE_BENCH_SCALE=$scale cargo bench -p fluree-db-api --bench query_overlay_matrix --bench query_hot_bsbm
             done
             cargo run -p fluree-bench-support --bin bench-baseline -- \
               capture --label guardrails-pre-ci --out bench-baselines/guardrails-pre-ci.json \
@@ -166,7 +217,7 @@ jobs:
           done
 
       - name: Upload CI-class baseline artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: guardrails-pre-ci-baseline
           path: bench-baselines/guardrails-pre-ci.json

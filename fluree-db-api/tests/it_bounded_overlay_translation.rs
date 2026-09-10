@@ -916,7 +916,7 @@ async fn warm_whole_product_short_circuits_and_respects_epoch() {
 async fn incoming_reference_seek_keeps_base_overlay_lifecycle() {
     let (fluree, _dir) = new_fluree().await;
     let ledger = fluree.create_ledger(LEDGER).await.expect("create");
-    let ledger = fluree
+    fluree
         .insert(
             ledger,
             &json!({
@@ -929,13 +929,17 @@ async fn incoming_reference_seek_keeps_base_overlay_lifecycle() {
             }),
         )
         .await
-        .expect("seed")
-        .ledger;
+        .expect("seed");
     fluree
         .reindex(LEDGER, ReindexOptions::default())
         .await
         .expect("index");
     let before = indexed_view(&fluree).await;
+    // Commit the overlay on the INDEXED state and query the state that comes
+    // back, so the view is "indexed base + trailing novelty" by construction —
+    // polling `db()` here races the background indexer, which may already have
+    // published the overlay commit.
+    let indexed = fluree.ledger(LEDGER).await.expect("indexed ledger state");
     let mut inserts = (0..80)
         .map(|i| {
             json!({
@@ -944,9 +948,9 @@ async fn incoming_reference_seek_keeps_base_overlay_lifecycle() {
         })
         .collect::<Vec<_>>();
     inserts.push(json!({"@id":"ex:added", "ex:q":{"@id":"ex:target"}}));
-    fluree
+    let updated = fluree
         .update(
-            ledger,
+            indexed,
             &json!({
                 "@context":ctx(),
                 "delete":{"@id":"ex:drop", "ex:p":{"@id":"ex:target"}},
@@ -954,11 +958,14 @@ async fn incoming_reference_seek_keeps_base_overlay_lifecycle() {
             }),
         )
         .await
-        .expect("overlay");
-    let view = indexed_view(&fluree).await;
+        .expect("overlay")
+        .ledger;
+    let view = crate::support::graphdb_from_ledger(&updated);
     assert!(
-        view.t > view.snapshot.t,
-        "fixture must retain trailing novelty"
+        view.snapshot.t > 0 && view.t > view.snapshot.t,
+        "fixture must be an indexed base with trailing novelty (t={}, snapshot.t={})",
+        view.t,
+        view.snapshot.t
     );
     let query = "SELECT ?s ?p WHERE { ?s ?p <http://example.org/target> } ORDER BY ?s ?p";
     let (spans, guard) = span_capture::init_test_tracing();

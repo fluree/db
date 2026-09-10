@@ -353,13 +353,25 @@ pub(crate) fn equality_norm(ctx: &crate::context::ExecutionContext<'_>) -> Optio
     })
 }
 
-/// Normalize one binding for use in an equality/hash key (no-op clone-free
-/// path for already-encoded bindings).
+/// Normalize one binding for use in an equality/hash key.
 pub(crate) fn normalize_for_key(
     binding: &Binding,
     store: Option<&BinaryIndexStore>,
     gv: Option<&fluree_db_binary_index::BinaryGraphView>,
 ) -> Binding {
+    normalize_for_key_cow(binding, store, gv).into_owned()
+}
+
+/// [`normalize_for_key`] without the clone: an already-encoded binding (the
+/// common case on the indexed scan path) is returned borrowed, so a hot
+/// equality surface such as `DISTINCT` can hash and probe a row without
+/// copying it and only materializes the key for rows it actually keeps.
+pub(crate) fn normalize_for_key_cow<'a>(
+    binding: &'a Binding,
+    store: Option<&BinaryIndexStore>,
+    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+) -> std::borrow::Cow<'a, Binding> {
+    use std::borrow::Cow;
     // Arena-keyed NUM_BIG values normalize by DECODING: handles are scoped
     // per (graph, predicate), so the encoded form is not a canonical key for
     // one value across predicates or against decoded rows (VALUES, BIND,
@@ -369,14 +381,15 @@ pub(crate) fn normalize_for_key(
         if let Some(gv) = gv {
             let materialized = crate::group_aggregate::materialize_encoded(binding, Some(gv));
             if !matches!(materialized, Binding::EncodedLit { .. }) {
-                return materialized;
+                return Cow::Owned(materialized);
             }
         }
-        return binding.clone();
+        return Cow::Borrowed(binding);
     }
-    store
-        .and_then(|s| encoded_equivalent(binding, s))
-        .unwrap_or_else(|| binding.clone())
+    match store.and_then(|s| encoded_equivalent(binding, s)) {
+        Some(encoded) => Cow::Owned(encoded),
+        None => Cow::Borrowed(binding),
+    }
 }
 
 /// True if this is an arena-backed (NUM_BIG) encoded literal.
