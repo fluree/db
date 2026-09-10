@@ -438,6 +438,11 @@ path = "tests/it_optional_after_union.rs"
 name = "it_query_sparql_indexed"
 path = "tests/it_query_sparql_indexed.rs"
 
+# Keep this binary single-test: its walk-floor override is cached process-wide.
+[[test]]
+name = "it_range_semijoin"
+path = "tests/it_range_semijoin.rs"
+
 [[test]]
 name = "it_rebuild_fetch_counts"
 path = "tests/it_rebuild_fetch_counts.rs"
