@@ -1479,15 +1479,26 @@ pub fn spawn_local_cache_event_listener(
                 // by raft failover — a write lands, replicates, applies
                 // on every node, yet only the staging node's cache shows
                 // it).
-                Ok(
-                    fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
-                        ledger_id, ..
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerCommitPublished {
+                    ledger_id,
+                    commit_t,
+                    ..
+                }) => {
+                    // A commit this process installed through the cached
+                    // handle is already in the cache; reconciling it would
+                    // only re-read the record it just wrote.
+                    let own = match ledger_manager.get_loaded_handle(&ledger_id).await {
+                        Some(handle) => handle.committed_t() >= commit_t,
+                        None => false,
+                    };
+                    if !own {
+                        reconcile_cached_ledger(&ledger_manager, &ledger_id).await;
                     }
-                    | fluree_db_nameservice::NameServiceEvent::LedgerCommitPublished {
-                        ledger_id,
-                        ..
-                    },
-                ) => {
+                }
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
+                    ledger_id,
+                    ..
+                }) => {
                     reconcile_cached_ledger(&ledger_manager, &ledger_id).await;
                 }
                 Ok(fluree_db_nameservice::NameServiceEvent::LedgerRetracted { ledger_id }) => {

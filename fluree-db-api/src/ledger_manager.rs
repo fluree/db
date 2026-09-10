@@ -74,6 +74,7 @@ fn monotonic_secs() -> u64 {
 pub struct LedgerWriteGuard {
     ledger: LedgerHandle,
     guard: tokio::sync::OwnedRwLockWriteGuard<LedgerState>,
+    acquired: Instant,
 }
 
 impl LedgerWriteGuard {
@@ -85,6 +86,11 @@ impl LedgerWriteGuard {
     /// Get reference to current state
     pub fn state(&self) -> &LedgerState {
         &self.guard
+    }
+
+    /// How long this guard has held the ledger's write lock.
+    pub fn held_for(&self) -> Duration {
+        self.acquired.elapsed()
     }
 
     /// Clone current state for passing to stage (which consumes by value)
@@ -207,6 +213,10 @@ struct LedgerHandleInner {
     /// [`RecentCommits`]). Written and read only under the `state` write
     /// lock; the mutex just satisfies the borrow checker.
     recent_commits: parking_lot::Mutex<RecentCommits>,
+    /// `t` of the last commit this handle installed through its own commit
+    /// path, so the publish listener can tell its own commits from others'
+    /// without touching the state lock.
+    committed_t: std::sync::atomic::AtomicI64,
     write_paths: WritePathCounters,
     /// Test hook: the next optimistic stage on this handle parks here after
     /// staging and before taking the lock (see
@@ -354,6 +364,7 @@ impl LedgerHandle {
                 tier_width: AtomicUsize::new(fluree_db_novelty::DEFAULT_TIER_WIDTH),
                 config_cache: RwLock::new(ConfigCacheEntry::default()),
                 recent_commits: parking_lot::Mutex::new(RecentCommits::default()),
+                committed_t: std::sync::atomic::AtomicI64::new(0),
                 write_paths: WritePathCounters::default(),
                 stage_gate: parking_lot::Mutex::new(None),
             }),
@@ -407,7 +418,20 @@ impl LedgerHandle {
 
     /// Remember a commit just installed under the write lock.
     pub(crate) fn record_commit(&self, footprint: CommitFootprint) {
+        self.inner
+            .committed_t
+            .store(footprint.t, std::sync::atomic::Ordering::Release);
         self.inner.recent_commits.lock().push(footprint);
+    }
+
+    /// `t` of the last commit installed through this handle's own commit
+    /// path (0 before any). Lock-free; may trail the state after commits
+    /// installed by other paths, which only makes a caller reconcile once
+    /// more than it needed to.
+    pub(crate) fn committed_t(&self) -> i64 {
+        self.inner
+            .committed_t
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The subjects touched by every commit after `(t0, head0)` up to the
@@ -545,6 +569,7 @@ impl LedgerHandle {
         LedgerWriteGuard {
             ledger: self.clone(),
             guard: Arc::clone(&self.inner.state).write_owned().await,
+            acquired: Instant::now(),
         }
     }
 
@@ -676,6 +701,7 @@ impl LedgerHandle {
             .map_err(|e| ApiError::internal(format!("failed to read index root: {e}")))?;
         let root = fluree_db_binary_index::IndexRoot::decode(&bytes)
             .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
+        let load_started = Instant::now();
 
         // The store this publish replaces: an incremental root shares nearly
         // all of its artifacts with it, and the load carries those over by
@@ -727,14 +753,20 @@ impl LedgerHandle {
         // swap. No event fires inside the lock: under a default `fmt`
         // subscriber, span lifecycle is in-memory bookkeeping rather than a
         // formatted write to a shared writer.
+        let load_us = load_started.elapsed().as_micros() as u64;
+        let wait_started = Instant::now();
         let state_guard = self
             .inner
             .state
             .write()
             .instrument(tracing::debug_span!("index_install_wait"))
             .await;
+        let wait_us = wait_started.elapsed().as_micros() as u64;
+        let install_started = Instant::now();
+        let ledger_id = self.id().to_string();
         let install = async move {
             let mut state = state_guard;
+            let novelty_flakes_before = state.novelty.len();
 
             // apply_loaded_db: validates, trims novelty, rebuilds dict_novelty
             state
@@ -773,6 +805,17 @@ impl LedgerHandle {
             let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
             state.binary_store = Some(TypeErasedStore(te_store));
             *self.inner.binary_store.write().await = Some(arc_store);
+            tracing::debug!(
+                target: "fluree::write_path",
+                ledger = ledger_id,
+                index_t = state.index_t(),
+                novelty_flakes_before,
+                novelty_flakes_after = state.novelty.len(),
+                load_us,
+                wait_us,
+                install_us = install_started.elapsed().as_micros() as u64,
+                "index install"
+            );
             Ok::<(), ApiError>(())
         };
         install

@@ -676,19 +676,32 @@ pub async fn build_commit(
     // attached the extension below would copy the table. It is taken off for
     // the extension and put back as it was; `finalize_state_with_base` rebuilds
     // it over the extended table.
-    let provider = if ns_delta.is_empty() {
-        None
-    } else {
-        Arc::make_mut(&mut base.snapshot).range_provider.take()
-    };
-    let applied = Arc::make_mut(&mut base.snapshot).apply_envelope_deltas(
-        &ns_delta,
-        graph_delta.values().map(std::string::String::as_str),
+    tracing::debug!(
+        target: "fluree::cow_probe",
+        snapshot_strong = Arc::strong_count(&base.snapshot),
+        ns_delta = ns_delta.len(),
+        graph_delta = graph_delta.len(),
+        "build_commit snapshot ownership before envelope apply"
     );
-    if let Some(provider) = provider {
-        Arc::make_mut(&mut base.snapshot).range_provider = Some(provider);
+    // Nothing to apply is the common case, and `make_mut` on a snapshot
+    // another holder shares (an index build in flight, a concurrent reader)
+    // copies the whole snapshot, stats included — so an empty delta must
+    // not touch it.
+    if !ns_delta.is_empty() || !graph_delta.is_empty() {
+        let provider = if ns_delta.is_empty() {
+            None
+        } else {
+            Arc::make_mut(&mut base.snapshot).range_provider.take()
+        };
+        let applied = Arc::make_mut(&mut base.snapshot).apply_envelope_deltas(
+            &ns_delta,
+            graph_delta.values().map(std::string::String::as_str),
+        );
+        if let Some(provider) = provider {
+            Arc::make_mut(&mut base.snapshot).range_provider = Some(provider);
+        }
+        applied?;
     }
-    applied?;
 
     // Resolve the commit's event time (`Commit.time`, the `@iso:` axis) and
     // the optional audit-axis receivedAt stamp. Validates monotonicity and
@@ -862,6 +875,7 @@ where
         .expect("build_commit sets commit.id");
     let ledger_id_for_publish = base.ledger_id().to_string();
 
+    let phase = std::time::Instant::now();
     // 8. Write referenced blobs the build phase deferred (today: none),
     //    then write the commit blob via put_with_id (idempotent).
     let write_and_publish = async {
@@ -880,6 +894,8 @@ where
                 .await?;
             tracing::info!(commit_bytes = commit_bytes.len(), "commit blob stored");
         }
+        let blob_us = phase.elapsed().as_micros() as u64;
+        let publish_started = std::time::Instant::now();
 
         // 9. Publish to nameservice.
         let new_head_ref = RefValue {
@@ -921,12 +937,21 @@ where
                 });
             }
         }
-        Ok::<_, TransactError>(())
+        Ok::<_, TransactError>((blob_us, publish_started.elapsed().as_micros() as u64))
     };
 
-    write_and_publish.await?;
+    let (blob_us, publish_us) = write_and_publish.await?;
+    let finalize_started = std::time::Instant::now();
 
-    finalize_state_with_base(commit_record, commit_cid, new_t, flake_count, base)
+    let finalized = finalize_state_with_base(commit_record, commit_cid, new_t, flake_count, base);
+    tracing::debug!(
+        target: "fluree::write_path",
+        blob_us,
+        publish_us,
+        finalize_us = finalize_started.elapsed().as_micros() as u64,
+        "commit apply"
+    );
+    finalized
 }
 
 fn finalize_state_with_base(
@@ -1015,6 +1040,8 @@ fn finalize_state_with_base(
         target: "fluree::cow_probe",
         dict_novelty_strong = Arc::strong_count(&dict_novelty),
         runtime_small_dicts_strong = Arc::strong_count(&runtime_small_dicts),
+        snapshot_strong = Arc::strong_count(&snapshot),
+        novelty_strong = Arc::strong_count(&base.novelty),
         had_binary_provider,
         "commit_txn dict ownership before make_mut"
     );
@@ -1114,12 +1141,14 @@ where
     );
 
     async move {
+        let phase = std::time::Instant::now();
         // Run the cheap pre-checks before awaiting the raw-txn upload
         // so a sequencing failure doesn't wait on storage I/O.
         let current = nameservice
             .lookup(view.base().ledger_id())
             .instrument(tracing::debug_span!("commit_nameservice_lookup"))
             .await?;
+        let ns_lookup_us = phase.elapsed().as_micros() as u64;
         {
             let span = tracing::debug_span!("commit_verify_sequencing");
             let _g = span.enter();
@@ -1138,6 +1167,7 @@ where
             opts.raw_txn_id.take()
         };
 
+        let phase = std::time::Instant::now();
         let staged = build_commit(
             view,
             ns_registry,
@@ -1147,6 +1177,12 @@ where
             opts,
         )
         .await?;
+        tracing::debug!(
+            target: "fluree::write_path",
+            ns_lookup_us,
+            build_us = phase.elapsed().as_micros() as u64,
+            "commit build"
+        );
         staged.apply(content_store, nameservice).await
     }
     .instrument(commit_span)

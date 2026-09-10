@@ -1921,12 +1921,16 @@ impl Fluree {
         touched: Option<Arc<FxHashSet<Sid>>>,
     ) -> Result<(fluree_db_transact::CommitReceipt, IndexingStatus)> {
         let parent = write_guard.state().head_commit_id.clone();
-        let hold_started = std::time::Instant::now();
+        let pre_us = write_guard.held_for().as_micros() as u64;
+        let hold_started = std::time::Instant::now() - write_guard.held_for();
+        let phase = std::time::Instant::now();
         // Empty the cache slot for the commit window. `view`'s base was cloned
         // from it, so until the cache's copy is gone every `Arc::make_mut` in
         // the commit path copy-on-writes the ledger dictionaries instead of
         // extending them in place. See [`DetachedCacheSlot`].
         let mut slot = DetachedCacheSlot::detach(write_guard, fluree.ledger_manager.clone());
+        let detach_us = phase.elapsed().as_micros() as u64;
+        let phase = std::time::Instant::now();
 
         let (receipt, new_state) = match fluree
             .commit_staged(view, ns_registry, &index_config, commit_opts)
@@ -1938,6 +1942,8 @@ impl Fluree {
                 return Err(e);
             }
         };
+        let commit_us = phase.elapsed().as_micros() as u64;
+        let phase = std::time::Instant::now();
 
         let indexing_status = IndexingStatus {
             enabled: fluree.indexing_mode.is_enabled(),
@@ -1967,6 +1973,10 @@ impl Fluree {
             target: "fluree::write_path",
             ledger = slot.guard_mut().ledger().id(),
             t = receipt.t,
+            pre_us,
+            detach_us,
+            commit_us,
+            install_us = phase.elapsed().as_micros() as u64,
             hold_us = hold_started.elapsed().as_micros() as u64,
             "commit"
         );
