@@ -19,7 +19,7 @@ use crate::ir::triple::{Ref, TriplePattern};
 use crate::operator::inline::InlineOperator;
 use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
-use fluree_db_binary_index::arena::numbig::{NumBigArena, NumBigRepr};
+use fluree_db_binary_index::arena::numbig::{NumBigArena, NumBigRepr, StoredBigValue};
 use fluree_db_binary_index::format::branch::LeafEntry;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::{
@@ -1186,10 +1186,10 @@ const NUMBIG_EXACT_SITE: &str = "distinct object COUNT (numbig exact)";
 /// arenas hold more entries than this in total declines the whole count to
 /// the general pipeline. Unset means no cap.
 ///
-/// There is deliberately no default. The branch's cost is bounded by arena
-/// entries — already resident in memory — plus cached directory reads, never
-/// by row count, and declining is the expensive outcome: the general pipeline
-/// scans and materializes every object in the graph. The predecessor of this
+/// There is deliberately no default. The branch reads resident arena entries
+/// and directory metadata, decoding mixed-type or legacy leaflets and scanning
+/// NumBig rows for predicates with stale handles. Declining instead scans and
+/// materializes every object in the graph. The predecessor of this
 /// branch capped on NumBig *rows* (25M) and declined above it, which on a
 /// Wikidata-scale ledger turned a 20 ms count into a full scan that timed out
 /// at 300 s.
@@ -1265,6 +1265,12 @@ pub(crate) fn count_distinct_objects(
 ///
 /// Returns `None` when the index is inconsistent (NumBig rows with no arena to
 /// decode them) or when [`numbig_exact_max_entries`] is set and exceeded.
+///
+/// Keys are built and sorted on every execution; the count is not cached.
+/// Before cross-predicate dedup, the vector holds one key per live arena
+/// entry, including repeated values across predicates. On typical 64-bit targets
+/// each key occupies 48 bytes, plus allocations for wide values and temporary
+/// buffers. Legacy arenas also pay for normalization during key construction.
 fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Result<Option<u64>> {
     use rayon::prelude::*;
 
@@ -1282,6 +1288,7 @@ fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Res
 
     let mut keys: Vec<NumBigDistinctKey> = Vec::new();
     for (p_id, arena) in arenas {
+        let normalized = arena.values_are_normalized();
         let live = count_live_numbig_handles(store, g_id, p_id)?;
         if live == 0 {
             continue;
@@ -1291,7 +1298,7 @@ fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Res
                 arena
                     .values()
                     .par_iter()
-                    .map(|v| NumBigDistinctKey::from_repr(v.normalized_repr())),
+                    .map(|v| NumBigDistinctKey::from_stored(v, normalized)),
             );
             continue;
         }
@@ -1301,7 +1308,7 @@ fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Res
             .map(|&h| {
                 arena
                     .get_by_handle(h)
-                    .map(|v| NumBigDistinctKey::from_repr(v.normalized_repr()))
+                    .map(|v| NumBigDistinctKey::from_stored(v, normalized))
                     .ok_or_else(|| {
                         QueryError::Internal(format!(
                             "NumBig handle {h} beyond arena for g_id={g_id}, p_id={p_id}"
@@ -1321,7 +1328,7 @@ fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Res
 /// Canonical signed little-endian bytes of at most 16 bytes fold into an
 /// `i128`; anything wider keeps its bytes. The encoding is minimal, so a value
 /// that fits `i128` never appears in the wide arm and the mapping is injective.
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum NumBigDistinctKey {
     Int(i128),
     IntWide(Vec<u8>),
@@ -1330,6 +1337,25 @@ enum NumBigDistinctKey {
 }
 
 impl NumBigDistinctKey {
+    /// Only bypass normalization when the arena proves all stored values are
+    /// normalized. Inline keys borrow bytes without allocating; wide keys own
+    /// a copy so they can be sorted together across arenas.
+    fn from_stored(value: &StoredBigValue, normalized: bool) -> Self {
+        if !normalized {
+            return Self::from_repr(value.normalized_repr());
+        }
+        match value {
+            StoredBigValue::BigInt(bytes) => match i128_from_signed_le(bytes) {
+                Some(v) => Self::Int(v),
+                None => Self::IntWide(bytes.clone()),
+            },
+            StoredBigValue::BigDec { unscaled, scale } => match i128_from_signed_le(unscaled) {
+                Some(v) => Self::Dec(v, *scale),
+                None => Self::DecWide(unscaled.clone(), *scale),
+            },
+        }
+    }
+
     fn from_repr(repr: NumBigRepr) -> Self {
         match repr {
             NumBigRepr::BigIntBytes(bytes) => match i128_from_signed_le(&bytes) {
@@ -2136,6 +2162,109 @@ mod tests {
     use super::*;
     use fluree_db_core::index_stats::{GraphPropertyStatEntry, GraphStatsEntry};
     use fluree_db_core::IndexStats;
+
+    #[test]
+    fn numbig_signed_keys_preserve_boundaries() {
+        use num_bigint::BigInt;
+        for value in [
+            0,
+            127,
+            128,
+            -128,
+            -129,
+            i64::MIN as i128,
+            i64::MAX as i128,
+            i128::MIN,
+            i128::MAX,
+        ] {
+            let bytes = BigInt::from(value).to_signed_bytes_le();
+            assert_eq!(i128_from_signed_le(&bytes), Some(value));
+            assert_eq!(
+                NumBigDistinctKey::from_stored(&StoredBigValue::BigInt(bytes), true),
+                NumBigDistinctKey::Int(value)
+            );
+        }
+        for value in [BigInt::from(i128::MIN) - 1u8, BigInt::from(i128::MAX) + 1u8] {
+            let bytes = value.to_signed_bytes_le();
+            assert_eq!(i128_from_signed_le(&bytes), None);
+            let int = NumBigDistinctKey::from_stored(&StoredBigValue::BigInt(bytes.clone()), true);
+            let dec = NumBigDistinctKey::from_stored(
+                &StoredBigValue::BigDec {
+                    unscaled: bytes.clone(),
+                    scale: 0,
+                },
+                true,
+            );
+            assert_eq!(int, NumBigDistinctKey::IntWide(bytes.clone()));
+            assert_eq!(dec, NumBigDistinctKey::DecWide(bytes, 0));
+            assert_ne!(int, dec);
+        }
+    }
+
+    #[test]
+    fn numbig_stored_keys_match_normalized_keys() {
+        use fluree_db_binary_index::arena::numbig::{
+            read_numbig_arena_from_bytes, write_numbig_arena_to_bytes,
+        };
+        let mut arena = NumBigArena::new();
+        for lexical in [
+            "1.50",
+            "-1.500",
+            "0.000",
+            "1000.00",
+            "170141183460469231731687303715884105728.1",
+        ] {
+            arena.get_or_insert_bigdec(&lexical.parse().unwrap());
+        }
+        arena.get_or_insert_bigint(&"170141183460469231731687303715884105728".parse().unwrap());
+        let loaded =
+            read_numbig_arena_from_bytes(&write_numbig_arena_to_bytes(&arena).unwrap()).unwrap();
+        for arena in [&arena, &loaded] {
+            assert!(arena.values_are_normalized());
+            for value in arena.values() {
+                assert_eq!(
+                    NumBigDistinctKey::from_stored(value, arena.values_are_normalized()),
+                    NumBigDistinctKey::from_repr(value.normalized_repr())
+                );
+            }
+        }
+        for (unscaled, scale, expected) in [
+            (150i128, 2, NumBigDistinctKey::Dec(15, 1)),
+            (0, 3, NumBigDistinctKey::Dec(0, 0)),
+            (-1000, 2, NumBigDistinctKey::Dec(-1, -1)),
+        ] {
+            let value = StoredBigValue::BigDec {
+                unscaled: num_bigint::BigInt::from(unscaled).to_signed_bytes_le(),
+                scale,
+            };
+            assert_eq!(NumBigDistinctKey::from_stored(&value, false), expected);
+        }
+        assert_ne!(NumBigDistinctKey::Dec(15, 1), NumBigDistinctKey::Int(15));
+    }
+
+    #[test]
+    fn numbig_handle_partials_dedup_seams_and_preserve_empty_chunks() {
+        let mut left = NumBigHandlePartial::default();
+        left.push_run(2, 0, 1);
+        left.push_run(2, 1, 2);
+        assert_eq!((left.count, left.first, left.last), (3, Some(0), Some(2)));
+        let left = NumBigHandlePartial::combine(NumBigHandlePartial::default(), left);
+        let left = NumBigHandlePartial::combine(left, NumBigHandlePartial::default());
+        let mut right = NumBigHandlePartial::default();
+        right.push_run(2, 2, 3);
+        let merged = NumBigHandlePartial::combine(left, right);
+        assert_eq!(
+            (merged.count, merged.first, merged.last),
+            (4, Some(0), Some(3))
+        );
+        let mut disjoint = NumBigHandlePartial::default();
+        disjoint.push_run(2, 5, 6);
+        let merged = NumBigHandlePartial::combine(merged, disjoint);
+        assert_eq!(
+            (merged.count, merged.first, merged.last),
+            (6, Some(0), Some(6))
+        );
+    }
 
     fn prop(p_id: u32, datatypes: Vec<(u8, u64)>) -> GraphPropertyStatEntry {
         let count = datatypes.iter().map(|&(_, c)| c).sum();

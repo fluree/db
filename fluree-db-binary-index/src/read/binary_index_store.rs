@@ -1957,7 +1957,6 @@ impl BinaryIndexStore {
         &self.dicts.dt_sids
     }
 
-    /// Reverse subject lookup by namespace parts (avoids IRI construction).
     /// Every NumBig arena held for `g_id`, keyed by predicate. Arenas are
     /// loaded whole at store open, so iterating them touches no storage.
     pub fn numbig_arenas(

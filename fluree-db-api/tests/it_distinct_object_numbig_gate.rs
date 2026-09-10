@@ -57,8 +57,8 @@ const F_REPORTED: &str = r#"
 "#;
 
 /// Two decimals under ONE predicate: handles 0 and 1 in a single arena, so this
-/// answered correctly even unfixed. It still declines now — the gate is on the
-/// presence of a NumBig row, not on a collision it cannot see from metadata.
+/// answered correctly even unfixed. It now takes the exact arena branch, as
+/// does every graph with NumBig objects and no explicit entries cap.
 const F_ONE_PRED: &str = r#"
 <http://ex/s1> <http://ex/p1> "514.0000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
 <http://ex/s2> <http://ex/p1> "640.0000"^^<http://www.w3.org/2001/XMLSchema#decimal> .
@@ -336,7 +336,7 @@ impl Drop for FastPathGuard {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn distinct_object_count_declines_numbig_object_keys() {
+async fn distinct_object_count_counts_numbig_object_keys_exactly() {
     // The kill switch OR's with this env var, so with it set the fast lane
     // would run generically and every assertion below would be vacuous.
     assert!(
@@ -409,7 +409,7 @@ async fn distinct_object_count_declines_numbig_object_keys() {
     // ---- Phase 2: the over-broad-fix guards, on a decimal-bearing ledger --
     // Only the whole-graph OPST object arm is unsound. Declining its siblings
     // would be a gratuitous perf regression, so both must still fire on the
-    // very ledger that makes the object arm decline.
+    // very ledger that requires the exact object-count branch.
     {
         let (_db, _data, fluree, ledger_id) = build_indexed(F_LOSS3, "must-fire-guards").await;
         let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
@@ -588,12 +588,21 @@ async fn distinct_object_count_declines_numbig_object_keys() {
     // live row. The exact branch must count only handles POST still holds —
     // and must notice from directory metadata alone that an arena is not
     // fully live.
-    {
-        let (_db, _data, fluree, ledger_id) = build_indexed(F_LIFECYCLE, "liveness").await;
+    // Keep the decimal-only fixture for the numeric ordering pin. Adding a
+    // string here exercises the stale lane's per-row o_type filter on a real
+    // column, while the original fixture still covers type-pure leaflets.
+    let mixed_lifecycle = format!("{F_LIFECYCLE}\n<http://ex/a6> <http://ex/p1> \"alpha\" .\n");
+    for (ttl, slug, initial, rebuilt, incremental) in [
+        (F_LIFECYCLE, "liveness", "8", "7", "4"),
+        (mixed_lifecycle.as_str(), "mixed-liveness", "9", "8", "5"),
+    ] {
+        let (_db, _data, fluree, ledger_id) = build_indexed(ttl, slug).await;
         let ctx = json!({"ex": "http://ex/", "xsd": "http://www.w3.org/2001/XMLSchema#"});
+        check_liveness(&fluree, &ledger_id, initial, slug, &mut failures).await;
 
         // Retract 5.5 (p1 only: the term is gone) and p2's 9.9 (the term
-        // survives under p1). Union 8 → 7; both arenas keep a stale handle.
+        // survives under p1). Decimal union 8 → 7, plus the mixed fixture's
+        // string; both arenas keep a stale handle.
         let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
         fluree
             .update(
@@ -609,7 +618,14 @@ async fn distinct_object_count_declines_numbig_object_keys() {
             .await
             .expect("retract two decimals");
         support::rebuild_and_publish_index(&fluree, &ledger_id).await;
-        check_liveness(&fluree, &ledger_id, "7", "after rebuild", &mut failures).await;
+        check_liveness(
+            &fluree,
+            &ledger_id,
+            rebuilt,
+            &format!("{slug} after rebuild"),
+            &mut failures,
+        )
+        .await;
 
         // Retract every remaining p2 value: p2's arena has no live handle at
         // all, and the incremental build carries it forward unchanged.
@@ -629,7 +645,14 @@ async fn distinct_object_count_declines_numbig_object_keys() {
             .await
             .expect("retract p2");
         support::build_and_publish_index(&fluree, &ledger_id).await;
-        check_liveness(&fluree, &ledger_id, "4", "after incremental", &mut failures).await;
+        check_liveness(
+            &fluree,
+            &ledger_id,
+            incremental,
+            &format!("{slug} after incremental"),
+            &mut failures,
+        )
+        .await;
     }
 
     assert!(
