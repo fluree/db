@@ -18,6 +18,7 @@ use fluree_db_api::{FlureeBuilder, IndexConfig};
 use fluree_db_core::{load_ledger_snapshot, LedgerSnapshot};
 use fluree_db_transact::{CommitOpts, TxnOpts};
 use serde_json::json;
+use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
 #[tokio::test]
@@ -188,5 +189,105 @@ async fn cached_handle_applies_local_background_index_publish_without_refresh() 
 
     panic!(
         "cached handle did not apply local index event without refresh: index_t={last_index_t}, novelty_size={last_novelty_size}, commit_t={commit_t}"
+    );
+}
+
+/// Wait until the cached handle has applied a publish covering `commit_t`,
+/// returning the view that shows it.
+async fn view_after_publish(
+    cached: &fluree_db_api::LedgerHandle,
+    commit_t: i64,
+) -> fluree_db_api::LedgerView {
+    for _ in 0..200 {
+        let view = cached.snapshot().await;
+        if view.index_t() >= commit_t && view.novelty.size == 0 {
+            return view;
+        }
+        drop(view);
+        sleep(Duration::from_millis(20)).await;
+    }
+    panic!("cached handle did not apply the publish covering t={commit_t}");
+}
+
+/// An incremental publish keeps nearly every artifact of the previous root.
+/// The store installed for it must carry those over from the store it
+/// replaces — every forward pack the two roots share is the same open
+/// handle, and an unchanged namespace table is the same allocation — rather
+/// than reopening the whole index on every publish.
+#[tokio::test]
+async fn an_index_publish_reuses_the_artifacts_of_the_store_it_replaces() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+
+    let fluree = FlureeBuilder::file(path)
+        .with_indexing_thresholds(1_000_000, 10_000_000)
+        .build()
+        .expect("build file fluree");
+    let indexer = fluree
+        .indexer_handle()
+        .expect("file builder should start background indexing")
+        .clone();
+
+    let ledger_id = "it/publish-reuse:main";
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let cached = fluree.ledger_cached(ledger_id).await.expect("cache ledger");
+
+    let publish = |round: usize| {
+        let fluree = &fluree;
+        let cached = &cached;
+        let indexer = &indexer;
+        async move {
+            let tx = json!({
+                "@context": {"ex": "http://example.org/"},
+                // Same namespaces every round, so the namespace table of the
+                // second root is exactly the first's.
+                "@graph": (0..3).map(|i| json!({
+                    "@id": format!("ex:thing-{round}-{i}"),
+                    "ex:label": format!("round {round} thing {i}")
+                })).collect::<Vec<_>>()
+            });
+            let commit_t = fluree
+                .stage(cached)
+                .insert(&tx)
+                .execute()
+                .await
+                .expect("insert")
+                .receipt
+                .t;
+            match indexer.trigger(ledger_id, commit_t).await.wait().await {
+                fluree_db_api::IndexOutcome::Completed { .. } => {}
+                other => panic!("indexing did not complete: {other:?}"),
+            }
+            view_after_publish(cached, commit_t)
+                .await
+                .binary_store
+                .expect("published index attaches a store")
+        }
+    };
+
+    let first = publish(0).await;
+    let second = publish(1).await;
+    assert!(
+        !Arc::ptr_eq(&first, &second),
+        "a publish installs a new store"
+    );
+
+    let (shared, total) = second.forward_packs_shared_with(&first);
+    let (_, before) = first.forward_packs_shared_with(&first);
+    assert!(before > 0, "the first root has forward packs");
+    assert_eq!(
+        shared, before,
+        "every pack of the previous root must be carried over, not reopened"
+    );
+    assert!(
+        total > shared,
+        "the second root appends packs for the new subjects and strings"
+    );
+    assert!(
+        second.shares_namespace_tables_with(&first),
+        "an unchanged namespace table must be shared, not rebuilt"
     );
 }

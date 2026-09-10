@@ -56,19 +56,22 @@ pub(crate) struct DictionarySet {
     pub(crate) graphs_reverse: HashMap<String, GraphId>,
     /// Subject forward packs keyed by ns_code.
     pub(crate) subject_forward_packs: std::collections::BTreeMap<u16, ForwardPackReader>,
-    pub(crate) subject_reverse_tree: Option<DictTreeReader>,
+    pub(crate) subject_reverse_tree: Option<Arc<DictTreeReader>>,
     /// String forward pack reader (all string IDs in one stream).
     pub(crate) string_forward_packs: ForwardPackReader,
-    pub(crate) string_reverse_tree: Option<DictTreeReader>,
+    pub(crate) string_reverse_tree: Option<Arc<DictTreeReader>>,
     // Kept for: DictOverlay watermark computation (query overlay resolution).
     // Use when: DictOverlay is wired into V3 query execution for overlay transactions.
     #[expect(dead_code)]
     pub(crate) subject_count: u32,
     /// Total string count (for DictOverlay watermark).
     pub(crate) string_count: u32,
-    pub(crate) namespace_codes: HashMap<u16, String>,
-    pub(crate) namespace_reverse: HashMap<String, u16>,
-    pub(crate) prefix_trie: PrefixTrie,
+    /// Namespace tables and the prefix trie are shared with the previous
+    /// store across a reload when the root's namespace table is unchanged
+    /// (`Arc::make_mut` on augmentation), so a publish does not rebuild them.
+    pub(crate) namespace_codes: Arc<HashMap<u16, String>>,
+    pub(crate) namespace_reverse: Arc<HashMap<String, u16>>,
+    pub(crate) prefix_trie: Arc<PrefixTrie>,
     pub(crate) language_tags: LanguageTagDict,
     pub(crate) dt_sids: Vec<Sid>,
 }
@@ -207,6 +210,9 @@ where
 
 struct GraphIndex {
     orders: HashMap<RunSortOrder, Arc<BranchManifest>>,
+    /// Branch cid behind each named-graph order (default-graph orders are
+    /// inline in the root); what a reload matches on to reuse the manifest.
+    order_cids: HashMap<RunSortOrder, ContentId>,
     numbig: HashMap<u32, crate::arena::numbig::NumBigArena>,
     vectors: HashMap<u32, crate::arena::vector::LazyVectorArena>,
     spatial: HashMap<u32, Arc<dyn crate::wasm_compat::SpatialIndexProvider>>,
@@ -350,12 +356,40 @@ impl BinaryIndexStore {
         cache_dir: &Path,
         leaflet_cache: Option<Arc<LeafletCache>>,
     ) -> io::Result<Self> {
+        Self::load_from_root_v6_reusing(cs, root, cache_dir, leaflet_cache, None).await
+    }
+
+    /// [`Self::load_from_root_v6`] for a reload of the same ledger: every
+    /// artifact `root` shares with `prev` by content id — forward pack
+    /// handles, reverse dictionary readers and their leaf paths, named-graph
+    /// branch manifests, the namespace tables — is carried over instead of
+    /// being re-opened and re-decoded.
+    ///
+    /// An incremental index publish changes a handful of artifacts and keeps
+    /// thousands, so loading from scratch on every publish spent most of its
+    /// time re-stating and re-reading files it already had open. The reuse is
+    /// keyed purely on content ids, so a mismatched or absent `prev` only
+    /// costs the fresh load. The store id is still fresh: a publish can
+    /// re-rank dictionary ids, and the overlay translation cache keys on it.
+    pub async fn load_from_root_v6_reusing(
+        cs: Arc<dyn ContentStore>,
+        root: &IndexRoot,
+        cache_dir: &Path,
+        leaflet_cache: Option<Arc<LeafletCache>>,
+        prev: Option<&BinaryIndexStore>,
+    ) -> io::Result<Self> {
         tracing::debug!("BinaryIndexStore::load_from_root_v6 starting");
         fluree_db_core::disk_cache::ensure_cache_dir(cache_dir)?;
 
         // ── Dict loading ──────────────────────────────────────────────────────────────
-        let dicts =
-            build_dictionary_set(Arc::clone(&cs), root, cache_dir, leaflet_cache.as_ref()).await?;
+        let dicts = build_dictionary_set(
+            Arc::clone(&cs),
+            root,
+            cache_dir,
+            leaflet_cache.as_ref(),
+            prev.map(|p| &p.dicts),
+        )
+        .await?;
 
         // ── Per-graph specialty arenas ───────────────────────────────
         let mut per_graph_arenas = load_per_graph_arenas(
@@ -376,6 +410,7 @@ impl BinaryIndexStore {
             };
             let gi = graph_indexes.entry(0).or_insert_with(|| GraphIndex {
                 orders: HashMap::new(),
+                order_cids: HashMap::new(),
                 numbig: HashMap::new(),
                 vectors: HashMap::new(),
                 spatial: HashMap::new(),
@@ -384,20 +419,33 @@ impl BinaryIndexStore {
             gi.orders.insert(dgo.order, Arc::new(branch));
         }
 
-        // Named graphs: fetch FBR3 branch manifests from CAS.
+        // Named graphs: FBR3 branch manifests from CAS, or from the previous
+        // store when the cid is unchanged.
         for ng in &root.named_graphs {
             for (order, branch_cid) in &ng.orders {
-                let branch_bytes =
-                    fetch_cached_bytes_cid(cs.as_ref(), branch_cid, cache_dir).await?;
-                let branch = read_branch_from_bytes(&branch_bytes)?;
+                let carried = prev
+                    .and_then(|p| p.graph_indexes.get(&ng.g_id))
+                    .filter(|gi| gi.order_cids.get(order) == Some(branch_cid))
+                    .and_then(|gi| gi.orders.get(order))
+                    .cloned();
+                let branch = match carried {
+                    Some(branch) => branch,
+                    None => {
+                        let branch_bytes =
+                            fetch_cached_bytes_cid(cs.as_ref(), branch_cid, cache_dir).await?;
+                        Arc::new(read_branch_from_bytes(&branch_bytes)?)
+                    }
+                };
                 let gi = graph_indexes.entry(ng.g_id).or_insert_with(|| GraphIndex {
                     orders: HashMap::new(),
+                    order_cids: HashMap::new(),
                     numbig: HashMap::new(),
                     vectors: HashMap::new(),
                     spatial: HashMap::new(),
                     fulltext: HashMap::new(),
                 });
-                gi.orders.insert(*order, Arc::new(branch));
+                gi.orders.insert(*order, branch);
+                gi.order_cids.insert(*order, branch_cid.clone());
             }
         }
 
@@ -405,6 +453,7 @@ impl BinaryIndexStore {
         for (g_id, arenas) in per_graph_arenas.drain() {
             let gi = graph_indexes.entry(g_id).or_insert_with(|| GraphIndex {
                 orders: HashMap::new(),
+                order_cids: HashMap::new(),
                 numbig: HashMap::new(),
                 vectors: HashMap::new(),
                 spatial: HashMap::new(),
@@ -503,6 +552,31 @@ impl BinaryIndexStore {
 
     pub fn leaflet_cache(&self) -> Option<&Arc<LeafletCache>> {
         self.leaflet_cache.as_ref()
+    }
+
+    /// `(shared, total)` forward-pack handles this store has in common with
+    /// `other` — the number of packs a reload carried over rather than
+    /// reopened. Diagnostic for the index publish path.
+    pub fn forward_packs_shared_with(&self, other: &BinaryIndexStore) -> (usize, usize) {
+        let mut shared = self
+            .dicts
+            .string_forward_packs
+            .packs_shared_with(&other.dicts.string_forward_packs);
+        let mut total = self.dicts.string_forward_packs.pack_count();
+        for (ns_code, reader) in &self.dicts.subject_forward_packs {
+            total += reader.pack_count();
+            if let Some(o) = other.dicts.subject_forward_packs.get(ns_code) {
+                shared += reader.packs_shared_with(o);
+            }
+        }
+        (shared, total)
+    }
+
+    /// Whether this store's namespace tables are the same allocation as
+    /// `other`'s (carried over by a reload with an unchanged namespace table).
+    pub fn shares_namespace_tables_with(&self, other: &BinaryIndexStore) -> bool {
+        Arc::ptr_eq(&self.dicts.namespace_codes, &other.dicts.namespace_codes)
+            && Arc::ptr_eq(&self.dicts.prefix_trie, &other.dicts.prefix_trie)
     }
 
     /// Best-effort concurrent prewarm of the remote leaves a `[min_key, max_key]`
@@ -2166,13 +2240,20 @@ impl BinaryIndexStore {
             new_entries.push((code, prefix.clone()));
         }
 
-        // Apply validated new entries to all three structures.
-        for (code, prefix) in new_entries {
-            self.dicts.namespace_codes.insert(code, prefix.clone());
-            if !prefix.is_empty() {
-                self.dicts.prefix_trie.insert(&prefix, code);
+        // Apply validated new entries to all three structures. The tables may
+        // be shared with the previous store; `make_mut` unshares only when
+        // there is something to add.
+        if !new_entries.is_empty() {
+            let codes = Arc::make_mut(&mut self.dicts.namespace_codes);
+            let trie = Arc::make_mut(&mut self.dicts.prefix_trie);
+            let reverse = Arc::make_mut(&mut self.dicts.namespace_reverse);
+            for (code, prefix) in new_entries {
+                codes.insert(code, prefix.clone());
+                if !prefix.is_empty() {
+                    trie.insert(&prefix, code);
+                }
+                reverse.insert(prefix, code);
             }
-            self.dicts.namespace_reverse.insert(prefix, code);
         }
         Ok(())
     }
@@ -2841,6 +2922,7 @@ async fn build_dictionary_set(
     root: &IndexRoot,
     cache_dir: &Path,
     leaflet_cache: Option<&Arc<LeafletCache>>,
+    prev: Option<&DictionarySet>,
 ) -> io::Result<DictionarySet> {
     // Predicates (inline in root).
     let (predicates, predicate_reverse) = {
@@ -2863,12 +2945,13 @@ async fn build_dictionary_set(
     // Subject forward packs.
     let mut subject_forward_packs = std::collections::BTreeMap::new();
     for (ns_code, ns_refs) in &root.dict_refs.forward_packs.subject_fwd_ns_packs {
-        let reader = ForwardPackReader::from_pack_refs(
+        let reader = ForwardPackReader::from_pack_refs_reusing(
             Arc::clone(&cs),
             cache_dir,
             ns_refs,
             KIND_SUBJECT_FWD,
             *ns_code,
+            prev.and_then(|p| p.subject_forward_packs.get(ns_code)),
         )
         .await?;
         subject_forward_packs.insert(*ns_code, reader);
@@ -2876,47 +2959,75 @@ async fn build_dictionary_set(
 
     // Subject reverse tree.
     let subject_reverse_tree = Some(
-        DictTreeReader::from_refs(
+        DictTreeReader::from_refs_reusing(
             &cs,
             &root.dict_refs.subject_reverse,
             leaflet_cache,
             Some(cache_dir),
+            prev.and_then(|p| p.subject_reverse_tree.as_ref()),
         )
         .await?,
     );
 
     // String forward packs.
-    let string_forward_packs = ForwardPackReader::from_pack_refs(
+    let string_forward_packs = ForwardPackReader::from_pack_refs_reusing(
         Arc::clone(&cs),
         cache_dir,
         &root.dict_refs.forward_packs.string_fwd_packs,
         KIND_STRING_FWD,
         0,
+        prev.map(|p| &p.string_forward_packs),
     )
     .await?;
 
     // String reverse tree.
     let string_reverse_tree = Some(
-        DictTreeReader::from_refs(
+        DictTreeReader::from_refs_reusing(
             &cs,
             &root.dict_refs.string_reverse,
             leaflet_cache,
             Some(cache_dir),
+            prev.and_then(|p| p.string_reverse_tree.as_ref()),
         )
         .await?,
     );
 
-    // Namespace codes.
-    let namespace_codes: HashMap<u16, String> = root
-        .namespace_codes
-        .iter()
-        .map(|(&k, v)| (k, v.clone()))
-        .collect();
-    let namespace_reverse: HashMap<String, u16> = namespace_codes
-        .iter()
-        .map(|(&code, prefix)| (prefix.clone(), code))
-        .collect();
-    let prefix_trie = PrefixTrie::from_namespace_codes(&namespace_codes);
+    // Namespace codes: shared with the previous store when it already holds
+    // every entry of the root's table. Codes are never reassigned within a
+    // ledger, and the previous store's extras (codes the snapshot augmented
+    // it with after its root) are exactly what `augment_namespace_codes`
+    // would add back after this load, so the shared table ends up identical
+    // to a rebuilt one. A publish rarely adds a namespace, so this is the
+    // common case.
+    let carried = prev.filter(|p| {
+        root.namespace_codes
+            .iter()
+            .all(|(code, prefix)| p.namespace_codes.get(code) == Some(prefix))
+    });
+    let (namespace_codes, namespace_reverse, prefix_trie) = match carried {
+        Some(p) => (
+            Arc::clone(&p.namespace_codes),
+            Arc::clone(&p.namespace_reverse),
+            Arc::clone(&p.prefix_trie),
+        ),
+        None => {
+            let namespace_codes: HashMap<u16, String> = root
+                .namespace_codes
+                .iter()
+                .map(|(&k, v)| (k, v.clone()))
+                .collect();
+            let namespace_reverse: HashMap<String, u16> = namespace_codes
+                .iter()
+                .map(|(&code, prefix)| (prefix.clone(), code))
+                .collect();
+            let prefix_trie = PrefixTrie::from_namespace_codes(&namespace_codes);
+            (
+                Arc::new(namespace_codes),
+                Arc::new(namespace_reverse),
+                Arc::new(prefix_trie),
+            )
+        }
+    };
 
     // Language tags.
     let mut language_tags = LanguageTagDict::new();
@@ -3375,9 +3486,9 @@ pub(crate) mod tests {
                 string_reverse_tree: None,
                 subject_count: 0,
                 string_count: 0,
-                namespace_codes: HashMap::new(),
-                namespace_reverse: HashMap::new(),
-                prefix_trie: PrefixTrie::new(),
+                namespace_codes: Arc::new(HashMap::new()),
+                namespace_reverse: Arc::new(HashMap::new()),
+                prefix_trie: Arc::new(PrefixTrie::new()),
                 language_tags: LanguageTagDict::new(),
                 dt_sids: Vec::new(),
             },
@@ -3873,7 +3984,7 @@ pub(crate) mod tests {
 
         let cache_dir = temp_cache_dir();
         let mut binary_store = empty_store(Arc::clone(&cs), cache_dir.clone());
-        binary_store.dicts.subject_reverse_tree = Some(tree);
+        binary_store.dicts.subject_reverse_tree = Some(Arc::new(tree));
         let binary_store = Arc::new(binary_store);
 
         // Cold: the translation lookup misses, typed and registered.
@@ -4177,13 +4288,14 @@ pub(crate) mod tests {
         let full_iri = "https://dblp.org/streams/conf/IEEEpact";
         let s_id = SubjectId::new(namespaces::OVERFLOW, 7).as_u64();
 
-        store.dicts.subject_reverse_tree = Some(build_reverse_reader(vec![ReverseEntry {
-            key: crate::dict::reverse_leaf::subject_reverse_key(
-                namespaces::OVERFLOW,
-                full_iri.as_bytes(),
-            ),
-            id: s_id,
-        }]));
+        store.dicts.subject_reverse_tree =
+            Some(Arc::new(build_reverse_reader(vec![ReverseEntry {
+                key: crate::dict::reverse_leaf::subject_reverse_key(
+                    namespaces::OVERFLOW,
+                    full_iri.as_bytes(),
+                ),
+                id: s_id,
+            }])));
         store.dicts.subject_forward_packs.insert(
             namespaces::OVERFLOW,
             ForwardPackReader::from_memory(vec![Arc::from(

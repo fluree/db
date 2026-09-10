@@ -466,19 +466,26 @@ impl LedgerHandle {
             .get(index_id)
             .await
             .map_err(|e| ApiError::internal(format!("failed to read index root: {e}")))?;
+        let root = fluree_db_binary_index::IndexRoot::decode(&bytes)
+            .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
 
-        let mut store = BinaryIndexStore::load_from_root_bytes(
+        // The store this publish replaces: an incremental root shares nearly
+        // all of its artifacts with it, and the load carries those over by
+        // content id instead of reopening them. A brief read of the store
+        // slot alone (no `state` lock held) cannot invert the lock order.
+        let prev_store = self.inner.binary_store.read().await.clone();
+        let mut store = BinaryIndexStore::load_from_root_v6_reusing(
             Arc::clone(&cs),
-            &bytes,
+            &root,
             cache_dir,
             leaflet_cache,
+            prev_store.as_deref(),
         )
         .await
         .map_err(|e| ApiError::internal(format!("failed to load binary index: {e}")))?;
+        drop(prev_store);
 
         // Build metadata-only LedgerSnapshot from FIR6 root.
-        let root = fluree_db_binary_index::IndexRoot::decode(&bytes)
-            .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
         let meta = LedgerSnapshotMetadata {
             ledger_id: root.ledger_id,
             t: root.index_t,
@@ -874,12 +881,16 @@ async fn prefetch_novelty_translation(
 /// ledger is a branch — without it, the index root and any inherited
 /// leaf/branch blobs that live under the source branch's namespace would
 /// 404 on a fresh branch that hasn't yet had its own index built.
+///
+/// `prev` is the store this load replaces, if any (a reload of a cached
+/// ledger); artifacts the new root shares with it are carried over.
 pub(crate) async fn load_and_attach_binary_store(
     backend: &StorageBackend,
     nameservice: &dyn fluree_db_nameservice::NameServiceLookup,
     state: &mut LedgerState,
     cache_dir: &std::path::Path,
     leaflet_cache: Option<Arc<LeafletCache>>,
+    prev: Option<&BinaryIndexStore>,
 ) -> std::result::Result<Option<Arc<BinaryIndexStore>>, ApiError> {
     let record = match state.ns_record.as_ref() {
         Some(r) => r,
@@ -908,6 +919,17 @@ pub(crate) async fn load_and_attach_binary_store(
     // DictNovelty/DictOverlay correctness (especially bound-object filters and overlay merges).
     let root = fluree_db_binary_index::IndexRoot::decode(&bytes)
         .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
+
+    let mut store = BinaryIndexStore::load_from_root_v6_reusing(
+        Arc::clone(&cs),
+        &root,
+        cache_dir,
+        leaflet_cache,
+        prev,
+    )
+    .await
+    .map_err(|e| ApiError::internal(format!("failed to load binary index: {e}")))?;
+
     {
         let snap = Arc::make_mut(&mut state.snapshot);
         snap.subject_watermarks = root.subject_watermarks;
@@ -925,11 +947,6 @@ pub(crate) async fn load_and_attach_binary_store(
         state.snapshot.subject_watermarks.clone(),
         state.snapshot.string_watermark,
     ));
-
-    let mut store =
-        BinaryIndexStore::load_from_root_bytes(Arc::clone(&cs), &bytes, cache_dir, leaflet_cache)
-            .await
-            .map_err(|e| ApiError::internal(format!("failed to load binary index: {e}")))?;
 
     // Sync namespace codes between store and snapshot (bimap validation).
     crate::ns_helpers::sync_store_and_snapshot_ns(&mut store, Arc::make_mut(&mut state.snapshot))?;
@@ -1379,6 +1396,7 @@ impl LedgerManager {
                     &mut state,
                     &self.config.cache_dir,
                     self.config.leaflet_cache.clone(),
+                    None,
                 )
                 .await
                 {
@@ -1650,12 +1668,17 @@ impl LedgerManager {
                 let result = match loaded {
                     Ok(mut new_state) => {
                         // Attempt to load binary index store (v2 only) — still off-lock.
+                        // Artifacts shared with the store being replaced are
+                        // carried over; the slot is read on its own (no
+                        // `state` lock held), which keeps the lock order.
+                        let prev_store = handle.inner.binary_store.read().await.clone();
                         let new_binary_store = match load_and_attach_binary_store(
                             &self.backend,
                             self.nameservice_mode.reader(),
                             &mut new_state,
                             &self.config.cache_dir,
                             self.config.leaflet_cache.clone(),
+                            prev_store.as_deref(),
                         )
                         .await
                         {
