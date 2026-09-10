@@ -539,8 +539,16 @@ impl crate::Fluree {
 
         let current_head_t = target_state.t();
 
-        let view = StagedLedger::new(target_state, resolved_flakes, &reverse_graph)
+        let mut view = StagedLedger::new(target_state, resolved_flakes, &reverse_graph)
             .map_err(|e| ApiError::internal(format!("Failed to stage flakes during merge: {e}")))?;
+
+        // Validate the merged state against the target's shapes before any
+        // side effect: a merge that would leave the ledger in a state its own
+        // shapes reject fails here exactly as a transaction producing that
+        // state would, with nothing written and the target untouched.
+        self.validate_branch_op_view(&mut view, &reverse_graph, &namespace_delta)
+            .await?
+            .into_result()?;
 
         // Create merge commit with the source head as an additional parent,
         // propagating namespace and graph deltas from the source branch.
