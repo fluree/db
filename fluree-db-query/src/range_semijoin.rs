@@ -29,8 +29,8 @@
 //! a restricting policy), a bound is not numeric (the walk keys inline
 //! numerics only), or the envelope would cover too many rows for the driving
 //! stream — the batch is answered by the same batched subject probes the
-//! nested loop would have used, so the lane never costs more than the chain
-//! it replaced.
+//! nested loop would have used. If that lane declines too, one seeded
+//! probe/filter plan answers the batch through the generic pipeline.
 //!
 //! Semantics: this is a SEMI-join — a row is kept at most once however many of
 //! its values pass. That equals the probe+filter chain only where downstream
@@ -51,6 +51,7 @@
 
 use crate::binding::{Batch, Binding, RowAccess};
 use crate::context::ExecutionContext;
+use crate::distinct::DistinctOperator;
 use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::execute::build_where_operators_seeded;
@@ -67,7 +68,7 @@ use crate::join::{
 };
 use crate::object_binding::{equality_norm, materialized_object_binding, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
-use crate::seed::SeedOperator;
+use crate::seed::BatchSeedOperator;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -99,6 +100,13 @@ pub const RANGE_SEMIJOIN_SITE: &str = "range-semijoin";
 /// walk for a query that a few probes would answer.
 const WALK_ROW_FLOOR: usize = 4_000;
 const WALK_ROWS_PER_DRIVING_ROW: usize = 16;
+// A changing anchor must not re-walk an ever-growing envelope per batch.
+// Fixed-anchor queries build once; allow a few expansions, then use probes.
+const MAX_WALKS_PER_CONDITION: usize = 4;
+
+fn walkable_numeric(o_type: OType) -> bool {
+    o_type.is_numeric() || o_type == OType::NUM_BIG_OVERFLOW
+}
 
 fn walk_row_floor() -> usize {
     static ENV: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -200,7 +208,7 @@ impl Envelope {
 enum WalkValue {
     Int(i64),
     Float(f64),
-    Other(Binding),
+    Other(Box<Binding>),
 }
 
 impl WalkValue {
@@ -220,7 +228,7 @@ impl WalkValue {
                 val: FlakeValue::Double(d),
                 ..
             } => WalkValue::Float(*d),
-            other => WalkValue::Other(other.clone()),
+            other => WalkValue::Other(Box::new(other.clone())),
         }
     }
 
@@ -347,15 +355,17 @@ fn key_bounds(envelope: &Envelope, kind: DecodeKind) -> Option<(u64, u64)> {
     let f = |v: &FlakeValue| as_f64(v).filter(|f| !f.is_nan());
     match kind {
         DecodeKind::I64 => {
+            // Decimal/BigInt -> f64 can round inward above 2^53. Widen
+            // before ceil/floor; the exact value check removes extra rows.
             let lo = match &envelope.lower {
                 None => u64::MIN,
                 Some(FlakeValue::Long(n)) => ObjKey::encode_i64(*n).as_u64(),
-                Some(v) => ObjKey::encode_i64(clamp_i64(f(v)?.ceil())).as_u64(),
+                Some(v) => ObjKey::encode_i64(clamp_i64(f(v)?.next_down().ceil())).as_u64(),
             };
             let hi = match &envelope.upper {
                 None => u64::MAX,
                 Some(FlakeValue::Long(n)) => ObjKey::encode_i64(*n).as_u64(),
-                Some(v) => ObjKey::encode_i64(clamp_i64(f(v)?.floor())).as_u64(),
+                Some(v) => ObjKey::encode_i64(clamp_i64(f(v)?.next_up().floor())).as_u64(),
             };
             Some((lo, hi))
         }
@@ -387,7 +397,8 @@ struct WalkedLeaflet {
 }
 
 pub struct RangeSemiJoinOperator {
-    child: BoxedOperator,
+    child: Option<BoxedOperator>,
+    fallback_dedup: Option<DistinctOperator>,
     subject_var: VarId,
     conditions: Vec<RangeSemiJoinCondition>,
     filters: Vec<PreparedBoolExpression>,
@@ -402,6 +413,8 @@ pub struct RangeSemiJoinOperator {
     /// go straight to probes instead of re-walking an envelope that only grows
     /// (the decline conditions hold for the whole query).
     walk_off: Vec<bool>,
+    walk_attempts: Vec<usize>,
+    fallback_batches: usize,
     probed_rows: usize,
     kept_rows: usize,
     fallback_rows: usize,
@@ -431,7 +444,8 @@ impl RangeSemiJoinOperator {
             .collect();
         let n = conditions.len();
         Self {
-            child,
+            child: Some(child),
+            fallback_dedup: None,
             subject_var,
             conditions,
             filters,
@@ -442,10 +456,32 @@ impl RangeSemiJoinOperator {
             norm: None,
             indexes: (0..n).map(|_| None).collect(),
             walk_off: vec![false; n],
+            walk_attempts: vec![0; n],
+            fallback_batches: 0,
             probed_rows: 0,
             kept_rows: 0,
             fallback_rows: 0,
             probe_batches: 0,
+        }
+    }
+
+    fn input(&self) -> &dyn Operator {
+        match &self.fallback_dedup {
+            Some(dedup) => dedup,
+            None => self.child.as_deref().expect("semi-join child"),
+        }
+    }
+
+    fn input_mut(&mut self) -> &mut dyn Operator {
+        match &mut self.fallback_dedup {
+            Some(dedup) => dedup,
+            None => self.child.as_deref_mut().expect("semi-join child"),
+        }
+    }
+
+    fn restore_child(&mut self) {
+        if let Some(dedup) = self.fallback_dedup.take() {
+            self.child = Some(dedup.into_child());
         }
     }
 
@@ -622,7 +658,7 @@ impl RangeSemiJoinOperator {
                 let key_range = match (entry.p_const, entry.o_type_const) {
                     (Some(_), Some(ot)) => {
                         let o_type = OType::from_u16(ot);
-                        if !o_type.is_numeric() {
+                        if !walkable_numeric(o_type) {
                             continue;
                         }
                         match key_bounds(envelope, o_type.decode_kind()) {
@@ -728,7 +764,9 @@ impl RangeSemiJoinOperator {
                             DecodeKind::F64 => {
                                 WalkValue::Float(ObjKey::from_u64(o_key).decode_f64())
                             }
-                            _ => WalkValue::Other(decoded_binding(store, g_id, p_id, ot, o_key)?),
+                            _ => WalkValue::Other(Box::new(decoded_binding(
+                                store, g_id, p_id, ot, o_key,
+                            )?)),
                         };
                         values.push(GroupKeyOwned::Sid(batch.s_id.get(row)), value);
                         rows += 1;
@@ -742,7 +780,7 @@ impl RangeSemiJoinOperator {
                         let ot = leaflet
                             .o_type_const
                             .unwrap_or_else(|| batch.o_type.get_or(row, 0));
-                        if !OType::from_u16(ot).is_numeric() {
+                        if !walkable_numeric(OType::from_u16(ot)) {
                             continue;
                         }
                         let o_key = batch.o_key.get(row);
@@ -755,9 +793,9 @@ impl RangeSemiJoinOperator {
                         let value = match val {
                             FlakeValue::Long(n) => WalkValue::Int(n),
                             FlakeValue::Double(d) => WalkValue::Float(d),
-                            other => WalkValue::Other(materialized_object_binding(
+                            other => WalkValue::Other(Box::new(materialized_object_binding(
                                 store, ot, p_id, other, None, None,
-                            )),
+                            ))),
                         };
                         values.push(GroupKeyOwned::Sid(batch.s_id.get(row)), value);
                         rows += 1;
@@ -847,6 +885,7 @@ impl RangeSemiJoinOperator {
             probed = Some(values);
         }
 
+        let mut fallback_rows = Vec::new();
         for (row, keep_row) in keep.iter_mut().enumerate() {
             if !*keep_row {
                 continue;
@@ -868,29 +907,70 @@ impl RangeSemiJoinOperator {
                 }
                 (Some(Binding::Poisoned), _) => false,
                 _ => {
-                    self.fallback_rows += 1;
-                    self.row_passes_exactly(c, batch, row, ctx).await?
+                    fallback_rows.push(row);
+                    continue;
                 }
             };
             if !passes {
                 *keep_row = false;
             }
         }
+        self.filter_batch_exactly(c, batch, &fallback_rows, keep, ctx)
+            .await?;
         Ok(())
     }
 
-    /// Exact evaluation of the original probe + filter seeded with one row,
-    /// for rows no batched path can answer (an unbound or unresolvable
-    /// subject).
-    async fn row_passes_exactly(
-        &self,
+    /// Plan the generic probe/filter once for all fallback rows. A private
+    /// row id survives the join: subject identity alone is insufficient when
+    /// two rows have different bounds, or an initially unbound subject binds.
+    async fn filter_batch_exactly(
+        &mut self,
         c: usize,
         batch: &Batch,
-        row: usize,
+        rows: &[usize],
+        keep: &mut [bool],
         ctx: &ExecutionContext<'_>,
-    ) -> Result<bool> {
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.fallback_rows += rows.len();
+        self.fallback_batches += 1;
         let cond = &self.conditions[c];
-        let seed = SeedOperator::from_batch_row(batch, row);
+        let mut used: std::collections::HashSet<VarId> = batch.schema().iter().copied().collect();
+        used.extend(cond.filter.referenced_vars());
+        used.insert(self.subject_var);
+        used.insert(cond.value_var);
+        let row_var = (0..=u16::MAX)
+            .rev()
+            .map(VarId)
+            .find(|v| !used.contains(v))
+            .ok_or_else(|| {
+                QueryError::Internal("no variable available for semi-join row id".into())
+            })?;
+        // Only the subject and filter operands are needed in the inner plan.
+        let mut schema: Vec<VarId> = batch
+            .schema()
+            .iter()
+            .copied()
+            .filter(|v| *v == self.subject_var || self.bound_vars[c].contains(v))
+            .collect();
+        let mut columns: Vec<Vec<Binding>> = schema
+            .iter()
+            .map(|v| {
+                rows.iter()
+                    .map(|r| batch.get(*r, *v).cloned().unwrap_or(Binding::Unbound))
+                    .collect()
+            })
+            .collect();
+        schema.push(row_var);
+        let row_datatype = fluree_db_core::Sid::new(fluree_vocab::namespaces::XSD, "long");
+        columns.push(
+            rows.iter()
+                .map(|r| Binding::lit(FlakeValue::Long(*r as i64), row_datatype.clone()))
+                .collect(),
+        );
+        let seed = BatchSeedOperator::from_batch(Batch::new(schema.into(), columns)?);
         let patterns = [
             Pattern::Triple(cond.probe(self.subject_var)),
             Pattern::Filter(cond.filter.clone()),
@@ -899,19 +979,42 @@ impl RangeSemiJoinOperator {
             Some(Box::new(seed)),
             &patterns,
             None,
-            None,
+            Some(&[row_var]),
             &self.planning,
         )?;
-        inner.open(ctx).await?;
-        let mut passes = false;
-        while let Some(out) = inner.next_batch(ctx).await? {
-            if !out.is_empty() {
-                passes = true;
-                break;
-            }
+        for row in rows {
+            keep[*row] = false;
         }
+        // Close the subtree on errors as well as on exhaustion.
+        let result = async {
+            inner.open(ctx).await?;
+            let mut remaining = rows.len();
+            while let Some(out) = inner.next_batch(ctx).await? {
+                for r in 0..out.len() {
+                    let Some(Binding::Lit {
+                        val: FlakeValue::Long(row),
+                        ..
+                    }) = out.get(r, row_var)
+                    else {
+                        return Err(QueryError::Internal(
+                            "semi-join fallback lost row id".into(),
+                        ));
+                    };
+                    if !keep[*row as usize] {
+                        keep[*row as usize] = true;
+                        remaining -= 1;
+                    }
+                }
+                // A semi-join needs only one witness per driving row.
+                if remaining == 0 {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        .await;
         inner.close();
-        Ok(passes)
+        result
     }
 }
 
@@ -943,7 +1046,7 @@ fn decoded_binding(
 #[async_trait]
 impl Operator for RangeSemiJoinOperator {
     fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
-        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+        vec![crate::plan_node::PlanChild::child(self.input())]
     }
 
     fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
@@ -988,13 +1091,33 @@ impl Operator for RangeSemiJoinOperator {
         if self.norm.is_none() {
             self.norm = equality_norm(ctx);
         }
-        self.child.open(ctx).await?;
+        self.restore_child();
+        if ctx.binary_store.is_none()
+            || !root_or_no_policy(ctx)
+            || ctx.is_multi_ledger()
+            || ctx.eager_materialization
+        {
+            // The generic plan dedups dead feature variables before probing.
+            // Retain that advantage when probe lanes decline. The fold's
+            // where_dedup_safe license permits this; all child bindings,
+            // including each row's range operands, remain in the dedup key.
+            self.fallback_dedup = Some(DistinctOperator::new(
+                self.child.take().expect("semi-join child"),
+            ));
+        }
+        self.input_mut().open(ctx).await?;
         for index in &mut self.indexes {
             *index = None;
         }
         for off in &mut self.walk_off {
             *off = false;
         }
+        self.walk_attempts.fill(0);
+        self.probed_rows = 0;
+        self.kept_rows = 0;
+        self.fallback_rows = 0;
+        self.fallback_batches = 0;
+        self.probe_batches = 0;
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -1004,7 +1127,7 @@ impl Operator for RangeSemiJoinOperator {
             return Ok(None);
         }
         loop {
-            let batch = match self.child.next_batch(ctx).await? {
+            let batch = match self.input_mut().next_batch(ctx).await? {
                 Some(b) if !b.is_empty() => b,
                 Some(_) => continue,
                 None => {
@@ -1013,6 +1136,8 @@ impl Operator for RangeSemiJoinOperator {
                         kept = self.kept_rows,
                         fallback = self.fallback_rows,
                         probe_batches = self.probe_batches,
+                        fallback_batches = self.fallback_batches,
+                        walk_attempts = ?self.walk_attempts,
                         walked = self
                             .indexes
                             .iter()
@@ -1074,7 +1199,13 @@ impl Operator for RangeSemiJoinOperator {
                             Some(index) => index.envelope.union(&batch_envelope),
                             None => batch_envelope.clone(),
                         };
-                        match self.build_index_walk(c, &target, ctx)? {
+                        let outcome = if self.walk_attempts[c] < MAX_WALKS_PER_CONDITION {
+                            self.walk_attempts[c] += 1;
+                            self.build_index_walk(c, &target, ctx)?
+                        } else {
+                            WalkOutcome::Capped
+                        };
+                        match outcome {
                             WalkOutcome::Built(index) => self.indexes[c] = Some(index),
                             WalkOutcome::Capped | WalkOutcome::Declined => {
                                 self.walk_off[c] = true;
@@ -1133,12 +1264,8 @@ impl Operator for RangeSemiJoinOperator {
                         *keep_row = false;
                     }
                 }
-                for row in fallback_rows {
-                    self.fallback_rows += 1;
-                    if !self.row_passes_exactly(c, &batch, row, ctx).await? {
-                        keep[row] = false;
-                    }
-                }
+                self.filter_batch_exactly(c, &batch, &fallback_rows, &mut keep, ctx)
+                    .await?;
             }
 
             let kept = keep.iter().filter(|k| **k).count();
@@ -1172,7 +1299,8 @@ impl Operator for RangeSemiJoinOperator {
     }
 
     fn close(&mut self) {
-        self.child.close();
+        self.input_mut().close();
+        self.restore_child();
         for index in &mut self.indexes {
             *index = None;
         }
@@ -1180,6 +1308,41 @@ impl Operator for RangeSemiJoinOperator {
     }
 
     fn estimated_rows(&self) -> Option<usize> {
-        self.child.estimated_rows()
+        self.input().estimated_rows()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn integer_walk_bounds_round_outward_above_f64_precision() {
+        for (lower, upper, inside) in [
+            (
+                "18014398509481986.1",
+                "18014398509481987.9",
+                18_014_398_509_481_987,
+            ),
+            (
+                "-18014398509481987.9",
+                "-18014398509481986.1",
+                -18_014_398_509_481_987,
+            ),
+        ] {
+            let decimal =
+                |s| FlakeValue::Decimal(Box::new(bigdecimal::BigDecimal::from_str(s).unwrap()));
+            let envelope = Envelope {
+                lower: Some(decimal(lower)),
+                upper: Some(decimal(upper)),
+            };
+            let (lo, hi) = key_bounds(&envelope, DecodeKind::I64).unwrap();
+            let key = ObjKey::encode_i64(inside).as_u64();
+            assert!(
+                lo <= key && key <= hi,
+                "rounded walk bounds must include {inside}"
+            );
+        }
     }
 }

@@ -1547,6 +1547,7 @@ fn build_sequential_join_block(
                 &pending_binds,
                 &pending_filters,
                 &pushdown.consumed_indices,
+                &pushdown.object_bounds,
                 ctx,
                 hash_planner.step_est(),
             ),
@@ -3306,6 +3307,7 @@ fn collect_range_semijoin_folds(
     pending_binds: &[BindPattern],
     pending_filters: &[FilterPattern],
     pushdown_consumed: &[usize],
+    pushdown_bounds: &HashMap<VarId, ObjectBounds>,
     ctx: &TriplePlanContext<'_>,
     driving_est: Option<f64>,
 ) -> Vec<RangeSemiJoinFold> {
@@ -3355,7 +3357,9 @@ fn collect_range_semijoin_folds(
             || pending_binds
                 .iter()
                 .any(|b| b.var == *v || b.expr.referenced_vars().contains(v));
-        if read_elsewhere {
+        // Consumed constant filters are enforced by the scan/join we would
+        // remove. Keep that probe unless its bounds are carried by the fold.
+        if read_elsewhere || pushdown_bounds.contains_key(v) {
             continue;
         }
         let mut readers = pending_filters.iter().filter(|f| {

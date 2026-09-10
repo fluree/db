@@ -2867,6 +2867,54 @@ mod tests {
         );
     }
 
+    /// Both tie-breaks can fire on the same pair. The filter wins only at
+    /// equal cardinality; absent the filter, the BI bowtie keeps its hash scan.
+    #[test]
+    fn pinned_filter_and_hash_scan_tie_break_precedence() {
+        let stats = stats_with(&[
+            ("vendor", 10_000, 10_000),
+            ("numeric", 10_000, 10_000),
+            ("reviewer", 100_000, 100_000),
+        ]);
+        let product = VarId(0);
+        let vendor = VarId(1);
+        let numeric = VarId(2);
+        let remaining = vec![
+            RankedPattern {
+                orig_index: 0,
+                pattern: Pattern::Triple(make_pattern(product, "vendor", vendor)),
+            },
+            RankedPattern {
+                orig_index: 1,
+                pattern: Pattern::Triple(make_pattern(product, "numeric", numeric)),
+            },
+            RankedPattern {
+                orig_index: 2,
+                pattern: Pattern::Triple(make_pattern(VarId(3), "reviewer", vendor)),
+            },
+        ];
+        let bound = HashSet::from([product]);
+        let deferred = vec![DeferredPattern {
+            orig_index: 3,
+            required_vars: HashSet::from([numeric]),
+            pattern: Pattern::Filter(Expression::eq(
+                Expression::Var(numeric),
+                Expression::Const(FlakeValue::Long(100)),
+            )),
+            nestable: false,
+            after_indices: Vec::new(),
+        }];
+        assert_eq!(
+            unlocked_object_hash_scan(0, &remaining, &bound, Some(&stats)),
+            100_000
+        );
+        assert!(unlocks_deferred_filter(&remaining[1], &bound, &deferred));
+        assert!(
+            rank_seed_candidates(0, 1, &remaining, &bound, Some(&stats), true, &deferred).is_gt()
+        );
+        assert!(rank_seed_candidates(0, 1, &remaining, &bound, Some(&stats), true, &[]).is_lt());
+    }
+
     /// A one-sided bound does not pull its probe forward: BSBM Q7's
     /// `?date > now` keeps half the offers, and hoisting `validTo` ahead of
     /// the probe that unlocks the selective `?vendor :country <DE>` check cost

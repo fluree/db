@@ -10,7 +10,9 @@
 mod support;
 
 use fluree_db_api::{FlureeBuilder, QueryInput};
+use num_bigdecimal::BigDecimal;
 use serde_json::{json, Value as JsonValue};
+use std::str::FromStr;
 use support::{
     genesis_ledger, normalize_rows, rebuild_and_publish_index, span_capture, MemoryFluree,
 };
@@ -147,6 +149,36 @@ fn products() -> Vec<Product> {
             vec!["r2"],
         ),
     ];
+    let numeric = |value: &str, kind: &str| {
+        json!({
+            "@value": value, "@type": format!("http://www.w3.org/2001/XMLSchema#{kind}")
+        })
+    };
+    for (id, value) in [
+        ("decimal_in", "150.5"),
+        ("decimal_out", "220"),
+        ("decimal_below", "-20.5"),
+    ] {
+        out.push(p(
+            id,
+            vec!["f1"],
+            vec![numeric(value, "decimal")],
+            vec![json!(500)],
+            vec![id],
+        ));
+    }
+    for (id, value) in [
+        ("big_in", "9223372036854776001"),
+        ("big_out", "9223372036854776120"),
+    ] {
+        out.push(p(
+            id,
+            vec!["fbig"],
+            vec![numeric(value, "integer")],
+            vec![json!(500)],
+            vec![id],
+        ));
+    }
     // Bulk products so the planner's driving-row estimate clears the lane's
     // minimum on the indexed ledger; deterministic LCG values, ~12% / ~17%
     // of them inside each range as in BSBM. Each carries a few features so
@@ -209,11 +241,19 @@ fn expected_date_labels(products: &[Product]) -> Vec<String> {
     labels
 }
 
+fn numeric_value(v: &JsonValue) -> Option<BigDecimal> {
+    if let Some(n) = v.as_i64() {
+        Some(n.into())
+    } else {
+        BigDecimal::from_str(v.get("@value")?.as_str()?).ok()
+    }
+}
+
 fn in_range(values: &[JsonValue], center: i64, half: i64) -> bool {
-    values.iter().any(|v| {
-        v.as_i64()
-            .is_some_and(|n| n < center + half && n > center - half)
-    })
+    values
+        .iter()
+        .filter_map(numeric_value)
+        .any(|n| n < center + half && n > center - half)
 }
 
 /// (label) rows the DISTINCT query must return, in label order.
@@ -239,6 +279,11 @@ fn graph(products: &[Product]) -> JsonValue {
         "ex:dhi": {"@value": DATE_HI, "@type": "http://www.w3.org/2001/XMLSchema#dateTime"},
         "ex:label": "anchor"
     })];
+    nodes.push(json!({
+        "@id": "ex:BigAnchor", "ex:feature": {"@id": "ex:fbig"},
+        "ex:n1": {"@value": "9223372036854776000", "@type": "http://www.w3.org/2001/XMLSchema#integer"},
+        "ex:n2": 500, "ex:label": "big_anchor"
+    }));
     for p in products {
         let mut node = serde_json::Map::new();
         node.insert("@id".into(), json!(format!("ex:{}", p.id)));
@@ -419,6 +464,9 @@ async fn correlated_range_probes_fold_into_a_semijoin_with_exact_rows() {
     let novelty_view = support::graphdb_from_ledger(&ledger);
     assert_eq!(labels_of(&fluree, &novelty_view, Q5_SHAPE).await, expected);
 
+    check_constant_filter(&fluree, &novelty_view, &products).await;
+    check_fallback_rows(&novelty_view).await;
+
     // Binary index: EncodedSid keys, the POST walk, planner statistics.
     rebuild_and_publish_index(&fluree, LEDGER).await;
     let view = fluree.db(LEDGER).await.expect("indexed view");
@@ -428,6 +476,41 @@ async fn correlated_range_probes_fold_into_a_semijoin_with_exact_rows() {
     assert!(
         !outcomes.is_empty() && outcomes.iter().all(|o| o == "proceed"),
         "every batch of the Q5 shape is answered from a built index: {outcomes:?}"
+    );
+
+    assert_eq!(
+        labels_of(&fluree, &view, &Q5_SHAPE.replace("ex:P", "ex:BigAnchor")).await,
+        vec!["big_in"]
+    );
+    check_constant_filter(&fluree, &view, &products).await;
+    check_growing_envelopes(&view, &events).await;
+
+    // Restricted views must use the generic batch fallback and obey policy.
+    let restricted = fluree.db_with_policy(LEDGER, &fluree_db_api::GovernanceOptions {
+        policy: Some(json!([
+            {"@id":"ex:denyA", "@type":"f:AccessPolicy", "f:action":"f:view",
+             "f:onSubject":[{"@id":"http://example.org/ns/A"}], "f:allow":false},
+            {"@id":"ex:allowAll", "@type":"f:AccessPolicy", "f:action":"f:view", "f:allow":true}
+        ])),
+        default_allow: Some(true),
+        ..Default::default()
+    }).await.expect("restricted view");
+    assert!(!restricted.is_root());
+    let before = events.find_events("range semijoin exhausted").len();
+    let allowed: Vec<String> = expected
+        .iter()
+        .filter(|label| label.as_str() != "a")
+        .cloned()
+        .collect();
+    assert_eq!(labels_of(&fluree, &restricted, Q5_SHAPE).await, allowed);
+    let fallback = events.find_events("range semijoin exhausted");
+    assert!(
+        fallback[before..].iter().any(|event| {
+            let rows: usize = event.fields["fallback"].parse().unwrap();
+            let batches: usize = event.fields["fallback_batches"].parse().unwrap();
+            rows > 0 && batches > 0 && batches < rows
+        }),
+        "restricted results must exercise batch fallback"
     );
 
     // Wide range on a rare anchor: the walk caps out and the batch is
@@ -551,5 +634,203 @@ async fn correlated_range_probes_fold_into_a_semijoin_with_exact_rows() {
             .iter()
             .any(|n| n.starts_with("NestedLoopJoinOperator") && n.contains(":n1> ?")),
         "the probe whose value is projected must stay a join: {names:?}"
+    );
+}
+
+async fn check_constant_filter(
+    fluree: &MemoryFluree,
+    view: &fluree_db_api::GraphDb,
+    products: &[Product],
+) {
+    for (op, bound) in [(">", 150), (">=", 150), ("<", 130), ("<=", 130), ("=", 150)] {
+        let query = Q5_SHAPE.replace(
+            "} ORDER BY",
+            &format!("FILTER (?s1 {op} {bound}) }} ORDER BY"),
+        );
+        let mut expected: Vec<String> = products
+            .iter()
+            .filter(|p| p.features.iter().any(|f| ["f1", "f2"].contains(f)))
+            .filter(|p| in_range(&p.n2, ANCHOR_N2, 170))
+            .filter(|p| {
+                p.n1.iter().filter_map(numeric_value).any(|v| {
+                    v > -20
+                        && v < 220
+                        && match op {
+                            ">" => v > bound,
+                            ">=" => v >= bound,
+                            "<" => v < bound,
+                            "<=" => v <= bound,
+                            _ => v == bound,
+                        }
+                })
+            })
+            .flat_map(|p| p.labels.iter().cloned())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            labels_of(fluree, view, &query).await,
+            expected,
+            "constant + correlated: {op}"
+        );
+    }
+}
+
+// Supply deterministic batch boundaries; a query-level hash join may scramble
+// drifting anchors and hide repeated envelope rebuilds.
+struct Batches {
+    schema: std::sync::Arc<[fluree_db_query::VarId]>,
+    batches: std::collections::VecDeque<fluree_db_query::binding::Batch>,
+}
+
+#[async_trait::async_trait]
+impl fluree_db_query::operator::Operator for Batches {
+    fn schema(&self) -> &[fluree_db_query::VarId] {
+        &self.schema
+    }
+    async fn open(
+        &mut self,
+        _: &fluree_db_query::context::ExecutionContext<'_>,
+    ) -> fluree_db_query::error::Result<()> {
+        Ok(())
+    }
+    async fn next_batch(
+        &mut self,
+        _: &fluree_db_query::context::ExecutionContext<'_>,
+    ) -> fluree_db_query::error::Result<Option<fluree_db_query::binding::Batch>> {
+        Ok(self.batches.pop_front())
+    }
+    fn close(&mut self) {}
+}
+
+async fn run_direct_batches(
+    view: &fluree_db_api::GraphDb,
+    rows: Vec<Vec<(i64, fluree_db_query::binding::Binding, i64, i64)>>,
+) -> Vec<i64> {
+    use fluree_db_core::{FlakeValue, Sid};
+    use fluree_db_query::binding::{Batch, Binding};
+    use fluree_db_query::ir::{Expression, Ref};
+    use fluree_db_query::operator::Operator;
+    use fluree_db_query::range_semijoin::{RangeSemiJoinCondition, RangeSemiJoinOperator};
+    let mut vars = fluree_db_query::VarRegistry::new();
+    let tag = vars.get_or_insert("?tag");
+    let subject = vars.get_or_insert("?s");
+    let lo = vars.get_or_insert("?lo");
+    let hi = vars.get_or_insert("?hi");
+    let value = vars.get_or_insert("?value");
+    let schema: std::sync::Arc<[_]> = vec![tag, subject, lo, hi].into();
+    let lit = |n| Binding::lit(FlakeValue::Long(n), Sid::new(2, "long"));
+    let batches = rows
+        .into_iter()
+        .map(|rows| {
+            let mut columns = vec![Vec::new(); 4];
+            for (tag, s, lo, hi) in rows {
+                columns[0].push(lit(tag));
+                columns[1].push(s);
+                columns[2].push(lit(lo));
+                columns[3].push(lit(hi));
+            }
+            Batch::new(schema.clone(), columns).unwrap()
+        })
+        .collect();
+    let condition = RangeSemiJoinCondition {
+        predicate: Ref::Iri("http://example.org/ns/n1".into()),
+        value_var: value,
+        lower: Some((Expression::Var(lo), false)),
+        upper: Some((Expression::Var(hi), false)),
+        filter: Expression::and(vec![
+            Expression::gt(Expression::Var(value), Expression::Var(lo)),
+            Expression::lt(Expression::Var(value), Expression::Var(hi)),
+        ]),
+    };
+    let mut op = RangeSemiJoinOperator::new(
+        Box::new(Batches { schema, batches }),
+        subject,
+        vec![condition],
+        Some(&[tag]),
+        fluree_db_query::temporal_mode::PlanningContext::current(),
+    );
+    let ctx = fluree_db_query::context::ExecutionContext::from_graph_db_ref(
+        view.as_graph_db_ref(),
+        &vars,
+    );
+    op.open(&ctx).await.unwrap();
+    let mut tags = Vec::new();
+    while let Some(batch) = op.next_batch(&ctx).await.unwrap() {
+        for row in 0..batch.len() {
+            let Some(Binding::Lit {
+                val: FlakeValue::Long(n),
+                ..
+            }) = batch.get(row, tag)
+            else {
+                panic!("missing tag")
+            };
+            tags.push(*n);
+        }
+    }
+    op.close();
+    tags
+}
+
+async fn check_fallback_rows(view: &fluree_db_api::GraphDb) {
+    use fluree_db_query::binding::Binding;
+    let a = Binding::Iri("http://example.org/ns/A".into());
+    assert_eq!(
+        run_direct_batches(
+            view,
+            vec![vec![
+                (10, a.clone(), 100, 160),
+                (20, a, 160, 170),
+                (30, Binding::Unbound, 149, 151),
+                (40, Binding::Unbound, -999, -998),
+                (50, Binding::Poisoned, 100, 160),
+                (
+                    60,
+                    Binding::Iri("http://example.org/ns/missing".into()),
+                    100,
+                    160
+                ),
+            ]]
+        )
+        .await,
+        vec![10, 30],
+        "fallback keeps row identity and unbound-subject semantics"
+    );
+}
+
+async fn check_growing_envelopes(view: &fluree_db_api::GraphDb, events: &span_capture::SpanStore) {
+    use fluree_db_query::binding::Binding;
+    let s_id = view
+        .binary_store()
+        .unwrap()
+        .find_subject_id("http://example.org/ns/A")
+        .unwrap()
+        .unwrap();
+    let a = Binding::EncodedSid {
+        s_id,
+        t: None,
+        op: None,
+    };
+    let before = events
+        .find_events("range semijoin index built by POST walk")
+        .len();
+    assert_eq!(
+        run_direct_batches(
+            view,
+            (1..=10)
+                .map(|i| vec![(i, a.clone(), 0, i * 20); 1000])
+                .collect()
+        )
+        .await,
+        (8..=10)
+            .flat_map(|i| std::iter::repeat_n(i, 1000))
+            .collect::<Vec<_>>()
+    );
+    let walks = events
+        .find_events("range semijoin index built by POST walk")
+        .len()
+        - before;
+    assert_eq!(
+        walks, 4,
+        "drifting bounds have bounded rebuild work; later batches use probes"
     );
 }

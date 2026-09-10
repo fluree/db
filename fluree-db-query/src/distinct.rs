@@ -59,6 +59,11 @@ impl DistinctOperator {
         }
     }
 
+    /// Recover the child when a runtime-only dedup wrapper is closed.
+    pub(crate) fn into_child(self) -> BoxedOperator {
+        self.child
+    }
+
     /// Get the number of unique rows seen so far
     pub fn unique_count(&self) -> usize {
         self.seen.len()
