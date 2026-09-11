@@ -116,7 +116,7 @@ Enable `RUST_LOG=info,fluree_db_server::authorization=debug` for credential scop
 
 Query, streaming, transaction, and explain paths return an error when the ledger's config graph cannot be read. An unreadable config graph is never treated as "no configuration": doing so would run the request unrestricted on a ledger whose operator may have configured a deny default or a mandatory policy class. Previously such reads were best-effort and fell back to system defaults.
 
-In practice this only surfaces on snapshots that cannot serve any range read, such as a metadata-only historical view loaded without its binary index, where data queries already fail with the same error. A ledger with no config graph is unaffected: a successful read that finds nothing is cached on the view as absent and is not repeated for that snapshot.
+For example, a metadata-only historical view loaded without its binary index cannot serve the config read. Other config-read failures also return errors. A successful read that finds no config graph is cached on the view as absent and is not repeated for that snapshot.
 
 ### Policy-scoped explain withholds statistics
 

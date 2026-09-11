@@ -542,6 +542,12 @@ impl GraphDb {
     pub fn with_graph_id(mut self, graph_id: GraphId) -> Self {
         if self.graph_id != graph_id {
             self.clear_config_resolution();
+            // Only the default graph routes to a virtual source's provider.
+            // Its system graphs read the empty genesis snapshot; dropping the
+            // model config must also drop the virtual-data routing tag.
+            if graph_id != fluree_db_core::DEFAULT_GRAPH_ID {
+                self.graph_source_id = None;
+            }
         }
         self.graph_id = graph_id;
         self

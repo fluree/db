@@ -747,28 +747,12 @@ impl Fluree {
             fluree_db_ledger::LedgerState::new(snapshot, fluree_db_novelty::Novelty::new(0));
         let mut db = GraphDb::from_ledger_state(&state);
 
-        match graph_ref {
-            GraphRef::Default => {
-                // The virtual default graph: tag the view so query execution
-                // auto-wraps patterns in `GRAPH <gs_id> { ... }` and the configured
-                // provider (Iceberg / R2RML / BM25 / vector) resolves them.
-                // `resolved_config` rides with the tag — both say "this view IS
-                // the virtual source" — and `wrap_policy` reads the tag to decide
-                // that the model, not this empty genesis snapshot, holds the
-                // identity's `f:policyClass`.
-                db.resolved_config = Self::graph_source_model_config(&record);
-                db.graph_source_id = Some(gs_id.into());
-                Ok(Some(db))
-            }
-            // A graph source has no Fluree commit-metadata (`#txn-meta`) graph —
-            // that system graph is genuinely empty for a virtual dataset. Select
-            // the (empty) txn-meta graph on the genesis snapshot and deliberately
-            // DO NOT tag `graph_source_id`, so `maybe_wrap_for_graph_source` stays
-            // a no-op: the query reads the empty graph and returns [], rather than
-            // routing txn-meta patterns to the data provider (which has no such
-            // graph) or 500-ing on a NotFound alias.
-            other => Self::select_graph(db, other).map(Some),
-        }
+        // The default graph routes to the virtual provider and uses its model
+        // configuration. Shared graph selection removes both when selecting an
+        // empty system graph, for fragments and explicit dataset selectors alike.
+        db.resolved_config = Self::graph_source_model_config(&record);
+        db.graph_source_id = Some(gs_id.into());
+        Self::select_graph(db, graph_ref).map(Some)
     }
 }
 
