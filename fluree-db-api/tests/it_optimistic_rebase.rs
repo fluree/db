@@ -215,6 +215,130 @@ async fn a_stage_whose_namespace_code_was_taken_is_rebased_onto_a_fresh_code() {
     fluree.disconnect().await;
 }
 
+/// A stage names its subjects under the namespace codes it allocated; the
+/// commits in between name theirs under the codes the ledger gave the same
+/// prefixes. Once a commit has taken the stage's code, the same IRI carries
+/// different codes on the two sides, and an overlap compared code for code
+/// reads as disjoint: an upsert re-bases over a write to its own subject and
+/// both values survive. The overlap has to be found in the ledger's codes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stage_on_a_subject_written_under_a_moved_code_is_restaged() {
+    let (_dir, fluree, handle) = open().await;
+    update(&fluree, &handle, "INSERT DATA { ex:seed ex:p 0 }").await;
+
+    let (parked, release) = handle.gate_next_optimistic_stage_for_test();
+    let behind = {
+        let fluree = fluree.clone();
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            fluree
+                .stage(&handle)
+                .upsert(&serde_json::json!({
+                    "@id": "http://b.example/s",
+                    "http://example.org/p": 1
+                }))
+                .execute()
+                .await
+                .expect("upsert")
+                .receipt
+                .t
+        })
+    };
+    parked.await.expect("the write parks after staging");
+
+    // Takes the code the parked stage allocated for its prefix ...
+    update(
+        &fluree,
+        &handle,
+        "INSERT DATA { <http://a.example/a> ex:p 9 }",
+    )
+    .await;
+    // ... so this write to the parked stage's own subject gets the next one.
+    update(
+        &fluree,
+        &handle,
+        "INSERT DATA { <http://b.example/s> ex:p 2 }",
+    )
+    .await;
+    release.send(true).unwrap();
+    behind.await.expect("task");
+
+    let stats = handle.write_path_stats();
+    assert_eq!(
+        (stats.rebased, stats.restaged),
+        (0, 1),
+        "a write to the stage's own subject is a conflict under any code: {stats:?}"
+    );
+    assert_eq!(
+        count(
+            &fluree,
+            &handle,
+            "SELECT ?v WHERE { <http://b.example/s> ex:p ?v }"
+        )
+        .await,
+        1,
+        "an upsert replaces the value written ahead of it"
+    );
+    fluree.disconnect().await;
+}
+
+/// A stage staged while the ledger had no shapes is bounded to its subjects,
+/// and a commit that adds a shape touches only the shape's own subjects, so
+/// the stage would re-base over it without ever being validated. A commit
+/// that changes what validation depends on is a barrier instead: what was
+/// staged before it stages again, and meets the shape.
+#[cfg(feature = "shacl")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stage_behind_a_commit_that_adds_a_shape_is_validated_against_it() {
+    let (_dir, fluree, handle) = open().await;
+    update(&fluree, &handle, "INSERT DATA { ex:seed ex:p 0 }").await;
+
+    let (parked, release) = handle.gate_next_optimistic_stage_for_test();
+    let behind = {
+        let fluree = fluree.clone();
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            fluree
+                .stage(&handle)
+                .sparql_update(&format!("{PREFIX}INSERT DATA {{ ex:bob a ex:Person }}"))
+                .execute()
+                .await
+                .map(|r| r.receipt.t)
+        })
+    };
+    parked.await.expect("the write parks after staging");
+
+    update(
+        &fluree,
+        &handle,
+        "PREFIX sh: <http://www.w3.org/ns/shacl#> \
+         INSERT DATA { \
+           ex:PersonShape a sh:NodeShape ; sh:targetClass ex:Person ; sh:property ex:NameShape . \
+           ex:NameShape sh:path ex:name ; sh:minCount 1 . \
+         }",
+    )
+    .await;
+    release.send(true).unwrap();
+
+    let result = behind.await.expect("task");
+    let err = result.expect_err("a Person without a name violates the shape committed ahead of it");
+    assert!(
+        format!("{err:?}").contains("MinCount"),
+        "rejected for the right reason: {err:?}"
+    );
+    assert_eq!(
+        handle.write_path_stats().rebased,
+        0,
+        "nothing re-bases across a commit that changes the shapes"
+    );
+    assert_eq!(
+        count(&fluree, &handle, "SELECT ?s WHERE { ?s a ex:Person }").await,
+        0,
+        "the unvalidated insert must not have landed"
+    );
+    fluree.disconnect().await;
+}
+
 /// Many SPARQL writers on one ledger all land, and most of them by re-base:
 /// under contention the state has moved by the time a stage takes the lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

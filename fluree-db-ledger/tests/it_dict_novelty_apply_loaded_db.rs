@@ -76,3 +76,54 @@ fn apply_loaded_db_repopulates_dict_novelty_for_remaining_overlay_strings() {
     assert_eq!(state.dict_novelty.strings.watermark(), 2);
     assert_eq!(state.dict_novelty.strings.resolve_string(3), Some("b"));
 }
+
+/// Installing an index trims the dictionary novelty in place when nothing
+/// else holds it: the field is the only reference, so the retire mutates
+/// that allocation rather than copying the whole dictionary under the
+/// write lock. Observed by allocation identity.
+#[test]
+fn apply_loaded_db_trims_an_unshared_dict_novelty_in_place() {
+    let mut snapshot = LedgerSnapshot::genesis("test:main");
+    snapshot.t = 1;
+    snapshot.string_watermark = 1;
+    let mut state = LedgerState::new(snapshot, Novelty::new(1));
+    let reverse_graph = state.snapshot.build_reverse_graph().unwrap_or_default();
+    let (s, p, dt) = (
+        Sid::new(0, "ex:s"),
+        Sid::new(0, "ex:p"),
+        Sid::new(2, "string"),
+    );
+    for (t, value) in [(2, "a"), (3, "b")] {
+        let flakes = vec![Flake::new(
+            s.clone(),
+            p.clone(),
+            FlakeValue::String(value.to_string()),
+            dt.clone(),
+            t,
+            true,
+            None,
+        )];
+        std::sync::Arc::make_mut(&mut state.dict_novelty).populate_from_flakes(&flakes);
+        std::sync::Arc::make_mut(&mut state.novelty)
+            .apply_commit(flakes, t, &reverse_graph)
+            .unwrap();
+    }
+    assert_eq!(
+        std::sync::Arc::strong_count(&state.dict_novelty),
+        1,
+        "nothing but the state holds the dictionary"
+    );
+    let before = std::sync::Arc::as_ptr(&state.dict_novelty);
+
+    let mut new_snapshot = LedgerSnapshot::genesis("test:main");
+    new_snapshot.t = 2;
+    new_snapshot.string_watermark = 2;
+    state.apply_loaded_db(new_snapshot, None).unwrap();
+
+    assert_eq!(
+        std::sync::Arc::as_ptr(&state.dict_novelty),
+        before,
+        "the dictionary was copied rather than trimmed in place"
+    );
+    assert_eq!(state.dict_novelty.strings.resolve_string(3), Some("b"));
+}

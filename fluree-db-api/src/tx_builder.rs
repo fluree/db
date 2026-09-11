@@ -1826,8 +1826,22 @@ impl Fluree {
             .with_txn_meta(txn_meta)
             .with_graph_delta(graph_delta.into_iter().collect());
         let staged = view.staged_flakes();
-        let touched: Option<Arc<FxHashSet<Sid>>> = (staged.len()
-            <= crate::ledger_manager::MAX_FOOTPRINT_FLAKES)
+        // A commit that changes what staging depends on beyond its own
+        // subjects records no subject set, which the ring reads as touching
+        // everything: a stage computed before it stages again rather than
+        // re-basing over it unvalidated. That is a shape, the class
+        // hierarchy shapes target through, or anything in a named graph,
+        // where shapes and the ledger's config live.
+        let changes_dependencies = staged.iter().any(|flake| {
+            use fluree_vocab::namespaces::{RDFS, SHACL};
+            flake.g.is_some()
+                || flake.p.namespace_code == SHACL
+                || matches!(&flake.o, fluree_db_core::FlakeValue::Ref(o) if o.namespace_code == SHACL)
+                || (flake.p.namespace_code == RDFS
+                    && matches!(flake.p.name.as_ref(), "subClassOf" | "subPropertyOf"))
+        });
+        let touched: Option<Arc<FxHashSet<Sid>>> = (!changes_dependencies
+            && staged.len() <= crate::ledger_manager::MAX_FOOTPRINT_FLAKES)
             .then(|| Arc::new(staged.iter().map(|flake| flake.s.clone()).collect()));
 
         if !view.has_staged()
@@ -2027,19 +2041,11 @@ impl Fluree {
             tracing::debug!(target: "fluree::write_path", ledger = ledger_id, base_t, current_t = current.t(), reason = "chain unknown", "restage");
             return None;
         };
-        for subjects in &since {
-            let (small, large) = if subjects.len() < touched.len() {
-                (subjects.as_ref(), touched)
-            } else {
-                (touched, subjects.as_ref())
-            };
-            if small.iter().any(|s| large.contains(s)) {
-                tracing::debug!(target: "fluree::write_path", ledger = ledger_id, base_t, current_t = current.t(), reason = "subject conflict", "restage");
-                return None;
-            }
-        }
-
-        // Re-allocate this stage's new namespaces against the current table.
+        // Re-allocate this stage's new namespaces against the current table
+        // before anything is compared: the commits in between name subjects
+        // under the codes the ledger gave their prefixes, so the stage's
+        // subjects have to be compared under those same codes, or a write
+        // to one of them under a moved code reads as disjoint.
         let mut ns_registry = NamespaceRegistry::from_db(&current.snapshot);
         let mut remap: HashMap<u16, u16> = HashMap::new();
         let mut allocations: Vec<(&u16, &String)> = stage.ns_registry.delta().iter().collect();
@@ -2052,6 +2058,31 @@ impl Fluree {
             }
             if now != *code {
                 remap.insert(*code, now);
+            }
+        }
+        let touched: std::borrow::Cow<'_, FxHashSet<Sid>> = if remap.is_empty() {
+            std::borrow::Cow::Borrowed(touched)
+        } else {
+            std::borrow::Cow::Owned(
+                touched
+                    .iter()
+                    .cloned()
+                    .map(|mut sid| {
+                        remap_sid(&mut sid, &remap);
+                        sid
+                    })
+                    .collect(),
+            )
+        };
+        for subjects in &since {
+            let (small, large) = if subjects.len() < touched.len() {
+                (subjects.as_ref(), &*touched)
+            } else {
+                (&*touched, subjects.as_ref())
+            };
+            if small.iter().any(|s| large.contains(s)) {
+                tracing::debug!(target: "fluree::write_path", ledger = ledger_id, base_t, current_t = current.t(), reason = "subject conflict", "restage");
+                return None;
             }
         }
 

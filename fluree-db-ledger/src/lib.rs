@@ -743,10 +743,11 @@ impl LedgerState {
         // The dictionary novelty: drop what the indexed commits introduced and
         // renumber the rest above the new watermarks. A dictionary that
         // cannot be trimmed (a placeholder, a layer) is rebuilt from the
-        // remaining flakes.
-        let mut new_dict_novelty = Arc::clone(&self.dict_novelty);
-        let dict_shared = Arc::strong_count(&new_dict_novelty) > 1;
-        let retired = Arc::make_mut(&mut new_dict_novelty).retire_seen_through(
+        // remaining flakes. Mutated through the field itself: a clone taken
+        // first would be a second reference, and the whole dictionary would
+        // be copied on every install whether or not a reader holds it.
+        let dict_shared = Arc::strong_count(&self.dict_novelty) > 1;
+        let retired = Arc::make_mut(&mut self.dict_novelty).retire_seen_through(
             self.snapshot.t,
             &self.snapshot.subject_watermarks,
             self.snapshot.string_watermark,
@@ -767,7 +768,7 @@ impl LedgerState {
                         self.novelty.iter_flakes(fluree_db_core::IndexType::Post),
                     );
                 }
-                new_dict_novelty = Arc::new(rebuilt);
+                self.dict_novelty = Arc::new(rebuilt);
                 Arc::new(runtime)
             }
         };
@@ -784,7 +785,6 @@ impl LedgerState {
         );
 
         // Update state
-        self.dict_novelty = new_dict_novelty;
         self.runtime_small_dicts = new_runtime_small_dicts;
         self.head_index_id = index_id.cloned();
 
