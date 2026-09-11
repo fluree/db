@@ -59,7 +59,7 @@ const TAG_WRITE: u8 = 1;
 const TAG_INSERT: u8 = 2;
 const TAG_CAS: u8 = 3;
 const TAG_DELETE: u8 = 4;
-const TAG_DELETE_IF: u8 = 5;
+const TAG_CANCEL: u8 = 5;
 
 /// One logged storage operation. Keys are paths relative to the storage root.
 pub(super) enum Op<'a> {
@@ -75,8 +75,9 @@ pub(super) enum Op<'a> {
     },
     /// Remove a file.
     Delete { key: &'a str },
-    /// Remove a file whose current contents are `expected`.
-    DeleteIf { key: &'a str, expected: &'a [u8] },
+    /// Record `seq`, on `key`, was appended but its file write failed:
+    /// replay must not apply it.
+    Cancel { seq: u64, key: &'a str },
 }
 
 enum OwnedOp {
@@ -96,9 +97,9 @@ enum OwnedOp {
     Delete {
         key: String,
     },
-    DeleteIf {
+    Cancel {
+        seq: u64,
         key: String,
-        expected: Vec<u8>,
     },
 }
 
@@ -109,7 +110,7 @@ impl Op<'_> {
             | Op::Insert { key, .. }
             | Op::Cas { key, .. }
             | Op::Delete { key }
-            | Op::DeleteIf { key, .. } => key,
+            | Op::Cancel { key, .. } => key,
         }
     }
 
@@ -146,10 +147,10 @@ impl Op<'_> {
                 out.push(TAG_DELETE);
                 put(&mut out, key.as_bytes());
             }
-            Op::DeleteIf { key, expected } => {
-                out.push(TAG_DELETE_IF);
+            Op::Cancel { seq, key } => {
+                out.push(TAG_CANCEL);
                 put(&mut out, key.as_bytes());
-                put(&mut out, expected);
+                out.extend_from_slice(&seq.to_le_bytes());
             }
         }
         out
@@ -201,10 +202,12 @@ fn decode_op(payload: &[u8]) -> Option<OwnedOp> {
             }
         }
         TAG_DELETE => OwnedOp::Delete { key: c.key()? },
-        TAG_DELETE_IF => OwnedOp::DeleteIf {
-            key: c.key()?,
-            expected: c.bytes()?,
-        },
+        TAG_CANCEL => {
+            let key = c.key()?;
+            let seq = u64::from_le_bytes(c.0.get(..8)?.try_into().ok()?);
+            c.0 = &c.0[8..];
+            OwnedOp::Cancel { seq, key }
+        }
         _ => return None,
     };
     c.done().then_some(op)
@@ -308,6 +311,8 @@ struct Closed {
 #[must_use = "drop this only after the file the record describes is written"]
 pub(super) struct Appended {
     in_flight: Arc<AtomicUsize>,
+    /// The record's sequence, for a [`Wal::cancel`] should its file write fail.
+    pub(super) seq: u64,
 }
 
 impl Drop for Appended {
@@ -346,10 +351,17 @@ pub(super) struct Wal {
     /// last unlink. Two retirements with separate batches could otherwise
     /// remove a later segment while an earlier one was still held back.
     retiring: Mutex<()>,
+    /// Per-key exclusion for logged operations, by hash of the key. On the
+    /// log rather than the handle: every handle on a root shares its log,
+    /// so they share what orders it. See [`Self::key_stripe`].
+    key_stripes: Vec<Arc<tokio::sync::Mutex<()>>>,
     /// Test hook: make the next flush report failure.
     #[cfg(test)]
     fail_next_sync: AtomicBool,
 }
+
+/// How many keys share one lock in [`Wal::key_stripes`].
+const KEY_STRIPES: usize = 256;
 
 impl std::fmt::Debug for Wal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -614,20 +626,8 @@ fn apply(base: &Path, op: &OwnedOp, touched: &mut Vec<String>) -> io::Result<()>
             }
             touched.push(key.clone());
         }
-        OwnedOp::DeleteIf { key, expected } => {
-            let path = base.join(key);
-            let _lock = key_lock(&path)?;
-            // Only what the record names: a head another writer has since
-            // created here is theirs to keep.
-            if read_opt(&path)?.as_deref() == Some(expected.as_slice()) {
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            touched.push(key.clone());
-        }
+        // Acted on before any record is applied; see `replay`.
+        OwnedOp::Cancel { .. } => {}
     }
     Ok(())
 }
@@ -655,12 +655,20 @@ fn segment_paths(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 /// Replay every segment in `dir` onto `base`, flush what that touched, and
 /// remove the segments. Returns the next sequence number, the next segment
 /// id, and how many records were applied.
-fn replay(base: &Path, dir: &Path, fsyncs: &AtomicU64) -> io::Result<(u64, u64, usize)> {
+/// Read the segments under `dir` in order, each checked against the last,
+/// and hand every segment's records to `f` with the sequence of its first.
+/// A final segment that never got its header is removed as never used, and
+/// a torn final frame is discarded, noted when `report` is set. Returns the
+/// sequence after the last record, if there was any segment.
+fn walk_segments(
+    dir: &Path,
+    fsyncs: &AtomicU64,
+    report: bool,
+    mut f: impl FnMut(u64, &[OwnedOp]) -> io::Result<()>,
+) -> io::Result<Option<u64>> {
     let segments = segment_paths(dir)?;
     let last = segments.len().saturating_sub(1);
     let mut next_seq = None;
-    let mut touched = Vec::new();
-    let mut records = 0usize;
     for (i, (_, path)) in segments.iter().enumerate() {
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
@@ -696,19 +704,52 @@ fn replay(base: &Path, dir: &Path, fsyncs: &AtomicU64) -> io::Result<(u64, u64, 
                 ),
             ));
         }
-        if !decoded.clean {
+        if !decoded.clean && report {
             tracing::info!(
                 segment = %path.display(),
                 replayed = decoded.ops.len(),
                 "WAL ends in a torn frame; discarding it as unacknowledged"
             );
         }
-        for op in &decoded.ops {
-            apply(base, op, &mut touched)?;
-        }
-        records += decoded.ops.len();
+        f(decoded.next_seq - decoded.ops.len() as u64, &decoded.ops)?;
         next_seq = Some(decoded.next_seq);
     }
+    Ok(next_seq)
+}
+
+fn replay(base: &Path, dir: &Path, fsyncs: &AtomicU64) -> io::Result<(u64, u64, usize)> {
+    let segments = segment_paths(dir)?;
+    // A record cancelled by a later one is never applied, and only the whole
+    // log says which those are: one pass to collect them, one to apply.
+    let mut cancelled = BTreeSet::new();
+    walk_segments(dir, fsyncs, false, |first, ops| {
+        for (i, op) in ops.iter().enumerate() {
+            if let OwnedOp::Cancel { seq, key } = op {
+                if *seq >= first + i as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "WAL record {} on {key} cancels a record not before it",
+                            first + i as u64
+                        ),
+                    ));
+                }
+                cancelled.insert(*seq);
+            }
+        }
+        Ok(())
+    })?;
+    let mut touched = Vec::new();
+    let mut records = 0usize;
+    let next_seq = walk_segments(dir, fsyncs, true, |first, ops| {
+        for (i, op) in ops.iter().enumerate() {
+            if !cancelled.contains(&(first + i as u64)) {
+                apply(base, op, &mut touched)?;
+            }
+        }
+        records += ops.len();
+        Ok(())
+    })?;
     if records > 0 {
         tracing::info!(
             root = %base.display(),
@@ -822,6 +863,9 @@ impl Wal {
             hold_segments: AtomicBool::new(false),
             poisoned: AtomicBool::new(false),
             retiring: Mutex::new(()),
+            key_stripes: (0..KEY_STRIPES)
+                .map(|_| Arc::new(tokio::sync::Mutex::new(())))
+                .collect(),
             #[cfg(test)]
             fail_next_sync: AtomicBool::new(false),
         });
@@ -842,6 +886,21 @@ impl Wal {
 
     pub(super) fn fsyncs_issued(&self) -> u64 {
         self.fsyncs.load(Ordering::Relaxed)
+    }
+
+    /// Hold `key` for a logged operation, from its record to its file
+    /// operation, so a key's records sit in the log in the order its file
+    /// operations landed and replay reproduces what the process saw. An
+    /// oversized write holds it from the checkpoint to the rename, so no
+    /// record for its key can come between the two. A compare-and-swap
+    /// holds it across its read, closure and write, hence the owned guard.
+    /// Blocking; call from a blocking context.
+    pub(super) fn key_stripe(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let stripe = (hasher.finish() % self.key_stripes.len() as u64) as usize;
+        Arc::clone(&self.key_stripes[stripe]).blocking_lock_owned()
     }
 
     fn refuse_if_unavailable(&self) -> io::Result<()> {
@@ -953,23 +1012,26 @@ impl Wal {
         if full {
             self.rotate(&mut inner)?;
         }
-        Ok(Appended { in_flight })
+        Ok(Appended { in_flight, seq })
     }
 
-    /// Log that `op`, appended and flushed, was never materialized: its file
-    /// write failed and the file still holds what the record expected. Replay
-    /// would otherwise install the failed transition and skip a later one
-    /// that succeeded from the same starting value. Flushed like the record
-    /// it undoes. If even this cannot be appended the log is poisoned: what
-    /// replay would do is then unknown.
-    pub(super) fn undo(&self, op: Op<'_>) -> io::Result<()> {
-        self.append(op, true).map(drop).map_err(|e| {
-            if self.poisoned.load(Ordering::Acquire) {
-                e
-            } else {
-                self.poison(e)
-            }
-        })
+    /// Log that record `seq`, appended and flushed, was never materialized:
+    /// its file write failed. Replay then skips that record, and only that
+    /// record; a value another writer lands afterwards, even the same bytes,
+    /// is theirs. Without this replay would install the failed transition
+    /// and skip a later one that succeeded from the same starting value.
+    /// Flushed like the record it cancels. If even this cannot be appended
+    /// the log is poisoned: what replay would do is then unknown.
+    pub(super) fn cancel(&self, seq: u64, key: &str) -> io::Result<()> {
+        self.append(Op::Cancel { seq, key }, true)
+            .map(drop)
+            .map_err(|e| {
+                if self.poisoned.load(Ordering::Acquire) {
+                    e
+                } else {
+                    self.poison(e)
+                }
+            })
     }
 
     /// Create the next segment: header written and flushed under a temporary
@@ -1211,9 +1273,9 @@ mod tests {
             cas("ns/h.json", None, b"v1"),
             cas("ns/h.json", Some(b"v1"), b"v2"),
             Op::Delete { key: "gone.json" },
-            Op::DeleteIf {
+            Op::Cancel {
+                seq: 10,
                 key: "ns/h.json",
-                expected: b"v2",
             },
         ];
         let mut segment = SEGMENT_MAGIC.to_vec();
@@ -1234,9 +1296,9 @@ mod tests {
             _ => panic!("wrong op"),
         }
         match &decoded.ops[5] {
-            OwnedOp::DeleteIf { key, expected } => {
+            OwnedOp::Cancel { seq, key } => {
+                assert_eq!(*seq, 10);
                 assert_eq!(key, "ns/h.json");
-                assert_eq!(expected, b"v2");
             }
             _ => panic!("wrong op"),
         }
@@ -1891,6 +1953,8 @@ mod tests {
     /// and its rename would replay over the write. The key is held from one
     /// to the other, so a concurrent operation on it lands after, in the log
     /// and on the device alike, and recovery agrees with what the process saw.
+    /// The racer is a separate handle on the root, not a clone: handles share
+    /// the root's log, so they have to share what orders it.
     #[tokio::test]
     async fn an_operation_racing_an_oversized_write_recovers_in_the_order_it_landed() {
         use crate::{Durability, FileStorage, StorageRead, StorageWrite};
@@ -1899,7 +1963,7 @@ mod tests {
         let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
         storage.hold_wal_segments_for_test().unwrap();
         let key = "fluree:file://large.bin";
-        let racer = storage.clone();
+        let racer = FileStorage::new(dir.path()).with_durability(Durability::Wal);
         let deleting: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
         let started = Arc::clone(&deleting);
         storage.set_after_checkpoint_hook_for_test(move || {
@@ -1931,6 +1995,52 @@ mod tests {
             live,
             "recovery disagreed with the state the process saw (present: {live})"
         );
+    }
+
+    /// A failed head write's undo must name the record that failed, not the
+    /// value: a writer in per-write mode may land the very same bytes
+    /// afterwards, durably, and recovery has to leave those alone whether the
+    /// failed write was a creation or a replacement.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_head_write_undo_spares_the_same_value_written_by_another_writer() {
+        use crate::{CasAction, Durability, FileStorage, StorageCas, StorageRead};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        let fresh = "fluree:file://ns/fresh.json";
+        let existing = "fluree:file://ns/existing.json";
+        storage.insert(existing, b"before").await.unwrap();
+        FileStorage::checkpoint_wal(dir.path()).unwrap();
+        storage.hold_wal_segments_for_test().unwrap();
+        let ns = dir.path().join("ns");
+        std::fs::write(ns.join("fresh.lock"), []).unwrap();
+        std::fs::set_permissions(&ns, std::fs::Permissions::from_mode(0o555)).unwrap();
+        for key in [fresh, existing] {
+            let failed = storage
+                .compare_and_swap(key, |_| Ok(CasAction::<()>::Write(b"same".to_vec())))
+                .await;
+            assert!(failed.is_err(), "staging {key} must fail");
+        }
+        std::fs::set_permissions(&ns, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let other = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        for key in [fresh, existing] {
+            other
+                .compare_and_swap(key, |_| Ok(CasAction::<()>::Write(b"same".to_vec())))
+                .await
+                .unwrap();
+        }
+        storage.simulate_crash_for_test();
+        let reopened = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        reopened.recover_wal().unwrap();
+        for key in [fresh, existing] {
+            assert_eq!(
+                reopened.read_bytes(key).await.unwrap(),
+                b"same",
+                "{key}: recovery undid a head another writer wrote"
+            );
+        }
     }
 
     /// A handle's first operation may be a compare-and-swap on a key the

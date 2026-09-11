@@ -522,15 +522,9 @@ pub struct FileStorage {
     /// writes an earlier, still-running flush took waits for that flush
     /// instead of returning before its files are on the device.
     flushing: Arc<tokio::sync::Mutex<()>>,
-    /// Per-key exclusion for logged writes and deletes, by hash of the key.
-    /// See [`Self::key_stripe`]. Shared across clones.
-    key_stripes: Arc<Vec<std::sync::Mutex<()>>>,
     #[cfg(test)]
     after_checkpoint: AfterCheckpoint,
 }
-
-/// How many keys share one lock in [`FileStorage::key_stripes`].
-const KEY_STRIPES: usize = 256;
 
 #[cfg(test)]
 type Hook = Box<dyn Fn() + Send + Sync>;
@@ -547,6 +541,9 @@ impl std::fmt::Debug for AfterCheckpoint {
         f.write_str("AfterCheckpoint")
     }
 }
+
+/// A logged operation's exclusive hold on its key; see [`FileStorage::hold_key`].
+type KeyHold = tokio::sync::OwnedMutexGuard<()>;
 
 /// What the WAL resolved to for one root.
 #[derive(Debug)]
@@ -582,11 +579,6 @@ impl FileStorage {
             wal_owner: None,
             unflushed: Arc::new(std::sync::Mutex::new(Vec::new())),
             flushing: Arc::new(tokio::sync::Mutex::new(())),
-            key_stripes: Arc::new(
-                (0..KEY_STRIPES)
-                    .map(|_| std::sync::Mutex::new(()))
-                    .collect(),
-            ),
             #[cfg(test)]
             after_checkpoint: AfterCheckpoint::default(),
         }
@@ -943,20 +935,15 @@ impl FileStorage {
         *self.after_checkpoint.0.lock().unwrap() = Some(Box::new(f));
     }
 
-    /// Hold `key` for a logged write or delete, from its record to its file
-    /// operation, so a key's records sit in the log in the order its file
-    /// operations landed and replay reproduces what the process saw. An
-    /// oversized write holds it from the checkpoint to the rename, so no
-    /// record for its key can come between the two. Keys that are inserted
-    /// or compare-and-swapped are ordered by their sidecar lock instead.
-    fn key_stripe(&self, key: &str) -> std::sync::MutexGuard<'_, ()> {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
-        let stripe = (hasher.finish() % self.key_stripes.len() as u64) as usize;
-        self.key_stripes[stripe]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// The root log's hold on `key` for an operation logged under
+    /// `durability`, or nothing when the operation is not logged. Take it
+    /// before the operation's record and keep it past its file operation;
+    /// see [`Wal::key_stripe`]. Blocking; attaches the log.
+    fn hold_key(&self, durability: Durability, key: &str) -> Result<Option<KeyHold>> {
+        if durability != Durability::Wal {
+            return Ok(None);
+        }
+        Ok(self.attach_wal(true)?.map(|log| log.key_stripe(key)))
     }
 
     /// Durability for a write of `kind`.
@@ -1434,7 +1421,7 @@ impl StorageWrite for FileStorage {
         let (key, path) = self.resolve_key(address)?;
         let storage = self.clone();
         tokio::task::spawn_blocking(move || {
-            let _key = (storage.durability == Durability::Wal).then(|| storage.key_stripe(&key));
+            let _key = storage.hold_key(storage.durability, &key)?;
             let (_, log) = storage.write_plan(storage.durability, 0)?;
             let _appended = match &log {
                 // Ordered after the writes it undoes, so replay cannot bring
@@ -1517,7 +1504,7 @@ impl FileStorage {
         // per `tokio::fs` call. Attaching the log may replay, so that is in
         // here too.
         tokio::task::spawn_blocking(move || {
-            let _key = (durability == Durability::Wal).then(|| storage.key_stripe(&key));
+            let _key = storage.hold_key(durability, &key)?;
             let (policy, log) = storage.write_plan(durability, bytes.len())?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -1567,6 +1554,9 @@ impl FileStorage {
     ) -> StorageExtResult<bool> {
         let storage = self.clone();
         tokio::task::spawn_blocking(move || {
+            let _key = storage
+                .hold_key(storage.durability, &key)
+                .map_err(|e| StorageExtError::io(e.to_string()))?;
             let (policy, log) = storage
                 .write_plan(storage.durability, bytes.len())
                 .map_err(|e| StorageExtError::io(e.to_string()))?;
@@ -1624,8 +1614,8 @@ impl FileStorage {
         tokio::task::spawn_blocking(move || {
             // Attaching replays the leftover log, and replay takes the same
             // sidecar lock for a record on this key; it has to come first.
-            storage
-                .attach_wal(true)
+            let key_hold = storage
+                .hold_key(storage.durability, &key)
                 .map_err(|e| StorageExtError::io(e.to_string()))?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -1670,6 +1660,7 @@ impl FileStorage {
                     key,
                     path,
                     _lock_file: lock_file,
+                    _key_hold: key_hold,
                 },
             ))
         })
@@ -1698,7 +1689,7 @@ impl FileStorage {
             // The one flush a commit pays. It lands before the file does, so
             // a head on disk always has its log record — and every content
             // append before it — on disk too.
-            let _appended = match &log {
+            let appended = match &log {
                 Some(log) => Some(
                     log.append(
                         Op::Cas {
@@ -1716,23 +1707,12 @@ impl FileStorage {
             };
             if let Err(e) = write_atomic(&locked.path, &new_bytes, &policy) {
                 // Staging or the rename failed, so the file still holds
-                // `expected` while the log says it moved. Say otherwise
+                // `expected` while the log says it moved. Cancel the record
                 // before a retry logs its own transition from the same value.
-                if let Some(log) = &log {
-                    let undone = match expected.as_deref() {
-                        Some(previous) => Op::Cas {
-                            key: &locked.key,
-                            expected: Some(&new_bytes),
-                            new: previous,
-                        },
-                        None => Op::DeleteIf {
-                            key: &locked.key,
-                            expected: &new_bytes,
-                        },
-                    };
-                    log.undo(undone).map_err(|undo| {
+                if let (Some(log), Some(appended)) = (&log, &appended) {
+                    log.cancel(appended.seq, &locked.key).map_err(|cancel| {
                         StorageExtError::io(format!(
-                            "write {}: {e}; WAL undo also failed: {undo}",
+                            "write {}: {e}; WAL cancel also failed: {cancel}",
                             locked.path.display()
                         ))
                     })?;
@@ -1758,6 +1738,8 @@ struct LockedFile {
     key: String,
     path: PathBuf,
     _lock_file: std::fs::File,
+    /// The log's hold on the key, released with the flock.
+    _key_hold: Option<KeyHold>,
 }
 
 #[async_trait]
