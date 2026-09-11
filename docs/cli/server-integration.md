@@ -824,6 +824,7 @@ GET {api_base_url}/merge-preview/{ledger}?source={source}&target={target}
    &max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}
    &include_conflict_details={bool}&strategy={strategy}
    &include_changes={bool}&max_changes={n}&changes_after_subject={iri}
+   &include_validation={bool}
 ```
 
 | Parameter | Type | Required | Server default | Description |
@@ -839,6 +840,7 @@ GET {api_base_url}/merge-preview/{ledger}?source={source}&target={target}
 | `include_changes` | bool | No | `false` | When `true`, include the aggregate netted change set as `changes` |
 | `max_changes` | integer | No | `500` | Cap on `changes.entries`, counted in flakes, cut at subject boundaries. `0` = stats-only mode |
 | `changes_after_subject` | string | No | — | Pagination cursor (full subject IRI); requires `include_changes=true` |
+| `include_validation` | bool | No | `true` | When `true`, stage the strategy-resolved change set on the target and validate it against the target's SHACL shapes; report as `validation` and fold into `mergeable` |
 
 Auth follows the same pattern as `GET /branch/*ledger` (read-only): require
 a Bearer when `data_auth.mode == required`; gate on `can_read(ledger)`;
@@ -935,6 +937,22 @@ These rules are not negotiable; the CLI and other clients depend on them:
    `include_changes=true` is a `400`. The source-side commit replay is
    shared with the conflict walk when both are requested; each pagination
    page re-pays the replay cost.
+12. **Validation.** When `include_validation == true` (the default) and
+   `!fast_forward`, stage the change set from rule 11, resolved under
+   `strategy` against the **uncapped** conflict set, onto the target's
+   current state and run the same SHACL validation `POST /merge` runs for
+   that strategy. Report `validation: { conforms, report? }`, where
+   `report` is present only when `conforms == false` and is the message
+   the merge would fail with. `mergeable` is then
+   `strategy-applies && validation.conforms`; with
+   `include_validation=false` it is the strategy signal alone and
+   `validation` is absent. Fast-forward previews carry no `validation`:
+   the adopted commits were validated when authored. Under
+   `strategy=abort` with conflicts the merge never reaches validation, so
+   `validation` is absent there too. This rule is what lets a client
+   trust `mergeable=true`: absent a change to either ledger in between,
+   the merge will go through. Warn-mode graphs log and count as
+   conforming, matching transactions. This is still read-only (rule 9).
 
 ### Response (`200 OK`)
 
@@ -962,6 +980,7 @@ These rules are not negotiable; the CLI and other clients depend on them:
   "behind": { "count": 1, "commits": [], "truncated": false },
   "fast_forward": false,
   "mergeable": true,
+  "validation": { "conforms": true },
   "conflicts": {
     "count": 1,
     "keys": [{ "s": [100, "alice"], "p": [100, "status"], "g": null }],
@@ -1022,11 +1041,12 @@ When `include_conflict_details=false`, `conflicts.details` is omitted. When it
 is true, `source_values` and `target_values` are resolved flake tuples for the
 current asserted values in the same shape returned by `GET /show/*ledger`;
 `resolution` is a label only. `mergeable` is `false` when the chosen strategy
-would abort (currently `strategy=abort` with one or more conflicts). It is not
-full transaction validation for constraints that might fail during the real
-merge commit. `mergeable=true` does not guarantee a subsequent `POST /merge`
-will succeed; it only reflects the conflict/strategy interaction at preview
-time.
+would abort (currently `strategy=abort` with one or more conflicts) or, when
+`validation` is present, when the merged state fails the target's SHACL
+shapes (rule 12). With validation on, `mergeable=true` means a subsequent
+`POST /merge` with the same strategy will succeed unless either branch
+changes in between; with `include_validation=false` it reflects only the
+conflict/strategy interaction.
 
 ### Error responses
 

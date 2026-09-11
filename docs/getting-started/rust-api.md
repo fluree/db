@@ -1128,9 +1128,24 @@ async fn main() -> Result<()> {
             println!("  - s={} p={}", k.s, k.p);
         }
     }
+
+    // `mergeable` is the answer to "will `merge_branch` go through?": the
+    // strategy applies without aborting AND the merged state conforms to
+    // the target's SHACL shapes. The preview stages the resolved change
+    // set and runs the same validation the merge runs, so the two agree.
+    if let Some(v) = &preview.validation {
+        if !v.conforms {
+            println!("merge would be rejected:\n{}", v.report.as_deref().unwrap_or(""));
+        }
+    }
+    println!("mergeable: {}", preview.mergeable);
     Ok(())
 }
 ```
+
+`validation` is present for every non-fast-forward preview unless
+`MergePreviewOpts::include_validation` is `false`. A fast-forward adopts
+commits that were validated when they were authored, so it carries none.
 
 #### Tuning the preview
 
@@ -1154,6 +1169,7 @@ async fn main() -> Result<()> {
                 max_commits: Some(0),       // counts only — no commit summaries
                 max_conflict_keys: Some(0),
                 include_conflicts: false,
+                include_validation: false,  // skip the target-state load + SHACL pass
                 ..MergePreviewOpts::default()
             },
         )
@@ -1274,12 +1290,15 @@ lists**, not the cost of computing them:
 | `ConflictSummary` | `count` (unbounded), `keys: Vec<ConflictKey>` (sorted, capped), `truncated`, `strategy`, `details` |
 | `ConflictDetail` | `key`, `source_values`, `target_values`, `resolution` (values are the current asserted values at each branch HEAD) |
 | `ConflictKey` | `s: Sid`, `p: Sid`, `g: Option<Sid>` |
+| `ValidationSummary` | `conforms`, `report: Option<String>` (present only when `conforms` is false; the message the merge would fail with) |
 
-`mergeable` only reflects whether the selected strategy would abort due to
-detected conflicts; it is not full validation of every constraint the eventual
-merge commit may encounter. `mergeable=true` does not guarantee a subsequent
-merge will succeed; it only reflects the conflict/strategy interaction at
-preview time.
+`mergeable` is `false` when the selected strategy would abort on detected
+conflicts or, when `validation` is present, when the merged state fails the
+target's SHACL shapes. The preview stages the resolved change set and runs
+the same validation `merge_branch` runs, so with `include_validation` on
+(the default) `mergeable=true` means the merge will succeed unless either
+branch changes first. With it off, `mergeable` reflects only the
+conflict/strategy interaction.
 
 All types derive `Serialize` so the response is wire-stable; the HTTP
 endpoint at `GET /v1/fluree/merge-preview/{ledger...}` returns the same struct.

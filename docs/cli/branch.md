@@ -206,6 +206,8 @@ If the branch has no unique commits, a fast-forward rebase is performed — the 
 
 Conflicts occur when both the branch and source have modified the same (subject, predicate, graph) tuples. See [conflict strategies](../concepts/ledgers-and-nameservice.md#rebasing-a-branch) for details.
 
+Each replayed commit is validated against the source branch's SHACL configuration and shapes, exactly as a transaction would be. A commit that conformed on the branch can violate a shape the source installed since the fork; the first such replay aborts the whole rebase with the same violation report a rejected transaction prints, naming the commit it stopped on, and the branch is left as it was.
+
 **Examples:**
 
 ```bash
@@ -260,7 +262,8 @@ fluree branch diff <SOURCE> [OPTIONS]
 | `--max-conflict-keys <N>` | Cap on conflict keys shown (default: 50; pass 0 for unbounded in local mode) |
 | `--no-conflicts` | Skip conflict computation for a cheaper preview |
 | `--conflict-details` | Include source/target flake values for returned conflict keys |
-| `--strategy <STRATEGY>` | Strategy used for conflict detail labels (default: `take-both`). Options: `take-both`, `abort`, `take-source`, `take-branch` |
+| `--strategy <STRATEGY>` | Strategy used for conflict detail labels and for resolving the change set that validation stages (default: `take-both`). Options: `take-both`, `abort`, `take-source`, `take-branch` |
+| `--no-validate` | Skip SHACL validation of the merged state. Validation runs by default and its outcome folds into `mergeable` |
 | `--json` | Emit the raw JSON preview |
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `--remote <REMOTE>` | Execute against a remote server |
@@ -268,6 +271,8 @@ fluree branch diff <SOURCE> [OPTIONS]
 **Description:**
 
 `branch diff` reports ahead/behind commits, fast-forward eligibility, and conflicting `(subject, predicate, graph)` keys without mutating state. With `--conflict-details`, the preview also shows the source and target values for the returned conflict keys and annotates what the selected strategy would do.
+
+By default the preview also stages the merge's resolved change set on the target and validates it against the target's SHACL configuration and shapes, through the same code path `branch merge` uses. The `validation:` line reports `conforms` or the violation report the merge would fail with, and `mergeable:` is `yes` only when the strategy applies and the result conforms. A preview that says `mergeable: yes` therefore means the merge will go through unless the ledger changes in between. Fast-forward previews carry no validation line: the adopted commits were validated when they were authored. Pass `--no-validate` for a cheaper count-only preview.
 
 **Examples:**
 
@@ -318,6 +323,8 @@ When `--target` is omitted, the merge target is inferred from the source branch'
 
 After a successful merge, the source branch remains intact and can continue to receive new transactions and be merged again. Only the new commits since the last merge (or branch creation) are copied.
 
+A non-fast-forward merge is validated against the target's SHACL configuration and shapes before anything is written, exactly as a transaction producing the merged state would be. This matters most for `take-both`, whose "both values coexist" resolution can breach a `sh:maxCount` on a property both sides changed: the merge is rejected with the same violation report a rejected transaction prints, and the target is left untouched. Warn-mode graphs log and proceed. Shapes referenced through a cross-ledger `f:shapesSource` are resolved and enforced like any other. Use `branch diff` to see the outcome before merging.
+
 **Examples:**
 
 ```bash
@@ -359,6 +366,8 @@ fluree branch revert --from <COMMIT> --to <COMMIT>
 ```
 
 Accepts either positional commit references (cherry-pick style, one or several) or a git-style range. Each commit reference may be a `t:N` transaction number, a hex digest prefix, or a full commit ID — the same forms `branch create --at` accepts.
+
+The revert commit is validated against the branch's SHACL configuration and shapes before it is written. Undoing a commit can remove a value a later shape requires (a `sh:minCount`, say); such a revert is rejected with the same violation report a rejected transaction prints, and the branch is left as it was.
 
 | Option | Description |
 |--------|-------------|

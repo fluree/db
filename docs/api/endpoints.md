@@ -2488,7 +2488,7 @@ Bearer token required when `data_auth.mode = required`; reads are gated on `bear
 
 **URL:**
 ```
-GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}&include_conflict_details={bool}&strategy={strategy}&include_changes={bool}&max_changes={n}&changes_after_subject={iri}
+GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}&include_conflict_details={bool}&strategy={strategy}&include_changes={bool}&max_changes={n}&changes_after_subject={iri}&include_validation={bool}
 ```
 
 **Path / Query Parameters:**
@@ -2506,6 +2506,7 @@ GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}
 | `include_changes` | bool | No | When true, includes the aggregate **netted** change set the merge would apply (source side, ancestor..source-head) as `changes`. Defaults to false. Costs one full commit load per commit in the source divergence; the walk is shared with the conflict computation when both are requested. |
 | `max_changes` | number | No | Cap on change entries returned, counted in **flakes** and cut at subject boundaries (default 500; server clamps to a hard maximum of 5,000). A single subject larger than the cap is returned whole. `0` is a valid "diff stats" mode: exact counts, no payload. Bounds response size, **not** the replay walk. |
 | `changes_after_subject` | string | No | Pagination cursor: return only subjects whose full IRI sorts strictly after this value. Pass the previous response's `changes.next_cursor`. Each page re-pays the full replay + netting cost. Requires `include_changes=true`. |
+| `include_validation` | bool | No | When true (the default), stages the strategy-resolved change set on the target and validates it against the target's SHACL configuration and shapes exactly as `POST /merge` would, reporting the outcome as `validation` and folding it into `mergeable`. Costs a target-state load plus the validation pass, plus the source replay when `include_changes` is false. Set false for count-only previews. |
 
 **Response body (200 OK):**
 
@@ -2525,6 +2526,7 @@ GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}
   "behind": { "count": 1, "commits": [...], "truncated": false },
   "fast_forward": false,
   "mergeable": true,
+  "validation": { "conforms": true },
   "conflicts": {
     "count": 1,
     "keys": [{ "s": [100, "alice"], "p": [100, "status"], "g": null }],
@@ -2567,7 +2569,8 @@ GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}
 | `ahead` | object | Commits on source not on target (`count`, `commits`, `truncated`) |
 | `behind` | object | Commits on target not on source |
 | `fast_forward` | bool | True when target HEAD == ancestor (or both heads absent) |
-| `mergeable` | bool | False only when the selected preview strategy would abort, e.g. `strategy=abort` with conflicts. This is a strategy/conflict signal, not full transaction validation. `mergeable=true` does not guarantee a subsequent `POST /merge` will succeed; it only reflects the conflict/strategy interaction at preview time. |
+| `mergeable` | bool | Whether the merge would go through: the selected strategy can be applied without aborting (false for `strategy=abort` with conflicts) **and**, when `validation` is present, the merged state conforms to the target's shapes. With `include_validation=false` it is the strategy/conflict signal alone. |
+| `validation` | object | Present iff `include_validation=true` (the default) and the merge is not a fast-forward. `{ "conforms": bool, "report"?: string }` — the same SHACL outcome `POST /merge` would produce for this strategy; `report` is present only when `conforms` is false and is the message the merge would fail with. A fast-forward adopts commits already validated when they were authored, so it carries no `validation`. |
 | `conflicts` | object | Overlapping `(s, p, g)` keys touched on both sides since the ancestor. Empty when `fast_forward` or `include_conflicts=false` |
 | `changes` | object | Present iff `include_changes=true`. Aggregate netted change set — see below |
 
