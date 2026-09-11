@@ -9,7 +9,7 @@
 #![cfg(all(feature = "native", unix))]
 
 use fluree_db_api::{Fluree, FlureeBuilder, GraphDb, LedgerHandle};
-use fluree_db_core::IndexType;
+use fluree_db_core::{range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeTest};
 
 const LEDGER: &str = "it/optimistic-rebase:main";
 const PREFIX: &str = "PREFIX ex: <http://example.org/> ";
@@ -394,5 +394,164 @@ async fn sparql_writes_under_contention_land_by_rebase() {
         stats.rebased > 0,
         "contended disjoint writes should re-base: {stats:?}"
     );
+    fluree.disconnect().await;
+}
+
+/// Metadata carries namespace codes outside the staged flakes. All three
+/// slots (predicate, IRI value, datatype) must move with a taken code, in
+/// both the cached state and the persisted commit envelope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rebase_preserves_transaction_metadata_namespaces() {
+    let (_dir, fluree, handle) = open().await;
+    update(&fluree, &handle, "INSERT DATA { ex:seed ex:p 1 }").await;
+    let (parked, release) = handle.gate_next_optimistic_stage_for_test();
+    let behind = {
+        let fluree = fluree.clone();
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            let txn = serde_json::json!({
+                "@context": {"ex": "http://example.org/", "meta": "http://meta.example/"},
+                "@graph": [{"@id": "ex:behind", "ex:p": 2}],
+                "meta:source": {"@id": "meta:producer"},
+                "meta:token": {"@value": "abc", "@type": "meta:Token"},
+                "meta:label": "unchanged",
+                "ex:existing": {"@id": "ex:seed"}
+            });
+            fluree
+                .stage(&handle)
+                .insert(&txn)
+                .execute()
+                .await
+                .expect("insert with metadata")
+        })
+    };
+    parked.await.expect("metadata write parked");
+    update(
+        &fluree,
+        &handle,
+        "INSERT DATA { <http://ahead.example/s> ex:p 3 }",
+    )
+    .await;
+    release.send(true).unwrap();
+    behind.await.expect("metadata task");
+    let stats = handle.write_path_stats();
+    assert_eq!((stats.rebased, stats.restaged), (1, 0));
+
+    for state in [
+        handle.snapshot().await.to_ledger_state(),
+        fluree
+            .ledger(LEDGER)
+            .await
+            .expect("replay persisted commits"),
+    ] {
+        let flakes = range_with_overlay(
+            &state.snapshot,
+            fluree_db_core::TXN_META_GRAPH_ID,
+            state.novelty.as_ref(),
+            IndexType::Post,
+            RangeTest::Eq,
+            RangeMatch::new(),
+            Default::default(),
+        )
+        .await
+        .expect("read transaction metadata");
+        let metadata = |name: &str| {
+            flakes
+                .iter()
+                .find(|f| f.p.name.as_ref() == name)
+                .expect("metadata entry")
+        };
+        for name in ["source", "token", "label"] {
+            assert_eq!(
+                state.snapshot.decode_sid(&metadata(name).p),
+                Some(format!("http://meta.example/{name}")),
+                "metadata predicate must keep its original IRI"
+            );
+        }
+        let FlakeValue::Ref(source) = &metadata("source").o else {
+            panic!("metadata source must remain an IRI");
+        };
+        assert_eq!(
+            state.snapshot.decode_sid(source).as_deref(),
+            Some("http://meta.example/producer")
+        );
+        assert_eq!(
+            state.snapshot.decode_sid(&metadata("token").dt).as_deref(),
+            Some("http://meta.example/Token")
+        );
+        assert_eq!(metadata("token").o, FlakeValue::String("abc".into()));
+        assert_eq!(metadata("label").o, FlakeValue::String("unchanged".into()));
+        assert_eq!(
+            state
+                .snapshot
+                .decode_sid(&metadata("existing").p)
+                .as_deref(),
+            Some("http://example.org/existing")
+        );
+        let FlakeValue::Ref(existing) = &metadata("existing").o else {
+            panic!("existing metadata reference must remain an IRI");
+        };
+        assert_eq!(
+            state.snapshot.decode_sid(existing).as_deref(),
+            Some("http://example.org/seed")
+        );
+    }
+    fluree.disconnect().await;
+}
+
+/// The delete initially sees no annotations. The upsert adds one, but its
+/// unchanged base edge cancels out, so its written subjects alone do not
+/// intersect the delete's scope. Restaging must discover and cascade it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_behind_a_new_annotation_is_restaged_to_cascade_it() {
+    let (_dir, fluree, handle) = open().await;
+    update(&fluree, &handle, "INSERT DATA { ex:a ex:p ex:o }").await;
+    let (parked, release) = handle.gate_next_optimistic_stage_for_test();
+    let behind = spawn_update(&fluree, &handle, "DELETE DATA { ex:a ex:p ex:o }");
+    parked.await.expect("delete parked");
+    let annotated = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:a",
+        "ex:p": {"@id": "ex:o", "@annotation": {"@id": "ex:ann", "ex:role": "test"}}
+    });
+    fluree
+        .stage(&handle)
+        .upsert(&annotated)
+        .execute()
+        .await
+        .expect("annotate existing edge");
+    release.send(true).unwrap();
+    behind.await.expect("delete task");
+    let stats = handle.write_path_stats();
+    assert_eq!((stats.rebased, stats.restaged), (0, 1));
+    assert_eq!(
+        count(&fluree, &handle, "SELECT ?o WHERE { ex:a ex:p ?o }").await,
+        0
+    );
+    for state in [
+        handle.snapshot().await.to_ledger_state(),
+        fluree
+            .ledger(LEDGER)
+            .await
+            .expect("replay persisted commits"),
+    ] {
+        let flakes = range_with_overlay(
+            &state.snapshot,
+            0,
+            state.novelty.as_ref(),
+            IndexType::Post,
+            RangeTest::Eq,
+            RangeMatch::new(),
+            Default::default(),
+        )
+        .await
+        .expect("read remaining facts");
+        assert!(
+            !flakes
+                .iter()
+                .any(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p)),
+            "deleting the base edge must retract its attachment bundle: {flakes:?}"
+        );
+    }
     fluree.disconnect().await;
 }

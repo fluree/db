@@ -28,7 +28,7 @@ use crate::{
     ApiError, Fluree, PolicyContext, Result, TrackedErrorResponse, TrackedTransactionInput,
     Tracker, TrackingOptions, TrackingTally,
 };
-use fluree_db_core::{ContentId, ContentKind, ContentStore, LedgerSnapshot, Sid};
+use fluree_db_core::{ContentId, ContentKind, ContentStore, LedgerSnapshot, Sid, TxnMetaValue};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_novelty::Novelty;
@@ -1831,10 +1831,14 @@ impl Fluree {
         // everything: a stage computed before it stages again rather than
         // re-basing over it unvalidated. That is a shape, the class
         // hierarchy shapes target through, or anything in a named graph,
-        // where shapes and the ledger's config live.
+        // where shapes and the ledger's config live. Attachment changes also
+        // affect a delete's cascade beyond its own subjects: an upsert can
+        // attach an annotation while its unchanged base edge cancels out of
+        // the staged flakes, leaving only the annotation subject here.
         let changes_dependencies = staged.iter().any(|flake| {
             use fluree_vocab::namespaces::{RDFS, SHACL};
             flake.g.is_some()
+                || fluree_db_core::is_reserved_reifies_predicate(&flake.p)
                 || flake.p.namespace_code == SHACL
                 || matches!(&flake.o, fluree_db_core::FlakeValue::Ref(o) if o.namespace_code == SHACL)
                 || (flake.p.namespace_code == RDFS
@@ -2016,7 +2020,8 @@ impl Fluree {
     /// commits. The namespace codes the stage allocated against the old table
     /// are re-allocated against the new one: a commit in between may have
     /// given the same code to another prefix, or the same prefix another
-    /// code, and every Sid the stage minted under a moved code is rewritten.
+    /// code, and every Sid and transaction-metadata namespace code the stage
+    /// minted under a moved code is rewritten.
     /// On a pass the flakes are restamped to the new `t` and layered over a
     /// clone of the locked state; on a fail the stage is dropped and `None`
     /// says to stage again under the lock.
@@ -2090,7 +2095,7 @@ impl Fluree {
             view,
             ns_registry: _stale_registry,
             scope,
-            txn_meta,
+            mut txn_meta,
             graph_delta,
             sync_graph,
         } = stage;
@@ -2105,6 +2110,28 @@ impl Fluree {
                 remap_sid(&mut flake.dt, &remap);
                 if let fluree_db_core::FlakeValue::Ref(sid) = &mut flake.o {
                     remap_sid(sid, &remap);
+                }
+            }
+        }
+        // Metadata is stored separately from the data flakes but uses the
+        // same namespace table. Remap its predicates, IRI objects, and typed
+        // literal datatypes before the commit envelope is built.
+        if !remap.is_empty() {
+            for entry in &mut txn_meta {
+                if let Some(code) = remap.get(&entry.predicate_ns) {
+                    entry.predicate_ns = *code;
+                }
+                match &mut entry.value {
+                    TxnMetaValue::Ref { ns, .. } | TxnMetaValue::TypedLiteral { dt_ns: ns, .. } => {
+                        if let Some(code) = remap.get(ns) {
+                            *ns = *code;
+                        }
+                    }
+                    TxnMetaValue::String(_)
+                    | TxnMetaValue::LangString { .. }
+                    | TxnMetaValue::Long(_)
+                    | TxnMetaValue::Double(_)
+                    | TxnMetaValue::Boolean(_) => {}
                 }
             }
         }
