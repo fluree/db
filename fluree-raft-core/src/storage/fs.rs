@@ -5,7 +5,7 @@
 //! ```text
 //! <root>/
 //!   vote             # postcard-serialized Vote
-//!   committed.slots  # two 64-byte slots, the newer valid one wins
+//!   committed.slots  # two 4 KiB slots, the newer valid one wins
 //!   last_purged      # postcard-serialized LogId (absent when never purged)
 //!   log/
 //!     <first>.seg    # framed entries from index <first> up, zero-padded
@@ -148,8 +148,10 @@ const FRAME_MAGIC: &[u8; 4] = b"FRLE";
 const FRAME_HEADER: usize = 4 + 4 + 8 + 8;
 const FRAME_HASH: usize = 8;
 const DEFAULT_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
-const COMMITTED_MAGIC: &[u8; 4] = b"FRCM";
-const COMMITTED_SLOT: usize = 64;
+const LEGACY_COMMITTED_MAGIC: &[u8; 4] = b"FRCM";
+const LEGACY_COMMITTED_SLOT: usize = 64;
+const COMMITTED_MAGIC: &[u8; 4] = b"FRC2";
+const COMMITTED_SLOT: usize = 4096;
 const COMMITTED_FILE: &str = "committed.slots";
 
 fn segment_filename(first_index: u64) -> String {
@@ -213,11 +215,15 @@ fn encode_committed(generation: u64, id: Option<LogId>) -> [u8; COMMITTED_SLOT] 
 }
 
 fn decode_committed(slot: &[u8]) -> Option<(u64, Option<LogId>)> {
-    if slot.len() != COMMITTED_SLOT || &slot[..4] != COMMITTED_MAGIC {
+    let magic = match slot.len() {
+        COMMITTED_SLOT => COMMITTED_MAGIC,
+        LEGACY_COMMITTED_SLOT => LEGACY_COMMITTED_MAGIC,
+        _ => return None,
+    };
+    if &slot[..4] != magic {
         return None;
     }
-    if frame_hash(&slot[..COMMITTED_SLOT - FRAME_HASH]).to_le_bytes()
-        != slot[COMMITTED_SLOT - FRAME_HASH..]
+    if frame_hash(&slot[..slot.len() - FRAME_HASH]).to_le_bytes() != slot[slot.len() - FRAME_HASH..]
     {
         return None;
     }
@@ -535,13 +541,32 @@ impl Inner {
         let slots = self.root.join(COMMITTED_FILE);
         match std::fs::read(&slots) {
             Ok(bytes) => {
+                // Intermediate builds used adjacent 64-byte slots. Publish
+                // their replacement atomically: a crash during migration must
+                // leave either the old file or both new, separated slots.
+                let legacy = bytes.len() == 2 * LEGACY_COMMITTED_SLOT;
+                let stride = if legacy {
+                    LEGACY_COMMITTED_SLOT
+                } else {
+                    COMMITTED_SLOT
+                };
                 let best = bytes
-                    .chunks(COMMITTED_SLOT)
+                    .chunks(stride)
                     .filter_map(decode_committed)
                     .max_by_key(|(generation, _)| *generation);
                 if let Some((generation, id)) = best {
                     self.committed_generation = generation;
                     self.committed = id;
+                }
+                if legacy {
+                    let mut migrated = vec![0u8; 2 * COMMITTED_SLOT];
+                    for (i, slot) in bytes.chunks(stride).enumerate() {
+                        if let Some((generation, id)) = decode_committed(slot) {
+                            migrated[i * COMMITTED_SLOT..(i + 1) * COMMITTED_SLOT]
+                                .copy_from_slice(&encode_committed(generation, id));
+                        }
+                    }
+                    atomic_write_blocking(&slots, &migrated)?;
                 }
                 return Ok(());
             }
@@ -581,8 +606,9 @@ impl Inner {
         let generation = self.committed_generation + 1;
         let slot = encode_committed(generation, id);
         let file = self.committed_file.as_mut().expect("opened above");
-        // Alternate slots, so a torn write can only damage the older of
-        // the two and the read side falls back to the other.
+        // Alternate slots on separate 4 KiB boundaries, so a sector-local
+        // tear of this update leaves the previous slot available. This does
+        // not promise isolation from arbitrary device-wide corruption.
         file.seek(SeekFrom::Start(
             ((generation % 2) as usize * COMMITTED_SLOT) as u64,
         ))
@@ -1974,5 +2000,65 @@ mod tests {
         );
         let (_, data) = storage.snapshots().current().await.unwrap().unwrap();
         assert_eq!(data, vec![99]);
+    }
+
+    #[tokio::test]
+    async fn review_committed_survives_loss_of_new_slots_entire_page() {
+        let dir = TempDir::new().unwrap();
+        let store = reopen(&dir).await;
+        store.save_committed(Some(LogId::new(1, 1))).await.unwrap();
+        store.save_committed(Some(LogId::new(1, 2))).await.unwrap();
+        drop(store);
+        let path = dir.path().join(COMMITTED_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 8192);
+        bytes[..4096].fill(0); // Generation 2's page, including neighboring bytes.
+        std::fs::write(&path, bytes).unwrap();
+        let store = reopen(&dir).await;
+        assert_eq!(
+            store.read_committed().await.unwrap(),
+            Some(LogId::new(1, 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn review_legacy_committed_slots_migrate_and_keep_fallback() {
+        let dir = TempDir::new().unwrap();
+        let mut bytes = vec![0u8; 128];
+        // Encode the old layout independently of the new encoder.
+        for (i, generation) in [(0, 2u64), (1, 1u64)] {
+            let slot = &mut bytes[i * 64..(i + 1) * 64];
+            slot[..4].copy_from_slice(b"FRCM");
+            slot[4..12].copy_from_slice(&generation.to_le_bytes());
+            slot[12] = 1;
+            slot[13..21].copy_from_slice(&1u64.to_le_bytes());
+            slot[21..29].copy_from_slice(&generation.to_le_bytes());
+            let hash = frame_hash(&slot[..56]);
+            slot[56..].copy_from_slice(&hash.to_le_bytes());
+        }
+        let path = dir.path().join(COMMITTED_FILE);
+        std::fs::write(&path, bytes).unwrap();
+        let store = reopen(&dir).await;
+        assert_eq!(
+            store.read_committed().await.unwrap(),
+            Some(LogId::new(1, 2))
+        );
+        drop(store);
+        let mut migrated = std::fs::read(&path).unwrap();
+        assert_eq!(migrated.len(), 8192);
+        migrated[..4096].fill(0);
+        std::fs::write(&path, migrated).unwrap();
+        let store = reopen(&dir).await;
+        assert_eq!(
+            store.read_committed().await.unwrap(),
+            Some(LogId::new(1, 1))
+        );
+        store.save_committed(Some(LogId::new(1, 3))).await.unwrap();
+        drop(store);
+        let store = reopen(&dir).await;
+        assert_eq!(
+            store.read_committed().await.unwrap(),
+            Some(LogId::new(1, 3))
+        );
     }
 }

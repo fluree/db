@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
+use xxhash_rust::xxh64::Xxh64;
 
 /// Directory under the storage root holding the lock and segments.
 pub(super) const WAL_DIR: &str = ".fluree-wal";
@@ -35,11 +36,13 @@ pub(super) const WAL_DIR: &str = ".fluree-wal";
 const OWNERS_DIR: &str = "owners";
 const LOCK_FILE: &str = "LOCK";
 const SEGMENT_EXT: &str = "wal";
-const SEGMENT_MAGIC: &[u8; 8] = b"FRDOSEG1";
+const LEGACY_SEGMENT_MAGIC: &[u8; 8] = b"FRDOSEG1";
+const SEGMENT_MAGIC: &[u8; 8] = b"FRDOSEG2";
 const SEGMENT_HEADER: usize = 16;
 const FRAME_MAGIC: &[u8; 4] = b"FRDO";
 const FRAME_HEADER: usize = 4 + 4 + 8;
-const HASH: usize = 32;
+const HASH: usize = 8;
+const LEGACY_HASH: usize = 32;
 
 /// Largest single record the log accepts. A write above this bypasses the log
 /// and is flushed directly: past a few megabytes a flush costs bandwidth, not
@@ -213,15 +216,39 @@ fn decode_op(payload: &[u8]) -> Option<OwnedOp> {
     c.done().then_some(op)
 }
 
-fn encode_frame(seq: u64, payload: &[u8]) -> Vec<u8> {
+/// Hash the payload and allocate its frame before taking the log mutex.
+/// Version 2 checksums payload followed by header, so the sequence number
+/// can be folded in after it is assigned without rehashing the payload.
+fn prepare_frame(payload: &[u8]) -> (Vec<u8>, Xxh64) {
     let mut frame = Vec::with_capacity(FRAME_HEADER + payload.len() + HASH);
     frame.extend_from_slice(FRAME_MAGIC);
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&seq.to_le_bytes());
+    frame.extend_from_slice(&0u64.to_le_bytes());
     frame.extend_from_slice(payload);
-    let hash = Sha256::digest(&frame);
-    frame.extend_from_slice(&hash);
+    let mut hash = Xxh64::new(0);
+    hash.update(payload);
+    (frame, hash)
+}
+
+fn finish_frame(seq: u64, mut frame: Vec<u8>, mut hash: Xxh64) -> Vec<u8> {
+    frame[8..16].copy_from_slice(&seq.to_le_bytes());
+    hash.update(&frame[..FRAME_HEADER]);
+    frame.extend_from_slice(&hash.digest().to_le_bytes());
     frame
+}
+
+#[cfg(test)]
+fn encode_frame(seq: u64, payload: &[u8]) -> Vec<u8> {
+    let (frame, hash) = prepare_frame(payload);
+    finish_frame(seq, frame, hash)
+}
+
+fn segment_hash_size(bytes: &[u8]) -> Option<usize> {
+    match bytes.get(..8)? {
+        magic if magic == SEGMENT_MAGIC => Some(HASH),
+        magic if magic == LEGACY_SEGMENT_MAGIC => Some(LEGACY_HASH),
+        _ => None,
+    }
 }
 
 /// Frames decoded from one segment, and whether the segment ended cleanly.
@@ -233,12 +260,13 @@ struct Decoded {
 }
 
 fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<Decoded> {
-    if bytes.len() < SEGMENT_HEADER || &bytes[..8] != SEGMENT_MAGIC {
+    if bytes.len() < SEGMENT_HEADER || segment_hash_size(bytes).is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "WAL segment header is missing or unrecognized",
         ));
     }
+    let hash_size = segment_hash_size(bytes).expect("validated above");
     let first_seq = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
     if expected_first_seq.is_some_and(|expected| expected != first_seq) {
         return Err(io::Error::new(
@@ -264,10 +292,18 @@ fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<D
             break false;
         }
         let end = at + FRAME_HEADER + len;
-        let Some(stored) = bytes.get(end..end + HASH) else {
+        let Some(stored) = bytes.get(end..end + hash_size) else {
             break false;
         };
-        if Sha256::digest(&bytes[at..end]).as_slice() != stored {
+        let valid = if hash_size == LEGACY_HASH {
+            Sha256::digest(&bytes[at..end]).as_slice() == stored
+        } else {
+            let mut hash = Xxh64::new(0);
+            hash.update(&bytes[at + FRAME_HEADER..end]);
+            hash.update(header);
+            hash.digest().to_le_bytes() == stored
+        };
+        if !valid {
             break false;
         }
         let Some(op) = decode_op(&bytes[at + FRAME_HEADER..end]) else {
@@ -275,7 +311,7 @@ fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<D
         };
         ops.push(op);
         seq += 1;
-        at = end + HASH;
+        at = end + hash_size;
     };
     Ok(Decoded {
         ops,
@@ -321,6 +357,14 @@ impl Drop for Appended {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum DeviceStep {
+    FilesFlushed(PathBuf),
+    Unlink(PathBuf),
+    DirFlushed,
+}
+
 struct Inner {
     active: Option<Segment>,
     closed: Vec<Closed>,
@@ -358,6 +402,8 @@ pub(super) struct Wal {
     /// Test hook: make the next flush report failure.
     #[cfg(test)]
     fail_next_sync: AtomicBool,
+    #[cfg(test)]
+    device_trace: Mutex<Vec<DeviceStep>>,
 }
 
 /// How many keys share one lock in [`Wal::key_stripes`].
@@ -453,12 +499,18 @@ pub(super) fn replay_unowned(base: &Path) -> io::Result<usize> {
         {
             Ok(lock) => lock,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
+            Err(e) => {
+                skip_unavailable_owner(&dir, e)?;
+                continue;
+            }
         };
         match lock.try_lock_exclusive() {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(e),
+            Err(e) => {
+                skip_unavailable_owner(&dir, e)?;
+                continue;
+            }
         }
         let (_, _, records) = replay(&base, &dir, &AtomicU64::new(0))?;
         if records > 0 {
@@ -473,6 +525,27 @@ pub(super) fn replay_unowned(base: &Path) -> io::Result<usize> {
         // already retired log.
     }
     Ok(applied)
+}
+
+/// A failed first acquisition can leave an empty owner directory. It is
+/// safe to ignore that directory, but retained segments may hold the only
+/// durable copy of an acknowledged payload and must not be skipped silently.
+fn skip_unavailable_owner(dir: &Path, error: io::Error) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        if entry?
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == SEGMENT_EXT)
+        {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("cannot lock retained WAL at {}: {error}", dir.display()),
+            ));
+        }
+    }
+    tracing::warn!(owner = %dir.display(), error = %error,
+        "cannot lock an empty owner's WAL; skipping it (per-write fallback)");
+    Ok(())
 }
 
 fn validate_owner(owner: &str) -> io::Result<()> {
@@ -505,8 +578,11 @@ fn fsync_dir(path: &Path, fsyncs: &AtomicU64) -> io::Result<()> {
 /// root. Missing files were deleted after being logged, which is fine: the
 /// directory flush makes the unlink durable.
 pub(super) fn flush_keys(base: &Path, keys: &[String], fsyncs: &AtomicU64) -> io::Result<()> {
+    let mut unique: Vec<&String> = keys.iter().collect();
+    unique.sort_unstable();
+    unique.dedup();
     let mut dirs = BTreeSet::new();
-    for key in keys {
+    for key in unique {
         let path = base.join(key);
         match File::open(&path) {
             Ok(file) => {
@@ -672,7 +748,7 @@ fn walk_segments(
     for (i, (_, path)) in segments.iter().enumerate() {
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
-        if i == last && (bytes.len() < SEGMENT_HEADER || &bytes[..8] != SEGMENT_MAGIC) {
+        if i == last && bytes.len() < SEGMENT_HEADER {
             // Creation interrupted before the header was written. A record
             // is only ever appended after the header is durable, so this
             // segment holds nothing acknowledged.
@@ -868,6 +944,8 @@ impl Wal {
                 .collect(),
             #[cfg(test)]
             fail_next_sync: AtomicBool::new(false),
+            #[cfg(test)]
+            device_trace: Mutex::new(Vec::new()),
         });
         let weak = Arc::downgrade(&log);
         let ticker = weak.clone();
@@ -965,6 +1043,7 @@ impl Wal {
         self.refuse_if_unavailable()?;
         let sync = sync || self.flush_every_append;
         let payload = op.encode();
+        let (frame, hash) = prepare_frame(&payload);
         let mut inner = self
             .inner
             .lock()
@@ -977,7 +1056,7 @@ impl Wal {
             let segment = self.open_segment(&mut inner, seq)?;
             inner.active = Some(segment);
         }
-        let frame = encode_frame(seq, &payload);
+        let frame = finish_frame(seq, frame, hash);
         let (full, in_flight) = {
             let segment = inner.active.as_mut().expect("opened above");
             let start = segment.len;
@@ -1164,8 +1243,20 @@ impl Wal {
                 kept.push(segment);
                 break;
             }
-            let retired = flush_keys(&self.base, &segment.touched, &self.fsyncs)
-                .and_then(|()| std::fs::remove_file(&segment.path));
+            let retired = flush_keys(&self.base, &segment.touched, &self.fsyncs).and_then(|()| {
+                #[cfg(test)]
+                self.device_trace
+                    .lock()
+                    .unwrap()
+                    .push(DeviceStep::FilesFlushed(segment.path.clone()));
+                std::fs::remove_file(&segment.path)?;
+                #[cfg(test)]
+                self.device_trace
+                    .lock()
+                    .unwrap()
+                    .push(DeviceStep::Unlink(segment.path.clone()));
+                Ok(())
+            });
             match retired {
                 Ok(()) => removed = true,
                 Err(e) => {
@@ -1179,6 +1270,12 @@ impl Wal {
         if removed {
             if let Err(e) = fsync_dir(&self.dir, &self.fsyncs) {
                 failure.get_or_insert(e);
+            } else {
+                #[cfg(test)]
+                self.device_trace
+                    .lock()
+                    .unwrap()
+                    .push(DeviceStep::DirFlushed);
             }
         }
         let waiting = kept.len();
@@ -2095,5 +2192,224 @@ mod tests {
             storage.fsyncs_issued() > before,
             "sync returned with the log still dirty"
         );
+    }
+
+    #[tokio::test]
+    async fn review_empty_unavailable_owner_does_not_break_startup_or_read_misses() {
+        use crate::{Durability, FileStorage, StorageRead};
+        let dir = tempfile::tempdir().unwrap();
+        let owner = dir.path().join(WAL_DIR).join(OWNERS_DIR).join("node-1");
+        // Opening a directory for read/write fails on all supported Unix
+        // platforms; exercise the same fallback for an unusable owner lock.
+        std::fs::create_dir_all(owner.join(LOCK_FILE)).unwrap();
+        let storage = FileStorage::new(dir.path())
+            .with_durability(Durability::Wal)
+            .with_wal_owner("node-1");
+        storage.recover_wal().unwrap();
+        assert_eq!(storage.effective_durability(), Durability::Sync);
+        assert!(matches!(
+            storage.read_bytes("fluree:file://missing").await,
+            Err(crate::Error::NotFound(_))
+        ));
+        // A retained log is different: it may hold acknowledged data.
+        std::fs::write(owner.join("00000001.wal"), b"retained").unwrap();
+        assert!(storage
+            .recover_wal()
+            .unwrap_err()
+            .to_string()
+            .contains("retained WAL"));
+        assert!(owner.join("00000001.wal").exists());
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn review_unsupported_flock_on_empty_owner_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = dir.path().join(WAL_DIR).join(OWNERS_DIR).join("node-1");
+        std::fs::create_dir_all(&owner).unwrap();
+        let lock_path = owner.join(LOCK_FILE);
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&lock_path)
+            .status()
+            .unwrap()
+            .success());
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let error = lock.try_lock_exclusive().unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(replay_unowned(dir.path()).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn review_failed_plain_write_is_cancelled_before_recovery() {
+        use crate::{Durability, FileStorage, StorageRead, StorageWrite};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        storage.hold_wal_segments_for_test().unwrap();
+        let path = dir.path().join("head");
+        std::fs::create_dir(&path).unwrap(); // The final rename must fail.
+        assert!(storage
+            .write_bytes("fluree:file://head", b"failed")
+            .await
+            .is_err());
+        storage.simulate_crash_for_test();
+        std::fs::remove_dir(&path).unwrap();
+        let reopened = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        reopened.recover_wal().unwrap();
+        assert!(matches!(
+            reopened.read_bytes("fluree:file://head").await,
+            Err(crate::Error::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn review_failed_plain_delete_preserves_a_later_writer() {
+        use crate::{Durability, FileStorage, StorageRead, StorageWrite};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        storage.hold_wal_segments_for_test().unwrap();
+        let path = dir.path().join("head");
+        std::fs::create_dir(&path).unwrap(); // remove_file cannot delete it.
+        assert!(storage.delete("fluree:file://head").await.is_err());
+        std::fs::remove_dir(&path).unwrap();
+        let other = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        other
+            .write_bytes("fluree:file://head", b"acknowledged")
+            .await
+            .unwrap();
+        storage.simulate_crash_for_test();
+        let reopened = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        reopened.recover_wal().unwrap();
+        assert_eq!(
+            reopened.read_bytes("fluree:file://head").await.unwrap(),
+            b"acknowledged"
+        );
+    }
+
+    #[test]
+    fn review_retirement_flushes_repeated_keys_once_before_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.hold_segments();
+        std::fs::write(dir.path().join("head"), b"value").unwrap();
+        for _ in 0..20 {
+            drop(
+                log.append(
+                    Op::Write {
+                        key: "head",
+                        bytes: b"value",
+                    },
+                    false,
+                )
+                .unwrap(),
+            );
+        }
+        rotate_now(&log);
+        let segment = log.inner.lock().unwrap().closed[0].path.clone();
+        let before = log.fsyncs_issued();
+        assert_eq!(log.retire_closed().unwrap(), 0);
+        assert_eq!(
+            log.fsyncs_issued() - before,
+            3,
+            "file, root directory, WAL directory"
+        );
+        assert_eq!(
+            *log.device_trace.lock().unwrap(),
+            vec![
+                DeviceStep::FilesFlushed(segment.clone()),
+                DeviceStep::Unlink(segment),
+                DeviceStep::DirFlushed,
+            ]
+        );
+    }
+
+    fn legacy_frame(seq: u64, payload: &[u8]) -> Vec<u8> {
+        let mut frame = FRAME_MAGIC.to_vec();
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&seq.to_le_bytes());
+        frame.extend_from_slice(payload);
+        let hash = Sha256::digest(&frame);
+        frame.extend_from_slice(&hash);
+        frame
+    }
+
+    #[test]
+    fn review_replays_legacy_and_new_checksum_segments_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join(WAL_DIR);
+        std::fs::create_dir(&wal).unwrap();
+        for (id, magic, frame) in [
+            (
+                1,
+                LEGACY_SEGMENT_MAGIC,
+                legacy_frame(
+                    1,
+                    &Op::Write {
+                        key: "head",
+                        bytes: b"old",
+                    }
+                    .encode(),
+                ),
+            ),
+            (
+                2,
+                SEGMENT_MAGIC,
+                encode_frame(
+                    2,
+                    &Op::Write {
+                        key: "head",
+                        bytes: b"new",
+                    }
+                    .encode(),
+                ),
+            ),
+        ] {
+            let mut bytes = magic.to_vec();
+            bytes.extend_from_slice(&(id as u64).to_le_bytes());
+            bytes.extend_from_slice(&frame);
+            std::fs::write(wal.join(format!("{id:08}.wal")), bytes).unwrap();
+        }
+        let (_, _, records) = replay(dir.path(), &wal, &AtomicU64::new(0)).unwrap();
+        assert_eq!(records, 2);
+        assert_eq!(std::fs::read(dir.path().join("head")).unwrap(), b"new");
+        assert!(segment_paths(&wal).unwrap().is_empty());
+    }
+
+    #[test]
+    fn review_new_checksum_covers_payload_and_sequence() {
+        let payload = Op::Write {
+            key: "head",
+            bytes: b"value",
+        }
+        .encode();
+        let mut bytes = SEGMENT_MAGIC.to_vec();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&encode_frame(1, &payload));
+        assert!(decode_segment(&bytes, None).unwrap().clean);
+        let mut changed_payload = bytes.clone();
+        changed_payload[SEGMENT_HEADER + FRAME_HEADER + payload.len() - 1] ^= 1;
+        assert!(!decode_segment(&changed_payload, None).unwrap().clean);
+        // Keep the structural sequence checks satisfied; the checksum must
+        // independently detect that the header's sequence was changed.
+        bytes[8..16].copy_from_slice(&2u64.to_le_bytes());
+        bytes[SEGMENT_HEADER + 8..SEGMENT_HEADER + 16].copy_from_slice(&2u64.to_le_bytes());
+        assert!(!decode_segment(&bytes, None).unwrap().clean);
+    }
+
+    #[test]
+    fn review_unknown_segment_version_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join(WAL_DIR);
+        std::fs::create_dir(&wal).unwrap();
+        let path = wal.join("00000001.wal");
+        let mut bytes = b"FRDOSEG9".to_vec();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&encode_frame(1, &Op::Delete { key: "head" }.encode()));
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(replay(dir.path(), &wal, &AtomicU64::new(0)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }

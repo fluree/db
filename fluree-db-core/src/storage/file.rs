@@ -1423,7 +1423,7 @@ impl StorageWrite for FileStorage {
         tokio::task::spawn_blocking(move || {
             let _key = storage.hold_key(storage.durability, &key)?;
             let (_, log) = storage.write_plan(storage.durability, 0)?;
-            let _appended = match &log {
+            let appended = match &log {
                 // Ordered after the writes it undoes, so replay cannot bring
                 // the file back. Covered by the next flush, which is no weaker
                 // than an unlink that was never followed by a directory flush.
@@ -1438,11 +1438,20 @@ impl StorageWrite for FileStorage {
                 Ok(()) => Ok(()),
                 // Idempotent: not found is OK
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(crate::error::Error::io(format!(
-                    "Failed to delete {}: {}",
-                    path.display(),
-                    e
-                ))),
+                Err(e) => {
+                    if let (Some(log), Some(appended)) = (&log, &appended) {
+                        log.cancel(appended.seq, &key).map_err(|cancel| {
+                            crate::error::Error::io(format!(
+                                "delete {}: {e}; WAL cancel also failed: {cancel}",
+                                path.display()
+                            ))
+                        })?;
+                    }
+                    Err(crate::error::Error::io(format!(
+                        "Failed to delete {}: {e}",
+                        path.display()
+                    )))
+                }
             }
         })
         .await
@@ -1519,7 +1528,7 @@ impl FileStorage {
             // that follows flushes the log, and a crash before then leaves an
             // unreferenced file at worst. The guard keeps the record's segment
             // from being retired until the file is written.
-            let _appended = match &log {
+            let appended = match &log {
                 Some(log) => Some(
                     log.append(
                         Op::Write {
@@ -1534,9 +1543,21 @@ impl FileStorage {
             };
             // Overwrites if present, which is idempotent for content-addressed
             // writes: the address is derived from these bytes.
-            write_atomic(&path, &bytes, &policy).map_err(|e| {
-                crate::error::Error::io(format!("Failed to write {}: {}", path.display(), e))
-            })
+            if let Err(e) = write_atomic(&path, &bytes, &policy) {
+                if let (Some(log), Some(appended)) = (&log, &appended) {
+                    log.cancel(appended.seq, &key).map_err(|cancel| {
+                        crate::error::Error::io(format!(
+                            "write {}: {e}; WAL cancel also failed: {cancel}",
+                            path.display()
+                        ))
+                    })?;
+                }
+                return Err(crate::error::Error::io(format!(
+                    "Failed to write {}: {e}",
+                    path.display()
+                )));
+            }
+            Ok(())
         })
         .await
         .map_err(|e| crate::error::Error::io(format!("write {} join: {e}", for_err.display())))?

@@ -215,3 +215,59 @@ async fn timing_wal_vs_sync() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn review_read_only_client_recovers_without_retaining_writer_lock() {
+    use fluree_db_api::NameServiceMode;
+    use fluree_db_core::{StorageRead, StorageWrite};
+    use fluree_db_nameservice::memory::MemoryNameService;
+    use fs2::FileExt;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let previous = probe(dir.path());
+    previous.hold_wal_segments_for_test().unwrap();
+    previous
+        .write_bytes("fluree:file://payload", b"recover me")
+        .await
+        .unwrap();
+    previous.sync().await.unwrap();
+    previous.simulate_crash_for_test();
+    std::fs::remove_file(dir.path().join("payload")).unwrap();
+    let reader = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build_client_with_nameservice(NameServiceMode::ReadOnly(
+            Arc::new(MemoryNameService::new()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(dir.path().join("payload")).unwrap(),
+        b"recover me"
+    );
+    // Use an independent OS lock, because in-process writers share a WAL
+    // instance and would hide the reader's ownership bug.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.path().join(".fluree-wal/LOCK"))
+        .unwrap();
+    lock.try_lock_exclusive()
+        .expect("reader must leave the WAL available to a writer process");
+    drop(lock);
+    let writer = probe(dir.path());
+    writer
+        .write_bytes("fluree:file://later", b"writer")
+        .await
+        .unwrap();
+    assert_eq!(writer.effective_durability(), Durability::Wal);
+    assert!(
+        writer.fsyncs_issued() > 0,
+        "writer actually opened a WAL segment"
+    );
+    assert_eq!(
+        writer.read_bytes("fluree:file://later").await.unwrap(),
+        b"writer"
+    );
+    drop(reader);
+}

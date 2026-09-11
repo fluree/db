@@ -357,7 +357,7 @@ or by `FLUREE_STORAGE_FSYNC`:
 
 | Mode | Acknowledged when | Survives | Flushes per commit |
 |---|---|---|---|
-| `wal` (default) | the write is in the root's WAL and the log is flushed | process death and power loss | one |
+| `wal` (default; effective `sync` on Windows or when advisory locking is unavailable) | the write is in the root's WAL and the log is flushed | process death and power loss | one |
 | `sync` | bytes and directory entry flushed to the device | process death and power loss | two per file: six for a commit with a recorded transaction |
 | `page-cache` | bytes reach the OS page cache | process death only | none |
 
@@ -390,12 +390,22 @@ The files on disk remain the database. The log adds nothing another version of
 Fluree needs to understand: after a clean shutdown, or after any start of a
 WAL-aware binary, the root reads exactly as it did under `sync`. The one rule
 for downgrading is therefore *start the WAL-aware binary once after a crash*
-before pointing an older binary at the root, so the tail is applied.
+before pointing an older binary at the root, so the tail is applied. Stop that
+binary cleanly and confirm the WAL segments have been retired before downgrading.
+Otherwise a later WAL-aware start can replay stale writes or deletions over changes
+made by the older binary, including deleting a head it re-created.
 
 One process owns a root's log at a time. A second handle on the same root
 cannot take the lock and flushes each write itself, exactly as `sync` does,
 with a warning at startup. Where the filesystem refuses advisory locks the same
-fallback applies. The log is Unix-only.
+fallback applies. That fallback lasts for the handle's lifetime; restart the
+writer after the competing process exits to enable WAL mode. Read-only API clients
+replay existing logs without retaining WAL ownership. The log is Unix-only.
+
+An unsupported owner lock left by an unsuccessful first acquisition is skipped
+with a warning when that owner has no segments. If segments remain, recovery
+fails rather than ignoring potentially acknowledged payloads; restore access to
+advisory locking before reopening that root.
 
 A Raft cluster's payload store is one root shared by every node, so each node
 journals it under a log of its own, at `<root>/.fluree-wal/owners/node-<id>/`.
@@ -413,6 +423,11 @@ bandwidth rather than latency, and the log would only write the bytes twice. Rec
 in a segment that was flushed before a later segment was opened cannot tear, so
 damage there fails the open with the segment named; a torn final frame is
 discarded, since acknowledgment follows the flush and could not have covered it.
+
+Current WAL segments use xxh64 checksums to detect accidental corruption. The
+reader also accepts the preceding SHA-256 segment format. Checksums do not provide
+authentication. See the [storage WAL release notes](storage-wal-release-notes.md)
+for durability fixes and format upgrade constraints.
 
 > **macOS note.** `sync` on macOS issues `F_FULLFSYNC`, a full drive-cache
 > barrier that is far more expensive than the equivalent `fsync` on Linux —
