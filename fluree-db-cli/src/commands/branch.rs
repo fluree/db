@@ -1291,17 +1291,12 @@ fn print_preview_local(p: &fluree_db_api::MergePreview) {
         }
     }
 
-    if let Some(v) = &p.validation {
-        if v.conforms {
-            println!("validation: conforms");
-        } else {
-            println!("validation: violations (merge would be rejected)");
-            for line in v.report.as_deref().unwrap_or_default().lines() {
-                println!("  {line}");
-            }
-        }
-    }
-    println!("mergeable: {}", if p.mergeable { "yes" } else { "no" });
+    print_validation(
+        p.validation
+            .as_ref()
+            .map(|v| (v.conforms, v.report.as_deref())),
+        p.mergeable,
+    );
 
     if let Some(ch) = &p.changes {
         let shown: usize = ch
@@ -1337,6 +1332,22 @@ fn print_preview_local(p: &fluree_db_api::MergePreview) {
             println!("  next page: --changes-after '{cursor}'");
         }
     }
+}
+
+/// The SHACL outcome and the mergeable verdict, rendered identically by the
+/// local and remote printers so the two cannot drift apart.
+fn print_validation(validation: Option<(bool, Option<&str>)>, mergeable: bool) {
+    if let Some((conforms, report)) = validation {
+        if conforms {
+            println!("validation: conforms");
+        } else {
+            println!("validation: violations (merge would be rejected)");
+            for line in report.unwrap_or_default().lines() {
+                println!("  {line}");
+            }
+        }
+    }
+    println!("mergeable: {}", if mergeable { "yes" } else { "no" });
 }
 
 fn print_delta_local(label: &str, d: &fluree_db_api::BranchDelta) {
@@ -1452,6 +1463,17 @@ fn print_preview_json(v: &serde_json::Value) -> CliResult<()> {
             }
         }
     }
+
+    let validation = v.get("validation").map(|val| {
+        (
+            val.get("conforms")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            val.get("report").and_then(Value::as_str),
+        )
+    });
+    let mergeable = v.get("mergeable").and_then(Value::as_bool).unwrap_or(false);
+    print_validation(validation, mergeable);
 
     if let Some(ch) = v.get("changes").filter(|x| !x.is_null()) {
         let asserts = ch.get("assert_count").and_then(Value::as_u64).unwrap_or(0);
