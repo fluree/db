@@ -473,8 +473,8 @@ Specifics:
   re-validation for cross-ledger sources: the origin already
   validated against M when the commit was authored, and
   re-resolving M at replay time could see a different head.
-  Branch operations are authoring, not replay — the state they
-  stage onto the target is a combination nobody has validated —
+  Branch operations are authoring, not replay: the state they
+  stage onto the target is a combination nobody has validated,
   so they resolve M at operation time and enforce its shapes
   like any transaction would.
 - **`sh:sparql` constraints travel over the wire** — the query

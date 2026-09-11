@@ -140,7 +140,7 @@ impl NetChangeAccumulator {
 /// One walk serves every output, so callers that need conflict keys *and*
 /// the change set (merge preview) replay the source chain once instead of
 /// twice. The third element is the union of the range's namespace deltas,
-/// earliest commit winning on a code collision — the codes a consumer needs
+/// earliest commit winning on a code collision: the codes a consumer needs
 /// to make the change set's terms encodable before the range is committed.
 pub async fn compute_delta_keys_and_changes<C: ContentStore + Clone + 'static>(
     store: C,

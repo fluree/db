@@ -2570,7 +2570,7 @@ GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}
 | `behind` | object | Commits on target not on source |
 | `fast_forward` | bool | True when target HEAD == ancestor (or both heads absent) |
 | `mergeable` | bool | Whether the merge would go through: the selected strategy can be applied without aborting (false for `strategy=abort` with conflicts) **and**, when `validation` is present, the merged state conforms to the target's shapes. With `include_validation=false` it is the strategy/conflict signal alone. |
-| `validation` | object | Present iff `include_validation=true` (the default) and the merge is not a fast-forward. `{ "conforms": bool, "report"?: string }` — the same SHACL outcome `POST /merge` would produce for this strategy; `report` is present only when `conforms` is false and is the message the merge would fail with. A fast-forward adopts commits already validated when they were authored, so it carries no `validation`. |
+| `validation` | object | Present iff `include_validation=true` (the default) and the merge is not a fast-forward. `{ "conforms": bool, "report"?: string }`, the same SHACL outcome `POST /merge` would produce for this strategy; `report` is present only when `conforms` is false and is the message the merge would fail with. A fast-forward adopts commits already validated when they were authored, so it carries no `validation`. |
 | `conflicts` | object | Overlapping `(s, p, g)` keys touched on both sides since the ancestor. Empty when `fast_forward` or `include_conflicts=false` |
 | `changes` | object | Present iff `include_changes=true`. Aggregate netted change set — see below |
 
