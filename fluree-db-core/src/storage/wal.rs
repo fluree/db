@@ -59,6 +59,7 @@ const TAG_WRITE: u8 = 1;
 const TAG_INSERT: u8 = 2;
 const TAG_CAS: u8 = 3;
 const TAG_DELETE: u8 = 4;
+const TAG_DELETE_IF: u8 = 5;
 
 /// One logged storage operation. Keys are paths relative to the storage root.
 pub(super) enum Op<'a> {
@@ -74,6 +75,8 @@ pub(super) enum Op<'a> {
     },
     /// Remove a file.
     Delete { key: &'a str },
+    /// Remove a file whose current contents are `expected`.
+    DeleteIf { key: &'a str, expected: &'a [u8] },
 }
 
 enum OwnedOp {
@@ -93,6 +96,10 @@ enum OwnedOp {
     Delete {
         key: String,
     },
+    DeleteIf {
+        key: String,
+        expected: Vec<u8>,
+    },
 }
 
 impl Op<'_> {
@@ -101,7 +108,8 @@ impl Op<'_> {
             Op::Write { key, .. }
             | Op::Insert { key, .. }
             | Op::Cas { key, .. }
-            | Op::Delete { key } => key,
+            | Op::Delete { key }
+            | Op::DeleteIf { key, .. } => key,
         }
     }
 
@@ -137,6 +145,11 @@ impl Op<'_> {
             Op::Delete { key } => {
                 out.push(TAG_DELETE);
                 put(&mut out, key.as_bytes());
+            }
+            Op::DeleteIf { key, expected } => {
+                out.push(TAG_DELETE_IF);
+                put(&mut out, key.as_bytes());
+                put(&mut out, expected);
             }
         }
         out
@@ -188,6 +201,10 @@ fn decode_op(payload: &[u8]) -> Option<OwnedOp> {
             }
         }
         TAG_DELETE => OwnedOp::Delete { key: c.key()? },
+        TAG_DELETE_IF => OwnedOp::DeleteIf {
+            key: c.key()?,
+            expected: c.bytes()?,
+        },
         _ => return None,
     };
     c.done().then_some(op)
@@ -594,6 +611,20 @@ fn apply(base: &Path, op: &OwnedOp, touched: &mut Vec<String>) -> io::Result<()>
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
+            }
+            touched.push(key.clone());
+        }
+        OwnedOp::DeleteIf { key, expected } => {
+            let path = base.join(key);
+            let _lock = key_lock(&path)?;
+            // Only what the record names: a head another writer has since
+            // created here is theirs to keep.
+            if read_opt(&path)?.as_deref() == Some(expected.as_slice()) {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
             }
             touched.push(key.clone());
         }
@@ -1180,6 +1211,10 @@ mod tests {
             cas("ns/h.json", None, b"v1"),
             cas("ns/h.json", Some(b"v1"), b"v2"),
             Op::Delete { key: "gone.json" },
+            Op::DeleteIf {
+                key: "ns/h.json",
+                expected: b"v2",
+            },
         ];
         let mut segment = SEGMENT_MAGIC.to_vec();
         segment.extend_from_slice(&7u64.to_le_bytes());
@@ -1188,13 +1223,20 @@ mod tests {
         }
         let decoded = decode_segment(&segment, Some(7)).unwrap();
         assert!(decoded.clean);
-        assert_eq!(decoded.next_seq, 12);
-        assert_eq!(decoded.ops.len(), 5);
+        assert_eq!(decoded.next_seq, 13);
+        assert_eq!(decoded.ops.len(), 6);
         match &decoded.ops[3] {
             OwnedOp::Cas { key, expected, new } => {
                 assert_eq!(key, "ns/h.json");
                 assert_eq!(expected.as_deref(), Some(b"v1".as_slice()));
                 assert_eq!(new, b"v2");
+            }
+            _ => panic!("wrong op"),
+        }
+        match &decoded.ops[5] {
+            OwnedOp::DeleteIf { key, expected } => {
+                assert_eq!(key, "ns/h.json");
+                assert_eq!(expected, b"v2");
             }
             _ => panic!("wrong op"),
         }
@@ -1809,6 +1851,118 @@ mod tests {
         let reopened = FileStorage::new(dir.path()).with_durability(Durability::Wal);
         reopened.recover_wal().unwrap();
         assert_eq!(reopened.read_bytes(key).await.unwrap(), b"acknowledged");
+    }
+
+    /// The undo of a failed creation names the value that failed, so replay
+    /// leaves a head another writer created there in the meantime alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_creation_undo_leaves_another_writers_head_alone() {
+        use crate::{CasAction, Durability, FileStorage, StorageCas, StorageRead};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        storage.hold_wal_segments_for_test().unwrap();
+        let key = "fluree:file://ns/head.json";
+        let ns = dir.path().join("ns");
+        std::fs::create_dir_all(&ns).unwrap();
+        // The sidecar lock exists already; only staging the head can fail.
+        std::fs::write(ns.join("head.lock"), []).unwrap();
+        std::fs::set_permissions(&ns, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let failed = storage
+            .compare_and_swap(key, |_| Ok(CasAction::<()>::Write(b"failed".to_vec())))
+            .await;
+        std::fs::set_permissions(&ns, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(failed.is_err(), "staging the head must fail");
+        // A writer in per-write mode on the same root creates the head.
+        let other = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        other
+            .compare_and_swap(key, |_| Ok(CasAction::<()>::Write(b"theirs".to_vec())))
+            .await
+            .unwrap();
+        storage.simulate_crash_for_test();
+        let reopened = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        reopened.recover_wal().unwrap();
+        assert_eq!(reopened.read_bytes(key).await.unwrap(), b"theirs");
+    }
+
+    /// A record appended while an oversized write sits between its checkpoint
+    /// and its rename would replay over the write. The key is held from one
+    /// to the other, so a concurrent operation on it lands after, in the log
+    /// and on the device alike, and recovery agrees with what the process saw.
+    #[tokio::test]
+    async fn an_operation_racing_an_oversized_write_recovers_in_the_order_it_landed() {
+        use crate::{Durability, FileStorage, StorageRead, StorageWrite};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        storage.hold_wal_segments_for_test().unwrap();
+        let key = "fluree:file://large.bin";
+        let racer = storage.clone();
+        let deleting: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::default();
+        let started = Arc::clone(&deleting);
+        storage.set_after_checkpoint_hook_for_test(move || {
+            // Delete the same key from another thread while the write is
+            // between its checkpoint and its rename, and give it time to
+            // either finish or block, whichever the write path allows.
+            let racer = racer.clone();
+            let handle = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(racer.delete(key))
+                    .unwrap();
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            *started.lock().unwrap() = Some(handle);
+        });
+        let large = vec![b'n'; MAX_RECORD_BYTES + 1];
+        storage.write_bytes(key, &large).await.unwrap();
+        let handle = deleting.lock().unwrap().take().expect("the delete ran");
+        handle.join().unwrap();
+        let live = storage.exists(key).await.unwrap();
+        storage.simulate_crash_for_test();
+        let reopened = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        reopened.recover_wal().unwrap();
+        assert_eq!(
+            reopened.exists(key).await.unwrap(),
+            live,
+            "recovery disagreed with the state the process saw (present: {live})"
+        );
+    }
+
+    /// A handle's first operation may be a compare-and-swap on a key the
+    /// leftover log holds a record for. Attaching the log replays that record
+    /// under the key's sidecar lock, so it must happen before the swap takes
+    /// that lock, or the handle waits on itself.
+    #[tokio::test]
+    async fn a_first_compare_and_swap_replays_before_taking_the_key_lock() {
+        use crate::{CasAction, Durability, FileStorage, StorageCas, StorageRead};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        storage.hold_wal_segments_for_test().unwrap();
+        let key = "fluree:file://head.json";
+        storage.insert(key, b"first").await.unwrap();
+        storage
+            .compare_and_swap(key, |_| Ok(CasAction::<()>::Write(b"second".to_vec())))
+            .await
+            .unwrap();
+        storage.simulate_crash_for_test();
+        let fresh = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        let swapped = tokio::time::timeout(
+            Duration::from_secs(5),
+            fresh.compare_and_swap(key, |current| {
+                assert_eq!(current, Some(&b"second"[..]));
+                Ok(CasAction::<()>::Write(b"third".to_vec()))
+            }),
+        )
+        .await
+        .expect("the swap deadlocked on its own replay");
+        swapped.unwrap();
+        assert_eq!(fresh.read_bytes(key).await.unwrap(), b"third");
     }
 
     /// `sync` is the barrier a caller uses before publishing a pointer

@@ -522,6 +522,30 @@ pub struct FileStorage {
     /// writes an earlier, still-running flush took waits for that flush
     /// instead of returning before its files are on the device.
     flushing: Arc<tokio::sync::Mutex<()>>,
+    /// Per-key exclusion for logged writes and deletes, by hash of the key.
+    /// See [`Self::key_stripe`]. Shared across clones.
+    key_stripes: Arc<Vec<std::sync::Mutex<()>>>,
+    #[cfg(test)]
+    after_checkpoint: AfterCheckpoint,
+}
+
+/// How many keys share one lock in [`FileStorage::key_stripes`].
+const KEY_STRIPES: usize = 256;
+
+#[cfg(test)]
+type Hook = Box<dyn Fn() + Send + Sync>;
+
+/// A test's hook into the oversized write path, run between the checkpoint
+/// and the write.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct AfterCheckpoint(Arc<std::sync::Mutex<Option<Hook>>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for AfterCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AfterCheckpoint")
+    }
 }
 
 /// What the WAL resolved to for one root.
@@ -558,6 +582,13 @@ impl FileStorage {
             wal_owner: None,
             unflushed: Arc::new(std::sync::Mutex::new(Vec::new())),
             flushing: Arc::new(tokio::sync::Mutex::new(())),
+            key_stripes: Arc::new(
+                (0..KEY_STRIPES)
+                    .map(|_| std::sync::Mutex::new(()))
+                    .collect(),
+            ),
+            #[cfg(test)]
+            after_checkpoint: AfterCheckpoint::default(),
         }
     }
 
@@ -868,6 +899,10 @@ impl FileStorage {
                      records still materializing; refusing a write that replay could undo"
                 )));
             }
+            #[cfg(test)]
+            if let Some(hook) = self.after_checkpoint.0.lock().unwrap().as_ref() {
+                hook();
+            }
         }
         Ok((self.policy(Durability::Sync), None))
     }
@@ -899,6 +934,29 @@ impl FileStorage {
             log.hold_segments();
         }
         Ok(())
+    }
+
+    /// Run `f` on the writing thread between an oversized write's checkpoint
+    /// and its write. Shared across clones.
+    #[cfg(test)]
+    pub(crate) fn set_after_checkpoint_hook_for_test(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.after_checkpoint.0.lock().unwrap() = Some(Box::new(f));
+    }
+
+    /// Hold `key` for a logged write or delete, from its record to its file
+    /// operation, so a key's records sit in the log in the order its file
+    /// operations landed and replay reproduces what the process saw. An
+    /// oversized write holds it from the checkpoint to the rename, so no
+    /// record for its key can come between the two. Keys that are inserted
+    /// or compare-and-swapped are ordered by their sidecar lock instead.
+    fn key_stripe(&self, key: &str) -> std::sync::MutexGuard<'_, ()> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let stripe = (hasher.finish() % self.key_stripes.len() as u64) as usize;
+        self.key_stripes[stripe]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Durability for a write of `kind`.
@@ -1376,6 +1434,7 @@ impl StorageWrite for FileStorage {
         let (key, path) = self.resolve_key(address)?;
         let storage = self.clone();
         tokio::task::spawn_blocking(move || {
+            let _key = (storage.durability == Durability::Wal).then(|| storage.key_stripe(&key));
             let (_, log) = storage.write_plan(storage.durability, 0)?;
             let _appended = match &log {
                 // Ordered after the writes it undoes, so replay cannot bring
@@ -1458,6 +1517,7 @@ impl FileStorage {
         // per `tokio::fs` call. Attaching the log may replay, so that is in
         // here too.
         tokio::task::spawn_blocking(move || {
+            let _key = (durability == Durability::Wal).then(|| storage.key_stripe(&key));
             let (policy, log) = storage.write_plan(durability, bytes.len())?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
@@ -1560,7 +1620,13 @@ impl FileStorage {
         key: String,
         path: PathBuf,
     ) -> StorageExtResult<(Option<Vec<u8>>, LockedFile)> {
+        let storage = self.clone();
         tokio::task::spawn_blocking(move || {
+            // Attaching replays the leftover log, and replay takes the same
+            // sidecar lock for a record on this key; it has to come first.
+            storage
+                .attach_wal(true)
+                .map_err(|e| StorageExtError::io(e.to_string()))?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     StorageExtError::io(format!("mkdir {}: {}", parent.display(), e))
@@ -1659,7 +1725,10 @@ impl FileStorage {
                             expected: Some(&new_bytes),
                             new: previous,
                         },
-                        None => Op::Delete { key: &locked.key },
+                        None => Op::DeleteIf {
+                            key: &locked.key,
+                            expected: &new_bytes,
+                        },
                     };
                     log.undo(undone).map_err(|undo| {
                         StorageExtError::io(format!(
