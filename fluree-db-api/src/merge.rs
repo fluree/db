@@ -15,7 +15,7 @@ use fluree_db_core::{
     collect_dag_cids, collect_first_parent_cids, load_commit_by_id, CommonAncestor,
 };
 use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore};
-use fluree_db_ledger::{LedgerState, StagedLedger};
+use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{NsRecord, NsRecordSnapshot};
 use fluree_db_novelty::compute_delta_keys;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
@@ -500,7 +500,7 @@ impl crate::Fluree {
         let conflict_count = conflicts.len();
 
         // Abort if conflicts exist and strategy is Abort.
-        if strategy == ConflictStrategy::Abort && !conflicts.is_empty() {
+        if strategy.aborts_on(conflicts.len()) {
             return Err(ApiError::BranchConflict(format!(
                 "Merge aborted: {} conflict(s) between {} and {} with abort strategy",
                 conflicts.len(),
@@ -525,30 +525,25 @@ impl crate::Fluree {
             graph_delta,
         } = collect_commit_data(source_store, &source_head_id, ancestor.t).await?;
 
-        // Resolve conflicts via the shared two-way strategy helper.
-        let resolved_flakes = self
-            .apply_two_way_strategy(source_flakes, &conflicts, &strategy, &target_state)
-            .await?;
-
-        // Stage resolved flakes onto target state. An empty flake set is valid
-        // (e.g., TakeBranch drops all source flakes) — we still create the merge
-        // commit to record the parent relationship and prevent future re-merges.
-        let reverse_graph = target_state.snapshot.build_reverse_graph().map_err(|e| {
-            ApiError::internal(format!("Failed to build reverse graph during merge: {e}"))
-        })?;
-
         let current_head_t = target_state.t();
 
-        let mut view = StagedLedger::new(target_state, resolved_flakes, &reverse_graph)
-            .map_err(|e| ApiError::internal(format!("Failed to stage flakes during merge: {e}")))?;
-
-        // Validate the merged state against the target's shapes before any
-        // side effect: a merge that would leave the ledger in a state its own
-        // shapes reject fails here exactly as a transaction producing that
-        // state would, with nothing written and the target untouched.
-        self.validate_branch_op_view(&mut view, &reverse_graph, &namespace_delta)
-            .await?
-            .into_result()?;
+        // Resolve conflicts, stage the result onto the target, and validate
+        // it against the target's shapes before any side effect: a merge
+        // that would leave the ledger in a state its own shapes reject fails
+        // here exactly as a transaction producing that state would, with
+        // nothing written and the target untouched. An empty flake set is
+        // valid (e.g., TakeBranch drops all source flakes): the merge commit
+        // still records the parent relationship and prevents re-merges.
+        let (view, outcome) = self
+            .stage_merge(
+                target_state,
+                source_flakes,
+                &conflicts,
+                &strategy,
+                &namespace_delta,
+            )
+            .await?;
+        outcome.into_result()?;
 
         // Create merge commit with the source head as an additional parent,
         // propagating namespace and graph deltas from the source branch.

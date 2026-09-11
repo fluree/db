@@ -570,3 +570,93 @@ async fn preview_validation_can_be_skipped() {
         "strategy-only answer when validation is skipped"
     );
 }
+
+/// Validation resolves conflicts the way the merge would even when the
+/// caller asked for no conflict reporting: take-source retracts main's
+/// value, so the staged result has one name and conforms.
+#[tokio::test]
+async fn preview_validation_resolves_conflicts_without_conflict_reporting() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let main = seed_alice_with_shape(&fluree).await;
+
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .update(dev, &replace_name("ex:alice", "B"))
+        .await
+        .unwrap();
+    fluree
+        .update(main, &replace_name("ex:alice", "C"))
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_conflicts: false,
+                conflict_strategy: ConflictStrategy::TakeSource,
+                ..MergePreviewOpts::default()
+            },
+        )
+        .await
+        .expect("preview");
+    assert_eq!(preview.conflicts.count, 0, "reporting was opted out");
+    let validation = preview.validation.expect("validation still runs");
+    assert!(
+        validation.conforms,
+        "take-source leaves one name: {:?}",
+        validation.report
+    );
+    assert!(preview.mergeable);
+
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::TakeSource)
+        .await
+        .expect("merge succeeds as previewed");
+    assert_eq!(report.conflict_count, 1);
+    assert_eq!(names(&fluree, "mydb:main").await, vec!["B"]);
+}
+
+/// Sibling branches allocate namespace codes independently, so the same code
+/// can mean different prefixes on each. Such a merge cannot be built; the
+/// preview reports that as a branch conflict rather than an internal error.
+#[tokio::test]
+async fn preview_reports_conflict_when_sibling_namespaces_collide() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    fluree
+        .insert(ledger, &insert_name("ex:alice", "A"))
+        .await
+        .unwrap();
+    fluree.create_branch("mydb", "a", None, None).await.unwrap();
+    fluree.create_branch("mydb", "b", None, None).await.unwrap();
+
+    // Each branch introduces a fresh prefix; both get the next free code.
+    let a = fluree.ledger("mydb:a").await.unwrap();
+    fluree
+        .insert(
+            a,
+            &json!({"@context": {"foo": "http://foo.example/"}, "@id": "foo:x", "foo:p": "1"}),
+        )
+        .await
+        .unwrap();
+    let b = fluree.ledger("mydb:b").await.unwrap();
+    fluree
+        .insert(
+            b,
+            &json!({"@context": {"bar": "http://bar.example/"}, "@id": "bar:y", "bar:q": "2"}),
+        )
+        .await
+        .unwrap();
+
+    let err = fluree
+        .merge_preview_with("mydb", "b", Some("a"), MergePreviewOpts::default())
+        .await
+        .expect_err("colliding namespace codes cannot be staged");
+    assert!(
+        matches!(err, ApiError::BranchConflict(_)),
+        "expected BranchConflict, got: {err:?}"
+    );
+}

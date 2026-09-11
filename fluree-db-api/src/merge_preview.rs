@@ -20,7 +20,6 @@ use fluree_db_core::{
     ContentId, ContentStore, Flake,
 };
 use fluree_db_ledger::LedgerState;
-use fluree_db_ledger::StagedLedger;
 use fluree_db_novelty::{compute_delta_keys, compute_delta_keys_and_changes};
 use futures::{stream, StreamExt, TryStreamExt};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -539,9 +538,12 @@ impl crate::Fluree {
                 _ => Ok((None, None, None)),
             }
         };
+        // Validation resolves conflicts the way the merge does, so it needs
+        // the target delta even when the caller asked for no conflict
+        // reporting (`include_conflicts=false`).
         let target_fut = async {
             match (&target_head, &ancestor) {
-                (Some(t_head), Some(anc)) if need_conflicts => {
+                (Some(t_head), Some(anc)) if need_conflicts || need_validation => {
                     let keys =
                         compute_delta_keys(target_branched.clone(), t_head.clone(), anc.t).await?;
                     Ok::<_, ApiError>(Some(keys))
@@ -552,32 +554,37 @@ impl crate::Fluree {
         let ((source_delta, net_flakes, source_ns_delta), target_delta) =
             tokio::try_join!(source_fut, target_fut)?;
 
-        // ---- Conflicts (only if relevant). --------------------------------
-        // `all_conflict_keys` is the uncapped set: the cap bounds the
-        // response, not what the strategy resolves when validation stages
-        // the merge.
-        let (conflict_keys, all_conflict_keys, conflict_count, conflicts_truncated) =
-            match (need_conflicts, &source_delta, &target_delta) {
-                (true, Some(s_delta), Some(t_delta)) => {
-                    // Sort lexicographically by (s, p, g) so capped responses
-                    // are stable across builds and across requests — `HashSet`
-                    // intersection order is otherwise unspecified.
-                    let mut keys: Vec<ConflictKey> =
-                        s_delta.intersection(t_delta).cloned().collect();
-                    keys.sort();
-                    let all = keys.clone();
-                    let count = keys.len();
-                    let truncated = match opts.max_conflict_keys {
-                        Some(cap) if count > cap => {
-                            keys.truncate(cap);
-                            true
-                        }
-                        _ => false,
-                    };
-                    (keys, all, count, truncated)
+        // ---- Conflicts. ----------------------------------------------------
+        // `all_conflict_keys` is the full, uncapped intersection whenever both
+        // deltas were walked: what validation resolves the merge against.
+        // The reported `conflicts` are gated on `include_conflicts` and
+        // capped: the cap bounds the response, not what the strategy
+        // resolves.
+        let all_conflict_keys: Vec<ConflictKey> = match (&source_delta, &target_delta) {
+            (Some(s_delta), Some(t_delta)) => {
+                // Sort lexicographically by (s, p, g) so capped responses
+                // are stable across builds and across requests — `HashSet`
+                // intersection order is otherwise unspecified.
+                let mut keys: Vec<ConflictKey> = s_delta.intersection(t_delta).cloned().collect();
+                keys.sort();
+                keys
+            }
+            _ => Vec::new(),
+        };
+        let (conflict_keys, conflict_count, conflicts_truncated) = if need_conflicts {
+            let mut keys = all_conflict_keys.clone();
+            let count = keys.len();
+            let truncated = match opts.max_conflict_keys {
+                Some(cap) if count > cap => {
+                    keys.truncate(cap);
+                    true
                 }
-                _ => (Vec::new(), Vec::new(), 0, false),
+                _ => false,
             };
+            (keys, count, truncated)
+        } else {
+            (Vec::new(), 0, false)
+        };
 
         // ---- Load states needed for IRI resolution. -----------------------
         // Conflict details need both sides; the change payload needs only the
@@ -646,38 +653,34 @@ impl crate::Fluree {
         // it on a clone of the target state, and run the branch-operation
         // validator. Under `Abort` with conflicts the merge never reaches
         // validation, so neither does the preview.
-        let validation = if need_validation
-            && (opts.conflict_strategy != ConflictStrategy::Abort || conflict_count == 0)
-        {
-            let target_state = target_state.as_ref().expect("loaded for validation");
-            let resolved = self
-                .apply_two_way_strategy(
-                    net_flakes.clone().unwrap_or_default(),
-                    &all_conflict_keys,
-                    &opts.conflict_strategy,
-                    target_state,
-                )
-                .await?;
-            let reverse_graph = target_state.snapshot.build_reverse_graph().map_err(|e| {
-                ApiError::internal(format!(
-                    "Failed to build reverse graph during merge preview: {e}"
-                ))
-            })?;
-            let mut view = StagedLedger::new(target_state.clone(), resolved, &reverse_graph)
-                .map_err(|e| {
-                    ApiError::internal(format!("Failed to stage flakes during merge preview: {e}"))
-                })?;
-            let ns_delta = source_ns_delta.unwrap_or_default();
-            let outcome = self
-                .validate_branch_op_view(&mut view, &reverse_graph, &ns_delta)
-                .await?;
-            Some(ValidationSummary {
-                conforms: outcome.conforms(),
-                report: outcome.report,
-            })
-        } else {
-            None
-        };
+        let mut net_flakes = net_flakes;
+        let validation =
+            if need_validation && !opts.conflict_strategy.aborts_on(all_conflict_keys.len()) {
+                let target_state = target_state.as_ref().expect("loaded for validation");
+                // The change summary below still needs the net set when it was
+                // requested; otherwise hand it over without a copy.
+                let net = if need_changes {
+                    net_flakes.clone()
+                } else {
+                    net_flakes.take()
+                };
+                let ns_delta = source_ns_delta.unwrap_or_default();
+                let (_view, outcome) = self
+                    .stage_merge(
+                        target_state.clone(),
+                        net.unwrap_or_default(),
+                        &all_conflict_keys,
+                        &opts.conflict_strategy,
+                        &ns_delta,
+                    )
+                    .await?;
+                Some(ValidationSummary {
+                    conforms: outcome.conforms(),
+                    report: outcome.report,
+                })
+            } else {
+                None
+            };
 
         // ---- Changes (only if requested). ----------------------------------
         let changes = if need_changes {
@@ -704,7 +707,7 @@ impl crate::Fluree {
             None
         };
 
-        let mergeable = (opts.conflict_strategy != ConflictStrategy::Abort || conflicts.count == 0)
+        let mergeable = !opts.conflict_strategy.aborts_on(conflicts.count)
             && validation.as_ref().is_none_or(|v| v.conforms);
 
         // ---- Invariants (debug-only). -------------------------------------

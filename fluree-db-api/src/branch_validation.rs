@@ -10,13 +10,14 @@
 //! A branch operation is authoring, not replay: the combination it stages
 //! onto the target is new state nobody has validated. So, unlike commit
 //! replay, a cross-ledger `f:shapesSource` is resolved and enforced here
-//! rather than skipped. Branch operations carry no request surface — no
-//! requested validation mode, identity, inline shapes, or authoring context
-//! — and run the ledger's configured posture.
+//! rather than skipped. Branch operations carry no request surface (no
+//! requested validation mode, identity, inline shapes, or authoring context)
+//! and run the ledger's configured posture.
 
-use crate::error::Result;
-use fluree_db_core::{GraphId, Sid};
-use fluree_db_ledger::StagedLedger;
+use crate::error::{ApiError, Result};
+use crate::rebase::ConflictStrategy;
+use fluree_db_core::{ConflictKey, Flake, GraphId, Sid};
+use fluree_db_ledger::{LedgerState, StagedLedger};
 use std::collections::HashMap;
 
 /// Outcome of validating a branch operation's staged view.
@@ -63,21 +64,65 @@ impl BranchOpValidation {
 }
 
 impl crate::Fluree {
-    /// Validate a branch operation's staged view against the target ledger's
-    /// SHACL configuration and shapes.
+    /// Stage `flakes` onto `state` and validate the result against the
+    /// ledger's SHACL configuration and shapes.
     ///
-    /// `reverse_graph` is the map the view was built with. `namespace_delta`
-    /// holds the namespace codes the operation introduces, which the snapshot
-    /// will not carry until the commit lands; they make the operation's own
-    /// terms encodable for `sh:sparql` lowering and resolvable in messages.
+    /// This is the one way a branch operation builds a view to commit: the
+    /// staging and the validation travel together so no operation can copy
+    /// one without the other. Returns the validated view and the outcome;
+    /// the caller decides what a rejection means (merge and revert fail,
+    /// rebase names the commit it stopped on, preview reports it).
+    ///
+    /// `namespace_delta` holds the namespace codes the operation introduces,
+    /// which the snapshot will not carry until the commit lands; they make
+    /// the operation's own terms encodable for `sh:sparql` lowering and
+    /// resolvable in messages. `op` names the operation in error messages.
+    pub(crate) async fn stage_validated(
+        &self,
+        state: LedgerState,
+        flakes: Vec<Flake>,
+        namespace_delta: &HashMap<u16, String>,
+        op: &'static str,
+    ) -> Result<(StagedLedger, BranchOpValidation)> {
+        let reverse_graph = state.snapshot.build_reverse_graph().map_err(|e| {
+            ApiError::internal(format!("Failed to build reverse graph during {op}: {e}"))
+        })?;
+        let mut view = StagedLedger::new(state, flakes, &reverse_graph)
+            .map_err(|e| ApiError::internal(format!("Failed to stage flakes during {op}: {e}")))?;
+        let outcome = self
+            .validate_branch_op_view(&mut view, &reverse_graph, namespace_delta)
+            .await?;
+        Ok((view, outcome))
+    }
+
+    /// The merge's staging, shared by the merge itself and its preview:
+    /// resolve `source_flakes` under `strategy` against `target_state`, then
+    /// stage and validate the result.
+    pub(crate) async fn stage_merge(
+        &self,
+        target_state: LedgerState,
+        source_flakes: Vec<Flake>,
+        conflicts: &[ConflictKey],
+        strategy: &ConflictStrategy,
+        namespace_delta: &HashMap<u16, String>,
+    ) -> Result<(StagedLedger, BranchOpValidation)> {
+        let resolved = self
+            .apply_two_way_strategy(source_flakes, conflicts, strategy, &target_state)
+            .await?;
+        self.stage_validated(target_state, resolved, namespace_delta, "merge")
+            .await
+    }
+
+    /// Validate a staged view against the target ledger's SHACL
+    /// configuration and shapes. `reverse_graph` is the map the view was
+    /// built with.
     #[cfg(feature = "shacl")]
-    pub(crate) async fn validate_branch_op_view(
+    async fn validate_branch_op_view(
         &self,
         view: &mut StagedLedger,
         reverse_graph: &HashMap<Sid, GraphId>,
         namespace_delta: &HashMap<u16, String>,
     ) -> Result<BranchOpValidation> {
-        use crate::error::ApiError;
         use crate::tx::{
             apply_shacl_policy_to_staged_view, open_cross_ledger_shapes_model,
             resolve_cross_ledger_schema_for_tx, StagedShaclContext,
@@ -114,12 +159,17 @@ impl crate::Fluree {
 
         // The staged namespace registry: the snapshot's codes plus the ones
         // this operation brings in.
+        // Sibling branches allocate codes independently, so a code or prefix
+        // the source introduced can already mean something else on the
+        // target. The commit builder rejects such a merge too; surfacing it
+        // here, as a conflict rather than an internal error, lets a preview
+        // answer instead of failing.
         let mut staged_ns = NamespaceRegistry::from_db(&base.snapshot);
         staged_ns
             .adopt_delta_for_persistence(namespace_delta)
             .map_err(|e| {
-                ApiError::internal(format!(
-                    "branch-operation namespace delta conflicts with the target registry: {e}"
+                ApiError::BranchConflict(format!(
+                    "the source branch's namespace allocations conflict with the target's: {e}"
                 ))
             })?;
         let cross_ledger_data_ns_map: Option<HashMap<u16, String>> =
@@ -187,7 +237,7 @@ impl crate::Fluree {
 
     /// Without the `shacl` feature there is nothing to validate against.
     #[cfg(not(feature = "shacl"))]
-    pub(crate) async fn validate_branch_op_view(
+    async fn validate_branch_op_view(
         &self,
         _view: &mut StagedLedger,
         _reverse_graph: &HashMap<Sid, GraphId>,
