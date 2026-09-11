@@ -573,7 +573,11 @@ fn apply(base: &Path, op: &OwnedOp, touched: &mut Vec<String>) -> io::Result<()>
             let current = read_opt(&path)?;
             if current.as_deref() == Some(new.as_slice()) {
                 // Already materialized before the crash.
-            } else if current == *expected {
+            } else if current.is_none() || current == *expected {
+                // The rename never reached the device, or it did ahead of
+                // the replacement inode's contents. Nothing that replaces a
+                // head leaves it without contents, so an empty or missing
+                // file is a torn write to repair, not a later state.
                 write_page_cache(&path, new)?;
             } else {
                 // A later record, or a writer in per-write mode, moved the
@@ -921,6 +925,22 @@ impl Wal {
         Ok(Appended { in_flight })
     }
 
+    /// Log that `op`, appended and flushed, was never materialized: its file
+    /// write failed and the file still holds what the record expected. Replay
+    /// would otherwise install the failed transition and skip a later one
+    /// that succeeded from the same starting value. Flushed like the record
+    /// it undoes. If even this cannot be appended the log is poisoned: what
+    /// replay would do is then unknown.
+    pub(super) fn undo(&self, op: Op<'_>) -> io::Result<()> {
+        self.append(op, true).map(drop).map_err(|e| {
+            if self.poisoned.load(Ordering::Acquire) {
+                e
+            } else {
+                self.poison(e)
+            }
+        })
+    }
+
     /// Create the next segment: header written and flushed under a temporary
     /// name, then renamed into place, so a crash can never leave a segment
     /// whose header is missing or partial.
@@ -1086,8 +1106,8 @@ impl Wal {
     /// Flush everything and leave no segments behind, so the root reads the
     /// same to a binary that knows nothing about the log. Waits briefly for
     /// appends still materializing; anything still in flight after that is
-    /// left for the next open to replay.
-    fn checkpoint(&self) -> io::Result<()> {
+    /// left for the next open to replay. Returns how many segments that is.
+    pub(super) fn checkpoint(&self) -> io::Result<usize> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             {
@@ -1097,8 +1117,9 @@ impl Wal {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 self.rotate(&mut inner)?;
             }
-            if self.retire_closed()? == 0 || Instant::now() >= deadline {
-                return Ok(());
+            let waiting = self.retire_closed()?;
+            if waiting == 0 || Instant::now() >= deadline {
+                return Ok(waiting);
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -1620,10 +1641,12 @@ mod tests {
     }
 
     /// A head too large for the log is flushed directly, but the content it
-    /// names may still sit in unflushed records. Publishing it has to flush
-    /// those first, or a crash keeps the head and loses what it points to.
+    /// names may still sit in unflushed records. Publishing it has to put
+    /// those on the device and retire them first: a crash must not keep the
+    /// head and lose what it points to, and no record may be left to replay
+    /// over the file the head lands on.
     #[tokio::test]
-    async fn an_oversized_head_flushes_the_appends_before_it() {
+    async fn an_oversized_head_checkpoints_the_log_before_it_lands() {
         use crate::{CasAction, Durability, FileStorage, StorageCas, StorageRead, StorageWrite};
 
         let dir = tempfile::tempdir().unwrap();
@@ -1655,12 +1678,15 @@ mod tests {
             log.fsyncs_issued() > before,
             "an oversized head was published without flushing the log"
         );
-        assert!(!log.inner.lock().unwrap().active.as_ref().unwrap().dirty);
+        assert!(
+            segment_paths(&log.dir).unwrap().is_empty(),
+            "records were left to replay over a directly written head"
+        );
+        assert!(log.inner.lock().unwrap().active.is_none());
 
-        // Power loss keeps the directly flushed head; the payload file never
-        // was flushed, and only its log record can bring it back.
+        // Power loss keeps the directly flushed head and the payload the
+        // checkpoint put on the device ahead of it; nothing is replayed.
         log.simulate_crash();
-        std::fs::remove_file(dir.path().join("payload.bin")).unwrap();
         let reopened = FileStorage::new(dir.path()).with_durability(Durability::Wal);
         reopened.recover_wal().unwrap();
         assert_eq!(
@@ -1668,5 +1694,142 @@ mod tests {
             oversized.len()
         );
         assert_eq!(reopened.read_bytes(payload).await.unwrap(), b"payload");
+    }
+
+    /// A head write that fails after its record is logged must not replay
+    /// over the retry that then succeeded from the same starting value.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_head_write_does_not_replay_over_its_successful_retry() {
+        use crate::{CasAction, Durability, FileStorage, StorageCas, StorageRead};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        let key = "fluree:file://ns/head.json";
+        storage.insert(key, b"checkpointed").await.unwrap();
+        FileStorage::checkpoint_wal(dir.path()).unwrap();
+        storage.hold_wal_segments_for_test().unwrap();
+        let ns = dir.path().join("ns");
+        std::fs::set_permissions(&ns, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let failed = storage
+            .compare_and_swap(key, |_| Ok(CasAction::<()>::Write(b"failed".to_vec())))
+            .await;
+        std::fs::set_permissions(&ns, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            failed.is_err(),
+            "staging the head must fail after its record is logged"
+        );
+        storage
+            .compare_and_swap(key, |_| {
+                Ok(CasAction::<()>::Write(b"acknowledged".to_vec()))
+            })
+            .await
+            .unwrap();
+        storage.simulate_crash_for_test();
+        // The retry's rename was lost; the checkpointed head is intact.
+        std::fs::write(ns.join("head.json"), b"checkpointed").unwrap();
+        let reopened = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        reopened.recover_wal().unwrap();
+        assert_eq!(reopened.read_bytes(key).await.unwrap(), b"acknowledged");
+    }
+
+    /// A write too large for the log lands directly, and nothing the log
+    /// still holds may replay over it: a crash would undo a write the caller
+    /// was told is durable.
+    #[tokio::test]
+    async fn an_oversized_write_is_not_undone_by_the_records_before_it() {
+        use crate::{Durability, FileStorage, StorageRead, StorageWrite};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        storage.hold_wal_segments_for_test().unwrap();
+        let key = "fluree:file://mutable.json";
+        storage.write_bytes(key, b"old").await.unwrap();
+        let large = vec![b'n'; MAX_RECORD_BYTES + 1];
+        storage.write_bytes(key, &large).await.unwrap();
+        storage.simulate_crash_for_test();
+        let reopened = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        reopened.recover_wal().unwrap();
+        assert_eq!(reopened.read_bytes(key).await.unwrap().len(), large.len());
+    }
+
+    /// The content-addressed shape of the same hazard: a blob deleted through
+    /// the log and re-created directly is named by an acknowledged head, and
+    /// replaying the deletion must not remove it.
+    #[tokio::test]
+    async fn an_oversized_blob_recreated_after_a_delete_survives_replay() {
+        use crate::{CasAction, Durability, FileStorage, StorageCas, StorageRead, StorageWrite};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        storage.hold_wal_segments_for_test().unwrap();
+        let key = "fluree:file://large.bin";
+        let large = vec![b'n'; MAX_RECORD_BYTES + 1];
+        storage.write_bytes(key, &large).await.unwrap();
+        storage.delete(key).await.unwrap();
+        storage.write_bytes(key, &large).await.unwrap();
+        storage
+            .compare_and_swap("fluree:file://head.json", |_| {
+                Ok(CasAction::<()>::Write(b"large.bin".to_vec()))
+            })
+            .await
+            .unwrap();
+        storage.simulate_crash_for_test();
+        let reopened = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        reopened.recover_wal().unwrap();
+        assert!(
+            reopened.exists(key).await.unwrap(),
+            "replay removed the blob the acknowledged head names"
+        );
+    }
+
+    /// Once the head before a transition is checkpointed only that
+    /// transition's record remains. A rename that reached the device ahead of
+    /// the replacement inode's contents leaves an empty file; replay must read
+    /// that as a torn write to repair, not as a later state to leave alone.
+    #[tokio::test]
+    async fn a_head_whose_contents_were_lost_is_restored_from_its_record() {
+        use crate::{CasAction, Durability, FileStorage, StorageCas, StorageRead};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        let key = "fluree:file://head.json";
+        storage.insert(key, b"checkpointed").await.unwrap();
+        FileStorage::checkpoint_wal(dir.path()).unwrap();
+        storage.hold_wal_segments_for_test().unwrap();
+        storage
+            .compare_and_swap(key, |_| {
+                Ok(CasAction::<()>::Write(b"acknowledged".to_vec()))
+            })
+            .await
+            .unwrap();
+        storage.simulate_crash_for_test();
+        std::fs::write(dir.path().join("head.json"), []).unwrap();
+        let reopened = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        reopened.recover_wal().unwrap();
+        assert_eq!(reopened.read_bytes(key).await.unwrap(), b"acknowledged");
+    }
+
+    /// `sync` is the barrier a caller uses before publishing a pointer
+    /// somewhere other than this root's own head file, so it flushes the
+    /// log's tail too, not only derived content.
+    #[tokio::test]
+    async fn sync_flushes_the_logged_tail() {
+        use crate::{Durability, FileStorage, StorageWrite};
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        storage.hold_wal_segments_for_test().unwrap();
+        storage
+            .write_bytes("fluree:file://commit.bin", b"commit")
+            .await
+            .unwrap();
+        let before = storage.fsyncs_issued();
+        storage.sync().await.unwrap();
+        assert!(
+            storage.fsyncs_issued() > before,
+            "sync returned with the log still dirty"
+        );
     }
 }

@@ -842,9 +842,11 @@ impl FileStorage {
 
     /// How a write of `len` bytes lands under `durability`: the log it is
     /// appended to first, if any, and the policy the file is then written with.
-    /// A record too large for the log is flushed directly instead, after the
-    /// log's earlier appends: a head published that way must not become
-    /// durable ahead of the content it names.
+    /// A record too large for the log is flushed directly instead, once the
+    /// log is checkpointed: its earlier appends must be durable before a head
+    /// published this way is, and nothing left to replay may touch the key
+    /// the write lands on, or a crash would undo a write the caller was told
+    /// is durable.
     fn write_plan(
         &self,
         durability: Durability,
@@ -857,9 +859,15 @@ impl FileStorage {
             if len <= wal::MAX_RECORD_BYTES {
                 return Ok((self.policy(Durability::PageCache), Some(log)));
             }
-            log.flush().map_err(|e| {
-                crate::error::Error::io(format!("WAL flush before an oversized write: {e}"))
+            let waiting = log.checkpoint().map_err(|e| {
+                crate::error::Error::io(format!("WAL checkpoint before an oversized write: {e}"))
             })?;
+            if waiting > 0 {
+                return Err(crate::error::Error::io(format!(
+                    "WAL checkpoint before an oversized write left {waiting} segment(s) with \
+                     records still materializing; refusing a write that replay could undo"
+                )));
+            }
         }
         Ok((self.policy(Durability::Sync), None))
     }
@@ -1305,15 +1313,20 @@ impl StorageWrite for FileStorage {
     }
 
     /// Flush the derived content written since the last call, file by file
-    /// plus the directories between them and the root. Source-of-truth
-    /// content never waits here: it is durable when its write returns, in
-    /// the log or on the device.
+    /// plus the directories between them and the root, and the log's
+    /// unflushed tail. Source-of-truth content is otherwise durable no later
+    /// than the next head publication through this root; a caller publishing
+    /// its pointer elsewhere gets the same guarantee from this barrier.
     async fn sync(&self) -> Result<()> {
         // The guard travels into the blocking task below: cancelling this
         // future must not release the barrier while the flush is still
         // running, or a later caller would see nothing pending and return
         // before its files were on the device.
         let one_at_a_time = Arc::clone(&self.flushing).lock_owned().await;
+        let log = match self.wal.get() {
+            Some(WalAttach::Log(log)) => Some(Arc::clone(log)),
+            _ => None,
+        };
         let keys: Vec<String> = {
             let mut pending = self
                 .unflushed
@@ -1324,7 +1337,7 @@ impl StorageWrite for FileStorage {
             keys.dedup();
             keys
         };
-        if keys.is_empty() {
+        if keys.is_empty() && log.is_none() {
             return Ok(());
         }
         let base = self.base_path.clone();
@@ -1332,7 +1345,15 @@ impl StorageWrite for FileStorage {
         let unflushed = Arc::clone(&self.unflushed);
         tokio::task::spawn_blocking(move || {
             let _one_at_a_time = one_at_a_time;
-            match wal::flush_keys(&base, &keys, &fsyncs) {
+            let flushed = match &log {
+                Some(log) => log.flush().map_err(|e| format!("flush WAL: {e}")),
+                None => Ok(()),
+            }
+            .and_then(|()| {
+                wal::flush_keys(&base, &keys, &fsyncs)
+                    .map_err(|e| format!("flush derived content: {e}"))
+            });
+            match flushed {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     // The batch is still owed: a retry must flush it, and a
@@ -1343,9 +1364,7 @@ impl StorageWrite for FileStorage {
                     let mut owed = keys;
                     owed.append(&mut pending);
                     *pending = owed;
-                    Err(crate::error::Error::io(format!(
-                        "flush derived content: {e}"
-                    )))
+                    Err(crate::error::Error::io(e))
                 }
             }
         })
@@ -1629,8 +1648,32 @@ impl FileStorage {
                 ),
                 None => None,
             };
-            write_atomic(&locked.path, &new_bytes, &policy)
-                .map_err(|e| StorageExtError::io(format!("write {}: {}", locked.path.display(), e)))
+            if let Err(e) = write_atomic(&locked.path, &new_bytes, &policy) {
+                // Staging or the rename failed, so the file still holds
+                // `expected` while the log says it moved. Say otherwise
+                // before a retry logs its own transition from the same value.
+                if let Some(log) = &log {
+                    let undone = match expected.as_deref() {
+                        Some(previous) => Op::Cas {
+                            key: &locked.key,
+                            expected: Some(&new_bytes),
+                            new: previous,
+                        },
+                        None => Op::Delete { key: &locked.key },
+                    };
+                    log.undo(undone).map_err(|undo| {
+                        StorageExtError::io(format!(
+                            "write {}: {e}; WAL undo also failed: {undo}",
+                            locked.path.display()
+                        ))
+                    })?;
+                }
+                return Err(StorageExtError::io(format!(
+                    "write {}: {e}",
+                    locked.path.display()
+                )));
+            }
+            Ok(())
             // lock released when `locked._lock_file` is dropped
         })
         .await

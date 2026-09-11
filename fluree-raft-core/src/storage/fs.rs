@@ -290,11 +290,23 @@ struct Loc {
     term: u64,
 }
 
+/// One thing `truncate_from` or `purge_through` did to the device, in
+/// order, for the tests that pin their crash ordering.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeviceStep {
+    Unlink(PathBuf),
+    DirFsync,
+    Shorten,
+}
+
 struct Inner {
     root: PathBuf,
     log_dir: PathBuf,
     segment_bytes: u64,
     segments: Vec<Segment>,
+    #[cfg(test)]
+    device_trace: Vec<DeviceStep>,
     /// Live entries (above the purge cutoff) by index.
     index: BTreeMap<u64, Loc>,
     /// Write handle on the last segment, opened on demand.
@@ -315,6 +327,8 @@ impl Inner {
             log_dir,
             segment_bytes,
             segments: Vec::new(),
+            #[cfg(test)]
+            device_trace: Vec::new(),
             index: BTreeMap::new(),
             active: None,
             last_purged,
@@ -749,36 +763,47 @@ impl Inner {
                     .map(|(_, loc)| (loc.segment, SEGMENT_HEADER as u64))
             })
             .expect("live entries exist");
-        // Later segments go whole; the one holding the cut is shortened.
-        let mut removed = false;
+        // Every crash point must leave a prefix of the log: a later segment
+        // gone while the retained one still reaches past the cut reads as a
+        // truncation not yet made, a hole does not. So later segments go
+        // newest first, each unlink durable before the next, and the segment
+        // holding the cut is shortened only once they are all gone.
+        self.active = None;
         while self
             .segments
             .last()
             .is_some_and(|seg| seg.first_index > cut.0)
         {
-            let seg = self.segments.pop().expect("checked");
-            std::fs::remove_file(&seg.path).map_err(|e| io_err("remove segment", e))?;
-            removed = true;
+            self.remove_last_segment()?;
         }
-        self.active = None;
         if cut.1 == SEGMENT_HEADER as u64 {
             // Nothing of the segment survives the cut: remove it rather than
             // keep a header naming an index the log may never return to.
-            let seg = self.segments.pop().expect("holds the cut");
-            std::fs::remove_file(&seg.path).map_err(|e| io_err("remove segment", e))?;
-            removed = true;
+            self.remove_last_segment()?;
         } else {
             let file = self.active_file()?;
             file.set_len(cut.1).map_err(|e| io_err("cut segment", e))?;
             file.sync_all().map_err(|e| io_err("sync segment", e))?;
+            #[cfg(test)]
+            self.device_trace.push(DeviceStep::Shorten);
             let seg = self.segments.last_mut().expect("holds the cut");
             seg.len = cut.1;
             seg.last_index = Some(from_index - 1);
         }
-        if removed {
-            fsync_dir_blocking(&self.log_dir)?;
-        }
         self.index.split_off(&from_index);
+        Ok(())
+    }
+
+    /// Unlink the newest segment and make that durable before forgetting it.
+    fn remove_last_segment(&mut self) -> Result<(), StorageError> {
+        let seg = self.segments.last().expect("a segment to remove");
+        std::fs::remove_file(&seg.path).map_err(|e| io_err("remove segment", e))?;
+        #[cfg(test)]
+        self.device_trace.push(DeviceStep::Unlink(seg.path.clone()));
+        fsync_dir_blocking(&self.log_dir)?;
+        #[cfg(test)]
+        self.device_trace.push(DeviceStep::DirFsync);
+        self.segments.pop();
         Ok(())
     }
 
@@ -792,7 +817,11 @@ impl Inner {
         atomic_write_blocking(&self.root.join("last_purged"), &bytes)?;
         self.last_purged = Some(log_id);
         self.index = self.index.split_off(&(log_id.index + 1));
-        let mut removed = false;
+        self.active = None;
+        // Oldest first, each unlink durable before the next, so the segments
+        // on the device are a contiguous suffix at every crash point. A newer
+        // unlink outliving an older one would leave a hole the scan refuses,
+        // even below the marker.
         let mut kept = Vec::with_capacity(self.segments.len());
         for seg in self.segments.drain(..) {
             // Whole segments at or below the marker go, and so does an empty
@@ -803,16 +832,16 @@ impl Inner {
             };
             if obsolete {
                 std::fs::remove_file(&seg.path).map_err(|e| io_err("remove segment", e))?;
-                removed = true;
+                #[cfg(test)]
+                self.device_trace.push(DeviceStep::Unlink(seg.path.clone()));
+                fsync_dir_blocking(&self.log_dir)?;
+                #[cfg(test)]
+                self.device_trace.push(DeviceStep::DirFsync);
             } else {
                 kept.push(seg);
             }
         }
         self.segments = kept;
-        self.active = None;
-        if removed {
-            fsync_dir_blocking(&self.log_dir)?;
-        }
         Ok(())
     }
 
@@ -872,6 +901,14 @@ impl FsRaftLogStore {
     #[cfg(test)]
     fn log_dir(&self) -> PathBuf {
         self.root.join("log")
+    }
+
+    /// Drain what the last truncation or purge did to the device, in order.
+    #[cfg(test)]
+    async fn device_trace(&self) -> Vec<DeviceStep> {
+        self.with_inner(|inner| Ok(std::mem::take(&mut inner.device_trace)))
+            .await
+            .unwrap()
     }
 
     /// Run `f` against the store's state on the blocking pool.
@@ -1256,6 +1293,100 @@ mod tests {
         let got = store.read_range(0..100).await.unwrap();
         let indices: Vec<u64> = got.iter().map(|e| e.log_id.index).collect();
         assert_eq!(indices, vec![1, 2, 3]);
+    }
+
+    /// The unlinks a directory fsync has not yet covered at `crash_at`, in
+    /// the order they were issued. A crash there may lose any of them.
+    fn unsynced_unlinks(trace: &[DeviceStep], crash_at: usize) -> Vec<PathBuf> {
+        let mut unsynced = Vec::new();
+        for step in &trace[..crash_at] {
+            match step {
+                DeviceStep::Unlink(path) => unsynced.push(path.clone()),
+                DeviceStep::DirFsync => unsynced.clear(),
+                DeviceStep::Shorten => {}
+            }
+        }
+        unsynced
+    }
+
+    async fn three_segments() -> (TempDir, FsRaftLogStore, Vec<(PathBuf, Vec<u8>)>) {
+        let dir = TempDir::new().unwrap();
+        // Tiny segments: every append starts a new one.
+        let store = FsRaftLogStore::open_with_segment_bytes(dir.path().to_path_buf(), 1)
+            .await
+            .unwrap();
+        store.append(&[entry(1, 1), entry(1, 2)]).await.unwrap();
+        store.append(&[entry(1, 3)]).await.unwrap();
+        store.append(&[entry(1, 4)]).await.unwrap();
+        let files = segment_files(&store);
+        assert_eq!(files.len(), 3);
+        let saved = files
+            .iter()
+            .map(|p| (p.clone(), std::fs::read(p).unwrap()))
+            .collect();
+        (dir, store, saved)
+    }
+
+    /// Every crash point inside `truncate_from` must leave a prefix of the
+    /// log. Modelled on what a directory fsync promises: an unlink is on the
+    /// device once one follows it and may be lost until then. A crash right
+    /// after the retained segment is shortened has to find every later
+    /// segment's unlink already covered, or reopen meets a hole.
+    #[tokio::test]
+    async fn later_segments_are_durably_gone_before_the_cut_segment_shrinks() {
+        let (dir, store, saved) = three_segments().await;
+        store.truncate_from(2).await.unwrap();
+        let trace = store.device_trace().await;
+        let shorten = trace
+            .iter()
+            .position(|s| *s == DeviceStep::Shorten)
+            .expect("the cut segment was shortened");
+        let lost = unsynced_unlinks(&trace, shorten + 1);
+        drop(store);
+        for (path, bytes) in &saved {
+            if lost.contains(path) {
+                std::fs::write(path, bytes).unwrap();
+            }
+        }
+        let reopened = FsRaftLogStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap_or_else(|e| {
+                panic!("an interrupted truncation must not prevent restart: {e} (unlinks not durable when the segment shrank: {lost:?})")
+            });
+        let got = reopened.read_range(0..100).await.unwrap();
+        let indices: Vec<u64> = got.iter().map(|e| e.log_id.index).collect();
+        assert_eq!(indices, vec![1]);
+    }
+
+    /// The same for `purge_through`, which removes obsolete segments oldest
+    /// first: at any crash point the segments still on the device must be a
+    /// contiguous suffix. Losing an older unlink while a newer one held
+    /// would leave a hole below the marker that the scan refuses.
+    #[tokio::test]
+    async fn purged_segments_go_oldest_first_each_durable_before_the_next() {
+        let (dir, store, saved) = three_segments().await;
+        store.purge_through(LogId::new(1, 3)).await.unwrap();
+        let trace = store.device_trace().await;
+        let last_fsync = trace
+            .iter()
+            .rposition(|s| *s == DeviceStep::DirFsync)
+            .expect("removals were flushed");
+        // Crash just before the final directory fsync, and lose the oldest
+        // unlink it had not yet covered while keeping every newer one.
+        let lost = unsynced_unlinks(&trace, last_fsync).into_iter().next();
+        drop(store);
+        if let Some(path) = &lost {
+            let bytes = &saved.iter().find(|(p, _)| p == path).unwrap().1;
+            std::fs::write(path, bytes).unwrap();
+        }
+        let reopened = FsRaftLogStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap_or_else(|e| {
+                panic!("an interrupted purge must not prevent restart: {e} (lost unlink: {lost:?})")
+            });
+        let got = reopened.read_range(0..100).await.unwrap();
+        let indices: Vec<u64> = got.iter().map(|e| e.log_id.index).collect();
+        assert_eq!(indices, vec![4]);
     }
 
     #[tokio::test]
