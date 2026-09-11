@@ -3499,6 +3499,7 @@ dependencies = [
  "chrono",
  "ciborium",
  "clap",
+ "criterion",
  "dashmap",
  "ed25519-dalek",
  "fluree-db-api",

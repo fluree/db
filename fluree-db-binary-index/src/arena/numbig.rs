@@ -71,6 +71,26 @@ pub enum StoredBigValue {
 }
 
 impl StoredBigValue {
+    /// The value's dedup key, normalized the way [`NumBigArena::get_or_insert_bigdec`]
+    /// keys it: a BigDecimal has its trailing zeros stripped so `1.5` and
+    /// `1.50` map to one repr, whatever scale the entry was persisted under
+    /// (legacy pre-normalization arenas keep the original scale on disk).
+    /// Two entries — in one arena or across arenas — denote the same term iff
+    /// their normalized reprs are equal.
+    pub fn normalized_repr(&self) -> NumBigRepr {
+        match self {
+            Self::BigInt(bytes) => NumBigRepr::BigIntBytes(bytes.clone()),
+            Self::BigDec { unscaled, scale } => {
+                let bd = BigDecimal::new(BigInt::from_signed_bytes_le(unscaled), *scale);
+                let (norm_unscaled, norm_scale) = bd.normalized().as_bigint_and_exponent();
+                NumBigRepr::BigDecBytes {
+                    unscaled: norm_unscaled.to_signed_bytes_le(),
+                    scale: norm_scale,
+                }
+            }
+        }
+    }
+
     /// Reconstruct a `FlakeValue` from the stored bytes.
     pub fn to_flake_value(&self) -> fluree_db_core::value::FlakeValue {
         use fluree_db_core::value::FlakeValue;
@@ -105,6 +125,9 @@ pub struct NumBigArena {
     dedup: HashMap<NumBigRepr, u32>,
     /// Forward: handle -> stored value.
     values: Vec<StoredBigValue>,
+    /// True when every stored decimal already has its normalized repr.
+    /// Legacy arenas may contain a non-normalized value even without duplicates.
+    values_normalized: bool,
     /// Extra handles per repr beyond the first (legacy pre-normalization
     /// arenas only: the same decimal value persisted under several scales,
     /// each with its own positional handle). Empty for arenas written after
@@ -119,6 +142,7 @@ impl NumBigArena {
         Self {
             dedup: HashMap::new(),
             values: Vec::new(),
+            values_normalized: true,
             dup_handles: HashMap::new(),
         }
     }
@@ -232,6 +256,13 @@ impl NumBigArena {
     /// complete.
     pub fn has_duplicate_handles(&self) -> bool {
         !self.dup_handles.is_empty()
+    }
+
+    /// Whether stored values can be used directly as normalized dedup keys.
+    /// New inserts are normalized; loading checks every decimal's stored repr.
+    /// This is independent of whether the arena has duplicate handles.
+    pub fn values_are_normalized(&self) -> bool {
+        self.values_normalized
     }
 
     /// Number of entries.
@@ -398,20 +429,13 @@ pub fn read_numbig_arena_from_bytes(data: &[u8]) -> io::Result<NumBigArena> {
                     unscaled: unscaled_bytes.to_vec(),
                     scale,
                 };
-                let bd = BigDecimal::new(BigInt::from_signed_bytes_le(unscaled_bytes), scale);
-                let normalized = bd.normalized();
-                let (norm_unscaled, norm_scale) = normalized.as_bigint_and_exponent();
-                let norm_repr = NumBigRepr::BigDecBytes {
-                    unscaled: norm_unscaled.to_signed_bytes_le(),
-                    scale: norm_scale,
+                let stored = StoredBigValue::BigDec {
+                    unscaled: unscaled_bytes.to_vec(),
+                    scale,
                 };
-                arena.push_stored(
-                    StoredBigValue::BigDec {
-                        unscaled: unscaled_bytes.to_vec(),
-                        scale,
-                    },
-                    [raw_repr, norm_repr],
-                );
+                let norm_repr = stored.normalized_repr();
+                arena.values_normalized &= raw_repr == norm_repr;
+                arena.push_stored(stored, [raw_repr, norm_repr]);
             }
             _ => {
                 return Err(io::Error::new(
@@ -444,6 +468,7 @@ mod tests {
     #[test]
     fn test_empty_arena() {
         let arena = NumBigArena::new();
+        assert!(arena.values_are_normalized());
         assert_eq!(arena.len(), 0);
         assert!(arena.is_empty());
         assert!(arena.get_by_handle(0).is_none());
@@ -517,6 +542,7 @@ mod tests {
         bigdec_entry(&mut buf, 1999, 2); // 19.99 -> handle 2
 
         let arena = read_numbig_arena_from_bytes(&buf).unwrap();
+        assert!(!arena.values_are_normalized());
 
         // Handles are positional: a duplicate-value legacy entry must NOT
         // shift subsequent handles.
@@ -559,10 +585,51 @@ mod tests {
         arena.get_or_insert_bigdec(&"1.5".parse::<BigDecimal>().unwrap());
         arena.get_or_insert_bigdec(&"19.99".parse::<BigDecimal>().unwrap());
         assert!(!arena.has_duplicate_handles());
+        assert!(arena.values_are_normalized());
+        let loaded =
+            read_numbig_arena_from_bytes(&write_numbig_arena_to_bytes(&arena).unwrap()).unwrap();
+        assert!(loaded.values_are_normalized());
         assert_eq!(
             arena.find_bigdec_handles(&"1.500".parse::<BigDecimal>().unwrap()),
             vec![0]
         );
+    }
+
+    #[test]
+    fn test_legacy_normalization_is_independent_of_duplicate_handles() {
+        for lexical in ["1.50", "0.000", "-10.00"] {
+            // A single legacy value cannot have duplicate handles, but still
+            // needs normalization. Test both entry orders so later normalized
+            // entries cannot accidentally reset the arena-wide flag.
+            for legacy_first in [false, true] {
+                let decimal: BigDecimal = lexical.parse().unwrap();
+                let (unscaled, scale) = decimal.as_bigint_and_exponent();
+                let legacy = StoredBigValue::BigDec {
+                    unscaled: unscaled.to_signed_bytes_le(),
+                    scale,
+                };
+                let normalized = StoredBigValue::BigDec {
+                    unscaled: vec![23],
+                    scale: 1,
+                };
+                let mut original = NumBigArena::new();
+                original.values = if legacy_first {
+                    vec![legacy, normalized]
+                } else {
+                    vec![normalized, legacy]
+                };
+                let bytes = write_numbig_arena_to_bytes(&original).unwrap();
+                let mut loaded = read_numbig_arena_from_bytes(&bytes).unwrap();
+                assert!(!loaded.has_duplicate_handles());
+                assert!(!loaded.values_are_normalized(), "{lexical}");
+                loaded.get_or_insert_bigdec(&"9.90".parse().unwrap());
+                assert!(!loaded.values_are_normalized());
+                let reloaded =
+                    read_numbig_arena_from_bytes(&write_numbig_arena_to_bytes(&loaded).unwrap())
+                        .unwrap();
+                assert!(!reloaded.values_are_normalized());
+            }
+        }
     }
 
     #[test]

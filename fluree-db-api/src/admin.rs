@@ -1885,6 +1885,7 @@ impl crate::Fluree {
     /// 2. Builds a fresh binary columnar index from the commit chain
     /// 3. Validates ledger hasn't advanced (conflict detection)
     /// 4. Publishes new index (allows same t via AdminPublisher)
+    /// 5. Evicts the cached ledger so subsequent loads use the rebuilt index
     ///
     /// # Errors
     /// - `NotFound` if ledger doesn't exist or has no commits
@@ -2077,6 +2078,12 @@ impl crate::Fluree {
         self.publisher()?
             .publish_index_allow_equal(&ledger_id, index_result.index_t, &index_result.root_id)
             .await?;
+
+        // Reindex can replace a damaged root at the same index t. A cached
+        // handle may otherwise keep its old graph registry indefinitely.
+        if let Some(ref lm) = self.ledger_manager {
+            lm.disconnect(&ledger_id).await;
+        }
 
         info!(
             ledger_id = %ledger_id,

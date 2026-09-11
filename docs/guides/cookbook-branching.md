@@ -156,6 +156,28 @@ fluree branch rebase my-branch --strategy abort
 fluree branch rebase my-branch --strategy take-source
 ```
 
+### Fast-forward indexing and transaction ordering
+
+A fast-forward advances the target to the source's commit head while retaining the target's own index. It does not copy or adopt the source's index, because that index's reserved graph names belong to the source branch. Queries replay commits after the target's indexed point until indexing catches up; a target with no index replays from genesis. For a large merged range, run `fluree index mydb:main` to catch up explicitly.
+
+For embedded applications calling `Fluree::merge_branch` directly with a Raft nameservice, the fast-forward ref update goes through consensus but bypasses the per-branch work queue. It can overtake transactions already submitted to that queue. The CAS checks the target head observed during merge preparation; if another writer advances it first, the merge returns `BranchConflict` (409) and should be retried so it recomputes against the new head. Repeating an already-completed fast-forward succeeds without copying commits again.
+
+The server's Raft merge path uses `QueuedTransactor::merge`, which queues the merge alongside transactions and prepares it when the worker reaches it. That path preserves queue ordering and was not affected by the direct API's empty-queue publish failure.
+
+### Repair a target that adopted another branch's index
+
+Older direct fast-forward merges from an indexed source could adopt the source's index root, giving the target the source branch's `#txn-meta` and `#config` graph labels. Ordinary data queries could still work while the target stopped resolving its own governance configuration. Rewriting the config alone does not repair the graph registry.
+
+Run a full rebuild of the affected target:
+
+```bash
+fluree reindex mydb:main
+```
+
+In an embedded application, call `fluree.reindex("mydb:main", ReindexOptions::default()).await?` on the serving instance. After publishing the rebuilt root, reindex evicts that instance's cached ledger so subsequent loads read the corrected registry, even when the index transaction time is unchanged. Existing handles held by callers must be reacquired; other serving instances must also reload their cached ledger. Older versions without this eviction require a cache disconnect or process restart after reindex.
+
+An affected root can also cause `graph_iris[0] must be txn-meta IRI` on the second incremental indexing cycle: the first cycle stamps the target's ledger ID onto the root but retains the source's graph labels. The normal indexer falls back to a full rebuild when this validation fails; it does not permanently stop indexing. Explicit reindex repairs the target without waiting for those cycles.
+
 ### Compare branches
 
 See what's different between two branches:

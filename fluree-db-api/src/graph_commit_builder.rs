@@ -169,6 +169,7 @@ pub struct CommitBuilder<'a, 'g> {
     identity: Option<String>,
     /// Default policy class for policy filtering.
     policy_class: Option<String>,
+    governance: Option<GovernanceOptions>,
 }
 
 impl<'a, 'g> CommitBuilder<'a, 'g> {
@@ -179,6 +180,7 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
             user_context: None,
             identity: None,
             policy_class: None,
+            governance: None,
         }
     }
 
@@ -189,6 +191,7 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
             user_context: None,
             identity: None,
             policy_class: None,
+            governance: None,
         }
     }
 
@@ -199,6 +202,7 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
             user_context: None,
             identity: None,
             policy_class: None,
+            governance: None,
         }
     }
 
@@ -227,6 +231,14 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
     /// Set the default policy class for policy-based flake filtering.
     pub fn policy_class(mut self, policy_class: Option<&str>) -> Self {
         self.policy_class = policy_class.map(std::string::ToString::to_string);
+        self
+    }
+
+    /// Supply the full host-selected governance, including inline policies and
+    /// bindings. This takes precedence over the identity/class convenience
+    /// setters and resolves ledger defaults even when the options are empty.
+    pub fn governance(mut self, options: &GovernanceOptions) -> Self {
+        self.governance = Some(options.clone());
         self
     }
 
@@ -271,23 +283,22 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
         let mut commit = read_commit(&blob)
             .map_err(|e| ApiError::internal(format!("Failed to decode commit {commit_id}: {e}")))?;
 
-        // 6. Apply policy filtering (if identity or policy_class is set).
+        // 6. Apply policy filtering when governance or identity/class is supplied.
         //    Calls policy_builder and enforcer directly to preserve ApiError
         //    variants (query vs internal) instead of losing them through
         //    BlockFetchError's stringified intermediary.
-        if self.identity.is_some() || self.policy_class.is_some() {
-            let opts = GovernanceOptions {
+        if self.governance.is_some() || self.identity.is_some() || self.policy_class.is_some() {
+            let opts = self.governance.unwrap_or_else(|| GovernanceOptions {
                 identity: self.identity.clone(),
                 policy_class: self.policy_class.as_deref().map(|c| vec![c.to_string()]),
                 ..Default::default()
-            };
+            });
             // Use the novelty overlay so policy rules in uncommitted
             // transactions are visible to the policy builder. Config-aware:
             // a configured `f:policySource` (same-ledger named graph or
             // cross-ledger model reference) redirects the policy-rule
             // lookup instead of assuming the default graph. The
-            // identity/policy_class gate above is unchanged — commit-detail
-            // filtering stays opt-in per request.
+            // full governance also retains narrowing delegated selections.
             let overlay: &dyn OverlayProvider = snapshot.novelty.as_ref();
             let policy_ctx = crate::policy_view::build_transact_policy_context(
                 self.graph.fluree,

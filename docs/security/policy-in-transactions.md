@@ -313,13 +313,11 @@ fluree insert --as ex:readOnlyIdentity --policy-class ex:CorpPolicy -f new-data.
 fluree insert --as ex:writerIdentity --policy-class ex:CorpPolicy -f new-data.ttl
 ```
 
-The flags work locally and against remote servers. On remote, the CLI sends the policy options as HTTP headers (`fluree-identity`, `fluree-policy-class`, `fluree-default-allow`) and, for JSON-LD bodies, also injects them into `opts`. The server applies the **root-impersonation gate**: your bearer identity may delegate to `--as <iri>` only when the bearer identity itself has no `f:policyClass` on the target ledger. Restricted bearers have `--as` force-overridden back to their own identity (and writes only what their own policies permit).
-
-This is the standard service-account pattern — see [Policy in queries → Remote impersonation](policy-in-queries.md#remote-impersonation-how-its-authorized) for the full authorization rules and audit-log format.
+The CLI transports these options locally or through HTTP headers/body opts. Authenticated servers bind them to verified policy selection. Application-selected policies require explicit [trusted authorization](policy-authorization.md); policy-free identities do not confer impersonation privileges.
 
 ### Transaction enforcement is end-to-end
 
-Unsigned bearer-authenticated transactions build a `PolicyContext` from the (post-header-merge) opts and route through the policy-enforcing `transact_tracked_with_policy` path. A non-root bearer's `f:modify` constraints apply to their writes, matching the long-standing query-side behavior. SPARQL UPDATE inherits the same enforcement, with identity sourced from either the bearer or the `fluree-identity` header (impersonation-gated).
+JSON-LD transaction options are bound after header merging, then carried into consensus as governance. SPARQL UPDATE, Cypher, Turtle/TriG, and push ingestion use the same verified selection. Malformed JSON policy options are rejected rather than falling back to unrestricted governance. The resulting policy context enforces modify restrictions while staging the transaction.
 
 ## Related documentation
 
