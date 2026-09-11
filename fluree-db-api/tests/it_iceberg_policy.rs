@@ -789,14 +789,14 @@ async fn model_ledger_supplies_policies_and_hierarchy() {
     let rows = |v: Value| v.as_array().map_or(0, Vec::len);
     let (sel, wh) = name_query();
 
-    // No policy inputs on the request: unrestricted, as for a native ledger.
+    // Omitted request options still enforce the registered model defaults.
     let r = fluree
         .query_from()
         .jsonld(&query(json!(null), sel.clone(), wh.clone()))
         .execute_formatted()
         .await
         .unwrap();
-    assert_eq!(rows(r), 5);
+    assert_eq!(rows(r), 0);
 
     // Anonymous governed request: the baseline f:AccessPolicy rules apply, and
     // `ex:Agent` reaches `ex:Person` through M's subclass hierarchy.
@@ -1202,4 +1202,80 @@ async fn txn_meta_on_a_governed_source_is_empty_not_an_error() {
         .await
         .expect("default graph query");
     assert_eq!(default_graph.as_array().map_or(1, Vec::len), 0);
+}
+
+#[tokio::test]
+async fn authorization_crawl_preserves_policy_across_formatting_terminals() {
+    use fluree_db_api::{GovernanceOptions, PolicyAuthorization};
+    let fluree = setup().await;
+    for source in virtual_sources(GS) {
+        for deny_all in [true, false] {
+            let auth = PolicyAuthorization::from_trusted_options(if deny_all {
+                GovernanceOptions::default()
+            } else {
+                GovernanceOptions {
+                    policy: Some(json!([deny(
+                        "ex:hideScore",
+                        on_property("http://example.org/score")
+                    )])),
+                    default_allow: Some(true),
+                    ..Default::default()
+                }
+            });
+            let flat = json!({
+                "@context": context(), "from": source, "select": ["?s"],
+                "where": {"@id": "?s", "@type": "ex:Person"}
+            });
+            let flat_result = fluree
+                .query_from()
+                .jsonld(&flat)
+                .authorization(&auth)
+                .execute_formatted()
+                .await
+                .unwrap();
+            assert_eq!(
+                flat_result.as_array().unwrap().len(),
+                if deny_all { 0 } else { 5 }
+            );
+            let crawl = json!({
+                "@context": context(), "from": source, "select": {"?s": ["*"]},
+                "where": {"@id": "?s", "@type": "ex:Person"}
+            });
+            let formatted = fluree
+                .query_from()
+                .jsonld(&crawl)
+                .authorization(&auth)
+                .execute_formatted()
+                .await
+                .unwrap();
+            let string = fluree
+                .query_from()
+                .jsonld(&crawl)
+                .authorization(&auth)
+                .execute_formatted_string()
+                .await
+                .unwrap();
+            let tracked = fluree
+                .query_from()
+                .jsonld(&crawl)
+                .authorization(&auth)
+                .execute_tracked()
+                .await
+                .unwrap()
+                .result;
+            assert_eq!(formatted, serde_json::from_str::<Value>(&string).unwrap());
+            assert_eq!(formatted, tracked);
+            assert_eq!(
+                formatted.as_array().unwrap().len(),
+                if deny_all { 0 } else { 5 }
+            );
+            if !deny_all {
+                assert!(formatted.to_string().contains("alice"));
+                assert!(
+                    !formatted.to_string().contains("score"),
+                    "{source}: {formatted}"
+                );
+            }
+        }
+    }
 }

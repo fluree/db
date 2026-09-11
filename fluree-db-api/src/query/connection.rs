@@ -1065,7 +1065,7 @@ impl Fluree {
     ///
     /// Per-source policy takes precedence if present, otherwise global policy is used.
     /// If neither has policy, applies configured ledger defaults.
-    async fn apply_source_or_global_policy(
+    pub(crate) async fn apply_source_or_global_policy(
         &self,
         view: crate::view::GraphDb,
         source: &crate::dataset::GraphSource,

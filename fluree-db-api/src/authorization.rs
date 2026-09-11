@@ -38,6 +38,9 @@ impl PolicyAuthorization {
             options.default_allow = Some(false);
         }
         if !options.has_any_policy_inputs() {
+            // These ordinary fields survive JSON/consensus serialization.
+            // Empty classes also exclude rules supplied by a shared model.
+            options.policy_class = Some(Vec::new());
             options.policy = Some(Value::Array(Vec::new()));
             options.default_allow = Some(false);
         }
@@ -54,10 +57,6 @@ impl PolicyAuthorization {
     pub fn constrain_options(&self, requested: &GovernanceOptions) -> GovernanceOptions {
         let mut options = self.options.clone();
         if requested.default_allow == Some(false) {
-            options.default_allow = Some(false);
-        }
-        if !options.has_any_policy_inputs() {
-            options.policy = Some(Value::Array(Vec::new()));
             options.default_allow = Some(false);
         }
         options

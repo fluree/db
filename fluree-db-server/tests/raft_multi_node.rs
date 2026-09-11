@@ -675,6 +675,31 @@ async fn delegated_policy_survives_follower_forwarding_and_the_raft_command_queu
                 "@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob",
                 "opts": {"identity": "http://example.org/manager", "policy": [{"f:allow": true}], "default-allow": true}
             })).send().await.unwrap();
+        // Conflicting caller selections fail at binding, before entering Raft.
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(
+            body.to_string()
+                .contains("Credential does not permit policy selection"),
+            "{body}"
+        );
+        // A request without conflicts must still carry the token's full policy
+        // through follower forwarding and the replicated transaction queue.
+        let response = cluster
+            .client
+            .post(format!(
+                "{}/v1/fluree/insert/{ledger}",
+                cluster.public_url(follower)
+            ))
+            .bearer_auth(&token)
+            .header("idempotency-key", idempotency_key)
+            .json(&json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:bob", "@type": "ex:Person", "ex:name": "Bob"
+            }))
+            .send()
+            .await
+            .unwrap();
         let status = response.status();
         let body: serde_json::Value = response.json().await.unwrap();
         if allow {

@@ -496,3 +496,22 @@ Authorization reuses token verification and adds claim parsing, an authority che
 and request validation/normalization. It adds no ledger lookup, network request,
 or per-fact authorization work. Embedded binding clones query JSON; large inline
 policies increase parsing and cloning cost.
+
+### Full HTTP policy path
+
+Run `cargo bench -p fluree-db-server --bench policy_http` to compare warm,
+in-process HTTP queries with auth disabled, ordinary credentials, fixed
+selections, request selections, and 32 inline rules. Every case must return the
+same one-row result before timing. This benchmark includes signature verification,
+credential validation, body/header binding, config resolution, database execution,
+and response serialization. Socket/TLS costs are excluded. The fixture uses 256
+novelty-resident records with indexing disabled; these numbers do not characterize
+cold storage, indexed workloads, or large federated queries.
+
+Use the same benchmark source, build features, and machine on both revisions
+when comparing the no-auth case against `main`. For a quick correctness check,
+run `cargo test -p fluree-db-server --bench policy_http -- --test`. The bench
+declares `required-features = ["native", "credential"]`; both are default
+features, so it is silently skipped only under `--no-default-features`. Config
+absence is cached on each view, and regression tests verify that wrapping
+followed by execution does not repeat the config scan.

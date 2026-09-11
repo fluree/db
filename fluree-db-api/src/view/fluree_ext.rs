@@ -114,10 +114,10 @@ impl Fluree {
     /// via `config_resolver::merge_reasoning()`, which applies override
     /// control against whatever server-verified identity the caller supplies.
     pub(crate) async fn resolve_and_attach_config(&self, view: GraphDb) -> Result<GraphDb> {
-        // Config reads are best-effort. If the config graph is unqueryable
-        // (e.g., historical snapshot without a range_provider for g_id=2),
-        // treat it as "no config" and apply system defaults.
-        //
+        if view.config_is_resolved() {
+            return Ok(view);
+        }
+        // A read failure must never become an unrestricted policy view.
         // Resolved through the same marker-keyed cache the write path uses:
         // query preparation completes config defaults on every view that
         // arrives without them, which for the ledger-scoped server routes is
@@ -129,23 +129,18 @@ impl Fluree {
         // may be a composed reasoning overlay rather than a bare `Novelty`, in
         // which case the resolver's own downcast would find no marker and
         // silently stop caching.
-        let config = match crate::policy_view::resolve_ledger_config_cached(
+        let config = crate::policy_view::resolve_ledger_config_cached(
             self,
             &view.snapshot,
             &*view.overlay,
             view.novelty().map(|n| &**n),
             view.t,
         )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(error = %e, "Config graph read failed — using system defaults");
-                return Ok(view);
-            }
-        };
+        .await?;
 
         let Some(config) = config else {
+            let mut view = view;
+            view.config_absent = true;
             return Ok(view);
         };
 
@@ -789,11 +784,7 @@ impl Fluree {
         if view.has_policy() {
             return Ok(view);
         }
-        let view = if view.resolved_config().is_some() {
-            view
-        } else {
-            self.resolve_and_attach_config(view).await?
-        };
+        let view = self.resolve_and_attach_config(view).await?;
         if view
             .resolved_config()
             .is_some_and(|config| config.policy.is_some())
@@ -832,11 +823,7 @@ impl Fluree {
         // Callers may construct a view directly from staged/loaded ledger state.
         // Such a view must not bypass ledger override controls just because
         // config has not been attached yet (for example GraphQL read-back).
-        let view = if view.resolved_config().is_some() {
-            view
-        } else {
-            self.resolve_and_attach_config(view).await?
-        };
+        let view = self.resolve_and_attach_config(view).await?;
         let effective_opts = if let Some(ref resolved) = view.resolved_config {
             config_resolver::merge_policy_opts(resolved, opts, server_identity)
         } else {
@@ -1133,10 +1120,7 @@ impl Fluree {
         view: &GraphDb,
         server_identity: Option<&str>,
     ) -> Result<GraphDb> {
-        let view = match view.resolved_config() {
-            Some(_) => view.clone(),
-            None => self.resolve_and_attach_config(view.clone()).await?,
-        };
+        let view = self.resolve_and_attach_config(view.clone()).await?;
         Ok(self.apply_config_defaults(view, server_identity))
     }
 

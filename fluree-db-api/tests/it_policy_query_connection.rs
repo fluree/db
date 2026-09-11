@@ -978,3 +978,162 @@ async fn solo_embedded_policy_selection_and_privileged_read_defaults() {
         );
     }
 }
+
+#[tokio::test]
+async fn policy_defaults_config_read_error_must_fail_closed() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct FailedConfig(Arc<AtomicUsize>);
+    impl fluree_db_core::RangeProvider for FailedConfig {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn range(
+            &self,
+            query: &fluree_db_core::RangeQuery<'_>,
+        ) -> std::io::Result<Vec<fluree_db_core::Flake>> {
+            assert_eq!(query.g_id, 2);
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(std::io::Error::other("simulated config index read failure"))
+        }
+    }
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .create_ledger("review/config-failure:main")
+        .await
+        .unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut snapshot = (*ledger.snapshot).clone();
+    snapshot.range_provider = Some(Arc::new(FailedConfig(count.clone())));
+    let db = fluree_db_api::GraphDb::new(
+        Arc::new(snapshot),
+        Arc::new(fluree_db_core::NoOverlay),
+        None,
+        0,
+        "review/config-failure:main",
+    );
+    let result = fluree.wrap_policy_defaults(db).await;
+    assert!(count.load(Ordering::Relaxed) > 0, "fault must be exercised");
+    assert!(
+        result.is_err(),
+        "config read failure returned an unrestricted view: {}",
+        result
+            .as_ref()
+            .map(fluree_db_api::GraphDb::is_root)
+            .unwrap_or(false)
+    );
+}
+
+#[tokio::test]
+async fn absent_config_is_resolved_once_through_wrapping_and_execution() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct EmptyIndex(Arc<AtomicUsize>);
+    impl fluree_db_core::RangeProvider for EmptyIndex {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn range(
+            &self,
+            query: &fluree_db_core::RangeQuery<'_>,
+        ) -> std::io::Result<Vec<fluree_db_core::Flake>> {
+            if query.g_id == 2 {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(vec![])
+        }
+    }
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("policy/no-config:main").await.unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let mut snapshot = (*ledger.snapshot).clone();
+    snapshot.range_provider = Some(Arc::new(EmptyIndex(count.clone())));
+    let db = fluree_db_api::GraphDb::new(
+        Arc::new(snapshot),
+        Arc::new(fluree_db_core::NoOverlay),
+        None,
+        0,
+        "policy/no-config:main",
+    );
+    let view = fluree.wrap_policy_defaults(db).await.unwrap();
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+    let query =
+        json!({"select": ["?s"], "where": {"@id": "?s", "@type": "http://example.org/User"}});
+    for _ in 0..2 {
+        let view = fluree.wrap_policy_defaults(view.clone()).await.unwrap();
+        fluree.query(&view, &query).await.unwrap();
+    }
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        1,
+        "plain execution must reuse absent config"
+    );
+    fluree.wrap_policy_defaults(view.as_of(1)).await.unwrap();
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        2,
+        "a different snapshot must resolve anew"
+    );
+}
+
+#[tokio::test]
+async fn scoped_explain_withholds_statistics_for_every_language() {
+    use fluree_db_api::{GovernanceOptions, GraphDb};
+    use fluree_db_core::{IndexStats, PropertyStatEntry};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people_with_ssn(&fluree, "policy/explain:main").await;
+    let mut view = GraphDb::from_ledger_state(&ledger);
+    let predicate = view.snapshot.encode_iri("http://schema.org/name").unwrap();
+    // Deliberately distinctive stored counts: policy must not disclose them.
+    std::sync::Arc::make_mut(&mut view.snapshot).stats = Some(IndexStats {
+        flakes: 987_654,
+        properties: Some(vec![PropertyStatEntry {
+            sid: (predicate.namespace_code, predicate.name.to_string()),
+            count: 987_654,
+            ndv_values: 987_654,
+            ndv_subjects: 987_654,
+            last_modified_t: 1,
+            datatypes: vec![],
+            observed_datatypes: vec![],
+            historical_datatypes: vec![],
+        }]),
+        ..Default::default()
+    });
+    let scoped = fluree
+        .wrap_policy(
+            view.clone(),
+            &GovernanceOptions {
+                default_allow: Some(false),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let jsonld =
+        json!({"select": ["?name"], "where": {"@id": "?s", "http://schema.org/name": "?name"}});
+    let sparql = "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }";
+    let root = fluree.explain(&view, &jsonld).await.unwrap();
+    assert!(root.to_string().contains("987654"), "{root}");
+    for result in [
+        fluree.explain(&scoped, &jsonld).await.unwrap(),
+        fluree.explain_sparql(&scoped, sparql).await.unwrap(),
+        fluree
+            .explain_cypher(
+                &scoped,
+                "MATCH (n:`http://example.org/ns/User`) RETURN n",
+                None,
+            )
+            .await
+            .unwrap(),
+    ] {
+        assert!(result["plan"]["logical"].is_array(), "{result}");
+        assert!(!result.to_string().contains("987654"), "{result}");
+        assert!(result["plan"].get("statistics").is_none(), "{result}");
+    }
+    assert_eq!(view.snapshot.stats.as_ref().unwrap().flakes, 987_654);
+}

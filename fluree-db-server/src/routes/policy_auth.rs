@@ -78,8 +78,28 @@ pub(crate) async fn wrap_authorized_view(
     headers: &FlureeHeaders,
 ) -> Result<fluree_db_api::GraphDb> {
     let opts = bound_governance(headers.identity.as_deref(), headers)?;
+    wrap_governed_view(state, view, &opts).await
+}
+
+/// JSON routes must use the finalized body selection, including request-selected
+/// credentials and body-level narrowing, after authorization has been applied.
+pub(crate) async fn wrap_jsonld_view(
+    state: &AppState,
+    view: fluree_db_api::GraphDb,
+    query: &Value,
+) -> Result<fluree_db_api::GraphDb> {
+    let opts = GovernanceOptions::from_json(query)
+        .map_err(|e| crate::error::ServerError::bad_request(e.to_string()))?;
+    wrap_governed_view(state, view, &opts).await
+}
+
+async fn wrap_governed_view(
+    state: &AppState,
+    view: fluree_db_api::GraphDb,
+    opts: &GovernanceOptions,
+) -> Result<fluree_db_api::GraphDb> {
     if opts.has_any_policy_inputs() {
-        Ok(state.fluree.wrap_policy(view, &opts, None).await?)
+        Ok(state.fluree.wrap_policy(view, opts, None).await?)
     } else {
         Ok(state.fluree.wrap_policy_defaults(view).await?)
     }

@@ -899,6 +899,18 @@ impl GovernanceOptions {
         self.default_allow.unwrap_or(false)
     }
 
+    /// An explicitly empty rule selection with a deny default cannot grant
+    /// access. Preserve this narrowing even when config prohibits replacements.
+    /// Unlike a deny default alone, this also excludes configured class rules.
+    pub(crate) fn denies_all(&self) -> bool {
+        self.default_allow == Some(false)
+            && self.policy_class.as_ref().is_some_and(Vec::is_empty)
+            && self
+                .policy
+                .as_ref()
+                .is_none_or(|p| p.is_null() || p.as_array().is_some_and(Vec::is_empty))
+    }
+
     /// Whether the request selects or changes the policy set, subject to
     /// configured override controls. An empty class list selects no stored rules;
     /// an allow default can widen access. A deny default alone only narrows the

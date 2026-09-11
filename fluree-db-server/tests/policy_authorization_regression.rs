@@ -1375,3 +1375,125 @@ async fn authority_alone_authenticates_and_missing_request_context_denies() {
     assert_eq!(status, StatusCode::OK, "{result}");
     assert_eq!(names_from_results(&result).len(), 3);
 }
+
+#[tokio::test]
+async fn missing_controller_selection_with_locked_defaults_denies() {
+    let (_tmp, state) = policy_test_state().await;
+    let ledger = "empty-controller:main";
+    let app = setup_policy_ledger(build_router(state), ledger).await;
+    add_modify_policies(&app, ledger).await;
+    let config = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix ex: <http://example.org/> .
+        GRAPH <urn:fluree:{ledger}#config> {{
+            <urn:cfg:main> a f:LedgerConfig ; f:policyDefaults <urn:cfg:policy> .
+            <urn:cfg:policy> f:defaultAllow false ; f:policyClass ex:ManagerClass ;
+                f:overrideControl f:OverrideNone .
+        }}
+    "
+    );
+    let (status, result) = post_policy_request(
+        &app,
+        &format!("/v1/fluree/upsert/{ledger}"),
+        None,
+        "application/trig",
+        config,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let token = create_jws(
+        &controller_claims(ledger),
+        &SigningKey::from_bytes(&[200; 32]),
+    );
+    let query = serde_json::json!({
+        "select": ["?value"],
+        "where": {"@id": "http://example.org/doc3", "http://schema.org/name": "?value"}
+    });
+    let (status, result) = post_policy_request(
+        &app,
+        &format!("/v1/fluree/query/{ledger}"),
+        Some(&token),
+        "application/json",
+        query.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(
+        result,
+        serde_json::json!([]),
+        "missing request selection must deny"
+    );
+
+    let (status, result) = post_policy_request(
+        &app,
+        &format!("/v1/fluree/insert/{ledger}"),
+        Some(&token),
+        "text/turtle",
+        "<http://example.org/blocked> <http://schema.org/name> \"Blocked\" .".into(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+
+    // A fixed empty selection must not acquire the identity's or config's grants.
+    let fixed = delegated_token(
+        "http://example.org/manager-user",
+        ledger,
+        serde_json::json!({"policy-class": []}),
+    );
+    let (status, result) = post_policy_request(
+        &app,
+        &format!("/v1/fluree/query/{ledger}"),
+        Some(&fixed),
+        "application/json",
+        query.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result, serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn explain_uses_final_body_policy_selection_on_both_routes() {
+    let (_tmp, state) = policy_test_state().await;
+    let ledger = "explain-selection:main";
+    let app = setup_policy_ledger(build_router(state), ledger).await;
+    let token = create_jws(
+        &controller_claims(ledger),
+        &SigningKey::from_bytes(&[200; 32]),
+    );
+    for scoped_route in [true, false] {
+        let uri = if scoped_route {
+            format!("/v1/fluree/explain/{ledger}")
+        } else {
+            "/v1/fluree/explain".into()
+        };
+        for allow in [true, false] {
+            let mut query = serde_json::json!({
+                "opts": {"default-allow": allow},
+                "select": ["?name"],
+                "where": {"@id": "?s", "http://schema.org/name": "?name"}
+            });
+            if !scoped_route {
+                query["from"] = ledger.into();
+            }
+            let (status, result) = post_policy_request(
+                &app,
+                &uri,
+                Some(&token),
+                "application/json",
+                query.to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{result}");
+            assert_eq!(
+                result["plan"]["reason"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("withheld by policy"),
+                !allow,
+                "{result}"
+            );
+        }
+    }
+}

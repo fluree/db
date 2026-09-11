@@ -107,6 +107,12 @@
         "small": 5.0
       }
     },
+    "fluree-db-server": {
+      "policy_http": {
+        "tiny": 10.0,
+        "small": 5.0
+      }
+    },
     "fluree-db-query": {
       "vector_math": {
         "small": 3.0

@@ -52,7 +52,7 @@ curl -X POST https://db.example/v1/fluree/query/customer/data:main \
 
 Change `identity`, `policy-class`, inline `policy`, or `policy-values` on the next request without issuing another token. Explicit classes select rules; identity binds `?$identity`. Identity alone selects that identity's classes. Use fully qualified identity and class IRIs.
 
-An omitted or empty application selection denies access. An empty class list selects no stored rules and defaults to deny. For intentionally permissive access, explicitly select `default-allow: true`; shared policy sources can still supply rules. Where overrides are permitted, `policy-class: []` plus `default-allow: true` explicitly selects no stored class rules. Configured override restrictions still govern these choices.
+An omitted or empty application selection denies access, including when locked ledger defaults select allowing rules. An empty class list selects no stored rules and defaults to deny. An explicit empty class list with a deny default and no inline rules is an absolute narrowing: configured grants cannot widen it. For intentionally permissive access, explicitly select `default-allow: true`; shared policy sources can still supply rules. Where overrides are permitted, `policy-class: []` plus `default-allow: true` explicitly selects no stored class rules. Configured override restrictions still govern these choices.
 
 The `fluree-identity`, `fluree-policy-class`, `fluree-policy`, `fluree-policy-values`, and `fluree-default-allow` headers carry policy options for SPARQL, Cypher, GraphQL, push, and commit show. JSON body options override header defaults. Multi-query aliases retain envelope/sub-query precedence. One selection applies across a query's sources; conflicting per-source selections are rejected. A signed request body uses its signing identity and does not inherit an accompanying application's credential authority.
 
@@ -111,3 +111,15 @@ Other user-visible changes:
 - Policy headers (`fluree-identity`, `fluree-policy-class`, `fluree-policy`, `fluree-policy-values`, and `fluree-default-allow`) now supply defaults for JSON-LD transaction body options even when tracking is disabled. This intentional bug fix also applies to anonymous/no-auth requests. Body options retain precedence, and credential checks still apply.
 
 Enable `RUST_LOG=info,fluree_db_server::authorization=debug` for credential scope events: issuer, effective identity for fixed contexts, mode (`fixed`, `request-selected`, `scope-only`), ledger, action, and scope decision. These precede policy evaluation; request-selected scope events do not identify the dynamically selected user. Tokens, inline policies, and policy values are omitted. See [Benchmarks](../contributing/benches.md) for measuring authorization overhead.
+
+### Ledger configuration reads fail closed
+
+Query, streaming, transaction, and explain paths return an error when the ledger's config graph cannot be read. An unreadable config graph is never treated as "no configuration": doing so would run the request unrestricted on a ledger whose operator may have configured a deny default or a mandatory policy class. Previously such reads were best-effort and fell back to system defaults.
+
+In practice this only surfaces on snapshots that cannot serve any range read, such as a metadata-only historical view loaded without its binary index, where data queries already fail with the same error. A ledger with no config graph is unaffected: a successful read that finds nothing is cached on the view as absent and is not repeated for that snapshot.
+
+### Policy-scoped explain withholds statistics
+
+Explain on a policy-scoped view (any view that is not root, including a plain `default-allow: false` narrowing) returns a plan built without ledger or annotation statistics, and `plan.reason` states that statistics were withheld by policy. A caller who can only see a filtered subset must not learn unfiltered cardinalities from the planner. Unrestricted explains retain their statistics.
+
+The trade-off is that the explained plan may differ from the executed plan: execution still uses the full statistics, so a scoped caller may see a heuristic join order that the engine does not actually choose. When diagnosing performance under policy, run explain with an unrestricted credential against the same query.

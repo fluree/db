@@ -356,6 +356,12 @@ pub fn merge_policy_opts(
         None => return opts.clone(),
     };
 
+    // No configured grant may widen an explicit deny-all selection. This is
+    // also how an empty host authorization survives the JSON/consensus wire.
+    if opts.denies_all() {
+        return opts.clone();
+    }
+
     let query_selects_policy = opts.selects_policy_set();
     let override_denied =
         query_selects_policy && !policy.override_control.permits_override(server_identity);

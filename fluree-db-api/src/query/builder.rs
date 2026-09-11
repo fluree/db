@@ -794,7 +794,7 @@ impl<'a> FromQueryBuilder<'a> {
         // Resolve the single target ledger from the query's own dataset spec. A
         // crawl over a federated multi-source dataset must not collapse to one
         // source, so bail unless exactly one graph is specified.
-        let (spec, _) = parse_dataset_spec(json)?;
+        let (spec, opts) = parse_dataset_spec(json)?;
         if spec.default_graphs.len() + spec.named_graphs.len() != 1 {
             return Ok(None);
         }
@@ -803,10 +803,19 @@ impl<'a> FromQueryBuilder<'a> {
             .first()
             .or_else(|| spec.named_graphs.first())
             .expect("exactly one graph checked above");
-        let view = self
-            .fluree
-            .db_or_graph_source(alias.identifier.as_str())
-            .await?;
+        let view = self.fluree.load_view_from_source(alias).await?;
+        if view.graph_source_id.is_none() {
+            return Ok(None);
+        }
+        // Expansion executes a rewritten query against this view, so bind
+        // policy here before the original JSON options disappear.
+        let view = if let Some(policy) = &self.policy {
+            view.with_policy(Arc::clone(policy))
+        } else {
+            self.fluree
+                .apply_source_or_global_policy(view, alias, &opts)
+                .await?
+        };
         crate::graph_source::crawl::maybe_expand_crawl(
             self.fluree,
             &view,

@@ -1406,7 +1406,7 @@ pub async fn explain_ledger(
             load_ledger_for_query(&state, &ledger_id, &span).await?
         };
         let db = fluree_db_api::GraphDb::from_ledger_state(&loaded);
-        let db = crate::routes::policy_auth::wrap_authorized_view(&state, db, &headers).await?;
+        let db = crate::routes::policy_auth::wrap_jsonld_view(&state, db, &query_json).await?;
         let result = state
             .fluree
             .explain(&db, &query_json)
@@ -3549,7 +3549,7 @@ pub async fn explain(
             load_ledger_for_query(&state, &ledger_id, &span).await?
         };
         let db = fluree_db_api::GraphDb::from_ledger_state(&loaded);
-        let db = crate::routes::policy_auth::wrap_authorized_view(&state, db, &headers).await?;
+        let db = crate::routes::policy_auth::wrap_jsonld_view(&state, db, &query_json).await?;
         let result = match state.fluree.explain(&db, &query_json).await {
             Ok(result) => {
                 tracing::info!(status = "success", "explain completed");
