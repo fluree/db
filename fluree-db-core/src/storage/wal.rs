@@ -16,7 +16,10 @@
 //! final frame is discarded: acknowledgment follows the flush, and a flush
 //! covers every earlier frame, so a frame that did not make it whole was never
 //! acknowledged. Damage *before* a later, complete segment cannot be explained
-//! that way and fails the open instead of being skipped.
+//! that way and fails the open instead of being skipped. In a damaged final
+//! suffix, a validated later frame also fails recovery conservatively: it may
+//! indicate acknowledged data corruption or an unacknowledged tail persisted
+//! out of order. The log is preserved; replay never resumes past the damage.
 
 use fs2::FileExt;
 use std::collections::{BTreeSet, HashMap};
@@ -240,6 +243,57 @@ fn encode_frame(seq: u64, payload: &[u8]) -> Vec<u8> {
     finish_frame(seq, frame, hash)
 }
 
+/// A valid-looking later frame makes a damaged suffix ambiguous: it could be
+/// media corruption of acknowledged data or out-of-order persistence of an
+/// unacknowledged tail. Refuse both rather than discard potentially durable
+/// history. Never use this scan to resume replay beyond a damaged frame.
+fn check_damaged_suffix(bytes: &[u8], damaged_at: usize, expected_seq: u64) -> io::Result<()> {
+    // Bound hashing work as well as the byte scan: arbitrary payloads can
+    // contain many convincing frame headers. Exhaustion also preserves the log.
+    let mut budget = bytes.len().saturating_mul(4);
+    for (offset, magic) in bytes[damaged_at..].windows(FRAME_MAGIC.len()).enumerate() {
+        if magic != FRAME_MAGIC {
+            continue;
+        }
+        let at = damaged_at + offset;
+        let Some(header) = bytes.get(at..at + FRAME_HEADER) else {
+            continue;
+        };
+        let seq = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        if seq <= expected_seq {
+            continue;
+        }
+        let len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        let Some(end) = at
+            .checked_add(FRAME_HEADER)
+            .and_then(|at| at.checked_add(len))
+        else {
+            continue;
+        };
+        let Some(hash_end) = end.checked_add(HASH) else {
+            continue;
+        };
+        let Some(stored) = bytes.get(end..hash_end) else {
+            continue;
+        };
+        budget = budget.checked_sub(len + FRAME_HEADER).ok_or_else(|| io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("WAL damage at byte {damaged_at}; look-ahead validation budget exceeded; preserving log for investigation"),
+        ))?;
+        let mut hash = Xxh64::new(0);
+        hash.update(&bytes[at + FRAME_HEADER..end]);
+        hash.update(header);
+        if hash.digest().to_le_bytes() == stored
+            && decode_op(&bytes[at + FRAME_HEADER..end]).is_some()
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "WAL damage at byte {damaged_at}, sequence {expected_seq}, followed by a valid-looking frame at byte {at}, sequence {seq}; preserving log for investigation"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Frames decoded from one segment, and whether the segment ended cleanly.
 struct Decoded {
     ops: Vec<OwnedOp>,
@@ -296,6 +350,9 @@ fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<D
         seq += 1;
         at = end + HASH;
     };
+    if !clean {
+        check_damaged_suffix(bytes, at, seq)?;
+    }
     Ok(Decoded {
         ops,
         next_seq: seq,
@@ -405,6 +462,8 @@ pub(super) enum Acquire {
     Absent,
     /// Another process holds the lock.
     Busy,
+    /// A live takeover must not replay history over completed fallback writes.
+    RecoveryPending,
     /// The filesystem refused the lock or the directory could not be set up.
     Unsupported(io::Error),
 }
@@ -412,6 +471,52 @@ pub(super) enum Acquire {
 fn registry() -> &'static Mutex<HashMap<PathBuf, Weak<Wal>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Wal>>>> = OnceLock::new();
     REGISTRY.get_or_init(Default::default)
+}
+
+/// Coordinate local file operations with acquisition/replay, including handles
+/// that currently flush per write. Cache this gate on the FileStorage handle;
+/// only its first use resolves the root. Construction creates no directories.
+pub(super) fn operation_gate(base: &Path) -> io::Result<Arc<tokio::sync::RwLock<()>>> {
+    type Gates = Mutex<HashMap<PathBuf, Weak<tokio::sync::RwLock<()>>>>;
+    static GATES: OnceLock<Gates> = OnceLock::new();
+    let absolute = if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(base)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    let mut canonical = loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(path) => break path,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let component = ancestor.components().next_back().ok_or(e)?;
+                suffix.push(component.as_os_str().to_owned());
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| io::Error::other("storage root has no existing ancestor"))?;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    for component in suffix.into_iter().rev() {
+        if component == ".." {
+            canonical.pop();
+        } else if component != "." {
+            canonical.push(component);
+        }
+    }
+    let mut gates = GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(gate) = gates.get(&canonical).and_then(Weak::upgrade) {
+        return Ok(gate);
+    }
+    gates.retain(|_, gate| gate.strong_count() != 0);
+    let gate = Arc::new(tokio::sync::RwLock::new(()));
+    gates.insert(canonical, Arc::downgrade(&gate));
+    Ok(gate)
 }
 
 /// Flush and retire every segment of every log this process holds under
@@ -767,7 +872,7 @@ fn walk_segments(
             tracing::info!(
                 segment = %path.display(),
                 replayed = decoded.ops.len(),
-                "WAL ends in a torn frame; discarding it as unacknowledged"
+                "WAL ends in a damaged suffix with no validated later frame; treating it as an unacknowledged torn tail"
             );
         }
         f(decoded.next_seq - decoded.ops.len() as u64, &decoded.ops)?;
@@ -843,6 +948,26 @@ impl Wal {
     /// log directory is reported rather than made, so a read-only open leaves
     /// no trace on a root that never journaled.
     pub(super) fn acquire(base: &Path, owner: Option<&str>, create: bool) -> io::Result<Acquire> {
+        Self::acquire_inner(base, owner, create, true)
+    }
+
+    /// A live fallback writer can join an existing in-process log or take over
+    /// a cleanly checkpointed root. Crash history may predate its completed
+    /// Sync writes, so leave that history for explicit startup recovery.
+    pub(super) fn acquire_for_retry(
+        base: &Path,
+        owner: Option<&str>,
+        create: bool,
+    ) -> io::Result<Acquire> {
+        Self::acquire_inner(base, owner, create, false)
+    }
+
+    fn acquire_inner(
+        base: &Path,
+        owner: Option<&str>,
+        create: bool,
+        recover: bool,
+    ) -> io::Result<Acquire> {
         if !cfg!(unix) {
             return Ok(Acquire::Unsupported(io::Error::other(
                 "the WAL needs directory fsync, which only Unix provides",
@@ -903,6 +1028,17 @@ impl Wal {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(Acquire::Busy),
             Err(e) => return Ok(Acquire::Unsupported(e)),
+        }
+        if !recover {
+            for entry in std::fs::read_dir(&dir)? {
+                if entry?
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == SEGMENT_EXT)
+                {
+                    return Ok(Acquire::RecoveryPending);
+                }
+            }
         }
         let fsyncs = AtomicU64::new(0);
         let (next_seq, next_segment, _) = replay(&base, &dir, &fsyncs)?;
@@ -1324,10 +1460,16 @@ impl Drop for Wal {
         if let Err(e) = self.checkpoint() {
             tracing::warn!(error = %e, dir = %self.dir.display(), "WAL checkpoint on close failed; the next open will replay it");
         }
-        registry()
+        let mut registry = registry()
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.dir);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            self.lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+        registry.remove(&self.dir);
     }
 }
 
@@ -1420,9 +1562,10 @@ mod tests {
         segment.extend_from_slice(&encode_frame(1, &Op::Delete { key: "k" }.encode()));
         segment.extend_from_slice(&encode_frame(2, &Op::Delete { key: "k2" }.encode()));
         segment[start + FRAME_HEADER + 3] ^= 0xff;
-        let decoded = decode_segment(&segment, None).unwrap();
-        assert!(!decoded.clean);
-        assert!(decoded.ops.is_empty());
+        let error = decode_segment(&segment, None)
+            .err()
+            .expect("later valid frame must make recovery fail");
+        assert!(error.to_string().contains("valid-looking frame"));
     }
 
     #[test]
@@ -2342,5 +2485,110 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         assert!(replay(dir.path(), &wal, &AtomicU64::new(0)).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn lookahead_preserves_the_log_and_files_on_ambiguous_tail_damage() {
+        for corrupt_length in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let wal = dir.path().join(WAL_DIR);
+            std::fs::create_dir(&wal).unwrap();
+            std::fs::write(dir.path().join("head"), b"untouched").unwrap();
+            let mut bytes = SEGMENT_MAGIC.to_vec();
+            bytes.extend_from_slice(&1u64.to_le_bytes());
+            bytes.extend_from_slice(&encode_frame(
+                1,
+                &Op::Write {
+                    key: "head",
+                    bytes: b"prefix",
+                }
+                .encode(),
+            ));
+            let damaged_at = bytes.len();
+            bytes.extend_from_slice(&encode_frame(
+                2,
+                &Op::Write {
+                    key: "head",
+                    bytes: b"damaged",
+                }
+                .encode(),
+            ));
+            if corrupt_length {
+                bytes[damaged_at + 4..damaged_at + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+            } else {
+                bytes[damaged_at + FRAME_HEADER + 1] ^= 0xff;
+            }
+            // This is also a permitted unacknowledged suffix: the later
+            // frame landed ahead of the damaged one's missing blocks. The
+            // conservative policy refuses that case as well as media damage.
+            bytes.extend_from_slice(&encode_frame(3, &Op::Delete { key: "head" }.encode()));
+            let path = wal.join("00000001.wal");
+            std::fs::write(&path, &bytes).unwrap();
+            for _ in 0..2 {
+                let error = replay(dir.path(), &wal, &AtomicU64::new(0)).unwrap_err();
+                assert!(error.to_string().contains("valid-looking frame"), "{error}");
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert_eq!(
+                    std::fs::read(dir.path().join("head")).unwrap(),
+                    b"untouched"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lookahead_requires_a_valid_checksum_and_later_sequence() {
+        for invalid_hash in [false, true] {
+            let mut bytes = SEGMENT_MAGIC.to_vec();
+            bytes.extend_from_slice(&1u64.to_le_bytes());
+            bytes.extend_from_slice(b"bad frame");
+            let seq = if invalid_hash { 2 } else { 1 };
+            let mut candidate = encode_frame(seq, &Op::Delete { key: "head" }.encode());
+            if invalid_hash {
+                *candidate.last_mut().unwrap() ^= 1;
+            }
+            bytes.extend_from_slice(&candidate);
+            let decoded = decode_segment(&bytes, None).unwrap();
+            assert!(!decoded.clean);
+            assert!(decoded.ops.is_empty());
+        }
+    }
+
+    #[test]
+    fn lookahead_bounds_validation_work_on_many_candidate_headers() {
+        let mut bytes = vec![0u8; 4096];
+        bytes[..8].copy_from_slice(SEGMENT_MAGIC);
+        bytes[8..16].copy_from_slice(&1u64.to_le_bytes());
+        for i in 0..16 {
+            let at = SEGMENT_HEADER + 1 + i * FRAME_HEADER;
+            let len = (bytes.len() - at - FRAME_HEADER - HASH) as u32;
+            bytes[at..at + 4].copy_from_slice(FRAME_MAGIC);
+            bytes[at + 4..at + 8].copy_from_slice(&len.to_le_bytes());
+            bytes[at + 8..at + 16].copy_from_slice(&2u64.to_le_bytes());
+        }
+        let error = decode_segment(&bytes, None)
+            .err()
+            .expect("ambiguous scan must be bounded");
+        assert!(error.to_string().contains("budget exceeded"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn retry_does_not_replace_a_poisoned_attached_log() {
+        use crate::{Durability, FileStorage, StorageWrite};
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.fail_next_sync.store(true, Ordering::Release);
+        let storage = FileStorage::new(dir.path())
+            .with_durability(Durability::Wal)
+            .with_wal_owner("review");
+        assert!(storage
+            .write_bytes("fluree:file://first", b"failed")
+            .await
+            .is_err());
+        let error = storage
+            .write_bytes("fluree:file://second", b"must fail")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("failed flush"), "{error}");
     }
 }

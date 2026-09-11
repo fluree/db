@@ -14,6 +14,20 @@ an error. Recovery no longer applies those failed operations over subsequent
 writes. Retirement flushes each touched key once per batch. Read-only API clients
 recover an existing WAL without keeping the writer's ownership lock.
 
+Writers temporarily blocked by another WAL owner retry on subsequent writes,
+at most once every two seconds per handle and its clones. A shared local root
+gate prevents a takeover from crossing an in-flight operation. Clean handoffs
+resume WAL mode automatically; retained crash logs are left for deliberate
+startup recovery rather than replayed over completed fallback writes. Unsupported
+mounts and poisoned logs are not treated as temporary contention.
+
+Recovery now refuses a damaged final suffix when a validated later frame exists.
+It preserves the log and reports the damaged and later frame locations. This can
+also reject an unacknowledged tail whose blocks reached disk out of order; it
+favors investigation over silently discarding potentially acknowledged records.
+Recovery never resumes past a damaged frame, and look-ahead validation work is
+bounded.
+
 ## Upgrades and downgrades
 
 - WAL segments use the `FRDOSEG2` format with an xxh64 checksum over the

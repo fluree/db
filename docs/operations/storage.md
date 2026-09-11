@@ -395,12 +395,22 @@ binary cleanly and confirm the WAL segments have been retired before downgrading
 Otherwise a later WAL-aware start can replay stale writes or deletions over changes
 made by the older binary, including deleting a head it re-created.
 
-One process owns a root's log at a time. A second handle on the same root
-cannot take the lock and flushes each write itself, exactly as `sync` does,
-with a warning at startup. Where the filesystem refuses advisory locks the same
-fallback applies. That fallback lasts for the handle's lifetime; restart the
-writer after the competing process exits to enable WAL mode. Read-only API clients
-replay existing logs without retaining WAL ownership. The log is Unix-only.
+One process owns a root's log at a time; handles in that process share it.
+A writer in another process that cannot take the lock flushes each write itself,
+exactly as `sync` does, with a warning on first contention. Subsequent writes
+retry acquisition at most once every two seconds per handle (shared by its
+clones). After a clean handoff they automatically resume WAL mode. In-process
+operations share a root gate, so takeover waits for earlier file operations and
+each operation retains one mode through completion, including compare-and-swap.
+
+A live retry never replays a previous owner's crash segments over writes completed
+during fallback. If segments remain, the handle keeps per-write durability and
+warns that startup recovery is needed. Stop and reconcile the writers before
+recovering that history; restarting blindly can replay older plain writes over
+newer fallback values. Retrying can also join a WAL already held by this process.
+Unsupported filesystems remain in `sync` for the handle's lifetime; poisoned WALs
+continue to refuse writes until recovery. Read-only API clients recover existing
+logs without retaining WAL ownership. The log is Unix-only.
 
 An unsupported owner lock left by an unsuccessful first acquisition is skipped
 with a warning when that owner has no segments. If segments remain, recovery
@@ -421,8 +431,17 @@ log has been checkpointed: everything appended before it is on the device and
 nothing is left that replay could apply over it. Past that size a flush costs
 bandwidth rather than latency, and the log would only write the bytes twice. Records
 in a segment that was flushed before a later segment was opened cannot tear, so
-damage there fails the open with the segment named; a torn final frame is
-discarded, since acknowledgment follows the flush and could not have covered it.
+damage there fails the open with the segment named. A damaged final suffix is
+normally discarded as an unacknowledged torn tail. Before doing so, recovery
+looks for a later frame with a higher sequence, valid checksum, and decodable
+operation. Finding one stops recovery and preserves the log for investigation;
+recovery never skips the damaged record and resumes after it.
+
+This check is deliberately conservative: a valid-looking later frame can also
+result from out-of-order persistence of unacknowledged writes, so some otherwise
+recoverable crashes require intervention. It cannot detect every corruption case,
+including damage confined to the last record. Candidate-checksum work is bounded;
+exceeding the scan budget also stops recovery and preserves the log.
 
 WAL segments use xxh64 checksums to detect accidental corruption. Checksums do
 not provide authentication. See the [storage WAL release notes](storage-wal-release-notes.md)
