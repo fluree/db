@@ -85,7 +85,7 @@ pub struct DataAuthConfig {
     pub audience: Option<String>,
     /// Trusted issuer did:key identifiers for Bearer tokens
     pub trusted_issuers: Vec<String>,
-    /// Verified issuers allowed to select policies via the signed fluree.policy claim.
+    /// Verified issuers allowed to issue fixed policy selections or controller credentials.
     pub policy_authorities: Vec<String>,
     /// Default policy class IRI for authenticated requests without delegated policies.
     pub default_policy_class: Option<String>,
@@ -105,12 +105,13 @@ impl DataAuthConfig {
         }
         if self.mode == DataAuthMode::Required
             && self.trusted_issuers.is_empty()
+            && self.policy_authorities.is_empty()
             && !self.has_jwks_issuers
             && !self.insecure_accept_any_issuer
         {
             return Err(
                 "data_auth.mode=required requires --data-auth-trusted-issuer, \
-                 --jwks-issuer, or --data-auth-insecure-accept-any-issuer flag"
+                 --data-auth-policy-authority, --jwks-issuer, or --data-auth-insecure-accept-any-issuer flag"
                     .to_string(),
             );
         }
@@ -123,10 +124,10 @@ impl DataAuthConfig {
         if self.insecure_accept_any_issuer {
             return true;
         }
-        if self.trusted_issuers.is_empty() {
-            return false;
-        }
-        self.trusted_issuers.iter().any(|i| i == issuer)
+        self.trusted_issuers
+            .iter()
+            .chain(&self.policy_authorities)
+            .any(|i| i == issuer)
     }
 }
 
@@ -626,8 +627,8 @@ pub struct ServerConfig {
     )]
     pub data_auth_trusted_issuers: Vec<String>,
 
-    /// Issuer allowed to select policies in signed fluree.policy claims (repeatable).
-    /// Also requires ordinary issuer trust and --data-auth-audience.
+    /// Issuer allowed to issue fixed policy selections or controller credentials (repeatable).
+    /// Establishes issuer trust and requires --data-auth-audience.
     #[arg(
         long = "data-auth-policy-authority",
         env = "FLUREE_DATA_AUTH_POLICY_AUTHORITIES"
@@ -1461,6 +1462,19 @@ mod gc_retention_flag_tests {
 #[cfg(test)]
 mod policy_authority_tests {
     use super::*;
+
+    #[test]
+    fn policy_authority_also_establishes_issuer_trust() {
+        let config = DataAuthConfig {
+            mode: DataAuthMode::Required,
+            audience: Some("db".into()),
+            policy_authorities: vec!["did:key:app".into()],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        assert!(config.is_issuer_trusted("did:key:app"));
+        assert!(!config.is_issuer_trusted("did:key:other"));
+    }
 
     #[test]
     fn policy_authorities_require_an_audience_even_with_development_issuer_trust() {

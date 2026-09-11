@@ -112,7 +112,7 @@ fn build_principal(
     // filtering. Never accept a token and silently discard its restrictions.
     if payload.fluree_policy.is_some() {
         return Err(ServerError::unauthorized(
-            "Signed policy delegation is not supported by storage proxy endpoints",
+            "Policy delegation and controller credentials are not supported by storage proxy endpoints",
         ));
     }
     Ok(StorageProxyPrincipal {

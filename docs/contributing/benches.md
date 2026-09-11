@@ -482,3 +482,17 @@ When reviewing someone else's bench, check:
   integration test (`fluree-bench-support/tests/workspace_reconcile.rs`)
   and is invoked by the `bench-gate` CI job — there is no library
   function for it.
+
+## Policy authorization
+
+Run `cargo bench -p fluree-db-api --features credential --bench policy_authorization`
+to measure fixed policy binding. It compares ordinary and delegated claim parsing
+and simple/multiple-source normalization, reporting latency and allocation bytes.
+Tracking-allocator overhead is included; signature verification, issuer lookup,
+networking, and database policy evaluation are excluded. Use `CRITERION_HOME` to
+choose the output directory.
+
+Authorization reuses token verification and adds claim parsing, an authority check,
+and request validation/normalization. It adds no ledger lookup, network request,
+or per-fact authorization work. Embedded binding clones query JSON; large inline
+policies increase parsing and cloning cost.

@@ -2,11 +2,12 @@
 //!
 //! Policy-free identities do not acquire delegation privileges. Embedded hosts
 //! construct `PolicyAuthorization` directly; network hosts use the signed
-//! `fluree.policy` claim from an explicitly configured policy authority. Normal
+//! `fluree.policy` fixed selection or request-selection capability
+//! from a configured policy authority. Normal
 //! bearer and signed-request identities use server-selected / ledger policies.
 
 use crate::error::Result;
-use crate::extract::{DataPrincipal, FlureeHeaders, MaybeCredential};
+use crate::extract::{CredentialPolicy, DataPrincipal, FlureeHeaders, MaybeCredential};
 use crate::state::AppState;
 use fluree_db_api::{GovernanceOptions, PolicyAuthorization};
 use serde_json::Value;
@@ -22,8 +23,8 @@ pub(crate) fn bind_authorization(
     credential: &MaybeCredential,
 ) -> Result<FlureeHeaders> {
     let authorization = if let Some(did) = credential.did() {
-        Some(PolicyAuthorization::from_trusted_options(
-            GovernanceOptions {
+        Some(CredentialPolicy::Fixed(
+            PolicyAuthorization::from_trusted_options(GovernanceOptions {
                 identity: Some(did.to_owned()),
                 policy_class: state
                     .config
@@ -31,16 +32,20 @@ pub(crate) fn bind_authorization(
                     .clone()
                     .map(|c| vec![c]),
                 ..Default::default()
-            },
+            }),
         ))
     } else {
         principal.map(|p| p.policy_authorization.clone())
     };
     if let Some(authorization) = authorization {
-        let options = authorization.constrain_options(&GovernanceOptions {
-            default_allow: headers.default_allow,
-            ..Default::default()
-        });
+        // Request-selected credentials must wait until body/header merging is complete.
+        if matches!(authorization, CredentialPolicy::Request) {
+            headers.policy_authorization = Some(authorization);
+            return Ok(headers);
+        }
+        let requested =
+            crate::routes::query::sparql_qc_opts(headers.identity.as_deref(), &headers)?;
+        let options = authorization.resolve_options(&requested)?;
         headers.identity = options.identity;
         headers.policy_class = options.policy_class.unwrap_or_default();
         headers.policy = options.policy;
@@ -76,6 +81,6 @@ pub(crate) async fn wrap_authorized_view(
     if opts.has_any_policy_inputs() {
         Ok(state.fluree.wrap_policy(view, &opts, None).await?)
     } else {
-        Ok(view)
+        Ok(state.fluree.wrap_policy_defaults(view).await?)
     }
 }

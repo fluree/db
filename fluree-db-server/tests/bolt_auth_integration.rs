@@ -752,3 +752,31 @@ async fn delegated_bolt_sessions_enforce_grants_scopes_and_reauthentication() {
         .await
         .assert_failure_code("Neo.ClientError.Security.Unauthorized");
 }
+
+#[tokio::test]
+async fn bolt_rejects_unsupported_impersonation_instead_of_ignoring_it() {
+    let (_tmp, _state, addr) = auth_server(DataAuthMode::None).await;
+    for signature in [msg::RUN, msg::BEGIN] {
+        let mut client = BoltClient::ready_54(addr, MapValue::new()).await;
+        let mut extra = MapValue::new();
+        extra.insert("imp_user", "https://example.org/another-user");
+        let fields = if signature == msg::RUN {
+            vec![
+                Value::from("RETURN 1"),
+                Value::empty_map(),
+                Value::Map(extra),
+            ]
+        } else {
+            vec![Value::Map(extra)]
+        };
+        client.send(signature, fields).await;
+        let response = client.recv().await;
+        response.assert_failure_code("Neo.ClientError.Request.Invalid");
+        assert!(response
+            .metadata()
+            .get_str("message")
+            .unwrap()
+            .contains("impersonation"));
+        client.assert_closed().await;
+    }
+}

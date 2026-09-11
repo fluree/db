@@ -305,15 +305,14 @@ async fn build_policy_context_from_opts_inner(
         };
 
         (identity_sid, merged)
-    } else if let (Some(identity_iri), Some(classes)) = (
-        &opts.identity,
-        opts.policy_class.as_ref().filter(|c| !c.is_empty()),
-    ) {
+    } else if let (Some(identity_iri), Some(classes)) = (&opts.identity, opts.policy_class.as_ref())
+    {
         // Same-ledger identity + explicit `policy-class`: the request's
         // classes select the policy set; the identity is BIND-ONLY — it
         // resolves to populate `?$identity` for f:query rules and never
         // drives rule selection. This mirrors the cross-ledger identity
-        // contract above.
+        // contract above. An explicitly empty class list selects no stored
+        // policies; it must not fall back to this identity's wider assignments.
         //
         // Without this arm, a request carrying both fields silently ignored
         // `policy-class` and fell through to identity-mode selection below —
@@ -477,10 +476,15 @@ async fn build_policy_context_from_opts_inner(
     // were provided. When an identity IS specified but has no matching policies, is_root must
     // be false so that `default_allow` (not a blanket bypass) governs access.
     let has_explicit_policy_input = opts.identity.is_some()
-        || opts.policy_class.as_ref().is_some_and(|v| !v.is_empty())
+        || opts.policy_class.is_some()
         || opts.policy.is_some()
+        || opts
+            .policy_values
+            .as_ref()
+            .is_some_and(|values| !values.is_empty())
         || has_cross_ledger_source;
     let is_root = !has_explicit_policy_input
+        && opts.default_allow != Some(false)
         && view_set.restrictions.is_empty()
         && modify_set.restrictions.is_empty();
 

@@ -364,7 +364,7 @@ The flags work in both modes:
 
 ### Remote impersonation: how it's authorized
 
-Authenticated requests use verified policy selection. `--as`, class, inline-policy, and policy-value options cannot override a bearer or signed-request identity. A policy-free identity record does not confer delegation authority. Application gateways select policies through the signed `fluree.policy` claim from a configured policy authority; embedded applications construct a typed context. See [Trusted policy authorization](policy-authorization.md) for configuration, scopes, and migration.
+Authenticated requests use verified policy selection. With ordinary or fixed-delegation credentials, `--as`, class, inline-policy, and policy-value options must match that selection; conflicts return HTTP 403. Signed request bodies use their signing identity. A policy-free identity record does not confer delegation authority. Applications with an explicit `"fluree.policy": "request"` credential may select request policies dynamically. Downstream clients use a fixed signed `fluree.policy` selection from a configured policy authority; embedded applications construct a typed context. See [Trusted policy authorization](policy-authorization.md) for configuration, scopes, and migration.
 
 Direct local queries and intentionally anonymous private-server requests retain caller-selected policy options. Explicit caller default-deny can narrow an authenticated selection's default.
 

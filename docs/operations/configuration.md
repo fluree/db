@@ -563,10 +563,11 @@ Bearer token scopes:
 
 Back-compat: `fluree.storage.*` claims imply **read** scope for data endpoints.
 
-Application gateways may select policies through the signed `fluree.policy`
-claim only when the verified issuer is also a configured policy authority.
-This repeatable setting requires a nonempty data-auth audience; it does not
-replace ordinary issuer trust. See [Trusted policy authorization](../security/policy-authorization.md)
+Applications may select request policies using a credential with
+`"fluree.policy": "request"`, or issue a fixed signed `fluree.policy`
+selection for downstream clients. Both require the verified issuer to be a
+configured policy authority.
+This repeatable setting requires a nonempty data-auth audience; policy authorities also establish ordinary issuer trust. See [Trusted policy authorization](../security/policy-authorization.md)
 for the TOML configuration, claim format, and embedded SDK equivalent.
 
 ```bash
@@ -780,7 +781,7 @@ fluree-server \
 
 > **JWKS support**: When `--jwks-issuer` is configured, storage proxy endpoints accept RS256 OIDC tokens in addition to Ed25519 JWS tokens. The `--jwks-issuer` flag is shared with data, admin, and events endpoints — a single flag enables OIDC across all endpoint groups.
 
-Storage proxy rejects tokens containing a signed `fluree.policy` context. Delegated policy selection is supported by the data API, not storage-proxy endpoints. Use separate replication credentials for storage access; see [Trusted policy authorization](../security/policy-authorization.md).
+Storage proxy rejects fixed `fluree.policy` delegation and `"fluree.policy": "request"` credentials. Delegated policy selection is supported by the data API, not storage-proxy endpoints. Use separate replication credentials for storage access; see [Trusted policy authorization](../security/policy-authorization.md).
 
 ## Complete Configuration Examples
 

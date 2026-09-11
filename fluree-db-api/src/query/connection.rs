@@ -1064,7 +1064,7 @@ impl Fluree {
     /// Apply per-source or global policy to a view.
     ///
     /// Per-source policy takes precedence if present, otherwise global policy is used.
-    /// If neither has policy, returns the view unchanged.
+    /// If neither has policy, applies configured ledger defaults.
     async fn apply_source_or_global_policy(
         &self,
         view: crate::view::GraphDb,
@@ -1082,7 +1082,7 @@ impl Fluree {
         if global_opts.has_any_policy_inputs() {
             self.wrap_policy(view, global_opts, None).await
         } else {
-            Ok(view)
+            self.wrap_policy_defaults(view).await
         }
     }
 }

@@ -18,7 +18,7 @@ use tracing_subscriber::registry::LookupSpan;
 #[test]
 fn authorization_events_record_scope_decisions_without_policy_payloads() {
     use fluree_db_api::{GovernanceOptions, PolicyAuthorization};
-    use fluree_db_server::extract::DataPrincipal;
+    use fluree_db_server::extract::{CredentialPolicy, DataPrincipal};
 
     type Events = Arc<Mutex<Vec<HashMap<String, String>>>>;
     struct EventCapture(Events);
@@ -35,7 +35,13 @@ fn authorization_events_record_scope_decisions_without_policy_payloads() {
     let events = Events::default();
     let subscriber = tracing_subscriber::registry().with(EventCapture(events.clone()));
     tracing::subscriber::with_default(subscriber, || {
-        for mode in ["delegated", "server-default", "identity", "scope-only"] {
+        for mode in [
+            "controller",
+            "delegated",
+            "server-default",
+            "identity",
+            "scope-only",
+        ] {
             let identity = (mode != "scope-only").then(|| "https://app.example/user".to_string());
             let authorization = PolicyAuthorization::from_trusted_options(GovernanceOptions {
                 identity: identity.clone(),
@@ -52,6 +58,11 @@ fn authorization_events_record_scope_decisions_without_policy_payloads() {
                 }),
                 default_allow: Some(false),
             });
+            let authorization = match mode {
+                "controller" => CredentialPolicy::Request,
+                "scope-only" => CredentialPolicy::ScopeOnly,
+                _ => CredentialPolicy::Fixed(authorization),
+            };
             let principal = DataPrincipal {
                 issuer: "https://issuer.example".into(),
                 subject: Some("user".into()),
@@ -62,7 +73,6 @@ fn authorization_events_record_scope_decisions_without_policy_payloads() {
                 write_ledgers: ["allowed:main".into()].into(),
                 expires_unix: u64::MAX,
                 policy_authorization: authorization,
-                delegated_policy: mode == "delegated",
             };
             assert!(principal.can_read("allowed:main"));
             assert!(!principal.can_read("denied:main"));
@@ -71,10 +81,16 @@ fn authorization_events_record_scope_decisions_without_policy_payloads() {
         }
     });
     let events = events.lock().unwrap();
-    assert_eq!(events.len(), 16);
-    for (mode, chunk) in ["delegated", "server-default", "identity", "scope-only"]
-        .into_iter()
-        .zip(events.chunks(4))
+    assert_eq!(events.len(), 20);
+    for (mode, chunk) in [
+        "controller",
+        "delegated",
+        "server-default",
+        "identity",
+        "scope-only",
+    ]
+    .into_iter()
+    .zip(events.chunks(4))
     {
         for (event, (action, allowed)) in chunk.iter().zip([
             ("read", true),
@@ -83,7 +99,14 @@ fn authorization_events_record_scope_decisions_without_policy_payloads() {
             ("write", false),
         ]) {
             assert_eq!(event["issuer"], "https://issuer.example");
-            assert_eq!(event["authorization_mode"], mode);
+            assert_eq!(
+                event["authorization_mode"],
+                match mode {
+                    "controller" => "request-selected",
+                    "scope-only" => "scope-only",
+                    _ => "fixed",
+                }
+            );
             assert_eq!(event["action"], action);
             assert_eq!(event["scope_allowed"], allowed.to_string());
             assert_eq!(
@@ -96,7 +119,7 @@ fn authorization_events_record_scope_decisions_without_policy_payloads() {
             );
             assert_eq!(
                 event["effective_identity"],
-                if mode == "scope-only" {
+                if mode == "scope-only" || mode == "controller" {
                     "None"
                 } else {
                     "Some(\"https://app.example/user\")"

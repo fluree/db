@@ -756,3 +756,225 @@ async fn trusted_authorization_binds_all_builder_terminals() {
         .validate()
         .is_err());
 }
+
+/// Solo resolves grants in its router and calls the embedded API without a
+/// server credential. Preserve both its class-selected requests and its
+/// explicit allow for grants without row restrictions. Privileged reads must
+/// also be explicit on configured ledgers: omitted inputs now honor defaults.
+#[tokio::test]
+async fn solo_embedded_policy_selection_and_privileged_read_defaults() {
+    use fluree_db_api::{GovernanceOptions, PolicyAuthorization};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "policy/solo-compat:main";
+    let ledger = seed_people_with_ssn(&fluree, ledger_id).await;
+    let mut query = json!({
+        "from": ledger_id,
+        "select": "?name",
+        "where": {"@id": "?s", "http://schema.org/name": "?name"}
+    });
+    let names = json!(["Alice", "John"]);
+    assert_eq!(
+        normalize_rows(
+            &fluree
+                .query_from()
+                .jsonld(&query)
+                .execute_formatted()
+                .await
+                .unwrap()
+        ),
+        normalize_rows(&names),
+        "an unconfigured embedded ledger remains unrestricted"
+    );
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix ex: <http://example.org/ns/> .
+        ex:nameAccess a ex:NameReader ; f:action f:view ;
+            f:onProperty <http://schema.org/name> ; f:allow true .
+        ex:defaultRestriction a ex:DefaultPolicy ; f:action f:view ;
+            f:onProperty <http://schema.org/name> ; f:allow false .
+        GRAPH <urn:fluree:{ledger_id}#config> {{
+            <urn:cfg:main> a f:LedgerConfig ; f:policyDefaults <urn:cfg:policy> .
+            <urn:cfg:policy> f:defaultAllow false ; f:policyClass ex:DefaultPolicy .
+        }}
+    "
+        ))
+        .execute()
+        .await
+        .unwrap();
+
+    // Shapes emitted by Solo's merge_policy_into_opts and privileged paths.
+    for (opts, expected) in [
+        (json!({}), json!([])),
+        (
+            json!({"identity": "http://example.org/ns/alice",
+            "policy-class": ["http://example.org/ns/NameReader"]}),
+            names.clone(),
+        ),
+        (
+            json!({"identity": "http://example.org/ns/alice", "default-allow": true}),
+            names.clone(),
+        ),
+        (json!({"default-allow": true}), names.clone()),
+        (
+            json!({"identity": "http://example.org/ns/alice",
+            "policy-class": [], "default-allow": true}),
+            names.clone(),
+        ),
+    ] {
+        query["opts"] = opts.clone();
+        let result = fluree
+            .query_from()
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .unwrap();
+        assert_eq!(
+            normalize_rows(&result),
+            normalize_rows(&expected),
+            "opts: {opts}"
+        );
+
+        let governance = GovernanceOptions::from_json(&query).unwrap();
+        let sparql = format!(
+            "SELECT ?name FROM <{ledger_id}> WHERE {{ ?s <http://schema.org/name> ?name }}"
+        );
+        let result = fluree
+            .query_from()
+            .sparql(&sparql)
+            .connection_opts(governance.clone())
+            .execute_formatted()
+            .await
+            .unwrap();
+        assert_eq!(
+            result["results"]["bindings"].as_array().unwrap().len(),
+            expected.as_array().unwrap().len(),
+            "SPARQL opts: {opts}"
+        );
+
+        // Adopting the new fixed-context helper requires no token/issuer setup.
+        let authorization = PolicyAuthorization::from_trusted_options(governance);
+        let result = fluree
+            .query_from()
+            .jsonld(&query)
+            .authorization(&authorization)
+            .execute_formatted()
+            .await
+            .unwrap();
+        assert_eq!(
+            normalize_rows(&result),
+            normalize_rows(&expected),
+            "authorized opts: {opts}"
+        );
+
+        // Solo's streaming Lambda uses the dataset producer directly.
+        let dataset = fluree.build_stream_dataset(&query).await.unwrap();
+        let plan = fluree
+            .plan_stream_query_dataset(
+                &dataset,
+                &fluree_db_api::OwnedStreamQuery::JsonLd(query.clone()),
+            )
+            .await
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        fluree
+            .run_stream_query_dataset(
+                dataset,
+                plan,
+                fluree_db_api::Tracker::new(fluree_db_api::TrackingOptions::default()),
+                fluree_db_api::QueryExecutionOptions::default(),
+                tx,
+            )
+            .await;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            bytes.extend_from_slice(&chunk);
+        }
+        let records: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records.last().unwrap()["type"],
+            "end",
+            "stream opts: {opts}"
+        );
+        assert_eq!(
+            records.last().unwrap()["rows"],
+            expected.as_array().unwrap().len(),
+            "stream opts: {opts}"
+        );
+    }
+
+    query["opts"] = json!({"identity": "http://example.org/ns/alice",
+        "policy-class": ["http://example.org/ns/NameReader"]});
+    query["where"] = json!({"@id": "?s", "http://schema.org/ssn": "?name"});
+    assert_eq!(
+        fluree
+            .query_from()
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .unwrap(),
+        json!([]),
+        "class-selected access must still hide ungranted properties"
+    );
+
+    // A shared governance model still supplies rules for a default-allow-only
+    // request. Where overrides are allowed, the host can deliberately select
+    // no classes as well as an allow default to express its privileged grant.
+    let model_id = "policy/solo-compat-model:main";
+    fluree
+        .stage_owned(genesis_ledger(&fluree, model_id))
+        .upsert_turtle(
+            r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix ex: <http://example.org/ns/> .
+        GRAPH <http://example.org/model-policy> {
+            ex:deny a ex:DefaultPolicy ; f:action f:view ;
+                f:onProperty <http://schema.org/name> ; f:allow false .
+        }
+    ",
+        )
+        .execute()
+        .await
+        .unwrap();
+    fluree
+        .stage_owned(fluree.ledger(ledger_id).await.unwrap())
+        .upsert_turtle(&format!(
+            r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        GRAPH <urn:fluree:{ledger_id}#config> {{
+            <urn:cfg:policy> f:policySource <urn:cfg:ref> .
+            <urn:cfg:ref> a f:GraphRef ; f:graphSource <urn:cfg:source> .
+            <urn:cfg:source> f:ledger <{model_id}> ;
+                f:graphSelector <http://example.org/model-policy> .
+        }}
+    "
+        ))
+        .execute()
+        .await
+        .unwrap();
+    query["where"] = json!({"@id": "?s", "http://schema.org/name": "?name"});
+    for (opts, expected) in [
+        (json!({"default-allow": true}), json!([])),
+        (json!({"policy-class": [], "default-allow": true}), names),
+    ] {
+        query["opts"] = opts.clone();
+        let result = fluree
+            .query_from()
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .unwrap();
+        assert_eq!(
+            normalize_rows(&result),
+            normalize_rows(&expected),
+            "model opts: {opts}"
+        );
+    }
+}

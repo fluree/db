@@ -348,17 +348,8 @@ async fn stream_query_inner(
             // Plain single-ledger SPARQL (no policy, no FROM).
             let input = OwnedStreamQuery::Sparql(sparql);
             let ledger_state = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
-            let plan = {
-                let graph = GraphDb::from_ledger_state(&ledger_state);
-                fluree
-                    .plan_stream_query(&graph, &input)
-                    .await
-                    .map_err(ServerError::Api)?
-            };
-            (
-                StreamPlan::Single { ledger_state, plan },
-                stream_tracker_from_headers(&headers),
-            )
+            let plan = plan_with_ledger_defaults(&state, ledger_state, &input).await?;
+            (plan, stream_tracker_from_headers(&headers))
         }
     } else {
         let mut query_json: JsonValue = credential.body_json()?;
@@ -428,14 +419,8 @@ async fn stream_query_inner(
         } else {
             let input = OwnedStreamQuery::JsonLd(query_json);
             let ledger_state = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
-            let plan = {
-                let graph = GraphDb::from_ledger_state(&ledger_state);
-                fluree
-                    .plan_stream_query(&graph, &input)
-                    .await
-                    .map_err(ServerError::Api)?
-            };
-            (StreamPlan::Single { ledger_state, plan }, tracker)
+            let plan = plan_with_ledger_defaults(&state, ledger_state, &input).await?;
+            (plan, tracker)
         }
     };
 
@@ -443,6 +428,28 @@ async fn stream_query_inner(
     let mut response = finish_stream(&state, fluree, stream_plan, tracker);
     response.headers_mut().extend(warn_headers);
     Ok(response)
+}
+
+/// Keep the plain stream path for unconfigured/root views. A configured
+/// filter must travel with the dataset into the producer, not be discarded
+/// when the single-ledger producer reconstructs its view from LedgerState.
+async fn plan_with_ledger_defaults(
+    state: &AppState,
+    ledger_state: LedgerState,
+    input: &OwnedStreamQuery,
+) -> Result<StreamPlan> {
+    let fluree = &state.fluree;
+    let graph = fluree
+        .wrap_policy_defaults(GraphDb::from_ledger_state(&ledger_state))
+        .await?;
+    if graph.is_root() {
+        let plan = fluree.plan_stream_query(&graph, input).await?;
+        Ok(StreamPlan::Single { ledger_state, plan })
+    } else {
+        let dataset = DataSetDb::single(graph);
+        let plan = fluree.plan_stream_query_dataset(&dataset, input).await?;
+        Ok(StreamPlan::Dataset { dataset, plan })
+    }
 }
 
 /// Spawn the producer for a resolved plan and assemble the NDJSON streaming

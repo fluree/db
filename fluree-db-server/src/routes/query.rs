@@ -302,16 +302,14 @@ fn has_tracking_opts(query_json: &JsonValue) -> bool {
 
 /// Check if the query opts request identity-based policy enforcement.
 ///
-/// Returns true when `opts.identity` or `opts.policy-class` is present.
+/// Returns true when identity, policy class, or inline policy is non-null.
+/// Canonical nulls only shadow outer options; they do not engage enforcement.
 /// These fields trigger policy lookup in the connection execution path;
 /// the plain GraphDb path does not process them.
 pub(crate) fn has_policy_opts(query_json: &JsonValue) -> bool {
-    let Some(opts) = query_json.get("opts") else {
-        return false;
-    };
-    opts.get("identity").is_some()
-        || opts.get("policy-class").is_some()
-        || opts.get("policy").is_some()
+    fluree_db_api::GovernanceOptions::from_json(query_json)
+        .map(|opts| opts.has_any_policy_inputs())
+        .unwrap_or(true)
 }
 
 /// Extract a representative ledger identifier from a `from` / `fromNamed`
@@ -2073,7 +2071,7 @@ async fn execute_query(
             return Err(ServerError::Api(ApiError::NotFound(ledger_id.to_string())));
         }
     };
-    let graph = GraphDb::from_ledger_state(&ledger);
+    let graph = state.fluree.wrap_policy_defaults(GraphDb::from_ledger_state(&ledger)).await?;
     let fluree = &state.fluree;
 
     // Check if tracking is requested
@@ -2195,13 +2193,13 @@ async fn execute_query_proxy(
     query_json: &JsonValue,
     span: &tracing::Span,
 ) -> Result<Response> {
+    let view = state.fluree.db(ledger_id).await?;
+    let view = state.fluree.wrap_policy_defaults(view).await?;
     // Check if tracking is requested
     if has_tracking_opts(query_json) {
         // Execute tracked query
-        let response = match state
-            .fluree
-            .graph(ledger_id)
-            .query()
+        let response = match view
+            .query(state.fluree.as_ref())
             .jsonld(query_json)
             .execution_options(query_execution_options(state))
             .execute_tracked()
@@ -2242,10 +2240,8 @@ async fn execute_query_proxy(
     }
 
     // Execute query
-    let result = match state
-        .fluree
-        .graph(ledger_id)
-        .query()
+    let result = match view
+        .query(state.fluree.as_ref())
         .jsonld(query_json)
         .execution_options(query_execution_options(state))
         .execute_formatted()
@@ -2274,7 +2270,7 @@ pub(crate) fn sparql_qc_opts(
     headers: &FlureeHeaders,
 ) -> Result<fluree_db_api::GovernanceOptions> {
     let policy_values_map = headers.policy_values_map()?;
-    Ok(fluree_db_api::GovernanceOptions {
+    let requested = fluree_db_api::GovernanceOptions {
         identity: identity.map(String::from),
         policy_class: if headers.policy_class.is_empty() {
             None
@@ -2284,7 +2280,11 @@ pub(crate) fn sparql_qc_opts(
         policy: headers.policy.clone(),
         policy_values: policy_values_map,
         default_allow: headers.default_allow,
-    })
+    };
+    match &headers.policy_authorization {
+        Some(authorization) => authorization.resolve_options(&requested),
+        None => Ok(requested),
+    }
 }
 
 /// Build a `DatasetSpec` from a ledger-scoped SPARQL `FROM`/`FROM NAMED` clause.
@@ -2600,20 +2600,7 @@ async fn execute_cypher_ledger(
     // Build policy options from the resolved identity + headers. Cypher has no
     // body `opts` block, so headers are the only transport for `policy-class`,
     // `policy`, `policy-values`, and `default-allow` (same as SPARQL).
-    let policy_values_map = headers.policy_values_map().inspect_err(|_| {
-        set_span_error_code(span, "error:BadRequest");
-    })?;
-    let qc_opts = fluree_db_api::GovernanceOptions {
-        identity: identity.map(String::from),
-        policy_class: if headers.policy_class.is_empty() {
-            None
-        } else {
-            Some(headers.policy_class.clone())
-        },
-        policy: headers.policy.clone(),
-        policy_values: policy_values_map,
-        default_allow: headers.default_allow,
-    };
+    let qc_opts = sparql_qc_opts(identity, headers)?;
 
     let view = state
         .fluree
@@ -2629,7 +2616,7 @@ async fn execute_cypher_ledger(
             .await
             .map_err(ServerError::Api)?
     } else {
-        view
+        state.fluree.wrap_policy_defaults(view).await?
     };
 
     let result = state
@@ -2773,6 +2760,7 @@ async fn execute_sparql_ledger(
                 .inspect_err(|_| {
                     set_span_error_code(&span, "error:QueryFailed");
                 })?;
+                let view = state.fluree.wrap_policy_defaults(view).await?;
                 view.query(state.fluree.as_ref())
                     .sparql(sparql)
                     .format(json_fmt_config.clone())
@@ -3122,6 +3110,7 @@ async fn execute_sparql_ledger(
             use_default_context,
         )
         .await?;
+        let graph = state.fluree.wrap_policy_defaults(graph).await?;
         let fluree = &state.fluree;
 
         // Tracked SPARQL: if tracking headers are present, use tracked execution path

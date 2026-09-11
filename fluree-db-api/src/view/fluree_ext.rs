@@ -782,6 +782,29 @@ impl Fluree {
 // ============================================================================
 
 impl Fluree {
+    /// Apply configured policy defaults when no request policy was selected.
+    /// Unconfigured views keep their plain-query path. Unlike a synthetic
+    /// `default_allow: true`, empty governance lets config supply its classes.
+    pub async fn wrap_policy_defaults(&self, view: GraphDb) -> Result<GraphDb> {
+        if view.has_policy() {
+            return Ok(view);
+        }
+        let view = if view.resolved_config().is_some() {
+            view
+        } else {
+            self.resolve_and_attach_config(view).await?
+        };
+        if view
+            .resolved_config()
+            .is_some_and(|config| config.policy.is_some())
+        {
+            self.wrap_policy(view, &GovernanceOptions::default(), None)
+                .await
+        } else {
+            Ok(view)
+        }
+    }
+
     /// Build policy from options and wrap a view.
     ///
     /// If the view has a `ResolvedConfig`, config defaults are merged with query
@@ -806,6 +829,14 @@ impl Fluree {
         opts: &GovernanceOptions,
         server_identity: Option<&str>,
     ) -> Result<GraphDb> {
+        // Callers may construct a view directly from staged/loaded ledger state.
+        // Such a view must not bypass ledger override controls just because
+        // config has not been attached yet (for example GraphQL read-back).
+        let view = if view.resolved_config().is_some() {
+            view
+        } else {
+            self.resolve_and_attach_config(view).await?
+        };
         let effective_opts = if let Some(ref resolved) = view.resolved_config {
             config_resolver::merge_policy_opts(resolved, opts, server_identity)
         } else {

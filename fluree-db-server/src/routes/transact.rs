@@ -432,9 +432,6 @@ fn maybe_rewrite_form_encoded_update(credential: &mut MaybeCredential) {
 /// Mirrors the query-side `inject_headers_into_query` pattern: header values act
 /// as defaults that do not override body-level opts.
 fn inject_headers_into_txn(body: &mut JsonValue, headers: &FlureeHeaders) {
-    if !headers.has_tracking() {
-        return;
-    }
     if let Some(obj) = body.as_object_mut() {
         let opts = obj
             .entry("opts")
@@ -1976,25 +1973,8 @@ async fn execute_turtle_transaction(
         // ledger state and enforces f:modify on the write.
         let effective_identity = headers.identity.clone();
 
-        let policy_values_map = match headers.policy_values_map() {
-            Ok(v) => v,
-            Err(e) => {
-                set_span_error_code(&span, "error:BadRequest");
-                tracing::warn!(error = %e, "invalid fluree-policy-values header");
-                return Err(e);
-            }
-        };
-        let governance = GovernanceOptions {
-            identity: effective_identity.clone(),
-            policy_class: if headers.policy_class.is_empty() {
-                None
-            } else {
-                Some(headers.policy_class.clone())
-            },
-            policy: headers.policy.clone(),
-            policy_values: policy_values_map,
-            default_allow: headers.default_allow,
-        };
+        let governance =
+            crate::routes::query::sparql_qc_opts(effective_identity.as_deref(), headers)?;
 
         let commit_opts = build_commit_opts(
             effective_identity.as_deref(),
@@ -2060,20 +2040,7 @@ async fn execute_cypher_transact(
     // Use the verified effective identity and build policy
     // options from headers, same as the SPARQL UPDATE path.
     let effective_identity = headers.identity.clone();
-    let policy_values_map = headers.policy_values_map().inspect_err(|_| {
-        set_span_error_code(span, "error:BadRequest");
-    })?;
-    let qc_opts = fluree_db_api::GovernanceOptions {
-        identity: effective_identity.clone(),
-        policy_class: if headers.policy_class.is_empty() {
-            None
-        } else {
-            Some(headers.policy_class.clone())
-        },
-        policy: headers.policy.clone(),
-        policy_values: policy_values_map,
-        default_allow: headers.default_allow,
-    };
+    let qc_opts = crate::routes::query::sparql_qc_opts(effective_identity.as_deref(), headers)?;
 
     // Submit through consensus, exactly like SPARQL UPDATE: the Cypher statement
     // is lowered to a `Txn` inside the consensus layer under the ledger write
@@ -2294,25 +2261,7 @@ async fn execute_sparql_update_request(
     // Policy headers have already been bound to verified authorization.
     let effective_identity = headers.identity.clone();
 
-    let policy_values_map = match headers.policy_values_map() {
-        Ok(v) => v,
-        Err(e) => {
-            set_span_error_code(parent_span, "error:BadRequest");
-            tracing::warn!(error = %e, "invalid fluree-policy-values header");
-            return Err(e);
-        }
-    };
-    let governance = GovernanceOptions {
-        identity: effective_identity.clone(),
-        policy_class: if headers.policy_class.is_empty() {
-            None
-        } else {
-            Some(headers.policy_class.clone())
-        },
-        policy: headers.policy.clone(),
-        policy_values: policy_values_map,
-        default_allow: headers.default_allow,
-    };
+    let governance = crate::routes::query::sparql_qc_opts(effective_identity.as_deref(), headers)?;
 
     let commit_opts = build_commit_opts(
         effective_identity.as_deref(),

@@ -1,6 +1,6 @@
 use super::*;
 
-async fn transport_state(mut config: ServerConfig) -> (TempDir, Arc<AppState>) {
+pub(super) async fn transport_state(mut config: ServerConfig) -> (TempDir, Arc<AppState>) {
     let tmp = tempfile::tempdir().unwrap();
     config.cors_enabled = false;
     config.indexing_enabled = false;
@@ -26,9 +26,13 @@ async fn storage_proxy_rejects_signed_delegation_without_downgrading_to_scopes()
         "iss": issuer, "exp": now_secs() + 300,
         "fluree.storage.ledgers": [ledger]
     });
-    for delegated in [false, true] {
-        if delegated {
+    for mode in ["ordinary", "delegated", "controller"] {
+        let delegated = mode != "ordinary";
+        claims.as_object_mut().unwrap().remove("fluree.policy");
+        if mode == "delegated" {
             claims["fluree.policy"] = serde_json::json!({"default-allow": false});
+        } else if mode == "controller" {
+            claims["fluree.policy"] = "request".into();
         }
         let token = create_jws(&claims, &key);
         let resp = app
@@ -54,7 +58,8 @@ async fn storage_proxy_rejects_signed_delegation_without_downgrading_to_scopes()
         );
         if delegated {
             assert!(
-                body.to_string().contains("delegation is not supported"),
+                body.to_string()
+                    .contains("not supported by storage proxy endpoints"),
                 "{body}"
             );
             // Block fetch uses the same extractor, before any block lookup.
@@ -135,8 +140,6 @@ async fn push_preserves_signed_policy_and_rejected_commit_can_be_retried_with_a_
                     .uri(format!("/v1/fluree/push/{ledger}"))
                     .header("content-type", "application/json")
                     .header("authorization", format!("Bearer {token}"))
-                    .header("fluree-policy", r#"[{"f:allow":true}]"#)
-                    .header("fluree-policy-class", "http://example.org/ManagerClass")
                     .body(Body::from(request.clone()))
                     .unwrap(),
             )
@@ -212,6 +215,34 @@ async fn oidc_delegation_requires_authority_and_constrains_reads_and_writes() {
             "fluree.storage.ledgers": [ledger],
             "fluree.policy": {"policy-class": ["http://example.org/EmployeeClass"]}
         });
+        let mut controller = claims.clone();
+        controller.as_object_mut().unwrap().remove("fluree.policy");
+        controller["fluree.policy"] = "request".into();
+        let controller = encode(&header, &controller, &key).unwrap();
+        let query = serde_json::json!({
+            "opts": {"policy-class": ["http://example.org/EmployeeClass"]},
+            "select": ["?name"], "where": {"@id": "?s", "http://schema.org/name": "?name"}
+        });
+        let (status, body) = post_policy_request(
+            &app,
+            &format!("/v1/fluree/query/{ledger}"),
+            Some(&controller),
+            "application/json",
+            query.to_string(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            if is_authority {
+                StatusCode::OK
+            } else {
+                StatusCode::UNAUTHORIZED
+            },
+            "{body}"
+        );
+        if is_authority {
+            assert_eq!(body.as_array().unwrap().len(), 2, "{body}");
+        }
         let token = encode(&header, &claims, &key).unwrap();
         let (status, body) = query_docs(app.clone(), ledger, Some(&token), false).await;
         if !is_authority {
@@ -255,7 +286,8 @@ async fn oidc_delegation_requires_authority_and_constrains_reads_and_writes() {
         let (status, body) = json_body(resp).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
         assert!(
-            body.to_string().contains("delegation is not supported"),
+            body.to_string()
+                .contains("not supported by storage proxy endpoints"),
             "{body}"
         );
 

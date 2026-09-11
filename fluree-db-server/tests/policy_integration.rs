@@ -451,14 +451,10 @@ async fn unknown_identity_cannot_choose_default_allow_true() {
     );
 
     let (status, json) = query_docs(app, "policy5:main", Some(&token), true).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let names = names_from_results(&json);
-    assert_eq!(
-        names.len(),
-        0,
-        "unknown identity + default-allow:true must see all documents; got: {names:?}"
-    );
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert!(json
+        .to_string()
+        .contains("Credential does not permit policy selection"));
 }
 
 /// A property-level `f:allow: false` on `ex:content` should strip that field
@@ -629,14 +625,10 @@ async fn unassigned_identity_cannot_choose_default_allow_true() {
     );
 
     let (status, json) = query_docs(app, "policy7:main", Some(&token), true).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let names = names_from_results(&json);
-    assert_eq!(
-        names.len(),
-        0,
-        "known identity with no policyClass + default-allow:true cannot grant itself access; got: {names:?}"
-    );
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert!(json
+        .to_string()
+        .contains("Credential does not permit policy selection"));
 }
 
 /// Register an identity without policy assignments to exercise delegation boundaries.
@@ -701,7 +693,7 @@ async fn query_docs_as(
 }
 
 /// An explicitly trusted issuer can select employee classes for an app identity.
-/// Conflicting request identity is ignored.
+/// Matching request identity is accepted.
 #[tokio::test]
 async fn policy_authority_can_delegate_employee_access() {
     let (_tmp, state) = policy_test_state().await;
@@ -715,7 +707,7 @@ async fn policy_authority_can_delegate_employee_access() {
     );
 
     let (status, json) =
-        query_docs_as(app, "imp1:main", &token, "http://example.org/employee-user").await;
+        query_docs_as(app, "imp1:main", &token, "http://example.org/svc-bearer").await;
     assert_eq!(status, StatusCode::OK);
 
     let names = names_from_results(&json);
@@ -729,9 +721,7 @@ async fn policy_authority_can_delegate_employee_access() {
     assert!(!names.contains(&"Executive Salaries"));
 }
 
-/// A restricted bearer (employee) attempting impersonation has the
-/// `opts.identity` force-overridden by the server back to its own bearer
-/// identity — it sees its own filtered view, NOT the target's.
+/// A restricted bearer receives an explicit refusal for conflicting identity.
 #[tokio::test]
 async fn restricted_bearer_cannot_impersonate_manager() {
     let (_tmp, state) = policy_test_state().await;
@@ -744,21 +734,16 @@ async fn restricted_bearer_cannot_impersonate_manager() {
         "imp2:main",
     );
 
-    // Employee tries to impersonate manager — should be force-overridden.
+    // Employee tries to impersonate manager — reject the conflicting selection.
     let (status, json) =
         query_docs_as(app, "imp2:main", &token, "http://example.org/manager-user").await;
-    assert_eq!(status, StatusCode::OK);
-
-    let names = names_from_results(&json);
-    assert_eq!(
-        names.len(),
-        2,
-        "restricted bearer should see employee view (2 docs), not manager view (3); got: {names:?}"
-    );
-    assert!(!names.contains(&"Executive Salaries"));
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert!(json
+        .to_string()
+        .contains("Credential does not permit policy selection"));
 }
 
-/// Signed selection also governs SPARQL, regardless of caller identity headers.
+/// Signed selection governs SPARQL when identity headers agree.
 #[tokio::test]
 async fn policy_authority_can_delegate_sparql_access() {
     let (_tmp, state) = policy_test_state().await;
@@ -782,7 +767,7 @@ async fn policy_authority_can_delegate_sparql_access() {
         .uri("/v1/fluree/query/imp3:main")
         .header("content-type", "application/sparql-query")
         .header("authorization", format!("Bearer {token}"))
-        .header("fluree-identity", "http://example.org/public-user");
+        .header("fluree-identity", "http://example.org/svc-bearer-sparql");
 
     let resp = app
         .oneshot(req.body(Body::from(sparql)).unwrap())
@@ -809,7 +794,7 @@ async fn policy_authority_can_delegate_sparql_access() {
     assert_eq!(names[0], "Public Post");
 }
 
-/// Restricted bearer attempting SPARQL impersonation via header is force-overridden.
+/// Restricted bearer attempting SPARQL impersonation via header is rejected.
 #[tokio::test]
 async fn restricted_bearer_cannot_impersonate_via_sparql_header() {
     let (_tmp, state) = policy_test_state().await;
@@ -841,31 +826,11 @@ async fn restricted_bearer_cannot_impersonate_via_sparql_header() {
         .unwrap();
 
     let (status, json) = json_body(resp).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let bindings = json
-        .pointer("/results/bindings")
-        .and_then(|v| v.as_array())
-        .expect("expected SPARQL results.bindings array");
-    let names: Vec<&str> = bindings
-        .iter()
-        .filter_map(|b| b.pointer("/name/value").and_then(|v| v.as_str()))
-        .collect();
-    assert_eq!(
-        names.len(),
-        2,
-        "restricted SPARQL bearer should see employee view (2), not manager (3); got: {names:?}"
-    );
-    assert!(!names.contains(&"Executive Salaries"));
+    assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+    assert!(json
+        .to_string()
+        .contains("Credential does not permit policy selection"));
 }
-
-// ── Inline policy and policy-values tests ────────────────────────────────────
-//
-// These exercise the ad-hoc policy CLI flags (`--policy` / `--policy-file` and
-// `--policy-values` / `--policy-values-file`) via their on-the-wire forms:
-// body `opts.policy` / `opts.policy-values` for JSON-LD, and
-// `fluree-policy` / `fluree-policy-values` headers for SPARQL. These are the
-// "test policies before persisting them" path.
 
 /// Helper: extract names from SPARQL results bindings.
 fn sparql_names(json: &JsonValue) -> Vec<&str> {
@@ -1409,7 +1374,7 @@ async fn delegated_employee_write_enforces_modify_policy() {
     let mut body = modify_public_doc_content_body();
     body.as_object_mut().unwrap().insert(
         "opts".to_string(),
-        serde_json::json!({"identity": "http://example.org/employee-user"}),
+        serde_json::json!({"identity": "http://example.org/svc-writer"}),
     );
 
     let req = Request::builder()
@@ -1862,11 +1827,9 @@ async fn tracked_read_zero_policy_identity_reports_deny_all() {
     );
 }
 
-/// An anonymous request builds no policy context. Its tracked output must be
-/// exactly what it was before the enforcement record existed: the empty tally,
-/// no enforcement field, and no enforcement header.
+/// An anonymous request explicitly selecting deny must engage enforcement.
 #[tokio::test]
-async fn tracked_read_anonymous_reports_no_enforcement() {
+async fn tracked_read_anonymous_explicit_deny_is_enforced() {
     let (_tmp, state) = policy_test_state().await;
     let app = setup_policy_ledger(build_router(state), "policytrack3:main").await;
 
@@ -1874,23 +1837,16 @@ async fn tracked_read_anonymous_reports_no_enforcement() {
         tracked_query_docs(app, "policytrack3:main", None, false).await;
     assert_eq!(status, StatusCode::OK);
 
+    assert_eq!(json["result"], serde_json::json!([]));
     assert_eq!(
-        json["result"].as_array().map(Vec::len),
-        Some(3),
-        "unenforced request sees every document; got: {json}"
-    );
-    assert_eq!(json["policy"], serde_json::json!({}));
-    assert!(
-        json.get("policy_enforcement").is_none(),
-        "no policy context was built, so no enforcement is claimed; got: {json}"
+        json["policy_enforcement"],
+        serde_json::json!({"enforced": true, "denies_all_data": true})
     );
     assert_eq!(
-        enforcement_header, None,
-        "and no enforcement header is emitted"
+        enforcement_header.as_deref(),
+        Some(r#"{"enforced":true,"denies_all_data":true}"#)
     );
 }
-
-// ── ledger-configured f:defaultAllow over real HTTP ───────────────────────────
 
 /// Creates a ledger with 3 documents, **no policies at all**, and a config graph
 /// declaring `f:defaultAllow <value>`.

@@ -15,7 +15,7 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use fluree_db_api::{GovernanceOptions, PolicyAuthorization};
-use fluree_db_credential::jwt_claims::EventsTokenPayload;
+use fluree_db_credential::jwt_claims::{EventsTokenPayload, PolicyClaim};
 use serde_json::{json, Value};
 use std::hint::black_box;
 
@@ -29,13 +29,14 @@ const CLASS: &str = "https://app.example/policies/Employee";
 // the issuer. It is not a replacement for the server's token verifier.
 fn authorization(claims: &EventsTokenPayload) -> PolicyAuthorization {
     let options = match &claims.fluree_policy {
-        Some(policy) => GovernanceOptions {
+        Some(PolicyClaim::Fixed(policy)) => GovernanceOptions {
             identity: claims.resolve_identity(),
             policy_class: policy.policy_class.clone(),
             policy: policy.policy.clone(),
             policy_values: policy.policy_values.clone(),
             default_allow: policy.default_allow,
         },
+        Some(PolicyClaim::Request(_)) => panic!("this benchmark measures fixed selections"),
         None => GovernanceOptions {
             identity: claims.resolve_identity(),
             policy_class: Some(vec![CLASS.into()]),

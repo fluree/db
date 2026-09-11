@@ -85,12 +85,9 @@ async fn push_ledger_local(
     // Push has no signed body credential. Its verified bearer selects policy;
     // inline/header grants cannot replace it, just as on ordinary writes.
     if let Some(principal) = &bearer {
-        governance = principal
-            .policy_authorization
-            .constrain_options(&GovernanceOptions {
-                default_allow: headers.default_allow,
-                ..Default::default()
-            });
+        governance = principal.policy_authorization.resolve_options(
+            &crate::routes::query::sparql_qc_opts(headers.identity.as_deref(), &headers)?,
+        )?;
     }
 
     let idempotency_key = extract_idempotency_key(&headers.raw)?;

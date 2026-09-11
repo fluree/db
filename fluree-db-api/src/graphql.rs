@@ -996,19 +996,21 @@ impl RootExecutor for LedgerExecutor {
         // it started rather than destroying the state a later field needs.
         let unchanged = ledger.clone();
         let result = async {
-            let policy = if let Some(authorization) = &self.authorization {
-                crate::build_transact_policy_context(
-                    &self.fluree,
-                    &ledger.snapshot,
-                    ledger.novelty.as_ref(),
-                    Some(ledger.novelty.as_ref()),
-                    ledger.t(),
-                    authorization.options(),
-                )
-                .await?
-            } else {
-                None
-            };
+            let default_options = crate::GovernanceOptions::default();
+            let opts = self
+                .authorization
+                .as_ref()
+                .map(PolicyAuthorization::options)
+                .unwrap_or(&default_options);
+            let policy = crate::build_transact_policy_context(
+                &self.fluree,
+                &ledger.snapshot,
+                ledger.novelty.as_ref(),
+                Some(ledger.novelty.as_ref()),
+                ledger.t(),
+                opts,
+            )
+            .await?;
             let builder = self.fluree.stage_owned(ledger);
             let mut builder = match lowered.verb {
                 Verb::Insert => builder.insert(&lowered.transaction),
@@ -1044,7 +1046,10 @@ impl RootExecutor for LedgerExecutor {
                 .await
                 .map_err(|e| GqlError::Execution(e.to_string()))?
         } else {
-            view
+            self.fluree
+                .wrap_policy_defaults(view)
+                .await
+                .map_err(|e| GqlError::Execution(e.to_string()))?
         };
 
         self.read_back(&view, &request, &lowered.subjects).await
@@ -1281,7 +1286,7 @@ impl Fluree {
         let db = if let Some(authorization) = authorization {
             self.wrap_policy(db, authorization.options(), None).await?
         } else {
-            db
+            self.wrap_policy_defaults(db).await?
         };
         let slot = parking_lot::Mutex::new(Some(ledger));
         let envelope = self

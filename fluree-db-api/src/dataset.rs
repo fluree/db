@@ -301,13 +301,8 @@ impl SourcePolicyOverride {
     ///
     /// Returns true if at least one policy field is set.
     ///
-    /// Deliberately broader than [`GovernanceOptions::has_any_policy_inputs`],
-    /// which counts only `Some(true)` for `default_allow`: an override naming
-    /// only `default_allow: false` *is* an override and must be applied, even
-    /// though it does not by itself request enforcement. The two predicates
-    /// disagreeing is safe only because `merge_policy_opts` fills config into a
-    /// genuine unset rather than over an explicit value — see the precedence
-    /// note there before changing either one.
+    /// An explicit default or empty class selection must be applied even
+    /// without other policy inputs.
     pub fn has_policy(&self) -> bool {
         self.identity.is_some()
             || self.policy_class.is_some()
@@ -816,10 +811,15 @@ impl GovernanceOptions {
             }
         };
 
-        let identity = opts
-            .get("identity")
-            .and_then(|v| v.as_str())
-            .map(std::string::ToString::to_string);
+        let identity = match opts.get("identity") {
+            None | Some(JsonValue::Null) => None,
+            Some(JsonValue::String(value)) => Some(value.clone()),
+            Some(_) => {
+                return Err(DatasetParseError::InvalidOptions(
+                    "'identity' must be a string".into(),
+                ))
+            }
+        };
 
         let policy_class_val = opts
             .get("policy-class")
@@ -868,13 +868,19 @@ impl GovernanceOptions {
             }
         };
 
-        // Absent (or non-boolean) stays `None` so ledger config can fill it;
-        // an explicit `false` is preserved as an override of config.
-        let default_allow = opts
+        let default_allow = match opts
             .get("default-allow")
             .or_else(|| opts.get("default_allow"))
             .or_else(|| opts.get("defaultAllow"))
-            .and_then(serde_json::Value::as_bool);
+        {
+            None | Some(JsonValue::Null) => None,
+            Some(JsonValue::Bool(value)) => Some(*value),
+            Some(_) => {
+                return Err(DatasetParseError::InvalidOptions(
+                    "'default-allow' must be a boolean".into(),
+                ))
+            }
+        };
 
         Ok(Self {
             identity,
@@ -893,19 +899,14 @@ impl GovernanceOptions {
         self.default_allow.unwrap_or(false)
     }
 
-    /// Whether the request itself asked for policy enforcement.
-    ///
-    /// `Some(false)` deliberately does **not** count: it is the fail-closed
-    /// value, and treating it as a policy input would turn enforcement on for
-    /// an otherwise-anonymous request — the opposite of the pre-tri-state
-    /// behavior, where a literal `false` was indistinguishable from absent.
-    /// Only `Some(true)` contributes, exactly as the bare `bool` did.
+    /// Whether the request explicitly selects policy enforcement. An empty
+    /// class selection and an explicit deny default are meaningful inputs.
     pub fn has_any_policy_inputs(&self) -> bool {
         self.identity.is_some()
-            || self.policy_class.as_ref().is_some_and(|v| !v.is_empty())
-            || self.policy.is_some()
+            || self.policy_class.is_some()
+            || self.policy.as_ref().is_some_and(|p| !p.is_null())
             || self.policy_values.as_ref().is_some_and(|m| !m.is_empty())
-            || self.default_allow == Some(true)
+            || self.default_allow.is_some()
     }
 }
 
@@ -2649,14 +2650,13 @@ mod tests {
         }
     }
 
-    /// Non-boolean values are ignored rather than coerced, which leaves the
-    /// field unset (the pre-existing `as_bool` behavior, now visible as `None`).
+    /// Malformed values fail rather than silently falling back to config.
     #[test]
-    fn default_allow_non_boolean_stays_unset() {
-        assert_eq!(
-            parse_default_allow(&serde_json::json!({"opts": {"default-allow": "true"}})),
-            None
-        );
+    fn malformed_default_allow_is_rejected_and_null_stays_unset() {
+        assert!(GovernanceOptions::from_json(
+            &serde_json::json!({"opts": {"default-allow": "true"}})
+        )
+        .is_err());
         assert_eq!(
             parse_default_allow(&serde_json::json!({"opts": {"default-allow": null}})),
             None

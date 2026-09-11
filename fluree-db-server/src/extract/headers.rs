@@ -33,7 +33,7 @@ pub struct FlureeHeaders {
     pub raw: HeaderMap,
 
     /// Host-verified policy selection. Never populated by HTTP header parsing.
-    pub policy_authorization: Option<fluree_db_api::PolicyAuthorization>,
+    pub policy_authorization: Option<super::CredentialPolicy>,
 
     /// Ledger alias from header (lower precedence than path)
     pub ledger: Option<String>,
@@ -407,7 +407,11 @@ impl FlureeHeaders {
             opts.insert("policy".to_string(), self.policy.clone().unwrap());
         }
 
-        if !self.policy_class.is_empty() && !opts.contains_key("policy-class") {
+        if !self.policy_class.is_empty()
+            && !["policy-class", "policy_class", "policyClass"]
+                .iter()
+                .any(|key| opts.contains_key(*key))
+        {
             opts.insert(
                 "policy-class".to_string(),
                 JsonValue::Array(
@@ -420,7 +424,11 @@ impl FlureeHeaders {
             );
         }
 
-        if self.policy_values.is_some() && !opts.contains_key("policy-values") {
+        if self.policy_values.is_some()
+            && !["policy-values", "policy_values", "policyValues"]
+                .iter()
+                .any(|key| opts.contains_key(*key))
+        {
             opts.insert(
                 "policy-values".to_string(),
                 self.policy_values.clone().unwrap(),

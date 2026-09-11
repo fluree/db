@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 
 use crate::{ApiError, GovernanceOptions, Result};
 
-/// Immutable policy inputs selected by an authenticated host application.
+/// Host-established authority for selecting policy inputs.
 ///
 /// This selects the policies to enforce; it does not itself grant ledger access
 /// or bypass configured policy-override controls. The host must authorize every
@@ -32,6 +32,11 @@ impl PolicyAuthorization {
         if options.policy.as_ref().is_some_and(Value::is_null) {
             options.policy = None;
         }
+        if options.policy_class.as_ref().is_some_and(Vec::is_empty)
+            && options.default_allow.is_none()
+        {
+            options.default_allow = Some(false);
+        }
         if !options.has_any_policy_inputs() {
             options.policy = Some(Value::Array(Vec::new()));
             options.default_allow = Some(false);
@@ -39,13 +44,13 @@ impl PolicyAuthorization {
         Self { options }
     }
 
-    /// Policy inputs to pass to a view or transaction builder.
+    /// The fixed, host-established policy inputs.
     pub fn options(&self) -> &GovernanceOptions {
         &self.options
     }
 
-    /// Replace caller policy selection, retaining an explicit default-deny
-    /// request as a narrowing of the application's default.
+    /// Resolve request options against the established selection authority.
+    /// Replaces caller selections while preserving explicit default-deny narrowing.
     pub fn constrain_options(&self, requested: &GovernanceOptions) -> GovernanceOptions {
         let mut options = self.options.clone();
         if requested.default_allow == Some(false) {

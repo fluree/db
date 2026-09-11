@@ -94,7 +94,11 @@ impl SessionAuth {
     fn governance(&self) -> fluree_db_api::GovernanceOptions {
         self.principal
             .as_ref()
-            .map(|p| p.policy_authorization.options().clone())
+            .map(|p| {
+                p.policy_authorization
+                    .resolve_options(&Default::default())
+                    .expect("omitted selection is valid for every credential mode")
+            })
             .unwrap_or_default()
     }
 }
@@ -206,6 +210,26 @@ async fn handle_connection(
                     break;
                 }
             };
+            // Until transaction-scoped impersonation is implemented, do not
+            // silently execute an impersonated request as the logged-in user.
+            let impersonated = match &request {
+                Request::Run { extra, .. } | Request::Begin { extra } => extra.get("imp_user"),
+                Request::Route {
+                    extra: Value::Map(extra),
+                    ..
+                } => extra.get("imp_user"),
+                _ => None,
+            }
+            .is_some_and(|value| !matches!(value, Value::Null));
+            if impersonated {
+                write_message(
+                    &Response::failure(CODE_INVALID, "Bolt impersonation is not supported")
+                        .encode(),
+                    &mut out_buf,
+                );
+                close = true;
+                break;
+            }
             match session.on_request(request) {
                 Turn::Reply(replies) => {
                     for reply in replies {
@@ -583,7 +607,11 @@ async fn try_execute_txn_run(
             .await
             .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     } else {
-        view
+        state
+            .fluree
+            .wrap_policy_defaults(view)
+            .await
+            .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     };
     let result = state
         .fluree
@@ -660,7 +688,11 @@ async fn execute_read(
             .await
             .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     } else {
-        view
+        state
+            .fluree
+            .wrap_policy_defaults(view)
+            .await
+            .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     };
     let result = state
         .fluree

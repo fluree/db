@@ -264,30 +264,8 @@ async fn policy_view(
     ledger: &str,
     headers: &FlureeHeaders,
 ) -> Result<fluree_db_api::GraphDb> {
-    let identity = headers.identity.clone();
-
-    let opts = fluree_db_api::GovernanceOptions {
-        identity,
-        policy_class: (!headers.policy_class.is_empty()).then(|| headers.policy_class.clone()),
-        policy: headers.policy.clone(),
-        policy_values: headers.policy_values_map()?,
-        default_allow: headers.default_allow,
-    };
-
-    let view = state
-        .fluree
-        .db_with_default_context(ledger)
-        .await
-        .map_err(ServerError::Api)?;
-    if opts.has_any_policy_inputs() {
-        state
-            .fluree
-            .wrap_policy(view, &opts, None)
-            .await
-            .map_err(ServerError::Api)
-    } else {
-        Ok(view)
-    }
+    let view = state.fluree.db_with_default_context(ledger).await?;
+    crate::routes::policy_auth::wrap_authorized_view(state, view, headers).await
 }
 
 fn parse_request(

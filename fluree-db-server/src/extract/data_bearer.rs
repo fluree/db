@@ -17,10 +17,12 @@ use axum::http::request::Parts;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use super::CredentialPolicy;
 use crate::config::DataAuthMode;
 use crate::error::ServerError;
 use crate::state::AppState;
 use fluree_db_credential::jwt_claims::EventsTokenPayload;
+use fluree_db_credential::jwt_claims::PolicyClaim;
 
 /// Verified principal from a data API Bearer token
 #[derive(Debug, Clone)]
@@ -44,9 +46,7 @@ pub struct DataPrincipal {
     /// before each statement.
     pub expires_unix: u64,
     /// Policy selection constructed from verified claims and server configuration.
-    pub policy_authorization: fluree_db_api::PolicyAuthorization,
-    /// True only when a verified policy authority supplied fluree.policy.
-    pub delegated_policy: bool,
+    pub policy_authorization: CredentialPolicy,
 }
 
 impl DataPrincipal {
@@ -66,20 +66,15 @@ impl DataPrincipal {
     /// check, not a claim that subsequent per-fact policy enforcement allowed
     /// the operation. Disabled unless this tracing target is enabled at DEBUG.
     fn audit_scope(&self, ledger_id: &str, action: &str, allowed: bool) {
-        let opts = self.policy_authorization.options();
-        let mode = if self.delegated_policy {
-            "delegated"
-        } else if opts.policy_class.is_some() {
-            "server-default"
-        } else if self.identity.is_some() {
-            "identity"
-        } else {
-            "scope-only"
-        };
+        let effective_identity = self
+            .policy_authorization
+            .fixed_options()
+            .and_then(|o| o.identity.as_deref());
+        let mode = self.policy_authorization.mode();
         tracing::debug!(
             target: "fluree_db_server::authorization",
             issuer = %self.issuer,
-            effective_identity = ?opts.identity,
+            effective_identity = ?effective_identity,
             authorization_mode = mode,
             ledger = ledger_id,
             action,
@@ -194,49 +189,47 @@ pub(crate) async fn verify_data_principal(
         return Err(ServerError::unauthorized("token authorizes no resources"));
     }
 
-    let options = if let Some(policy) = &payload.fluree_policy {
-        if !config.policy_authorities.contains(&issuer)
-            || config.audience.as_deref().is_none_or(str::is_empty)
-        {
-            return Err(ServerError::unauthorized(
-                "Issuer is not a configured policy authority",
-            ));
-        }
-        fluree_db_api::GovernanceOptions {
-            identity: payload.resolve_identity(),
-            policy_class: policy.policy_class.clone(),
-            policy: policy.policy.clone(),
-            policy_values: policy.policy_values.clone(),
-            default_allow: policy.default_allow,
-        }
+    if payload.fluree_policy.is_some()
+        && (!config.policy_authorities.contains(&issuer)
+            || config.audience.as_deref().is_none_or(str::is_empty))
+    {
+        return Err(ServerError::unauthorized(
+            "Issuer is not a configured policy authority",
+        ));
+    }
+    let authorization = if matches!(payload.fluree_policy, Some(PolicyClaim::Request(_))) {
+        CredentialPolicy::Request
+    } else if let Some(PolicyClaim::Fixed(policy)) = &payload.fluree_policy {
+        CredentialPolicy::Fixed(fluree_db_api::PolicyAuthorization::from_trusted_options(
+            fluree_db_api::GovernanceOptions {
+                identity: payload.resolve_identity(),
+                policy_class: policy.policy_class.clone(),
+                policy: policy.policy.clone(),
+                policy_values: policy.policy_values.clone(),
+                default_allow: policy.default_allow,
+            },
+        ))
+    } else if payload.resolve_identity().is_none() && config.default_policy_class.is_none() {
+        CredentialPolicy::ScopeOnly
     } else {
-        // A trusted issuer can issue a scope-only service credential (no
-        // identity or policy class). Preserve that explicit coarse-access
-        // contract; it still cannot select arbitrary policies via request
-        // options, and mandatory ledger configuration remains authoritative.
-        let scope_only =
-            payload.resolve_identity().is_none() && config.default_policy_class.is_none();
-        fluree_db_api::GovernanceOptions {
-            identity: payload.resolve_identity(),
-            policy_class: config.default_policy_class.map(|c| vec![c]),
-            default_allow: scope_only.then_some(true),
-            ..Default::default()
-        }
+        CredentialPolicy::Fixed(fluree_db_api::PolicyAuthorization::from_trusted_options(
+            fluree_db_api::GovernanceOptions {
+                identity: payload.resolve_identity(),
+                policy_class: config.default_policy_class.map(|c| vec![c]),
+                ..Default::default()
+            },
+        ))
     };
-    Ok(build_principal(
-        &payload,
-        fluree_db_api::PolicyAuthorization::from_trusted_options(options),
-    ))
+    Ok(build_principal(&payload, authorization))
 }
 
 /// Build a `DataPrincipal` from verified claims.
 fn build_principal(
     payload: &EventsTokenPayload,
-    policy_authorization: fluree_db_api::PolicyAuthorization,
+    policy_authorization: CredentialPolicy,
 ) -> DataPrincipal {
     DataPrincipal {
         policy_authorization,
-        delegated_policy: payload.fluree_policy.is_some(),
         issuer: payload.iss.clone(),
         subject: payload.sub.clone(),
         identity: payload.resolve_identity(),

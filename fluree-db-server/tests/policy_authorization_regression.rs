@@ -90,7 +90,34 @@ async fn configured_model_policy_controls_delegated_reads_and_writes() {
         let delegated =
             delegated_token("http://example.org/application-user", ledger, grant.clone());
         let key = SigningKey::from_bytes(&[205; 32]);
-        let mut tokens = vec![delegated];
+        let controller_key = SigningKey::from_bytes(&[200; 32]);
+        if allowed {
+            let controller = create_jws(&controller_claims(ledger), &controller_key);
+            let empty = serde_json::json!({
+                "opts": {"identity": "http://example.org/manager-user", "policy-class": []},
+                "select": ["?value"],
+                "where": {"@id": "http://example.org/doc1", "http://schema.org/name": "?value"}
+            });
+            let (status, body) = post_policy_request(
+                &app,
+                &format!("/v1/fluree/query/{ledger}"),
+                Some(&controller),
+                "application/json",
+                empty.to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                body,
+                serde_json::json!([]),
+                "empty groups must not inherit model defaults"
+            );
+        }
+
+        let mut tokens = vec![
+            delegated,
+            create_jws(&controller_claims(ledger), &controller_key),
+        ];
         if !allowed {
             tokens.push(identity_token_rw(
                 &key,
@@ -107,13 +134,18 @@ async fn configured_model_policy_controls_delegated_reads_and_writes() {
                 &key,
             ));
         }
-        for token in tokens {
+        for (index, token) in tokens.into_iter().enumerate() {
+            let request_opts = if index < 2 {
+                grant.clone()
+            } else {
+                serde_json::json!({})
+            };
             for (property, expected) in [
                 ("http://schema.org/name", 1),
                 ("http://example.org/content", usize::from(allowed)),
             ] {
                 let query = serde_json::json!({
-                    "opts": grant, "select": ["?value"],
+                    "opts": request_opts, "select": ["?value"],
                     "where": {"@id": "http://example.org/doc1", (property): "?value"}
                 });
                 let (status, result) = post_policy_request(
@@ -137,7 +169,7 @@ async fn configured_model_policy_controls_delegated_reads_and_writes() {
                 "delete": {"@id": "http://example.org/doc1", "http://example.org/content": "visible to all"},
                 "insert": {"@id": "http://example.org/doc1", "http://example.org/content": "rewritten"}
             });
-            body["opts"] = grant.clone();
+            body["opts"] = request_opts;
             let (status, result) = post_policy_request(
                 &app,
                 &format!("/v1/fluree/update/{ledger}"),
@@ -227,9 +259,7 @@ async fn signed_request_identity_does_not_inherit_bearer_delegation() {
         create_jws(&query, &key),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{result}");
-    assert_eq!(names_from_results(&result).len(), 2, "{result}");
-    assert!(!names_from_results(&result).contains(&"Executive Salaries"));
+    assert_eq!(status, StatusCode::FORBIDDEN, "{result}");
 }
 
 #[cfg(feature = "graphql")]
@@ -281,8 +311,6 @@ async fn graphql_mutation_preserves_verified_authorization() {
                 .uri(format!("/v1/fluree/graphql/{ledger}"))
                 .header("content-type", "application/json")
                 .header("authorization", format!("Bearer {denied}"))
-                .header("fluree-policy-class", "http://example.org/ManagerClass")
-                .header("fluree-default-allow", "true")
                 .body(Body::from(mutation.to_string()))
                 .unwrap(),
         )
@@ -410,11 +438,10 @@ async fn restricted_bearer_cannot_replace_or_supplement_policy() {
             .await
             .unwrap();
         let (status, result) = json_body(resp).await;
-        assert_eq!(status, StatusCode::OK, "{result}");
-        let names = names_from_results(&result);
-        println!("restricted bearer opts={opts}: {names:?}");
-        assert_eq!(names.len(), 2);
-        assert!(!names.contains(&"Executive Salaries"));
+        assert_eq!(status, StatusCode::FORBIDDEN, "{result}");
+        assert!(result
+            .to_string()
+            .contains("Credential does not permit policy selection"));
     }
     let body = serde_json::json!({
         "from": {"@id": ledger, "policy": {"identity": "http://example.org/manager-user", "default-allow": false}},
@@ -435,11 +462,7 @@ async fn restricted_bearer_cannot_replace_or_supplement_policy() {
         .await
         .unwrap();
     let (status, result) = json_body(resp).await;
-    assert_eq!(status, StatusCode::OK, "{result}");
-    let names = names_from_results(&result);
-    println!("restricted bearer per-source identity override: {names:?}");
-    assert_eq!(names.len(), 2);
-    assert!(!names.contains(&"Executive Salaries"));
+    assert_eq!(status, StatusCode::FORBIDDEN, "{result}");
 }
 
 #[tokio::test]
@@ -563,8 +586,7 @@ async fn signed_policy_context_requires_authority_scope_and_valid_signature() {
     let token = identity_token(&ordinary, "http://example.org/unassigned", ledger);
     let (status, result) =
         query_docs_as(app, ledger, &token, "http://example.org/manager-user").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(names_from_results(&result).is_empty());
+    assert_eq!(status, StatusCode::FORBIDDEN, "{result}");
 }
 
 #[tokio::test]
@@ -577,7 +599,7 @@ async fn policy_headers_cannot_widen_sparql_reads() {
         "http://example.org/employee-user",
         ledger,
     );
-    for (uri, content_type, body, stream) in [
+    for (uri, content_type, body, _stream) in [
         (format!("/v1/fluree/query/{ledger}"), "application/sparql-query", "SELECT ?name WHERE { ?doc a <http://example.org/Document>; <http://schema.org/name> ?name }".to_string(), false),
         ("/v1/fluree/query".into(), "application/sparql-query", format!("SELECT ?name FROM <{ledger}> WHERE {{ ?doc a <http://example.org/Document>; <http://schema.org/name> ?name }}"), false),
         ("/v1/fluree/stream/query".into(), "application/sparql-query", format!("SELECT ?name FROM <{ledger}> WHERE {{ ?doc a <http://example.org/Document>; <http://schema.org/name> ?name }}"), true),
@@ -591,14 +613,7 @@ async fn policy_headers_cannot_widen_sparql_reads() {
             .header("fluree-policy-values", r#"{"?$identity":{"@id":"http://example.org/manager-user"}}"#)
             .header("fluree-default-allow", "true")
             .body(Body::from(body)).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let text = std::str::from_utf8(&bytes).unwrap();
-        assert!(text.contains("Public Post") && text.contains("Internal Memo"), "{uri}: {text}");
-        assert!(!text.contains("Executive Salaries"), "{uri}: {text}");
-        if !stream {
-            assert_eq!(sparql_names(&serde_json::from_str(text).unwrap()).len(), 2);
-        }
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
     }
 }
 
@@ -671,10 +686,10 @@ async fn hostile_policy_selection_cannot_authorize_a_write() {
             .await
             .unwrap();
         let (status, error) = json_body(resp).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{content_type}: {error}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{content_type}: {error}");
         assert!(error
             .to_string()
-            .contains("Employees may not modify document content."));
+            .contains("Credential does not permit policy selection"));
     }
     let query = serde_json::json!({"select": ["?content"], "where": {"@id": "http://example.org/doc1", "http://example.org/content": "?content"}});
     let resp = app
@@ -729,10 +744,13 @@ async fn dataset_options_and_envelope_defaults_cannot_replace_authority() {
             .await
             .unwrap();
         let (status, rows) = json_body(resp).await;
-        assert_eq!(status, StatusCode::OK, "{uri}: {rows}");
-        assert_eq!(names_from_results(&rows).len(), 2);
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {rows}");
         let mut redirected = query.clone();
         redirected["opts"]["from"]["@id"] = serde_json::json!(other);
+        redirected["opts"]["from"]
+            .as_object_mut()
+            .unwrap()
+            .remove("policy");
         let resp = app
             .clone()
             .oneshot(
@@ -768,22 +786,521 @@ async fn dataset_options_and_envelope_defaults_cannot_replace_authority() {
         .await
         .unwrap();
     let (status, result) = json_body(resp).await;
-    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{result}");
+    assert!(!result.to_string().contains("Executive Salaries"));
     assert!(
         result
-            .get("errors")
-            .is_none_or(|e| e.as_object().is_some_and(serde_json::Map::is_empty)),
+            .to_string()
+            .contains("Credential does not permit policy selection"),
         "{result}"
     );
+}
+
+#[tokio::test]
+async fn controller_selects_dynamic_policies_without_changing_credential() {
+    let (_tmp, state) = policy_test_state().await;
+    let ledger = "controller:main";
+    let app = setup_policy_ledger(build_router(state), ledger).await;
+    add_modify_policies(&app, ledger).await;
+    let key = SigningKey::from_bytes(&[200; 32]);
+    let token = create_jws(&controller_claims(ledger), &key);
+    for (class, count) in [
+        ("PublicClass", 1),
+        ("EmployeeClass", 2),
+        ("ManagerClass", 3),
+    ] {
+        let query = serde_json::json!({
+            "opts": {"identity": "http://example.org/manager-user", "policyClass": [format!("http://example.org/{class}")]},
+            "from": [{"@id": ledger}],
+            "select": ["?name"],
+            "where": {"@id": "?s", "http://schema.org/name": "?name"}
+        });
+        let (status, body) = post_policy_request(
+            &app,
+            &format!("/v1/fluree/query/{ledger}"),
+            Some(&token),
+            "application/json",
+            query.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.as_array().unwrap().len(), count, "{body}");
+    }
+    // An empty set of application grants is not the same as omitting policy
+    // selection. Both missing selection and empty grants fail closed.
+    for (opts, expected) in [
+        (serde_json::json!({}), 0),
+        (serde_json::json!({"policy-class": []}), 0),
+        (
+            serde_json::json!({"policy-values": {"?unused": "value"}}),
+            0,
+        ),
+        (
+            serde_json::json!({"identity": "http://example.org/manager-user", "policy-class": []}),
+            0,
+        ),
+        (serde_json::json!({"default-allow": false}), 0),
+    ] {
+        let query = serde_json::json!({"opts": opts, "select": ["?name"],
+            "where": {"@id": "?s", "http://schema.org/name": "?name"}});
+        let (status, body) = post_policy_request(
+            &app,
+            &format!("/v1/fluree/query/{ledger}"),
+            Some(&token),
+            "application/json",
+            query.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body.as_array().unwrap().len(), expected, "{body}");
+    }
+    // Identity can be chosen dynamically without specifying a class as well.
+    let query = serde_json::json!({"opts": {"identity": "http://example.org/employee-user"},
+        "select": ["?name"], "where": {"@id": "?s", "http://schema.org/name": "?name"}});
+    let (status, body) = post_policy_request(
+        &app,
+        &format!("/v1/fluree/query/{ledger}"),
+        Some(&token),
+        "application/json",
+        query.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.as_array().unwrap().len(), 2, "{body}");
+
+    // Inline policy and variable bindings also belong to the app, not to the
+    // credential subject. Reuse the same token to choose another user's data.
+    assign_docs_to_identities(&app, ledger).await;
+    let query = serde_json::json!({
+        "opts": {
+            "policy": [{"@type": "f:AccessPolicy", "f:action": [{"@id": "f:view"}],
+                "f:query": {"@type": "@json", "@value": {
+                    "where": {"@id": "?$this", "http://example.org/assignedTo": "?$identity"}
+                }}
+            }],
+            "policy-values": {"?$identity": {"@id": "http://example.org/employee-user"}},
+            "default-allow": false
+        },
+        "select": ["?name"], "where": {"@id": "?s", "http://schema.org/name": "?name"}
+    });
+    let (status, body) = post_policy_request(
+        &app,
+        &format!("/v1/fluree/query/{ledger}"),
+        Some(&token),
+        "application/json",
+        query.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, serde_json::json!([["Internal Memo"]]));
+
+    // SPARQL uses the same selection via existing headers.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/query/{ledger}"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/sparql-query")
+                .header("fluree-policy-class", "http://example.org/EmployeeClass")
+                .body(Body::from(
+                    "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        names_from_results(&result["results"]["jsonld"]).len(),
+        body["results"]["bindings"].as_array().unwrap().len(),
         2,
-        "{result}"
+        "{body}"
     );
-    assert_eq!(
-        sparql_names(&result["results"]["sparql"]).len(),
-        2,
-        "{result}"
+
+    for (class, expected) in [
+        ("EmployeeClass", StatusCode::BAD_REQUEST),
+        ("ManagerClass", StatusCode::OK),
+    ] {
+        let mut update = modify_public_doc_content_body();
+        update["opts"] = serde_json::json!({"policy-class": [format!("http://example.org/{class}")], "default-allow": true});
+        let (status, body) = post_policy_request(
+            &app,
+            &format!("/v1/fluree/update/{ledger}"),
+            Some(&token),
+            "application/json",
+            update.to_string(),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn controller_capability_requires_explicit_claim_authority_and_scope() {
+    let (_tmp, state) = policy_test_state().await;
+    let ledger = "controller-gates:main";
+    let app = setup_policy_ledger(build_router(state), ledger).await;
+    let key = SigningKey::from_bytes(&[200; 32]);
+    let query = serde_json::json!({"opts": {"policy-class": ["http://example.org/ManagerClass"], "default-allow": true},
+        "select": ["?name"], "where": {"@id": "?s", "http://schema.org/name": "?name"}});
+    let mut ordinary = controller_claims(ledger);
+    ordinary.as_object_mut().unwrap().remove("fluree.policy");
+    let ordinary = create_jws(&ordinary, &key);
+    let (status, body) = post_policy_request(
+        &app,
+        &format!("/v1/fluree/query/{ledger}"),
+        Some(&ordinary),
+        "application/json",
+        query.to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    for case in [
+        "untrusted-authority",
+        "invalid-policy-mode",
+        "wrong-audience",
+        "expired",
+        "wrong-scope",
+        "null-claim",
+    ] {
+        let mut claims = controller_claims(ledger);
+        let other = SigningKey::from_bytes(&[201; 32]);
+        let signing_key = if case == "untrusted-authority" {
+            &other
+        } else {
+            &key
+        };
+        claims["iss"] = did_from_pubkey(&signing_key.verifying_key().to_bytes()).into();
+        match case {
+            "invalid-policy-mode" => {
+                claims["fluree.policy"] = serde_json::json!(["request", {"default-allow": false}]);
+            }
+            "wrong-audience" => claims["aud"] = "other-server".into(),
+            "expired" => claims["exp"] = 1.into(),
+            "wrong-scope" => {
+                claims["fluree.ledger.read.ledgers"] = serde_json::json!(["other:main"]);
+            }
+            "null-claim" => claims["fluree.policy"] = JsonValue::Null,
+            _ => {}
+        }
+        let token = create_jws(&claims, signing_key);
+        let (status, body) = post_policy_request(
+            &app,
+            &format!("/v1/fluree/query/{ledger}"),
+            Some(&token),
+            "application/json",
+            query.to_string(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            if case == "wrong-scope" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::UNAUTHORIZED
+            },
+            "{case}: {body}"
+        );
+    }
+    let mut read_only = controller_claims(ledger);
+    read_only
+        .as_object_mut()
+        .unwrap()
+        .remove("fluree.ledger.write.ledgers");
+    let token = create_jws(&read_only, &key);
+    let (status, body) = post_policy_request(
+        &app,
+        &format!("/v1/fluree/update/{ledger}"),
+        Some(&token),
+        "application/json",
+        modify_public_doc_content_body().to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
+#[tokio::test]
+async fn scope_only_preserves_delimited_output_and_ledger_write_defaults() {
+    let (_tmp, state) = policy_test_state().await;
+    let ledger = "scope-defaults:main";
+    let app = setup_policy_ledger(build_router(state), ledger).await;
+    add_modify_policies(&app, ledger).await;
+    let key = SigningKey::from_bytes(&[200; 32]);
+    let mut claims = controller_claims(ledger);
+    claims.as_object_mut().unwrap().remove("fluree.policy");
+    claims.as_object_mut().unwrap().remove("sub");
+    let token = create_jws(&claims, &key);
+    let query = serde_json::json!({
+        "select": ["?name"], "where": {"@id": "?s", "http://schema.org/name": "?name"}});
+    for format in ["text/csv", "text/tab-separated-values"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/fluree/query/{ledger}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .header("accept", format)
+                    .body(Body::from(query.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{format}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            text.contains("Executive Salaries"),
+            "scope-only request has no policy selection: {text}"
+        );
+    }
+    let config = format!(
+        r"@prefix f: <https://ns.flur.ee/db#> . @prefix ex: <http://example.org/> .
+        GRAPH <urn:fluree:{ledger}#config> {{
+          <urn:cfg:main> a f:LedgerConfig ; f:policyDefaults <urn:cfg:policy> .
+          <urn:cfg:policy> f:defaultAllow true ; f:policyClass ex:EmployeeClass .
+        }}"
     );
-    assert!(!result.to_string().contains("Executive Salaries"));
+    let (status, body) = post_policy_request(
+        &app,
+        &format!("/v1/fluree/upsert/{ledger}"),
+        None,
+        "application/trig",
+        config,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Default governance must survive both the plain and dataset read paths,
+    // including streaming and delimited output after the null-marker fix.
+    for (route, content_type, accept, dataset) in [
+        ("query", "application/json", "application/json", false),
+        ("query", "application/json", "application/json", true),
+        ("query", "application/json", "text/csv", false),
+        (
+            "query",
+            "application/sparql-query",
+            "application/json",
+            false,
+        ),
+        (
+            "stream/query",
+            "application/json",
+            "application/x-ndjson",
+            false,
+        ),
+        (
+            "stream/query",
+            "application/sparql-query",
+            "application/x-ndjson",
+            false,
+        ),
+    ] {
+        let mut query = serde_json::json!({"select": ["?name"],
+            "where": {"@id": "?s", "http://schema.org/name": "?name"}});
+        if dataset {
+            query["from"] = serde_json::json!([ledger]);
+        }
+        let body = if content_type == "application/json" {
+            query.to_string()
+        } else {
+            "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }".into()
+        };
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/fluree/{route}/{ledger}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", content_type)
+                    .header("accept", accept)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{route}: {content_type}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains("Public Post"), "{route}: {text}");
+        assert!(!text.contains("Executive Salaries"), "{route}: {text}");
+    }
+    for bearer in [None, Some(token.as_str())] {
+        let (status, body) = post_policy_request(
+            &app,
+            &format!("/v1/fluree/update/{ledger}"),
+            bearer,
+            "application/json",
+            modify_public_doc_content_body().to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.to_string().contains("Employees may not modify"),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn show_preserves_narrowing_delegation_and_controller_headers() {
+    let (_tmp, state) = policy_test_state().await;
+    let ledger = "show-delegation:main";
+    let app = setup_policy_ledger(build_router(state), ledger).await;
+    let (status, body) = post_policy_request(&app, &format!("/v1/fluree/insert/{ledger}"), None, "application/json",
+        serde_json::json!({"@context": {"ex": "http://example.org/", "schema": "http://schema.org/"}, "insert": [
+            {"@id": "ex:new-public", "schema:name": "New public", "ex:classification": "public"},
+            {"@id": "ex:new-secret", "schema:name": "New secret", "ex:classification": "confidential"}
+        ]}).to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let t = body["t"].as_i64().unwrap();
+    let delegated = delegated_token(
+        "http://example.org/manager-user",
+        ledger,
+        serde_json::json!({"policy-class": ["http://example.org/EmployeeClass"]}),
+    );
+    let key = SigningKey::from_bytes(&[200; 32]);
+    let controller = create_jws(&controller_claims(ledger), &key);
+    for (token, class, secret) in [
+        (&delegated, "EmployeeClass", false),
+        (&controller, "EmployeeClass", false),
+        (&controller, "ManagerClass", true),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/fluree/show/{ledger}?commit=t:{t}"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("fluree-policy-class", format!("http://example.org/{class}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = json_body(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let flakes = body["flakes"].to_string();
+        assert!(flakes.contains("New public"), "{body}");
+        assert_eq!(flakes.contains("New secret"), secret, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn mcp_refuses_policy_credentials_instead_of_discarding_context() {
+    use fluree_db_server::mcp::auth::validate_mcp_token;
+    let key = SigningKey::from_bytes(&[200; 32]);
+    let issuer = did_from_pubkey(&key.verifying_key().to_bytes());
+    let (_tmp, state) = policy_transport_regression::transport_state(ServerConfig {
+        mcp_auth_trusted_issuers: vec![issuer],
+        ..Default::default()
+    })
+    .await;
+    // Use the actual authentication middleware with a sentinel handler, so the
+    // ordinary credential proves that the refusal isn't a missing route.
+    let app = axum::Router::new()
+        .route("/", axum::routing::get(|| async { StatusCode::OK }))
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            validate_mcp_token,
+        ));
+    for mode in ["ordinary", "delegated", "controller"] {
+        let mut claims = controller_claims("mcp:main");
+        claims.as_object_mut().unwrap().remove("fluree.policy");
+        match mode {
+            "delegated" => {
+                claims["fluree.policy"] =
+                    serde_json::json!({"policy-class": ["http://example.org/EmployeeClass"]});
+            }
+            "controller" => claims["fluree.policy"] = "request".into(),
+            _ => {}
+        }
+        let token = create_jws(&claims, &key);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if mode == "ordinary" {
+                StatusCode::OK
+            } else {
+                StatusCode::UNAUTHORIZED
+            },
+            "{mode}"
+        );
+    }
+}
+
+fn controller_claims(ledger: &str) -> JsonValue {
+    let key = SigningKey::from_bytes(&[200; 32]);
+    serde_json::json!({
+        "iss": did_from_pubkey(&key.verifying_key().to_bytes()),
+        "aud": "fluree-policy-test", "sub": "http://example.org/public-user",
+        "exp": now_secs() + 300,
+        "fluree.ledger.read.ledgers": [ledger],
+        "fluree.ledger.write.ledgers": [ledger],
+        "fluree.policy": "request"
+    })
+}
+
+#[tokio::test]
+async fn authority_alone_authenticates_and_missing_request_context_denies() {
+    let key = SigningKey::from_bytes(&[200; 32]);
+    let (_tmp, state) = policy_transport_regression::transport_state(ServerConfig {
+        data_auth_mode: DataAuthMode::Optional,
+        data_auth_audience: Some("fluree-policy-test".into()),
+        data_auth_policy_authorities: vec![did_from_pubkey(&key.verifying_key().to_bytes())],
+        ..Default::default()
+    })
+    .await;
+    let ledger = "authority-alone:main";
+    let app = setup_policy_ledger(build_router(state), ledger).await;
+    let token = create_jws(&controller_claims(ledger), &key);
+    for (opts, expected) in [
+        (serde_json::json!({}), 0),
+        (serde_json::json!({"identity": null}), 0),
+        (serde_json::json!({"default-allow": true}), 3),
+    ] {
+        let (status, result) = post_policy_request(
+            &app,
+            &format!("/v1/fluree/query/{ledger}"),
+            Some(&token),
+            "application/json",
+            serde_json::json!({"opts": opts,
+                "select": ["?name"], "where": {"@id": "?s", "http://schema.org/name": "?name"}})
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result.as_array().unwrap().len(), expected, "{result}");
+    }
+    // A headers-only write must resolve the same missing selection to deny.
+    let (status, result) = post_policy_request(
+        &app,
+        &format!("/v1/fluree/insert/{ledger}"),
+        Some(&token),
+        "text/turtle",
+        "<http://example.org/new> <http://schema.org/name> \"New\" .".into(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+    // Omitting auth still supports the private-server direct-option contract.
+    let (status, result) = query_docs_tri_state(app, ledger, None, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(names_from_results(&result).len(), 3);
 }
