@@ -96,7 +96,7 @@ async fn stream_query_connection_inner(
         &state,
         headers,
         bearer.0.as_ref(),
-        &credential,
+        credential.did(),
     )?;
     let span = tracing::Span::current();
 
@@ -151,7 +151,10 @@ async fn stream_query_connection_inner(
         let dataset = fluree
             .build_stream_dataset_for_sparql(
                 &sparql,
-                &crate::routes::query::sparql_qc_opts(headers.identity.as_deref(), &headers)?,
+                &crate::routes::policy_auth::bound_governance(
+                    headers.identity.as_deref(),
+                    &headers,
+                )?,
             )
             .await
             .map_err(ServerError::Api)?;
@@ -238,7 +241,7 @@ async fn stream_query_inner(
         &state,
         headers,
         bearer.0.as_ref(),
-        &credential,
+        credential.did(),
     )?;
     let span = tracing::Span::current();
 
@@ -281,7 +284,7 @@ async fn stream_query_inner(
         // `Fluree-Policy*` / `Fluree-Default-Allow` headers.
 
         let identity = headers.identity.clone();
-        let qc_opts = crate::routes::query::sparql_qc_opts(identity.as_deref(), &headers)?;
+        let qc_opts = crate::routes::policy_auth::bound_governance(identity.as_deref(), &headers)?;
 
         // Detect FROM/FROM NAMED dataset clauses.
         let parsed = fluree_db_sparql::parse_sparql(&sparql);

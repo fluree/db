@@ -2755,7 +2755,7 @@ pub struct TokenCreateArgs {
     /// Allow this backend credential to select request policies (requires --audience
     /// and a receiving server that trusts the issuer as a policy authority)
     #[arg(long, requires = "audiences")]
-    pub policy_controller: bool,
+    pub policy_select: bool,
 
     /// Grant access to all ledgers (fluree.events.all=true, fluree.storage.all=true)
     #[arg(long)]

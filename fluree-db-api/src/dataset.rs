@@ -899,14 +899,23 @@ impl GovernanceOptions {
         self.default_allow.unwrap_or(false)
     }
 
-    /// Whether the request explicitly selects policy enforcement. An empty
-    /// class selection and an explicit deny default are meaningful inputs.
-    pub fn has_any_policy_inputs(&self) -> bool {
+    /// Whether the request selects or changes the policy set, subject to
+    /// configured override controls. An empty class list selects no stored rules;
+    /// an allow default can widen access. A deny default alone only narrows the
+    /// configured set and does not count as a replacement selection.
+    pub fn selects_policy_set(&self) -> bool {
         self.identity.is_some()
             || self.policy_class.is_some()
             || self.policy.as_ref().is_some_and(|p| !p.is_null())
             || self.policy_values.as_ref().is_some_and(|m| !m.is_empty())
-            || self.default_allow.is_some()
+            || self.default_allow == Some(true)
+    }
+
+    /// Whether the request engages policy enforcement. Unlike
+    /// [`Self::selects_policy_set`], a deny default alone counts: it must not take
+    /// the unrestricted shortcut, even though it retains configured policies.
+    pub fn has_any_policy_inputs(&self) -> bool {
+        self.selects_policy_set() || self.default_allow == Some(false)
     }
 }
 

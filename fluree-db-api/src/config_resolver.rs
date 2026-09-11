@@ -356,16 +356,9 @@ pub fn merge_policy_opts(
         None => return opts.clone(),
     };
 
-    // Does the query specify any policy inputs?
-    // A deny default alone narrows configured policies; it does not replace
-    // their class selection. It still engages enforcement at execution time.
-    let query_has_policy = opts.identity.is_some()
-        || opts.policy_class.is_some()
-        || opts.policy.as_ref().is_some_and(|p| !p.is_null())
-        || opts.policy_values.as_ref().is_some_and(|v| !v.is_empty())
-        || opts.default_allow == Some(true);
+    let query_selects_policy = opts.selects_policy_set();
     let override_denied =
-        query_has_policy && !policy.override_control.permits_override(server_identity);
+        query_selects_policy && !policy.override_control.permits_override(server_identity);
 
     let mut merged = opts.clone();
 
@@ -400,10 +393,11 @@ pub fn merge_policy_opts(
     }
 
     // policy_class stays request-first: config supplies it only when the request
-    // carried no policy inputs at all. Widening this to "fill when unset" would
+    // did not select a policy set (a deny default alone only narrows it).
+    // Widening this to "fill when unset" would
     // start applying config's f:policyClass to identity-carrying requests on the
     // local path, which it never has — see the note in fluree_ext.rs::wrap_policy.
-    if !query_has_policy {
+    if !query_selects_policy {
         if let Some(ref classes) = policy.policy_class {
             merged.policy_class = Some(classes.clone());
         }
@@ -2593,18 +2587,28 @@ mod tests {
     fn either_explicit_default_counts_as_a_policy_input() {
         let unset = GovernanceOptions::default();
         assert!(!unset.has_any_policy_inputs());
+        assert!(!unset.selects_policy_set());
 
         let explicit_false = GovernanceOptions {
             default_allow: Some(false),
             ..Default::default()
         };
         assert!(explicit_false.has_any_policy_inputs());
+        assert!(!explicit_false.selects_policy_set());
 
         let explicit_true = GovernanceOptions {
             default_allow: Some(true),
             ..Default::default()
         };
         assert!(explicit_true.has_any_policy_inputs());
+        assert!(explicit_true.selects_policy_set());
+
+        let empty_classes = GovernanceOptions {
+            policy_class: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(empty_classes.has_any_policy_inputs());
+        assert!(empty_classes.selects_policy_set());
     }
 
     /// An explicit `Some(false)` survives even though it carries no *other*

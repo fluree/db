@@ -2,10 +2,10 @@ use assert_cmd::cargo_bin_cmd;
 use fluree_db_credential::{verify_jws, EventsTokenPayload};
 
 #[test]
-fn controller_credential_is_explicit_signed_and_scoped() {
+fn request_selection_credential_is_explicit_signed_and_scoped() {
     // Fixed fixture key, used only to verify the CLI's signed output locally.
     let key = format!("0x{}", "42".repeat(32));
-    for controller in [false, true] {
+    for select_policy in [false, true] {
         let mut cmd = cargo_bin_cmd!("fluree");
         cmd.args([
             "token",
@@ -17,8 +17,8 @@ fn controller_credential_is_explicit_signed_and_scoped() {
             "--read-ledger",
             "books:main",
         ]);
-        if controller {
-            cmd.arg("--policy-controller");
+        if select_policy {
+            cmd.arg("--policy-select");
         }
         let output = cmd.assert().success().get_output().stdout.clone();
         let token = String::from_utf8(output).unwrap();
@@ -32,7 +32,7 @@ fn controller_credential_is_explicit_signed_and_scoped() {
                 claims.fluree_policy,
                 Some(fluree_db_credential::jwt_claims::PolicyClaim::Request(_))
             ),
-            controller
+            select_policy
         );
         assert_eq!(
             claims.ledger_read_ledgers,
@@ -43,7 +43,7 @@ fn controller_credential_is_explicit_signed_and_scoped() {
 }
 
 #[test]
-fn controller_creation_requires_an_audience() {
+fn request_selection_creation_requires_an_audience() {
     cargo_bin_cmd!("fluree")
         .args([
             "token",
@@ -52,7 +52,7 @@ fn controller_creation_requires_an_audience() {
             "0x4242424242424242424242424242424242424242424242424242424242424242",
             "--read-ledger",
             "books:main",
-            "--policy-controller",
+            "--policy-select",
         ])
         .assert()
         .failure()

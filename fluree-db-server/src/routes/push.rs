@@ -64,31 +64,23 @@ async fn push_ledger_local(
         }
     }
 
-    // Build policy options.
-    //
-    let mut governance = GovernanceOptions {
-        // Identity is non-spoofable: derived from bearer token (fluree.identity ?? sub).
-        identity: bearer.as_ref().and_then(|p| p.identity.clone()),
-        // Allow client-provided inline policy and policy-values headers.
-        policy: headers.policy.clone(),
-        policy_values: headers.policy_values_map()?,
-        ..Default::default()
+    // Push has no signed body credential; bind its verified bearer exactly as
+    // ordinary writes do, then resolve the complete header selection.
+    let headers =
+        crate::routes::policy_auth::bind_authorization(&state, headers, bearer.as_ref(), None)?;
+    let governance = if bearer.is_some() {
+        crate::routes::policy_auth::bound_governance(headers.identity.as_deref(), &headers)?
+    } else {
+        // Preserve the anonymous push defaults, including the server class.
+        GovernanceOptions {
+            policy_class: data_auth.default_policy_class.map(|c| vec![c]).or_else(|| {
+                (!headers.policy_class.is_empty()).then(|| headers.policy_class.clone())
+            }),
+            policy: headers.policy.clone(),
+            policy_values: headers.policy_values_map()?,
+            ..Default::default()
+        }
     };
-
-    // Force server default policy-class if configured (non-spoofable).
-    if let Some(pc) = data_auth.default_policy_class.as_ref() {
-        governance.policy_class = Some(vec![pc.clone()]);
-    } else if !headers.policy_class.is_empty() {
-        governance.policy_class = Some(headers.policy_class.clone());
-    }
-
-    // Push has no signed body credential. Its verified bearer selects policy;
-    // inline/header grants cannot replace it, just as on ordinary writes.
-    if let Some(principal) = &bearer {
-        governance = principal.policy_authorization.resolve_options(
-            &crate::routes::query::sparql_qc_opts(headers.identity.as_deref(), &headers)?,
-        )?;
-    }
 
     let idempotency_key = extract_idempotency_key(&headers.raw)?;
 

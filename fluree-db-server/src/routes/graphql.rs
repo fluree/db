@@ -53,7 +53,7 @@ pub async fn graphql_ledger_tail(
         &state,
         headers,
         bearer.0.as_ref(),
-        &credential,
+        credential.did(),
     )?;
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
@@ -129,7 +129,7 @@ pub async fn graphql_schema_ledger_tail(
         &state,
         headers,
         bearer.0.as_ref(),
-        &credential,
+        credential.did(),
     )?;
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
@@ -200,7 +200,8 @@ async fn execute_mutation(
         .map_err(ServerError::Api)?;
     // Bound headers carry the verified selection, including caller default-deny
     // narrowing. The API retains it through schema, writes, and read-back.
-    let governance = crate::routes::query::sparql_qc_opts(headers.identity.as_deref(), headers)?;
+    let governance =
+        crate::routes::policy_auth::bound_governance(headers.identity.as_deref(), headers)?;
     let result = if governance.has_any_policy_inputs() {
         let authorization = fluree_db_api::PolicyAuthorization::from_trusted_options(governance);
         state

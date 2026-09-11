@@ -23,7 +23,7 @@ audience = "fluree-production"
 policy_authorities = ["did:key:<app-signing-key>"]
 ```
 
-A policy authority is also a trusted issuer; do not list it twice. Additional login-only issuers belong in `trusted_issuers` and cannot issue policy capabilities. OIDC authorities still need configured JWKS verification. Only designate an issuer that controls the policy claim, rather than allowing users to set it through profile data.
+A policy authority is also a trusted issuer and need not be listed again in `trusted_issuers`. Additional login-only issuers belong in `trusted_issuers` and cannot issue policy capabilities. OIDC authorities still need configured JWKS verification. Only designate an issuer that controls the policy claim, rather than allowing users to set it through profile data.
 
 Create a reusable application credential:
 
@@ -31,7 +31,7 @@ Create a reusable application credential:
 fluree token create --private-key @app.key --subject backend \
   --audience fluree-production --expires-in 1h \
   --read-ledger customer/data:main --write-ledger customer/data:main \
-  --policy-controller
+  --policy-select
 ```
 
 The CLI signs `"fluree.policy": "request"` together with the audience, expiry, and ledger scopes. Keep this credential in the backend and renew it before expiry. The application authenticates its users, resolves their grants, and supplies the resulting context:
@@ -95,12 +95,19 @@ let result = fluree.query_from()
     .execute_formatted().await?;
 ```
 
-`PolicyAuthorization` always holds a fixed context. Empty trusted inputs deny; the host authorizes each ledger separately. No token or issuer configuration is required inside the process. The helper replaces query-supplied selections with the host's selection; credential conflict errors are enforced at the server boundary.
+`PolicyAuthorization` always holds a fixed context. Empty trusted inputs deny; the host authorizes each ledger separately. No token or issuer configuration is required inside the process. The embedded helper silently replaces query-supplied selections with the host's fixed selection, preserving `default-allow: false` narrowing; it does not report selection conflicts. HTTP credential binding instead rejects conflicting selections with 403.
 
 ## Transport support and migration
 
 HTTP queries, streaming, transactions, GraphQL, push, and commit show use the same credential selection rules. Bolt supports fixed selections; request-selected credentials without a selection deny, and explicit `imp_user` requests are rejected until impersonation is supported. MCP and storage proxy reject either policy claim because they cannot enforce the complete selection contract. Use separate replication credentials for storage access. `/log` returns read-scoped commit metadata, not policy-filtered flakes. GraphQL mutations on Raft servers return 501; use transaction endpoints.
 
 Clients that previously used policy-free identities to impersonate must use an application credential or fixed delegation. Conflicting `--as` and policy options now return 403 rather than silently displaying another view. Plain and streaming connection reads honor configured defaults, including an explicit deny default with no class selection. Applications that used omitted options for privileged reads must select their intended privileged context explicitly. No-auth, unconfigured deployments remain unrestricted.
+
+Other user-visible changes:
+
+- An explicit `default-allow: false` is now an enforcement input, closing the unrestricted shortcut when it is the only policy option. Configured rules still apply; unmatched access is denied.
+- `policy-class: []` explicitly selects no stored class rules instead of being treated as absent. It does not fall back to the identity's classes; configured override restrictions still apply.
+- A non-string `identity` or non-boolean `default-allow` in JSON policy options now returns HTTP 400 instead of being silently ignored. Omission and JSON `null` still leave either field unset.
+- Policy headers (`fluree-identity`, `fluree-policy-class`, `fluree-policy`, `fluree-policy-values`, and `fluree-default-allow`) now supply defaults for JSON-LD transaction body options even when tracking is disabled. This intentional bug fix also applies to anonymous/no-auth requests. Body options retain precedence, and credential checks still apply.
 
 Enable `RUST_LOG=info,fluree_db_server::authorization=debug` for credential scope events: issuer, effective identity for fixed contexts, mode (`fixed`, `request-selected`, `scope-only`), ledger, action, and scope decision. These precede policy evaluation; request-selected scope events do not identify the dynamically selected user. Tokens, inline policies, and policy values are omitted. See [Benchmarks](../contributing/benches.md) for measuring authorization overhead.

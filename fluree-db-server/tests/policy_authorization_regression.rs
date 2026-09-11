@@ -1150,6 +1150,53 @@ async fn scope_only_preserves_delimited_output_and_ledger_write_defaults() {
 }
 
 #[tokio::test]
+async fn anonymous_transaction_policy_headers_apply_without_tracking() {
+    for mode in [DataAuthMode::None, DataAuthMode::Optional] {
+        let (_tmp, state) = policy_transport_regression::transport_state(ServerConfig {
+            data_auth_mode: mode,
+            ..Default::default()
+        })
+        .await;
+        let ledger = "anonymous-header-defaults:main";
+        let app = setup_policy_ledger(build_router(state), ledger).await;
+        add_modify_policies(&app, ledger).await;
+
+        // No tracking headers or opts: the employee header must still restrict
+        // this write. A body selection takes precedence over that default.
+        for (body_class, expected) in [
+            (None, StatusCode::BAD_REQUEST),
+            (Some("http://example.org/ManagerClass"), StatusCode::OK),
+        ] {
+            let mut body = modify_public_doc_content_body();
+            if let Some(class) = body_class {
+                body["opts"] = serde_json::json!({"policy-class": [class]});
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/v1/fluree/update/{ledger}"))
+                        .header("content-type", "application/json")
+                        .header("fluree-policy-class", "http://example.org/EmployeeClass")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let (status, body) = json_body(response).await;
+            assert_eq!(status, expected, "{mode:?}: {body}");
+            if expected == StatusCode::BAD_REQUEST {
+                assert!(
+                    body.to_string().contains("Employees may not modify"),
+                    "{body}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn show_preserves_narrowing_delegation_and_controller_headers() {
     let (_tmp, state) = policy_test_state().await;
     let ledger = "show-delegation:main";
@@ -1190,6 +1237,30 @@ async fn show_preserves_narrowing_delegation_and_controller_headers() {
         let flakes = body["flakes"].to_string();
         assert!(flakes.contains("New public"), "{body}");
         assert_eq!(flakes.contains("New secret"), secret, "{body}");
+    }
+    // Binding must reject a conflicting fixed header, and a request-selected
+    // credential with no context must keep the commit flakes hidden.
+    for (token, class, expected) in [
+        (&delegated, Some("ManagerClass"), StatusCode::FORBIDDEN),
+        (&controller, None, StatusCode::OK),
+    ] {
+        let mut request = Request::builder()
+            .uri(format!("/v1/fluree/show/{ledger}?commit=t:{t}"))
+            .header("authorization", format!("Bearer {token}"));
+        if let Some(class) = class {
+            request = request.header("fluree-policy-class", format!("http://example.org/{class}"));
+        }
+        let (status, body) = json_body(
+            app.clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, expected, "{body}");
+        if expected == StatusCode::OK {
+            assert_eq!(body["flakes"], serde_json::json!([]), "{body}");
+        }
     }
 }
 

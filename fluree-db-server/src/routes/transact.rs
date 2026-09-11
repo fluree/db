@@ -427,10 +427,11 @@ fn maybe_rewrite_form_encoded_update(credential: &mut MaybeCredential) {
     }
 }
 
-/// Inject header-based tracking options into transaction body (modifies in place).
+/// Inject header-based policy and tracking defaults into the transaction body.
 ///
 /// Mirrors the query-side `inject_headers_into_query` pattern: header values act
-/// as defaults that do not override body-level opts.
+/// as defaults that do not override body-level opts. Policy headers apply even
+/// without tracking, including for anonymous requests.
 fn inject_headers_into_txn(body: &mut JsonValue, headers: &FlureeHeaders) {
     if let Some(obj) = body.as_object_mut() {
         let opts = obj
@@ -607,7 +608,7 @@ async fn update_local(
         &state,
         headers,
         bearer.as_ref(),
-        &credential,
+        credential.did(),
     )?;
 
     // W3C SPARQL Protocol: rewrite form-encoded `update=...` to sparql-update
@@ -771,7 +772,7 @@ async fn update_ledger_local(
         &state,
         headers,
         bearer.as_ref(),
-        &credential,
+        credential.did(),
     )?;
 
     // W3C SPARQL Protocol: rewrite form-encoded `update=...` to sparql-update
@@ -927,7 +928,7 @@ async fn insert_local(
         &state,
         headers,
         bearer.as_ref(),
-        &credential,
+        credential.did(),
     )?;
 
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
@@ -1080,7 +1081,7 @@ async fn upsert_local(
         &state,
         headers,
         bearer.as_ref(),
-        &credential,
+        credential.did(),
     )?;
 
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
@@ -1243,7 +1244,7 @@ async fn sync_local(
         &state,
         headers,
         bearer.as_ref(),
-        &credential,
+        credential.did(),
     )?;
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
 
@@ -1421,7 +1422,7 @@ async fn insert_ledger_local(
         &state,
         headers,
         bearer.as_ref(),
-        &credential,
+        credential.did(),
     )?;
 
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
@@ -1575,7 +1576,7 @@ async fn upsert_ledger_local(
         &state,
         headers,
         bearer.as_ref(),
-        &credential,
+        credential.did(),
     )?;
 
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
@@ -1974,7 +1975,7 @@ async fn execute_turtle_transaction(
         let effective_identity = headers.identity.clone();
 
         let governance =
-            crate::routes::query::sparql_qc_opts(effective_identity.as_deref(), headers)?;
+            crate::routes::policy_auth::bound_governance(effective_identity.as_deref(), headers)?;
 
         let commit_opts = build_commit_opts(
             effective_identity.as_deref(),
@@ -2040,7 +2041,8 @@ async fn execute_cypher_transact(
     // Use the verified effective identity and build policy
     // options from headers, same as the SPARQL UPDATE path.
     let effective_identity = headers.identity.clone();
-    let qc_opts = crate::routes::query::sparql_qc_opts(effective_identity.as_deref(), headers)?;
+    let qc_opts =
+        crate::routes::policy_auth::bound_governance(effective_identity.as_deref(), headers)?;
 
     // Submit through consensus, exactly like SPARQL UPDATE: the Cypher statement
     // is lowered to a `Txn` inside the consensus layer under the ledger write
@@ -2261,7 +2263,8 @@ async fn execute_sparql_update_request(
     // Policy headers have already been bound to verified authorization.
     let effective_identity = headers.identity.clone();
 
-    let governance = crate::routes::query::sparql_qc_opts(effective_identity.as_deref(), headers)?;
+    let governance =
+        crate::routes::policy_auth::bound_governance(effective_identity.as_deref(), headers)?;
 
     let commit_opts = build_commit_opts(
         effective_identity.as_deref(),

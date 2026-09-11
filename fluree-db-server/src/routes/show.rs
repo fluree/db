@@ -123,16 +123,19 @@ async fn show_local(
 
         // Keep the entire verified selection: reconstructing it from identity
         // alone can widen a delegated view to the identity's local policy set.
-        let governance = match bearer.0.as_ref() {
-            Some(principal) => {
-                let requested =
-                    crate::routes::query::sparql_qc_opts(headers.identity.as_deref(), &headers)?;
-                principal.policy_authorization.resolve_options(&requested)?
-            }
-            None => fluree_db_api::GovernanceOptions {
+        let headers = crate::routes::policy_auth::bind_authorization(
+            &state,
+            headers,
+            bearer.0.as_ref(),
+            None,
+        )?;
+        let governance = if bearer.0.is_some() {
+            crate::routes::policy_auth::bound_governance(headers.identity.as_deref(), &headers)?
+        } else {
+            fluree_db_api::GovernanceOptions {
                 policy_class: data_auth.default_policy_class.map(|c| vec![c]),
                 ..Default::default()
-            },
+            }
         };
 
         // Proxy storage mode cannot decode commits (no local index).

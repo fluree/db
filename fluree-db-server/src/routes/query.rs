@@ -527,7 +527,7 @@ pub async fn query(
         &state,
         headers,
         bearer.0.as_ref(),
-        &credential,
+        credential.did(),
     )?;
     // Create request span with correlation context
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
@@ -657,7 +657,7 @@ pub async fn query(
             .await;
         }
 
-        let qc_opts = sparql_qc_opts(headers.identity.as_deref(), &headers)?;
+        let qc_opts = crate::routes::policy_auth::bound_governance(headers.identity.as_deref(), &headers)?;
 
         // Parse once and reuse across the format branches below (#1473): the
         // agent-json and plain paths both need the AST, and the advisory header
@@ -933,7 +933,7 @@ pub async fn query_ledger(
         &state,
         headers,
         bearer.0.as_ref(),
-        &credential,
+        credential.did(),
     )?;
     // Create request span with correlation context
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
@@ -1162,7 +1162,7 @@ pub async fn explain_ledger(
         &state,
         headers,
         bearer.0.as_ref(),
-        &credential,
+        credential.did(),
     )?;
     // Create request span with correlation context
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
@@ -1254,7 +1254,7 @@ pub async fn explain_ledger(
                 // suffix on FROM <ledger@t:N> drives snapshot selection.
                 let result = state
                     .fluree
-                    .explain_connection_sparql_with_opts(&sparql, &sparql_qc_opts(headers.identity.as_deref(), &headers)?)
+                    .explain_connection_sparql_with_opts(&sparql, &crate::routes::policy_auth::bound_governance(headers.identity.as_deref(), &headers)?)
                     .await
                     .map_err(ServerError::Api)?;
                 tracing::info!(
@@ -2265,28 +2265,6 @@ async fn execute_query_proxy(
     Ok((HeaderMap::new(), Json(result)).into_response())
 }
 
-pub(crate) fn sparql_qc_opts(
-    identity: Option<&str>,
-    headers: &FlureeHeaders,
-) -> Result<fluree_db_api::GovernanceOptions> {
-    let policy_values_map = headers.policy_values_map()?;
-    let requested = fluree_db_api::GovernanceOptions {
-        identity: identity.map(String::from),
-        policy_class: if headers.policy_class.is_empty() {
-            None
-        } else {
-            Some(headers.policy_class.clone())
-        },
-        policy: headers.policy.clone(),
-        policy_values: policy_values_map,
-        default_allow: headers.default_allow,
-    };
-    match &headers.policy_authorization {
-        Some(authorization) => authorization.resolve_options(&requested),
-        None => Ok(requested),
-    }
-}
-
 /// Build a `DatasetSpec` from a ledger-scoped SPARQL `FROM`/`FROM NAMED` clause.
 ///
 /// FROM/FROM NAMED select named graphs *within this ledger*: a bare graph IRI
@@ -2600,7 +2578,7 @@ async fn execute_cypher_ledger(
     // Build policy options from the resolved identity + headers. Cypher has no
     // body `opts` block, so headers are the only transport for `policy-class`,
     // `policy`, `policy-values`, and `default-allow` (same as SPARQL).
-    let qc_opts = sparql_qc_opts(identity, headers)?;
+    let qc_opts = crate::routes::policy_auth::bound_governance(identity, headers)?;
 
     let view = state
         .fluree
@@ -2699,7 +2677,7 @@ async fn execute_sparql_ledger(
         // Build GovernanceOptions from the resolved identity plus header-supplied
         // policy fields. SPARQL has no body `opts` block, so headers are the only
         // transport for `policy-class`, `policy`, `policy-values`, and `default-allow`.
-        let qc_opts = sparql_qc_opts(identity, headers).inspect_err(|e| {
+        let qc_opts = crate::routes::policy_auth::bound_governance(identity, headers).inspect_err(|e| {
             set_span_error_code(&span, "error:BadRequest");
             tracing::warn!(error = %e, "invalid fluree-policy-values header");
         })?;
@@ -3354,7 +3332,7 @@ pub async fn explain(
         &state,
         headers,
         bearer.0.as_ref(),
-        &credential,
+        credential.did(),
     )?;
     // Create request span with correlation context
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
@@ -3460,7 +3438,7 @@ pub async fn explain(
             if ledger_id_raw != ledger_id {
                 let result = state
                     .fluree
-                    .explain_connection_sparql_with_opts(&sparql, &sparql_qc_opts(headers.identity.as_deref(), &headers)?)
+                    .explain_connection_sparql_with_opts(&sparql, &crate::routes::policy_auth::bound_governance(headers.identity.as_deref(), &headers)?)
                     .await
                     .map_err(ServerError::Api)?;
                 tracing::info!(status = "success", "explain completed (dataset path)");
@@ -3970,7 +3948,7 @@ pub async fn multi_query(
         &state,
         headers,
         bearer.0.as_ref(),
-        &credential,
+        credential.did(),
     )?;
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
