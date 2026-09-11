@@ -547,6 +547,7 @@ Protect query/transaction endpoints (including `/v1/fluree/query/{ledger...}`,
 | `--data-auth-mode`                 | `FLUREE_DATA_AUTH_MODE`                 | `none`  |
 | `--data-auth-audience`             | `FLUREE_DATA_AUTH_AUDIENCE`             | None    |
 | `--data-auth-trusted-issuer`       | `FLUREE_DATA_AUTH_TRUSTED_ISSUERS`      | None    |
+| `--data-auth-policy-authority`     | `FLUREE_DATA_AUTH_POLICY_AUTHORITIES`  | None    |
 | `--data-auth-default-policy-class` | `FLUREE_DATA_AUTH_DEFAULT_POLICY_CLASS` | None    |
 
 Modes:
@@ -561,6 +562,13 @@ Bearer token scopes:
 - **Write**: `fluree.ledger.write.all=true` or `fluree.ledger.write.ledgers=[...]`
 
 Back-compat: `fluree.storage.*` claims imply **read** scope for data endpoints.
+
+Applications may select request policies using a credential with
+`"fluree.policy": "request"`, or issue a fixed signed `fluree.policy`
+selection for downstream clients. Both require the verified issuer to be a
+configured policy authority.
+This repeatable setting requires a nonempty data-auth audience; policy authorities also establish ordinary issuer trust. See [Trusted policy authorization](../security/policy-authorization.md)
+for the TOML configuration, claim format, and embedded SDK equivalent.
 
 ```bash
 fluree-server \
@@ -772,6 +780,8 @@ fluree-server \
 ```
 
 > **JWKS support**: When `--jwks-issuer` is configured, storage proxy endpoints accept RS256 OIDC tokens in addition to Ed25519 JWS tokens. The `--jwks-issuer` flag is shared with data, admin, and events endpoints — a single flag enables OIDC across all endpoint groups.
+
+Storage proxy rejects fixed `fluree.policy` delegation and `"fluree.policy": "request"` credentials. Delegated policy selection is supported by the data API, not storage-proxy endpoints. Use separate replication credentials for storage access; see [Trusted policy authorization](../security/policy-authorization.md).
 
 ## Complete Configuration Examples
 
