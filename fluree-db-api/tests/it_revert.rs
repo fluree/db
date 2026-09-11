@@ -644,3 +644,66 @@ async fn revert_range_nets_replace_and_restore() {
 
     assert_eq!(query_all_names(&fluree, "mydb:main").await, vec!["Alice"]);
 }
+
+/// A commit that reached this branch through a merge is not on the branch's
+/// first-parent history. Conflict detection walks that history, so such a
+/// commit is never compared against the commits that followed it: reverting
+/// it under `Abort` applies silently even when a later commit changed the
+/// same key. Revert refuses it, as it already refuses merge commits.
+#[tokio::test]
+async fn revert_refuses_commit_that_arrived_through_a_merge() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let main = fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    // dev writes ex:bob; main diverges so the merge is not a fast-forward.
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    let dev_commit = fluree
+        .insert(dev, &doc("ex:bob", "Bob"))
+        .await
+        .unwrap()
+        .receipt
+        .commit_id;
+    fluree
+        .insert(main, &doc("ex:carol", "Carol"))
+        .await
+        .unwrap();
+    fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .expect("merge dev into main");
+
+    // main then changes the same (subject, predicate) the merged-in commit
+    // wrote, which is exactly what conflict detection exists to catch.
+    let main_head = fluree.ledger("mydb:main").await.unwrap();
+    fluree
+        .insert(main_head, &doc("ex:bob", "Bob-2"))
+        .await
+        .unwrap();
+
+    let err = fluree
+        .revert_commit(
+            "mydb",
+            "main",
+            CommitRef::Exact(dev_commit),
+            ConflictStrategy::Abort,
+        )
+        .await
+        .expect_err("reverting a merged-in commit must be refused");
+    assert!(
+        matches!(err, fluree_db_api::ApiError::InvalidBranch(_)),
+        "expected InvalidBranch, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("merge"),
+        "the error should say the commit arrived through a merge: {err}"
+    );
+}

@@ -1674,4 +1674,35 @@ mod tests {
         assert_eq!(commits[0].parents.len(), 2);
         assert!(commits[1..].iter().all(|c| c.parents.len() <= 1));
     }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn test_first_parent_walk_rejects_non_decreasing_t() {
+        use futures::StreamExt;
+
+        // `t` must strictly decrease toward genesis along a first-parent
+        // lineage. A parent claiming its child's `t` is a corrupted chain,
+        // not history to replay.
+        let store = MemoryContentStore::new();
+        let parent = store_commit(&store, &Commit::new(2, vec![make_test_flake(1, 1, 1, 2)])).await;
+        let child = Commit::new(2, vec![make_test_flake(1, 1, 2, 2)]).with_parent(parent);
+        let child_id = store_commit(&store, &child).await;
+
+        let err = collect_first_parent_cids(&store, &child_id, 0)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not t-decreasing"),
+            "unexpected error: {err}"
+        );
+
+        let items: Vec<Result<Commit>> = trace_first_parent_commits_by_id(store, child_id, 0)
+            .collect()
+            .await;
+        assert_eq!(items.len(), 2, "the child streams, then the error");
+        assert!(items[0].is_ok());
+        assert!(items[1]
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("not t-decreasing")));
+    }
 }
