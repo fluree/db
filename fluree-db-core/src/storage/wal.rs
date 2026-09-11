@@ -19,7 +19,6 @@
 //! that way and fails the open instead of being skipped.
 
 use fs2::FileExt;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -36,13 +35,11 @@ pub(super) const WAL_DIR: &str = ".fluree-wal";
 const OWNERS_DIR: &str = "owners";
 const LOCK_FILE: &str = "LOCK";
 const SEGMENT_EXT: &str = "wal";
-const LEGACY_SEGMENT_MAGIC: &[u8; 8] = b"FRDOSEG1";
 const SEGMENT_MAGIC: &[u8; 8] = b"FRDOSEG2";
 const SEGMENT_HEADER: usize = 16;
 const FRAME_MAGIC: &[u8; 4] = b"FRDO";
 const FRAME_HEADER: usize = 4 + 4 + 8;
 const HASH: usize = 8;
-const LEGACY_HASH: usize = 32;
 
 /// Largest single record the log accepts. A write above this bypasses the log
 /// and is flushed directly: past a few megabytes a flush costs bandwidth, not
@@ -243,14 +240,6 @@ fn encode_frame(seq: u64, payload: &[u8]) -> Vec<u8> {
     finish_frame(seq, frame, hash)
 }
 
-fn segment_hash_size(bytes: &[u8]) -> Option<usize> {
-    match bytes.get(..8)? {
-        magic if magic == SEGMENT_MAGIC => Some(HASH),
-        magic if magic == LEGACY_SEGMENT_MAGIC => Some(LEGACY_HASH),
-        _ => None,
-    }
-}
-
 /// Frames decoded from one segment, and whether the segment ended cleanly.
 struct Decoded {
     ops: Vec<OwnedOp>,
@@ -260,13 +249,12 @@ struct Decoded {
 }
 
 fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<Decoded> {
-    if bytes.len() < SEGMENT_HEADER || segment_hash_size(bytes).is_none() {
+    if bytes.len() < SEGMENT_HEADER || &bytes[..8] != SEGMENT_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "WAL segment header is missing or unrecognized",
         ));
     }
-    let hash_size = segment_hash_size(bytes).expect("validated above");
     let first_seq = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
     if expected_first_seq.is_some_and(|expected| expected != first_seq) {
         return Err(io::Error::new(
@@ -292,18 +280,13 @@ fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<D
             break false;
         }
         let end = at + FRAME_HEADER + len;
-        let Some(stored) = bytes.get(end..end + hash_size) else {
+        let Some(stored) = bytes.get(end..end + HASH) else {
             break false;
         };
-        let valid = if hash_size == LEGACY_HASH {
-            Sha256::digest(&bytes[at..end]).as_slice() == stored
-        } else {
-            let mut hash = Xxh64::new(0);
-            hash.update(&bytes[at + FRAME_HEADER..end]);
-            hash.update(header);
-            hash.digest().to_le_bytes() == stored
-        };
-        if !valid {
+        let mut hash = Xxh64::new(0);
+        hash.update(&bytes[at + FRAME_HEADER..end]);
+        hash.update(header);
+        if hash.digest().to_le_bytes() != stored {
             break false;
         }
         let Some(op) = decode_op(&bytes[at + FRAME_HEADER..end]) else {
@@ -311,7 +294,7 @@ fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<D
         };
         ops.push(op);
         seq += 1;
-        at = end + hash_size;
+        at = end + HASH;
     };
     Ok(Decoded {
         ops,
@@ -2324,58 +2307,6 @@ mod tests {
                 DeviceStep::DirFlushed,
             ]
         );
-    }
-
-    fn legacy_frame(seq: u64, payload: &[u8]) -> Vec<u8> {
-        let mut frame = FRAME_MAGIC.to_vec();
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&seq.to_le_bytes());
-        frame.extend_from_slice(payload);
-        let hash = Sha256::digest(&frame);
-        frame.extend_from_slice(&hash);
-        frame
-    }
-
-    #[test]
-    fn review_replays_legacy_and_new_checksum_segments_together() {
-        let dir = tempfile::tempdir().unwrap();
-        let wal = dir.path().join(WAL_DIR);
-        std::fs::create_dir(&wal).unwrap();
-        for (id, magic, frame) in [
-            (
-                1,
-                LEGACY_SEGMENT_MAGIC,
-                legacy_frame(
-                    1,
-                    &Op::Write {
-                        key: "head",
-                        bytes: b"old",
-                    }
-                    .encode(),
-                ),
-            ),
-            (
-                2,
-                SEGMENT_MAGIC,
-                encode_frame(
-                    2,
-                    &Op::Write {
-                        key: "head",
-                        bytes: b"new",
-                    }
-                    .encode(),
-                ),
-            ),
-        ] {
-            let mut bytes = magic.to_vec();
-            bytes.extend_from_slice(&(id as u64).to_le_bytes());
-            bytes.extend_from_slice(&frame);
-            std::fs::write(wal.join(format!("{id:08}.wal")), bytes).unwrap();
-        }
-        let (_, _, records) = replay(dir.path(), &wal, &AtomicU64::new(0)).unwrap();
-        assert_eq!(records, 2);
-        assert_eq!(std::fs::read(dir.path().join("head")).unwrap(), b"new");
-        assert!(segment_paths(&wal).unwrap().is_empty());
     }
 
     #[test]

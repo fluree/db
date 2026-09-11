@@ -424,9 +424,8 @@ in a segment that was flushed before a later segment was opened cannot tear, so
 damage there fails the open with the segment named; a torn final frame is
 discarded, since acknowledgment follows the flush and could not have covered it.
 
-Current WAL segments use xxh64 checksums to detect accidental corruption. The
-reader also accepts the preceding SHA-256 segment format. Checksums do not provide
-authentication. See the [storage WAL release notes](storage-wal-release-notes.md)
+WAL segments use xxh64 checksums to detect accidental corruption. Checksums do
+not provide authentication. See the [storage WAL release notes](storage-wal-release-notes.md)
 for durability fixes and format upgrade constraints.
 
 > **macOS note.** `sync` on macOS issues `F_FULLFSYNC`, a full drive-cache
