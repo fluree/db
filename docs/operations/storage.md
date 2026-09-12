@@ -347,62 +347,27 @@ See [Storage Encryption](../security/encryption.md) for full documentation.
 
 ### Durability
 
-Every write is atomic: bytes are staged alongside the destination and moved into
-place, so a reader never observes a partially written file, and an interrupted
-write leaves nothing at the final name.
+**Filesystem syncing (FSYNC) is on by default.** Fluree flushes committed data
+to durable storage so acknowledged commits survive a process crash or power
+loss. No configuration is needed to enable it.
 
-Whether an acknowledged write survives the machine *losing power*, and what a
-commit pays for that, is controlled by the storage node's `durability` property,
-or by `FLUREE_STORAGE_FSYNC`:
+To turn FSYNC off, set this environment variable before starting Fluree:
 
-| Mode | Acknowledged when | Survives | Flushes per commit |
-|---|---|---|---|
-| `wal` (default; effective `sync` on Windows or when advisory locking is unavailable) | the write is in the root's WAL and the log is flushed | process death and power loss | one |
-| `sync` | bytes and directory entry flushed to the device | process death and power loss | two per file: six for a commit with a recorded transaction |
-| `page-cache` | bytes reach the OS page cache | process death only | none |
+```bash
+export FLUREE_STORAGE_FSYNC=0
+```
 
-This applies to the writes that are the source of truth — commits, transactions,
-ledger config, graph-source mappings — and to nameservice records. Index nodes,
-dictionaries, sketches and annotation arenas are always written page-cache: they
-are written at much higher volume than commits and can be rebuilt from the commit
-chain, so flushing them would cost throughput on the busiest path for no
-durability gain. They are flushed once, as a batch, at the end of each index
-build and before the pointer that names them is published, so an index pointer
-never names files that did not reach the device. That cost lands on the
-indexer, not on the transaction path.
+With FSYNC off, writes reach the operating system's page cache without waiting
+for a disk flush. This can improve performance for development, benchmarks, or
+restartable imports, but a power loss or kernel panic can lose acknowledged
+commits. Keep FSYNC on for data you need to retain.
 
-Turning durability off is reasonable for bulk imports (restartable from the
-source data), CI, and benchmarks. It is not a safe default for a ledger you
-intend to keep.
+To turn it back on, set `FLUREE_STORAGE_FSYNC=1` and restart Fluree. The environment
+variable overrides the storage node's `durability` setting and applies only to
+local file storage; it does not disable Raft log flushing.
 
-#### The write-ahead log
-
-The default `wal` mode reduces disk flushes while preserving commit durability.
-Recovery runs automatically when file storage opens; normal operation requires
-no WAL administration. Keep the `.fluree-wal/` directory with its storage root:
-retained logs may contain the only durable copy of acknowledged data.
-
-If another process temporarily owns the log, writes use `sync` durability and
-retry WAL acquisition automatically. Filesystems that cannot support WAL stay
-in `sync`. If a previous owner's crash logs remain after fallback writes, Fluree
-keeps using `sync` and warns that recovery is needed. Stop and reconcile the
-writers before recovering that history, since older logged writes could
-otherwise overwrite newer fallback values.
-
-If recovery reports damaged or unsupported logs, preserve the storage root and
-logs for investigation. Do not delete logs to bypass the error. Recovery can
-stop when it cannot safely distinguish corruption from an interrupted write.
-
-Before downgrading to a binary without WAL support, recover the root with the
-current binary, stop it cleanly, and confirm its WAL segments have been retired.
-Skipping this step can cause data loss or let a later recovery overwrite changes
-made by the older binary. Raft clusters also have separate
-[storage downgrade constraints](raft-clusters.md#rolling-upgrades).
-
-> **macOS note.** `sync` on macOS issues `F_FULLFSYNC`, a full drive-cache
-> barrier that is far more expensive than the equivalent `fsync` on Linux —
-> measured here at ~4 ms versus ~0.08 ms. Local development on macOS may want
-> `FLUREE_STORAGE_FSYNC=0`; it is not representative of Linux production cost.
+Writes remain atomic with either setting: readers do not see partially written
+files.
 
 Because the staged file is moved into place, each write gives the destination a
 new inode. Ownership, permissions, ACLs and hard links applied to a *path* are
