@@ -1203,7 +1203,8 @@ async fn walk_commit_chain_since(
         .map_err(|e| IncrementalResolveError::CommitChain(e.to_string()))?;
     let dag_collect_ms = walk_started.elapsed().as_millis() as u64;
 
-    // collect_first_parent_cids returns (t, cid) sorted by t descending; reverse for chronological order.
+    // collect_first_parent_cids returns (t, cid) newest first; reverse for
+    // chronological order.
     let mut commits = Vec::with_capacity(dag.len());
     let mut cumulative_bytes: usize = 0;
     let fetch_started = Instant::now();

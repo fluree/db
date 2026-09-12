@@ -20,7 +20,8 @@ pub(crate) async fn walk_commit_chain_full(
 ) -> Result<Vec<ContentId>> {
     // stop_at_t=0 collects all commits (t starts at 1).
     let dag = fluree_db_core::collect_first_parent_cids(content_store, head_commit_id, 0).await?;
-    // collect_first_parent_cids returns (t, cid) sorted by t descending; reverse for chronological order.
+    // collect_first_parent_cids returns (t, cid) newest first; reverse for
+    // chronological order.
     let cids: Vec<ContentId> = dag.into_iter().rev().map(|(_, cid)| cid).collect();
     Ok(cids)
 }

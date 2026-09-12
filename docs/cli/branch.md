@@ -360,6 +360,8 @@ fluree branch revert --from <COMMIT> --to <COMMIT>
 
 Accepts either positional commit references (cherry-pick style, one or several) or a git-style range. Each commit reference may be a `t:N` transaction number, a hex digest prefix, or a full commit ID — the same forms `branch create --at` accepts.
 
+A commit must be on the branch's own history, which is the line of commits reached by following each merge's first parent. The genesis commit, a merge commit, and a commit that reached this branch through a merge are all refused: the first two have no single change to undo, and the third belongs to the branch that authored it, where its own history can say what changed after it. Revert it there and merge again.
+
 | Option | Description |
 |--------|-------------|
 | `<COMMITS>...` | Commits to revert (mutually exclusive with `--from`/`--to`) |
