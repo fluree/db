@@ -235,6 +235,27 @@ ordering and the scan layer work from the narrower form:
   compound patterns are rewrite boundaries because MINUS/EXISTS semantics can
   change when a shared variable disappears before the retained VALUES binds it.
 
+### Multi-row VALUES in stars
+
+A pure, unseeded star with no constant object anchor can start from one small
+object `VALUES` table when predicate statistics predict at least a 16-fold
+reduction over its smallest predicate scan. The table must contain at most 64
+rows of fully bound references. The
+planner probes the associated predicate first, joins other `VALUES` as soon as
+all their variables are available, and visits constrained endpoints before
+unconstrained payload columns. It retains the actual `ValuesOperator` joins, so
+duplicates multiply results, `UNDEF` remains a wildcard, and multi-column
+correlations survive. Independent tables are never multiplied into a seed.
+
+Broad or unsupported seeds, unavailable object NDV, existing subject seeds,
+constant-object anchors, history, and multi-graph default unions retain their
+existing planning paths. In particular, existing fused stars keep their fusion.
+This decision uses the same ordinary scan/join operators as other queries; it
+does not rewrite `VALUES` into `FILTER IN`. The `it_values_object_bounds` tests
+pin the physical plan, scan fuel, and result semantics. The
+`query_hot_values_star` benchmark compares the two spellings at 6k–500k edges
+and includes singleton and broad-set controls.
+
 ### Cost constants are coupled and tested
 
 Estimator constants are not free parameters. `DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY`

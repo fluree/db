@@ -1049,9 +1049,8 @@ fn apply_values(
 /// rest, which must stay behind the triples.
 ///
 /// A VALUES binding the star's subject constrains every triple in it at once, so
-/// seeding hands the star a bound driving set. Anything else — a VALUES binding
-/// only a leaf object var, or sharing no variable with the star at all — would
-/// seed a cartesian product instead, so it defers.
+/// seeding hands the star a bound driving set. Selective object seeds are handled
+/// separately by `selective_object_values_seed`; everything left here defers.
 ///
 /// The caller only reaches this for a star (`is_property_join`), which guarantees
 /// every triple shares the first triple's subject var.
@@ -1065,6 +1064,88 @@ fn split_values_seeding_star(
     values
         .into_iter()
         .partition(|vp| vp.vars.contains(&subject))
+}
+
+/// Keep large/unknown object sets on the star's scan path. A small, fully bound
+/// resource table can instead drive object probes when measured NDV predicts a
+/// substantial reduction. Seed ONE table: multiplying independent VALUES first
+/// would turn two selective sets into a potentially large cartesian product.
+const OBJECT_VALUES_SEED_MAX_ROWS: usize = 64;
+const OBJECT_VALUES_SEED_MIN_GAIN: f64 = 16.0;
+
+fn object_values_var(values: &ValuesPattern) -> Option<VarId> {
+    let [var] = values.vars.as_slice() else {
+        return None;
+    };
+    if values.rows.is_empty() || values.rows.len() > OBJECT_VALUES_SEED_MAX_ROWS {
+        return None;
+    }
+    values
+        .rows
+        .iter()
+        .all(|row| {
+            matches!(
+                row.as_slice(),
+                [crate::binding::Binding::Sid { .. }
+                    | crate::binding::Binding::Iri(_)
+                    | crate::binding::Binding::IriMatch { .. }]
+            )
+        })
+        .then_some(*var)
+}
+
+/// Called only for an unseeded, pure inner-join star. Returns the VALUES and
+/// triple to drive from; no pattern is replaced or deduplicated. In particular,
+/// duplicate VALUES rows still multiply solutions and UNDEF tables stay joins.
+fn selective_object_values_seed(
+    values: &[ValuesPattern],
+    triples: &[TriplePattern],
+    stats: Option<&StatsView>,
+) -> Option<(usize, usize)> {
+    let stats = stats?;
+    let subject = triples.first()?.s.as_var()?;
+    // A constant object can anchor the fused PropertyJoinOperator. Leave that
+    // entire family alone: this optimization repairs unanchored stars only.
+    if triples.iter().any(TriplePattern::o_bound) {
+        return None;
+    }
+    if values.iter().any(|vp| vp.vars.contains(&subject)) {
+        return None; // Preserve the existing subject-seeding path.
+    }
+    let unbound = HashSet::new();
+    // Compare against the smallest predicate scan the old plan could drive.
+    let baseline = triples
+        .iter()
+        .map(|tp| crate::planner::estimate_triple_row_count(tp, &unbound, Some(stats)))
+        .fold(f64::INFINITY, f64::min);
+    let mut best = None;
+    let mut best_work = baseline / OBJECT_VALUES_SEED_MIN_GAIN;
+    for (vi, vp) in values.iter().enumerate() {
+        let Some(var) = object_values_var(vp) else {
+            continue;
+        };
+        for (ti, tp) in triples.iter().enumerate() {
+            if tp.o.as_var() != Some(var) {
+                continue;
+            }
+            let prop = match &tp.p {
+                Ref::Sid(sid) => stats.get_property(sid),
+                Ref::Iri(iri) => stats.get_property_by_iri(iri),
+                Ref::Var(_) => None,
+            };
+            let Some(prop) = prop.filter(|p| p.ndv_values > 0) else {
+                continue;
+            };
+            let fanout = (prop.count as f64 / prop.ndv_values as f64).max(1.0);
+            // Count duplicate seed rows too, and charge one seek per row.
+            let work = vp.rows.len() as f64 * (1.0 + fanout);
+            if work < best_work {
+                best_work = work;
+                best = Some((vi, ti));
+            }
+        }
+    }
+    best
 }
 
 /// Partition filters into those eligible for inline evaluation and those still waiting.
@@ -2211,6 +2292,51 @@ pub fn build_where_operators_seeded_with_needed(
                 if block.binds.is_empty() && block.filters.is_empty() {
                     let mut augmented_rwv = augmented_at(end);
 
+                    if operator.is_none()
+                        && !block.values.is_empty()
+                        && is_property_join(&block.triples)
+                        && !planning.multi_default_graph
+                        && !planning.is_history()
+                    {
+                        if let Some((vi, ti)) = selective_object_values_seed(
+                            &block.values,
+                            &block.triples,
+                            stats.as_deref(),
+                        ) {
+                            let mut values = block.values;
+                            let seed = values.remove(vi);
+                            let mut triples = block.triples;
+                            let driver = triples.remove(ti);
+                            // Test the other endpoints before fetching unrestrained
+                            // payload columns. Stable sort preserves other ties.
+                            triples.sort_by_key(|tp| {
+                                !(tp.o_bound()
+                                    || values.iter().any(|vp| {
+                                        object_values_var(vp)
+                                            .is_some_and(|v| tp.o.as_var() == Some(v))
+                                    }))
+                            });
+                            triples.insert(0, driver);
+                            let ctx = TriplePlanContext {
+                                required_where_vars: augmented_rwv.as_deref(),
+                                var_counts: &var_counts,
+                                protected_vars: &protected_vars,
+                                group_by,
+                                where_dedup_safe,
+                                planning,
+                                stats: stats.as_deref(),
+                            };
+                            operator = Some(build_sequential_triple_chain(
+                                apply_values(None, vec![seed]),
+                                &triples,
+                                &HashMap::new(),
+                                &ctx,
+                                values,
+                            )?);
+                            continue;
+                        }
+                    }
+
                     // Preserve property-join eligibility when a top-level VALUES precedes
                     // a pure star block. Wrapping VALUES first seeds the schema/operator and
                     // prevents `build_triple_operators()` from taking the property-join path.
@@ -3190,6 +3316,7 @@ fn build_sequential_triple_chain(
     triples: &[TriplePattern],
     object_bounds: &HashMap<VarId, ObjectBounds>,
     ctx: &TriplePlanContext<'_>,
+    mut pending_values: Vec<ValuesPattern>,
 ) -> Result<BoxedOperator> {
     let mut operator = existing;
     let rwv_set: Option<HashSet<VarId>> =
@@ -3215,7 +3342,13 @@ fn build_sequential_triple_chain(
                 .iter()
                 .flat_map(crate::ir::triple::TriplePattern::referenced_vars)
                 .collect();
-            base.union(&suffix_vars).copied().collect::<Vec<VarId>>()
+            let mut live = base.union(&suffix_vars).copied().collect::<Vec<VarId>>();
+            for var in pending_values.iter().flat_map(|vp| &vp.vars) {
+                if !live.contains(var) {
+                    live.push(*var);
+                }
+            }
+            live
         });
 
         let emit = emit_mask_for_triple(pattern, ctx.var_counts, ctx.protected_vars);
@@ -3230,6 +3363,17 @@ fn build_sequential_triple_chain(
             ctx.planning,
             &hash_planner,
         ));
+
+        // Retain the real VALUES join, including duplicates and wildcard cells.
+        // Only move it past required triples, once ALL its variables are bound;
+        // disconnected/correlated-column tables remain deferred to the end.
+        if !pending_values.is_empty() {
+            let (ready, pending) = pending_values
+                .into_iter()
+                .partition(|vp| vp.vars.iter().all(|v| seen_vars.contains(v)));
+            operator = apply_values(operator, ready);
+            pending_values = pending;
+        }
 
         // Early dedup (sound because downstream is multiplicity-insensitive —
         // see `where_dedup_safe`) where this step trimmed a variable that was
@@ -3252,7 +3396,7 @@ fn build_sequential_triple_chain(
         }
     }
 
-    Ok(operator.unwrap())
+    Ok(apply_values(operator, pending_values).unwrap())
 }
 
 /// Whether a join step that leaves `dead_after` variables trimmed (`dead_before`
@@ -3518,8 +3662,13 @@ pub fn build_triple_operators(
 
     if existing.is_none() && object_bounds.is_empty() {
         if let Some(cyclic_plan) = analyze_cyclic_bgp(&triples_for_exec, ctx.stats) {
-            let fallback =
-                build_sequential_triple_chain(None, &triples_for_exec, object_bounds, ctx)?;
+            let fallback = build_sequential_triple_chain(
+                None,
+                &triples_for_exec,
+                object_bounds,
+                ctx,
+                Vec::new(),
+            )?;
             return Ok(Box::new(CyclicBgpOperator::new(
                 cyclic_plan,
                 ctx.required_where_vars,
@@ -3529,7 +3678,7 @@ pub fn build_triple_operators(
         }
     }
 
-    build_sequential_triple_chain(existing, &triples_for_exec, object_bounds, ctx)
+    build_sequential_triple_chain(existing, &triples_for_exec, object_bounds, ctx, Vec::new())
 }
 
 #[cfg(test)]
@@ -3821,6 +3970,145 @@ mod tests {
             ops.extend(plan_ops(&edge.node));
         }
         ops
+    }
+
+    fn object_seed_fixture() -> (Vec<ValuesPattern>, Vec<TriplePattern>, StatsView) {
+        use crate::binding::Binding;
+        let values = [VarId(1), VarId(2)]
+            .into_iter()
+            .map(|v| {
+                ValuesPattern::new(
+                    vec![v],
+                    vec![vec![Binding::iri("ex:a")], vec![Binding::iri("ex:b")]],
+                )
+            })
+            .collect();
+        // Payload deliberately first: the object seed must reorder the driver.
+        let triples = vec![
+            make_pattern(VarId(0), "payload", VarId(3)),
+            make_pattern(VarId(0), "left", VarId(1)),
+            make_pattern(VarId(0), "right", VarId(2)),
+        ];
+        let mut stats = StatsView::default();
+        for p in ["payload", "left", "right"] {
+            stats.properties.insert(
+                Sid::new(100, p),
+                PropertyStatData {
+                    count: 100_000,
+                    ndv_values: 100_000,
+                    ndv_subjects: 100_000,
+                },
+            );
+        }
+        (values, triples, stats)
+    }
+
+    #[test]
+    fn object_values_seed_uses_selectivity_and_keeps_existing_anchors() {
+        let (values, triples, mut stats) = object_seed_fixture();
+        assert_eq!(
+            selective_object_values_seed(&values, &triples, Some(&stats)),
+            Some((0, 1))
+        );
+        // The first endpoint is a hub: seed from the second instead.
+        stats
+            .properties
+            .get_mut(&Sid::new(100, "left"))
+            .unwrap()
+            .ndv_values = 1;
+        assert_eq!(
+            selective_object_values_seed(&values, &triples, Some(&stats)),
+            Some((1, 2))
+        );
+        stats
+            .properties
+            .get_mut(&Sid::new(100, "right"))
+            .unwrap()
+            .ndv_values = 1;
+        assert!(selective_object_values_seed(&values, &triples, Some(&stats)).is_none());
+        let (values, mut triples, stats) = object_seed_fixture();
+        triples[0].o = Term::Iri(Arc::from("ex:unique-payload"));
+        assert!(selective_object_values_seed(&values, &triples, Some(&stats)).is_none());
+        // Even a broad constant anchor keeps its fused-star eligibility.
+        let mut broad_anchor_stats = stats.clone();
+        broad_anchor_stats
+            .properties
+            .get_mut(&Sid::new(100, "payload"))
+            .unwrap()
+            .ndv_values = 1;
+        assert!(
+            selective_object_values_seed(&values, &triples, Some(&broad_anchor_stats)).is_none()
+        );
+        assert!(selective_object_values_seed(&values, &triples, None).is_none());
+    }
+
+    #[test]
+    fn object_values_seed_declines_unknown_broad_and_non_resource_sets() {
+        use crate::binding::Binding;
+        let (mut values, triples, mut stats) = object_seed_fixture();
+        values.truncate(1);
+        for rows in [
+            vec![],
+            vec![vec![Binding::Unbound]],
+            vec![vec![Binding::iri("ex:a")], vec![Binding::Unbound]],
+            vec![vec![Binding::lit(
+                FlakeValue::Long(1),
+                Sid::new(2, "integer"),
+            )]],
+            vec![vec![Binding::iri("ex:a")]; OBJECT_VALUES_SEED_MAX_ROWS + 1],
+        ] {
+            let candidate = [ValuesPattern::new(vec![VarId(1)], rows)];
+            assert!(selective_object_values_seed(&candidate, &triples, Some(&stats)).is_none());
+        }
+        // Multi-column correlation, disconnected sets, and subject seeds retain
+        // their existing plans even when another object table could seed.
+        values[0].vars = vec![VarId(1), VarId(2)];
+        assert!(selective_object_values_seed(&values, &triples, Some(&stats)).is_none());
+        values[0].vars = vec![VarId(9)];
+        assert!(selective_object_values_seed(&values, &triples, Some(&stats)).is_none());
+        let (mut values, _, _) = object_seed_fixture();
+        values.push(ValuesPattern::new(
+            vec![VarId(0)],
+            vec![vec![Binding::iri("ex:s")]],
+        ));
+        assert!(selective_object_values_seed(&values, &triples, Some(&stats)).is_none());
+        values.pop();
+        for p in stats.properties.values_mut() {
+            p.ndv_values = 0;
+        }
+        assert!(selective_object_values_seed(&values, &triples, Some(&stats)).is_none());
+    }
+
+    #[test]
+    fn object_values_seed_plan_probes_before_payload_and_preserves_duplicates() {
+        let (mut values, triples, stats) = object_seed_fixture();
+        let duplicate = values[0].rows[0].clone();
+        values[0].rows.push(duplicate);
+        assert_eq!(
+            selective_object_values_seed(&values, &triples, Some(&stats)),
+            Some((1, 2))
+        );
+        let mut patterns: Vec<_> = values
+            .into_iter()
+            .map(|vp| Pattern::Values {
+                vars: vp.vars,
+                rows: vp.rows,
+            })
+            .collect();
+        patterns.extend(triples.into_iter().map(Pattern::Triple));
+        let op = build_where_operators(&patterns, Some(Arc::new(stats))).unwrap();
+        let plan = op.describe();
+        assert_eq!(
+            plan_ops(&plan),
+            vec![
+                "NestedLoopJoinOperator", // payload AFTER the second VALUES join
+                "ValuesOperator",
+                "NestedLoopJoinOperator",
+                "NestedLoopJoinOperator",
+                "ValuesOperator", // one seed, never a cartesian product of tables
+                "EmptyOperator",
+            ]
+        );
     }
 
     /// Regression (#51): a VALUES sharing a variable with the star must seed it.
