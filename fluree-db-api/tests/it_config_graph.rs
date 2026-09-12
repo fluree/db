@@ -3906,13 +3906,26 @@ async fn seed_shacl_mode_ledger(
                     "ex": "http://example.org/",
                     "xsd": "http://www.w3.org/2001/XMLSchema#"
                 },
-                "@id": "ex:PersonShape",
-                "@type": "sh:NodeShape",
-                "sh:targetClass": {"@id": "ex:Person"},
-                "sh:property": [{
-                    "sh:path": {"@id": "ex:name"},
-                    "sh:minCount": 1
-                }]
+                "@graph": [
+                    {
+                        "@id": "ex:PersonShape",
+                        "@type": "sh:NodeShape",
+                        "sh:targetClass": {"@id": "ex:Person"},
+                        "sh:property": [{
+                            "sh:path": {"@id": "ex:name"},
+                            "sh:minCount": 1
+                        }]
+                    },
+                    // The allow-listed DID exists as a subject, as a policy
+                    // identity would. The pre-fix gate decoded the policy
+                    // context's identity, so it only ever matched an IRI the
+                    // ledger knew; without this subject that gate denies an
+                    // allow-listed policy identity for the wrong reason and
+                    // `shacl_txn_validation_mode_ignores_policy_identity`
+                    // would pass against the very bug it pins. Untyped, so the
+                    // `ex:Person` shape does not target it.
+                    {"@id": "did:key:remediator", "ex:name": "Remediator"}
+                ]
             }),
         )
         .await
