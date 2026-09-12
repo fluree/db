@@ -690,9 +690,11 @@ impl BinaryScanOperator {
         if object_bounds.is_some() && index == IndexType::Psot {
             index = IndexType::Post;
         }
-        // Generic optimization: if the object is a constant (and can be safely encoded),
-        // prefer the object-leading OPST index when the subject is unbound. This avoids
-        // pathological scans like PSOT(p, *, o_const) that can't narrow by o_key.
+        // A fixed predicate + object already selects POST above. Keep that
+        // predicate-leading range, including when the object cannot be encoded
+        // (e.g. a decimal without a unique arena handle). Overriding it with
+        // OPST would lose the only usable leading bound and walk unrelated
+        // predicates. OPST is useful when only the object is bound.
         //
         // IMPORTANT: plain strings without a datatype constraint are ambiguous (xsd:string
         // vs rdf:langString). In that case we don't force OPST because we may be unable to
@@ -700,6 +702,7 @@ impl BinaryScanOperator {
         if index_hint.is_none()
             && object_bounds.is_none()
             && !s_bound
+            && !p_bound
             && o_bound
             && (pattern.dtc.is_some() || !matches!(&pattern.o, Term::Value(FlakeValue::String(_))))
         {
@@ -2106,7 +2109,7 @@ impl Operator for BinaryScanOperator {
                 // Scan-time datatype narrowing only — never semantic elision.
                 false,
             );
-            let inferred_dt_sid = if dt_sid.is_none() && lang.is_none() {
+            let mut inferred_dt_sid = if dt_sid.is_none() && lang.is_none() {
                 filter.p_id.and_then(|p_id| {
                     infer_exact_datatype_sid_from_stats(
                         stats_view.as_deref(),
@@ -2118,6 +2121,28 @@ impl Operator for BinaryScanOperator {
             } else {
                 None
             };
+
+            // Indexed NumBig statistics deliberately use UNKNOWN: arena handles
+            // can hold either decimals or overflow integers. Prove both the row
+            // encoding and arena contents instead of interpreting UNKNOWN as a
+            // datatype. Limit this additional proof to current, indexed reads;
+            // novelty and historical reads retain the general numeric matcher.
+            if dt_sid.is_none()
+                && inferred_dt_sid.is_none()
+                && lang.is_none()
+                && matches!(bound_o, FlakeValue::Decimal(_))
+                && !self.pattern.s_bound()
+                && !self.mode.is_history()
+                && ctx.to_t >= store_ref.max_t()
+                && !crate::fast_path_common::overlay_has_novelty(ctx)
+                && std::env::var_os("FLUREE_DISABLE_DECIMAL_SEEKS").is_none()
+            {
+                if let Some(p_id) = filter.p_id {
+                    if predicate_is_decimal_only(store_ref, self.g_id, p_id)? {
+                        inferred_dt_sid = Some(Sid::new(namespaces::XSD, xsd_names::DECIMAL));
+                    }
+                }
+            }
 
             // An untyped string that stats couldn't pin to a single datatype:
             // the predicate has langString and/or multiple string-compatible
@@ -2168,7 +2193,41 @@ impl Operator for BinaryScanOperator {
             } else {
                 let encoded = match (dt_sid.or(inferred_dt_sid.as_ref()), lang) {
                     (Some(dt_sid), lang) => {
-                        value_to_otype_okey(bound_o, dt_sid, lang, store_ref, dict_novelty, None)
+                        // Decimal arena handles are local to (graph, predicate).
+                        // Only an explicit decimal constraint or the singleton
+                        // datatype/encoding proof above licenses a point lookup:
+                        // an untyped mixed numeric predicate can also match an
+                        // integer/double representation of the same value.
+                        // Distinguish an absent value from ambiguous legacy
+                        // scale aliases. Only a conclusive miss may skip base
+                        // rows; novelty still goes through the decoded fallback.
+                        if let FlakeValue::Decimal(value) = bound_o {
+                            if *dt_sid == Sid::new(namespaces::XSD, xsd_names::DECIMAL)
+                                && !self.mode.is_history()
+                                && ctx.to_t >= store_ref.max_t()
+                                && std::env::var_os("FLUREE_DISABLE_DECIMAL_SEEKS").is_none()
+                            {
+                                decimal_object_key(store_ref, self.g_id, filter.p_id, value)
+                            } else {
+                                value_to_otype_okey(
+                                    bound_o,
+                                    dt_sid,
+                                    lang,
+                                    store_ref,
+                                    dict_novelty,
+                                    None,
+                                )
+                            }
+                        } else {
+                            value_to_otype_okey(
+                                bound_o,
+                                dt_sid,
+                                lang,
+                                store_ref,
+                                dict_novelty,
+                                None,
+                            )
+                        }
                     }
                     // Refs and untyped strings are handled above; this is reached
                     // for untyped non-string values (numeric/bool/date/…).
@@ -3837,6 +3896,62 @@ pub(crate) fn encode_bound_object_prefilter(
     }
 }
 
+/// A base-only proof. A mixed/unknown leaflet declines, even if the arena itself
+/// contains only decimals: numerically equal inline values must not be missed.
+fn predicate_is_decimal_only(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<bool> {
+    use fluree_db_binary_index::format::run_record::RunSortOrder;
+    if !store.numbig_is_decimal_only(g_id, p_id)
+        || store.branch_for_order(g_id, RunSortOrder::Post).is_none()
+    {
+        return Ok(false);
+    }
+    let decimal_type = OType::NUM_BIG_OVERFLOW.as_u16();
+    for leaf in
+        crate::fast_path_common::leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id)
+    {
+        // POST sorts by predicate, then object type. Interior leaf extrema
+        // prove uniformity without opening directories. Only the (at most two)
+        // boundary leaves can require directory reads, even for huge predicates.
+        if leaf.first_key.p_id == p_id && leaf.last_key.p_id == p_id {
+            if leaf.first_key.o_type != decimal_type || leaf.last_key.o_type != decimal_type {
+                return Ok(false);
+            }
+            continue;
+        }
+        let dir = store
+            .open_leaf_dir(&leaf.leaf_cid)
+            .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
+        for entry in &dir.entries {
+            if entry.row_count == 0 || entry.p_const.is_some_and(|p| p != p_id) {
+                continue;
+            }
+            if entry.p_const != Some(p_id) || entry.o_type_const != Some(decimal_type) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn decimal_object_key(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: Option<u32>,
+    value: &bigdecimal::BigDecimal,
+) -> std::io::Result<(OType, u64)> {
+    match p_id.and_then(|p| store.find_decimal_handles(g_id, p, value)) {
+        Some(handles) if handles.is_empty() => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "decimal absent from predicate arena",
+        )),
+        Some(handles) if handles.len() == 1 => Ok((OType::NUM_BIG_OVERFLOW, u64::from(handles[0]))),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "decimal arena unavailable or has multiple equal-value handles",
+        )),
+    }
+}
+
 fn infer_exact_datatype_sid_from_stats(
     stats_view: Option<&fluree_db_core::StatsView>,
     g_id: GraphId,
@@ -3899,6 +4014,9 @@ fn datatype_sid_for_untyped_value(
     tag: fluree_db_core::ValueTypeTag,
 ) -> Option<Sid> {
     match value {
+        FlakeValue::Decimal(_) if tag == fluree_db_core::ValueTypeTag::DECIMAL => {
+            Some(Sid::new(namespaces::XSD, xsd_names::DECIMAL))
+        }
         FlakeValue::Long(_) => match tag {
             fluree_db_core::ValueTypeTag::INTEGER => {
                 Some(Sid::new(namespaces::XSD, xsd_names::INTEGER))
@@ -4582,6 +4700,71 @@ mod tests {
         .expect("datatype");
         assert_eq!(inferred.namespace_code, namespaces::XSD);
         assert_eq!(inferred.name, xsd_names::INT.into());
+    }
+
+    #[test]
+    fn decimal_seek_inference_requires_a_single_observed_type() {
+        let value = FlakeValue::Decimal(Box::new("230.00".parse().unwrap()));
+        for observed in [
+            vec![ValueTypeTag::DECIMAL],
+            vec![ValueTypeTag::DECIMAL, ValueTypeTag::INTEGER],
+            vec![ValueTypeTag::DECIMAL, ValueTypeTag::DOUBLE],
+            vec![ValueTypeTag::DECIMAL, ValueTypeTag::UNKNOWN],
+            vec![],
+        ] {
+            let singleton = observed == [ValueTypeTag::DECIMAL];
+            // Counts alone can look uniform after no-op retractions.
+            let stats = stats_with(vec![(ValueTypeTag::DECIMAL, 10)], observed);
+            assert_eq!(
+                infer_exact_datatype_sid_from_stats(
+                    Some(&stats),
+                    0,
+                    RuntimePredicateId::from_u32(7),
+                    &value
+                ),
+                singleton.then(|| Sid::new(namespaces::XSD, xsd_names::DECIMAL)),
+            );
+        }
+    }
+
+    #[test]
+    fn bound_predicate_retains_a_leading_index_bound() {
+        for object in [
+            Term::Value(FlakeValue::Decimal(Box::new("230.00".parse().unwrap()))),
+            Term::Value(FlakeValue::Long(230)),
+            Term::Value(FlakeValue::String("value".into())),
+            Term::Sid(Sid::new(100, "target")),
+        ] {
+            let pattern =
+                TriplePattern::new(Ref::Var(VarId(0)), Ref::Sid(Sid::new(100, "p")), object);
+            assert_eq!(
+                BinaryScanOperator::new(pattern.clone(), None, vec![]).index,
+                IndexType::Post
+            );
+            let explicit = BinaryScanOperator::new_with_emit_and_index(
+                pattern.clone(),
+                None,
+                vec![],
+                EmitMask::ALL,
+                Some(IndexType::Opst),
+            );
+            assert_eq!(explicit.index, IndexType::Opst);
+            let mut subject_bound = pattern;
+            subject_bound.s = Ref::Sid(Sid::new(100, "s"));
+            assert_eq!(
+                BinaryScanOperator::new(subject_bound, None, vec![]).index,
+                IndexType::Spot
+            );
+        }
+        let variable_predicate = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Var(VarId(1)),
+            Term::Sid(Sid::new(100, "target")),
+        );
+        assert_eq!(
+            BinaryScanOperator::new(variable_predicate, None, vec![]).index,
+            IndexType::Opst
+        );
     }
 
     #[test]

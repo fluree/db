@@ -125,6 +125,8 @@ pub struct NumBigArena {
     dedup: HashMap<NumBigRepr, u32>,
     /// Forward: handle -> stored value.
     values: Vec<StoredBigValue>,
+    /// Monotone summary; NumBig also stores overflow integers.
+    contains_bigint: bool,
     /// True when every stored decimal already has its normalized repr.
     /// Legacy arenas may contain a non-normalized value even without duplicates.
     values_normalized: bool,
@@ -142,6 +144,7 @@ impl NumBigArena {
         Self {
             dedup: HashMap::new(),
             values: Vec::new(),
+            contains_bigint: false,
             values_normalized: true,
             dup_handles: HashMap::new(),
         }
@@ -156,6 +159,7 @@ impl NumBigArena {
         }
         let handle = self.values.len() as u32;
         self.values.push(StoredBigValue::BigInt(bytes));
+        self.contains_bigint = true;
         self.dedup.insert(repr, handle);
         handle
     }
@@ -190,6 +194,7 @@ impl NumBigArena {
     /// tracked as duplicates so value lookups can report every handle.
     fn push_stored(&mut self, value: StoredBigValue, reprs: impl IntoIterator<Item = NumBigRepr>) {
         let handle = self.values.len() as u32;
+        self.contains_bigint |= matches!(value, StoredBigValue::BigInt(_));
         self.values.push(value);
         for repr in reprs {
             match self.dedup.entry(repr) {
@@ -211,6 +216,12 @@ impl NumBigArena {
     /// Look up a stored value by handle.
     pub fn get_by_handle(&self, handle: u32) -> Option<&StoredBigValue> {
         self.values.get(handle as usize)
+    }
+
+    /// Whether this nonempty arena contains exclusively decimal values.
+    /// Includes obsolete handles, so retractions cannot make this proof weaker.
+    pub fn is_decimal_only(&self) -> bool {
+        !self.values.is_empty() && !self.contains_bigint
     }
 
     /// Find a BigInt's handle without inserting (read-only lookup for query path).
@@ -576,6 +587,23 @@ mod tests {
             arena.find_bigdec_handles(&"19.99".parse::<BigDecimal>().unwrap()),
             vec![2]
         );
+    }
+
+    #[test]
+    fn decimal_only_summary_survives_reload_and_integer_insertion() {
+        let mut arena = NumBigArena::new();
+        assert!(!arena.is_decimal_only());
+        arena.get_or_insert_bigdec(&"22.00".parse().unwrap());
+        assert!(arena.is_decimal_only());
+        let mut loaded =
+            read_numbig_arena_from_bytes(&write_numbig_arena_to_bytes(&arena).unwrap()).unwrap();
+        assert!(loaded.is_decimal_only());
+        loaded.get_or_insert_bigint(&BigInt::from(22));
+        loaded.get_or_insert_bigdec(&"23.0".parse().unwrap());
+        assert!(!loaded.is_decimal_only());
+        let reloaded =
+            read_numbig_arena_from_bytes(&write_numbig_arena_to_bytes(&loaded).unwrap()).unwrap();
+        assert!(!reloaded.is_decimal_only());
     }
 
     #[test]
