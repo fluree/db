@@ -90,14 +90,12 @@ impl DictId for u64 {
 // VecBiDict
 // ---------------------------------------------------------------------------
 
-/// Vec-backed bidirectional dictionary for dense sequential IDs.
-///
-/// - **Forward:** `Vec<Arc<str>>` indexed by `(id - base_id)`. O(1), no hashing.
-/// - **Reverse:** `HashMap<Arc<str>, Id>` sharing `Arc` with the Vec. One hash lookup.
-/// - **Insert-only** (no remove). IDs are monotonically assigned from `base_id`.
 #[derive(Clone, Debug)]
 pub struct VecBiDict<Id: DictId> {
     entries: Vec<Arc<str>>,
+    /// Parallel to `entries`: the commit `t` that introduced each entry,
+    /// `i64::MAX` when unknown. What [`Self::retire_seen_through`] keys on.
+    first_t: Vec<i64>,
     reverse: HashMap<Arc<str>, Id>,
     base_id: Id,
     next_id: Id,
@@ -108,6 +106,7 @@ impl<Id: DictId> VecBiDict<Id> {
     pub fn new(base_id: Id) -> Self {
         Self {
             entries: Vec::new(),
+            first_t: Vec::new(),
             reverse: HashMap::new(),
             base_id,
             next_id: base_id,
@@ -132,6 +131,7 @@ impl<Id: DictId> VecBiDict<Id> {
                 .expect("DictId overflow in from_ordered_vec");
         }
         Self {
+            first_t: vec![i64::MAX; entries.len()],
             entries,
             reverse,
             base_id,
@@ -145,7 +145,20 @@ impl<Id: DictId> VecBiDict<Id> {
     /// Otherwise allocates the next sequential ID and inserts into both
     /// forward and reverse structures.
     pub fn assign_or_lookup(&mut self, value: &str) -> Id {
+        self.assign_or_lookup_at(value, i64::MAX)
+    }
+
+    /// [`Self::assign_or_lookup`] recording the commit `t` the entry was
+    /// seen at: a new entry starts there, an existing one keeps the earliest
+    /// `t` it has been seen at, whatever order the flakes arrive in.
+    pub fn assign_or_lookup_at(&mut self, value: &str, t: i64) -> Id {
         if let Some(&id) = self.reverse.get(value) {
+            if let Some(seen) = self
+                .first_t
+                .get_mut(id.to_usize().wrapping_sub(self.base_id.to_usize()))
+            {
+                *seen = (*seen).min(t);
+            }
             return id;
         }
 
@@ -156,9 +169,41 @@ impl<Id: DictId> VecBiDict<Id> {
 
         let interned: Arc<str> = Arc::from(value);
         self.entries.push(Arc::clone(&interned));
+        self.first_t.push(t);
         self.reverse.insert(interned, id);
 
         id
+    }
+
+    /// Drop every entry introduced at or before commit `t` and renumber the
+    /// rest contiguously from `new_base` — what an index publish covering
+    /// `t` does to a novelty dictionary: the dropped entries are now in the
+    /// persisted dictionary (or referenced by nothing that remains), the
+    /// kept ones sit above the new persisted watermark. Returns how many
+    /// were dropped.
+    pub fn retire_seen_through(&mut self, t: i64, new_base: Id) -> usize {
+        let before = self.entries.len();
+        let mut kept = Vec::with_capacity(before);
+        let mut kept_t = Vec::with_capacity(before);
+        for (value, first_t) in self.entries.drain(..).zip(self.first_t.drain(..)) {
+            if first_t > t {
+                kept.push(value);
+                kept_t.push(first_t);
+            }
+        }
+        self.reverse.clear();
+        let mut id = new_base;
+        for value in &kept {
+            self.reverse.insert(Arc::clone(value), id);
+            id = id
+                .checked_add(Id::one())
+                .expect("DictId overflow in retire_seen_through");
+        }
+        self.entries = kept;
+        self.first_t = kept_t;
+        self.base_id = new_base;
+        self.next_id = id;
+        before - self.entries.len()
     }
 
     /// Reverse lookup: find ID by value.
@@ -370,5 +415,38 @@ mod tests {
         let d = VecBiDict::<u32>::from_ordered_vec(5, Vec::new());
         assert!(d.is_empty());
         assert_eq!(d.base_id(), 5);
+    }
+
+    /// Retiring through a commit drops what that commit and earlier ones
+    /// introduced and renumbers the rest from the new base, whatever order
+    /// they were introduced in.
+    #[test]
+    fn retire_seen_through_drops_by_commit_and_renumbers() {
+        let mut d: VecBiDict<u32> = VecBiDict::new(11);
+        d.assign_or_lookup_at("t1-a", 1);
+        d.assign_or_lookup_at("t3-b", 3);
+        d.assign_or_lookup_at("t2-c", 2);
+        d.assign_or_lookup_at("t3-d", 3);
+        assert_eq!(d.assign_or_lookup_at("t1-a", 9), 11, "keeps its id");
+        assert_eq!(d.assign_or_lookup_at("t3-d", 2), 14, "takes the earliest t");
+
+        let dropped = d.retire_seen_through(2, 20);
+        assert_eq!(dropped, 3);
+        assert_eq!(d.find("t1-a"), None);
+        assert_eq!(d.find("t2-c"), None);
+        assert_eq!(d.find("t3-d"), None, "seen at t=2 as well, so retired");
+        assert_eq!(d.find("t3-b"), Some(20), "renumbered from the new base");
+        assert_eq!(d.resolve(20), Some("t3-b"));
+        assert_eq!(d.resolve(12), None);
+        assert_eq!(d.base_id(), 20);
+        assert_eq!(
+            d.assign_or_lookup_at("t4-e", 4),
+            21,
+            "continues after the kept"
+        );
+
+        assert_eq!(d.retire_seen_through(10, 30), 2);
+        assert!(d.is_empty());
+        assert_eq!(d.next_id(), 30);
     }
 }

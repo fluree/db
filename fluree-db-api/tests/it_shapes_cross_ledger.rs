@@ -807,3 +807,73 @@ async fn model_head_advance_recompiles_shapes() {
         .await
         .expect("deactivated shape must no longer reject");
 }
+
+/// A `f:shapesSource` whose `f:ledger` names the data ledger itself is a
+/// same-ledger reference in cross-ledger clothing. A write that stages under
+/// the ledger's write lock (a SPARQL update always does) then opened the
+/// "model" ledger through the ledger cache, whose read of that same lock
+/// waited forever. The self-reference is now served from the state staging
+/// already holds.
+#[tokio::test]
+async fn self_referencing_shapes_source_does_not_deadlock_a_locked_write() {
+    use std::time::Duration;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let data_id = "test/cross-ledger-shapes/self-ref:main";
+    fluree.create_ledger(data_id).await.expect("create");
+    let handle = fluree.ledger_cached(data_id).await.expect("cache");
+
+    let shapes_graph_iri = "http://example.org/governance/shapes";
+    let config_iri = config_graph_iri(data_id);
+    let seed = format!(
+        r"
+        @prefix sh:   <http://www.w3.org/ns/shacl#> .
+        @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+        @prefix ex:   <http://example.org/ns/> .
+        @prefix f:    <https://ns.flur.ee/db#> .
+
+        GRAPH <{shapes_graph_iri}> {{
+            ex:PersonShape
+                rdf:type        sh:NodeShape ;
+                sh:targetClass  ex:Person ;
+                sh:property     ex:pshape_name .
+            ex:pshape_name
+                sh:path     ex:name ;
+                sh:minCount 1 ;
+                sh:datatype xsd:string .
+        }}
+        GRAPH <{config_iri}> {{
+            <urn:cfg:main> rdf:type f:LedgerConfig .
+            <urn:cfg:main> f:shaclDefaults <urn:cfg:shacl> .
+            <urn:cfg:shacl> f:shaclEnabled true .
+            <urn:cfg:shacl> f:shapesSource <urn:cfg:shapes-ref> .
+            <urn:cfg:shapes-ref> rdf:type f:GraphRef ;
+                                 f:graphSource <urn:cfg:shapes-src> .
+            <urn:cfg:shapes-src> f:ledger <{data_id}> ;
+                                 f:graphSelector <{shapes_graph_iri}> .
+        }}
+    "
+    );
+    fluree
+        .stage(&handle)
+        .upsert_turtle(&seed)
+        .execute()
+        .await
+        .expect("seed shapes and a self-referencing config");
+
+    let wait = Duration::from_secs(20);
+    let ok = "PREFIX ex: <http://example.org/ns/> \
+              INSERT DATA { ex:alice a ex:Person ; ex:name \"Alice\" }";
+    tokio::time::timeout(wait, fluree.stage(&handle).sparql_update(ok).execute())
+        .await
+        .expect("the write completed instead of waiting on its own ledger lock")
+        .expect("a conforming Person passes the self-referenced shape");
+
+    let bad = "PREFIX ex: <http://example.org/ns/> INSERT DATA { ex:bob a ex:Person }";
+    let err = tokio::time::timeout(wait, fluree.stage(&handle).sparql_update(bad).execute())
+        .await
+        .expect("the write completed instead of waiting on its own ledger lock")
+        .expect_err("a Person without a name is rejected by the self-referenced shape");
+    assert_shacl_violation(err, "self-referencing shapes source");
+}

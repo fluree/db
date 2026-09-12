@@ -46,8 +46,8 @@
 //!   `TranslationFailed` (no silent drop; dropping a target would
 //!   produce a structurally weaker policy than authored).
 
+use super::ResolveCtx;
 use super::{encode_system_iri, CrossLedgerError};
-use crate::Fluree;
 use fluree_db_core::{FlakeValue, IndexType, LedgerSnapshot, RangeMatch, RangeTest, Sid};
 use fluree_vocab::policy_iris;
 
@@ -70,7 +70,7 @@ use std::collections::HashSet;
 #[tracing::instrument(
     name = "cross_ledger.policy.materialize",
     level = "debug",
-    skip(fluree),
+    skip(ctx),
     fields(
         model_ledger = canonical_model_ledger_id,
         graph_iri = graph_iri,
@@ -81,11 +81,11 @@ pub(super) async fn materialize_policy_rules(
     canonical_model_ledger_id: &str,
     graph_iri: &str,
     resolved_t: i64,
-    fluree: &Fluree,
+    ctx: &ResolveCtx<'_>,
 ) -> Result<PolicyArtifactWire, CrossLedgerError> {
     // 1. Open M at resolved_t.
-    let m_db = fluree
-        .load_graph_db_at_t(canonical_model_ledger_id, resolved_t)
+    let m_db = ctx
+        .open_model_db(canonical_model_ledger_id, resolved_t)
         .await
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),

@@ -31,6 +31,10 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 // ============================================================================
 
 struct PackHandle {
+    /// Content id from the root routing table; `None` for in-memory packs.
+    /// Together with the id range this is what a later load matches on to
+    /// reuse the handle instead of reopening the file.
+    cid: Option<ContentId>,
     /// ID range from the root routing table (always known, even for lazy packs).
     first_id: u64,
     last_id: u64,
@@ -110,7 +114,9 @@ struct LoadContext {
 /// Locally available packs are eagerly loaded at construction. Remote packs
 /// are lazily fetched on first lookup.
 pub struct ForwardPackReader {
-    packs: Vec<PackHandle>,
+    /// Shared so a reload of the same routing table can carry a handle (and
+    /// its open backing) over from the previous reader.
+    packs: Vec<Arc<PackHandle>>,
     /// Shared loading context. `None` for in-memory readers.
     load_ctx: Option<LoadContext>,
 }
@@ -138,6 +144,27 @@ impl ForwardPackReader {
         expected_kind: u8,
         expected_ns_code: u16,
     ) -> io::Result<Self> {
+        Self::from_pack_refs_reusing(cs, cache_dir, refs, expected_kind, expected_ns_code, None)
+            .await
+    }
+
+    /// [`Self::from_pack_refs`], carrying over every handle of `prev` whose
+    /// content id and id range match a routing entry.
+    ///
+    /// A pack is an immutable content-addressed blob, so a handle that was
+    /// valid for the same cid in the previous reader is valid here without
+    /// another open, size probe, or header parse — an incremental index
+    /// publish keeps nearly every pack of the previous root, and this path
+    /// used to reopen all of them. `prev` is ignored unless it was loaded for
+    /// the same kind and namespace code.
+    pub async fn from_pack_refs_reusing(
+        cs: Arc<dyn ContentStore>,
+        cache_dir: &Path,
+        refs: &[PackBranchEntry],
+        expected_kind: u8,
+        expected_ns_code: u16,
+        prev: Option<&ForwardPackReader>,
+    ) -> io::Result<Self> {
         // Pre-create cache directory once.
         if !refs.is_empty() {
             fluree_db_core::disk_cache::ensure_cache_dir(cache_dir).map_err(|e| {
@@ -145,51 +172,102 @@ impl ForwardPackReader {
             })?;
         }
 
+        let prev = prev.filter(|p| {
+            p.load_ctx.as_ref().is_some_and(|ctx| {
+                ctx.expected_kind == expected_kind && ctx.expected_ns_code == expected_ns_code
+            })
+        });
+        // The routing table of a stream that received nothing since the
+        // previous root is the previous table entry for entry — the case
+        // for nearly every namespace of a ledger with many — and needs no
+        // matching at all. Compared in order rather than through a map so a
+        // ledger with tens of thousands of namespaces pays no allocation
+        // per stream.
+        if let Some(p) = prev {
+            let unchanged = p.packs.len() == refs.len()
+                && p.packs.iter().zip(refs).all(|(h, entry)| {
+                    h.cid.as_ref() == Some(&entry.pack_cid)
+                        && h.first_id == entry.first_id
+                        && h.last_id == entry.last_id
+                });
+            if unchanged {
+                return Ok(Self {
+                    packs: p.packs.clone(),
+                    load_ctx: Some(LoadContext {
+                        cs,
+                        expected_kind,
+                        expected_ns_code,
+                    }),
+                });
+            }
+        }
+        let reusable: std::collections::HashMap<&ContentId, &Arc<PackHandle>> = prev
+            .map(|p| {
+                p.packs
+                    .iter()
+                    .filter_map(|h| h.cid.as_ref().map(|cid| (cid, h)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut packs = Vec::with_capacity(refs.len());
+        let mut reused = 0usize;
 
         for entry in refs {
+            if let Some(handle) = reusable.get(&entry.pack_cid) {
+                if handle.first_id == entry.first_id && handle.last_id == entry.last_id {
+                    packs.push(Arc::clone(handle));
+                    reused += 1;
+                    continue;
+                }
+            }
+
             let cache_name = format!("{}.fpk", entry.pack_cid.digest_hex());
             let cache_path = cache_dir.join(&cache_name);
 
             let local_path = cs.resolve_local_path(&entry.pack_cid);
 
-            if let Some(path) = local_path {
+            let inner = if let Some(path) = local_path {
                 // Local CAS path.
                 let backing = load_pack_backing(&path)?;
                 let meta = parse_pack_meta(backing.bytes())?;
                 validate_meta(&meta, entry, expected_kind, expected_ns_code)?;
-                packs.push(PackHandle {
-                    first_id: entry.first_id,
-                    last_id: entry.last_id,
-                    inner: PackInner::Loaded { meta, backing },
-                });
+                PackInner::Loaded { meta, backing }
             } else if cache_path.exists() {
                 // Cached on disk.
                 let backing = load_pack_backing(&cache_path)?;
                 let meta = parse_pack_meta(backing.bytes())?;
                 validate_meta(&meta, entry, expected_kind, expected_ns_code)?;
-                packs.push(PackHandle {
-                    first_id: entry.first_id,
-                    last_id: entry.last_id,
-                    inner: PackInner::Loaded { meta, backing },
-                });
+                PackInner::Loaded { meta, backing }
             } else {
                 // Remote — defer to lazy fetch on first lookup.
-                packs.push(PackHandle {
-                    first_id: entry.first_id,
-                    last_id: entry.last_id,
-                    inner: PackInner::Lazy {
-                        pack_cid: entry.pack_cid.clone(),
-                        cache_path,
-                        loaded: OnceCell::new(),
-                    },
-                });
-            }
+                PackInner::Lazy {
+                    pack_cid: entry.pack_cid.clone(),
+                    cache_path,
+                    loaded: OnceCell::new(),
+                }
+            };
+            packs.push(Arc::new(PackHandle {
+                cid: Some(entry.pack_cid.clone()),
+                first_id: entry.first_id,
+                last_id: entry.last_id,
+                inner,
+            }));
         }
 
         // Sort by first_id (should already be sorted, but enforce).
         packs.sort_by_key(|p| p.first_id);
         validate_pack_routing(&packs)?;
+
+        if reused > 0 {
+            tracing::trace!(
+                kind = expected_kind,
+                ns_code = expected_ns_code,
+                reused,
+                total = packs.len(),
+                "forward packs carried over from the previous reader"
+            );
+        }
 
         Ok(Self {
             packs,
@@ -207,14 +285,15 @@ impl ForwardPackReader {
 
         for bytes in pack_bytes_list {
             let meta = parse_pack_meta(&bytes)?;
-            packs.push(PackHandle {
+            packs.push(Arc::new(PackHandle {
+                cid: None,
                 first_id: meta.first_id,
                 last_id: meta.last_id,
                 inner: PackInner::Loaded {
                     meta,
                     backing: LoadedBacking::InMemory(bytes),
                 },
-            });
+            }));
         }
 
         packs.sort_by_key(|p| p.first_id);
@@ -237,6 +316,17 @@ impl ForwardPackReader {
     /// Number of packs in this reader.
     pub fn pack_count(&self) -> usize {
         self.packs.len()
+    }
+
+    /// Number of packs whose handle (and open backing) this reader shares
+    /// with `other`. Diagnostic for the reload path: after an incremental
+    /// publish this should equal the number of packs the two roots have in
+    /// common.
+    pub fn packs_shared_with(&self, other: &ForwardPackReader) -> usize {
+        self.packs
+            .iter()
+            .filter(|h| other.packs.iter().any(|o| Arc::ptr_eq(h, o)))
+            .count()
     }
 
     /// Pre-warm forward-dict pack pages into the OS page cache, up to
@@ -332,7 +422,7 @@ impl std::fmt::Debug for ForwardPackReader {
 // ============================================================================
 
 /// Validate that pack handles have strictly increasing, non-overlapping ID ranges.
-fn validate_pack_routing(packs: &[PackHandle]) -> io::Result<()> {
+fn validate_pack_routing(packs: &[Arc<PackHandle>]) -> io::Result<()> {
     for i in 1..packs.len() {
         let prev_last = packs[i - 1].last_id;
         let curr_first = packs[i].first_id;
@@ -657,7 +747,7 @@ fn atomic_write_to_cache(cache_path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dict::forward_pack::{encode_forward_pack, KIND_STRING_FWD};
+    use crate::dict::forward_pack::{encode_forward_pack, KIND_STRING_FWD, KIND_SUBJECT_FWD};
     use crate::format::wire_helpers::PackBranchEntry;
     use fluree_db_core::content_kind::DictKind;
     use fluree_db_core::{ContentKind, MemoryContentStore};
@@ -883,6 +973,111 @@ mod tests {
         assert_eq!(reader.forward_lookup_str(50).unwrap(), None);
 
         // Cleanup.
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    /// A reload of a routing table that still names a pack must share the
+    /// previous reader's handle for it, and only load what is new. Matching is
+    /// by cid AND id range, and never across a reader built for another
+    /// dictionary stream.
+    #[tokio::test]
+    async fn a_reload_carries_over_matching_pack_handles() {
+        let cs: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+        let kind = ContentKind::DictBlob {
+            dict: DictKind::StringForward,
+        };
+        let p1 = cs.put(kind, &make_pack_bytes(0, 50)).await.unwrap();
+        let p2 = cs.put(kind, &make_pack_bytes(50, 50)).await.unwrap();
+        let entry = |first: u64, last: u64, cid: &ContentId| PackBranchEntry {
+            first_id: first,
+            last_id: last,
+            pack_cid: cid.clone(),
+        };
+        let cache_dir = std::env::temp_dir().join(format!(
+            "fluree_test_pack_reuse_{}_{}",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        let first = ForwardPackReader::from_pack_refs(
+            Arc::clone(&cs),
+            &cache_dir,
+            &[entry(0, 49, &p1)],
+            KIND_STRING_FWD,
+            0,
+        )
+        .await
+        .unwrap();
+        // Resolve through the first reader so its lazy handle is loaded; the
+        // second reader must see that load, not repeat it.
+        assert_eq!(
+            first.forward_lookup_str(7).unwrap().as_deref(),
+            Some("val_7")
+        );
+
+        let second = ForwardPackReader::from_pack_refs_reusing(
+            Arc::clone(&cs),
+            &cache_dir,
+            &[entry(0, 49, &p1), entry(50, 99, &p2)],
+            KIND_STRING_FWD,
+            0,
+            Some(&first),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.pack_count(), 2);
+        assert_eq!(
+            second.packs_shared_with(&first),
+            1,
+            "the pack both tables name must be the same handle"
+        );
+        assert!(
+            Arc::ptr_eq(&second.packs[0], &first.packs[0]),
+            "the shared handle is the one for the common pack"
+        );
+        assert!(matches!(
+            &second.packs[0].inner,
+            PackInner::Lazy { loaded, .. } if loaded.get().is_some()
+        ));
+        assert_eq!(
+            second.forward_lookup_str(7).unwrap().as_deref(),
+            Some("val_7")
+        );
+        assert_eq!(
+            second.forward_lookup_str(75).unwrap().as_deref(),
+            Some("val_75")
+        );
+
+        // Same cid under a different id range is a different routing entry
+        // (a fresh cache dir keeps the handle lazy, so the mismatch is not
+        // caught by the eager header check first).
+        let other_cache_dir = cache_dir.join("shifted");
+        let shifted = ForwardPackReader::from_pack_refs_reusing(
+            Arc::clone(&cs),
+            &other_cache_dir,
+            &[entry(100, 149, &p1)],
+            KIND_STRING_FWD,
+            0,
+            Some(&first),
+        )
+        .await
+        .unwrap();
+        assert_eq!(shifted.packs_shared_with(&first), 0);
+
+        // A reader for another stream never lends its handles.
+        let other_stream = ForwardPackReader::from_pack_refs_reusing(
+            Arc::clone(&cs),
+            &cache_dir.join("other-stream"),
+            &[entry(0, 49, &p1)],
+            KIND_SUBJECT_FWD,
+            3,
+            Some(&first),
+        )
+        .await
+        .unwrap();
+        assert_eq!(other_stream.packs_shared_with(&first), 0);
+
         let _ = std::fs::remove_dir_all(&cache_dir);
     }
 

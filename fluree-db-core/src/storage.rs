@@ -19,9 +19,10 @@ pub enum Durability {
     /// Report complete once the write is in the storage root's WAL and
     /// that log has been flushed. The file itself is written page-cache and
     /// flushed in the background; a restart replays the log first. Survives
-    /// power loss. A head publication costs one flush regardless of how many
-    /// objects the commit wrote; content writes are covered by the next head
-    /// publication or the next background flush, whichever comes first.
+    /// power loss. A head publication costs at most one flush regardless of
+    /// how many objects the commit wrote, and publications that overlap share
+    /// one; content writes are covered by the next head publication or the
+    /// next background flush, whichever comes first.
     ///
     /// Unix only. Where the root cannot be journaled — a second process holds
     /// the log, or the filesystem refuses advisory locks — writes fall back to

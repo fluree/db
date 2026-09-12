@@ -339,6 +339,7 @@ impl Fluree {
             txn_meta,
             graph_delta,
             sync_graph: _,
+            scope: _,
         } = stage_result;
 
         if !view.has_staged() {

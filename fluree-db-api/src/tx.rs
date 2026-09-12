@@ -81,6 +81,8 @@ pub(crate) struct SequentialStager {
     /// The virtual state. `None` only after a `stage(…, advance: false)`
     /// consumed it (the caller declared no further reads).
     current: Option<LedgerState>,
+    /// Every operation's scope merged; bounded only while all of them are.
+    scope: WriteScope,
 }
 
 /// Fact identity for the sequential fold (flake minus `t`/`op`).
@@ -108,6 +110,7 @@ impl SequentialStager {
             last_ns_registry: None,
             union_ns_delta: std::collections::HashMap::new(),
             current: Some(ledger),
+            scope: WriteScope::Subjects(FxHashSet::default()),
         }
     }
 
@@ -164,6 +167,7 @@ impl SequentialStager {
 
         self.txn_meta.extend(result.txn_meta);
         self.last_ns_registry = Some(result.ns_registry);
+        self.scope = std::mem::replace(&mut self.scope, WriteScope::Unbounded).merge(result.scope);
 
         let (mut state_i, flakes_i) = result.view.into_parts();
         let staged_count = flakes_i.len();
@@ -247,6 +251,7 @@ impl SequentialStager {
         Ok(StageResult {
             view,
             ns_registry,
+            scope: self.scope,
             txn_meta: self.txn_meta,
             graph_delta,
             sync_graph: None,
@@ -750,8 +755,7 @@ pub(crate) async fn open_cross_ledger_shapes_model(
         return Ok(None);
     };
     let model_db = resolve_ctx
-        .fluree
-        .load_graph_db_at_t(&resolved.model_ledger_id, resolved.resolved_t)
+        .open_model_db(&resolved.model_ledger_id, resolved.resolved_t)
         .await
         .map_err(|e| {
             fluree_db_transact::TransactError::Parse(format!(
@@ -961,7 +965,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     view: &mut StagedLedger,
     ctx: StagedShaclContext<'_>,
     preresolved_config: Option<Arc<LedgerConfig>>,
-) -> std::result::Result<(), fluree_db_transact::TransactError> {
+) -> std::result::Result<bool, fluree_db_transact::TransactError> {
     let base = view.base();
 
     // 1. Config from pre-transaction state. The caller may pass a config it
@@ -1015,7 +1019,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     let has_config = config.is_some();
     if has_config && per_graph_policy.is_none() {
         // Config exists but every graph is disabled → nothing to do.
-        return Ok(());
+        return Ok(false);
     }
 
     // 4a. Cross-ledger shapes: when a `ShapesArtifactWire` is
@@ -1128,7 +1132,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
                     "commit replay: skipping SHACL re-validation for cross-ledger \
                      f:shapesSource (validated at origin)"
                 );
-                return Ok(());
+                return Ok(false);
             }
             let shapes_g_ids = resolve_shapes_source_g_ids(config.as_deref(), &base.snapshot)?;
             membership_g_ids = shapes_g_ids.clone();
@@ -1236,7 +1240,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     // shapes-exist heuristic applies. Skipping here keeps a shapeless
     // transaction from paying for the staged dictionary layer below.
     if shacl_cache.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     // Validation reads the staged view on the binary lane; its dictionaries
@@ -1276,7 +1280,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     //    merges namespace maps and parses the context, neither of which the
     //    conforming path should pay for.
     if outcome.conforms() {
-        return Ok(());
+        return Ok(true);
     }
     let compactor = violation_iri_compactor(view, &ctx);
 
@@ -1302,7 +1306,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
             format_violations(&reject_violations, &compactor),
         ));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Build the compactor that renders identifiers in violation messages.
@@ -1389,7 +1393,8 @@ async fn stage_with_config_shacl(
     options: StageOptions<'_>,
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
     txn_context: Option<&JsonValue>,
-) -> std::result::Result<(StagedLedger, NamespaceRegistry), fluree_db_transact::TransactError> {
+) -> std::result::Result<(StagedLedger, NamespaceRegistry, bool), fluree_db_transact::TransactError>
+{
     // Capture graph_delta + tracker before stage_txn consumes the options/txn.
     // graph_delta is used both for per-graph config lookup and for rebuilding
     // graph_sids after staging (IRIs are already interned in ns_registry, so
@@ -1512,7 +1517,7 @@ async fn stage_with_config_shacl(
         _ => None,
     };
 
-    apply_shacl_policy_to_staged_view(
+    let validated = apply_shacl_policy_to_staged_view(
         &mut view,
         StagedShaclContext {
             graph_delta: Some(&graph_delta),
@@ -1533,7 +1538,7 @@ async fn stage_with_config_shacl(
     )
     .await?;
 
-    Ok((view, ns_registry))
+    Ok((view, ns_registry, validated))
 }
 
 // =============================================================================
@@ -1555,7 +1560,7 @@ async fn enforce_unique_after_staging(
     resolve_ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
     inline_unique_properties: Option<&[String]>,
     staged_ns: &NamespaceRegistry,
-) -> std::result::Result<(), fluree_db_transact::TransactError> {
+) -> std::result::Result<bool, fluree_db_transact::TransactError> {
     let config = load_transaction_config(view.base()).await;
 
     // Start with config-resolved per-graph SIDs (same/cross ledger).
@@ -1613,10 +1618,10 @@ async fn enforce_unique_after_staging(
     }
 
     if per_graph_unique.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     enforce_unique_constraints(view, &per_graph_unique, graph_delta).await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Derive the set of graph IDs touched by staged flakes. Used by
@@ -2083,6 +2088,9 @@ pub struct TransactResultRef {
 pub struct StageResult {
     pub view: StagedLedger,
     pub ns_registry: NamespaceRegistry,
+    /// What the staging read and wrote, as far as a later commit needs to
+    /// know to re-base it over commits that landed after its snapshot.
+    pub scope: WriteScope,
     /// User-provided transaction metadata (extracted from envelope-form JSON-LD)
     pub txn_meta: Vec<TxnMetaEntry>,
     /// Named graph IRI to g_id mappings introduced by this transaction
@@ -2092,6 +2100,121 @@ pub struct StageResult {
     /// flakes is a legitimate no-change outcome, so the commit paths skip
     /// the commit for it exactly like a no-op update/upsert.
     pub sync_graph: Option<String>,
+}
+
+/// What a staging read and wrote, in the terms a re-base needs.
+///
+/// A stage computed against snapshot `t0` is still a correct stage over a
+/// later state when nothing that landed in between touched anything it read
+/// or wrote. `Subjects` says every read and every write was bound to the
+/// listed subjects — the WHERE patterns named their subjects, the templates
+/// wrote them, no validation looked anywhere else — so that question is a
+/// set intersection against the commits since `t0`. `Unbounded` says the
+/// stage read something no subject set describes (an unbound-subject
+/// pattern, shape validation, uniqueness, a whole-graph operation) and can
+/// only be redone against the current state.
+#[derive(Debug, Clone)]
+pub enum WriteScope {
+    Subjects(FxHashSet<Sid>),
+    Unbounded,
+}
+
+impl WriteScope {
+    /// Both stagings' scopes as one: bounded only if both were.
+    pub fn merge(self, other: WriteScope) -> WriteScope {
+        match (self, other) {
+            (WriteScope::Subjects(mut a), WriteScope::Subjects(b)) => {
+                a.extend(b);
+                WriteScope::Subjects(a)
+            }
+            _ => WriteScope::Unbounded,
+        }
+    }
+}
+
+/// The subjects a transaction reads through its WHERE and templates, when
+/// every such read is bound to a subject named in the transaction itself;
+/// `None` when some read is not.
+///
+/// Bound reads: a WHERE triple pattern whose subject is an IRI reads that
+/// subject; an upsert reads the existing values of every constant template
+/// subject. Anything else — a variable-subject pattern, a filter, a SPARQL
+/// WHERE clause, VALUES, a graph operation, inline shapes or uniqueness,
+/// dataset scoping — reads through data no subject set describes. A
+/// retraction on a ledger carrying edge annotations cascades to the
+/// annotation nodes hanging off the retracted edges, which are other
+/// subjects, so retractions are bounded only on a ledger without them.
+/// Template subjects bound by variables are covered by the written set:
+/// their bindings come from reads over the bound subjects, so any change
+/// to them shows up there.
+fn bounded_read_subjects(
+    txn: &Txn,
+    ns_registry: &mut NamespaceRegistry,
+    ledger: &LedgerState,
+) -> Option<FxHashSet<Sid>> {
+    if txn.graph_mgmt.is_some()
+        || txn.sync_graph.is_some()
+        || !txn.graph_delta.is_empty()
+        || txn.sparql_where.is_some()
+        || txn.values.is_some()
+        || txn.update_where_default_graph_iris.is_some()
+        || txn.update_where_named_graphs.is_some()
+        || txn.opts.shapes.is_some()
+        || txn
+            .opts
+            .unique_properties
+            .as_ref()
+            .is_some_and(|u| !u.is_empty())
+    {
+        return None;
+    }
+    let retracts = !txn.delete_templates.is_empty() || txn.txn_type == TxnType::Upsert;
+    if retracts && (ledger.snapshot.has_annotations || ledger.novelty.attachments.has_annotations())
+    {
+        return None;
+    }
+
+    let mut subjects = FxHashSet::default();
+    for pattern in &txn.where_patterns {
+        let fluree_db_query::parse::UnresolvedPattern::Triple(tp) = pattern else {
+            return None;
+        };
+        let fluree_db_query::parse::UnresolvedTerm::Iri(iri) = &tp.s else {
+            return None;
+        };
+        subjects.insert(ns_registry.sid_for_iri(iri));
+    }
+    if txn.txn_type == TxnType::Upsert {
+        for template in &txn.insert_templates {
+            if let fluree_db_transact::TemplateTerm::Sid(sid) = &template.subject {
+                subjects.insert(sid.clone());
+            }
+        }
+    }
+    Some(subjects)
+}
+
+/// The scope of a finished staging: the bounded read subjects plus every
+/// staged flake's subject, unless validation read beyond them or the
+/// transaction was staged with a policy or wrote to a named graph.
+fn write_scope(
+    read_subjects: Option<FxHashSet<Sid>>,
+    view: &StagedLedger,
+    read_beyond_subjects: bool,
+) -> WriteScope {
+    let Some(mut subjects) = read_subjects else {
+        return WriteScope::Unbounded;
+    };
+    if read_beyond_subjects {
+        return WriteScope::Unbounded;
+    }
+    for flake in view.staged_flakes() {
+        if flake.g.is_some() {
+            return WriteScope::Unbounded;
+        }
+        subjects.insert(flake.s.clone());
+    }
+    WriteScope::Subjects(subjects)
 }
 
 /// Convert named graph blocks to TripleTemplates with proper graph_id assignments.
@@ -2490,7 +2613,7 @@ impl crate::Fluree {
         &self,
         ledger: LedgerState,
         txn: Txn,
-        ns_registry: NamespaceRegistry,
+        mut ns_registry: NamespaceRegistry,
         txn_json: &JsonValue,
         index_config: Option<&IndexConfig>,
         external_tracker: Option<&Tracker>,
@@ -2502,6 +2625,7 @@ impl crate::Fluree {
         let graph_delta = txn.graph_delta.clone();
         let sync_graph = txn.sync_graph.clone();
         let inline_unique_properties = txn.opts.unique_properties.clone();
+        let read_subjects = bounded_read_subjects(&txn, &mut ns_registry, &ledger);
 
         // Use external tracker if provided, otherwise fall back to limits-only tracker
         let limits_tracker;
@@ -2533,7 +2657,8 @@ impl crate::Fluree {
         // Captured before `ledger` moves into staging, so a max-novelty
         // rejection can name the t the indexer should build to.
         let base_t = ledger.t();
-        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
+            .with_data_state(ledger.clone());
 
         #[cfg(feature = "shacl")]
         let staged = stage_with_config_shacl(
@@ -2546,8 +2671,10 @@ impl crate::Fluree {
         )
         .await;
         #[cfg(not(feature = "shacl"))]
-        let staged = stage_txn(ledger, txn, ns_registry, options).await;
-        let (view, ns_registry) = match staged {
+        let staged = stage_txn(ledger, txn, ns_registry, options)
+            .await
+            .map(|(view, ns_registry)| (view, ns_registry, false));
+        let (view, ns_registry, validated) = match staged {
             Ok(staged) => staged,
             Err(e) => {
                 self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
@@ -2557,7 +2684,7 @@ impl crate::Fluree {
         };
 
         // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(
+        let unique_enforced = enforce_unique_after_staging(
             &view,
             &graph_delta,
             &mut resolve_ctx,
@@ -2568,9 +2695,15 @@ impl crate::Fluree {
 
         validate_staged_reasoning_modes(&view)?;
 
+        let scope = write_scope(
+            read_subjects,
+            &view,
+            validated || unique_enforced || policy.is_some(),
+        );
         Ok(StageResult {
             view,
             ns_registry,
+            scope,
             txn_meta,
             graph_delta,
             sync_graph,
@@ -2592,12 +2725,13 @@ impl crate::Fluree {
     ) -> Result<StageResult> {
         let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
         let sync_graph = txn.sync_graph.clone();
-        let (view, ns_registry, txn_meta, graph_delta) = self
+        let (view, ns_registry, scope, txn_meta, graph_delta) = self
             .stage_view_once(ledger, txn, ns_registry, index_config, policy, tracker)
             .await?;
         Ok(StageResult {
             view,
             ns_registry,
+            scope,
             txn_meta,
             graph_delta,
             sync_graph,
@@ -2621,6 +2755,7 @@ impl crate::Fluree {
     ) -> Result<(
         StagedLedger,
         NamespaceRegistry,
+        WriteScope,
         Vec<TxnMetaEntry>,
         FxHashMap<u16, String>,
     )> {
@@ -2655,6 +2790,7 @@ impl crate::Fluree {
         let txn_meta = txn.txn_meta.clone();
         let graph_delta = txn.graph_delta.clone();
         let inline_unique_properties = txn.opts.unique_properties.clone();
+        let read_subjects = bounded_read_subjects(&txn, &mut ns_registry, &ledger);
 
         let mut options = match index_config {
             Some(cfg) => StageOptions::new().with_index_config(cfg),
@@ -2675,7 +2811,8 @@ impl crate::Fluree {
         // Captured before `ledger` moves into staging, so a max-novelty
         // rejection can name the t the indexer should build to.
         let base_t = ledger.t();
-        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
+            .with_data_state(ledger.clone());
 
         #[cfg(feature = "shacl")]
         let staged = stage_with_config_shacl(
@@ -2690,8 +2827,10 @@ impl crate::Fluree {
         )
         .await;
         #[cfg(not(feature = "shacl"))]
-        let staged = stage_txn(ledger, txn, ns_registry, options).await;
-        let (view, ns_registry) = match staged {
+        let staged = stage_txn(ledger, txn, ns_registry, options)
+            .await
+            .map(|(view, ns_registry)| (view, ns_registry, false));
+        let (view, ns_registry, validated) = match staged {
             Ok(staged) => staged,
             Err(e) => {
                 self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
@@ -2701,7 +2840,7 @@ impl crate::Fluree {
         };
 
         // Enforce uniqueness constraints (independent of shacl feature)
-        enforce_unique_after_staging(
+        let unique_enforced = enforce_unique_after_staging(
             &view,
             &graph_delta,
             &mut resolve_ctx,
@@ -2712,7 +2851,12 @@ impl crate::Fluree {
 
         validate_staged_reasoning_modes(&view)?;
 
-        Ok((view, ns_registry, txn_meta, graph_delta))
+        let scope = write_scope(
+            read_subjects,
+            &view,
+            validated || unique_enforced || policy.is_some(),
+        );
+        Ok((view, ns_registry, scope, txn_meta, graph_delta))
     }
 
     /// Stage an ordered pair of transactions against the same base ledger and
@@ -2741,7 +2885,7 @@ impl crate::Fluree {
         tracker: Option<&Tracker>,
     ) -> Result<StageResult> {
         let ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
-        let (view1, ns_registry, mut txn_meta, mut graph_delta) = self
+        let (view1, ns_registry, _, mut txn_meta, mut graph_delta) = self
             .stage_view_once(
                 ledger.clone(),
                 first,
@@ -2751,7 +2895,7 @@ impl crate::Fluree {
                 tracker,
             )
             .await?;
-        let (view2, ns_registry, meta2, gdelta2) = self
+        let (view2, ns_registry, _, meta2, gdelta2) = self
             .stage_view_once(ledger, second, ns_registry, index_config, policy, tracker)
             .await?;
 
@@ -2776,6 +2920,8 @@ impl crate::Fluree {
         Ok(StageResult {
             view,
             ns_registry,
+            // The pair path commits under the lock; nothing re-bases it.
+            scope: WriteScope::Unbounded,
             txn_meta,
             graph_delta,
             sync_graph: None,
@@ -2841,6 +2987,7 @@ impl crate::Fluree {
             return Ok(StageResult {
                 view,
                 ns_registry,
+                scope: WriteScope::Subjects(FxHashSet::default()),
                 txn_meta: Vec::new(),
                 graph_delta: FxHashMap::default(),
                 sync_graph: None,
@@ -2904,7 +3051,8 @@ impl crate::Fluree {
         // Captured before `ledger` moves into staging; see the matching block
         // above.
         let base_t = ledger.t();
-        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
+            .with_data_state(ledger.clone());
 
         #[cfg(feature = "shacl")]
         let staged = stage_with_config_shacl(
@@ -2924,8 +3072,10 @@ impl crate::Fluree {
         )
         .await;
         #[cfg(not(feature = "shacl"))]
-        let staged = stage_txn(ledger, txn, ns_registry, options).await;
-        let (view, ns_registry) = match staged {
+        let staged = stage_txn(ledger, txn, ns_registry, options)
+            .await
+            .map(|(view, ns_registry)| (view, ns_registry, false));
+        let (view, ns_registry, _validated) = match staged {
             Ok(staged) => staged,
             Err(e) => {
                 self.request_index_after_novelty_rejection(&ledger_id_owned, base_t, &e)
@@ -2957,6 +3107,8 @@ impl crate::Fluree {
         Ok(StageResult {
             view,
             ns_registry,
+            // Policy-bearing writes commit under the lock; nothing re-bases them.
+            scope: WriteScope::Unbounded,
             txn_meta,
             graph_delta,
             sync_graph: None,
@@ -2996,6 +3148,7 @@ impl crate::Fluree {
             txn_meta,
             graph_delta,
             sync_graph: _,
+            scope: _,
         } = self
             .stage_transaction_tracked_with_policy(ledger, input, Some(index_config), &tracker)
             .await?;
@@ -3161,6 +3314,7 @@ impl crate::Fluree {
             txn_meta,
             graph_delta,
             sync_graph,
+            scope: _,
         } = self
             .stage_transaction(ledger, txn_type, txn_json, txn_opts, Some(index_config))
             .await?;
@@ -3237,6 +3391,7 @@ impl crate::Fluree {
             txn_meta,
             graph_delta,
             sync_graph,
+            scope: _,
         } = self
             .stage_transaction_with_trig_meta(
                 ledger,
@@ -3320,6 +3475,7 @@ impl crate::Fluree {
             txn_meta,
             graph_delta,
             sync_graph,
+            scope: _,
         } = self
             .stage_transaction_with_named_graphs(
                 ledger,
@@ -3469,6 +3625,7 @@ impl crate::Fluree {
             txn_meta,
             graph_delta,
             sync_graph: _,
+            scope: _,
         } = stage_result;
 
         // Add transaction metadata and graph delta (graph_delta typically empty for Turtle)
@@ -3545,7 +3702,8 @@ impl crate::Fluree {
                 )))
             })?;
             let ledger_id_owned = ledger.ledger_id().to_string();
-            let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self);
+            let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id_owned, self)
+                .with_data_state(ledger.clone());
             let shapes = open_cross_ledger_shapes_model(config.as_ref(), &mut resolve_ctx)
                 .await
                 .map_err(ApiError::from)?;
@@ -3648,6 +3806,7 @@ impl crate::Fluree {
         Ok(StageResult {
             view,
             ns_registry,
+            scope: WriteScope::Unbounded,
             txn_meta: Vec::new(),
             graph_delta: rustc_hash::FxHashMap::default(),
             sync_graph: None,

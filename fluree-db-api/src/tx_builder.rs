@@ -18,13 +18,17 @@ use std::sync::Arc;
 use serde_json::Value as JsonValue;
 
 use crate::error::{BuilderError, BuilderErrors};
-use crate::ledger_manager::{LedgerHandle, LedgerManager, LedgerWriteGuard, RefreshOpts};
-use crate::tx::{IndexingMode, IndexingStatus, StageResult, TransactResult, TransactResultRef};
+use crate::ledger_manager::{
+    CommitFootprint, LedgerHandle, LedgerManager, LedgerWriteGuard, RefreshOpts, WritePath,
+};
+use crate::tx::{
+    IndexingMode, IndexingStatus, StageResult, TransactResult, TransactResultRef, WriteScope,
+};
 use crate::{
     ApiError, Fluree, PolicyContext, Result, TrackedErrorResponse, TrackedTransactionInput,
     Tracker, TrackingOptions, TrackingTally,
 };
-use fluree_db_core::{ContentId, ContentKind, ContentStore, LedgerSnapshot};
+use fluree_db_core::{ContentId, ContentKind, ContentStore, LedgerSnapshot, Sid, TxnMetaValue};
 use fluree_db_ledger::{IndexConfig, LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_novelty::Novelty;
@@ -32,6 +36,8 @@ use fluree_db_transact::{
     lower_sparql_update_request, parse_trig_phase1, CommitOpts, NamedGraphBlock, NamespaceRegistry,
     RawTrigMeta, TransactError, Txn, TxnOpts, TxnType,
 };
+use rustc_hash::FxHashSet;
+use std::collections::HashMap;
 
 /// Parse, validate, and lower a SPARQL UPDATE request to a sequence of
 /// transaction IRs (one per `;`-separated operation, in request order)
@@ -760,6 +766,7 @@ impl<'a> OwnedTransactBuilder<'a> {
                 txn_meta,
                 graph_delta,
                 sync_graph,
+                scope: _,
             } = if let Some(followup) = self.core.pre_built_txn_followup {
                 // Per-row relationship MERGE … ON MATCH SET: both branches stage
                 // into one commit, or an error returns with nothing committed.
@@ -887,6 +894,7 @@ impl<'a> OwnedTransactBuilder<'a> {
                 txn_meta,
                 graph_delta,
                 sync_graph: _,
+                scope: _,
             } = stage_result;
             let registers_new_graph = graph_delta.values().any(|iri| {
                 view.base()
@@ -1319,8 +1327,21 @@ impl<'a> RefTransactBuilder<'a> {
 
 /// A pre-parsed transaction operation, ready to be re-staged across the
 /// optimistic-path retry loop without re-doing parse work.
+/// Move `sid` to the namespace code its prefix has in the table a re-base
+/// lands on, when the stage had minted it under a code that table gave to
+/// something else.
+fn remap_sid(sid: &mut Sid, remap: &HashMap<u16, u16>) {
+    if let Some(code) = remap.get(&sid.namespace_code) {
+        sid.namespace_code = *code;
+    }
+}
+
 enum OpPlan<'a> {
     InsertTurtle(&'a str),
+    /// A SPARQL UPDATE request, parsed and lowered against whichever state
+    /// it is staged on — lowering allocates namespace codes relative to
+    /// that state's table.
+    Sparql(&'a str),
     JsonLike {
         txn_type: TxnType,
         txn_json: JsonValue,
@@ -1678,6 +1699,25 @@ impl Fluree {
         let ledger_id = ledger_state.ledger_id().to_string();
         let store_raw_txn = txn_opts.store_raw_txn.unwrap_or(false);
         match op_plan {
+            OpPlan::Sparql(sparql) => {
+                let txns = parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, txn_opts)?;
+                // A single-op request reports its own type; a multi-op (or
+                // empty no-op) request is reported as a generic update.
+                let txn_type = match txns.as_slice() {
+                    [only] => only.txn_type,
+                    _ => TxnType::Update,
+                };
+                let stage_result = self
+                    .stage_transaction_from_txns(
+                        ledger_state,
+                        txns,
+                        Some(index_config),
+                        None,
+                        tracker_ref,
+                    )
+                    .await?;
+                Ok((stage_result, txn_type, commit_opts_base.clone()))
+            }
             OpPlan::InsertTurtle(turtle) => {
                 let commit_opts = self.maybe_spawn_txn_upload(
                     commit_opts_base.clone(),
@@ -1771,6 +1811,7 @@ impl Fluree {
             txn_meta,
             graph_delta,
             sync_graph,
+            scope: _,
         } = stage_result;
         // See the pre_built_txn path: a registration-only commit (new graph
         // IRI in the delta, zero flakes) must not take the no-op shortcut.
@@ -1784,6 +1825,28 @@ impl Fluree {
         let commit_opts = commit_opts
             .with_txn_meta(txn_meta)
             .with_graph_delta(graph_delta.into_iter().collect());
+        let staged = view.staged_flakes();
+        // A commit that changes what staging depends on beyond its own
+        // subjects records no subject set, which the ring reads as touching
+        // everything: a stage computed before it stages again rather than
+        // re-basing over it unvalidated. That is a shape, the class
+        // hierarchy shapes target through, or anything in a named graph,
+        // where shapes and the ledger's config live. Attachment changes also
+        // affect a delete's cascade beyond its own subjects: an upsert can
+        // attach an annotation while its unchanged base edge cancels out of
+        // the staged flakes, leaving only the annotation subject here.
+        let changes_dependencies = staged.iter().any(|flake| {
+            use fluree_vocab::namespaces::{RDFS, SHACL};
+            flake.g.is_some()
+                || fluree_db_core::is_reserved_reifies_predicate(&flake.p)
+                || flake.p.namespace_code == SHACL
+                || matches!(&flake.o, fluree_db_core::FlakeValue::Ref(o) if o.namespace_code == SHACL)
+                || (flake.p.namespace_code == RDFS
+                    && matches!(flake.p.name.as_ref(), "subClassOf" | "subPropertyOf"))
+        });
+        let touched: Option<Arc<FxHashSet<Sid>>> = (!changes_dependencies
+            && staged.len() <= crate::ledger_manager::MAX_FOOTPRINT_FLAKES)
+            .then(|| Arc::new(staged.iter().map(|flake| flake.s.clone()).collect()));
 
         if !view.has_staged()
             && !registers_new_graph
@@ -1830,6 +1893,7 @@ impl Fluree {
                 ns_registry,
                 index_config.clone(),
                 commit_opts,
+                touched,
             ),
             tracing::Span::current(),
         ));
@@ -1872,12 +1936,19 @@ impl Fluree {
         ns_registry: NamespaceRegistry,
         index_config: IndexConfig,
         commit_opts: CommitOpts,
+        touched: Option<Arc<FxHashSet<Sid>>>,
     ) -> Result<(fluree_db_transact::CommitReceipt, IndexingStatus)> {
+        let parent = write_guard.state().head_commit_id.clone();
+        let pre_us = write_guard.held_for().as_micros() as u64;
+        let hold_started = fluree_db_core::clock::Instant::now() - write_guard.held_for();
+        let phase = fluree_db_core::clock::Instant::now();
         // Empty the cache slot for the commit window. `view`'s base was cloned
         // from it, so until the cache's copy is gone every `Arc::make_mut` in
         // the commit path copy-on-writes the ledger dictionaries instead of
         // extending them in place. See [`DetachedCacheSlot`].
         let mut slot = DetachedCacheSlot::detach(write_guard, fluree.ledger_manager.clone());
+        let detach_us = phase.elapsed().as_micros() as u64;
+        let phase = fluree_db_core::clock::Instant::now();
 
         let (receipt, new_state) = match fluree
             .commit_staged(view, ns_registry, &index_config, commit_opts)
@@ -1889,6 +1960,8 @@ impl Fluree {
                 return Err(e);
             }
         };
+        let commit_us = phase.elapsed().as_micros() as u64;
+        let phase = fluree_db_core::clock::Instant::now();
 
         let indexing_status = IndexingStatus {
             enabled: fluree.indexing_mode.is_enabled(),
@@ -1896,6 +1969,12 @@ impl Fluree {
             novelty_size: new_state.novelty_size(),
             index_t: new_state.index_t(),
             commit_t: receipt.t,
+        };
+        let footprint = CommitFootprint {
+            t: receipt.t,
+            parent,
+            id: receipt.commit_id.clone(),
+            subjects: touched,
         };
 
         if let Err(e) = fluree
@@ -1905,6 +1984,20 @@ impl Fluree {
             slot.recover(&fluree).await;
             return Err(e);
         }
+        // Still under the lock: the footprint lands before any later writer
+        // can ask about it.
+        slot.guard_mut().ledger().record_commit(footprint);
+        tracing::debug!(
+            target: "fluree::write_path",
+            ledger = slot.guard_mut().ledger().id(),
+            t = receipt.t,
+            pre_us,
+            detach_us,
+            commit_us,
+            install_us = phase.elapsed().as_micros() as u64,
+            hold_us = hold_started.elapsed().as_micros() as u64,
+            "commit"
+        );
 
         // Lock released here, before the (potentially slow) reindex trigger.
         let ledger = slot.refilled();
@@ -1913,6 +2006,171 @@ impl Fluree {
             .await;
 
         Ok((receipt, indexing_status))
+    }
+
+    /// Re-base a stage computed against `(base_t, base_head)` onto the state
+    /// the guard now holds, if the commits in between touched nothing the
+    /// stage read or wrote.
+    ///
+    /// Staged flakes name subjects by IRI and only get dictionary ids at
+    /// finalize, under the lock, so the flakes themselves are as valid over
+    /// the new state as over the old; what has to be re-checked is what the
+    /// staging depended on. That is the stage's [`WriteScope`] — bounded to a
+    /// subject set, or not — against the footprints of the intervening
+    /// commits. The namespace codes the stage allocated against the old table
+    /// are re-allocated against the new one: a commit in between may have
+    /// given the same code to another prefix, or the same prefix another
+    /// code, and every Sid and transaction-metadata namespace code the stage
+    /// minted under a moved code is rewritten.
+    /// On a pass the flakes are restamped to the new `t` and layered over a
+    /// clone of the locked state; on a fail the stage is dropped and `None`
+    /// says to stage again under the lock.
+    fn rebase_stage(
+        guard: &LedgerWriteGuard,
+        stage: StageResult,
+        base_t: i64,
+        base_head: Option<&ContentId>,
+    ) -> Option<StageResult> {
+        let ledger_id = guard.ledger().id();
+        let WriteScope::Subjects(touched) = &stage.scope else {
+            tracing::debug!(target: "fluree::write_path", ledger = ledger_id, base_t, reason = "unbounded", "restage");
+            return None;
+        };
+        let current = guard.state();
+        let Some(since) = guard.ledger().subjects_committed_between(
+            base_t,
+            base_head,
+            current.t(),
+            current.head_commit_id.as_ref(),
+        ) else {
+            tracing::debug!(target: "fluree::write_path", ledger = ledger_id, base_t, current_t = current.t(), reason = "chain unknown", "restage");
+            return None;
+        };
+        // Re-allocate this stage's new namespaces against the current table
+        // before anything is compared: the commits in between name subjects
+        // under the codes the ledger gave their prefixes, so the stage's
+        // subjects have to be compared under those same codes, or a write
+        // to one of them under a moved code reads as disjoint.
+        let mut ns_registry = NamespaceRegistry::from_db(&current.snapshot);
+        let mut remap: HashMap<u16, u16> = HashMap::new();
+        let mut allocations: Vec<(&u16, &String)> = stage.ns_registry.delta().iter().collect();
+        allocations.sort();
+        for (code, prefix) in allocations {
+            let now = ns_registry.get_or_allocate(prefix);
+            if now == fluree_vocab::namespaces::OVERFLOW {
+                tracing::debug!(target: "fluree::write_path", ledger = ledger_id, base_t, reason = "namespace overflow", "restage");
+                return None;
+            }
+            if now != *code {
+                remap.insert(*code, now);
+            }
+        }
+        let touched: std::borrow::Cow<'_, FxHashSet<Sid>> = if remap.is_empty() {
+            std::borrow::Cow::Borrowed(touched)
+        } else {
+            std::borrow::Cow::Owned(
+                touched
+                    .iter()
+                    .cloned()
+                    .map(|mut sid| {
+                        remap_sid(&mut sid, &remap);
+                        sid
+                    })
+                    .collect(),
+            )
+        };
+        for subjects in &since {
+            let (small, large) = if subjects.len() < touched.len() {
+                (subjects.as_ref(), &*touched)
+            } else {
+                (&*touched, subjects.as_ref())
+            };
+            if small.iter().any(|s| large.contains(s)) {
+                tracing::debug!(target: "fluree::write_path", ledger = ledger_id, base_t, current_t = current.t(), reason = "subject conflict", "restage");
+                return None;
+            }
+        }
+
+        let StageResult {
+            view,
+            ns_registry: _stale_registry,
+            scope,
+            mut txn_meta,
+            graph_delta,
+            sync_graph,
+        } = stage;
+        let (stale_base, mut flakes) = view.into_parts();
+        drop(stale_base);
+        let new_t = current.t() + 1;
+        for flake in &mut flakes {
+            flake.t = new_t;
+            if !remap.is_empty() {
+                remap_sid(&mut flake.s, &remap);
+                remap_sid(&mut flake.p, &remap);
+                remap_sid(&mut flake.dt, &remap);
+                if let fluree_db_core::FlakeValue::Ref(sid) = &mut flake.o {
+                    remap_sid(sid, &remap);
+                }
+            }
+        }
+        // Metadata is stored separately from the data flakes but uses the
+        // same namespace table. Remap its predicates, IRI objects, and typed
+        // literal datatypes before the commit envelope is built.
+        if !remap.is_empty() {
+            for entry in &mut txn_meta {
+                if let Some(code) = remap.get(&entry.predicate_ns) {
+                    entry.predicate_ns = *code;
+                }
+                match &mut entry.value {
+                    TxnMetaValue::Ref { ns, .. } | TxnMetaValue::TypedLiteral { dt_ns: ns, .. } => {
+                        if let Some(code) = remap.get(ns) {
+                            *ns = *code;
+                        }
+                    }
+                    TxnMetaValue::String(_)
+                    | TxnMetaValue::LangString { .. }
+                    | TxnMetaValue::Long(_)
+                    | TxnMetaValue::Double(_)
+                    | TxnMetaValue::Boolean(_) => {}
+                }
+            }
+        }
+        let scope = if remap.is_empty() {
+            scope
+        } else {
+            match scope {
+                WriteScope::Subjects(subjects) => WriteScope::Subjects(
+                    subjects
+                        .into_iter()
+                        .map(|mut sid| {
+                            remap_sid(&mut sid, &remap);
+                            sid
+                        })
+                        .collect(),
+                ),
+                other => other,
+            }
+        };
+        tracing::debug!(
+            target: "fluree::write_path",
+            ledger = ledger_id,
+            base_t,
+            current_t = current.t(),
+            behind = since.len(),
+            remapped_namespaces = remap.len(),
+            "rebase"
+        );
+        // A bounded scope has no named-graph flakes (see `write_scope`), so
+        // the graph routing map is empty.
+        let view = StagedLedger::new(guard.clone_state(), flakes, &HashMap::new()).ok()?;
+        Some(StageResult {
+            view,
+            ns_registry,
+            scope,
+            txn_meta,
+            graph_delta,
+            sync_graph,
+        })
     }
 
     /// Apply an already-built [`StagedCommit`] against the cached handle with
@@ -2046,6 +2304,7 @@ impl Fluree {
             txn_meta,
             graph_delta,
             sync_graph,
+            scope: _,
         } = stage_result;
         // Same no-op rule as `commit_and_finalize`: a registration-only
         // transaction must still build a commit; a zero-flake
@@ -2167,13 +2426,12 @@ impl Fluree {
             .map(Tracker::new)
             .unwrap_or_else(Tracker::disabled);
 
-        // Fast path: pre-built Txn IR, pending SPARQL, or policy-gated
+        // Fast path: pre-built Txn IR, Cypher sequences, or policy-gated
         // requests need the write lock held across the entire stage +
         // commit. These inputs can't be safely restaged on retry — a
-        // pre-built `Txn` carries internal references; SPARQL namespace
-        // allocation must share the staging registry.
+        // pre-built `Txn` carries internal references — and policy
+        // enforcement reads through the state it stages on.
         if core.pre_built_txn.is_some()
-            || core.pending_sparql.is_some()
             || core.pre_built_cypher_seq.is_some()
             || core.policy.is_some()
         {
@@ -2226,39 +2484,99 @@ impl Fluree {
         }
 
         // Optimistic path: stage outside the lock against a snapshot, then
-        // acquire the lock briefly for the commit. If the cached state
-        // moved between snapshot and lock, the stage is stale — retry
-        // against the latest state. Bounded to prevent livelock.
-        let op = core.operation.take().unwrap(); // safe: validate checks
-        let op_plan = OpPlan::from_op(op)?;
+        // acquire the lock for the commit. If the cached state moved between
+        // snapshot and lock, the stage is re-based over the commits in
+        // between when none of them touched its subjects
+        // ([`Self::rebase_stage`]), and otherwise staged again under the
+        // held lock. Under steady contention the state has always moved —
+        // the lock is FIFO and some commit is always in flight at snapshot
+        // time — so the re-base is what keeps the lock hold down to the
+        // commit itself. Later attempts take the lock first and stage under
+        // it; they are for commit conflicts that `refresh` heals.
+        let op_plan = match core.pending_sparql.take() {
+            Some(sparql) => OpPlan::Sparql(sparql),
+            None => OpPlan::from_op(core.operation.take().unwrap())?, // safe: validate checks
+        };
         let txn_opts = core.txn_opts;
         let commit_opts_base = core.commit_opts;
         let tracker_ref = tracker.is_enabled().then_some(&tracker);
 
         const MAX_RETRIES: usize = 16;
         for attempt in 0..MAX_RETRIES {
-            let snap = ledger.snapshot().await;
-            let base_t = snap.t;
-            let base_head_id = snap.head_commit_id.clone();
-            let ledger_state = snap.to_ledger_state();
+            let (write_guard, stage_result, txn_type, commit_opts) = if attempt == 0 {
+                let snapshot_started = fluree_db_core::clock::Instant::now();
+                let snap = ledger.snapshot().await;
+                let snapshot_us = snapshot_started.elapsed().as_micros() as u64;
+                let base_t = snap.t;
+                let base_head_id = snap.head_commit_id.clone();
+                let ledger_state = snap.to_ledger_state();
 
-            let (stage_result, txn_type, commit_opts) = self
-                .stage_plan(
-                    &op_plan,
-                    ledger_state,
-                    txn_opts.clone(),
-                    &commit_opts_base,
-                    tracker_ref,
-                    &index_config,
-                )
-                .await?;
+                let stage_started = fluree_db_core::clock::Instant::now();
+                let (stage_result, txn_type, commit_opts) = self
+                    .stage_plan(
+                        &op_plan,
+                        ledger_state,
+                        txn_opts.clone(),
+                        &commit_opts_base,
+                        tracker_ref,
+                        &index_config,
+                    )
+                    .await?;
+                let stage_us = stage_started.elapsed().as_micros() as u64;
+                if let Some(gate) = ledger.take_stage_gate() {
+                    gate.park().await;
+                }
 
-            let write_guard = ledger.lock_for_write().await;
-            if write_guard.state().t() != base_t
-                || write_guard.state().head_commit_id.as_ref() != base_head_id.as_ref()
-            {
-                continue;
-            }
+                let lock_started = fluree_db_core::clock::Instant::now();
+                let write_guard = ledger.lock_for_write().await;
+                tracing::debug!(
+                    target: "fluree::write_path",
+                    ledger = ledger.id(),
+                    base_t,
+                    snapshot_us,
+                    stage_us,
+                    lock_wait_us = lock_started.elapsed().as_micros() as u64,
+                    "staged"
+                );
+                let unchanged = write_guard.state().t() == base_t
+                    && write_guard.state().head_commit_id.as_ref() == base_head_id.as_ref();
+                if unchanged {
+                    ledger.note_write_path(WritePath::Direct);
+                    tracing::debug!(target: "fluree::write_path", ledger = ledger.id(), base_t, "direct");
+                    (write_guard, stage_result, txn_type, commit_opts)
+                } else if let Some(rebased) =
+                    Self::rebase_stage(&write_guard, stage_result, base_t, base_head_id.as_ref())
+                {
+                    ledger.note_write_path(WritePath::Rebased);
+                    (write_guard, rebased, txn_type, commit_opts)
+                } else {
+                    ledger.note_write_path(WritePath::Restaged);
+                    let (stage_result, txn_type, commit_opts) = self
+                        .stage_plan(
+                            &op_plan,
+                            write_guard.clone_state(),
+                            txn_opts.clone(),
+                            &commit_opts_base,
+                            tracker_ref,
+                            &index_config,
+                        )
+                        .await?;
+                    (write_guard, stage_result, txn_type, commit_opts)
+                }
+            } else {
+                let write_guard = ledger.lock_for_write().await;
+                let (stage_result, txn_type, commit_opts) = self
+                    .stage_plan(
+                        &op_plan,
+                        write_guard.clone_state(),
+                        txn_opts.clone(),
+                        &commit_opts_base,
+                        tracker_ref,
+                        &index_config,
+                    )
+                    .await?;
+                (write_guard, stage_result, txn_type, commit_opts)
+            };
 
             match self
                 .commit_and_finalize(

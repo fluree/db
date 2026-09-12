@@ -1651,8 +1651,9 @@ async fn every_node_journals_the_shared_root_under_its_own_log() {
 /// worker is whichever voter the rendezvous hash picked, so the test finds
 /// it by the log that holds the commit keys, abandons that log as a crash
 /// would, stops the node, and removes every commit file from the shared
-/// root. A surviving node that never loaded the ledger misses those files,
-/// applies the stopped node's log, and serves the data.
+/// root. A surviving node explicitly reads a missing payload through its
+/// storage, applies the stopped node's log, and serves the data. A query alone
+/// may use cached state or an index without ever reading a missing commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_survivors_miss_applies_the_stopped_workers_log() {
     let mut cluster = TestCluster::spawn(3).await;
@@ -1734,19 +1735,30 @@ async fn a_survivors_miss_applies_the_stopped_workers_log() {
         .position(|n| n.node_id == worker)
         .expect("worker is a node");
     cluster.nodes[index].shutdown().await;
+    let expected_payload = std::fs::read(&commits[0]).expect("read payload before simulated loss");
     for path in &commits {
         std::fs::remove_file(path).expect("remove a payload the crash lost");
     }
 
-    // A node that has not loaded the ledger, so its first read is a miss.
+    // Read through a surviving node's actual storage, bypassing ledger/index
+    // caches. Query success alone does not prove a storage miss occurred.
     let survivor = cluster
         .nodes
         .iter()
         .find(|n| n.node_id != worker && n.node_id != leader)
-        .map(|n| n.node_id)
         .expect("three nodes leave one that is neither worker nor leader");
+    let address = format!("fluree:file://{}", keys[0]);
+    let recovered = survivor
+        ._state
+        .fluree
+        .admin_storage()
+        .expect("file-backed survivor has storage")
+        .read_bytes(&address)
+        .await
+        .expect("a storage miss must replay the stopped worker's WAL");
+    assert_eq!(recovered, expected_payload);
     cluster
-        .wait_for_names(survivor, ledger, &["Ann", "Bo"], DEFAULT_TIMEOUT)
+        .wait_for_names(survivor.node_id, ledger, &["Ann", "Bo"], DEFAULT_TIMEOUT)
         .await;
     assert!(
         commits.iter().all(|p| p.exists()),

@@ -223,6 +223,50 @@ impl Segment {
         }
     }
 
+    /// The flakes after `cutoff_t`, as a segment. Each of the four orders is
+    /// filtered rather than re-sorted — dropping flakes leaves the survivors
+    /// in order — so trimming a large segment at an index publish costs a
+    /// pass over it, not four sorts. `None` when nothing survives.
+    fn after(&self, cutoff_t: i64) -> Option<Segment> {
+        let mut remap: Vec<u32> = vec![u32::MAX; self.flakes.len()];
+        let mut flakes = Vec::new();
+        let mut min_t = i64::MAX;
+        let mut max_t = i64::MIN;
+        let mut size = 0usize;
+        for (i, f) in self.flakes.iter().enumerate() {
+            if f.t > cutoff_t {
+                remap[i] = flakes.len() as u32;
+                min_t = min_t.min(f.t);
+                max_t = max_t.max(f.t);
+                size += f.size_bytes();
+                flakes.push(f.clone());
+            }
+        }
+        if flakes.is_empty() {
+            return None;
+        }
+        let filter = |order: &[u32]| -> Vec<u32> {
+            order
+                .iter()
+                .filter_map(|&i| {
+                    let mapped = remap[i as usize];
+                    (mapped != u32::MAX).then_some(mapped)
+                })
+                .collect()
+        };
+        Some(Segment {
+            seg_id: NEXT_SEG_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            spot: filter(&self.spot),
+            psot: filter(&self.psot),
+            post: filter(&self.post),
+            opst: filter(&self.opst),
+            flakes,
+            min_t,
+            max_t,
+            size,
+        })
+    }
+
     #[inline]
     fn order(&self, index: IndexType) -> &[u32] {
         match index {
@@ -1150,15 +1194,9 @@ impl Novelty {
                     kept.push(seg); // entirely fresh
                     continue;
                 }
-                // Straddling: rebuild from survivors.
-                let survivors: Vec<Flake> = seg
-                    .flakes
-                    .iter()
-                    .filter(|f| f.t > cutoff_t)
-                    .cloned()
-                    .collect();
-                if !survivors.is_empty() {
-                    kept.push(Arc::new(Segment::build(survivors, false)));
+                // Straddling: keep the survivors, in the orders they already have.
+                if let Some(survivors) = seg.after(cutoff_t) {
+                    kept.push(Arc::new(survivors));
                 }
             }
             if kept.is_empty() {
