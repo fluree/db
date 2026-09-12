@@ -633,10 +633,29 @@ async fn walk_first_parent<C: ContentStore + ?Sized>(
         if envelope.t <= stop_at_t {
             break;
         }
+        // The DAG walk is bounded by its visited set; this walk is bounded by
+        // `t` strictly decreasing toward genesis. A parent that does not
+        // decrease it is a corrupted chain, not history to replay.
+        if let Some(&(child_t, _)) = result.last() {
+            if envelope.t >= child_t {
+                return Err(Error::invalid_commit(format!(
+                    "first-parent chain is not t-decreasing: commit {cid} has t={} \
+                     under a child with t={child_t}",
+                    envelope.t
+                )));
+            }
+        }
         if let Some(mode) = envelope.ns_split_mode {
             split_mode = mode;
         }
-        next = envelope.parent_ids().next().cloned();
+        // Given that invariant the parent's `t` is at most this one's minus
+        // one, so once that is at or below the stop point the parent is out
+        // of range and is never fetched.
+        next = if envelope.t - 1 > stop_at_t {
+            envelope.parent_ids().next().cloned()
+        } else {
+            None
+        };
         result.push((envelope.t, cid));
     }
 
@@ -654,6 +673,10 @@ async fn walk_first_parent<C: ContentStore + ?Sized>(
 /// branch's commits a second time, stamped with `t` values from *that*
 /// branch's clock. Use [`collect_dag_cids`] only for reachability questions
 /// (common ancestors, blob copying, packing, verification).
+///
+/// Returns an error when the chain's `t` fails to strictly decrease toward
+/// genesis, rather than replaying a corrupted lineage into novelty or an
+/// index build.
 pub async fn collect_first_parent_cids<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
@@ -731,30 +754,6 @@ pub fn trace_commits_by_id<C: ContentStore + Clone + 'static>(
     head_id: ContentId,
     stop_at_t: i64,
 ) -> impl Stream<Item = Result<Commit>> {
-    commits_stream(store, head_id, stop_at_t, false)
-}
-
-/// Stream commits along a branch's first-parent lineage, newest first.
-///
-/// The streaming counterpart of [`collect_first_parent_cids`]: yields full
-/// [`Commit`] values for every commit with `t > stop_at_t` on the lineage,
-/// never descending into merge parents.
-pub fn trace_first_parent_commits_by_id<C: ContentStore + Clone + 'static>(
-    store: C,
-    head_id: ContentId,
-    stop_at_t: i64,
-) -> impl Stream<Item = Result<Commit>> {
-    commits_stream(store, head_id, stop_at_t, true)
-}
-
-/// Shared body of the two commit streams: collect the CID list up front
-/// (DAG or first-parent), then load one full commit per yielded item.
-fn commits_stream<C: ContentStore + Clone + 'static>(
-    store: C,
-    head_id: ContentId,
-    stop_at_t: i64,
-    first_parent_only: bool,
-) -> impl Stream<Item = Result<Commit>> {
     stream::unfold(
         None::<std::result::Result<std::vec::IntoIter<(i64, ContentId)>, ()>>,
         move |state| {
@@ -764,17 +763,10 @@ fn commits_stream<C: ContentStore + Clone + 'static>(
                 let mut iter = match state {
                     Some(Ok(iter)) => iter,
                     Some(Err(())) => return None,
-                    None => {
-                        let collected = if first_parent_only {
-                            collect_first_parent_cids(&store, &head_id, stop_at_t).await
-                        } else {
-                            collect_dag_cids(&store, &head_id, stop_at_t).await
-                        };
-                        match collected {
-                            Ok(cids) => cids.into_iter(),
-                            Err(e) => return Some((Err(e), Some(Err(())))),
-                        }
-                    }
+                    None => match collect_dag_cids(&store, &head_id, stop_at_t).await {
+                        Ok(cids) => cids.into_iter(),
+                        Err(e) => return Some((Err(e), Some(Err(())))),
+                    },
                 };
 
                 let (_t, cid) = iter.next()?;
@@ -785,6 +777,64 @@ fn commits_stream<C: ContentStore + Clone + 'static>(
             }
         },
     )
+}
+
+/// Stream commits along a branch's first-parent lineage, newest first.
+///
+/// The streaming counterpart of [`collect_first_parent_cids`]: yields full
+/// [`Commit`] values for every commit with `t > stop_at_t` on the lineage,
+/// never descending into merge parents.
+///
+/// Single pass: each commit blob is read once and its first parent followed
+/// from it, so a lineage costs one round trip per commit rather than the
+/// envelope-then-blob pair the DAG stream needs to order its result. The
+/// `t`-decreasing guard of [`collect_first_parent_cids`] applies here too,
+/// and bounds the walk the same way.
+pub fn trace_first_parent_commits_by_id<C: ContentStore + Clone + 'static>(
+    store: C,
+    head_id: ContentId,
+    stop_at_t: i64,
+) -> impl Stream<Item = Result<Commit>> {
+    // State: the next commit to load, plus the `t` of the one just yielded.
+    // `None` ends the stream: the lineage is exhausted, the stop point is
+    // reached, or an error has already surfaced.
+    stream::unfold(Some((head_id, None::<i64>)), move |state| {
+        let store = store.clone();
+        async move {
+            let (cid, child_t) = state?;
+            let commit = match load_commit_by_id(&store, &cid).await {
+                Ok(commit) => commit,
+                Err(e) => return Some((Err(e), None)),
+            };
+            if commit.t <= stop_at_t {
+                return None;
+            }
+            if let Some(child_t) = child_t {
+                if commit.t >= child_t {
+                    return Some((
+                        Err(Error::invalid_commit(format!(
+                            "first-parent chain is not t-decreasing: commit {cid} has \
+                             t={} under a child with t={child_t}",
+                            commit.t
+                        ))),
+                        None,
+                    ));
+                }
+            }
+            // As in the collector: the parent cannot reach above `t - 1`, so
+            // there is nothing to fetch once that is at or below the stop.
+            let next = if commit.t - 1 > stop_at_t {
+                commit
+                    .parents
+                    .first()
+                    .cloned()
+                    .map(|parent| (parent, Some(commit.t)))
+            } else {
+                None
+            };
+            Some((Ok(commit), next))
+        }
+    })
 }
 
 // =============================================================================
