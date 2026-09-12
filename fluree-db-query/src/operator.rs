@@ -61,6 +61,13 @@ pub trait Operator: Send + Sync {
         None
     }
 
+    /// True only for a source guaranteed to emit exactly one empty solution.
+    /// This is an algebraic identity, not an estimated row count. Operators with
+    /// zero columns may still emit zero or many rows and must keep the default.
+    fn is_identity_seed(&self) -> bool {
+        false
+    }
+
     /// Consume all remaining output rows to exhaustion and return the total count.
     ///
     /// # Contract

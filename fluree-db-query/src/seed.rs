@@ -234,6 +234,9 @@ impl Default for EmptyOperator {
 
 #[async_trait]
 impl Operator for EmptyOperator {
+    fn is_identity_seed(&self) -> bool {
+        true
+    }
     fn schema(&self) -> &[VarId] {
         // Empty schema - no columns
         &[]

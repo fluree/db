@@ -35,6 +35,7 @@ use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::StatsView;
+use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -54,10 +55,17 @@ pub struct SubqueryOperator {
     select_index: HashMap<VarId, usize>,
     /// Operator state
     state: OperatorState,
-    /// Buffered results
-    result_buffer: Vec<Vec<Binding>>,
-    /// Current position in result buffer
-    buffer_pos: usize,
+    /// Current parent and inner positions. Output expansion resumes here instead
+    /// of collecting an entire parent batch's join product.
+    parent_batch: Option<RetainedBatch>,
+    parent_row: usize,
+    inner: Option<BoxedOperator>,
+    inner_batch: Option<RetainedBatch>,
+    inner_row: usize,
+    probe: Option<MatchCursor>,
+    /// A structural guarantee, never a cardinality estimate: joining to the
+    /// identity solution needs neither a reusable materialization nor an index.
+    stream_identity: bool,
     /// Optional stats for selectivity-based pattern reordering in subquery
     stats: Option<Arc<StatsView>>,
     /// Planning context captured at planner-time for the subquery subplan.
@@ -84,16 +92,17 @@ pub struct SubqueryOperator {
     /// merge check is therefore LOAD-BEARING in BOTH modes — it is NOT a per-row
     /// no-op, so do not gate it on join-mode. Fixes W3C `var-scope-join-1`
     /// (join-scope-1), where `?X` is bound only by an inner `OPTIONAL` and must
-    /// reconcile against the parent `?X`. See the merge in `process_parent_batch`.
+    /// reconcile against the parent `?X`. See the merge in `merge_row`.
     reconcile_vars: Vec<VarId>,
-    /// Whether the subquery is evaluated ONCE and hash-joined (on `join_keys`)
-    /// rather than re-executed per parent row. Independent SPARQL subqueries
-    /// with grouping, DISTINCT, or slicing require this mode for correctness.
+    /// Whether the subquery is evaluated ONCE rather than per parent row.
+    /// Reusable results are hash-joined on `join_keys`; an identity seed instead
+    /// streams them. Independent SPARQL subqueries with grouping, DISTINCT, or
+    /// slicing require independent evaluation for correctness.
     /// Otherwise eligibility and parent cardinality decide whether evaluating
     /// once beats per-row seeding. Bound outer keys use an exact hash probe;
     /// unbound outer keys match all compatible materialized rows.
     join_mode: bool,
-    /// Lazily materialized subquery result (built once when `join_mode`): all
+    /// Lazily materialized result (built once for non-identity `join_mode`): all
     /// result rows plus a hash index from the correlation-variable values to the
     /// rows carrying them. Reused across every parent row and batch.
     materialized: Option<MaterializedSubquery>,
@@ -107,10 +116,151 @@ pub struct SubqueryOperator {
 struct MaterializedSubquery {
     /// All subquery result rows (projected to the subquery SELECT list).
     rows: Vec<Vec<Binding>>,
+    _memory: MemoryCharge,
     /// Correlation-variable values -> indices into `rows`. An empty key vector
     /// (no correlation) maps every row under a single bucket (broadcast).
-    index: HashMap<Vec<GroupKeyOwned>, Vec<usize>>,
+    index: IndexMap<Vec<GroupKeyOwned>, Vec<usize>>,
 }
+
+/// Own only this operator's allocation charges. Dropping a batch or a complete
+/// materialization releases its charge; never subtract a context-wide delta
+/// across streaming yields, since downstream operators also use that counter.
+struct MemoryCharge {
+    cancellation: fluree_db_core::QueryCancellation,
+    bytes: usize,
+}
+
+impl MemoryCharge {
+    fn new(ctx: &ExecutionContext<'_>) -> Self {
+        Self {
+            cancellation: ctx.cancellation.clone(),
+            bytes: 0,
+        }
+    }
+
+    fn add(&mut self, ctx: &ExecutionContext<'_>, bytes: usize) -> Result<()> {
+        self.cancellation.record_alloc(bytes);
+        self.bytes = self.bytes.saturating_add(bytes);
+        ctx.checkpoint()
+    }
+}
+
+impl Drop for MemoryCharge {
+    fn drop(&mut self) {
+        self.cancellation.release(self.bytes);
+    }
+}
+
+struct RetainedBatch {
+    batch: Batch,
+    _memory: MemoryCharge,
+}
+
+impl RetainedBatch {
+    fn new(batch: Batch, ctx: &ExecutionContext<'_>) -> Result<Self> {
+        let mut memory = MemoryCharge::new(ctx);
+        memory.add(
+            ctx,
+            batch
+                .len()
+                .saturating_mul(batch.schema().len())
+                .saturating_mul(crate::context::BINDING_EST_BYTES),
+        )?;
+        Ok(Self {
+            batch,
+            _memory: memory,
+        })
+    }
+}
+
+impl std::ops::Deref for RetainedBatch {
+    type Target = Batch;
+    fn deref(&self) -> &Batch {
+        &self.batch
+    }
+}
+
+/// Resumable probe without copying matching rows or building a match list.
+/// IndexMap lets partial keys visit buckets by position without keeping a
+/// self-referential hash iterator across await points.
+enum MatchCursor {
+    Exact {
+        bucket: usize,
+        row: usize,
+    },
+    All {
+        row: usize,
+    },
+    Partial {
+        key: Vec<GroupKeyOwned>,
+        unbound: Vec<usize>,
+        bucket: usize,
+        row: usize,
+    },
+    Done,
+}
+
+impl MatchCursor {
+    fn next(
+        &mut self,
+        mat: &MaterializedSubquery,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<usize>> {
+        match self {
+            Self::Done => Ok(None),
+            Self::Exact { bucket, row } => {
+                let idx = mat
+                    .index
+                    .get_index(*bucket)
+                    .and_then(|(_, rows)| rows.get(*row))
+                    .copied();
+                *row += usize::from(idx.is_some());
+                Ok(idx)
+            }
+            Self::All { row } => {
+                if *row == mat.rows.len() {
+                    return Ok(None);
+                }
+                let idx = *row;
+                *row += 1;
+                Ok(Some(idx))
+            }
+            Self::Partial {
+                key,
+                unbound,
+                bucket,
+                row,
+            } => {
+                while let Some((inner_key, rows)) = mat.index.get_index(*bucket) {
+                    if *row == 0 {
+                        if *bucket % 1024 == 0 {
+                            ctx.check_cancelled()?;
+                        }
+                        if !key
+                            .iter()
+                            .zip(inner_key)
+                            .enumerate()
+                            .all(|(col, (p, s))| p == s || unbound.contains(&col))
+                        {
+                            *bucket += 1;
+                            continue;
+                        }
+                    }
+                    if let Some(&idx) = rows.get(*row) {
+                        *row += 1;
+                        return Ok(Some(idx));
+                    }
+                    *bucket += 1;
+                    *row = 0;
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Bound the join product independently of either input's cardinality.
+const SUBQUERY_BATCH_SIZE: usize = 1024;
 
 impl SubqueryOperator {
     /// Create a new subquery operator
@@ -186,14 +336,14 @@ impl SubqueryOperator {
         // unreferenced in the inner body (seeding it is a no-op). When that
         // holds, per-row seeding yields the same multiset as evaluating the
         // subquery independently and joining; otherwise (a var referenced in an
-        // inner FILTER/BIND/aggregate) only materialize-once is correct.
+        // inner FILTER/BIND/aggregate) only independent evaluation is correct.
         let body_referenced = referenced_vars_set(&subquery.patterns);
         let pass_through_ok = correlation_vars
             .iter()
             .all(|v| produced.contains(v) || !body_referenced.contains(v));
 
         // SPARQL 1.1 §18.2: a sub-SELECT is evaluated INDEPENDENTLY and then
-        // joined. Materialize-once is only *required* to honor that when the
+        // joined. Independent evaluation is only *required* to honor that when the
         // subquery is sliced, deduplicated, or aggregated (per-row seeding
         // would then change the result — e.g. an inner LIMIT applying per parent
         // row, W3C subquery/sq11), or when a correlation var is referenced but
@@ -202,14 +352,14 @@ impl SubqueryOperator {
         // choice below and may prune via per-row seeding for a small, selective
         // parent — the legacy optimization we'd otherwise lose for all SPARQL
         // sub-SELECTs.
-        let must_materialize_once = subquery.uncorrelated
+        let must_evaluate_once = subquery.uncorrelated
             && (subquery.limit.is_some()
                 || subquery.offset.is_some()
                 || subquery.distinct
                 || subquery.grouping.is_some()
                 || !pass_through_ok);
 
-        let join_mode = if must_materialize_once {
+        let join_mode = if must_evaluate_once {
             true
         } else {
             // Evaluate-once + hash-join only when there is no inner slice and
@@ -238,6 +388,8 @@ impl SubqueryOperator {
                         .is_none_or(|n| n >= SUBQUERY_MATERIALIZE_MIN_PARENT_ROWS))
         };
 
+        let stream_identity = join_mode && child.is_identity_seed();
+
         Self {
             child,
             subquery,
@@ -246,8 +398,13 @@ impl SubqueryOperator {
             new_vars,
             select_index,
             state: OperatorState::Created,
-            result_buffer: Vec::new(),
-            buffer_pos: 0,
+            parent_batch: None,
+            parent_row: 0,
+            inner: None,
+            inner_batch: None,
+            inner_row: 0,
+            probe: None,
+            stream_identity,
             stats,
             planning,
             out_schema: None,
@@ -282,6 +439,7 @@ impl Operator for SubqueryOperator {
     fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut m = serde_json::Map::new();
         m.insert("join-mode".into(), self.join_mode.into());
+        m.insert("stream-identity".into(), self.stream_identity.into());
         if !self.correlation_vars.is_empty() {
             m.insert(
                 "correlation-vars".into(),
@@ -297,7 +455,7 @@ impl Operator for SubqueryOperator {
     }
 
     /// The subquery's inner operator tree is built lazily at runtime (it is not
-    /// held as a field), so the default `plan_children` walk can't reach it.
+    /// present before execution), so the default `plan_children` walk can't reach it.
     /// Rebuild it here — build-only, no `open()`/exec — from the stored IR +
     /// stats + planning, and attach it under a `SubqueryBody` node so the inner
     /// joins (where BSBM-BI time lives) are visible. The first child is the outer
@@ -364,40 +522,22 @@ impl Operator for SubqueryOperator {
             return Ok(None);
         }
 
-        // If buffer has results, return them
-        if self.buffer_pos < self.result_buffer.len() {
-            return self.drain_buffer().await;
+        let result = self.next_bounded_batch(ctx).await;
+        if result.is_err() {
+            self.close();
         }
-
-        // Pull parent batches until one yields at least one merged row. A parent
-        // batch can legitimately produce no rows — in join mode, when none of its
-        // join keys are present in the (sliced) subquery result; in per-row mode,
-        // when the seeded subquery is empty. An empty result buffer must NOT be
-        // reported to the consumer as `None`, because `None` means "operator
-        // exhausted" and would drop every later parent batch. Only a `None` from
-        // the child ends iteration.
-        loop {
-            let Some(parent_batch) = self.child.next_batch(ctx).await? else {
-                self.state = OperatorState::Exhausted;
-                return Ok(None);
-            };
-
-            // Process each parent row
-            self.result_buffer.clear();
-            self.buffer_pos = 0;
-
-            self.process_parent_batch(ctx, &parent_batch).await?;
-
-            if !self.result_buffer.is_empty() {
-                return self.drain_buffer().await;
-            }
-            // No matches in this batch — pull the next one.
-        }
+        result
     }
 
     fn close(&mut self) {
         self.child.close();
-        self.result_buffer.clear();
+        if let Some(mut inner) = self.inner.take() {
+            inner.close();
+        }
+        self.parent_batch = None;
+        self.inner_batch = None;
+        self.materialized = None;
+        self.probe = None;
         self.state = OperatorState::Closed;
     }
 
@@ -421,207 +561,241 @@ impl Operator for SubqueryOperator {
 }
 
 impl SubqueryOperator {
-    /// Merge one parent batch against the subquery result into `result_buffer`.
-    async fn process_parent_batch(
-        &mut self,
-        ctx: &ExecutionContext<'_>,
-        parent_batch: &Batch,
-    ) -> Result<()> {
-        for row_idx in 0..parent_batch.len() {
-            // Produce this parent row's matching subquery rows.
-            //
-            // JOIN MODE: evaluate the subquery ONCE (empty seed), index it by
-            // the correlation-variable values, and for each parent row take only
-            // the subquery rows whose join key matches — equivalent to seeding
-            // per row but without rebuilding/re-running the subquery N times.
-            // An empty correlation set indexes every row under one bucket, so
-            // the match is a broadcast (the uncorrelated case).
-            //
-            // Otherwise (a genuine per-row correlation, or an inner slice that
-            // makes seeding result-sensitive), fall back to per-row seeding.
-            let subquery_results: Vec<Vec<Binding>> = if self.join_mode {
+    async fn next_bounded_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        ctx.checkpoint()?;
+        let mut columns: Vec<Vec<Binding>> =
+            (0..self.in_schema.len()).map(|_| Vec::new()).collect();
+        // Charge the output columns as they grow, and release on handoff.
+        // Tiny results do not reserve a full 1024-row window.
+        let mut output_memory = MemoryCharge::new(ctx);
+        let mut output_capacity = 0;
+        let mut emitted = 0;
+        let mut visited = 0usize;
+        while emitted < SUBQUERY_BATCH_SIZE {
+            if visited.is_multiple_of(SUBQUERY_BATCH_SIZE) {
+                ctx.check_cancelled()?;
+            }
+            visited += 1;
+            if self.parent_batch.is_none() {
+                match self.child.next_batch(ctx).await? {
+                    Some(batch) => {
+                        self.parent_batch = Some(RetainedBatch::new(batch, ctx)?);
+                        self.parent_row = 0;
+                    }
+                    None => {
+                        self.state = OperatorState::Exhausted;
+                        break;
+                    }
+                }
+            }
+            let parent = self.parent_batch.as_ref().unwrap();
+            if self.parent_row == parent.len() {
+                self.parent_batch = None;
+                continue;
+            }
+
+            let merged = if self.join_mode && !self.stream_identity {
                 if self.materialized.is_none() {
-                    let m = self.materialize(ctx).await?;
-                    self.materialized = Some(m);
+                    self.materialized = Some(self.materialize(ctx).await?);
+                }
+                if self.probe.is_none() {
+                    self.probe = Some(self.start_probe());
                 }
                 let mat = self.materialized.as_ref().unwrap();
-                // Track actual Unbound bindings before key normalization:
-                // Poisoned also normalizes to Absent, but must not become a
-                // wildcard. Fully bound rows allocate no extra mask storage.
-                let mut unbound_columns = Vec::new();
-                let parent_key: Vec<GroupKeyOwned> = self
-                    .join_keys
-                    .iter()
-                    .enumerate()
-                    .map(|(col, v)| {
-                        let binding = parent_batch.get(row_idx, *v);
-                        if binding.is_none_or(|b| matches!(b, Binding::Unbound)) {
-                            unbound_columns.push(col);
-                        }
-                        binding
-                            .map(|b| {
-                                let (store, gv) = EqualityNorm::parts(&self.norm);
-                                binding_to_group_key_normalized(b, store, gv)
-                            })
-                            .unwrap_or(GroupKeyOwned::Absent)
-                    })
-                    .collect();
-                if unbound_columns.is_empty() {
-                    match mat.index.get(&parent_key) {
-                        Some(idxs) => idxs.iter().map(|&i| mat.rows[i].clone()).collect(),
-                        None => Vec::new(),
-                    }
-                } else if unbound_columns.len() == parent_key.len() {
-                    // No restrictions: preserve every inner solution, including
-                    // duplicate keys, and let the existing merge bind the parent.
-                    mat.rows.clone()
-                } else {
-                    let mut matches = Vec::new();
-                    for (bucket, (key, idxs)) in mat.index.iter().enumerate() {
-                        if bucket % 1024 == 0 {
-                            ctx.check_cancelled()?;
-                        }
-                        if parent_key
-                            .iter()
-                            .zip(key)
-                            .enumerate()
-                            .all(|(col, (p, s))| p == s || unbound_columns.contains(&col))
-                        {
-                            matches.extend(idxs.iter().map(|&i| mat.rows[i].clone()));
-                        }
-                    }
-                    matches
-                }
+                let Some(idx) = self.probe.as_mut().unwrap().next(mat, ctx)? else {
+                    self.probe = None;
+                    self.parent_row += 1;
+                    continue;
+                };
+                self.merge_row(parent, self.parent_row, |col| mat.rows[idx].get(col))
             } else {
-                self.execute_subquery_for_row(ctx, parent_batch, row_idx)
-                    .await?
+                // Per-row correlations keep their pruning seed. An identity
+                // parent uses an independent empty seed and runs the body once.
+                if self.inner.is_none() {
+                    let seed = self.seed_for_row(parent, self.parent_row);
+                    let mut inner = self.build_inner_plan(seed)?;
+                    if let Err(error) = inner.open(ctx).await {
+                        inner.close();
+                        return Err(error);
+                    }
+                    self.inner = Some(inner);
+                }
+                if self.inner_batch.is_none() {
+                    match self.inner.as_mut().unwrap().next_batch(ctx).await? {
+                        Some(batch) => {
+                            self.inner_batch = Some(RetainedBatch::new(batch, ctx)?);
+                            self.inner_row = 0;
+                        }
+                        None => {
+                            self.inner.take().unwrap().close();
+                            self.parent_row += 1;
+                            continue;
+                        }
+                    }
+                }
+                let batch = self.inner_batch.as_ref().unwrap();
+                if self.inner_row == batch.len() {
+                    self.inner_batch = None;
+                    continue;
+                }
+                let row = self.inner_row;
+                self.inner_row += 1;
+                self.merge_row(parent, self.parent_row, |col| {
+                    self.subquery
+                        .select
+                        .get(col)
+                        .and_then(|v| batch.get(row, *v))
+                })
             };
-
-            // Merge results with parent row
-            for subquery_row in subquery_results {
-                // Family B — reconcile OPTIONAL/UNION-produced correlation vars.
-                // These are correlation vars the subquery does not self-produce,
-                // so they are not hash join keys; the subquery binds them
-                // independently (they are never seeded — per-row mode seeds only
-                // `join_keys`) and can bind one to a term that conflicts with the
-                // parent's. SPARQL's natural join keeps a solution only when every
-                // shared variable is compatible (equal, or unbound on either
-                // side), so drop a row whose reconcile var is bound on BOTH sides
-                // to different terms (normalized like the hash key). This check is
-                // load-bearing in BOTH per-row and join mode — it is not a per-row
-                // no-op.
-                if !self.reconcile_vars.is_empty() {
-                    let (store, gv) = EqualityNorm::parts(&self.norm);
-                    let incompatible = self.reconcile_vars.iter().any(|v| {
-                        let parent = parent_batch.get(row_idx, *v);
-                        let sub = self.select_index.get(v).and_then(|&i| subquery_row.get(i));
-                        match (parent, sub) {
-                            (Some(p), Some(s))
-                                if !matches!(p, Binding::Unbound | Binding::Poisoned)
-                                    && !matches!(s, Binding::Unbound | Binding::Poisoned) =>
-                            {
-                                binding_to_group_key_normalized(p, store, gv)
-                                    != binding_to_group_key_normalized(s, store, gv)
-                            }
-                            _ => false,
-                        }
-                    });
-                    if incompatible {
-                        continue;
-                    }
+            if let Some(row) = merged {
+                for (col, binding) in columns.iter_mut().zip(row) {
+                    col.push(binding);
                 }
-
-                let mut merged_row = Vec::with_capacity(self.in_schema.len());
-
-                // Copy parent bindings
-                for var in self.child.schema() {
-                    let binding = parent_batch
-                        .get(row_idx, *var)
-                        .cloned()
-                        .unwrap_or(Binding::Unbound);
-                    merged_row.push(binding);
+                let capacity: usize = columns.iter().map(Vec::capacity).sum();
+                if capacity > output_capacity {
+                    output_memory.add(
+                        ctx,
+                        (capacity - output_capacity)
+                            .saturating_mul(crate::context::BINDING_EST_BYTES),
+                    )?;
+                    output_capacity = capacity;
                 }
-
-                // Fill in any subquery-selected vars that already exist in the parent schema,
-                // but are currently Unbound/Poisoned in the parent row (non-clobbering merge).
-                for (parent_idx, var) in self.child.schema().iter().enumerate() {
-                    if matches!(merged_row[parent_idx], Binding::Unbound | Binding::Poisoned) {
-                        if let Some(&sel_idx) = self.select_index.get(var) {
-                            if let Some(val) = subquery_row.get(sel_idx) {
-                                if !matches!(val, Binding::Unbound | Binding::Poisoned) {
-                                    merged_row[parent_idx] = val.clone();
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Append new vars introduced by the subquery select list, preserving select order.
-                for var in &self.new_vars {
-                    let binding = self
-                        .select_index
-                        .get(var)
-                        .and_then(|&idx| subquery_row.get(idx))
-                        .cloned()
-                        .unwrap_or(Binding::Unbound);
-                    merged_row.push(binding);
-                }
-
-                self.result_buffer.push(merged_row);
+                emitted += 1;
             }
         }
-
-        Ok(())
-    }
-
-    /// Drain buffered results into a batch
-    async fn drain_buffer(&mut self) -> Result<Option<Batch>> {
-        if self.buffer_pos >= self.result_buffer.len() {
+        if emitted == 0 {
             return Ok(None);
         }
+        if columns.is_empty() {
+            return Ok(Some(Batch::empty_schema_with_len(emitted)));
+        }
+        Ok(trim_batch(
+            &self.out_schema,
+            Batch::new(self.in_schema.clone(), columns)?,
+        ))
+    }
 
-        // Number of rows about to be drained — needed to size an empty-schema
-        // batch, where there are no columns to infer the row count from.
-        let drained = self.result_buffer.len() - self.buffer_pos;
+    fn start_probe(&self) -> MatchCursor {
+        let parent = self.parent_batch.as_ref().unwrap();
+        // Only actual Unbound values are wildcards. Poisoned also normalizes
+        // to Absent but must retain the existing blocking semantics.
+        let mut unbound = Vec::new();
+        let key: Vec<_> = self
+            .join_keys
+            .iter()
+            .enumerate()
+            .map(|(col, v)| {
+                let binding = parent.get(self.parent_row, *v);
+                if binding.is_none_or(|b| matches!(b, Binding::Unbound)) {
+                    unbound.push(col);
+                }
+                let (store, gv) = EqualityNorm::parts(&self.norm);
+                binding
+                    .map(|b| binding_to_group_key_normalized(b, store, gv))
+                    .unwrap_or(GroupKeyOwned::Absent)
+            })
+            .collect();
+        if unbound.is_empty() {
+            self.materialized
+                .as_ref()
+                .unwrap()
+                .index
+                .get_index_of(&key)
+                .map_or(MatchCursor::Done, |bucket| MatchCursor::Exact {
+                    bucket,
+                    row: 0,
+                })
+        } else if unbound.len() == key.len() {
+            MatchCursor::All { row: 0 }
+        } else {
+            MatchCursor::Partial {
+                key,
+                unbound,
+                bucket: 0,
+                row: 0,
+            }
+        }
+    }
 
-        // Build batch from buffer
-        let num_cols = self.in_schema.len();
-        let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+    fn merge_row<'a>(
+        &self,
+        parent_batch: &Batch,
+        row_idx: usize,
+        subquery_row: impl Fn(usize) -> Option<&'a Binding>,
+    ) -> Option<Vec<Binding>> {
+        // Family B — reconcile OPTIONAL/UNION-produced correlation vars.
+        // These are correlation vars the subquery does not self-produce,
+        // so they are not hash join keys; the subquery binds them
+        // independently (they are never seeded — per-row mode seeds only
+        // `join_keys`) and can bind one to a term that conflicts with the
+        // parent's. SPARQL's natural join keeps a solution only when every
+        // shared variable is compatible (equal, or unbound on either
+        // side), so drop a row whose reconcile var is bound on BOTH sides
+        // to different terms (normalized like the hash key). This check is
+        // load-bearing in BOTH per-row and join mode — it is not a per-row
+        // no-op.
+        if !self.reconcile_vars.is_empty() {
+            let (store, gv) = EqualityNorm::parts(&self.norm);
+            let incompatible = self.reconcile_vars.iter().any(|v| {
+                let parent = parent_batch.get(row_idx, *v);
+                let sub = self.select_index.get(v).and_then(|&i| subquery_row(i));
+                match (parent, sub) {
+                    (Some(p), Some(s))
+                        if !matches!(p, Binding::Unbound | Binding::Poisoned)
+                            && !matches!(s, Binding::Unbound | Binding::Poisoned) =>
+                    {
+                        binding_to_group_key_normalized(p, store, gv)
+                            != binding_to_group_key_normalized(s, store, gv)
+                    }
+                    _ => false,
+                }
+            });
+            if incompatible {
+                return None;
+            }
+        }
 
-        for row in &self.result_buffer[self.buffer_pos..] {
-            for (col_idx, binding) in row.iter().enumerate() {
-                if col_idx < columns.len() {
-                    columns[col_idx].push(binding.clone());
+        let mut merged_row = Vec::with_capacity(self.in_schema.len());
+
+        // Copy parent bindings
+        for var in self.child.schema() {
+            let binding = parent_batch
+                .get(row_idx, *var)
+                .cloned()
+                .unwrap_or(Binding::Unbound);
+            merged_row.push(binding);
+        }
+
+        // Fill in any subquery-selected vars that already exist in the parent schema,
+        // but are currently Unbound/Poisoned in the parent row (non-clobbering merge).
+        for (parent_idx, var) in self.child.schema().iter().enumerate() {
+            if matches!(merged_row[parent_idx], Binding::Unbound | Binding::Poisoned) {
+                if let Some(&sel_idx) = self.select_index.get(var) {
+                    if let Some(val) = subquery_row(sel_idx) {
+                        if !matches!(val, Binding::Unbound | Binding::Poisoned) {
+                            merged_row[parent_idx] = val.clone();
+                        }
+                    }
                 }
             }
         }
 
-        self.buffer_pos = self.result_buffer.len();
-
-        // A variable-free subquery (e.g. `{ SELECT * WHERE { :a :p "1" } }`)
-        // produces an empty schema; a match is still one empty-binding solution
-        // per row. Emit an empty-schema batch with the row count rather than
-        // collapsing to zero rows (out_schema is also empty here, so there is
-        // nothing to trim).
-        if num_cols == 0 {
-            return Ok(Some(Batch::empty_schema_with_len(drained)));
+        // Append new vars introduced by the subquery select list, preserving select order.
+        for var in &self.new_vars {
+            let binding = self
+                .select_index
+                .get(var)
+                .and_then(|&idx| subquery_row(idx))
+                .cloned()
+                .unwrap_or(Binding::Unbound);
+            merged_row.push(binding);
         }
 
-        if columns[0].is_empty() {
-            Ok(None)
-        } else {
-            let batch = Batch::new(self.in_schema.clone(), columns)?;
-            Ok(trim_batch(&self.out_schema, batch))
-        }
+        Some(merged_row)
     }
 
-    /// Execute subquery for a single parent row
-    async fn execute_subquery_for_row(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        parent_batch: &Batch,
-        row_idx: usize,
-    ) -> Result<Vec<Vec<Binding>>> {
+    /// Seed only the inputs admitted by the existing correlation rules.
+    fn seed_for_row(&self, parent_batch: &Batch, row_idx: usize) -> BoxedOperator {
         // Build seed from parent row (for correlated execution). Seed ONLY the
         // `join_keys` (self-produced correlation vars): seeding such a var merely
         // filters the subquery's own output to that value, which is join-equivalent
@@ -650,39 +824,90 @@ impl SubqueryOperator {
             Box::new(SeedOperator::from_row(schema, seed_row))
         };
 
-        self.run_subquery_with_seed(ctx, seed).await
+        seed
     }
 
     /// Evaluate the subquery ONCE with an empty seed and index its result rows
     /// by their correlation-variable values, for hash-join probing in join-mode.
     /// An empty correlation set produces a single bucket (broadcast).
     async fn materialize(&self, ctx: &ExecutionContext<'_>) -> Result<MaterializedSubquery> {
-        let rows = self
-            .run_subquery_with_seed(ctx, Box::new(EmptyOperator::new()))
-            .await?;
-        let mut index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
-        for (i, row) in rows.iter().enumerate() {
-            let key: Vec<GroupKeyOwned> = self
+        let mut operator = self.build_inner_plan(Box::new(EmptyOperator::new()))?;
+        let mut mat = MaterializedSubquery {
+            rows: Vec::new(),
+            index: IndexMap::new(),
+            _memory: MemoryCharge::new(ctx),
+        };
+        let result: Result<()> = async {
+            operator.open(ctx).await?;
+            while let Some(batch) = operator.next_batch(ctx).await? {
+                let batch = RetainedBatch::new(batch, ctx)?;
+                // Binding payload plus row slots; allow geometric growth
+                // of the outer row vector. Like the
+                // other query budget estimates this excludes owned value heaps.
+                mat._memory.add(
+                    ctx,
+                    batch.len().saturating_mul(
+                        self.subquery.select.len() * crate::context::BINDING_EST_BYTES
+                            + 2 * std::mem::size_of::<Vec<Binding>>(),
+                    ),
+                )?;
+                for i in 0..batch.len() {
+                    if i % SUBQUERY_BATCH_SIZE == 0 {
+                        ctx.check_cancelled()?;
+                    }
+                    mat.rows.push(
+                        self.subquery
+                            .select
+                            .iter()
+                            .map(|v| batch.get(i, *v).cloned().unwrap_or(Binding::Unbound))
+                            .collect(),
+                    );
+                }
+            }
+            Ok(())
+        }
+        .await;
+        operator.close();
+        drop(operator);
+        result?;
+        // Keep the original phase separation: inner join/aggregate state is
+        // released before allocating the reusable result's index. Building it
+        // during the drain would unnecessarily overlap both memory peaks.
+        let mut index_bytes = 0usize;
+        for (i, row) in mat.rows.iter().enumerate() {
+            if i % SUBQUERY_BATCH_SIZE == 0 {
+                mat._memory.add(ctx, index_bytes)?;
+                index_bytes = 0;
+            }
+            let (store, gv) = EqualityNorm::parts(&self.norm);
+            let key: Vec<_> = self
                 .join_keys
                 .iter()
                 .map(|v| {
                     self.select_index
                         .get(v)
-                        .and_then(|&si| row.get(si))
-                        .map(|b| {
-                            let (store, gv) = EqualityNorm::parts(&self.norm);
-                            binding_to_group_key_normalized(b, store, gv)
-                        })
+                        .and_then(|&col| row.get(col))
+                        .map(|b| binding_to_group_key_normalized(b, store, gv))
                         .unwrap_or(GroupKeyOwned::Absent)
                 })
                 .collect();
-            index.entry(key).or_default().push(i);
+            let indices = mat.index.entry(key).or_insert_with(|| {
+                index_bytes += 2
+                    * (std::mem::size_of::<Vec<GroupKeyOwned>>()
+                        + std::mem::size_of::<Vec<usize>>()
+                        + 3 * std::mem::size_of::<usize>())
+                    + self.join_keys.len() * std::mem::size_of::<GroupKeyOwned>();
+                Vec::new()
+            });
+            index_bytes += 2 * std::mem::size_of::<usize>();
+            indices.push(i);
         }
-        Ok(MaterializedSubquery { rows, index })
+        mat._memory.add(ctx, index_bytes)?;
+        Ok(mat)
     }
 
     /// Build the subquery's inner operator tree for `EXPLAIN` (build-only — no
-    /// `open()`/exec). Mirrors [`run_subquery_with_seed`](Self::run_subquery_with_seed)'s
+    /// `open()`/exec). Mirrors [`build_inner_plan`](Self::build_inner_plan)'s
     /// construction with no execution.
     ///
     /// The seed must match the path that actually runs, because the seed's schema
@@ -691,7 +916,7 @@ impl SubqueryOperator {
     /// `join_mode` to per-row). `join_mode` evaluates the body ONCE with an empty
     /// seed (`materialize`); per-row seeds the `join_keys` — NOT the reconcile vars,
     /// which are produced independently and reconciled at merge (see
-    /// `execute_subquery_for_row`). An uncorrelated subquery has no seed either way.
+    /// `seed_for_row`). An uncorrelated subquery has no seed either way.
     fn build_inner_plan_for_explain(&self) -> Result<BoxedOperator> {
         let seed: BoxedOperator = if self.join_mode || self.join_keys.is_empty() {
             Box::new(EmptyOperator::new())
@@ -701,6 +926,12 @@ impl SubqueryOperator {
             Box::new(SeedOperator::from_row(seed_schema, seed_row))
         };
 
+        self.build_inner_plan(seed)
+    }
+
+    /// Preserve the scope and the complete modifier tail in every execution
+    /// mode. Streaming does not push an outer seed or LIMIT through this tree.
+    fn build_inner_plan(&self, seed: BoxedOperator) -> Result<BoxedOperator> {
         let where_op = build_where_operators_seeded(
             Some(seed),
             &self.subquery.patterns,
@@ -708,8 +939,7 @@ impl SubqueryOperator {
             None,
             &self.planning,
         )?;
-
-        let select_vars: Option<&[VarId]> =
+        let select_vars =
             (!self.subquery.select.is_empty()).then_some(self.subquery.select.as_slice());
         crate::execute::operator_tree::apply_solution_modifiers(
             where_op,
@@ -724,76 +954,6 @@ impl SubqueryOperator {
             None,
             &self.planning,
         )
-    }
-
-    /// Build and run the subquery's operator tree from `seed`, returning rows
-    /// projected to the subquery SELECT list. Shared by the per-row (correlated)
-    /// and once (join-mode) execution paths.
-    async fn run_subquery_with_seed(
-        &self,
-        ctx: &ExecutionContext<'_>,
-        seed: BoxedOperator,
-    ) -> Result<Vec<Vec<Binding>>> {
-        // Build full operator tree for subquery patterns (supports filters, optionals, union, etc.)
-        let where_op: BoxedOperator = build_where_operators_seeded(
-            Some(seed),
-            &self.subquery.patterns,
-            self.stats.clone(),
-            None,
-            &self.planning,
-        )?;
-
-        // Apply the shared solution-modifier tail — GROUP BY + aggregation,
-        // HAVING, post-aggregation binds, expression/aggregate ORDER-BY binds,
-        // sort-var validation, ORDER BY (sort *before* project, with safe top-k),
-        // PROJECT, DISTINCT, OFFSET, LIMIT — so a subquery inherits identical
-        // modifier semantics to a top-level SELECT (same code path).
-        //
-        // Projection trimming (`variable_deps`) and the streaming-group
-        // partition hint are skipped: the subquery's full select list flows
-        // back into the merge.
-        let select_vars: Option<&[VarId]> =
-            (!self.subquery.select.is_empty()).then_some(self.subquery.select.as_slice());
-        let mut operator = crate::execute::operator_tree::apply_solution_modifiers(
-            where_op,
-            self.subquery.grouping.as_ref(),
-            &self.subquery.order_binds,
-            &self.subquery.ordering,
-            select_vars,
-            self.subquery.distinct,
-            self.subquery.offset,
-            self.subquery.limit,
-            false,
-            None,
-            &self.planning,
-        )?;
-
-        // Execute and collect results
-        operator.open(ctx).await?;
-        let mut results = Vec::new();
-
-        while let Some(batch) = operator.next_batch(ctx).await? {
-            ctx.check_cancelled()?;
-            for sub_row_idx in 0..batch.len() {
-                // Extract bindings for subquery SELECT variables (in order)
-                let row: Vec<Binding> = self
-                    .subquery
-                    .select
-                    .iter()
-                    .map(|var| {
-                        batch
-                            .get(sub_row_idx, *var)
-                            .cloned()
-                            .unwrap_or(Binding::Unbound)
-                    })
-                    .collect();
-                results.push(row);
-            }
-            ctx.check_cancelled()?;
-        }
-
-        operator.close();
-        Ok(results)
     }
 }
 
@@ -864,7 +1024,7 @@ mod tests {
             vec![lit(1), lit(10), lit(101)],
             vec![lit(2), lit(20), lit(200)],
         ];
-        let mut index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
+        let mut index: IndexMap<Vec<GroupKeyOwned>, Vec<usize>> = IndexMap::new();
         for (i, row) in rows.iter().enumerate() {
             index
                 .entry(row[..2].iter().map(binding_to_group_key_owned).collect())
@@ -884,6 +1044,7 @@ mod tests {
         op.reconcile_vars.clear();
         op.materialized = Some(MaterializedSubquery {
             rows: rows.clone(),
+            _memory: MemoryCharge::new(&ctx),
             index,
         });
         let parent = Batch::new(
@@ -908,20 +1069,252 @@ mod tests {
             ],
         )
         .unwrap();
-        op.process_parent_batch(&ctx, &parent).await.unwrap();
-        assert_eq!(op.result_buffer.len(), 7);
+        op.parent_batch = Some(RetainedBatch::new(parent, &ctx).unwrap());
+        let result = op.next_bounded_batch(&ctx).await.unwrap().unwrap();
+        let result_rows: Vec<_> = (0..result.len())
+            .map(|i| result.row_view(i).unwrap().to_vec())
+            .collect();
+        assert_eq!(result_rows.len(), 7);
         for (row, copies) in rows.iter().zip([3, 3, 1]) {
-            assert_eq!(
-                op.result_buffer.iter().filter(|r| *r == row).count(),
-                copies
-            );
+            assert_eq!(result_rows.iter().filter(|r| *r == row).count(), copies);
         }
 
         // Reuse the same materialization for a subsequent fully bound batch;
         // both inner rows sharing its key must survive the exact lookup.
         let parent = Batch::new(keys, vec![vec![lit(1)], vec![lit(10)]]).unwrap();
-        op.process_parent_batch(&ctx, &parent).await.unwrap();
-        assert_eq!(&op.result_buffer[7..], &rows[..2]);
+        op.parent_batch = Some(RetainedBatch::new(parent, &ctx).unwrap());
+        op.parent_row = 0;
+        let result = op.next_bounded_batch(&ctx).await.unwrap().unwrap();
+        let result_rows: Vec<_> = (0..result.len())
+            .map(|i| result.row_view(i).unwrap().to_vec())
+            .collect();
+        assert_eq!(&result_rows, &rows[..2]);
+    }
+
+    fn values_subquery(rows: usize, vars: Vec<VarId>) -> SubqueryPattern {
+        use fluree_db_core::{FlakeValue, Sid};
+        SubqueryPattern::new(
+            vars.clone(),
+            vec![Pattern::Values {
+                vars: vars.clone(),
+                rows: (0..rows)
+                    .map(|i| {
+                        vars.iter()
+                            .map(|_| Binding::lit(FlakeValue::Long(i as i64), Sid::xsd_integer()))
+                            .collect()
+                    })
+                    .collect(),
+            }],
+        )
+        .with_uncorrelated()
+    }
+
+    #[tokio::test]
+    async fn identity_scope_streams_and_close_discards_pending_input() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let mut op = SubqueryOperator::new(
+            Box::new(EmptyOperator::new()),
+            values_subquery(3 * SUBQUERY_BATCH_SIZE + 7, vec![VarId(0)]),
+            None,
+            PlanningContext::current(),
+        );
+        assert!(op.stream_identity);
+        op.open(&ctx).await.unwrap();
+        let first = op.next_batch(&ctx).await.unwrap().unwrap();
+        assert_eq!(first.len(), SUBQUERY_BATCH_SIZE);
+        assert!(op.materialized.is_none());
+        assert!(
+            op.inner.is_some(),
+            "the body must remain resumable, not fully drained"
+        );
+        let mut count = first.len();
+        while let Some(batch) = op.next_batch(&ctx).await.unwrap() {
+            assert!(batch.len() <= SUBQUERY_BATCH_SIZE);
+            count += batch.len();
+        }
+        assert_eq!(count, 3 * SUBQUERY_BATCH_SIZE + 7);
+        op.close();
+        assert!(op.inner.is_none() && op.inner_batch.is_none() && op.parent_batch.is_none());
+
+        let mut op = SubqueryOperator::new(
+            Box::new(EmptyOperator::new()),
+            values_subquery(3 * SUBQUERY_BATCH_SIZE, vec![VarId(0)]),
+            None,
+            PlanningContext::current(),
+        );
+        op.open(&ctx).await.unwrap();
+        op.next_batch(&ctx).await.unwrap().unwrap();
+        op.close();
+        assert!(op.inner.is_none() && op.inner_batch.is_none());
+        assert!(op.next_batch(&ctx).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn broadcast_batches_preserve_empty_schema_multiplicity() {
+        use crate::seed::BatchSeedOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        for parents in [0, 1, 3] {
+            let child = BatchSeedOperator::from_batch(Batch::empty_schema_with_len(parents));
+            let mut subquery = values_subquery(SUBQUERY_BATCH_SIZE + 7, vec![VarId(99)]);
+            subquery.select.clear(); // project away the inner variable, keeping its multiplicity
+            let mut op =
+                SubqueryOperator::new(Box::new(child), subquery, None, PlanningContext::current());
+            // A zero-column source is not necessarily the identity solution.
+            assert!(!op.stream_identity);
+            op.open(&ctx).await.unwrap();
+            let mut count = 0;
+            while let Some(batch) = op.next_batch(&ctx).await.unwrap() {
+                assert!(batch.schema().is_empty());
+                assert!(batch.len() <= SUBQUERY_BATCH_SIZE);
+                count += batch.len();
+            }
+            assert_eq!(count, parents * (SUBQUERY_BATCH_SIZE + 7));
+            op.close();
+        }
+    }
+
+    #[tokio::test]
+    async fn materialized_duplicate_bucket_resumes_without_copying_matches() {
+        use crate::group_aggregate::binding_to_group_key_owned;
+        use crate::seed::BatchSeedOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{FlakeValue, LedgerSnapshot, Sid};
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let lit = |i| Binding::lit(FlakeValue::Long(i), Sid::xsd_integer());
+        let n = 2 * SUBQUERY_BATCH_SIZE + 3;
+        for wildcard in [false, true] {
+            let parent = Batch::new(
+                Arc::from(vec![VarId(0), VarId(1)]),
+                vec![
+                    vec![lit(1), if wildcard { Binding::Unbound } else { lit(1) }],
+                    vec![Binding::Unbound, lit(2)],
+                ],
+            )
+            .unwrap();
+            let mut op = SubqueryOperator::new(
+                Box::new(BatchSeedOperator::from_batch(parent)),
+                values_subquery(0, vec![VarId(0), VarId(1), VarId(2)]),
+                None,
+                PlanningContext::current(),
+            );
+            op.join_mode = true;
+            op.join_keys = vec![VarId(0), VarId(1)];
+            op.reconcile_vars.clear();
+            op.open(&ctx).await.unwrap();
+            let rows: Vec<_> = (0..n)
+                .map(|i| vec![lit(1), lit(2), lit(i as i64)])
+                .collect();
+            let mut index = IndexMap::new();
+            index.insert(
+                rows[0][..2]
+                    .iter()
+                    .map(binding_to_group_key_owned)
+                    .collect(),
+                (0..n).collect(),
+            );
+            op.materialized = Some(MaterializedSubquery {
+                rows,
+                index,
+                _memory: MemoryCharge::new(&ctx),
+            });
+            let mut result = Vec::new();
+            while let Some(batch) = op.next_batch(&ctx).await.unwrap() {
+                assert!(batch.len() <= SUBQUERY_BATCH_SIZE);
+                result.extend((0..batch.len()).map(|i| batch.get_by_col(i, 2).clone()));
+            }
+            let expected: Vec<_> = (0..n).chain(0..n).map(|i| lit(i as i64)).collect();
+            assert_eq!(result, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn materialization_and_stream_buffers_enforce_memory_budget() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        for identity in [false, true] {
+            let cancel = QueryCancellation::new();
+            // Reusable mode admits the input batch but not its retained copy.
+            // Identity mode exercises the streaming input-buffer guard itself.
+            cancel.set_memory_limit(if identity {
+                1
+            } else {
+                100 * crate::context::BINDING_EST_BYTES + 1
+            });
+            let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+            let child: BoxedOperator = if identity {
+                Box::new(EmptyOperator::new())
+            } else {
+                Box::new(SeedOperator::from_row(Arc::from(vec![]), vec![]))
+            };
+            let mut op = SubqueryOperator::new(
+                child,
+                values_subquery(100, vec![VarId(0)]),
+                None,
+                PlanningContext::current(),
+            );
+            op.open(&ctx).await.unwrap();
+            let error = op.next_batch(&ctx).await.unwrap_err();
+            assert!(
+                matches!(error, QueryError::MemoryBudgetExceeded { .. }),
+                "{error:?}"
+            );
+            assert!(op.materialized.is_none() && op.inner.is_none() && op.parent_batch.is_none());
+            assert_eq!(ctx.mem_used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_or_cancelling_releases_only_owned_memory() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        for identity in [false, true] {
+            let cancellation = QueryCancellation::new();
+            let ctx =
+                ExecutionContext::new(&snapshot, &vars).with_cancellation(cancellation.clone());
+            for cancel in [false, true] {
+                let child: BoxedOperator = if identity {
+                    Box::new(EmptyOperator::new())
+                } else {
+                    Box::new(SeedOperator::from_row(Arc::from(vec![]), vec![]))
+                };
+                let mut op = SubqueryOperator::new(
+                    child,
+                    values_subquery(3 * SUBQUERY_BATCH_SIZE, vec![VarId(0)]),
+                    None,
+                    PlanningContext::current(),
+                );
+                let baseline = ctx.mem_used();
+                op.open(&ctx).await.unwrap();
+                op.next_batch(&ctx).await.unwrap().unwrap();
+                assert!(ctx.mem_used() > baseline);
+                // Simulate another operator retaining memory between pulls.
+                ctx.record_alloc(123);
+                if cancel {
+                    cancellation.cancel();
+                    assert!(matches!(
+                        op.next_batch(&ctx).await,
+                        Err(QueryError::Cancelled { .. })
+                    ));
+                } else {
+                    op.close();
+                }
+                assert_eq!(ctx.mem_used(), baseline + 123);
+            }
+        }
     }
 
     /// Verifies that correlation uses SELECT vars, not internal pattern vars.
