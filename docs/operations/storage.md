@@ -347,89 +347,27 @@ See [Storage Encryption](../security/encryption.md) for full documentation.
 
 ### Durability
 
-Every write is atomic: bytes are staged alongside the destination and moved into
-place, so a reader never observes a partially written file, and an interrupted
-write leaves nothing at the final name.
+**Filesystem syncing (FSYNC) is on by default.** Fluree flushes committed data
+to durable storage so acknowledged commits survive a process crash or power
+loss. No configuration is needed to enable it.
 
-Whether an acknowledged write survives the machine *losing power*, and what a
-commit pays for that, is controlled by the storage node's `durability` property,
-or by `FLUREE_STORAGE_FSYNC`:
+To turn FSYNC off, set this environment variable before starting Fluree:
 
-| Mode | Acknowledged when | Survives | Flushes per commit |
-|---|---|---|---|
-| `wal` (default) | the write is in the root's WAL and the log is flushed | process death and power loss | at most one; commits that arrive together share it |
-| `sync` | bytes and directory entry flushed to the device | process death and power loss | two per file: six for a commit with a recorded transaction |
-| `page-cache` | bytes reach the OS page cache | process death only | none |
+```bash
+export FLUREE_STORAGE_FSYNC=0
+```
 
-This applies to the writes that are the source of truth — commits, transactions,
-ledger config, graph-source mappings — and to nameservice records. Index nodes,
-dictionaries, sketches and annotation arenas are always written page-cache: they
-are written at much higher volume than commits and can be rebuilt from the commit
-chain, so flushing them would cost throughput on the busiest path for no
-durability gain. They are flushed once, as a batch, at the end of each index
-build and before the pointer that names them is published, so an index pointer
-never names files that did not reach the device. That cost lands on the
-indexer, not on the transaction path.
+With FSYNC off, writes reach the operating system's page cache without waiting
+for a disk flush. This can improve performance for development, benchmarks, or
+restartable imports, but a power loss or kernel panic can lose acknowledged
+commits. Keep FSYNC on for data you need to retain.
 
-Turning durability off is reasonable for bulk imports (restartable from the
-source data), CI, and benchmarks. It is not a safe default for a ledger you
-intend to keep.
+To turn it back on, set `FLUREE_STORAGE_FSYNC=1` and restart Fluree. The environment
+variable overrides the storage node's `durability` setting and applies only to
+local file storage; it does not disable Raft log flushing.
 
-#### The write-ahead log
-
-Under `wal`, every source-of-truth write is first appended to a log under
-`<root>/.fluree-wal/` and the file itself is written page-cache. Content writes
-append without flushing; the head publication that ends a commit appends and
-waits for a flush, and that one flush covers everything appended before it.
-Flushes are shared: the first publication to wait issues the device flush,
-and every publication that reaches the log while it runs — from any ledger
-under the root — is covered by it or by the one that starts the moment it
-ends. A lone commit still pays one flush; sixteen ledgers committing at once
-pay a few between them, so throughput across ledgers is no longer bounded by
-one commit per device flush. Opening a new log segment, about once a second
-under load, costs two more flushes for its header and directory entry.
-
-A background thread flushes the files a closed log segment covered and removes
-the segment, so the log only ever holds the recent tail. That flush is one
-batch: each file the segment named is flushed once however many records named
-it, and the batch is committed with one call rather than one per file: a
-filesystem sync on Linux, a drive-cache barrier on macOS. Opening the root replays what is left — the connection and builder paths
-do this before anything reads — and a clean shutdown leaves no segments at all.
-
-The files on disk remain the database. The log adds nothing another version of
-Fluree needs to understand: after a clean shutdown, or after any start of a
-WAL-aware binary, the root reads exactly as it did under `sync`. The one rule
-for downgrading is therefore *start the WAL-aware binary once after a crash*
-before pointing an older binary at the root, so the tail is applied.
-
-One process owns a root's log at a time. A second handle on the same root
-cannot take the lock and flushes each write itself, exactly as `sync` does,
-with a warning at startup. Where the filesystem refuses advisory locks the same
-fallback applies. The log is Unix-only.
-
-A Raft cluster's payload store is one root shared by every node, so each node
-journals it under a log of its own, at `<root>/.fluree-wal/owners/node-<id>/`.
-An owned log flushes on every write: the head lives in Raft rather than in a
-file under the root, so nothing later would flush on a payload's behalf, and a
-payload must be durable before its reference is proposed. That is one flush per
-payload instead of two. Any node applies a stopped node's unflushed tail when
-it opens the root or misses a file, so a payload survives the loss of the node
-that wrote it as long as the shared store does.
-
-A write larger than 8 MiB bypasses the log and is flushed directly, once the
-log has been checkpointed: everything appended before it is on the device and
-nothing is left that replay could apply over it. Past that size a flush costs
-bandwidth rather than latency, and the log would only write the bytes twice. Records
-in a segment that was flushed before a later segment was opened cannot tear, so
-damage there fails the open with the segment named; a torn final frame is
-discarded, since acknowledgment follows the flush and could not have covered it.
-
-> **macOS note.** A flush on macOS issues `F_FULLFSYNC`, a full drive-cache
-> barrier that is far more expensive than the equivalent `fsync` on Linux —
-> measured here at ~5 ms versus ~0.08 ms. Under `wal` a commit pays one such
-> barrier (shared when commits overlap); under `sync` it pays several. Local
-> development on macOS may want `FLUREE_STORAGE_FSYNC=0`; it is not
-> representative of Linux production cost.
+Writes remain atomic with either setting: readers do not see partially written
+files.
 
 Because the staged file is moved into place, each write gives the destination a
 new inode. Ownership, permissions, ACLs and hard links applied to a *path* are

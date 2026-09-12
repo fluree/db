@@ -21,10 +21,12 @@
 //! final frame is discarded: acknowledgment follows the flush, and a flush
 //! covers every earlier frame, so a frame that did not make it whole was never
 //! acknowledged. Damage *before* a later, complete segment cannot be explained
-//! that way and fails the open instead of being skipped.
+//! that way and fails the open instead of being skipped. In a damaged final
+//! suffix, a validated later frame also fails recovery conservatively: it may
+//! indicate acknowledged data corruption or an unacknowledged tail persisted
+//! out of order. The log is preserved; replay never resumes past the damage.
 
 use fs2::FileExt;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -32,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
+use xxhash_rust::xxh64::Xxh64;
 
 /// Directory under the storage root holding the lock and segments.
 pub(super) const WAL_DIR: &str = ".fluree-wal";
@@ -40,11 +43,11 @@ pub(super) const WAL_DIR: &str = ".fluree-wal";
 const OWNERS_DIR: &str = "owners";
 const LOCK_FILE: &str = "LOCK";
 const SEGMENT_EXT: &str = "wal";
-const SEGMENT_MAGIC: &[u8; 8] = b"FRDOSEG1";
+const SEGMENT_MAGIC: &[u8; 8] = b"FRDOSEG2";
 const SEGMENT_HEADER: usize = 16;
 const FRAME_MAGIC: &[u8; 4] = b"FRDO";
 const FRAME_HEADER: usize = 4 + 4 + 8;
-const HASH: usize = 32;
+const HASH: usize = 8;
 
 /// Largest single record the log accepts. A write above this bypasses the log
 /// and is flushed directly: past a few megabytes a flush costs bandwidth, not
@@ -218,15 +221,82 @@ fn decode_op(payload: &[u8]) -> Option<OwnedOp> {
     c.done().then_some(op)
 }
 
-fn encode_frame(seq: u64, payload: &[u8]) -> Vec<u8> {
+/// Hash the payload and allocate its frame before taking the log mutex.
+/// Version 2 checksums payload followed by header, so the sequence number
+/// can be folded in after it is assigned without rehashing the payload.
+fn prepare_frame(payload: &[u8]) -> (Vec<u8>, Xxh64) {
     let mut frame = Vec::with_capacity(FRAME_HEADER + payload.len() + HASH);
     frame.extend_from_slice(FRAME_MAGIC);
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&seq.to_le_bytes());
+    frame.extend_from_slice(&0u64.to_le_bytes());
     frame.extend_from_slice(payload);
-    let hash = Sha256::digest(&frame);
-    frame.extend_from_slice(&hash);
+    let mut hash = Xxh64::new(0);
+    hash.update(payload);
+    (frame, hash)
+}
+
+fn finish_frame(seq: u64, mut frame: Vec<u8>, mut hash: Xxh64) -> Vec<u8> {
+    frame[8..16].copy_from_slice(&seq.to_le_bytes());
+    hash.update(&frame[..FRAME_HEADER]);
+    frame.extend_from_slice(&hash.digest().to_le_bytes());
     frame
+}
+
+#[cfg(test)]
+fn encode_frame(seq: u64, payload: &[u8]) -> Vec<u8> {
+    let (frame, hash) = prepare_frame(payload);
+    finish_frame(seq, frame, hash)
+}
+
+/// A valid-looking later frame makes a damaged suffix ambiguous: it could be
+/// media corruption of acknowledged data or out-of-order persistence of an
+/// unacknowledged tail. Refuse both rather than discard potentially durable
+/// history. Never use this scan to resume replay beyond a damaged frame.
+fn check_damaged_suffix(bytes: &[u8], damaged_at: usize, expected_seq: u64) -> io::Result<()> {
+    // Bound hashing work as well as the byte scan: arbitrary payloads can
+    // contain many convincing frame headers. Exhaustion also preserves the log.
+    let mut budget = bytes.len().saturating_mul(4);
+    for (offset, magic) in bytes[damaged_at..].windows(FRAME_MAGIC.len()).enumerate() {
+        if magic != FRAME_MAGIC {
+            continue;
+        }
+        let at = damaged_at + offset;
+        let Some(header) = bytes.get(at..at + FRAME_HEADER) else {
+            continue;
+        };
+        let seq = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        if seq <= expected_seq {
+            continue;
+        }
+        let len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        let Some(end) = at
+            .checked_add(FRAME_HEADER)
+            .and_then(|at| at.checked_add(len))
+        else {
+            continue;
+        };
+        let Some(hash_end) = end.checked_add(HASH) else {
+            continue;
+        };
+        let Some(stored) = bytes.get(end..hash_end) else {
+            continue;
+        };
+        budget = budget.checked_sub(len + FRAME_HEADER).ok_or_else(|| io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("WAL damage at byte {damaged_at}; look-ahead validation budget exceeded; preserving log for investigation"),
+        ))?;
+        let mut hash = Xxh64::new(0);
+        hash.update(&bytes[at + FRAME_HEADER..end]);
+        hash.update(header);
+        if hash.digest().to_le_bytes() == stored
+            && decode_op(&bytes[at + FRAME_HEADER..end]).is_some()
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "WAL damage at byte {damaged_at}, sequence {expected_seq}, followed by a valid-looking frame at byte {at}, sequence {seq}; preserving log for investigation"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Frames decoded from one segment, and whether the segment ended cleanly.
@@ -262,10 +332,10 @@ fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<D
             break false;
         };
         if header[..4] == [0; 4] {
-            // The preallocated tail: nothing was ever written here. A frame
-            // whose first bytes never landed reads the same, and was never
-            // acknowledged either.
-            break true;
+            // Only an entirely zero suffix is an unused preallocated tail.
+            // A missing/corrupted frame header can also be zero; if later
+            // bytes exist, run the same damage look-ahead as for other tears.
+            break bytes[at..].iter().all(|byte| *byte == 0);
         }
         if &header[..4] != FRAME_MAGIC {
             break false;
@@ -278,7 +348,10 @@ fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<D
         let Some(stored) = bytes.get(end..end + HASH) else {
             break false;
         };
-        if Sha256::digest(&bytes[at..end]).as_slice() != stored {
+        let mut hash = Xxh64::new(0);
+        hash.update(&bytes[at + FRAME_HEADER..end]);
+        hash.update(header);
+        if hash.digest().to_le_bytes() != stored {
             break false;
         }
         let Some(op) = decode_op(&bytes[at + FRAME_HEADER..end]) else {
@@ -288,6 +361,9 @@ fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<D
         seq += 1;
         at = end + HASH;
     };
+    if !clean {
+        check_damaged_suffix(bytes, at, seq)?;
+    }
     Ok(Decoded {
         ops,
         next_seq: seq,
@@ -332,6 +408,14 @@ impl Drop for Appended {
     fn drop(&mut self) {
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum DeviceStep {
+    FilesFlushed(PathBuf),
+    Unlink(PathBuf),
+    DirFlushed,
 }
 
 struct Inner {
@@ -388,6 +472,8 @@ pub(super) struct Wal {
     /// any other flush of the same file succeeds.
     #[cfg(test)]
     fail_next_leader_sync: AtomicBool,
+    #[cfg(test)]
+    device_trace: Mutex<Vec<DeviceStep>>,
 }
 
 /// How many keys share one lock in [`Wal::key_stripes`].
@@ -406,6 +492,8 @@ pub(super) enum Acquire {
     Absent,
     /// Another process holds the lock.
     Busy,
+    /// A live takeover must not replay history over completed fallback writes.
+    RecoveryPending,
     /// The filesystem refused the lock or the directory could not be set up.
     Unsupported(io::Error),
 }
@@ -413,6 +501,52 @@ pub(super) enum Acquire {
 fn registry() -> &'static Mutex<HashMap<PathBuf, Weak<Wal>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Wal>>>> = OnceLock::new();
     REGISTRY.get_or_init(Default::default)
+}
+
+/// Coordinate local file operations with acquisition/replay, including handles
+/// that currently flush per write. Cache this gate on the FileStorage handle;
+/// only its first use resolves the root. Construction creates no directories.
+pub(super) fn operation_gate(base: &Path) -> io::Result<Arc<tokio::sync::RwLock<()>>> {
+    type Gates = Mutex<HashMap<PathBuf, Weak<tokio::sync::RwLock<()>>>>;
+    static GATES: OnceLock<Gates> = OnceLock::new();
+    let absolute = if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(base)
+    };
+    let mut ancestor = absolute.as_path();
+    let mut suffix = Vec::new();
+    let mut canonical = loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(path) => break path,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let component = ancestor.components().next_back().ok_or(e)?;
+                suffix.push(component.as_os_str().to_owned());
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| io::Error::other("storage root has no existing ancestor"))?;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    for component in suffix.into_iter().rev() {
+        if component == ".." {
+            canonical.pop();
+        } else if component != "." {
+            canonical.push(component);
+        }
+    }
+    let mut gates = GATES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(gate) = gates.get(&canonical).and_then(Weak::upgrade) {
+        return Ok(gate);
+    }
+    gates.retain(|_, gate| gate.strong_count() != 0);
+    let gate = Arc::new(tokio::sync::RwLock::new(()));
+    gates.insert(canonical, Arc::downgrade(&gate));
+    Ok(gate)
 }
 
 /// Flush and retire every segment of every log this process holds under
@@ -483,12 +617,18 @@ pub(super) fn replay_unowned(base: &Path) -> io::Result<usize> {
         {
             Ok(lock) => lock,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
+            Err(e) => {
+                skip_unavailable_owner(&dir, e)?;
+                continue;
+            }
         };
         match lock.try_lock_exclusive() {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(e),
+            Err(e) => {
+                skip_unavailable_owner(&dir, e)?;
+                continue;
+            }
         }
         let (_, _, records) = replay(&base, &dir, &AtomicU64::new(0))?;
         if records > 0 {
@@ -503,6 +643,27 @@ pub(super) fn replay_unowned(base: &Path) -> io::Result<usize> {
         // already retired log.
     }
     Ok(applied)
+}
+
+/// A failed first acquisition can leave an empty owner directory. It is
+/// safe to ignore that directory, but retained segments may hold the only
+/// durable copy of an acknowledged payload and must not be skipped silently.
+fn skip_unavailable_owner(dir: &Path, error: io::Error) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        if entry?
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == SEGMENT_EXT)
+        {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("cannot lock retained WAL at {}: {error}", dir.display()),
+            ));
+        }
+    }
+    tracing::warn!(owner = %dir.display(), error = %error,
+        "cannot lock an empty owner's WAL; skipping it (per-write fallback)");
+    Ok(())
 }
 
 fn validate_owner(owner: &str) -> io::Result<()> {
@@ -784,7 +945,7 @@ fn walk_segments(
     for (i, (_, path)) in segments.iter().enumerate() {
         let mut bytes = Vec::new();
         File::open(path)?.read_to_end(&mut bytes)?;
-        if i == last && (bytes.len() < SEGMENT_HEADER || &bytes[..8] != SEGMENT_MAGIC) {
+        if i == last && bytes.len() < SEGMENT_HEADER {
             // Creation interrupted before the header was written. A record
             // is only ever appended after the header is durable, so this
             // segment holds nothing acknowledged.
@@ -820,7 +981,7 @@ fn walk_segments(
             tracing::info!(
                 segment = %path.display(),
                 replayed = decoded.ops.len(),
-                "WAL ends in a torn frame; discarding it as unacknowledged"
+                "WAL ends in a damaged suffix with no validated later frame; treating it as an unacknowledged torn tail"
             );
         }
         f(decoded.next_seq - decoded.ops.len() as u64, &decoded.ops)?;
@@ -896,6 +1057,26 @@ impl Wal {
     /// log directory is reported rather than made, so a read-only open leaves
     /// no trace on a root that never journaled.
     pub(super) fn acquire(base: &Path, owner: Option<&str>, create: bool) -> io::Result<Acquire> {
+        Self::acquire_inner(base, owner, create, true)
+    }
+
+    /// A live fallback writer can join an existing in-process log or take over
+    /// a cleanly checkpointed root. Crash history may predate its completed
+    /// Sync writes, so leave that history for explicit startup recovery.
+    pub(super) fn acquire_for_retry(
+        base: &Path,
+        owner: Option<&str>,
+        create: bool,
+    ) -> io::Result<Acquire> {
+        Self::acquire_inner(base, owner, create, false)
+    }
+
+    fn acquire_inner(
+        base: &Path,
+        owner: Option<&str>,
+        create: bool,
+        recover: bool,
+    ) -> io::Result<Acquire> {
         if !cfg!(unix) {
             return Ok(Acquire::Unsupported(io::Error::other(
                 "the WAL needs directory fsync, which only Unix provides",
@@ -957,6 +1138,17 @@ impl Wal {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(Acquire::Busy),
             Err(e) => return Ok(Acquire::Unsupported(e)),
         }
+        if !recover {
+            for entry in std::fs::read_dir(&dir)? {
+                if entry?
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == SEGMENT_EXT)
+                {
+                    return Ok(Acquire::RecoveryPending);
+                }
+            }
+        }
         let fsyncs = AtomicU64::new(0);
         let (next_seq, next_segment, _) = replay(&base, &dir, &fsyncs)?;
         let log = Arc::new(Wal {
@@ -986,6 +1178,8 @@ impl Wal {
             fail_next_sync: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_leader_sync: AtomicBool::new(false),
+            #[cfg(test)]
+            device_trace: Mutex::new(Vec::new()),
         });
         let weak = Arc::downgrade(&log);
         let ticker = weak.clone();
@@ -1094,6 +1288,7 @@ impl Wal {
         self.refuse_if_unavailable()?;
         let sync = sync || self.flush_every_append;
         let payload = op.encode();
+        let (frame, hash) = prepare_frame(&payload);
         let mut inner = self
             .inner
             .lock()
@@ -1106,7 +1301,7 @@ impl Wal {
             let segment = self.open_segment(&mut inner, seq)?;
             inner.active = Some(segment);
         }
-        let frame = encode_frame(seq, &payload);
+        let frame = finish_frame(seq, frame, hash);
         let (full, appended) = {
             let segment = inner.active.as_mut().expect("opened above");
             let start = segment.len;
@@ -1410,8 +1605,20 @@ impl Wal {
                 kept.push(segment);
                 break;
             }
-            let retired = flush_keys(&self.base, &segment.touched, &self.fsyncs)
-                .and_then(|()| std::fs::remove_file(&segment.path));
+            let retired = flush_keys(&self.base, &segment.touched, &self.fsyncs).and_then(|()| {
+                #[cfg(test)]
+                self.device_trace
+                    .lock()
+                    .unwrap()
+                    .push(DeviceStep::FilesFlushed(segment.path.clone()));
+                std::fs::remove_file(&segment.path)?;
+                #[cfg(test)]
+                self.device_trace
+                    .lock()
+                    .unwrap()
+                    .push(DeviceStep::Unlink(segment.path.clone()));
+                Ok(())
+            });
             match retired {
                 Ok(()) => removed = true,
                 Err(e) => {
@@ -1425,6 +1632,12 @@ impl Wal {
         if removed {
             if let Err(e) = fsync_dir(&self.dir, &self.fsyncs) {
                 failure.get_or_insert(e);
+            } else {
+                #[cfg(test)]
+                self.device_trace
+                    .lock()
+                    .unwrap()
+                    .push(DeviceStep::DirFlushed);
             }
         }
         let waiting = kept.len();
@@ -1522,10 +1735,16 @@ impl Drop for Wal {
         if let Err(e) = self.checkpoint() {
             tracing::warn!(error = %e, dir = %self.dir.display(), "WAL checkpoint on close failed; the next open will replay it");
         }
-        registry()
+        let mut registry = registry()
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.dir);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            self.lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+        registry.remove(&self.dir);
     }
 }
 
@@ -1618,9 +1837,10 @@ mod tests {
         segment.extend_from_slice(&encode_frame(1, &Op::Delete { key: "k" }.encode()));
         segment.extend_from_slice(&encode_frame(2, &Op::Delete { key: "k2" }.encode()));
         segment[start + FRAME_HEADER + 3] ^= 0xff;
-        let decoded = decode_segment(&segment, None).unwrap();
-        assert!(!decoded.clean);
-        assert!(decoded.ops.is_empty());
+        let error = decode_segment(&segment, None)
+            .err()
+            .expect("later valid frame must make recovery fail");
+        assert!(error.to_string().contains("valid-looking frame"));
     }
 
     #[test]
@@ -2606,5 +2826,294 @@ mod tests {
             flushes <= 4,
             "{flushes} flushes to retire two files named 50 times each"
         );
+    }
+
+    #[tokio::test]
+    async fn review_empty_unavailable_owner_does_not_break_startup_or_read_misses() {
+        use crate::{Durability, FileStorage, StorageRead};
+        let dir = tempfile::tempdir().unwrap();
+        let owner = dir.path().join(WAL_DIR).join(OWNERS_DIR).join("node-1");
+        // Opening a directory for read/write fails on all supported Unix
+        // platforms; exercise the same fallback for an unusable owner lock.
+        std::fs::create_dir_all(owner.join(LOCK_FILE)).unwrap();
+        let storage = FileStorage::new(dir.path())
+            .with_durability(Durability::Wal)
+            .with_wal_owner("node-1");
+        storage.recover_wal().unwrap();
+        assert_eq!(storage.effective_durability(), Durability::Sync);
+        assert!(matches!(
+            storage.read_bytes("fluree:file://missing").await,
+            Err(crate::Error::NotFound(_))
+        ));
+        // A retained log is different: it may hold acknowledged data.
+        std::fs::write(owner.join("00000001.wal"), b"retained").unwrap();
+        assert!(storage
+            .recover_wal()
+            .unwrap_err()
+            .to_string()
+            .contains("retained WAL"));
+        assert!(owner.join("00000001.wal").exists());
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn review_unsupported_flock_on_empty_owner_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = dir.path().join(WAL_DIR).join(OWNERS_DIR).join("node-1");
+        std::fs::create_dir_all(&owner).unwrap();
+        let lock_path = owner.join(LOCK_FILE);
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&lock_path)
+            .status()
+            .unwrap()
+            .success());
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let error = lock.try_lock_exclusive().unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(replay_unowned(dir.path()).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn review_failed_plain_write_is_cancelled_before_recovery() {
+        use crate::{Durability, FileStorage, StorageRead, StorageWrite};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        storage.hold_wal_segments_for_test().unwrap();
+        let path = dir.path().join("head");
+        std::fs::create_dir(&path).unwrap(); // The final rename must fail.
+        assert!(storage
+            .write_bytes("fluree:file://head", b"failed")
+            .await
+            .is_err());
+        storage.simulate_crash_for_test();
+        std::fs::remove_dir(&path).unwrap();
+        let reopened = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        reopened.recover_wal().unwrap();
+        assert!(matches!(
+            reopened.read_bytes("fluree:file://head").await,
+            Err(crate::Error::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn review_failed_plain_delete_preserves_a_later_writer() {
+        use crate::{Durability, FileStorage, StorageRead, StorageWrite};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        storage.hold_wal_segments_for_test().unwrap();
+        let path = dir.path().join("head");
+        std::fs::create_dir(&path).unwrap(); // remove_file cannot delete it.
+        assert!(storage.delete("fluree:file://head").await.is_err());
+        std::fs::remove_dir(&path).unwrap();
+        let other = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        other
+            .write_bytes("fluree:file://head", b"acknowledged")
+            .await
+            .unwrap();
+        storage.simulate_crash_for_test();
+        let reopened = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        reopened.recover_wal().unwrap();
+        assert_eq!(
+            reopened.read_bytes("fluree:file://head").await.unwrap(),
+            b"acknowledged"
+        );
+    }
+
+    #[test]
+    fn review_retirement_flushes_repeated_keys_once_before_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.hold_segments();
+        std::fs::write(dir.path().join("head"), b"value").unwrap();
+        for _ in 0..20 {
+            drop(
+                log.append(
+                    Op::Write {
+                        key: "head",
+                        bytes: b"value",
+                    },
+                    false,
+                )
+                .unwrap(),
+            );
+        }
+        rotate_now(&log);
+        let segment = log.inner.lock().unwrap().closed[0].path.clone();
+        let before = log.fsyncs_issued();
+        assert_eq!(log.retire_closed().unwrap(), 0);
+        // Apple adds one drive-cache barrier after the file/directory
+        // writebacks. Linux replaces the root-directory flush with syncfs.
+        let expected_flushes = if cfg!(target_vendor = "apple") { 4 } else { 3 };
+        assert_eq!(
+            log.fsyncs_issued() - before,
+            expected_flushes,
+            "one file writeback, the platform's batch barrier, and WAL directory flush"
+        );
+        assert_eq!(
+            *log.device_trace.lock().unwrap(),
+            vec![
+                DeviceStep::FilesFlushed(segment.clone()),
+                DeviceStep::Unlink(segment),
+                DeviceStep::DirFlushed,
+            ]
+        );
+    }
+
+    #[test]
+    fn review_new_checksum_covers_payload_and_sequence() {
+        let payload = Op::Write {
+            key: "head",
+            bytes: b"value",
+        }
+        .encode();
+        let mut bytes = SEGMENT_MAGIC.to_vec();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&encode_frame(1, &payload));
+        assert!(decode_segment(&bytes, None).unwrap().clean);
+        let mut changed_payload = bytes.clone();
+        changed_payload[SEGMENT_HEADER + FRAME_HEADER + payload.len() - 1] ^= 1;
+        assert!(!decode_segment(&changed_payload, None).unwrap().clean);
+        // Keep the structural sequence checks satisfied; the checksum must
+        // independently detect that the header's sequence was changed.
+        bytes[8..16].copy_from_slice(&2u64.to_le_bytes());
+        bytes[SEGMENT_HEADER + 8..SEGMENT_HEADER + 16].copy_from_slice(&2u64.to_le_bytes());
+        assert!(!decode_segment(&bytes, None).unwrap().clean);
+    }
+
+    #[test]
+    fn review_unknown_segment_version_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = dir.path().join(WAL_DIR);
+        std::fs::create_dir(&wal).unwrap();
+        let path = wal.join("00000001.wal");
+        let mut bytes = b"FRDOSEG9".to_vec();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&encode_frame(1, &Op::Delete { key: "head" }.encode()));
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(replay(dir.path(), &wal, &AtomicU64::new(0)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn lookahead_preserves_the_log_and_files_on_ambiguous_tail_damage() {
+        for damage in ["payload", "length", "zeroed header"] {
+            let dir = tempfile::tempdir().unwrap();
+            let wal = dir.path().join(WAL_DIR);
+            std::fs::create_dir(&wal).unwrap();
+            std::fs::write(dir.path().join("head"), b"untouched").unwrap();
+            let mut bytes = SEGMENT_MAGIC.to_vec();
+            bytes.extend_from_slice(&1u64.to_le_bytes());
+            bytes.extend_from_slice(&encode_frame(
+                1,
+                &Op::Write {
+                    key: "head",
+                    bytes: b"prefix",
+                }
+                .encode(),
+            ));
+            let damaged_at = bytes.len();
+            bytes.extend_from_slice(&encode_frame(
+                2,
+                &Op::Write {
+                    key: "head",
+                    bytes: b"damaged",
+                }
+                .encode(),
+            ));
+            match damage {
+                "length" => {
+                    bytes[damaged_at + 4..damaged_at + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+                }
+                "zeroed header" => bytes[damaged_at..damaged_at + FRAME_HEADER].fill(0),
+                _ => bytes[damaged_at + FRAME_HEADER + 1] ^= 0xff,
+            }
+            // This is also a permitted unacknowledged suffix: the later
+            // frame landed ahead of the damaged one's missing blocks. The
+            // conservative policy refuses that case as well as media damage.
+            bytes.extend_from_slice(&encode_frame(3, &Op::Delete { key: "head" }.encode()));
+            let path = wal.join("00000001.wal");
+            std::fs::write(&path, &bytes).unwrap();
+            for _ in 0..2 {
+                let error = replay(dir.path(), &wal, &AtomicU64::new(0)).unwrap_err();
+                assert!(error.to_string().contains("valid-looking frame"), "{error}");
+                assert_eq!(std::fs::read(&path).unwrap(), bytes);
+                assert_eq!(
+                    std::fs::read(dir.path().join("head")).unwrap(),
+                    b"untouched"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preallocated_zero_tail_is_clean() {
+        let mut bytes = SEGMENT_MAGIC.to_vec();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&encode_frame(1, &Op::Delete { key: "head" }.encode()));
+        bytes.resize(ROTATE_BYTES as usize, 0);
+        let decoded = decode_segment(&bytes, None).unwrap();
+        assert!(decoded.clean);
+        assert_eq!(decoded.ops.len(), 1);
+        assert_eq!(decoded.next_seq, 2);
+    }
+
+    #[test]
+    fn lookahead_requires_a_valid_checksum_and_later_sequence() {
+        for invalid_hash in [false, true] {
+            let mut bytes = SEGMENT_MAGIC.to_vec();
+            bytes.extend_from_slice(&1u64.to_le_bytes());
+            bytes.extend_from_slice(b"bad frame");
+            let seq = if invalid_hash { 2 } else { 1 };
+            let mut candidate = encode_frame(seq, &Op::Delete { key: "head" }.encode());
+            if invalid_hash {
+                *candidate.last_mut().unwrap() ^= 1;
+            }
+            bytes.extend_from_slice(&candidate);
+            let decoded = decode_segment(&bytes, None).unwrap();
+            assert!(!decoded.clean);
+            assert!(decoded.ops.is_empty());
+        }
+    }
+
+    #[test]
+    fn lookahead_bounds_validation_work_on_many_candidate_headers() {
+        let mut bytes = vec![0u8; 4096];
+        bytes[..8].copy_from_slice(SEGMENT_MAGIC);
+        bytes[8..16].copy_from_slice(&1u64.to_le_bytes());
+        for i in 0..16 {
+            let at = SEGMENT_HEADER + 1 + i * FRAME_HEADER;
+            let len = (bytes.len() - at - FRAME_HEADER - HASH) as u32;
+            bytes[at..at + 4].copy_from_slice(FRAME_MAGIC);
+            bytes[at + 4..at + 8].copy_from_slice(&len.to_le_bytes());
+            bytes[at + 8..at + 16].copy_from_slice(&2u64.to_le_bytes());
+        }
+        let error = decode_segment(&bytes, None)
+            .err()
+            .expect("ambiguous scan must be bounded");
+        assert!(error.to_string().contains("budget exceeded"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn retry_does_not_replace_a_poisoned_attached_log() {
+        use crate::{Durability, FileStorage, StorageWrite};
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.fail_next_sync.store(true, Ordering::Release);
+        let storage = FileStorage::new(dir.path())
+            .with_durability(Durability::Wal)
+            .with_wal_owner("review");
+        assert!(storage
+            .write_bytes("fluree:file://first", b"failed")
+            .await
+            .is_err());
+        let error = storage
+            .write_bytes("fluree:file://second", b"must fail")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("failed flush"), "{error}");
     }
 }

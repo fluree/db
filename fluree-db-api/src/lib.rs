@@ -3295,7 +3295,15 @@ impl FlureeBuilder {
                 .ok_or_else(|| ApiError::config("File storage requires filePath"))?
                 .clone();
 
-            let file_storage = self.file_storage(path.as_ref());
+            let mut file_storage = self.file_storage(path.as_ref());
+            // A query peer must recover the preceding writer's tail without
+            // retaining its WAL lock. Any incidental storage writes remain
+            // durable through per-write flushing and cannot reacquire the WAL.
+            if matches!(&nameservice, Some(NameServiceMode::ReadOnly(_)))
+                && file_storage.durability() == fluree_db_core::Durability::Wal
+            {
+                file_storage = file_storage.with_durability(fluree_db_core::Durability::Sync);
+            }
             // Client build is startup: take the explicit sweep of
             // crash-orphaned staging files here, where startup is known.
             file_storage.sweep_orphaned_staging();
