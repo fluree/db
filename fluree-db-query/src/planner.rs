@@ -1613,6 +1613,15 @@ pub fn reorder_patterns(
         .flatten()
         .collect();
 
+    // Only dependencies with a producer in this scope can become ready later.
+    // Do not delay pipeline consumers on permanently unbound variables (or
+    // expression-local EXISTS variables) behind unrelated scans.
+    let scope_produced_vars: HashSet<VarId> = if subquery_output_vars.is_empty() {
+        HashSet::new()
+    } else {
+        patterns.iter().flat_map(Pattern::produced_vars).collect()
+    };
+
     // Anchor vars for the seed race: subquery-producer outputs plus every
     // VALUES/UNWIND var. A constant row set is a guaranteed producer with
     // EXACT cardinality, so a disconnected `rdf:type <C>` class anchor must
@@ -1746,12 +1755,25 @@ pub fn reorder_patterns(
         } else {
             // Consumer of an uncorrelated WITH-subquery's output: defer it on
             // those vars so the producing subquery is placed first.
-            let needs: HashSet<VarId> = pattern
+            let mut needs: HashSet<VarId> = pattern
                 .referenced_vars()
                 .into_iter()
                 .filter(|v| subquery_output_vars.contains(v))
                 .collect();
             if !needs.is_empty() {
+                // A scalar consumer can also read non-pipeline outputs (for
+                // example an aggregate from a sibling subquery). Waiting only
+                // for the pipeline subset evaluates the expression too early.
+                if matches!(
+                    pattern,
+                    Pattern::Filter(_) | Pattern::Bind { .. } | Pattern::Unwind { .. }
+                ) {
+                    needs.extend(
+                        deferred_required_vars(pattern)
+                            .into_iter()
+                            .filter(|v| scope_produced_vars.contains(v)),
+                    );
+                }
                 deferred.push(DeferredPattern {
                     orig_index: i,
                     required_vars: needs,
@@ -2587,6 +2609,116 @@ mod tests {
 
     fn make_pattern(s: VarId, p_name: &str, o: VarId) -> TriplePattern {
         TriplePattern::new(Ref::Var(s), Ref::Sid(Sid::new(100, p_name)), Term::Var(o))
+    }
+
+    #[test]
+    fn scalar_pipeline_consumers_wait_for_all_inputs() {
+        use crate::ir::{AggregateFn, AggregateSpec, Aggregation, Expression, InputSemantics};
+        use fluree_db_core::{FlakeValue, NonEmpty};
+        let (key, input, average, bound, output) =
+            (VarId(0), VarId(1), VarId(2), VarId(3), VarId(4));
+        let grouped = Pattern::Subquery(
+            SubqueryPattern::new(
+                vec![key, average],
+                vec![Pattern::Triple(make_pattern(key, "price", input))],
+            )
+            .with_uncorrelated()
+            .with_grouping(Grouping::Explicit {
+                group_by: NonEmpty::singleton(key),
+                aggregation: Some(Aggregation {
+                    aggregates: NonEmpty::singleton(AggregateSpec {
+                        function: AggregateFn::Avg(input, InputSemantics::List),
+                        output_var: average,
+                    }),
+                    binds: vec![],
+                }),
+                having: None,
+            }),
+        );
+        let pipeline = Pattern::Subquery(
+            SubqueryPattern::new(
+                vec![key, bound],
+                vec![
+                    // A scalar producer wins the source race over the grouped
+                    // price scan, exposing the premature-consumer schedule.
+                    Pattern::Values {
+                        vars: vec![key],
+                        rows: vec![vec![crate::binding::Binding::lit(
+                            FlakeValue::Long(1),
+                            Sid::xsd_integer(),
+                        )]],
+                    },
+                    Pattern::Bind {
+                        var: bound,
+                        expr: Expression::Const(FlakeValue::Long(5)),
+                    },
+                ],
+            )
+            .with_uncorrelated(),
+        );
+        let expr = Expression::div(Expression::Var(average), Expression::Var(bound));
+        for consumer in [
+            Pattern::Bind {
+                var: output,
+                expr: expr.clone(),
+            },
+            Pattern::Filter(Expression::gt(
+                expr.clone(),
+                Expression::Const(FlakeValue::Long(1)),
+            )),
+            Pattern::Unwind {
+                var: output,
+                list: expr,
+            },
+        ] {
+            let ordered = reorder_patterns(
+                &[grouped.clone(), pipeline.clone(), consumer],
+                None,
+                &HashSet::new(),
+            );
+            assert!(
+                matches!(
+                    ordered.last(),
+                    Some(Pattern::Bind { .. } | Pattern::Filter(_) | Pattern::Unwind { .. })
+                ),
+                "scalar consumer ran before one of its input subqueries: {ordered:?}"
+            );
+        }
+
+        // A missing variable cannot acquire a value from the remaining grouped
+        // scan. Keep the old early placement for this COALESCE consumer, rather
+        // than treating the missing variable as an unsatisfied dependency.
+        let fallback = Expression::call(
+            crate::ir::Function::Coalesce,
+            vec![Expression::Var(bound), Expression::Var(VarId(100))],
+        );
+        for consumer in [
+            Pattern::Bind {
+                var: output,
+                expr: fallback.clone(),
+            },
+            Pattern::Filter(Expression::gt(
+                fallback.clone(),
+                Expression::Const(FlakeValue::Long(1)),
+            )),
+            Pattern::Unwind {
+                var: output,
+                list: fallback,
+            },
+        ] {
+            let ordered = reorder_patterns(
+                &[grouped.clone(), pipeline.clone(), consumer],
+                None,
+                &HashSet::new(),
+            );
+            assert!(
+                matches!(
+                    ordered.get(1),
+                    Some(Pattern::Bind { .. } | Pattern::Filter(_) | Pattern::Unwind { .. })
+                ),
+                "a permanently unbound input delayed the consumer: {ordered:?}",
+            );
+        }
     }
 
     #[test]
