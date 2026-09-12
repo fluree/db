@@ -4,14 +4,14 @@
 //! modified between two points, producing a set of [`ConflictKey`]s that
 //! can be checked against branch commits to detect overlapping changes.
 
-use crate::{trace_commits_by_id, Result};
+use crate::{trace_first_parent_commits_by_id, Result};
 use fluree_db_core::{ConflictKey, ContentId, ContentStore, Flake, FlakeValue, Sid};
 use futures::TryStreamExt;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
 
-/// Walk the commit chain from `head_id` back to `stop_at_t` and collect
-/// all (subject, predicate, graph) tuples modified in those commits.
+/// Walk the first-parent lineage from `head_id` back to `stop_at_t` and
+/// collect all (subject, predicate, graph) tuples modified in those commits.
 ///
 /// This produces the "source delta" — the set of data points changed on
 /// the source branch since the branch point. During rebase, branch commits
@@ -27,7 +27,7 @@ pub async fn compute_delta_keys<C: ContentStore + Clone + 'static>(
     head_id: ContentId,
     stop_at_t: i64,
 ) -> Result<FxHashSet<ConflictKey>> {
-    let stream = trace_commits_by_id(store, head_id, stop_at_t);
+    let stream = trace_first_parent_commits_by_id(store, head_id, stop_at_t);
     futures::pin_mut!(stream);
 
     let mut keys = FxHashSet::default();
@@ -52,8 +52,8 @@ pub async fn compute_delta_keys<C: ContentStore + Clone + 'static>(
 /// must treat the same triple in two graphs as two distinct facts, and must
 /// keep language-tagged strings and list positions apart, so `g`, `lang`,
 /// and `i` are all part of the key.
-#[derive(PartialEq, Eq, Hash)]
-struct FactKey {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FactKey {
     g: Option<Sid>,
     s: Sid,
     p: Sid,
@@ -64,7 +64,8 @@ struct FactKey {
 }
 
 impl FactKey {
-    fn of(flake: &Flake) -> Self {
+    /// The identity of `flake`'s fact, independent of `t` and `op`.
+    pub fn of(flake: &Flake) -> Self {
         Self {
             g: flake.g.clone(),
             s: flake.s.clone(),
@@ -143,7 +144,7 @@ pub async fn compute_delta_keys_and_changes<C: ContentStore + Clone + 'static>(
     head_id: ContentId,
     stop_at_t: i64,
 ) -> Result<(FxHashSet<ConflictKey>, Vec<Flake>)> {
-    let stream = trace_commits_by_id(store, head_id, stop_at_t);
+    let stream = trace_first_parent_commits_by_id(store, head_id, stop_at_t);
     futures::pin_mut!(stream);
 
     let mut keys = FxHashSet::default();

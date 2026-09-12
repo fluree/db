@@ -867,6 +867,207 @@ async fn merge_explicit_target_matches_parent() {
 }
 
 // =============================================================================
+// Folding a source range into one commit: per-fact netting
+// =============================================================================
+
+/// Query all ex:nick values on a branch.
+async fn query_all_nicks(fluree: &support::MemoryFluree, ledger_id: &str) -> Vec<String> {
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "select": ["?nick"],
+        "where": {"@id": "?s", "ex:nick": "?nick"}
+    });
+    let result = support::query_jsonld(fluree, &ledger, &query)
+        .await
+        .unwrap();
+    let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+    extract_names(&rows)
+}
+
+fn replace_name(id: &str, name: &str) -> serde_json::Value {
+    json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "where": {"@id": id, "ex:name": "?old"},
+        "delete": {"@id": id, "ex:name": "?old"},
+        "insert": {"@id": id, "ex:name": name}
+    })
+}
+
+/// A general merge lands every source commit in ONE commit at ONE `t`, and
+/// a same-`t` retract beats a same-`t` assert. A fact the source asserted,
+/// retracted, then asserted again must survive the fold.
+#[tokio::test]
+async fn merge_folds_source_history_per_fact() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let main = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    // dev: nick set, removed, set again.
+    let ctx = json!({"ex": "http://example.org/ns/"});
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    let dev = fluree
+        .insert(
+            dev,
+            &json!({"@context": ctx, "@graph": [{"@id": "ex:alice", "ex:nick": "N"}]}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let dev = fluree
+        .update(
+            dev,
+            &json!({
+                "@context": ctx,
+                "delete": {"@id": "ex:alice", "ex:nick": "N"}
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .insert(
+            dev,
+            &json!({"@context": ctx, "@graph": [{"@id": "ex:alice", "ex:nick": "N"}]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(query_all_nicks(&fluree, "mydb:dev").await, vec!["N"]);
+
+    // main diverges so the merge is not a fast-forward.
+    fluree
+        .insert(
+            main,
+            &json!({"@context": ctx, "@graph": [{"@id": "ex:bob", "ex:name": "Bob"}]}),
+        )
+        .await
+        .unwrap();
+
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(!report.fast_forward);
+    assert_eq!(report.conflict_count, 0);
+
+    assert_eq!(query_all_nicks(&fluree, "mydb:main").await, vec!["N"]);
+}
+
+/// The mirror image: a value the source replaced and then restored must
+/// still be there after the fold (retract + assert of the same fact at one
+/// `t` would otherwise resolve to "gone").
+#[tokio::test]
+async fn merge_keeps_value_source_replaced_and_restored() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let main = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    let dev = fluree
+        .update(dev, &replace_name("ex:alice", "B"))
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .update(dev, &replace_name("ex:alice", "Alice"))
+        .await
+        .unwrap();
+
+    fluree
+        .insert(
+            main,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:bob", "ex:name": "Bob"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(!report.fast_forward);
+
+    assert_eq!(
+        query_all_names(&fluree, "mydb:main").await,
+        vec!["Alice", "Bob"]
+    );
+}
+
+/// Take-source retracts the target's values under each conflict key. When
+/// both sides made the identical change, the source's assert is a no-op
+/// (already asserted) and an unfiltered retract would wipe the value both
+/// sides agree on.
+#[tokio::test]
+async fn merge_take_source_keeps_value_both_sides_asserted() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let main = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .update(dev, &replace_name("ex:alice", "C"))
+        .await
+        .unwrap();
+    fluree
+        .update(main, &replace_name("ex:alice", "C"))
+        .await
+        .unwrap();
+
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::TakeSource)
+        .await
+        .unwrap();
+    assert_eq!(report.conflict_count, 1);
+
+    assert_eq!(query_all_names(&fluree, "mydb:main").await, vec!["C"]);
+}
+
+// =============================================================================
 // Fast-forward merge keeps the target's own graph registry
 // =============================================================================
 

@@ -31,7 +31,7 @@ use fluree_db_binary_index::{BinaryIndexStore, LeafletCache};
 use fluree_db_core::db::{LedgerSnapshot, LedgerSnapshotMetadata};
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::ledger_config::LedgerConfig;
-use fluree_db_core::trace_commits_by_id;
+use fluree_db_core::trace_first_parent_commits_by_id;
 use fluree_db_core::{ledger_id::normalize_ledger_id, ContentId, ContentStore, StorageBackend};
 use fluree_db_ledger::{LedgerState, TypeErasedStore};
 use fluree_db_nameservice::NsRecord;
@@ -2150,12 +2150,15 @@ impl LedgerManager {
                 let cs: Arc<dyn ContentStore> = cs_for_record().await?;
 
                 // Load commits outside any lock.
-                // trace_commits_by_id walks HEAD → oldest, stopping at local_t.
+                // trace_first_parent_commits_by_id walks HEAD → oldest, stopping at local_t.
                 // Collect then reverse to apply oldest → newest.
                 let mut commits = Vec::with_capacity(gap as usize);
                 {
-                    let stream =
-                        trace_commits_by_id(Arc::clone(&cs), commit_head_id.clone(), local_t);
+                    let stream = trace_first_parent_commits_by_id(
+                        Arc::clone(&cs),
+                        commit_head_id.clone(),
+                        local_t,
+                    );
                     futures::pin_mut!(stream);
                     while let Some(result) = futures::StreamExt::next(&mut stream).await {
                         let commit = result.map_err(|e| {

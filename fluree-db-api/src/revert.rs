@@ -18,7 +18,7 @@
 //!   rejected — only `Abort`, `TakeSource`, and `TakeBranch` make sense for
 //!   revert.
 
-use crate::commit_data::{collect_from_commits, CollectedCommitData};
+use crate::commit_data::{collect_from_commits, CollectedCommitData, Fold};
 use crate::error::{ApiError, Result};
 use crate::ledger_manager::GuardedStagedCommit;
 use crate::ledger_view::{CommitRef, LedgerView};
@@ -26,8 +26,9 @@ use crate::rebase::ConflictStrategy;
 use fluree_db_core::commit::{TxnMetaEntry, TxnMetaValue};
 use fluree_db_core::ledger_id::format_ledger_id;
 use fluree_db_core::{
-    collect_dag_cids, load_commit_by_id, load_commit_envelope_by_id, trace_commits_by_id,
-    BranchedContentStore, CommitId, ConflictKey, ContentStore, NonEmpty,
+    collect_dag_cids, collect_first_parent_cids, load_commit_by_id, load_commit_envelope_by_id,
+    trace_first_parent_commits_by_id, BranchedContentStore, CommitId, ConflictKey, ContentStore,
+    NonEmpty,
 };
 use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecordSnapshot;
@@ -424,9 +425,10 @@ impl crate::Fluree {
         let conflict_count = conflict_keys.len();
         let rollback_snapshot = NsRecordSnapshot::from_record(&branch_record);
         // Load reverted commits oldest-first then fold via the shared
-        // accumulator: invert each flake's `op` (assertion ⇄ retraction) and
-        // accumulate `namespace_delta`/`graph_delta` with earlier-wins
-        // semantics, matching the merge path's `collect_commit_data`.
+        // accumulator: invert each flake's `op` (assertion ⇄ retraction),
+        // net per fact, and accumulate `namespace_delta`/`graph_delta` with
+        // earlier-wins semantics, matching the merge path's
+        // `collect_commit_data`.
         let mut commits = Vec::with_capacity(plan.ordered_commits.len());
         for commit_id in plan.ordered_commits.iter().rev() {
             commits.push(load_commit_by_id(&branch_store, commit_id).await?);
@@ -435,7 +437,7 @@ impl crate::Fluree {
             flakes: inverted,
             namespace_delta,
             graph_delta,
-        } = collect_from_commits(commits, |f| f.invert_at(0));
+        } = collect_from_commits(commits, Fold::Undo);
 
         // Acquire state under the ledger write lock when a manager is
         // available, serializing with regular transactions. Without a
@@ -647,15 +649,50 @@ pub struct StagedRevert {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// `t` of `commit_id` on the branch's own history.
+///
+/// A commit the branch can reach but that is not on that history arrived
+/// through a merge. Its `t` belongs to the branch that authored it, and the
+/// conflict walk never visits it, so reverting it would apply without ever
+/// comparing it against what followed. The DAG walk here runs only to tell
+/// that case apart from a commit this branch has never seen.
+async fn locate_on_lineage<C: ContentStore + ?Sized>(
+    store: &C,
+    head_id: &CommitId,
+    lineage_t: &FxHashMap<CommitId, i64>,
+    commit_id: &CommitId,
+    label: &str,
+) -> Result<i64> {
+    if let Some(t) = lineage_t.get(commit_id) {
+        return Ok(*t);
+    }
+    let reachable = collect_dag_cids(store, head_id, 0)
+        .await?
+        .iter()
+        .any(|(_, c)| c == commit_id);
+    Err(ApiError::InvalidBranch(if reachable {
+        format!(
+            "{label} {commit_id} reached this branch through a merge, so it is not on the \
+             branch's own history; revert it on the branch that authored it and merge again"
+        )
+    } else {
+        format!("{label} {commit_id} is not reachable from the branch HEAD")
+    }))
+}
+
 async fn resolve_revert_plan<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &CommitId,
     source: &ResolvedSource,
 ) -> Result<RevertPlan> {
-    // Walk the branch's full ancestry once for reachability validation.
-    // `dag` is newest-first.
-    let dag = collect_dag_cids(store, head_id, 0).await?;
-    let dag_index: FxHashMap<CommitId, i64> = dag.iter().cloned().map(|(t, c)| (c, t)).collect();
+    // A branch's own history is its first-parent lineage: a merge commit
+    // folds what it merged, so the merged branch's commits are not part of
+    // it. Conflict detection walks that lineage, and `t` is only comparable
+    // along it, so only commits on it can be reverted. `lineage` is
+    // newest-first with strictly decreasing `t`.
+    let lineage = collect_first_parent_cids(store, head_id, 0).await?;
+    let lineage_t: FxHashMap<CommitId, i64> =
+        lineage.iter().cloned().map(|(t, c)| (c, t)).collect();
 
     // Build a list of (t, commit_id) pairs to revert. Each branch produces
     // a non-empty result (the cherry-pick branch via `NonEmpty`, the range
@@ -668,11 +705,7 @@ async fn resolve_revert_plan<C: ContentStore + ?Sized>(
                 if !seen.insert(commit_id.clone()) {
                     continue;
                 }
-                let t = dag_index.get(commit_id).copied().ok_or_else(|| {
-                    ApiError::InvalidBranch(format!(
-                        "Commit {commit_id} is not reachable from the branch HEAD"
-                    ))
-                })?;
+                let t = locate_on_lineage(store, head_id, &lineage_t, commit_id, "Commit").await?;
                 out.push((t, commit_id.clone()));
             }
             // De-duplication preserves at least one element since the input
@@ -681,32 +714,20 @@ async fn resolve_revert_plan<C: ContentStore + ?Sized>(
             NonEmpty::try_from_vec(out).expect("dedup of NonEmpty input is non-empty")
         }
         ResolvedSource::Range { from, to } => {
-            let to_t = dag_index.get(to).copied().ok_or_else(|| {
-                ApiError::InvalidBranch(format!(
-                    "Range endpoint {to} is not reachable from the branch HEAD"
-                ))
-            })?;
-            let from_t = dag_index.get(from).copied().ok_or_else(|| {
-                ApiError::InvalidBranch(format!(
-                    "Range endpoint {from} is not reachable from the branch HEAD"
-                ))
-            })?;
+            let to_t = locate_on_lineage(store, head_id, &lineage_t, to, "Range endpoint").await?;
+            let from_t =
+                locate_on_lineage(store, head_id, &lineage_t, from, "Range endpoint").await?;
             if from_t >= to_t {
                 return Err(ApiError::InvalidBranch(format!(
                     "Range start {from} is not an ancestor of {to}"
                 )));
             }
-            // Confirm `from` is on `to`'s ancestry path, then collect (from, to].
-            let to_ancestry = collect_dag_cids(store, to, 0).await?;
-            let to_set: FxHashSet<CommitId> = to_ancestry.iter().map(|(_, c)| c.clone()).collect();
-            if !to_set.contains(from) {
-                return Err(ApiError::InvalidBranch(format!(
-                    "Range start {from} is not an ancestor of {to}"
-                )));
-            }
-            let collected: Vec<(i64, CommitId)> = to_ancestry
-                .into_iter()
-                .filter(|(t, c)| c != from && *t > from_t)
+            // Both endpoints are on the lineage and `t` orders it, so
+            // (from, to] is the slice between them. No second walk.
+            let collected: Vec<(i64, CommitId)> = lineage
+                .iter()
+                .filter(|(t, _)| *t > from_t && *t <= to_t)
+                .cloned()
                 .collect();
             NonEmpty::try_from_vec(collected).ok_or_else(|| {
                 ApiError::InvalidBranch("Revert range selects zero commits".to_string())
@@ -757,6 +778,10 @@ async fn resolve_revert_plan<C: ContentStore + ?Sized>(
 
 /// Compute the conflict keys: `(s, p, g)` tuples touched by the reverted set
 /// that are also touched by intervening commits not in the revert set.
+///
+/// Walks the branch's first-parent lineage, which is sound because
+/// `resolve_revert_plan` admits only commits on it: every reverted commit is
+/// visited, and every `t` compared is on this branch's clock.
 async fn compute_conflict_keys<C: ContentStore + Clone + 'static>(
     store: &C,
     head_id: &CommitId,
@@ -765,7 +790,7 @@ async fn compute_conflict_keys<C: ContentStore + Clone + 'static>(
 ) -> Result<Vec<ConflictKey>> {
     // stop_at_t = oldest_t - 1 → include every commit with t >= oldest_t.
     let stop = oldest_t.saturating_sub(1);
-    let stream = trace_commits_by_id(store.clone(), head_id.clone(), stop);
+    let stream = trace_first_parent_commits_by_id(store.clone(), head_id.clone(), stop);
     futures::pin_mut!(stream);
 
     let mut reverted_keys: FxHashSet<ConflictKey> = FxHashSet::default();

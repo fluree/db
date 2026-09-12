@@ -461,9 +461,10 @@ impl Flake {
         }
     }
 
-    /// Like [`Self::invert`] but also overrides the transaction time. Useful
-    /// when staging inverted flakes for a new commit, where the staging layer
-    /// will rewrite `t` anyway.
+    /// Like [`Self::invert`] but also overrides the transaction time.
+    ///
+    /// Not needed when the result is headed for a commit: `StagedLedger::new`
+    /// restamps every staged flake to the commit's `t`.
     pub fn invert_at(&self, t: i64) -> Self {
         Self {
             t,

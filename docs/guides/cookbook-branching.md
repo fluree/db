@@ -201,6 +201,8 @@ Each branch has its own transaction history. Query any branch at any point in ti
 fluree query --ledger mydb:experiment --at 3 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
 ```
 
+Each branch numbers its transactions on its own clock, starting from the point where it forked, so `--at 3` on `experiment` and `--at 3` on `main` are unrelated states. A merge lands on the target as a single commit at the target's next transaction number, carrying the whole resolved change from the source. Reads below that number return what the target held at the time: merging never rewrites a branch's earlier history, and a branch's state at any `--at` is the fold of its own line of commits, not of the branches merged into it.
+
 ### Branch at a historical point
 
 By default, `branch create` starts the new branch at the source's current HEAD. Pass `--at` to start it at an earlier commit on the source branch instead — useful for recovering to a known-good state, forking off an older release, or experimenting with what-if scenarios from a past point in time.
