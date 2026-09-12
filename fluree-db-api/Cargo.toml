@@ -587,6 +587,10 @@ name = "query_hot_fanout_star"
 harness = false
 
 [[bench]]
+name = "query_hot_values_star"
+harness = false
+
+[[bench]]
 name = "query_overlay_matrix"
 harness = false
 
