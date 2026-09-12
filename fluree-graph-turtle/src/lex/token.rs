@@ -134,6 +134,12 @@ pub enum TokenKind {
     /// SPARQL-style `BASE` (without @)
     KwSparqlBase,
 
+    /// RDF 1.2 `@version` directive (terminated by `.`)
+    KwVersion,
+
+    /// RDF 1.2 SPARQL-style `VERSION` directive (no `.`)
+    KwSparqlVersion,
+
     /// `a` keyword (shorthand for rdf:type)
     KwA,
 
@@ -217,6 +223,8 @@ impl std::fmt::Display for TokenKind {
             TokenKind::KwBase => write!(f, "@base"),
             TokenKind::KwSparqlPrefix => write!(f, "PREFIX"),
             TokenKind::KwSparqlBase => write!(f, "BASE"),
+            TokenKind::KwVersion => write!(f, "@version"),
+            TokenKind::KwSparqlVersion => write!(f, "VERSION"),
             TokenKind::KwA => write!(f, "a"),
             TokenKind::KwTrue => write!(f, "true"),
             TokenKind::KwFalse => write!(f, "false"),

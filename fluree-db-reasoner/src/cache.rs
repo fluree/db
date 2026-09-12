@@ -120,6 +120,22 @@ impl ReasoningBudget {
     }
 }
 
+/// Rough heap footprint of one derived flake, for the memory budget.
+///
+/// Counts the `Flake` itself plus the heap behind its subject and predicate
+/// names and its object (string / JSON payload, or a reference's name). An
+/// estimate, not an allocator measurement — it exists so a runaway closure is
+/// capped by size and not only by count.
+pub fn approx_flake_bytes(flake: &fluree_db_core::Flake) -> usize {
+    use fluree_db_core::value::FlakeValue;
+    let heap = match &flake.o {
+        FlakeValue::String(s) | FlakeValue::Json(s) => s.len(),
+        FlakeValue::Ref(sid) => sid.name.len(),
+        _ => 0,
+    };
+    std::mem::size_of::<fluree_db_core::Flake>() + flake.s.name.len() + flake.p.name.len() + heap
+}
+
 /// Diagnostics from a reasoning operation
 ///
 /// Always returned alongside the overlay so callers can understand

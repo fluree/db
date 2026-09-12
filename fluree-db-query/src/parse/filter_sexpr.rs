@@ -23,7 +23,7 @@
 //! - Quoted strings may contain whitespace, parentheses, and backslash
 //!   escapes (`\"` and `\\`); any other `\x` sequence is preserved verbatim
 
-use super::ast::UnresolvedExpression;
+use super::ast::{UnresolvedExpression, UnresolvedFilterValue};
 use super::error::{ParseError, Result};
 use super::filter_common;
 use super::sexpr_tokenize;
@@ -225,8 +225,29 @@ fn parse_s_expression_atom(s: &str) -> Result<UnresolvedExpression> {
         return Ok(UnresolvedExpression::string(unescape_string(unquoted)));
     }
 
-    // Plain string
-    Ok(UnresolvedExpression::string(s))
+    // Unquoted: IRI forms, a possible compact IRI, or a plain string.
+    Ok(classify_unquoted_atom(s))
+}
+
+/// Classify an unquoted atom that is not a variable, boolean or number.
+///
+/// - `<…>` and `http(s)://…` are absolute IRIs.
+/// - `prefix:name` may be a compact IRI; only the WHERE-clause parser, which
+///   has the `@context`, can tell, so it is handed over undecided as
+///   [`UnresolvedFilterValue::Curie`] and lowers as a string if nothing
+///   resolves it.
+/// - Anything else is the bare string it always was.
+fn classify_unquoted_atom(s: &str) -> UnresolvedExpression {
+    if s.len() > 2 && s.starts_with('<') && s.ends_with('>') {
+        return UnresolvedExpression::Const(UnresolvedFilterValue::iri(&s[1..s.len() - 1]));
+    }
+    if s.starts_with("http://") || s.starts_with("https://") {
+        return UnresolvedExpression::Const(UnresolvedFilterValue::iri(s));
+    }
+    if looks_like_compact_iri(s) {
+        return UnresolvedExpression::Const(UnresolvedFilterValue::Curie(Arc::from(s)));
+    }
+    UnresolvedExpression::Const(UnresolvedFilterValue::Bare(Arc::from(s)))
 }
 
 /// Parse arguments in an S-expression
@@ -384,9 +405,28 @@ fn atom_token_to_expr(s: &str) -> Result<UnresolvedExpression> {
     if let Ok(f) = s.parse::<f64>() {
         return Ok(UnresolvedExpression::double(f));
     }
-    // Unquoted atom that didn't match any other shape — treat as a bare
-    // string. Quoted strings take the explicit `String` path above.
-    Ok(UnresolvedExpression::string(s))
+    // Unquoted atom that didn't match any other shape: IRI, compact IRI, or
+    // bare string. Quoted strings take the explicit `String` path above.
+    Ok(classify_unquoted_atom(s))
+}
+
+/// `prefix:name` shape: a non-empty alphabetic-leading prefix (or the empty
+/// prefix `:name`), a colon, and a non-empty local part with no whitespace.
+fn looks_like_compact_iri(s: &str) -> bool {
+    let Some((prefix, local)) = s.split_once(':') else {
+        return false;
+    };
+    if local.is_empty() || local.chars().any(char::is_whitespace) {
+        return false;
+    }
+    prefix.is_empty()
+        || (prefix
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+            && prefix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
 }
 
 fn list_tokens_to_expr(items: &[SexprToken]) -> Result<UnresolvedExpression> {
@@ -705,5 +745,74 @@ mod tests {
             }
             _ => panic!("Expected Call"),
         }
+    }
+
+    /// The second operand of `(= ?p <atom>)`, as the string-path parser sees it.
+    fn second_operand(expr: &str) -> UnresolvedFilterValue {
+        match parse_s_expression(expr).unwrap() {
+            UnresolvedExpression::Call { args, .. } => match &args[1] {
+                UnresolvedExpression::Const(v) => v.clone(),
+                other => panic!("expected a constant operand, got {other:?}"),
+            },
+            other => panic!("expected a call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unquoted_iri_atoms_are_iris_not_strings() {
+        // `<…>` and http(s) atoms are absolute IRIs, as in SPARQL; they used
+        // to lower as the string "<http://…>" and could never equal an IRI.
+        assert!(matches!(
+            second_operand("(= ?p <http://example.org/knows>)"),
+            UnresolvedFilterValue::Iri(i) if i.as_ref() == "http://example.org/knows"
+        ));
+        assert!(matches!(
+            second_operand("(= ?p http://example.org/knows)"),
+            UnresolvedFilterValue::Iri(i) if i.as_ref() == "http://example.org/knows"
+        ));
+    }
+
+    #[test]
+    fn unquoted_prefixed_name_is_handed_over_as_curie() {
+        // The S-expression parser has no @context: `ex:knows` is neither an
+        // IRI nor a string yet. The WHERE-clause parser decides.
+        assert!(matches!(
+            second_operand("(= ?p ex:knows)"),
+            UnresolvedFilterValue::Curie(c) if c.as_ref() == "ex:knows"
+        ));
+        // Empty prefix (`:knows`) is a compact IRI too.
+        assert!(matches!(
+            second_operand("(= ?p :knows)"),
+            UnresolvedFilterValue::Curie(c) if c.as_ref() == ":knows"
+        ));
+    }
+
+    #[test]
+    fn strings_and_string_lookalikes_stay_strings() {
+        // Quoted operands are always strings, even when they spell an IRI.
+        assert!(matches!(
+            second_operand("(= ?p \"ex:knows\")"),
+            UnresolvedFilterValue::String(s) if s.as_ref() == "ex:knows"
+        ));
+        // A bare word with no prefix is the string it always was (tagged
+        // `Bare` so rule validation can tell it from a quoted literal).
+        assert!(matches!(
+            second_operand("(= ?status active)"),
+            UnresolvedFilterValue::Bare(s) if s.as_ref() == "active"
+        ));
+        // A numeric-looking "prefix" is not a compact IRI: `12:30` stays a string.
+        assert!(matches!(
+            second_operand("(= ?slot 12:30)"),
+            UnresolvedFilterValue::Bare(s) if s.as_ref() == "12:30"
+        ));
+        // The token path used by select expressions agrees with the string path.
+        assert!(matches!(
+            atom_token_to_expr("ex:knows").unwrap(),
+            UnresolvedExpression::Const(UnresolvedFilterValue::Curie(_))
+        ));
+        assert!(matches!(
+            atom_token_to_expr("12:30").unwrap(),
+            UnresolvedExpression::Const(UnresolvedFilterValue::Bare(_))
+        ));
     }
 }

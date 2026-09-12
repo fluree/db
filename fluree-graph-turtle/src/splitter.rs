@@ -177,12 +177,12 @@ fn extract_prefix_block_from_bytes(buf: &[u8]) -> Result<(String, u64), SplitErr
 
     for tok in &tokens {
         match tok.kind {
-            TokenKind::KwPrefix | TokenKind::KwBase => {
+            TokenKind::KwPrefix | TokenKind::KwBase | TokenKind::KwVersion => {
                 in_directive = true;
                 sparql_directive = false;
                 saw_any_directive = true;
             }
-            TokenKind::KwSparqlPrefix | TokenKind::KwSparqlBase => {
+            TokenKind::KwSparqlPrefix | TokenKind::KwSparqlBase | TokenKind::KwSparqlVersion => {
                 in_directive = true;
                 sparql_directive = true;
                 saw_any_directive = true;
@@ -192,9 +192,11 @@ fn extract_prefix_block_from_bytes(buf: &[u8]) -> Result<(String, u64), SplitErr
                 in_directive = false;
                 last_directive_end = tok.end;
             }
-            TokenKind::Iri if in_directive && sparql_directive => {
-                // SPARQL-style directives end after the IRI (no dot required).
-                // `PREFIX ns: <iri>` and `BASE <iri>` both terminate here.
+            TokenKind::Iri | TokenKind::String | TokenKind::StringEscaped(_)
+                if in_directive && sparql_directive =>
+            {
+                // SPARQL-style directives end after their operand (no dot
+                // required): `PREFIX ns: <iri>`, `BASE <iri>`, `VERSION "1.2"`.
                 in_directive = false;
                 last_directive_end = tok.end;
             }
@@ -1950,6 +1952,51 @@ ex:bob ex:name \"Bob\" .
         let ranges = compute_chunk_boundaries(f.path(), data_start, 1024 * 1024).unwrap();
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].0, data_start);
+    }
+
+    #[test]
+    fn star_statements_split_on_statement_ends_and_keep_their_reifiers() {
+        // RDF 1.2 constructs the pre-scan never sees as tokens: `<< … >>`
+        // (its `<` opens the IRI state until the first `>`), `{| … |}` bodies
+        // with decimals and `;`, and `~ reifier`. None may be mistaken for a
+        // statement boundary, and every chunk must parse with its reifier
+        // attachments intact.
+        let ttl = "\
+@prefix ex: <http://example.org/> .
+
+ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 ; ex:source \"hr.system\" |} .
+<< ex:alice ex:knows ex:carol >> ex:certainty 0.5 .
+ex:bob ex:knows ex:dave {| ex:since \"2024-01-01\" |} .
+ex:carol ex:age 42 ~ ex:claim2 .
+";
+        let f = write_temp(ttl);
+        let config = TurtleSplitConfig {
+            chunk_size_bytes: 60, // force multiple chunks
+        };
+        let reader = TurtleChunkReader::new(f.path(), &config).unwrap();
+        assert!(reader.chunk_count() > 1, "{}", reader.chunk_count());
+
+        let mut annotated_edges = 0;
+        for i in 0..reader.chunk_count() {
+            let chunk_text = reader.read_chunk(i).unwrap().unwrap();
+            let json = crate::parse_to_json(&chunk_text).unwrap_or_else(|e| {
+                panic!("chunk {i} must be valid Turtle-star: {e}\n{chunk_text}")
+            });
+            for node in json.as_array().unwrap() {
+                for (key, values) in node.as_object().unwrap() {
+                    if key.starts_with('@') {
+                        continue;
+                    }
+                    annotated_edges += values
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|v| v.get("@annotation").is_some())
+                        .count();
+                }
+            }
+        }
+        assert_eq!(annotated_edges, 4, "one reifier per star statement");
     }
 
     #[test]

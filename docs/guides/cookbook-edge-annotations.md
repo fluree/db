@@ -12,7 +12,7 @@ Throughout, the running example is employment: a `worksFor` edge that needs a `r
 |---|---|---|
 | JSON-LD writes, or you need named-graph edges, or literal-valued edges | **JSON-LD `@annotation`** | Most complete surface — covers everything below. |
 | A SPARQL 1.1/1.2 pipeline, or you're porting RDF-star data | **SPARQL 1.2 annotation tail** (`{\| \|}`, `~`, `rdf:reifies`) | Standards syntax. Default-graph only today. |
-| A Turtle/TriG/N-Triples/N-Quads file with annotations | Convert to JSON-LD, **or** ingest plain edges then add annotations via SPARQL UPDATE | Those ingest paths don't parse RDF 1.2 tails (see [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)). |
+| A Turtle file with annotations | **Ingest it as-is** — `insert`, `upsert`, `import` and `graph sync` all accept the RDF 1.2 tail (`{\| \|}`, `~`, `<< >>`) | Same on-disk shape as `@annotation`; re-`upsert` the file to update claim bodies (see [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)). |
 
 ## Attach metadata to a relationship
 
@@ -257,30 +257,63 @@ Edge annotations live in the same graph as the edge they reify. On the JSON-LD s
 
 > **SPARQL UPDATE is default-graph only today.** An annotation tail inside an explicit `GRAPH { }` block or under a `WITH <g>` template is rejected — use the JSON-LD surface above for named-graph edge annotations.
 
-## Add annotations to data you already ingested as Turtle
+## Keep a Turtle claims file in sync
 
-The Turtle/N-Triples/TriG/N-Quads ingest paths don't parse annotation tails. Ingest the plain edges, then layer annotations on with SPARQL UPDATE:
+The Turtle parser accepts RDF 1.2 annotation tails on every write path, so a claims file needs no conversion. `upsert` is the verb for keeping it in sync: each claim's body is replaced (the way upsert replaces any predicate value) while the edge and the reifier attachment stay put.
 
 ```bash
-# 1. Ingest the plain edges
+# claims.ttl
+# @prefix ex: <http://example.org/> .
+# ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 ; ex:source ex:hr |} .
+
 curl -X POST "http://localhost:8090/v1/fluree/upsert?ledger=mydb:main" \
   -H "Content-Type: text/turtle" \
-  --data-binary '@employments.ttl'
+  --data-binary '@claims.ttl'
+```
 
-# 2. Add annotations
+Name your reifiers (`~ ex:claim1`) when the file will be re-sent: an anonymous `{| |}` block mints a fresh reifier on every ingest, so a re-upsert adds a second claim on the edge instead of updating the first.
+
+The same claim can be layered on afterwards with SPARQL UPDATE when the annotations come from a separate process:
+
+```bash
 curl -X POST "http://localhost:8090/v1/fluree/update?ledger=mydb:main" \
   -H "Content-Type: application/sparql-update" \
   --data-binary @- <<'SPARQL'
 PREFIX ex: <http://example.org/>
 INSERT DATA {
-  ex:alice ex:worksFor ex:acme {| ex:role "Engineer" ; ex:since "2024-01-01" |} .
+  ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 ; ex:source ex:hr |} .
 }
 SPARQL
 ```
 
+## Retract one claim and keep the edge
+
+The natural-looking SPARQL form deletes more than the claim:
+
+```sparql
+# Retracts the base edge ex:alice ex:knows ex:bob — and with it the
+# attachment of EVERY claim on that edge, not only ex:claim1.
+DELETE DATA { ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 |} . }
+```
+
+`DELETE DATA` / `DELETE WHERE` with an annotation tail always retract the base edge, and the edge retract cascades to all of its annotations ([Retractions](../transactions/retractions.md#edge-annotation-cascade)). SPARQL has no form for "retract this one claim, keep the edge". Use the JSON-LD by-id retract, which removes exactly one attachment:
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "delete": {
+    "@id": "ex:alice",
+    "ex:knows": { "@id": "ex:bob", "@annotation": { "@id": "ex:claim1" } }
+  }
+}
+```
+
+The edge and every other claim on it stay live. In RDF mode the named claim's body (`ex:confidence`, `ex:source`) survives as ordinary RDF about `ex:claim1` — retract it in the same transaction if it should go too; in LPG mode (`opts.lpgEdgeLifecycle: true`) the body is removed with the attachment.
+
 ## Gotchas
 
 - **An annotation reifies exactly one live edge.** A single edge carries many parallel annotations, but one annotation `@id` can't point at two edges at once. To re-home an explicit-IRI annotation, retract the old attachment and assert the new one in the same transaction.
+- **Deleting a claim with `DELETE DATA { … ~ :claim {| … |} }` deletes the edge** and detaches every other claim on it. Retract one claim with the JSON-LD by-id form (see [above](#retract-one-claim-and-keep-the-edge)).
 - **Don't write `f:reifies*` predicates by hand.** They're reserved and rejected on every write surface; they're also hidden from `?p` scans and `select: "*"`. Use `@annotation` / the annotation tail. (See [Vocabulary](../reference/vocabulary.md#edge-annotation-predicates-reserved).)
 - **Empty `@annotation: {}`** is a no-op in RDF mode (no subject minted); in LPG mode it mints a property-less relationship with identity.
 - **Not yet supported** (all reject cleanly, no silent partial results): annotations on `@list` elements, reifiers for unasserted triples, triple terms as object values, annotation output in Turtle/CONSTRUCT, and the SPARQL 1.2 triple-term functions (`TRIPLE`, `isTRIPLE`, …). See [Current limits](../concepts/edge-annotations.md#current-limits).

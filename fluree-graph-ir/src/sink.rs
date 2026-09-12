@@ -365,6 +365,9 @@ pub struct GraphCollectorSink {
     /// [`GraphSink::abort_statement`]. Advanced at every statement boundary,
     /// so it is always "everything before the statement in flight".
     statement_mark: usize,
+    /// Reification count at the current statement's start — the rewind
+    /// point for reifier attachments, kept alongside `statement_mark`.
+    reification_mark: usize,
 }
 
 impl GraphCollectorSink {
@@ -378,6 +381,7 @@ impl GraphCollectorSink {
             literal_slots: Vec::new(),
             literal_cursor: 0,
             statement_mark: 0,
+            reification_mark: 0,
         }
     }
 
@@ -391,6 +395,7 @@ impl GraphCollectorSink {
             literal_slots: Vec::new(),
             literal_cursor: 0,
             statement_mark: 0,
+            reification_mark: 0,
         }
     }
 
@@ -545,6 +550,7 @@ impl GraphSink for GraphCollectorSink {
         self.debug_assert_retiring_slots_are_literals();
         self.literal_cursor = 0;
         self.statement_mark = self.graph.len();
+        self.reification_mark = self.graph.reifications_len();
     }
 
     /// Roll the graph back to the statement's start, so a statement that
@@ -554,6 +560,7 @@ impl GraphSink for GraphCollectorSink {
         // Same retirement, same invariant.
         self.debug_assert_retiring_slots_are_literals();
         self.graph.truncate(self.statement_mark);
+        self.graph.truncate_reifications(self.reification_mark);
         self.literal_cursor = 0;
     }
 
@@ -562,6 +569,31 @@ impl GraphSink for GraphCollectorSink {
         let p = self.get_term(predicate).clone();
         let o = self.get_term(object).clone();
         self.graph.add(Triple::new(s, p, o));
+        Ok(())
+    }
+
+    /// The collector records reifier attachments as [`Graph::reifications`]
+    /// so consumers (the Turtle→JSON-LD adapter) can re-emit them as
+    /// `@annotation` blocks. Producers may hand this sink a literal object id
+    /// that stays live across an annotation body; that is safe here because
+    /// literal slots are recycled only at `end_statement`, never inside a
+    /// statement (see [`Self::add_literal_term`]).
+    fn supports_reified_triples(&self) -> bool {
+        true
+    }
+
+    fn emit_reified_triple(
+        &mut self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+        reifier: TermId,
+    ) -> SinkResult {
+        let s = self.get_term(subject).clone();
+        let p = self.get_term(predicate).clone();
+        let o = self.get_term(object).clone();
+        let r = self.get_term(reifier).clone();
+        self.graph.add_reification(s, p, o, r);
         Ok(())
     }
 
@@ -801,10 +833,71 @@ mod tests {
     #[test]
     fn triple_only_sinks_do_not_claim_quad_support() {
         // The capability probe producers of N-Quads/TriG/`@graph` must
-        // consult before emitting.
+        // consult before emitting. Reified triples are a separate
+        // capability: the collector records those as `Graph::reifications`.
         let sink = GraphCollectorSink::new();
         assert!(!sink.supports_quads());
-        assert!(!sink.supports_reified_triples());
+        assert!(sink.supports_reified_triples());
+    }
+
+    #[test]
+    fn collector_records_reifier_attachments_without_duplicating_the_base_triple() {
+        let mut sink = GraphCollectorSink::new();
+        let s = sink.term_iri("http://example.org/alice");
+        let p = sink.term_iri("http://example.org/knows");
+        let o = sink.term_iri("http://example.org/bob");
+        let r = sink.term_iri("http://example.org/claim1");
+        let conf_p = sink.term_iri("http://example.org/confidence");
+        let conf_o = sink.term_literal_value(LiteralValue::Double(0.9), Datatype::xsd_double());
+
+        // The producer emits the base triple, the attachment, then the
+        // annotation body as ordinary triples about the reifier.
+        sink.emit_triple(s, p, o).unwrap();
+        sink.emit_reified_triple(s, p, o, r).unwrap();
+        sink.emit_triple(r, conf_p, conf_o).unwrap();
+        sink.end_statement();
+
+        let graph = sink.into_graph();
+        assert_eq!(graph.len(), 2, "base triple + one body triple");
+        let reifs = graph.reifications();
+        assert_eq!(reifs.len(), 1);
+        assert_eq!(
+            reifs[0].triple,
+            Triple::new(
+                Term::iri("http://example.org/alice"),
+                Term::iri("http://example.org/knows"),
+                Term::iri("http://example.org/bob"),
+            )
+        );
+        assert_eq!(reifs[0].reifier, Term::iri("http://example.org/claim1"));
+    }
+
+    #[test]
+    fn abort_statement_rewinds_reifier_attachments_with_the_triples() {
+        let mut sink = GraphCollectorSink::new();
+        let s = sink.term_iri("http://example.org/alice");
+        let p = sink.term_iri("http://example.org/knows");
+        let o = sink.term_iri("http://example.org/bob");
+        let r1 = sink.term_iri("http://example.org/claim1");
+        sink.emit_triple(s, p, o).unwrap();
+        sink.emit_reified_triple(s, p, o, r1).unwrap();
+        sink.end_statement();
+
+        let carol = sink.term_iri("http://example.org/carol");
+        let r2 = sink.term_iri("http://example.org/claim2");
+        sink.emit_triple(s, p, carol).unwrap();
+        sink.emit_reified_triple(s, p, carol, r2).unwrap();
+        // The second statement fails mid-way: everything it emitted — the
+        // triple AND the attachment — must vanish, and nothing else.
+        sink.abort_statement();
+
+        let graph = sink.into_graph();
+        assert_eq!(graph.len(), 1);
+        assert_eq!(graph.reifications().len(), 1);
+        assert_eq!(
+            graph.reifications()[0].reifier,
+            Term::iri("http://example.org/claim1")
+        );
     }
 
     /// Symmetric with quads: a sink that claims the capability but never

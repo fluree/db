@@ -599,6 +599,28 @@ Apply conditions to filter results:
 }
 ```
 
+**Comparing against IRIs:**
+
+An unquoted prefixed name or `<...>` IRI in a filter expression is an IRI
+operand and compares by identity, so `(= ?p ex:knows)` matches the predicate
+`ex:knows` — never the string `"ex:knows"`:
+
+```json
+{
+  "@context": { "ex": "http://example.org/" },
+  "select": ["?s", "?o"],
+  "where": [
+    { "@id": "?s", "?p": "?o" },
+    ["filter", "(= ?p ex:knows)"]
+  ]
+}
+```
+
+A prefixed name whose prefix the query's `@context` does not define stays a
+plain string and never equals an IRI; quote a value (`"ex:knows"`) when you
+mean the literal text. Inside [datalog rules](datalog-rules.md) an undefined
+prefix is an error rather than a silent string.
+
 **Complex Filters:**
 
 ```json

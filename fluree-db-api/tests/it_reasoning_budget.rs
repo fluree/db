@@ -365,3 +365,44 @@ async fn datalog_query_budget_caps_fixpoint_and_surfaces_in_tracking() {
         "capped result carries a reason"
     );
 }
+
+// ============================================================================
+// The fact cap holds INSIDE a round, not only between rounds
+// ============================================================================
+
+/// A 40-node `partOf` chain under a transitive property has a 780-fact
+/// closure. With `maxFacts: 50` the materialization must stop inside the
+/// round that crosses the cap; before the in-round check the whole round ran
+/// to completion (a dense 100k-edge graph derived 21M facts under a 1M cap).
+#[tokio::test]
+async fn fact_cap_holds_within_a_single_round() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/reasoning-budget-in-round:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let mut trig = String::from(
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+         @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         ex:partOf rdf:type owl:TransitiveProperty .\n",
+    );
+    for i in 0..40 {
+        trig.push_str(&format!("ex:n{i} ex:partOf ex:n{} .\n", i + 1));
+    }
+    let _ = apply_trig(&fluree, ledger, &trig).await;
+
+    let mut query = reasoning_query(ledger_id);
+    query["reasoningBudget"] = json!({"maxFacts": 50});
+    let resp = run_tracked(&fluree, &query).await;
+    let reasoning = resp.reasoning.expect("reasoning block");
+    assert!(
+        reasoning.capped,
+        "maxFacts=50 must cap a 780-fact closure: {reasoning:?}"
+    );
+    assert_eq!(reasoning.capped_reason.as_deref(), Some("facts"));
+    assert!(
+        reasoning.derived_facts <= 100,
+        "the cap must hold within the round (at most one delta fact's fan-out \
+         past 50), got {} derived facts",
+        reasoning.derived_facts
+    );
+}

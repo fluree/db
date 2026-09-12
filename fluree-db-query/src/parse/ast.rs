@@ -467,12 +467,30 @@ pub enum UnresolvedFilterValue {
     Double(f64),
     String(Arc<str>),
     Bool(bool),
+    /// An absolute IRI operand (`<http://…>`, or a compact IRI the query's
+    /// `@context` expanded). Lowers to `IRI(<string>)` so it compares by term
+    /// identity against `Sid` bindings, as SPARQL's `?p = ex:knows` does.
+    Iri(Arc<str>),
+    /// An unquoted `prefix:name` atom that has not been expanded yet — the
+    /// S-expression parser has no `@context`. The WHERE-clause parser resolves
+    /// it to [`Self::Iri`] when the prefix is defined; otherwise it lowers as
+    /// the plain string it always was, so `(= ?time 12:30)` keeps working.
+    Curie(Arc<str>),
+    /// An unquoted bare word (`active`, `knows`). Lowers exactly like
+    /// [`Self::String`]; the distinct variant only lets rule validation tell
+    /// an unquoted operand from a quoted string literal.
+    Bare(Arc<str>),
 }
 
 impl UnresolvedFilterValue {
     /// Create a string filter value
     pub fn string(s: impl AsRef<str>) -> Self {
         UnresolvedFilterValue::String(Arc::from(s.as_ref()))
+    }
+
+    /// Create an absolute-IRI filter value
+    pub fn iri(s: impl AsRef<str>) -> Self {
+        UnresolvedFilterValue::Iri(Arc::from(s.as_ref()))
     }
 }
 

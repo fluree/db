@@ -798,6 +798,15 @@ impl From<&crate::parse::ast::UnresolvedFilterValue> for FlakeValue {
             UnresolvedFilterValue::Double(d) => FlakeValue::Double(*d),
             UnresolvedFilterValue::String(s) => FlakeValue::String(s.to_string()),
             UnresolvedFilterValue::Bool(b) => FlakeValue::Boolean(*b),
+            // IRI operands are lowered to `IRI(<string>)` calls before this
+            // conversion is reached (see `lower_filter_expr_inner`); as a
+            // plain constant the IRI string is the only sensible value.
+            UnresolvedFilterValue::Iri(s) => FlakeValue::String(s.to_string()),
+            // An unexpanded `prefix:name` atom, or an unquoted bare word, is
+            // the string it always was.
+            UnresolvedFilterValue::Curie(s) | UnresolvedFilterValue::Bare(s) => {
+                FlakeValue::String(s.to_string())
+            }
         }
     }
 }

@@ -318,10 +318,35 @@ fn parse_at_directive(input: &mut Input<'_>) -> ModalResult<TokenKind> {
     let word: &str =
         take_while(1.., |c: char| c.is_ascii_alphanumeric() || c == '-').parse_next(input)?;
 
-    match word.to_lowercase().as_str() {
+    // The `@`-directives are case-sensitive terminals (`@prefix`, `@base`,
+    // `@version`); only the bare SPARQL-style keywords are case-insensitive.
+    // `@BASE` therefore lexes as a language tag and fails at the parser
+    // (W3C turtle-syntax-bad-base-02).
+    match word {
         "prefix" => Ok(TokenKind::KwPrefix),
         "base" => Ok(TokenKind::KwBase),
-        _ => Ok(TokenKind::LangTag),
+        "version" => Ok(TokenKind::KwVersion),
+        _ => {
+            // LANGTAG ::= '@' [a-zA-Z]+ ('-' [a-zA-Z0-9]+)* ('--' ('ltr' | 'rtl'))?
+            // — the tag proper starts with a letter (W3C turtle-syntax-bad-
+            // lang-01 rejects `@1`); an RDF 1.2 base direction, when present,
+            // is exactly `ltr` or `rtl` (nt-ttl12-langdir-bad-1/2).
+            let (tag, direction) = match word.split_once("--") {
+                Some((tag, dir)) => (tag, Some(dir)),
+                None => (word, None),
+            };
+            let tag_ok = tag.split('-').enumerate().all(|(i, part)| {
+                !part.is_empty()
+                    && part.chars().all(|c| c.is_ascii_alphanumeric())
+                    && (i > 0 || part.chars().all(|c| c.is_ascii_alphabetic()))
+            });
+            let dir_ok = matches!(direction, None | Some("ltr" | "rtl"));
+            if tag_ok && dir_ok {
+                Ok(TokenKind::LangTag)
+            } else {
+                Err(winnow::error::ErrMode::Cut(ContextError::new()))
+            }
+        }
     }
 }
 
@@ -401,14 +426,18 @@ fn parse_prefixed_name_or_keyword(input: &mut Input<'_>) -> ModalResult<TokenKin
             None => Ok(TokenKind::PrefixedNameNs),
         }
     } else {
-        // Check if it's a keyword
+        // Check if it's a keyword. `a`, `true` and `false` are case-sensitive;
+        // the SPARQL-style directive keywords are case-insensitive (Turtle
+        // §7.1 — W3C turtle-syntax-base-04 `base`, turtle-syntax-prefix-02
+        // `PreFIX`).
         match word.as_str() {
             "a" => Ok(TokenKind::KwA),
             "true" => Ok(TokenKind::KwTrue),
             "false" => Ok(TokenKind::KwFalse),
-            "PREFIX" => Ok(TokenKind::KwSparqlPrefix),
-            "BASE" => Ok(TokenKind::KwSparqlBase),
-            "GRAPH" => Ok(TokenKind::KwGraph),
+            w if w.eq_ignore_ascii_case("PREFIX") => Ok(TokenKind::KwSparqlPrefix),
+            w if w.eq_ignore_ascii_case("BASE") => Ok(TokenKind::KwSparqlBase),
+            w if w.eq_ignore_ascii_case("VERSION") => Ok(TokenKind::KwSparqlVersion),
+            w if w.eq_ignore_ascii_case("GRAPH") => Ok(TokenKind::KwGraph),
             _ => {
                 input.reset(&start);
                 Err(winnow::error::ErrMode::Backtrack(ContextError::new()))

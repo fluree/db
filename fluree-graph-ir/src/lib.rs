@@ -45,7 +45,7 @@ mod triple;
 pub mod xsd_double;
 
 pub use datatype::Datatype;
-pub use graph::Graph;
+pub use graph::{Graph, Reification};
 pub use sink::{GraphCollectorSink, GraphSink, SinkError, SinkResult, TermId};
 pub use term::{BlankId, LiteralValue, Term};
 pub use triple::Triple;

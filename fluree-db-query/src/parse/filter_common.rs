@@ -26,6 +26,8 @@ pub fn reject_constant_bool_expr(expr: &UnresolvedExpression, clause: &str) -> R
         UnresolvedFilterValue::String(s) => format!("\"{s}\""),
         UnresolvedFilterValue::Long(n) => n.to_string(),
         UnresolvedFilterValue::Double(d) => d.to_string(),
+        UnresolvedFilterValue::Iri(i) => format!("<{i}>"),
+        UnresolvedFilterValue::Curie(c) | UnresolvedFilterValue::Bare(c) => c.to_string(),
     };
     Err(ParseError::InvalidFilter(format!(
         "{clause} expression {rendered} is a constant and would match every row; \

@@ -685,6 +685,7 @@ dependencies = [
  "fluree-db-r2rml",
  "fluree-db-sparql",
  "fluree-db-spatial",
+ "fluree-db-stats",
  "fluree-db-tabular",
  "fluree-db-transact",
  "fluree-graph-format",
@@ -857,6 +858,7 @@ dependencies = [
  "fluree-db-nameservice",
  "fluree-db-novelty",
  "fluree-db-spatial",
+ "fluree-db-stats",
  "fluree-vocab",
  "futures",
  "hex",
@@ -1065,6 +1067,17 @@ dependencies = [
  "tracing",
  "wkt",
  "zstd",
+]
+
+[[package]]
+name = "fluree-db-stats"
+version = "4.2.0"
+dependencies = [
+ "fluree-db-tabular",
+ "hex",
+ "serde",
+ "serde_json",
+ "xxhash-rust",
 ]
 
 [[package]]

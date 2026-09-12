@@ -1028,7 +1028,7 @@ fn parse_rdf_dawg_result_set(content: &str) -> Result<SparqlResults> {
 }
 
 /// Convert a `fluree_graph_ir::Term` to our local [`RdfTerm`].
-fn ir_term_to_rdf_term(term: &IrTerm) -> RdfTerm {
+pub(crate) fn ir_term_to_rdf_term(term: &IrTerm) -> RdfTerm {
     match term {
         IrTerm::Iri(iri) => RdfTerm::Iri(iri.to_string()),
         IrTerm::BlankNode(id) => RdfTerm::BlankNode(id.as_str().to_string()),
