@@ -1,0 +1,6 @@
+# cq046 — verbatim corpus q046_orders_top_by_total.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?tot
+WHERE { ?o a edw:Order ; edw:orderId ?oid ; edw:orderTotal ?tot . }
+ORDER BY DESC(?tot) ?oid
+LIMIT 10

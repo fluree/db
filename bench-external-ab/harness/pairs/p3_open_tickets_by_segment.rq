@@ -1,0 +1,10 @@
+# p3_open_tickets_by_segment — Fluree/SPARQL side. Shape-equivalent (no verbatim
+# corpus member). Open tickets (status != "Closed") counted by customer segment.
+# fact edw:SupportTicket -> edw:customer -> dim edw:Customer{segment}; FILTER != const.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?seg (COUNT(?t) AS ?n)
+WHERE { ?t a edw:SupportTicket ; edw:status ?st ; edw:customer ?c .
+        ?c edw:segment ?seg .
+        FILTER(?st != "Closed") }
+GROUP BY ?seg
+ORDER BY ?seg
