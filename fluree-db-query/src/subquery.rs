@@ -87,11 +87,11 @@ pub struct SubqueryOperator {
     /// reconcile against the parent `?X`. See the merge in `process_parent_batch`.
     reconcile_vars: Vec<VarId>,
     /// Whether the subquery is evaluated ONCE and hash-joined (on `join_keys`)
-    /// rather than re-executed per parent row. Requires no inner `LIMIT`/`OFFSET`
-    /// and that every non-key correlation variable is an unreferenced
-    /// pass-through. Gated by a parent-cardinality check so we only materialize
-    /// when it beats per-row seeding; an uncorrelated subquery always
-    /// materializes. Mirrors `SemijoinOperator`'s hash probe.
+    /// rather than re-executed per parent row. Independent SPARQL subqueries
+    /// with grouping, DISTINCT, or slicing require this mode for correctness.
+    /// Otherwise eligibility and parent cardinality decide whether evaluating
+    /// once beats per-row seeding. Bound outer keys use an exact hash probe;
+    /// unbound outer keys match all compatible materialized rows.
     join_mode: bool,
     /// Lazily materialized subquery result (built once when `join_mode`): all
     /// result rows plus a hash index from the correlation-variable values to the
@@ -445,12 +445,20 @@ impl SubqueryOperator {
                     self.materialized = Some(m);
                 }
                 let mat = self.materialized.as_ref().unwrap();
+                // Track actual Unbound bindings before key normalization:
+                // Poisoned also normalizes to Absent, but must not become a
+                // wildcard. Fully bound rows allocate no extra mask storage.
+                let mut unbound_columns = Vec::new();
                 let parent_key: Vec<GroupKeyOwned> = self
                     .join_keys
                     .iter()
-                    .map(|v| {
-                        parent_batch
-                            .get(row_idx, *v)
+                    .enumerate()
+                    .map(|(col, v)| {
+                        let binding = parent_batch.get(row_idx, *v);
+                        if binding.is_none_or(|b| matches!(b, Binding::Unbound)) {
+                            unbound_columns.push(col);
+                        }
+                        binding
                             .map(|b| {
                                 let (store, gv) = EqualityNorm::parts(&self.norm);
                                 binding_to_group_key_normalized(b, store, gv)
@@ -458,9 +466,31 @@ impl SubqueryOperator {
                             .unwrap_or(GroupKeyOwned::Absent)
                     })
                     .collect();
-                match mat.index.get(&parent_key) {
-                    Some(idxs) => idxs.iter().map(|&i| mat.rows[i].clone()).collect(),
-                    None => Vec::new(),
+                if unbound_columns.is_empty() {
+                    match mat.index.get(&parent_key) {
+                        Some(idxs) => idxs.iter().map(|&i| mat.rows[i].clone()).collect(),
+                        None => Vec::new(),
+                    }
+                } else if unbound_columns.len() == parent_key.len() {
+                    // No restrictions: preserve every inner solution, including
+                    // duplicate keys, and let the existing merge bind the parent.
+                    mat.rows.clone()
+                } else {
+                    let mut matches = Vec::new();
+                    for (bucket, (key, idxs)) in mat.index.iter().enumerate() {
+                        if bucket % 1024 == 0 {
+                            ctx.check_cancelled()?;
+                        }
+                        if parent_key
+                            .iter()
+                            .zip(key)
+                            .enumerate()
+                            .all(|(col, (p, s))| p == s || unbound_columns.contains(&col))
+                        {
+                            matches.extend(idxs.iter().map(|&i| mat.rows[i].clone()));
+                        }
+                    }
+                    matches
                 }
             } else {
                 self.execute_subquery_for_row(ctx, parent_batch, row_idx)
@@ -816,6 +846,83 @@ mod tests {
     use crate::ir::SubqueryPattern;
     use crate::seed::SeedOperator;
     use crate::var_registry::VarId;
+
+    #[tokio::test]
+    async fn materialized_join_matches_partial_keys_without_reviving_poisoned_rows() {
+        use crate::group_aggregate::binding_to_group_key_owned;
+        use crate::ir::FlakeValue;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, Sid};
+
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let lit = |n| Binding::lit(FlakeValue::Long(n), Sid::xsd_integer());
+        let keys: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)]);
+        let rows = vec![
+            vec![lit(1), lit(10), lit(100)],
+            vec![lit(1), lit(10), lit(101)],
+            vec![lit(2), lit(20), lit(200)],
+        ];
+        let mut index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
+        for (i, row) in rows.iter().enumerate() {
+            index
+                .entry(row[..2].iter().map(binding_to_group_key_owned).collect())
+                .or_default()
+                .push(i);
+        }
+        let child = SeedOperator::from_row(keys.clone(), vec![Binding::Unbound; 2]);
+        let mut op = SubqueryOperator::new(
+            Box::new(child),
+            SubqueryPattern::new(vec![VarId(0), VarId(1), VarId(2)], vec![]),
+            None,
+            PlanningContext::current(),
+        );
+        // Pin the executor path: planner reordering must not hide this case.
+        op.join_mode = true;
+        op.join_keys = keys.to_vec();
+        op.reconcile_vars.clear();
+        op.materialized = Some(MaterializedSubquery {
+            rows: rows.clone(),
+            index,
+        });
+        let parent = Batch::new(
+            keys.clone(),
+            vec![
+                vec![
+                    Binding::Poisoned,
+                    Binding::Unbound,
+                    Binding::Unbound,
+                    lit(1),
+                    lit(1),
+                    Binding::Unbound,
+                ],
+                vec![
+                    Binding::Unbound,
+                    Binding::Poisoned,
+                    lit(10),
+                    Binding::Unbound,
+                    lit(20),
+                    Binding::Unbound,
+                ],
+            ],
+        )
+        .unwrap();
+        op.process_parent_batch(&ctx, &parent).await.unwrap();
+        assert_eq!(op.result_buffer.len(), 7);
+        for (row, copies) in rows.iter().zip([3, 3, 1]) {
+            assert_eq!(
+                op.result_buffer.iter().filter(|r| *r == row).count(),
+                copies
+            );
+        }
+
+        // Reuse the same materialization for a subsequent fully bound batch;
+        // both inner rows sharing its key must survive the exact lookup.
+        let parent = Batch::new(keys, vec![vec![lit(1)], vec![lit(10)]]).unwrap();
+        op.process_parent_batch(&ctx, &parent).await.unwrap();
+        assert_eq!(&op.result_buffer[7..], &rows[..2]);
+    }
 
     /// Verifies that correlation uses SELECT vars, not internal pattern vars.
     ///
