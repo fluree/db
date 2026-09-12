@@ -377,75 +377,27 @@ intend to keep.
 
 #### The write-ahead log
 
-Under `wal`, every source-of-truth write is first appended to a log under
-`<root>/.fluree-wal/` and the file itself is written page-cache. Content writes
-append without flushing; the head publication that ends a commit appends and
-flushes, and that one flush covers everything appended before it. A background
-thread flushes the files a closed log segment covered and removes the segment,
-so the log only ever holds the recent tail. Opening the root replays what is
-left — the connection and builder paths do this before anything reads — and a
-clean shutdown leaves no segments at all.
+The default `wal` mode reduces disk flushes while preserving commit durability.
+Recovery runs automatically when file storage opens; normal operation requires
+no WAL administration. Keep the `.fluree-wal/` directory with its storage root:
+retained logs may contain the only durable copy of acknowledged data.
 
-The files on disk remain the database. The log adds nothing another version of
-Fluree needs to understand: after a clean shutdown, or after any start of a
-WAL-aware binary, the root reads exactly as it did under `sync`. The one rule
-for downgrading is therefore *start the WAL-aware binary once after a crash*
-before pointing an older binary at the root, so the tail is applied. Stop that
-binary cleanly and confirm the WAL segments have been retired before downgrading.
-Otherwise a later WAL-aware start can replay stale writes or deletions over changes
-made by the older binary, including deleting a head it re-created.
+If another process temporarily owns the log, writes use `sync` durability and
+retry WAL acquisition automatically. Filesystems that cannot support WAL stay
+in `sync`. If a previous owner's crash logs remain after fallback writes, Fluree
+keeps using `sync` and warns that recovery is needed. Stop and reconcile the
+writers before recovering that history, since older logged writes could
+otherwise overwrite newer fallback values.
 
-One process owns a root's log at a time; handles in that process share it.
-A writer in another process that cannot take the lock flushes each write itself,
-exactly as `sync` does, with a warning on first contention. Subsequent writes
-retry acquisition at most once every two seconds per handle (shared by its
-clones). After a clean handoff they automatically resume WAL mode. In-process
-operations share a root gate, so takeover waits for earlier file operations and
-each operation retains one mode through completion, including compare-and-swap.
+If recovery reports damaged or unsupported logs, preserve the storage root and
+logs for investigation. Do not delete logs to bypass the error. Recovery can
+stop when it cannot safely distinguish corruption from an interrupted write.
 
-A live retry never replays a previous owner's crash segments over writes completed
-during fallback. If segments remain, the handle keeps per-write durability and
-warns that startup recovery is needed. Stop and reconcile the writers before
-recovering that history; restarting blindly can replay older plain writes over
-newer fallback values. Retrying can also join a WAL already held by this process.
-Unsupported filesystems remain in `sync` for the handle's lifetime; poisoned WALs
-continue to refuse writes until recovery. Read-only API clients recover existing
-logs without retaining WAL ownership. The log is Unix-only.
-
-An unsupported owner lock left by an unsuccessful first acquisition is skipped
-with a warning when that owner has no segments. If segments remain, recovery
-fails rather than ignoring potentially acknowledged payloads; restore access to
-advisory locking before reopening that root.
-
-A Raft cluster's payload store is one root shared by every node, so each node
-journals it under a log of its own, at `<root>/.fluree-wal/owners/node-<id>/`.
-An owned log flushes on every write: the head lives in Raft rather than in a
-file under the root, so nothing later would flush on a payload's behalf, and a
-payload must be durable before its reference is proposed. That is one flush per
-payload instead of two. Any node applies a stopped node's unflushed tail when
-it opens the root or misses a file, so a payload survives the loss of the node
-that wrote it as long as the shared store does.
-
-A write larger than 8 MiB bypasses the log and is flushed directly, once the
-log has been checkpointed: everything appended before it is on the device and
-nothing is left that replay could apply over it. Past that size a flush costs
-bandwidth rather than latency, and the log would only write the bytes twice. Records
-in a segment that was flushed before a later segment was opened cannot tear, so
-damage there fails the open with the segment named. A damaged final suffix is
-normally discarded as an unacknowledged torn tail. Before doing so, recovery
-looks for a later frame with a higher sequence, valid checksum, and decodable
-operation. Finding one stops recovery and preserves the log for investigation;
-recovery never skips the damaged record and resumes after it.
-
-This check is deliberately conservative: a valid-looking later frame can also
-result from out-of-order persistence of unacknowledged writes, so some otherwise
-recoverable crashes require intervention. It cannot detect every corruption case,
-including damage confined to the last record. Candidate-checksum work is bounded;
-exceeding the scan budget also stops recovery and preserves the log.
-
-WAL segments use xxh64 checksums to detect accidental corruption. Checksums do
-not provide authentication. See the [storage WAL release notes](storage-wal-release-notes.md)
-for durability fixes and format upgrade constraints.
+Before downgrading to a binary without WAL support, recover the root with the
+current binary, stop it cleanly, and confirm its WAL segments have been retired.
+Skipping this step can cause data loss or let a later recovery overwrite changes
+made by the older binary. Raft clusters also have separate
+[storage downgrade constraints](raft-clusters.md#rolling-upgrades).
 
 > **macOS note.** `sync` on macOS issues `F_FULLFSYNC`, a full drive-cache
 > barrier that is far more expensive than the equivalent `fsync` on Linux —
