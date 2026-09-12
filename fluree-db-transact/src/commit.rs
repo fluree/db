@@ -898,7 +898,7 @@ where
         .expect("build_commit sets commit.id");
     let ledger_id_for_publish = base.ledger_id().to_string();
 
-    let phase = std::time::Instant::now();
+    let phase = fluree_db_core::clock::Instant::now();
     // 8. Write referenced blobs the build phase deferred (today: none),
     //    then write the commit blob via put_with_id (idempotent).
     let write_and_publish = async {
@@ -918,7 +918,7 @@ where
             tracing::info!(commit_bytes = commit_bytes.len(), "commit blob stored");
         }
         let blob_us = phase.elapsed().as_micros() as u64;
-        let publish_started = std::time::Instant::now();
+        let publish_started = fluree_db_core::clock::Instant::now();
 
         // 9. Publish to nameservice.
         let new_head_ref = RefValue {
@@ -964,7 +964,7 @@ where
     };
 
     let (blob_us, publish_us) = write_and_publish.await?;
-    let finalize_started = std::time::Instant::now();
+    let finalize_started = fluree_db_core::clock::Instant::now();
 
     let finalized = finalize_state_with_base(commit_record, commit_cid, new_t, flake_count, base);
     tracing::debug!(
@@ -1164,7 +1164,7 @@ where
     );
 
     async move {
-        let phase = std::time::Instant::now();
+        let phase = fluree_db_core::clock::Instant::now();
         // Run the cheap pre-checks before awaiting the raw-txn upload
         // so a sequencing failure doesn't wait on storage I/O.
         let current = nameservice
@@ -1190,7 +1190,7 @@ where
             opts.raw_txn_id.take()
         };
 
-        let phase = std::time::Instant::now();
+        let phase = fluree_db_core::clock::Instant::now();
         let staged = build_commit(
             view,
             ns_registry,

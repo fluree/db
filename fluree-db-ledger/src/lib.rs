@@ -673,7 +673,7 @@ impl LedgerState {
             return Ok(());
         }
 
-        let phase = std::time::Instant::now();
+        let phase = fluree_db_core::clock::Instant::now();
         // Clear novelty up to new index_t
         let mut new_novelty = (*self.novelty).clone();
         new_novelty.clear_up_to(new_snapshot.t);
@@ -681,7 +681,7 @@ impl LedgerState {
         // holds dead flakes, but `size` tracks only active bytes.
         let has_remaining_novelty = new_novelty.size > 0;
         let novelty_us = phase.elapsed().as_micros() as u64;
-        let phase = std::time::Instant::now();
+        let phase = fluree_db_core::clock::Instant::now();
 
         // Preserve namespace codes and graph IRIs from commits still in novelty.
         // The new snapshot from the index root only has codes/IRIs up to index_t.
@@ -738,7 +738,7 @@ impl LedgerState {
         self.snapshot = Arc::new(merged_snapshot);
         self.novelty = Arc::new(new_novelty);
         let merge_us = phase.elapsed().as_micros() as u64;
-        let phase = std::time::Instant::now();
+        let phase = fluree_db_core::clock::Instant::now();
 
         // The dictionary novelty: drop what the indexed commits introduced and
         // renumber the rest above the new watermarks. A dictionary that
