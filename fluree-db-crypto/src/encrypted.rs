@@ -269,6 +269,10 @@ where
         // Pass through - deletion doesn't need encryption
         self.inner.delete(address).await
     }
+
+    async fn sync(&self) -> fluree_db_core::error::Result<()> {
+        self.inner.sync().await
+    }
 }
 
 #[async_trait]

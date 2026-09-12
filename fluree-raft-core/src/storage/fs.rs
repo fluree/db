@@ -4,33 +4,39 @@
 //!
 //! ```text
 //! <root>/
-//!   vote           # postcard-serialized Vote
-//!   committed      # postcard-serialized LogId (absent when None)
-//!   last_purged    # postcard-serialized LogId (absent when never purged)
+//!   vote             # postcard-serialized Vote
+//!   committed.slots  # two 4 KiB slots, the newer valid one wins
+//!   last_purged      # postcard-serialized LogId (absent when never purged)
 //!   log/
-//!     <index>.entry  # postcard-serialized LogEntry, name is zero-padded
-//!                    #   16-char hex of the index so directory listings
-//!                    #   sort naturally
+//!     <first>.seg    # framed entries from index <first> up, zero-padded
+//!                    #   16-char hex so directory listings sort naturally;
+//!                    #   <index>.entry files from earlier releases are
+//!                    #   folded into a segment on open
 //!   snapshots/
 //!     current        # plain-text snapshot id
 //!     <id>.meta      # postcard-serialized SnapshotMeta
 //!     <id>.data      # raw snapshot bytes
 //! ```
 //!
-//! Every mutation is atomic-write-then-rename with `fsync` of both the
-//! temp file and the parent directory (so the rename's directory
-//! entry is durable across power loss, not just the file contents).
-//! Directory fsync is a no-op on non-Unix targets, which don't expose
-//! an equivalent operation.
+//! Entries append to segments with one flush per batch and the
+//! committed watermark is rewritten in place with one flush; see the
+//! segmented-log section below. Every other mutation is
+//! atomic-write-then-rename with `fsync` of both the temp file and
+//! the parent directory (so the rename's directory entry is durable
+//! across power loss, not just the file contents). Directory fsync
+//! is a no-op on non-Unix targets, which don't expose an equivalent
+//! operation.
 
 use super::{
     LogEntry, LogId, LogState, RaftLogStore, RaftSnapshotStore, RaftStorage, SnapshotId,
     SnapshotMeta, StorageError, Vote,
 };
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tracing::warn;
@@ -121,216 +127,857 @@ fn parse_entry_filename(name: &str) -> Option<u64> {
     u64::from_str_radix(stem, 16).ok()
 }
 
+// ---- Segmented log ----------------------------------------------------------
+//
+// Entries live in append-only segments under `log/`, one flush per
+// `append` batch instead of a file flush per entry plus a directory
+// flush per batch. The committed watermark lives in a two-slot file
+// rewritten in place, one flush instead of a staged write and a
+// directory flush. Vote, purge marker and snapshots keep their
+// atomic-write discipline; they are rare.
+//
+// Recovery reads segments in order. A frame that does not decode at
+// the end of the last segment is a torn append that was never
+// acknowledged and is cut off; a bad frame before a later segment
+// cannot be explained that way and fails the open. Per-entry files
+// from earlier releases are folded into a segment once, on open.
+
+const SEGMENT_MAGIC: &[u8; 8] = b"FRSG0001";
+const SEGMENT_HEADER: usize = 16;
+const FRAME_MAGIC: &[u8; 4] = b"FRLE";
+const FRAME_HEADER: usize = 4 + 4 + 8 + 8;
+const FRAME_HASH: usize = 8;
+const DEFAULT_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+const LEGACY_COMMITTED_MAGIC: &[u8; 4] = b"FRCM";
+const LEGACY_COMMITTED_SLOT: usize = 64;
+const COMMITTED_MAGIC: &[u8; 4] = b"FRC2";
+const COMMITTED_SLOT: usize = 4096;
+const COMMITTED_FILE: &str = "committed.slots";
+
+fn segment_filename(first_index: u64) -> String {
+    format!("{first_index:016x}.seg")
+}
+
+fn parse_segment_filename(name: &str) -> Option<u64> {
+    u64::from_str_radix(name.strip_suffix(".seg")?, 16).ok()
+}
+
+fn frame_hash(bytes: &[u8]) -> u64 {
+    xxhash_rust::xxh64::xxh64(bytes, 0x5261_6674_4c6f_6721)
+}
+
+fn encode_frame(entry: &LogEntry) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(FRAME_HEADER + entry.payload.len() + FRAME_HASH);
+    frame.extend_from_slice(FRAME_MAGIC);
+    frame.extend_from_slice(&(entry.payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(&entry.log_id.index.to_le_bytes());
+    frame.extend_from_slice(&entry.log_id.term.to_le_bytes());
+    frame.extend_from_slice(&entry.payload);
+    let hash = frame_hash(&frame);
+    frame.extend_from_slice(&hash.to_le_bytes());
+    frame
+}
+
+/// The frame at `at`: its id, payload and total length. `None` for
+/// anything short, unrecognized or failing its hash.
+fn decode_frame(bytes: &[u8], at: usize) -> Option<(LogId, &[u8], usize)> {
+    let header = bytes.get(at..at + FRAME_HEADER)?;
+    if &header[..4] != FRAME_MAGIC {
+        return None;
+    }
+    let len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+    let index = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    let term = u64::from_le_bytes(header[16..24].try_into().unwrap());
+    let end = at + FRAME_HEADER + len;
+    let stored = bytes.get(end..end + FRAME_HASH)?;
+    if frame_hash(&bytes[at..end]).to_le_bytes() != stored {
+        return None;
+    }
+    Some((
+        LogId::new(term, index),
+        &bytes[at + FRAME_HEADER..end],
+        FRAME_HEADER + len + FRAME_HASH,
+    ))
+}
+
+fn encode_committed(generation: u64, id: Option<LogId>) -> [u8; COMMITTED_SLOT] {
+    let mut slot = [0u8; COMMITTED_SLOT];
+    slot[..4].copy_from_slice(COMMITTED_MAGIC);
+    slot[4..12].copy_from_slice(&generation.to_le_bytes());
+    if let Some(id) = id {
+        slot[12] = 1;
+        slot[13..21].copy_from_slice(&id.term.to_le_bytes());
+        slot[21..29].copy_from_slice(&id.index.to_le_bytes());
+    }
+    let hash = frame_hash(&slot[..COMMITTED_SLOT - FRAME_HASH]);
+    slot[COMMITTED_SLOT - FRAME_HASH..].copy_from_slice(&hash.to_le_bytes());
+    slot
+}
+
+fn decode_committed(slot: &[u8]) -> Option<(u64, Option<LogId>)> {
+    let magic = match slot.len() {
+        COMMITTED_SLOT => COMMITTED_MAGIC,
+        LEGACY_COMMITTED_SLOT => LEGACY_COMMITTED_MAGIC,
+        _ => return None,
+    };
+    if &slot[..4] != magic {
+        return None;
+    }
+    if frame_hash(&slot[..slot.len() - FRAME_HASH]).to_le_bytes() != slot[slot.len() - FRAME_HASH..]
+    {
+        return None;
+    }
+    let generation = u64::from_le_bytes(slot[4..12].try_into().unwrap());
+    let id = (slot[12] == 1).then(|| {
+        LogId::new(
+            u64::from_le_bytes(slot[13..21].try_into().unwrap()),
+            u64::from_le_bytes(slot[21..29].try_into().unwrap()),
+        )
+    });
+    Some((generation, id))
+}
+
+fn fsync_dir_blocking(path: &Path) -> Result<(), StorageError> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| io_err("sync dir", e))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn atomic_write_blocking(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = std::fs::File::create(&tmp).map_err(|e| io_err("create tmp", e))?;
+        file.write_all(bytes).map_err(|e| io_err("write tmp", e))?;
+        file.sync_all().map_err(|e| io_err("sync tmp", e))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| io_err("rename tmp", e))?;
+    if let Some(parent) = path.parent() {
+        fsync_dir_blocking(parent)?;
+    }
+    Ok(())
+}
+
+fn read_postcard<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    what: &str,
+) -> Result<Option<T>, StorageError> {
+    match std::fs::read(path) {
+        Ok(bytes) => postcard::from_bytes(&bytes)
+            .map(Some)
+            .map_err(|e| ser_err(what, e)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io_err(what, e)),
+    }
+}
+
+struct Segment {
+    first_index: u64,
+    /// Highest index physically present, purged or not. `None` for a
+    /// segment holding only its header.
+    last_index: Option<u64>,
+    path: PathBuf,
+    len: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Loc {
+    segment: u64,
+    offset: u64,
+    len: u32,
+    term: u64,
+}
+
+/// One thing `truncate_from` or `purge_through` did to the device, in
+/// order, for the tests that pin their crash ordering.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeviceStep {
+    Unlink(PathBuf),
+    DirFsync,
+    Shorten,
+}
+
+struct Inner {
+    root: PathBuf,
+    log_dir: PathBuf,
+    segment_bytes: u64,
+    segments: Vec<Segment>,
+    #[cfg(test)]
+    device_trace: Vec<DeviceStep>,
+    /// Live entries (above the purge cutoff) by index.
+    index: BTreeMap<u64, Loc>,
+    /// Write handle on the last segment, opened on demand.
+    active: Option<std::fs::File>,
+    last_purged: Option<LogId>,
+    committed: Option<LogId>,
+    committed_generation: u64,
+    committed_file: Option<std::fs::File>,
+}
+
+impl Inner {
+    fn open(root: PathBuf, segment_bytes: u64) -> Result<Self, StorageError> {
+        let log_dir = root.join("log");
+        std::fs::create_dir_all(&log_dir).map_err(|e| io_err("create log dir", e))?;
+        let last_purged = read_postcard(&root.join("last_purged"), "decode last_purged")?;
+        let mut inner = Self {
+            root,
+            log_dir,
+            segment_bytes,
+            segments: Vec::new(),
+            #[cfg(test)]
+            device_trace: Vec::new(),
+            index: BTreeMap::new(),
+            active: None,
+            last_purged,
+            committed: None,
+            committed_generation: 0,
+            committed_file: None,
+        };
+        inner.migrate_legacy_entries()?;
+        inner.scan_segments()?;
+        inner.load_committed()?;
+        Ok(inner)
+    }
+
+    fn cutoff(&self) -> Option<u64> {
+        self.last_purged.map(|p| p.index)
+    }
+
+    fn live(&self, index: u64) -> bool {
+        self.cutoff().is_none_or(|c| index > c)
+    }
+
+    /// Fold per-entry files from earlier releases into one segment. The
+    /// contiguous run above the purge cutoff is kept, exactly what the
+    /// old `log_state` would have reported; orphans past a gap are
+    /// dropped as they were on every restart. The segment is published
+    /// by rename before any entry file is removed, so a crash at any
+    /// point leaves either the entries or the finished segment.
+    fn migrate_legacy_entries(&mut self) -> Result<(), StorageError> {
+        let mut indices = Vec::new();
+        let mut has_segment = false;
+        for entry in std::fs::read_dir(&self.log_dir).map_err(|e| io_err("read log dir", e))? {
+            let entry = entry.map_err(|e| io_err("iter log dir", e))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Some(index) = parse_entry_filename(name) {
+                indices.push(index);
+            } else if parse_segment_filename(name).is_some() {
+                has_segment = true;
+            } else if name.ends_with(".seg.tmp") {
+                std::fs::remove_file(entry.path())
+                    .map_err(|e| io_err("remove stale segment", e))?;
+            }
+        }
+        if indices.is_empty() {
+            return Ok(());
+        }
+        indices.sort_unstable();
+        if !has_segment {
+            let anchor = self.cutoff().map_or(1, |c| c + 1);
+            let run: Vec<u64> = indices
+                .iter()
+                .copied()
+                .filter(|&i| self.live(i))
+                .scan(anchor, |expected, i| {
+                    (i == *expected).then(|| {
+                        *expected += 1;
+                        i
+                    })
+                })
+                .collect();
+            if let Some(&first) = run.first() {
+                let mut buf = SEGMENT_MAGIC.to_vec();
+                buf.extend_from_slice(&first.to_le_bytes());
+                for index in &run {
+                    let bytes = std::fs::read(self.log_dir.join(entry_filename(*index)))
+                        .map_err(|e| io_err("read legacy entry", e))?;
+                    let entry: LogEntry = postcard::from_bytes(&bytes)
+                        .map_err(|e| ser_err("decode legacy entry", e))?;
+                    buf.extend_from_slice(&encode_frame(&entry));
+                }
+                let path = self.log_dir.join(segment_filename(first));
+                let tmp = self.log_dir.join(format!("{first:016x}.seg.tmp"));
+                {
+                    use std::io::Write;
+                    let mut file =
+                        std::fs::File::create(&tmp).map_err(|e| io_err("create segment", e))?;
+                    file.write_all(&buf)
+                        .map_err(|e| io_err("write segment", e))?;
+                    file.sync_all().map_err(|e| io_err("sync segment", e))?;
+                }
+                std::fs::rename(&tmp, &path).map_err(|e| io_err("publish segment", e))?;
+                fsync_dir_blocking(&self.log_dir)?;
+            }
+            tracing::info!(
+                entries = run.len(),
+                dropped = indices.len() - run.len(),
+                "folded per-entry raft log files into a segment"
+            );
+        }
+        for index in indices {
+            match std::fs::remove_file(self.log_dir.join(entry_filename(index))) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io_err("remove legacy entry", e)),
+            }
+        }
+        fsync_dir_blocking(&self.log_dir)
+    }
+
+    fn scan_segments(&mut self) -> Result<(), StorageError> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&self.log_dir).map_err(|e| io_err("read log dir", e))? {
+            let entry = entry.map_err(|e| io_err("iter log dir", e))?;
+            if let Some(first) = entry.file_name().to_str().and_then(parse_segment_filename) {
+                found.push((first, entry.path()));
+            }
+        }
+        found.sort();
+        let last = found.len().saturating_sub(1);
+        let mut expected_next: Option<u64> = None;
+        for (i, (first, path)) in found.into_iter().enumerate() {
+            let bytes = std::fs::read(&path).map_err(|e| io_err("read segment", e))?;
+            if bytes.len() < SEGMENT_HEADER
+                || &bytes[..8] != SEGMENT_MAGIC
+                || u64::from_le_bytes(bytes[8..16].try_into().unwrap()) != first
+            {
+                if i == last {
+                    // Creation interrupted before the header landed. An entry
+                    // is only appended after the header is durable, so this
+                    // segment holds nothing acknowledged.
+                    warn!(
+                        segment = %path.display(),
+                        "raft log segment has no valid header; removing it as never used"
+                    );
+                    std::fs::remove_file(&path).map_err(|e| io_err("remove segment", e))?;
+                    fsync_dir_blocking(&self.log_dir)?;
+                    break;
+                }
+                return Err(StorageError::corruption(format!(
+                    "raft log segment {} has a bad header",
+                    path.display()
+                )));
+            }
+            if expected_next.is_some_and(|next| next != first) {
+                return Err(StorageError::corruption(format!(
+                    "raft log segment {} does not continue the previous segment",
+                    path.display()
+                )));
+            }
+            let mut at = SEGMENT_HEADER;
+            let mut physical_next = first;
+            let mut last_index = None;
+            loop {
+                if at == bytes.len() {
+                    break;
+                }
+                match decode_frame(&bytes, at) {
+                    Some((id, _, frame_len)) if id.index == physical_next => {
+                        if self.live(id.index) {
+                            self.index.insert(
+                                id.index,
+                                Loc {
+                                    segment: first,
+                                    offset: at as u64,
+                                    len: frame_len as u32,
+                                    term: id.term,
+                                },
+                            );
+                        }
+                        last_index = Some(id.index);
+                        physical_next += 1;
+                        at += frame_len;
+                    }
+                    _ if i == last => {
+                        // A torn append: never acknowledged, so never
+                        // relied upon. Cut it off so the next append
+                        // continues from a clean frame boundary.
+                        warn!(
+                            segment = %path.display(),
+                            kept = last_index,
+                            "raft log segment ends in a torn frame; discarding it"
+                        );
+                        let file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&path)
+                            .map_err(|e| io_err("open segment", e))?;
+                        file.set_len(at as u64)
+                            .map_err(|e| io_err("cut segment", e))?;
+                        file.sync_all().map_err(|e| io_err("sync segment", e))?;
+                        break;
+                    }
+                    _ => {
+                        return Err(StorageError::corruption(format!(
+                            "raft log segment {} is damaged before a later segment \
+                             (frame at byte {at}); move it aside only if the entries \
+                             it held are covered by a snapshot",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+            self.segments.push(Segment {
+                first_index: first,
+                last_index,
+                path,
+                len: at as u64,
+            });
+            expected_next = Some(physical_next);
+        }
+        Ok(())
+    }
+
+    fn load_committed(&mut self) -> Result<(), StorageError> {
+        let slots = self.root.join(COMMITTED_FILE);
+        match std::fs::read(&slots) {
+            Ok(bytes) => {
+                // Intermediate builds used adjacent 64-byte slots. Publish
+                // their replacement atomically: a crash during migration must
+                // leave either the old file or both new, separated slots.
+                let legacy = bytes.len() == 2 * LEGACY_COMMITTED_SLOT;
+                let stride = if legacy {
+                    LEGACY_COMMITTED_SLOT
+                } else {
+                    COMMITTED_SLOT
+                };
+                let best = bytes
+                    .chunks(stride)
+                    .filter_map(decode_committed)
+                    .max_by_key(|(generation, _)| *generation);
+                if let Some((generation, id)) = best {
+                    self.committed_generation = generation;
+                    self.committed = id;
+                }
+                if legacy {
+                    let mut migrated = vec![0u8; 2 * COMMITTED_SLOT];
+                    for (i, slot) in bytes.chunks(stride).enumerate() {
+                        if let Some((generation, id)) = decode_committed(slot) {
+                            migrated[i * COMMITTED_SLOT..(i + 1) * COMMITTED_SLOT]
+                                .copy_from_slice(&encode_committed(generation, id));
+                        }
+                    }
+                    atomic_write_blocking(&slots, &migrated)?;
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err("read committed", e)),
+        }
+        // An earlier release's marker, folded into the slot file once.
+        let legacy = self.root.join("committed");
+        if let Some(id) = read_postcard::<LogId>(&legacy, "decode committed")? {
+            self.committed = Some(id);
+            self.write_committed(Some(id))?;
+            std::fs::remove_file(&legacy).map_err(|e| io_err("remove legacy committed", e))?;
+            fsync_dir_blocking(&self.root)?;
+        }
+        Ok(())
+    }
+
+    fn write_committed(&mut self, id: Option<LogId>) -> Result<(), StorageError> {
+        use std::io::{Seek, SeekFrom, Write};
+        if self.committed_file.is_none() {
+            let created = !self.root.join(COMMITTED_FILE).exists();
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(self.root.join(COMMITTED_FILE))
+                .map_err(|e| io_err("open committed", e))?;
+            if created {
+                file.set_len((2 * COMMITTED_SLOT) as u64)
+                    .map_err(|e| io_err("size committed", e))?;
+                file.sync_all().map_err(|e| io_err("sync committed", e))?;
+                fsync_dir_blocking(&self.root)?;
+            }
+            self.committed_file = Some(file);
+        }
+        let generation = self.committed_generation + 1;
+        let slot = encode_committed(generation, id);
+        let file = self.committed_file.as_mut().expect("opened above");
+        // Alternate slots on separate 4 KiB boundaries, so a sector-local
+        // tear of this update leaves the previous slot available. This does
+        // not promise isolation from arbitrary device-wide corruption.
+        file.seek(SeekFrom::Start(
+            ((generation % 2) as usize * COMMITTED_SLOT) as u64,
+        ))
+        .map_err(|e| io_err("seek committed", e))?;
+        file.write_all(&slot)
+            .map_err(|e| io_err("write committed", e))?;
+        file.sync_all().map_err(|e| io_err("sync committed", e))?;
+        self.committed_generation = generation;
+        self.committed = id;
+        Ok(())
+    }
+
+    /// Create the next segment: header written and flushed under a temporary
+    /// name, then renamed into place, so a crash can never leave a segment
+    /// whose header is missing or partial.
+    fn start_segment(&mut self, first_index: u64) -> Result<(), StorageError> {
+        use std::io::Write;
+        let path = self.log_dir.join(segment_filename(first_index));
+        let tmp = self.log_dir.join(format!("{first_index:016x}.seg.tmp"));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| io_err("create segment", e))?;
+        let mut header = SEGMENT_MAGIC.to_vec();
+        header.extend_from_slice(&first_index.to_le_bytes());
+        file.write_all(&header)
+            .map_err(|e| io_err("write segment header", e))?;
+        file.sync_all().map_err(|e| io_err("sync segment", e))?;
+        std::fs::rename(&tmp, &path).map_err(|e| io_err("publish segment", e))?;
+        fsync_dir_blocking(&self.log_dir)?;
+        self.segments.push(Segment {
+            first_index,
+            last_index: None,
+            path,
+            len: SEGMENT_HEADER as u64,
+        });
+        self.active = Some(file);
+        Ok(())
+    }
+
+    fn active_file(&mut self) -> Result<&mut std::fs::File, StorageError> {
+        if self.active.is_none() {
+            let path = &self.segments.last().expect("a segment exists").path;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|e| io_err("open segment", e))?;
+            self.active = Some(file);
+        }
+        Ok(self.active.as_mut().expect("set above"))
+    }
+
+    fn append(&mut self, entries: &[LogEntry]) -> Result<(), StorageError> {
+        use std::io::{Seek, SeekFrom, Write};
+        let Some(first) = entries.first().map(|e| e.log_id.index) else {
+            return Ok(());
+        };
+        if let Some((&last, _)) = self.index.iter().next_back() {
+            if first != last + 1 {
+                return Err(StorageError::corruption(format!(
+                    "append at index {first} does not continue the log at {last}"
+                )));
+            }
+        }
+        // A segment holding only its header names a first index; if that is
+        // not the index being appended, it is a leftover (a truncation that
+        // emptied it, or a purge that outran it) and must go, or its entries
+        // would read as torn on the next open.
+        if let Some(seg) = self
+            .segments
+            .pop_if(|seg| seg.last_index.is_none() && seg.first_index != first)
+        {
+            self.active = None;
+            std::fs::remove_file(&seg.path).map_err(|e| io_err("remove segment", e))?;
+            fsync_dir_blocking(&self.log_dir)?;
+        }
+        let needs_segment = self
+            .segments
+            .last()
+            .is_none_or(|seg| seg.len >= self.segment_bytes);
+        if needs_segment {
+            self.start_segment(first)?;
+        }
+        let mut buf = Vec::new();
+        let mut locs = Vec::with_capacity(entries.len());
+        {
+            let seg = self.segments.last().expect("ensured above");
+            for entry in entries {
+                let frame = encode_frame(entry);
+                locs.push((
+                    entry.log_id.index,
+                    Loc {
+                        segment: seg.first_index,
+                        offset: seg.len + buf.len() as u64,
+                        len: frame.len() as u32,
+                        term: entry.log_id.term,
+                    },
+                ));
+                buf.extend_from_slice(&frame);
+            }
+        }
+        let start = self.segments.last().expect("ensured above").len;
+        let file = self.active_file()?;
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| io_err("seek segment", e))?;
+        file.write_all(&buf)
+            .map_err(|e| io_err("write segment", e))?;
+        // The one flush an append pays.
+        file.sync_all().map_err(|e| io_err("sync segment", e))?;
+        let seg = self.segments.last_mut().expect("ensured above");
+        seg.len += buf.len() as u64;
+        seg.last_index = Some(entries.last().expect("non-empty").log_id.index);
+        for (index, loc) in locs {
+            self.index.insert(index, loc);
+        }
+        Ok(())
+    }
+
+    fn segment_path(&self, first_index: u64) -> Result<&Path, StorageError> {
+        self.segments
+            .iter()
+            .find(|s| s.first_index == first_index)
+            .map(|s| s.path.as_path())
+            .ok_or_else(|| StorageError::corruption(format!("no segment starts at {first_index}")))
+    }
+
+    fn read_range(&self, range: Range<u64>) -> Result<Vec<LogEntry>, StorageError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut out = Vec::new();
+        let mut open: Option<(u64, std::fs::File)> = None;
+        for (&index, loc) in self.index.range(range) {
+            if open.as_ref().is_none_or(|(first, _)| *first != loc.segment) {
+                let file = std::fs::File::open(self.segment_path(loc.segment)?)
+                    .map_err(|e| io_err("open segment", e))?;
+                open = Some((loc.segment, file));
+            }
+            let file = &mut open.as_mut().expect("opened above").1;
+            let mut frame = vec![0u8; loc.len as usize];
+            file.seek(SeekFrom::Start(loc.offset))
+                .map_err(|e| io_err("seek entry", e))?;
+            file.read_exact(&mut frame)
+                .map_err(|e| io_err("read entry", e))?;
+            let (id, payload, _) = decode_frame(&frame, 0)
+                .filter(|(id, _, _)| id.index == index)
+                .ok_or_else(|| {
+                    StorageError::corruption(format!("raft log entry {index} failed its check"))
+                })?;
+            out.push(LogEntry {
+                log_id: id,
+                payload: payload.to_vec(),
+            });
+        }
+        Ok(out)
+    }
+
+    fn truncate_from(&mut self, from_index: u64) -> Result<(), StorageError> {
+        if self
+            .index
+            .iter()
+            .next_back()
+            .is_none_or(|(&last, _)| last < from_index)
+        {
+            return Ok(());
+        }
+        let cut = self
+            .index
+            .get(&from_index)
+            .map(|loc| (loc.segment, loc.offset))
+            .or_else(|| {
+                // `from_index` sits below the live range: cut everything.
+                self.index
+                    .iter()
+                    .next()
+                    .map(|(_, loc)| (loc.segment, SEGMENT_HEADER as u64))
+            })
+            .expect("live entries exist");
+        // Every crash point must leave a prefix of the log: a later segment
+        // gone while the retained one still reaches past the cut reads as a
+        // truncation not yet made, a hole does not. So later segments go
+        // newest first, each unlink durable before the next, and the segment
+        // holding the cut is shortened only once they are all gone.
+        self.active = None;
+        while self
+            .segments
+            .last()
+            .is_some_and(|seg| seg.first_index > cut.0)
+        {
+            self.remove_last_segment()?;
+        }
+        if cut.1 == SEGMENT_HEADER as u64 {
+            // Nothing of the segment survives the cut: remove it rather than
+            // keep a header naming an index the log may never return to.
+            self.remove_last_segment()?;
+        } else {
+            let file = self.active_file()?;
+            file.set_len(cut.1).map_err(|e| io_err("cut segment", e))?;
+            file.sync_all().map_err(|e| io_err("sync segment", e))?;
+            #[cfg(test)]
+            self.device_trace.push(DeviceStep::Shorten);
+            let seg = self.segments.last_mut().expect("holds the cut");
+            seg.len = cut.1;
+            seg.last_index = Some(from_index - 1);
+        }
+        self.index.split_off(&from_index);
+        Ok(())
+    }
+
+    /// Unlink the newest segment and make that durable before forgetting it.
+    fn remove_last_segment(&mut self) -> Result<(), StorageError> {
+        let seg = self.segments.last().expect("a segment to remove");
+        std::fs::remove_file(&seg.path).map_err(|e| io_err("remove segment", e))?;
+        #[cfg(test)]
+        self.device_trace.push(DeviceStep::Unlink(seg.path.clone()));
+        fsync_dir_blocking(&self.log_dir)?;
+        #[cfg(test)]
+        self.device_trace.push(DeviceStep::DirFsync);
+        self.segments.pop();
+        Ok(())
+    }
+
+    fn purge_through(&mut self, log_id: LogId) -> Result<(), StorageError> {
+        if self.last_purged.is_some_and(|p| p.index >= log_id.index) {
+            return Ok(());
+        }
+        // The marker first: a crash after it leaves entries the scan
+        // ignores, never a hole below a stale marker.
+        let bytes = postcard::to_allocvec(&log_id).map_err(|e| ser_err("encode last_purged", e))?;
+        atomic_write_blocking(&self.root.join("last_purged"), &bytes)?;
+        self.last_purged = Some(log_id);
+        self.index = self.index.split_off(&(log_id.index + 1));
+        self.active = None;
+        // Oldest first, each unlink durable before the next, so the segments
+        // on the device are a contiguous suffix at every crash point. A newer
+        // unlink outliving an older one would leave a hole the scan refuses,
+        // even below the marker.
+        let mut kept = Vec::with_capacity(self.segments.len());
+        for seg in self.segments.drain(..) {
+            // Whole segments at or below the marker go, and so does an empty
+            // one whose first index the marker has passed.
+            let obsolete = match seg.last_index {
+                Some(last) => last <= log_id.index,
+                None => seg.first_index <= log_id.index,
+            };
+            if obsolete {
+                std::fs::remove_file(&seg.path).map_err(|e| io_err("remove segment", e))?;
+                #[cfg(test)]
+                self.device_trace.push(DeviceStep::Unlink(seg.path.clone()));
+                fsync_dir_blocking(&self.log_dir)?;
+                #[cfg(test)]
+                self.device_trace.push(DeviceStep::DirFsync);
+            } else {
+                kept.push(seg);
+            }
+        }
+        self.segments = kept;
+        Ok(())
+    }
+
+    fn log_state(&self) -> LogState {
+        LogState {
+            last_purged: self.last_purged,
+            last_log: self
+                .index
+                .iter()
+                .next_back()
+                .map(|(&index, loc)| LogId::new(loc.term, index)),
+        }
+    }
+}
+
 /// Filesystem-backed implementation of [`RaftLogStore`].
 pub struct FsRaftLogStore {
     root: PathBuf,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl FsRaftLogStore {
     /// Open or create the log store rooted at `root`. Creates the
-    /// directory tree if missing.
+    /// directory tree if missing, folds per-entry files from earlier
+    /// releases into a segment, and replays the segments.
     pub async fn open(root: impl Into<PathBuf>) -> Result<Self, StorageError> {
-        let root = root.into();
-        fs::create_dir_all(root.join("log"))
-            .await
-            .map_err(|e| io_err("create log dir", e))?;
-        Ok(Self { root })
+        Self::open_with_segment_bytes(root, DEFAULT_SEGMENT_BYTES).await
     }
 
-    fn log_dir(&self) -> PathBuf {
-        self.root.join("log")
+    /// [`Self::open`] with the size at which a segment is closed and the
+    /// next one started. Tests use small values to exercise rotation.
+    #[doc(hidden)]
+    pub async fn open_with_segment_bytes(
+        root: impl Into<PathBuf>,
+        segment_bytes: u64,
+    ) -> Result<Self, StorageError> {
+        let root = root.into();
+        let for_open = root.clone();
+        let inner = tokio::task::spawn_blocking(move || Inner::open(for_open, segment_bytes))
+            .await
+            .map_err(|e| StorageError::other(format!("open join: {e}")))??;
+        Ok(Self {
+            root,
+            inner: Arc::new(Mutex::new(inner)),
+        })
     }
 
     fn vote_path(&self) -> PathBuf {
         self.root.join("vote")
     }
 
-    fn committed_path(&self) -> PathBuf {
-        self.root.join("committed")
-    }
-
+    #[cfg(test)]
     fn last_purged_path(&self) -> PathBuf {
         self.root.join("last_purged")
     }
 
-    fn entry_path(&self, index: u64) -> PathBuf {
-        self.log_dir().join(entry_filename(index))
+    #[cfg(test)]
+    fn log_dir(&self) -> PathBuf {
+        self.root.join("log")
     }
 
-    async fn list_entry_indices(&self) -> Result<Vec<u64>, StorageError> {
-        let mut dir = fs::read_dir(self.log_dir())
+    /// Drain what the last truncation or purge did to the device, in order.
+    #[cfg(test)]
+    async fn device_trace(&self) -> Vec<DeviceStep> {
+        self.with_inner(|inner| Ok(std::mem::take(&mut inner.device_trace)))
             .await
-            .map_err(|e| io_err("read log dir", e))?;
-        let mut indices = Vec::new();
-        while let Some(entry) = dir
-            .next_entry()
-            .await
-            .map_err(|e| io_err("iter log dir", e))?
-        {
-            let name = entry.file_name();
-            if let Some(name_str) = name.to_str() {
-                if let Some(idx) = parse_entry_filename(name_str) {
-                    indices.push(idx);
-                }
-            }
-        }
-        indices.sort_unstable();
-        Ok(indices)
+            .unwrap()
     }
 
-    async fn read_entry(&self, index: u64) -> Result<Option<LogEntry>, StorageError> {
-        match read_if_exists(&self.entry_path(index)).await? {
-            Some(bytes) => {
-                let entry = postcard::from_bytes(&bytes).map_err(|e| ser_err("decode entry", e))?;
-                Ok(Some(entry))
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn read_last_purged(&self) -> Result<Option<LogId>, StorageError> {
-        match read_if_exists(&self.last_purged_path()).await? {
-            Some(bytes) => {
-                let id =
-                    postcard::from_bytes(&bytes).map_err(|e| ser_err("decode last_purged", e))?;
-                Ok(Some(id))
-            }
-            None => Ok(None),
-        }
+    /// Run `f` against the store's state on the blocking pool.
+    async fn with_inner<T, F>(&self, f: F) -> Result<T, StorageError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Inner) -> Result<T, StorageError> + Send + 'static,
+    {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            f(&mut guard)
+        })
+        .await
+        .map_err(|e| StorageError::other(format!("log store join: {e}")))?
     }
 }
 
 #[async_trait]
 impl RaftLogStore for FsRaftLogStore {
     async fn append(&self, entries: &[LogEntry]) -> Result<(), StorageError> {
-        // Each entry's contents are fsync'd before its rename; the
-        // renames are made durable by a single directory fsync at the
-        // end, so a batch of N pays N+1 fsyncs rather than 2N. A crash
-        // before that final fsync can leave the tail renames durable
-        // out of order (a gap), but the append hasn't been acked to
-        // openraft, and `log_state` reports only the contiguous prefix
-        // above the purge cutoff — so the gap and any orphans past it
-        // are dropped and re-appended on recovery.
-        for entry in entries {
-            let bytes = postcard::to_allocvec(entry).map_err(|e| ser_err("encode entry", e))?;
-            write_and_rename(&self.entry_path(entry.log_id.index), &bytes).await?;
-        }
-        if !entries.is_empty() {
-            fsync_dir(&self.log_dir()).await?;
-        }
-        Ok(())
+        let entries = entries.to_vec();
+        self.with_inner(move |inner| inner.append(&entries)).await
     }
 
     async fn read_range(&self, range: Range<u64>) -> Result<Vec<LogEntry>, StorageError> {
-        let indices = self.list_entry_indices().await?;
-        let mut entries = Vec::new();
-        for idx in indices.into_iter().filter(|i| range.contains(i)) {
-            if let Some(entry) = self.read_entry(idx).await? {
-                entries.push(entry);
-            }
-        }
-        Ok(entries)
+        self.with_inner(move |inner| inner.read_range(range)).await
     }
 
     async fn truncate_from(&self, from_index: u64) -> Result<(), StorageError> {
-        // Delete in descending order so the surviving prefix stays
-        // contiguous after a crash mid-loop. The reverse order
-        // (ascending) can leave a hole — e.g. removing 5 and 6 but
-        // crashing before 7..N — and `log_state` would then report
-        // `last_log` from a stale-term entry above the missing
-        // window, which openraft cannot reconcile. With descending
-        // deletion the worst-case post-crash state is some
-        // stale-term entries still in [from_index, k]; openraft's
-        // append-entries conflict detection re-triggers
-        // `truncate_from` against the actual conflict point on
-        // recovery, so no missing-middle hole ever surfaces.
-        let indices = self.list_entry_indices().await?;
-        let mut removed = false;
-        for idx in indices.into_iter().filter(|&i| i >= from_index).rev() {
-            remove_if_exists(&self.entry_path(idx)).await?;
-            removed = true;
-        }
-        // One directory fsync makes the whole unlink batch durable.
-        // Without it a crash can resurrect deleted entries, and
-        // POSIX doesn't order unlink persistence, so even the
-        // descending delete order above can be defeated — a
-        // resurrected entry above a persisted deletion is a mid-log
-        // hole that `read_range` cannot represent.
-        if removed {
-            fsync_dir(&self.log_dir()).await?;
-        }
-        Ok(())
+        self.with_inner(move |inner| inner.truncate_from(from_index))
+            .await
     }
 
     async fn purge_through(&self, log_id: LogId) -> Result<(), StorageError> {
-        let existing = self.read_last_purged().await?;
-        if matches!(existing, Some(p) if p.index >= log_id.index) {
-            return Ok(());
-        }
-
-        // Persist the marker BEFORE deleting any entry files. A crash
-        // after the marker but before all deletions leaves orphans at
-        // indices <= log_id.index, which `log_state` / `read_range`
-        // filter out via the marker; openraft sees a consistent
-        // (last_purged, last_log] window. The reverse order would
-        // leave entries 1..k missing with `last_purged` still
-        // pointing at an older id — a hole openraft cannot reconcile.
-        let bytes = postcard::to_allocvec(&log_id).map_err(|e| ser_err("encode last_purged", e))?;
-        atomic_write(&self.last_purged_path(), &bytes).await?;
-
-        let indices = self.list_entry_indices().await?;
-        let mut removed = false;
-        for idx in indices.into_iter().filter(|&i| i <= log_id.index) {
-            remove_if_exists(&self.entry_path(idx)).await?;
-            removed = true;
-        }
-        // See `truncate_from`: the batch's unlinks aren't durable
-        // until the directory is synced.
-        if removed {
-            fsync_dir(&self.log_dir()).await?;
-        }
-        Ok(())
+        self.with_inner(move |inner| inner.purge_through(log_id))
+            .await
     }
 
     async fn log_state(&self) -> Result<LogState, StorageError> {
-        let last_purged = self.read_last_purged().await?;
-        let purged_cutoff = last_purged.map(|p| p.index);
-        let indices = self.list_entry_indices().await?;
-        // `last_log` is the top of the contiguous run of entries above
-        // `last_purged`. Two orphan sources make this a contiguous
-        // scan rather than a plain max:
-        //   - indices <= cutoff (a `purge_through` that crashed between
-        //     marker write and deletion) — filtered out by the cutoff;
-        //   - a gap anywhere from `cutoff + 1` up (an `append` batch
-        //     that crashed before its final directory fsync, leaving
-        //     renames durable out of order) — the scan is anchored at
-        //     `cutoff + 1` (or index 1 with nothing purged) and stops
-        //     at the first missing index, so openraft never sees a
-        //     `last_log` past a hole. A gap at the very front (the
-        //     first expected index absent) yields `None`. Entries
-        //     beyond the gap are orphans that recovery re-appends over.
-        let first_expected = purged_cutoff.map_or(1, |c| c + 1);
-        let last_index = indices
-            .iter()
-            .copied()
-            .filter(|&idx| purged_cutoff.is_none_or(|c| idx > c))
-            .scan(first_expected, |expected, idx| {
-                if idx == *expected {
-                    *expected += 1;
-                    Some(idx)
-                } else {
-                    None // gap (at the anchor or in the tail) — stop the run
-                }
-            })
-            .last();
-        let last_log = match last_index {
-            Some(idx) => self.read_entry(idx).await?.map(|e| e.log_id),
-            None => None,
-        };
-        Ok(LogState {
-            last_purged,
-            last_log,
-        })
+        self.with_inner(|inner| Ok(inner.log_state())).await
     }
 
     async fn save_vote(&self, vote: &Vote) -> Result<(), StorageError> {
@@ -349,39 +996,12 @@ impl RaftLogStore for FsRaftLogStore {
     }
 
     async fn save_committed(&self, log_id: Option<LogId>) -> Result<(), StorageError> {
-        match log_id {
-            Some(id) => {
-                let bytes =
-                    postcard::to_allocvec(&id).map_err(|e| ser_err("encode committed", e))?;
-                atomic_write(&self.committed_path(), &bytes).await
-            }
-            None => {
-                remove_if_exists(&self.committed_path()).await?;
-                // The unlink is a durability point like the write
-                // arm's `atomic_write`: sync its directory so the
-                // stale committed marker can't resurrect on crash.
-                fsync_dir(&self.root).await
-            }
-        }
+        self.with_inner(move |inner| inner.write_committed(log_id))
+            .await
     }
 
     async fn read_committed(&self) -> Result<Option<LogId>, StorageError> {
-        match read_if_exists(&self.committed_path()).await? {
-            Some(bytes) => {
-                let id =
-                    postcard::from_bytes(&bytes).map_err(|e| ser_err("decode committed", e))?;
-                Ok(Some(id))
-            }
-            None => Ok(None),
-        }
-    }
-}
-
-async fn remove_if_exists(path: &Path) -> Result<(), StorageError> {
-    match fs::remove_file(path).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(io_err("remove file", e)),
+        self.with_inner(|inner| Ok(inner.committed)).await
     }
 }
 
@@ -653,34 +1273,47 @@ mod tests {
         assert_eq!(got[0].log_id.index, 1);
     }
 
-    /// Simulates a crash mid-`truncate_from`: the descending-order
-    /// loop completed deletions of the top few entries but stopped
-    /// before reaching the truncation point. The surviving log must
-    /// be a contiguous prefix — no missing-middle hole — so
-    /// `log_state` reports a coherent `last_log` and `read_range`
-    /// returns every index up to it.
+    /// A segment's files in index order, for tests that damage them.
+    fn segment_files(store: &FsRaftLogStore) -> Vec<PathBuf> {
+        let mut files: Vec<_> = std::fs::read_dir(store.log_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "seg"))
+            .collect();
+        files.sort();
+        files
+    }
+
+    async fn reopen(dir: &TempDir) -> FsRaftLogStore {
+        FsRaftLogStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap()
+    }
+
+    /// Simulates a crash mid-`truncate_from` across segments: the later
+    /// segment was removed but the one holding the cut was not yet
+    /// shortened. The surviving log must be a contiguous prefix — no
+    /// missing-middle hole — so `log_state` reports a coherent
+    /// `last_log` and `read_range` returns every index up to it.
     #[tokio::test]
     async fn partial_truncate_leaves_contiguous_prefix() {
-        let (_dir, store) = fresh_log_store().await;
-        store
-            .append(&[
-                entry(1, 1),
-                entry(1, 2),
-                entry(1, 3),
-                entry(1, 4),
-                entry(1, 5),
-            ])
+        let dir = TempDir::new().unwrap();
+        // Tiny segments: every append starts a new one.
+        let store = FsRaftLogStore::open_with_segment_bytes(dir.path().to_path_buf(), 1)
             .await
             .unwrap();
+        store.append(&[entry(1, 1), entry(1, 2)]).await.unwrap();
+        store.append(&[entry(1, 3)]).await.unwrap();
+        store.append(&[entry(1, 4), entry(1, 5)]).await.unwrap();
+        let files = segment_files(&store);
+        assert_eq!(files.len(), 3);
+        drop(store);
 
-        // Hand-delete the top two entries to mimic the on-disk
-        // state after a `truncate_from(2)` that crashed after
-        // removing 5 and 4 but before 3 and 2. Ascending-order
-        // deletion would have left 5 in place with 2 and 3 gone — a
-        // hole at indices 2,3 with last_log=5.
-        remove_if_exists(&store.entry_path(5)).await.unwrap();
-        remove_if_exists(&store.entry_path(4)).await.unwrap();
-
+        // Hand-remove the last segment, as a `truncate_from(2)` that
+        // crashed after removing later segments would leave things.
+        std::fs::remove_file(&files[2]).unwrap();
+        let store = reopen(&dir).await;
         let state = store.log_state().await.unwrap();
         assert_eq!(state.last_log, Some(LogId::new(1, 3)));
         let got = store.read_range(0..100).await.unwrap();
@@ -688,59 +1321,220 @@ mod tests {
         assert_eq!(indices, vec![1, 2, 3]);
     }
 
+    /// The unlinks a directory fsync has not yet covered at `crash_at`, in
+    /// the order they were issued. A crash there may lose any of them.
+    fn unsynced_unlinks(trace: &[DeviceStep], crash_at: usize) -> Vec<PathBuf> {
+        let mut unsynced = Vec::new();
+        for step in &trace[..crash_at] {
+            match step {
+                DeviceStep::Unlink(path) => unsynced.push(path.clone()),
+                DeviceStep::DirFsync => unsynced.clear(),
+                DeviceStep::Shorten => {}
+            }
+        }
+        unsynced
+    }
+
+    async fn three_segments() -> (TempDir, FsRaftLogStore, Vec<(PathBuf, Vec<u8>)>) {
+        let dir = TempDir::new().unwrap();
+        // Tiny segments: every append starts a new one.
+        let store = FsRaftLogStore::open_with_segment_bytes(dir.path().to_path_buf(), 1)
+            .await
+            .unwrap();
+        store.append(&[entry(1, 1), entry(1, 2)]).await.unwrap();
+        store.append(&[entry(1, 3)]).await.unwrap();
+        store.append(&[entry(1, 4)]).await.unwrap();
+        let files = segment_files(&store);
+        assert_eq!(files.len(), 3);
+        let saved = files
+            .iter()
+            .map(|p| (p.clone(), std::fs::read(p).unwrap()))
+            .collect();
+        (dir, store, saved)
+    }
+
+    /// Every crash point inside `truncate_from` must leave a prefix of the
+    /// log. Modelled on what a directory fsync promises: an unlink is on the
+    /// device once one follows it and may be lost until then. A crash right
+    /// after the retained segment is shortened has to find every later
+    /// segment's unlink already covered, or reopen meets a hole.
     #[tokio::test]
-    async fn purge_removes_prefix_and_records_last_purged() {
-        let (_dir, store) = fresh_log_store().await;
+    async fn later_segments_are_durably_gone_before_the_cut_segment_shrinks() {
+        let (dir, store, saved) = three_segments().await;
+        store.truncate_from(2).await.unwrap();
+        let trace = store.device_trace().await;
+        let shorten = trace
+            .iter()
+            .position(|s| *s == DeviceStep::Shorten)
+            .expect("the cut segment was shortened");
+        let lost = unsynced_unlinks(&trace, shorten + 1);
+        drop(store);
+        for (path, bytes) in &saved {
+            if lost.contains(path) {
+                std::fs::write(path, bytes).unwrap();
+            }
+        }
+        let reopened = FsRaftLogStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap_or_else(|e| {
+                panic!("an interrupted truncation must not prevent restart: {e} (unlinks not durable when the segment shrank: {lost:?})")
+            });
+        let got = reopened.read_range(0..100).await.unwrap();
+        let indices: Vec<u64> = got.iter().map(|e| e.log_id.index).collect();
+        assert_eq!(indices, vec![1]);
+    }
+
+    /// The same for `purge_through`, which removes obsolete segments oldest
+    /// first: at any crash point the segments still on the device must be a
+    /// contiguous suffix. Losing an older unlink while a newer one held
+    /// would leave a hole below the marker that the scan refuses.
+    #[tokio::test]
+    async fn purged_segments_go_oldest_first_each_durable_before_the_next() {
+        let (dir, store, saved) = three_segments().await;
+        store.purge_through(LogId::new(1, 3)).await.unwrap();
+        let trace = store.device_trace().await;
+        let last_fsync = trace
+            .iter()
+            .rposition(|s| *s == DeviceStep::DirFsync)
+            .expect("removals were flushed");
+        // Crash just before the final directory fsync, and lose the oldest
+        // unlink it had not yet covered while keeping every newer one.
+        let lost = unsynced_unlinks(&trace, last_fsync).into_iter().next();
+        drop(store);
+        if let Some(path) = &lost {
+            let bytes = &saved.iter().find(|(p, _)| p == path).unwrap().1;
+            std::fs::write(path, bytes).unwrap();
+        }
+        let reopened = FsRaftLogStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap_or_else(|e| {
+                panic!("an interrupted purge must not prevent restart: {e} (lost unlink: {lost:?})")
+            });
+        let got = reopened.read_range(0..100).await.unwrap();
+        let indices: Vec<u64> = got.iter().map(|e| e.log_id.index).collect();
+        assert_eq!(indices, vec![4]);
+    }
+
+    #[tokio::test]
+    async fn entries_span_segments_and_survive_reopen() {
+        let dir = TempDir::new().unwrap();
+        let store = FsRaftLogStore::open_with_segment_bytes(dir.path().to_path_buf(), 64)
+            .await
+            .unwrap();
+        for i in 1..=20 {
+            store.append(&[entry(1, i)]).await.unwrap();
+        }
+        assert!(segment_files(&store).len() > 1, "rotation happened");
+        let got = store.read_range(5..15).await.unwrap();
+        let indices: Vec<u64> = got.iter().map(|e| e.log_id.index).collect();
+        assert_eq!(indices, (5..15).collect::<Vec<_>>());
+        drop(store);
+
+        let store = reopen(&dir).await;
+        let got = store.read_range(0..100).await.unwrap();
+        assert_eq!(got.len(), 20);
+        assert_eq!(got[19].payload, b"entry-1-20");
+        assert_eq!(
+            store.log_state().await.unwrap().last_log,
+            Some(LogId::new(1, 20))
+        );
+        // The log continues where it left off after a reopen.
+        store.append(&[entry(2, 21)]).await.unwrap();
+        assert_eq!(
+            store.log_state().await.unwrap().last_log,
+            Some(LogId::new(2, 21))
+        );
+    }
+
+    #[tokio::test]
+    async fn truncate_inside_a_segment_then_append_continues() {
+        let dir = TempDir::new().unwrap();
+        let store = reopen(&dir).await;
         store
             .append(&[entry(1, 1), entry(1, 2), entry(1, 3), entry(1, 4)])
             .await
             .unwrap();
-        store.purge_through(LogId::new(1, 2)).await.unwrap();
-
+        store.truncate_from(3).await.unwrap();
+        store.append(&[entry(2, 3), entry(2, 4)]).await.unwrap();
         let got = store.read_range(0..100).await.unwrap();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].log_id.index, 3);
-
-        let state = store.log_state().await.unwrap();
-        assert_eq!(state.last_purged, Some(LogId::new(1, 2)));
-        assert_eq!(state.last_log, Some(LogId::new(1, 4)));
+        let ids: Vec<LogId> = got.iter().map(|e| e.log_id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                LogId::new(1, 1),
+                LogId::new(1, 2),
+                LogId::new(2, 3),
+                LogId::new(2, 4)
+            ]
+        );
+        drop(store);
+        let store = reopen(&dir).await;
+        let got = store.read_range(0..100).await.unwrap();
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[2].log_id, LogId::new(2, 3));
     }
 
+    /// Per-entry files from an earlier release fold into one segment on
+    /// open, keeping the contiguous run above the purge cutoff and
+    /// dropping orphans past a gap, as the old store's `log_state` did.
     #[tokio::test]
-    async fn purge_idempotent_when_already_past() {
-        let (_dir, store) = fresh_log_store().await;
-        store
-            .append(&[entry(1, 1), entry(1, 2), entry(1, 3)])
-            .await
-            .unwrap();
-        store.purge_through(LogId::new(1, 2)).await.unwrap();
-        store.purge_through(LogId::new(1, 1)).await.unwrap();
-        let state = store.log_state().await.unwrap();
-        assert_eq!(state.last_purged, Some(LogId::new(1, 2)));
+    async fn legacy_entry_files_fold_into_a_segment_on_open() {
+        let dir = TempDir::new().unwrap();
+        let log_dir = dir.path().join("log");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        for i in [1, 2, 3, 4, 6] {
+            let bytes = postcard::to_allocvec(&entry(1, i)).unwrap();
+            std::fs::write(log_dir.join(entry_filename(i)), bytes).unwrap();
+        }
+        let marker = postcard::to_allocvec(&LogId::new(1, 1)).unwrap();
+        std::fs::write(dir.path().join("last_purged"), marker).unwrap();
+        let committed = postcard::to_allocvec(&LogId::new(1, 3)).unwrap();
+        std::fs::write(dir.path().join("committed"), committed).unwrap();
+
+        let store = reopen(&dir).await;
+        let got = store.read_range(0..100).await.unwrap();
+        let indices: Vec<u64> = got.iter().map(|e| e.log_id.index).collect();
+        assert_eq!(indices, vec![2, 3, 4], "above the cutoff, up to the gap");
+        assert_eq!(
+            store.read_committed().await.unwrap(),
+            Some(LogId::new(1, 3))
+        );
+        assert!(
+            std::fs::read_dir(&log_dir)
+                .unwrap()
+                .flatten()
+                .all(|e| e.path().extension().is_some_and(|x| x == "seg")),
+            "only segments remain"
+        );
+        assert!(!dir.path().join("committed").exists());
+        store.append(&[entry(1, 5)]).await.unwrap();
+        assert_eq!(
+            store.log_state().await.unwrap().last_log,
+            Some(LogId::new(1, 5))
+        );
     }
 
     /// Simulates a crash after `purge_through` wrote the marker but
-    /// before all entry files at or below it were deleted. The
-    /// orphans must be invisible to openraft: `log_state` reports
-    /// `last_log` from entries strictly above the marker, and
-    /// `read_range` returns only the live tail.
+    /// before the segments at or below it were removed. The orphans
+    /// must be invisible to openraft: `log_state` reports `last_log`
+    /// from entries strictly above the marker, and `read_range`
+    /// returns only the live tail.
     #[tokio::test]
     async fn log_state_hides_orphans_below_last_purged() {
-        let (_dir, store) = fresh_log_store().await;
+        let dir = TempDir::new().unwrap();
+        let store = reopen(&dir).await;
         store
             .append(&[entry(1, 1), entry(1, 2), entry(1, 3), entry(2, 4)])
             .await
             .unwrap();
-
-        // Hand-write the marker as if a purge through index 3 had
-        // gotten that far. Entries 1..3 are still on disk — those
-        // are the orphans the next-step deletion would have removed.
         let marker =
             postcard::to_allocvec(&LogId::new(1, 3)).expect("encode last_purged for fixture");
         atomic_write(&store.last_purged_path(), &marker)
             .await
             .expect("write last_purged fixture");
+        drop(store);
 
+        let store = reopen(&dir).await;
         let state = store.log_state().await.unwrap();
         assert_eq!(state.last_purged, Some(LogId::new(1, 3)));
         assert_eq!(
@@ -748,10 +1542,7 @@ mod tests {
             Some(LogId::new(2, 4)),
             "last_log must come from entries strictly above last_purged"
         );
-
-        // A range covering everything above the marker must not be
-        // affected by the orphans.
-        let tail = store.read_range(4..100).await.unwrap();
+        let tail = store.read_range(0..100).await.unwrap();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].log_id, LogId::new(2, 4));
     }
@@ -762,15 +1553,17 @@ mod tests {
     /// instead of advertising an orphan as the live tail.
     #[tokio::test]
     async fn log_state_returns_none_when_only_orphans_remain() {
-        let (_dir, store) = fresh_log_store().await;
+        let dir = TempDir::new().unwrap();
+        let store = reopen(&dir).await;
         store.append(&[entry(1, 1), entry(1, 2)]).await.unwrap();
-
         let marker =
             postcard::to_allocvec(&LogId::new(1, 5)).expect("encode last_purged for fixture");
         atomic_write(&store.last_purged_path(), &marker)
             .await
             .expect("write last_purged fixture");
+        drop(store);
 
+        let store = reopen(&dir).await;
         let state = store.log_state().await.unwrap();
         assert_eq!(state.last_purged, Some(LogId::new(1, 5)));
         assert!(
@@ -779,74 +1572,149 @@ mod tests {
         );
     }
 
+    /// An append that crashed mid-write leaves a torn frame at the end
+    /// of the last segment. It was never acknowledged; the open cuts it
+    /// off and `last_log` is the last whole frame.
     #[tokio::test]
-    async fn log_state_stops_at_a_tail_gap() {
-        // Simulate an `append` batch that crashed before its final
-        // directory fsync: entries 1..3 durable, 4's rename lost, 5
-        // durable past the gap. `log_state` must report `last_log = 3`
-        // (the contiguous prefix), never 5 — otherwise openraft would
-        // see a `last_log` past the missing entry 4.
-        let (_dir, store) = fresh_log_store().await;
-        store
-            .append(&[
-                entry(1, 1),
-                entry(1, 2),
-                entry(1, 3),
-                entry(1, 4),
-                entry(1, 5),
-            ])
-            .await
-            .unwrap();
-        std::fs::remove_file(store.entry_path(4)).expect("open the gap at index 4");
-
-        let state = store.log_state().await.unwrap();
-        assert_eq!(
-            state.last_log,
-            Some(LogId::new(1, 3)),
-            "last_log must stop at the gap, ignoring the orphan at 5"
-        );
-    }
-
-    #[tokio::test]
-    async fn log_state_reports_none_on_a_front_gap() {
-        // The gap is at the very first expected index. This is the
-        // crash-mid-append case on a log that was empty above the
-        // cutoff (fresh node, or right after a snapshot install +
-        // full purge): the batch's first entry's rename is lost while
-        // later ones survive. With nothing older to anchor the run,
-        // `last_log` must be `None` — reporting the surviving orphans'
-        // top would put `last_log` above the missing anchor.
-
-        // No purge marker → the anchor is index 1; drop entry 1.
-        let (_dir, store) = fresh_log_store().await;
+    async fn a_torn_tail_is_cut_on_open() {
+        let dir = TempDir::new().unwrap();
+        let store = reopen(&dir).await;
         store
             .append(&[entry(1, 1), entry(1, 2), entry(1, 3)])
             .await
             .unwrap();
-        std::fs::remove_file(store.entry_path(1)).expect("open the front gap at index 1");
-        let state = store.log_state().await.unwrap();
-        assert!(
-            state.last_log.is_none(),
-            "a gap at the anchor must yield last_log=None, got {:?}",
-            state.last_log
-        );
+        let file = segment_files(&store).pop().unwrap();
+        drop(store);
+        let len = std::fs::metadata(&file).unwrap().len();
+        let torn = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        torn.set_len(len - 3).unwrap();
+        drop(torn);
 
-        // With a purge cutoff at 3, the anchor is index 4; drop entry 4.
-        let (_dir2, store2) = fresh_log_store().await;
-        store2
-            .append(&[entry(1, 4), entry(1, 5), entry(1, 6)])
-            .await
-            .unwrap();
+        let store = reopen(&dir).await;
+        assert_eq!(
+            store.log_state().await.unwrap().last_log,
+            Some(LogId::new(1, 2))
+        );
+        store.append(&[entry(1, 3)]).await.unwrap();
+        let got = store.read_range(0..100).await.unwrap();
+        assert_eq!(got.len(), 3);
+    }
+
+    /// A torn frame at the very front leaves nothing: `last_log` is
+    /// `None`, with or without a purge cutoff, rather than an orphan.
+    #[tokio::test]
+    async fn a_torn_first_frame_leaves_an_empty_log() {
+        let dir = TempDir::new().unwrap();
+        let store = reopen(&dir).await;
+        store.append(&[entry(1, 4), entry(1, 5)]).await.unwrap();
         let marker = postcard::to_allocvec(&LogId::new(1, 3)).expect("encode marker");
-        atomic_write(&store2.last_purged_path(), &marker)
+        atomic_write(&store.last_purged_path(), &marker)
             .await
             .expect("write marker");
-        std::fs::remove_file(store2.entry_path(4)).expect("open the front gap at index 4");
-        let state2 = store2.log_state().await.unwrap();
+        let file = segment_files(&store).pop().unwrap();
+        drop(store);
+        let mut bytes = std::fs::read(&file).unwrap();
+        bytes[SEGMENT_HEADER + 5] ^= 0xff;
+        std::fs::write(&file, bytes).unwrap();
+
+        let store = reopen(&dir).await;
+        let state = store.log_state().await.unwrap();
+        assert_eq!(state.last_purged, Some(LogId::new(1, 3)));
         assert!(
-            state2.last_log.is_none(),
-            "a gap at cutoff+1 must yield last_log=None, got {:?}",
-            state2.last_log
+            state.last_log.is_none(),
+            "a torn anchor must yield last_log=None, got {:?}",
+            state.last_log
+        );
+    }
+
+    /// Damage before a later segment is not a torn append — rotation
+    /// flushed that segment before the next one opened — so it may
+    /// cover acknowledged entries. The open refuses instead of skipping.
+    #[tokio::test]
+    async fn damage_before_a_later_segment_fails_open() {
+        let dir = TempDir::new().unwrap();
+        let store = FsRaftLogStore::open_with_segment_bytes(dir.path().to_path_buf(), 1)
+            .await
+            .unwrap();
+        store.append(&[entry(1, 1), entry(1, 2)]).await.unwrap();
+        store.append(&[entry(1, 3)]).await.unwrap();
+        let files = segment_files(&store);
+        drop(store);
+        let mut bytes = std::fs::read(&files[0]).unwrap();
+        bytes[SEGMENT_HEADER + 5] ^= 0xff;
+        std::fs::write(&files[0], bytes).unwrap();
+
+        let err = match FsRaftLogStore::open(dir.path().to_path_buf()).await {
+            Ok(_) => panic!("damaged early segment must refuse"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, StorageError::Corruption(_)), "{err:?}");
+    }
+
+    /// Truncating a segment to nothing and purging past it must not leave a
+    /// header naming an old index that a later append would silently fill
+    /// behind, only for the next open to read those entries as torn.
+    #[tokio::test]
+    async fn snapshot_after_truncation_preserves_new_entries() {
+        let dir = TempDir::new().unwrap();
+        let store = reopen(&dir).await;
+        store
+            .append(&(1..=10).map(|i| entry(1, i)).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        store.truncate_from(1).await.unwrap();
+        store.purge_through(LogId::new(2, 10)).await.unwrap();
+        store.append(&[entry(2, 11)]).await.unwrap();
+        assert_eq!(store.read_range(11..12).await.unwrap().len(), 1);
+        drop(store);
+        let store = reopen(&dir).await;
+        assert_eq!(store.read_range(11..12).await.unwrap().len(), 1);
+        assert_eq!(
+            store.log_state().await.unwrap().last_log,
+            Some(LogId::new(2, 11))
+        );
+    }
+
+    /// A crash while the next segment was being created leaves no published
+    /// segment without a header; an empty published file from an older
+    /// layout is removed rather than refusing the open.
+    #[tokio::test]
+    async fn a_torn_new_segment_does_not_block_recovery() {
+        let dir = TempDir::new().unwrap();
+        let store = reopen(&dir).await;
+        store.append(&[entry(1, 1)]).await.unwrap();
+        drop(store);
+        let log_dir = dir.path().join("log");
+        std::fs::write(log_dir.join(segment_filename(2)), []).unwrap();
+        std::fs::write(log_dir.join("0000000000000003.seg.tmp"), b"partial").unwrap();
+        let store = reopen(&dir).await;
+        assert_eq!(
+            store.log_state().await.unwrap().last_log,
+            Some(LogId::new(1, 1))
+        );
+        store.append(&[entry(1, 2)]).await.unwrap();
+        assert_eq!(store.read_range(0..100).await.unwrap().len(), 2);
+        assert!(!log_dir.join("0000000000000003.seg.tmp").exists());
+    }
+
+    /// The committed watermark alternates between two slots; a torn
+    /// write of the newer one falls back to the older valid value.
+    #[tokio::test]
+    async fn committed_falls_back_to_the_older_slot_when_the_newer_is_torn() {
+        let dir = TempDir::new().unwrap();
+        let store = reopen(&dir).await;
+        store.save_committed(Some(LogId::new(1, 1))).await.unwrap();
+        store.save_committed(Some(LogId::new(1, 2))).await.unwrap();
+        drop(store);
+        let path = dir.path().join(COMMITTED_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Generation 2 landed in slot 0; damage it.
+        bytes[3] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        let store = reopen(&dir).await;
+        assert_eq!(
+            store.read_committed().await.unwrap(),
+            Some(LogId::new(1, 1))
         );
     }
 
@@ -1132,5 +2000,65 @@ mod tests {
         );
         let (_, data) = storage.snapshots().current().await.unwrap().unwrap();
         assert_eq!(data, vec![99]);
+    }
+
+    #[tokio::test]
+    async fn review_committed_survives_loss_of_new_slots_entire_page() {
+        let dir = TempDir::new().unwrap();
+        let store = reopen(&dir).await;
+        store.save_committed(Some(LogId::new(1, 1))).await.unwrap();
+        store.save_committed(Some(LogId::new(1, 2))).await.unwrap();
+        drop(store);
+        let path = dir.path().join(COMMITTED_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 8192);
+        bytes[..4096].fill(0); // Generation 2's page, including neighboring bytes.
+        std::fs::write(&path, bytes).unwrap();
+        let store = reopen(&dir).await;
+        assert_eq!(
+            store.read_committed().await.unwrap(),
+            Some(LogId::new(1, 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn review_legacy_committed_slots_migrate_and_keep_fallback() {
+        let dir = TempDir::new().unwrap();
+        let mut bytes = vec![0u8; 128];
+        // Encode the old layout independently of the new encoder.
+        for (i, generation) in [(0, 2u64), (1, 1u64)] {
+            let slot = &mut bytes[i * 64..(i + 1) * 64];
+            slot[..4].copy_from_slice(b"FRCM");
+            slot[4..12].copy_from_slice(&generation.to_le_bytes());
+            slot[12] = 1;
+            slot[13..21].copy_from_slice(&1u64.to_le_bytes());
+            slot[21..29].copy_from_slice(&generation.to_le_bytes());
+            let hash = frame_hash(&slot[..56]);
+            slot[56..].copy_from_slice(&hash.to_le_bytes());
+        }
+        let path = dir.path().join(COMMITTED_FILE);
+        std::fs::write(&path, bytes).unwrap();
+        let store = reopen(&dir).await;
+        assert_eq!(
+            store.read_committed().await.unwrap(),
+            Some(LogId::new(1, 2))
+        );
+        drop(store);
+        let mut migrated = std::fs::read(&path).unwrap();
+        assert_eq!(migrated.len(), 8192);
+        migrated[..4096].fill(0);
+        std::fs::write(&path, migrated).unwrap();
+        let store = reopen(&dir).await;
+        assert_eq!(
+            store.read_committed().await.unwrap(),
+            Some(LogId::new(1, 1))
+        );
+        store.save_committed(Some(LogId::new(1, 3))).await.unwrap();
+        drop(store);
+        let store = reopen(&dir).await;
+        assert_eq!(
+            store.read_committed().await.unwrap(),
+            Some(LogId::new(1, 3))
+        );
     }
 }

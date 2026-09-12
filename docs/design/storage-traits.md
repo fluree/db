@@ -186,6 +186,14 @@ commits. Source-of-truth kinds — `Commit`, `Txn`, `LedgerConfig`,
 `GraphSourceMapping` — follow the instance setting. The match is exhaustive, so
 adding a `ContentKind` forces this decision at compile time.
 
+`StorageWrite::sync` (and `ContentStore::sync`, which forwards to it) flushes
+whatever the backend reported complete short of the device: for `FileStorage`,
+the derived content written since the last call. Publishing a pointer to
+derived content — an index head — calls it first, so the pointer never names
+files that did not reach the device, and the flushes are paid once per build
+rather than once per object. Backends whose writes are durable on return keep
+the default no-op.
+
 Callers that need a durability guarantee should get it from the backend rather
 than adding flushes of their own; see
 [Storage durability](../operations/storage.md#durability).

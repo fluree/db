@@ -4,6 +4,7 @@
 //! using `tokio::fs` for async I/O. This module is only compiled on non-WASM
 //! targets with the `native` feature enabled.
 
+use super::wal::{self, Acquire, Op, Wal, WAL_DIR};
 use crate::error::Result;
 use crate::{
     content_address, CasAction, CasOutcome, ContentAddressedWrite, ContentKind, ContentWriteResult,
@@ -12,7 +13,7 @@ use crate::{
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub use super::Durability;
 
@@ -304,7 +305,10 @@ fn sweep_orphaned_staging_files(
                 continue;
             };
             if file_type.is_dir() {
-                dirs.push(entry.path());
+                // The WAL stages nothing this sweep should touch.
+                if entry.file_name() != WAL_DIR {
+                    dirs.push(entry.path());
+                }
                 continue;
             }
             if !file_type.is_file() {
@@ -504,6 +508,68 @@ pub struct FileStorage {
     /// Device flushes issued so far. Shared across clones, which address the
     /// same directory and so are the same storage. See [`Self::fsyncs_issued`].
     fsyncs: Arc<AtomicU64>,
+    /// The root's WAL under [`Durability::Wal`], attached on the
+    /// first write or by [`Self::recover_wal`]. Shared across clones.
+    wal: Arc<parking_lot::Mutex<WalAttach>>,
+    /// Shared across all local handles on the canonical root, including Sync
+    /// handles. Readers of this gate are file operations; replay is exclusive.
+    operation_gate: Arc<OnceLock<Arc<tokio::sync::RwLock<()>>>>,
+    /// Which log this handle owns when the root is shared by several
+    /// processes. See [`Self::with_wal_owner`].
+    wal_owner: Option<Arc<str>>,
+    /// Derived content written since the last [`StorageWrite::sync`], as
+    /// root-relative keys. Shared across clones. Empty under
+    /// [`Durability::PageCache`], where nothing is ever flushed.
+    unflushed: Arc<std::sync::Mutex<Vec<String>>>,
+    /// One [`StorageWrite::sync`] at a time per root, so a caller whose
+    /// writes an earlier, still-running flush took waits for that flush
+    /// instead of returning before its files are on the device.
+    flushing: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(test)]
+    after_checkpoint: AfterCheckpoint,
+}
+
+#[cfg(test)]
+type Hook = Box<dyn Fn() + Send + Sync>;
+
+/// A test's hook into the oversized write path, run between the checkpoint
+/// and the write.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct AfterCheckpoint(Arc<std::sync::Mutex<Option<Hook>>>);
+
+#[cfg(test)]
+impl std::fmt::Debug for AfterCheckpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AfterCheckpoint")
+    }
+}
+
+/// A logged operation's exclusive hold on its key.
+type KeyHold = tokio::sync::OwnedMutexGuard<()>;
+
+/// The next operation may retry contention, but never unsupported storage or
+/// a poisoned attached log. The root operation gate serializes transitions.
+#[derive(Debug)]
+enum WalAttach {
+    Unattached,
+    Log(Arc<Wal>),
+    Busy {
+        retry_at: std::time::Instant,
+        recovery_pending: bool,
+    },
+    Unsupported,
+}
+
+const WAL_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Pins one mode through read/closure/write (including a CAS's async hop).
+/// Drop the key guard before releasing the root gate.
+struct OperationHold {
+    _key: Option<KeyHold>,
+    log: Option<Arc<Wal>>,
+    durability: Durability,
+    _root: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
 impl FileStorage {
@@ -512,21 +578,29 @@ impl FileStorage {
     /// The base path should be the ledger's data directory containing the ledger
     /// subdirectories (e.g. `mydb/main/index/...`).
     ///
-    /// Durability defaults to [`Durability::Sync`], overridable for this
+    /// Durability defaults to [`Durability::Wal`], overridable for this
     /// process by [`Durability::ENV_VAR`] or per instance by
     /// [`Self::with_durability`].
     ///
     /// Constructing a storage touches nothing on disk. In particular it does
-    /// **not** reclaim orphaned staging files: unlinking is a startup
-    /// decision, and only the startup layer knows it is starting up. A test
-    /// or a tool that constructs a `FileStorage` on a directory it does not
-    /// own must not mutate that directory — the connection and builder
-    /// startup paths call [`Self::sweep_orphaned_staging`] explicitly.
+    /// **not** reclaim orphaned staging files or replay a WAL: both are
+    /// startup decisions, and only the startup layer knows it is starting up.
+    /// A test or a tool that constructs a `FileStorage` on a directory it does
+    /// not own must not mutate that directory — the connection and builder
+    /// startup paths call [`Self::sweep_orphaned_staging`] and
+    /// [`Self::recover_wal`] explicitly.
     pub fn new(base_path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             base_path: base_path.into(),
             durability: Durability::from_env(),
             fsyncs: Arc::new(AtomicU64::new(0)),
+            wal: Arc::new(parking_lot::Mutex::new(WalAttach::Unattached)),
+            operation_gate: Arc::new(OnceLock::new()),
+            wal_owner: None,
+            unflushed: Arc::new(std::sync::Mutex::new(Vec::new())),
+            flushing: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            after_checkpoint: AfterCheckpoint::default(),
         }
     }
 
@@ -681,14 +755,280 @@ impl FileStorage {
         self.durability
     }
 
+    /// Journal a root that other processes journal too, under a log of this
+    /// handle's own. For a Raft cluster's shared payload store: each node
+    /// passes its own id. An owned log flushes on every write, because the
+    /// head that would otherwise flush on a payload's behalf lives in Raft,
+    /// not in a file under this root; a payload is therefore durable before
+    /// its reference is proposed, at one flush instead of two. Any node
+    /// applies a stopped node's unflushed tail when it opens the root or
+    /// misses a file.
+    ///
+    /// Owner names are 1-64 characters of `[A-Za-z0-9._-]` not starting with
+    /// a dot; an invalid name makes the first write fail.
+    pub fn with_wal_owner(mut self, owner: impl Into<String>) -> Self {
+        self.wal_owner = Some(Arc::from(owner.into()));
+        self
+    }
+
     /// Device flushes issued by this storage since it was constructed, counting
-    /// both the staged file and its parent directory.
+    /// both the staged file and its parent directory, and under
+    /// [`Durability::Wal`] every flush of the root's WAL, including
+    /// the background ones that retire its segments.
     ///
     /// Stays at zero under [`Durability::PageCache`] and for derived content in
-    /// either mode. Exposed because a flush leaves no trace in the bytes on
+    /// any mode. Exposed because a flush leaves no trace in the bytes on
     /// disk, so this is the only way to tell a durable write from a cheap one.
     pub fn fsyncs_issued(&self) -> u64 {
-        self.fsyncs.load(Ordering::Relaxed)
+        let own = self.fsyncs.load(Ordering::Relaxed);
+        match &*self.wal.lock() {
+            WalAttach::Log(log) => own + log.fsyncs_issued(),
+            _ => own,
+        }
+    }
+
+    /// The durability writes actually get. [`Durability::Wal`] reads as
+    /// [`Durability::Sync`] once this root's log turned out to be unavailable.
+    pub fn effective_durability(&self) -> Durability {
+        match (self.durability, &*self.wal.lock()) {
+            (Durability::Wal, WalAttach::Busy { .. } | WalAttach::Unsupported) => Durability::Sync,
+            (durability, _) => durability,
+        }
+    }
+
+    /// Replay the WAL an earlier run left under this root, if any, so
+    /// state acknowledged before a crash is on disk before the first read.
+    ///
+    /// A startup action like [`Self::sweep_orphaned_staging`]: the connection
+    /// and builder paths call it, constructing a handle never does. Blocking.
+    /// Replays under any durability setting, so an operator who switched back
+    /// to per-write flushing after a crash still sees the acknowledged tail.
+    /// Leaves no trace on a root that never journaled.
+    pub fn recover_wal(&self) -> Result<()> {
+        let _root = futures::executor::block_on(self.root_gate()?.write_owned());
+        if self.durability == Durability::Wal {
+            self.attach_wal_locked(false)?;
+        } else {
+            // Replay and let go: this handle is not going to journal.
+            Wal::acquire(&self.base_path, self.wal_owner.as_deref(), false)
+                .map(drop)
+                .map_err(|e| Self::recovery_error(&self.base_path, e))?;
+        }
+        // A root several processes journal: apply what a stopped one left.
+        wal::replay_unowned(&self.base_path)
+            .map(drop)
+            .map_err(|e| Self::recovery_error(&self.base_path, e))
+    }
+
+    /// Apply the unflushed tail of any owner that is no longer running, for
+    /// a file that turned out to be missing. Only a shared root has owners,
+    /// so a standalone root pays one directory probe per miss and no more.
+    /// Returns whether anything was applied, so the caller can retry.
+    async fn replay_foreign_logs(&self) -> Result<bool> {
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _root = futures::executor::block_on(storage.root_gate()?.write_owned());
+            let base = &storage.base_path;
+            wal::replay_unowned(base)
+                .map(|records| records > 0)
+                .map_err(|e| Self::recovery_error(base, e))
+        })
+        .await
+        .map_err(|e| crate::error::Error::io(format!("WAL replay join: {e}")))?
+    }
+
+    fn recovery_error(base: &Path, e: std::io::Error) -> crate::error::Error {
+        crate::error::Error::storage(format!("WAL recovery failed for {}: {e}", base.display()))
+    }
+
+    fn root_gate(&self) -> Result<Arc<tokio::sync::RwLock<()>>> {
+        if let Some(gate) = self.operation_gate.get() {
+            return Ok(Arc::clone(gate));
+        }
+        let gate = wal::operation_gate(&self.base_path)
+            .map_err(|e| Self::recovery_error(&self.base_path, e))?;
+        Ok(Arc::clone(self.operation_gate.get_or_init(|| gate)))
+    }
+
+    fn attached_log(&self) -> Option<Arc<Wal>> {
+        match &*self.wal.lock() {
+            WalAttach::Log(log) => Some(Arc::clone(log)),
+            _ => None,
+        }
+    }
+
+    /// Called only with the root gate held exclusively and before any key
+    /// lock. Acquiring may replay and therefore must not overlap file writes.
+    fn attach_wal_locked(&self, create: bool) -> Result<Option<Arc<Wal>>> {
+        if self.durability != Durability::Wal {
+            return Ok(None);
+        }
+        let mut attached = self.wal.lock();
+        match &*attached {
+            WalAttach::Log(log) => return Ok(Some(Arc::clone(log))),
+            WalAttach::Unsupported => return Ok(None),
+            WalAttach::Busy { retry_at, .. } if std::time::Instant::now() < *retry_at => {
+                return Ok(None)
+            }
+            _ => {}
+        }
+        let retrying = matches!(*attached, WalAttach::Busy { .. });
+        let acquired = if retrying {
+            Wal::acquire_for_retry(&self.base_path, self.wal_owner.as_deref(), create)
+        } else {
+            Wal::acquire(&self.base_path, self.wal_owner.as_deref(), create)
+        }
+        .map_err(|e| Self::recovery_error(&self.base_path, e))?;
+        match acquired {
+            Acquire::Log(log) => {
+                if retrying {
+                    tracing::info!(root = %self.base_path.display(), "WAL contention cleared; using WAL durability");
+                }
+                *attached = WalAttach::Log(Arc::clone(&log));
+                Ok(Some(log))
+            }
+            Acquire::Absent => {
+                *attached = WalAttach::Unattached;
+                Ok(None)
+            }
+            Acquire::RecoveryPending => {
+                if !matches!(
+                    *attached,
+                    WalAttach::Busy {
+                        recovery_pending: true,
+                        ..
+                    }
+                ) {
+                    tracing::warn!(root = %self.base_path.display(), "WAL contention cleared but crash segments remain; keeping per-write durability until explicit recovery, without replaying over fallback writes");
+                }
+                *attached = WalAttach::Busy {
+                    retry_at: std::time::Instant::now() + WAL_RETRY_INTERVAL,
+                    recovery_pending: true,
+                };
+                Ok(None)
+            }
+            Acquire::Busy => {
+                if !retrying {
+                    tracing::warn!(root = %self.base_path.display(), "another process holds this root's WAL; flushing per write until acquisition can be retried");
+                }
+                *attached = WalAttach::Busy {
+                    retry_at: std::time::Instant::now() + WAL_RETRY_INTERVAL,
+                    recovery_pending: false,
+                };
+                Ok(None)
+            }
+            Acquire::Unsupported(e) => {
+                tracing::warn!(root = %self.base_path.display(), error = %e, "WAL unavailable here; this handle flushes per write instead");
+                *attached = WalAttach::Unsupported;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Pin the mode once, before taking any key lock. Established WAL use
+    /// only takes a shared root gate. A due retry takes exclusive ownership,
+    /// waits for preceding local operations, acquires a clean log (or joins
+    /// one already held locally), then downgrades the gate.
+    fn begin_operation(&self, durability: Durability, key: &str) -> Result<OperationHold> {
+        let gate = self.root_gate()?;
+        let mut root = futures::executor::block_on(Arc::clone(&gate).read_owned());
+        let needs_attach = durability == Durability::Wal
+            && match &*self.wal.lock() {
+                WalAttach::Unattached => true,
+                WalAttach::Busy { retry_at, .. } => std::time::Instant::now() >= *retry_at,
+                _ => false,
+            };
+        if needs_attach {
+            drop(root);
+            let exclusive = futures::executor::block_on(gate.write_owned());
+            self.attach_wal_locked(true)?;
+            root = exclusive.downgrade();
+        }
+        let log = if durability == Durability::Wal {
+            self.attached_log()
+        } else {
+            None
+        };
+        let key_hold = log.as_ref().map(|log| log.key_stripe(key));
+        Ok(OperationHold {
+            _key: key_hold,
+            log,
+            durability,
+            _root: root,
+        })
+    }
+
+    /// How a write of `len` bytes lands under `durability`: the log it is
+    /// appended to first, if any, and the policy the file is then written with.
+    /// A record too large for the log is flushed directly instead, once the
+    /// log is checkpointed: its earlier appends must be durable before a head
+    /// published this way is, and nothing left to replay may touch the key
+    /// the write lands on, or a crash would undo a write the caller was told
+    /// is durable.
+    fn write_plan(
+        &self,
+        operation: &OperationHold,
+        len: usize,
+    ) -> Result<(WritePolicy, Option<Arc<Wal>>)> {
+        if operation.durability != Durability::Wal {
+            return Ok((self.policy(operation.durability), None));
+        }
+        if let Some(log) = operation.log.as_ref() {
+            if len <= wal::MAX_RECORD_BYTES {
+                return Ok((self.policy(Durability::PageCache), Some(Arc::clone(log))));
+            }
+            let waiting = log.checkpoint().map_err(|e| {
+                crate::error::Error::io(format!("WAL checkpoint before an oversized write: {e}"))
+            })?;
+            if waiting > 0 {
+                return Err(crate::error::Error::io(format!(
+                    "WAL checkpoint before an oversized write left {waiting} segment(s) with \
+                     records still materializing; refusing a write that replay could undo"
+                )));
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.after_checkpoint.0.lock().unwrap().as_ref() {
+                hook();
+            }
+        }
+        Ok((self.policy(Durability::Sync), None))
+    }
+
+    /// Flush everything the WAL under `root` still covers and retire its
+    /// segments, so the root reads the same to a binary that knows nothing
+    /// about the log. The shutdown hook for a WAL-owning process; dropping the
+    /// last handle does the same, but a handle a background task still holds
+    /// would keep the log open until that task ends. Blocking. A root this
+    /// process is not the WAL is left alone.
+    pub fn checkpoint_wal(root: impl AsRef<Path>) -> Result<bool> {
+        wal::checkpoint_root(root.as_ref()).map_err(|e| Self::recovery_error(root.as_ref(), e))
+    }
+
+    /// Abandon the WAL without flushing, as a crash would, so a test can
+    /// reopen the root and exercise replay within one process.
+    #[doc(hidden)]
+    pub fn simulate_crash_for_test(&self) {
+        if let Some(log) = self.attached_log() {
+            log.simulate_crash();
+        }
+    }
+
+    /// Keep WAL segments until close, so a test that crashes the log finds
+    /// its records still there however slowly it runs. Attaches the log.
+    #[doc(hidden)]
+    pub fn hold_wal_segments_for_test(&self) -> Result<()> {
+        let _root = futures::executor::block_on(self.root_gate()?.write_owned());
+        if let Some(log) = self.attach_wal_locked(true)? {
+            log.hold_segments();
+        }
+        Ok(())
+    }
+
+    /// Run `f` on the writing thread between an oversized write's checkpoint
+    /// and its write. Shared across clones.
+    #[cfg(test)]
+    pub(crate) fn set_after_checkpoint_hook_for_test(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.after_checkpoint.0.lock().unwrap() = Some(Box::new(f));
     }
 
     /// Durability for a write of `kind`.
@@ -740,28 +1080,36 @@ impl FileStorage {
     /// Handles both raw file paths and Fluree address format.
     /// Address format: `fluree:file://path/to/file.json`
     fn resolve_path(&self, address: &str) -> Result<std::path::PathBuf> {
-        if let Some(path) = Self::extract_path_from_address(address) {
-            return self.resolve_relative_path(path);
-        }
-        // Simple case: just a node ID, look for it as a .json file
-        self.resolve_relative_path(&format!("{address}.json"))
+        self.resolve_key(address).map(|(_, path)| path)
+    }
+
+    /// Resolve an address to the root-relative key the WAL records and
+    /// the file path it names.
+    fn resolve_key(&self, address: &str) -> Result<(String, std::path::PathBuf)> {
+        let key = match Self::extract_path_from_address(address) {
+            Some(path) => path.to_owned(),
+            // Simple case: just a node ID, look for it as a .json file
+            None => format!("{address}.json"),
+        };
+        let path = self.resolve_relative_path(&key)?;
+        Ok((key, path))
     }
 
     fn resolve_relative_path(&self, path: &str) -> Result<std::path::PathBuf> {
         use std::path::Component;
         let p = std::path::Path::new(path);
 
-        // Disallow absolute paths and path traversal.
+        // Disallow absolute paths, path traversal, and the log's own directory.
         if p.is_absolute()
             || p.components().any(|c| {
                 matches!(
                     c,
                     Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
+                ) || c.as_os_str() == WAL_DIR
             })
         {
             return Err(crate::error::Error::storage(format!(
-                "Invalid storage path '{path}': must be a relative path without '..'"
+                "Invalid storage path '{path}': must be a relative path without '..' or '{WAL_DIR}'"
             )));
         }
 
@@ -773,7 +1121,15 @@ impl FileStorage {
 impl StorageRead for FileStorage {
     async fn read_bytes(&self, address: &str) -> Result<Vec<u8>> {
         let path = self.resolve_path(address)?;
-        let bytes = tokio::fs::read(&path).await.map_err(|e| {
+        let mut read = tokio::fs::read(&path).await;
+        if read
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            && self.replay_foreign_logs().await?
+        {
+            read = tokio::fs::read(&path).await;
+        }
+        let bytes = read.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 crate::error::Error::not_found(format!("{}: {}", address, path.display()))
             } else {
@@ -825,6 +1181,18 @@ impl StorageRead for FileStorage {
                 );
                 None
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // On a shared root a stopped owner's log may still hold this
+                // file. Applying it blocks, but only on a miss, and only when
+                // the root has owned logs at all.
+                match wal::replay_unowned(&self.base_path) {
+                    Ok(applied) if applied > 0 => std::fs::metadata(&path)
+                        .ok()
+                        .filter(|m| m.len() > 0)
+                        .map(|_| path),
+                    _ => None,
+                }
+            }
             Err(_) => None,
         }
     }
@@ -836,108 +1204,124 @@ impl StorageRead for FileStorage {
         }
         let requested = range.end - range.start;
         let offset = range.start;
-        let address = address.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::File::open(&path).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    crate::error::Error::not_found(format!("{}: {}", address, path.display()))
-                } else {
-                    crate::error::Error::io(format!("Failed to open {}: {}", path.display(), e))
+
+        /// One attempt; the caller retries once after applying a stopped
+        /// owner's log on a miss (see `replay_foreign_logs`).
+        async fn read_once(
+            path: PathBuf,
+            address: String,
+            offset: u64,
+            requested: u64,
+        ) -> Result<Vec<u8>> {
+            tokio::task::spawn_blocking(move || {
+                let file = std::fs::File::open(&path).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        crate::error::Error::not_found(format!("{}: {}", address, path.display()))
+                    } else {
+                        crate::error::Error::io(format!("Failed to open {}: {}", path.display(), e))
+                    }
+                })?;
+                // One stat off the open handle, serving both the zero-length guard
+                // and the clamp below: no extra syscall, and no window between the
+                // check and the read. `fstat` on a descriptor this thread owns does
+                // not fail in practice; if it ever did there would be nothing to
+                // size the read against, and saying so beats guessing a length.
+                let file_len = file
+                    .metadata()
+                    .map_err(|e| {
+                        crate::error::Error::io(format!("Failed to stat {}: {}", path.display(), e))
+                    })?
+                    .len();
+                // The fourth read path, held to the same rule as the other three:
+                // an empty file at a content address is debris, not content. A
+                // ranged read would otherwise stop at EOF and hand back an empty
+                // buffer — the "empty content" answer this whole change exists to
+                // replace with "absent". This arm is not hypothetical: once
+                // `resolve_local_path` refuses the debris, the leaflet reader
+                // falls through to `ContentStore::get_range`, which lands here for
+                // the very same file.
+                if file_len == 0 {
+                    tracing::warn!(
+                        address,
+                        path = %path.display(),
+                        "zero-length blob treated as absent on a ranged read (failed write \
+                         debris); it will be re-fetched or rebuilt. Delete it to reclaim the inode."
+                    );
+                    return Err(crate::error::Error::not_found(format!(
+                        "{}: {} (zero-length blob, treated as absent)",
+                        address,
+                        path.display()
+                    )));
                 }
-            })?;
-            // One stat off the open handle, serving both the zero-length guard
-            // and the clamp below: no extra syscall, and no window between the
-            // check and the read. `fstat` on a descriptor this thread owns does
-            // not fail in practice; if it ever did there would be nothing to
-            // size the read against, and saying so beats guessing a length.
-            let file_len = file
-                .metadata()
-                .map_err(|e| {
-                    crate::error::Error::io(format!("Failed to stat {}: {}", path.display(), e))
-                })?
-                .len();
-            // The fourth read path, held to the same rule as the other three:
-            // an empty file at a content address is debris, not content. A
-            // ranged read would otherwise stop at EOF and hand back an empty
-            // buffer — the "empty content" answer this whole change exists to
-            // replace with "absent". This arm is not hypothetical: once
-            // `resolve_local_path` refuses the debris, the leaflet reader
-            // falls through to `ContentStore::get_range`, which lands here for
-            // the very same file.
-            if file_len == 0 {
-                tracing::warn!(
-                    address,
-                    path = %path.display(),
-                    "zero-length blob treated as absent on a ranged read (failed write \
-                     debris); it will be re-fetched or rebuilt. Delete it to reclaim the inode."
-                );
-                return Err(crate::error::Error::not_found(format!(
-                    "{}: {} (zero-length blob, treated as absent)",
-                    address,
-                    path.display()
-                )));
-            }
-            // SIZE THE BUFFER FROM THE OBJECT, NOT FROM THE RANGE. The trait
-            // documents a ranged read as returning bytes that "may be shorter
-            // than requested if the object is smaller than `range.end`", and
-            // `mid..u64::MAX` is the established spelling of "read to the end"
-            // against it. Trusting the range's width made that spelling a
-            // `usize::MAX` allocation — a capacity-overflow panic that
-            // `spawn_blocking` caught and relabelled `Io("spawn_blocking
-            // failed: ...")`, so the one backend that could not serve the call
-            // was also the one that could not say why. The loops below already
-            // stop at EOF, so a range that fits reads exactly as before; this
-            // only stops the allocation from believing the caller.
-            let len = requested.min(file_len.saturating_sub(offset)) as usize;
-            let mut buf = vec![0u8; len];
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::FileExt;
-                let mut total = 0;
-                while total < len {
-                    let n = file
-                        .read_at(&mut buf[total..], offset + total as u64)
-                        .map_err(|e| {
+                // SIZE THE BUFFER FROM THE OBJECT, NOT FROM THE RANGE. The trait
+                // documents a ranged read as returning bytes that "may be shorter
+                // than requested if the object is smaller than `range.end`", and
+                // `mid..u64::MAX` is the established spelling of "read to the end"
+                // against it. Trusting the range's width made that spelling a
+                // `usize::MAX` allocation — a capacity-overflow panic that
+                // `spawn_blocking` caught and relabelled `Io("spawn_blocking
+                // failed: ...")`, so the one backend that could not serve the call
+                // was also the one that could not say why. The loops below already
+                // stop at EOF, so a range that fits reads exactly as before; this
+                // only stops the allocation from believing the caller.
+                let len = requested.min(file_len.saturating_sub(offset)) as usize;
+                let mut buf = vec![0u8; len];
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    let mut total = 0;
+                    while total < len {
+                        let n = file
+                            .read_at(&mut buf[total..], offset + total as u64)
+                            .map_err(|e| {
+                                crate::error::Error::io(format!(
+                                    "Failed to read range from {}: {}",
+                                    path.display(),
+                                    e
+                                ))
+                            })?;
+                        if n == 0 {
+                            break; // EOF
+                        }
+                        total += n;
+                    }
+                    buf.truncate(total);
+                }
+                #[cfg(not(unix))]
+                {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut file = file;
+                    file.seek(SeekFrom::Start(offset)).map_err(|e| {
+                        crate::error::Error::io(format!("Failed to seek {}: {}", path.display(), e))
+                    })?;
+                    let mut total = 0;
+                    while total < len {
+                        let n = file.read(&mut buf[total..]).map_err(|e| {
                             crate::error::Error::io(format!(
                                 "Failed to read range from {}: {}",
                                 path.display(),
                                 e
                             ))
                         })?;
-                    if n == 0 {
-                        break; // EOF
+                        if n == 0 {
+                            break; // EOF
+                        }
+                        total += n;
                     }
-                    total += n;
+                    buf.truncate(total);
                 }
-                buf.truncate(total);
+                Ok(buf)
+            })
+            .await
+            .map_err(|e| crate::error::Error::io(format!("spawn_blocking failed: {e}")))?
+        }
+
+        match read_once(path.clone(), address.to_owned(), offset, requested).await {
+            Err(crate::error::Error::NotFound(_)) if self.replay_foreign_logs().await? => {
+                read_once(path, address.to_owned(), offset, requested).await
             }
-            #[cfg(not(unix))]
-            {
-                use std::io::{Read, Seek, SeekFrom};
-                let mut file = file;
-                file.seek(SeekFrom::Start(offset)).map_err(|e| {
-                    crate::error::Error::io(format!("Failed to seek {}: {}", path.display(), e))
-                })?;
-                let mut total = 0;
-                while total < len {
-                    let n = file.read(&mut buf[total..]).map_err(|e| {
-                        crate::error::Error::io(format!(
-                            "Failed to read range from {}: {}",
-                            path.display(),
-                            e
-                        ))
-                    })?;
-                    if n == 0 {
-                        break; // EOF
-                    }
-                    total += n;
-                }
-                buf.truncate(total);
-            }
-            Ok(buf)
-        })
-        .await
-        .map_err(|e| crate::error::Error::io(format!("spawn_blocking failed: {e}")))?
+            first => first,
+        }
     }
 
     fn supports_ranged_reads(&self) -> bool {
@@ -946,7 +1330,15 @@ impl StorageRead for FileStorage {
 
     async fn exists(&self, address: &str) -> Result<bool> {
         let path = self.resolve_path(address)?;
-        match tokio::fs::metadata(&path).await {
+        let mut metadata = tokio::fs::metadata(&path).await;
+        if metadata
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            && self.replay_foreign_logs().await?
+        {
+            metadata = tokio::fs::metadata(&path).await;
+        }
+        match metadata {
             // Zero length is absent here too, and the consistency is the point:
             // reporting `true` for a blob `read_bytes` then refuses to return is a
             // worse contract than either answer alone — a caller that checks before
@@ -1016,7 +1408,10 @@ impl StorageRead for FileStorage {
                 })?;
 
                 if file_type.is_dir() {
-                    dirs_to_visit.push(path);
+                    // Log segments are not content and never carry an address.
+                    if entry.file_name() != WAL_DIR {
+                        dirs_to_visit.push(path);
+                    }
                 } else if file_type.is_file() {
                     // A staging file left by an interrupted write is not
                     // content and must not be handed out as an address.
@@ -1047,18 +1442,102 @@ impl StorageWrite for FileStorage {
             .await
     }
 
-    async fn delete(&self, address: &str) -> Result<()> {
-        let path = self.resolve_path(address)?;
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            // Idempotent: not found is OK
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(crate::error::Error::io(format!(
-                "Failed to delete {}: {}",
-                path.display(),
-                e
-            ))),
+    /// Flush the derived content written since the last call, file by file
+    /// plus the directories between them and the root, and the log's
+    /// unflushed tail. Source-of-truth content is otherwise durable no later
+    /// than the next head publication through this root; a caller publishing
+    /// its pointer elsewhere gets the same guarantee from this barrier.
+    async fn sync(&self) -> Result<()> {
+        // The guard travels into the blocking task below: cancelling this
+        // future must not release the barrier while the flush is still
+        // running, or a later caller would see nothing pending and return
+        // before its files were on the device.
+        let one_at_a_time = Arc::clone(&self.flushing).lock_owned().await;
+        let log = self.attached_log();
+        let keys: Vec<String> = {
+            let mut pending = self
+                .unflushed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut keys: Vec<String> = std::mem::take(&mut *pending);
+            keys.sort_unstable();
+            keys.dedup();
+            keys
+        };
+        if keys.is_empty() && log.is_none() {
+            return Ok(());
         }
+        let base = self.base_path.clone();
+        let fsyncs = Arc::clone(&self.fsyncs);
+        let unflushed = Arc::clone(&self.unflushed);
+        tokio::task::spawn_blocking(move || {
+            let _one_at_a_time = one_at_a_time;
+            let flushed = match &log {
+                Some(log) => log.flush().map_err(|e| format!("flush WAL: {e}")),
+                None => Ok(()),
+            }
+            .and_then(|()| {
+                wal::flush_keys(&base, &keys, &fsyncs)
+                    .map_err(|e| format!("flush derived content: {e}"))
+            });
+            match flushed {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // The batch is still owed: a retry must flush it, and a
+                    // publish must not go ahead on a success that never was.
+                    let mut pending = unflushed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut owed = keys;
+                    owed.append(&mut pending);
+                    *pending = owed;
+                    Err(crate::error::Error::io(e))
+                }
+            }
+        })
+        .await
+        .map_err(|e| crate::error::Error::io(format!("sync join: {e}")))?
+    }
+
+    async fn delete(&self, address: &str) -> Result<()> {
+        let (key, path) = self.resolve_key(address)?;
+        let storage = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let operation = storage.begin_operation(storage.durability, &key)?;
+            let (_, log) = storage.write_plan(&operation, 0)?;
+            let appended = match &log {
+                // Ordered after the writes it undoes, so replay cannot bring
+                // the file back. Covered by the next flush, which is no weaker
+                // than an unlink that was never followed by a directory flush.
+                Some(log) => {
+                    Some(log.append(Op::Delete { key: &key }, false).map_err(|e| {
+                        crate::error::Error::io(format!("WAL append for {key}: {e}"))
+                    })?)
+                }
+                None => None,
+            };
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                // Idempotent: not found is OK
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => {
+                    if let (Some(log), Some(appended)) = (&log, &appended) {
+                        log.cancel(appended.seq, &key).map_err(|cancel| {
+                            crate::error::Error::io(format!(
+                                "delete {}: {e}; WAL cancel also failed: {cancel}",
+                                path.display()
+                            ))
+                        })?;
+                    }
+                    Err(crate::error::Error::io(format!(
+                        "Failed to delete {}: {e}",
+                        path.display()
+                    )))
+                }
+            }
+        })
+        .await
+        .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
     }
 }
 
@@ -1078,8 +1557,18 @@ impl ContentAddressedWrite for FileStorage {
         bytes: &[u8],
     ) -> Result<ContentWriteResult> {
         let address = content_address(STORAGE_METHOD_FILE, kind, ledger_id, content_hash_hex);
-        self.write_bytes_durable(&address, bytes, self.durability_for(kind))
+        let durability = self.durability_for(kind);
+        self.write_bytes_durable(&address, bytes, durability)
             .await?;
+        // Derived content on a durable instance is flushed later, by `sync`,
+        // in one batch before the pointer that names it is published.
+        if durability == Durability::PageCache && self.durability != Durability::PageCache {
+            let (key, _) = self.resolve_key(&address)?;
+            self.unflushed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(key);
+        }
         Ok(ContentWriteResult {
             address,
             content_hash: content_hash_hex.to_string(),
@@ -1097,14 +1586,17 @@ impl FileStorage {
         bytes: &[u8],
         durability: Durability,
     ) -> Result<()> {
-        let path = self.resolve_path(address)?;
+        let (key, path) = self.resolve_key(address)?;
         let bytes = bytes.to_vec();
         let for_err = path.clone();
-        let policy = self.policy(durability);
+        let storage = self.clone();
 
-        // One blocking hop for mkdir + stage + rename, rather than one per
-        // `tokio::fs` call.
+        // One blocking hop for mkdir + log + stage + rename, rather than one
+        // per `tokio::fs` call. Attaching the log may replay, so that is in
+        // here too.
         tokio::task::spawn_blocking(move || {
+            let operation = storage.begin_operation(durability, &key)?;
+            let (policy, log) = storage.write_plan(&operation, bytes.len())?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     crate::error::Error::io(format!(
@@ -1114,11 +1606,40 @@ impl FileStorage {
                     ))
                 })?;
             }
+            // Logged before it lands, and not flushed: the head publication
+            // that follows flushes the log, and a crash before then leaves an
+            // unreferenced file at worst. The guard keeps the record's segment
+            // from being retired until the file is written.
+            let appended = match &log {
+                Some(log) => Some(
+                    log.append(
+                        Op::Write {
+                            key: &key,
+                            bytes: &bytes,
+                        },
+                        false,
+                    )
+                    .map_err(|e| crate::error::Error::io(format!("WAL append for {key}: {e}")))?,
+                ),
+                None => None,
+            };
             // Overwrites if present, which is idempotent for content-addressed
             // writes: the address is derived from these bytes.
-            write_atomic(&path, &bytes, &policy).map_err(|e| {
-                crate::error::Error::io(format!("Failed to write {}: {}", path.display(), e))
-            })
+            if let Err(e) = write_atomic(&path, &bytes, &policy) {
+                if let (Some(log), Some(appended)) = (&log, &appended) {
+                    log.cancel(appended.seq, &key).map_err(|cancel| {
+                        crate::error::Error::io(format!(
+                            "write {}: {e}; WAL cancel also failed: {cancel}",
+                            path.display()
+                        ))
+                    })?;
+                }
+                return Err(crate::error::Error::io(format!(
+                    "Failed to write {}: {e}",
+                    path.display()
+                )));
+            }
+            Ok(())
         })
         .await
         .map_err(|e| crate::error::Error::io(format!("write {} join: {e}", for_err.display())))?
@@ -1128,17 +1649,52 @@ impl FileStorage {
     ///
     /// Stages the bytes and links them into place, so a caller that observes
     /// the file sees it complete.
-    async fn blocking_insert(&self, path: PathBuf, bytes: Vec<u8>) -> StorageExtResult<bool> {
-        let policy = self.policy(self.durability);
+    async fn blocking_insert(
+        &self,
+        key: String,
+        path: PathBuf,
+        bytes: Vec<u8>,
+    ) -> StorageExtResult<bool> {
+        let storage = self.clone();
         tokio::task::spawn_blocking(move || {
+            let operation = storage
+                .begin_operation(storage.durability, &key)
+                .map_err(|e| StorageExtError::io(e.to_string()))?;
+            let (policy, log) = storage
+                .write_plan(&operation, bytes.len())
+                .map_err(|e| StorageExtError::io(e.to_string()))?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     StorageExtError::io(format!("mkdir {}: {}", parent.display(), e))
                 })?;
             }
-
-            create_new_atomic(&path, &bytes, &policy)
-                .map_err(|e| StorageExtError::io(format!("write {}: {}", path.display(), e)))
+            // The same sidecar lock a compare-and-swap on this key holds and
+            // replay takes: between the link and the record no other writer
+            // may advance the file, or the log would carry their transition
+            // ahead of the creation it builds on.
+            let _key_lock = wal::key_lock(&path)
+                .map_err(|e| StorageExtError::io(format!("lock {}: {}", path.display(), e)))?;
+            let created = create_new_atomic(&path, &bytes, &policy)
+                .map_err(|e| StorageExtError::io(format!("write {}: {}", path.display(), e)))?;
+            if created {
+                if let Some(log) = &log {
+                    // The file decides the race, so only the caller whose
+                    // link won logs; replay then installs what won. Logged
+                    // after the file exists, and flushed here: an insert is
+                    // a lifecycle event (a ledger coming into existence)
+                    // with nothing after it to flush on its behalf.
+                    let _appended = log
+                        .append(
+                            Op::Insert {
+                                key: &key,
+                                bytes: &bytes,
+                            },
+                            true,
+                        )
+                        .map_err(|e| StorageExtError::io(format!("WAL append for {key}: {e}")))?;
+                }
+            }
+            Ok(created)
         })
         .await
         .map_err(|e| StorageExtError::io(format!("spawn_blocking join: {e}")))?
@@ -1154,9 +1710,16 @@ impl FileStorage {
     /// element to release the lock.
     async fn blocking_locked_read(
         &self,
+        key: String,
         path: PathBuf,
     ) -> StorageExtResult<(Option<Vec<u8>>, LockedFile)> {
+        let storage = self.clone();
         tokio::task::spawn_blocking(move || {
+            // Attaching replays the leftover log, and replay takes the same
+            // sidecar lock for a record on this key; it has to come first.
+            let operation = storage
+                .begin_operation(storage.durability, &key)
+                .map_err(|e| StorageExtError::io(e.to_string()))?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     StorageExtError::io(format!("mkdir {}: {}", parent.display(), e))
@@ -1197,8 +1760,10 @@ impl FileStorage {
             Ok((
                 current,
                 LockedFile {
+                    key,
                     path,
                     _lock_file: lock_file,
+                    operation,
                 },
             ))
         })
@@ -1210,16 +1775,57 @@ impl FileStorage {
     ///
     /// Writes `new_bytes` to a temp file and renames into place while the
     /// flock from `blocking_locked_read` is still held. The lock is released
-    /// when the `LockedFile` guard is dropped at the end.
+    /// when the `LockedFile` guard is dropped at the end. `expected` is what
+    /// the read under that lock returned, so the log can replay the transition
+    /// only against the state it was made from.
     async fn blocking_locked_write(
         &self,
         locked: LockedFile,
+        expected: Option<Vec<u8>>,
         new_bytes: Vec<u8>,
     ) -> StorageExtResult<()> {
-        let policy = self.policy(self.durability);
+        let storage = self.clone();
         tokio::task::spawn_blocking(move || {
-            write_atomic(&locked.path, &new_bytes, &policy)
-                .map_err(|e| StorageExtError::io(format!("write {}: {}", locked.path.display(), e)))
+            let (policy, log) = storage
+                .write_plan(&locked.operation, new_bytes.len())
+                .map_err(|e| StorageExtError::io(e.to_string()))?;
+            // The one flush a commit pays. It lands before the file does, so
+            // a head on disk always has its log record — and every content
+            // append before it — on disk too.
+            let appended = match &log {
+                Some(log) => Some(
+                    log.append(
+                        Op::Cas {
+                            key: &locked.key,
+                            expected: expected.as_deref(),
+                            new: &new_bytes,
+                        },
+                        true,
+                    )
+                    .map_err(|e| {
+                        StorageExtError::io(format!("WAL append for {}: {e}", locked.key))
+                    })?,
+                ),
+                None => None,
+            };
+            if let Err(e) = write_atomic(&locked.path, &new_bytes, &policy) {
+                // Staging or the rename failed, so the file still holds
+                // `expected` while the log says it moved. Cancel the record
+                // before a retry logs its own transition from the same value.
+                if let (Some(log), Some(appended)) = (&log, &appended) {
+                    log.cancel(appended.seq, &locked.key).map_err(|cancel| {
+                        StorageExtError::io(format!(
+                            "write {}: {e}; WAL cancel also failed: {cancel}",
+                            locked.path.display()
+                        ))
+                    })?;
+                }
+                return Err(StorageExtError::io(format!(
+                    "write {}: {e}",
+                    locked.path.display()
+                )));
+            }
+            Ok(())
             // lock released when `locked._lock_file` is dropped
         })
         .await
@@ -1232,17 +1838,20 @@ impl FileStorage {
 /// The lock is released when this struct is dropped (the `_lock_file` field's
 /// `Drop` impl calls `flock(LOCK_UN)`).
 struct LockedFile {
+    key: String,
     path: PathBuf,
     _lock_file: std::fs::File,
+    /// Pins the mode and root/key guards until after the flock is released.
+    operation: OperationHold,
 }
 
 #[async_trait]
 impl StorageCas for FileStorage {
     async fn insert(&self, address: &str, bytes: &[u8]) -> StorageExtResult<bool> {
-        let path = self
-            .resolve_path(address)
+        let (key, path) = self
+            .resolve_key(address)
             .map_err(|e| StorageExtError::io(e.to_string()))?;
-        self.blocking_insert(path, bytes.to_vec()).await
+        self.blocking_insert(key, path, bytes.to_vec()).await
     }
 
     async fn compare_and_swap<T, F>(&self, address: &str, f: F) -> StorageExtResult<CasOutcome<T>>
@@ -1250,18 +1859,19 @@ impl StorageCas for FileStorage {
         F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError> + Send + Sync,
         T: Send,
     {
-        let path = self
-            .resolve_path(address)
+        let (key, path) = self
+            .resolve_key(address)
             .map_err(|e| StorageExtError::io(e.to_string()))?;
 
         // Phase 1: acquire lock + read (blocking)
-        let (current, locked) = self.blocking_locked_read(path).await?;
+        let (current, locked) = self.blocking_locked_read(key, path).await?;
 
         // Phase 2: call closure on async task
         match f(current.as_deref())? {
             CasAction::Write(new_bytes) => {
                 // Phase 3: write under same lock (blocking)
-                self.blocking_locked_write(locked, new_bytes).await?;
+                self.blocking_locked_write(locked, current, new_bytes)
+                    .await?;
                 Ok(CasOutcome::Written)
             }
             CasAction::Abort(t) => Ok(CasOutcome::Aborted(t)),
@@ -1287,9 +1897,9 @@ mod tests {
     /// parse, not on a constructed storage, so the test does not depend on the
     /// environment it runs in.
     #[test]
-    fn durability_defaults_to_sync() {
-        assert_eq!(Durability::default(), Durability::Sync);
-        assert_eq!(Durability::parse(None), Durability::Sync);
+    fn durability_defaults_to_wal() {
+        assert_eq!(Durability::default(), Durability::Wal);
+        assert_eq!(Durability::parse(None), Durability::Wal);
     }
 
     #[test]
@@ -1297,9 +1907,13 @@ mod tests {
         for v in ["0", "false", "off", "no", "OFF", " false "] {
             assert_eq!(Durability::parse(Some(v)), Durability::PageCache, "{v:?}");
         }
-        // Anything else keeps the safe setting rather than guessing.
-        for v in ["1", "true", "on", "", "nonsense"] {
+        // Per-write flushing has to be asked for by name.
+        for v in ["sync", "fsync", "direct", " SYNC "] {
             assert_eq!(Durability::parse(Some(v)), Durability::Sync, "{v:?}");
+        }
+        // Anything else keeps the safe setting rather than guessing.
+        for v in ["1", "true", "on", "", "nonsense", "journal", "wal"] {
+            assert_eq!(Durability::parse(Some(v)), Durability::Wal, "{v:?}");
         }
     }
 
@@ -1307,8 +1921,8 @@ mod tests {
     /// override a checked-in config file for one run without editing it.
     #[test]
     fn durability_precedence_is_env_then_config_then_default() {
-        use Durability::{PageCache, Sync};
-        assert_eq!(Durability::resolve_from(None, None), Sync);
+        use Durability::{PageCache, Sync, Wal};
+        assert_eq!(Durability::resolve_from(None, None), Wal);
         assert_eq!(Durability::resolve_from(None, Some(PageCache)), PageCache);
         assert_eq!(Durability::resolve_from(Some(Sync), Some(PageCache)), Sync);
         assert_eq!(
@@ -1319,7 +1933,9 @@ mod tests {
 
     #[test]
     fn durability_mode_names_parse_and_reject() {
-        use Durability::{PageCache, Sync};
+        use Durability::{PageCache, Sync, Wal};
+        assert_eq!(Durability::from_mode_name("journal"), Some(Wal));
+        assert_eq!(Durability::from_mode_name("WAL"), Some(Wal));
         assert_eq!(Durability::from_mode_name("sync"), Some(Sync));
         assert_eq!(Durability::from_mode_name(" SYNC "), Some(Sync));
         assert_eq!(Durability::from_mode_name("page-cache"), Some(PageCache));
@@ -1367,7 +1983,7 @@ mod tests {
     #[test]
     fn source_of_truth_content_follows_the_configured_durability() {
         let dir = tempfile::tempdir().unwrap();
-        for mode in [Durability::Sync, Durability::PageCache] {
+        for mode in [Durability::Wal, Durability::Sync, Durability::PageCache] {
             let storage = FileStorage::new(dir.path()).with_durability(mode);
             for kind in [ContentKind::Commit, ContentKind::Txn] {
                 assert_eq!(storage.durability_for(kind), mode, "{kind:?}");
@@ -2304,5 +2920,687 @@ mod tests {
             storage.read_byte_range("z/tiny.dict", 0..1).await.unwrap(),
             b"x"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod wal_tests {
+    use super::*;
+    use crate::{CasAction, CasOutcome, StorageCas, StorageRead, StorageWrite};
+
+    const TXN: &str = "fluree:file://ledger/txn/aaaa.bin";
+    const COMMIT: &str = "fluree:file://ledger/commit/bbbb.bin";
+    const HEAD: &str = "fluree:file://ns@v2/ledger/main.json";
+
+    fn with_wal(dir: &Path) -> FileStorage {
+        let storage = FileStorage::new(dir).with_durability(Durability::Wal);
+        storage.recover_wal().unwrap();
+        storage
+    }
+
+    async fn publish(storage: &FileStorage, head: &[u8]) {
+        let head = head.to_vec();
+        let outcome = storage
+            .compare_and_swap(HEAD, |_| Ok(CasAction::Write::<()>(head.clone())))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CasOutcome::Written));
+    }
+
+    /// One commit: raw transaction, commit blob, head publication.
+    async fn commit(storage: &FileStorage, n: u8) {
+        storage.write_bytes(TXN, &[b'r', n]).await.unwrap();
+        storage.write_bytes(COMMIT, &[b'c', n]).await.unwrap();
+        publish(storage, &[b'h', n]).await;
+    }
+
+    fn wal_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir.join(WAL_DIR))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The point of the mode. A commit is three writes; per-write flushing
+    /// pays two flushes for each of them, the log pays one for the lot.
+    #[tokio::test]
+    async fn a_commit_costs_one_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        // The first write also creates the segment, which is its own cost.
+        commit(&storage, 1).await;
+        let before = storage.fsyncs_issued();
+        commit(&storage, 2).await;
+        assert_eq!(storage.fsyncs_issued() - before, 1);
+
+        // Same three writes with per-write flushing, as the control.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        commit(&storage, 1).await;
+        assert_eq!(storage.fsyncs_issued(), 6);
+    }
+
+    /// What the flush buys: after a crash that loses every file the page
+    /// cache held, replay rebuilds them from the log, then retires the log.
+    #[tokio::test]
+    async fn replay_restores_acknowledged_writes_after_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        storage.hold_wal_segments_for_test().unwrap();
+        commit(&storage, 1).await;
+        commit(&storage, 2).await;
+        storage.simulate_crash_for_test();
+        drop(storage);
+        for address in [TXN, COMMIT, HEAD] {
+            let path = FileStorage::new(dir.path()).resolve_path(address).unwrap();
+            std::fs::remove_file(path).unwrap();
+        }
+
+        let storage = with_wal(dir.path());
+        assert_eq!(storage.read_bytes(TXN).await.unwrap(), b"r\x02");
+        assert_eq!(storage.read_bytes(COMMIT).await.unwrap(), b"c\x02");
+        assert_eq!(storage.read_bytes(HEAD).await.unwrap(), b"h\x02");
+        assert_eq!(wal_entries(dir.path()), ["LOCK"], "replay retires the log");
+    }
+
+    /// Replay applies records in order, so a delete cannot resurrect what it
+    /// removed, and a later write after the delete wins.
+    #[tokio::test]
+    async fn replay_keeps_write_and_delete_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        storage.hold_wal_segments_for_test().unwrap();
+        storage
+            .write_bytes("fluree:file://a.bin", b"a")
+            .await
+            .unwrap();
+        storage.delete("fluree:file://a.bin").await.unwrap();
+        storage
+            .write_bytes("fluree:file://b.bin", b"b1")
+            .await
+            .unwrap();
+        storage.delete("fluree:file://b.bin").await.unwrap();
+        storage
+            .write_bytes("fluree:file://b.bin", b"b2")
+            .await
+            .unwrap();
+        publish(&storage, b"h").await;
+        storage.simulate_crash_for_test();
+        drop(storage);
+        let _ = std::fs::remove_file(dir.path().join("b.bin"));
+
+        let storage = with_wal(dir.path());
+        assert!(!storage.exists("fluree:file://a.bin").await.unwrap());
+        assert_eq!(
+            storage.read_bytes("fluree:file://b.bin").await.unwrap(),
+            b"b2"
+        );
+    }
+
+    /// A head that moved on — another process in per-write mode advanced it
+    /// after the crash — is left alone rather than rolled back by replay.
+    #[tokio::test]
+    async fn replay_does_not_roll_back_a_head_that_moved_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        storage.hold_wal_segments_for_test().unwrap();
+        publish(&storage, b"h1").await;
+        storage.simulate_crash_for_test();
+        drop(storage);
+
+        let other = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        publish(&other, b"h9").await;
+
+        let storage = with_wal(dir.path());
+        assert_eq!(storage.read_bytes(HEAD).await.unwrap(), b"h9");
+    }
+
+    /// A clean close flushes everything and leaves no segments, so a binary
+    /// that has never heard of the log reads the root exactly as before.
+    #[tokio::test]
+    async fn clean_close_leaves_nothing_to_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        commit(&storage, 1).await;
+        drop(storage);
+        assert_eq!(wal_entries(dir.path()), ["LOCK"]);
+
+        let plain = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        assert_eq!(plain.read_bytes(HEAD).await.unwrap(), b"h\x01");
+        assert_eq!(plain.read_bytes(COMMIT).await.unwrap(), b"c\x01");
+    }
+
+    /// A root another process holds the WAL for cannot be taken over. The
+    /// second handle keeps every guarantee by flushing each write itself.
+    #[tokio::test]
+    async fn second_owner_falls_back_to_per_write_flushing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(WAL_DIR)).unwrap();
+        let held = std::fs::File::create(dir.path().join(WAL_DIR).join("LOCK")).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+
+        let storage = with_wal(dir.path());
+        assert_eq!(storage.effective_durability(), Durability::Sync);
+        storage.write_bytes(COMMIT, b"c").await.unwrap();
+        assert_eq!(
+            storage.fsyncs_issued(),
+            2,
+            "file and directory, as in sync mode"
+        );
+    }
+
+    /// Index output is rebuilt from commits and never goes through the log;
+    /// a root that only ever holds derived content gets no log at all.
+    #[tokio::test]
+    async fn derived_content_stays_off_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        storage
+            .content_write_bytes_with_hash(
+                ContentKind::IndexLeaf,
+                "l:main",
+                "ab".repeat(16).as_str(),
+                b"leaf",
+            )
+            .await
+            .unwrap();
+        assert_eq!(storage.fsyncs_issued(), 0);
+        assert!(!dir.path().join(WAL_DIR).exists());
+    }
+
+    fn owned(dir: &Path, owner: &str) -> FileStorage {
+        let storage = FileStorage::new(dir)
+            .with_durability(Durability::Wal)
+            .with_wal_owner(owner);
+        storage.recover_wal().unwrap();
+        storage
+    }
+
+    /// Several processes on one root each own a log, and an owned log
+    /// flushes each write on its own: nothing later would.
+    #[tokio::test]
+    async fn owners_keep_separate_logs_and_flush_every_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = owned(dir.path(), "node-1");
+        let b = owned(dir.path(), "node-2");
+        a.write_bytes(TXN, b"from a").await.unwrap();
+        let before = a.fsyncs_issued();
+        a.write_bytes(COMMIT, b"from a").await.unwrap();
+        assert_eq!(a.fsyncs_issued() - before, 1, "one flush, for the log");
+        assert_eq!(b.read_bytes(TXN).await.unwrap(), b"from a");
+        b.write_bytes(HEAD, b"from b").await.unwrap();
+        assert_eq!(a.read_bytes(HEAD).await.unwrap(), b"from b");
+        let owners = dir.path().join(WAL_DIR).join("owners");
+        assert!(owners.join("node-1").join("LOCK").exists());
+        assert!(owners.join("node-2").join("LOCK").exists());
+        assert!(a.write_bytes("fluree:file://x.bin", b"x").await.is_ok());
+        assert!(FileStorage::new(dir.path())
+            .with_durability(Durability::Wal)
+            .with_wal_owner("../escape")
+            .write_bytes("fluree:file://y.bin", b"y")
+            .await
+            .is_err());
+    }
+
+    /// A node that stopped with records still in its log: another node
+    /// missing one of those files applies that log and finds the file.
+    #[tokio::test]
+    async fn another_owner_recovers_a_stopped_owners_tail_on_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = owned(dir.path(), "node-1");
+        a.hold_wal_segments_for_test().unwrap();
+        a.write_bytes(COMMIT, b"c").await.unwrap();
+        a.simulate_crash_for_test();
+        drop(a);
+        std::fs::remove_file(dir.path().join("ledger/commit/bbbb.bin")).unwrap();
+
+        let b = owned(dir.path(), "node-2");
+        assert!(b.exists(COMMIT).await.unwrap());
+        assert_eq!(b.read_bytes(COMMIT).await.unwrap(), b"c");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join(WAL_DIR).join("owners").join("node-1"))
+                .unwrap()
+                .count(),
+            1,
+            "the stopped owner's log was retired, leaving its lock file"
+        );
+    }
+
+    /// Opening the root applies stopped owners' logs too, under any
+    /// durability, so a per-write handle sees the acknowledged tail.
+    #[tokio::test]
+    async fn opening_a_shared_root_applies_stopped_owners_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = owned(dir.path(), "node-1");
+        a.hold_wal_segments_for_test().unwrap();
+        a.write_bytes(TXN, b"t").await.unwrap();
+        a.simulate_crash_for_test();
+        drop(a);
+        std::fs::remove_file(dir.path().join("ledger/txn/aaaa.bin")).unwrap();
+
+        let plain = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        plain.recover_wal().unwrap();
+        assert!(dir.path().join("ledger/txn/aaaa.bin").exists());
+    }
+
+    /// Two inserts race on one key: the file decides, and only the caller
+    /// whose link won logs a record, so replay installs what won.
+    #[tokio::test]
+    async fn only_the_winning_insert_is_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        storage.hold_wal_segments_for_test().unwrap();
+        assert!(storage.insert(HEAD, b"winner").await.unwrap());
+        let after_winner = storage.fsyncs_issued();
+        assert!(!storage.insert(HEAD, b"loser").await.unwrap());
+        assert_eq!(
+            storage.fsyncs_issued(),
+            after_winner,
+            "a losing insert appends and flushes nothing"
+        );
+        storage.simulate_crash_for_test();
+        drop(storage);
+        std::fs::remove_file(dir.path().join("ns@v2/ledger/main.json")).unwrap();
+        let storage = with_wal(dir.path());
+        assert_eq!(storage.read_bytes(HEAD).await.unwrap(), b"winner");
+    }
+
+    /// An insert holds the key's sidecar lock from the link to the record,
+    /// so a compare-and-swap on the same key cannot slip its transition into
+    /// the log ahead of the creation it builds on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_insert_waits_for_a_held_cas_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        let path = storage.resolve_path(HEAD).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let held = std::fs::File::create(path.with_extension("lock")).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+
+        let inserter = storage.clone();
+        let insert = tokio::spawn(async move { inserter.insert(HEAD, b"initial").await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !insert.is_finished(),
+            "the insert must wait for the key's lock"
+        );
+        assert!(!path.exists(), "and must not have linked its file");
+        drop(held);
+        assert!(insert.await.unwrap().unwrap());
+        assert_eq!(storage.read_bytes(HEAD).await.unwrap(), b"initial");
+    }
+
+    /// Index output is written page-cache and flushed once, in a batch, by
+    /// `sync`: nothing on the write path, every file and directory after.
+    #[tokio::test]
+    async fn derived_content_is_flushed_by_sync_not_by_its_write() {
+        for durability in [Durability::Wal, Durability::Sync] {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = FileStorage::new(dir.path()).with_durability(durability);
+            for i in 0..3u8 {
+                storage
+                    .content_write_bytes_with_hash(
+                        ContentKind::IndexLeaf,
+                        "l:main",
+                        &format!("{i:0>64}"),
+                        &[i],
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                storage.fsyncs_issued(),
+                0,
+                "{durability:?}: no flush on write"
+            );
+            storage.sync().await.unwrap();
+            let after = storage.fsyncs_issued();
+            assert!(
+                after > 3,
+                "{durability:?}: three files and at least their directory, got {after}"
+            );
+            storage.sync().await.unwrap();
+            assert_eq!(
+                storage.fsyncs_issued(),
+                after,
+                "{durability:?}: nothing left to flush"
+            );
+        }
+
+        // Under page-cache durability nothing is ever flushed, sync included.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::PageCache);
+        storage
+            .content_write_bytes_with_hash(ContentKind::IndexLeaf, "l:main", &"a".repeat(64), b"x")
+            .await
+            .unwrap();
+        storage.sync().await.unwrap();
+        assert_eq!(storage.fsyncs_issued(), 0);
+    }
+
+    /// A second `sync` cannot return before a flush already in progress has
+    /// put the caller's files on the device: the first drained them, so the
+    /// second must wait for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_concurrent_sync_waits_for_the_flush_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        let result = storage
+            .content_write_bytes_with_hash(
+                ContentKind::IndexLeaf,
+                "l:main",
+                &"a".repeat(64),
+                b"leaf",
+            )
+            .await
+            .unwrap();
+        let path = storage.resolve_path(&result.address).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // A FIFO in the artifact's place holds the first flush at its open.
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let first_storage = storage.clone();
+        let first = tokio::spawn(async move { first_storage.sync().await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !storage.unflushed.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first sync drained the batch");
+        let second =
+            tokio::time::timeout(std::time::Duration::from_millis(100), storage.sync()).await;
+        // Release the held open; its flush of a FIFO then fails, harmlessly.
+        let unblock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let _ = first.await.unwrap();
+        drop(unblock);
+        assert!(
+            second.is_err(),
+            "a second sync returned before the first flushed anything: {second:?}"
+        );
+    }
+
+    /// Cancelling a `sync` must not release the barrier while its flush is
+    /// still running on the blocking pool: the guard rides with the flush.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_sync_keeps_its_barrier_until_the_flush_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        let result = storage
+            .content_write_bytes_with_hash(
+                ContentKind::IndexLeaf,
+                "l:main",
+                &"a".repeat(64),
+                b"leaf",
+            )
+            .await
+            .unwrap();
+        let path = storage.resolve_path(&result.address).unwrap();
+        let sentinel = storage
+            .content_write_bytes_with_hash(
+                ContentKind::IndexLeaf,
+                "l:main",
+                &"b".repeat(64),
+                b"sentinel",
+            )
+            .await
+            .unwrap();
+        let sentinel_path = storage.resolve_path(&sentinel.address).unwrap();
+        std::fs::remove_file(&sentinel_path).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &sentinel_path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let first_storage = storage.clone();
+        let first = tokio::spawn(async move { first_storage.sync().await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !storage.unflushed.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first sync drained the batch");
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let second =
+            tokio::time::timeout(std::time::Duration::from_millis(100), storage.sync()).await;
+        let unblock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // The detached flush reaches the device node, fails, and returns
+        // its batch to the queue.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while storage.unflushed.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the failed batch came back");
+        drop(unblock);
+        assert!(
+            second.is_err(),
+            "a sync returned while the cancelled caller's flush was still running: {second:?}"
+        );
+    }
+
+    /// A batch whose flush failed stays owed: the retry flushes it rather
+    /// than reporting a success the device never saw.
+    #[tokio::test]
+    async fn a_failed_sync_keeps_its_batch_for_the_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        let result = storage
+            .content_write_bytes_with_hash(
+                ContentKind::IndexLeaf,
+                "l:main",
+                &"a".repeat(64),
+                b"leaf",
+            )
+            .await
+            .unwrap();
+        let path = storage.resolve_path(&result.address).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &path).unwrap();
+        assert!(
+            storage.sync().await.is_err(),
+            "flushing a device node fails"
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"leaf").unwrap();
+        let before = storage.fsyncs_issued();
+        storage.sync().await.unwrap();
+        assert!(
+            storage.fsyncs_issued() > before,
+            "the retry must flush the file from the failed batch"
+        );
+    }
+
+    /// The log's directory is neither content nor staging debris.
+    #[tokio::test]
+    async fn listing_and_addresses_keep_out_of_the_log_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        commit(&storage, 1).await;
+        let listed = storage.list_prefix("").await.unwrap();
+        assert!(!listed.is_empty());
+        assert!(listed.iter().all(|a| !a.contains(WAL_DIR)), "{listed:?}");
+        assert!(storage
+            .write_bytes(&format!("fluree:file://{WAL_DIR}/x.bin"), b"x")
+            .await
+            .is_err());
+    }
+
+    fn contested_root(dir: &Path) -> (FileStorage, std::fs::File) {
+        std::fs::create_dir(dir.join(WAL_DIR)).unwrap();
+        let held = std::fs::File::create(dir.join(WAL_DIR).join("LOCK")).unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        let storage = with_wal(dir);
+        assert_eq!(storage.effective_durability(), Durability::Sync);
+        (storage, held)
+    }
+
+    fn retry_due(storage: &FileStorage) {
+        let mut state = storage.wal.lock();
+        let WalAttach::Busy { retry_at, .. } = &mut *state else {
+            panic!("expected contention");
+        };
+        *retry_at = std::time::Instant::now();
+    }
+
+    #[tokio::test]
+    async fn retry_contention_clears_without_restarting_the_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, held) = contested_root(dir.path());
+        storage.write_bytes(COMMIT, b"sync value").await.unwrap();
+        drop(held);
+        // A cached Busy result is not retried on every operation.
+        if let WalAttach::Busy { retry_at, .. } = &mut *storage.wal.lock() {
+            *retry_at = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        }
+        storage.write_bytes(COMMIT, b"still sync").await.unwrap();
+        assert_eq!(storage.effective_durability(), Durability::Sync);
+        retry_due(&storage);
+        storage.write_bytes(COMMIT, b"logged").await.unwrap();
+        assert_eq!(storage.effective_durability(), Durability::Wal);
+        storage.hold_wal_segments_for_test().unwrap();
+        storage.sync().await.unwrap();
+        storage.simulate_crash_for_test();
+        std::fs::remove_file(storage.resolve_path(COMMIT).unwrap()).unwrap();
+        let reopened = with_wal(dir.path());
+        assert_eq!(reopened.read_bytes(COMMIT).await.unwrap(), b"logged");
+    }
+
+    #[tokio::test]
+    async fn retry_cannot_change_mode_between_cas_read_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, held) = contested_root(dir.path());
+        let held = std::sync::Mutex::new(Some(held));
+        let before = storage.fsyncs_issued();
+        storage
+            .compare_and_swap(HEAD, |_| {
+                drop(held.lock().unwrap().take());
+                retry_due(&storage);
+                Ok(CasAction::<()>::Write(b"sync head".to_vec()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.effective_durability(),
+            Durability::Sync,
+            "the CAS must finish using its original mode"
+        );
+        assert_eq!(storage.fsyncs_issued() - before, 2);
+        publish(&storage, b"wal head").await;
+        assert_eq!(storage.effective_durability(), Durability::Wal);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_waits_for_an_independent_handles_in_flight_cas() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let (storage, held) = contested_root(dir.path());
+        let plain = FileStorage::new(dir.path()).with_durability(Durability::Sync);
+        let (key, path) = plain.resolve_key(HEAD).unwrap();
+        let (current, locked) = plain.blocking_locked_read(key, path).await.unwrap();
+        drop(held);
+        retry_due(&storage);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let contender = storage.clone();
+        let thread = std::thread::spawn(move || {
+            let op = contender.begin_operation(Durability::Wal, "other").unwrap();
+            done_tx.send(op.log.is_some()).unwrap();
+        });
+        let premature = done_rx.recv_timeout(Duration::from_millis(200));
+        // Always release the holder before asserting, so a failed test cannot
+        // leave the contending thread parked forever.
+        plain
+            .blocking_locked_write(locked, current, b"finished".to_vec())
+            .await
+            .unwrap();
+        thread.join().unwrap();
+        assert!(premature.is_err(), "takeover overlapped a local CAS");
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert_eq!(plain.read_bytes(HEAD).await.unwrap(), b"finished");
+        assert_eq!(storage.effective_durability(), Durability::Wal);
+    }
+
+    #[tokio::test]
+    async fn retry_does_not_replay_crash_history_over_completed_fallback_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = with_wal(dir.path());
+        original.hold_wal_segments_for_test().unwrap();
+        original
+            .write_bytes(COMMIT, b"older logged value")
+            .await
+            .unwrap();
+        original.sync().await.unwrap();
+        original.simulate_crash_for_test();
+        let lock_path = dir.path().join(WAL_DIR).join("LOCK");
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&held).unwrap();
+        let storage = with_wal(dir.path());
+        storage
+            .write_bytes(COMMIT, b"newer sync value")
+            .await
+            .unwrap();
+        let segment = dir.path().join(WAL_DIR).join("00000001.wal");
+        let retained = std::fs::read(&segment).unwrap();
+        drop(held);
+        retry_due(&storage);
+        storage
+            .write_bytes("fluree:file://other", b"still available")
+            .await
+            .unwrap();
+        assert_eq!(storage.effective_durability(), Durability::Sync);
+        assert_eq!(
+            storage.read_bytes(COMMIT).await.unwrap(),
+            b"newer sync value"
+        );
+        assert_eq!(std::fs::read(&segment).unwrap(), retained);
+        assert!(matches!(
+            *storage.wal.lock(),
+            WalAttach::Busy {
+                recovery_pending: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn retry_never_reenables_an_unsupported_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(WAL_DIR).join("LOCK");
+        std::fs::create_dir_all(&lock_path).unwrap();
+        let storage = with_wal(dir.path());
+        assert!(matches!(*storage.wal.lock(), WalAttach::Unsupported));
+        std::fs::remove_dir(&lock_path).unwrap();
+        storage.write_bytes(COMMIT, b"sync").await.unwrap();
+        assert_eq!(storage.effective_durability(), Durability::Sync);
+        assert!(storage.attached_log().is_none());
+    }
+
+    #[test]
+    fn retry_gate_is_shared_before_and_after_root_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new/root");
+        let first = FileStorage::new(&path).root_gate().unwrap();
+        assert!(!path.exists(), "gate discovery must not create storage");
+        std::fs::create_dir_all(&path).unwrap();
+        let second = FileStorage::new(&path).root_gate().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let aliased = FileStorage::new(path.join(".")).root_gate().unwrap();
+        assert!(Arc::ptr_eq(&first, &aliased));
     }
 }

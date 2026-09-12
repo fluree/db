@@ -123,7 +123,7 @@ Not yet supported (parsed/ignored or absent):
 Supported:
 - `filePath`
 - `AES256Key` (supports `ConfigurationValue`)
-- `durability` — `"sync"` (default) or `"page-cache"`
+- `durability` — `"wal"` (default), `"sync"` or `"page-cache"`
 
 Notes:
 - Rust expects `AES256Key` to be **base64-encoded** and decode to exactly 32 bytes.
@@ -142,28 +142,22 @@ Notes:
 
 #### durability
 
-When a write is reported complete. Both modes are atomic — a reader never sees a
-partially written file either way — so this is only about what survives the
-machine losing power.
+Filesystem syncing (FSYNC) is on by default. Leave this property unset for the
+default behavior, or use `"page-cache"` to turn syncing off in a storage config.
 
 | Value | Meaning |
 |---|---|
-| `sync` (default) | The bytes and the directory entry naming them are flushed to the device before the write is acknowledged. An acknowledged commit survives power loss. |
-| `page-cache` | Acknowledged once the bytes reach the OS page cache. Survives the process dying, but a power loss or kernel panic can lose acknowledged commits. |
+| `wal` (default) | FSYNC on. Acknowledged commits survive process crashes and power loss. |
+| `sync` | FSYNC on, flushing each file individually. Acknowledged commits survive process crashes and power loss. |
+| `page-cache` | FSYNC off. Writes reach the OS page cache, but a power loss or kernel panic can lose acknowledged commits. |
 
-An unrecognized value is rejected at config load rather than defaulting, so a
-typo fails loudly instead of quietly downgrading durability.
+Writes remain atomic with every setting. An unrecognized value is rejected at
+config load.
 
-Applies to content that is the source of truth — commits, transactions, ledger
-config, graph-source mappings — and to nameservice records. Content that can be
-rebuilt from the commit chain (index nodes, dictionaries, sketches, annotation
-arenas) is always written page-cache, in either mode: it is written at far higher
-volume than commits and is reproducible, so flushing it would put the cost on the
-path that can least afford it for no durability gain.
-
-`FLUREE_STORAGE_FSYNC` overrides this property, so an operator can change it for
-one run without editing a checked-in config file. See
-[Configuration](../operations/configuration.md).
+To turn FSYNC off without editing the config, set `FLUREE_STORAGE_FSYNC=0` before
+starting Fluree. Set `FLUREE_STORAGE_FSYNC=1` to turn it back on. This environment
+variable overrides the `durability` property. See
+[Storage durability](../operations/storage.md#durability).
 
 ### S3 storage (requires `aws`)
 

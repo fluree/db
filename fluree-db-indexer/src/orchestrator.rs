@@ -424,8 +424,21 @@ impl IndexerOrchestrator {
     ///
     /// Combines `index_ledger` with publishing to the nameservice.
     pub async fn index_and_publish(&self, ledger_id: &str) -> Result<IndexResult> {
-        let result = self.index_ledger(ledger_id).await?;
-        publish_index_result(self.nameservice.as_ref(), &result).await?;
+        let cs = fluree_db_nameservice::branched_content_store_for_id(
+            &self.backend,
+            self.nameservice.as_ref(),
+            ledger_id,
+        )
+        .await
+        .map_err(|e| crate::error::IndexerError::NameService(e.to_string()))?;
+        let result = crate::build_index_for_ledger(
+            cs.clone(),
+            self.nameservice.as_ref(),
+            ledger_id,
+            self.config.clone(),
+        )
+        .await?;
+        publish_index_result(&cs, self.nameservice.as_ref(), &result).await?;
         Ok(result)
     }
 
@@ -1725,7 +1738,7 @@ impl BackgroundIndexerWorker {
         };
 
         let result = crate::build_index_for_record_with_tracker(
-            content_store,
+            content_store.clone(),
             build_tracker.clone(),
             &record,
             job_config,
@@ -1735,8 +1748,12 @@ impl BackgroundIndexerWorker {
         match result {
             Ok(index_result) => {
                 // Try to publish
-                if let Err(e) =
-                    crate::publish_index_result(self.nameservice.as_ref(), &index_result).await
+                if let Err(e) = crate::publish_index_result(
+                    &content_store,
+                    self.nameservice.as_ref(),
+                    &index_result,
+                )
+                .await
                 {
                     // Surface the build's fuel + index_t on publish failure —
                     // in background mode there is no caller, so this is the
@@ -2234,10 +2251,15 @@ where
                 fuel = ?result.fuel,
                 "post-commit index build complete"
             );
-            // Track publish result but continue regardless
-            let publish_result = nameservice
-                .publish_index(&ledger_addr, result.index_t, &result.root_id)
-                .await;
+            // Track publish result but continue regardless. The artifacts
+            // go to the device before the pointer that names them.
+            let publish_result = match cs.sync().await {
+                Ok(()) => nameservice
+                    .publish_index(&ledger_addr, result.index_t, &result.root_id)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(format!("flush index artifacts: {e}")),
+            };
             let published = publish_result.is_ok();
             let publish_error = publish_result.err().map(|e| e.to_string());
 
@@ -2343,6 +2365,11 @@ where
         "pre-commit index refresh complete"
     );
 
+    cs.sync().await.map_err(|e| {
+        IndexerError::Core(fluree_db_core::Error::io(format!(
+            "flush index artifacts: {e}"
+        )))
+    })?;
     nameservice
         .publish_index(&ledger_addr, result.index_t, &result.root_id)
         .await

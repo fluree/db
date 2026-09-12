@@ -441,7 +441,7 @@ pub async fn build_default_fluree(
     if config.is_proxy_storage_mode() {
         build_proxy_fluree(config)
     } else {
-        build_direct_fluree(config, None, event_bus, CatchupSweeps::Owned).await
+        build_direct_fluree(config, None, event_bus, CatchupSweeps::Owned, None).await
     }
 }
 
@@ -462,6 +462,7 @@ pub async fn build_fluree_with_nameservice(
     config: &ServerConfig,
     nameservice: fluree_db_api::NameServiceMode,
     event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
+    node_id: u64,
 ) -> Result<(Arc<Fluree>, tokio::task::JoinHandle<()>), fluree_db_api::ApiError> {
     if config.is_proxy_storage_mode() {
         return Err(fluree_db_api::ApiError::config(
@@ -480,6 +481,7 @@ pub async fn build_fluree_with_nameservice(
         Some(nameservice),
         event_bus,
         CatchupSweeps::Delegated,
+        Some(format!("node-{node_id}")),
     )
     .await
 }
@@ -488,11 +490,14 @@ pub async fn build_fluree_with_nameservice(
 /// config. When `nameservice` is `Some`, it replaces the
 /// backend-implied nameservice. When `event_bus` is `Some`, it
 /// replaces Fluree's default per-instance bus.
+/// `wal_owner` names this process's WAL when the storage root is
+/// shared with other processes (a Raft cluster's payload store).
 async fn build_direct_fluree(
     config: &ServerConfig,
     nameservice: Option<fluree_db_api::NameServiceMode>,
     event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
     catchup_sweeps: CatchupSweeps,
+    wal_owner: Option<String>,
 ) -> Result<(Arc<Fluree>, tokio::task::JoinHandle<()>), fluree_db_api::ApiError> {
     let mut builder = if let Some(ref path) = config.connection_config {
         // Connection config: build from JSON-LD (supports S3,
@@ -523,6 +528,12 @@ async fn build_direct_fluree(
     };
 
     // Server-level overrides take precedence over connection config defaults.
+    if let Some(owner) = wal_owner {
+        // Voters share one payload root, so each node journals it under a
+        // log of its own; an owned log flushes every payload before its
+        // reference can be proposed.
+        builder = builder.with_storage_wal_owner(owner);
+    }
     if let Some(max_mb) = config.cache_max_mb {
         builder = builder.cache_max_mb(max_mb);
     }

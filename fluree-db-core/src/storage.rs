@@ -11,14 +11,26 @@
 
 /// When a write to `FileStorage` is reported complete.
 ///
-/// Both settings are atomic — a reader never observes a partial file either
-/// way. They differ in what survives the machine losing power.
+/// Every setting is atomic — a reader never observes a partial file. They
+/// differ in what survives the machine losing power, and in how many device
+/// flushes a commit costs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Durability {
+    /// Report complete once the write is in the storage root's WAL and
+    /// that log has been flushed. The file itself is written page-cache and
+    /// flushed in the background; a restart replays the log first. Survives
+    /// power loss. A head publication costs one flush regardless of how many
+    /// objects the commit wrote; content writes are covered by the next head
+    /// publication or the next background flush, whichever comes first.
+    ///
+    /// Unix only. Where the root cannot be journaled — a second process holds
+    /// the log, or the filesystem refuses advisory locks — writes fall back to
+    /// [`Self::Sync`] for the life of the handle.
+    #[default]
+    Wal,
     /// Report complete once the bytes and the directory entry naming them have
     /// been flushed to the device. Survives power loss; costs an fsync of the
     /// staged file and one of its parent directory per write.
-    #[default]
     Sync,
     /// Report complete once the bytes reach the OS page cache. Survives process
     /// death, but a power loss or kernel panic can lose writes already reported
@@ -40,8 +52,8 @@ impl Durability {
         matches!(self, Durability::Sync)
     }
 
-    /// Default read from [`Self::ENV_VAR`], falling back to [`Self::Sync`] when
-    /// unset or unrecognized.
+    /// Default read from [`Self::ENV_VAR`], falling back to [`Self::Wal`]
+    /// when unset or unrecognized.
     ///
     /// Read once per storage construction rather than per write, so tests set
     /// the field through `FileStorage::with_durability` and never race on
@@ -81,11 +93,14 @@ impl Durability {
     fn parse(value: Option<&str>) -> Self {
         match value.map(|v| v.trim().to_ascii_lowercase()) {
             Some(v) if matches!(v.as_str(), "0" | "false" | "off" | "no") => Durability::PageCache,
-            _ => Durability::Sync,
+            // The per-write spelling is explicit: the truthy spellings (`1`,
+            // `true`, `on`) mean "durable", and the durable default is the log.
+            Some(v) if matches!(v.as_str(), "sync" | "fsync" | "direct") => Durability::Sync,
+            _ => Durability::Wal,
         }
     }
 
-    /// Parse a configuration mode name (`sync` / `page-cache`).
+    /// Parse a configuration mode name (`wal` / `sync` / `page-cache`).
     ///
     /// Named modes rather than the environment variable's boolean: a config
     /// file is read to understand a deployment, and a name says what it does.
@@ -93,6 +108,7 @@ impl Durability {
     /// rather than silently pick a durability the operator did not ask for.
     pub fn from_mode_name(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "wal" | "journal" => Some(Durability::Wal),
             "sync" | "fsync" => Some(Durability::Sync),
             "page-cache" | "pagecache" => Some(Durability::PageCache),
             _ => None,
@@ -104,6 +120,8 @@ impl Durability {
 mod file;
 mod memory;
 pub mod residency;
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+mod wal;
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use file::{FileStorage, STORAGE_METHOD_FILE};
@@ -328,6 +346,18 @@ pub trait StorageWrite: Debug + Send + Sync {
     /// This is idempotent: deleting a non-existent object succeeds.
     /// Only returns an error for actual failures (network, permissions, etc).
     async fn delete(&self, address: &str) -> Result<()>;
+
+    /// Make every write this storage reported complete short of the device
+    /// durable now.
+    ///
+    /// Backends whose writes are durable on return (object stores, memory)
+    /// have nothing to do and keep the default. `FileStorage` writes derived
+    /// content at page-cache durability and flushes it here, so a caller
+    /// about to publish a pointer to that content can put the content on the
+    /// device first without paying a flush per object on the write path.
+    async fn sync(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -476,6 +506,10 @@ impl StorageWrite for Arc<dyn Storage> {
     async fn delete(&self, address: &str) -> Result<()> {
         self.as_ref().delete(address).await
     }
+
+    async fn sync(&self) -> Result<()> {
+        self.as_ref().sync().await
+    }
 }
 
 #[async_trait]
@@ -613,6 +647,13 @@ pub trait ContentStore: Debug + Send + Sync {
         }
         Ok(full[start..end].to_vec())
     }
+
+    /// Make every write this store reported complete short of the device
+    /// durable now; see [`StorageWrite::sync`]. Call it before publishing a
+    /// pointer to content written through this store.
+    async fn sync(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 // Blanket `ContentStore` impl for `Arc<dyn ContentStore>`, so callers can pass
@@ -622,6 +663,10 @@ pub trait ContentStore: Debug + Send + Sync {
 impl ContentStore for Arc<dyn ContentStore> {
     async fn has(&self, id: &ContentId) -> Result<bool> {
         self.as_ref().has(id).await
+    }
+
+    async fn sync(&self) -> Result<()> {
+        self.as_ref().sync().await
     }
 
     async fn get(&self, id: &ContentId) -> Result<Vec<u8>> {
@@ -772,6 +817,10 @@ pub fn candidate_addresses(method: &str, ledger_id: &str, id: &ContentId) -> Vec
 
 #[async_trait]
 impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
+    async fn sync(&self) -> Result<()> {
+        self.storage.sync().await
+    }
+
     async fn has(&self, id: &ContentId) -> Result<bool> {
         let address = self.cid_to_address(id)?;
         if self.storage.exists(&address).await? {
@@ -1152,6 +1201,12 @@ impl Debug for BranchedContentStore {
 
 #[async_trait]
 impl ContentStore for BranchedContentStore {
+    /// Writes only ever land in the branch's own store; parents are read
+    /// fallbacks.
+    async fn sync(&self) -> Result<()> {
+        self.branch_store.sync().await
+    }
+
     async fn has(&self, id: &ContentId) -> Result<bool> {
         if self.branch_store.has(id).await? {
             return Ok(true);
