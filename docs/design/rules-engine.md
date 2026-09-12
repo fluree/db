@@ -194,6 +194,17 @@ Two things need deciding before B ships: whether minted reifiers count against
 materialization sidecar (if built) persists them with the same deterministic
 ids, which would make derived provenance durable and diffable across commits.
 
+## Known limit: rule bodies run under the budget, not the query's tracker
+
+Materialization happens while the query is *prepared*, before its execution
+context — fuel tracker and cancellation handle — exists, exactly as OWL 2 RL
+materialization always has. A rule body is therefore bounded by the reasoning
+budget (facts, memory, time — checked between rules and rounds) but cannot be
+cancelled mid-body by the query's cancellation token, and its scans are not
+charged as query fuel. Threading the tracker and cancellation into
+prepare-time materialization is the follow-up that closes this for both
+engines.
+
 ## Why not keep the old matcher and extend it
 
 The matcher's cost was its own bookkeeping, and extending its pattern language
