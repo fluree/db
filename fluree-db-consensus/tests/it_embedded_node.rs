@@ -421,3 +421,98 @@ async fn a_probe_that_finds_the_entry_just_popped_still_returns_the_receipt() {
         last_t = receipt.commit.t;
     }
 }
+
+/// A fast-forward merge lands on a queue-backed nameservice.
+///
+/// The regression this pins: `apply_merge`'s fast-forward arm used to call
+/// `publish_commit`, whose contract on the replicated data plane is "apply
+/// the staged queue front". A fast-forward stages nothing on the target —
+/// that is what makes it a fast-forward — so it failed with "per-branch
+/// queue is empty — nothing staged for this branch" on precisely the merges
+/// that need the least work, while a divergent merge (which stages a merge
+/// commit) succeeded.
+///
+/// It has to run here rather than beside the other merge tests: those build
+/// `FlureeBuilder::memory()`, whose `publish_commit` is already a plain ref
+/// write, so every one of them passed throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fast_forward_merge_lands_through_consensus() {
+    use fluree_db_api::ConflictStrategy;
+
+    let (integration, fluree, node, _dirs) = stand_up(15, |config| config).await;
+    fluree.create_ledger("ffdb").await.expect("create ledger");
+
+    // One commit on main, so the branch has somewhere to fork from.
+    node.committer
+        .transact(TransactionRequest {
+            idempotency_key: None,
+            ledger_id: "ffdb:main".into(),
+            body: TransactionBody::JsonLdInsert(serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:base", "ex:name": "base"
+            })),
+            txn_opts: Default::default(),
+            commit_opts: Default::default(),
+            tracking: None,
+            governance: Default::default(),
+        })
+        .await
+        .expect("seed main");
+
+    fluree
+        .create_branch("ffdb", "feature", None, None)
+        .await
+        .expect("create branch");
+
+    // Two commits on the branch and NONE on main — the shape that failed.
+    for i in 0..2 {
+        node.committer
+            .transact(TransactionRequest {
+                idempotency_key: None,
+                ledger_id: "ffdb:feature".into(),
+                body: TransactionBody::JsonLdInsert(serde_json::json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "@id": format!("ex:item{i}"), "ex:name": format!("item {i}")
+                })),
+                txn_opts: Default::default(),
+                commit_opts: Default::default(),
+                tracking: None,
+                governance: Default::default(),
+            })
+            .await
+            .expect("commit on branch");
+    }
+
+    let report = fluree
+        .merge_branch("ffdb", "feature", None, ConflictStrategy::default())
+        .await
+        .expect("a fast-forward merge must land on a queue-backed nameservice");
+
+    assert!(
+        report.fast_forward,
+        "main never advanced, so this must be a fast-forward: {report:?}"
+    );
+    assert_eq!(
+        report.conflict_count, 0,
+        "nothing diverged, so nothing can conflict: {report:?}"
+    );
+    assert_eq!(
+        report.commits_copied, 2,
+        "main gains both of the branch's commits: {report:?}"
+    );
+
+    // The head actually moved — a merge that reports success without
+    // advancing the ref would leave the proposal unlanded.
+    let record = integration
+        .nameservice()
+        .lookup("ffdb:main")
+        .await
+        .expect("lookup")
+        .expect("main is registered");
+    assert_eq!(
+        record.commit_t, report.new_head_t,
+        "main's replicated head must be the merged head: {report:?}"
+    );
+
+    node.shutdown().await;
+}

@@ -305,15 +305,14 @@ async fn build_policy_context_from_opts_inner(
         };
 
         (identity_sid, merged)
-    } else if let (Some(identity_iri), Some(classes)) = (
-        &opts.identity,
-        opts.policy_class.as_ref().filter(|c| !c.is_empty()),
-    ) {
+    } else if let (Some(identity_iri), Some(classes)) = (&opts.identity, opts.policy_class.as_ref())
+    {
         // Same-ledger identity + explicit `policy-class`: the request's
         // classes select the policy set; the identity is BIND-ONLY — it
         // resolves to populate `?$identity` for f:query rules and never
         // drives rule selection. This mirrors the cross-ledger identity
-        // contract above.
+        // contract above. An explicitly empty class list selects no stored
+        // policies; it must not fall back to this identity's wider assignments.
         //
         // Without this arm, a request carrying both fields silently ignored
         // `policy-class` and fell through to identity-mode selection below —
@@ -477,10 +476,15 @@ async fn build_policy_context_from_opts_inner(
     // were provided. When an identity IS specified but has no matching policies, is_root must
     // be false so that `default_allow` (not a blanket bypass) governs access.
     let has_explicit_policy_input = opts.identity.is_some()
-        || opts.policy_class.as_ref().is_some_and(|v| !v.is_empty())
+        || opts.policy_class.is_some()
         || opts.policy.is_some()
+        || opts
+            .policy_values
+            .as_ref()
+            .is_some_and(|values| !values.is_empty())
         || has_cross_ledger_source;
     let is_root = !has_explicit_policy_input
+        && opts.default_allow != Some(false)
         && view_set.restrictions.is_empty()
         && modify_set.restrictions.is_empty();
 
@@ -507,21 +511,12 @@ async fn build_policy_context_from_opts_inner(
     Ok(PolicyContext::new(wrapper, identity_sid))
 }
 
-/// Returns `true` iff `identity_iri` exists as a subject in the ledger but has
-/// **no** `f:policyClass` assignments — meaning no policy restrictions apply to
-/// that identity.
+/// Returns `true` iff `identity_iri` exists as a subject in the default policy
+/// graph but has no `f:policyClass` assignments there.
 ///
-/// This is the predicate used to decide whether a bearer-authenticated identity
-/// may impersonate another identity via `opts.identity` for policy testing.
-/// The semantics are:
-///
-/// - `FoundNoPolicies` → `true`: the identity is known and unrestricted, so it
-///   may delegate / impersonate.
-/// - `FoundWithPolicies` → `false`: the identity is itself policy-constrained
-///   and must not be allowed to bypass its own constraints by acting as another
-///   identity.
-/// - `NotFound` → `false`: an unknown identity must not gain impersonation
-///   rights regardless of `default_allow`.
+/// This describes local assignments only. It does not prove unrestricted
+/// access or confer authority to impersonate: configured/model policies and
+/// default-deny may still apply. Hosts must establish delegation separately.
 pub async fn identity_has_no_policies(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
@@ -555,9 +550,8 @@ pub async fn identity_has_no_policies(
 /// carries restrictions. `default_allow` governs access in all three cases — the
 /// "not found" / "found-no-policies" distinction is about SID availability, not gating.
 ///
-/// A separate predicate, [`identity_has_no_policies`], uses this enum to gate
-/// impersonation (only `FoundNoPolicies` qualifies); that gate is orthogonal to
-/// `default_allow`.
+/// [`identity_has_no_policies`] exposes the local-assignment distinction for
+/// inspection. It is not an authorization or delegation check.
 enum IdentityLookupResult {
     /// The identity IRI cannot be resolved (unregistered namespace) or has no subject
     /// node in this ledger. No identity SID is available to bind `?$identity`.

@@ -4,6 +4,8 @@ Fluree supports multiple authentication mechanisms to cover different deployment
 
 This document describes the authentication model, the supported modes, the bearer token claim set, and the access boundary between replication and query operations.
 
+See [Trusted policy authorization](policy-authorization.md) for the separation between authenticated identity, caller options, and explicit application delegation.
+
 ## Identity vs transport
 
 ### Identity (who)

@@ -38,7 +38,7 @@ pub(super) enum FastEqOutcome {
     OtherUnbound,
 }
 
-fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
+pub(crate) fn fast_eq_ne_for_iri_bindings<R: RowAccess>(
     op: CompareOp,
     args: &[Expression],
     row: &R,

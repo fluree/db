@@ -126,6 +126,11 @@ Every mutation is an ordinary Fluree transaction, so SHACL validation and policy
 apply unchanged and a rejected write comes back as a GraphQL error having
 written nothing.
 
+On a server running Raft consensus, GraphQL mutations return HTTP 501 before
+execution. Use the [transaction endpoints](../api/endpoints.md#transaction-endpoints) for writes in
+that deployment. GraphQL reads remain available, even when mutations are
+enabled in the ledger's schema.
+
 ## Explain
 
 Pass `?explain=true`, or `extensions: {"explain": true}` in the request body, to

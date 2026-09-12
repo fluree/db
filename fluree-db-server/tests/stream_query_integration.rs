@@ -230,10 +230,9 @@ async fn connection_missing_ledger_spec_rejected() {
     );
 }
 
-/// Connection-scoped SPARQL refuses policy signals (no multi-ledger identity
-/// resolution); use the ledger-scoped route or /query.
+/// Connection SPARQL enforces supplied policies; a missing class grants no rows.
 #[tokio::test]
-async fn connection_sparql_policy_refused() {
+async fn connection_sparql_policy_enforced() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
     create_ledger(&app, "strm:cpr").await;
@@ -245,7 +244,9 @@ async fn connection_sparql_policy_refused() {
         Some(("fluree-policy-class", "http://example.org/PublicClass")),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(!std::str::from_utf8(&bytes).unwrap().contains("Xavier"));
 }
 
 async fn state_no_heartbeat() -> (TempDir, Arc<AppState>) {

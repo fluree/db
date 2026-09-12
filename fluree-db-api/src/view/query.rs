@@ -20,6 +20,21 @@ use fluree_db_query::ir::{GraphName, Pattern};
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
 use serde_json::Value as JsonValue;
 
+fn explain_policy_notice(mut result: JsonValue, view: &GraphDb) -> JsonValue {
+    if view.is_root() {
+        return result;
+    }
+    // Every explain surface emits `plan` as an object; tolerate a different
+    // shape rather than panicking inside a diagnostics path.
+    if let Some(plan) = result.get_mut("plan").and_then(JsonValue::as_object_mut) {
+        plan.insert(
+            "reason".into(),
+            JsonValue::String("Statistics withheld by policy; estimates are heuristic".into()),
+        );
+    }
+    result
+}
+
 /// The content store backing `db`'s binary index, when it participates in
 /// the sync residency tier (exposes a miss register): the handle the
 /// query-entry retry loop drains misses from, fetches through, and holds
@@ -711,26 +726,43 @@ impl Fluree {
         Ok(result)
     }
 
+    /// Explain may show query structure, but a scoped caller must not learn
+    /// unrestricted cardinalities (including annotation-derived counts).
+    /// Keep the normal snapshot on the root path; only governed explains clone.
+    async fn prepare_explain_view(&self, db: &GraphDb) -> Result<GraphDb> {
+        let mut view = self.wrap_policy_defaults(db.clone()).await?;
+        if !view.is_root() {
+            let snapshot = std::sync::Arc::make_mut(&mut view.snapshot);
+            snapshot.stats = None;
+            snapshot.annotation_index = None;
+        }
+        Ok(view)
+    }
+
     /// Explain a JSON-LD query plan against a GraphDb.
     ///
     /// This uses the same default-context behavior as query execution.
     pub async fn explain(&self, db: &GraphDb, query_json: &JsonValue) -> Result<JsonValue> {
+        let db = self.prepare_explain_view(db).await?;
         crate::explain::explain_jsonld_with_default_context(
             &db.snapshot,
             query_json,
             db.default_context.as_ref(),
         )
         .await
+        .map(|result| explain_policy_notice(result, &db))
     }
 
     /// Explain a SPARQL query plan against a GraphDb.
     pub async fn explain_sparql(&self, db: &GraphDb, sparql: &str) -> Result<JsonValue> {
+        let db = self.prepare_explain_view(db).await?;
         crate::explain::explain_sparql_with_default_context(
             &db.snapshot,
             sparql,
             db.default_context.as_ref(),
         )
         .await
+        .map(|result| explain_policy_notice(result, &db))
     }
 
     /// Explain a Cypher query plan against a GraphDb.
@@ -744,8 +776,10 @@ impl Fluree {
         cypher: &str,
         params: Option<&fluree_db_cypher::ParamMap>,
     ) -> Result<JsonValue> {
+        let db = self.prepare_explain_view(db).await?;
         crate::explain::explain_cypher(&db.snapshot, cypher, db.default_context.as_ref(), params)
             .await
+            .map(|result| explain_policy_notice(result, &db))
     }
 
     /// Execute a query with tracking.

@@ -35,6 +35,8 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod admin;
+pub mod authorization;
+pub use authorization::PolicyAuthorization;
 pub mod block_fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;

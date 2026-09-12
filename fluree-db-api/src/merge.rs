@@ -16,7 +16,7 @@ use fluree_db_core::{
 };
 use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore};
 use fluree_db_ledger::LedgerState;
-use fluree_db_nameservice::{NsRecord, NsRecordSnapshot};
+use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefKind, RefValue};
 use fluree_db_novelty::compute_delta_keys;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
 use serde::Serialize;
@@ -83,9 +83,9 @@ pub struct StagedMerge {
     /// `None` for fast-forward (the ref just advances to
     /// `new_head_*`).
     pub commit: Option<GuardedStagedCommit>,
-    /// Source's index ref (if any). Best-effort copy after the ref
-    /// advance so the target reuses the source's index. Only set for
-    /// fast-forward — general merge invalidates the source's index.
+    /// Source's index artifacts to copy best-effort after a general merge.
+    /// The root is never published as the target's index. Fast-forward
+    /// merges leave this unset and retain the target's own index.
     pub source_index_for_publish: Option<(ContentId, i64)>,
     /// Source ledger id used as the source for any best-effort
     /// post-apply index copy. Carried through so the apply path can
@@ -122,6 +122,17 @@ impl crate::Fluree {
     ///
     /// If `target_branch` is `None`, the source's parent branch (from its
     /// branch point) is used as the target.
+    ///
+    /// On a queue-backed nameservice, this direct API's fast-forward uses
+    /// a ref CAS through consensus, bypassing the per-branch work queue.
+    /// It can therefore overtake previously queued transactions. Server
+    /// merges submitted through `QueuedTransactor` remain queue-ordered.
+    /// If the target head changes after preparation, re-run the merge on
+    /// `BranchConflict` to recompute against that head.
+    ///
+    /// Fast-forward retains the target's index and replays the merged
+    /// commits on reads until indexing catches up; it does not adopt or
+    /// copy the source's index artifacts.
     pub async fn merge_branch(
         &self,
         ledger_name: &str,
@@ -137,10 +148,32 @@ impl crate::Fluree {
             let source_id = staged.source_id.clone();
             let target_id = staged.target_id.clone();
             let target_snapshot = staged.rollback_snapshot.clone();
+            let published_head = staged.new_head_id.clone();
 
             match self.apply_merge(staged).await {
                 Ok(report) => Ok(report),
                 Err(e) => {
+                    // Roll back only a head this merge advanced. A failure
+                    // before the publish — a fast-forward CAS that lost to a
+                    // concurrent writer included — leaves the target's head
+                    // to that writer; forcing the snapshot back over it
+                    // would orphan their commit.
+                    let head_is_ours = self
+                        .nameservice()
+                        .lookup(&target_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|r| r.commit_head_id.as_ref() == Some(&published_head));
+                    if !head_is_ours {
+                        tracing::warn!(
+                            source = %source_id,
+                            target = %target_id,
+                            error = %e,
+                            "merge failed before its head was published; nothing to roll back"
+                        );
+                        return Err(e);
+                    }
                     tracing::warn!(
                         source = %source_id,
                         target = %target_id,
@@ -319,8 +352,8 @@ impl crate::Fluree {
             conflict_count,
             strategy,
             commits_copied,
-            current_head_t: _,
-            current_head_id: _,
+            current_head_t,
+            current_head_id,
             new_head_t,
             new_head_id,
             commit,
@@ -355,17 +388,84 @@ impl crate::Fluree {
             },
             None => {
                 // Fast-forward: advance target's HEAD to the source's head.
-                self.publisher()?
-                    .publish_commit(&target_id, new_head_t, &new_head_id)
-                    .await?;
+                //
+                // A ref-level CAS, NOT `publish_commit`. On a queue-backed
+                // nameservice (the raft data plane) `publish_commit`'s
+                // contract is "apply the staged queue front", and a
+                // fast-forward stages nothing on the target — so it failed
+                // with "per-branch queue is empty — nothing staged for this
+                // branch" on exactly the merges that need no work. The
+                // general path above stages a merge commit, which is why a
+                // DIVERGENT merge succeeded while a clean fast-forwardable
+                // one did not: the easier the merge, the surer the failure.
+                //
+                // The CAS expects the head `prepare_merge` computed the
+                // fast-forward against. Fast-forward is an ancestry claim
+                // ("the target head is the common ancestor"), and a retrying
+                // `fast_forward_commit` only checks `t`-ordering: a commit
+                // that landed on the target after preparation would be
+                // silently orphaned by a source head with a larger `t`. The
+                // general path gets the same guard from its write lock and
+                // `expected_head_ref`; this is the fast-forward twin.
+                let expected = RefValue {
+                    id: current_head_id.clone(),
+                    t: current_head_t,
+                };
+                let new_ref = RefValue {
+                    id: Some(new_head_id.clone()),
+                    t: new_head_t,
+                };
+                match self
+                    .publisher()?
+                    .compare_and_set_ref(&target_id, RefKind::CommitHead, Some(&expected), &new_ref)
+                    .await?
+                {
+                    CasResult::Updated => {}
+                    // Idempotent re-run: the head is already exactly where
+                    // this merge wanted to put it.
+                    CasResult::Conflict { actual }
+                        if actual.as_ref().is_some_and(|a| {
+                            a.t == new_head_t && a.id.as_ref() == Some(&new_head_id)
+                        }) => {}
+                    CasResult::Conflict { actual } => {
+                        let moved_to = actual.as_ref().map_or_else(
+                            || "an unknown head".to_string(),
+                            |a| format!("t={} id={:?}", a.t, a.id),
+                        );
+                        return Err(ApiError::BranchConflict(format!(
+                            "fast-forward merge into {target_id} lost a race: the head moved \
+                             from t={current_head_t} to {moved_to} while the merge was being \
+                             prepared — re-run the merge so it recomputes against the new head"
+                        )));
+                    }
+                }
                 (new_head_t, new_head_id)
             }
         };
 
-        // Best-effort: copy source's index into the target namespace
-        // (and, for fast-forward, publish the index ref too). Errors
-        // here only warn — the target can rebuild from commits.
-        if let Some((index_cid, index_t)) = source_index_for_publish {
+        // Best-effort: copy source's index artifacts into the target
+        // namespace. Errors here only warn — the target can rebuild from
+        // commits.
+        //
+        // The source's index ROOT is deliberately not published as the
+        // target's. A root carries `graph_iris`, the g_id → IRI table the
+        // registry is re-seeded from, and those IRIs are branch-qualified:
+        // slot 1 is `urn:fluree:{ledger}:{branch}#txn-meta` and slot 2
+        // `…#config`. Publishing the source's root therefore relabels the
+        // target's reserved slots with the SOURCE branch's names, and since
+        // the config graph is resolved by slot (`CONFIG_GRAPH_ID = 2`), the
+        // target reads the source's empty config and reports itself
+        // ungoverned — while its real config is displaced to a user slot.
+        // The flakes are untouched (queries resolve by slot, so data and
+        // txn-meta still read correctly); it is the label table that is
+        // wrong, which is worse for being invisible to a data query.
+        //
+        // Leaving the target's own index ref alone costs a rebuild from
+        // commits — the same cost as any un-indexed write — and keeps the
+        // registry the target created for itself. Adopting the root would
+        // need its `graph_iris` rewritten to the target's before publish;
+        // that is the optimisation, not the fix.
+        if let Some((index_cid, _index_t)) = source_index_for_publish {
             if let Err(e) = self
                 .copy_index_to_branch(&source_ledger_id, &target_id, &index_cid)
                 .await
@@ -374,14 +474,6 @@ impl crate::Fluree {
                     %e, source = %source_ledger_id, target = %target_id,
                     "failed to copy index during merge; target will rebuild from commits"
                 );
-            } else if fast_forward {
-                if let Err(e) = self
-                    .publisher()?
-                    .publish_index(&target_id, index_t, &index_cid)
-                    .await
-                {
-                    tracing::warn!(%e, "failed to publish index for merged target");
-                }
             }
         }
 
@@ -421,11 +513,6 @@ impl crate::Fluree {
             .await?;
 
         let current_head_t = ancestor.map(|a| a.t).unwrap_or(0);
-        let source_index_for_publish = source_record
-            .index_head_id
-            .as_ref()
-            .map(|cid| (cid.clone(), source_record.index_t));
-
         Ok(StagedMerge {
             target: resolved_target.to_string(),
             source: source_branch.to_string(),
@@ -442,7 +529,7 @@ impl crate::Fluree {
             new_head_t: source_head_t,
             new_head_id: source_head_id,
             commit: None,
-            source_index_for_publish,
+            source_index_for_publish: None,
         })
     }
 
