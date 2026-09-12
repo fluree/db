@@ -2086,6 +2086,35 @@ impl BinaryIndexStore {
         }
     }
 
+    /// All stored decimal representations of a value under one graph/predicate.
+    /// `None` means no arena is available; an empty vector is a conclusive miss
+    /// in an available arena. Includes legacy scale-variant aliases. This does
+    /// not look up numerically equal integers or floats: callers narrowing a
+    /// scan must independently establish that only decimal rows can match.
+    pub fn find_decimal_handles(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+        value: &bigdecimal::BigDecimal,
+    ) -> Option<Vec<u32>> {
+        Some(
+            self.graph_indexes
+                .get(&g_id)?
+                .numbig
+                .get(&p_id)?
+                .find_bigdec_handles(value),
+        )
+    }
+
+    /// Whether the predicate's NumBig arena contains only decimals. This says
+    /// nothing about rows stored outside that arena (e.g. inline integers).
+    pub fn numbig_is_decimal_only(&self, g_id: GraphId, p_id: u32) -> bool {
+        self.graph_indexes
+            .get(&g_id)
+            .and_then(|graph| graph.numbig.get(&p_id))
+            .is_some_and(crate::arena::numbig::NumBigArena::is_decimal_only)
+    }
+
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {
         match &self.dicts.subject_reverse_tree {
             Some(tree) => {
