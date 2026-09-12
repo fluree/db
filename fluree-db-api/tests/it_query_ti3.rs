@@ -27,7 +27,7 @@ async fn seed(fluree: &Fluree, probe: usize, noise: usize, misses: usize) {
     for i in 0..probe {
         graph.push(
             // Keep p3's average fanout above p2's, matching TI3's join order.
-            json!({"@id":format!("ex:u{i}"), "ex:p3":decimal(if i < 2 {230+i} else {100000+i % (probe / 20).max(1)})}),
+            json!({"@id":format!("ex:u{i}"), "ex:p3":decimal(if i < 2 {230+i} else {100_000+i % (probe / 20).max(1)})}),
         );
     }
     for i in 0..noise {
