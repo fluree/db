@@ -15,6 +15,7 @@ use crate::parse::IriEncoder;
 use crate::reasoning::ReasoningOverlay;
 use crate::{ContextConfig, ExecutableQuery};
 use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_core::clock::Instant;
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::edge::id_datatype_sid;
 use fluree_db_core::flake::FlakeMeta;
@@ -26,7 +27,6 @@ use fluree_db_reasoner::{
 };
 use std::collections::HashSet;
 use std::sync::Arc;
-use fluree_db_core::clock::Instant;
 
 /// Execution resources rule bodies should use — the same binary index store
 /// the enclosing query plans against, so rule bodies take the indexed lanes.
