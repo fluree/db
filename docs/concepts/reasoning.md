@@ -78,7 +78,8 @@ Before your query runs, the engine:
 
 ### Budget controls
 
-To guarantee termination, materialization enforces configurable limits:
+To guarantee termination, materialization (OWL 2 RL and datalog rules)
+enforces configurable limits, checked as facts are derived:
 
 | Limit | Default | What happens when exceeded |
 |-------|---------|--------------------------|

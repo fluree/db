@@ -1704,19 +1704,14 @@ async fn datalog_filter_iri_object_position_exclusion() {
     );
 }
 
-/// Fail CLOSED, not open. A filter operand that is shaped like a compact IRI
-/// but whose prefix the rule's `@context` never defines cannot be compared as
-/// an IRI. Demoting it to a string — what the engine used to do — is exactly
-/// the fail-open exclusion of #1556, so the rule is rejected at parse time
-/// instead: it derives nothing rather than deriving the excluded fact, and the
-/// author gets a named error.
-#[tokio::test(flavor = "current_thread")]
+/// An unquoted filter operand with an undefined prefix must fail CLOSED
+/// (#1556): the rule is rejected and the query fails naming the operand,
+/// rather than the rule running with a filter that cannot match and copying
+/// the very value it was written to exclude.
+#[tokio::test]
 async fn datalog_filter_unresolvable_iri_operand_fails_closed() {
-    let (store, _guard) = support::span_capture::init_test_tracing();
-
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "datalog/filter-iri-unresolvable");
-
     let rule_data = json!({
         "@context": {
             "ex": "http://example.org/",
@@ -1724,7 +1719,6 @@ async fn datalog_filter_unresolvable_iri_operand_fails_closed() {
         },
         "@graph": [
             {
-                // Sound rule: must keep deriving even though its sibling is rejected.
                 "@id": "ex:grandparentRule",
                 "f:rule": {
                     "@type": "@json",
@@ -1736,8 +1730,9 @@ async fn datalog_filter_unresolvable_iri_operand_fails_closed() {
                 }
             },
             {
-                // `foo:` is never defined in this rule's @context, so the
-                // operand cannot be resolved to an IRI.
+                // `foo:` is not defined in the rule's @context: an unresolvable
+                // operand can never equal an IRI, so `!=` would keep every row
+                // and copy the SSN. Fail closed: the query is rejected.
                 "@id": "ex:copyPropsRule",
                 "f:rule": {
                     "@type": "@json",
@@ -1755,11 +1750,11 @@ async fn datalog_filter_unresolvable_iri_operand_fails_closed() {
         ]
     });
     let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
-
     let data = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
-            {"@id": "ex:alice", "ex:sameAs": {"@id": "ex:bob"}, "ex:parent": {"@id": "ex:dan"}},
+            {"@id": "ex:alice", "ex:sameAs": {"@id": "ex:bob"}, "ex:parent": {"@id": "ex:dan"},
+             "ex:relType": {"@id": "ex:friendOf"}, "ex:knows": {"@id": "ex:bob"}},
             {"@id": "ex:dan", "ex:parent": {"@id": "ex:erin"}},
             {"@id": "ex:bob", "ex:name": "Bob", "ex:ssn": "123-45-6789"}
         ]
@@ -1772,37 +1767,20 @@ async fn datalog_filter_unresolvable_iri_operand_fails_closed() {
         "where": {"@id": "ex:alice", "?prop": "?val"},
         "reasoning": "datalog"
     });
-    let rows = support::query_jsonld(&fluree, &ledger, &q)
+    // Loud rejection: a rule that cannot run fails the query naming the rule
+    // and the problem, instead of being skipped with a log line while the
+    // query answers over an incomplete rule set.
+    let err = support::query_jsonld(&fluree, &ledger, &q)
         .await
-        .unwrap()
-        .to_jsonld(&ledger.snapshot)
-        .unwrap();
-    let results = normalize_rows(&rows);
-
-    let rendered = serde_json::to_string(&results).unwrap();
+        .expect_err("a query over a broken stored rule must fail, not answer");
+    let message = err.to_string();
     assert!(
-        !rendered.contains("123-45-6789"),
-        "an unresolvable IRI filter operand must fail CLOSED — the rule must not \
-         run and copy the value its filter was meant to exclude, got {results:?}"
+        message.contains("foo:ssn"),
+        "unexpected rejection message: {message}"
     );
     assert!(
-        results.contains(&json!(["ex:grandparent", "ex:erin"])),
-        "the sound sibling rule must keep deriving, got {results:?}"
-    );
-
-    let diagnostics: Vec<String> = store
-        .all_events()
-        .into_iter()
-        .filter(|e| e.level == tracing::Level::WARN)
-        .flat_map(|e| {
-            let mut parts: Vec<String> = e.fields.values().cloned().collect();
-            parts.push(e.message().to_string());
-            parts
-        })
-        .collect();
-    assert!(
-        diagnostics.iter().any(|d| d.contains("foo:ssn")),
-        "the rejected rule must produce a diagnostic naming the operand, got {diagnostics:?}"
+        message.contains("copyPropsRule"),
+        "unexpected rejection message: {message}"
     );
 }
 
@@ -1810,18 +1788,13 @@ async fn datalog_filter_unresolvable_iri_operand_fails_closed() {
 // Unbound insert-pattern variables (issue #1560)
 // =============================================================================
 
-/// #1560: a rule whose `insert` references a variable the `where` clause never
-/// binds derives nothing for every binding row — `instantiate_pattern` returns
-/// `None` and the row is dropped. That is correct semantics but it used to be
-/// completely silent. It must now produce a diagnostic naming the variable,
-/// without disturbing any other rule's derivations.
-#[tokio::test(flavor = "current_thread")]
+/// A head variable the body never binds (#1560) rejects the rule with an
+/// error naming the variable; the query fails rather than running a rule
+/// that could never instantiate.
+#[tokio::test]
 async fn datalog_unbound_insert_variable_reports_named_diagnostic() {
-    let (store, _guard) = support::span_capture::init_test_tracing();
-
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "datalog/unbound-insert-var");
-
     let rule_data = json!({
         "@context": {
             "ex": "http://example.org/",
@@ -1840,7 +1813,7 @@ async fn datalog_unbound_insert_variable_reports_named_diagnostic() {
                 }
             },
             {
-                // The where clause binds ?relation; the insert says ?rel.
+                // `?rel` is never bound — the where clause binds `?relation`.
                 "@id": "ex:typoRule",
                 "f:rule": {
                     "@type": "@json",
@@ -1854,12 +1827,13 @@ async fn datalog_unbound_insert_variable_reports_named_diagnostic() {
         ]
     });
     let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
-
     let data = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
-            {"@id": "ex:alice", "ex:relType": {"@id": "ex:friendOf"}, "ex:parent": {"@id": "ex:bob"}},
-            {"@id": "ex:bob", "ex:parent": {"@id": "ex:charlie"}}
+            {"@id": "ex:alice", "ex:sameAs": {"@id": "ex:bob"}, "ex:parent": {"@id": "ex:dan"},
+             "ex:relType": {"@id": "ex:friendOf"}, "ex:knows": {"@id": "ex:bob"}},
+            {"@id": "ex:dan", "ex:parent": {"@id": "ex:erin"}},
+            {"@id": "ex:bob", "ex:name": "Bob", "ex:ssn": "123-45-6789"}
         ]
     });
     let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
@@ -1870,32 +1844,20 @@ async fn datalog_unbound_insert_variable_reports_named_diagnostic() {
         "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
         "reasoning": "datalog"
     });
-    let rows = support::query_jsonld(&fluree, &ledger, &q)
+    // Loud rejection: a rule that cannot run fails the query naming the rule
+    // and the problem, instead of being skipped with a log line while the
+    // query answers over an incomplete rule set.
+    let err = support::query_jsonld(&fluree, &ledger, &q)
         .await
-        .unwrap()
-        .to_jsonld(&ledger.snapshot)
-        .unwrap();
-    let results = normalize_rows(&rows);
-
+        .expect_err("a query over a broken stored rule must fail, not answer");
+    let message = err.to_string();
     assert!(
-        results.contains(&json!("ex:charlie")),
-        "the sound rule must keep deriving alongside the broken one, got {results:?}"
+        message.contains("?rel"),
+        "unexpected rejection message: {message}"
     );
-
-    let diagnostics: Vec<String> = store
-        .all_events()
-        .into_iter()
-        .filter(|e| e.level == tracing::Level::WARN)
-        .flat_map(|e| {
-            let mut parts: Vec<String> = e.fields.values().cloned().collect();
-            parts.push(e.message().to_string());
-            parts
-        })
-        .collect();
     assert!(
-        diagnostics.iter().any(|d| d.contains("?rel")),
-        "a rule whose insert references an unbindable variable must produce a \
-         diagnostic naming ?rel, got {diagnostics:?}"
+        message.contains("typoRule"),
+        "unexpected rejection message: {message}"
     );
 }
 
@@ -2102,30 +2064,28 @@ async fn datalog_filter_quoted_operand_with_whitespace_works() {
     );
 }
 
-/// A malformed filter must not vanish. If it does, `rule.filters` is empty,
-/// filtering is skipped entirely, and the rule derives everything it was
-/// written to restrict — the #1556 failure mode reached by another route.
-///
-/// All three shapes were silently dropped before: a wrong-length array, a
-/// non-string expression, and a filter keyword whose case does not match.
-#[tokio::test(flavor = "current_thread")]
+/// A malformed filter element must not be dropped on the floor (#1556 by
+/// another route): every malformed shape rejects the rule, and the query
+/// fails instead of the rule running unfiltered and copying the SSN. A
+/// case-variant `FILTER` keyword is not malformed any more — the query
+/// parser accepts it — so that shape must simply filter correctly.
+#[tokio::test]
 async fn datalog_malformed_filter_does_not_silently_vanish() {
-    for (label, filter_element) in [
+    for (label, filter_element, expect_error) in [
         (
             "wrong arity",
             json!(["filter", "(!= ?prop ex:ssn)", "oops"]),
+            true,
         ),
-        ("wrong case", json!(["FILTER", "(!= ?prop ex:ssn)"])),
+        ("wrong case", json!(["FILTER", "(!= ?prop ex:ssn)"]), false),
         (
             "non-string expression",
             json!(["filter", {"expr": "(!= ?prop ex:ssn)"}]),
+            true,
         ),
     ] {
-        let (store, _guard) = support::span_capture::init_test_tracing();
-
         let fluree = FlureeBuilder::memory().build_memory();
         let ledger0 = genesis_ledger(&fluree, "datalog/malformed-filter");
-
         let rule_data = json!({
             "@context": {
                 "ex": "http://example.org/",
@@ -2150,7 +2110,6 @@ async fn datalog_malformed_filter_does_not_silently_vanish() {
             ]
         });
         let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
-
         let data = json!({
             "@context": {"ex": "http://example.org/"},
             "@graph": [
@@ -2159,55 +2118,51 @@ async fn datalog_malformed_filter_does_not_silently_vanish() {
             ]
         });
         let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
-
         let q = json!({
             "@context": {"ex": "http://example.org/"},
             "select": ["?prop", "?val"],
             "where": {"@id": "ex:alice", "?prop": "?val"},
             "reasoning": "datalog"
         });
-        let rows = support::query_jsonld(&fluree, &ledger, &q)
-            .await
-            .unwrap()
-            .to_jsonld(&ledger.snapshot)
-            .unwrap();
-        let results = normalize_rows(&rows);
-
-        let rendered = serde_json::to_string(&results).unwrap();
-        assert!(
-            !rendered.contains("123-45-6789"),
-            "[{label}] a malformed filter must not be dropped on the floor — the \
-             rule ran unfiltered and copied the value the filter was meant to \
-             exclude, got {results:?}"
-        );
-
-        let warned = store
-            .all_events()
-            .into_iter()
-            .any(|e| e.level == tracing::Level::WARN);
-        assert!(
-            warned,
-            "[{label}] rejecting a malformed filter must produce a diagnostic"
-        );
+        let outcome = support::query_jsonld(&fluree, &ledger, &q).await;
+        if expect_error {
+            let message = outcome
+                .expect_err("[{label}] a malformed filter must reject the rule, not vanish")
+                .to_string();
+            assert!(
+                message.contains("copyPropsRule"),
+                "[{label}] the rejection must name the rule, got: {message}"
+            );
+            assert!(
+                !message.contains("123-45-6789"),
+                "[{label}] the rejection must not leak data, got: {message}"
+            );
+        } else {
+            let rows = outcome
+                .unwrap_or_else(|e| panic!("[{label}] the filter must apply, got error: {e}"))
+                .to_jsonld(&ledger.snapshot)
+                .unwrap();
+            let results = normalize_rows(&rows);
+            let rendered = serde_json::to_string(&results).unwrap();
+            assert!(
+                !rendered.contains("123-45-6789"),
+                "[{label}] the filter must exclude the SSN, got {results:?}"
+            );
+            assert!(
+                results.contains(&json!(["ex:name", "Bob"])),
+                "[{label}] the rule must still copy the other property, got {results:?}"
+            );
+        }
     }
 }
 
-/// The bare-local-name filter form — `(= ?p knows)` — was the only operand
-/// shape that ever matched a bound IRI before #1556 was fixed, so a rule
-/// written as a workaround uses exactly it. Read as a string literal the form
-/// is a trap in BOTH directions: `=` derives nothing (a string never equals an
-/// IRI) and `!=` derives everything, including the fact the filter was written
-/// to exclude. Neither failure is visible at run time — RDFterm-equal makes
-/// IRI-vs-literal a clean `True`/`False`, never an `Error` — so the bare form
-/// is rejected at parse time with a message naming the operand and both
-/// rewrites (quote it for a string, prefix it for an IRI).
-#[tokio::test(flavor = "current_thread")]
+/// A bare-word filter operand (`(= ?p knows)`) is rejected with an error
+/// naming the operand and offering both rewrites — quoted string and
+/// prefixed IRI — instead of matching namespace-blindly (#1556).
+#[tokio::test]
 async fn datalog_bare_token_filter_operand_is_rejected_with_named_operand() {
-    let (store, _guard) = support::span_capture::init_test_tracing();
-
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "datalog/bare-local-name-filter");
-
     let rule_data = json!({
         "@context": {
             "ex": "http://example.org/",
@@ -2215,6 +2170,20 @@ async fn datalog_bare_token_filter_operand_is_rejected_with_named_operand() {
         },
         "@graph": [
             {
+                "@id": "ex:grandparentRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
+                        "insert": {"@id": "?person", "ex:grandparent": {"@id": "?grandparent"}}
+                    }
+                }
+            },
+            {
+                // `(= ?p knows)`: a bare local name is ambiguous between the
+                // string "knows" and the IRI ex:knows, and a string comparison
+                // against an IRI-bound ?p fails invisibly either way.
                 "@id": "ex:staleWorkaroundRule",
                 "f:rule": {
                     "@type": "@json",
@@ -2231,10 +2200,14 @@ async fn datalog_bare_token_filter_operand_is_rejected_with_named_operand() {
         ]
     });
     let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
-
     let data = json!({
         "@context": {"ex": "http://example.org/"},
-        "@graph": [{"@id": "ex:alice", "ex:knows": {"@id": "ex:bob"}}]
+        "@graph": [
+            {"@id": "ex:alice", "ex:sameAs": {"@id": "ex:bob"}, "ex:parent": {"@id": "ex:dan"},
+             "ex:relType": {"@id": "ex:friendOf"}, "ex:knows": {"@id": "ex:bob"}},
+            {"@id": "ex:dan", "ex:parent": {"@id": "ex:erin"}},
+            {"@id": "ex:bob", "ex:name": "Bob", "ex:ssn": "123-45-6789"}
+        ]
     });
     let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
 
@@ -2244,40 +2217,28 @@ async fn datalog_bare_token_filter_operand_is_rejected_with_named_operand() {
         "where": {"@id": "ex:alice", "ex:derivedKnows": "?who"},
         "reasoning": "datalog"
     });
-    let rows = support::query_jsonld(&fluree, &ledger, &q)
+    // Loud rejection: a rule that cannot run fails the query naming the rule
+    // and the problem, instead of being skipped with a log line while the
+    // query answers over an incomplete rule set.
+    let err = support::query_jsonld(&fluree, &ledger, &q)
         .await
-        .unwrap()
-        .to_jsonld(&ledger.snapshot)
-        .unwrap();
-    let results = normalize_rows(&rows);
-
+        .expect_err("a query over a broken stored rule must fail, not answer");
+    let message = err.to_string();
     assert!(
-        results.is_empty(),
-        "a bare local name must never match an IRI namespace-blindly — the rule \
-         is rejected at parse time and derives nothing, got {results:?}"
-    );
-
-    let diagnostics: Vec<String> = store
-        .all_events()
-        .into_iter()
-        .filter(|e| e.level == tracing::Level::WARN)
-        .flat_map(|e| {
-            let mut parts: Vec<String> = e.fields.values().cloned().collect();
-            parts.push(e.message().to_string());
-            parts
-        })
-        .collect();
-    assert!(
-        diagnostics.iter().any(|d| d.contains("`knows`")),
-        "a bare-token filter operand must be rejected with a diagnostic naming \
-         the operand, got {diagnostics:?}"
+        message.contains("`knows`"),
+        "unexpected rejection message: {message}"
     );
     assert!(
-        diagnostics
-            .iter()
-            .any(|d| d.contains("\"knows\"") && d.contains("ex:knows")),
-        "the rejection must offer both rewrites — quoted string and prefixed \
-         IRI, got {diagnostics:?}"
+        message.contains("\"knows\""),
+        "unexpected rejection message: {message}"
+    );
+    assert!(
+        message.contains("ex:knows"),
+        "unexpected rejection message: {message}"
+    );
+    assert!(
+        message.contains("staleWorkaroundRule"),
+        "unexpected rejection message: {message}"
     );
 }
 
@@ -2351,20 +2312,13 @@ async fn datalog_iri_versus_literal_filter_that_keeps_rows_is_not_flagged() {
     );
 }
 
-/// The headline failure mode of #1556, reached through the `!=` direction of
-/// the workaround operand form. `(!= ?prop ssn)` read as a string comparison
-/// keeps every row — an IRI-bound `?prop` never equals the string `"ssn"` —
-/// so the copy-properties rule derives exactly the fact its filter was written
-/// to withhold, and no run-time gate can see it (every row surviving looks
-/// like success). The bare operand must therefore be rejected at parse time:
-/// the rule derives nothing, and the diagnostic names the operand.
-#[tokio::test(flavor = "current_thread")]
+/// The `!=` twin of the bare-token mistake keeps every row instead of
+/// dropping them all, which no run-time gate can distinguish from success —
+/// so the bare form is rejected at parse time and the query fails.
+#[tokio::test]
 async fn datalog_bare_token_exclusion_filter_must_not_leak_the_excluded_fact() {
-    let (store, _guard) = support::span_capture::init_test_tracing();
-
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "datalog/bare-token-exclusion");
-
     let rule_data = json!({
         "@context": {
             "ex": "http://example.org/",
@@ -2372,7 +2326,6 @@ async fn datalog_bare_token_exclusion_filter_must_not_leak_the_excluded_fact() {
         },
         "@graph": [
             {
-                // Sound rule: must keep deriving even though its sibling is rejected.
                 "@id": "ex:grandparentRule",
                 "f:rule": {
                     "@type": "@json",
@@ -2384,9 +2337,9 @@ async fn datalog_bare_token_exclusion_filter_must_not_leak_the_excluded_fact() {
                 }
             },
             {
-                // The pre-#1556 workaround form, in the direction that leaks:
-                // as a string comparison `(!= ?prop ssn)` is true for every
-                // IRI-bound ?prop, so the rule would copy ex:ssn.
+                // `(!= ?prop ssn)`: as a string comparison this keeps every
+                // row and copies the SSN — the exclusion filter derives exactly
+                // the fact it was written to exclude. Rejected at parse time.
                 "@id": "ex:copyPropsRule",
                 "f:rule": {
                     "@type": "@json",
@@ -2404,11 +2357,11 @@ async fn datalog_bare_token_exclusion_filter_must_not_leak_the_excluded_fact() {
         ]
     });
     let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
-
     let data = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
-            {"@id": "ex:alice", "ex:sameAs": {"@id": "ex:bob"}, "ex:parent": {"@id": "ex:dan"}},
+            {"@id": "ex:alice", "ex:sameAs": {"@id": "ex:bob"}, "ex:parent": {"@id": "ex:dan"},
+             "ex:relType": {"@id": "ex:friendOf"}, "ex:knows": {"@id": "ex:bob"}},
             {"@id": "ex:dan", "ex:parent": {"@id": "ex:erin"}},
             {"@id": "ex:bob", "ex:name": "Bob", "ex:ssn": "123-45-6789"}
         ]
@@ -2421,38 +2374,20 @@ async fn datalog_bare_token_exclusion_filter_must_not_leak_the_excluded_fact() {
         "where": {"@id": "ex:alice", "?prop": "?val"},
         "reasoning": "datalog"
     });
-    let rows = support::query_jsonld(&fluree, &ledger, &q)
+    // Loud rejection: a rule that cannot run fails the query naming the rule
+    // and the problem, instead of being skipped with a log line while the
+    // query answers over an incomplete rule set.
+    let err = support::query_jsonld(&fluree, &ledger, &q)
         .await
-        .unwrap()
-        .to_jsonld(&ledger.snapshot)
-        .unwrap();
-    let results = normalize_rows(&rows);
-
-    let rendered = serde_json::to_string(&results).unwrap();
+        .expect_err("a query over a broken stored rule must fail, not answer");
+    let message = err.to_string();
     assert!(
-        !rendered.contains("123-45-6789"),
-        "a bare-token exclusion filter must fail CLOSED — the rule must not run \
-         and copy the value its filter was meant to exclude, got {results:?}"
+        message.contains("`ssn`"),
+        "unexpected rejection message: {message}"
     );
     assert!(
-        results.contains(&json!(["ex:grandparent", "ex:erin"])),
-        "the sound sibling rule must keep deriving, got {results:?}"
-    );
-
-    let diagnostics: Vec<String> = store
-        .all_events()
-        .into_iter()
-        .filter(|e| e.level == tracing::Level::WARN)
-        .flat_map(|e| {
-            let mut parts: Vec<String> = e.fields.values().cloned().collect();
-            parts.push(e.message().to_string());
-            parts
-        })
-        .collect();
-    assert!(
-        diagnostics.iter().any(|d| d.contains("`ssn`")),
-        "the rejected rule must produce a diagnostic naming the operand, \
-         got {diagnostics:?}"
+        message.contains("copyPropsRule"),
+        "unexpected rejection message: {message}"
     );
 }
 
@@ -2628,18 +2563,14 @@ async fn datalog_quoted_curie_lookalike_that_empties_rows_gets_the_runtime_hint(
 // Per-pattern insert instantiation (multi-head rules)
 // =============================================================================
 
-/// A multi-head rule with one bad head must keep deriving from its good heads.
-/// `execute_rule_with_bindings` instantiates each insert pattern independently
-/// — that per-pattern semantic predates the #1560 diagnostic and must survive
-/// it: only a rule where NO insert pattern can ever instantiate is rejected
-/// outright. The bad head is skipped with a warning naming the variable.
-#[tokio::test(flavor = "current_thread")]
-async fn datalog_multi_head_rule_keeps_deriving_when_one_head_is_unbound() {
-    let (store, _guard) = support::span_capture::init_test_tracing();
-
+/// A multi-head rule with one head that can never instantiate is rejected
+/// as a whole (range restriction is per rule): a rule that quietly derives
+/// only some of what it was written to is the partial answer loud rejection
+/// exists to prevent.
+#[tokio::test]
+async fn datalog_multi_head_rule_with_an_unbound_head_is_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "datalog/multi-head-partial");
-
+    let ledger0 = genesis_ledger(&fluree, "datalog/multi-head-unbound");
     let rule_data = json!({
         "@context": {
             "ex": "http://example.org/",
@@ -2647,8 +2578,21 @@ async fn datalog_multi_head_rule_keeps_deriving_when_one_head_is_unbound() {
         },
         "@graph": [
             {
-                // Two heads: the first is sound, the second says ?rel where the
-                // where clause binds ?relation.
+                "@id": "ex:grandparentRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
+                        "insert": {"@id": "?person", "ex:grandparent": {"@id": "?grandparent"}}
+                    }
+                }
+            },
+            {
+                // Two heads; the second uses `?rel`, which nothing binds.
+                // The whole rule is rejected: deriving the first head while
+                // silently dropping the second is exactly the partial answer
+                // loud rejection exists to prevent.
                 "@id": "ex:twoHeadRule",
                 "f:rule": {
                     "@type": "@json",
@@ -2656,7 +2600,7 @@ async fn datalog_multi_head_rule_keeps_deriving_when_one_head_is_unbound() {
                         "@context": {"ex": "http://example.org/"},
                         "where": {"@id": "?s", "ex:relType": {"@id": "?relation"}},
                         "insert": [
-                            {"@id": "?s", "ex:hasRelation": {"@id": "?relation"}},
+                            {"@id": "?s", "ex:hasRelType": true},
                             {"@id": "?s", "?rel": {"@id": "?s"}}
                         ]
                     }
@@ -2665,46 +2609,36 @@ async fn datalog_multi_head_rule_keeps_deriving_when_one_head_is_unbound() {
         ]
     });
     let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
-
     let data = json!({
         "@context": {"ex": "http://example.org/"},
         "@graph": [
-            {"@id": "ex:alice", "ex:relType": {"@id": "ex:friendOf"}}
+            {"@id": "ex:alice", "ex:sameAs": {"@id": "ex:bob"}, "ex:parent": {"@id": "ex:dan"},
+             "ex:relType": {"@id": "ex:friendOf"}, "ex:knows": {"@id": "ex:bob"}},
+            {"@id": "ex:dan", "ex:parent": {"@id": "ex:erin"}},
+            {"@id": "ex:bob", "ex:name": "Bob", "ex:ssn": "123-45-6789"}
         ]
     });
     let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
 
     let q = json!({
         "@context": {"ex": "http://example.org/"},
-        "select": "?rel",
-        "where": {"@id": "ex:alice", "ex:hasRelation": "?rel"},
+        "select": "?s",
+        "where": {"@id": "?s", "ex:hasRelType": true},
         "reasoning": "datalog"
     });
-    let rows = support::query_jsonld(&fluree, &ledger, &q)
+    // Loud rejection: a rule that cannot run fails the query naming the rule
+    // and the problem, instead of being skipped with a log line while the
+    // query answers over an incomplete rule set.
+    let err = support::query_jsonld(&fluree, &ledger, &q)
         .await
-        .unwrap()
-        .to_jsonld(&ledger.snapshot)
-        .unwrap();
-    let results = normalize_rows(&rows);
-
+        .expect_err("a query over a broken stored rule must fail, not answer");
+    let message = err.to_string();
     assert!(
-        results.contains(&json!("ex:friendOf")),
-        "the sound head of a multi-head rule must keep deriving when a sibling \
-         head cannot instantiate, got {results:?}"
+        message.contains("?rel"),
+        "unexpected rejection message: {message}"
     );
-
-    let diagnostics: Vec<String> = store
-        .all_events()
-        .into_iter()
-        .filter(|e| e.level == tracing::Level::WARN)
-        .flat_map(|e| {
-            let mut parts: Vec<String> = e.fields.values().cloned().collect();
-            parts.push(e.message().to_string());
-            parts
-        })
-        .collect();
     assert!(
-        diagnostics.iter().any(|d| d.contains("?rel")),
-        "the skipped head must produce a diagnostic naming ?rel, got {diagnostics:?}"
+        message.contains("twoHeadRule"),
+        "unexpected rejection message: {message}"
     );
 }

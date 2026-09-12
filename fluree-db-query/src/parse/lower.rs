@@ -1627,6 +1627,17 @@ fn lower_filter_expr_inner<E: IriEncoder>(
             let var_id = vars.get_or_insert(name);
             Ok(Expression::Var(var_id))
         }
+        // An IRI operand becomes `IRI("<iri>")`, exactly as the SPARQL lowering
+        // does for `?p = ex:knows`: the evaluator resolves the string to the
+        // ledger's `Sid` (or keeps it as an IRI value when the namespace is
+        // unknown), so the comparison is by term identity rather than by
+        // string, and an IRI-bound variable can match it.
+        UnresolvedExpression::Const(crate::parse::ast::UnresolvedFilterValue::Iri(iri)) => {
+            Ok(Expression::Call {
+                func: crate::ir::Function::Iri,
+                args: vec![Expression::Const(FlakeValue::String(iri.to_string()))],
+            })
+        }
         UnresolvedExpression::Const(val) => Ok(Expression::Const(val.into())),
         UnresolvedExpression::And(exprs) => {
             let lowered: Result<Vec<Expression>> = exprs

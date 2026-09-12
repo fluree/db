@@ -5,7 +5,10 @@
 //!
 //! # Design
 //!
-//! - Flakes are stored sorted by each index type for efficient range queries
+//! - Flakes are stored once, sorted in SPOT order; the other three index
+//!   orders are permutations of that array (`u32` positions), so a derived
+//!   fact costs one `Flake` plus twelve bytes rather than four `Flake`s.
+//!   Range lookups binary-search the permutation with the index comparator.
 //! - The overlay includes `FrozenSameAs` for owl:sameAs equivalence handling
 //! - Derived facts are canonicalized (use canonical representatives for S/O positions)
 //! - Query-time lookups canonicalize the query key first, only expand when necessary
@@ -23,14 +26,14 @@ use crate::same_as::FrozenSameAs;
 /// Implements `OverlayProvider` to be composable with base overlays (e.g., novelty).
 #[derive(Debug, Clone)]
 pub struct DerivedFactsOverlay {
-    /// Flakes sorted by SPOT index order
+    /// Flakes sorted by SPOT index order — the only materialized copy.
     spot: Arc<[Flake]>,
-    /// Flakes sorted by PSOT index order
-    psot: Arc<[Flake]>,
-    /// Flakes sorted by POST index order
-    post: Arc<[Flake]>,
-    /// Flakes sorted by OPST index order
-    opst: Arc<[Flake]>,
+    /// Positions into `spot`, ordered by the PSOT comparator.
+    psot: Arc<[u32]>,
+    /// Positions into `spot`, ordered by the POST comparator.
+    post: Arc<[u32]>,
+    /// Positions into `spot`, ordered by the OPST comparator.
+    opst: Arc<[u32]>,
     /// owl:sameAs equivalence classes
     same_as: FrozenSameAs,
     /// Epoch for cache key differentiation
@@ -69,29 +72,37 @@ impl DerivedFactsOverlay {
         }
     }
 
-    /// Create an overlay from pre-sorted flakes
+    /// Create an overlay from flakes in any order.
+    ///
+    /// The flakes are sorted into SPOT order once; the PSOT / POST / OPST
+    /// orders are derived as position permutations over that array.
     ///
     /// # Arguments
     ///
-    /// * `spot` - Flakes sorted by SPOT order
-    /// * `psot` - Flakes sorted by PSOT order
-    /// * `post` - Flakes sorted by POST order
-    /// * `opst` - Flakes sorted by OPST order
+    /// * `flakes` - Derived flakes (deduplicated by the caller)
     /// * `same_as` - Frozen sameAs equivalence classes
     /// * `epoch` - Epoch for cache differentiation
-    pub fn new(
-        spot: Vec<Flake>,
-        psot: Vec<Flake>,
-        post: Vec<Flake>,
-        opst: Vec<Flake>,
-        same_as: FrozenSameAs,
-        epoch: u64,
-    ) -> Self {
+    pub fn new(mut flakes: Vec<Flake>, same_as: FrozenSameAs, epoch: u64) -> Self {
+        assert!(
+            flakes.len() <= u32::MAX as usize,
+            "derived-facts overlay exceeds u32 positions"
+        );
+        flakes.sort_by(|a, b| IndexType::Spot.comparator()(a, b));
+        let spot: Arc<[Flake]> = flakes.into();
+        let permutation = |index: IndexType| -> Arc<[u32]> {
+            let cmp = index.comparator();
+            let mut order: Vec<u32> = (0..spot.len() as u32).collect();
+            order.sort_by(|a, b| cmp(&spot[*a as usize], &spot[*b as usize]));
+            order.into()
+        };
+        let psot = permutation(IndexType::Psot);
+        let post = permutation(IndexType::Post);
+        let opst = permutation(IndexType::Opst);
         Self {
-            spot: spot.into(),
-            psot: psot.into(),
-            post: post.into(),
-            opst: opst.into(),
+            spot,
+            psot,
+            post,
+            opst,
             same_as,
             epoch,
             instance_id: fluree_db_core::overlay::next_overlay_content_version(),
@@ -128,22 +139,68 @@ impl DerivedFactsOverlay {
         self.spot.is_empty()
     }
 
-    /// Get flakes by index type (for iteration/debugging)
-    pub fn flakes(&self, index: IndexType) -> &[Flake] {
-        match index {
-            IndexType::Spot => &self.spot,
-            IndexType::Psot => &self.psot,
-            IndexType::Post => &self.post,
-            IndexType::Opst => &self.opst,
+    /// The derived flakes in SPOT order.
+    pub fn flakes_spot(&self) -> &[Flake] {
+        &self.spot
+    }
+
+    /// Iterate the derived flakes in the given index order.
+    pub fn iter(&self, index: IndexType) -> impl Iterator<Item = &Flake> + '_ {
+        let view = self.view(index);
+        (0..view.len()).map(move |i| view.get(i))
+    }
+
+    /// Positional view of the flakes in one index order.
+    fn view(&self, index: IndexType) -> OrderView<'_> {
+        let order = match index {
+            IndexType::Spot => None,
+            IndexType::Psot => Some(&*self.psot),
+            IndexType::Post => Some(&*self.post),
+            IndexType::Opst => Some(&*self.opst),
+        };
+        OrderView {
+            spot: &self.spot,
+            order,
         }
     }
 
     /// Binary search for the first flake > target in the given index
     fn upper_bound(&self, index: IndexType, target: &Flake) -> usize {
-        let flakes = self.flakes(index);
+        let view = self.view(index);
         let cmp = index.comparator();
+        // partition_point over positions [0, len): the ordered predicate
+        // "flake at position <= target" is monotone in every index order.
+        let (mut lo, mut hi) = (0usize, view.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if cmp(view.get(mid), target).is_le() {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+}
 
-        flakes.partition_point(|f| cmp(f, target).is_le())
+/// Read-only view of the SPOT array through one index order's permutation
+/// (`None` = SPOT itself, the identity order).
+#[derive(Clone, Copy)]
+struct OrderView<'a> {
+    spot: &'a [Flake],
+    order: Option<&'a [u32]>,
+}
+
+impl<'a> OrderView<'a> {
+    fn len(&self) -> usize {
+        self.spot.len()
+    }
+
+    fn get(&self, i: usize) -> &'a Flake {
+        match self.order {
+            None => &self.spot[i],
+            Some(order) => &self.spot[order[i] as usize],
+        }
     }
 }
 
@@ -175,8 +232,8 @@ impl OverlayProvider for DerivedFactsOverlay {
             return;
         }
 
-        let flakes = self.flakes(index);
-        if flakes.is_empty() {
+        let view = self.view(index);
+        if view.len() == 0 {
             return;
         }
 
@@ -195,11 +252,12 @@ impl OverlayProvider for DerivedFactsOverlay {
             // Inclusive right boundary: include rhs
             self.upper_bound(index, rhs)
         } else {
-            flakes.len()
+            view.len()
         };
 
         // Emit flakes in range, filtered by to_t
-        for flake in &flakes[start..end] {
+        for i in start..end {
+            let flake = view.get(i);
             if flake.t <= to_t {
                 callback(flake);
             }
@@ -254,30 +312,8 @@ impl DerivedFactsBuilder {
     /// Sorts flakes by each index and constructs the immutable overlay.
     /// Preserves `same_as` and `epoch` even when no flakes were derived.
     pub fn build(self, same_as: FrozenSameAs, epoch: u64) -> DerivedFactsOverlay {
-        if self.flakes.is_empty() {
-            // Preserve same_as and epoch even with zero derived flakes
-            return DerivedFactsOverlay::new(
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                same_as,
-                epoch,
-            );
-        }
-
-        // Sort by each index
-        let mut spot = self.flakes.clone();
-        let mut psot = self.flakes.clone();
-        let mut post = self.flakes.clone();
-        let mut opst = self.flakes;
-
-        spot.sort_by(|a, b| IndexType::Spot.comparator()(a, b));
-        psot.sort_by(|a, b| IndexType::Psot.comparator()(a, b));
-        post.sort_by(|a, b| IndexType::Post.comparator()(a, b));
-        opst.sort_by(|a, b| IndexType::Opst.comparator()(a, b));
-
-        DerivedFactsOverlay::new(spot, psot, post, opst, same_as, epoch)
+        // Preserves same_as and epoch even with zero derived flakes.
+        DerivedFactsOverlay::new(self.flakes, same_as, epoch)
     }
 }
 
@@ -336,5 +372,64 @@ mod tests {
             collected.push(f.clone());
         });
         assert_eq!(collected.len(), 2);
+    }
+
+    /// Every index order must enumerate the same flakes as a fully sorted
+    /// copy would, and range bounds must resolve identically through the
+    /// permutation — the property the four-copies layout used to give for
+    /// free.
+    #[test]
+    fn permuted_orders_match_fully_sorted_copies() {
+        let mut builder = DerivedFactsBuilder::new();
+        // Deliberately unsorted, with repeated predicates and objects so the
+        // non-SPOT orders differ from SPOT.
+        for (s, p, o) in [
+            (3, 2, 5),
+            (1, 2, 9),
+            (2, 1, 5),
+            (1, 1, 7),
+            (3, 1, 9),
+            (2, 2, 7),
+        ] {
+            builder.push(make_flake(s, p, o, 1));
+        }
+        let overlay = builder.build(FrozenSameAs::empty(), 1);
+
+        for index in [
+            IndexType::Spot,
+            IndexType::Psot,
+            IndexType::Post,
+            IndexType::Opst,
+        ] {
+            let mut expected: Vec<Flake> = overlay.flakes_spot().to_vec();
+            expected.sort_by(|a, b| index.comparator()(a, b));
+
+            let via_iter: Vec<Flake> = overlay.iter(index).cloned().collect();
+            assert_eq!(via_iter, expected, "iter order for {index:?}");
+
+            let mut via_scan = Vec::new();
+            overlay.for_each_overlay_flake(0, index, None, None, true, i64::MAX, &mut |f| {
+                via_scan.push(f.clone());
+            });
+            assert_eq!(via_scan, expected, "full scan order for {index:?}");
+
+            // A bounded scan (exclusive left = second flake, inclusive right =
+            // fourth flake) must yield exactly the sorted slice (2..=3].
+            let mut bounded = Vec::new();
+            overlay.for_each_overlay_flake(
+                0,
+                index,
+                Some(&expected[1]),
+                Some(&expected[3]),
+                false,
+                i64::MAX,
+                &mut |f| bounded.push(f.clone()),
+            );
+            assert_eq!(
+                bounded,
+                expected[2..=3].to_vec(),
+                "bounded scan for {index:?}"
+            );
+        }
     }
 }

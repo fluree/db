@@ -48,6 +48,72 @@ fn parse_filter_value(value: &JsonValue) -> Result<super::ast::UnresolvedExpress
     super::parse_filter_value(value)
 }
 
+/// Parse a FILTER / BIND / UNWIND expression and resolve its unquoted
+/// `prefix:name` atoms against the query's `@context`.
+///
+/// The S-expression parser has no context, so it hands such atoms over as
+/// [`UnresolvedFilterValue::Curie`]. An atom whose prefix the context defines
+/// becomes an IRI operand (`(= ?p ex:knows)` compares by term identity, as in
+/// SPARQL); one whose prefix is undefined stays the plain string it always
+/// was, so `(= ?slot 12:30)` is unaffected.
+fn parse_expr_with_ctx(
+    value: &JsonValue,
+    ctx: &JsonLdParseCtx,
+) -> Result<super::ast::UnresolvedExpression> {
+    Ok(resolve_compact_iri_atoms(parse_filter_value(value)?, ctx))
+}
+
+/// Walk an expression tree, expanding [`UnresolvedFilterValue::Curie`] atoms
+/// whose prefix the context knows into [`UnresolvedFilterValue::Iri`].
+pub(crate) fn resolve_compact_iri_atoms(
+    expr: super::ast::UnresolvedExpression,
+    ctx: &JsonLdParseCtx,
+) -> super::ast::UnresolvedExpression {
+    use super::ast::{UnresolvedExpression as E, UnresolvedFilterValue as V};
+    match expr {
+        E::Const(V::Curie(atom)) => match ctx.expand_iri(&atom) {
+            // Expansion changed the text: the prefix was defined.
+            Ok(expanded) if expanded.as_str() != atom.as_ref() => {
+                E::Const(V::Iri(Arc::from(expanded.as_str())))
+            }
+            _ => E::Const(V::Curie(atom)),
+        },
+        E::And(items) => E::And(
+            items
+                .into_iter()
+                .map(|e| resolve_compact_iri_atoms(e, ctx))
+                .collect(),
+        ),
+        E::Or(items) => E::Or(
+            items
+                .into_iter()
+                .map(|e| resolve_compact_iri_atoms(e, ctx))
+                .collect(),
+        ),
+        E::Not(inner) => E::Not(Box::new(resolve_compact_iri_atoms(*inner, ctx))),
+        E::In {
+            expr,
+            values,
+            negated,
+        } => E::In {
+            expr: Box::new(resolve_compact_iri_atoms(*expr, ctx)),
+            values: values
+                .into_iter()
+                .map(|e| resolve_compact_iri_atoms(e, ctx))
+                .collect(),
+            negated,
+        },
+        E::Call { func, args } => E::Call {
+            func,
+            args: args
+                .into_iter()
+                .map(|e| resolve_compact_iri_atoms(e, ctx))
+                .collect(),
+        },
+        other => other,
+    }
+}
+
 /// Validate that a string looks like a variable (starts with ?)
 fn validate_var_name(name: &str) -> Result<()> {
     if !name.starts_with('?') {
@@ -201,7 +267,7 @@ pub fn parse_where_array_element(
                 })?;
                 validate_var_name(var)?;
 
-                let expr = parse_filter_value(&arr[i + 1])?;
+                let expr = parse_expr_with_ctx(&arr[i + 1], ctx)?;
                 query.patterns.push(UnresolvedPattern::Bind {
                     var: Arc::from(var),
                     expr,
@@ -226,7 +292,7 @@ pub fn parse_where_array_element(
                 ParseError::InvalidWhere("unwind var must be a string".to_string())
             })?;
             validate_var_name(var)?;
-            let expr = parse_filter_value(&arr[2])?;
+            let expr = parse_expr_with_ctx(&arr[2], ctx)?;
             query.patterns.push(UnresolvedPattern::Unwind {
                 var: Arc::from(var),
                 expr,
@@ -333,7 +399,7 @@ pub fn parse_where_array_element(
                         super::filter_data::parse_filter_expr_ctx(expr_val, &pattern_parser)?
                     }
                     // Non-array values (strings, etc.) use the standard parser
-                    _ => parse_filter_value(expr_val)?,
+                    _ => parse_expr_with_ctx(expr_val, ctx)?,
                 };
                 super::filter_common::reject_constant_bool_expr(&filter_expr, "filter")?;
                 query.add_filter(filter_expr);

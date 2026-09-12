@@ -253,6 +253,14 @@ pub async fn run_fixpoint(
 
         // Single pass over the delta: dispatch each fact to exactly the
         // compiled rules its predicate/class can fire (rulesFor index).
+        // The budget is also checked INSIDE the round, after every delta fact
+        // is dispatched: one round of a transitive closure over a dense graph
+        // can derive tens of millions of facts, so a between-rounds check alone
+        // let the default 1M cap overshoot twentyfold. The count is an upper
+        // estimate — it includes this round's candidates before they are
+        // deduplicated against earlier rounds — so a closure may cap slightly
+        // early, never late.
+        let mut in_round_cap: Option<&'static str> = None;
         for flake in delta.iter() {
             for rule in compiled.property_rules_for(&flake.p) {
                 fire_property_rule(rule, &ontology, &restrictions, flake, &mut ctx);
@@ -264,20 +272,31 @@ pub async fn run_fixpoint(
                     }
                 }
             }
+            if let Some(reason) = budget_exceeded(budget, &start, ctx.derived, ctx.new_delta) {
+                in_round_cap = Some(reason);
+                break;
+            }
         }
 
-        // Property chains (prp-spo2) are n-way joins seeded from every chain
-        // position; they run whole, gated on any component predicate being
-        // present in the delta.
-        let chains = ontology.property_chains();
-        for chain_idx in compiled.triggered_chains(delta.predicates()) {
-            apply_single_property_chain(&chains[chain_idx], &mut ctx);
+        if in_round_cap.is_none() {
+            // Property chains (prp-spo2) are n-way joins seeded from every chain
+            // position; they run whole, gated on any component predicate being
+            // present in the delta.
+            let chains = ontology.property_chains();
+            for chain_idx in compiled.triggered_chains(delta.predicates()) {
+                apply_single_property_chain(&chains[chain_idx], &mut ctx);
+                if let Some(reason) = budget_exceeded(budget, &start, ctx.derived, ctx.new_delta) {
+                    in_round_cap = Some(reason);
+                    break;
+                }
+            }
         }
 
         // cls-oo: enumerated individuals are typed unconditionally (no delta
         // trigger); the derived-set check keeps it idempotent per iteration.
-        if compiled.one_of_active() {
+        if in_round_cap.is_none() && compiled.one_of_active() {
             apply_one_of_rule(&restrictions, &mut ctx);
+            in_round_cap = budget_exceeded(budget, &start, ctx.derived, ctx.new_delta);
         }
 
         // If sameAs changed this iteration, canonicalize both delta and
@@ -311,6 +330,11 @@ pub async fn run_fixpoint(
         }
 
         delta = filtered_delta;
+
+        if let Some(reason) = in_round_cap {
+            diagnostics.mark_capped(reason, iterations, derived.derived_len(), start.elapsed());
+            break;
+        }
     }
 
     // Finalize sameAs
@@ -330,6 +354,25 @@ pub async fn run_fixpoint(
     }
 
     Ok((derived.into_derived_flakes(), frozen_same_as, diagnostics))
+}
+
+/// In-round budget check: derived facts so far plus this round's candidates,
+/// their approximate heap footprint, and wall-clock time.
+fn budget_exceeded(
+    budget: &crate::cache::ReasoningBudget,
+    start: &Instant,
+    derived: &DerivedSet,
+    new_delta: &DeltaSet,
+) -> Option<&'static str> {
+    if derived.derived_len() + new_delta.len() > budget.max_facts {
+        Some("facts")
+    } else if derived.approx_bytes() + new_delta.approx_bytes() > budget.max_memory_bytes {
+        Some("memory")
+    } else if start.elapsed() > budget.max_duration {
+        Some("time")
+    } else {
+        None
+    }
 }
 
 /// Dispatch one delta fact to a compiled property-triggered rule.

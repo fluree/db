@@ -177,12 +177,12 @@ fn extract_prefix_block_from_bytes(buf: &[u8]) -> Result<(String, u64), SplitErr
 
     for tok in &tokens {
         match tok.kind {
-            TokenKind::KwPrefix | TokenKind::KwBase => {
+            TokenKind::KwPrefix | TokenKind::KwBase | TokenKind::KwVersion => {
                 in_directive = true;
                 sparql_directive = false;
                 saw_any_directive = true;
             }
-            TokenKind::KwSparqlPrefix | TokenKind::KwSparqlBase => {
+            TokenKind::KwSparqlPrefix | TokenKind::KwSparqlBase | TokenKind::KwSparqlVersion => {
                 in_directive = true;
                 sparql_directive = true;
                 saw_any_directive = true;
@@ -192,9 +192,11 @@ fn extract_prefix_block_from_bytes(buf: &[u8]) -> Result<(String, u64), SplitErr
                 in_directive = false;
                 last_directive_end = tok.end;
             }
-            TokenKind::Iri if in_directive && sparql_directive => {
-                // SPARQL-style directives end after the IRI (no dot required).
-                // `PREFIX ns: <iri>` and `BASE <iri>` both terminate here.
+            TokenKind::Iri | TokenKind::String | TokenKind::StringEscaped(_)
+                if in_directive && sparql_directive =>
+            {
+                // SPARQL-style directives end after their operand (no dot
+                // required): `PREFIX ns: <iri>`, `BASE <iri>`, `VERSION "1.2"`.
                 in_directive = false;
                 last_directive_end = tok.end;
             }
@@ -292,6 +294,11 @@ struct Lookahead {
     pending_quote_char: u8,
     /// `\r` was the last byte — check for `\n` to form CRLF.
     pending_cr: bool,
+    /// A `<` was the last byte in Normal state; waiting to see whether it
+    /// opens an IRI (`<http://…>`) or, followed by a second `<`, an RDF 1.2
+    /// reified triple (`<< s p o >>`), whose contents are ordinary terms —
+    /// including string literals that may contain `>` and `.`.
+    pending_lt: bool,
 }
 
 /// Compute chunk byte ranges by scanning the file for statement boundaries.
@@ -359,6 +366,22 @@ pub fn compute_chunk_boundaries(
                     }
                 }
                 // The dot was not a boundary — fall through to process `b` normally.
+            }
+
+            // Handle a pending `<`: `<<` opens a reified triple, not an IRI.
+            // Scanning `<< :a :q "x > y . z" >>` as an IRI would exit at the
+            // `>` inside the string and then take the `.` as a statement
+            // boundary, splitting a chunk in the middle of a literal.
+            if lookahead.pending_lt {
+                lookahead.pending_lt = false;
+                prefix_check.feed(b, abs_pos)?;
+                state = match b {
+                    b'<' => ScanState::Normal,
+                    b'>' => ScanState::Normal, // `<>` — the empty relative IRI
+                    _ => ScanState::InIri,
+                };
+                prev_byte = Some(b);
+                continue;
             }
 
             // Handle pending CR for CRLF detection.
@@ -532,7 +555,11 @@ fn advance_state(
                     lookahead.pending_quote_char = b'\'';
                     Ok(ScanState::Normal)
                 }
-                b'<' => Ok(ScanState::InIri),
+                b'<' => {
+                    // Resolved on the next byte: IRI, or `<<` reified triple.
+                    lookahead.pending_lt = true;
+                    Ok(ScanState::Normal)
+                }
                 b'#' => Ok(ScanState::InComment),
                 b'.' => {
                     lookahead.pending_dot = Some(abs_pos);
@@ -1950,6 +1977,93 @@ ex:bob ex:name \"Bob\" .
         let ranges = compute_chunk_boundaries(f.path(), data_start, 1024 * 1024).unwrap();
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].0, data_start);
+    }
+
+    #[test]
+    fn star_statements_split_on_statement_ends_and_keep_their_reifiers() {
+        // RDF 1.2 constructs the pre-scan never sees as tokens: `<< … >>`
+        // (its `<` opens the IRI state until the first `>`), `{| … |}` bodies
+        // with decimals and `;`, and `~ reifier`. None may be mistaken for a
+        // statement boundary, and every chunk must parse with its reifier
+        // attachments intact.
+        let ttl = "\
+@prefix ex: <http://example.org/> .
+
+ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 ; ex:source \"hr.system\" |} .
+<< ex:alice ex:knows ex:carol >> ex:certainty 0.5 .
+ex:bob ex:knows ex:dave {| ex:since \"2024-01-01\" |} .
+ex:carol ex:age 42 ~ ex:claim2 .
+";
+        let f = write_temp(ttl);
+        let config = TurtleSplitConfig {
+            chunk_size_bytes: 60, // force multiple chunks
+        };
+        let reader = TurtleChunkReader::new(f.path(), &config).unwrap();
+        assert!(reader.chunk_count() > 1, "{}", reader.chunk_count());
+
+        let mut annotated_edges = 0;
+        for i in 0..reader.chunk_count() {
+            let chunk_text = reader.read_chunk(i).unwrap().unwrap();
+            let json = crate::parse_to_json(&chunk_text).unwrap_or_else(|e| {
+                panic!("chunk {i} must be valid Turtle-star: {e}\n{chunk_text}")
+            });
+            for node in json.as_array().unwrap() {
+                for (key, values) in node.as_object().unwrap() {
+                    if key.starts_with('@') {
+                        continue;
+                    }
+                    annotated_edges += values
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|v| v.get("@annotation").is_some())
+                        .count();
+                }
+            }
+        }
+        assert_eq!(annotated_edges, 4, "one reifier per star statement");
+    }
+
+    #[test]
+    fn reified_triple_with_gt_and_dot_inside_a_string_does_not_split_mid_statement() {
+        // `<<` must not be scanned as the start of an IRI: the `>` inside the
+        // literal would end the bogus IRI and the following ` . ` would be
+        // taken for a statement boundary, cutting the chunk inside the string.
+        let ttl = "\
+@prefix ex: <http://example.org/> .
+
+ex:s ex:p << ex:a ex:q \"has > and . here\" >> .
+ex:t ex:u ex:v .
+ex:w ex:x << ex:b ex:y <http://example.org/o> >> .
+";
+        let f = write_temp(ttl);
+        let config = TurtleSplitConfig {
+            chunk_size_bytes: 20, // force a boundary search right after the first statement
+        };
+        let reader = TurtleChunkReader::new(f.path(), &config).unwrap();
+        let mut subjects = Vec::new();
+        for i in 0..reader.chunk_count() {
+            let chunk_text = reader.read_chunk(i).unwrap().unwrap();
+            let json = crate::parse_to_json(&chunk_text).unwrap_or_else(|e| {
+                panic!("chunk {i} must be valid Turtle-star: {e}\n{chunk_text}")
+            });
+            for node in json.as_array().unwrap() {
+                subjects.push(node["@id"].as_str().unwrap().to_string());
+            }
+        }
+        assert!(reader.chunk_count() >= 2, "{}", reader.chunk_count());
+        assert!(
+            subjects.contains(&"http://example.org/s".to_string()),
+            "{subjects:?}"
+        );
+        assert!(
+            subjects.contains(&"http://example.org/t".to_string()),
+            "{subjects:?}"
+        );
+        assert!(
+            subjects.contains(&"http://example.org/w".to_string()),
+            "{subjects:?}"
+        );
     }
 
     #[test]

@@ -30,6 +30,8 @@ pub struct DerivedSet {
     is_base: Vec<bool>,
     /// Number of entries in `flakes` flagged as base facts.
     base_count: usize,
+    /// Approximate heap footprint of every flake held, for the memory budget.
+    approx_bytes: usize,
 }
 
 impl DerivedSet {
@@ -38,7 +40,7 @@ impl DerivedSet {
     }
 
     /// Compute a hash key for a flake's object
-    fn object_hash(o: &FlakeValue) -> u64 {
+    pub(crate) fn object_hash(o: &FlakeValue) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         match o {
@@ -168,6 +170,7 @@ impl DerivedSet {
         self.is_base.push(is_base);
 
         self.seen.insert(key);
+        self.approx_bytes += crate::cache::approx_flake_bytes(&flake);
         let idx = self.flakes.len();
 
         // Index by predicate
@@ -229,6 +232,12 @@ impl DerivedSet {
     /// Number of genuinely derived facts (total minus re-added base facts).
     pub fn derived_len(&self) -> usize {
         self.flakes.len() - self.base_count
+    }
+
+    /// Approximate heap footprint of the held flakes (see
+    /// [`crate::approx_flake_bytes`]).
+    pub fn approx_bytes(&self) -> usize {
+        self.approx_bytes
     }
 
     /// Check if empty

@@ -453,34 +453,35 @@ ex:dataset-import-2024-01-22 a ex:DatasetImport ;
 
 ## Edge annotations (RDF 1.2 / Turtle-star)
 
-The Turtle ingest path — and the related N-Triples (`.nt`), TriG, and N-Quads paths, which share the same lexer — is RDF 1.1 + Fluree extensions. It does **not** parse RDF 1.2 annotation tails (`{| ... |}`), the `~` reifier, or the parenthesized `<<( ... )>>` triple term. A file containing those productions **fails to parse** with a lexer error (e.g. `unexpected character '~'`; a `<<` triple term errors as a malformed IRI) — the data is rejected, not silently ingested without the annotations.
+The Turtle parser accepts the RDF 1.2 *asserting* annotation forms on every Turtle write path — `insert`, `upsert`, bulk `import`, `fluree graph sync`, and the memory importer:
 
-If you want to ingest edge annotations on data that lives in Turtle today, two paths work:
+- `:s :p :o {| :q :v |}` — an annotation block on a triple (fresh anonymous reifier);
+- `:s :p :o ~ :r {| :q :v |}` — a named reifier (`~ :r` on its own attaches the reifier without a body);
+- `<< :s :p :o >> :q :v` — a reified triple in subject or object position.
 
-**Path 1: Convert to JSON-LD before ingest.** Re-emit the file as JSON-LD with `@annotation` on the value objects you want annotated. The on-disk shape after ingest is identical to what an RDF 1.2 Turtle ingest would produce.
+Fluree's model reifies **asserted** edges, so every form above asserts the base triple `:s :p :o` and attaches the reifier to it — `<< … >>` is not the non-asserting form it is in plain RDF 1.2. The reifier's own triples (the annotation body) are ordinary RDF about the reifier. On disk the result is the same `f:reifies*` bundle that the JSON-LD `@annotation` and SPARQL 1.2 `{| |}` surfaces write, so the annotations are queryable from every query surface.
 
-**Path 2: Ingest plain Turtle first, then add annotations with SPARQL UPDATE.** Useful when the base edges are already in your Turtle export and the annotations come from a separate process.
+```turtle
+@prefix ex: <http://example.org/> .
 
-```bash
-# 1. Ingest the plain edges
-curl -X POST "http://localhost:8090/v1/fluree/upsert?ledger=mydb:main" \
-  -H "Content-Type: text/turtle" \
-  --data-binary '@employments.ttl'
-
-# 2. Add annotations via SPARQL UPDATE
-curl -X POST "http://localhost:8090/v1/fluree/update?ledger=mydb:main" \
-  -H "Content-Type: application/sparql-update" \
-  --data-binary @- <<'SPARQL'
-PREFIX ex: <http://example.org/>
-INSERT DATA {
-  ex:alice ex:worksFor ex:acme {| ex:role "Engineer" ; ex:since "2024-01-01" |} .
-}
-SPARQL
+ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 ; ex:source ex:hr |} .
+ex:alice ex:knows ex:carol {| ex:source ex:linkedin |} .
 ```
 
-See the [Edge annotations concept doc](../concepts/edge-annotations.md) for the full SPARQL 1.2 surface — `~` for named reifiers, `rdf:reifies` for annotation-rooted queries, the per-operation rules for INSERT DATA / DELETE DATA / INSERT WHERE / DELETE WHERE templates, and the deferred shapes that produce parse errors.
+Sending a claims file through `upsert` replaces each claim's body (`ex:confidence`) the way upsert replaces any other predicate value, while the edge and its attachment stay put — the natural way to keep a claims file in sync with a ledger.
 
-A `.ttl`-native annotation ingest would land alongside a Turtle-star vs RDF 1.2 reifier output decision and is tracked as a future extension.
+Rejected with a clear parse or stage error, never silently dropped:
+
+- the parenthesized triple term `<<( :s :p :o )>>` as a value (RDF 1.2 triple terms are not representable yet);
+- an annotation block nested inside an annotation body (`{| :q :v {| … |} |}`);
+- an annotation on a collection object (`( :a :b ) {| … |}`);
+- one named reifier on two different triples — a reifier denotes exactly one edge (see [the single-target invariant](../concepts/edge-annotations.md#one-annotation-one-edge-single-target-invariant));
+- an annotation on an `rdf:type` edge (`:s a :C {| … |}`) on the paths that convert Turtle to JSON-LD first (`upsert`, `graph sync`, memory import) — JSON-LD has no place to hang an annotation on a `@type` value. `insert` and SPARQL UPDATE accept it;
+- TriG: annotations inside a `GRAPH { }` block — same rule as SPARQL UPDATE (default graph only); use JSON-LD `@annotation` for named-graph edges.
+
+The RDF 1.2 version directive — `VERSION "1.2"` or `@version "1.2" .` — is accepted anywhere a directive may appear and ignored: the RDF 1.2 surface is always on. Base-direction language tags (`"…"@en--ltr`) are accepted; a direction other than `ltr` / `rtl` is a syntax error.
+
+Turtle-star output is not produced yet: exports and CONSTRUCT emit annotations in JSON-LD only. For the SPARQL 1.2 UPDATE equivalents see [the cookbook](../guides/cookbook-edge-annotations.md#the-same-patterns-in-sparql-12); for the full model and its limits see the [Edge annotations concept doc](../concepts/edge-annotations.md).
 
 ## Comparing Formats
 

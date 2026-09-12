@@ -56,10 +56,11 @@ fn test_recanonicalize_subjects_and_objects() {
     // P(1, 3) - already canonical
     delta.push(make_ref_flake(1, 10, 3, 1));
 
-    // Recanonicalize
+    // Recanonicalize. Both flakes canonicalize to the same (s, p, o), and a
+    // delta holds each fact once, so the two collapse into one.
     let canonical_delta = delta.recanonicalize(&tracker);
 
-    assert_eq!(canonical_delta.len(), 2);
+    assert_eq!(canonical_delta.len(), 1);
 
     // Verify both flakes now use canonical representatives
     let canonical_1 = tracker.canonical(&sid(1));

@@ -423,7 +423,7 @@ pub(crate) fn normalize_context_value(context_val: &JsonValue) -> JsonValue {
 ///
 /// - `@path` and `@reverse` on the same term → error (mutually exclusive).
 /// - `@path` value must be a string or array → error otherwise.
-fn extract_path_aliases(
+pub(crate) fn extract_path_aliases(
     context_val: &JsonValue,
     parsed_context: &ParsedContext,
     policy: JsonLdParsePolicy,
@@ -2651,6 +2651,61 @@ mod tests {
                     UnresolvedExpression::Const(UnresolvedFilterValue::Long(18))
                 ));
             }
+            _ => panic!("Expected Call expression"),
+        }
+    }
+
+    #[test]
+    fn filter_compact_iri_operand_resolves_through_context() {
+        // `(= ?p ex:knows)`: the prefix is defined, so the operand is the IRI
+        // http://example.org/knows — compared by term identity, like SPARQL —
+        // not the string "ex:knows" (which an IRI-bound ?p could never equal).
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s", "?o"],
+            "where": [
+                { "@id": "?s", "?p": "?o" },
+                ["filter", "(= ?p ex:knows)"]
+            ]
+        });
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::Call { args, .. } => assert!(
+                matches!(
+                    &args[1],
+                    UnresolvedExpression::Const(UnresolvedFilterValue::Iri(i))
+                        if i.as_ref() == "http://example.org/knows"
+                ),
+                "expected an expanded IRI operand, got {:?}",
+                args[1]
+            ),
+            _ => panic!("Expected Call expression"),
+        }
+
+        // An undefined prefix is not expanded: the atom stays the plain
+        // string it always was (a Curie that lowers as a string), so
+        // `(= ?slot 12:30)`-style values are unaffected.
+        let json = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": ["?s"],
+            "where": [
+                { "@id": "?s", "?p": "?o" },
+                ["filter", "(= ?p zz:knows)"]
+            ]
+        });
+        let (ast, _) = parse_query_ast(&json, None).unwrap();
+        let filter = find_filter(&ast.patterns).expect("Should have a filter");
+        match filter {
+            UnresolvedExpression::Call { args, .. } => assert!(
+                matches!(
+                    &args[1],
+                    UnresolvedExpression::Const(UnresolvedFilterValue::Curie(c))
+                        if c.as_ref() == "zz:knows"
+                ),
+                "expected an unexpanded Curie operand, got {:?}",
+                args[1]
+            ),
             _ => panic!("Expected Call expression"),
         }
     }

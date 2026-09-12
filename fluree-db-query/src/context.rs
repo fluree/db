@@ -1533,7 +1533,7 @@ impl<'a> ExecutionContext<'a> {
     /// This is critical for decoding novelty-only subject/string IDs when executing via
     /// `BinaryScanOperator`. Without it, decoding falls back to persisted forward packs and
     /// fails for novelty IDs (e.g. "string id N not found in forward packs").
-    fn extract_dict_novelty(snapshot: &LedgerSnapshot) -> Option<Arc<DictNovelty>> {
+    pub(crate) fn extract_dict_novelty(snapshot: &LedgerSnapshot) -> Option<Arc<DictNovelty>> {
         snapshot
             .range_provider
             .as_ref()

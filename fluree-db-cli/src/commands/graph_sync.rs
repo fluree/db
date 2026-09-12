@@ -220,3 +220,32 @@ fn print_remote_response(graph: &str, value: &serde_json::Value, dry_run: bool) 
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turtle_star_sync_source_converts_to_annotation_blocks() {
+        // `fluree graph sync` converts Turtle client-side; an ontology
+        // export carrying RDF 1.2 annotations must reach the sync endpoint
+        // as `@annotation` blocks instead of failing the conversion.
+        let source = SyncSource::RdfText {
+            content: "@prefix ex: <http://example.org/> .\n\
+                      ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 |} .\n"
+                .to_string(),
+            format: detect::DataFormat::Turtle,
+        };
+        let payload = source.into_payload().expect("Turtle-star converts");
+        let alice = payload
+            .as_array()
+            .expect("node array")
+            .iter()
+            .find(|n| n["@id"] == "http://example.org/alice")
+            .expect("alice node");
+        assert_eq!(
+            alice["http://example.org/knows"][0]["@annotation"]["@id"],
+            "http://example.org/claim1"
+        );
+    }
+}
