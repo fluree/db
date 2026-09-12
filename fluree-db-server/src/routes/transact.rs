@@ -246,9 +246,9 @@ fn prepare_transaction_body(
     let mut governance =
         GovernanceOptions::from_json(&body).map_err(|e| ServerError::bad_request(e.to_string()))?;
     // The auth-layer-verified identity `f:overrideControl` gates on, bound by
-    // `bind_authorization`. Under root impersonation `identity` above carries
-    // the target while this stays the bearer, and `from_json` never reads it
-    // from the body.
+    // `bind_authorization`. Where a credential lets its holder select the
+    // policy identity, `identity` above carries the selected one while this
+    // stays the credential's own; `from_json` never reads it from the body.
     governance.server_identity = headers.server_identity.clone();
 
     Ok(PreparedTransaction {

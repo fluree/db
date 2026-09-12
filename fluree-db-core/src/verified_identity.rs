@@ -4,8 +4,8 @@
 //! *who the caller provably is*, which is a different thing from the policy
 //! identity a request may name in `opts.identity` or a `fluree-identity`
 //! header. Those are policy evaluation context and may legitimately be
-//! caller-supplied (under root impersonation, for instance); they must never
-//! satisfy an allow-list. Keeping the verified identity in its own type makes
+//! caller-supplied (a credential may let its holder select one); they must
+//! never satisfy an allow-list. Keeping the verified identity in its own type makes
 //! the difference visible at every boundary: a bare `String` cannot be passed
 //! where a [`VerifiedIdentity`] is expected, so the only way one comes into
 //! existence is an explicit [`VerifiedIdentity::new`], and those call sites

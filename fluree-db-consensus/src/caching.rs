@@ -680,8 +680,9 @@ impl<C: Committer> CachingCommitter<C> {
 /// - Scalar fields (`identity`, `server_identity`, `default_allow`)
 ///   and the length-prefixed string list (`policy_class`) hash to
 ///   stable bytes for a given input. `server_identity` is included
-///   because two verified bearers impersonating the same target share
-///   an `identity` yet may resolve `f:overrideControl` differently.
+///   because two gateway credentials selecting the same policy
+///   identity share an `identity` yet may resolve
+///   `f:overrideControl` differently.
 /// - `policy_values` keys are sorted before iteration so HashMap
 ///   iteration order doesn't perturb the digest.
 /// - `policy` and individual `policy_values` entries are
@@ -2158,9 +2159,9 @@ mod tests {
         // `server_identity` is the auth-layer-verified DID that
         // `f:overrideControl` gates on. Two submissions with the same
         // body and the same policy `identity` can still resolve
-        // override control differently when the verified bearer
-        // differs (root impersonation of a shared target), so it must
-        // be part of the digest — including the None / Some edge.
+        // override control differently when the credential behind them
+        // differs (two gateways selecting the same policy identity), so
+        // it must be part of the digest — including the None / Some edge.
         let (_fluree, committer, ledger_id) = setup().await;
         let body = sample_insert("alice");
 

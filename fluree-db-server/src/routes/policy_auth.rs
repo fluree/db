@@ -26,9 +26,13 @@ pub(crate) fn bind_authorization(
     // Both arguments are auth-layer verified — a signed request's DID and a
     // verified bearer's identity — so this is the one place that may mint the
     // identity `f:overrideControl` gates on. Same precedence as the policy
-    // selection below: a signed request outranks a bearer token. Under
-    // impersonation `headers.identity` moves to the target while this stays
-    // the bearer, which is what keeps an allow-list honest.
+    // selection below: a signed request outranks a bearer token.
+    //
+    // Set before the request-selection early return, so a credential that lets
+    // its holder choose the policy identity still carries the identity it was
+    // itself issued to. That split is what keeps an allow-list honest: a
+    // gateway acting for an end user evaluates policy as that user while
+    // override control still answers to the gateway's own credential.
     headers.server_identity = signed_identity
         .map(std::string::ToString::to_string)
         .or_else(|| principal.and_then(|p| p.identity.clone()))

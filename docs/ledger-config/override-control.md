@@ -48,7 +48,7 @@ Override identity is the **auth-layer-verified request identity**, never a value
 What does **not** count, in any server mode:
 
 - `"opts": {"identity": "..."}` in query or transaction JSON, and the `fluree-identity` header. Both are policy evaluation context. In unauthenticated server modes they become the policy identity, but override control never consults the policy identity, so no request can satisfy an allow-list there.
-- Under root-bearer impersonation, policy evaluation uses the impersonated target while override control uses the bearer's own verified DID.
+- A credential that lets its holder select the policy identity (a trusted gateway acting for an end user) does not thereby select the override identity. Policy evaluation uses the selected identity; override control uses the DID the credential was issued to.
 - Anonymous requests (no verified identity) are always denied by `f:IdentityRestricted`.
 - CLI requests are always anonymous for override purposes: the CLI has no auth layer, so its `--identity` and policy flags only set the policy identity.
 

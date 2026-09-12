@@ -798,8 +798,9 @@ pub struct GovernanceOptions {
     /// or bearer token. It is never parsed from the query/transaction JSON or
     /// from headers ([`GovernanceOptions::from_json`] always leaves it `None`),
     /// so a caller cannot satisfy an allow-list by writing it into `opts`.
-    /// Under root-bearer impersonation this stays the bearer's own DID while
-    /// `identity` carries the impersonation target.
+    /// When a credential lets its holder select the policy identity (a trusted
+    /// gateway acting for an end user), this stays the DID the credential was
+    /// issued to while `identity` carries the selected one.
     ///
     /// It is distinct from `identity`, which is the policy-evaluation context
     /// and may legitimately come from the request. Server routes populate it;
