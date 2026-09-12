@@ -26,7 +26,7 @@ use fluree_db_reasoner::{
 };
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use fluree_db_core::clock::Instant;
 
 /// Execution resources rule bodies should use — the same binary index store
 /// the enclosing query plans against, so rule bodies take the indexed lanes.
