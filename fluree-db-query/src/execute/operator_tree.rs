@@ -2311,7 +2311,7 @@ fn build_operator_tree_folds(
     // feature x product cross-product. Clone only when a candidate is present.
     if crate::aggregate_complement_fold::has_aggregate_complement_candidate(query) {
         let mut rewritten = query.clone();
-        crate::aggregate_complement_fold::fold_aggregate_complements(&mut rewritten);
+        crate::aggregate_complement_fold::fold_aggregate_complements(&mut rewritten, planning);
         return build_operator_tree_inner(&rewritten, stats, true, planning);
     }
     build_operator_tree_inner(query, stats, true, planning)

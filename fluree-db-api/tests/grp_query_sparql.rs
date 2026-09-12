@@ -9,6 +9,8 @@ mod it_issue_1723_sameterm_fold;
 mod it_issue_1738_scan_narrowing;
 #[path = "it_query_ask.rs"]
 mod it_query_ask;
+#[path = "it_query_bi_q4.rs"]
+mod it_query_bi_q4;
 #[path = "it_query_collect.rs"]
 mod it_query_collect;
 #[path = "it_query_construct.rs"]
