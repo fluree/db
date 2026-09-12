@@ -11,7 +11,7 @@ use fluree_db_core::{
     RangeTest, DEFAULT_GRAPH_ID,
 };
 use fluree_db_core::{trace_first_parent_commits_by_id, Commit};
-use fluree_db_ledger::{LedgerState, StagedLedger};
+use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NsRecordSnapshot;
 use fluree_db_novelty::{compute_delta_keys, FactKey};
 use fluree_db_transact::{CommitOpts, NamespaceRegistry, StagedCommit};
@@ -42,6 +42,13 @@ pub enum ConflictStrategy {
 }
 
 impl ConflictStrategy {
+    /// Whether this strategy refuses to proceed given `conflict_count`
+    /// conflicting keys. The one shared answer for merge, revert, and merge
+    /// preview, so the preview cannot drift from what the merge does.
+    pub fn aborts_on(&self, conflict_count: usize) -> bool {
+        matches!(self, Self::Abort) && conflict_count > 0
+    }
+
     /// Parse a canonical strategy name from a string.
     ///
     /// Unlike [`Self::from_str_name`], this intentionally rejects aliases such
@@ -654,12 +661,18 @@ impl crate::Fluree {
         flakes: Vec<Flake>,
         original_commit: &Commit,
     ) -> Result<StagedCommit> {
-        let reverse_graph = state.snapshot.build_reverse_graph().map_err(|e| {
-            ApiError::internal(format!("Failed to build reverse graph during rebase: {e}"))
-        })?;
-
-        let view = StagedLedger::new(state, flakes, &reverse_graph).map_err(|e| {
-            ApiError::internal(format!("Failed to stage flakes during rebase: {e}"))
+        // A commit that conformed on the branch can violate a shape the
+        // source installed since the fork. Each replay is validated against
+        // the state it lands on; the first violation aborts the whole rebase,
+        // which has published nothing yet, naming the commit it stopped on.
+        let (view, outcome) = self
+            .stage_validated(state, flakes, &original_commit.namespace_delta, "rebase")
+            .await?;
+        outcome.into_result_with(|report| {
+            format!(
+                "replaying commit t={} would violate the source branch's shapes:\n{report}",
+                original_commit.t
+            )
         })?;
 
         let ns_registry = NamespaceRegistry::from_db(view.db());

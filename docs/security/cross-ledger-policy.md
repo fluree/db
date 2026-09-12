@@ -466,12 +466,17 @@ Specifics:
   transaction](../guides/cookbook-shacl.md#inline-shapes-per-transaction).
 - **Enforced surfaces**: JSON-LD transactions (insert / upsert /
   update, including TriG upserts), direct-flake Turtle inserts,
+  branch operations (merge, rebase, revert, and merge preview),
   and validation reports (`fluree validate` in ledger mode, the
   HTTP validate endpoint, `Fluree::validate_ledger`). Commit
   replay (graph-sync push) intentionally skips SHACL
   re-validation for cross-ledger sources: the origin already
   validated against M when the commit was authored, and
   re-resolving M at replay time could see a different head.
+  Branch operations are authoring, not replay: the state they
+  stage onto the target is a combination nobody has validated,
+  so they resolve M at operation time and enforce its shapes
+  like any transaction would.
 - **`sh:sparql` constraints travel over the wire** — the query
   text, `sh:prefixes` declarations, and their `owl:imports`
   closure are all projected. At write time the query lowers

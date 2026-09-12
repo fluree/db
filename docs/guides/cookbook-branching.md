@@ -180,6 +180,18 @@ An affected root can also cause `graph_iris[0] must be txn-meta IRI` on the seco
 
 ### Compare branches
 
+Preview what a merge would do before doing it:
+
+```bash
+# Ahead/behind commits, conflicts, whether the merge would go through
+fluree branch diff my-branch --target main
+
+# With the values on each side of every conflict
+fluree branch diff my-branch --target main --conflict-details
+```
+
+The preview stages the merge's resolved change set on the target and validates it against the target's SHACL shapes, through the same code path the merge uses. `mergeable: yes` means the merge will go through unless either branch changes first; otherwise the `validation:` line carries the report the merge would fail with. Pass `--no-validate` for a cheaper count-only preview.
+
 See what's different between two branches:
 
 ```bash

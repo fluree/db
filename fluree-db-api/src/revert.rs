@@ -30,7 +30,7 @@ use fluree_db_core::{
     trace_first_parent_commits_by_id, BranchedContentStore, CommitId, ConflictKey, ContentStore,
     NonEmpty,
 };
-use fluree_db_ledger::{LedgerState, StagedLedger};
+use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NsRecordSnapshot;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
 use fluree_vocab::namespaces::FLUREE_DB;
@@ -212,7 +212,7 @@ impl crate::Fluree {
             .build_revert_context(ledger_name, branch, selection)
             .await?;
 
-        if strategy == ConflictStrategy::Abort && !ctx.conflict_keys.is_empty() {
+        if strategy.aborts_on(ctx.conflict_keys.len()) {
             return Err(ApiError::BranchConflict(format!(
                 "Revert aborted: {} conflict(s) on {} with abort strategy",
                 ctx.conflict_keys.len(),
@@ -487,13 +487,12 @@ impl crate::Fluree {
             })
             .collect();
 
-        let reverse_graph = target_state.snapshot.build_reverse_graph().map_err(|e| {
-            ApiError::internal(format!("Failed to build reverse graph during revert: {e}"))
-        })?;
-
-        let view = StagedLedger::new(target_state, staged, &reverse_graph).map_err(|e| {
-            ApiError::internal(format!("Failed to stage flakes during revert: {e}"))
-        })?;
+        // Undoing a commit can remove a value a later shape requires. The
+        // inverted state is validated like any transaction producing it.
+        let (view, outcome) = self
+            .stage_validated(target_state, staged, &namespace_delta, "revert")
+            .await?;
+        outcome.into_result()?;
 
         let ns_registry = NamespaceRegistry::from_db(view.db());
         let mut commit_opts = CommitOpts::default().with_txn_meta(txn_meta);

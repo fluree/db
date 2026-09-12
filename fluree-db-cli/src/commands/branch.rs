@@ -107,6 +107,7 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
             max_changes,
             stat,
             changes_after,
+            no_validate,
             json,
             ledger,
             remote,
@@ -127,6 +128,7 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
                     max_changes,
                     stat,
                     changes_after,
+                    include_validation: !no_validate,
                     json,
                 },
                 ledger.as_deref(),
@@ -1049,6 +1051,8 @@ struct DiffOpts {
     max_changes: Option<usize>,
     stat: bool,
     changes_after: Option<String>,
+    /// SHACL validation of the merged state (on by default; `--no-validate`).
+    include_validation: bool,
     json: bool,
 }
 
@@ -1098,6 +1102,7 @@ async fn run_diff(
     // convention maps to `None` locally and to "omit the param" remotely
     // (the server always enforces its own cap).
     let include_changes = opts.include_changes;
+    let include_validation = opts.include_validation;
     let max_changes = if opts.stat {
         Some(0)
     } else {
@@ -1125,6 +1130,7 @@ async fn run_diff(
                 include_changes.then_some(true),
                 max_changes.filter(|_| include_changes),
                 opts.changes_after.as_deref(),
+                (!include_validation).then_some(false),
             )
             .await?;
 
@@ -1168,6 +1174,7 @@ async fn run_diff(
                     include_changes.then_some(true),
                     max_changes.filter(|_| include_changes),
                     opts.changes_after.as_deref(),
+                    (!include_validation).then_some(false),
                 )
                 .await?;
 
@@ -1190,6 +1197,7 @@ async fn run_diff(
                 include_changes,
                 max_changes,
                 changes_after_subject: opts.changes_after.clone(),
+                include_validation,
             };
 
             let preview = fluree
@@ -1283,6 +1291,13 @@ fn print_preview_local(p: &fluree_db_api::MergePreview) {
         }
     }
 
+    print_validation(
+        p.validation
+            .as_ref()
+            .map(|v| (v.conforms, v.report.as_deref())),
+        p.mergeable,
+    );
+
     if let Some(ch) = &p.changes {
         let shown: usize = ch
             .entries
@@ -1317,6 +1332,22 @@ fn print_preview_local(p: &fluree_db_api::MergePreview) {
             println!("  next page: --changes-after '{cursor}'");
         }
     }
+}
+
+/// The SHACL outcome and the mergeable verdict, rendered identically by the
+/// local and remote printers so the two cannot drift apart.
+fn print_validation(validation: Option<(bool, Option<&str>)>, mergeable: bool) {
+    if let Some((conforms, report)) = validation {
+        if conforms {
+            println!("validation: conforms");
+        } else {
+            println!("validation: violations (merge would be rejected)");
+            for line in report.unwrap_or_default().lines() {
+                println!("  {line}");
+            }
+        }
+    }
+    println!("mergeable: {}", if mergeable { "yes" } else { "no" });
 }
 
 fn print_delta_local(label: &str, d: &fluree_db_api::BranchDelta) {
@@ -1432,6 +1463,17 @@ fn print_preview_json(v: &serde_json::Value) -> CliResult<()> {
             }
         }
     }
+
+    let validation = v.get("validation").map(|val| {
+        (
+            val.get("conforms")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            val.get("report").and_then(Value::as_str),
+        )
+    });
+    let mergeable = v.get("mergeable").and_then(Value::as_bool).unwrap_or(false);
+    print_validation(validation, mergeable);
 
     if let Some(ch) = v.get("changes").filter(|x| !x.is_null()) {
         let asserts = ch.get("assert_count").and_then(Value::as_u64).unwrap_or(0);

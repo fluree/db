@@ -9,6 +9,7 @@ use fluree_db_core::{ConflictKey, ContentId, ContentStore, Flake, FlakeValue, Si
 use futures::TryStreamExt;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 
 /// Walk the first-parent lineage from `head_id` back to `stop_at_t` and
 /// collect all (subject, predicate, graph) tuples modified in those commits.
@@ -136,21 +137,29 @@ impl NetChangeAccumulator {
 /// into the aggregate change set the range applies (see
 /// [`NetChangeAccumulator`] for the netting contract).
 ///
-/// One walk serves both outputs, so callers that need conflict keys *and*
-/// the change set (merge preview with `include_changes`) replay the source
-/// chain once instead of twice.
+/// One walk serves every output, so callers that need conflict keys *and*
+/// the change set (merge preview) replay the source chain once instead of
+/// twice. The third element is the union of the range's namespace deltas,
+/// earliest commit winning on a code collision: the codes a consumer needs
+/// to make the change set's terms encodable before the range is committed.
 pub async fn compute_delta_keys_and_changes<C: ContentStore + Clone + 'static>(
     store: C,
     head_id: ContentId,
     stop_at_t: i64,
-) -> Result<(FxHashSet<ConflictKey>, Vec<Flake>)> {
+) -> Result<(FxHashSet<ConflictKey>, Vec<Flake>, HashMap<u16, String>)> {
     let stream = trace_first_parent_commits_by_id(store, head_id, stop_at_t);
     futures::pin_mut!(stream);
 
     let mut keys = FxHashSet::default();
     let mut acc = NetChangeAccumulator::default();
+    let mut namespace_delta: HashMap<u16, String> = HashMap::new();
 
     while let Some(commit) = stream.try_next().await? {
+        // Commits stream newest-first, so a plain insert leaves the oldest
+        // commit's prefix in place for a colliding code.
+        for (code, prefix) in commit.namespace_delta {
+            namespace_delta.insert(code, prefix);
+        }
         // Commits stream newest-first; iterate each commit's flakes in
         // reverse so the accumulator sees a strictly reverse-chronological
         // sequence even when one commit touches the same fact twice.
@@ -164,7 +173,7 @@ pub async fn compute_delta_keys_and_changes<C: ContentStore + Clone + 'static>(
         }
     }
 
-    Ok((keys, acc.finish()))
+    Ok((keys, acc.finish(), namespace_delta))
 }
 
 #[cfg(test)]
