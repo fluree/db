@@ -444,6 +444,14 @@ Enable background indexing and configure novelty backpressure thresholds:
 | `--reindex-min-bytes` | `FLUREE_REINDEX_MIN_BYTES` | `100`     | Soft threshold (triggers background indexing; default ≈ reindex every commit) |
 | `--reindex-max-bytes` | `FLUREE_REINDEX_MAX_BYTES` | 20% of system RAM (256 MB fallback) | Hard threshold: transactions are rejected with HTTP 503 `err:db/NoveltyAtMax` (+ `Retry-After`) until the indexer catches up — nothing waits or queues; clients should retry |
 
+Index garbage-collection retention (see [Index Retention](../indexing-and-search/background-indexing.md#index-retention)):
+
+| Flag                         | Env Var                           | Default | Description                                     |
+| ---------------------------- | --------------------------------- | ------- | ----------------------------------------------- |
+| `--gc-max-old-indexes`       | `FLUREE_GC_MAX_OLD_INDEXES`       | `5`     | Old index versions to retain before GC |
+| `--gc-min-time-mins`         | `FLUREE_GC_MIN_TIME_MINS`         | `30`    | Minimum age (minutes) before an index version can be collected. Protects queries that started against an older version. ANDed with the count, so the slower of the two wins |
+| `--gc-hard-max-old-indexes`  | `FLUREE_GC_HARD_MAX_OLD_INDEXES`  | unset   | Version ceiling past which the age guard is overridden and versions are collected regardless of age. Bounds retained versions, not bytes; past it GC can release artifacts a still-running query needs, so set it well above the versions published during your longest query |
+
 Config file equivalent:
 
 ```toml
@@ -451,6 +459,9 @@ Config file equivalent:
 enabled = true
 reindex_min_bytes = 100            # ≈ every commit — soft trigger
 # reindex_max_bytes = 536870912    # 512 MB — defaults to 20% of system RAM if omitted
+# gc_max_old_indexes = 5
+# gc_min_time_mins = 30
+# gc_hard_max_old_indexes = 40     # unset by default: the age guard is never overridden
 ```
 
 ## Server Role Configuration
@@ -536,6 +547,7 @@ Protect query/transaction endpoints (including `/v1/fluree/query/{ledger...}`,
 | `--data-auth-mode`                 | `FLUREE_DATA_AUTH_MODE`                 | `none`  |
 | `--data-auth-audience`             | `FLUREE_DATA_AUTH_AUDIENCE`             | None    |
 | `--data-auth-trusted-issuer`       | `FLUREE_DATA_AUTH_TRUSTED_ISSUERS`      | None    |
+| `--data-auth-policy-authority`     | `FLUREE_DATA_AUTH_POLICY_AUTHORITIES`  | None    |
 | `--data-auth-default-policy-class` | `FLUREE_DATA_AUTH_DEFAULT_POLICY_CLASS` | None    |
 
 Modes:
@@ -550,6 +562,13 @@ Bearer token scopes:
 - **Write**: `fluree.ledger.write.all=true` or `fluree.ledger.write.ledgers=[...]`
 
 Back-compat: `fluree.storage.*` claims imply **read** scope for data endpoints.
+
+Applications may select request policies using a credential with
+`"fluree.policy": "request"`, or issue a fixed signed `fluree.policy`
+selection for downstream clients. Both require the verified issuer to be a
+configured policy authority.
+This repeatable setting requires a nonempty data-auth audience; policy authorities also establish ordinary issuer trust. See [Trusted policy authorization](../security/policy-authorization.md)
+for the TOML configuration, claim format, and embedded SDK equivalent.
 
 ```bash
 fluree-server \
@@ -762,6 +781,8 @@ fluree-server \
 
 > **JWKS support**: When `--jwks-issuer` is configured, storage proxy endpoints accept RS256 OIDC tokens in addition to Ed25519 JWS tokens. The `--jwks-issuer` flag is shared with data, admin, and events endpoints — a single flag enables OIDC across all endpoint groups.
 
+Storage proxy rejects fixed `fluree.policy` delegation and `"fluree.policy": "request"` credentials. Delegated policy selection is supported by the data API, not storage-proxy endpoints. Use separate replication credentials for storage access; see [Trusted policy authorization](../security/policy-authorization.md).
+
 ## Complete Configuration Examples
 
 ### Development (Memory Storage)
@@ -892,6 +913,9 @@ fluree server run \
 | `FLUREE_INDEXING_ENABLED`               | Enable background indexing                      | `true`                                                                  |
 | `FLUREE_REINDEX_MIN_BYTES`              | Soft reindex threshold (bytes)                  | `100000`                                                                |
 | `FLUREE_REINDEX_MAX_BYTES`              | Hard reindex threshold (bytes)                  | 20% of system RAM (256 MB fallback)                                      |
+| `FLUREE_GC_MAX_OLD_INDEXES`             | Old index versions to retain before GC          | `5`                                                                     |
+| `FLUREE_GC_MIN_TIME_MINS`               | Minimum age (minutes) before an index version can be collected; protects queries that started against an older version | `30`                              |
+| `FLUREE_GC_HARD_MAX_OLD_INDEXES`        | Version ceiling past which the age guard is overridden. Bounds versions, not bytes; past it GC can release artifacts a still-running query needs — see [Index Retention](../indexing-and-search/background-indexing.md#index-retention) | Unset (no ceiling) |
 | `FLUREE_DICT_COMPACTION`                | Merge forward dictionary packs during incremental index builds. Off (`0`/`false`/`off`/`no`) appends packs without ever merging them, so a dictionary's object and mapping count grows once per build forever — see [Forward pack compaction](../design/index-format.md#forward-pack-compaction). Read once per process. | `true` |
 | `FLUREE_CACHE_MAX_MB`                   | Global in-memory cache budget (MB)              | Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`                                                     |
 | `FLUREE_DISK_CACHE_MAX_MB`              | Global on-disk cache budget (MB), shared across object storage + Iceberg | Auto-detect from free disk; `0` disables |
@@ -1090,6 +1114,8 @@ environment-only.
 | `FLUREE_ICEBERG_SCAN_CONCURRENCY` | `min(cores, files, 8)` | Number of data files read concurrently within one scan. Raise it for high-latency remote object stores (it is not capped, but is bounded by the number of files in the scan). |
 | `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` | `1024` | Memory budget (MB) for one materialize pass's subject accumulator — the pass's dominant memory term (one retained node per distinct subject in the window). A window whose **estimated** accumulator exceeds the budget fails with a typed error *before any commit* (nothing partially applied, watermark un-advanced) instead of the process being OOM-killed. The failure is deterministic and recurs every poll until the budget or the window changes: shorten the poll interval so incremental windows stay small, or raise the budget for a large full read. `0` disables the gate. |
 | `FLUREE_MATERIALIZE_WATERMARK_REFRESH_MINS` | `30` | How old a materialize window may grow before an *empty* poll still persists its watermark. Skipping watermark writes on no-data polls keeps the state ledger from taking ~1,200 empty commits/hour, but never refreshing lets the stored snapshot age out of the source's snapshot retention — after which every poll degrades to a full table read. This bound is the compromise: quiet tables refresh their watermark at most once per interval. |
+| `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` | derived | Rows one materialize pass may take before checkpointing, on both the full-read and the incremental path. Unset, it is derived from the configured novelty ceiling (`reindex_max_bytes`, however it was set): a quarter of the ceiling divided by `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW`, floored at 1,000 rows, so that a bounded pass can actually commit. A **full read** stops at a commit boundary and records where it got to — as a snapshot checkpoint when a retained snapshot names it, otherwise as a commit-sequence cursor, which survives snapshot expiry. An **incremental window** whose snapshots (sized from their `added-records` summaries) exceed the budget stops at the last snapshot the budget covers and advances the watermark to it, so a backlog drains in bounded steps instead of re-reading a growing window on every poll until the watermark expires. Either way the next poll resumes from where this one stopped. `0` disables the bound and reads the whole window in one pass. |
+| `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW` | `108` | Estimated bytes of novelty one materialized row costs; used only to convert the novelty ceiling into the row budget above. Set this, rather than the row budget, when rows are much wider or narrower, so the budget keeps tracking the ceiling. |
 
 **Caching model.** Catalog access is cached at two scopes. Within a single query,
 the first scan of a table pins its `metadata_location`, so every scan in that

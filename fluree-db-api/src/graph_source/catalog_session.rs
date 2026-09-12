@@ -143,6 +143,7 @@ pub(crate) struct IcebergCatalogSession {
 }
 
 impl IcebergCatalogSession {
+    #[cfg(feature = "sql")]
     pub(crate) fn mark_sql_source(&self, graph_source_id: &str) {
         self.sql_sources
             .lock()

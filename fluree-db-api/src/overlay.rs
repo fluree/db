@@ -13,6 +13,9 @@ use fluree_db_core::{Flake, GraphId, IndexType, OverlayProvider};
 /// to the callback.
 pub struct CompositeOverlay {
     epoch: u64,
+    /// Composed from the parts' versions, in order; `None` when any part
+    /// cannot vouch for its own.
+    content_version: Option<u64>,
     overlays: Vec<std::sync::Arc<dyn OverlayProvider>>,
 }
 
@@ -23,7 +26,16 @@ impl CompositeOverlay {
         for o in &overlays {
             epoch = epoch.wrapping_mul(1_000_003).wrapping_add(o.epoch());
         }
-        Self { epoch, overlays }
+        let content_version = overlays
+            .iter()
+            .map(|o| o.content_version())
+            .collect::<Option<Vec<u64>>>()
+            .map(|parts| fluree_db_core::overlay::compose_content_version(&parts));
+        Self {
+            epoch,
+            content_version,
+            overlays,
+        }
     }
 }
 
@@ -34,6 +46,10 @@ impl OverlayProvider for CompositeOverlay {
 
     fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    fn content_version(&self) -> Option<u64> {
+        self.content_version
     }
 
     fn is_effectively_empty(&self) -> bool {

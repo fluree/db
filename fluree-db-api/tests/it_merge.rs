@@ -8,6 +8,9 @@ use crate::support;
 use fluree_db_api::{ConflictStrategy, FlureeBuilder};
 use serde_json::json;
 
+#[path = "support/merge_race.rs"]
+mod race_nameservice;
+
 /// Extract sorted name strings from query result rows.
 fn extract_names(rows: &serde_json::Value) -> Vec<String> {
     let mut names: Vec<String> = rows
@@ -88,9 +91,123 @@ async fn merge_fast_forward() {
     assert_eq!(report.source, "dev");
     assert!(report.commits_copied > 0);
 
+    let repeated = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .expect("repeating a completed fast-forward is idempotent");
+    assert!(repeated.fast_forward);
+    assert_eq!(repeated.commits_copied, 0);
+    assert_eq!(repeated.new_head_id, report.new_head_id);
+    assert_eq!(repeated.new_head_t, report.new_head_t);
+    let head = fluree
+        .nameservice()
+        .lookup("mydb:main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.commit_head_id.as_ref(), Some(&report.new_head_id));
+    assert_eq!(head.commit_t, report.new_head_t);
+
     // Main should now see Alice (base) + Bob (from dev)
     let names = query_all_names(&fluree, "mydb:main").await;
     assert_eq!(names, vec!["Alice", "Bob"]);
+}
+
+/// Pause the public merge after preparation and land a real target commit.
+/// A smaller t than the source catches a retry based on t-ordering; equal t
+/// with a different CID catches an idempotency check that ignores identity.
+async fn assert_fast_forward_loses_race(source_commits: usize) {
+    use fluree_db_api::{ApiError, Fluree, NameServiceMode};
+    use std::{sync::Arc, time::Duration};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    fluree
+        .insert(
+            ledger,
+            &json!({"@id": "urn:base", "http://example.org/ns/name": "Base"}),
+        )
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    for i in 0..source_commits {
+        let dev = fluree.ledger("mydb:dev").await.unwrap();
+        fluree
+            .insert(
+                dev,
+                &json!({"@id": format!("urn:source:{i}"), "http://example.org/ns/name": "Source"}),
+            )
+            .await
+            .unwrap();
+    }
+    let pause = Arc::new(race_nameservice::PausingNameService::new(
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+    ));
+    let merger = Fluree::from_backend(
+        fluree.config().clone(),
+        fluree.backend().clone(),
+        NameServiceMode::ReadWrite(pause.clone()),
+    );
+    let merging = tokio::spawn(async move {
+        merger
+            .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+        .await
+        .expect("merge must reach the prepared-head CAS");
+
+    let main = fluree.ledger("mydb:main").await.unwrap();
+    let winner = fluree
+        .insert(
+            main,
+            &json!({"@id": "urn:winner", "http://example.org/ns/name": "Winner"}),
+        )
+        .await
+        .unwrap();
+    let winner_head = fluree
+        .nameservice()
+        .lookup("mydb:main")
+        .await
+        .unwrap()
+        .unwrap();
+    pause.resume.notify_one();
+    let error = tokio::time::timeout(Duration::from_secs(10), merging)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(error, ApiError::BranchConflict(_)), "{error:?}");
+    assert_eq!(error.status_code(), 409);
+    let after = fluree
+        .nameservice()
+        .lookup("mydb:main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.commit_head_id, winner_head.commit_head_id,
+        "rollback must preserve the concurrent writer's head"
+    );
+    assert_eq!(after.commit_t, winner_head.commit_t);
+    assert_eq!(after.commit_t, winner.ledger.t());
+    assert_eq!(
+        query_all_names(&fluree, "mydb:main").await,
+        vec!["Base", "Winner"]
+    );
+}
+
+#[tokio::test]
+async fn merge_fast_forward_preserves_concurrent_target_commit() {
+    assert_fast_forward_loses_race(2).await;
+}
+
+#[tokio::test]
+async fn merge_fast_forward_rejects_same_t_with_different_head() {
+    assert_fast_forward_loses_race(1).await;
 }
 
 /// Fast-forward merge with multiple commits on the source branch.
@@ -747,4 +864,366 @@ async fn merge_explicit_target_matches_parent() {
 
     let names = query_all_names(&fluree, "mydb:main").await;
     assert_eq!(names, vec!["Alice", "Bob"]);
+}
+
+// =============================================================================
+// Fast-forward merge keeps the target's own graph registry
+// =============================================================================
+
+/// The `f:defaultAllow` value a ledger's attached config resolves to, read
+/// the way the engine reads it: by the config graph's fixed slot.
+async fn resolved_default_allow(fluree: &support::MemoryFluree, ledger_id: &str) -> Option<bool> {
+    let view = fluree.db(ledger_id).await.unwrap();
+    view.ledger_config()
+        .and_then(|config| config.policy.as_ref())
+        .and_then(|policy| policy.default_allow)
+}
+
+/// Build and publish a real index root for `ledger_id`. The branch's
+/// pre-fork commits live in its source's namespace, so the rebuild needs
+/// the branch-aware store rather than the flat one the shared helper uses.
+async fn index_branch(fluree: &support::MemoryFluree, ledger_id: &str) {
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .unwrap()
+        .expect("branch is registered");
+    let store = fluree.branched_content_store(ledger_id).await.unwrap();
+    let built = fluree_db_indexer::rebuild_index_from_commits(
+        store,
+        ledger_id,
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("branch index rebuild");
+    fluree
+        .publisher()
+        .unwrap()
+        .publish_index(ledger_id, built.index_t, &built.root_id)
+        .await
+        .unwrap();
+}
+
+/// A fast-forward merge must not publish the source's index root as the
+/// target's. An index root carries `graph_iris`, the slot → IRI table the
+/// registry is re-seeded from, and those IRIs are branch-qualified: slot 1
+/// is `urn:fluree:{ledger}:{branch}#txn-meta`, slot 2 `…#config`. Adopting
+/// the branch's root relabelled main's reserved slots with the branch's
+/// names, and because the config graph is resolved by slot, main read the
+/// branch's empty config and reported itself ungoverned while its real
+/// config sat in a user slot. Data queries resolve by slot too, so they
+/// kept working — the corruption was only visible through the registry.
+#[tokio::test]
+async fn merge_fast_forward_keeps_target_graph_registry_and_config() {
+    let fluree = governed_main_with_indexed_feature().await;
+    let feature_ref = fluree
+        .nameservice()
+        .lookup("mydb:feature")
+        .await
+        .unwrap()
+        .unwrap();
+    let source_root = feature_ref.index_head_id.unwrap();
+    assert!(fluree
+        .content_store("mydb:main")
+        .get(&source_root)
+        .await
+        .is_err());
+
+    let report = fluree
+        .merge_branch("mydb", "feature", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(report.fast_forward, "main never advanced: {report:?}");
+
+    let main = fluree.ledger("mydb:main").await.unwrap();
+    assert_eq!(
+        main.snapshot.graph_registry.iri_for_graph_id(1),
+        Some("urn:fluree:mydb:main#txn-meta"),
+        "slot 1 must stay main's txn-meta, not the branch's"
+    );
+    assert_eq!(
+        main.snapshot.graph_registry.iri_for_graph_id(2),
+        Some("urn:fluree:mydb:main#config"),
+        "slot 2 must stay main's config — it is resolved by slot"
+    );
+    assert_eq!(
+        resolved_default_allow(&fluree, "mydb:main").await,
+        Some(false),
+        "main must still resolve its own config after the merge"
+    );
+
+    assert!(
+        fluree
+            .content_store("mydb:main")
+            .get(&source_root)
+            .await
+            .is_err(),
+        "fast-forward must not copy the unreferenced source index root"
+    );
+
+    // And the merge still delivered the data.
+    assert_eq!(
+        query_all_names(&fluree, "mydb:main").await,
+        vec!["Alice", "Bob"]
+    );
+}
+
+async fn governed_main_with_indexed_feature() -> fluree_db_api::Fluree {
+    use fluree_db_core::graph_registry::config_graph_iri;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let main_ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    // Govern main.
+    let config_iri = config_graph_iri("mydb:main");
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:policyDefaults <urn:config:policy> .
+            <urn:config:policy> f:defaultAllow false .
+        }}
+    "
+    );
+    fluree
+        .stage_owned(main_ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write");
+    assert_eq!(
+        resolved_default_allow(&fluree, "mydb:main").await,
+        Some(false),
+        "main is governed before the branch exists"
+    );
+
+    // Fork from an unindexed main, so the branch seeds its own registry
+    // under its own name, then give it a commit and a real index root.
+    fluree
+        .create_branch("mydb", "feature", None, None)
+        .await
+        .unwrap();
+    let feature_ledger = fluree.ledger("mydb:feature").await.unwrap();
+    fluree
+        .insert(
+            feature_ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:bob", "ex:name": "Bob"}]
+            }),
+        )
+        .await
+        .unwrap();
+    index_branch(&fluree, "mydb:feature").await;
+
+    // Precondition for the regression: the branch's root labels its
+    // reserved slots with the BRANCH's IRIs. Without this the publish
+    // would be harmless and the assertions below vacuous.
+    let feature = fluree.ledger("mydb:feature").await.unwrap();
+    assert_eq!(
+        feature.snapshot.graph_registry.iri_for_graph_id(1),
+        Some("urn:fluree:mydb:feature#txn-meta")
+    );
+    assert_eq!(
+        feature.snapshot.graph_registry.iri_for_graph_id(2),
+        Some("urn:fluree:mydb:feature#config")
+    );
+
+    fluree
+}
+
+/// Reproduce the old fast-forward's index adoption using real source
+/// artifacts, without changing the merge implementation under test.
+async fn main_with_adopted_feature_index() -> fluree_db_api::Fluree {
+    use fluree_db_binary_index::{collect_root_cas_ids_expanded, format::index_root::IndexRoot};
+    use fluree_db_core::CODEC_FLUREE_DICT_BLOB;
+
+    let fluree = governed_main_with_indexed_feature().await;
+    fluree
+        .merge_branch("mydb", "feature", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+    let source = fluree
+        .nameservice()
+        .lookup("mydb:feature")
+        .await
+        .unwrap()
+        .unwrap();
+    let source_root = source.index_head_id.unwrap();
+    let source_store = fluree.branched_content_store("mydb:feature").await.unwrap();
+    let root_bytes = source_store.get(&source_root).await.unwrap();
+    let root = IndexRoot::decode(&root_bytes).unwrap();
+    let target_store = fluree.content_store("mydb:main");
+    for cid in collect_root_cas_ids_expanded(&source_store, &root)
+        .await
+        .unwrap()
+    {
+        if cid.codec() != CODEC_FLUREE_DICT_BLOB && cid.content_kind().is_some() {
+            target_store
+                .put_with_id(&cid, &source_store.get(&cid).await.unwrap())
+                .await
+                .unwrap();
+        }
+    }
+    target_store
+        .put_with_id(&source_root, &root_bytes)
+        .await
+        .unwrap();
+    fluree
+        .publisher()
+        .unwrap()
+        .publish_index("mydb:main", source.index_t, &source_root)
+        .await
+        .unwrap();
+    fluree
+        .ledger_manager()
+        .unwrap()
+        .disconnect("mydb:main")
+        .await;
+    let cached = fluree
+        .ledger_cached("mydb:main")
+        .await
+        .unwrap()
+        .snapshot()
+        .await;
+    assert_eq!(
+        cached.snapshot.graph_registry.iri_for_graph_id(1),
+        Some("urn:fluree:mydb:feature#txn-meta")
+    );
+    assert_eq!(resolved_default_allow(&fluree, "mydb:main").await, None);
+    fluree
+}
+
+#[tokio::test]
+async fn reindex_repairs_adopted_branch_registry_in_cached_reads() {
+    let fluree = main_with_adopted_feature_index().await;
+    let before = fluree
+        .nameservice()
+        .lookup("mydb:main")
+        .await
+        .unwrap()
+        .unwrap();
+    fluree
+        .reindex("mydb:main", fluree_db_api::ReindexOptions::default())
+        .await
+        .unwrap();
+    let after = fluree
+        .nameservice()
+        .lookup("mydb:main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.index_t, before.index_t,
+        "repair replaces the root at the same t"
+    );
+    assert_ne!(after.index_head_id, before.index_head_id);
+    assert_eq!(after.commit_head_id, before.commit_head_id);
+
+    // No manual disconnect or new Fluree instance: normal cached reads must
+    // now see the repaired registry, policy, and data.
+    let cached = fluree
+        .ledger_cached("mydb:main")
+        .await
+        .unwrap()
+        .snapshot()
+        .await;
+    assert_eq!(
+        cached.snapshot.graph_registry.iri_for_graph_id(1),
+        Some("urn:fluree:mydb:main#txn-meta")
+    );
+    assert_eq!(
+        cached.snapshot.graph_registry.iri_for_graph_id(2),
+        Some("urn:fluree:mydb:main#config")
+    );
+    assert_eq!(
+        resolved_default_allow(&fluree, "mydb:main").await,
+        Some(false)
+    );
+    assert_eq!(
+        query_all_names(&fluree, "mydb:main").await,
+        vec!["Alice", "Bob"]
+    );
+}
+
+#[tokio::test]
+async fn adopted_branch_index_second_cycle_falls_back_to_rebuild() {
+    use fluree_db_binary_index::format::index_root::IndexRoot;
+    use fluree_db_indexer::run_index::resolve::resolver::SharedResolverState;
+
+    let fluree = main_with_adopted_feature_index().await;
+    for cycle in 1..=2 {
+        let ledger = fluree.ledger("mydb:main").await.unwrap();
+        fluree.insert(ledger, &json!({"@id": format!("urn:cycle:{cycle}"), "http://example.org/ns/name": format!("Cycle {cycle}")})).await.unwrap();
+        let record = fluree
+            .nameservice()
+            .lookup("mydb:main")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(record.commit_t > record.index_t);
+        let config = fluree_db_indexer::IndexerConfig::default();
+        assert!(config.incremental_enabled);
+        assert!(record.commit_t - record.index_t <= config.incremental_max_commits as i64);
+        let result = fluree_db_indexer::build_index_for_record(
+            fluree.content_store("mydb:main"),
+            &record,
+            config,
+        )
+        .await
+        .unwrap();
+        let root = IndexRoot::decode(
+            &fluree
+                .content_store("mydb:main")
+                .get(&result.root_id)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(root.ledger_id, "mydb:main");
+        if cycle == 1 {
+            assert_eq!(
+                root.graph_iris[0], "urn:fluree:mydb:feature#txn-meta",
+                "first incremental cycle preserves the adopted labels"
+            );
+            let error = SharedResolverState::from_index_root(&root)
+                .err()
+                .expect("the next incremental cycle cannot seed from this root");
+            assert!(
+                error
+                    .to_string()
+                    .contains("graph_iris[0] must be txn-meta IRI"),
+                "{error}"
+            );
+        } else {
+            assert_eq!(
+                root.graph_iris[0], "urn:fluree:mydb:main#txn-meta",
+                "second cycle falls back to a full rebuild"
+            );
+            assert_eq!(root.graph_iris[1], "urn:fluree:mydb:main#config");
+            assert!(SharedResolverState::from_index_root(&root).is_ok());
+        }
+        fluree
+            .publisher()
+            .unwrap()
+            .publish_index("mydb:main", result.index_t, &result.root_id)
+            .await
+            .unwrap();
+    }
 }

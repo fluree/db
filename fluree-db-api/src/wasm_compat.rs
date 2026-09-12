@@ -109,6 +109,8 @@ mod stubs {
     pub struct IndexerConfig {
         pub gc_max_old_indexes: u32,
         pub gc_min_time_mins: u32,
+        /// Carried for `FlureeBuilder::with_gc_settings`; no GC runs on wasm.
+        pub gc_hard_max_old_indexes: Option<u32>,
         pub catchup_interval: std::time::Duration,
         pub catchup_sweeps_enabled: bool,
     }

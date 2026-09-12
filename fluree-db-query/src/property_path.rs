@@ -1403,10 +1403,19 @@ impl PropertyPathOperator {
     ///
     /// This is called once during open() to compute all results.
     async fn execute_unseeded(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        // Pattern constants are encoded in the requesting query's namespace
+        // space; re-encode into the active graph (as `process_correlated_row`
+        // does) so a divergent-namespace endpoint traverses — and is emitted —
+        // as the graph's own SID. Falls back to the raw SID when undecodable.
+        let (db_for_encode, _overlay, _to_t) = ctx.require_single_graph()?;
+        let reencode = |s: &Sid| -> Sid {
+            crate::context::reencode_sid(ctx, db_for_encode, s).unwrap_or_else(|| s.clone())
+        };
         let results = match (&self.pattern.subject, &self.pattern.object) {
             (Ref::Sid(subj), Ref::Var(_)) => {
                 // Subject constant, object variable -> forward traversal
-                let reachable = self.traverse_forward_bindings(ctx, subj).await?;
+                let subj = reencode(subj);
+                let reachable = self.traverse_forward_bindings(ctx, &subj).await?;
                 reachable
                     .into_iter()
                     .map(|obj| (Binding::sid(subj.clone()), obj))
@@ -1414,25 +1423,19 @@ impl PropertyPathOperator {
             }
             (Ref::Var(_), Ref::Sid(obj)) => {
                 // Subject variable, object constant -> backward traversal
-                let sources = self.traverse_backward_bindings(ctx, obj).await?;
+                let obj = reencode(obj);
+                let sources = self.traverse_backward_bindings(ctx, &obj).await?;
                 sources
                     .into_iter()
                     .map(|subj| (subj, Binding::sid(obj.clone())))
                     .collect()
             }
             (Ref::Var(_), Ref::Var(_)) => self.compute_closure(ctx).await?,
-            (Ref::Sid(_), Ref::Sid(_)) => {
+            (Ref::Sid(subj), Ref::Sid(obj)) => {
                 // Both constants: reachability check (0/1 rows). We use a dummy pair to indicate 1 row.
-                let subj = match &self.pattern.subject {
-                    Ref::Sid(s) => s,
-                    _ => unreachable!(),
-                };
-                let obj = match &self.pattern.object {
-                    Ref::Sid(s) => s,
-                    _ => unreachable!(),
-                };
-                if self.path_exists(ctx, subj, obj).await? {
-                    vec![(Binding::sid(subj.clone()), Binding::sid(obj.clone()))]
+                let (subj, obj) = (reencode(subj), reencode(obj));
+                if self.path_exists(ctx, &subj, &obj).await? {
+                    vec![(Binding::sid(subj), Binding::sid(obj))]
                 } else {
                     vec![]
                 }
@@ -1695,7 +1698,10 @@ impl Operator for PropertyPathOperator {
                 }
             }
 
-            let batch = Batch::new(self.in_schema.clone(), columns)?;
+            let batch = crate::dataset_operator::stamp_if_armed(
+                Batch::new(self.in_schema.clone(), columns)?,
+                ctx,
+            )?;
             return Ok(trim_batch(&self.out_schema, batch));
         }
 
@@ -1762,7 +1768,10 @@ impl Operator for PropertyPathOperator {
                     }
                 }
 
-                let batch = Batch::new(self.in_schema.clone(), columns)?;
+                let batch = crate::dataset_operator::stamp_if_armed(
+                    Batch::new(self.in_schema.clone(), columns)?,
+                    ctx,
+                )?;
                 return Ok(trim_batch(&self.out_schema, batch));
             }
 

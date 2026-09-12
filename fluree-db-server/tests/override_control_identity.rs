@@ -10,8 +10,13 @@
 //! Config says `f:reasoningModes f:rdfs`; every query here says
 //! `"reasoning": "none"` (or the SPARQL pragma). An entailed row means the
 //! override was denied and config won; no row means it was permitted.
-//! `default-allow: true` rides along so the policy wrap a bearer identity
-//! triggers cannot hide the row and masquerade as a permitted override.
+//!
+//! Reasoning, datalog, and SHACL requests carry no policy selection at all:
+//! an ordinary bearer's credential may only narrow policy, never widen it, so
+//! a `default-allow: true` scaffold would be refused at the credential layer
+//! before override control ever ran. The policy-group test therefore uses a
+//! token whose `fluree.policy: "request"` claim permits the selection, which
+//! isolates this gate from that one.
 
 use axum::body::Body;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -40,12 +45,20 @@ ex:alice ex:childName "Alice" .
 "#;
 
 /// RDFS by default; only `did:key:admin` may override.
+///
+/// `f:defaultAllow true` opens policy at the ledger, which is what keeps the
+/// row visible: a bearer carrying `fluree.identity` is bound to a Fixed
+/// credential selection, so every request here is policy-enforced and would
+/// otherwise be fail-closed. The reasoning group's override control is what
+/// these tests actually exercise.
 const CONFIG_TRIG: &str = r"
 @prefix f: <https://ns.flur.ee/db#> .
 @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
 
 GRAPH <urn:fluree:overridectl:main#config> {
     <urn:overridectl:config> rdf:type f:LedgerConfig .
+    <urn:overridectl:config> f:policyDefaults <urn:overridectl:openpolicy> .
+    <urn:overridectl:openpolicy> f:defaultAllow true .
     <urn:overridectl:config> f:reasoningDefaults <urn:overridectl:reasoning> .
     <urn:overridectl:reasoning> f:reasoningModes f:rdfs .
     <urn:overridectl:reasoning> f:overrideControl <urn:overridectl:oc> .
@@ -82,8 +95,12 @@ fn create_jws(claims: &JsonValue, signing_key: &SigningKey) -> String {
 /// `fluree.identity`, which the server treats as the verified identity.
 fn bearer(identity: Option<&str>, write: bool) -> String {
     let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+    // `aud` is ignored unless the server configures one, which only the
+    // policy-authority variant does; carrying it always keeps one seed token
+    // valid on both.
     let mut claims = json!({
         "iss": fluree_db_credential::did_from_pubkey(&signing_key.verifying_key().to_bytes()),
+        "aud": AUDIENCE,
         "exp": now_secs() + 3600,
         "iat": now_secs(),
         "fluree.ledger.read.ledgers": [LEDGER],
@@ -112,11 +129,51 @@ GRAPH <urn:fluree:overridectl:main#config> {
 }
 ";
 
+/// Audience for the policy-authority server the policy-group test needs.
+const AUDIENCE: &str = "override-control-test";
+
+fn signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[9u8; 32])
+}
+
+fn issuer_did() -> String {
+    fluree_db_credential::did_from_pubkey(&signing_key().verifying_key().to_bytes())
+}
+
+/// A bearer whose `fluree.policy: "request"` claim lets the caller select its
+/// own policy. An ordinary bearer is bound to a Fixed selection it may only
+/// narrow, so it could never ask to open a closed configured default; this
+/// token clears the credential gate and leaves the ledger's override control
+/// as the only thing deciding.
+fn policy_request_bearer(identity: &str) -> String {
+    create_jws(
+        &json!({
+            "iss": issuer_did(),
+            "aud": AUDIENCE,
+            "exp": now_secs() + 3600,
+            "iat": now_secs(),
+            "fluree.identity": identity,
+            "fluree.ledger.read.ledgers": [LEDGER],
+            "fluree.ledger.write.ledgers": [LEDGER],
+            "fluree.policy": "request",
+        }),
+        &signing_key(),
+    )
+}
+
 async fn seeded_app(mode: DataAuthMode) -> (TempDir, axum::Router) {
     seeded_app_with(mode, CONFIG_TRIG).await
 }
 
 async fn seeded_app_with(mode: DataAuthMode, config_trig: &str) -> (TempDir, axum::Router) {
+    seeded_app_full(mode, config_trig, false).await
+}
+
+async fn seeded_app_full(
+    mode: DataAuthMode,
+    config_trig: &str,
+    policy_authority: bool,
+) -> (TempDir, axum::Router) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cfg = ServerConfig {
         cors_enabled: false,
@@ -124,6 +181,12 @@ async fn seeded_app_with(mode: DataAuthMode, config_trig: &str) -> (TempDir, axu
         storage_path: Some(tmp.path().to_path_buf()),
         data_auth_mode: mode,
         data_auth_insecure_accept_any_issuer: true,
+        data_auth_audience: policy_authority.then(|| AUDIENCE.to_string()),
+        data_auth_policy_authorities: if policy_authority {
+            vec![issuer_did()]
+        } else {
+            Vec::new()
+        },
         ..Default::default()
     };
     let telemetry = TelemetryConfig::with_server_config(&cfg);
@@ -219,7 +282,7 @@ fn bindings(json: &JsonValue) -> usize {
 #[tokio::test]
 async fn allow_listed_bearer_may_override_reasoning_defaults() {
     let (_tmp, app) = seeded_app(DataAuthMode::Required).await;
-    let body = reasoning_none_body(json!({"default-allow": true}));
+    let body = reasoning_none_body(json!({}));
 
     let auth = (
         "authorization",
@@ -250,7 +313,6 @@ async fn allow_listed_bearer_may_override_reasoning_defaults() {
 #[tokio::test]
 async fn allow_listed_bearer_may_override_reasoning_defaults_sparql() {
     let (_tmp, app) = seeded_app(DataAuthMode::Required).await;
-    let default_allow = ("fluree-default-allow", "true".to_string());
 
     let auth = (
         "authorization",
@@ -260,7 +322,7 @@ async fn allow_listed_bearer_may_override_reasoning_defaults_sparql() {
         &app,
         "application/sparql-query",
         SPARQL_REASONING_NONE.to_string(),
-        &[auth, default_allow.clone()],
+        &[auth],
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{json}");
@@ -278,7 +340,7 @@ async fn allow_listed_bearer_may_override_reasoning_defaults_sparql() {
         &app,
         "application/sparql-query",
         SPARQL_REASONING_NONE.to_string(),
-        &[auth, default_allow],
+        &[auth],
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{json}");
@@ -296,7 +358,7 @@ async fn allow_listed_bearer_may_override_reasoning_defaults_sparql() {
 async fn unverified_identity_in_body_or_header_does_not_authorize_override() {
     let (_tmp, app) = seeded_app(DataAuthMode::None).await;
 
-    let body = reasoning_none_body(json!({"identity": ADMIN, "default-allow": true}));
+    let body = reasoning_none_body(json!({"identity": ADMIN}));
     let (status, json) = query(&app, "application/json", body, &[]).await;
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(
@@ -305,7 +367,7 @@ async fn unverified_identity_in_body_or_header_does_not_authorize_override() {
         "opts.identity naming the allow-listed DID must not authorize the override"
     );
 
-    let body = reasoning_none_body(json!({"default-allow": true}));
+    let body = reasoning_none_body(json!({}));
     let header = ("fluree-identity", ADMIN.to_string());
     let (status, json) = query(&app, "application/json", body, &[header]).await;
     assert_eq!(status, StatusCode::OK, "{json}");
@@ -315,10 +377,7 @@ async fn unverified_identity_in_body_or_header_does_not_authorize_override() {
         "a fluree-identity header naming the allow-listed DID must not authorize the override"
     );
 
-    let headers = [
-        ("fluree-identity", ADMIN.to_string()),
-        ("fluree-default-allow", "true".to_string()),
-    ];
+    let headers = [("fluree-identity", ADMIN.to_string())];
     let (status, json) = query(
         &app,
         "application/sparql-query",
@@ -374,16 +433,20 @@ fn open_policy_insert(subject: &str, opts: JsonValue) -> String {
 }
 
 /// `merge_policy_opts` on the transact path reads the verified identity from
-/// the governance the route built, so the allow-listed bearer may open policy
+/// the governance the route built, so the allow-listed caller may open policy
 /// for its write and a non-listed one may not.
+///
+/// Both requests use a policy-selecting credential, so the credential layer
+/// permits the selection either way and the ledger's `f:overrideControl` is
+/// the only difference between them.
 #[tokio::test]
 async fn allow_listed_bearer_may_override_transact_policy_defaults() {
-    let (_tmp, app) = seeded_app_with(DataAuthMode::Required, POLICY_CONFIG_TRIG).await;
+    let (_tmp, app) = seeded_app_full(DataAuthMode::Required, POLICY_CONFIG_TRIG, true).await;
     let opts = json!({"default-allow": true});
 
     let auth = (
         "authorization",
-        format!("Bearer {}", bearer(Some(ADMIN), true)),
+        format!("Bearer {}", policy_request_bearer(ADMIN)),
     );
     let (status, json) = insert(&app, open_policy_insert("ex:bob", opts.clone()), &[auth]).await;
     assert_eq!(
@@ -394,7 +457,7 @@ async fn allow_listed_bearer_may_override_transact_policy_defaults() {
 
     let auth = (
         "authorization",
-        format!("Bearer {}", bearer(Some(OTHER), true)),
+        format!("Bearer {}", policy_request_bearer(OTHER)),
     );
     let (status, json) = insert(&app, open_policy_insert("ex:carol", opts), &[auth]).await;
     assert!(
@@ -444,6 +507,10 @@ ex:PersonShape rdf:type sh:NodeShape ;
 
 GRAPH <urn:fluree:overridectl:main#config> {
     <urn:overridectl:config> rdf:type f:LedgerConfig .
+    # Open policy so a bearer's Fixed credential selection does not make the
+    # write fail closed; the SHACL group's override control is under test.
+    <urn:overridectl:config> f:policyDefaults <urn:overridectl:openpolicy> .
+    <urn:overridectl:openpolicy> f:defaultAllow true .
     <urn:overridectl:config> f:shaclDefaults <urn:overridectl:shacl> .
     <urn:overridectl:shacl> f:shaclEnabled true .
     <urn:overridectl:shacl> f:overrideControl <urn:overridectl:oc> .
@@ -456,7 +523,7 @@ GRAPH <urn:fluree:overridectl:main#config> {
 /// `default-allow: true` keeps the policy wrap a bearer identity triggers
 /// from being the reason the write fails.
 fn warn_mode_violating_insert(subject: &str, extra_opts: JsonValue) -> String {
-    let mut opts = json!({"validationMode": "warn", "default-allow": true});
+    let mut opts = json!({"validationMode": "warn"});
     if let (Some(base), Some(extra)) = (opts.as_object_mut(), extra_opts.as_object()) {
         base.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
     }

@@ -62,17 +62,12 @@ const CODE_TOKEN_EXPIRED: &str = "Neo.ClientError.Security.TokenExpired";
 /// `principal: None` is an anonymous session (allowed outside Required
 /// mode, mirroring the HTTP extractor); scope checks then allow all.
 struct SessionAuth {
-    /// Policy identity (`fluree.identity ?? sub`) for governance wiring.
-    identity: Option<String>,
     principal: Option<DataPrincipal>,
 }
 
 impl SessionAuth {
     fn anonymous() -> Self {
-        Self {
-            identity: None,
-            principal: None,
-        }
+        Self { principal: None }
     }
 
     /// Bolt sessions outlive the login-time `exp` validation; statements
@@ -95,18 +90,28 @@ impl SessionAuth {
             .is_none_or(|p| p.can_write(ledger_id))
     }
 
-    /// Governance for statements in this session. Bolt has no header
-    /// channel for policy knobs (policy-class, default-allow) by design:
-    /// policy derives entirely from the identity's in-ledger bindings
-    /// (plus the ledger's `#config` defaults, merged downstream).
+    /// Reuse the login-time verified policy selection; statements cannot supply
+    /// policy options. Ledger/action scope and expiry are checked per statement.
     fn governance(&self) -> fluree_db_api::GovernanceOptions {
-        fluree_db_api::GovernanceOptions {
-            identity: self.identity.clone(),
-            // The `fluree.identity` claim sits inside a verified token, so it
-            // is auth-layer verified and gates `f:overrideControl` too.
-            server_identity: self.identity.clone().map(VerifiedIdentity::new),
-            ..Default::default()
-        }
+        let mut governance = self
+            .principal
+            .as_ref()
+            .map(|p| {
+                p.policy_authorization
+                    .resolve_options(&Default::default())
+                    .expect("omitted selection is valid for every credential mode")
+            })
+            .unwrap_or_default();
+        // The `fluree.identity` claim sits inside a verified token, so it is
+        // auth-layer verified and gates `f:overrideControl` too. Stamped after
+        // resolution, which rebuilds the options from the bound authority and
+        // would otherwise drop it.
+        governance.server_identity = self
+            .principal
+            .as_ref()
+            .and_then(|p| p.identity.clone())
+            .map(VerifiedIdentity::new);
+        governance
     }
 }
 
@@ -217,6 +222,26 @@ async fn handle_connection(
                     break;
                 }
             };
+            // Until transaction-scoped impersonation is implemented, do not
+            // silently execute an impersonated request as the logged-in user.
+            let impersonated = match &request {
+                Request::Run { extra, .. } | Request::Begin { extra } => extra.get("imp_user"),
+                Request::Route {
+                    extra: Value::Map(extra),
+                    ..
+                } => extra.get("imp_user"),
+                _ => None,
+            }
+            .is_some_and(|value| !matches!(value, Value::Null));
+            if impersonated {
+                write_message(
+                    &Response::failure(CODE_INVALID, "Bolt impersonation is not supported")
+                        .encode(),
+                    &mut out_buf,
+                );
+                close = true;
+                break;
+            }
             match session.on_request(request) {
                 Turn::Reply(replies) => {
                     for reply in replies {
@@ -380,7 +405,6 @@ async fn authenticate(state: &AppState, auth: &AuthRequest) -> Result<SessionAut
         .await
         .map_err(|e| RunFailure::new(CODE_UNAUTHORIZED, e.to_string()))?;
     Ok(SessionAuth {
-        identity: principal.identity.clone(),
         principal: Some(principal),
     })
 }
@@ -595,7 +619,11 @@ async fn try_execute_txn_run(
             .await
             .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     } else {
-        view
+        state
+            .fluree
+            .wrap_policy_defaults(view)
+            .await
+            .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     };
     let result = state
         .fluree
@@ -677,7 +705,11 @@ async fn execute_read(
             .await
             .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     } else {
-        view
+        state
+            .fluree
+            .wrap_policy_defaults(view)
+            .await
+            .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     };
     let result = state
         .fluree
@@ -1133,11 +1165,19 @@ mod tests {
     #[test]
     fn session_governance_carries_the_verified_identity() {
         let auth = SessionAuth {
-            identity: Some("did:key:admin".into()),
-            principal: None,
+            principal: Some(DataPrincipal {
+                issuer: "did:key:issuer".into(),
+                subject: None,
+                identity: Some("did:key:admin".into()),
+                read_all: true,
+                read_ledgers: Default::default(),
+                write_all: false,
+                write_ledgers: Default::default(),
+                expires_unix: u64::MAX,
+                policy_authorization: crate::extract::CredentialPolicy::ScopeOnly,
+            }),
         };
         let governance = auth.governance();
-        assert_eq!(governance.identity.as_deref(), Some("did:key:admin"));
         assert_eq!(
             governance.server_identity,
             Some(VerifiedIdentity::new("did:key:admin"))

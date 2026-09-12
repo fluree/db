@@ -38,7 +38,7 @@ Conventions:
 `guardrails-pre.json` is the PR-1 (guardrails net) reference — captured at the
 merge-base engine, quick profile, tiny+small, schema 1. It predates the host
 block, so its `runner_class: "local"` is read as `host.class = "local"`: an
-honest "some developer machine, unspecified". That is why the per-PR compare
+honest "some developer machine, unspecified". That is why the nightly/on-demand compare
 still runs with `--allow-host-mismatch`.
 
 Capture (the `--label`/`--out` name the phase reference; capture at the

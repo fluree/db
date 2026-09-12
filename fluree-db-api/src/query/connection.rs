@@ -659,6 +659,16 @@ impl Fluree {
     /// time-travel suffix). Rejects `FROM NAMED` and multi-`FROM` queries,
     /// since the planner is single-ledger.
     pub async fn explain_connection_sparql(&self, sparql: &str) -> Result<JsonValue> {
+        self.explain_connection_sparql_with_opts(sparql, &GovernanceOptions::default())
+            .await
+    }
+
+    /// Explain with host-selected policy inputs, using the query's snapshot.
+    pub async fn explain_connection_sparql_with_opts(
+        &self,
+        sparql: &str,
+        opts: &GovernanceOptions,
+    ) -> Result<JsonValue> {
         let ast = parse_and_validate_sparql(sparql)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
@@ -668,10 +678,7 @@ impl Fluree {
             ));
         }
 
-        let Some(view) = self
-            .prepare_single_view_for_connection(&spec, &crate::GovernanceOptions::default())
-            .await?
-        else {
+        let Some(view) = self.prepare_single_view_for_connection(&spec, opts).await? else {
             return Err(ApiError::query(
                 "Multi-ledger / FROM NAMED datasets are not supported for SPARQL explain; \
                  use a single `FROM <ledger:branch>` (with optional time-travel suffix).",
@@ -1062,8 +1069,8 @@ impl Fluree {
     /// Apply per-source or global policy to a view.
     ///
     /// Per-source policy takes precedence if present, otherwise global policy is used.
-    /// If neither has policy, returns the view unchanged.
-    async fn apply_source_or_global_policy(
+    /// If neither has policy, applies configured ledger defaults.
+    pub(crate) async fn apply_source_or_global_policy(
         &self,
         view: crate::view::GraphDb,
         source: &crate::dataset::GraphSource,
@@ -1083,7 +1090,7 @@ impl Fluree {
         if global_opts.has_any_policy_inputs() {
             self.wrap_policy(view, global_opts).await
         } else {
-            Ok(view)
+            self.wrap_policy_defaults(view).await
         }
     }
 }

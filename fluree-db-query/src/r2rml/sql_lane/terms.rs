@@ -93,10 +93,19 @@ impl Materializer {
                 output_idx,
             });
         }
-        for (_, term) in &lowered.terms {
-            if let TermSource::Object { tm_iri, .. } = term {
-                map_of(tm_iri)?;
+        fn maps_in<'t>(term: &'t TermSource, out: &mut Vec<&'t str>) {
+            match term {
+                TermSource::Object { tm_iri, .. } => out.push(tm_iri),
+                TermSource::Union { branches, .. } => branches.iter().for_each(|b| maps_in(b, out)),
+                _ => {}
             }
+        }
+        let mut read_through = Vec::new();
+        for (_, term) in &lowered.terms {
+            maps_in(term, &mut read_through);
+        }
+        for tm_iri in read_through {
+            map_of(tm_iri)?;
         }
         Ok(Self {
             aliases,
@@ -114,6 +123,16 @@ impl Materializer {
         let num_rows = page.num_rows;
         let schema = page.schema;
         let mut columns: Vec<Option<Column>> = page.columns.into_iter().map(Some).collect();
+        // An output several aliases read (a union's slot, once per branch)
+        // is cloned for all but its last reader.
+        let mut readers: Vec<usize> = vec![0; columns.len()];
+        for a in &self.aliases {
+            for out_idx in &a.output_idx {
+                if let Some(i) = schema.index_by_name(&outputs[*out_idx].name) {
+                    readers[i] += 1;
+                }
+            }
+        }
         let mut out = HashMap::with_capacity(self.aliases.len());
         for a in &self.aliases {
             let mut fields = Vec::with_capacity(a.columns.len());
@@ -126,7 +145,13 @@ impl Materializer {
                         a.alias
                     ))
                 })?;
-                let col = columns[page_idx].take().ok_or_else(|| {
+                readers[page_idx] -= 1;
+                let col = if readers[page_idx] == 0 {
+                    columns[page_idx].take()
+                } else {
+                    columns[page_idx].clone()
+                };
+                let col = col.ok_or_else(|| {
                     QueryError::Internal(format!("column '{out_name}' claimed twice"))
                 })?;
                 fields.push(FieldInfo {
@@ -160,39 +185,76 @@ impl Materializer {
     ) -> Result<Vec<(VarId, Binding)>> {
         let mut out = Vec::with_capacity(self.terms.len());
         for (var, term) in &self.terms {
-            let binding = match term {
-                TermSource::Constant(t) => {
-                    // Any encoder will do for a constant: datatype Sids resolve
-                    // the same way for every triples map.
-                    self.maps
-                        .values()
-                        .next()
-                        .map(|(_, e)| e.encode(t))
-                        .unwrap_or(Binding::Unbound)
-                }
-                TermSource::Subject { alias } => {
-                    let a = self.alias(alias)?;
-                    let (tm, encoder) = self.map(&a.tm_iri)?;
-                    let batch = &batches[alias];
-                    match materialize_subject_from_batch(&tm.subject_map, batch, row_idx) {
-                        Ok(Some(t)) => encoder.encode(&t),
-                        _ => Binding::Unbound,
-                    }
-                }
-                TermSource::Object { alias, tm_iri, pom } => {
-                    self.alias(alias)?;
-                    let (tm, encoder) = self.map(tm_iri)?;
-                    let batch = &batches[alias];
-                    let om = &tm.predicate_object_maps[*pom].object_map;
-                    match materialize_object_from_batch(om, batch, row_idx) {
-                        Ok(Some(t)) => encoder.encode(&t),
-                        _ => Binding::Unbound,
-                    }
-                }
-            };
-            out.push((*var, binding));
+            out.push((*var, self.decode(term, batches, row_idx)?));
         }
         Ok(out)
+    }
+
+    fn decode(
+        &self,
+        term: &TermSource,
+        batches: &HashMap<String, ColumnBatch>,
+        row_idx: usize,
+    ) -> Result<Binding> {
+        Ok(match term {
+            TermSource::Constant(t) => {
+                // Any encoder will do for a constant: datatype Sids resolve
+                // the same way for every triples map.
+                self.maps
+                    .values()
+                    .next()
+                    .map(|(_, e)| e.encode(t))
+                    .unwrap_or(Binding::Unbound)
+            }
+            TermSource::Subject { alias } => {
+                let a = self.alias(alias)?;
+                let (tm, encoder) = self.map(&a.tm_iri)?;
+                let batch = &batches[alias];
+                match materialize_subject_from_batch(&tm.subject_map, batch, row_idx) {
+                    Ok(Some(t)) => encoder.encode(&t),
+                    _ => Binding::Unbound,
+                }
+            }
+            TermSource::Object { alias, tm_iri, pom } => {
+                self.alias(alias)?;
+                let (tm, encoder) = self.map(tm_iri)?;
+                let batch = &batches[alias];
+                let om = &tm.predicate_object_maps[*pom].object_map;
+                match materialize_object_from_batch(om, batch, row_idx) {
+                    Ok(Some(t)) => encoder.encode(&t),
+                    _ => Binding::Unbound,
+                }
+            }
+            TermSource::Aggregate { alias, kind } => {
+                self.alias(alias)?;
+                super::aggregate::decode_aggregate(&batches[alias], kind, row_idx)?
+            }
+            // The tag names the branch whose term decodes the row.
+            TermSource::Union {
+                alias,
+                tag,
+                branches,
+            } => {
+                self.alias(alias)?;
+                let batch = &batches[alias];
+                // An integer literal arrives as the dialect's own integer
+                // type.
+                let branch = batch
+                    .schema
+                    .index_by_name(tag)
+                    .and_then(|i| {
+                        let col = &batch.columns[i];
+                        col.get_i64(row_idx)
+                            .or_else(|| col.get_i32(row_idx).map(i64::from))
+                    })
+                    .and_then(|n| usize::try_from(n).ok())
+                    .and_then(|n| branches.get(n));
+                match branch {
+                    Some(b) => self.decode(b, batches, row_idx)?,
+                    None => Binding::Unbound,
+                }
+            }
+        })
     }
 
     fn map(&self, tm_iri: &str) -> Result<&(TriplesMap, LiteralEncoder)> {

@@ -3557,25 +3557,18 @@ async fn identity_only_without_config_still_denies_all() {
     );
 }
 
-/// Unchanged posture: an anonymous request is wholly unenforced, so a ledger's
-/// configured `f:defaultAllow false` does not close it.
-///
-/// `has_any_policy_inputs()` is false for an anonymous request, so
-/// `apply_source_or_global_policy` never calls `wrap_policy` and no
-/// `PolicyContext` — and therefore no config default — is ever built. Pinned
-/// here as current behavior, not endorsed: see the note in the branch report.
+/// Anonymous connection queries still enforce configured ledger defaults.
 #[tokio::test]
-async fn anonymous_request_unenforced_despite_config_default_allow_false() {
+async fn anonymous_request_enforces_config_default_allow_false() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/config-default-allow-anonymous:main";
     seed_default_allow_ledger(&fluree, ledger_id, Some(false)).await;
 
     let names = visible_names(&fluree, ledger_id, serde_json::Value::Null).await;
 
-    assert_eq!(
-        names,
-        vec!["Alice".to_string(), "Bob".to_string()],
-        "anonymous requests remain unenforced regardless of config default-allow"
+    assert!(
+        names.is_empty(),
+        "configured deny must apply to anonymous reads"
     );
 }
 

@@ -608,6 +608,28 @@ target. The materializer enforces what it can and documents the rest:
   target *partially applied* — some subjects re-asserted, others not yet — until
   the next successful poll re-materializes the window (the watermark only
   advances after the whole window commits).
+- **A full read is bounded and resumable.** When a source falls back to a full
+  read — first run, a watermark expired by the source's snapshot retention, or a
+  window containing an `overwrite`/`delete` — the pass reads a commit-ordered
+  prefix sized to the novelty ceiling (`FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS`,
+  derived from `reindex_max_bytes` by default) and records where it stopped: at a
+  retained snapshot when one names the prefix, otherwise as a commit-sequence
+  cursor (`urn:fluree:materialize#appliedSequence`), which survives snapshot
+  expiry. Each poll resumes above the cursor until the read completes, at which
+  point the snapshot watermark advances and the cursor is retired. Without the
+  bound, a full read too large to commit deferred on every poll and never made
+  progress.
+- **An incremental backlog is bounded too.** A window is only committed whole,
+  so a window whose flakes exceed the target's novelty ceiling is deferred on
+  every poll, writes no watermark, and grows by one poll each time — until the
+  stored snapshot falls out of the source's retention and the job degrades to a
+  full read of the whole table to recover a backlog that was a few snapshots
+  wide. So an unpinned incremental window over the same per-pass budget (sized
+  from each snapshot's `added-records` summary, so no manifest is read to
+  decide) stops at the last snapshot the budget covers, keeping that snapshot
+  whole, and advances the watermark to it. The next poll resumes from there.
+  A window with an `overwrite`/`delete` anywhere in it is not cut: it full-reads
+  the head regardless, and that read subsumes every prefix.
 - **A window's working memory is budgeted, not unbounded.** The pass retains one
   node per distinct subject in the window; a window whose estimated accumulator
   exceeds `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` (default 1024; `0` disables)
@@ -630,7 +652,8 @@ target. The materializer enforces what it can and documents the rest:
   rows into named graphs per the subject map's graph map; the virtual query path
   does not yet read graph maps, so a graph-scoped query returns different
   results against the source and its twin. Query-path parity is a tracked
-  follow-up.
+  follow-up. The [native twin](#materializing-a-native-twin) builder refuses a
+  mapping with a graph map rather than flattening it into the default graph.
 - **Compaction can silently turn incremental into a full re-read.** The
   incremental window treats `replace` (compaction) snapshots as safe when the
   writer preserves data sequence numbers (Spark's `rewrite_data_files` default).
@@ -751,6 +774,21 @@ Iceberg optimizations:
   - File skipping (skip files outside date range)
   - Column pruning (only read order_id, order_date)
 ```
+
+### Same-subject stars over several triples maps
+
+A star of predicates on one subject is read in one scan when a single
+triples map provides every member. Where a second map over the same table
+and subject template provides only some of them and mints each the same way
+(the same column under the same predicate — the one-map-per-class idiom,
+where a `Customer` map and a `CustomerCountry` map both carry `ex:label`
+from `name`), the star stays one scan: that map adds no triple the fused
+scan misses, and an RDF graph holds a triple once. A map deriving a member
+differently (another column, a datatype, a reference) is a real second
+provider: the star is then read as one scan per member and joined on the
+subject, so every provider's rows come back. Two maps minting a pattern's
+triples alike are read once at the scan as well; when the pattern projects
+the type (`?s a ?t`), both are kept unless their class sets are equal.
 
 ### Best Practices
 

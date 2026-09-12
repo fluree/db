@@ -32,6 +32,18 @@ pub struct FlureeHeaders {
     /// Raw HTTP headers (for telemetry/tracing)
     pub raw: HeaderMap,
 
+    /// Host-verified policy selection. Never populated by HTTP header parsing.
+    pub policy_authorization: Option<super::CredentialPolicy>,
+
+    /// The auth-layer-verified caller identity, set by
+    /// [`crate::routes::policy_auth::bind_authorization`] from the signed
+    /// credential DID or the verified bearer's identity. Never populated by
+    /// HTTP header parsing: `fluree-identity` is policy evaluation context and
+    /// lands in [`Self::identity`], which a caller may set and which override
+    /// control must never trust. This is the value `f:overrideControl`
+    /// (`f:IdentityRestricted`) gates on.
+    pub server_identity: Option<fluree_db_core::VerifiedIdentity>,
+
     /// Ledger alias from header (lower precedence than path)
     pub ledger: Option<String>,
 
@@ -86,6 +98,8 @@ impl Default for FlureeHeaders {
     fn default() -> Self {
         Self {
             raw: HeaderMap::new(),
+            policy_authorization: None,
+            server_identity: None,
             ledger: None,
             identity: None,
             policy: None,
@@ -403,7 +417,11 @@ impl FlureeHeaders {
             opts.insert("policy".to_string(), self.policy.clone().unwrap());
         }
 
-        if !self.policy_class.is_empty() && !opts.contains_key("policy-class") {
+        if !self.policy_class.is_empty()
+            && !["policy-class", "policy_class", "policyClass"]
+                .iter()
+                .any(|key| opts.contains_key(*key))
+        {
             opts.insert(
                 "policy-class".to_string(),
                 JsonValue::Array(
@@ -416,7 +434,11 @@ impl FlureeHeaders {
             );
         }
 
-        if self.policy_values.is_some() && !opts.contains_key("policy-values") {
+        if self.policy_values.is_some()
+            && !["policy-values", "policy_values", "policyValues"]
+                .iter()
+                .any(|key| opts.contains_key(*key))
+        {
             opts.insert(
                 "policy-values".to_string(),
                 self.policy_values.clone().unwrap(),

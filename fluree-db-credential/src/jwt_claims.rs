@@ -93,6 +93,52 @@ pub struct EventsTokenPayload {
     /// Identity for policy resolution
     #[serde(rename = "fluree.identity")]
     pub fluree_identity: Option<String>,
+
+    /// Application-selected policies. This claim conveys authority only when
+    /// the receiving server explicitly trusts the verified issuer to select
+    /// policies. Ledger/action scopes, audience and expiry still apply.
+    #[serde(
+        rename = "fluree.policy",
+        default,
+        deserialize_with = "deserialize_policy_claim"
+    )]
+    pub fluree_policy: Option<PolicyClaim>,
+}
+
+/// Policy authority carried by one signed claim: a fixed object or "request".
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PolicyClaim {
+    Fixed(DelegatedPolicy),
+    Request(RequestPolicy),
+}
+
+/// The only accepted string form of `fluree.policy`.
+#[derive(Debug, Clone, Deserialize)]
+pub enum RequestPolicy {
+    #[serde(rename = "request")]
+    Request,
+}
+
+/// Signed policy selection for a trusted application gateway.
+/// Identity comes from `fluree.identity` / `sub`; this selection applies uniformly
+/// to the token's authorized ledger/action scopes. Unknown fields are rejected.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct DelegatedPolicy {
+    pub policy_class: Option<Vec<String>>,
+    pub policy: Option<serde_json::Value>,
+    pub policy_values: Option<std::collections::HashMap<String, serde_json::Value>>,
+    pub default_allow: Option<bool>,
+}
+
+// Missing means ordinary authentication; a present null/malformed context must
+// not silently fall back to a scope-only service credential.
+fn deserialize_policy_claim<'de, D>(deserializer: D) -> Result<Option<PolicyClaim>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    PolicyClaim::deserialize(deserializer).map(Some)
 }
 
 /// Error type for JWT claims validation
@@ -414,6 +460,7 @@ mod tests {
             ledger_write_all: None,
             ledger_write_ledgers: None,
             fluree_identity: None,
+            fluree_policy: None,
         }
     }
 
@@ -789,6 +836,7 @@ mod tests {
             ledger_write_all: None,
             ledger_write_ledgers: None,
             fluree_identity: Some("did:key:z6MkTest".to_string()),
+            fluree_policy: None,
         }
     }
 
@@ -856,5 +904,48 @@ mod tests {
                 false,
             )
             .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod policy_claim_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn policy_claim_has_one_unambiguous_mode() {
+        let base = json!({"iss": "test-issuer", "exp": 1});
+        assert!(serde_json::from_value::<EventsTokenPayload>(base.clone())
+            .unwrap()
+            .fluree_policy
+            .is_none());
+        for (claim, request) in [
+            (json!("request"), true),
+            (json!({}), false),
+            (
+                json!({"policy-class": ["ex:Reader"], "default-allow": false}),
+                false,
+            ),
+        ] {
+            let mut token = base.clone();
+            token["fluree.policy"] = claim;
+            let parsed: EventsTokenPayload = serde_json::from_value(token).unwrap();
+            assert_eq!(
+                matches!(parsed.fluree_policy, Some(PolicyClaim::Request(_))),
+                request
+            );
+        }
+        for claim in [
+            json!(null),
+            json!(true),
+            json!("controller"),
+            json!(["request", {}]),
+            json!({"request": true}),
+            json!({"policy-class": "ex:Reader"}),
+        ] {
+            let mut token = base.clone();
+            token["fluree.policy"] = claim;
+            assert!(serde_json::from_value::<EventsTokenPayload>(token).is_err());
+        }
     }
 }

@@ -35,6 +35,8 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod admin;
+pub mod authorization;
+pub use authorization::PolicyAuthorization;
 pub mod block_fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
@@ -89,6 +91,7 @@ mod overlay;
 pub mod pack;
 pub mod policy_builder;
 pub mod policy_view;
+pub mod profile;
 pub mod query;
 mod rebase;
 pub mod remote_service;
@@ -2107,6 +2110,50 @@ impl FlureeBuilder {
                 index_config: cfg.index_config,
             });
         }
+        self
+    }
+
+    /// Override index garbage-collection retention. `None` leaves a setting at its
+    /// default; order relative to [`Self::with_indexing_thresholds`] does not
+    /// matter, since each preserves the other's half of the config.
+    ///
+    /// `max_old_indexes` and `min_time_mins` are ANDed, so under a fast publish
+    /// rate the age guard always wins and the count target bounds nothing.
+    /// `hard_max_old_indexes` is an opt-in ceiling past which the guard is
+    /// overridden. It bounds retained versions, not bytes, and overriding the
+    /// guard can release artifacts a query still reading an older version
+    /// needs; see `CleanGarbageConfig::hard_max_old_indexes` in
+    /// `fluree_db_indexer::gc` for the trade-off.
+    pub fn with_gc_settings(
+        mut self,
+        max_old_indexes: Option<u32>,
+        min_time_mins: Option<u32>,
+        hard_max_old_indexes: Option<u32>,
+    ) -> Self {
+        let existing = self.indexing_config.take();
+        let index_config = existing
+            .as_ref()
+            .map(|c| c.index_config.clone())
+            .unwrap_or_else(server_defaults::default_index_config);
+        let mut indexer_config = existing.map(|c| c.indexer_config).unwrap_or_default();
+        if let Some(v) = max_old_indexes {
+            indexer_config.gc_max_old_indexes = v;
+        }
+        if let Some(v) = min_time_mins {
+            indexer_config.gc_min_time_mins = v;
+        }
+        if hard_max_old_indexes.is_some() {
+            indexer_config.gc_hard_max_old_indexes = hard_max_old_indexes;
+        }
+        if max_old_indexes.is_some() || min_time_mins.is_some() || hard_max_old_indexes.is_some() {
+            // An explicit retention choice deserves the same "this build path
+            // discards indexer config" warning as any other explicit setter.
+            self.indexer_config_user_set = true;
+        }
+        self.indexing_config = Some(IndexingBuilderConfig {
+            indexer_config,
+            index_config,
+        });
         self
     }
 
@@ -5338,6 +5385,48 @@ mod tests {
         let cfg2 = b2.indexing_config.as_ref().expect("set");
         assert_eq!(cfg2.indexer_config.incremental_max_commits, 123);
         assert_eq!(cfg2.index_config.reindex_min_bytes, 500_000);
+    }
+
+    /// The env → `ServerConfig` → `with_gc_settings` → `IndexerConfig` path
+    /// is otherwise unpinned. This covers the builder hop in both orders
+    /// relative to the thresholds, and that `None` leaves the defaults alone.
+    #[test]
+    fn test_with_gc_settings_reaches_indexer_config_in_either_order() {
+        let b1 = FlureeBuilder::memory()
+            .with_indexing_thresholds(500_000, 5_000_000)
+            .with_gc_settings(Some(3), Some(45), Some(12));
+        let cfg1 = b1.indexing_config.as_ref().expect("set");
+        assert_eq!(cfg1.indexer_config.gc_max_old_indexes, 3);
+        assert_eq!(cfg1.indexer_config.gc_min_time_mins, 45);
+        assert_eq!(cfg1.indexer_config.gc_hard_max_old_indexes, Some(12));
+        assert_eq!(cfg1.index_config.reindex_min_bytes, 500_000);
+        assert!(b1.indexer_config_user_set);
+
+        let b2 = FlureeBuilder::memory()
+            .with_gc_settings(Some(3), Some(45), Some(12))
+            .with_indexing_thresholds(500_000, 5_000_000);
+        let cfg2 = b2.indexing_config.as_ref().expect("set");
+        assert_eq!(cfg2.indexer_config.gc_max_old_indexes, 3);
+        assert_eq!(cfg2.indexer_config.gc_min_time_mins, 45);
+        assert_eq!(cfg2.indexer_config.gc_hard_max_old_indexes, Some(12));
+        assert_eq!(cfg2.index_config.reindex_min_bytes, 500_000);
+
+        let b3 = FlureeBuilder::memory().with_gc_settings(None, None, None);
+        let cfg3 = b3.indexing_config.as_ref().expect("set");
+        let defaults = IndexerConfig::default();
+        assert_eq!(
+            cfg3.indexer_config.gc_max_old_indexes,
+            defaults.gc_max_old_indexes
+        );
+        assert_eq!(
+            cfg3.indexer_config.gc_min_time_mins,
+            defaults.gc_min_time_mins
+        );
+        assert_eq!(
+            cfg3.indexer_config.gc_hard_max_old_indexes, None,
+            "the ceiling is opt-in"
+        );
+        assert!(!b3.indexer_config_user_set);
     }
 
     #[tokio::test]

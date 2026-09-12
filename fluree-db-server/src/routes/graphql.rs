@@ -49,6 +49,12 @@ pub async fn graphql_ledger_tail(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Response> {
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.0.as_ref(),
+        credential.did(),
+    )?;
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
     let span = create_request_span(
@@ -65,7 +71,7 @@ pub async fn graphql_ledger_tail(
     // client disconnect cancels the whole fan-out, not one field of it.
     let timeout_ms = state.config.query_timeout_ms;
     let limits = graphql_limits(&state);
-    let server_identity = crate::routes::query::effective_identity(&credential, &bearer);
+    let server_identity = headers.server_identity.clone();
     crate::query_control::run_query_task(timeout_ms, server_identity, move || {
         async move {
             authorize_read(&state, &ledger, &bearer, &credential)?;
@@ -95,7 +101,7 @@ pub async fn graphql_ledger_tail(
                 )
                 .await?
             } else {
-                let view = policy_view(&state, &ledger, &headers, &bearer, &credential).await?;
+                let view = policy_view(&state, &ledger, &headers).await?;
                 state
                     .fluree
                     .graphql_with_options(&view, prepared, options)
@@ -120,6 +126,12 @@ pub async fn graphql_schema_ledger_tail(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Response> {
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.0.as_ref(),
+        credential.did(),
+    )?;
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
     let span = create_request_span(
@@ -133,9 +145,9 @@ pub async fn graphql_schema_ledger_tail(
 
     async move {
         authorize_read(&state, &ledger, &bearer, &credential)?;
-        let view = policy_view(&state, &ledger, &headers, &bearer, &credential).await?;
-        // Includes mutations when the ledger's `graphql:Schema` enables them,
-        // so the SDL matches what this endpoint will actually accept.
+        let view = policy_view(&state, &ledger, &headers).await?;
+        // Includes the ledger's configured mutations. Runtime restrictions
+        // (including the Raft mutation gate) still apply when executing them.
         let sdl = fluree_db_api::graphql::schema_sdl_with_mutations(&view)
             .await
             .map_err(ServerError::Api)?;
@@ -168,10 +180,15 @@ async fn execute_mutation(
             return Err(ServerError::not_found("Ledger not found"));
         }
     }
-    // Policy still applies: `wrap_policy` on the read view is what prunes the
-    // schema, and the transaction path enforces write policy itself.
-    let _ = policy_view(state, ledger, headers, bearer, credential).await?;
-
+    // The GraphQL executor commits locally. Until it submits through consensus,
+    // reject mutations on every Raft node, including the leader. Forwarding
+    // alone would still permit writes outside the replicated command queue.
+    #[cfg(feature = "raft")]
+    if state.raft.is_some() {
+        return Err(ServerError::not_implemented(
+            "GraphQL mutations are not supported in Raft mode; use the transaction endpoints",
+        ));
+    }
     let loaded = state
         .fluree
         .ledger(ledger)
@@ -182,11 +199,23 @@ async fn execute_mutation(
         .get_default_context(ledger)
         .await
         .map_err(ServerError::Api)?;
-    let (response, _committed) = state
-        .fluree
-        .graphql_transact_with_options(loaded, context, prepared, options)
-        .await
-        .map_err(ServerError::Api)?;
+    // Bound headers carry the verified selection, including caller default-deny
+    // narrowing. The API retains it through schema, writes, and read-back.
+    let governance =
+        crate::routes::policy_auth::bound_governance(headers.identity.as_deref(), headers)?;
+    let result = if governance.has_any_policy_inputs() {
+        let authorization = fluree_db_api::PolicyAuthorization::from_trusted_options(governance);
+        state
+            .fluree
+            .graphql_transact_with_authorization(loaded, context, prepared, options, &authorization)
+            .await
+    } else {
+        state
+            .fluree
+            .graphql_transact_with_options(loaded, context, prepared, options)
+            .await
+    };
+    let (response, _committed) = result.map_err(ServerError::Api)?;
     Ok(response)
 }
 
@@ -236,42 +265,9 @@ async fn policy_view(
     state: &AppState,
     ledger: &str,
     headers: &FlureeHeaders,
-    bearer: &MaybeDataBearer,
-    credential: &MaybeCredential,
 ) -> Result<fluree_db_api::GraphDb> {
-    let bearer_identity = crate::routes::query::effective_identity(credential, bearer);
-    let identity = crate::routes::policy_auth::resolve_sparql_identity(
-        state,
-        ledger,
-        bearer_identity.as_deref(),
-        headers.identity.as_deref(),
-    )
-    .await;
-
-    let opts = fluree_db_api::GovernanceOptions {
-        identity,
-        policy_class: (!headers.policy_class.is_empty()).then(|| headers.policy_class.clone()),
-        policy: headers.policy.clone(),
-        policy_values: headers.policy_values_map()?,
-        // The verified bearer/credential DID, not the impersonation target.
-        server_identity: bearer_identity,
-        default_allow: headers.default_allow,
-    };
-
-    let view = state
-        .fluree
-        .db_with_default_context(ledger)
-        .await
-        .map_err(ServerError::Api)?;
-    if opts.has_any_policy_inputs() {
-        state
-            .fluree
-            .wrap_policy(view, &opts)
-            .await
-            .map_err(ServerError::Api)
-    } else {
-        Ok(view)
-    }
+    let view = state.fluree.db_with_default_context(ledger).await?;
+    crate::routes::policy_auth::wrap_authorized_view(state, view, headers).await
 }
 
 fn parse_request(

@@ -15,6 +15,136 @@ use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
 
+#[test]
+fn authorization_events_record_scope_decisions_without_policy_payloads() {
+    use fluree_db_api::{GovernanceOptions, PolicyAuthorization};
+    use fluree_db_server::extract::{CredentialPolicy, DataPrincipal};
+
+    type Events = Arc<Mutex<Vec<HashMap<String, String>>>>;
+    struct EventCapture(Events);
+    impl<S: Subscriber> Layer<S> for EventCapture {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            if event.metadata().target() == "fluree_db_server::authorization" {
+                assert_eq!(*event.metadata().level(), tracing::Level::DEBUG);
+                let mut visitor = Vis(HashMap::new());
+                event.record(&mut visitor);
+                self.0.lock().unwrap().push(visitor.0);
+            }
+        }
+    }
+    let events = Events::default();
+    let subscriber = tracing_subscriber::registry().with(EventCapture(events.clone()));
+    tracing::subscriber::with_default(subscriber, || {
+        for mode in [
+            "controller",
+            "delegated",
+            "server-default",
+            "identity",
+            "scope-only",
+        ] {
+            let identity = (mode != "scope-only").then(|| "https://app.example/user".to_string());
+            let authorization = PolicyAuthorization::from_trusted_options(GovernanceOptions {
+                identity: identity.clone(),
+                policy_class: (mode == "server-default")
+                    .then(|| vec!["https://app.example/Employee".into()]),
+                policy: (mode == "delegated")
+                    .then(|| serde_json::json!({"secret-policy": "never-log-this-policy"})),
+                policy_values: (mode == "delegated").then(|| {
+                    [(
+                        "?secret".into(),
+                        serde_json::json!("never-log-these-values"),
+                    )]
+                    .into()
+                }),
+                default_allow: Some(false),
+                ..Default::default()
+            });
+            let authorization = match mode {
+                "controller" => CredentialPolicy::Request,
+                "scope-only" => CredentialPolicy::ScopeOnly,
+                _ => CredentialPolicy::Fixed(authorization),
+            };
+            let principal = DataPrincipal {
+                issuer: "https://issuer.example".into(),
+                subject: Some("user".into()),
+                identity,
+                read_all: false,
+                read_ledgers: ["allowed:main".into()].into(),
+                write_all: false,
+                write_ledgers: ["allowed:main".into()].into(),
+                expires_unix: u64::MAX,
+                policy_authorization: authorization,
+            };
+            assert!(principal.can_read("allowed:main"));
+            assert!(!principal.can_read("denied:main"));
+            assert!(principal.can_write("allowed:main"));
+            assert!(!principal.can_write("denied:main"));
+        }
+    });
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 20);
+    for (mode, chunk) in [
+        "controller",
+        "delegated",
+        "server-default",
+        "identity",
+        "scope-only",
+    ]
+    .into_iter()
+    .zip(events.chunks(4))
+    {
+        for (event, (action, allowed)) in chunk.iter().zip([
+            ("read", true),
+            ("read", false),
+            ("write", true),
+            ("write", false),
+        ]) {
+            assert_eq!(event["issuer"], "https://issuer.example");
+            assert_eq!(
+                event["authorization_mode"],
+                match mode {
+                    "controller" => "request-selected",
+                    "scope-only" => "scope-only",
+                    _ => "fixed",
+                }
+            );
+            assert_eq!(event["action"], action);
+            assert_eq!(event["scope_allowed"], allowed.to_string());
+            assert_eq!(
+                event["ledger"],
+                if allowed {
+                    "allowed:main"
+                } else {
+                    "denied:main"
+                }
+            );
+            assert_eq!(
+                event["effective_identity"],
+                if mode == "scope-only" || mode == "controller" {
+                    "None"
+                } else {
+                    "Some(\"https://app.example/user\")"
+                }
+            );
+            let keys: std::collections::BTreeSet<_> = event.keys().map(String::as_str).collect();
+            assert_eq!(
+                keys,
+                [
+                    "issuer",
+                    "effective_identity",
+                    "authorization_mode",
+                    "ledger",
+                    "action",
+                    "scope_allowed",
+                    "message"
+                ]
+                .into()
+            );
+        }
+    }
+    assert!(!format!("{events:?}").contains("never-log-"));
+}
+
 // ---------------------------------------------------------------------------
 // Minimal span capture (self-contained — server tests don't share fluree-db-api test support)
 // ---------------------------------------------------------------------------

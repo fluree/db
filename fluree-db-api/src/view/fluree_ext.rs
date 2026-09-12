@@ -115,10 +115,10 @@ impl Fluree {
     /// via `config_resolver::merge_reasoning()`, which applies override
     /// control against whatever server-verified identity the caller supplies.
     pub(crate) async fn resolve_and_attach_config(&self, view: GraphDb) -> Result<GraphDb> {
-        // Config reads are best-effort. If the config graph is unqueryable
-        // (e.g., historical snapshot without a range_provider for g_id=2),
-        // treat it as "no config" and apply system defaults.
-        //
+        if view.config_is_resolved() {
+            return Ok(view);
+        }
+        // A read failure must never become an unrestricted policy view.
         // Resolved through the same marker-keyed cache the write path uses:
         // query preparation completes config defaults on every view that
         // arrives without them, which for the ledger-scoped server routes is
@@ -130,23 +130,18 @@ impl Fluree {
         // may be a composed reasoning overlay rather than a bare `Novelty`, in
         // which case the resolver's own downcast would find no marker and
         // silently stop caching.
-        let config = match crate::policy_view::resolve_ledger_config_cached(
+        let config = crate::policy_view::resolve_ledger_config_cached(
             self,
             &view.snapshot,
             &*view.overlay,
             view.novelty().map(|n| &**n),
             view.t,
         )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(error = %e, "Config graph read failed — using system defaults");
-                return Ok(view);
-            }
-        };
+        .await?;
 
         let Some(config) = config else {
+            let mut view = view;
+            view.config_absent = true;
             return Ok(view);
         };
 
@@ -753,28 +748,12 @@ impl Fluree {
             fluree_db_ledger::LedgerState::new(snapshot, fluree_db_novelty::Novelty::new(0));
         let mut db = GraphDb::from_ledger_state(&state);
 
-        match graph_ref {
-            GraphRef::Default => {
-                // The virtual default graph: tag the view so query execution
-                // auto-wraps patterns in `GRAPH <gs_id> { ... }` and the configured
-                // provider (Iceberg / R2RML / BM25 / vector) resolves them.
-                // `resolved_config` rides with the tag — both say "this view IS
-                // the virtual source" — and `wrap_policy` reads the tag to decide
-                // that the model, not this empty genesis snapshot, holds the
-                // identity's `f:policyClass`.
-                db.resolved_config = Self::graph_source_model_config(&record);
-                db.graph_source_id = Some(gs_id.into());
-                Ok(Some(db))
-            }
-            // A graph source has no Fluree commit-metadata (`#txn-meta`) graph —
-            // that system graph is genuinely empty for a virtual dataset. Select
-            // the (empty) txn-meta graph on the genesis snapshot and deliberately
-            // DO NOT tag `graph_source_id`, so `maybe_wrap_for_graph_source` stays
-            // a no-op: the query reads the empty graph and returns [], rather than
-            // routing txn-meta patterns to the data provider (which has no such
-            // graph) or 500-ing on a NotFound alias.
-            other => Self::select_graph(db, other).map(Some),
-        }
+        // The default graph routes to the virtual provider and uses its model
+        // configuration. Shared graph selection removes both when selecting an
+        // empty system graph, for fragments and explicit dataset selectors alike.
+        db.resolved_config = Self::graph_source_model_config(&record);
+        db.graph_source_id = Some(gs_id.into());
+        Self::select_graph(db, graph_ref).map(Some)
     }
 }
 
@@ -783,6 +762,24 @@ impl Fluree {
 // ============================================================================
 
 impl Fluree {
+    /// Apply configured policy defaults when no request policy was selected.
+    /// Unconfigured views keep their plain-query path. Unlike a synthetic
+    /// `default_allow: true`, empty governance lets config supply its classes.
+    pub async fn wrap_policy_defaults(&self, view: GraphDb) -> Result<GraphDb> {
+        if view.has_policy() {
+            return Ok(view);
+        }
+        let view = self.resolve_and_attach_config(view).await?;
+        if view
+            .resolved_config()
+            .is_some_and(|config| config.policy.is_some())
+        {
+            self.wrap_policy(view, &GovernanceOptions::default()).await
+        } else {
+            Ok(view)
+        }
+    }
+
     /// Build policy from options and wrap a view.
     ///
     /// If the view has a `ResolvedConfig`, config defaults are merged with query
@@ -806,6 +803,10 @@ impl Fluree {
     /// let view = fluree.wrap_policy(view, &opts).await?;
     /// ```
     pub async fn wrap_policy(&self, view: GraphDb, opts: &GovernanceOptions) -> Result<GraphDb> {
+        // Callers may construct a view directly from staged/loaded ledger state.
+        // Such a view must not bypass ledger override controls just because
+        // config has not been attached yet (for example GraphQL read-back).
+        let view = self.resolve_and_attach_config(view).await?;
         let effective_opts = if let Some(ref resolved) = view.resolved_config {
             config_resolver::merge_policy_opts(resolved, opts)
         } else {
@@ -1109,10 +1110,7 @@ impl Fluree {
         view: &GraphDb,
         server_identity: Option<&VerifiedIdentity>,
     ) -> Result<GraphDb> {
-        let view = match view.resolved_config() {
-            Some(_) => view.clone(),
-            None => self.resolve_and_attach_config(view.clone()).await?,
-        };
+        let view = self.resolve_and_attach_config(view.clone()).await?;
         Ok(self.apply_config_defaults(view, server_identity))
     }
 

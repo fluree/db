@@ -114,10 +114,23 @@ impl NsVecBiDict {
     /// namespace and inserts into both forward and reverse structures.
     pub fn assign_or_lookup(&mut self, ns_code: u16, suffix: &str) -> u64 {
         let key = lookup_key(ns_code, suffix);
-        if let Some(&id) = self.reverse.get(key.as_slice()) {
+        if let Some(id) = self.find_by_key(&key) {
             return id;
         }
+        self.insert_new(ns_code, suffix, key)
+    }
 
+    /// Reverse lookup by an already-encoded key (see [`lookup_key`]), so a
+    /// caller probing several dictionaries encodes the suffix once.
+    #[inline]
+    pub fn find_by_key(&self, key: &[u8]) -> Option<u64> {
+        self.reverse.get(key).copied()
+    }
+
+    /// Allocate the next local_id for `ns_code` and insert `(key, suffix)`.
+    /// The caller has established the key is absent (see [`Self::find_by_key`]).
+    pub fn insert_new(&mut self, ns_code: u16, suffix: &str, key: Vec<u8>) -> u64 {
+        debug_assert!(self.find_by_key(&key).is_none());
         let local_id = if ns_code == NS_OVERFLOW {
             if self.overflow_next_local_id <= self.overflow_watermark {
                 self.overflow_next_local_id = self.overflow_watermark + 1;
@@ -169,8 +182,53 @@ impl NsVecBiDict {
 
     /// Reverse lookup: find sid64 by `(ns_code, suffix)`.
     pub fn find_subject(&self, ns_code: u16, suffix: &str) -> Option<u64> {
-        let key = lookup_key(ns_code, suffix);
-        self.reverse.get(key.as_slice()).copied()
+        self.find_by_key(&lookup_key(ns_code, suffix))
+    }
+
+    /// The local_id the next allocation in `ns_code` would take, following
+    /// the same rules as [`Self::assign_or_lookup`].
+    fn next_local_id(&self, ns_code: u16) -> u64 {
+        if ns_code == NS_OVERFLOW {
+            return self.overflow_next_local_id.max(self.overflow_watermark + 1);
+        }
+        let ns_idx = ns_code as usize;
+        let mut wm = self.watermarks.get(ns_idx).copied().unwrap_or(0);
+        if wm == 0 && self.local_base > 1 {
+            wm = self.local_base - 1;
+        }
+        let mut next = self
+            .next_local_ids
+            .get(ns_idx)
+            .copied()
+            .unwrap_or(self.local_base);
+        if next == 0 && self.local_base > 1 {
+            next = self.local_base;
+        }
+        next.max(wm + 1)
+    }
+
+    /// An empty dictionary whose allocation starts where this one's ends:
+    /// every namespace's first new local_id is `self.next_local_id(ns)`, so
+    /// ids minted in the layer never collide with ids this dictionary holds
+    /// or would mint next. The layer's internal per-namespace floor is this
+    /// dictionary's allocation frontier, not the persisted watermark; a
+    /// layered [`crate::DictNovelty`] reports the persisted watermark from
+    /// its parent.
+    pub fn layer_above(&self) -> Self {
+        let n = self.watermarks.len().max(self.next_local_ids.len());
+        let watermarks: Vec<u64> = (0..n).map(|ns| self.next_local_id(ns as u16) - 1).collect();
+        let next_local_ids: Vec<u64> = watermarks.iter().map(|&wm| wm + 1).collect();
+        let overflow_watermark = self.next_local_id(NS_OVERFLOW) - 1;
+        Self {
+            entries: vec![Vec::new(); n],
+            reverse: HashMap::new(),
+            local_base: self.local_base,
+            watermarks,
+            next_local_ids,
+            overflow_watermark,
+            overflow_next_local_id: overflow_watermark + 1,
+            overflow_entries: Vec::new(),
+        }
     }
 
     /// Forward lookup: resolve sid64 → `(ns_code, &suffix)`.
@@ -249,7 +307,7 @@ impl Default for NsVecBiDict {
 
 /// Build a lookup key as `Vec<u8>`: `[ns_code BE 2 bytes][suffix UTF-8 bytes]`.
 #[inline]
-fn lookup_key(ns_code: u16, suffix: &str) -> Vec<u8> {
+pub fn lookup_key(ns_code: u16, suffix: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(2 + suffix.len());
     key.extend_from_slice(&ns_code.to_be_bytes());
     key.extend_from_slice(suffix.as_bytes());
@@ -372,6 +430,40 @@ mod tests {
         assert_eq!(d.watermark_for_ns(2), 30);
         assert_eq!(d.watermark_for_ns(3), 0); // out of range
         assert_eq!(d.watermark_for_ns(NS_OVERFLOW), 50);
+    }
+
+    #[test]
+    fn layer_above_allocates_past_the_parent_frontier() {
+        let mut parent = NsVecBiDict::with_watermarks(vec![0, 0, 100], 7);
+        let a = parent.assign_or_lookup(2, "a"); // 101
+        let b = parent.assign_or_lookup(2, "b"); // 102
+        let o = parent.assign_or_lookup(NS_OVERFLOW, "http://x/full"); // 8
+        let fresh_ns = parent.assign_or_lookup(9, "z"); // ns 9, local 1
+
+        let mut layer = parent.layer_above();
+        assert!(layer.is_empty());
+        let c = layer.assign_or_lookup(2, "c");
+        assert_eq!(SubjectId::from_u64(c).local_id(), 103);
+        let o2 = layer.assign_or_lookup(NS_OVERFLOW, "http://y/full");
+        assert_eq!(SubjectId::from_u64(o2).local_id(), 9);
+        let z2 = layer.assign_or_lookup(9, "z2");
+        assert_eq!(SubjectId::from_u64(z2).local_id(), 2);
+        // A namespace the parent never touched starts at 1.
+        let n = layer.assign_or_lookup(12, "n");
+        assert_eq!(SubjectId::from_u64(n).local_id(), 1);
+
+        // The layer holds only its own ids; parent ids resolve to None here.
+        for id in [a, b, o, fresh_ns] {
+            assert!(layer.resolve_subject(id).is_none());
+        }
+        assert_eq!(layer.resolve_subject(c), Some((2, "c")));
+        assert_eq!(
+            layer.resolve_subject(o2),
+            Some((NS_OVERFLOW, "http://y/full"))
+        );
+        // The parent is untouched.
+        assert_eq!(parent.len(), 4);
+        assert_eq!(parent.find_subject(2, "c"), None);
     }
 
     #[test]

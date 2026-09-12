@@ -100,6 +100,15 @@ const SHOP_R2RML: &str = r#"
         rr:logicalTable [ rr:tableName "shop.notes" ] ;
         rr:subjectMap [ rr:template "http://example.org/order/{order_ref}" ] ;
         rr:predicateObjectMap [ rr:predicate ex:memo ; rr:objectMap [ rr:column "body" ] ] .
+
+    # A subject under the order prefix with a different skeleton: an
+    # `order_ref` of `10/note` would collide with an order, so the lane can
+    # neither join nor rule the pair out.
+    <http://example.org/mapping#OrderNote>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.notes" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{order_ref}/note" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:noteBody ; rr:objectMap [ rr:column "body" ] ] .
 "#;
 
 /// The customer entity split across three triples maps sharing its subject
@@ -107,6 +116,43 @@ const SHOP_R2RML: &str = r#"
 /// over `profiles` (by table). `ex:label` is on both `customers` maps.
 fn vp_mapping(prefix: &str) -> String {
     VP_R2RML.replace("shop.", prefix)
+}
+
+/// Two maps minting `ex:memo` for subjects under the order prefix from one
+/// table: `order/{order_ref}` and `order/{order_ref}-note`, whose subjects
+/// meet where one key is another's under the suffix, and a pointer whose
+/// foreign key targets the first.
+fn memo_mapping(prefix: &str) -> String {
+    format!(
+        r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Memo>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "{prefix}memos" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{{order_ref}}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:memo ; rr:objectMap [ rr:column "body" ] ] .
+
+    <http://example.org/mapping#MemoNote>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "{prefix}memos" ] ;
+        rr:subjectMap [ rr:template "http://example.org/order/{{order_ref}}-note" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:memo ; rr:objectMap [ rr:column "body" ] ] .
+
+    <http://example.org/mapping#Pointer>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "{prefix}pointers" ] ;
+        rr:subjectMap [ rr:template "http://example.org/pointer/{{id}}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:about ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Memo> ;
+                rr:joinCondition [ rr:child "ref" ; rr:parent "order_ref" ]
+            ]
+        ] .
+"#
+    )
 }
 
 fn typed_mapping(prefix: &str) -> String {
@@ -140,7 +186,20 @@ const VP_R2RML: &str = r#"
         rr:logicalTable [ rr:tableName "shop.customers" ] ;
         rr:subjectMap [ rr:template "http://example.org/customer/{id}" ; rr:class ex:Customer ] ;
         rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
-        rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "name" ] ] .
+        rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "name" ] ] ;
+        rr:predicateObjectMap [ rr:predicate ex:code ; rr:objectMap [ rr:column "country" ] ] .
+
+    # Another subject minting `ex:label`, and `ex:code` from a column of
+    # another type than the customers' one.
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.people" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ; rr:class ex:Person ] ;
+        rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "name" ] ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:code ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:integer ]
+        ] .
 
     <http://example.org/mapping#CustomerCountry>
         a rr:TriplesMap ;
@@ -154,6 +213,14 @@ const VP_R2RML: &str = r#"
         rr:logicalTable [ rr:tableName "shop.profiles" ] ;
         rr:subjectMap [ rr:template "http://example.org/customer/{id}" ] ;
         rr:predicateObjectMap [ rr:predicate ex:email ; rr:objectMap [ rr:column "email" ] ] .
+
+    # The same subject minting `ex:label` from another table's column: a
+    # second provider proper, unlike CustomerCountry's copy of Customer's.
+    <http://example.org/mapping#CustomerAlias>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "shop.profiles" ] ;
+        rr:subjectMap [ rr:template "http://example.org/customer/{id}" ] ;
+        rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "email" ] ] .
 
     <http://example.org/mapping#Order>
         a rr:TriplesMap ;
@@ -281,6 +348,29 @@ async fn shop() -> MockServer {
             &[("order_no", "bigint"), ("carrier", "varchar")],
             vec![vec![json!(10), json!("UPS")], vec![json!(12), json!("DHL")]],
         ))
+        // Memos keyed by text under the order prefix, where one key is
+        // another's under a `-note` suffix; pointers into them.
+        .table(Table::new(
+            "shop.memos",
+            &[
+                ("id", "bigint"),
+                ("order_ref", "varchar"),
+                ("body", "varchar"),
+            ],
+            vec![
+                vec![json!(1), json!("10"), json!("gift wrap")],
+                vec![json!(2), json!("10-note"), json!("wrapped")],
+                vec![json!(3), json!("12"), json!("call first")],
+            ],
+        ))
+        .table(Table::new(
+            "shop.pointers",
+            &[("id", "bigint"), ("ref", "varchar")],
+            vec![
+                vec![json!(1), json!("10")],
+                vec![json!(2), json!("10-note")],
+            ],
+        ))
         .mount()
         .await
 }
@@ -312,7 +402,95 @@ async fn setup() -> (MockServer, Fluree) {
         ))
         .await
         .expect("create typed sql source");
+    fluree
+        .create_sql_graph_source(SqlCreateConfig::new(
+            "shop-memo",
+            server.uri(),
+            memo_mapping("shop."),
+        ))
+        .await
+        .expect("create memo sql source");
+    seed_native_twin(&fluree).await;
     (server, fluree)
+}
+
+/// Cases the per-scan lane cannot run (a graph source has no native index
+/// for the engine's subquery operator), checked against the native twin
+/// of the shop fixture instead.
+const LANE_ONLY_CASES: &[&str] = &[
+    "a sub-select projects an OPTIONAL variable as nullable",
+    "a grouped sub-select joins its counts to the outer rows",
+    "a grouped sub-select sums in the database and finalizes in the engine",
+    "a DISTINCT sub-select pushes as a distinct derived table",
+    "a top-k sub-select orders and limits inside the derived table",
+    "a sub-select's HAVING pushes inside its derived table",
+];
+
+/// The shop fixture as a native ledger (`shop-native:main`): the oracle for
+/// shapes the per-scan lane cannot answer.
+async fn seed_native_twin(fluree: &Fluree) {
+    let ledger = fluree
+        .create_ledger("shop-native:main")
+        .await
+        .expect("native twin ledger");
+    let ex = "http://example.org/";
+    let customer = |id: u32, name: &str, country: Option<&str>| {
+        let mut c = json!({
+            "@id": format!("{ex}customer/{id}"),
+            "@type": format!("{ex}Customer"),
+            format!("{ex}name"): name,
+        });
+        if let Some(k) = country {
+            c[format!("{ex}country")] = json!(k);
+        }
+        c
+    };
+    let order = |id: u32,
+                 customer: Option<u32>,
+                 total: &str,
+                 placed: Option<&str>,
+                 at: Option<&str>| {
+        let mut o = json!({
+            "@id": format!("{ex}order/{id}"),
+            "@type": format!("{ex}Order"),
+            format!("{ex}total"): {"@value": total, "@type": "http://www.w3.org/2001/XMLSchema#decimal"},
+        });
+        if let Some(c) = customer {
+            o[format!("{ex}customer")] = json!({"@id": format!("{ex}customer/{c}")});
+        }
+        if let Some(p) = placed {
+            o[format!("{ex}placed")] =
+                json!({"@value": p, "@type": "http://www.w3.org/2001/XMLSchema#date"});
+        }
+        if let Some(t) = at {
+            for pred in ["shipped", "updated"] {
+                o[format!("{ex}{pred}")] =
+                    json!({"@value": t, "@type": "http://www.w3.org/2001/XMLSchema#dateTime"});
+            }
+        }
+        o
+    };
+    let graph = json!({"@graph": [
+        customer(1, "Ada", Some("UK")),
+        customer(2, "Bo", None),
+        customer(3, "Cy", Some("US")),
+        order(10, Some(1), "99.50", Some("2024-01-05"), Some("2024-01-06T09:30:00Z")),
+        order(11, Some(1), "5.00", Some("2024-02-01"), Some("2024-02-02T18:00:00Z")),
+        order(12, Some(2), "42.00", Some("2024-03-01"), None),
+        order(13, None, "7.00", None, None),
+    ]});
+    fluree
+        .insert(ledger, &graph)
+        .await
+        .expect("seed native twin");
+}
+
+/// A case's rows from the native twin, comparable by value with the lane's.
+async fn native_rows(fluree: &Fluree, sparql: &str) -> Vec<String> {
+    let sparql = sparql
+        .replace("shop-sql:main", "shop-native:main")
+        .replace("shop-live:main", "shop-native:main");
+    by_value(&rows_of(&query(fluree, &sparql).await))
 }
 
 /// SPARQL JSON results as sorted rows of `var=value` pairs (variables in
@@ -463,7 +641,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "unpushable filter stays in the engine as a residual",
-            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(STRLEN(?n) > 2) }",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(REGEX(?n, \"a$\")) }",
             sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
             rows: &["n=Ada"],
             routing: Routing::MustFire,
@@ -596,7 +774,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "a residual filter keeps LIMIT in the engine",
-            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(STRLEN(?n) > 1) } LIMIT 1",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(REGEX(?n, \"[a-z]$\")) } LIMIT 1",
             sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
             rows: &["n=Ada"],
             routing: Routing::MustFire,
@@ -631,11 +809,51 @@ fn cases() -> Vec<Case> {
             routing: Routing::MustFire,
             declined: None,
         },
+        // A numeric BIND of `+`, `-`, `*` over native numeric columns is an
+        // expression the statement can compute: a filter over it pushes
+        // exactly, a top-k orders by it, and the engine still builds the
+        // bound value itself. Division stays in the engine (SPARQL divides
+        // integers into a decimal, SQL into an integer).
         Case {
-            name: "a filter over a BIND variable stays in the engine after the BIND",
+            name: "a filter over a numeric BIND pushes the expression",
             sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) FILTER(?d > 50) }",
-            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND ("t0"."total" * 2) > 50"#],
             rows: &["o=http://example.org/order/10", "o=http://example.org/order/12"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            // A decimal constant is typed per dialect (SQLite would compute
+            // 99.50 * 0.1 in floating point and miss 9.95), so the
+            // expression stays a residual in the engine.
+            name: "an expression over a decimal constant stays in the engine",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t FILTER(?t * 0.1 = 9.95) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            rows: &["o=http://example.org/order/10"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a nested BIND expression pushes with the plan's precedence",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(?t * 2 + 1 AS ?d) FILTER(100 < ?d) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND (("t0"."total" * 2) + 1) > 100"#],
+            rows: &["o=http://example.org/order/10"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a top-k over a numeric BIND orders by the expression",
+            sparql: "SELECT ?o ?d FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) } ORDER BY DESC(?d) LIMIT 2",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL ORDER BY ("t0"."total" * 2) DESC LIMIT 2"#],
+            rows: &["d=199.00 o=http://example.org/order/10", "d=84.00 o=http://example.org/order/12"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a filter over a BIND that divides stays in the engine",
+            sparql: "SELECT ?o FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(?t / 2 AS ?h) FILTER(?h > 40) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            rows: &["o=http://example.org/order/10"],
             routing: Routing::MustFire,
             declined: None,
         },
@@ -650,10 +868,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "a BIND after a UNION reads the union's variable",
             sparql: "SELECT ?o ?s FROM <shop-sql:main> WHERE { { ?o ex:total ?v } UNION { ?o ex:placed ?v } BIND(STR(?v) AS ?s) }",
-            sql: &[
-                r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#,
-                r#"SELECT "t0"."id" AS "c0", "t0"."placed" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL"#,
-            ],
+            sql: &[r#"SELECT "u"."c0" AS "c0", "u"."c1" AS "c1", "u"."c2" AS "c2", "u"."c3" AS "c3" FROM (SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", NULL AS "c2", 0 AS "c3" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL UNION ALL SELECT "t0"."id" AS "c0", NULL AS "c1", "t0"."placed" AS "c2", 1 AS "c3" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL) AS "u""#],
             rows: &[
                 "o=http://example.org/order/10 s=2024-01-05",
                 "o=http://example.org/order/10 s=99.50",
@@ -762,7 +977,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "a widened conjunction drops what it cannot widen and keeps the exact part",
-            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n ; ex:country ?k FILTER(STRSTARTS(?n, \"A\") && STRLEN(?k) = 2 && ?k = \"UK\") }",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n ; ex:country ?k FILTER(STRSTARTS(?n, \"A\") && REGEX(?k, \"K$\") && ?k = \"UK\") }",
             sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t0"."country" AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."country" IS NOT NULL AND "t0"."name" LIKE 'A%' ESCAPE '!' AND "t0"."country" = 'UK'"#],
             rows: &["n=Ada"],
             routing: Routing::MustFire,
@@ -816,19 +1031,170 @@ fn cases() -> Vec<Case> {
             routing: Routing::MustFire,
             declined: None,
         },
+        // An entity several resolutions provide (a predicate two maps
+        // mint, on the same subject or on different ones) is one derived
+        // table: the resolutions `UNION ALL`ed, each row tagged with its
+        // branch so its terms decode through that branch's maps. Two maps
+        // minting a triple alike (CustomerCountry's copy of Customer's
+        // label) count as one provider: the graph holds the triple once.
         Case {
-            name: "a predicate two maps provide, with no map providing the entity, declines",
+            name: "a predicate two maps provide unions the resolutions at the node",
             sparql: "SELECT ?l ?e FROM <shop-vp:main> WHERE { ?c ex:label ?l ; ex:email ?e }",
-            sql: &[],
-            // The per-scan lane answers once per map minting the triple.
+            sql: &[r#"SELECT "u0"."c3" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2", "u0"."c2" AS "c3" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t1"."email" AS "c2", 0 AS "c3" FROM "shop"."customers" AS "t0" JOIN "shop"."profiles" AS "t1" ON "t0"."id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t2"."email" AS "c2", 1 AS "c3" FROM "shop"."profiles" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL) AS "u0""#],
             rows: &[
                 "e=ada@example.org l=Ada",
-                "e=ada@example.org l=Ada",
+                "e=ada@example.org l=ada@example.org",
                 "e=cy@example.org l=Cy",
-                "e=cy@example.org l=Cy",
+                "e=cy@example.org l=cy@example.org",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "maps with different subjects providing a predicate union their accesses",
+            sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l }",
+            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 1 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0""#],
+            // The subject has no key over the union (two templates), so it
+            // decodes per branch; the object is one string column.
+            rows: &[
+                "l=Ada s=http://example.org/customer/1",
+                "l=Ada s=http://example.org/person/1",
+                "l=Bo s=http://example.org/customer/2",
+                "l=Bo s=http://example.org/person/2",
+                "l=Cy s=http://example.org/customer/3",
+                "l=Cy s=http://example.org/person/3",
+                "l=Di s=http://example.org/person/4",
+                "l=ada@example.org s=http://example.org/customer/1",
+                "l=cy@example.org s=http://example.org/customer/3",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a filter on a union variable pushes on the union's column",
+            sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l FILTER(?l = \"Ada\") }",
+            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 1 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" WHERE "u0"."c1" = 'Ada'"#],
+            rows: &[
+                "l=Ada s=http://example.org/customer/1",
+                "l=Ada s=http://example.org/person/1",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a top-k on a union variable pushes its LIMIT",
+            sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l } ORDER BY DESC(?l) LIMIT 1",
+            // Every branch requires the column, so the union's is required
+            // and orders exactly.
+            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 1 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" ORDER BY "u0"."c1" DESC LIMIT 1"#],
+            rows: &["l=cy@example.org s=http://example.org/customer/3"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        // A foreign key into a union entity joins the parent's columns the
+        // union exposes: a branch on the parent's row carries them as its
+        // own, one on the parent's subject over another table (the alias
+        // on profiles) takes the parent's row as a part joined on the
+        // subject key, and one minting another subject (people) can never
+        // meet a key that is certain to be placed, so it is dropped.
+        Case {
+            name: "a foreign key into a union entity joins the parent's columns",
+            sparql: "SELECT ?o ?l FROM <shop-vp:main> WHERE { ?o ex:customer ?c . ?c ex:label ?l }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "u0"."c3" AS "c1", "u0"."c0" AS "c2", "u0"."c1" AS "c3", "u0"."c2" AS "c4" FROM "shop"."orders" AS "t0" JOIN (SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", "t1"."id" AS "c2", 0 AS "c3" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t3"."id" AS "c2", 1 AS "c3" FROM "shop"."profiles" AS "t2" JOIN "shop"."customers" AS "t3" ON "t2"."id" = "t3"."id" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL AND "t3"."id" IS NOT NULL) AS "u0" ON "t0"."customer_id" = "u0"."c2" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL"#],
+            rows: &[
+                "l=Ada o=http://example.org/order/10",
+                "l=Ada o=http://example.org/order/11",
+                "l=Bo o=http://example.org/order/12",
+                "l=ada@example.org o=http://example.org/order/10",
+                "l=ada@example.org o=http://example.org/order/11",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a foreign key into a partitioned union entity keeps its other parts",
+            sparql: "SELECT ?o ?l ?k FROM <shop-vp:main> WHERE { ?o ex:customer ?c . ?c ex:label ?l ; ex:country ?k }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "u0"."c4" AS "c1", "u0"."c0" AS "c2", "u0"."c1" AS "c3", "u0"."c2" AS "c4", "u0"."c3" AS "c5" FROM "shop"."orders" AS "t0" JOIN (SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", "t1"."country" AS "c2", "t1"."id" AS "c3", 0 AS "c4" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL AND "t1"."country" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t3"."country" AS "c2", "t3"."id" AS "c3", 1 AS "c4" FROM "shop"."profiles" AS "t2" JOIN "shop"."customers" AS "t3" ON "t2"."id" = "t3"."id" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL AND "t3"."id" IS NOT NULL AND "t3"."country" IS NOT NULL) AS "u0" ON "t0"."customer_id" = "u0"."c3" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL"#],
+            rows: &[
+                "k=UK l=Ada o=http://example.org/order/10",
+                "k=UK l=Ada o=http://example.org/order/11",
+                "k=UK l=ada@example.org o=http://example.org/order/10",
+                "k=UK l=ada@example.org o=http://example.org/order/11",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "union branches whose column types differ decline",
+            sparql: "SELECT ?s ?v FROM <shop-vp:main> WHERE { ?s ex:code ?v }",
+            sql: &[],
+            rows: &[
+                "s=http://example.org/customer/1 v=UK",
+                "s=http://example.org/customer/3 v=US",
+                "s=http://example.org/person/1 v=1",
+                "s=http://example.org/person/2 v=2",
+                "s=http://example.org/person/3 v=3",
+                "s=http://example.org/person/4 v=4",
             ],
             routing: Routing::MustNotFire,
-            declined: Some("predicate provided by several triples maps"),
+            declined: Some("union branch column types differ"),
+        },
+        // A sub-select is a derived table joined on its projected keys: a
+        // grouped one carries its aggregates as outputs the engine decodes
+        // like the grouped lane's; DISTINCT and ORDER BY … LIMIT push inside
+        // it. HAVING, OFFSET, a nested sub-select and a hidden inner
+        // variable the block reuses decline.
+        Case {
+            // The derived table keeps the inner LEFT JOIN's column nullable,
+            // so a customer without a country still comes back unbound.
+            name: "a sub-select projects an OPTIONAL variable as nullable",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c ?k WHERE { ?c ex:name ?x OPTIONAL { ?c ex:country ?k } } } }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "d0"."c0" AS "c2", "d0"."c1" AS "c3" FROM "shop"."customers" AS "t0" JOIN (SELECT "t1"."id" AS "c0", "t1"."country" AS "c1" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL) AS "d0" ON "t0"."id" = "d0"."c0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            rows: &["k= n=Bo", "k=UK n=Ada", "k=US n=Cy"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a sub-select's HAVING pushes inside its derived table",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c (COUNT(?o) AS ?k) WHERE { ?o ex:customer ?c } GROUP BY ?c HAVING (COUNT(?o) > 1) } }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "d0"."c1" AS "c2" FROM "shop"."customers" AS "t0" JOIN (SELECT "t2"."id" AS "c0", COUNT("t1"."id") AS "c1" FROM "shop"."orders" AS "t1" JOIN "shop"."customers" AS "t2" ON "t1"."customer_id" = "t2"."id" WHERE "t1"."id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL AND "t2"."id" IS NOT NULL GROUP BY "t2"."id" HAVING COUNT("t1"."id") > 1) AS "d0" ON "t0"."id" = "d0"."c0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            rows: &[
+                "k=2 n=Ada",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a grouped sub-select joins its counts to the outer rows",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c (COUNT(?o) AS ?k) WHERE { ?o ex:customer ?c } GROUP BY ?c } }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "d0"."c1" AS "c2" FROM "shop"."customers" AS "t0" JOIN (SELECT "t2"."id" AS "c0", COUNT("t1"."id") AS "c1" FROM "shop"."orders" AS "t1" JOIN "shop"."customers" AS "t2" ON "t1"."customer_id" = "t2"."id" WHERE "t1"."id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL AND "t2"."id" IS NOT NULL GROUP BY "t2"."id") AS "d0" ON "t0"."id" = "d0"."c0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            rows: &["k=1 n=Bo", "k=2 n=Ada"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a grouped sub-select sums in the database and finalizes in the engine",
+            sparql: "SELECT ?n ?s FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c (SUM(?t) AS ?s) WHERE { ?o ex:customer ?c ; ex:total ?t } GROUP BY ?c } }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "d0"."c1" AS "c2", "d0"."c2" AS "c3" FROM "shop"."customers" AS "t0" JOIN (SELECT "t2"."id" AS "c0", SUM("t1"."total") AS "c1", COUNT("t1"."total") AS "c2" FROM "shop"."orders" AS "t1" JOIN "shop"."customers" AS "t2" ON "t1"."customer_id" = "t2"."id" WHERE "t1"."id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL AND "t1"."total" IS NOT NULL AND "t2"."id" IS NOT NULL GROUP BY "t2"."id") AS "d0" ON "t0"."id" = "d0"."c0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            rows: &["n=Ada s=104.50", "n=Bo s=42.00"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a DISTINCT sub-select pushes as a distinct derived table",
+            sparql: "SELECT ?n FROM <shop-sql:main> WHERE { { SELECT DISTINCT ?c WHERE { ?o ex:customer ?c } } ?c ex:name ?n }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" JOIN (SELECT DISTINCT "t2"."id" AS "c0" FROM "shop"."orders" AS "t1" JOIN "shop"."customers" AS "t2" ON "t1"."customer_id" = "t2"."id" WHERE "t1"."id" IS NOT NULL AND "t1"."customer_id" IS NOT NULL AND "t2"."id" IS NOT NULL) AS "d0" ON "t0"."id" = "d0"."c0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#],
+            rows: &["n=Ada", "n=Bo"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a top-k sub-select orders and limits inside the derived table",
+            sparql: "SELECT ?o ?p FROM <shop-sql:main> WHERE { { SELECT ?o WHERE { ?o ex:total ?t } ORDER BY DESC(?t) LIMIT 2 } ?o ex:placed ?p }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."placed" AS "c1" FROM "shop"."orders" AS "t0" JOIN (SELECT "t1"."id" AS "c0" FROM "shop"."orders" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."total" IS NOT NULL ORDER BY "t1"."total" DESC LIMIT 2) AS "d0" ON "t0"."id" = "d0"."c0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL"#],
+            rows: &["o=http://example.org/order/10 p=2024-01-05", "o=http://example.org/order/12 p=2024-03-01"],
+            routing: Routing::MustFire,
+            declined: None,
         },
         Case {
             name: "UNION branch combinations above the cap decline",
@@ -918,6 +1284,30 @@ fn cases() -> Vec<Case> {
             declined: Some("join between two column classes"),
         },
         Case {
+            name: "a subject shared by templates of one prefix but different skeletons declines",
+            sparql: "SELECT ?o ?t ?b FROM <shop-sql:main> WHERE { ?o ex:total ?t . ?o ex:noteBody ?b }",
+            sql: &[],
+            rows: &[],
+            routing: Routing::MustNotFire,
+            declined: Some("entity spans subject templates the lane cannot relate"),
+        },
+        Case {
+            // Pointer 2 targets order/10-note, which the `-note` map mints
+            // from the `10` memo as well as the plain map from the `10-note`
+            // one: a branch the lane can neither join to the parent nor
+            // rule out declines rather than drops.
+            name: "a foreign key into a union entity over templates of one prefix but different skeletons declines",
+            sparql: "SELECT ?n ?o ?m FROM <shop-memo:main> WHERE { ?n ex:about ?o . ?o ex:memo ?m }",
+            sql: &[],
+            rows: &[
+                "m=gift wrap n=http://example.org/pointer/1 o=http://example.org/order/10",
+                "m=gift wrap n=http://example.org/pointer/2 o=http://example.org/order/10-note",
+                "m=wrapped n=http://example.org/pointer/2 o=http://example.org/order/10-note",
+            ],
+            routing: Routing::MustNotFire,
+            declined: Some("ref object map into a union entity over templates the lane cannot relate"),
+        },
+        Case {
             name: "an optional hanging off an optional entity declines",
             sparql: "SELECT ?n ?t FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?o ex:customer ?c } OPTIONAL { ?o ex:total ?t } }",
             sql: &[],
@@ -976,19 +1366,21 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "DISTINCT keeps the columns a residual filter reads",
-            sparql: "SELECT DISTINCT ?c FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?c ex:name ?n FILTER(STRLEN(?n) > 2) }",
+            sparql: "SELECT DISTINCT ?c FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?c ex:name ?n FILTER(REGEX(?n, \"a$\")) }",
             sql: &[r#"SELECT DISTINCT "t1"."id" AS "c0", "t1"."name" AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL"#],
             rows: &["c=http://example.org/customer/1"],
             routing: Routing::MustFire,
             declined: None,
         },
         Case {
-            name: "UNION runs one statement per branch",
+            // `UNION` branches share one statement: `UNION ALL`ed under
+            // typed slots (a variable bound on columns of different types
+            // takes one per type, padded with NULL where a branch does not
+            // bind it), each row tagged with its branch, whose own
+            // materializer and residuals still run over it.
+            name: "UNION branches share one statement",
             sparql: "SELECT ?o ?v FROM <shop-sql:main> WHERE { { ?o ex:total ?v } UNION { ?o ex:placed ?v } }",
-            sql: &[
-                r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#,
-                r#"SELECT "t0"."id" AS "c0", "t0"."placed" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL"#,
-            ],
+            sql: &[r#"SELECT "u"."c0" AS "c0", "u"."c1" AS "c1", "u"."c2" AS "c2", "u"."c3" AS "c3" FROM (SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", NULL AS "c2", 0 AS "c3" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL UNION ALL SELECT "t0"."id" AS "c0", NULL AS "c1", "t0"."placed" AS "c2", 1 AS "c3" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL) AS "u""#],
             rows: &[
                 "o=http://example.org/order/10 v=2024-01-05",
                 "o=http://example.org/order/10 v=99.50",
@@ -1004,15 +1396,131 @@ fn cases() -> Vec<Case> {
         Case {
             name: "UNION branches carry the block's other triples and their own filters",
             sparql: "SELECT ?o ?n FROM <shop-sql:main> WHERE { ?o ex:customer ?c . ?c ex:name ?n . { ?c ex:country \"UK\" } UNION { ?o ex:total ?t FILTER(?t > 40) } }",
-            sql: &[
-                r#"SELECT "t0"."id" AS "c0", "t1"."id" AS "c1", "t1"."name" AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL AND "t1"."country" IS NOT NULL AND "t1"."country" = 'UK'"#,
-                r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", "t1"."id" AS "c2", "t1"."name" AS "c3" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."total" > 40 AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL"#,
-            ],
+            sql: &[r#"SELECT "u"."c0" AS "c0", "u"."c1" AS "c1", "u"."c2" AS "c2", "u"."c3" AS "c3", "u"."c4" AS "c4" FROM (SELECT "t0"."id" AS "c0", "t1"."id" AS "c1", "t1"."name" AS "c2", NULL AS "c3", 0 AS "c4" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL AND "t1"."country" IS NOT NULL AND "t1"."country" = 'UK' UNION ALL SELECT "t0"."id" AS "c0", "t1"."id" AS "c1", "t1"."name" AS "c2", "t0"."total" AS "c3", 1 AS "c4" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."total" > 40 AND "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL) AS "u""#],
             rows: &[
                 "n=Ada o=http://example.org/order/10",
                 "n=Ada o=http://example.org/order/10",
                 "n=Ada o=http://example.org/order/11",
                 "n=Bo o=http://example.org/order/12",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a top-k on a variable every UNION branch orders pushes on the union",
+            sparql: "SELECT ?o ?t FROM <shop-sql:main> WHERE { { ?o ex:total ?t FILTER(?t > 40) } UNION { ?o ex:total ?t FILTER(?t < 6) } } ORDER BY DESC(?t) LIMIT 2",
+            sql: &[r#"SELECT "u"."c0" AS "c0", "u"."c1" AS "c1", "u"."c2" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", 0 AS "c2" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."total" > 40 UNION ALL SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", 1 AS "c2" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t0"."total" < 6) AS "u" ORDER BY "u"."c1" DESC LIMIT 2"#],
+            rows: &[
+                "o=http://example.org/order/10 t=99.50",
+                "o=http://example.org/order/12 t=42.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            // Grouped, the union could not push the branch's own LIMIT.
+            name: "a top-k on a variable one UNION branch lacks keeps one statement per branch",
+            sparql: "SELECT ?o ?t ?p FROM <shop-sql:main> WHERE { { ?o ex:total ?t } UNION { ?o ex:placed ?p } } ORDER BY DESC(?t) LIMIT 2",
+            sql: &[
+                r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL ORDER BY "t0"."total" DESC LIMIT 2"#,
+                r#"SELECT "t0"."id" AS "c0", "t0"."placed" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL"#,
+            ],
+            rows: &[
+                "o=http://example.org/order/10 p= t=99.50",
+                "o=http://example.org/order/12 p= t=42.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a VALUES key set joins inside every branch of a shared UNION statement",
+            sparql: "SELECT ?o ?v FROM <shop-sql:main> WHERE { VALUES ?o { <http://example.org/order/10> <http://example.org/order/12> } { ?o ex:total ?v } UNION { ?o ex:placed ?v } }",
+            sql: &[r#"SELECT "u"."c0" AS "c0", "u"."c1" AS "c1", "u"."c2" AS "c2", "u"."c3" AS "c3" FROM (SELECT "t0"."id" AS "c0", "t0"."total" AS "c1", NULL AS "c2", 0 AS "c3" FROM "shop"."orders" AS "t0" JOIN (VALUES (10), (12)) AS "v0" ("k0") ON "v0"."k0" = "t0"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL UNION ALL SELECT "t0"."id" AS "c0", NULL AS "c1", "t0"."placed" AS "c2", 1 AS "c3" FROM "shop"."orders" AS "t0" JOIN (VALUES (10), (12)) AS "v0" ("k0") ON "v0"."k0" = "t0"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."placed" IS NOT NULL) AS "u""#],
+            rows: &[
+                "o=http://example.org/order/10 v=2024-01-05",
+                "o=http://example.org/order/10 v=99.50",
+                "o=http://example.org/order/12 v=2024-03-01",
+                "o=http://example.org/order/12 v=42.00",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            // An outer key set (bound above the graph block) joins the
+            // union once, on the slot the seed's key column shares across
+            // the branches, rather than once per branch.
+            name: "an outer key set joins a shared UNION statement once",
+            sparql: "SELECT ?c ?v FROM NAMED <shop-sql:main> WHERE { VALUES ?c { <http://example.org/customer/1> <http://example.org/customer/3> } GRAPH <shop-sql:main> { { ?c ex:name ?v } UNION { ?c ex:country ?v } } }",
+            sql: &[r#"SELECT "u"."c0" AS "c0", "u"."c1" AS "c1", "u"."c2" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t0"."id" AS "c0", "t0"."country" AS "c1", 1 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."country" IS NOT NULL) AS "u" JOIN (VALUES (1), (3)) AS "k" ("k0") ON "k"."k0" = "u"."c0""#],
+            rows: &[
+                "c=http://example.org/customer/1 v=Ada",
+                "c=http://example.org/customer/1 v=UK",
+                "c=http://example.org/customer/3 v=Cy",
+                "c=http://example.org/customer/3 v=US",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        // String expressions push as the dialect's own functions where
+        // their definition is SPARQL's: CONCAT, STRLEN and SUBSTR from a
+        // positive position, over plain string columns; the bound value is
+        // still computed in the engine. LCASE/UCASE equality widens: the
+        // fold is exact on printable ASCII, other values come back.
+        Case {
+            name: "a CONCAT bind compares in the database",
+            sparql: "SELECT ?c ?x FROM <shop-sql:main> WHERE { ?c ex:name ?n ; ex:country ?k BIND(CONCAT(?n, \"-\", ?k) AS ?x) FILTER(?x = \"Ada-UK\") }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t0"."country" AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."country" IS NOT NULL AND ("t0"."name" || '-' || "t0"."country") = 'Ada-UK'"#],
+            rows: &[
+                "c=http://example.org/customer/1 x=Ada-UK",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "STRLEN and SUBSTR compare in the database without a BIND",
+            sparql: "SELECT ?c ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(STRLEN(?n) > 2 && SUBSTR(?n, 1, 1) = \"A\") }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND LENGTH("t0"."name") > 2 AND SUBSTR("t0"."name", 1, 1) = 'A'"#],
+            rows: &[
+                "c=http://example.org/customer/1 n=Ada",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a string bind orders and limits in the database",
+            sparql: "SELECT ?c ?x FROM <shop-sql:main> WHERE { ?c ex:name ?n ; ex:country ?k BIND(CONCAT(?k, ?n) AS ?x) } ORDER BY DESC(?x) LIMIT 1",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t0"."country" AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t0"."country" IS NOT NULL ORDER BY ("t0"."country" || "t0"."name") DESC LIMIT 1"#],
+            rows: &[
+                "c=http://example.org/customer/3 x=USCy",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a CONCAT over a numeric column stays in the engine",
+            sparql: "SELECT ?o ?x FROM <shop-sql:main> WHERE { ?o ex:total ?t BIND(CONCAT(\"$\", ?t) AS ?x) FILTER(?x = \"$42.00\") }",
+            // CONCAT over a decimal is a type error in SPARQL: no row.
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."total" AS "c1" FROM "shop"."orders" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."total" IS NOT NULL"#],
+            rows: &[],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "LCASE equality widens to the dialect's fold on ASCII",
+            sparql: "SELECT ?c ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(LCASE(?n) = \"ada\") }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND ((LOWER("t0"."name") = 'ada') OR (NOT regexp_like("t0"."name", '^[ -~]*$')))"#],
+            rows: &[
+                "c=http://example.org/customer/1 n=Ada",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "UCASE equality widens with the literal first",
+            sparql: "SELECT ?c ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n FILTER(\"CY\" = UCASE(?n)) }",
+            sql: &[r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND ((UPPER("t0"."name") = 'CY') OR (NOT regexp_like("t0"."name", '^[ -~]*$')))"#],
+            rows: &[
+                "c=http://example.org/customer/3 n=Cy",
             ],
             routing: Routing::MustFire,
             declined: None,
@@ -1075,7 +1583,23 @@ async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
         let before_events = store.find_events("fast-path outcome").len();
         let before_declines = store.find_events("sql pushdown declined").len();
         let before_stmts = block_statements(&server).await.len();
-        let rows = rows_of(&query(&fluree, &format!("{PREFIX}{}", c.sparql)).await);
+        let sparql = format!("{PREFIX}{}", c.sparql);
+        let rows = match fluree.query_from().sparql(&sparql).execute_tracked().await {
+            Ok(t) => rows_of(&t.result),
+            Err(e) => {
+                let declines: Vec<String> = store.find_events("sql pushdown declined")
+                    [before_declines..]
+                    .iter()
+                    .map(|ev| format!("{ev:?}"))
+                    .collect();
+                failures.push(format!(
+                    "{}: query failed: {}\n  declines: {declines:?}",
+                    c.name, e.error
+                ));
+                lane_rows.push(Vec::new());
+                continue;
+            }
+        };
         let proceeded = proceeded_sites(&store, before_events);
         let declined: Vec<String> = store.find_events("sql pushdown declined")[before_declines..]
             .iter()
@@ -1130,9 +1654,21 @@ async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
     }
     drop(tracing_guard);
 
-    set_fast_paths_disabled(true);
     for (i, c) in cases.iter().enumerate() {
-        let rows = rows_of(&query(&fluree, &format!("{PREFIX}{}", c.sparql)).await);
+        let sparql = format!("{PREFIX}{}", c.sparql);
+        if LANE_ONLY_CASES.contains(&c.name) {
+            let native = native_rows(&fluree, &sparql).await;
+            if native != by_value(&lane_rows[i]) {
+                failures.push(format!(
+                    "{}: native twin rows {native:?} differ from lane rows {:?}",
+                    c.name, lane_rows[i]
+                ));
+            }
+            continue;
+        }
+        set_fast_paths_disabled(true);
+        let rows = rows_of(&query(&fluree, &sparql).await);
+        set_fast_paths_disabled(false);
         if rows != lane_rows[i] {
             failures.push(format!(
                 "{}: scan lane rows {rows:?} differ from lane rows {:?}",
@@ -1140,7 +1676,6 @@ async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
             ));
         }
     }
-    set_fast_paths_disabled(false);
 
     assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
 }
@@ -1226,8 +1761,10 @@ async fn static_policy_prunes_the_statement() {
         "{rows}"
     );
 
-    // Subject targeting is not static: the lane declines, the scan lane hides
-    // the one subject.
+    // A subject-targeted policy is a key predicate (see
+    // `subject_policy_pushes_a_key_predicate`); a policy on both a subject
+    // and a class the map derives per row is not static: the lane declines
+    // and the scan lane decides per row.
     let before = block_statements(&server).await.len();
     let before_events = store.find_events("fast-path outcome").len();
     let rows = run(
@@ -1240,14 +1777,172 @@ async fn static_policy_prunes_the_statement() {
     )
     .await;
     assert_eq!(rows, json!([["Bo"], ["Cy"]]), "{rows}");
-    assert_eq!(
-        block_statements(&server).await.len(),
-        before,
-        "declined: no block statement"
-    );
+    assert_eq!(block_statements(&server).await.len(), before + 1);
     let proceeded = proceeded_sites(&store, before_events);
-    assert!(!proceeded.iter().any(|s| s == SITE), "{proceeded:?}");
+    assert!(proceeded.iter().any(|s| s == SITE), "{proceeded:?}");
     drop(tracing_guard);
+}
+
+/// A subject-targeted view policy is decided per targeted subject and
+/// pushed as a predicate on the subject key columns, where the lane used to
+/// decline; a subject the map cannot mint adds nothing, and on an optional
+/// entity the predicate joins as a condition so hidden rows leave the
+/// variables unbound. The per-scan lane, deciding per row, is the oracle.
+#[tokio::test]
+async fn subject_policy_pushes_a_key_predicate() {
+    let _lock = KILL_SWITCH.lock().await;
+    let (server, fluree) = setup().await;
+    let context = json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"});
+    let on_subjects = |allow: bool, subjects: &[&str]| {
+        json!([{
+            "@id": "http://example.org/p", "@type": "f:AccessPolicy", "f:action": "f:view",
+            "f:allow": allow,
+            "f:onSubject": subjects.iter().map(|s| json!({"@id": s})).collect::<Vec<_>>()
+        }])
+    };
+    let run = |from: &str, policy: Value, default_allow: bool, r#where: Value, select: Value| {
+        let fluree = &fluree;
+        let context = context.clone();
+        let from = from.to_string();
+        async move {
+            let q = json!({
+                "@context": context,
+                "from": from,
+                "opts": {"policy": policy, "default-allow": default_allow},
+                "select": select,
+                "where": r#where,
+            });
+            let lane = fluree
+                .query_from()
+                .jsonld(&q)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("policy query failed: {e}"));
+            set_fast_paths_disabled(true);
+            let scan = fluree
+                .query_from()
+                .jsonld(&q)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("policy query failed: {e}"));
+            set_fast_paths_disabled(false);
+            assert_eq!(lane, scan, "scan lane disagrees");
+            lane
+        }
+    };
+    let names = json!({"@id": "?c", "ex:name": "?n"});
+    let name = json!(["?n"]);
+
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        "shop-sql:main",
+        on_subjects(false, &["http://example.org/customer/1"]),
+        true,
+        names.clone(),
+        name.clone(),
+    )
+    .await;
+    assert_eq!(rows, json!([["Bo"], ["Cy"]]), "{rows}");
+    assert_eq!(
+        block_statements(&server).await[before..],
+        [r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND NOT ("t0"."id" = 1) AND "t0"."name" IS NOT NULL"#.to_string()]
+    );
+
+    // Allowed subjects under a deny default: only their rows stay.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        "shop-sql:main",
+        on_subjects(
+            true,
+            &[
+                "http://example.org/customer/2",
+                "http://example.org/customer/3",
+            ],
+        ),
+        false,
+        names.clone(),
+        name.clone(),
+    )
+    .await;
+    assert_eq!(rows, json!([["Bo"], ["Cy"]]), "{rows}");
+    assert_eq!(
+        block_statements(&server).await[before..],
+        [r#"SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."id" IN (2, 3) AND "t0"."name" IS NOT NULL"#.to_string()]
+    );
+
+    // A subject outside the template names no row of this map.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        "shop-sql:main",
+        on_subjects(false, &["http://example.org/order/10"]),
+        true,
+        names.clone(),
+        name.clone(),
+    )
+    .await;
+    assert_eq!(rows, json!([["Ada"], ["Bo"], ["Cy"]]), "{rows}");
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert!(!sent[0].contains(" IN "), "{}", sent[0]);
+
+    // On an optional entity the predicate is a join condition: the hidden
+    // order does not join, and Ada keeps her other order.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        "shop-sql:main",
+        on_subjects(false, &["http://example.org/order/10"]),
+        true,
+        json!([
+            {"@id": "?c", "ex:name": "?n"},
+            ["optional", {"@id": "?o", "ex:customer": "?c"}]
+        ]),
+        json!(["?n", "?o"]),
+    )
+    .await;
+    let orders: Vec<String> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            format!(
+                "{}:{}",
+                r[0].as_str().unwrap(),
+                r[1].as_str().unwrap_or("-")
+            )
+        })
+        .collect();
+    assert_eq!(
+        orders
+            .iter()
+            .map(|s| s.rsplit('/').next().unwrap_or(s))
+            .collect::<Vec<_>>(),
+        vec!["11", "12", "Cy:-"],
+        "{rows}"
+    );
+    let sent = block_statements(&server).await[before..].to_vec();
+    assert!(
+        sent[0].contains(r#"LEFT JOIN "shop"."orders" AS "t1" ON NOT ("t1"."id" = 10) AND"#),
+        "{}",
+        sent[0]
+    );
+
+    // A subject policy beside a class policy over a column-derived type is
+    // decided per row: the lane declines.
+    let before = block_statements(&server).await.len();
+    let rows = run(
+        "shop-typed:main",
+        json!([
+            {"@id": "http://example.org/p1", "@type": "f:AccessPolicy", "f:action": "f:view",
+             "f:allow": false, "f:onSubject": [{"@id": "http://example.org/person/1"}]},
+            {"@id": "http://example.org/p2", "@type": "f:AccessPolicy", "f:action": "f:view",
+             "f:allow": false, "f:onClass": [{"@id": "http://example.org/kind/guest"}]}
+        ]),
+        true,
+        json!({"@id": "?p", "ex:name": "?n"}),
+        name,
+    )
+    .await;
+    assert_eq!(rows, json!([["Cy"], ["Di"]]), "{rows}");
+    assert_eq!(block_statements(&server).await.len(), before, "declined");
 }
 
 /// Bindings the outer query already holds are sent into the statement as a
@@ -1466,6 +2161,52 @@ async fn class_policy_on_a_derived_type_pushes_a_predicate() {
     assert!(!sent[0].contains("kind"), "{}", sent[0]);
 }
 
+/// A sub-select the lane cannot take has no other lane: a graph source has
+/// no native index for the engine's subquery operator, so the query refuses
+/// as it did before the lane took any sub-select at all. Never a silent
+/// empty answer.
+#[tokio::test]
+async fn sub_selects_the_lane_cannot_take_still_refuse() {
+    let _lock = KILL_SWITCH.lock().await;
+    let (_server, fluree) = setup().await;
+    let shapes = [
+        (
+            "a HAVING over an AVG",
+            "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c (COUNT(?o) AS ?k) WHERE { ?o ex:customer ?c ; ex:total ?t } GROUP BY ?c HAVING (AVG(?t) > 1) } }",
+        ),
+        (
+            "an OPTIONAL variable the outer block binds",
+            "SELECT ?c ?k ?x FROM <shop-sql:main> WHERE { ?x ex:country ?k { SELECT ?c ?k WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k } } } }",
+        ),
+        (
+            "a hidden variable the block reuses",
+            "SELECT ?n ?t FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c WHERE { ?o ex:customer ?c } } ?o ex:total ?t }",
+        ),
+        (
+            "OFFSET",
+            "SELECT ?o ?p FROM <shop-sql:main> WHERE { { SELECT ?o WHERE { ?o ex:total ?t } ORDER BY DESC(?t) LIMIT 2 OFFSET 1 } ?o ex:placed ?p }",
+        ),
+        (
+            "a nested sub-select",
+            "SELECT ?n FROM <shop-sql:main> WHERE { ?c ex:name ?n { SELECT ?c WHERE { { SELECT ?c WHERE { ?o ex:customer ?c } } } } }",
+        ),
+    ];
+    for (what, sparql) in shapes {
+        let err = fluree
+            .query_from()
+            .sparql(&format!("{PREFIX}{sparql}"))
+            .execute_tracked()
+            .await
+            .err()
+            .map(|e| e.error.to_string())
+            .unwrap_or_else(|| panic!("{what}: expected a refusal"));
+        assert!(
+            err.contains("cannot be evaluated over a virtual dataset") && err.contains("subquery"),
+            "{what}: {err}"
+        );
+    }
+}
+
 /// Outer bindings above the provider's key-set row cap go out as several
 /// statements. Inside the block, the key set is not chunked: an `IN` list
 /// above the cap stays a residual on the lane, and a `VALUES` block above it
@@ -1501,7 +2242,7 @@ async fn key_sets_above_the_cap_chunk_or_stay_in_the_engine() {
     );
     assert_eq!(
         sent[0],
-        r#"SELECT COUNT(*) AS "n" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL"#
+        r#"SELECT COUNT(*) AS "n" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL LIMIT 100001) AS "p""#
     );
     assert_eq!(
         sent[1],
@@ -1524,7 +2265,12 @@ async fn key_sets_above_the_cap_chunk_or_stay_in_the_engine() {
         3,
         "a COUNT(*) probe, then 2000 + 1 keys: {sent:?}"
     );
-    assert!(sent[0].starts_with("SELECT COUNT(*)"), "{}", sent[0]);
+    // The probe is bounded at the cap plus one: it never scans past the cap.
+    assert!(
+        sent[0].starts_with("SELECT COUNT(*)") && sent[0].contains("LIMIT 3) AS \"p\""),
+        "{}",
+        sent[0]
+    );
     assert!(sent[1].contains("(2000)") && !sent[1].contains("(2001)"));
     assert!(sent[2].contains("(VALUES (2001)) AS \"k\""), "{}", sent[2]);
 
@@ -1537,6 +2283,39 @@ async fn key_sets_above_the_cap_chunk_or_stay_in_the_engine() {
     std::env::remove_var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS");
     assert_eq!(sent.len(), 2, "2001 keys chunk into 2000 + 1: {sent:?}");
     assert!(sent[0].contains("(2000)") && !sent[0].contains("(2001)"));
+    assert!(sent[1].contains("(VALUES (2001)) AS \"k\""), "{}", sent[1]);
+
+    // The key set joins a shared UNION ALL statement once, outside the
+    // union, so two branches still chunk at the cap: 2000 + 1.
+    std::env::set_var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS", "0");
+    let union = format!(
+        "{PREFIX}SELECT ?c ?n FROM NAMED <shop-sql:main> WHERE {{ VALUES ?c {{ {values} }} GRAPH <shop-sql:main> {{ {{ ?c ex:name ?n }} UNION {{ ?c ex:country ?n }} }} }}"
+    );
+    let before = block_statements(&server).await.len();
+    let rows = rows_of(&query(&fluree, &union).await);
+    let sent = block_statements(&server).await[before..].to_vec();
+    std::env::remove_var("FLUREE_SQL_PUSHDOWN_CACHE_ROWS");
+    assert_eq!(
+        rows,
+        vec![
+            "c=http://example.org/customer/1 n=Ada",
+            "c=http://example.org/customer/1 n=UK",
+            "c=http://example.org/customer/2 n=Bo",
+            "c=http://example.org/customer/3 n=Cy",
+            "c=http://example.org/customer/3 n=US",
+        ]
+    );
+    assert_eq!(sent.len(), 2, "2001 keys chunk into 2000 + 1: {sent:?}");
+    assert!(
+        sent[0].contains(") AS \"u\" JOIN (VALUES ") && sent[0].matches("VALUES").count() == 1,
+        "the key set joins the union once, outside it: {}",
+        sent[0]
+    );
+    assert!(
+        sent[0].contains("(2000)") && !sent[0].contains("(2001)"),
+        "{}",
+        sent[0]
+    );
     assert!(sent[1].contains("(VALUES (2001)) AS \"k\""), "{}", sent[1]);
 
     let sparql = format!(
@@ -1714,12 +2493,66 @@ fn aggregate_cases() -> Vec<Case> {
             routing: Routing::MustFire,
             declined: None,
         },
+        // A HAVING comparing COUNT or an exact SUM with a constant goes
+        // with the statement (the engine's HAVING still runs above it); a
+        // top-k may then follow it. One over an AVG, divided in the engine,
+        // stays there and keeps the LIMIT with it.
         Case {
-            name: "HAVING keeps LIMIT in the engine and filters the groups",
+            name: "HAVING filters the groups in the database",
             sparql: "SELECT ?c (COUNT(?o) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c } GROUP BY ?c HAVING (COUNT(?o) > 1) LIMIT 5",
-            sql: &[r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            sql: &[r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id" HAVING COUNT("t0"."id") > 1"#],
             rows: &["c=http://example.org/customer/1 n=2"],
             routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "HAVING over a SUM and a COUNT pushes with a top-k",
+            sparql: "SELECT ?c (SUM(?t) AS ?s) FROM <shop-sql:main> WHERE { ?o ex:customer ?c ; ex:total ?t } GROUP BY ?c HAVING (SUM(?t) > 10 && COUNT(?o) >= 1) ORDER BY DESC(?s) LIMIT 1",
+            sql: &[r#"SELECT "t1"."id" AS "c0", SUM("t0"."total") AS "c1", COUNT("t0"."total") AS "c2", COUNT("t0"."id") AS "c3" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id" HAVING (SUM("t0"."total") > 10) AND (COUNT("t0"."id") >= 1) ORDER BY "c1" DESC LIMIT 1"#],
+            rows: &[
+                "c=http://example.org/customer/1 s=104.50",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "HAVING over an AVG stays in the engine with the LIMIT",
+            sparql: "SELECT ?c (COUNT(?o) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c ; ex:total ?t } GROUP BY ?c HAVING (AVG(?t) > 30) ORDER BY DESC(?n) LIMIT 1",
+            sql: &[r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1", SUM("t0"."total") AS "c2", COUNT("t0"."total") AS "c3" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t0"."total" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            rows: &[
+                "c=http://example.org/customer/1 n=2",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            // SQL's SUM over a group NULL throughout is NULL, and no HAVING
+            // comparison keeps a NULL, where SPARQL's empty sum is 0 and
+            // `>= 0` does: the HAVING stays in the engine, above the
+            // grouped statement.
+            name: "HAVING over SUM of a nullable variable stays in the engine",
+            sparql: "SELECT ?c (SUM(?d) AS ?s) FROM <shop-sql:main> WHERE { ?o ex:customer ?c OPTIONAL { ?o ex:discount ?d } } GROUP BY ?c HAVING (SUM(?d) >= 0)",
+            sql: &[r#"SELECT "t1"."id" AS "c0", SUM("t0"."discount") AS "c1", COUNT("t0"."discount") AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            rows: &["c=http://example.org/customer/1 s=0"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "HAVING under NOT over SUM of a nullable variable stays in the engine",
+            sparql: "SELECT ?c (SUM(?d) AS ?s) FROM <shop-sql:main> WHERE { ?o ex:customer ?c OPTIONAL { ?o ex:discount ?d } } GROUP BY ?c HAVING (!(SUM(?d) < 0))",
+            sql: &[r#"SELECT "t1"."id" AS "c0", SUM("t0"."discount") AS "c1", COUNT("t0"."discount") AS "c2" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            rows: &["c=http://example.org/customer/1 s=0"],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            // The fast path returns before the generic tail applies the
+            // DISTINCT over a projection narrower than the outputs.
+            name: "SELECT DISTINCT over a narrower projection of a grouped statement declines",
+            sparql: "SELECT DISTINCT (COUNT(*) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:total ?t } GROUP BY ?o",
+            sql: &[],
+            rows: &["n=1"],
+            routing: Routing::MustNotFire,
             declined: None,
         },
         Case {
@@ -1732,7 +2565,7 @@ fn aggregate_cases() -> Vec<Case> {
         },
         Case {
             name: "a residual filter under an aggregate declines",
-            sparql: "SELECT (COUNT(*) AS ?n) FROM <shop-sql:main> WHERE { ?c ex:name ?x FILTER(STRLEN(?x) > 2) }",
+            sparql: "SELECT (COUNT(*) AS ?n) FROM <shop-sql:main> WHERE { ?c ex:name ?x FILTER(REGEX(?x, \"a$\")) }",
             sql: &[],
             rows: &["n=1"],
             routing: Routing::MustNotFire,
@@ -1974,6 +2807,8 @@ const SQLITE: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS people",
         "DROP TABLE IF EXISTS notes",
         "DROP TABLE IF EXISTS shipments",
+        "DROP TABLE IF EXISTS memos",
+        "DROP TABLE IF EXISTS pointers",
         "CREATE TABLE customers (id INTEGER, name TEXT, country TEXT)",
         "CREATE TABLE profiles (id INTEGER, email TEXT)",
         "CREATE TABLE people (id INTEGER, kind TEXT, name TEXT)",
@@ -1983,6 +2818,8 @@ const SQLITE: LiveBackend = LiveBackend {
         "CREATE TABLE events (id INTEGER, at_tz TIMESTAMP, at_local TIMESTAMP)",
         "CREATE TABLE notes (id INTEGER, order_ref TEXT, body TEXT)",
         "CREATE TABLE shipments (order_no INTEGER, carrier TEXT)",
+        "CREATE TABLE memos (id INTEGER, order_ref TEXT, body TEXT)",
+        "CREATE TABLE pointers (id INTEGER, ref TEXT)",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
         PEOPLE_ROWS,
@@ -1996,12 +2833,15 @@ const SQLITE: LiveBackend = LiveBackend {
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00', '2024-01-09 21:00:00')",
         "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
         "INSERT INTO shipments VALUES (10, 'UPS'), (12, 'DHL')",
+        "INSERT INTO memos VALUES (1, '10', 'gift wrap'), (2, '10-note', 'wrapped'), (3, '12', 'call first')",
+        "INSERT INTO pointers VALUES (1, '10'), (2, '10-note')",
     ],
     // SQLite's `NUMERIC` reaches the bridge as text or double, so a SUM/AVG
     // over it declines (its datatype is decimal).
     declines: &[
         "GROUP BY a foreign-key object with COUNT and SUM",
         "AVG pushes SUM and COUNT and divides in the engine",
+        "a grouped sub-select sums in the database and finalizes in the engine",
     ],
 };
 
@@ -2020,6 +2860,8 @@ const POSTGRES: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS people",
         "DROP TABLE IF EXISTS notes",
         "DROP TABLE IF EXISTS shipments",
+        "DROP TABLE IF EXISTS memos",
+        "DROP TABLE IF EXISTS pointers",
         "CREATE TABLE customers (id BIGINT, name TEXT, country TEXT)",
         "CREATE TABLE profiles (id BIGINT, email TEXT)",
         "CREATE TABLE people (id BIGINT, kind TEXT, name TEXT)",
@@ -2029,6 +2871,8 @@ const POSTGRES: LiveBackend = LiveBackend {
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMPTZ, at_local TIMESTAMP)",
         "CREATE TABLE notes (id BIGINT, order_ref TEXT, body TEXT)",
         "CREATE TABLE shipments (order_no BIGINT, carrier TEXT)",
+        "CREATE TABLE memos (id BIGINT, order_ref TEXT, body TEXT)",
+        "CREATE TABLE pointers (id BIGINT, ref TEXT)",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
         PEOPLE_ROWS,
@@ -2042,6 +2886,8 @@ const POSTGRES: LiveBackend = LiveBackend {
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00+00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00+00:00', '2024-01-09 21:00:00')",
         "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
         "INSERT INTO shipments VALUES (10, 'UPS'), (12, 'DHL')",
+        "INSERT INTO memos VALUES (1, '10', 'gift wrap'), (2, '10-note', 'wrapped'), (3, '12', 'call first')",
+        "INSERT INTO pointers VALUES (1, '10'), (2, '10-note')",
     ],
     declines: &[],
 };
@@ -2059,6 +2905,8 @@ const MYSQL: LiveBackend = LiveBackend {
         "DROP TABLE IF EXISTS people",
         "DROP TABLE IF EXISTS notes",
         "DROP TABLE IF EXISTS shipments",
+        "DROP TABLE IF EXISTS memos",
+        "DROP TABLE IF EXISTS pointers",
         "CREATE TABLE customers (id BIGINT, name VARCHAR(64), country VARCHAR(64))",
         "CREATE TABLE profiles (id BIGINT, email VARCHAR(64))",
         "CREATE TABLE people (id BIGINT, kind VARCHAR(64), name VARCHAR(64))",
@@ -2068,6 +2916,8 @@ const MYSQL: LiveBackend = LiveBackend {
         "CREATE TABLE events (id BIGINT, at_tz TIMESTAMP NULL, at_local DATETIME)",
         "CREATE TABLE notes (id BIGINT, order_ref VARCHAR(64), body VARCHAR(64))",
         "CREATE TABLE shipments (order_no BIGINT, carrier VARCHAR(64))",
+        "CREATE TABLE memos (id BIGINT, order_ref VARCHAR(64), body VARCHAR(64))",
+        "CREATE TABLE pointers (id BIGINT, ref VARCHAR(64))",
         CUSTOMER_ROWS,
         PROFILE_ROWS,
         PEOPLE_ROWS,
@@ -2081,6 +2931,8 @@ const MYSQL: LiveBackend = LiveBackend {
         "INSERT INTO events VALUES (1, '2024-01-10 03:00:00+00:00', '2024-01-10 03:00:00'), (2, '2024-01-09 21:00:00+00:00', '2024-01-09 21:00:00')",
         "INSERT INTO notes VALUES (1, '10', 'gift wrap'), (2, '12', 'call first')",
         "INSERT INTO shipments VALUES (10, 'UPS'), (12, 'DHL')",
+        "INSERT INTO memos VALUES (1, '10', 'gift wrap'), (2, '10-note', 'wrapped'), (3, '12', 'call first')",
+        "INSERT INTO pointers VALUES (1, '10'), (2, '10-note')",
     ],
     declines: &[],
 };
@@ -2376,22 +3228,35 @@ fn live_cases() -> Vec<LiveCase> {
             only: &[Postgres, Mysql],
             sent: &[(Postgres, Sent::Contains("SUM(")), (Mysql, Sent::Contains("SUM("))],
         },
+        // The filter over the BIND pushes as an expression; the bound value
+        // itself is still the engine's (its lexical follows the column).
         LiveCase {
-            name: "a BIND and a filter over it run in the engine",
+            name: "a filter over a BIND pushes the expression and the engine binds the value",
             sparql: "SELECT ?o ?d FROM <shop-live:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) FILTER(?d > 50) }",
             rows: &[
                 "d=199.000000 o=http://example.org/order/10",
                 "d=84.000000 o=http://example.org/order/12",
             ],
             only: &[Postgres, Mysql],
-            sent: &[(Postgres, Sent::Lacks("* 2")), (Mysql, Sent::Lacks("* 2"))],
+            sent: &[(Postgres, Sent::Contains("* 2) > 50")), (Mysql, Sent::Contains("* 2) > 50"))],
         },
         LiveCase {
-            name: "a BIND and a filter over it run in the engine on SQLite",
+            name: "a filter over a BIND pushes the expression on SQLite",
             sparql: "SELECT ?o ?d FROM <shop-live:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) FILTER(?d > 50) }",
             rows: &["d=199.0 o=http://example.org/order/10", "d=84 o=http://example.org/order/12"],
             only: &[Sqlite],
-            sent: &[(Sqlite, Sent::Lacks("* 2"))],
+            sent: &[(Sqlite, Sent::Contains("* 2) > 50"))],
+        },
+        LiveCase {
+            name: "a top-k over a BIND orders by the expression",
+            sparql: "SELECT ?o FROM <shop-live:main> WHERE { ?o ex:total ?t BIND(?t * 2 AS ?d) } ORDER BY DESC(?d) LIMIT 1",
+            rows: &["o=http://example.org/order/10"],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("ORDER BY (\"t0\".\"total\" * 2) DESC LIMIT 1")),
+                (Postgres, Sent::Contains("ORDER BY (\"t0\".\"total\" * 2) DESC LIMIT 1")),
+                (Mysql, Sent::Contains("ORDER BY (`t0`.`total` * 2) DESC LIMIT 1")),
+            ],
         },
         LiveCase {
             name: "STRSTARTS widens to a LIKE the engine narrows back",
@@ -2413,6 +3278,38 @@ fn live_cases() -> Vec<LiveCase> {
                 (Sqlite, Sent::Contains("LIKE '%mile%' ESCAPE '!'")),
                 (Postgres, Sent::Contains("LIKE '%mile%' ESCAPE '!'")),
                 (Mysql, Sent::Contains("LIKE BINARY '%mile%' ESCAPE '!'")),
+            ],
+        },
+        LiveCase {
+            // Outer rows past the key-set cap probe the block's size with a
+            // COUNT(*) over the fetch statement as a derived table under a
+            // LIMIT of the cache cap plus one; the block then comes back
+            // whole and every batch joins in memory. Every dialect here must
+            // accept a LIMIT inside a derived table.
+            name: "the block-size probe is bounded at the cache cap on every database",
+            sparql: Box::leak(
+                format!(
+                    "SELECT ?c ?n FROM NAMED <shop-live:main> WHERE {{ VALUES ?c {{ {} }} GRAPH <shop-live:main> {{ ?c ex:name ?n }} }}",
+                    (1..=2001)
+                        .map(|i| format!("<http://example.org/customer/{i}>"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+                .into_boxed_str(),
+            ),
+            rows: &[
+                "c=http://example.org/customer/1 n=Ada",
+                "c=http://example.org/customer/2 n=Bo",
+                "c=http://example.org/customer/3 n=Cy",
+            ],
+            only: &[],
+            sent: &[
+                (Sqlite, Sent::Contains("SELECT COUNT(*) AS \"n\" FROM (SELECT")),
+                (Sqlite, Sent::Contains("LIMIT 100001) AS \"p\"")),
+                (Postgres, Sent::Contains("SELECT COUNT(*) AS \"n\" FROM (SELECT")),
+                (Postgres, Sent::Contains("LIMIT 100001) AS \"p\"")),
+                (Mysql, Sent::Contains("SELECT COUNT(*) AS")),
+                (Mysql, Sent::Contains("LIMIT 100001) AS")),
             ],
         },
         LiveCase {
@@ -2543,21 +3440,34 @@ async fn live_differential(backend: &LiveBackend) {
         .create_sql_graph_source(partitioned)
         .await
         .expect("create live partitioned sql source");
-    let mut typed = SqlCreateConfig::new("shop-typed-live", url, typed_mapping(""));
+    let mut typed = SqlCreateConfig::new("shop-typed-live", url.clone(), typed_mapping(""));
     typed.dialect = backend.dialect;
     fluree
         .create_sql_graph_source(typed)
         .await
         .expect("create live typed sql source");
+    let mut memo = SqlCreateConfig::new("shop-memo-live", url, memo_mapping(""));
+    memo.dialect = backend.dialect;
+    fluree
+        .create_sql_graph_source(memo)
+        .await
+        .expect("create live memo sql source");
+    seed_native_twin(&fluree).await;
 
     let mut failures: Vec<String> = Vec::new();
     for c in cases().into_iter().chain(aggregate_cases()) {
         let sparql = format!("{PREFIX}{}", c.sparql)
             .replace("shop-sql:main", "shop-live:main")
             .replace("shop-vp:main", "shop-vp-live:main")
-            .replace("shop-typed:main", "shop-typed-live:main");
-        let (lane_rows, sent) = lane_run(&fluree, &sparql, c.name).await;
+            .replace("shop-typed:main", "shop-typed-live:main")
+            .replace("shop-memo:main", "shop-memo-live:main");
         let declines = backend.declines.contains(&c.name);
+        // A sub-select the lane declines has no other lane here: the query
+        // refuses (pinned in `sub_selects_the_lane_cannot_take_still_refuse`).
+        if declines && LANE_ONLY_CASES.contains(&c.name) {
+            continue;
+        }
+        let (lane_rows, sent) = lane_run(&fluree, &sparql, c.name).await;
         match (&c.routing, c.sql.is_empty()) {
             (Routing::MustFire, false) if declines && !sent.is_empty() => {
                 failures.push(format!(
@@ -2586,6 +3496,16 @@ async fn live_differential(backend: &LiveBackend) {
                 "{}: lane rows {lane_rows:?} differ from the pinned rows {:?} [sent: {sent:?}]",
                 c.name, c.rows
             ));
+        }
+        if LANE_ONLY_CASES.contains(&c.name) {
+            let native = native_rows(&fluree, &sparql).await;
+            if native != by_value(&lane_rows) {
+                failures.push(format!(
+                    "{}: native twin rows {native:?} differ from lane rows {lane_rows:?}",
+                    c.name
+                ));
+            }
+            continue;
         }
         let scan_rows = scan_run(&fluree, &sparql).await;
         if lane_rows != scan_rows {

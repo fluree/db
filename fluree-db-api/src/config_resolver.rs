@@ -354,11 +354,16 @@ pub fn merge_policy_opts(resolved: &ResolvedConfig, opts: &GovernanceOptions) ->
         None => return opts.clone(),
     };
 
-    // Does the query specify any policy inputs?
-    let query_has_policy = opts.has_any_policy_inputs();
+    // No configured grant may widen an explicit deny-all selection. This is
+    // also how an empty host authorization survives the JSON/consensus wire.
+    if opts.denies_all() {
+        return opts.clone();
+    }
+
+    let query_selects_policy = opts.selects_policy_set();
     let server_identity = opts.server_identity.as_ref();
     let override_denied =
-        query_has_policy && !policy.override_control.permits_override(server_identity);
+        query_selects_policy && !policy.override_control.permits_override(server_identity);
 
     let mut merged = opts.clone();
 
@@ -368,30 +373,36 @@ pub fn merge_policy_opts(resolved: &ResolvedConfig, opts: &GovernanceOptions) ->
             "Query-time policy override denied by config override control — applying config defaults"
         );
 
-        // Config wins outright, including over an explicit request value.
-        if let Some(default_allow) = policy.default_allow {
-            merged.default_allow = Some(default_allow);
-        }
-        if let Some(ref classes) = policy.policy_class {
-            merged.policy_class = Some(classes.clone());
+        // Denying an override must clear *all* caller-selected grants, even
+        // fields for which config has no replacement. Inline required grants
+        // and policy-values can otherwise weaken the configured policy set.
+        merged.policy_class = policy.policy_class.clone();
+        merged.policy = None;
+        merged.policy_values = None;
+        merged.default_allow = if opts.default_allow == Some(false) {
+            Some(false)
+        } else {
+            policy.default_allow
+        };
+        if !merged.has_any_policy_inputs() {
+            merged.policy = Some(serde_json::json!([]));
         }
         return merged;
     }
 
     // Config fills only a genuine unset. An explicit `Some(false)` reaches here
-    // via a request that carries no *other* policy input (a per-source
-    // `SourcePolicyOverride` naming only `default_allow: false` is exactly that
-    // shape, since `has_any_policy_inputs` counts only `Some(true)`), and it
+    // via a request that carries no *other* policy selection, and it
     // must not be clobbered by config's `f:defaultAllow true`.
     if merged.default_allow.is_none() {
         merged.default_allow = policy.default_allow;
     }
 
     // policy_class stays request-first: config supplies it only when the request
-    // carried no policy inputs at all. Widening this to "fill when unset" would
+    // did not select a policy set (a deny default alone only narrows it).
+    // Widening this to "fill when unset" would
     // start applying config's f:policyClass to identity-carrying requests on the
     // local path, which it never has — see the note in fluree_ext.rs::wrap_policy.
-    if !query_has_policy {
+    if !query_selects_policy {
         if let Some(ref classes) = policy.policy_class {
             merged.policy_class = Some(classes.clone());
         }
@@ -2588,26 +2599,33 @@ mod tests {
         assert_eq!(merge_policy_opts(&resolved, &opts).default_allow, None);
     }
 
-    /// `Some(false)` is the fail-closed value, not a request to switch
-    /// enforcement on: it must not make an otherwise-anonymous request count as
-    /// carrying policy inputs. Only `Some(true)` does, matching the bare-bool
-    /// behavior this replaced.
+    /// Either explicit default engages enforcement; absent remains no input.
     #[test]
-    fn only_explicit_true_counts_as_a_policy_input() {
+    fn either_explicit_default_counts_as_a_policy_input() {
         let unset = GovernanceOptions::default();
         assert!(!unset.has_any_policy_inputs());
+        assert!(!unset.selects_policy_set());
 
         let explicit_false = GovernanceOptions {
             default_allow: Some(false),
             ..Default::default()
         };
-        assert!(!explicit_false.has_any_policy_inputs());
+        assert!(explicit_false.has_any_policy_inputs());
+        assert!(!explicit_false.selects_policy_set());
 
         let explicit_true = GovernanceOptions {
             default_allow: Some(true),
             ..Default::default()
         };
         assert!(explicit_true.has_any_policy_inputs());
+        assert!(explicit_true.selects_policy_set());
+
+        let empty_classes = GovernanceOptions {
+            policy_class: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(empty_classes.has_any_policy_inputs());
+        assert!(empty_classes.selects_policy_set());
     }
 
     /// An explicit `Some(false)` survives even though it carries no *other*
@@ -2615,9 +2633,8 @@ mod tests {
     ///
     /// This is the shape a per-source `SourcePolicyOverride` takes when it names
     /// only `default_allow: false`: `SourcePolicyOverride::has_policy()` counts
-    /// `is_some()` so the override is applied, but `has_any_policy_inputs()`
-    /// counts only `Some(true)` so the merge sees "no policy inputs". Config
-    /// must fill genuine unset, not overwrite an explicit caller value.
+    /// `is_some()` so the override is applied. Config still supplies the
+    /// class selection, without overwriting the explicit deny default.
     #[test]
     fn explicit_false_survives_the_no_policy_input_path() {
         let resolved = ResolvedConfig {
@@ -2660,9 +2677,8 @@ mod tests {
 
         let opts = override_opts.to_query_connection_options();
         assert!(
-            !opts.has_any_policy_inputs(),
-            "precondition: Some(false) is not a policy input, so this lands on \
-             the config-defaults path"
+            opts.has_any_policy_inputs(),
+            "an explicit deny default engages enforcement"
         );
         assert_eq!(
             merge_policy_opts(&resolved, &opts).default_allow,
@@ -2690,6 +2706,45 @@ mod tests {
             merge_policy_opts(&resolved, &opts).default_allow,
             Some(false)
         );
+    }
+
+    #[test]
+    fn denied_override_clears_inline_classes_values_and_permissive_defaults() {
+        let resolved = ResolvedConfig {
+            policy: Some(PolicyDefaults {
+                override_control: OverrideControl::None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = GovernanceOptions {
+            identity: Some("did:key:employee".into()),
+            policy_class: Some(vec!["ex:Manager".into()]),
+            policy: Some(serde_json::json!([{"f:required": true, "f:allow": true}])),
+            policy_values: Some(std::collections::HashMap::from([(
+                "?$identity".into(),
+                serde_json::json!({"@id": "did:key:manager"}),
+            )])),
+            default_allow: Some(true),
+            ..Default::default()
+        };
+        let merged = merge_policy_opts(&resolved, &opts);
+        assert_eq!(merged.identity, opts.identity);
+        assert!(
+            merged.policy_class.is_none()
+                && merged.policy.is_none()
+                && merged.policy_values.is_none()
+        );
+        assert!(!merged.effective_default_allow());
+        let anonymous = merge_policy_opts(
+            &resolved,
+            &GovernanceOptions {
+                default_allow: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(anonymous.has_any_policy_inputs());
+        assert!(!anonymous.effective_default_allow());
     }
 
     // --- merge_reasoning ---

@@ -50,15 +50,15 @@ const ADAPTIVE_FLUSH_GROWTH: usize = 8;
 /// leaf blob, decoded header/dir, the leaf-id hash, and the optional
 /// sidecar bytes — the leaflet loop body destructures this and proceeds
 /// without repeating the fetch+decode dance at each site.
-struct LeafScan {
-    leaf_bytes: fluree_db_binary_index::SharedLeafBytes,
-    header: fluree_db_binary_index::format::leaf::LeafHeaderV3,
-    dir: fluree_db_binary_index::format::leaf::DecodedLeafDirV3,
-    leaf_id: u128,
+pub(crate) struct LeafScan {
+    pub(crate) leaf_bytes: fluree_db_binary_index::SharedLeafBytes,
+    pub(crate) header: fluree_db_binary_index::format::leaf::LeafHeaderV3,
+    pub(crate) dir: fluree_db_binary_index::format::leaf::DecodedLeafDirV3,
+    pub(crate) leaf_id: u128,
     /// Sidecar bytes for time-travel replay. `None` at `max_t` (the base
     /// leaflet alone is authoritative); always fetched when `need_replay`
     /// is true so `replay_leaflet_at_t` can reconstruct historical state.
-    sidecar_bytes: Option<Vec<u8>>,
+    pub(crate) sidecar_bytes: Option<Vec<u8>>,
 }
 
 /// Read-only view of a single joined row — a stored left-batch row plus the
@@ -130,7 +130,7 @@ fn apply_inline_filters_view<R: RowAccess>(
     Ok(true)
 }
 
-fn prepare_leaf_for_scan(
+pub(crate) fn prepare_leaf_for_scan(
     store: &BinaryIndexStore,
     leaf_entry: &fluree_db_binary_index::format::branch::LeafEntry,
     need_replay: bool,

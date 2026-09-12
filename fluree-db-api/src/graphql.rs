@@ -39,7 +39,7 @@ use fluree_db_query::policy::QueryPolicyEnforcer;
 use serde_json::{json, Value as JsonValue};
 
 use crate::error::ApiError;
-use crate::{Fluree, GraphDb, LedgerState, QueryExecutionOptions, Result};
+use crate::{Fluree, GraphDb, LedgerState, PolicyAuthorization, QueryExecutionOptions, Result};
 
 pub use fluree_db_graphql::limits::{Limits, DEFAULT_MAX_COMPLEXITY, DEFAULT_MAX_DEPTH};
 
@@ -904,6 +904,8 @@ struct LedgerExecutor {
     /// many queries; they share one handle so a timeout or a client disconnect
     /// cancels all of them, not whichever happens to check next.
     options: QueryExecutionOptions,
+    /// Host-selected authority, rebuilt against each mutation's current state.
+    authorization: Option<PolicyAuthorization>,
 }
 
 impl LedgerExecutor {
@@ -993,15 +995,43 @@ impl RootExecutor for LedgerExecutor {
         // nothing and means a refused mutation leaves the caller exactly where
         // it started rather than destroying the state a later field needs.
         let unchanged = ledger.clone();
-        let result = match lowered.verb {
-            Verb::Insert => self.fluree.insert(ledger, &lowered.transaction).await,
-            Verb::Upsert => self.fluree.upsert(ledger, &lowered.transaction).await,
-            Verb::Update => self.fluree.update(ledger, &lowered.transaction).await,
-        };
+        let result = async {
+            let default_options = crate::GovernanceOptions::default();
+            let opts = self
+                .authorization
+                .as_ref()
+                .map(PolicyAuthorization::options)
+                .unwrap_or(&default_options);
+            let policy = crate::build_transact_policy_context(
+                &self.fluree,
+                &ledger.snapshot,
+                ledger.novelty.as_ref(),
+                Some(ledger.novelty.as_ref()),
+                ledger.t(),
+                opts,
+            )
+            .await?;
+            let builder = self.fluree.stage_owned(ledger);
+            let mut builder = match lowered.verb {
+                Verb::Insert => builder.insert(&lowered.transaction),
+                Verb::Upsert => builder.upsert(&lowered.transaction),
+                Verb::Update => builder.update(&lowered.transaction),
+            };
+            if let Some(policy) = policy {
+                builder = builder.policy(policy);
+            }
+            if let Some(authorization) = &self.authorization {
+                builder = builder.commit_opts(crate::CommitOpts {
+                    identity: authorization.options().identity.clone(),
+                    ..Default::default()
+                });
+            }
+            builder.execute().await
+        }
+        .await;
         // A SHACL violation, a policy denial, or any other rejection arrives
         // here as an ordinary transaction error and becomes a GraphQL error.
-        // Nothing on this path can bypass them: it is the same write API any
-        // other client uses.
+        // Restore the prior state on policy-build errors as well as rejected writes.
         let result = result.map_err(|e| {
             slot.lock().replace(unchanged);
             GqlError::Execution(e.to_string())
@@ -1010,6 +1040,17 @@ impl RootExecutor for LedgerExecutor {
         let view = GraphDb::from_ledger_state(&committed)
             .with_default_context(self.db.default_context.clone());
         slot.lock().replace(committed);
+        let view = if let Some(authorization) = &self.authorization {
+            self.fluree
+                .wrap_policy(view, authorization.options())
+                .await
+                .map_err(|e| GqlError::Execution(e.to_string()))?
+        } else {
+            self.fluree
+                .wrap_policy_defaults(view)
+                .await
+                .map_err(|e| GqlError::Execution(e.to_string()))?
+        };
 
         self.read_back(&view, &request, &lowered.subjects).await
     }
@@ -1158,7 +1199,7 @@ impl Fluree {
         prepared: PreparedRequest<'_>,
         options: QueryExecutionOptions,
     ) -> Result<JsonValue> {
-        self.run_graphql(db, prepared, None, options).await
+        self.run_graphql(db, prepared, None, options, None).await
     }
 
     /// Execute a GraphQL request that may write.
@@ -1207,10 +1248,49 @@ impl Fluree {
         prepared: PreparedRequest<'_>,
         options: QueryExecutionOptions,
     ) -> Result<(JsonValue, LedgerState)> {
+        self.graphql_transact_authorized(ledger, default_context, prepared, options, None)
+            .await
+    }
+
+    /// Execute with host-verified policy selection for schema visibility,
+    /// every mutation, and each committed subject's read-back. Policy contexts
+    /// are rebuilt against the current state for serial mutation fields.
+    /// The host must separately authorize ledger read/write access.
+    pub async fn graphql_transact_with_authorization(
+        &self,
+        ledger: LedgerState,
+        default_context: Option<JsonValue>,
+        prepared: PreparedRequest<'_>,
+        options: QueryExecutionOptions,
+        authorization: &PolicyAuthorization,
+    ) -> Result<(JsonValue, LedgerState)> {
+        self.graphql_transact_authorized(
+            ledger,
+            default_context,
+            prepared,
+            options,
+            Some(authorization),
+        )
+        .await
+    }
+
+    async fn graphql_transact_authorized(
+        &self,
+        ledger: LedgerState,
+        default_context: Option<JsonValue>,
+        prepared: PreparedRequest<'_>,
+        options: QueryExecutionOptions,
+        authorization: Option<&PolicyAuthorization>,
+    ) -> Result<(JsonValue, LedgerState)> {
         let db = GraphDb::from_ledger_state(&ledger).with_default_context(default_context);
+        let db = if let Some(authorization) = authorization {
+            self.wrap_policy(db, authorization.options()).await?
+        } else {
+            self.wrap_policy_defaults(db).await?
+        };
         let slot = parking_lot::Mutex::new(Some(ledger));
         let envelope = self
-            .run_graphql(&db, prepared, Some(&slot), options)
+            .run_graphql(&db, prepared, Some(&slot), options, authorization)
             .await?;
         let ledger = slot.lock().take().ok_or_else(|| {
             ApiError::Internal("the ledger state was consumed by a failed mutation".to_string())
@@ -1224,6 +1304,7 @@ impl Fluree {
         prepared: PreparedRequest<'_>,
         ledger: Option<&parking_lot::Mutex<Option<LedgerState>>>,
         options: QueryExecutionOptions,
+        authorization: Option<&PolicyAuthorization>,
     ) -> Result<JsonValue> {
         let PreparedRequest { request, doc, .. } = prepared;
         let derived = derive_schema(db).await;
@@ -1248,6 +1329,7 @@ impl Fluree {
             ledger: ledger.map(|slot| parking_lot::Mutex::new(slot.lock().take())),
             explain: request.explain.then(|| parking_lot::Mutex::new(Vec::new())),
             options,
+            authorization: authorization.cloned(),
         });
         // Registering the schema costs thousands of allocations — 2.5 ms for a
         // hundred-class ledger — so it is cached beside the model rather than

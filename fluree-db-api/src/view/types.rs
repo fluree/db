@@ -196,6 +196,8 @@ pub struct GraphDb {
     /// Carried on `GraphDb` so downstream callers can apply identity gating
     /// at request time without re-reading the config graph.
     pub(crate) resolved_config: Option<ResolvedConfig>,
+    /// Successful resolution found no config; distinct from not yet resolved.
+    pub(crate) config_absent: bool,
 
     // ========================================================================
     // Datalog config (from config graph, applied at query boundary)
@@ -295,6 +297,7 @@ impl GraphDb {
             default_context: None,
             ledger_config: None,
             resolved_config: None,
+            config_absent: false,
             datalog_enabled: true,
             query_time_rules_allowed: true,
             datalog_override_allowed: true,
@@ -407,18 +410,39 @@ impl GraphDb {
                 .map_err(|e| crate::ApiError::internal(e.to_string()))?;
         }
 
+        // The binary lane resolves overlay flakes through the persisted
+        // dictionary plus `DictNovelty`, both committed-state artefacts: the
+        // subjects and strings this transaction introduces are in neither.
+        // Read through a view-local extension of the base dictionaries, as
+        // SHACL and post-state policy do, so a preview neither fails to
+        // translate its own flakes nor re-walks the whole novelty per scan.
+        let staged_flakes = staged.view.staged_flakes();
+        let (dict_novelty, runtime_small_dicts) =
+            match fluree_db_transact::staged_dicts(base, staged_flakes)? {
+                Some(dicts) => {
+                    let provider = dicts.provider(snapshot.shared_namespaces());
+                    Arc::make_mut(&mut snapshot).range_provider = Some(provider);
+                    (dicts.dict_novelty, dicts.runtime_small_dicts)
+                }
+                None => {
+                    let mut runtime_small_dicts = (*base.runtime_small_dicts).clone();
+                    runtime_small_dicts.populate_from_flakes(staged_flakes);
+                    (
+                        Arc::clone(&base.dict_novelty),
+                        Arc::new(runtime_small_dicts),
+                    )
+                }
+            };
+
         // Clone base novelty and merge staged flakes into it so queries see
         // both committed and staged data.
         let mut combined = (*base.novelty).clone();
-        let staged_flakes = staged.view.staged_flakes().to_vec();
-        let mut runtime_small_dicts = (*base.runtime_small_dicts).clone();
         if !staged_flakes.is_empty() {
-            runtime_small_dicts.populate_from_flakes(&staged_flakes);
             let reverse_graph = snapshot
                 .build_reverse_graph()
                 .map_err(|e| crate::ApiError::internal(e.to_string()))?;
             combined
-                .apply_commit(staged_flakes, staged_t, &reverse_graph)
+                .apply_commit(staged_flakes.to_vec(), staged_t, &reverse_graph)
                 .map_err(|e| {
                     crate::ApiError::internal(format!(
                         "Failed to merge staged flakes into novelty: {e}"
@@ -435,8 +459,8 @@ impl GraphDb {
             staged_t,
             base.ledger_id(),
         );
-        gdb.dict_novelty = Some(base.dict_novelty.clone());
-        gdb.runtime_small_dicts = Some(Arc::new(runtime_small_dicts));
+        gdb.dict_novelty = Some(dict_novelty);
+        gdb.runtime_small_dicts = Some(runtime_small_dicts);
         // Carry binary store from the base ledger state
         gdb.binary_store = base
             .binary_store
@@ -496,6 +520,9 @@ impl GraphDb {
     /// let view = view.as_of(50);
     /// ```
     pub fn as_of(mut self, t: i64) -> Self {
+        if self.t != t {
+            self.clear_config_resolution();
+        }
         self.t = t;
         self
     }
@@ -513,6 +540,15 @@ impl GraphDb {
     /// `range_with_overlay()` must ensure the underlying `LedgerSnapshot.range_provider`
     /// is scoped appropriately for the chosen graph.
     pub fn with_graph_id(mut self, graph_id: GraphId) -> Self {
+        if self.graph_id != graph_id {
+            self.clear_config_resolution();
+            // Only the default graph routes to a virtual source's provider.
+            // Its system graphs read the empty genesis snapshot; dropping the
+            // model config must also drop the virtual-data routing tag.
+            if graph_id != fluree_db_core::DEFAULT_GRAPH_ID {
+                self.graph_source_id = None;
+            }
+        }
         self.graph_id = graph_id;
         self
     }
@@ -582,6 +618,17 @@ impl GraphDb {
     pub(crate) fn with_resolved_config(mut self, config: ResolvedConfig) -> Self {
         self.resolved_config = Some(config);
         self
+    }
+
+    fn clear_config_resolution(&mut self) {
+        self.config_absent = false;
+        self.resolved_config = None;
+        self.ledger_config = None;
+        self.rules_source_g_id = None;
+    }
+
+    pub(crate) fn config_is_resolved(&self) -> bool {
+        self.config_absent || self.resolved_config.is_some()
     }
 
     /// Get the full ledger config (if any).

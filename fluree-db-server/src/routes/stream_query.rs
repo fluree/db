@@ -41,8 +41,8 @@ use crate::extract::{FlureeHeaders, MaybeCredential, MaybeDataBearer};
 use crate::query_control::QueryDisconnectGuard;
 use crate::routes::query::{
     await_query_min_t_requirements, collect_jsonld_min_t_requirements,
-    collect_sparql_min_t_requirements, effective_identity, enforce_bearer_dataset_scope,
-    get_ledger_id, has_policy_opts, inject_default_context_if_requested, inject_headers_into_query,
+    collect_sparql_min_t_requirements, enforce_bearer_dataset_scope, get_ledger_id,
+    has_policy_opts, inject_default_context_if_requested, inject_headers_into_query,
     is_sparql_request, load_ledger_for_query, normalize_ledger_scoped_from,
     requires_dataset_features, resolve_sparql_text, SparqlParams,
 };
@@ -92,6 +92,12 @@ async fn stream_query_connection_inner(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Response> {
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.0.as_ref(),
+        credential.did(),
+    )?;
     let span = tracing::Span::current();
 
     let data_auth = state.config.data_auth();
@@ -118,22 +124,6 @@ async fn stream_query_connection_inner(
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
 
-        // Connection SPARQL has no single ledger to resolve a per-request
-        // identity against, so it cannot enforce identity policy (parity with
-        // /query, which runs connection SPARQL unpoliced). Rather than silently
-        // ignore an *explicit* policy request, refuse the explicit policy
-        // headers (Fluree-Identity / Fluree-Policy* / Fluree-Default-Allow) and
-        // point at the ledger-scoped route (which does enforce SPARQL policy).
-        // A plain bearer token (auth only) and the server `default_policy_class`
-        // are not per-request policy requests and do not apply to SPARQL, so
-        // they do not trigger a refusal here — same as /query.
-        if request_carries_policy(&headers) {
-            return Err(ServerError::bad_request(
-                "policy-scoped SPARQL is not supported on the connection-scoped streaming \
-                 endpoint; use /v1/fluree/stream/query/<ledger> or /v1/fluree/query",
-            ));
-        }
-
         // Bearer scope over every FROM/FROM NAMED ledger.
         if let Some(p) = bearer.0.as_ref() {
             if !credential.is_signed() {
@@ -158,16 +148,18 @@ async fn stream_query_connection_inner(
             fluree_db_sparql::parse_sparql(&sparql).ast.as_ref(),
         );
 
-        // Unpoliced (see above), but the auth-layer-verified identity still
-        // gates `f:overrideControl` on the ledgers' reasoning defaults.
-        let identity = effective_identity(&credential, &bearer);
-        let plan_options = crate::query_control::options_for_identity(identity.as_ref());
-        let governance = fluree_db_api::GovernanceOptions {
-            server_identity: identity,
-            ..Default::default()
-        };
+        // The auth-layer-verified identity gates `f:overrideControl` on the
+        // ledgers' reasoning defaults, so planning carries it too.
+        let plan_options =
+            crate::query_control::options_for_identity(headers.server_identity.as_ref());
         let dataset = fluree
-            .build_stream_dataset_for_sparql(&sparql, &governance)
+            .build_stream_dataset_for_sparql(
+                &sparql,
+                &crate::routes::policy_auth::bound_governance(
+                    headers.identity.as_deref(),
+                    &headers,
+                )?,
+            )
             .await
             .map_err(ServerError::Api)?;
         let input = OwnedStreamQuery::Sparql(sparql);
@@ -210,16 +202,9 @@ async fn stream_query_connection_inner(
             }
         }
         enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
-        let identity = effective_identity(&credential, &bearer);
-        let plan_options = crate::query_control::options_for_identity(identity.as_ref());
-        crate::routes::policy_auth::apply_auth_identity_to_opts(
-            state.as_ref(),
-            &ledger_id,
-            &mut query_json,
-            identity.as_deref(),
-            data_auth.default_policy_class.as_deref(),
-        )
-        .await;
+        let plan_options =
+            crate::query_control::options_for_identity(headers.server_identity.as_ref());
+        crate::routes::policy_auth::apply_authorization_to_opts(&mut query_json, &headers)?;
         let min_t = collect_jsonld_min_t_requirements(&headers, &query_json, Some(&ledger_id))?;
         await_query_min_t_requirements(state.as_ref(), min_t).await?;
         inject_default_context_if_requested(
@@ -257,6 +242,12 @@ async fn stream_query_inner(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Response> {
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.0.as_ref(),
+        credential.did(),
+    )?;
     let span = tracing::Span::current();
 
     // Enforce data auth if configured (Bearer token OR signed request).
@@ -296,20 +287,10 @@ async fn stream_query_inner(
         // SPARQL has no body `opts`, so policy arrives via the resolved identity
         // (bearer/header), the server default policy class, and the
         // `Fluree-Policy*` / `Fluree-Default-Allow` headers.
-        let bearer_identity = effective_identity(&credential, &bearer);
-        let plan_options = crate::query_control::options_for_identity(bearer_identity.as_ref());
-        let identity = crate::routes::policy_auth::resolve_sparql_identity(
-            state.as_ref(),
-            &ledger,
-            bearer_identity.as_deref(),
-            headers.identity.as_deref(),
-        )
-        .await;
-        let qc_opts = crate::routes::query::sparql_qc_opts(
-            identity.as_deref(),
-            bearer_identity.as_ref(),
-            &headers,
-        )?;
+        let plan_options =
+            crate::query_control::options_for_identity(headers.server_identity.as_ref());
+        let identity = headers.identity.clone();
+        let qc_opts = crate::routes::policy_auth::bound_governance(identity.as_deref(), &headers)?;
 
         // Detect FROM/FROM NAMED dataset clauses.
         let parsed = fluree_db_sparql::parse_sparql(&sparql);
@@ -376,17 +357,9 @@ async fn stream_query_inner(
             // Plain single-ledger SPARQL (no policy, no FROM).
             let input = OwnedStreamQuery::Sparql(sparql);
             let ledger_state = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
-            let plan = {
-                let graph = GraphDb::from_ledger_state(&ledger_state);
-                fluree
-                    .plan_stream_query_with_options(&graph, &input, &plan_options)
-                    .await
-                    .map_err(ServerError::Api)?
-            };
-            (
-                StreamPlan::Single { ledger_state, plan },
-                stream_tracker_from_headers(&headers),
-            )
+            let plan =
+                plan_with_ledger_defaults(&state, ledger_state, &input, &plan_options).await?;
+            (plan, stream_tracker_from_headers(&headers))
         }
     } else {
         let mut query_json: JsonValue = credential.body_json()?;
@@ -413,16 +386,9 @@ async fn stream_query_inner(
             }
         }
         enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
-        let identity = effective_identity(&credential, &bearer);
-        let plan_options = crate::query_control::options_for_identity(identity.as_ref());
-        crate::routes::policy_auth::apply_auth_identity_to_opts(
-            state.as_ref(),
-            &ledger,
-            &mut query_json,
-            identity.as_deref(),
-            data_auth.default_policy_class.as_deref(),
-        )
-        .await;
+        let plan_options =
+            crate::query_control::options_for_identity(headers.server_identity.as_ref());
+        crate::routes::policy_auth::apply_authorization_to_opts(&mut query_json, &headers)?;
 
         // Freshness barrier + stored-default-context injection, before planning,
         // to match /query's request controls.
@@ -464,14 +430,9 @@ async fn stream_query_inner(
         } else {
             let input = OwnedStreamQuery::JsonLd(query_json);
             let ledger_state = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
-            let plan = {
-                let graph = GraphDb::from_ledger_state(&ledger_state);
-                fluree
-                    .plan_stream_query_with_options(&graph, &input, &plan_options)
-                    .await
-                    .map_err(ServerError::Api)?
-            };
-            (StreamPlan::Single { ledger_state, plan }, tracker)
+            let plan =
+                plan_with_ledger_defaults(&state, ledger_state, &input, &plan_options).await?;
+            (plan, tracker)
         }
     };
 
@@ -479,6 +440,33 @@ async fn stream_query_inner(
     let mut response = finish_stream(&state, fluree, stream_plan, tracker);
     response.headers_mut().extend(warn_headers);
     Ok(response)
+}
+
+/// Keep the plain stream path for unconfigured/root views. A configured
+/// filter must travel with the dataset into the producer, not be discarded
+/// when the single-ledger producer reconstructs its view from LedgerState.
+async fn plan_with_ledger_defaults(
+    state: &AppState,
+    ledger_state: LedgerState,
+    input: &OwnedStreamQuery,
+    options: &fluree_db_api::QueryExecutionOptions,
+) -> Result<StreamPlan> {
+    let fluree = &state.fluree;
+    let graph = fluree
+        .wrap_policy_defaults(GraphDb::from_ledger_state(&ledger_state))
+        .await?;
+    if graph.is_root() {
+        let plan = fluree
+            .plan_stream_query_with_options(&graph, input, options)
+            .await?;
+        Ok(StreamPlan::Single { ledger_state, plan })
+    } else {
+        let dataset = DataSetDb::single(graph);
+        let plan = fluree
+            .plan_stream_query_dataset_with_options(&dataset, input, options)
+            .await?;
+        Ok(StreamPlan::Dataset { dataset, plan })
+    }
 }
 
 /// Spawn the producer for a resolved plan and assemble the NDJSON streaming
@@ -538,17 +526,6 @@ enum StreamPlan {
         dataset: DataSetDb,
         plan: StreamDatasetPlan,
     },
-}
-
-/// True if the request carries any policy-scoping signal: `Fluree-Identity`,
-/// `Fluree-Policy`, `Fluree-Policy-Class`, `Fluree-Policy-Values`, or
-/// `Fluree-Default-Allow`.
-fn request_carries_policy(headers: &FlureeHeaders) -> bool {
-    headers.identity.is_some()
-        || headers.policy.is_some()
-        || !headers.policy_class.is_empty()
-        || headers.policy_values.is_some()
-        || headers.default_allow == Some(true)
 }
 
 /// A fuel + time tracker for the streaming endpoint, honoring any `max-fuel`

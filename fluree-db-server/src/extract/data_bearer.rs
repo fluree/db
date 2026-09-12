@@ -17,10 +17,12 @@ use axum::http::request::Parts;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use super::CredentialPolicy;
 use crate::config::DataAuthMode;
 use crate::error::ServerError;
 use crate::state::AppState;
 use fluree_db_credential::jwt_claims::EventsTokenPayload;
+use fluree_db_credential::jwt_claims::PolicyClaim;
 
 /// Verified principal from a data API Bearer token
 #[derive(Debug, Clone)]
@@ -43,15 +45,42 @@ pub struct DataPrincipal {
     /// redundant there; long-lived transports (Bolt sessions) re-check it
     /// before each statement.
     pub expires_unix: u64,
+    /// Policy selection constructed from verified claims and server configuration.
+    pub policy_authorization: CredentialPolicy,
 }
 
 impl DataPrincipal {
     pub fn can_read(&self, ledger_id: &str) -> bool {
-        self.read_all || self.read_ledgers.contains(ledger_id)
+        let allowed = self.read_all || self.read_ledgers.contains(ledger_id);
+        self.audit_scope(ledger_id, "read", allowed);
+        allowed
     }
 
     pub fn can_write(&self, ledger_id: &str) -> bool {
-        self.write_all || self.write_ledgers.contains(ledger_id)
+        let allowed = self.write_all || self.write_ledgers.contains(ledger_id);
+        self.audit_scope(ledger_id, "write", allowed);
+        allowed
+    }
+
+    /// Request/statement-level evidence of the authority used for a scope
+    /// check, not a claim that subsequent per-fact policy enforcement allowed
+    /// the operation. Disabled unless this tracing target is enabled at DEBUG.
+    fn audit_scope(&self, ledger_id: &str, action: &str, allowed: bool) {
+        let effective_identity = self
+            .policy_authorization
+            .fixed_options()
+            .and_then(|o| o.identity.as_deref());
+        let mode = self.policy_authorization.mode();
+        tracing::debug!(
+            target: "fluree_db_server::authorization",
+            issuer = %self.issuer,
+            effective_identity = ?effective_identity,
+            authorization_mode = mode,
+            ledger = ledger_id,
+            action,
+            scope_allowed = allowed,
+            "data authorization scope check"
+        );
     }
 }
 
@@ -160,12 +189,48 @@ pub(crate) async fn verify_data_principal(
         return Err(ServerError::unauthorized("token authorizes no resources"));
     }
 
-    Ok(build_principal(&payload))
+    if payload.fluree_policy.is_some()
+        && (!config.policy_authorities.contains(&issuer)
+            || config.audience.as_deref().is_none_or(str::is_empty))
+    {
+        return Err(ServerError::unauthorized(
+            "Issuer is not a configured policy authority",
+        ));
+    }
+    let authorization = if matches!(payload.fluree_policy, Some(PolicyClaim::Request(_))) {
+        CredentialPolicy::Request
+    } else if let Some(PolicyClaim::Fixed(policy)) = &payload.fluree_policy {
+        CredentialPolicy::Fixed(fluree_db_api::PolicyAuthorization::from_trusted_options(
+            fluree_db_api::GovernanceOptions {
+                identity: payload.resolve_identity(),
+                policy_class: policy.policy_class.clone(),
+                policy: policy.policy.clone(),
+                policy_values: policy.policy_values.clone(),
+                default_allow: policy.default_allow,
+                ..Default::default()
+            },
+        ))
+    } else if payload.resolve_identity().is_none() && config.default_policy_class.is_none() {
+        CredentialPolicy::ScopeOnly
+    } else {
+        CredentialPolicy::Fixed(fluree_db_api::PolicyAuthorization::from_trusted_options(
+            fluree_db_api::GovernanceOptions {
+                identity: payload.resolve_identity(),
+                policy_class: config.default_policy_class.map(|c| vec![c]),
+                ..Default::default()
+            },
+        ))
+    };
+    Ok(build_principal(&payload, authorization))
 }
 
 /// Build a `DataPrincipal` from verified claims.
-fn build_principal(payload: &EventsTokenPayload) -> DataPrincipal {
+fn build_principal(
+    payload: &EventsTokenPayload,
+    policy_authorization: CredentialPolicy,
+) -> DataPrincipal {
     DataPrincipal {
+        policy_authorization,
         issuer: payload.iss.clone(),
         subject: payload.sub.clone(),
         identity: payload.resolve_identity(),

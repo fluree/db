@@ -8,6 +8,8 @@ Unlike [background indexing](background-indexing.md) which incrementally updates
 
 Reindex publishes the new index root via `publish_index_allow_equal`, which means a reindex can produce a **new index root CID** even when `index_t` stays the same (same logical snapshot, different physical layout/config).
 
+After a successful publish, reindex evicts the calling instance's cached ledger. Subsequent loads use the rebuilt root and graph registry even when `index_t` is unchanged. Callers holding an existing ledger handle must reacquire it; caches in other serving instances must also reload the ledger.
+
 ## When to Reindex
 
 ### Common Use Cases
@@ -85,6 +87,7 @@ ReindexOptions::default()
 let config = IndexerConfig::default()
     .with_gc_max_old_indexes(10)       // Keep more old index versions
     .with_gc_min_time_mins(60)         // Retain for at least 60 minutes
+    .with_gc_hard_max_old_indexes(Some(40)) // Collect past 40 versions even inside the age guard
     .with_run_budget_bytes(1 << 30)    // 1 GB memory budget for sort buffers
     .with_data_dir("/data/fluree");    // Directory for index artifacts
 
@@ -102,6 +105,7 @@ Key `IndexerConfig` fields:
 | `branch_max_children` | 200 | Maximum children per branch node |
 | `gc_max_old_indexes` | 5 | Old index versions to retain before GC |
 | `gc_min_time_mins` | 30 | Minimum age (minutes) before an index can be GC'd |
+| `gc_hard_max_old_indexes` | unset | Version ceiling past which the age guard is overridden. Bounds versions, not bytes, and can release artifacts a still-running query needs — see [Index Retention](background-indexing.md#index-retention) |
 | `run_budget_bytes` | 256 MB | Memory budget for sort buffers (split across all sort orders) |
 | `data_dir` | System temp dir | Base directory for index artifacts |
 | `incremental_enabled` | true | Background indexing: attempt incremental updates before full rebuild |

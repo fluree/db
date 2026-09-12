@@ -72,6 +72,7 @@ fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, o
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
 fluree-db-sql = { path = "../fluree-db-sql", optional = true }
 fluree-db-tabular = { path = "../fluree-db-tabular" }
+fluree-db-stats = { path = "../fluree-db-stats", features = ["tabular"] }
 fluree-db-storage-aws = { path = "../fluree-db-storage-aws", optional = true }
 fluree-db-storage-ipfs = { path = "../fluree-db-storage-ipfs", optional = true }
 fluree-search-protocol = { path = "../fluree-search-protocol" }
@@ -269,6 +270,20 @@ name = "it_cached_handle_cow"
 path = "tests/it_cached_handle_cow.rs"
 required-features = ["native"]
 
+# Own binary: installs a process-global tracing probe over overlay-translation
+# WARN events emitted while a transaction's SHACL pass queries the staged view.
+[[test]]
+name = "it_staged_view_dict"
+path = "tests/it_staged_view_dict.rs"
+required-features = ["native", "shacl"]
+
+# Own binary: installs a process-global tracing probe over the scan lane's
+# `overlay_translate` spans to pin cross-query translation cache hits.
+[[test]]
+name = "it_overlay_content_version"
+path = "tests/it_overlay_content_version.rs"
+required-features = ["native"]
+
 # Own binary for the same reason (process-global `fluree::cow_probe` capture),
 # covering the branch-op (merge / revert) commit flows.
 [[test]]
@@ -422,6 +437,11 @@ path = "tests/it_optional_after_union.rs"
 [[test]]
 name = "it_query_sparql_indexed"
 path = "tests/it_query_sparql_indexed.rs"
+
+# Keep this binary single-test: its walk-floor override is cached process-wide.
+[[test]]
+name = "it_range_semijoin"
+path = "tests/it_range_semijoin.rs"
 
 [[test]]
 name = "it_rebuild_fetch_counts"
@@ -579,6 +599,11 @@ name = "it_values_object_bounds"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "policy_authorization"
+harness = false
+required-features = ["credential"]
 
 [[bench]]
 name = "annotation_hydration"

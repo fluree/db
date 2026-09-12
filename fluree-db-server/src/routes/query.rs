@@ -9,7 +9,6 @@
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
 use crate::extract::{tracking_headers, FlureeHeaders, MaybeCredential, MaybeDataBearer};
-use fluree_db_core::VerifiedIdentity;
 // Note: NeedsRefresh is no longer used - replaced by FreshnessSource trait
 use crate::state::AppState;
 use crate::telemetry::{
@@ -272,22 +271,6 @@ pub(crate) fn is_sparql_request(
 // Data API Auth Helpers
 // ============================================================================
 
-/// Resolve the effective request identity for policy enforcement.
-///
-/// Precedence:
-/// 1) Signed request DID (credential)
-/// 2) Bearer token identity (fluree.identity ?? sub)
-pub(crate) fn effective_identity(
-    credential: &MaybeCredential,
-    bearer: &MaybeDataBearer,
-) -> Option<VerifiedIdentity> {
-    credential
-        .did()
-        .map(std::string::ToString::to_string)
-        .or_else(|| bearer.0.as_ref().and_then(|p| p.identity.clone()))
-        .map(VerifiedIdentity::new)
-}
-
 /// Check if tracking is requested in query opts
 fn has_tracking_opts(query_json: &JsonValue) -> bool {
     let Some(opts) = query_json.get("opts") else {
@@ -319,16 +302,14 @@ fn has_tracking_opts(query_json: &JsonValue) -> bool {
 
 /// Check if the query opts request identity-based policy enforcement.
 ///
-/// Returns true when `opts.identity` or `opts.policy-class` is present.
+/// Returns true when identity, policy class, or inline policy is non-null.
+/// Canonical nulls only shadow outer options; they do not engage enforcement.
 /// These fields trigger policy lookup in the connection execution path;
 /// the plain GraphDb path does not process them.
 pub(crate) fn has_policy_opts(query_json: &JsonValue) -> bool {
-    let Some(opts) = query_json.get("opts") else {
-        return false;
-    };
-    opts.get("identity").is_some()
-        || opts.get("policy-class").is_some()
-        || opts.get("policy").is_some()
+    fluree_db_api::GovernanceOptions::from_json(query_json)
+        .map(|opts| opts.has_any_policy_inputs())
+        .unwrap_or(true)
 }
 
 /// Extract a representative ledger identifier from a `from` / `fromNamed`
@@ -414,21 +395,12 @@ pub(crate) fn enforce_bearer_dataset_scope(
         return Ok(());
     }
 
-    let mut ids: Vec<String> = Vec::new();
-    if let Some(from) = query_json.get("from") {
-        collect_ledger_identifiers(from, &mut ids);
-    }
-    if let Some(named) = query_json
-        .get("fromNamed")
-        .or_else(|| query_json.get("from-named"))
-    {
-        collect_ledger_identifiers(named, &mut ids);
-    }
-
-    for raw in ids {
-        // Strip any `@t:` / `#graph` suffix so a scoped read token still
-        // authorizes time-travel / graph-fragment reads of an in-scope ledger.
-        let base = base_ledger_id(&raw)?;
+    // Use the engine's dataset parser: opts.from / opts.ledger / opts.fromNamed
+    // take precedence over the corresponding top-level fields.
+    let (spec, _) = DatasetSpec::from_query_json(query_json)
+        .map_err(|e| ServerError::bad_request(e.to_string()))?;
+    for source in spec.default_graphs.iter().chain(spec.named_graphs.iter()) {
+        let base = base_ledger_id(&source.identifier)?;
         if !principal.can_read(&base) {
             set_span_error_code(span, "error:Forbidden");
             return Err(ServerError::not_found("Ledger not found"));
@@ -551,6 +523,12 @@ pub async fn query(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Response> {
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.0.as_ref(),
+        credential.did(),
+    )?;
     // Create request span with correlation context
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
@@ -573,7 +551,7 @@ pub async fn query(
         Some(input_format),
     );
     let timeout_ms = state.config.query_timeout_ms;
-    let server_identity = effective_identity(&credential, &bearer);
+    let server_identity = headers.server_identity.clone();
     crate::query_control::run_query_task(timeout_ms, server_identity, move || async move {
     async move {
     let span = tracing::Span::current();
@@ -681,6 +659,8 @@ pub async fn query(
             .await;
         }
 
+        let qc_opts = crate::routes::policy_auth::bound_governance(headers.identity.as_deref(), &headers)?;
+
         // Parse once and reuse across the format branches below (#1473): the
         // agent-json and plain paths both need the AST, and the advisory header
         // is derived from the same parse rather than a third one.
@@ -731,6 +711,7 @@ pub async fn query(
                     .fluree
                     .query_from()
                     .sparql(&sparql)
+                    .connection_opts(qc_opts.clone())
                     .format(config)
                     .tracking(tracking_opts)
                     .execution_options(query_execution_options(&state))
@@ -777,6 +758,7 @@ pub async fn query(
                 .fluree
                 .query_from()
                 .sparql(&sparql)
+                .connection_opts(qc_opts.clone())
                 .format(config)
                 .execution_options(query_execution_options(&state))
                 .execute_formatted()
@@ -801,12 +783,12 @@ pub async fn query(
             let tracking_opts = headers.to_tracking_options();
             let response = state
                 .fluree
-                .query_connection_sparql_tracked_with_options(
-                    &sparql,
-                    None,
-                    Some(tracking_opts),
-                    query_execution_options(&state),
-                )
+                .query_from()
+                .sparql(&sparql)
+                .connection_opts(qc_opts.clone())
+                .tracking(tracking_opts)
+                .execution_options(query_execution_options(&state))
+                .execute_tracked()
                 .await;
             let response = match response {
                 Ok(r) => r,
@@ -845,6 +827,7 @@ pub async fn query(
             .fluree
             .query_from()
             .sparql(&sparql)
+            .connection_opts(qc_opts.clone())
             .format(fmt_config)
             .execution_options(query_execution_options(&state))
             .execute_formatted()
@@ -909,18 +892,9 @@ pub async fn query(
             collect_jsonld_min_t_requirements(&headers, &query_json, Some(&ledger_id))?;
         await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
 
-        // Apply bearer identity + server-default policy-class to opts, honoring
-        // the root-identity impersonation semantic (see routes::policy_auth).
-        let identity = effective_identity(&credential, &bearer);
-        let policy_class = data_auth.default_policy_class.as_deref();
-        crate::routes::policy_auth::apply_auth_identity_to_opts(
-            &state,
-            &ledger_id,
-            &mut query_json,
-            identity.as_deref(),
-            policy_class,
-        )
-        .await;
+        // Bind all policy options to verified authority after header merging.
+
+        crate::routes::policy_auth::apply_authorization_to_opts(&mut query_json, &headers)?;
 
         inject_default_context_if_requested(
             &state,
@@ -957,6 +931,12 @@ pub async fn query_ledger(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Response> {
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.0.as_ref(),
+        credential.did(),
+    )?;
     // Create request span with correlation context
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
@@ -976,7 +956,7 @@ pub async fn query_ledger(
         Some(input_format),
     );
     let timeout_ms = state.config.query_timeout_ms;
-    let server_identity = effective_identity(&credential, &bearer);
+    let server_identity = headers.server_identity.clone();
     crate::query_control::run_query_task(timeout_ms, server_identity, move || async move {
     async move {
     let span = tracing::Span::current();
@@ -1022,14 +1002,7 @@ pub async fn query_ledger(
             }
         }
 
-        let bearer_identity = effective_identity(&credential, &bearer);
-        let identity = crate::routes::policy_auth::resolve_sparql_identity(
-            &state,
-            &ledger,
-            bearer_identity.as_deref(),
-            headers.identity.as_deref(),
-        )
-        .await;
+        let identity = headers.identity.clone();
         let min_t_requirements =
             collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
         await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
@@ -1038,7 +1011,6 @@ pub async fn query_ledger(
             &ledger,
             &sparql,
             identity.as_deref(),
-            bearer_identity.as_ref(),
             delimited,
             &headers,
             params.default_context,
@@ -1059,16 +1031,10 @@ pub async fn query_ledger(
         }
         let cypher = credential.body_string()?;
         log_query_text(&cypher, &state.telemetry_config, &span);
-        // Resolve the effective identity (impersonation-aware), same as the
+        // Use the verified effective identity, same as the
         // SPARQL read path, so policy enforcement applies to Cypher too.
-        let bearer_identity = effective_identity(&credential, &bearer);
-        let identity = crate::routes::policy_auth::resolve_sparql_identity(
-            &state,
-            &ledger,
-            bearer_identity.as_deref(),
-            headers.identity.as_deref(),
-        )
-        .await;
+
+        let identity = headers.identity.clone();
         // Honor the `Fluree-Min-T` read-your-writes freshness wait, same as the
         // SPARQL/JSON-LD paths. Cypher has no FROM/dataset clause or `@t:` pin,
         // so the header is the only requirement source, against this one ledger.
@@ -1082,7 +1048,6 @@ pub async fn query_ledger(
             &ledger,
             &cypher,
             identity.as_deref(),
-            bearer_identity.as_ref(),
             &headers,
             &span,
         )
@@ -1135,18 +1100,9 @@ pub async fn query_ledger(
         collect_jsonld_min_t_requirements(&headers, &query_json, Some(&ledger_id))?;
     await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
 
-    // Apply bearer identity + server-default policy-class to opts, honoring
-    // the root-identity impersonation semantic (see routes::policy_auth).
-    let identity = effective_identity(&credential, &bearer);
-    let policy_class = data_auth.default_policy_class.as_deref();
-    crate::routes::policy_auth::apply_auth_identity_to_opts(
-        &state,
-        &ledger_id,
-        &mut query_json,
-        identity.as_deref(),
-        policy_class,
-    )
-    .await;
+    // Apply verified authorization after all caller/header option merges.
+
+    crate::routes::policy_auth::apply_authorization_to_opts(&mut query_json, &headers)?;
 
     inject_default_context_if_requested(
         &state,
@@ -1206,6 +1162,12 @@ pub async fn explain_ledger(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Json<JsonValue>> {
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.0.as_ref(),
+        credential.did(),
+    )?;
     // Create request span with correlation context
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
@@ -1296,7 +1258,7 @@ pub async fn explain_ledger(
                 // suffix on FROM <ledger@t:N> drives snapshot selection.
                 let result = state
                     .fluree
-                    .explain_connection_sparql(&sparql)
+                    .explain_connection_sparql_with_opts(&sparql, &crate::routes::policy_auth::bound_governance(headers.identity.as_deref(), &headers)?)
                     .await
                     .map_err(ServerError::Api)?;
                 tracing::info!(
@@ -1318,6 +1280,7 @@ pub async fn explain_ledger(
                 load_ledger_for_query(&state, &ledger_id, &span).await?
             };
             let db = fluree_db_api::GraphDb::from_ledger_state(&loaded);
+            let db = crate::routes::policy_auth::wrap_authorized_view(&state, db, &headers).await?;
             let result = state
                 .fluree
                 .explain_sparql(&db, &sparql)
@@ -1353,6 +1316,7 @@ pub async fn explain_ledger(
                 .db_with_default_context(&ledger)
                 .await
                 .map_err(ServerError::Api)?;
+            let view = crate::routes::policy_auth::wrap_authorized_view(&state, view, &headers).await?;
             let result = state
                 .fluree
                 .explain_cypher(&view, &cypher, cypher_params.as_ref())
@@ -1389,6 +1353,7 @@ pub async fn explain_ledger(
 
         // Inject header values into query opts
         inject_headers_into_query(&mut query_json, &headers);
+        enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
 
         // Enforce bearer ledger scope for unsigned requests
         if let Some(p) = bearer.0.as_ref() {
@@ -1402,18 +1367,9 @@ pub async fn explain_ledger(
             collect_jsonld_min_t_requirements(&headers, &query_json, Some(&ledger_id))?;
         await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
 
-        // Apply bearer identity + server-default policy-class to opts, honoring
-        // the root-identity impersonation semantic (see routes::policy_auth).
-        let identity = effective_identity(&credential, &bearer);
-        let policy_class = data_auth.default_policy_class.as_deref();
-        crate::routes::policy_auth::apply_auth_identity_to_opts(
-            &state,
-            &ledger_id,
-            &mut query_json,
-            identity.as_deref(),
-            policy_class,
-        )
-        .await;
+        // Bind all policy options to verified authority after header merging.
+
+        crate::routes::policy_auth::apply_authorization_to_opts(&mut query_json, &headers)?;
 
         // When the body carries a time-travel `from` (or any other dataset
         // feature `normalize_ledger_scoped_from` accepted), delegate to the
@@ -1454,6 +1410,7 @@ pub async fn explain_ledger(
             load_ledger_for_query(&state, &ledger_id, &span).await?
         };
         let db = fluree_db_api::GraphDb::from_ledger_state(&loaded);
+        let db = crate::routes::policy_auth::wrap_jsonld_view(&state, db, &query_json, &headers).await?;
         let result = state
             .fluree
             .explain(&db, &query_json)
@@ -2118,7 +2075,7 @@ async fn execute_query(
             return Err(ServerError::Api(ApiError::NotFound(ledger_id.to_string())));
         }
     };
-    let graph = GraphDb::from_ledger_state(&ledger);
+    let graph = state.fluree.wrap_policy_defaults(GraphDb::from_ledger_state(&ledger)).await?;
     let fluree = &state.fluree;
 
     // Check if tracking is requested
@@ -2240,13 +2197,13 @@ async fn execute_query_proxy(
     query_json: &JsonValue,
     span: &tracing::Span,
 ) -> Result<Response> {
+    let view = state.fluree.db(ledger_id).await?;
+    let view = state.fluree.wrap_policy_defaults(view).await?;
     // Check if tracking is requested
     if has_tracking_opts(query_json) {
         // Execute tracked query
-        let response = match state
-            .fluree
-            .graph(ledger_id)
-            .query()
+        let response = match view
+            .query(state.fluree.as_ref())
             .jsonld(query_json)
             .execution_options(query_execution_options(state))
             .execute_tracked()
@@ -2287,10 +2244,8 @@ async fn execute_query_proxy(
     }
 
     // Execute query
-    let result = match state
-        .fluree
-        .graph(ledger_id)
-        .query()
+    let result = match view
+        .query(state.fluree.as_ref())
         .jsonld(query_json)
         .execution_options(query_execution_options(state))
         .execute_formatted()
@@ -2312,30 +2267,6 @@ async fn execute_query_proxy(
         }
     };
     Ok((HeaderMap::new(), Json(result)).into_response())
-}
-
-/// Governance for a SPARQL request: `identity` is the resolved policy identity
-/// (impersonation-aware, may come from the `fluree-identity` header), while
-/// `server_identity` is the auth-layer-verified one (`effective_identity`)
-/// that `f:overrideControl` gates on.
-pub(crate) fn sparql_qc_opts(
-    identity: Option<&str>,
-    server_identity: Option<&VerifiedIdentity>,
-    headers: &FlureeHeaders,
-) -> Result<fluree_db_api::GovernanceOptions> {
-    let policy_values_map = headers.policy_values_map()?;
-    Ok(fluree_db_api::GovernanceOptions {
-        identity: identity.map(String::from),
-        policy_class: if headers.policy_class.is_empty() {
-            None
-        } else {
-            Some(headers.policy_class.clone())
-        },
-        policy: headers.policy.clone(),
-        policy_values: policy_values_map,
-        server_identity: server_identity.cloned(),
-        default_allow: headers.default_allow,
-    })
 }
 
 /// Build a `DatasetSpec` from a ledger-scoped SPARQL `FROM`/`FROM NAMED` clause.
@@ -2638,14 +2569,11 @@ fn pattern_reads_default_graph(pattern: &fluree_db_sparql::ast::GraphPattern) ->
     }
 }
 
-/// `identity` is the resolved policy identity; `server_identity` is the
-/// auth-layer-verified one that `f:overrideControl` gates on.
 async fn execute_cypher_ledger(
     state: &AppState,
     ledger_id: &str,
     cypher: &str,
     identity: Option<&str>,
-    server_identity: Option<&VerifiedIdentity>,
     headers: &FlureeHeaders,
     span: &tracing::Span,
 ) -> Result<Response> {
@@ -2654,21 +2582,7 @@ async fn execute_cypher_ledger(
     // Build policy options from the resolved identity + headers. Cypher has no
     // body `opts` block, so headers are the only transport for `policy-class`,
     // `policy`, `policy-values`, and `default-allow` (same as SPARQL).
-    let policy_values_map = headers.policy_values_map().inspect_err(|_| {
-        set_span_error_code(span, "error:BadRequest");
-    })?;
-    let qc_opts = fluree_db_api::GovernanceOptions {
-        identity: identity.map(String::from),
-        policy_class: if headers.policy_class.is_empty() {
-            None
-        } else {
-            Some(headers.policy_class.clone())
-        },
-        policy: headers.policy.clone(),
-        policy_values: policy_values_map,
-        server_identity: server_identity.cloned(),
-        default_allow: headers.default_allow,
-    };
+    let qc_opts = crate::routes::policy_auth::bound_governance(identity, headers)?;
 
     let view = state
         .fluree
@@ -2684,7 +2598,7 @@ async fn execute_cypher_ledger(
             .await
             .map_err(ServerError::Api)?
     } else {
-        view
+        state.fluree.wrap_policy_defaults(view).await?
     };
 
     let result = state
@@ -2728,15 +2642,11 @@ async fn execute_cypher_ledger(
 }
 
 /// Execute a SPARQL query against a specific ledger and return result
-/// `identity` is the resolved policy identity; `server_identity` is the
-/// auth-layer-verified one that `f:overrideControl` gates on.
-#[allow(clippy::too_many_arguments)]
 async fn execute_sparql_ledger(
     state: &AppState,
     ledger_id: &str,
     sparql: &str,
     identity: Option<&str>,
-    server_identity: Option<&VerifiedIdentity>,
     delimited: Option<DelimitedFormat>,
     headers: &FlureeHeaders,
     use_default_context: bool,
@@ -2776,7 +2686,7 @@ async fn execute_sparql_ledger(
         // Build GovernanceOptions from the resolved identity plus header-supplied
         // policy fields. SPARQL has no body `opts` block, so headers are the only
         // transport for `policy-class`, `policy`, `policy-values`, and `default-allow`.
-        let qc_opts = sparql_qc_opts(identity, server_identity, headers).inspect_err(|e| {
+        let qc_opts = crate::routes::policy_auth::bound_governance(identity, headers).inspect_err(|e| {
             set_span_error_code(&span, "error:BadRequest");
             tracing::warn!(error = %e, "invalid fluree-policy-values header");
         })?;
@@ -2837,6 +2747,7 @@ async fn execute_sparql_ledger(
                 .inspect_err(|_| {
                     set_span_error_code(&span, "error:QueryFailed");
                 })?;
+                let view = state.fluree.wrap_policy_defaults(view).await?;
                 view.query(state.fluree.as_ref())
                     .sparql(sparql)
                     .format(json_fmt_config.clone())
@@ -3201,6 +3112,7 @@ async fn execute_sparql_ledger(
             use_default_context,
         )
         .await?;
+        let graph = state.fluree.wrap_policy_defaults(graph).await?;
         let fluree = &state.fluree;
 
         // Tracked SPARQL: if tracking headers are present, use tracked execution path
@@ -3440,6 +3352,12 @@ pub async fn explain(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Json<JsonValue>> {
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.0.as_ref(),
+        credential.did(),
+    )?;
     // Create request span with correlation context
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
@@ -3544,7 +3462,7 @@ pub async fn explain(
             if ledger_id_raw != ledger_id {
                 let result = state
                     .fluree
-                    .explain_connection_sparql(&sparql)
+                    .explain_connection_sparql_with_opts(&sparql, &crate::routes::policy_auth::bound_governance(headers.identity.as_deref(), &headers)?)
                     .await
                     .map_err(ServerError::Api)?;
                 tracing::info!(status = "success", "explain completed (dataset path)");
@@ -3557,6 +3475,7 @@ pub async fn explain(
                 load_ledger_for_query(&state, &ledger_id, &span).await?
             };
             let db = fluree_db_api::GraphDb::from_ledger_state(&loaded);
+            let db = crate::routes::policy_auth::wrap_authorized_view(&state, db, &headers).await?;
             let result = {
                 match state.fluree.explain_sparql(&db, &sparql).await {
                     Ok(result) => {
@@ -3609,6 +3528,7 @@ pub async fn explain(
 
         // Inject header values into query opts
         inject_headers_into_query(&mut query_json, &headers);
+        enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
 
         // Enforce bearer ledger scope for unsigned requests (base id only).
         if let Some(p) = bearer.0.as_ref() {
@@ -3622,18 +3542,9 @@ pub async fn explain(
             collect_jsonld_min_t_requirements(&headers, &query_json, Some(&ledger_id))?;
         await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
 
-        // Apply bearer identity + server-default policy-class to opts, honoring
-        // the root-identity impersonation semantic (see routes::policy_auth).
-        let identity = effective_identity(&credential, &bearer);
-        let policy_class = data_auth.default_policy_class.as_deref();
-        crate::routes::policy_auth::apply_auth_identity_to_opts(
-            &state,
-            &ledger_id,
-            &mut query_json,
-            identity.as_deref(),
-            policy_class,
-        )
-        .await;
+        // Bind all policy options to verified authority after header merging.
+
+        crate::routes::policy_auth::apply_authorization_to_opts(&mut query_json, &headers)?;
 
         // When the body carries time-travel `from` (or any other dataset
         // feature parse_dataset_spec recognizes), route through the
@@ -3662,6 +3573,7 @@ pub async fn explain(
             load_ledger_for_query(&state, &ledger_id, &span).await?
         };
         let db = fluree_db_api::GraphDb::from_ledger_state(&loaded);
+        let db = crate::routes::policy_auth::wrap_jsonld_view(&state, db, &query_json, &headers).await?;
         let result = match state.fluree.explain(&db, &query_json).await {
             Ok(result) => {
                 tracing::info!(status = "success", "explain completed");
@@ -4056,6 +3968,12 @@ pub async fn multi_query(
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
 ) -> Result<Response> {
+    let headers = crate::routes::policy_auth::bind_authorization(
+        &state,
+        headers,
+        bearer.0.as_ref(),
+        credential.did(),
+    )?;
     let request_id = extract_request_id(&credential.headers, &state.telemetry_config);
     let trace_id = extract_trace_id(&credential.headers);
     let span = create_request_span(
@@ -4068,7 +3986,7 @@ pub async fn multi_query(
     );
 
     let timeout_ms = state.config.query_timeout_ms;
-    let server_identity = effective_identity(&credential, &bearer);
+    let server_identity = headers.server_identity.clone();
     crate::query_control::run_query_task(timeout_ms, server_identity, move || async move {
         async move {
             let span = tracing::Span::current();
@@ -4167,57 +4085,29 @@ pub async fn multi_query(
                 .await;
             }
 
-            // Per-sub-query identity / default-policy-class injection runs
-            // here, not inside the api crate. apply_auth_identity_to_opts
-            // depends on the server's impersonation table, which is a
-            // server concern.
-            //
-            // Two security invariants this block enforces:
-            //
-            // 1. The impersonation gate sees the **final** opts.identity
-            //    that would be in effect — including any value set at the
-            //    envelope level or in the sub.opts override. Without the
-            //    pre-merge below, an envelope-level `opts.identity` would
-            //    bypass the gate entirely because
-            //    `body_requests_impersonation` only inspects the query
-            //    body's opts.
-            //
-            // 2. The gate's decision (force bearer identity, or honour body
-            //    opts) is persisted into `sub.query["opts"]`, where the api
-            //    crate's dispatcher gives it precedence over `envelope.opts`
-            //    and `sub.opts`. The dispatcher's merge rule is
-            //    `envelope ⊕ sub.opts ⊕ body opts` with body winning, so
-            //    nothing downstream can clobber the forced identity by
-            //    setting an unrelated key like `meta` at the envelope or
-            //    sub-query level.
+            // Merge first, then bind each alias to the verified request context.
+            // Canonical nulls in the most specific layer also shadow any outer
+            // untrusted defaults when the dispatcher merges again.
             let envelope_opts_owned = envelope.opts.clone();
-            let effective_id = effective_identity(&credential, &bearer);
-            let default_policy_class = data_auth.default_policy_class.clone();
+
             for sub in envelope.queries.values_mut() {
                 if matches!(sub.language, SubqueryLanguage::JsonLd) {
                     premerge_opts_into_subquery_body(envelope_opts_owned.as_ref(), sub);
-                    apply_envelope_subquery_auth(
-                        &state,
-                        sub,
-                        effective_id.as_deref(),
-                        default_policy_class.as_deref(),
-                    )
-                    .await;
+                    enforce_bearer_dataset_scope(
+                        &sub.query,
+                        &bearer,
+                        credential.is_signed(),
+                        &span,
+                    )?;
+                    apply_envelope_subquery_auth(sub, &headers)?;
                 } else if matches!(sub.language, SubqueryLanguage::Sparql) {
                     // SPARQL aliases are policy-enforced too: resolve identity /
-                    // policy-class through the same impersonation gate and stash the
+                    // policy-class through the same authorization binding and stash the
                     // decision in `sub.opts`, which the api crate's SPARQL path reads
                     // (`run_sparql_subquery` → `connection_opts`). Without this a
                     // SPARQL alias would run unrestricted while its JSON-LD twin is
                     // gated.
-                    apply_envelope_sparql_auth(
-                        &state,
-                        sub,
-                        envelope_opts_owned.as_ref(),
-                        effective_id.as_deref(),
-                        default_policy_class.as_deref(),
-                    )
-                    .await;
+                    apply_envelope_sparql_auth(sub, envelope_opts_owned.as_ref(), &headers)?;
                 }
             }
 
@@ -4411,100 +4301,31 @@ fn inject_headers_into_envelope(
     envelope
 }
 
-/// Apply the server's bearer identity / default-policy-class to a
-/// single JSON-LD sub-query's `query` body before handing the envelope
-/// to the api-crate dispatcher.
-///
-/// Per-sub-query application uses the sub-query's primary ledger (first
-/// entry of `from`) as the impersonation-check context. Sub-queries
-/// that span multiple ledgers fall back to the first as a conservative
-/// default — same heuristic the previous server-side dispatcher used.
-async fn apply_envelope_subquery_auth(
-    state: &AppState,
+/// Apply the same verified context after merging each alias's final options.
+fn apply_envelope_subquery_auth(
     sub: &mut MultiQuerySubquery,
-    bearer_identity: Option<&str>,
-    default_policy_class: Option<&str>,
-) {
-    if bearer_identity.is_none() && default_policy_class.is_none() {
-        return;
-    }
-    let primary_ledger = primary_ledger_from_jsonld(&sub.query);
-    crate::routes::policy_auth::apply_auth_identity_to_opts(
-        state,
-        primary_ledger.as_deref().unwrap_or(""),
-        &mut sub.query,
-        bearer_identity,
-        default_policy_class,
-    )
-    .await;
+    headers: &FlureeHeaders,
+) -> Result<()> {
+    crate::routes::policy_auth::apply_authorization_to_opts(&mut sub.query, headers)
 }
 
-/// Run the impersonation gate for a **SPARQL** sub-query alias.
-///
-/// SPARQL bodies carry no `opts` block, so identity / policy inputs ride on the
-/// envelope `opts` (header-injected) and the per-alias `sub.opts` override —
-/// never on the query string. We reuse the **exact** JSON-LD gate
-/// ([`apply_auth_identity_to_opts`]) by feeding it a synthetic
-/// `{ "opts": <merged envelope ⊕ sub opts> }` object, then store the gated opts
-/// back as `sub.opts`. For SPARQL the api dispatcher merges `envelope ⊕ sub.opts`
-/// (there is no body layer), so a forced bearer identity in `sub.opts` wins and
-/// cannot be clobbered by a user-supplied envelope/sub `identity`. The
-/// per-ledger impersonation check uses the alias's first `FROM` ledger.
-///
-/// Reusing the JSON-LD gate (rather than re-deriving the decision) keeps SPARQL
-/// and JSON-LD aliases on identical impersonation semantics by construction.
-async fn apply_envelope_sparql_auth(
-    state: &AppState,
+/// SPARQL carries policy options outside its text. Canonical nulls in sub.opts
+/// prevent the dispatcher from restoring untrusted envelope defaults.
+fn apply_envelope_sparql_auth(
     sub: &mut MultiQuerySubquery,
     envelope_opts: Option<&JsonValue>,
-    bearer_identity: Option<&str>,
-    default_policy_class: Option<&str>,
-) {
-    if bearer_identity.is_none() && default_policy_class.is_none() {
-        return;
-    }
-    let sparql = sub.query.as_str().unwrap_or_default();
-    let ledger = fluree_db_api::sparql_dataset_ledger_ids(sparql)
-        .ok()
-        .and_then(|ids| ids.into_iter().next())
-        .unwrap_or_default();
-
-    // Wrap the merged opts as a synthetic query body so the JSON-LD gate can
-    // inspect/force identity & policy-class exactly as it does for JSON-LD.
+    headers: &FlureeHeaders,
+) -> Result<()> {
     let merged = fluree_db_api::query::multi::merged_opts(envelope_opts, sub.opts.as_ref());
-    let mut synthetic = JsonValue::Object(serde_json::Map::new());
-    if let Some(opts) = merged {
-        if let Some(obj) = synthetic.as_object_mut() {
-            obj.insert("opts".to_string(), opts);
-        }
-    }
-    crate::routes::policy_auth::apply_auth_identity_to_opts(
-        state,
-        &ledger,
-        &mut synthetic,
-        bearer_identity,
-        default_policy_class,
-    )
-    .await;
+    let mut synthetic = serde_json::json!({"opts": merged});
+    crate::routes::policy_auth::apply_authorization_to_opts(&mut synthetic, headers)?;
     sub.opts = synthetic.get("opts").cloned();
+    Ok(())
 }
 
-/// Pre-merge envelope-level `opts` and sub-query `opts` override into
-/// the sub-query body's `opts` BEFORE the impersonation gate runs.
-///
-/// Without this step, an envelope-level `opts.identity` (or one in the
-/// per-sub-query opts override) would never reach
-/// `body_requests_impersonation`, because the gate only inspects
-/// `sub.query["opts"]`. The result would be a silent identity bypass:
-/// the user's "request to impersonate" goes through unchecked because
-/// the gate didn't see it.
-///
-/// Precedence (most specific wins): `sub.query["opts"]` already in the
-/// body beats `sub.opts`, which beats `envelope.opts`. After this
-/// merge, `sub.query["opts"]` holds the final set the gate decides
-/// against. The api crate's dispatcher uses the same priority when it
-/// later merges envelope / sub / body together, so the gate's decision
-/// (written into `sub.query["opts"]`) survives.
+/// Merge envelope, alias, and body options before authorization, using the
+/// dispatcher's precedence. The trusted result is stored in the most specific
+/// layer so subsequent merges preserve it.
 fn premerge_opts_into_subquery_body(
     envelope_opts: Option<&JsonValue>,
     sub: &mut MultiQuerySubquery,
@@ -4523,37 +4344,4 @@ fn premerge_opts_into_subquery_body(
     if let Some(opts) = final_opts {
         body.insert("opts".to_string(), opts);
     }
-}
-
-/// Extract the first ledger identifier (with any temporal suffix and
-/// `#fragment` stripped) from a JSON-LD sub-query body's `from` field.
-/// Used as the impersonation-check context for
-/// [`apply_envelope_subquery_auth`].
-fn primary_ledger_from_jsonld(query: &JsonValue) -> Option<String> {
-    let from = query.as_object()?.get("from")?;
-    let raw = match from {
-        JsonValue::String(s) => s.clone(),
-        JsonValue::Array(arr) => arr.iter().find_map(|v| match v {
-            JsonValue::String(s) => Some(s.clone()),
-            JsonValue::Object(obj) => obj
-                .get("@id")
-                .or_else(|| obj.get("id"))
-                .and_then(JsonValue::as_str)
-                .map(str::to_string),
-            _ => None,
-        })?,
-        JsonValue::Object(obj) => obj
-            .get("@id")
-            .or_else(|| obj.get("id"))
-            .and_then(JsonValue::as_str)?
-            .to_string(),
-        _ => return None,
-    };
-    let bare = raw.split('#').next().unwrap_or(&raw);
-    for marker in ["@t:", "@iso:", "@commit:"] {
-        if let Some(idx) = bare.find(marker) {
-            return Some(bare[..idx].to_string());
-        }
-    }
-    Some(bare.to_string())
 }

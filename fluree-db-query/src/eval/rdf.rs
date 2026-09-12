@@ -233,7 +233,12 @@ pub fn eval_same_term<R: RowAccess>(
 
     let v1 = args[0].eval_to_comparable(row, ctx)?;
     let v2 = args[1].eval_to_comparable(row, ctx)?;
-    let same = matches!((v1, v2), (Some(a), Some(b)) if a == b);
+    let same = match (v1, v2) {
+        (Some(a), Some(b)) => {
+            a == b || super::compare::resource_iri_eq(&a, &b, ctx).unwrap_or(false)
+        }
+        _ => false,
+    };
     Ok(Some(ComparableValue::Bool(same)))
 }
 

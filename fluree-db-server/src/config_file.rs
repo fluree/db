@@ -137,6 +137,13 @@ pub struct IndexingFileConfig {
     pub indexer_catchup_interval_secs: Option<u64>,
     /// Keep BM25 full-text indexes current automatically.
     pub bm25_auto_sync: Option<bool>,
+    /// Old index versions to retain before GC.
+    pub gc_max_old_indexes: Option<u32>,
+    /// Minimum age in minutes before an index version can be collected.
+    pub gc_min_time_mins: Option<u32>,
+    /// Version ceiling past which the age guard is overridden. Unset means no
+    /// ceiling.
+    pub gc_hard_max_old_indexes: Option<u32>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -170,6 +177,7 @@ pub struct AuthEndpointFileConfig {
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct DataAuthFileConfig {
+    pub policy_authorities: Option<Vec<String>>,
     pub mode: Option<String>,
     pub audience: Option<String>,
     pub trusted_issuers: Option<Vec<String>>,
@@ -443,12 +451,16 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "reindex_min_bytes",
     "reindex_max_bytes",
     "indexer_catchup_interval_secs",
+    "gc_max_old_indexes",
+    "gc_min_time_mins",
+    "gc_hard_max_old_indexes",
     "events_auth_mode",
     "events_auth_audience",
     "events_auth_trusted_issuers",
     "data_auth_mode",
     "data_auth_audience",
     "data_auth_trusted_issuers",
+    "data_auth_policy_authorities",
     "data_auth_default_policy_class",
     "admin_auth_mode",
     "admin_auth_trusted_issuers",
@@ -622,6 +634,21 @@ pub fn apply_to_server_config(
                 config.indexer_catchup_interval_secs = v;
             }
         }
+        if is_default("gc_max_old_indexes") {
+            if let Some(v) = idx.gc_max_old_indexes {
+                config.gc_max_old_indexes = Some(v);
+            }
+        }
+        if is_default("gc_min_time_mins") {
+            if let Some(v) = idx.gc_min_time_mins {
+                config.gc_min_time_mins = Some(v);
+            }
+        }
+        if is_default("gc_hard_max_old_indexes") {
+            if let Some(v) = idx.gc_hard_max_old_indexes {
+                config.gc_hard_max_old_indexes = Some(v);
+            }
+        }
     }
 
     // --- Auth: events ---
@@ -663,6 +690,11 @@ pub fn apply_to_server_config(
             if is_default("data_auth_trusted_issuers") {
                 if let Some(ref v) = data.trusted_issuers {
                     config.data_auth_trusted_issuers = v.clone();
+                }
+            }
+            if is_default("data_auth_policy_authorities") {
+                if let Some(ref v) = data.policy_authorities {
+                    config.data_auth_policy_authorities = v.clone();
                 }
             }
             if is_default("data_auth_default_policy_class") {
@@ -1047,6 +1079,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn policy_authorities_load_from_toml_and_cli_overrides_the_whole_list() {
+        use clap::{CommandFactory, FromArgMatches};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fluree.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [server.auth.data]
+            mode = "required"
+            audience = "file-audience"
+            trusted_issuers = ["did:key:file"]
+            policy_authorities = ["did:key:file"]
+        "#,
+        )
+        .unwrap();
+        let section = load_config(&path).unwrap().server.unwrap();
+        for (args, authorities, audience) in [
+            (vec!["fluree-server"], vec!["did:key:file"], "file-audience"),
+            (
+                vec![
+                    "fluree-server",
+                    "--data-auth-policy-authority",
+                    "did:key:cli-1",
+                    "--data-auth-policy-authority",
+                    "did:key:cli-2",
+                    "--data-auth-audience",
+                    "cli-audience",
+                ],
+                vec!["did:key:cli-1", "did:key:cli-2"],
+                "cli-audience",
+            ),
+        ] {
+            let matches = ServerConfig::command().try_get_matches_from(args).unwrap();
+            let mut config = ServerConfig::from_arg_matches(&matches).unwrap();
+            apply_to_server_config(&section, &mut config, &matches);
+            let data = config.data_auth();
+            assert_eq!(data.policy_authorities, authorities);
+            assert_eq!(data.audience.as_deref(), Some(audience));
+            assert_eq!(data.trusted_issuers, ["did:key:file"]);
+            assert!(data.validate().is_ok());
+        }
+    }
+
+    #[test]
     fn test_load_toml_with_server_section() {
         let toml = r#"
 [[remotes]]
@@ -1070,6 +1147,9 @@ ttl_ms = 200
 enabled = true
 reindex_min_bytes = 200000
 reindex_max_bytes = 2000000
+gc_max_old_indexes = 3
+gc_min_time_mins = 45
+gc_hard_max_old_indexes = 12
 
 [server.auth.events]
 mode = "required"
@@ -1097,6 +1177,9 @@ default_policy_class = "ex:DefaultPolicy"
         assert_eq!(idx.enabled, Some(true));
         assert_eq!(idx.reindex_min_bytes, Some(200_000));
         assert_eq!(idx.reindex_max_bytes, Some(2_000_000));
+        assert_eq!(idx.gc_max_old_indexes, Some(3));
+        assert_eq!(idx.gc_min_time_mins, Some(45));
+        assert_eq!(idx.gc_hard_max_old_indexes, Some(12));
 
         let auth = server.auth.unwrap();
         let events = auth.events.unwrap();
@@ -1154,6 +1237,9 @@ default_policy_class = "ex:DefaultPolicy"
                 indexer_catchup_interval_secs: None,
                 reindex_max_bytes: Some(1_000_000),
                 bm25_auto_sync: None,
+                gc_max_old_indexes: Some(5),
+                gc_min_time_mins: None,
+                gc_hard_max_old_indexes: None,
             }),
             ..Default::default()
         };
@@ -1166,6 +1252,9 @@ default_policy_class = "ex:DefaultPolicy"
                 indexer_catchup_interval_secs: None,
                 reindex_max_bytes: None, // should NOT override
                 bm25_auto_sync: None,
+                gc_max_old_indexes: None, // should NOT override
+                gc_min_time_mins: None,
+                gc_hard_max_old_indexes: Some(40),
             }),
             ..Default::default()
         };
@@ -1182,6 +1271,9 @@ default_policy_class = "ex:DefaultPolicy"
         // indexing thresholds NOT overridden (overlay had None)
         assert_eq!(idx.reindex_min_bytes, Some(100_000));
         assert_eq!(idx.reindex_max_bytes, Some(1_000_000));
+        // GC retention merges per field the same way
+        assert_eq!(idx.gc_max_old_indexes, Some(5));
+        assert_eq!(idx.gc_hard_max_old_indexes, Some(40));
     }
 
     #[test]

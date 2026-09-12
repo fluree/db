@@ -137,7 +137,7 @@ impl Fluree {
         build_dataset_view_from_spec!(
             self,
             spec,
-            history_transform = |view| async { Ok::<GraphDb, ApiError>(view) },
+            history_transform = |view| self.wrap_policy_defaults(view),
             load_view = |source| self.load_view_from_source(source),
             apply_policy =
                 |view, source| self.maybe_apply_source_policy(view, source, server_identity),
@@ -169,7 +169,7 @@ impl Fluree {
         )
     }
 
-    /// Apply per-source policy if present, otherwise no policy.
+    /// Apply per-source policy if present, otherwise configured defaults.
     ///
     /// This is used by `build_dataset_view` when no global policy is provided.
     async fn maybe_apply_source_policy(
@@ -187,7 +187,7 @@ impl Fluree {
                 return self.wrap_policy(view, &opts).await;
             }
         }
-        Ok(view)
+        self.wrap_policy_defaults(view).await
     }
 
     /// Apply policy with per-source override taking precedence over global.

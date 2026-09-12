@@ -156,6 +156,7 @@
 
 - [Security and policy](security/README.md)
   - [Authentication](security/authentication.md)
+  - [Trusted policy authorization](security/policy-authorization.md)
   - [Storage encryption](security/encryption.md)
   - [Commit signing and attestation](security/commit-signing.md)
   - [Policy model and inputs](security/policy-model.md)
