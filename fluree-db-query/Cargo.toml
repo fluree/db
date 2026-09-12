@@ -59,6 +59,8 @@ xxhash-rust = "0.8"
 percent-encoding = "2"
 # HashSet raw entry API for DISTINCT (avoid per-row allocations)
 hashbrown = { workspace = true }
+# Stable bucket positions for resumable subquery join probes
+indexmap = { workspace = true }
 # GeoRust ecosystem for WKT parsing and geometry types (S2 search)
 geo = "0.29"
 geo-types = "0.7"

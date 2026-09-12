@@ -47,3 +47,6 @@ mod it_query_unwind;
 mod it_query_values;
 #[path = "it_w3c_result_formats.rs"]
 mod it_w3c_result_formats;
+
+#[path = "it_query_subquery_streaming.rs"]
+mod it_query_subquery_streaming;
