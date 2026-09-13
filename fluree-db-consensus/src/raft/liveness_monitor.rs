@@ -415,13 +415,21 @@ fn record_replication_progress(
     now: Instant,
 ) {
     // Track the peer's furthest observed match position (monotonic).
-    if log_advanced(&tracker.last_observed_log, &current_log) {
+    let advanced = log_advanced(&tracker.last_observed_log, &current_log);
+    if advanced {
         tracker.last_observed_log = current_log;
     }
-
-    if peer_is_keeping_up(leader_last_log, &tracker.last_observed_log, max_healthy_lag) {
-        // Within the healthy lag window — clear any pending
-        // unreachable timer. The first healthy sample after a
+    let caught_up = peer_is_keeping_up(leader_last_log, &tracker.last_observed_log, 0);
+    // Distance detects followers that advance too slowly. Lack of progress
+    // detects a dead follower on an otherwise quiet cluster: even one
+    // unacknowledged enqueue can strand every branch that voter owns.
+    // An absent match is also unhealthy after the ordinary grace period;
+    // on a new leader it can mean the former leader died, not just bootstrap.
+    if peer_is_keeping_up(leader_last_log, &tracker.last_observed_log, max_healthy_lag)
+        && (advanced || caught_up)
+    {
+        // Caught up, or advancing within the healthy lag window — clear
+        // any pending unreachable timer. The first healthy sample after a
         // demotion opens the recovery window; later healthy samples
         // don't push its start forward, so the promote check
         // measures sustained health from a fixed point.
@@ -432,9 +440,8 @@ fn record_replication_progress(
             tracker.recovering_since = Some(now);
         }
     } else {
-        // Trailing the leader by more than `max_healthy_lag` — the
-        // peer isn't keeping pace, even if its match index is still
-        // inching forward. Start the unreachable timer on the first
+        // Too far behind, stalled behind any pending work, or never
+        // acknowledged this leader. Start the unreachable timer on the first
         // lagging sample; subsequent samples don't reset it until the
         // peer catches back inside the window.
         tracker.unreachable_since.get_or_insert(now);
@@ -489,19 +496,10 @@ fn log_advanced(prev: &Option<LogId<NodeId>>, curr: &Option<LogId<NodeId>>) -> b
     }
 }
 
-/// True when the peer has matched at least one entry AND the
-/// leader's log is past it. Returns `false` when `peer_log` is
-/// `None` — a peer that has yet to match anything (bootstrap,
-/// snapshot install) is in an indeterminate state distinct from
-/// lag, and treating the absence of a baseline as lag would demote
-/// a freshly-added voter before it had any chance to start
-/// replicating.
-/// True when the peer's match log is within `max_healthy_lag` entries
-/// of the leader's last log — i.e. keeping pace. A peer that has yet
-/// to match anything (`None`) counts as keeping up: it's in its
-/// bootstrap / snapshot-install window, and treating an absent
-/// baseline as lag would demote every freshly-added voter. A leader
-/// with no log yet (`None`) trivially can't be ahead.
+/// True when an acknowledged match is within `max_healthy_lag` of
+/// the leader. A missing match is not evidence of health: learners are
+/// excluded before tracking, and newly admitted voters get the same bounded
+/// grace as other voters. Demotion removes work eligibility, not Raft votes.
 fn peer_is_keeping_up(
     leader_last_log: Option<u64>,
     peer_log: &Option<LogId<NodeId>>,
@@ -511,7 +509,8 @@ fn peer_is_keeping_up(
         (Some(leader_idx), Some(peer_log)) => {
             leader_idx.saturating_sub(peer_log.index) <= max_healthy_lag
         }
-        _ => true,
+        (Some(_), None) => false,
+        (None, _) => true,
     }
 }
 
@@ -989,46 +988,92 @@ mod tests {
     }
 
     #[test]
-    fn freshly_added_voter_bootstraps_without_premature_demotion() {
-        // A voter just added via membership change has `peer_log:
-        // None` until the first successful append-entries — for a
-        // sizable state machine this means the entire snapshot
-        // install window, well past `unreachable_after`. The monitor
-        // must not start the unreachable timer during this window;
-        // once the peer matches its first entry, the standard
-        // observed-lag detection takes over.
+    fn freshly_added_voter_gets_a_bounded_bootstrap_grace() {
         let cfg = fast_config();
         let t0 = Instant::now();
         let mut tracker = PeerTracker::for_eligible_peer();
-        // Bootstrap window: leader's log grows far past anything
-        // the peer has matched (peer_log stays None). Far longer
-        // than `unreachable_after` elapses — nothing fires.
-        let t1 = t0 + cfg.unreachable_after * 10;
-        let d1 = tick(&mut tracker, None, Some(20), t1, &cfg);
-        assert_eq!(d1, None, "never-matched peer is not lag-classified");
-        assert!(
-            tracker.unreachable_since.is_none(),
-            "no lag timer for a peer that has yet to match anything"
-        );
-        // Peer matches its first entry — `last_observed_log` is
-        // now populated and the bootstrap window ends.
-        let t2 = t1 + cfg.sample_interval;
-        let _ = tick(&mut tracker, Some(log_id(1, 5)), Some(20), t2, &cfg);
-        assert_eq!(tracker.last_observed_log, Some(log_id(1, 5)));
-        // Leader keeps advancing; peer stuck at 5. Standard lag
-        // detection now applies from here.
-        let t3 = t2 + cfg.sample_interval;
-        let _ = tick(&mut tracker, Some(log_id(1, 5)), Some(30), t3, &cfg);
-        assert!(
-            tracker.unreachable_since.is_some(),
-            "lag timer starts once the peer has matched a baseline"
-        );
-        let t4 = t3 + cfg.unreachable_after;
-        let d4 = tick(&mut tracker, Some(log_id(1, 5)), Some(30), t4, &cfg);
+        assert_eq!(tick(&mut tracker, None, Some(20), t0, &cfg), None);
         assert_eq!(
-            d4,
-            Some(EligibilityProposal::Demote),
-            "post-bootstrap lag detection still fires"
+            tick(
+                &mut tracker,
+                None,
+                Some(20),
+                t0 + cfg.unreachable_after / 2,
+                &cfg
+            ),
+            None
+        );
+        // A successful catch-up within the grace period clears suspicion.
+        assert_eq!(
+            tick(
+                &mut tracker,
+                Some(log_id(1, 20)),
+                Some(20),
+                t0 + cfg.unreachable_after,
+                &cfg
+            ),
+            None
+        );
+        assert!(tracker.unreachable_since.is_none());
+        assert_eq!(
+            tick(
+                &mut tracker,
+                Some(log_id(1, 20)),
+                Some(20),
+                t0 + cfg.unreachable_after * 10,
+                &cfg
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn low_volume_stalled_voter_is_demoted() {
+        let cfg = LivenessConfig::default();
+        let t0 = Instant::now();
+        let mut tracker = PeerTracker::for_eligible_peer();
+        tick(&mut tracker, Some(log_id(1, 100)), Some(100), t0, &cfg);
+        let t1 = t0 + cfg.sample_interval;
+        tick(&mut tracker, Some(log_id(1, 100)), Some(101), t1, &cfg);
+        assert_eq!(
+            tick(
+                &mut tracker,
+                Some(log_id(1, 100)),
+                Some(101),
+                t1 + cfg.unreachable_after,
+                &cfg
+            ),
+            Some(EligibilityProposal::Demote)
+        );
+    }
+
+    #[test]
+    fn former_leader_never_acknowledging_new_leader_is_demoted() {
+        let cfg = LivenessConfig::default();
+        let t0 = Instant::now();
+        let mut tracker = PeerTracker::for_eligible_peer();
+        assert_eq!(tick(&mut tracker, None, Some(100), t0, &cfg), None);
+        assert_eq!(
+            tick(
+                &mut tracker,
+                None,
+                Some(101),
+                t0 + cfg.unreachable_after,
+                &cfg
+            ),
+            Some(EligibilityProposal::Demote)
+        );
+    }
+
+    #[test]
+    fn never_acknowledging_demoted_voter_is_not_promoted() {
+        let cfg = LivenessConfig::default();
+        let t0 = Instant::now();
+        let mut tracker = PeerTracker::for_ineligible_peer();
+        tick(&mut tracker, None, Some(100), t0, &cfg);
+        assert_eq!(
+            tick(&mut tracker, None, Some(101), t0 + cfg.live_after, &cfg),
+            None
         );
     }
 }
