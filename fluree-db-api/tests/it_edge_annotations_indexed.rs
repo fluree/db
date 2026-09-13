@@ -1087,6 +1087,49 @@ async fn reindex_seals_arena_when_caching_enabled_no_provider_in_opts() {
     assert_eq!(stats.live_attachment_pairs, 1);
 }
 
+#[tokio::test]
+async fn reindex_seals_arena_without_ledger_caching() {
+    // The CLI builds its client `without_ledger_caching()`, so
+    // `Fluree::reindex` has no `LedgerManager` and therefore no
+    // attachment-events provider to ask. That is the configuration behind
+    // `fluree create --from <turtle-star>`, whose one-shot seal pass ended
+    // with `annotation_index = None` while printing "Annotation arena
+    // sealed" — every quoted-triple query on the imported ledger then took
+    // the generic join chain. The reindex must derive coverage from the
+    // ledger state it loads anyway.
+    use fluree_db_api::ReindexOptions;
+
+    let fluree = FlureeBuilder::memory()
+        .without_ledger_caching()
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:reindex-seals-arena-no-cache";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    fluree
+        .insert(ledger0, &annotated_insert())
+        .await
+        .expect("annotated insert");
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex must succeed");
+
+    let post = fluree.ledger(ledger_id).await.expect("reload");
+    assert!(post.snapshot.has_annotations, "sticky bit set");
+    let stats = &post
+        .snapshot
+        .annotation_index
+        .as_ref()
+        .expect(
+            "reindex without a ledger manager must still seal the arena from the \
+             ledger state's attachment events",
+        )
+        .stats;
+    assert_eq!(stats.distinct_annotations, 1);
+    assert_eq!(stats.live_attachment_pairs, 1);
+}
+
 /// #1467: a reification-aware COPY of a named-graph annotation must survive a
 /// reindex. The attachment indexer decodes each bundle via
 /// `EdgeKey::from_reifies_facts` at seal time

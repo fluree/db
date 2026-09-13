@@ -210,6 +210,14 @@ pub struct AnnotationEdgeProbeOperator {
 /// the buffer. Keeps any single output batch bounded.
 const PROBE_OUTPUT_CHUNK: usize = 4096;
 
+/// Below this many bound driving subjects the generic (well-ordered)
+/// `f:reifies*` chain — three narrow per-row probes — beats draining the
+/// whole annotation sidecar into hash maps and sweeping the base predicate.
+/// Checked twice: at plan time against the driving estimate (an unknown
+/// estimate admits the lane) and again at runtime by
+/// [`HashAnnotationEdgeProbeOperator`] against the buffered stream itself.
+pub(crate) const HASH_ANNOTATION_MIN_DRIVING_ROWS: usize = 256;
+
 impl AnnotationEdgeProbeOperator {
     pub(crate) fn new(
         child: BoxedOperator,
@@ -443,28 +451,75 @@ pub(crate) fn binding_sid(
 }
 
 /// The three `f:reifies*` lookups, drained once through ordinary planned
-/// scans (overlay-merged and policy-filtered like any scan) and
-/// hash-indexed. Shared by the value-only OPTIONAL lane
+/// scans (overlay-merged and policy-filtered like any scan) and indexed by
+/// the full reified edge `(s, p, o)`. Shared by the value-only OPTIONAL lane
 /// ([`crate::optional::AnnotationValueOptionalBuilder`]) and the required
 /// lane ([`HashAnnotationEdgeProbeOperator`]).
+///
+/// Keyed by the whole edge, not the subject alone: a subject-keyed map made
+/// every lookup walk all reifiers sharing that subject and test each one's
+/// predicate and object, which on a hub-heavy graph is a sum of squared
+/// reified out-degrees (one StarBench BKR subject carries 3,345 `TREATS`
+/// edges by itself) — the P11 timeout.
 pub(crate) struct AnnotationSidecarMaps {
-    pub(crate) s_to_anns: HashMap<Sid, Vec<Sid>>,
-    ann_preds: HashMap<Sid, Vec<Sid>>,
-    /// Object keyed by [`GroupKeyOwned`] (representation-normalized), so
-    /// ref objects AND literal objects (a literal-valued reified edge)
-    /// both match across encoded/materialized binding representations.
-    ann_objs: HashMap<Sid, Vec<GroupKeyOwned>>,
+    /// `s → p → o → live reifiers`. The object level is keyed by
+    /// [`GroupKeyOwned`] (representation-normalized), so ref objects AND
+    /// literal objects (a literal-valued reified edge) both match across
+    /// encoded/materialized binding representations.
+    edge_to_anns: HashMap<Sid, HashMap<Sid, HashMap<GroupKeyOwned, Vec<Sid>>>>,
 }
 
 impl AnnotationSidecarMaps {
-    pub(crate) fn matches(&self, ann: &Sid, p: &Sid, o: &GroupKeyOwned) -> bool {
-        self.ann_preds
-            .get(ann)
-            .is_some_and(|preds| preds.contains(p))
-            && self.ann_objs.get(ann).is_some_and(|objs| objs.contains(o))
+    /// Live reifiers of the edge `(s, p, o)`; empty when it has none.
+    pub(crate) fn anns_for(&self, s: &Sid, p: &Sid, o: &GroupKeyOwned) -> &[Sid] {
+        self.edge_to_anns
+            .get(s)
+            .and_then(|by_p| by_p.get(p))
+            .and_then(|by_o| by_o.get(o))
+            .map_or(&[], Vec::as_slice)
     }
 
-    /// Drain the three reifies triples and build the lookup maps.
+    /// Compose the per-slot `(reifier, value)` pairs into the edge-keyed
+    /// map. A reifier missing any slot attaches to nothing. A multi-target
+    /// reifier (legacy / replayed-from-corrupt-history ledgers) attaches to
+    /// every `subject × predicate × object` combination — the same answer
+    /// the per-slot containment test it replaces gave.
+    pub(crate) fn from_slot_pairs(
+        subj_pairs: Vec<(Sid, Sid)>,
+        pred_pairs: Vec<(Sid, Sid)>,
+        obj_pairs: Vec<(Sid, GroupKeyOwned)>,
+    ) -> Self {
+        let mut ann_subjs: HashMap<Sid, Vec<Sid>> = HashMap::new();
+        for (ann, s) in subj_pairs {
+            ann_subjs.entry(ann).or_default().push(s);
+        }
+        let mut ann_preds: HashMap<Sid, Vec<Sid>> = HashMap::new();
+        for (ann, p) in pred_pairs {
+            ann_preds.entry(ann).or_default().push(p);
+        }
+        let mut edge_to_anns: HashMap<Sid, HashMap<Sid, HashMap<GroupKeyOwned, Vec<Sid>>>> =
+            HashMap::new();
+        for (ann, o) in obj_pairs {
+            let (Some(subjs), Some(preds)) = (ann_subjs.get(&ann), ann_preds.get(&ann)) else {
+                continue;
+            };
+            for s in subjs {
+                for p in preds {
+                    edge_to_anns
+                        .entry(s.clone())
+                        .or_default()
+                        .entry(p.clone())
+                        .or_default()
+                        .entry(o.clone())
+                        .or_default()
+                        .push(ann.clone());
+                }
+            }
+        }
+        Self { edge_to_anns }
+    }
+
+    /// Drain the three reifies triples and build the lookup map.
     pub(crate) async fn build(
         r_subj: &TriplePattern,
         r_pred: &TriplePattern,
@@ -474,23 +529,10 @@ impl AnnotationSidecarMaps {
         ctx: &ExecutionContext<'_>,
         view: Option<&fluree_db_binary_index::BinaryGraphView>,
     ) -> Result<Self> {
-        let mut s_to_anns: HashMap<Sid, Vec<Sid>> = HashMap::new();
-        for (ann, s) in drain_pairs(r_subj, stats.clone(), planning, ctx, view).await? {
-            s_to_anns.entry(s).or_default().push(ann);
-        }
-        let mut ann_preds: HashMap<Sid, Vec<Sid>> = HashMap::new();
-        for (ann, pred) in drain_pairs(r_pred, stats.clone(), planning, ctx, view).await? {
-            ann_preds.entry(ann).or_default().push(pred);
-        }
-        let mut ann_objs: HashMap<Sid, Vec<GroupKeyOwned>> = HashMap::new();
-        for (ann, obj) in drain_object_keys(r_obj, stats, planning, ctx, view).await? {
-            ann_objs.entry(ann).or_default().push(obj);
-        }
-        Ok(Self {
-            s_to_anns,
-            ann_preds,
-            ann_objs,
-        })
+        let subj_pairs = drain_pairs(r_subj, stats.clone(), planning, ctx, view).await?;
+        let pred_pairs = drain_pairs(r_pred, stats.clone(), planning, ctx, view).await?;
+        let obj_pairs = drain_object_keys(r_obj, stats, planning, ctx, view).await?;
+        Ok(Self::from_slot_pairs(subj_pairs, pred_pairs, obj_pairs))
     }
 }
 
@@ -1080,6 +1122,28 @@ impl HashAnnotationEdgeProbeOperator {
             return Ok(());
         }
 
+        // Runtime lane choice. The plan-time gate admits this lane on an
+        // estimate that is often unknown; with the whole driving stream in
+        // hand, decide on what it actually holds. The three drains and the
+        // base sweep pay off only against MANY bound driving subjects, each
+        // of which would otherwise cost three scattered point probes. A
+        // handful of rows — a seed, or the matches of a selective sibling —
+        // runs the generic chain over the buffered rows instead: StarBench
+        // P1 swept the whole graph for 9 s to enrich 3 rows.
+        let child_rows: usize = child_batches.iter().map(Batch::len).sum();
+        if child_rows < HASH_ANNOTATION_MIN_DRIVING_ROWS
+            || (!keep_all && driving.len() < HASH_ANNOTATION_MIN_DRIVING_ROWS)
+        {
+            tracing::debug!(
+                rows = child_rows,
+                driving = driving.len(),
+                keep_all,
+                "annotation required-lane: driving stream below the sweep threshold; running the generic chain over the buffered rows"
+            );
+            return self.probe_generic(ctx, child_batches).await;
+        }
+
+        let started = std::time::Instant::now();
         let maps = AnnotationSidecarMaps::build(
             &self.r_subj,
             &self.r_pred,
@@ -1090,7 +1154,16 @@ impl HashAnnotationEdgeProbeOperator {
             view,
         )
         .await?;
+        let maps_ms = started.elapsed().as_millis();
         let edges = self.sweep_base_edges(ctx, view, &driving, keep_all).await?;
+        let swept: usize = edges.values().map(Vec::len).sum();
+        tracing::debug!(
+            maps_ms,
+            sweep_ms = started.elapsed().as_millis() - maps_ms,
+            swept,
+            keep_all,
+            "annotation required-lane hash probe: maps built, base edges swept"
+        );
 
         for batch in std::mem::take(&mut child_batches) {
             ctx.check_cancelled()?;
@@ -1153,19 +1226,11 @@ impl HashAnnotationEdgeProbeOperator {
                     if o_key.as_ref().is_some_and(|k| *k != edge.o_key) {
                         continue;
                     }
-                    let Some(cands) = maps.s_to_anns.get(&edge.s_sid) else {
-                        continue;
-                    };
-                    let matching: Vec<Sid> = cands
-                        .iter()
-                        .filter(|ann| {
-                            bound_ann.as_ref().is_none_or(|t| *t == **ann)
-                                && maps.matches(ann, &edge.p_sid, &edge.o_key)
-                        })
-                        .cloned()
-                        .collect();
-                    for ann in matching {
-                        self.emit_row(&batch, row, edge, &ann);
+                    for ann in maps.anns_for(&edge.s_sid, &edge.p_sid, &edge.o_key) {
+                        if bound_ann.as_ref().is_some_and(|t| t != ann) {
+                            continue;
+                        }
+                        self.emit_row(&batch, row, edge, ann);
                     }
                 }
             }
@@ -1173,8 +1238,52 @@ impl HashAnnotationEdgeProbeOperator {
         tracing::debug!(
             driving = driving.len(),
             rows = self.result_buffer.len(),
+            total_ms = started.elapsed().as_millis(),
             "annotation required-lane hash probe complete"
         );
+        Ok(())
+    }
+
+    /// Generic-chain fallback over the buffered driving rows: the base edge
+    /// and the three `f:reifies*` lookups plan as ordinary joins seeded by
+    /// the replayed child stream (same results as the sweep, per-row
+    /// probes instead), and each output row is re-shaped to this
+    /// operator's schema.
+    async fn probe_generic(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        child_batches: Vec<Batch>,
+    ) -> Result<()> {
+        let replay = Box::new(crate::seed::BatchReplayOperator::new(
+            Arc::from(self.child.schema().to_vec().into_boxed_slice()),
+            child_batches,
+        ));
+        let chain = [
+            Pattern::Triple(self.base.clone()),
+            Pattern::Triple(self.r_subj.clone()),
+            Pattern::Triple(self.r_pred.clone()),
+            Pattern::Triple(self.r_obj.clone()),
+        ];
+        let mut op = crate::execute::build_where_operators_seeded(
+            Some(replay),
+            &chain,
+            self.stats.clone(),
+            None,
+            &self.planning,
+        )?;
+        op.open(ctx).await?;
+        while let Some(batch) = op.next_batch(ctx).await? {
+            ctx.check_cancelled()?;
+            for row in 0..batch.len() {
+                let rb: Vec<Binding> = self
+                    .schema
+                    .iter()
+                    .map(|v| batch.get(row, *v).cloned().unwrap_or(Binding::Unbound))
+                    .collect();
+                self.result_buffer.push(rb);
+            }
+        }
+        op.close();
         Ok(())
     }
 
@@ -1374,18 +1483,40 @@ mod tests {
     #[test]
     fn annotation_sidecar_maps_preserve_multi_target_values() {
         let ann = Sid::new(1, "ann");
+        let s = Sid::new(3, "s");
         let p1 = Sid::new(2, "p1");
         let p2 = Sid::new(2, "p2");
         let ok = |s: &Sid| binding_to_group_key_normalized(&Binding::sid(s.clone()), None, None);
         let o1 = ok(&Sid::new(3, "o1"));
         let o2 = ok(&Sid::new(3, "o2"));
-        let maps = AnnotationSidecarMaps {
-            s_to_anns: HashMap::new(),
-            ann_preds: HashMap::from([(ann.clone(), vec![p1.clone(), p2.clone()])]),
-            ann_objs: HashMap::from([(ann.clone(), vec![o1.clone(), o2.clone()])]),
-        };
+        let maps = AnnotationSidecarMaps::from_slot_pairs(
+            vec![(ann.clone(), s.clone())],
+            vec![(ann.clone(), p1.clone()), (ann.clone(), p2.clone())],
+            vec![(ann.clone(), o1.clone()), (ann.clone(), o2.clone())],
+        );
 
-        assert!(maps.matches(&ann, &p1, &o1));
-        assert!(maps.matches(&ann, &p2, &o2));
+        assert_eq!(maps.anns_for(&s, &p1, &o1), std::slice::from_ref(&ann));
+        assert_eq!(maps.anns_for(&s, &p2, &o2), std::slice::from_ref(&ann));
+        // Every pred × obj combination, as the per-slot containment test did.
+        assert_eq!(maps.anns_for(&s, &p1, &o2), std::slice::from_ref(&ann));
+        assert!(maps.anns_for(&Sid::new(3, "other"), &p1, &o1).is_empty());
+    }
+
+    #[test]
+    fn annotation_sidecar_maps_keep_same_subject_edges_apart() {
+        // Two reifiers on edges that share a subject must not see each
+        // other: the lookup is by the full (s, p, o) edge.
+        let (a1, a2) = (Sid::new(1, "a1"), Sid::new(1, "a2"));
+        let s = Sid::new(3, "hub");
+        let p = Sid::new(2, "TREATS");
+        let ok = |s: &Sid| binding_to_group_key_normalized(&Binding::sid(s.clone()), None, None);
+        let (o1, o2) = (ok(&Sid::new(3, "o1")), ok(&Sid::new(3, "o2")));
+        let maps = AnnotationSidecarMaps::from_slot_pairs(
+            vec![(a1.clone(), s.clone()), (a2.clone(), s.clone())],
+            vec![(a1.clone(), p.clone()), (a2.clone(), p.clone())],
+            vec![(a1.clone(), o1.clone()), (a2.clone(), o2.clone())],
+        );
+        assert_eq!(maps.anns_for(&s, &p, &o1), [a1]);
+        assert_eq!(maps.anns_for(&s, &p, &o2), [a2]);
     }
 }

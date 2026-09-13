@@ -1108,14 +1108,66 @@ pub fn estimate_pattern(
             }
         }
 
-        // DefaultGraphSource wraps an inner subplan and runs it once
-        // per default-graph source. Cost is modeled like Graph — the
-        // inner branch's cardinality, scaled implicitly by the source
-        // count at runtime.
+        // DefaultGraphSource wraps an expanded edge-annotation chain and
+        // runs it once per default-graph source. The chain has its own
+        // cardinality model (one reifier per matching base edge); anything
+        // the chain recognizer rejects falls back to the branch model.
         Pattern::DefaultGraphSource { patterns, .. } => PatternEstimate::Source {
-            row_count: estimate_branch_cardinality(patterns, stats),
+            row_count: estimate_annotation_chain_cardinality(patterns, bound_vars, stats)
+                .unwrap_or_else(|| estimate_branch_cardinality_from(patterns, bound_vars, stats)),
         },
     }
+}
+
+/// The two entry points of an expanded edge-annotation chain, costed with
+/// `bound_vars` already bound: rows the base-edge scan yields (edge-first)
+/// and rows the most selective `f:reifies*` lookup yields (reifier-first).
+/// `None` when `patterns` is not a recognized chain. Shared by the wrapper's
+/// cardinality estimate and by the delegate's lane choice.
+pub(crate) fn annotation_chain_entry_rows(
+    patterns: &[Pattern],
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> Option<(f64, f64)> {
+    let shape = crate::annotation_edge_probe::recognize_annotation_edge(patterns)?;
+    let triple_rows = |p: &Pattern| match p {
+        Pattern::Triple(tp) => Some(estimate_triple_row_count(tp, bound_vars, stats)),
+        _ => None,
+    };
+    let edge_first = triple_rows(&shape.base)?;
+    let reifier_first = patterns[1..4]
+        .iter()
+        .filter_map(triple_rows)
+        .fold(f64::INFINITY, f64::min);
+    Some((edge_first, reifier_first))
+}
+
+/// Cardinality of an expanded edge-annotation chain — `[base edge, three
+/// `f:reifies*` triples, body…]`, the only shape `Pattern::DefaultGraphSource`
+/// wraps. The generic branch model multiplies the chain's triples in
+/// standalone-selectivity order with no regard for connectivity, so
+/// `<< ?s :P ?o >>` came out as reifiesPredicate × base edge (3,846 × 102,555
+/// ≈ 4e8 on StarBench P11) and the wrapper sorted behind its own 6.5M-row
+/// body triple, which then drove the chain once per row. The chain binds one
+/// reifier per matching base edge, so its cardinality is the cheaper of its
+/// two entry points — the base edge, or the most selective `f:reifies*`
+/// lookup — times the body's expansion with the edge and reifier bound.
+fn estimate_annotation_chain_cardinality(
+    patterns: &[Pattern],
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> Option<f64> {
+    let shape = crate::annotation_edge_probe::recognize_annotation_edge(patterns)?;
+    let (edge_first, reifier_first) = annotation_chain_entry_rows(patterns, bound_vars, stats)?;
+    let reifiers = edge_first.min(reifier_first).max(HIGHLY_SELECTIVE);
+    if shape.body.is_empty() {
+        return Some(reifiers);
+    }
+    let mut bound = bound_vars.clone();
+    bound.extend(shape.base.produced_vars());
+    bound.insert(shape.ann_var);
+    let body = estimate_branch_cardinality_from(&shape.body, &bound, stats);
+    Some((reifiers * body).max(HIGHLY_SELECTIVE))
 }
 
 /// Estimate cardinality for a sequence of patterns (UNION branch or subquery body).
@@ -1124,11 +1176,22 @@ pub fn estimate_pattern(
 /// each pattern is placed, so subsequent triples use the appropriate expansion factor
 /// rather than standalone row counts.
 pub fn estimate_branch_cardinality(patterns: &[Pattern], stats: Option<&StatsView>) -> f64 {
+    estimate_branch_cardinality_from(patterns, &HashSet::new(), stats)
+}
+
+/// [`estimate_branch_cardinality`] with variables already bound by the
+/// enclosing scope — the first triple's estimate then reflects those bindings
+/// instead of its standalone row count.
+fn estimate_branch_cardinality_from(
+    patterns: &[Pattern],
+    outer_bound: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> f64 {
     if patterns.is_empty() {
         return HIGHLY_SELECTIVE;
     }
 
-    let mut bound_vars: HashSet<VarId> = HashSet::new();
+    let mut bound_vars: HashSet<VarId> = outer_bound.clone();
 
     // Separate triples from non-triples
     let mut triples: Vec<&TriplePattern> = Vec::new();
@@ -2091,7 +2154,9 @@ fn demote_disconnected_class_anchors(
         .filter(|&i| {
             let p = &remaining[i].pattern;
             !is_disconnected_class_anchor(p, bound_vars, anchor_vars)
-                && !(has_non_chain_alt && is_broad_annotation_sidecar(p))
+                && !(has_non_chain_alt
+                    && is_broad_annotation_sidecar(p)
+                    && !reifier_subject_bound(p, bound_vars))
         })
         .collect();
     if demoted.is_empty() {
@@ -2278,6 +2343,21 @@ fn is_broad_annotation_sidecar(pattern: &Pattern) -> bool {
                 && (sid.name.as_ref() == fluree_vocab::db::REIFIES_SUBJECT
                     || sid.name.as_ref() == fluree_vocab::db::REIFIES_OBJECT)
         }
+        _ => false,
+    }
+}
+
+/// A sidecar is only *broad* while its reifier subject is unbound. Once
+/// `?ann` is bound — by a body triple placed earlier or by the chain's own
+/// `f:reifiesPredicate` step — `?ann f:reifiesObject ?o` is a one-row
+/// subject probe, and demoting it hands the seed to whichever connected
+/// non-chain triple remains: the base edge with only `(s, p)` bound (fan =
+/// out-degree) or a body triple such as `?ann :derives_from ?x` (fan =
+/// annotations per reifier). Every later per-row probe then runs once per
+/// fanned row instead of once per reifier — the StarBench P2 / P11 timeouts.
+fn reifier_subject_bound(pattern: &Pattern, bound_vars: &HashSet<VarId>) -> bool {
+    match pattern {
+        Pattern::Triple(tp) => tp.s.as_var().is_some_and(|v| bound_vars.contains(&v)),
         _ => false,
     }
 }
@@ -5847,6 +5927,187 @@ mod tests {
         assert!(
             pos("HAS_MEMBER") < pos(fluree_vocab::db::REIFIES_OBJECT),
             "base edge must drive before the f:reifiesObject sidecar: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn bound_reifier_sidecars_stay_ahead_of_body_fanout() {
+        // StarBench P11: `<< ?s :TREATS ?o >> :derives_from ?x` once the
+        // chain's `f:reifiesPredicate` step has bound `?ann`. The two
+        // remaining sidecars are one-row subject probes now, while the body
+        // triple fans ~22 rows per reifier. Demoting the sidecars (pre-fix)
+        // crowned the body triple, so every later probe ran once per fanned
+        // row instead of once per reifier.
+        use fluree_vocab::db::{REIFIES_OBJECT, REIFIES_SUBJECT};
+        let (s, o, ann, x) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let fsid = |name| Ref::Sid(Sid::new(fluree_vocab::namespaces::FLUREE_DB, name));
+        let base = Pattern::Triple(make_pattern(s, "TREATS", o));
+        let r_subj = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            fsid(REIFIES_SUBJECT),
+            Term::Var(s),
+        ));
+        let r_obj = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            fsid(REIFIES_OBJECT),
+            Term::Var(o),
+        ));
+        let body = Pattern::Triple(make_pattern(ann, "derives_from", x));
+        let mut stats = stats_with(&[
+            ("TREATS", 100_000, 6_000),
+            ("derives_from", 6_500_000, 300_000),
+        ]);
+        for name in [REIFIES_SUBJECT, REIFIES_OBJECT] {
+            stats.properties.insert(
+                Sid::new(fluree_vocab::namespaces::FLUREE_DB, name),
+                PropertyStatData {
+                    count: 300_000,
+                    ndv_values: 30_000,
+                    ndv_subjects: 300_000,
+                },
+            );
+        }
+        let patterns = vec![base, r_subj, r_obj, body];
+        let mut bound = HashSet::new();
+        bound.insert(ann);
+        let ordered = reorder_patterns(&patterns, Some(&stats), &bound);
+
+        let pos = |pred: &str| {
+            ordered
+                .iter()
+                .position(|p| {
+                    matches!(p, Pattern::Triple(tp)
+                    if matches!(&tp.p, Ref::Sid(ps) if ps.name.as_ref() == pred))
+                })
+                .unwrap_or(usize::MAX)
+        };
+        let last_sidecar = pos(REIFIES_SUBJECT).max(pos(REIFIES_OBJECT));
+        assert!(
+            last_sidecar < pos("derives_from"),
+            "bound-reifier sidecars must run before the fanning body triple: {ordered:?}"
+        );
+        assert!(
+            last_sidecar < pos("TREATS"),
+            "bound-reifier sidecars must run before the base edge: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn bound_reifier_sidecar_beats_partially_bound_wildcard_edge() {
+        // StarBench P2: `<< ?s ?p ?o >> :derives_from ?x` once
+        // `f:reifiesSubject` / `f:reifiesPredicate` have bound `?ann`, `?s`
+        // and `?p`. `?ann f:reifiesObject ?o` is a one-row probe; the base
+        // edge with only (s, p) bound fans out over the subject's objects,
+        // each of which then needed its own reifiesObject check.
+        use fluree_vocab::db::REIFIES_OBJECT;
+        let (s, p, o, ann) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let base = Pattern::Triple(TriplePattern::new(Ref::Var(s), Ref::Var(p), Term::Var(o)));
+        let r_obj = Pattern::Triple(TriplePattern::new(
+            Ref::Var(ann),
+            Ref::Sid(Sid::new(
+                fluree_vocab::namespaces::FLUREE_DB,
+                REIFIES_OBJECT,
+            )),
+            Term::Var(o),
+        ));
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            Sid::new(fluree_vocab::namespaces::FLUREE_DB, REIFIES_OBJECT),
+            PropertyStatData {
+                count: 300_000,
+                ndv_values: 30_000,
+                ndv_subjects: 300_000,
+            },
+        );
+        let patterns = vec![base, r_obj];
+        let bound: HashSet<VarId> = [ann, s, p].into_iter().collect();
+        let ordered = reorder_patterns(&patterns, Some(&stats), &bound);
+        assert!(
+            matches!(&ordered[0], Pattern::Triple(tp)
+                if matches!(&tp.p, Ref::Sid(ps) if ps.name.as_ref() == REIFIES_OBJECT)),
+            "bound-reifier f:reifiesObject probe must precede the (s, p)-bound wildcard edge: {ordered:?}"
+        );
+    }
+
+    #[test]
+    fn annotation_wrapper_estimate_is_one_reifier_per_edge() {
+        // StarBench P11: the wrapper's cardinality must not multiply the
+        // reifiesPredicate lookup by the base edge (3,846 × 102,555 ≈ 4e8),
+        // which sorted the wrapper behind its own 6.5M-row body triple so
+        // that triple drove the chain once per row.
+        use fluree_vocab::db::{REIFIES_OBJECT, REIFIES_PREDICATE, REIFIES_SUBJECT};
+        let (s, o, ann, x) = (VarId(0), VarId(1), VarId(2), VarId(3));
+        let fsid = |name| Ref::Sid(Sid::new(fluree_vocab::namespaces::FLUREE_DB, name));
+        let chain = vec![
+            Pattern::Triple(make_pattern(s, "TREATS", o)),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(ann),
+                fsid(REIFIES_SUBJECT),
+                Term::Var(s),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(ann),
+                fsid(REIFIES_PREDICATE),
+                Term::Sid(Sid::new(100, "TREATS")),
+            )),
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(ann),
+                fsid(REIFIES_OBJECT),
+                Term::Var(o),
+            )),
+        ];
+        let body = Pattern::Triple(make_pattern(ann, "derives_from", x));
+        let mut stats = stats_with(&[
+            ("TREATS", 102_555, 6_000),
+            ("derives_from", 6_500_000, 300_000),
+        ]);
+        for (name, ndv_values) in [
+            (REIFIES_SUBJECT, 34_000),
+            (REIFIES_PREDICATE, 78),
+            (REIFIES_OBJECT, 32_000),
+        ] {
+            stats.properties.insert(
+                Sid::new(fluree_vocab::namespaces::FLUREE_DB, name),
+                PropertyStatData {
+                    count: 300_000,
+                    ndv_values,
+                    ndv_subjects: 300_000,
+                },
+            );
+        }
+        let row_count = |patterns: Vec<Pattern>| match estimate_pattern(
+            &Pattern::DefaultGraphSource { patterns },
+            &HashSet::new(),
+            Some(&stats),
+        ) {
+            PatternEstimate::Source { row_count } => row_count,
+            other => panic!("wrapper must be a Source: {other:?}"),
+        };
+
+        // Bare chain: the reifiesPredicate lookup (300k / 78 ≈ 3,846) is
+        // the cheaper entry point and bounds the reifier count.
+        let bare = row_count(chain.clone());
+        assert!(
+            (3_000.0..5_000.0).contains(&bare),
+            "bare chain ≈ 3,846 reifiers, got {bare}"
+        );
+        // With the body nested: reifiers × ~22 derives_from rows each.
+        let mut with_body = chain.clone();
+        with_body.push(body.clone());
+        let nested = row_count(with_body);
+        assert!(
+            (50_000.0..150_000.0).contains(&nested),
+            "chain × body ≈ 85k, got {nested}"
+        );
+        // And the wrapper drives its body triple, not the other way round.
+        let ordered = reorder_patterns(
+            &[Pattern::DefaultGraphSource { patterns: chain }, body],
+            Some(&stats),
+            &HashSet::new(),
+        );
+        assert!(
+            matches!(&ordered[0], Pattern::DefaultGraphSource { .. }),
+            "the annotation wrapper must seed before its 6.5M-row body triple: {ordered:?}"
         );
     }
 

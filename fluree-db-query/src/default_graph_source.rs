@@ -38,14 +38,10 @@ use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::{Sid, StatsView};
+use std::collections::HashSet;
 use std::sync::Arc;
 
-/// Below this many estimated driving rows the generic (well-ordered)
-/// `f:reifies*` chain — three narrow per-row probes — beats draining the
-/// whole annotation sidecar into hash maps. An unknown estimate takes the
-/// hash path: the unbounded-stream shape is exactly what the drain
-/// protects against.
-const HASH_ANNOTATION_MIN_DRIVING_ROWS: usize = 256;
+use crate::annotation_edge_probe::HASH_ANNOTATION_MIN_DRIVING_ROWS;
 
 /// Resolve a recognized relationship predicate ref to a concrete `Sid`
 /// for this snapshot. Cypher lowers relationship types to `Ref::Iri`, so
@@ -135,7 +131,21 @@ impl DefaultGraphSourceOperator {
         child: BoxedOperator,
         ctx: &ExecutionContext<'_>,
     ) -> Result<BoxedOperator> {
-        if self.annotation_probe_gates_pass(ctx) {
+        tracing::debug!(
+            arena = ctx.active_snapshot.annotation_index.is_some(),
+            store = ctx.active_snapshot.content_store.is_some(),
+            history = self.planning.is_history(),
+            overlay_empty = ctx.overlay().is_effectively_empty(),
+            root_policy = ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root()),
+            multi_ledger = ctx.is_multi_ledger(),
+            driving_est = ?child.estimated_rows(),
+            recognized = crate::annotation_edge_probe::recognize_annotation_edge(
+                &self.inner_patterns
+            )
+            .is_some(),
+            "annotation delegate gates"
+        );
+        if self.annotation_probe_gates_pass(ctx) && self.arena_lane_pays_off(&child) {
             if let Some(shape) =
                 crate::annotation_edge_probe::recognize_annotation_edge(&self.inner_patterns)
             {
@@ -170,6 +180,7 @@ impl DefaultGraphSourceOperator {
                     );
                     // Body (relationship-property reads, filters) plans
                     // normally on top, with the reifier var now bound.
+                    tracing::debug!(lane = "arena", "annotation delegate lane");
                     return build_where_operators_seeded(
                         Some(probe),
                         &shape.body,
@@ -236,6 +247,7 @@ impl DefaultGraphSourceOperator {
                             self.planning,
                         ),
                     );
+                    tracing::debug!(lane = "hash", "annotation delegate lane");
                     return build_where_operators_seeded(
                         Some(probe),
                         &shape.body,
@@ -246,6 +258,7 @@ impl DefaultGraphSourceOperator {
                 }
             }
         }
+        tracing::debug!(lane = "generic", "annotation delegate lane");
         build_where_operators_seeded(
             Some(child),
             &self.inner_patterns,
@@ -253,6 +266,29 @@ impl DefaultGraphSourceOperator {
             None,
             &self.planning,
         )
+    }
+
+    /// The forward-arena probe drains the WHOLE base-edge scan into memory
+    /// and merge-probes the arena with it, so it pays off only when the
+    /// base edge is the cheaper entry point into the chain. Driving
+    /// `<< ?s ?p ?o >>` through it scanned every flake of the StarBench
+    /// slice (10.6M rows, 24 s) where the reifier-first generic chain
+    /// touched 300k rows (4 s); on the typed `<< ?s :P ?o >>` shape the
+    /// two were within 2× of each other. The ratio is that measured
+    /// crossover, not a tuned optimum.
+    fn arena_lane_pays_off(&self, child: &BoxedOperator) -> bool {
+        const EDGE_TO_REIFIER_ROWS_RATIO: f64 = 16.0;
+        let bound: HashSet<VarId> = child.schema().iter().copied().collect();
+        match crate::planner::annotation_chain_entry_rows(
+            &self.inner_patterns,
+            &bound,
+            self.stats.as_deref(),
+        ) {
+            Some((edge_first, reifier_first)) => {
+                edge_first <= reifier_first * EDGE_TO_REIFIER_ROWS_RATIO
+            }
+            None => true,
+        }
     }
 
     /// Eligibility for the required-lane hash sidecar probe. Unlike the
