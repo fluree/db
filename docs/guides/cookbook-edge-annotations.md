@@ -12,8 +12,7 @@ Throughout, the running example is employment: a `worksFor` edge that needs a `r
 |---|---|---|
 | JSON-LD writes, or you need named-graph edges, or literal-valued edges | **JSON-LD `@annotation`** | Most complete surface — covers everything below. |
 | A SPARQL 1.1/1.2 pipeline, or you're porting RDF-star data | **SPARQL 1.2 annotation tail** (`{\| \|}`, `~`, `rdf:reifies`) | Standards syntax. Default-graph only today. |
-| A Turtle / N-Triples file with RDF 1.2 annotations | **Ingest it directly** — `{\| \|}`, `~`, `<< >>`, and `rdf:reifies <<( )>>` all read | Same on-disk shape as `@annotation`; the reified triple is asserted. Default graph only (see [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)). |
-| A TriG / N-Quads file with annotations inside named graphs | Convert to JSON-LD, **or** ingest plain edges then add annotations | TriG-star inside `GRAPH { }` is deferred. |
+| A Turtle / N-Triples / TriG / N-Quads file with RDF 1.2 annotations | **Ingest it directly** — `{\| \|}`, `~`, `<< >>`, and `rdf:reifies <<( )>>` all read, in the default graph and inside `GRAPH { }` blocks | Same on-disk shape as `@annotation`; the reified triple is asserted (see [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)). |
 
 ## Attach metadata to a relationship
 

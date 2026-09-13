@@ -481,7 +481,18 @@ Two rules to know:
 - **The reified triple is asserted.** RDF 1.2 says `<< s p o >>` and `r rdf:reifies <<( s p o )>>` do *not* put `s p o` in the graph; Fluree's annotations describe a live edge, so ingest asserts the base triple as well. Each anonymous `<< s p o >>` / `{| |}` occurrence mints a fresh reifier — two textual occurrences are two annotations.
 - **`<<( ... )>>` is accepted only as the object of `rdf:reifies`.** As a plain value (`ex:doc ex:mentions <<( ... )>>`), nested inside another triple term, or inside an annotation body, it is rejected with a specific "deferred" error rather than silently dropped.
 
-TriG and N-Quads share the same parser for default-graph statements. A star construct **inside a `GRAPH { }` block** (or an N-Quads statement with a graph label) is rejected with a clear TriG-star deferred error — use the JSON-LD `@annotation` surface to annotate an edge in a named graph.
+TriG and N-Quads accept the same forms inside `GRAPH { }` blocks (and on N-Quads statements with a graph label). The annotation is written into that graph and carries the edge's graph identity, exactly as JSON-LD `@graph` + `@annotation` does:
+
+```trig
+@prefix ex: <http://example.org/> .
+
+GRAPH ex:hr {
+  ex:alice ex:worksFor ex:acme {| ex:role "Engineer" |} .
+  << ex:alice ex:knows ex:bob ~ ex:f1 >> ex:confidence 0.9 .
+}
+```
+
+Annotations are not allowed in the `#txn-meta` graph — its triples become commit metadata, not edges.
 
 See the [Edge annotations concept doc](../concepts/edge-annotations.md) for the full RDF 1.2 / SPARQL 1.2 surface — `rdf:reifies` for annotation-rooted queries, the per-operation rules for INSERT DATA / DELETE DATA / INSERT WHERE / DELETE WHERE templates, and the deferred shapes that produce parse errors.
 

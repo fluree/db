@@ -473,6 +473,7 @@ pub(crate) fn validate_value_dt_pair(val: &FlakeValue, dt: &Sid) -> Result<()> {
 /// guard already, so this only fires on shapes the base emission also
 /// rejected.
 pub(crate) fn reified_triple_bundle(
+    g: Option<Sid>,
     s: Sid,
     p: Sid,
     o: FlakeValue,
@@ -484,7 +485,7 @@ pub(crate) fn reified_triple_bundle(
     let lang = dtc.lang_tag().map(std::string::ToString::to_string);
     validate_value_dt_pair(&o, &dt)?;
     let key = fluree_db_core::edge::EdgeKey {
-        g: None,
+        g,
         s,
         p,
         o,

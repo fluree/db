@@ -307,7 +307,7 @@ impl GraphSink for FlakeSink<'_> {
             return Ok(());
         };
 
-        match crate::generate::flakes::reified_triple_bundle(s, p, o, &dtc, &ann, self.t) {
+        match crate::generate::flakes::reified_triple_bundle(None, s, p, o, &dtc, &ann, self.t) {
             Ok(bundle) => self.flakes.extend(bundle),
             Err(e) => {
                 tracing::error!("FlakeSink: invariant violation in reifier bundle, aborting — {e}");
