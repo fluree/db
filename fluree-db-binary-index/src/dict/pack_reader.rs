@@ -5,8 +5,8 @@
 //!
 //! ## Loading
 //!
-//! - **`from_pack_refs`**: Async constructor. Resolves locally available packs
-//!   immediately; defers remote packs to lazy fetch on first lookup.
+//! - **`from_pack_refs`**: Builds routing handles without opening pack files.
+//!   Local and remote packs load and validate on first lookup or background warming.
 //! - **`from_memory`**: In-memory constructor for testing.
 
 #[cfg(target_arch = "wasm32")]
@@ -47,7 +47,7 @@ enum PackInner {
         meta: ParsedPackMeta,
         backing: LoadedBacking,
     },
-    /// Pack deferred: will be fetched from CAS on first lookup.
+    /// Pack deferred: resolve locally or fetch from CAS on first lookup.
     Lazy {
         pack_cid: ContentId,
         cache_path: PathBuf,
@@ -111,8 +111,8 @@ struct LoadContext {
 /// Manages one or more `FPK1` packs, sorted by ID range. Lookups binary-search
 /// the packs, then use pre-parsed metadata for zero-alloc page navigation.
 ///
-/// Locally available packs are eagerly loaded at construction. Remote packs
-/// are lazily fetched on first lookup.
+/// Local and remote packs are loaded and validated on first lookup. Concurrent
+/// readers and background warming share the same one-time initialization.
 pub struct ForwardPackReader {
     /// Shared so a reload of the same routing table can carry a handle (and
     /// its open backing) over from the previous reader.
@@ -122,21 +122,13 @@ pub struct ForwardPackReader {
 }
 
 impl ForwardPackReader {
-    /// Load packs from CAS. Does not perform remote fetches.
+    /// Build routing handles without probing or opening pack files.
     ///
-    /// For each `PackBranchEntry`:
-    /// 1. If `cs.resolve_local_path(&cid)` returns a path → load + validate → `Loaded`.
-    /// 2. Else if cache file exists → load + validate → `Loaded`.
-    /// 3. Else → `Lazy` handle (fetched + cached + loaded on first lookup).
-    ///
-    /// "Load" is `read()` for small packs and `mmap` for large ones — see
-    /// [`DEFAULT_MMAP_MIN_BYTES`]. This path is eager over EVERY pack in the
-    /// routing table, so it is where a mapping-per-pack becomes a hard cap on
-    /// how many ledgers a process can hold open at once.
-    ///
-    /// Loaded packs are validated: ID range must match the routing entry, and
-    /// `kind`/`ns_code` must match `expected_kind`/`expected_ns_code`. Lazy packs
-    /// are validated on first fetch.
+    /// The root's ID ranges are checked immediately. On first lookup or warming,
+    /// each pack is resolved locally before trying remote CAS, opened (heap-read
+    /// for small packs, mmap for large ones), and validated against its routing
+    /// range, kind, and namespace. Missing or malformed packs therefore fail on
+    /// use rather than preventing unrelated queries from opening the ledger.
     pub async fn from_pack_refs(
         cs: Arc<dyn ContentStore>,
         cache_dir: &Path,
@@ -165,13 +157,6 @@ impl ForwardPackReader {
         expected_ns_code: u16,
         prev: Option<&ForwardPackReader>,
     ) -> io::Result<Self> {
-        // Pre-create cache directory once.
-        if !refs.is_empty() {
-            fluree_db_core::disk_cache::ensure_cache_dir(cache_dir).map_err(|e| {
-                io::Error::other(format!("create cache dir {}: {}", cache_dir.display(), e))
-            })?;
-        }
-
         let prev = prev.filter(|p| {
             p.load_ctx.as_ref().is_some_and(|ctx| {
                 ctx.expected_kind == expected_kind && ctx.expected_ns_code == expected_ns_code
@@ -225,27 +210,13 @@ impl ForwardPackReader {
             let cache_name = format!("{}.fpk", entry.pack_cid.digest_hex());
             let cache_path = cache_dir.join(&cache_name);
 
-            let local_path = cs.resolve_local_path(&entry.pack_cid);
-
-            let inner = if let Some(path) = local_path {
-                // Local CAS path.
-                let backing = load_pack_backing(&path)?;
-                let meta = parse_pack_meta(backing.bytes())?;
-                validate_meta(&meta, entry, expected_kind, expected_ns_code)?;
-                PackInner::Loaded { meta, backing }
-            } else if cache_path.exists() {
-                // Cached on disk.
-                let backing = load_pack_backing(&cache_path)?;
-                let meta = parse_pack_meta(backing.bytes())?;
-                validate_meta(&meta, entry, expected_kind, expected_ns_code)?;
-                PackInner::Loaded { meta, backing }
-            } else {
-                // Remote — defer to lazy fetch on first lookup.
-                PackInner::Lazy {
-                    pack_cid: entry.pack_cid.clone(),
-                    cache_path,
-                    loaded: OnceCell::new(),
-                }
+            // Use the same lazy path for local and remote packs. It probes
+            // local CAS and the disk cache before fetching, so opening a ledger
+            // needs only the routing table, not every dictionary file.
+            let inner = PackInner::Lazy {
+                pack_cid: entry.pack_cid.clone(),
+                cache_path,
+                loaded: OnceCell::new(),
             };
             packs.push(Arc::new(PackHandle {
                 cid: Some(entry.pack_cid.clone()),
@@ -423,6 +394,14 @@ impl std::fmt::Debug for ForwardPackReader {
 
 /// Validate that pack handles have strictly increasing, non-overlapping ID ranges.
 fn validate_pack_routing(packs: &[Arc<PackHandle>]) -> io::Result<()> {
+    for pack in packs {
+        if pack.first_id > pack.last_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pack routing: first_id exceeds last_id",
+            ));
+        }
+    }
     for i in 1..packs.len() {
         let prev_last = packs[i - 1].last_id;
         let curr_first = packs[i].first_id;
@@ -434,43 +413,6 @@ fn validate_pack_routing(packs: &[Arc<PackHandle>]) -> io::Result<()> {
                 ),
             ));
         }
-    }
-    Ok(())
-}
-
-/// Validate parsed pack metadata against the root routing entry and expected kind/ns_code.
-fn validate_meta(
-    meta: &ParsedPackMeta,
-    entry: &PackBranchEntry,
-    expected_kind: u8,
-    expected_ns_code: u16,
-) -> io::Result<()> {
-    if meta.first_id != entry.first_id || meta.last_id != entry.last_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "pack header range [{}, {}] doesn't match root routing entry [{}, {}]",
-                meta.first_id, meta.last_id, entry.first_id, entry.last_id,
-            ),
-        ));
-    }
-    if meta.kind != expected_kind {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "pack kind {} doesn't match expected {}",
-                meta.kind, expected_kind,
-            ),
-        ));
-    }
-    if meta.ns_code != expected_ns_code {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "pack ns_code {} doesn't match expected {}",
-                meta.ns_code, expected_ns_code,
-            ),
-        ));
     }
     Ok(())
 }
@@ -578,8 +520,7 @@ fn fetch_and_load(
     Ok(LazyLoaded { meta, backing })
 }
 
-/// Validate metadata for a lazily loaded pack (same checks as eager, but using
-/// the expected range stored on the handle rather than a `PackBranchEntry`).
+/// Validate a loaded pack against the expected range and dictionary stream.
 fn validate_lazy_meta(
     meta: &ParsedPackMeta,
     expected_first: u64,
@@ -1050,8 +991,7 @@ mod tests {
         );
 
         // Same cid under a different id range is a different routing entry
-        // (a fresh cache dir keeps the handle lazy, so the mismatch is not
-        // caught by the eager header check first).
+        // (the mismatch is checked when the new handle is used).
         let other_cache_dir = cache_dir.join("shifted");
         let shifted = ForwardPackReader::from_pack_refs_reusing(
             Arc::clone(&cs),
@@ -1152,5 +1092,299 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// Test store whose local-path probes are observable independently of CAS
+    /// fetches. The same files can also stand in for a populated disk cache.
+    #[derive(Debug)]
+    struct FilePackStore {
+        dir: PathBuf,
+        local: bool,
+        resolves: AtomicU64,
+        gets: AtomicU64,
+        fallback: MemoryContentStore,
+    }
+
+    impl FilePackStore {
+        fn new(local: bool) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "fluree_lazy_local_{}_{}",
+                std::process::id(),
+                TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self {
+                dir,
+                local,
+                resolves: AtomicU64::new(0),
+                gets: AtomicU64::new(0),
+                fallback: MemoryContentStore::new(),
+            }
+        }
+
+        fn path(&self, id: &ContentId) -> PathBuf {
+            self.dir.join(format!("{}.fpk", id.digest_hex()))
+        }
+    }
+
+    impl Drop for FilePackStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ContentStore for FilePackStore {
+        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+            self.fallback.has(id).await
+        }
+        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+            self.gets.fetch_add(1, Ordering::Relaxed);
+            self.fallback.get(id).await
+        }
+        async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {
+            let id = self.fallback.put(kind, bytes).await?;
+            std::fs::write(self.path(&id), bytes).unwrap();
+            Ok(id)
+        }
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.fallback.put_with_id(id, bytes).await?;
+            std::fs::write(self.path(id), bytes).unwrap();
+            Ok(())
+        }
+        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+            self.fallback.release(id).await
+        }
+        fn resolve_local_path(&self, id: &ContentId) -> Option<PathBuf> {
+            self.resolves.fetch_add(1, Ordering::Relaxed);
+            self.local.then(|| self.path(id))
+        }
+    }
+
+    async fn file_pack(cs: &FilePackStore, first: u64, count: usize) -> PackBranchEntry {
+        let pack_cid = cs
+            .put(
+                ContentKind::DictBlob {
+                    dict: DictKind::StringForward,
+                },
+                &make_pack_bytes(first, count),
+            )
+            .await
+            .unwrap();
+        PackBranchEntry {
+            first_id: first,
+            last_id: first + count as u64 - 1,
+            pack_cid,
+        }
+    }
+
+    #[tokio::test]
+    async fn local_and_cached_packs_open_only_on_use() {
+        for local in [true, false] {
+            let cs = Arc::new(FilePackStore::new(local));
+            let refs = vec![file_pack(&cs, 0, 50).await, file_pack(&cs, 100, 50).await];
+            let reader =
+                ForwardPackReader::from_pack_refs(cs.clone(), &cs.dir, &refs, KIND_STRING_FWD, 0)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                cs.resolves.load(Ordering::Relaxed),
+                0,
+                "constructor must not probe files"
+            );
+            assert_eq!(cs.gets.load(Ordering::Relaxed), 0);
+            assert_eq!(reader.prewarm(0), 0);
+            assert_eq!(
+                reader.forward_lookup_str(75).unwrap(),
+                None,
+                "gap needs no pack"
+            );
+            assert_eq!(cs.resolves.load(Ordering::Relaxed), 0);
+
+            // Reusing an unopened handle must remain lazy and share its first load.
+            let reused = ForwardPackReader::from_pack_refs_reusing(
+                cs.clone(),
+                &cs.dir,
+                &refs,
+                KIND_STRING_FWD,
+                0,
+                Some(&reader),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reused.packs_shared_with(&reader), 2);
+            assert_eq!(
+                reused.forward_lookup_str(7).unwrap().as_deref(),
+                Some("val_7")
+            );
+            assert_eq!(
+                reader.forward_lookup_str(7).unwrap().as_deref(),
+                Some("val_7")
+            );
+            assert_eq!(cs.resolves.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                cs.gets.load(Ordering::Relaxed),
+                0,
+                "local/cache hit must not fetch CAS"
+            );
+            assert!(
+                matches!(&reader.packs[1].inner, PackInner::Lazy {loaded, ..} if loaded.get().is_none())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_first_reads_and_warming_share_one_load() {
+        let cs = Arc::new(FilePackStore::new(true));
+        let refs = [file_pack(&cs, 0, 50).await];
+        let reader = Arc::new(
+            ForwardPackReader::from_pack_refs(cs.clone(), &cs.dir, &refs, KIND_STRING_FWD, 0)
+                .await
+                .unwrap(),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let reader = &reader;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..100 {
+                        assert_eq!(
+                            reader.forward_lookup_str(7).unwrap().as_deref(),
+                            Some("val_7")
+                        );
+                    }
+                });
+            }
+            barrier.wait();
+            assert_eq!(reader.prewarm(1), 1);
+        });
+        assert_eq!(cs.resolves.load(Ordering::Relaxed), 1);
+        assert_eq!(cs.gets.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_local_validation_and_retry_preserve_errors() {
+        let cs = Arc::new(FilePackStore::new(true));
+        let entry = file_pack(&cs, 0, 50).await;
+        for (first, last, kind, ns, message) in [
+            (1, 49, KIND_STRING_FWD, 0, "pack header range"),
+            (0, 49, KIND_SUBJECT_FWD, 0, "pack kind"),
+            (0, 49, KIND_STRING_FWD, 3, "pack ns_code"),
+        ] {
+            let refs = [PackBranchEntry {
+                first_id: first,
+                last_id: last,
+                pack_cid: entry.pack_cid.clone(),
+            }];
+            let reader = ForwardPackReader::from_pack_refs(cs.clone(), &cs.dir, &refs, kind, ns)
+                .await
+                .unwrap();
+            let err = reader.forward_lookup_str(7).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains(message), "{err}");
+        }
+
+        let reader = ForwardPackReader::from_pack_refs(
+            cs.clone(),
+            &cs.dir,
+            std::slice::from_ref(&entry),
+            KIND_STRING_FWD,
+            0,
+        )
+        .await
+        .unwrap();
+        let path = cs.path(&entry.pack_cid);
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"broken header").unwrap();
+        assert!(reader.forward_lookup_str(7).is_err());
+        // Failed initialization must not poison the cell; this also models a
+        // temporarily missing local artifact being restored by storage.
+        std::fs::remove_file(&path).unwrap();
+        assert!(reader.forward_lookup_str(7).is_err());
+        std::fs::write(&path, original).unwrap();
+        assert_eq!(
+            reader.forward_lookup_str(7).unwrap().as_deref(),
+            Some("val_7")
+        );
+    }
+
+    #[tokio::test]
+    async fn root_routing_is_validated_without_opening_packs() {
+        let cs = Arc::new(FilePackStore::new(true));
+        let entry = file_pack(&cs, 0, 50).await;
+        let reversed = PackBranchEntry {
+            first_id: 50,
+            last_id: 49,
+            pack_cid: entry.pack_cid.clone(),
+        };
+        for refs in [vec![reversed], vec![entry.clone(), entry]] {
+            let err =
+                ForwardPackReader::from_pack_refs(cs.clone(), &cs.dir, &refs, KIND_STRING_FWD, 0)
+                    .await
+                    .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+        assert_eq!(cs.resolves.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "local opening probe; DICT_OPEN_PACKS sets fixture size"]
+    async fn local_dictionary_open_probe() {
+        let n: usize = std::env::var("DICT_OPEN_PACKS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000);
+        let cs = Arc::new(FilePackStore::new(true));
+        let mut refs = Vec::with_capacity(n);
+        for i in 0..n {
+            refs.push(file_pack(&cs, i as u64 * 100, 100).await);
+        }
+        for run in 0..5 {
+            let start = std::time::Instant::now();
+            let reader =
+                ForwardPackReader::from_pack_refs(cs.clone(), &cs.dir, &refs, KIND_STRING_FWD, 0)
+                    .await
+                    .unwrap();
+            let open = start.elapsed();
+            let first = std::time::Instant::now();
+            assert_eq!(
+                reader.forward_lookup_str(7).unwrap().as_deref(),
+                Some("val_7")
+            );
+            let first = first.elapsed();
+            let all = std::time::Instant::now();
+            for i in 0..n {
+                let id = i as u64 * 100 + 7;
+                assert_eq!(
+                    reader.forward_lookup_str(id).unwrap(),
+                    Some(format!("val_{id}"))
+                );
+            }
+            let all = all.elapsed();
+            let hot = std::time::Instant::now();
+            let mut out = Vec::new();
+            for _ in 0..20 {
+                for i in 0..n {
+                    out.clear();
+                    assert!(reader
+                        .forward_lookup_into(i as u64 * 100 + 7, &mut out)
+                        .unwrap());
+                    std::hint::black_box(&out);
+                }
+            }
+            let hot = hot.elapsed();
+            eprintln!(
+                "DICT_HOT packs={n} run={run} lookups={} hot_us={}",
+                n * 20,
+                hot.as_micros()
+            );
+            eprintln!(
+                "DICT_OPEN packs={n} run={run} open_us={} first_us={} all_us={}",
+                open.as_micros(),
+                first.as_micros(),
+                all.as_micros()
+            );
+        }
     }
 }
