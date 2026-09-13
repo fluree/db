@@ -56,6 +56,15 @@ fn resolve_pred_sid(p: &Ref, ctx: &ExecutionContext<'_>) -> Option<Sid> {
     }
 }
 
+/// What the annotation-first enumeration lane binds (see
+/// `DefaultGraphSourceOperator::enumeration_plan`).
+struct EnumerationPlan {
+    s_var: VarId,
+    p_pos: crate::annotation_edge_probe::EdgePos,
+    o_var: VarId,
+    estimated: Option<usize>,
+}
+
 pub struct DefaultGraphSourceOperator {
     child: BoxedOperator,
     inner_patterns: Vec<Pattern>,
@@ -75,6 +84,11 @@ pub struct DefaultGraphSourceOperator {
     /// ONCE seeded by the whole child stream (base edge can hash-join) and
     /// streamed directly, instead of replanning + re-executing per parent row.
     single_graph_delegate: Option<BoxedOperator>,
+    /// Planner estimate of the wrapped chain's output, with the child's
+    /// variables bound — the same figure `reorder_patterns` placed the
+    /// wrapper by. Reported through `estimated_rows` so the join above sees
+    /// a real driving count instead of the `None` that read as one row.
+    estimated: Option<usize>,
 }
 
 impl DefaultGraphSourceOperator {
@@ -107,6 +121,21 @@ impl DefaultGraphSourceOperator {
         schema_vec.extend(&new_vars);
         let schema = Arc::from(schema_vec.into_boxed_slice());
 
+        let bound: HashSet<VarId> = child.schema().iter().copied().collect();
+        let estimated = crate::planner::estimate_annotation_chain_cardinality(
+            &inner_patterns,
+            &bound,
+            stats.as_deref(),
+        )
+        .unwrap_or_else(|| {
+            crate::planner::estimate_branch_cardinality_from(
+                &inner_patterns,
+                &bound,
+                stats.as_deref(),
+            )
+        });
+        let estimated = Some(estimated.round().max(1.0) as usize);
+
         Self {
             child,
             inner_patterns,
@@ -117,6 +146,7 @@ impl DefaultGraphSourceOperator {
             planning,
             stats,
             single_graph_delegate: None,
+            estimated,
         }
     }
 
@@ -183,6 +213,37 @@ impl DefaultGraphSourceOperator {
                     tracing::debug!(lane = "arena", "annotation delegate lane");
                     return build_where_operators_seeded(
                         Some(probe),
+                        &shape.body,
+                        self.stats.clone(),
+                        None,
+                        &self.planning,
+                    );
+                }
+            }
+        }
+        // Annotation-first enumeration: the arena lane was declined because
+        // the base edge is the wider entry point (a wildcard, or a predicate
+        // larger than the arena). Stream the arena instead of scanning the
+        // base edge — see `AnnotationEnumerateOperator` for why no base-edge
+        // check is needed under these gates.
+        if self.annotation_probe_gates_pass(ctx) && !self.arena_lane_pays_off(&child) {
+            if let Some(shape) =
+                crate::annotation_edge_probe::recognize_annotation_edge(&self.inner_patterns)
+            {
+                if let Some(plan) = self.enumeration_plan(&shape, &child, ctx) {
+                    let op = Box::new(
+                        crate::annotation_edge_probe::AnnotationEnumerateOperator::new(
+                            child,
+                            shape.ann_var,
+                            plan.s_var,
+                            plan.p_pos,
+                            plan.o_var,
+                            plan.estimated,
+                        ),
+                    );
+                    tracing::debug!(lane = "enumerate", "annotation delegate lane");
+                    return build_where_operators_seeded(
+                        Some(op),
                         &shape.body,
                         self.stats.clone(),
                         None,
@@ -269,26 +330,87 @@ impl DefaultGraphSourceOperator {
     }
 
     /// The forward-arena probe drains the WHOLE base-edge scan into memory
-    /// and merge-probes the arena with it, so it pays off only when the
-    /// base edge is the cheaper entry point into the chain. Driving
-    /// `<< ?s ?p ?o >>` through it scanned every flake of the StarBench
-    /// slice (10.6M rows, 24 s) where the reifier-first generic chain
-    /// touched 300k rows (4 s); on the typed `<< ?s :P ?o >>` shape the
-    /// two were within 2× of each other. The ratio is that measured
-    /// crossover, not a tuned optimum.
+    /// and merge-probes the arena with it, so it pays off only while the base
+    /// edge is narrower than the arena itself — the alternative for a wider
+    /// base edge is the enumeration lane, whose cost is the whole arena walk
+    /// (`live_attachment_pairs` rows) whatever the predicate. Driving
+    /// `<< ?s ?p ?o >>` through this lane scanned every flake of the
+    /// StarBench slice (10.6M rows, 24 s) where the reifier-first chain
+    /// touched 300k; at full scale `<< ?s :TREATS ?o >>` (952k edge rows)
+    /// belongs here, not in a 21.4M-row arena walk. Comparing against the
+    /// reifier-first *estimate* instead was wrong on skewed predicates: the
+    /// per-predicate NDV put TREATS at 31,751 reifiers when it has ~1.1M.
+    /// The buffer ceiling is the hash lane's sweep ceiling.
     fn arena_lane_pays_off(&self, child: &BoxedOperator) -> bool {
-        const EDGE_TO_REIFIER_ROWS_RATIO: f64 = 16.0;
+        const BUFFERED_BASE_MAX_ROWS: f64 = 20_000_000.0;
         let bound: HashSet<VarId> = child.schema().iter().copied().collect();
-        match crate::planner::annotation_chain_entry_rows(
+        let Some((edge_first, reifier_first)) = crate::planner::annotation_chain_entry_rows(
             &self.inner_patterns,
             &bound,
             self.stats.as_deref(),
-        ) {
-            Some((edge_first, reifier_first)) => {
-                edge_first <= reifier_first * EDGE_TO_REIFIER_ROWS_RATIO
-            }
-            None => true,
+        ) else {
+            return true;
+        };
+        let arena_rows = self.stats.as_deref().and_then(|s| {
+            s.get_property(&Sid::new(
+                fluree_vocab::namespaces::FLUREE_DB,
+                fluree_vocab::db::REIFIES_SUBJECT,
+            ))
+            .map(|p| p.count as f64)
+        });
+        match arena_rows {
+            Some(rows) => edge_first <= rows.min(BUFFERED_BASE_MAX_ROWS),
+            // No arena statistics: the generic ratio from before the arena
+            // row count was available.
+            None => edge_first <= reifier_first * 16.0,
         }
+    }
+
+    /// Eligibility for the annotation-first enumeration: both base-edge
+    /// endpoints are variables the child leaves unbound (so an edge-first
+    /// scan would sweep a whole predicate or the whole graph), the child
+    /// binds none of the chain's variables (each live pair simply fans out
+    /// per driving row), and the predicate is a variable or resolves for
+    /// this snapshot. The row estimate is the reifier-first entry cost the
+    /// planner already computed for the wrapper.
+    fn enumeration_plan(
+        &self,
+        shape: &crate::annotation_edge_probe::AnnotationEdgeShape,
+        child: &BoxedOperator,
+        ctx: &ExecutionContext<'_>,
+    ) -> Option<EnumerationPlan> {
+        use crate::annotation_edge_probe::EdgePos;
+        let (EdgePos::Var(s_var), EdgePos::Var(o_var)) = (&shape.s_pos, &shape.o_pos) else {
+            return None;
+        };
+        let p_pos = match &shape.p_pred {
+            Ref::Var(v) => EdgePos::Var(*v),
+            pred => EdgePos::Const(resolve_pred_sid(pred, ctx)?),
+        };
+        let child_vars: HashSet<VarId> = child.schema().iter().copied().collect();
+        let p_var = match &p_pos {
+            EdgePos::Var(v) => Some(*v),
+            EdgePos::Const(_) => None,
+        };
+        if child_vars.contains(s_var)
+            || child_vars.contains(o_var)
+            || child_vars.contains(&shape.ann_var)
+            || p_var.is_some_and(|v| child_vars.contains(&v))
+        {
+            return None;
+        }
+        let estimated = crate::planner::annotation_chain_entry_rows(
+            &self.inner_patterns,
+            &child_vars,
+            self.stats.as_deref(),
+        )
+        .map(|(_, reifier_first)| reifier_first.round().max(1.0) as usize);
+        Some(EnumerationPlan {
+            s_var: *s_var,
+            p_pos,
+            o_var: *o_var,
+            estimated,
+        })
     }
 
     /// Eligibility for the required-lane hash sidecar probe. Unlike the
@@ -561,6 +683,6 @@ impl Operator for DefaultGraphSourceOperator {
     }
 
     fn estimated_rows(&self) -> Option<usize> {
-        None
+        self.estimated
     }
 }

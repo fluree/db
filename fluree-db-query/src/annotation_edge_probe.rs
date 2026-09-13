@@ -1354,6 +1354,297 @@ impl Operator for HashAnnotationEdgeProbeOperator {
     }
 }
 
+/// Annotation-first enumeration: stream every live attachment out of the
+/// forward arena and bind the reified edge's positions plus the reifier,
+/// without scanning the base edge at all.
+///
+/// The physical answer to `<< ?s ?p ?o >> :q ?x` (and to `<< ?s :P ?o >>`
+/// when `:P` is wider than the arena). The edge-first lanes scan the base
+/// edge and probe per row, which for a wildcard base edge means every flake
+/// in the graph; the generic chain instead re-probes the base edge once per
+/// reifier — 33.6M fully-bound point lookups on full-scale StarBench P2
+/// (757 s). Here the arena's reverse leaves are read once, in reifier order, one
+/// leaf at a time, and each live `(edge, ann)` pair becomes a row per
+/// driving row, encoded through the dictionaries like scan output.
+///
+/// No base-edge visibility check is needed under this lane's gates (root
+/// policy, current state, empty overlay): every write surface asserts the
+/// base triple it annotates — Turtle-star ingest, JSON-LD `@annotation`,
+/// SPARQL UPDATE — `@reifies`-rooted inserts are rejected, and a base-edge
+/// retract cascades to its attachments, so a live arena row implies a live
+/// default-graph edge. Named-graph attachments (`EdgeKey.g = Some`) are
+/// skipped, as the arena probe lane skips them.
+/// The dictionaries the enumeration lane encodes through.
+struct Dicts<'a> {
+    store: Option<&'a fluree_db_binary_index::BinaryIndexStore>,
+    dict_novelty: Option<&'a fluree_db_core::dict_novelty::DictNovelty>,
+}
+
+pub struct AnnotationEnumerateOperator {
+    child: BoxedOperator,
+    /// Constant relationship predicate to filter the walk by, or the
+    /// variable the walk binds; the schema records where it lands.
+    p_pos: EdgePos,
+    schema: Arc<[VarId]>,
+    state: OperatorState,
+    root: Option<AnnotationIndexRoot>,
+    store: Option<Arc<dyn ContentStore>>,
+    as_of_t: i64,
+    /// Buffered driving rows (normally the one seed row); every live pair is
+    /// emitted once per driving row. `None` until the child is drained.
+    child_rows: Option<Vec<Vec<Binding>>>,
+    /// Reverse-arena leaves still to walk, in reifier order. `None` until
+    /// the branch is read.
+    leaves: Option<std::collections::VecDeque<fluree_db_core::ContentId>>,
+    /// Predicate `Sid → p_id` for this snapshot, so the walk emits
+    /// `EncodedPid` like a scan would (the table has a few hundred entries).
+    pred_ids: HashMap<Sid, u32>,
+    result_buffer: Vec<Vec<Binding>>,
+    buffer_pos: usize,
+    estimated: Option<usize>,
+}
+
+impl AnnotationEnumerateOperator {
+    pub(crate) fn new(
+        child: BoxedOperator,
+        ann_var: VarId,
+        s_var: VarId,
+        p_pos: EdgePos,
+        o_var: VarId,
+        estimated: Option<usize>,
+    ) -> Self {
+        // Child columns, then the edge positions this lane binds, then the
+        // reifier — the order `emit` fills.
+        let mut schema_vec: Vec<VarId> = child.schema().to_vec();
+        schema_vec.push(s_var);
+        if let EdgePos::Var(v) = &p_pos {
+            schema_vec.push(*v);
+        }
+        schema_vec.push(o_var);
+        schema_vec.push(ann_var);
+        Self {
+            child,
+            p_pos,
+            schema: Arc::from(schema_vec.into_boxed_slice()),
+            state: OperatorState::Created,
+            root: None,
+            store: None,
+            as_of_t: 0,
+            child_rows: None,
+            leaves: None,
+            pred_ids: HashMap::new(),
+            result_buffer: Vec::new(),
+            buffer_pos: 0,
+            estimated,
+        }
+    }
+
+    /// A ref position as the scan would bind it: `EncodedSid` through the
+    /// persisted subject dictionary (or dictionary novelty), falling back to
+    /// the materialized `Sid` only when the subject is unknown to both —
+    /// which the lane's empty-overlay gate makes unexpected. Encoded rows
+    /// keep the downstream join and aggregate in id space: the materialized
+    /// form cost 40% of P2's time in `Arc<str>` clone/drop churn.
+    fn ref_binding(sid: &Sid, dicts: &Dicts<'_>) -> Binding {
+        let persisted = dicts.store.and_then(|st| {
+            st.find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                .ok()
+                .flatten()
+        });
+        let novelty = || {
+            dicts
+                .dict_novelty
+                .filter(|dn| dn.is_initialized())
+                .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
+        };
+        match persisted.or_else(novelty) {
+            Some(s_id) => Binding::encoded_sid(s_id),
+            None => Binding::sid(sid.clone()),
+        }
+    }
+
+    /// The reified object as a binding, exactly as the base scan would have
+    /// bound it: refs encoded, literals with the datatype and language tag
+    /// the arena stored from the original flake.
+    fn object_binding(edge: &EdgeKey, dicts: &Dicts<'_>) -> Binding {
+        match (&edge.o, &edge.lang) {
+            (FlakeValue::Ref(sid), _) => Self::ref_binding(sid, dicts),
+            (val, Some(lang)) => Binding::lit_lang(val.clone(), lang.as_str()),
+            (val, None) => Binding::from_object(val.clone(), edge.dt.clone()),
+        }
+    }
+
+    fn emit(&mut self, edge: &EdgeKey, ann: &Sid, dicts: &Dicts<'_>) {
+        let s_b = Self::ref_binding(&edge.s, dicts);
+        let p_b = match self.p_pos {
+            EdgePos::Var(_) => Some(match self.pred_ids.get(&edge.p) {
+                Some(p_id) => Binding::EncodedPid { p_id: *p_id },
+                None => Binding::sid(edge.p.clone()),
+            }),
+            EdgePos::Const(_) => None,
+        };
+        let o_b = Self::object_binding(edge, dicts);
+        let ann_b = Self::ref_binding(ann, dicts);
+        let child_rows = self.child_rows.as_deref().unwrap_or(&[]);
+        for child_row in child_rows {
+            let mut row: Vec<Binding> = Vec::with_capacity(self.schema.len());
+            row.extend(child_row.iter().cloned());
+            row.push(s_b.clone());
+            if let Some(p_b) = &p_b {
+                row.push(p_b.clone());
+            }
+            row.push(o_b.clone());
+            row.push(ann_b.clone());
+            self.result_buffer.push(row);
+        }
+    }
+
+    /// Emit up to [`PROBE_OUTPUT_CHUNK`] buffered output rows as one batch.
+    fn drain_chunk(&mut self) -> Option<Batch> {
+        if self.buffer_pos >= self.result_buffer.len() {
+            return None;
+        }
+        let end = (self.buffer_pos + PROBE_OUTPUT_CHUNK).min(self.result_buffer.len());
+        let mut columns: Vec<Vec<Binding>> = (0..self.schema.len())
+            .map(|_| Vec::with_capacity(end - self.buffer_pos))
+            .collect();
+        for row in &self.result_buffer[self.buffer_pos..end] {
+            for (col, b) in row.iter().enumerate() {
+                columns[col].push(b.clone());
+            }
+        }
+        self.buffer_pos = end;
+        Batch::new(self.schema.clone(), columns).ok()
+    }
+}
+
+#[async_trait]
+impl Operator for AnnotationEnumerateOperator {
+    fn schema(&self) -> &[VarId] {
+        &self.schema
+    }
+
+    async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        self.root = ctx.active_snapshot.annotation_index.clone();
+        self.store = ctx.active_snapshot.content_store.clone();
+        self.as_of_t = ctx.to_t;
+        self.pred_ids = ctx
+            .graph_view()
+            .map(|view| {
+                view.store()
+                    .p_sid_table()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, sid)| (sid.clone(), i as u32))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.child.open(ctx).await?;
+        self.state = OperatorState::Open;
+        self.child_rows = None;
+        self.leaves = None;
+        self.result_buffer.clear();
+        self.buffer_pos = 0;
+        Ok(())
+    }
+
+    async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if self.state != OperatorState::Open {
+            return Ok(None);
+        }
+        if self.child_rows.is_none() {
+            let mut rows: Vec<Vec<Binding>> = Vec::new();
+            while let Some(batch) = self.child.next_batch(ctx).await? {
+                for row in 0..batch.len() {
+                    rows.push(
+                        self.child
+                            .schema()
+                            .iter()
+                            .map(|v| batch.get(row, *v).cloned().unwrap_or(Binding::Unbound))
+                            .collect(),
+                    );
+                }
+            }
+            if rows.is_empty() {
+                self.state = OperatorState::Exhausted;
+                return Ok(None);
+            }
+            self.child_rows = Some(rows);
+        }
+        let (Some(root), Some(store)) = (self.root.as_ref(), self.store.as_ref()) else {
+            // Gates guarantee both are present; defensive only.
+            self.state = OperatorState::Exhausted;
+            return Ok(None);
+        };
+        if self.leaves.is_none() {
+            // Reverse arena: reifier order is dictionary order, so the
+            // encodes below and the batched probes above walk the subject
+            // dictionary and PSOT sequentially instead of at random.
+            let entries = AnnotationArenaReader::new(root, store.as_ref())
+                .reverse_leaf_entries()
+                .await
+                .map_err(|e| QueryError::execution(format!("annotation arena walk: {e}")))?;
+            self.leaves = Some(entries.into_iter().map(|e| e.leaf_cid).collect());
+        }
+        let view = ctx.graph_view();
+        let dicts = Dicts {
+            store: view
+                .as_ref()
+                .map(fluree_db_binary_index::BinaryGraphView::store),
+            dict_novelty: ctx.dict_novelty.as_deref(),
+        };
+        loop {
+            if let Some(batch) = self.drain_chunk() {
+                return Ok(Some(batch));
+            }
+            ctx.check_cancelled()?;
+            let Some(cid) = self
+                .leaves
+                .as_mut()
+                .and_then(std::collections::VecDeque::pop_front)
+            else {
+                self.state = OperatorState::Exhausted;
+                return Ok(None);
+            };
+            self.result_buffer.clear();
+            self.buffer_pos = 0;
+            let pairs = {
+                let (Some(root), Some(store)) = (self.root.as_ref(), self.store.as_ref()) else {
+                    self.state = OperatorState::Exhausted;
+                    return Ok(None);
+                };
+                AnnotationArenaReader::new(root, store.as_ref())
+                    .live_pairs_in_reverse_leaf(&cid, self.as_of_t)
+                    .await
+                    .map_err(|e| QueryError::execution(format!("annotation arena walk: {e}")))?
+            };
+            for (edge, ann) in &pairs {
+                if edge.g.is_some() {
+                    continue;
+                }
+                if let EdgePos::Const(p) = &self.p_pos {
+                    if edge.p != *p {
+                        continue;
+                    }
+                }
+                self.emit(edge, ann, &dicts);
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        self.child.close();
+        self.child_rows = None;
+        self.leaves = None;
+        self.result_buffer.clear();
+        self.state = OperatorState::Closed;
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        self.estimated
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

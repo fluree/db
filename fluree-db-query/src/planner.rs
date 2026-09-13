@@ -1152,7 +1152,7 @@ pub(crate) fn annotation_chain_entry_rows(
 /// reifier per matching base edge, so its cardinality is the cheaper of its
 /// two entry points — the base edge, or the most selective `f:reifies*`
 /// lookup — times the body's expansion with the edge and reifier bound.
-fn estimate_annotation_chain_cardinality(
+pub(crate) fn estimate_annotation_chain_cardinality(
     patterns: &[Pattern],
     bound_vars: &HashSet<VarId>,
     stats: Option<&StatsView>,
@@ -1182,7 +1182,7 @@ pub fn estimate_branch_cardinality(patterns: &[Pattern], stats: Option<&StatsVie
 /// [`estimate_branch_cardinality`] with variables already bound by the
 /// enclosing scope — the first triple's estimate then reflects those bindings
 /// instead of its standalone row count.
-fn estimate_branch_cardinality_from(
+pub(crate) fn estimate_branch_cardinality_from(
     patterns: &[Pattern],
     outer_bound: &HashSet<VarId>,
     stats: Option<&StatsView>,
