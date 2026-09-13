@@ -2807,9 +2807,7 @@ impl BinaryGraphView {
                 return Err(store_err);
             };
             match dn.subjects.resolve_subject(s_id) {
-                Some((ns_code, suffix)) => self
-                    .namespace_prefix(ns_code)
-                    .map(|prefix| format!("{prefix}{suffix}")),
+                Some((ns_code, suffix)) => self.subject_iri_from_parts(ns_code, suffix),
                 None => Err(store_err),
             }
         });
@@ -2906,14 +2904,20 @@ impl BinaryGraphView {
         if sid64.local_id() <= wm {
             return None; // Persisted — let the store handle it
         }
-        // Novel — need full IRI string (prefix + suffix).
-        match dn.subjects.resolve_subject(s_id) {
-            Some((ns_code, suffix)) => match self.namespace_prefix(ns_code) {
-                Ok(prefix) => Some(Ok(format!("{prefix}{suffix}"))),
-                Err(e) => Some(Err(e)),
-            },
-            None => None, // Not in DictNovelty either — fall through to store
+        // Not in DictNovelty either — fall through to the store.
+        dn.subjects
+            .resolve_subject(s_id)
+            .map(|(ns_code, suffix)| self.subject_iri_from_parts(ns_code, suffix))
+    }
+
+    /// Match persisted subject decoding: EMPTY and OVERFLOW names already
+    /// contain the full IRI and need no namespace-table entry.
+    fn subject_iri_from_parts(&self, ns_code: u16, suffix: &str) -> io::Result<String> {
+        if ns_code == namespaces::EMPTY || ns_code == namespaces::OVERFLOW {
+            return Ok(suffix.to_owned());
         }
+        self.namespace_prefix(ns_code)
+            .map(|prefix| format!("{prefix}{suffix}"))
     }
 
     pub fn namespace_prefix(&self, ns_code: u16) -> io::Result<String> {
@@ -4314,6 +4318,99 @@ pub(crate) mod tests {
 
         let _ = std::fs::remove_dir_all(local_dir);
         let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn novelty_full_iri_namespaces_resolve_before_and_after_indexing() {
+        use fluree_db_core::dict_novelty::DictNovelty;
+
+        // Neither special namespace has a prefix: its stored name is the IRI.
+        for ns_code in [namespaces::EMPTY, namespaces::OVERFLOW] {
+            for initialized in [true, false] {
+                let cache_dir = temp_cache_dir();
+                let mut store = Arc::new(empty_store(
+                    Arc::new(MemoryContentStore::new()),
+                    cache_dir.clone(),
+                ));
+                let iri = "https://example.org/product/new?x=1&y=2";
+                let mut dn = if initialized {
+                    DictNovelty::with_watermarks(vec![], 0)
+                } else {
+                    // Exercise the store-miss fallback independently of the
+                    // initialized dictionary's above-watermark fast path.
+                    DictNovelty::new_uninitialized()
+                };
+                let s_id = dn.subjects.assign_or_lookup(ns_code, iri);
+                let view = BinaryGraphView::with_novelty(Arc::clone(&store), 0, Some(Arc::new(dn)));
+                assert_eq!(
+                    view.resolve_subject_iri(s_id).unwrap(),
+                    iri,
+                    "ns={ns_code}, initialized={initialized}"
+                );
+
+                // Once the same entry is persisted, it must decode identically.
+                let local_id = SubjectId::from_u64(s_id).local_id();
+                drop(view);
+                Arc::get_mut(&mut store)
+                    .unwrap()
+                    .dicts
+                    .subject_forward_packs
+                    .insert(
+                        ns_code,
+                        ForwardPackReader::from_memory(vec![Arc::from(
+                            make_subject_pack_bytes(&[(local_id, iri.as_bytes())])
+                                .into_boxed_slice(),
+                        )])
+                        .unwrap(),
+                    );
+                let persisted = BinaryGraphView::new(store, 0);
+                assert_eq!(persisted.resolve_subject_iri(s_id).unwrap(), iri);
+                let _ = std::fs::remove_dir_all(cache_dir);
+            }
+        }
+    }
+
+    #[test]
+    fn novelty_subject_iri_preserves_prefix_lookup_and_missing_namespace_errors() {
+        use fluree_db_core::dict_novelty::DictNovelty;
+
+        for initialized in [true, false] {
+            let cache_dir = temp_cache_dir();
+            let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
+            store.dicts.namespace_codes = Arc::new(HashMap::from([
+                (100, "https://example.org/".to_string()),
+                (namespaces::BLANK_NODE, "_:".to_string()),
+            ]));
+            let mut dn = if initialized {
+                DictNovelty::with_watermarks(vec![], 0)
+            } else {
+                DictNovelty::new_uninitialized()
+            };
+            let ordinary = dn.subjects.assign_or_lookup(100, "product");
+            let blank = dn.subjects.assign_or_lookup(namespaces::BLANK_NODE, "b1");
+            let new_namespace = dn.subjects.assign_or_lookup(101, "product");
+            let unknown = dn.subjects.assign_or_lookup(102, "product");
+            let view = BinaryGraphView::with_novelty(Arc::new(store), 0, Some(Arc::new(dn)))
+                .with_namespace_codes_fallback(Some(Arc::new(HashMap::from([(
+                    101,
+                    "https://new.example.org/".to_string(),
+                )]))));
+            assert_eq!(
+                view.resolve_subject_iri(ordinary).unwrap(),
+                "https://example.org/product"
+            );
+            assert_eq!(view.resolve_subject_iri(blank).unwrap(), "_:b1");
+            assert_eq!(
+                view.resolve_subject_iri(new_namespace).unwrap(),
+                "https://new.example.org/product"
+            );
+            let err = view.resolve_subject_iri(unknown).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::NotFound);
+            assert!(err.to_string().contains("no namespace prefix for code=102"));
+            let missing = SubjectId::new(namespaces::OVERFLOW, 999).as_u64();
+            assert!(view.resolve_subject_iri(missing).is_err());
+            let _ = std::fs::remove_dir_all(cache_dir);
+        }
     }
 
     #[test]
