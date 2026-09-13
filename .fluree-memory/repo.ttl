@@ -3680,6 +3680,51 @@ mem:fact-01kyp8dy5fbhd1f7svcj282d2y a mem:Fact ;
     mem:branch "perf/cypher-untyped-rel-scan" ;
     mem:createdAt "2026-07-29T06:19:14.479669+00:00"^^xsd:dateTime .
 
+mem:fact-01m2dhdd5ewaa1k1nqrg7f1g3n a mem:Fact ;
+    mem:content "Each annotation read lane had a scaling cliff on StarBench: hash-lane `AnnotationSidecarMaps` was subject-keyed (Σ squared reified out-degree on hubs; one subject has 3,345 TREATS edges) → now s→p→o→anns; the lane was admitted on an unknown estimate and swept the whole graph for 3 driving rows (P1 9s) → it now re-decides at runtime after buffering (`probe_generic` over `seed::BatchReplayOperator` below 256 rows/bound subjects); the forward-arena lane drains child × whole base scan, so `<< ?s ?p ?o >>` went 4s→24s once an arena existed → `arena_lane_pays_off` (edge_first ≤ 16 × reifier_first). `@id` dtc on reifiesSubject/Predicate now only for constant objects (it blocked `is_batched_eligible`)." ;
+    mem:tag "annotation-arena" ;
+    mem:tag "edge-annotation" ;
+    mem:tag "hash-lane" ;
+    mem:tag "performance" ;
+    mem:tag "rdf12" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/annotation_edge_probe.rs" ;
+    mem:artifactRef "fluree-db-query/src/default_graph_source.rs" ;
+    mem:artifactRef "fluree-db-query/src/seed.rs" ;
+    mem:branch "perf/lazy-local-dictionary-open" ;
+    mem:createdAt "2026-09-13T14:05:51.662738+00:00"^^xsd:dateTime ;
+    mem:rationale "Typed shapes run within 2× on either lane; gates avoid catastrophic cases rather than pick an optimum. Open: streaming arena-enumeration lane for unbound shapes at 21M reifiers, DefaultGraphSourceOperator::estimated_rows is None, C1 nested-reifier short-circuit." .
+
+mem:fact-01m2dhddbgmgvxaks02yw8qsqn a mem:Fact ;
+    mem:content "The CLI never sealed an annotation arena: `context::build_fluree` uses `without_ledger_caching()`, so `Fluree::reindex` had no LedgerManager/AttachmentEventsProvider, handed the indexer `None`, and `fluree create --from` still printed \"Annotation arena sealed\". Fixed: `reindex` falls back to `attachment_events_from_state` (novelty events, snapshot.t==0 → Authoritative else Augment, plus the base-index bootstrap scan) and `create` reports what the reloaded snapshot carries. A ledger whose head root came from any indexer pass has `had_annotation_arena` set and needs `FLUREE_FORCE_ANNOTATION_BOOTSTRAP=1 fluree reindex`; a fresh import bootstraps on its own. CLI `fluree index` (incremental) is still provider-less and drops an existing arena." ;
+    mem:tag "annotation-arena" ;
+    mem:tag "bulk-import" ;
+    mem:tag "cli" ;
+    mem:tag "edge-annotation" ;
+    mem:tag "reindex" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/admin.rs" ;
+    mem:artifactRef "fluree-db-api/src/indexer_attachment_provider.rs" ;
+    mem:artifactRef "fluree-db-cli/src/commands/create.rs" ;
+    mem:artifactRef "fluree-db-cli/src/context.rs" ;
+    mem:branch "perf/lazy-local-dictionary-open" ;
+    mem:createdAt "2026-09-13T14:05:51.856996+00:00"^^xsd:dateTime ;
+    mem:rationale "The StarBench slice ledger had no arena at all; regression test reindex_seals_arena_without_ledger_caching pins the fix." .
+
+mem:fact-01m2dhem5zjt5nh1zvfsrvejqs a mem:Fact ;
+    mem:content "StarBench RDF-star timeouts, planner half: (1) broad-sidecar demotion in `demote_disconnected_class_anchors` fired even with `?ann` already bound, handing the seed to a fan-out step (base edge with (s,p) bound, or the ~22-row/reifier body triple) — fixed by `reifier_subject_bound`; (2) `Pattern::DefaultGraphSource` was costed by the connectivity-blind branch model (reifiesPredicate × base edge ≈ 4e8), so the wrapper sorted BEHIND its own 6.5M-row body triple, which then drove the chain per row — fixed by `estimate_annotation_chain_cardinality` = min(edge-first, reifier-first) × body. /explain prints the un-expanded `annotation-target` estimate and hides both defects." ;
+    mem:tag "edge-annotation" ;
+    mem:tag "planner" ;
+    mem:tag "rdf12" ;
+    mem:tag "reifies" ;
+    mem:tag "starbench" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
+    mem:artifactRef "fluree-db-query/src/planner.rs" ;
+    mem:branch "perf/lazy-local-dictionary-open" ;
+    mem:createdAt "2026-09-13T14:06:31.615201+00:00"^^xsd:dateTime ;
+    mem:rationale "RDF-1.2-only code; non-annotation explain plans byte-identical. Slice: P11/S6/C8/C11 timeout→<1s, P2 >60s→3.9s. To see the real chain order use RUST_LOG=fluree_db_query::default_graph_source=debug,fluree_db_query::binary_scan=debug with `fluree query -v`. Tests bound_reifier_* / annotation_wrapper_estimate_* fail with the fixes reverted." .
+
 mem:fact-01kx4zr6ed32yj966mpngvqhcg a mem:Fact ;
     mem:content "HTTP Cypher READ endpoint already existed server-side: POST /v1/fluree/query/*ledger + Content-Type: application/cypher → execute_cypher_ledger (can_read/policy/Min-T, returns application/vnd.fluree.cypher+json). Gap was CLI-only; wired `fluree query --cypher --remote` via remote_client::query_cypher (body sent verbatim as RequestBody::Text; server calls extract_cypher_envelope itself) + run_remote_cypher_query. Remote emits cypher-json ONLY — --format json/typed-json/csv/tsv and --at rejected before network call, pointing to --direct." ;
     mem:tag "cli" ;
