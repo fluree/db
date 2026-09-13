@@ -207,6 +207,7 @@ pub(crate) async fn verify_data_principal(
                 policy: policy.policy.clone(),
                 policy_values: policy.policy_values.clone(),
                 default_allow: policy.default_allow,
+                ..Default::default()
             },
         ))
     } else if payload.resolve_identity().is_none() && config.default_policy_class.is_none() {

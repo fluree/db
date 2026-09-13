@@ -35,6 +35,15 @@ pub struct FlureeHeaders {
     /// Host-verified policy selection. Never populated by HTTP header parsing.
     pub policy_authorization: Option<super::CredentialPolicy>,
 
+    /// The auth-layer-verified caller identity, set by
+    /// [`crate::routes::policy_auth::bind_authorization`] from the signed
+    /// credential DID or the verified bearer's identity. Never populated by
+    /// HTTP header parsing: `fluree-identity` is policy evaluation context and
+    /// lands in [`Self::identity`], which a caller may set and which override
+    /// control must never trust. This is the value `f:overrideControl`
+    /// (`f:IdentityRestricted`) gates on.
+    pub server_identity: Option<fluree_db_core::VerifiedIdentity>,
+
     /// Ledger alias from header (lower precedence than path)
     pub ledger: Option<String>,
 
@@ -90,6 +99,7 @@ impl Default for FlureeHeaders {
         Self {
             raw: HeaderMap::new(),
             policy_authorization: None,
+            server_identity: None,
             ledger: None,
             identity: None,
             policy: None,

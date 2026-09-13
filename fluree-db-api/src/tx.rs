@@ -498,7 +498,7 @@ fn build_per_graph_shacl_policy(
     config: &LedgerConfig,
     graph_delta: &FxHashMap<u16, String>,
     requested_mode: Option<fluree_db_core::ledger_config::ValidationMode>,
-    request_identity: Option<&str>,
+    request_identity: Option<&fluree_db_core::VerifiedIdentity>,
 ) -> Option<HashMap<GraphId, fluree_db_transact::ShaclGraphPolicy>> {
     let mut map: HashMap<GraphId, fluree_db_transact::ShaclGraphPolicy> = HashMap::new();
 
@@ -643,12 +643,15 @@ pub(crate) struct StagedShaclContext<'a> {
     /// replay), which always run the configured posture.
     pub requested_validation_mode: Option<fluree_db_core::ledger_config::ValidationMode>,
 
-    /// Verified identity for override-control gating, decoded from the
-    /// transaction's policy context (which the server builds from the
-    /// auth-layer bearer / verified credential DID — not from user-settable
-    /// opts). `None` (no policy context: embedded root, unauthenticated dev
-    /// mode) passes `f:OverrideAll` and fails identity-restricted lists.
-    pub request_identity: Option<String>,
+    /// Auth-layer-verified identity for override-control gating, taken from
+    /// `TxnOpts::server_identity` (set through the stage builders'
+    /// `server_identity` setter; on the server from the verified bearer /
+    /// credential DID). Never derived from the policy context, whose identity
+    /// may be a caller-supplied `opts.identity` in unauthenticated modes.
+    /// `None` (no auth layer: embedded callers without their own, the CLI,
+    /// unauthenticated dev mode) passes `f:OverrideAll` and fails
+    /// identity-restricted lists.
+    pub request_identity: Option<fluree_db_core::VerifiedIdentity>,
 
     /// `true` only on commit replay (graph-sync push), where the flakes being
     /// staged are already-committed history validated at origin. When the
@@ -979,7 +982,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
             c,
             gd,
             ctx.requested_validation_mode,
-            ctx.request_identity.as_deref(),
+            ctx.request_identity.as_ref(),
         ),
         (Some(c), None) => {
             // No graph context — apply ledger-wide posture to the default
@@ -989,7 +992,7 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
             let ledger_wide = config_resolver::merge_shacl_opts(
                 &config_resolver::resolve_effective_config(c, None),
                 ctx.requested_validation_mode,
-                ctx.request_identity.as_deref(),
+                ctx.request_identity.as_ref(),
             );
             match ledger_wide {
                 Some(cfg) if cfg.enabled => {
@@ -1412,16 +1415,14 @@ async fn stage_with_config_shacl(
     let inline_shapes_json = txn.opts.shapes.take();
     let inline_shapes_ledger_id = ledger.snapshot.ledger_id.to_string();
 
-    // Requested SHACL mode + the identity that gates it. The identity comes
-    // from the staged policy context — built by the server from the verified
-    // bearer / credential DID — never from user-settable opts directly. A
-    // grounded-random identity (policy context without a real identity)
-    // decodes to a never-match IRI, which correctly fails identity-restricted
-    // override lists.
+    // Requested SHACL mode + the identity that gates it. The identity is the
+    // auth-layer-verified `TxnOpts::server_identity`, which no request body
+    // can populate. It is deliberately NOT read from the policy context: in
+    // unauthenticated server modes, the CLI, and the embedded API the policy
+    // identity is whatever the caller wrote into `opts.identity` or the
+    // `fluree-identity` header, which must never satisfy an allow-list.
     let requested_validation_mode = txn.opts.validation_mode;
-    let request_identity = options
-        .policy_ctx
-        .and_then(|p| ledger.snapshot.decode_sid(&p.identity));
+    let request_identity = txn.opts.server_identity.clone();
 
     // Detect cross-ledger governance at the API boundary BEFORE staging
     // starts. Resolve D's config once from pre-tx state and share it across

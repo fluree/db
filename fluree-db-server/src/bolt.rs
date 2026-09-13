@@ -16,6 +16,7 @@
 //! because Bolt sessions outlive the single HTTP request the token
 //! verification model assumes.
 
+use fluree_db_core::VerifiedIdentity;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -92,14 +93,25 @@ impl SessionAuth {
     /// Reuse the login-time verified policy selection; statements cannot supply
     /// policy options. Ledger/action scope and expiry are checked per statement.
     fn governance(&self) -> fluree_db_api::GovernanceOptions {
-        self.principal
+        let mut governance = self
+            .principal
             .as_ref()
             .map(|p| {
                 p.policy_authorization
                     .resolve_options(&Default::default())
                     .expect("omitted selection is valid for every credential mode")
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // The `fluree.identity` claim sits inside a verified token, so it is
+        // auth-layer verified and gates `f:overrideControl` too. Stamped after
+        // resolution, which rebuilds the options from the bound authority and
+        // would otherwise drop it.
+        governance.server_identity = self
+            .principal
+            .as_ref()
+            .and_then(|p| p.identity.clone())
+            .map(VerifiedIdentity::new);
+        governance
     }
 }
 
@@ -603,7 +615,7 @@ async fn try_execute_txn_run(
     let view = if governance.has_any_policy_inputs() {
         state
             .fluree
-            .wrap_policy(view, &governance, None)
+            .wrap_policy(view, &governance)
             .await
             .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     } else {
@@ -615,7 +627,12 @@ async fn try_execute_txn_run(
     };
     let result = state
         .fluree
-        .query_cypher_with_params(&view, &run.query, params.as_ref())
+        .query_cypher_with_options(
+            &view,
+            &run.query,
+            params.as_ref(),
+            &crate::query_control::options_for_identity(governance.server_identity.as_ref()),
+        )
         .await
         .map_err(|e| RunFailure::new(CODE_SYNTAX, e.to_string()))?;
     let (columns, rows) = result
@@ -684,7 +701,7 @@ async fn execute_read(
     let view = if governance.has_any_policy_inputs() {
         state
             .fluree
-            .wrap_policy(view, &governance, None)
+            .wrap_policy(view, &governance)
             .await
             .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     } else {
@@ -696,7 +713,12 @@ async fn execute_read(
     };
     let result = state
         .fluree
-        .query_cypher_with_params(&view, query, params.as_ref())
+        .query_cypher_with_options(
+            &view,
+            query,
+            params.as_ref(),
+            &crate::query_control::options_for_identity(governance.server_identity.as_ref()),
+        )
         .await
         .map_err(|e| RunFailure::new(CODE_SYNTAX, e.to_string()))?;
     let (columns, rows) = result
@@ -1135,6 +1157,38 @@ fn temporal_structure(temporal: CypherTemporal, version: BoltVersion) -> Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A session's token identity is auth-layer verified, so it gates
+    /// `f:overrideControl` as well as policy. Bolt has no request surface for
+    /// an override (no reasoning pragma, no policy or validation knobs), so
+    /// this wiring is the only observable part of the gate on this transport.
+    #[test]
+    fn session_governance_carries_the_verified_identity() {
+        let auth = SessionAuth {
+            principal: Some(DataPrincipal {
+                issuer: "did:key:issuer".into(),
+                subject: None,
+                identity: Some("did:key:admin".into()),
+                read_all: true,
+                read_ledgers: Default::default(),
+                write_all: false,
+                write_ledgers: Default::default(),
+                expires_unix: u64::MAX,
+                policy_authorization: crate::extract::CredentialPolicy::ScopeOnly,
+            }),
+        };
+        let governance = auth.governance();
+        assert_eq!(
+            governance.server_identity,
+            Some(VerifiedIdentity::new("did:key:admin"))
+        );
+        assert_eq!(
+            crate::query_control::options_for_identity(governance.server_identity.as_ref())
+                .server_identity,
+            governance.server_identity
+        );
+        assert_eq!(SessionAuth::anonymous().governance().server_identity, None);
+    }
 
     #[test]
     fn scalar_cells_map_natively() {

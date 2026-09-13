@@ -84,6 +84,19 @@ impl Fluree {
         db: &GraphDb,
         input: &OwnedStreamQuery,
     ) -> Result<StreamQueryPlan> {
+        self.plan_stream_query_with_options(db, input, &QueryExecutionOptions::default())
+            .await
+    }
+
+    /// [`Fluree::plan_stream_query`] with execution options. Planning consults
+    /// `server_identity`, the auth-layer-verified caller identity that
+    /// `f:overrideControl` gates on; the default is anonymous.
+    pub async fn plan_stream_query_with_options(
+        &self,
+        db: &GraphDb,
+        input: &OwnedStreamQuery,
+        options: &QueryExecutionOptions,
+    ) -> Result<StreamQueryPlan> {
         let input = input.as_input();
 
         let (vars, mut parsed) = match &input {
@@ -112,7 +125,9 @@ impl Fluree {
 
         ensure_streamable(&parsed.output)?;
 
-        let executable = self.build_executable_for_view(db, &parsed).await?;
+        let executable = self
+            .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
+            .await?;
 
         Ok(StreamQueryPlan {
             vars,
@@ -274,7 +289,22 @@ impl Fluree {
     /// — single-source specs yield a single-graph dataset — so the streaming
     /// producer is uniform.
     pub async fn build_stream_dataset(&self, query_json: &serde_json::Value) -> Result<DataSetDb> {
-        let (spec, qc_opts) = crate::query::helpers::parse_dataset_spec(query_json)?;
+        self.build_stream_dataset_with_options(query_json, &QueryExecutionOptions::default())
+            .await
+    }
+
+    /// [`Fluree::build_stream_dataset`] with execution options, whose
+    /// `server_identity` is stamped onto the parsed governance so global and
+    /// per-source policy overrides are gated on the verified caller.
+    pub async fn build_stream_dataset_with_options(
+        &self,
+        query_json: &serde_json::Value,
+        options: &QueryExecutionOptions,
+    ) -> Result<DataSetDb> {
+        let (spec, qc_opts) = crate::query::helpers::parse_dataset_spec_as(
+            query_json,
+            options.server_identity.as_ref(),
+        )?;
         if spec.is_empty() {
             return Err(ApiError::query(
                 "Missing ledger specification in connection query",
@@ -321,6 +351,23 @@ impl Fluree {
         dataset: &DataSetDb,
         input: &OwnedStreamQuery,
     ) -> Result<StreamDatasetPlan> {
+        self.plan_stream_query_dataset_with_options(
+            dataset,
+            input,
+            &QueryExecutionOptions::default(),
+        )
+        .await
+    }
+
+    /// [`Fluree::plan_stream_query_dataset`] with execution options. Planning
+    /// consults `server_identity`, the auth-layer-verified caller identity that
+    /// `f:overrideControl` gates on; the default is anonymous.
+    pub async fn plan_stream_query_dataset_with_options(
+        &self,
+        dataset: &DataSetDb,
+        input: &OwnedStreamQuery,
+        options: &QueryExecutionOptions,
+    ) -> Result<StreamDatasetPlan> {
         let primary = dataset
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no graphs for query execution"))?;
@@ -348,7 +395,9 @@ impl Fluree {
         )?;
         ensure_streamable(&parsed.output)?;
 
-        let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
+        let executable = self
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
+            .await?;
         Ok(StreamDatasetPlan {
             vars,
             parsed,

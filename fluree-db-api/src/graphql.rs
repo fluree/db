@@ -1042,7 +1042,7 @@ impl RootExecutor for LedgerExecutor {
         slot.lock().replace(committed);
         let view = if let Some(authorization) = &self.authorization {
             self.fluree
-                .wrap_policy(view, authorization.options(), None)
+                .wrap_policy(view, authorization.options())
                 .await
                 .map_err(|e| GqlError::Execution(e.to_string()))?
         } else {
@@ -1284,7 +1284,7 @@ impl Fluree {
     ) -> Result<(JsonValue, LedgerState)> {
         let db = GraphDb::from_ledger_state(&ledger).with_default_context(default_context);
         let db = if let Some(authorization) = authorization {
-            self.wrap_policy(db, authorization.options(), None).await?
+            self.wrap_policy(db, authorization.options()).await?
         } else {
             self.wrap_policy_defaults(db).await?
         };

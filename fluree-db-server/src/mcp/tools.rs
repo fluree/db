@@ -4,7 +4,9 @@
 //! trait with tools for SPARQL query execution and data model retrieval.
 
 use crate::mcp::auth::McpPrincipal;
+use crate::query_control::run_query_task;
 use crate::state::AppState;
+use fluree_db_core::VerifiedIdentity;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
@@ -192,11 +194,15 @@ impl FlureeToolService {
         let identity = identity.map(str::to_string);
         let timeout_ms = state.config.mcp_query_timeout_ms;
 
-        let mut envelope = crate::query_control::run_query_task(timeout_ms, move || async move {
+        // The identity comes from the authenticated MCP principal, so it is
+        // auth-layer verified: it gates `f:overrideControl` as well as policy.
+        let server_identity = identity.clone().map(VerifiedIdentity::new);
+        let mut envelope = run_query_task(timeout_ms, server_identity, move || async move {
             let envelope = match identity.as_deref() {
                 Some(id) => {
                     let opts = fluree_db_api::GovernanceOptions {
                         identity: Some(id.to_string()),
+                        server_identity: Some(VerifiedIdentity::new(id)),
                         ..Default::default()
                     };
                     let view = match t {

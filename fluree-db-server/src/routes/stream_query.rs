@@ -148,6 +148,10 @@ async fn stream_query_connection_inner(
             fluree_db_sparql::parse_sparql(&sparql).ast.as_ref(),
         );
 
+        // The auth-layer-verified identity gates `f:overrideControl` on the
+        // ledgers' reasoning defaults, so planning carries it too.
+        let plan_options =
+            crate::query_control::options_for_identity(headers.server_identity.as_ref());
         let dataset = fluree
             .build_stream_dataset_for_sparql(
                 &sparql,
@@ -160,7 +164,7 @@ async fn stream_query_connection_inner(
             .map_err(ServerError::Api)?;
         let input = OwnedStreamQuery::Sparql(sparql);
         let plan = fluree
-            .plan_stream_query_dataset(&dataset, &input)
+            .plan_stream_query_dataset_with_options(&dataset, &input, &plan_options)
             .await
             .map_err(ServerError::Api)?;
         (
@@ -198,7 +202,8 @@ async fn stream_query_connection_inner(
             }
         }
         enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
-
+        let plan_options =
+            crate::query_control::options_for_identity(headers.server_identity.as_ref());
         crate::routes::policy_auth::apply_authorization_to_opts(&mut query_json, &headers)?;
         let min_t = collect_jsonld_min_t_requirements(&headers, &query_json, Some(&ledger_id))?;
         await_query_min_t_requirements(state.as_ref(), min_t).await?;
@@ -212,12 +217,12 @@ async fn stream_query_connection_inner(
 
         let tracker = stream_tracker(Some(&query_json));
         let dataset = fluree
-            .build_stream_dataset(&query_json)
+            .build_stream_dataset_with_options(&query_json, &plan_options)
             .await
             .map_err(ServerError::Api)?;
         let input = OwnedStreamQuery::JsonLd(query_json);
         let plan = fluree
-            .plan_stream_query_dataset(&dataset, &input)
+            .plan_stream_query_dataset_with_options(&dataset, &input, &plan_options)
             .await
             .map_err(ServerError::Api)?;
         (StreamPlan::Dataset { dataset, plan }, tracker)
@@ -282,7 +287,8 @@ async fn stream_query_inner(
         // SPARQL has no body `opts`, so policy arrives via the resolved identity
         // (bearer/header), the server default policy class, and the
         // `Fluree-Policy*` / `Fluree-Default-Allow` headers.
-
+        let plan_options =
+            crate::query_control::options_for_identity(headers.server_identity.as_ref());
         let identity = headers.identity.clone();
         let qc_opts = crate::routes::policy_auth::bound_governance(identity.as_deref(), &headers)?;
 
@@ -340,7 +346,7 @@ async fn stream_query_inner(
                 .map_err(ServerError::Api)?;
             let input = OwnedStreamQuery::Sparql(sparql);
             let plan = fluree
-                .plan_stream_query_dataset(&dataset, &input)
+                .plan_stream_query_dataset_with_options(&dataset, &input, &plan_options)
                 .await
                 .map_err(ServerError::Api)?;
             (
@@ -351,7 +357,8 @@ async fn stream_query_inner(
             // Plain single-ledger SPARQL (no policy, no FROM).
             let input = OwnedStreamQuery::Sparql(sparql);
             let ledger_state = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
-            let plan = plan_with_ledger_defaults(&state, ledger_state, &input).await?;
+            let plan =
+                plan_with_ledger_defaults(&state, ledger_state, &input, &plan_options).await?;
             (plan, stream_tracker_from_headers(&headers))
         }
     } else {
@@ -379,7 +386,8 @@ async fn stream_query_inner(
             }
         }
         enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
-
+        let plan_options =
+            crate::query_control::options_for_identity(headers.server_identity.as_ref());
         crate::routes::policy_auth::apply_authorization_to_opts(&mut query_json, &headers)?;
 
         // Freshness barrier + stored-default-context injection, before planning,
@@ -410,19 +418,20 @@ async fn stream_query_inner(
             warn_headers =
                 crate::routes::query::jsonld_dataset_semantics_warning_headers(&query_json);
             let dataset = fluree
-                .build_stream_dataset(&query_json)
+                .build_stream_dataset_with_options(&query_json, &plan_options)
                 .await
                 .map_err(ServerError::Api)?;
             let input = OwnedStreamQuery::JsonLd(query_json);
             let plan = fluree
-                .plan_stream_query_dataset(&dataset, &input)
+                .plan_stream_query_dataset_with_options(&dataset, &input, &plan_options)
                 .await
                 .map_err(ServerError::Api)?;
             (StreamPlan::Dataset { dataset, plan }, tracker)
         } else {
             let input = OwnedStreamQuery::JsonLd(query_json);
             let ledger_state = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
-            let plan = plan_with_ledger_defaults(&state, ledger_state, &input).await?;
+            let plan =
+                plan_with_ledger_defaults(&state, ledger_state, &input, &plan_options).await?;
             (plan, tracker)
         }
     };
@@ -440,17 +449,22 @@ async fn plan_with_ledger_defaults(
     state: &AppState,
     ledger_state: LedgerState,
     input: &OwnedStreamQuery,
+    options: &fluree_db_api::QueryExecutionOptions,
 ) -> Result<StreamPlan> {
     let fluree = &state.fluree;
     let graph = fluree
         .wrap_policy_defaults(GraphDb::from_ledger_state(&ledger_state))
         .await?;
     if graph.is_root() {
-        let plan = fluree.plan_stream_query(&graph, input).await?;
+        let plan = fluree
+            .plan_stream_query_with_options(&graph, input, options)
+            .await?;
         Ok(StreamPlan::Single { ledger_state, plan })
     } else {
         let dataset = DataSetDb::single(graph);
-        let plan = fluree.plan_stream_query_dataset(&dataset, input).await?;
+        let plan = fluree
+            .plan_stream_query_dataset_with_options(&dataset, input, options)
+            .await?;
         Ok(StreamPlan::Dataset { dataset, plan })
     }
 }

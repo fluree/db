@@ -243,8 +243,13 @@ fn prepare_transaction_body(
     crate::routes::policy_auth::apply_authorization_to_opts(&mut body, headers)?;
 
     let tracking = tracking_options_from_body(&body);
-    let governance =
+    let mut governance =
         GovernanceOptions::from_json(&body).map_err(|e| ServerError::bad_request(e.to_string()))?;
+    // The auth-layer-verified identity `f:overrideControl` gates on, bound by
+    // `bind_authorization`. Where a credential lets its holder select the
+    // policy identity, `identity` above carries the selected one while this
+    // stays the credential's own; `from_json` never reads it from the body.
+    governance.server_identity = headers.server_identity.clone();
 
     Ok(PreparedTransaction {
         body,

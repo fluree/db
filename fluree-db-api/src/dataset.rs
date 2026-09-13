@@ -32,6 +32,7 @@
 //! ```
 
 use fluree_db_core::ledger_id::{split_time_travel_suffix, LedgerIdTimeSpec};
+use fluree_db_core::VerifiedIdentity;
 use fluree_db_sparql::ast::{DatasetClause as SparqlDatasetClause, IriValue};
 
 /// Convert a SPARQL IriValue to a string for use as a ledger identifier.
@@ -321,6 +322,10 @@ impl SourcePolicyOverride {
             policy_class: self.policy_class.clone(),
             policy: self.policy.clone(),
             policy_values: self.policy_values.clone(),
+            // A per-source override comes from the request body and can never
+            // carry a verified identity of its own. The caller stamps this from
+            // the request-level `GovernanceOptions` before wrapping policy.
+            server_identity: None,
             // Already tri-state here; it used to collapse to `false` at this
             // boundary, which is the same lost-unset bug one scope down.
             // Carrying it through is only half the fix — the explicit value
@@ -773,12 +778,37 @@ impl DatasetSpec {
 /// Tracking-related opts keys (`meta`, `max-fuel`) live on a separate
 /// [`TrackingOptions`] path; they are parsed and propagated by the
 /// transaction route, not by this type.
+///
+/// `Serialize` / `Deserialize` exist so the struct can ride the consensus
+/// request envelope (`QueuedTransact`, `QueuedPush`) from the accepting node
+/// to the commit worker. They are **not** a client-facing decoder: a server
+/// route must build this struct through [`GovernanceOptions::from_json`],
+/// never by deserializing a request body directly, because serde would
+/// populate [`GovernanceOptions::server_identity`] from client bytes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GovernanceOptions {
     pub identity: Option<String>,
     pub policy_class: Option<Vec<String>>,
     pub policy: Option<JsonValue>,
     pub policy_values: Option<HashMap<String, JsonValue>>,
+    /// Auth-layer-verified identity of the caller, used only for
+    /// `f:overrideControl` (`f:IdentityRestricted`) checks.
+    ///
+    /// This is the DID the server established from a verified JWS credential
+    /// or bearer token. It is never parsed from the query/transaction JSON or
+    /// from headers ([`GovernanceOptions::from_json`] always leaves it `None`),
+    /// so a caller cannot satisfy an allow-list by writing it into `opts`.
+    /// When a credential lets its holder select the policy identity (a trusted
+    /// gateway acting for an end user), this stays the DID the credential was
+    /// issued to while `identity` carries the selected one.
+    ///
+    /// It is distinct from `identity`, which is the policy-evaluation context
+    /// and may legitimately come from the request. Server routes populate it;
+    /// the CLI and embedded callers without their own auth layer leave it
+    /// `None`, and identity-restricted overrides are then denied. An embedding
+    /// application that verifies identities itself is the auth layer for that
+    /// deployment and may set it.
+    pub server_identity: Option<VerifiedIdentity>,
     /// Tri-state default-allow: `None` means the caller did not say, so the
     /// ledger's configured `f:defaultAllow` may fill it in
     /// ([`crate::config_resolver::merge_policy_opts`]); `Some(v)` is an explicit
@@ -887,6 +917,8 @@ impl GovernanceOptions {
             policy_class,
             policy,
             policy_values,
+            // Deliberately not read from `opts`: only an auth layer may set it.
+            server_identity: None,
             default_allow,
         })
     }
@@ -915,6 +947,11 @@ impl GovernanceOptions {
     /// configured override controls. An empty class list selects no stored rules;
     /// an allow default can widen access. A deny default alone only narrows the
     /// configured set and does not count as a replacement selection.
+    ///
+    /// `server_identity` deliberately does not count: it authorizes config
+    /// overrides, it does not select a policy set. On the server a verified
+    /// identity always arrives alongside a forced `identity`, which is what
+    /// engages enforcement.
     pub fn selects_policy_set(&self) -> bool {
         self.identity.is_some()
             || self.policy_class.is_some()
@@ -2697,6 +2734,37 @@ mod tests {
             ..Default::default()
         }
         .effective_default_allow());
+    }
+
+    /// `server_identity` is the value `f:overrideControl` gates on. It must
+    /// only ever come from an auth layer, so no spelling of it in the request
+    /// body may populate it — otherwise a caller could satisfy an
+    /// `f:IdentityRestricted` allow-list by writing the DID into `opts`.
+    #[test]
+    fn from_json_never_populates_server_identity() {
+        for key in ["server_identity", "serverIdentity", "server-identity"] {
+            let query = json!({
+                "select": ["?s"],
+                "opts": {"identity": "did:key:caller", key: "did:key:admin"}
+            });
+            let opts = GovernanceOptions::from_json(&query).expect("parses");
+            assert_eq!(opts.identity.as_deref(), Some("did:key:caller"));
+            assert_eq!(
+                opts.server_identity, None,
+                "opts.{key} must not populate server_identity"
+            );
+        }
+    }
+
+    /// A verified identity authorizes config overrides; it is not itself a
+    /// request for policy enforcement, so it must not force a policy wrap.
+    #[test]
+    fn server_identity_alone_is_not_a_policy_input() {
+        assert!(!GovernanceOptions {
+            server_identity: Some(VerifiedIdentity::new("did:key:admin")),
+            ..Default::default()
+        }
+        .has_any_policy_inputs());
     }
 
     // ---------------------------------------------------------------------

@@ -1110,7 +1110,6 @@ async fn scoped_explain_withholds_statistics_for_every_language() {
                 default_allow: Some(false),
                 ..Default::default()
             },
-            None,
         )
         .await
         .unwrap();
