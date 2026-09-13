@@ -4075,6 +4075,31 @@ async fn turtle_star_reified_triple_matches_jsonld_annotation() {
 }
 
 #[tokio::test]
+async fn turtle_rdf_reifies_triple_term_matches_jsonld_annotation() {
+    // The RDF 1.2 spelling every asserting form desugars to, and the only
+    // star construct N-Triples has: `r rdf:reifies <<( s p o )>>` plus the
+    // reifier's own property.
+    assert_turtle_star_matches_jsonld(
+        "it/turtle-star:rdf-reifies-triple-term",
+        json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "ex:q": { "@id": "ex:z" } }
+            }
+        }),
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         ex:r rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .\n\
+         ex:r ex:q ex:z .\n",
+        "http://example.org/alice",
+        "http://example.org/worksFor",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn turtle_star_lang_tagged_literal_matches_jsonld_annotation() {
     // Language-tagged base object: both surfaces must emit f:reifiesLang
     // and carry m.lang on the f:reifiesObject flake (BUGS-2 symmetry).

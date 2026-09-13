@@ -453,34 +453,37 @@ ex:dataset-import-2024-01-22 a ex:DatasetImport ;
 
 ## Edge annotations (RDF 1.2 / Turtle-star)
 
-The Turtle ingest path — and the related N-Triples (`.nt`), TriG, and N-Quads paths, which share the same lexer — is RDF 1.1 + Fluree extensions. It does **not** parse RDF 1.2 annotation tails (`{| ... |}`), the `~` reifier, or the parenthesized `<<( ... )>>` triple term. A file containing those productions **fails to parse** with a lexer error (e.g. `unexpected character '~'`; a `<<` triple term errors as a malformed IRI) — the data is rejected, not silently ingested without the annotations.
+The Turtle and N-Triples ingest paths read the RDF 1.2 asserting forms directly. All of these produce the same on-disk `f:reifies*` bundle as JSON-LD `@annotation` — bit-identical, so cascade retracts, hydration, and the annotation arena treat both surfaces as one:
 
-If you want to ingest edge annotations on data that lives in Turtle today, two paths work:
+```turtle
+@prefix ex:  <http://example.org/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
 
-**Path 1: Convert to JSON-LD before ingest.** Re-emit the file as JSON-LD with `@annotation` on the value objects you want annotated. The on-disk shape after ingest is identical to what an RDF 1.2 Turtle ingest would produce.
+# Annotation block — fresh anonymous reifier
+ex:alice ex:worksFor ex:acme {| ex:role "Engineer" ; ex:since "2024-01-01"^^xsd:date |} .
 
-**Path 2: Ingest plain Turtle first, then add annotations with SPARQL UPDATE.** Useful when the base edges are already in your Turtle export and the annotations come from a separate process.
+# Named reifier, with or without a block
+ex:alice ex:knows ex:bob ~ ex:friendship1 {| ex:since 2019 |} .
+ex:alice ex:knows ex:carol ~ ex:friendship2 .
 
-```bash
-# 1. Ingest the plain edges
-curl -X POST "http://localhost:8090/v1/fluree/upsert?ledger=mydb:main" \
-  -H "Content-Type: text/turtle" \
-  --data-binary '@employments.ttl'
+# Reified triple in subject or object position (the reifier is the node)
+<< ex:alice ex:worksFor ex:acme ~ ex:emp1 >> ex:confidence 0.97 .
+ex:doc ex:cites << ex:alice ex:worksFor ex:acme ~ ex:emp1 >> .
 
-# 2. Add annotations via SPARQL UPDATE
-curl -X POST "http://localhost:8090/v1/fluree/update?ledger=mydb:main" \
-  -H "Content-Type: application/sparql-update" \
-  --data-binary @- <<'SPARQL'
-PREFIX ex: <http://example.org/>
-INSERT DATA {
-  ex:alice ex:worksFor ex:acme {| ex:role "Engineer" ; ex:since "2024-01-01" |} .
-}
-SPARQL
+# The canonical RDF 1.2 spelling every form above desugars to — and the only
+# star construct N-Triples has
+ex:emp1 rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
 ```
 
-See the [Edge annotations concept doc](../concepts/edge-annotations.md) for the full SPARQL 1.2 surface — `~` for named reifiers, `rdf:reifies` for annotation-rooted queries, the per-operation rules for INSERT DATA / DELETE DATA / INSERT WHERE / DELETE WHERE templates, and the deferred shapes that produce parse errors.
+Two rules to know:
 
-A `.ttl`-native annotation ingest would land alongside a Turtle-star vs RDF 1.2 reifier output decision and is tracked as a future extension.
+- **The reified triple is asserted.** RDF 1.2 says `<< s p o >>` and `r rdf:reifies <<( s p o )>>` do *not* put `s p o` in the graph; Fluree's annotations describe a live edge, so ingest asserts the base triple as well. Each anonymous `<< s p o >>` / `{| |}` occurrence mints a fresh reifier — two textual occurrences are two annotations.
+- **`<<( ... )>>` is accepted only as the object of `rdf:reifies`.** As a plain value (`ex:doc ex:mentions <<( ... )>>`), nested inside another triple term, or inside an annotation body, it is rejected with a specific "deferred" error rather than silently dropped.
+
+TriG and N-Quads share the same parser for default-graph statements. A star construct **inside a `GRAPH { }` block** (or an N-Quads statement with a graph label) is rejected with a clear TriG-star deferred error — use the JSON-LD `@annotation` surface to annotate an edge in a named graph.
+
+See the [Edge annotations concept doc](../concepts/edge-annotations.md) for the full RDF 1.2 / SPARQL 1.2 surface — `rdf:reifies` for annotation-rooted queries, the per-operation rules for INSERT DATA / DELETE DATA / INSERT WHERE / DELETE WHERE templates, and the deferred shapes that produce parse errors.
 
 ## Comparing Formats
 

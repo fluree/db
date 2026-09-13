@@ -865,7 +865,16 @@ fn parse_punctuation(input: &mut Input<'_>) -> ModalResult<TokenKind> {
         '[' => Ok(TokenKind::LBracket),
         ']' => Ok(TokenKind::RBracket),
         '(' => Ok(TokenKind::LParen),
-        ')' => Ok(TokenKind::RParen),
+        // `)>>` closes an RDF 1.2 triple term; bare `)` stays a collection
+        // close. One extra peek on the `)` branch only.
+        ')' => {
+            if input.starts_with(">>") {
+                ">>".parse_next(input)?;
+                Ok(TokenKind::TripleTermEnd)
+            } else {
+                Ok(TokenKind::RParen)
+            }
+        }
         // `{|` opens an RDF 1.2 annotation block; bare `{` stays a TriG
         // graph-block brace. One extra byte peek on the `{` branch only.
         '{' => {
@@ -1163,6 +1172,7 @@ mod tests {
             vec![TokenKind::ReifiedTripleStart, TokenKind::ReifiedTripleEnd]
         );
         assert_eq!(tok("<<("), vec![TokenKind::TripleTermStart]);
+        assert_eq!(tok(")>>"), vec![TokenKind::TripleTermEnd]);
         assert_eq!(
             tok("{| |}"),
             vec![TokenKind::AnnotationOpen, TokenKind::AnnotationClose]
@@ -1196,6 +1206,39 @@ mod tests {
                 TokenKind::Iri,
                 TokenKind::ReifiedTripleEnd,
                 TokenKind::Dot,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_star_triple_term_token_stream() {
+        // `_:r rdf:reifies <<( :a :b :c )>> .` — the N-Triples 1.2 shape.
+        assert_eq!(
+            tok("_:r rdf:reifies <<( :a :b :c )>> ."),
+            vec![
+                TokenKind::BlankNodeLabel,
+                TokenKind::PrefixedName,
+                TokenKind::TripleTermStart,
+                TokenKind::PrefixedName,
+                TokenKind::PrefixedName,
+                TokenKind::PrefixedName,
+                TokenKind::TripleTermEnd,
+                TokenKind::Dot,
+            ]
+        );
+        // `)>>` must not split into `)` `>>`; a collection close followed by
+        // whitespace stays `RParen`.
+        assert_eq!(
+            tok("<<( )>>"),
+            vec![TokenKind::TripleTermStart, TokenKind::TripleTermEnd]
+        );
+        assert_eq!(
+            tok("( :a ) >>"),
+            vec![
+                TokenKind::LParen,
+                TokenKind::PrefixedName,
+                TokenKind::RParen,
+                TokenKind::ReifiedTripleEnd,
             ]
         );
     }

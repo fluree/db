@@ -178,9 +178,11 @@ pub enum TokenKind {
     /// `>>` — reified-triple close
     ReifiedTripleEnd,
     /// `<<(` — triple-term open (RDF 1.2 triple terms as values).
-    /// Lexed so the parser can reject it with a specific deferred error;
-    /// no closing `)>>` token is needed because parsing stops here.
+    /// Accepted by the parser only as the object of `rdf:reifies`; any
+    /// other position is rejected with a specific deferred error.
     TripleTermStart,
+    /// `)>>` — triple-term close
+    TripleTermEnd,
     /// `{|` — annotation block open
     AnnotationOpen,
     /// `|}` — annotation block close
@@ -234,6 +236,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::ReifiedTripleStart => write!(f, "<<"),
             TokenKind::ReifiedTripleEnd => write!(f, ">>"),
             TokenKind::TripleTermStart => write!(f, "<<("),
+            TokenKind::TripleTermEnd => write!(f, ")>>"),
             TokenKind::AnnotationOpen => write!(f, "{{|"),
             TokenKind::AnnotationClose => write!(f, "|}}"),
             TokenKind::Tilde => write!(f, "~"),
