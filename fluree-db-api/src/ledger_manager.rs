@@ -1171,16 +1171,27 @@ pub(crate) async fn load_and_attach_binary_store(
     let cs: Arc<dyn ContentStore> =
         fluree_db_nameservice::branched_content_store_for_record(backend, nameservice, record)
             .await?;
+    let root_started = Instant::now();
     let bytes = cs
         .get(&index_cid)
         .await
         .map_err(|e| ApiError::internal(format!("failed to read index root: {e}")))?;
+    let root_read_us = root_started.elapsed().as_micros() as u64;
+    let decode_started = Instant::now();
 
     // Decode FIR6 root metadata to populate snapshot watermarks.
     // `LedgerSnapshot::from_root_bytes` only parses the header; watermarks are needed for
     // DictNovelty/DictOverlay correctness (especially bound-object filters and overlay merges).
     let root = fluree_db_binary_index::IndexRoot::decode(&bytes)
         .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
+    tracing::debug!(
+        target: "fluree::open",
+        ledger = %record.ledger_id,
+        bytes = bytes.len(),
+        root_read_us,
+        root_decode_us = decode_started.elapsed().as_micros() as u64,
+        "binary index root loaded"
+    );
 
     let mut store = BinaryIndexStore::load_from_root_v6_reusing(
         Arc::clone(&cs),
