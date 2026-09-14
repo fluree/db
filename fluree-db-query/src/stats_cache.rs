@@ -4,7 +4,7 @@ use fluree_db_core::{
     GraphDbRef, GraphId, IndexStats, OverlayProvider, RuntimePredicateId, RuntimeSmallDicts, Sid,
     StatsView,
 };
-use fluree_db_novelty::{assemble_fast_stats_shared, Novelty, StatsAssemblyError, StatsLookup};
+use fluree_db_novelty::{assemble_planner_stats, Novelty, StatsAssemblyError, StatsLookup};
 use std::collections::HashMap;
 use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_128;
@@ -104,7 +104,7 @@ pub(crate) fn cached_stats_view_for_db(
             // of them, for the quadratic reason above.
             // Shared: the empty-window and below-published-`t` cases hand
             // back the same `Arc` rather than a second full copy.
-            assemble_fast_stats_shared(
+            assemble_planner_stats(
                 &indexed,
                 db.snapshot,
                 novelty,
