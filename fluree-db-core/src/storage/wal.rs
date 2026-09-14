@@ -57,6 +57,9 @@ pub(super) const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 const ROTATE_BYTES: u64 = 8 * 1024 * 1024;
 /// ... or this age with any record in it, so replay after a crash stays short.
 const ROTATE_AGE: Duration = Duration::from_secs(1);
+/// The least a new segment is filled with zeros ahead of its appends; see
+/// [`Wal::open_segment`].
+const MIN_FILL: u64 = 64 * 1024;
 /// How often the background thread looks for work.
 const TICK: Duration = Duration::from_millis(100);
 /// An append that no head publication has flushed is flushed by the thread
@@ -325,18 +328,16 @@ fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<D
     let mut seq = first_seq;
     let mut at = SEGMENT_HEADER;
     let clean = loop {
-        if at == bytes.len() {
+        // Only an entirely zero suffix, however short, is an unused
+        // preallocated tail. A missing/corrupted frame header can also be
+        // zero; if later bytes exist, it runs the same damage look-ahead as
+        // other tears.
+        if bytes[at..].iter().all(|byte| *byte == 0) {
             break true;
         }
         let Some(header) = bytes.get(at..at + FRAME_HEADER) else {
             break false;
         };
-        if header[..4] == [0; 4] {
-            // Only an entirely zero suffix is an unused preallocated tail.
-            // A missing/corrupted frame header can also be zero; if later
-            // bytes exist, run the same damage look-ahead as for other tears.
-            break bytes[at..].iter().all(|byte| *byte == 0);
-        }
         if &header[..4] != FRAME_MAGIC {
             break false;
         }
@@ -371,6 +372,22 @@ fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<D
     })
 }
 
+/// Write zeros over `[from, to)`; nothing when `to <= from`.
+fn write_zeros(file: &mut File, from: u64, to: u64) -> io::Result<()> {
+    static ZEROS: [u8; 1 << 20] = [0; 1 << 20];
+    if to <= from {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(from))?;
+    let mut at = from;
+    while at < to {
+        let chunk = (to - at).min(ZEROS.len() as u64) as usize;
+        file.write_all(&ZEROS[..chunk])?;
+        at += chunk as u64;
+    }
+    Ok(())
+}
+
 struct Segment {
     id: u64,
     path: PathBuf,
@@ -379,6 +396,8 @@ struct Segment {
     /// released while appends keep landing through `file`.
     sync_fd: Arc<File>,
     len: u64,
+    /// How far the file is written, zeros included; never below `len`.
+    filled: u64,
     /// Keys whose files must be flushed before this segment can be retired.
     touched: Vec<String>,
     /// Appends whose caller has not yet materialized the file. A segment
@@ -430,6 +449,8 @@ struct Inner {
     /// A leader has released `inner` and is inside the device flush. Waiters
     /// park until it publishes; the next one to wake leads the next flush.
     flushing: bool,
+    /// How far to fill the next segment: twice what the last one used.
+    next_fill: u64,
 }
 
 /// The WAL for one storage root. One per canonical root per process; the
@@ -712,6 +733,8 @@ fn writeback(file: &File, fsyncs: &AtomicU64) -> io::Result<()> {
     #[cfg(target_vendor = "apple")]
     {
         use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor belongs to `file`, which is borrowed for the
+        // call; fsync takes no pointers and does not keep the descriptor.
         if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -719,6 +742,8 @@ fn writeback(file: &File, fsyncs: &AtomicU64) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor belongs to `file`, which is borrowed for the
+        // call; sync_file_range takes no pointers and does not keep it.
         if unsafe { libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE) }
             != 0
         {
@@ -736,6 +761,8 @@ fn writeback(file: &File, fsyncs: &AtomicU64) -> io::Result<()> {
 fn syncfs(base: &Path, fsyncs: &AtomicU64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let dir = File::open(base)?;
+    // SAFETY: the descriptor belongs to `dir`, which is open for the call;
+    // syncfs takes no pointers and does not keep the descriptor.
     if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1163,6 +1190,7 @@ impl Wal {
                 next_segment,
                 durable_end: next_seq,
                 flushing: false,
+                next_fill: MIN_FILL,
             }),
             flushed: Condvar::new(),
             lock: Mutex::new(Some(lock)),
@@ -1253,8 +1281,9 @@ impl Wal {
         }
         #[cfg(not(test))]
         let _ = leading;
-        // Segments are preallocated, so a data-only flush covers every frame;
-        // where `sync_data` is the same call as `sync_all` nothing changes.
+        // `sync_data` still commits a size change the frames need, so it
+        // covers appends past a segment's zero fill; inside the fill it
+        // carries data alone.
         file.sync_data()?;
         self.fsyncs.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1305,22 +1334,41 @@ impl Wal {
         let (full, appended) = {
             let segment = inner.active.as_mut().expect("opened above");
             let start = segment.len;
+            let end = start + frame.len() as u64;
+            // A writer that outruns the fill extends it to what its rate so
+            // far will use before the segment ages out, at least doubling:
+            // each extension costs a size-changing flush, so a burst after
+            // an idle spell should reach its size in one or two, not seven.
+            let fill = if end > segment.filled && segment.filled < ROTATE_BYTES {
+                let elapsed = segment.opened.elapsed().max(Duration::from_millis(1));
+                let rate = (start - SEGMENT_HEADER as u64) as f64 / elapsed.as_secs_f64();
+                let ahead = rate * ROTATE_AGE.saturating_sub(elapsed).as_secs_f64();
+                (segment.filled * 2)
+                    .max(end + ahead as u64)
+                    .min(ROTATE_BYTES)
+            } else {
+                segment.filled
+            };
             // Always write at the frame boundary the log knows about, never
-            // at wherever an earlier, failed write left the cursor.
-            let written = segment
-                .file
-                .seek(SeekFrom::Start(start))
+            // at wherever an earlier, failed write left the cursor. The
+            // frame itself covers the fill up to its end.
+            let written = write_zeros(&mut segment.file, segment.filled.max(end), fill)
+                .and_then(|()| segment.file.seek(SeekFrom::Start(start)))
                 .and_then(|_| segment.file.write_all(&frame));
             if let Err(e) = written {
                 // Nothing acknowledged depends on the bytes that may have
                 // landed; cut back to the last frame boundary. If even
                 // that fails the file's state is unknown.
                 return Err(match segment.file.set_len(start) {
-                    Ok(()) => e,
+                    Ok(()) => {
+                        segment.filled = start;
+                        e
+                    }
                     Err(_) => self.poison(e),
                 });
             }
-            segment.len += frame.len() as u64;
+            segment.len = end;
+            segment.filled = fill.max(end);
             segment.last_append = Instant::now();
             segment.touched.push(op.key().to_owned());
             // Counted before any wait: the segment may close while this
@@ -1462,17 +1510,16 @@ impl Wal {
         let mut header = SEGMENT_MAGIC.to_vec();
         header.extend_from_slice(&first_seq.to_le_bytes());
         file.write_all(&header)?;
-        // Filled with zeros to its rotation size, so appending never grows
-        // the file: a flush then carries only data, which on Linux is a
-        // fraction of the cost of one that must also commit the inode.
-        // Replay reads the zero tail as the end of the segment.
-        let zeros = vec![0u8; 1 << 20];
-        let mut filled = header.len() as u64;
-        while filled < ROTATE_BYTES {
-            let chunk = (ROTATE_BYTES - filled).min(zeros.len() as u64) as usize;
-            file.write_all(&zeros[..chunk])?;
-            filled += chunk as u64;
-        }
+        // Filled with zeros ahead of its appends, so an append inside the
+        // fill does not grow the file: its flush then carries only data,
+        // which on Linux is a fraction of the cost of one that must also
+        // commit the inode (allocating the blocks, as `set_len` or
+        // `fallocate` would, does not help). Sized to the last segment's
+        // use, so a writer slower than rotation does not rewrite megabytes
+        // for each segment. Replay reads the zero tail as the end of the
+        // segment.
+        let filled = inner.next_fill;
+        write_zeros(&mut file, header.len() as u64, filled)?;
         file.sync_all()?;
         self.fsyncs.fetch_add(1, Ordering::Relaxed);
         std::fs::rename(&tmp, &path)?;
@@ -1486,6 +1533,7 @@ impl Wal {
             file,
             sync_fd,
             len: SEGMENT_HEADER as u64,
+            filled,
             touched: Vec::new(),
             in_flight: Arc::new(AtomicUsize::new(0)),
             last_append: Instant::now(),
@@ -1518,6 +1566,7 @@ impl Wal {
             inner.durable_end = inner.next_seq;
             self.flushed.notify_all();
         }
+        inner.next_fill = (segment.len * 2).clamp(MIN_FILL, ROTATE_BYTES);
         tracing::trace!(
             segment = segment.id,
             bytes = segment.len,
@@ -3051,14 +3100,127 @@ mod tests {
 
     #[test]
     fn preallocated_zero_tail_is_clean() {
-        let mut bytes = SEGMENT_MAGIC.to_vec();
-        bytes.extend_from_slice(&1u64.to_le_bytes());
-        bytes.extend_from_slice(&encode_frame(1, &Op::Delete { key: "head" }.encode()));
-        bytes.resize(ROTATE_BYTES as usize, 0);
-        let decoded = decode_segment(&bytes, None).unwrap();
-        assert!(decoded.clean);
-        assert_eq!(decoded.ops.len(), 1);
-        assert_eq!(decoded.next_seq, 2);
+        let mut frames = SEGMENT_MAGIC.to_vec();
+        frames.extend_from_slice(&1u64.to_le_bytes());
+        frames.extend_from_slice(&encode_frame(1, &Op::Delete { key: "head" }.encode()));
+        // Down to a tail too short to hold a frame header: a segment that
+        // filled to just short of its fill ends that way.
+        for tail in [1, FRAME_HEADER - 1, ROTATE_BYTES as usize - frames.len()] {
+            let mut bytes = frames.clone();
+            bytes.resize(frames.len() + tail, 0);
+            let decoded = decode_segment(&bytes, None).unwrap();
+            assert!(decoded.clean, "a {tail}-byte zero tail");
+            assert_eq!(decoded.ops.len(), 1);
+            assert_eq!(decoded.next_seq, 2);
+        }
+    }
+
+    /// A segment is zero-filled only as far as the last one was used, and an
+    /// append past its fill doubles the fill instead of growing the file per
+    /// frame. Replay reads every one of those tails as clean.
+    #[test]
+    fn a_segment_is_filled_to_what_the_last_one_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.hold_segments();
+        let active = |log: &Wal| {
+            let inner = log.inner.lock().unwrap();
+            let segment = inner.active.as_ref().unwrap();
+            (segment.len, segment.file.metadata().unwrap().len())
+        };
+
+        drop(log.append(write("small"), true).unwrap());
+        assert_eq!(active(&log).1, MIN_FILL, "a fresh log fills the minimum");
+
+        let big = vec![7u8; MIN_FILL as usize];
+        drop(
+            log.append(
+                Op::Write {
+                    key: "big",
+                    bytes: &big,
+                },
+                true,
+            )
+            .unwrap(),
+        );
+        let (used, file_len) = active(&log);
+        assert!(used > MIN_FILL);
+        assert_eq!(file_len, MIN_FILL * 2, "outrunning the fill doubles it");
+
+        rotate_now(&log);
+        drop(log.append(write("after-busy"), true).unwrap());
+        assert_eq!(active(&log).1, used * 2, "the next fill follows the use");
+
+        rotate_now(&log);
+        drop(log.append(write("after-quiet"), true).unwrap());
+        assert_eq!(
+            active(&log).1,
+            MIN_FILL,
+            "a quiet segment's successor is small"
+        );
+
+        log.simulate_crash();
+        let _reopened = owned(dir.path());
+        for key in ["small", "after-busy", "after-quiet"] {
+            assert_eq!(std::fs::read(dir.path().join(key)).unwrap(), b"payload");
+        }
+        assert_eq!(std::fs::read(dir.path().join("big")).unwrap(), big);
+    }
+
+    /// A writer that fills a segment early in its life extends the fill to
+    /// what that rate will use before the segment ages out, not merely
+    /// doubling it, so a burst does not pay a size-changing flush per step.
+    #[test]
+    fn a_burst_extends_its_fill_to_its_projected_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = owned(dir.path());
+        log.hold_segments();
+        let chunk = vec![7u8; 8 * 1024];
+        let mut appended = 0;
+        while appended + chunk.len() < (MIN_FILL - 1024) as usize {
+            let key = format!("k{appended}");
+            drop(
+                log.append(
+                    Op::Write {
+                        key: &key,
+                        bytes: &chunk,
+                    },
+                    false,
+                )
+                .unwrap(),
+            );
+            appended += chunk.len();
+        }
+        {
+            // Pin the rate: this much in 50 ms projects to many times the
+            // fill over the rest of the second.
+            let mut inner = log.inner.lock().unwrap();
+            let segment = inner.active.as_mut().unwrap();
+            segment.opened = Instant::now() - Duration::from_millis(50);
+        }
+        drop(
+            log.append(
+                Op::Write {
+                    key: "crossing",
+                    bytes: &chunk,
+                },
+                true,
+            )
+            .unwrap(),
+        );
+        let inner = log.inner.lock().unwrap();
+        let file_len = inner
+            .active
+            .as_ref()
+            .unwrap()
+            .file
+            .metadata()
+            .unwrap()
+            .len();
+        assert!(
+            file_len > 4 * MIN_FILL,
+            "extended to the projected use, not doubled: {file_len}"
+        );
     }
 
     #[test]

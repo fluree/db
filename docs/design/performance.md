@@ -235,6 +235,64 @@ ordering and the scan layer work from the narrower form:
   compound patterns are rewrite boundaries because MINUS/EXISTS semantics can
   change when a shared variable disappears before the retained VALUES binds it.
 
+### Multi-row VALUES in stars
+
+A pure, unseeded star with no constant object anchor can start from one small
+object `VALUES` table when predicate statistics predict at least a 16-fold
+reduction over its smallest predicate scan: the seed's estimated work,
+`rows × (1 + count / ndv)` for the probed predicate, must fall below
+`min(estimate) / 16`, where duplicate rows count toward `rows`. The table must
+contain at most 64 rows of fully bound references. The
+planner probes the associated predicate first, joins other `VALUES` as soon as
+all their variables are available, and visits constrained endpoints before
+unconstrained payload columns. It retains the actual `ValuesOperator` joins, so
+duplicates multiply results, `UNDEF` remains a wildcard, and multi-column
+correlations survive. Independent tables are never multiplied into a seed.
+
+Broad or unsupported seeds, unavailable object NDV, existing subject seeds,
+constant-object anchors, history, and multi-graph default unions retain their
+existing planning paths. In particular, existing fused stars keep their fusion.
+This decision uses the same ordinary scan/join operators as other queries; it
+does not rewrite `VALUES` into `FILTER IN`. The `it_values_object_bounds` tests
+pin the physical plan, scan fuel, and result semantics. The
+`query_hot_values_star` benchmark compares the two spellings at 6k–500k edges
+and includes singleton and broad-set controls.
+
+### Aggregate complement rewrites
+
+Two IR rewrites target the shape of BSBM BI Q4: the average of a value over
+entities that *lack* a key, written as every key from a `SELECT DISTINCT`
+universe crossed with every entity and filtered by `FILTER NOT EXISTS`. Both
+recognize that shape narrowly. A query computing the same answer another way,
+for example with an extra join, a different aggregate, or `GROUP BY` in place of
+`DISTINCT`, keeps the ordinary plan, and no error or hint explains why.
+
+- **Complement fold**
+  ([`aggregate_complement_fold.rs`](../../fluree-db-query/src/aggregate_complement_fold.rs)).
+  `SUM` and `COUNT` distribute over set difference, so the sub-SELECT becomes
+  one scalar universe total, a per-key aggregate over the `NOT EXISTS` body as a
+  positive join, and `(universeSum − withSum) / (universeCount − withCount)`. It
+  requires one grouping key, a single `AVG` whose input a `BIND` computes, one
+  `NOT EXISTS` that references the key, a `DISTINCT` universe sub-SELECT, and no
+  universe triple that binds the key.
+- **Aggregate sharing**
+  ([`aggregate_complement_fold/shared.rs`](../../fluree-db-query/src/aggregate_complement_fold/shared.rs)).
+  When a sibling sub-SELECT computes the matching WITH average and the outer
+  query only divides the two, as Q4 does, that sibling's grouped scan also
+  produces the `SUM` and `COUNT` the complement needs, so the per-key join runs
+  once. Admission requires:
+  - exactly two independent, unsliced sub-SELECTs plus the division `BIND`;
+  - a three-triple universe: a typed entity and an offer linking it to a
+    numeric value;
+  - the same `xsd:float` or `xsd:double` cast on both sides;
+  - no outer grouping or reasoning;
+  - current-state, single-graph execution under root or no policy.
+
+  Anything else falls back to the complement fold alone.
+
+EXPLAIN on a view, and the connection and HTTP explain endpoints, plan with the
+same policy gate as execution, so they report whichever plan runs.
+
 ### Cost constants are coupled and tested
 
 Estimator constants are not free parameters. `DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY`
@@ -255,6 +313,24 @@ Every planner decision is visible via [explain plans](../query/explain.md) —
 chosen index permutation per scan, whether statistics or fallbacks were used,
 estimated row counts per node, hash-join selection and its reasoning, and
 whether patterns were reordered.
+
+### Kill switches
+
+These environment variables restore a previous plan so a suspected optimizer
+defect can be A/B tested against a customer query. Setting a variable enables
+it; any value, including `0`, counts.
+
+| Variable | Effect | Read |
+|---|---|---|
+| `FLUREE_DISABLE_QUERY_FAST_PATHS` | Generic pipeline instead of fused fast paths, the count planner, the membership and range semijoin lanes, and the SQL pushdown lane. Does not affect the complement rewrites | Once per process |
+| `FLUREE_DISABLE_AGG_COMPLEMENT_FOLD` | Disables both [aggregate complement rewrites](#aggregate-complement-rewrites) | Per query |
+| `FLUREE_DISABLE_AGG_COMPLEMENT_SHARING` | Disables only aggregate sharing; the complement fold still applies | Per query |
+| `FLUREE_DISABLE_DECIMAL_SEEKS` | A scan with a bound decimal object uses the general numeric matcher instead of a point lookup in the predicate's decimal arena. The scan still leads with the predicate | Once per process |
+
+The planner switches apply to EXPLAIN as well as execution, so compare plans
+with the same environment the query runs in. `FLUREE_DISABLE_DECIMAL_SEEKS`
+acts when a scan opens and does not change the plan; compare fuel or timing
+instead.
 
 ## Layer 4: Join operators
 

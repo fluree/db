@@ -3,6 +3,7 @@
 //! - [`GraphTransactBuilder`] — lazy transaction from a [`Graph`] handle
 //! - [`StagedGraph`] — staged (uncommitted) transaction queryable via [`GraphSnapshotQueryBuilder`]
 
+use fluree_db_core::VerifiedIdentity;
 use serde_json::Value as JsonValue;
 
 use crate::error::BuilderErrors;
@@ -147,9 +148,11 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
 
     // -- Option setters --
 
-    /// Set transaction options (author, context, etc.).
+    /// Set transaction options (author, context, etc.). A verified identity
+    /// recorded earlier with [`Self::server_identity`] is kept unless `opts`
+    /// carries its own.
     pub fn txn_opts(mut self, opts: TxnOpts) -> Self {
-        self.core.txn_opts = opts;
+        self.core.set_txn_opts(opts);
         self
     }
 
@@ -174,6 +177,14 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
     /// Set policy enforcement for the transaction.
     pub fn policy(mut self, ctx: PolicyContext) -> Self {
         self.core.policy = Some(ctx);
+        self
+    }
+
+    /// Record the auth-layer-verified caller identity, the value the SHACL
+    /// group's `f:overrideControl` gates `opts.validationMode` on. See
+    /// `TransactBuilder::server_identity`.
+    pub fn server_identity(mut self, identity: Option<VerifiedIdentity>) -> Self {
+        self.core.set_server_identity(identity);
         self
     }
 
