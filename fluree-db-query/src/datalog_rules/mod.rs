@@ -119,9 +119,16 @@ impl DatalogRuleSet {
     /// with the subject's name in the message.
     pub fn add_rule(&mut self, rule: DatalogRule) -> Result<()> {
         if let Some(existing) = self.rules.iter().find(|r| r.id == rule.id) {
+            // No parenthetical naming "the two rules": they collide precisely
+            // because they share a subject, and a rule's `name` is that
+            // subject decoded, so both names are the same string. The earlier
+            // wording promised to tell them apart and always read
+            // `(ex:r1 and ex:r1)`.
             return Err(QueryError::InvalidQuery(format!(
-                "two datalog rules share the id <{}> ({} and {}); a rule id must name                  exactly one rule. Give each rule its own subject, or retract one of                  the `f:rule` values on that subject",
-                existing.name, existing.name, rule.name
+                "two datalog rules share the id <{}>; a rule id must name exactly one \
+                 rule. Give each rule its own subject, or retract one of the `f:rule` \
+                 values on that subject",
+                existing.name
             )));
         }
         self.rules.push(rule);

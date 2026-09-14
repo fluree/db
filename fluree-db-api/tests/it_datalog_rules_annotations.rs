@@ -1224,3 +1224,88 @@ async fn a_stored_rule_naming_an_unseen_namespace_still_runs() {
         "the refusal must name the operand: {err}"
     );
 }
+
+#[tokio::test]
+async fn typed_literals_in_a_sparql_rule_head_are_coerced_too() {
+    // The SPARQL twin of `typed_literals_in_a_rule_head_are_coerced_to_their_
+    // datatype`. Both of that fix's original tests used the JSON-LD `insert`
+    // shape, so nothing exercised this surface — and this surface was worse
+    // than the defect being fixed: the declared datatype was not mislabelled,
+    // it was discarded. `lower_construct_template` built the head through a
+    // lowering that ends at `TriplePattern::new(s, p, o)` and leaves `dtc`
+    // unset, so the head fell back to a datatype guessed from the value and
+    // `"2024-01-01"^^xsd:date` stored `xsd:string`.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/sparql-head-typed-literal").await;
+    let q = json!({
+        "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+        "select": ["?dt", "?y"],
+        "where": [
+            {"@id": "ex:alice", "ex:joined": "?d"},
+            ["bind", "?dt", "(datatype ?d)"],
+            ["bind", "?y", "(year ?d)"]
+        ],
+        "reasoning": "datalog",
+        "rules": [{
+            "@type": "f:sparql",
+            "@value": "PREFIX ex: <http://example.org/>\n\
+                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+                       CONSTRUCT { ?a ex:joined \"2024-01-01\"^^xsd:date }\n\
+                       WHERE { ?a ex:knows ?b }"
+        }]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("query over the derived date")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let row = rows[0].as_array().expect("row");
+    assert_eq!(
+        row[0].as_str(),
+        Some("xsd:date"),
+        "the declared datatype must survive into the head: {rows}"
+    );
+    assert_eq!(
+        row[1].as_i64(),
+        Some(2024),
+        "YEAR() binds only on a real xsd:date, not a string wearing its \
+         label: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn a_sparql_head_literal_its_datatype_rejects_fails_the_rule() {
+    // The SPARQL counterpart of
+    // `a_head_literal_its_datatype_rejects_fails_the_rule`, and deliberately
+    // not a twin: the two surfaces refuse this at different points.
+    //
+    // On the JSON-LD surface the value reaches the head as written and
+    // `coerced_literal` is what refuses it. On this surface
+    // `lower_typed_literal` parses the literal while lowering the CONSTRUCT
+    // template, so a value its datatype cannot accept never becomes a head at
+    // all — the message here comes from lowering, not from coercion. That is
+    // why this test passes whether or not the template carries the datatype,
+    // which the coercion test next to it does not.
+    //
+    // It still earns its place: it pins that the rule is refused rather than
+    // storing a mislabelled value, which is the property that matters, and it
+    // records which layer owns the check on each surface.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/sparql-head-bad-literal").await;
+    let message = rejection(
+        &fluree,
+        &ledger,
+        json!([{
+            "@type": "f:sparql",
+            "@value": "PREFIX ex: <http://example.org/>\n\
+                       PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+                       CONSTRUCT { ?a ex:joined \"not-a-date\"^^xsd:date }\n\
+                       WHERE { ?a ex:knows ?b }"
+        }]),
+    )
+    .await;
+    assert!(
+        message.contains("date") && message.contains("not-a-date"),
+        "the refusal must name the value and its datatype: {message}"
+    );
+}
