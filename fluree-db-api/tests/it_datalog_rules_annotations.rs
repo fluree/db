@@ -944,8 +944,9 @@ async fn filter_iri_operand_forms_across_spellings() {
     // absolute URL is an IRI, and a quoted value is a string. The array form
     // has no such syntax — every element is a JSON string — so a bare atom is
     // always a string there, and `iri(…)` is the way to mean the IRI. Note
-    // `iri(…)` does NOT expand a prefix (SPARQL's `IRI()` resolves against the
-    // base, not the prefix map), so the array form needs the full IRI.
+    // `iri(…)` does NOT expand a prefix — its argument is used verbatim, and
+    // this surface has no BASE to resolve against — so the array form needs
+    // the full IRI.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = claims_ledger(&fluree, "rules/filter-forms").await;
 

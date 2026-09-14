@@ -1759,15 +1759,27 @@ async fn enforce_single_target_reifiers(
     // `touched` keeps the "gate on asserts" property: a reifier is only work
     // when the txn ASSERTS one of its facts, so pure retracts (which can only
     // shrink a bundle) and non-annotation transactions stay at zero scan cost.
-    let mut by_reifier: HashMap<&Sid, Vec<&Flake>> = HashMap::new();
-    let mut touched: Vec<&Sid> = Vec::new();
+    //
+    // The key is `(graph, reifier)`, not the reifier alone. A bundle names its
+    // own graph in `f:reifiesGraph`, and `EdgeKey::from_reifies_facts` checks
+    // that a bundle is graph-uniform before it checks anything else, so
+    // folding one reifier's flakes from two graphs into one bundle reports
+    // `MixedFlakeGraphs` — surfaced here as "multi-target", which it is not.
+    // The same reifier in two graphs is a state graph management produces on
+    // purpose: `COPY <g1> TO <g2>` duplicates annotated edges, reifier IRIs
+    // included, and `add_same_edge_same_reifier_succeeds` pins that it must
+    // work. Keying by subject alone refused within one transaction exactly
+    // what two transactions were free to do.
+    let mut by_reifier: HashMap<(GraphId, &Sid), Vec<&Flake>> = HashMap::new();
+    let mut touched: Vec<(GraphId, &Sid)> = Vec::new();
     for f in flakes {
         if !is_reserved_reifies_predicate(&f.p) {
             continue;
         }
-        let group = by_reifier.entry(&f.s).or_default();
+        let key = (resolve_flake_graph_id(f, reverse_graph)?, &f.s);
+        let group = by_reifier.entry(key).or_default();
         if f.op && !group.iter().any(|g| g.op) {
-            touched.push(&f.s);
+            touched.push(key);
         }
         group.push(f);
     }
@@ -1798,26 +1810,22 @@ async fn enforce_single_target_reifiers(
         // resolves in neither dictionary, so each one walked the graph's whole
         // novelty: O(new reifiers x novelty) on exactly the bulk Turtle-star
         // insert this check exists to guard.
-        let mut anchors: Vec<(&Sid, GraphId, Option<Sid>)> = Vec::with_capacity(touched.len());
-        for ann_sid in &touched {
-            let anchor = by_reifier[ann_sid]
+        let mut anchors: Vec<((GraphId, &Sid), Option<Sid>)> = Vec::with_capacity(touched.len());
+        for key in &touched {
+            let anchor = by_reifier[key]
                 .iter()
                 .find(|f| f.op)
                 .expect("touched implies an assert");
-            anchors.push((
-                ann_sid,
-                resolve_flake_graph_id(anchor, reverse_graph)?,
-                anchor.g.clone(),
-            ));
+            anchors.push((*key, anchor.g.clone()));
         }
         let candidates: Vec<(GraphId, Sid)> = anchors
             .iter()
-            .map(|(sid, g_id, _)| (*g_id, (*sid).clone()))
+            .map(|((g_id, sid), _)| (*g_id, (*sid).clone()))
             .collect();
         let may_have_prior = subjects_with_prior_rows(ledger, &candidates);
 
-        for (ann_sid, g_id, g_sid) in anchors {
-            let mine = &by_reifier[ann_sid];
+        for ((g_id, ann_sid), g_sid) in anchors {
+            let mine = &by_reifier[&(g_id, ann_sid)];
 
             // Current asserted `f:reifies*` bundle for this SID
             // (pre-txn snapshot + novelty), as a deduped set. A reifier with

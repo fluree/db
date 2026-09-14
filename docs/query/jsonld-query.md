@@ -601,9 +601,11 @@ Apply conditions to filter results:
 
 **Comparing against IRIs:**
 
-An unquoted prefixed name or `<...>` IRI in a filter expression is an IRI
-operand and compares by identity, so `(= ?p ex:knows)` matches the predicate
-`ex:knows` — never the string `"ex:knows"`:
+An unquoted prefixed name or `<...>` IRI is an IRI operand wherever RDF terms
+are compared — `=`, `!=`, `in`, `not-in`, `sameTerm` — and compares by
+identity, so `(= ?p ex:knows)` matches the predicate `ex:knows` — never the
+string `"ex:knows"`. In every other position it is the string it has always
+been:
 
 ```json
 {
@@ -618,7 +620,7 @@ operand and compares by identity, so `(= ?p ex:knows)` matches the predicate
 
 A bare absolute URL is an IRI operand too: `(= ?u http://example.org/page)`
 compares against the IRI, and `(= ?u "http://example.org/page")` against the
-string. **This changed in 4.2.0.** Every unquoted atom used to lower to a
+string. **This changed after 4.2.0.** Every unquoted atom used to lower to a
 string, so `(= ?p ex:knows)` could never match a predicate — the bug this
 fixes. A query that compared a *string-valued* property against an unquoted
 URL matched before and does not now; quote the operand to restore it. The
@@ -641,9 +643,10 @@ IRI in `iri`, when you mean the IRI:
 ["filter", ["=", "?p", ["iri", "http://example.org/knows"]]]
 ```
 
-`iri` does not expand prefixes — like SPARQL's `IRI()`, it resolves against the
-base, not the query's `@context` — so `["iri", "ex:knows"]` builds the IRI
-`ex:knows` and matches nothing.
+`iri` does not expand prefixes: its argument is used verbatim, so
+`["iri", "ex:knows"]` builds the IRI `ex:knows` and matches nothing. (SPARQL's
+`IRI()` resolves a relative argument against the query's `BASE`; the JSON-LD
+surface has no `BASE`, so nothing is resolved here either.)
 
 **Complex Filters:**
 

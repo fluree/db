@@ -194,7 +194,10 @@ fn reasoning_budget(modes: &ReasoningModes) -> fluree_db_reasoner::ReasoningBudg
         budget.max_duration = std::time::Duration::from_secs(max_secs);
     }
     if let Some(max_facts) = modes.max_facts {
-        budget.max_facts = max_facts as usize;
+        // Saturating, for the same reason as the memory conversion below: on a
+        // 32-bit target a value past `usize::MAX` wraps, turning a ceiling the
+        // caller raised into a tiny one. `"maxFacts": 4294967297` became 1.
+        budget.max_facts = usize::try_from(max_facts).unwrap_or(usize::MAX);
     }
     if let Some(max_secs) = modes.max_seconds {
         budget.max_duration = std::time::Duration::from_secs(max_secs);

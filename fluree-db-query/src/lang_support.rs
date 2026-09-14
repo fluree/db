@@ -17,9 +17,6 @@ use crate::var_registry::VarRegistry;
 use fluree_db_core::LedgerSnapshot;
 use std::sync::OnceLock;
 
-// Re-exported so the registering layer can construct [`SparqlRuleParts`]
-// without depending on fluree-db-reasoner directly.
-
 /// Lower a SPARQL ASK/SELECT policy query to WHERE patterns.
 ///
 /// Registers special variables (e.g. `$this`, `$identity`) in `vars` as a
@@ -31,7 +28,6 @@ pub type SparqlPolicyLowerFn = fn(
     vars: &mut VarRegistry,
 ) -> Result<Vec<Pattern>, String>;
 
-/// Datalog rule parts lowered from a SPARQL `CONSTRUCT ... WHERE ...` rule.
 /// A lowered SPARQL `CONSTRUCT ... WHERE ...` rule: the whole lowered query
 /// (its `output` is the CONSTRUCT template, its `patterns` the rule body) and
 /// the variable registry the two share.

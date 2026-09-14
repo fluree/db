@@ -108,7 +108,7 @@ fn over_budget(
 ) -> Option<&'static str> {
     if start.elapsed() > budget.max_duration {
         Some("time")
-    } else if facts > budget.max_facts {
+    } else if facts >= budget.max_facts {
         Some("facts")
     } else if bytes > budget.max_memory_bytes {
         Some("memory")
@@ -207,14 +207,19 @@ pub async fn run_fixpoint(
                         if !seen.insert(fact_key(&flake)) {
                             continue;
                         }
+                        // Check before pushing. Pushing first and testing
+                        // `len() > max_facts` let one fact past the ceiling
+                        // through, and nothing trimmed it afterwards, so a
+                        // budget of N returned N+1 facts. Checking first also
+                        // stops charging `bytes` for a fact never kept.
+                        if derived.len() >= budget.max_facts {
+                            capped = Some("facts");
+                            break 'rounds;
+                        }
                         bytes += approx_flake_bytes(&flake);
                         diagnostics.record_rule_fired(&rule.name);
                         derived.push(flake);
                         new_this_round += 1;
-                        if derived.len() > budget.max_facts {
-                            capped = Some("facts");
-                            break 'rounds;
-                        }
                         if bytes > budget.max_memory_bytes {
                             capped = Some("memory");
                             break 'rounds;

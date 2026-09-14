@@ -519,8 +519,12 @@ This means:
 - **Termination is guaranteed** by a maximum fixpoint-iteration bound and by
   the shared reasoning budget — a maximum derived-fact count, a maximum
   memory estimate for the derived facts, and a maximum wall-clock time, the
-  same budget OWL2-RL uses. The budget is checked after every derived fact,
-  so a single round cannot overshoot it. Hitting the budget stops early and
+  same budget OWL2-RL uses. The fact ceiling is checked before each derived
+  fact is kept, so a run returns at most that many and a single round cannot
+  overshoot. The budget bounds the derived facts, not a rule body's
+  intermediate binding rows: each body is evaluated in full before its heads
+  are instantiated, so a body matching far more rows than it derives facts can
+  exceed the memory estimate while running. Hitting the budget stops early and
   marks the result `capped` in the tracked response's `reasoning` block.
   Configure it with `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` /
   `f:reasoningMaxMemoryMb` (ledger
