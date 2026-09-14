@@ -1,0 +1,24 @@
+[package]
+name = "fluree-delta-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone experiment: does not change Fluree's production dependency graph.
+[workspace]
+resolver = "2"
+
+[dependencies]
+delta_kernel = { version = "=0.28.0", features = ["arrow-58"] }
+delta_kernel_default_engine = { version = "=0.28.0", default-features = false, features = ["arrow-58", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
