@@ -183,6 +183,12 @@ pub(crate) fn cached_stats_view_for_db(
         // non-vouched (policy/dataset) execution at the same overlay epoch.
         view.class_coverage_trustworthy =
             allow_semantic_elision && novelty.is_some_and(Novelty::is_empty);
+        // `source` only serves the coverage proof. When that is off, `stats` may
+        // be a merged or time-travel copy the cache weight does not count, so
+        // do not keep it alive.
+        if !view.class_coverage_trustworthy {
+            view.source = None;
+        }
         // Overlay arena-derived stats for `f:reifies*` predicates so the
         // join planner gets tight selectivity estimates on snapshots
         // with a built annotation index. See
@@ -311,6 +317,78 @@ mod tests {
             true,
             None,
         )
+    }
+
+    /// The redundant-`rdf:type` coverage proof reads class usage through the
+    /// view's retained `source` and IRI encoder. The builder must keep both
+    /// when the proof is licensed, or the elision silently stops firing; and
+    /// drop `source` otherwise, since its weight is not counted.
+    #[test]
+    fn builder_keeps_class_usage_only_for_a_licensed_coverage_proof() {
+        use fluree_db_core::{ClassPropertyUsage, ClassStatEntry, ValueTypeTag};
+        let ref_tag = ValueTypeTag::JSON_LD_ID.as_u8();
+        let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("coverage-builder:main");
+        snapshot
+            .insert_namespace_code(100, "http://example.org/".to_string())
+            .expect("register ex namespace");
+        snapshot.stats = Some(Arc::new(IndexStats {
+            properties: Some(vec![PropertyStatEntry {
+                sid: (100, "p".to_string()),
+                count: 4,
+                ndv_values: 4,
+                ndv_subjects: 4,
+                last_modified_t: 0,
+                datatypes: vec![(ref_tag, 4)],
+                observed_datatypes: vec![ref_tag],
+                historical_datatypes: vec![],
+            }]),
+            classes: Some(vec![ClassStatEntry {
+                class_sid: Sid::new(100, "C"),
+                count: 4,
+                properties: vec![ClassPropertyUsage {
+                    property_sid: Sid::new(100, "p"),
+                    datatypes: vec![(ref_tag, 4)],
+                    langs: vec![],
+                    ref_classes: vec![],
+                }],
+            }]),
+            ..Default::default()
+        }));
+        let (p, c) = ("http://example.org/p", "http://example.org/C");
+        let empty = Novelty::new(1);
+
+        let licensed =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &empty, 0), None, true)
+                .expect("view");
+        assert!(licensed.predicate_subjects_all_in_class_by_iri(p, c));
+        assert!(
+            Arc::ptr_eq(
+                licensed.source.as_ref().expect("source kept"),
+                snapshot.stats.as_ref().expect("stats")
+            ),
+            "the licensed view shares the snapshot's stats rather than a copy"
+        );
+
+        let unvouched =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &empty, 0), None, false)
+                .expect("view");
+        assert!(!unvouched.predicate_subjects_all_in_class_by_iri(p, c));
+        assert!(unvouched.source.is_none());
+
+        let mut window = Novelty::new(1);
+        window
+            .apply_commit(
+                vec![prop_flake(Sid::new(100, "s"), Sid::new(100, "q"), 1, 2)],
+                2,
+                &HashMap::new(),
+            )
+            .unwrap();
+        let merged =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &window, 2), None, true)
+                .expect("view");
+        assert!(!merged.predicate_subjects_all_in_class_by_iri(p, c));
+        assert!(merged.source.is_none(), "a merged copy is not retained");
+        assert_eq!(merged.get_class_count_by_iri(c), Some(4));
     }
 
     #[test]
