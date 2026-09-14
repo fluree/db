@@ -1150,3 +1150,77 @@ async fn two_rules_on_one_subject_are_refused_rather_than_silently_dropped() {
         "the error must name the subject: {msg}"
     );
 }
+
+#[tokio::test]
+async fn a_stored_rule_naming_an_unseen_namespace_still_runs() {
+    // Whether a namespace exists is ledger state, not something about a rule's
+    // text. A stored rule is re-validated on every reasoning query, so a check
+    // that consults that state flips the rule between valid and invalid while
+    // the rule sits untouched — and one invalid stored rule fails every datalog
+    // query on the ledger.
+    //
+    // `FILTER(?b != <http://blocked.example/x>)` is correct and true for every
+    // row, but was refused until some `blocked.example` data happened to
+    // arrive, taking unrelated reasoning down with it.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/unseen-namespace").await;
+
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+                "@id": "ex:notBlockedRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?a", "ex:knows": {"@id": "?b"}},
+                            ["filter", "(!= ?b (iri \"http://blocked.example/x\"))"]
+                        ],
+                        "insert": {"@id": "?a", "ex:reaches": {"@id": "?b"}}
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("store the rule")
+        .ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?a", "?b"],
+        "where": {"@id": "?a", "ex:reaches": {"@id": "?b"}},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("a stored rule must not be refused for a namespace the ledger has not seen")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        rows.as_array().map(Vec::len).unwrap_or(0),
+        3,
+        "the filter excludes nothing here, so every edge derives: {rows}"
+    );
+
+    // A query-time rule still refuses: the author is present, the feedback is
+    // immediate, and nothing persists.
+    let mut inline = q.clone();
+    inline["rules"] = json!([{
+        "@context": {"ex": "http://example.org/"},
+        "where": [
+            {"@id": "?a", "ex:knows": {"@id": "?b"}},
+            ["filter", "(!= ?b (iri \"http://blocked.example/x\"))"]
+        ],
+        "insert": {"@id": "?a", "ex:alsoReaches": {"@id": "?b"}}
+    }]);
+    let err = support::query_jsonld(&fluree, &ledger, &inline)
+        .await
+        .expect_err("a query-time rule naming an unseen namespace is still refused");
+    assert!(
+        err.to_string().contains("blocked.example"),
+        "the refusal must name the operand: {err}"
+    );
+}

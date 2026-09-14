@@ -22,7 +22,12 @@ fn reject(rule: &str, what: &str) -> QueryError {
 /// Reject non-monotonic constructs anywhere in the body, and IRI filter
 /// operands whose namespace the ledger has never seen (they could never match
 /// a stored term, so an exclusion filter on them would keep every row).
-pub(super) fn validate_body(query: &Query, snapshot: &LedgerSnapshot, rule: &str) -> Result<()> {
+pub(super) fn validate_body(
+    query: &Query,
+    snapshot: &LedgerSnapshot,
+    rule: &str,
+    origin: super::parse::RuleOrigin,
+) -> Result<()> {
     if query.grouping.is_some() {
         return Err(reject(
             rule,
@@ -48,14 +53,19 @@ pub(super) fn validate_body(query: &Query, snapshot: &LedgerSnapshot, rule: &str
             ),
         ));
     }
-    walk_patterns(&query.patterns, snapshot, rule)?;
+    walk_patterns(&query.patterns, snapshot, rule, origin)?;
     if let Some(values) = &query.post_values {
-        walk_patterns(std::slice::from_ref(values), snapshot, rule)?;
+        walk_patterns(std::slice::from_ref(values), snapshot, rule, origin)?;
     }
     Ok(())
 }
 
-fn walk_patterns(patterns: &[Pattern], snapshot: &LedgerSnapshot, rule: &str) -> Result<()> {
+fn walk_patterns(
+    patterns: &[Pattern],
+    snapshot: &LedgerSnapshot,
+    rule: &str,
+    origin: super::parse::RuleOrigin,
+) -> Result<()> {
     for pattern in patterns {
         match pattern {
             Pattern::Optional(_) => {
@@ -67,15 +77,19 @@ fn walk_patterns(patterns: &[Pattern], snapshot: &LedgerSnapshot, rule: &str) ->
             Pattern::NotExists(_) => {
                 return Err(non_monotonic(rule, "NOT EXISTS (`not-exists`)"));
             }
-            Pattern::Filter(expr) => check_expr(expr, snapshot, rule, ExprPos::Positive)?,
+            Pattern::Filter(expr) => check_expr(expr, snapshot, rule, ExprPos::Positive, origin)?,
             // A bound value is not a truth value: an `EXISTS` here is
             // negatable later by anything that reads the variable, and the
             // walk cannot follow it, so `EXISTS` is opaque throughout.
-            Pattern::Bind { expr, .. } => check_expr(expr, snapshot, rule, ExprPos::Opaque)?,
-            Pattern::Unwind { list, .. } => check_expr(list, snapshot, rule, ExprPos::Opaque)?,
+            Pattern::Bind { expr, .. } => {
+                check_expr(expr, snapshot, rule, ExprPos::Opaque, origin)?;
+            }
+            Pattern::Unwind { list, .. } => {
+                check_expr(list, snapshot, rule, ExprPos::Opaque, origin)?;
+            }
             Pattern::Union(branches) => {
                 for branch in branches {
-                    walk_patterns(branch, snapshot, rule)?;
+                    walk_patterns(branch, snapshot, rule, origin)?;
                 }
             }
             Pattern::Exists(inner)
@@ -85,7 +99,7 @@ fn walk_patterns(patterns: &[Pattern], snapshot: &LedgerSnapshot, rule: &str) ->
             | Pattern::DefaultGraphSource { patterns: inner }
             | Pattern::EdgeAnnotation { body: inner, .. }
             | Pattern::AnnotationTarget { body: inner, .. } => {
-                walk_patterns(inner, snapshot, rule)?;
+                walk_patterns(inner, snapshot, rule, origin)?;
             }
             // Graph-source patterns read data from outside the ledger's own
             // flakes. Rule bodies run with a default `ContextConfig` (no
@@ -143,7 +157,7 @@ fn walk_patterns(patterns: &[Pattern], snapshot: &LedgerSnapshot, rule: &str) ->
                         ),
                     ));
                 }
-                walk_patterns(&sub.patterns, snapshot, rule)?;
+                walk_patterns(&sub.patterns, snapshot, rule, origin)?;
             }
             // Leaves: nothing to walk. Listed rather than matched by a
             // wildcard so a new `Pattern` variant is a compile error here
@@ -240,6 +254,7 @@ fn check_expr(
     snapshot: &LedgerSnapshot,
     rule: &str,
     pos: ExprPos,
+    origin: super::parse::RuleOrigin,
 ) -> Result<()> {
     match expr {
         Expression::Exists {
@@ -251,7 +266,7 @@ fn check_expr(
             // flipped by `ExprPos::negated`.
             let effective = if *inner { pos.negated() } else { pos };
             match effective {
-                ExprPos::Positive => walk_patterns(patterns, snapshot, rule),
+                ExprPos::Positive => walk_patterns(patterns, snapshot, rule, origin),
                 ExprPos::Negative => Err(non_monotonic(rule, "NOT EXISTS inside FILTER")),
                 ExprPos::Opaque => Err(reject(
                     rule,
@@ -268,15 +283,32 @@ fn check_expr(
             if matches!(func, Function::Iri) {
                 if let [Expression::Const(FlakeValue::String(iri))] = args.as_slice() {
                     if snapshot.encode_iri_strict(iri).is_none() {
-                        return Err(reject(
-                            rule,
-                            &format!(
-                                "filter operand <{iri}> names a namespace this ledger has never \
-                                 seen, so it can never equal a stored term; the rule is rejected \
-                                 rather than run with a filter that cannot match (quote the \
-                                 operand if you meant a string literal)"
+                        // Whether a namespace exists is ledger state, not
+                        // something about the rule's text, so this check can
+                        // flip a STORED rule between valid and invalid while
+                        // the rule sits untouched — and one invalid stored rule
+                        // fails every datalog query on the ledger.
+                        // `FILTER(?src != <http://blocked.example/x>)` is
+                        // perfectly correct, and true for every row, but was
+                        // refused until some `blocked.example` data happened to
+                        // arrive. A query-time rule has none of that: the
+                        // author is present, the feedback is immediate, and
+                        // nothing persists, so it still refuses.
+                        let message = format!(
+                            "filter operand <{iri}> names a namespace this ledger has never \
+                             seen, so it can never equal a stored term (quote the operand if \
+                             you meant a string literal)"
+                        );
+                        match origin {
+                            super::parse::RuleOrigin::QueryTime => {
+                                return Err(reject(rule, &message))
+                            }
+                            super::parse::RuleOrigin::Stored => tracing::warn!(
+                                rule,
+                                "{message}; the rule still runs, but a comparison against \
+                                 it cannot match"
                             ),
-                        ));
+                        }
                     }
                 }
             }
@@ -288,7 +320,7 @@ fn check_expr(
                 _ => ExprPos::Opaque,
             };
             for arg in args {
-                check_expr(arg, snapshot, rule, inner)?;
+                check_expr(arg, snapshot, rule, inner, origin)?;
             }
             Ok(())
         }
@@ -301,30 +333,32 @@ fn check_expr(
         )),
         Expression::Map(entries) => entries
             .iter()
-            .try_for_each(|(_, v)| check_expr(v, snapshot, rule, ExprPos::Opaque)),
+            .try_for_each(|(_, v)| check_expr(v, snapshot, rule, ExprPos::Opaque, origin)),
         Expression::ListComprehension {
             list, filter, map, ..
         } => {
-            check_expr(list, snapshot, rule, ExprPos::Opaque)?;
+            check_expr(list, snapshot, rule, ExprPos::Opaque, origin)?;
             for part in [filter, map].into_iter().flatten() {
-                check_expr(part, snapshot, rule, ExprPos::Opaque)?;
+                check_expr(part, snapshot, rule, ExprPos::Opaque, origin)?;
             }
             Ok(())
         }
         Expression::Reduce {
             init, list, body, ..
         } => {
-            check_expr(init, snapshot, rule, ExprPos::Opaque)?;
-            check_expr(list, snapshot, rule, ExprPos::Opaque)?;
-            check_expr(body, snapshot, rule, ExprPos::Opaque)
+            check_expr(init, snapshot, rule, ExprPos::Opaque, origin)?;
+            check_expr(list, snapshot, rule, ExprPos::Opaque, origin)?;
+            check_expr(body, snapshot, rule, ExprPos::Opaque, origin)
         }
         Expression::ListPredicate {
             list, predicate, ..
         } => {
-            check_expr(list, snapshot, rule, ExprPos::Opaque)?;
-            check_expr(predicate, snapshot, rule, ExprPos::Opaque)
+            check_expr(list, snapshot, rule, ExprPos::Opaque, origin)?;
+            check_expr(predicate, snapshot, rule, ExprPos::Opaque, origin)
         }
-        Expression::Member { target, .. } => check_expr(target, snapshot, rule, ExprPos::Opaque),
+        Expression::Member { target, .. } => {
+            check_expr(target, snapshot, rule, ExprPos::Opaque, origin)
+        }
         // Leaves: nothing to walk. `Resolved` is runtime-only and never
         // reaches a rule body at parse time.
         Expression::Var(_) | Expression::Const(_) | Expression::Resolved(_) => Ok(()),

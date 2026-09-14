@@ -213,10 +213,16 @@ pub async fn extract_datalog_rules(db: GraphDbRef<'_>) -> Result<DatalogRuleSet>
                         "stored datalog rule <{label}> is not valid JSON: {e}"
                     ))
                 })?;
-                parse::parse_jsonld_rule(&rule_id, &rule_json, db.snapshot, json_str.as_str())
+                parse::parse_jsonld_rule(
+                    &rule_id,
+                    &rule_json,
+                    db.snapshot,
+                    json_str.as_str(),
+                    parse::RuleOrigin::Stored,
+                )
             }
             FlakeValue::String(source) if flake.dt == sparql_dt => {
-                parse::parse_sparql_rule(&rule_id, source, db.snapshot)
+                parse::parse_sparql_rule(&rule_id, source, db.snapshot, parse::RuleOrigin::Stored)
             }
             _ => Err(QueryError::InvalidQuery(format!(
                 "stored datalog rule <{label}> has datatype {}; expected an @json rule \

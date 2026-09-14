@@ -565,6 +565,20 @@ pub struct StageOptions<'a> {
     ///
     /// The normal `stage()` path builds this internally from `txn.graph_delta`.
     pub graph_sids: Option<&'a HashMap<GraphId, Sid>>,
+
+    /// These flakes come from a commit that was already authored and written,
+    /// not from a transaction being authored now.
+    ///
+    /// Authoring invariants become advisory: a violation is logged rather than
+    /// refused. The single-target reifier rule is one. It reached
+    /// `stage_flakes` with this work, which put it on the push path — and
+    /// `insert_turtle` and the permissive bulk-import sink did not enforce it
+    /// before, so a commit written by an older build can hold a reifier on two
+    /// edges. Refusing that on push would strand the ledger permanently, with
+    /// no way forward short of rewriting history, to prevent data that is
+    /// already written. Authoring still refuses it, which is where refusing
+    /// can still change the outcome.
+    pub replaying_commit: bool,
 }
 
 impl<'a> StageOptions<'a> {
@@ -594,6 +608,13 @@ impl<'a> StageOptions<'a> {
     /// Set the graph routing map for named-graph flakes
     pub fn with_graph_sids(mut self, graph_sids: &'a HashMap<GraphId, Sid>) -> Self {
         self.graph_sids = Some(graph_sids);
+        self
+    }
+
+    /// Mark these flakes as the replay of an already-authored commit, making
+    /// authoring invariants advisory. See [`StageOptions::replaying_commit`].
+    pub fn replaying_commit(mut self) -> Self {
+        self.replaying_commit = true;
         self
     }
 }
@@ -1946,7 +1967,22 @@ pub async fn stage_flakes(
         };
 
         // 3. Stage-time attachment-bundle invariant: one reifier, one edge.
-        enforce_single_target_reifiers(&ledger, &flakes, &reverse_graph).await?;
+        //    Advisory when replaying a commit that was authored elsewhere —
+        //    see `StageOptions::replaying_commit` for why refusing there would
+        //    strand a ledger rather than prevent anything.
+        match enforce_single_target_reifiers(&ledger, &flakes, &reverse_graph).await {
+            Ok(()) => {}
+            Err(e) if options.replaying_commit => {
+                tracing::warn!(
+                    error = %e,
+                    "replayed commit violates the single-target reifier invariant; \
+                     applying it anyway because the commit is already authored. \
+                     Its attachment bundles will not decode, so the annotations \
+                     involved will not be queryable"
+                );
+            }
+            Err(e) => return Err(e),
+        }
 
         // 4. Charge 1 micro-fuel per staged flake.
         if let Some(tracker) = options.tracker {

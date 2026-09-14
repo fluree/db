@@ -64,17 +64,46 @@ pub fn parse_query_time_rule(
             None => synthetic_id(),
         };
         if let Some(source) = as_sparql_typed_value(f_rule) {
-            return parse_sparql_rule(&rule_id, source, snapshot);
+            return parse_sparql_rule(&rule_id, source, snapshot, RuleOrigin::QueryTime);
         }
         let rule_value = f_rule.get("@value").unwrap_or(f_rule);
-        return parse_jsonld_rule(&rule_id, rule_value, snapshot, &rule_value.to_string());
+        return parse_jsonld_rule(
+            &rule_id,
+            rule_value,
+            snapshot,
+            &rule_value.to_string(),
+            RuleOrigin::QueryTime,
+        );
     }
 
     let rule_id = synthetic_id();
     if let Some(source) = as_sparql_typed_value(json) {
-        return parse_sparql_rule(&rule_id, source, snapshot);
+        return parse_sparql_rule(&rule_id, source, snapshot, RuleOrigin::QueryTime);
     }
-    parse_jsonld_rule(&rule_id, json, snapshot, &json.to_string())
+    parse_jsonld_rule(
+        &rule_id,
+        json,
+        snapshot,
+        &json.to_string(),
+        RuleOrigin::QueryTime,
+    )
+}
+
+/// Where a rule came from, which decides how strictly ledger-state-dependent
+/// checks are applied.
+///
+/// A stored rule is re-validated on every reasoning query, long after it was
+/// written, against a ledger whose namespaces change. A check that consults
+/// that state can therefore flip a stored rule between valid and invalid
+/// without the rule's text changing — and one invalid stored rule fails every
+/// datalog query on the ledger. A query-time rule has none of that: the author
+/// is present, the feedback is immediate, and nothing persists.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum RuleOrigin {
+    /// An `f:rule` value read back from the ledger.
+    Stored,
+    /// Supplied inline with the query.
+    QueryTime,
 }
 
 /// Parse a JSON-LD rule `{ "@context", "where", "insert" }`.
@@ -83,6 +112,7 @@ pub(super) fn parse_jsonld_rule(
     json: &JsonValue,
     snapshot: &LedgerSnapshot,
     source: &str,
+    origin: RuleOrigin,
 ) -> Result<DatalogRule> {
     let label = rule_iri(snapshot, rule_id);
     let obj = json.as_object().ok_or_else(|| {
@@ -131,7 +161,16 @@ pub(super) fn parse_jsonld_rule(
         .map_err(|e| invalid(&label, format!("invalid where clause: {e}")))?;
 
     let heads = parse_heads(insert_val, &ctx, snapshot, &vars, &label)?;
-    build_rule(rule_id.clone(), label, query, vars, heads, source, snapshot)
+    build_rule(
+        rule_id.clone(),
+        label,
+        query,
+        vars,
+        heads,
+        source,
+        snapshot,
+        origin,
+    )
 }
 
 /// Parse a SPARQL `CONSTRUCT … WHERE …` rule. The CONSTRUCT template is the
@@ -140,6 +179,7 @@ pub(super) fn parse_sparql_rule(
     rule_id: &Sid,
     source: &str,
     snapshot: &LedgerSnapshot,
+    origin: RuleOrigin,
 ) -> Result<DatalogRule> {
     let label = rule_iri(snapshot, rule_id);
     let support = crate::lang_support::sparql_support().ok_or_else(|| {
@@ -181,10 +221,20 @@ pub(super) fn parse_sparql_rule(
         .map(|tp| head_from_triple(tp, snapshot, &label))
         .collect::<Result<Vec<_>>>()?;
 
-    build_rule(rule_id.clone(), label, query, vars, heads, source, snapshot)
+    build_rule(
+        rule_id.clone(),
+        label,
+        query,
+        vars,
+        heads,
+        source,
+        snapshot,
+        origin,
+    )
 }
 
 /// Validate the parsed pieces and assemble the rule.
+#[allow(clippy::too_many_arguments)]
 fn build_rule(
     id: Sid,
     label: String,
@@ -193,6 +243,7 @@ fn build_rule(
     heads: Vec<RuleHead>,
     source: &str,
     snapshot: &LedgerSnapshot,
+    origin: RuleOrigin,
 ) -> Result<DatalogRule> {
     if heads.is_empty() {
         return Err(invalid(&label, "the insert clause derives no triples"));
@@ -200,7 +251,7 @@ fn build_rule(
     if query.patterns.is_empty() && query.post_values.is_none() {
         return Err(invalid(&label, "the where clause has no patterns"));
     }
-    validate::validate_body(&query, snapshot, &label)?;
+    validate::validate_body(&query, snapshot, &label, origin)?;
     let body_vars = validate::body_vars(&query);
     validate::check_range_restriction(&heads, &body_vars, &vars, &label)?;
     validate::warn_iri_vs_literal(&query, &vars, &label);

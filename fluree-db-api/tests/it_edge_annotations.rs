@@ -5899,3 +5899,73 @@ async fn one_reifier_on_the_same_edge_in_two_graphs_writes_in_one_transaction() 
         assert_eq!(anns.len(), 1, "graph {g} must carry its own bundle");
     }
 }
+
+#[tokio::test]
+async fn replaying_a_commit_does_not_refuse_a_reifier_an_older_build_wrote() {
+    // The single-target invariant runs on `stage_flakes`, which put it on the
+    // push path. `insert_turtle` and the permissive bulk-import sink did not
+    // enforce it before this work, so a commit written by an older build can
+    // hold a reifier on two edges. Refusing that on push would strand the
+    // ledger permanently — there is no way forward short of rewriting history
+    // — to prevent data that is already written.
+    //
+    // Authoring still refuses it, which is the case where refusing changes the
+    // outcome. This drives both sides of that distinction through the same
+    // flakes, so the difference is the option and nothing else.
+    use fluree_db_core::{Flake, FlakeValue, Sid};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:replayed-commit";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let sid = |ns: u16, name: &str| Sid::new(ns, name);
+    let reifies = |local: &str| {
+        Sid::new(
+            fluree_vocab::namespaces::FLUREE_DB,
+            Box::leak(local.to_string().into_boxed_str()) as &'static str,
+        )
+    };
+    let ns = 100u16;
+    // One reifier, two different subjects: a bundle that cannot decode.
+    let assert_reifies = |object: Sid| {
+        Flake::new(
+            sid(ns, "claim1"),
+            reifies(fluree_vocab::db::REIFIES_SUBJECT),
+            FlakeValue::Ref(object),
+            Sid::new(0, "@id"),
+            1,
+            true,
+            None,
+        )
+    };
+    let flakes = vec![
+        assert_reifies(sid(ns, "alice")),
+        assert_reifies(sid(ns, "carol")),
+    ];
+
+    let authored = fluree_db_transact::stage_flakes(
+        ledger0.clone(),
+        flakes.clone(),
+        fluree_db_transact::StageOptions::new(),
+    )
+    .await;
+    let err = match authored {
+        Err(e) => e,
+        Ok(_) => panic!("authoring a two-target reifier must be refused"),
+    };
+    assert!(
+        err.to_string().contains("claim1"),
+        "the refusal must name the reifier: {err}"
+    );
+
+    let replayed = fluree_db_transact::stage_flakes(
+        ledger0,
+        flakes,
+        fluree_db_transact::StageOptions::new().replaying_commit(),
+    )
+    .await;
+    assert!(
+        replayed.is_ok(),
+        "replaying an already-authored commit must apply, not strand the ledger"
+    );
+}
