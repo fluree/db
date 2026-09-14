@@ -111,6 +111,55 @@ impl<'a> StreamingLexer<'a> {
     }
 }
 
+/// Whether the tag half of a `LANGTAG` is well-formed.
+///
+/// `LANGTAG ::= '@' [a-zA-Z]+ ('-' [a-zA-Z0-9]+)*` — the first subtag is
+/// letters only, later ones may include digits, and none may be empty.
+fn lang_tag_body_ok(tag: &str) -> bool {
+    tag.split('-').enumerate().all(|(i, part)| {
+        !part.is_empty()
+            && part.chars().all(|c| c.is_ascii_alphanumeric())
+            && (i > 0 || part.chars().all(|c| c.is_ascii_alphabetic()))
+    })
+}
+
+/// Explain a rejected `@`-word, when the rejection was about a language tag.
+///
+/// The generic lexer error reports the token's start position but names the
+/// character sitting at the *remaining* input, which `parse_at_directive` has
+/// already advanced past the whole tag. On `"x"@en--LTR .` that produced
+/// "unexpected character ' '" pointing at the `@` — a character that is not
+/// where the message says, and no mention of language tags at all. Uppercase
+/// `--LTR` reads as a plausible spelling, so saying which spelling is required
+/// is the entire fix the reader needs.
+fn lang_tag_error_message(source: &str, position: usize) -> Option<String> {
+    let rest = source.get(position..)?.strip_prefix('@')?;
+    let word: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    if word.is_empty() {
+        return None;
+    }
+    let (tag, direction) = match word.split_once("--") {
+        Some((tag, dir)) => (tag, Some(dir)),
+        None => (word.as_str(), None),
+    };
+    if !lang_tag_body_ok(tag) {
+        return Some(format!(
+            "invalid language tag `@{word}`: a language tag starts with a letter and \
+             continues as `-`-separated alphanumeric subtags (for example `@en` or `@en-GB`)"
+        ));
+    }
+    match direction {
+        Some(dir) if dir != "ltr" && dir != "rtl" => Some(format!(
+            "invalid base direction `--{dir}` in `@{word}`: a base direction must be \
+             exactly `--ltr` or `--rtl`, in lowercase"
+        )),
+        _ => None,
+    }
+}
+
 /// Create a descriptive error message for an invalid token.
 fn make_lex_error(source: &str, position: usize, input: &Input<'_>) -> TurtleError {
     let remaining = input.as_ref();
@@ -119,7 +168,11 @@ fn make_lex_error(source: &str, position: usize, input: &Input<'_>) -> TurtleErr
     let line_content = lex_get_line(source, line);
 
     let pointer = " ".repeat(col.saturating_sub(1));
-    let message = if bad_char == '"' || bad_char == '\'' {
+    let message = if let Some(explanation) = lang_tag_error_message(source, position) {
+        format!(
+            "{explanation} at line {line}, column {col}\n  |\n{line} | {line_content}\n  | {pointer}^"
+        )
+    } else if bad_char == '"' || bad_char == '\'' {
         format!(
             "unterminated string literal at line {line}, column {col}\n  |\n{line} | {line_content}\n  | {pointer}^"
         )
@@ -335,11 +388,7 @@ fn parse_at_directive(input: &mut Input<'_>) -> ModalResult<TokenKind> {
                 Some((tag, dir)) => (tag, Some(dir)),
                 None => (word, None),
             };
-            let tag_ok = tag.split('-').enumerate().all(|(i, part)| {
-                !part.is_empty()
-                    && part.chars().all(|c| c.is_ascii_alphanumeric())
-                    && (i > 0 || part.chars().all(|c| c.is_ascii_alphabetic()))
-            });
+            let tag_ok = lang_tag_body_ok(tag);
             let dir_ok = matches!(direction, None | Some("ltr" | "rtl"));
             if tag_ok && dir_ok {
                 Ok(TokenKind::LangTag)

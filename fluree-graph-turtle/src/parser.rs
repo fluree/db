@@ -531,19 +531,36 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         let is_sparql_style = matches!(self.current().kind, TokenKind::KwSparqlVersion);
         self.advance()?; // consume @version or VERSION
 
-        match self.current().kind {
-            TokenKind::String | TokenKind::StringEscaped(_) => {}
+        // `StringEscaped` is the escape-bearing slow path for *every* string
+        // lexer, long forms included, so the token kind alone cannot tell
+        // `"1.2"` from `"""1\u002E2"""`. Only an escape-free long string
+        // lexes as `LongString` and got rejected; one carrying any escape
+        // passed, in both the `@version` and SPARQL-style `VERSION` spellings.
+        // The span is what distinguishes them: a long string opens with three
+        // identical quotes.
+        let tok = self.current();
+        let opens_long = {
+            let text = &self.input[tok.start as usize..tok.end as usize];
+            text.starts_with("\"\"\"") || text.starts_with("'''")
+        };
+        match tok.kind {
+            TokenKind::String | TokenKind::StringEscaped(_) if !opens_long => {}
             _ => {
                 return Err(TurtleError::parse(
                     self.current().start as usize,
                     format!(
-                        "expected a quoted version specifier such as \"1.2\" after {}, found {:?}",
+                        "expected a short quoted version specifier such as \"1.2\" after {}, \
+                         found {}",
                         if is_sparql_style {
                             "VERSION"
                         } else {
                             "@version"
                         },
-                        self.current().kind
+                        if opens_long {
+                            "a long string".to_string()
+                        } else {
+                            format!("{:?}", self.current().kind)
+                        }
                     ),
                 ))
             }
@@ -3519,5 +3536,86 @@ mod tests {
             input.push_str(&format!("ex:s{i} ex:p [ ex:q ( ex:o ) ] .\n"));
         }
         parse_to_graph(&input).expect("sibling nesting must not accumulate");
+    }
+}
+
+#[cfg(test)]
+mod version_directive_tests {
+    use super::*;
+    use fluree_graph_ir::GraphCollectorSink;
+
+    fn parse(doc: &str) -> Result<()> {
+        let mut sink = GraphCollectorSink::new();
+        Parser::new(doc, &mut sink)?.parse()
+    }
+
+    /// The version specifier must be a *short* string.
+    ///
+    /// `StringEscaped` is the escape-bearing slow path for every string
+    /// lexer, so a long string carrying any escape produced the same token
+    /// kind as a short one and slipped through a check that only rejected the
+    /// escape-free `LongString`. The hole covered `'''…'''` and the
+    /// SPARQL-style `VERSION` keyword too.
+    #[test]
+    fn a_long_version_specifier_is_rejected_even_when_it_carries_an_escape() {
+        parse("@version \"1.2\" .\n").expect("a short specifier is the accepted form");
+
+        for bad in [
+            "@version \"\"\"1.2\"\"\" .\n",
+            "@version \"\"\"1\\u002E2\"\"\" .\n",
+            "@version '''1\\u002E2''' .\n",
+            "VERSION \"\"\"1\\u002E2\"\"\"\n",
+        ] {
+            let err = parse(bad).expect_err("a long specifier must be a syntax error");
+            assert!(
+                err.to_string().contains("short quoted version specifier"),
+                "input {bad:?} gave: {err}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod lang_tag_error_tests {
+    use super::*;
+    use fluree_graph_ir::GraphCollectorSink;
+
+    fn parse_err(doc: &str) -> String {
+        let mut sink = GraphCollectorSink::new();
+        match Parser::new(doc, &mut sink).and_then(Parser::parse) {
+            Err(e) => e.to_string(),
+            Ok(()) => panic!("expected {doc:?} to be rejected"),
+        }
+    }
+
+    /// A rejected language tag says what is wrong with it.
+    ///
+    /// The generic lexer error reported the token's start offset but named the
+    /// character at the *remaining* input, which the directive scan had
+    /// already advanced past the whole tag. `"x"@en--LTR .` therefore produced
+    /// "unexpected character ' '" with a caret on the `@`, and said nothing
+    /// about language tags. Uppercase `--LTR` is a plausible-looking spelling,
+    /// so naming the required one is the whole fix.
+    #[test]
+    fn a_rejected_language_tag_explains_itself() {
+        let doc = "<http://e/s> <http://e/p> \"x\"@en--LTR .\n";
+        let msg = parse_err(doc);
+        assert!(
+            msg.contains("--ltr") && msg.contains("base direction"),
+            "should name the required spelling: {msg}"
+        );
+
+        let msg = parse_err("<http://e/s> <http://e/p> \"x\"@1en .\n");
+        assert!(
+            msg.contains("language tag"),
+            "a tag starting with a digit should say so: {msg}"
+        );
+
+        // The valid spellings still parse.
+        let mut sink = GraphCollectorSink::new();
+        Parser::new("<http://e/s> <http://e/p> \"x\"@en--ltr .\n", &mut sink)
+            .unwrap()
+            .parse()
+            .expect("lowercase --ltr is the accepted form");
     }
 }
