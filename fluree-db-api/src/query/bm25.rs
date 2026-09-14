@@ -94,6 +94,9 @@ impl Fluree {
     /// For queries that don't use graph source patterns, prefer `query_connection()`
     /// as it may take faster code paths for simple single-ledger queries.
     pub async fn query_connection_with_bm25(&self, query_json: &JsonValue) -> Result<QueryResult> {
+        // This entry point carries no execution options, so there is no
+        // auth-layer-verified identity to stamp: it runs anonymous for
+        // `f:overrideControl` purposes.
         let (spec, qc_opts) = parse_dataset_spec(query_json)?;
 
         if spec.is_empty() {

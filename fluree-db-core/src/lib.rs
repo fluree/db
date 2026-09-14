@@ -84,6 +84,7 @@ pub mod tracking;
 pub mod value;
 pub mod value_id;
 pub mod vec_bi_dict;
+pub mod verified_identity;
 // moka stand-in for wasm32 (clock-free LRU); compiled on native only for its
 // unit tests. See module docs.
 #[cfg(any(target_arch = "wasm32", test))]
@@ -221,6 +222,7 @@ pub use value::{
     FlakeValue, GeoPointBits,
 };
 pub use value_id::{ObjKey, ObjKeyError, ObjKind, ObjPair, ValueTypeTag};
+pub use verified_identity::VerifiedIdentity;
 
 /// Prelude module for convenient imports of storage traits and common types.
 ///
