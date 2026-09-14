@@ -999,3 +999,143 @@ async fn filter_iri_operand_forms_across_spellings() {
         assert_eq!(rows, expected, "{label}");
     }
 }
+
+#[tokio::test]
+async fn iri_operands_resolve_the_same_way_in_every_expression_position() {
+    // Three separate gaps in how an unquoted atom becomes an IRI operand.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/atom-consistency").await;
+
+    // 1. Non-hierarchical schemes. Matching `http://` and `https://` by hand
+    //    left every other scheme looking like a compact IRI with an undefined
+    //    prefix, so it fell back to a string and matched nothing. `did:key:`
+    //    is a common shape in policy.
+    let extra = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:alice",
+        "ex:controller": {"@id": "did:key:z6MkExample"}
+    });
+    let ledger = fluree
+        .insert(ledger, &extra)
+        .await
+        .expect("seed a did")
+        .ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?s"],
+        "where": [
+            {"@id": "?s", "ex:controller": {"@id": "?c"}},
+            ["filter", "(= ?c did:key:z6MkExample)"]
+        ]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("a did: operand is an IRI")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        rows.as_array().map(Vec::len).unwrap_or(0),
+        1,
+        "a `did:` operand must compare as an IRI: {rows}"
+    );
+
+    // 2. Keyword aliases. A context may alias a JSON-LD keyword, and
+    //    expanding `type:admin` through `{"type": "@type"}` yields
+    //    `@typeadmin`, which is not an IRI and can never match. The author
+    //    meant the string, so the atom must stay one.
+    let q = json!({
+        "@context": {"ex": "http://example.org/", "type": "@type"},
+        "select": ["?s"],
+        "where": [
+            {"@id": "?s", "ex:knows": {"@id": "?o"}},
+            ["filter", "(= \"type:admin\" type:admin)"]
+        ]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("a keyword-aliased prefix stays a string")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert!(
+        rows.as_array().map(Vec::len).unwrap_or(0) > 0,
+        "`type:admin` under a keyword alias must stay the string it looks like: {rows}"
+    );
+
+    // 3. Position consistency. A computed SELECT column parsed its expression
+    //    without the `@context`, so `ex:knows` stayed a string there while the
+    //    identical comparison in a FILTER became an IRI operand — the computed
+    //    column was therefore always false.
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?s", "(as (= ?p ex:knows) ?isKnows)"],
+        "where": {"@id": "?s", "?p": {"@id": "?o"}}
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("a computed column resolves prefixes too")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let any_true = rows
+        .as_array()
+        .map(|rs| rs.iter().any(|r| r[1] == json!(true)))
+        .unwrap_or(false);
+    assert!(
+        any_true,
+        "`(= ?p ex:knows)` in a SELECT computation must match what it matches \
+         in a FILTER: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn two_rules_on_one_subject_are_refused_rather_than_silently_dropped() {
+    // `f:rule` is multi-cardinality like any other predicate, and a stored
+    // rule's id is its subject, so a subject carrying two rule values used to
+    // keep only whichever the index scan returned last — silently, and in an
+    // order the author does not control. A reasoning query answered over a
+    // rule set that quietly lost a rule is wrong.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/duplicate-id").await;
+
+    let rule_body = |head: &str| {
+        json!({
+            "@type": "@json",
+            "@value": {
+                "@context": {"ex": "http://example.org/"},
+                "where": {"@id": "?a", "ex:knows": {"@id": "?b"}},
+                "insert": {"@id": "?a", head: {"@id": "?b"}}
+            }
+        })
+    };
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+                "@id": "ex:ruleSubject",
+                "f:rule": [rule_body("ex:reaches"), rule_body("ex:contacts")]
+            }),
+        )
+        .await
+        .expect("storing two rule values on one subject is a legal write")
+        .ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?a", "?b"],
+        "where": {"@id": "?a", "ex:reaches": {"@id": "?b"}},
+        "reasoning": "datalog"
+    });
+    let err = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect_err("a reasoning query must not answer over a silently truncated rule set");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("share the id"),
+        "the error must say two rules collided: {msg}"
+    );
+    assert!(
+        msg.contains("ruleSubject"),
+        "the error must name the subject: {msg}"
+    );
+}

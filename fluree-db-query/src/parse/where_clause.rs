@@ -72,8 +72,18 @@ pub(crate) fn resolve_compact_iri_atoms(
     use super::ast::{UnresolvedExpression as E, UnresolvedFilterValue as V};
     match expr {
         E::Const(V::Curie(atom)) => match ctx.expand_iri(&atom) {
-            // Expansion changed the text: the prefix was defined.
-            Ok(expanded) if expanded.as_str() != atom.as_ref() => {
+            // Expansion changed the text *and* produced something that is
+            // actually an IRI: the prefix was defined and meant a namespace.
+            //
+            // A context may alias a JSON-LD keyword — `{"type": "@type"}` is
+            // ordinary — and expansion then turns `type:admin` into
+            // `@typeadmin`, which is not an IRI and matches nothing. The
+            // author meant the string. Requiring an absolute IRI keeps
+            // keyword aliases out of IRI operand position.
+            Ok(expanded)
+                if expanded.as_str() != atom.as_ref()
+                    && fluree_graph_json_ld::iri::is_absolute(expanded.as_str()) =>
+            {
                 E::Const(V::Iri(Arc::from(expanded.as_str())))
             }
             _ => E::Const(V::Curie(atom)),
@@ -111,6 +121,38 @@ pub(crate) fn resolve_compact_iri_atoms(
                 .collect(),
         },
         other => other,
+    }
+}
+
+/// Resolve compact-IRI atoms in the expression positions that sit outside the
+/// WHERE clause: computed SELECT columns and HAVING.
+///
+/// Those two parse their expressions without the `@context`, so an unquoted
+/// `ex:knows` stayed a plain string there while the identical expression in a
+/// FILTER became an IRI operand. `(as (= ?p ex:knows) ?isKnows)` was therefore
+/// always false, and the same comparison in a filter matched. An absolute
+/// `http://…` was an IRI in both, which made the inconsistency easy to miss.
+pub(crate) fn resolve_atoms_outside_where(
+    query: &mut super::ast::UnresolvedQuery,
+    ctx: &JsonLdParseCtx,
+) {
+    use super::ast::{UnresolvedColumn as C, UnresolvedProjection as P};
+
+    let mut fix_column = |col: &mut C| {
+        if let C::Computation { expr, .. } = col {
+            let taken =
+                std::mem::replace(expr, super::ast::UnresolvedExpression::Var(Arc::from("")));
+            *expr = resolve_compact_iri_atoms(taken, ctx);
+        }
+    };
+    match &mut query.select {
+        P::Tuple(cols) => cols.iter_mut().for_each(&mut fix_column),
+        P::Scalar(col) => fix_column(col),
+        P::Wildcard => {}
+    }
+
+    if let Some(having) = query.options.having.take() {
+        query.options.having = Some(resolve_compact_iri_atoms(having, ctx));
     }
 }
 

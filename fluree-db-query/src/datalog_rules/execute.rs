@@ -64,7 +64,7 @@ pub async fn load_rule_set(
     };
     let mut rule_set = extract_datalog_rules(rules_db).await?;
     for (idx, rule_json) in query_time_rules.iter().enumerate() {
-        rule_set.add_rule(parse_query_time_rule(rule_json, db.snapshot, idx)?);
+        rule_set.add_rule(parse_query_time_rule(rule_json, db.snapshot, idx)?)?;
     }
     Ok(rule_set)
 }

@@ -250,16 +250,25 @@ fn parse_s_expression_atom(s: &str) -> Result<UnresolvedExpression> {
 ///   resolves it.
 /// - Anything else is the bare string it always was.
 fn classify_unquoted_atom(s: &str) -> UnresolvedExpression {
+    use fluree_graph_json_ld::iri::UnresolvedIriDisposition;
     if s.len() > 2 && s.starts_with('<') && s.ends_with('>') {
         return UnresolvedExpression::Const(UnresolvedFilterValue::iri(&s[1..s.len() - 1]));
     }
-    if s.starts_with("http://") || s.starts_with("https://") {
-        return UnresolvedExpression::Const(UnresolvedFilterValue::iri(s));
+    // Scheme classification is shared with JSON-LD expansion rather than
+    // spelled again here. Matching `http://` and `https://` by hand made every
+    // other scheme a would-be compact IRI: `did:key:z6Mk…`, `urn:uuid:…` and
+    // `mailto:…` classified as a CURIE, found no such prefix, and fell back to
+    // a string — so `(= ?id did:key:z6Mk…)`, a common shape in policy, never
+    // matched, and in a rule it was rejected outright as an undefined prefix.
+    match fluree_graph_json_ld::iri::check_unresolved_iri(s) {
+        UnresolvedIriDisposition::AllowAbsolute | UnresolvedIriDisposition::AllowKnownScheme => {
+            UnresolvedExpression::Const(UnresolvedFilterValue::iri(s))
+        }
+        UnresolvedIriDisposition::RejectLikelyCompact { .. } if looks_like_compact_iri(s) => {
+            UnresolvedExpression::Const(UnresolvedFilterValue::Curie(Arc::from(s)))
+        }
+        _ => UnresolvedExpression::Const(UnresolvedFilterValue::Bare(Arc::from(s))),
     }
-    if looks_like_compact_iri(s) {
-        return UnresolvedExpression::Const(UnresolvedFilterValue::Curie(Arc::from(s)));
-    }
-    UnresolvedExpression::Const(UnresolvedFilterValue::Bare(Arc::from(s)))
 }
 
 /// Operators whose operands are compared as RDF *terms*, and so are the only

@@ -107,11 +107,26 @@ impl DatalogRuleSet {
         Self::default()
     }
 
-    /// Add a rule, replacing any earlier rule with the same id.
-    pub fn add_rule(&mut self, rule: DatalogRule) {
-        self.rules.retain(|r| r.id != rule.id);
+    /// Add a rule, refusing a second rule with the same id.
+    ///
+    /// This used to replace the earlier rule. A stored rule's id is its
+    /// `f:rule` subject, and `f:rule` is multi-cardinality like any other
+    /// predicate, so a subject carrying two rule values kept only whichever
+    /// the index scan returned last — silently, and in an order the author
+    /// does not control. That is the same silent-drop shape the rest of this
+    /// work is closing: a reasoning query answered over a rule set that
+    /// quietly lost a rule is wrong, and being wrong is worse than failing
+    /// with the subject's name in the message.
+    pub fn add_rule(&mut self, rule: DatalogRule) -> Result<()> {
+        if let Some(existing) = self.rules.iter().find(|r| r.id == rule.id) {
+            return Err(QueryError::InvalidQuery(format!(
+                "two datalog rules share the id <{}> ({} and {}); a rule id must name                  exactly one rule. Give each rule its own subject, or retract one of                  the `f:rule` values on that subject",
+                existing.name, existing.name, rule.name
+            )));
+        }
         self.rules.push(rule);
         self.rules.sort_by_key(|r| r.depends_on.len());
+        Ok(())
     }
 
     pub fn iter_in_order(&self) -> impl Iterator<Item = &DatalogRule> {
@@ -212,7 +227,7 @@ pub async fn extract_datalog_rules(db: GraphDbRef<'_>) -> Result<DatalogRuleSet>
             ))),
         };
         match parsed {
-            Ok(rule) => rule_set.add_rule(rule),
+            Ok(rule) => rule_set.add_rule(rule)?,
             Err(e) => {
                 return Err(QueryError::InvalidQuery(format!(
                     "stored datalog rule <{label}> is invalid and was not applied: {e}"

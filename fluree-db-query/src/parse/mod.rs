@@ -347,6 +347,9 @@ fn parse_query_ast_internal(
     // (HAVING may introduce synthetic aggregates like (count ?x) used only for filtering.)
     opts.aggregates.extend(aggregates_from_select);
     query.options = opts;
+    // SELECT computations and HAVING parse without the `@context`; give them
+    // the same compact-IRI resolution the WHERE clause gets.
+    where_clause::resolve_atoms_outside_where(&mut query, &ctx);
 
     // GROUP BY without explicit ORDER BY defaults to ordering by the group key(s).
     if query.options.order_by.is_empty() && !query.options.group_by.is_empty() {
