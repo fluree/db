@@ -544,9 +544,6 @@ fn explain_from_parsed(
     // still useful for planning. Without this, `/explain` would report
     // "no stats" while the planner happily uses arena-derived stats.
     let stats_view = if snapshot.stats.is_some() || snapshot.annotation_index.is_some() {
-        // Borrow, never clone: `IndexStats` carries the per-class property
-        // usage vectors, and on a ledger with a class per subject (BKR-star:
-        // 146M flakes) cloning them cost 1.2 s of a 4.7 s explain.
         let base = snapshot.stats.clone().unwrap_or_default();
         let mut view = StatsView::from_db_stats_with_namespaces(&base, snapshot);
         if let Some(ann) = snapshot.annotation_index.as_ref() {
