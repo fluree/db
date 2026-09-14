@@ -505,7 +505,8 @@ This means:
   same budget OWL2-RL uses. The budget is checked after every derived fact,
   so a single round cannot overshoot it. Hitting the budget stops early and
   marks the result `capped` in the tracked response's `reasoning` block.
-  Configure it with `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` (ledger
+  Configure it with `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` /
+  `f:reasoningMaxMemoryMb` (ledger
   config), `"reasoningBudget"` (query), or `FLUREE_REASONING_MAX_FACTS` /
   `FLUREE_REASONING_MAX_SECONDS` (server).
 

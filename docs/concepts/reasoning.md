@@ -85,7 +85,7 @@ enforces configurable limits, checked as facts are derived:
 |-------|---------|--------------------------|
 | Time | 30 seconds | Materialization stops; partial results used |
 | Derived facts | 1,000,000 | Materialization stops; partial results used |
-| Memory | 100 MB | Materialization stops; partial results used |
+| Memory | Derived from the fact limit | Materialization stops; partial results used |
 
 When a budget is exceeded the query still runs — but over an **incomplete**
 closure, so results may be missing entailments. A capped materialization is

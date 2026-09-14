@@ -464,12 +464,16 @@ pub fn config_reasoning_budget(
     server_identity: Option<&str>,
 ) -> Option<ConfigReasoningBudget> {
     let reasoning = resolved.reasoning.as_ref()?;
-    if reasoning.max_facts.is_none() && reasoning.max_seconds.is_none() {
+    if reasoning.max_facts.is_none()
+        && reasoning.max_seconds.is_none()
+        && reasoning.max_memory_mb.is_none()
+    {
         return None;
     }
     Some(ConfigReasoningBudget {
         max_facts: reasoning.max_facts,
         max_seconds: reasoning.max_seconds,
+        max_memory_mb: reasoning.max_memory_mb,
         force: !reasoning.override_control.permits_override(server_identity),
     })
 }
@@ -697,6 +701,7 @@ impl MergeableGroup for ReasoningDefaults {
             ontology_import_map: import_map,
             max_facts: self.max_facts.or(base.max_facts),
             max_seconds: self.max_seconds.or(base.max_seconds),
+            max_memory_mb: self.max_memory_mb.or(base.max_memory_mb),
             override_control: base.override_control.effective_min(&self.override_control),
         }
     }
@@ -1241,6 +1246,14 @@ async fn read_reasoning_defaults(
         config_iris::REASONING_MAX_SECONDS,
     )
     .await?;
+    let max_memory_mb = read_budget_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::REASONING_MAX_MEMORY_MB,
+    )
+    .await?;
     let override_control = read_override_control(snapshot, overlay, to_t, &group_sid).await?;
 
     Ok(Some(ReasoningDefaults {
@@ -1250,6 +1263,7 @@ async fn read_reasoning_defaults(
         ontology_import_map,
         max_facts,
         max_seconds,
+        max_memory_mb,
         override_control,
     }))
 }

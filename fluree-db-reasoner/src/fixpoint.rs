@@ -261,6 +261,10 @@ pub async fn run_fixpoint(
         // deduplicated against earlier rounds — so a closure may cap slightly
         // early, never late.
         let mut in_round_cap: Option<&'static str> = None;
+        // Clock-sample counter for the per-fact budget check; see
+        // `CLOCK_SAMPLE_INTERVAL`. Round-scoped, so each round samples on its
+        // own schedule and the exact check at the round head still bounds it.
+        let mut ticks: u32 = 0;
         for flake in delta.iter() {
             for rule in compiled.property_rules_for(&flake.p) {
                 fire_property_rule(rule, &ontology, &restrictions, flake, &mut ctx);
@@ -272,7 +276,9 @@ pub async fn run_fixpoint(
                     }
                 }
             }
-            if let Some(reason) = budget_exceeded(budget, &start, ctx.derived, ctx.new_delta) {
+            if let Some(reason) =
+                budget_exceeded_sampled(budget, &start, ctx.derived, ctx.new_delta, &mut ticks)
+            {
                 in_round_cap = Some(reason);
                 break;
             }
@@ -356,6 +362,17 @@ pub async fn run_fixpoint(
     Ok((derived.into_derived_flakes(), frozen_same_as, diagnostics))
 }
 
+/// How many per-fact checks pass between clock samples.
+///
+/// The fact and memory comparisons are two integer compares and stay exact on
+/// every call. Reading the clock is not free everywhere: `clock::Instant` is
+/// `std::time` natively, where `elapsed()` is a vDSO call, but `web_time` on
+/// wasm32, where it is a `performance.now()` call across the JS boundary —
+/// once per derived fact. Sampling bounds the time-cap overshoot by whatever
+/// the next 1,023 facts cost, and the round boundary checks the clock exactly
+/// anyway, so a short round is never left unchecked.
+const CLOCK_SAMPLE_INTERVAL: u32 = 1024;
+
 /// In-round budget check: derived facts so far plus this round's candidates,
 /// their approximate heap footprint, and wall-clock time.
 fn budget_exceeded(
@@ -364,11 +381,39 @@ fn budget_exceeded(
     derived: &DerivedSet,
     new_delta: &DeltaSet,
 ) -> Option<&'static str> {
+    budget_exceeded_inner(budget, derived, new_delta, || {
+        start.elapsed() > budget.max_duration
+    })
+}
+
+/// [`budget_exceeded`] for the per-fact dispatch loop: the facts and memory
+/// limits are exact, the clock is sampled every [`CLOCK_SAMPLE_INTERVAL`]
+/// calls.
+fn budget_exceeded_sampled(
+    budget: &crate::cache::ReasoningBudget,
+    start: &Instant,
+    derived: &DerivedSet,
+    new_delta: &DeltaSet,
+    ticks: &mut u32,
+) -> Option<&'static str> {
+    *ticks = ticks.wrapping_add(1);
+    let sample = (*ticks).is_multiple_of(CLOCK_SAMPLE_INTERVAL);
+    budget_exceeded_inner(budget, derived, new_delta, || {
+        sample && start.elapsed() > budget.max_duration
+    })
+}
+
+fn budget_exceeded_inner(
+    budget: &crate::cache::ReasoningBudget,
+    derived: &DerivedSet,
+    new_delta: &DeltaSet,
+    out_of_time: impl FnOnce() -> bool,
+) -> Option<&'static str> {
     if derived.derived_len() + new_delta.len() > budget.max_facts {
         Some("facts")
     } else if derived.approx_bytes() + new_delta.approx_bytes() > budget.max_memory_bytes {
         Some("memory")
-    } else if start.elapsed() > budget.max_duration {
+    } else if out_of_time() {
         Some("time")
     } else {
         None

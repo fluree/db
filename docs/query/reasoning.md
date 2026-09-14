@@ -290,9 +290,15 @@ query-time overrides are allowed. See
 ## Materialization budget
 
 Materialization — OWL 2 RL and datalog rules alike — runs under a budget
-(default: 1,000,000 derived facts / 30 seconds / 100 MB of derived-fact
-memory). The limits are checked as facts are derived, so a single large
-rule round cannot overshoot them. When the closure exceeds the budget it is
+(default: 1,000,000 derived facts / 30 seconds). The limits are checked as
+facts are derived, so a single large rule round cannot overshoot them.
+
+There is a third limit on the bytes those derived facts occupy. It has no
+default of its own: it is derived from the fact ceiling, at an allowance well
+above what an ordinary fact costs, so the **fact** cap is what binds on normal
+data and the memory cap only fires when facts are abnormally large — long
+IRIs, or big string and JSON literals. Raising `maxFacts` raises it with them.
+Both limits count only *derived* facts, not the base data the fixpoint reads. When the closure exceeds the budget it is
 **capped**: the query still answers, but over an incomplete closure —
 results may be missing entailments. A capped run is therefore surfaced, not
 just logged:
@@ -316,21 +322,26 @@ just logged:
 
 - The same JSON rides the `x-fdb-reasoning` response header.
 - `capped_reason` is `"facts"`, `"time"`, `"memory"` or, for datalog,
-  `"iterations"` (the fixpoint hit its round limit before converging);
-  `rules_fired` counts the rule applications that derived something.
+  `"iterations"` (the fixpoint hit its round limit before converging).
+- `rules_fired` breaks the tally down per rule. It counts derived **facts**
+  per rule, not rule applications: a rule that matches a thousand rows and
+  derives one new fact from them counts once.
 - The server logs a WARN per capped materialization.
 
 The budget is configurable at three levels (highest precedence first):
 
 1. **Per query** — JSON-LD `"reasoningBudget": {"maxFacts": 20000000,
-   "maxSeconds": 300}`, or SPARQL `# PRAGMA reasoning-max-facts: 20000000` /
-   `# PRAGMA reasoning-max-seconds: 300`. Subject to the ledger's
+   "maxSeconds": 300, "maxMemoryMb": 512}`, or SPARQL
+   `# PRAGMA reasoning-max-facts: 20000000` /
+   `# PRAGMA reasoning-max-seconds: 300` /
+   `# PRAGMA reasoning-max-memory-mb: 512`. Subject to the ledger's
    `f:overrideControl` on `f:reasoningDefaults`.
-2. **Per ledger** — `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` in
-   `f:reasoningDefaults` (see
+2. **Per ledger** — `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` /
+   `f:reasoningMaxMemoryMb` in `f:reasoningDefaults` (see
    [Setting groups](../ledger-config/setting-groups.md)).
 3. **Server-wide** — `FLUREE_REASONING_MAX_FACTS` /
-   `FLUREE_REASONING_MAX_SECONDS` environment variables.
+   `FLUREE_REASONING_MAX_SECONDS` / `FLUREE_REASONING_MAX_MEMORY_MB`
+   environment variables.
 
 ## Performance considerations
 

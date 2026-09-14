@@ -130,6 +130,11 @@ pub struct ReasoningDefaults {
     /// seconds before the OWL2-RL closure is capped. `None` means use the
     /// system default.
     pub max_seconds: Option<u64>,
+    /// `f:reasoningMaxMemoryMb` — materialization budget: max megabytes of
+    /// derived facts before the closure is capped. Like the other two this is
+    /// a correctness control, not a tuning knob: a capped closure is
+    /// incomplete. `None` means derive it from the effective fact cap.
+    pub max_memory_mb: Option<u64>,
     /// Override control for this setting group.
     pub override_control: OverrideControl,
 }

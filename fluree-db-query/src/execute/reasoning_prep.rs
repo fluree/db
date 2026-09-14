@@ -166,12 +166,19 @@ pub async fn schema_hierarchy_with_overlay(
 /// Build the OWL2-RL materialization budget for this query.
 ///
 /// Layered, lowest to highest precedence:
-/// 1. built-in default (1M facts / 30s),
-/// 2. server env (`FLUREE_REASONING_MAX_FACTS` / `FLUREE_REASONING_MAX_SECONDS`)
-///    — operator-wide override,
-/// 3. `modes.max_facts` / `modes.max_seconds` — the merged ledger-config /
-///    per-query budget (override control is enforced upstream at the view
-///    layer, so by the time it reaches here the value is authoritative).
+/// 1. built-in default (1M facts / 30s / a memory ceiling derived from the
+///    fact cap),
+/// 2. server env (`FLUREE_REASONING_MAX_FACTS` / `FLUREE_REASONING_MAX_SECONDS`
+///    / `FLUREE_REASONING_MAX_MEMORY_MB`) — operator-wide override,
+/// 3. `modes.max_facts` / `modes.max_seconds` / `modes.max_memory_mb` — the
+///    merged ledger-config / per-query budget (override control is enforced
+///    upstream at the view layer, so by the time it reaches here the value is
+///    authoritative).
+///
+/// The memory ceiling is resolved LAST and, when nothing sets it explicitly,
+/// is derived from the fact ceiling that won. A flat default made memory bind
+/// before facts on ordinary data, so raising `maxFacts` could not actually buy
+/// a larger closure.
 ///
 /// Datasets whose closure exceeds the budget get a CAPPED (incomplete)
 /// materialization — see the warning in [`compute_derived_facts`].
@@ -192,6 +199,14 @@ fn reasoning_budget(modes: &ReasoningModes) -> fluree_db_reasoner::ReasoningBudg
     if let Some(max_secs) = modes.max_seconds {
         budget.max_duration = std::time::Duration::from_secs(max_secs);
     }
+
+    let explicit_memory_mb = modes
+        .max_memory_mb
+        .or_else(|| budget_env_var::<u64>("FLUREE_REASONING_MAX_MEMORY_MB"));
+    budget.max_memory_bytes = match explicit_memory_mb {
+        Some(mb) => (mb as usize).saturating_mul(1024 * 1024),
+        None => fluree_db_reasoner::ReasoningBudget::memory_for_facts(budget.max_facts),
+    };
     budget
 }
 
@@ -317,7 +332,8 @@ pub async fn compute_derived_facts(
                          fixpoint; query results may be missing entailments. \
                          Raise the budget via f:reasoningMaxFacts/f:reasoningMaxSeconds \
                          (ledger config), \"reasoningBudget\" (query), or \
-                         FLUREE_REASONING_MAX_FACTS/FLUREE_REASONING_MAX_SECONDS (server)."
+                         FLUREE_REASONING_MAX_FACTS/FLUREE_REASONING_MAX_SECONDS/\
+                         FLUREE_REASONING_MAX_MEMORY_MB (server)."
                     );
                 } else {
                     tracing::debug!(

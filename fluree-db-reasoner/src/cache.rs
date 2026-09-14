@@ -80,12 +80,26 @@ pub struct ReasoningBudget {
     pub max_memory_bytes: usize,
 }
 
+/// Default fact ceiling: the cap an operator reasons about.
+pub const DEFAULT_MAX_FACTS: usize = 1_000_000;
+
+/// Byte allowance per derived fact used to derive the default memory ceiling.
+///
+/// A derived fact costs roughly `size_of::<Flake>()` (176 bytes on a 64-bit
+/// target) plus its subject, predicate and object names — call it 200 bytes
+/// for ordinary IRIs. The allowance is deliberately well above that so the
+/// FACT cap binds first on ordinary data and the memory cap only fires when
+/// facts are abnormally large (long IRIs, big string or JSON literals). A flat
+/// ceiling instead made memory bind at roughly half the fact cap, so a closure
+/// that completed before could come back silently truncated.
+pub const BYTES_PER_FACT_ALLOWANCE: usize = 512;
+
 impl Default for ReasoningBudget {
     fn default() -> Self {
         Self {
             max_duration: Duration::from_secs(30),
-            max_facts: 1_000_000,
-            max_memory_bytes: 100 * 1024 * 1024, // 100MB
+            max_facts: DEFAULT_MAX_FACTS,
+            max_memory_bytes: Self::memory_for_facts(DEFAULT_MAX_FACTS),
         }
     }
 }
@@ -107,6 +121,15 @@ impl ReasoningBudget {
             max_facts: usize::MAX,
             max_memory_bytes: usize::MAX,
         }
+    }
+
+    /// Memory ceiling coherent with a fact ceiling.
+    ///
+    /// Used whenever no explicit memory budget is configured, so raising
+    /// `max_facts` raises the memory the operator has implicitly accepted
+    /// rather than leaving a flat ceiling to bind first.
+    pub fn memory_for_facts(max_facts: usize) -> usize {
+        max_facts.saturating_mul(BYTES_PER_FACT_ALLOWANCE)
     }
 
     /// Compute a hash of budget settings for cache key
@@ -356,6 +379,16 @@ mod tests {
         let budget = ReasoningBudget::default();
         assert_eq!(budget.max_duration, Duration::from_secs(30));
         assert_eq!(budget.max_facts, 1_000_000);
-        assert_eq!(budget.max_memory_bytes, 100 * 1024 * 1024);
+        assert_eq!(
+            budget.max_memory_bytes,
+            ReasoningBudget::memory_for_facts(1_000_000),
+            "the default memory ceiling must be derived from the default fact \
+             ceiling, so the fact cap binds first on ordinary data"
+        );
+        assert!(
+            budget.max_memory_bytes
+                > budget.max_facts * std::mem::size_of::<fluree_db_core::Flake>(),
+            "a closure of max_facts ordinary flakes must fit under the memory cap"
+        );
     }
 }

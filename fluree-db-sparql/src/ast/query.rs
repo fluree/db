@@ -58,6 +58,8 @@ pub struct Pragmas {
     /// `# PRAGMA reasoning-max-facts: <n>` — OWL2-RL materialization budget
     /// (max derived facts). Collected verbatim; validates during lowering.
     pub reasoning_max_facts: Option<String>,
+    /// `# PRAGMA reasoning-max-memory-mb: <n>` — materialization memory cap.
+    pub reasoning_max_memory_mb: Option<String>,
     /// `# PRAGMA reasoning-max-seconds: <n>` — OWL2-RL materialization budget
     /// (max wall-clock seconds). Collected verbatim; validates during lowering.
     pub reasoning_max_seconds: Option<String>,

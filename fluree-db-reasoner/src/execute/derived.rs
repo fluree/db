@@ -170,7 +170,16 @@ impl DerivedSet {
         self.is_base.push(is_base);
 
         self.seen.insert(key);
-        self.approx_bytes += crate::cache::approx_flake_bytes(&flake);
+        // Seed facts are excluded from the memory total for the same reason
+        // `derived_len` excludes them from the fact total: they are the base
+        // data the fixpoint was handed, not closure it produced, and
+        // `into_derived_flakes` drops them from the overlay this budget
+        // bounds. Charging them made the memory cap fire on the seed delta —
+        // every fact of every rule-relevant predicate — from round two
+        // onward, capping closures far below their fact budget.
+        if !is_base {
+            self.approx_bytes += crate::cache::approx_flake_bytes(&flake);
+        }
         let idx = self.flakes.len();
 
         // Index by predicate
@@ -234,7 +243,8 @@ impl DerivedSet {
         self.flakes.len() - self.base_count
     }
 
-    /// Approximate heap footprint of the held flakes (see
+    /// Approximate heap footprint of the DERIVED flakes — the population
+    /// `into_derived_flakes` yields and `derived_len` counts (see
     /// [`crate::approx_flake_bytes`]).
     pub fn approx_bytes(&self) -> usize {
         self.approx_bytes
