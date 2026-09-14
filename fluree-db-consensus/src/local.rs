@@ -180,6 +180,9 @@ impl Committer for LocalCommitter {
             if let Some(policy) = policy_ctx {
                 builder = builder.policy(policy);
             }
+            // The verified identity rides governance from the route; the
+            // SHACL override gate reads it from here, not from the policy.
+            builder = builder.server_identity(governance.server_identity.clone());
 
             match builder.execute().await {
                 Ok(result) => {
@@ -492,7 +495,7 @@ pub(crate) async fn resolve_cypher_under_lock(
             let probe_state = ledger_handle.snapshot().await.to_ledger_state();
             let probe = GraphDb::from_ledger_state(&probe_state);
             let probe = if governance.has_any_policy_inputs() {
-                fluree.wrap_policy(probe, governance, None).await?
+                fluree.wrap_policy(probe, governance).await?
             } else {
                 probe
             };

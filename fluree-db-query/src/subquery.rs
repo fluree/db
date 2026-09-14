@@ -193,7 +193,7 @@ enum MatchCursor {
     },
     Partial {
         key: Vec<GroupKeyOwned>,
-        unbound: Vec<usize>,
+        bound: Vec<usize>,
         bucket: usize,
         row: usize,
     },
@@ -227,7 +227,7 @@ impl MatchCursor {
             }
             Self::Partial {
                 key,
-                unbound,
+                bound,
                 bucket,
                 row,
             } => {
@@ -236,12 +236,7 @@ impl MatchCursor {
                         if *bucket % 1024 == 0 {
                             ctx.check_cancelled()?;
                         }
-                        if !key
-                            .iter()
-                            .zip(inner_key)
-                            .enumerate()
-                            .all(|(col, (p, s))| p == s || unbound.contains(&col))
-                        {
+                        if !bound.iter().all(|&col| key[col] == inner_key[col]) {
                             *bucket += 1;
                             continue;
                         }
@@ -708,9 +703,12 @@ impl SubqueryOperator {
         } else if unbound.len() == key.len() {
             MatchCursor::All { row: 0 }
         } else {
+            let bound = (0..key.len())
+                .filter(|col| !unbound.contains(col))
+                .collect();
             MatchCursor::Partial {
                 key,
-                unbound,
+                bound,
                 bucket: 0,
                 row: 0,
             }

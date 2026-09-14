@@ -323,6 +323,9 @@ pub struct BinaryIndexStore {
     /// configuration (`set_ns_split_mode`, namespace augmentation), which
     /// cannot occur once the store is behind `Arc`.
     p_sid_table: std::sync::OnceLock<Arc<[Sid]>>,
+    /// Conclusive per-`(graph, predicate)` decimal-only proofs. Index contents
+    /// are immutable per store, so a proof holds for the store's lifetime.
+    decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
 }
 
 /// Lowercase the root's language tags, preserving position.
@@ -380,7 +383,7 @@ impl BinaryIndexStore {
     ) -> io::Result<Self> {
         tracing::debug!("BinaryIndexStore::load_from_root_v6 starting");
         fluree_db_core::disk_cache::ensure_cache_dir(cache_dir)?;
-        let phase = std::time::Instant::now();
+        let phase = fluree_db_core::clock::Instant::now();
 
         // ── Dict loading ──────────────────────────────────────────────────────────────
         let dicts = build_dictionary_set(
@@ -393,7 +396,7 @@ impl BinaryIndexStore {
         .await?;
 
         let dicts_us = phase.elapsed().as_micros() as u64;
-        let phase = std::time::Instant::now();
+        let phase = fluree_db_core::clock::Instant::now();
 
         // ── Per-graph specialty arenas ───────────────────────────────
         let mut per_graph_arenas = load_per_graph_arenas(
@@ -516,6 +519,7 @@ impl BinaryIndexStore {
             ns_split_mode: root.ns_split_mode,
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
+            decimal_only_proofs: RwLock::new(HashMap::new()),
         })
     }
 
@@ -2119,6 +2123,24 @@ impl BinaryIndexStore {
             .is_some_and(crate::arena::numbig::NumBigArena::is_decimal_only)
     }
 
+    /// Memoizes `prove` per `(graph, predicate)`. An inconclusive (`None`)
+    /// proof is not cached, so a transient read failure is retried later.
+    pub fn memoized_decimal_only_proof(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+        prove: impl FnOnce() -> Option<bool>,
+    ) -> Option<bool> {
+        if let Some(&proven) = self.decimal_only_proofs.read().get(&(g_id, p_id)) {
+            return Some(proven);
+        }
+        let proven = prove()?;
+        self.decimal_only_proofs
+            .write()
+            .insert((g_id, p_id), proven);
+        Some(proven)
+    }
+
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {
         match &self.dicts.subject_reverse_tree {
             Some(tree) => {
@@ -3589,6 +3611,7 @@ pub(crate) mod tests {
             ns_split_mode: NsSplitMode::default(),
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
+            decimal_only_proofs: RwLock::new(HashMap::new()),
         }
     }
 

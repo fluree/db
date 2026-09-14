@@ -197,7 +197,7 @@ impl Fluree {
                 // policy-visible data only.
                 let probe = GraphDb::from_ledger_state(&txn.state);
                 let probe = if txn.governance.has_any_policy_inputs() {
-                    self.wrap_policy(probe, &txn.governance, None).await?
+                    self.wrap_policy(probe, &txn.governance).await?
                 } else {
                     probe
                 };
