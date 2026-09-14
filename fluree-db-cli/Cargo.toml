@@ -96,13 +96,13 @@ tracing-subscriber = { workspace = true }
 libc = "0.2"
 
 # OpenTelemetry (optional, enabled by `otel` feature)
-tracing-opentelemetry = { version = "0.32.1", optional = true }
-opentelemetry = { version = "0.31.0", optional = true }
-opentelemetry-otlp = { version = "0.31.0", optional = true, features = [
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true, features = [
     "grpc-tonic",
     "http-proto",
 ] }
-opentelemetry_sdk = { version = "0.31.0", optional = true, features = [
+opentelemetry_sdk = { workspace = true, optional = true, features = [
     "rt-tokio",
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
@@ -120,7 +120,7 @@ sha2.workspace = true
 # Remote ledger client (track mode) + OIDC discovery/exchange
 # `stream` enables streaming a .flpack file body to POST /import without
 # buffering the whole archive; `tokio-util` io gives ReaderStream for it.
-reqwest = { workspace = true, features = ["stream"] }
+reqwest = { workspace = true, features = ["form", "stream"] }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes.workspace = true
 urlencoding = { workspace = true }
