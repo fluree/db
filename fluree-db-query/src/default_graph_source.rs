@@ -81,6 +81,10 @@ struct LaneInputs {
     subject_bound: bool,
     /// The child already binds the reifier.
     reifier_bound: bool,
+    /// The chain runs without its redundant checks (see
+    /// [`elide_redundant_chain`]): one range scan plus sequential batched
+    /// probes instead of a point scan per reifier.
+    chain_elided: bool,
 }
 
 /// One whole-leaf decode of the forward arena, in probed-row equivalents.
@@ -96,6 +100,16 @@ const LEAF_ROW_EQUIV: f64 = 400.0;
 /// touches.
 fn choose_chain_lane(inputs: LaneInputs) -> ChainLane {
     const PROBE_ROW_EQUIV: f64 = 16.0;
+    // An elided chain drives from one `f:reifies*` range scan in reifier
+    // order and every later probe is a batched sequential walk: ~2 rows per
+    // reifier (P11 full scale: 1.1M reifiers, ~2 µs each, against ~6 µs per
+    // arena-probed edge row).
+    const SEQUENTIAL_ROW_EQUIV: f64 = 2.0;
+    // Each live pair the enumeration emits costs a CBOR row decode plus two
+    // dictionary re-encodes of the edge endpoints: ~6× an elided chain's row
+    // (P2 full scale: 65 s enumerating 21.4M pairs, 10.6 s on the elided
+    // chain), still far under the generic chain's point scan per reifier.
+    const ENUMERATE_ROW_EQUIV: f64 = 12.0;
     const BUFFERED_BASE_MAX_ROWS: f64 = 20_000_000.0;
     let LaneInputs {
         edge_first,
@@ -103,6 +117,7 @@ fn choose_chain_lane(inputs: LaneInputs) -> ChainLane {
         arena_rows,
         subject_bound,
         reifier_bound,
+        chain_elided,
     } = inputs;
     // A bound reifier makes the chain one point probe per driving row; no
     // sweep beats that (P22 / C7 / C10 regressed 200× on the arena here).
@@ -132,8 +147,13 @@ fn choose_chain_lane(inputs: LaneInputs) -> ChainLane {
     } else {
         f64::INFINITY
     };
-    let chain_cost = probe_first * PROBE_ROW_EQUIV;
-    let enumerate_cost = arena_rows.unwrap_or(f64::INFINITY);
+    let per_reifier = if chain_elided {
+        SEQUENTIAL_ROW_EQUIV
+    } else {
+        PROBE_ROW_EQUIV
+    };
+    let chain_cost = probe_first * per_reifier;
+    let enumerate_cost = arena_rows.map_or(f64::INFINITY, |rows| rows * ENUMERATE_ROW_EQUIV);
     if arena_cost <= chain_cost && arena_cost <= enumerate_cost {
         ChainLane::Arena
     } else if enumerate_cost < chain_cost {
@@ -141,6 +161,60 @@ fn choose_chain_lane(inputs: LaneInputs) -> ChainLane {
     } else {
         ChainLane::Chain
     }
+}
+
+/// Drop the chain triples the write invariants make redundant. Every
+/// reifier carries exactly one `f:reifiesSubject`, `f:reifiesPredicate` and
+/// `f:reifiesObject`, written into the edge's own graph, and its base triple
+/// is asserted (`@reifies` without the base is rejected; retracting the base
+/// cascades). So once a reifies lookup has bound the reifier, the base edge
+/// never removes a row, and a reifies lookup whose position is a variable
+/// nobody reads is a cardinality-one no-op. A constant position stays: it is
+/// the constraint. A variable predicate that is read stays too, and keeps
+/// the base edge with it — the base scan binds it as a predicate, the
+/// reifies lookup as a plain ref. At least one lookup always remains, so a
+/// reifier bound by the body still has to be a reifier (P3 has three
+/// `:derives_from` rows on plain subjects that P2 must not count).
+///
+/// Measured on the full StarBench ledger this turns the predicate-only chain
+/// from one point scan per reifier (P11: 1.1M SPOT opens) into one POST
+/// range plus the body's batched probe.
+pub(crate) fn elide_redundant_chain(
+    patterns: &[Pattern],
+    needed_outside: &HashSet<VarId>,
+    child_bound: &HashSet<VarId>,
+) -> Option<Vec<Pattern>> {
+    let shape = crate::annotation_edge_probe::recognize_annotation_edge(patterns)?;
+    let Pattern::Triple(base) = &shape.base else {
+        return None;
+    };
+    let mut referenced: HashSet<VarId> = needed_outside.clone();
+    referenced.extend(child_bound.iter().copied());
+    let mut counts: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
+    crate::execute::collect_var_stats(&shape.body, &mut counts, &mut referenced);
+
+    if base.p.as_var().is_some_and(|v| referenced.contains(&v)) {
+        return None;
+    }
+    // A constant position is a constraint; a variable position is one only
+    // when something reads it.
+    let position_kept = |var: Option<VarId>| var.is_none_or(|v| referenced.contains(&v));
+    let keep = [
+        position_kept(base.s.as_var()),
+        position_kept(base.p.as_var()),
+        position_kept(base.o.as_var()),
+    ];
+    let mut kept: Vec<Pattern> = patterns[1..=3]
+        .iter()
+        .zip(keep)
+        .filter(|(_, keep)| *keep)
+        .map(|(p, _)| p.clone())
+        .collect();
+    if kept.is_empty() {
+        kept.push(patterns[1].clone());
+    }
+    kept.extend(shape.body.iter().cloned());
+    Some(kept)
 }
 
 /// Diagnostic override: `FLUREE_ANNOTATION_LANE=arena|enumerate|chain` pins
@@ -189,6 +263,10 @@ pub struct DefaultGraphSourceOperator {
     /// wrapper by. Reported through `estimated_rows` so the join above sees
     /// a real driving count instead of the `None` that read as one row.
     estimated: Option<usize>,
+    /// Variables read outside the wrapper (later siblings and the post-WHERE
+    /// pipeline); an inner position bound to none of them can drop its
+    /// `f:reifies*` lookup (see [`elide_redundant_chain`]).
+    needed_outside: HashSet<VarId>,
 }
 
 impl DefaultGraphSourceOperator {
@@ -197,6 +275,7 @@ impl DefaultGraphSourceOperator {
         inner_patterns: Vec<Pattern>,
         planning: PlanningContext,
         stats: Option<Arc<StatsView>>,
+        needed_outside: HashSet<VarId>,
     ) -> Self {
         let mut seen: std::collections::HashSet<VarId> = child.schema().iter().copied().collect();
 
@@ -247,6 +326,7 @@ impl DefaultGraphSourceOperator {
             stats,
             single_graph_delegate: None,
             estimated,
+            needed_outside,
         }
     }
 
@@ -275,7 +355,13 @@ impl DefaultGraphSourceOperator {
             .is_some(),
             "annotation delegate gates"
         );
-        let lane = self.chain_lane(&child);
+        let child_bound: HashSet<VarId> = child.schema().iter().copied().collect();
+        let elided = if self.elision_gates_pass(ctx) {
+            elide_redundant_chain(&self.inner_patterns, &self.needed_outside, &child_bound)
+        } else {
+            None
+        };
+        let lane = self.chain_lane(&child, elided.is_some());
         if self.annotation_probe_gates_pass(ctx) && lane == ChainLane::Arena {
             if let Some(shape) =
                 crate::annotation_edge_probe::recognize_annotation_edge(&self.inner_patterns)
@@ -420,14 +506,28 @@ impl DefaultGraphSourceOperator {
                 }
             }
         }
-        tracing::debug!(lane = "generic", "annotation delegate lane");
+        tracing::debug!(
+            lane = "generic",
+            elided = elided.is_some(),
+            "annotation delegate lane"
+        );
         build_where_operators_seeded(
             Some(child),
-            &self.inner_patterns,
+            elided.as_deref().unwrap_or(&self.inner_patterns),
             self.stats.clone(),
             None,
             &self.planning,
         )
+    }
+
+    /// The write invariants [`elide_redundant_chain`] relies on describe
+    /// current state under full visibility: a history walk replays events
+    /// the cascade later undid, a non-root policy may hide the base triple
+    /// but not its reifier, and a dataset correlates sources per row.
+    fn elision_gates_pass(&self, ctx: &ExecutionContext<'_>) -> bool {
+        !self.planning.is_history()
+            && !ctx.is_multi_ledger()
+            && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
     }
 
     /// Which physical lane the chain's entry costs favour. The three lanes
@@ -441,7 +541,7 @@ impl DefaultGraphSourceOperator {
     /// reifiers when it has 1.1M, and a child that already binds the
     /// reifier makes the chain a per-row probe no sweep can beat (P22 / C7
     /// / C10 regressed 200× when the arena lane was taken there).
-    fn chain_lane(&self, child: &BoxedOperator) -> ChainLane {
+    fn chain_lane(&self, child: &BoxedOperator, chain_elided: bool) -> ChainLane {
         if let Some(forced) = forced_chain_lane() {
             return forced;
         }
@@ -482,6 +582,7 @@ impl DefaultGraphSourceOperator {
             arena_rows,
             subject_bound,
             reifier_bound: bound.contains(&shape.ann_var),
+            chain_elided,
         })
     }
 
@@ -808,7 +909,13 @@ impl Operator for DefaultGraphSourceOperator {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_chain_lane, ChainLane, LaneInputs};
+    use super::{choose_chain_lane, elide_redundant_chain, ChainLane, LaneInputs};
+    use crate::ir::{Pattern, Ref, Term, TriplePattern};
+    use crate::var_registry::VarId;
+    use fluree_db_core::Sid;
+    use fluree_vocab::db::{REIFIES_OBJECT, REIFIES_PREDICATE, REIFIES_SUBJECT};
+    use fluree_vocab::namespaces::FLUREE_DB;
+    use std::collections::HashSet;
 
     const FULL_ARENA: Option<f64> = Some(21_400_294.0);
     const SLICE_ARENA: Option<f64> = Some(300_000.0);
@@ -826,7 +933,157 @@ mod tests {
             arena_rows,
             subject_bound,
             reifier_bound,
+            chain_elided: false,
         })
+    }
+
+    fn lane_elided(edge_first: f64, probe_first: f64, arena_rows: Option<f64>) -> ChainLane {
+        choose_chain_lane(LaneInputs {
+            edge_first,
+            probe_first,
+            arena_rows,
+            subject_bound: false,
+            reifier_bound: false,
+            chain_elided: true,
+        })
+    }
+
+    const S: VarId = VarId(1);
+    const P: VarId = VarId(2);
+    const O: VarId = VarId(3);
+    const ANN: VarId = VarId(4);
+    const X: VarId = VarId(5);
+
+    fn triple(s: Ref, p: Ref, o: Term) -> Pattern {
+        Pattern::Triple(TriplePattern { s, p, o, dtc: None })
+    }
+
+    fn reifies(name: &str) -> Ref {
+        Ref::Sid(Sid::new(FLUREE_DB, name))
+    }
+
+    /// `<< s p o >> :q ?x` as `expand_edge_annotation_patterns` emits it.
+    fn chain(s: Ref, p: Ref, o: Term) -> Vec<Pattern> {
+        let p_as_term = match &p {
+            Ref::Var(v) => Term::Var(*v),
+            Ref::Sid(sid) => Term::Sid(sid.clone()),
+            Ref::Iri(iri) => Term::Iri(iri.clone()),
+        };
+        vec![
+            triple(s.clone(), p.clone(), o.clone()),
+            triple(Ref::Var(ANN), reifies(REIFIES_SUBJECT), s.into()),
+            triple(Ref::Var(ANN), reifies(REIFIES_PREDICATE), p_as_term),
+            triple(Ref::Var(ANN), reifies(REIFIES_OBJECT), o),
+            triple(Ref::Var(ANN), Ref::Sid(Sid::new(9, "q")), Term::Var(X)),
+        ]
+    }
+
+    fn reifies_names(patterns: &[Pattern]) -> Vec<String> {
+        patterns
+            .iter()
+            .filter_map(|p| match p {
+                Pattern::Triple(tp) => match &tp.p {
+                    Ref::Sid(sid) if sid.namespace_code == FLUREE_DB => Some(sid.name.to_string()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn set(vars: &[VarId]) -> HashSet<VarId> {
+        vars.iter().copied().collect()
+    }
+
+    #[test]
+    fn count_shape_keeps_only_the_constraining_lookup() {
+        // P11: `<< ?s :P ?o >> :q ?x` with COUNT(*) — nothing reads ?s/?o.
+        let typed = Sid::new(9, "P");
+        let elided = elide_redundant_chain(
+            &chain(Ref::Var(S), Ref::Sid(typed.clone()), Term::Var(O)),
+            &set(&[]),
+            &set(&[]),
+        )
+        .expect("recognized chain");
+        assert_eq!(reifies_names(&elided), vec![REIFIES_PREDICATE]);
+        assert_eq!(elided.len(), 2, "predicate lookup + body: {elided:?}");
+        assert!(
+            !matches!(&elided[0], Pattern::Triple(tp) if tp.p == Ref::Sid(typed)),
+            "the base edge must be gone: {elided:?}"
+        );
+    }
+
+    #[test]
+    fn read_positions_keep_their_lookup_and_a_read_predicate_keeps_everything() {
+        let typed = Ref::Sid(Sid::new(9, "P"));
+        // ?o projected, ?s read by a later sibling.
+        let elided = elide_redundant_chain(
+            &chain(Ref::Var(S), typed.clone(), Term::Var(O)),
+            &set(&[O]),
+            &set(&[S]),
+        )
+        .expect("recognized chain");
+        assert_eq!(
+            reifies_names(&elided),
+            vec![REIFIES_SUBJECT, REIFIES_PREDICATE, REIFIES_OBJECT]
+        );
+        assert_eq!(elided.len(), 4, "three lookups + body, no base edge");
+        // A read variable predicate needs the base scan's predicate binding.
+        assert!(elide_redundant_chain(
+            &chain(Ref::Var(S), Ref::Var(P), Term::Var(O)),
+            &set(&[P]),
+            &set(&[]),
+        )
+        .is_none());
+        // The body's own reads count too.
+        let mut with_body_read = chain(Ref::Var(S), typed, Term::Var(O));
+        with_body_read.push(triple(
+            Ref::Var(O),
+            Ref::Sid(Sid::new(9, "r")),
+            Term::Var(VarId(6)),
+        ));
+        let elided =
+            elide_redundant_chain(&with_body_read, &set(&[]), &set(&[])).expect("recognized chain");
+        assert_eq!(
+            reifies_names(&elided),
+            vec![REIFIES_PREDICATE, REIFIES_OBJECT]
+        );
+    }
+
+    #[test]
+    fn wildcard_count_keeps_one_lookup_so_the_body_alone_cannot_qualify() {
+        // P2: `<< ?s ?p ?o >> :q ?x` COUNT(*) — every position unread, but a
+        // plain subject with `:q` must still not count as a reifier.
+        let elided = elide_redundant_chain(
+            &chain(Ref::Var(S), Ref::Var(P), Term::Var(O)),
+            &set(&[]),
+            &set(&[]),
+        )
+        .expect("recognized chain");
+        assert_eq!(reifies_names(&elided), vec![REIFIES_SUBJECT]);
+        assert_eq!(elided.len(), 2);
+    }
+
+    #[test]
+    fn elided_chain_costs_sequential_rows() {
+        // P11 with its lookups elided: 31k-est reifiers at ~2 rows each
+        // beats both the whole-arena decode and the 21.4M enumeration.
+        assert_eq!(
+            lane_elided(952_406.0, 31_751.0, FULL_ARENA),
+            ChainLane::Chain
+        );
+        // P2 elided: one `f:reifiesSubject` range over 21.4M reifiers plus
+        // the body probe ran 10.6 s against 65 s for the enumeration.
+        assert_eq!(
+            lane_elided(1e12, 21_400_294.0, FULL_ARENA),
+            ChainLane::Chain
+        );
+        // P6 / P7 read the endpoints and the predicate, so nothing is
+        // elided and the enumeration still beats a point scan per reifier.
+        assert_eq!(
+            lane(1e12, 21_400_294.0, FULL_ARENA, false, false),
+            ChainLane::Enumerate
+        );
     }
 
     #[test]

@@ -5842,3 +5842,101 @@ async fn copy_with_explicit_reifier_reads_scoped_per_graph() {
         );
     }
 }
+
+#[tokio::test]
+async fn count_shapes_read_only_the_reifies_lookups_they_need() {
+    // Without a sealed arena the wrapper runs the generic `f:reifies*`
+    // chain, which drops the base-edge check and every lookup whose
+    // position nothing reads (`elide_redundant_chain`). The answers must
+    // not move: a plain subject that merely carries the body predicate
+    // (`ex:carol ex:source`) is not a reifier, endpoints that are read
+    // still bind, and a constant endpoint still constrains.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:elided-count";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "ex:source": "hr" }
+                },
+                "ex:score": {
+                    "@value": 42,
+                    "@annotation": { "ex:source": "exam" }
+                }
+            },
+            { "@id": "ex:bob", "ex:worksFor": { "@id": "ex:acme" } },
+            { "@id": "ex:carol", "ex:source": "manual" }
+        ]
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed insert");
+    let ledger = committed.ledger;
+
+    let count = |sparql: &'static str| {
+        let fluree = &fluree;
+        let ledger = &ledger;
+        async move {
+            let rows = support::query_sparql_formatted(fluree, ledger, sparql)
+                .await
+                .expect("count query");
+            rows.as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|row| row.as_array())
+                .and_then(|cols| cols.first())
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_else(|| panic!("count row: {rows}"))
+        }
+    };
+
+    assert_eq!(
+        count(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(*) AS ?n) WHERE { << ?s ?p ?o >> ex:source ?src }"
+        )
+        .await,
+        2,
+        "two reified edges; ex:carol's ex:source is not an annotation"
+    );
+    assert_eq!(
+        count(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(*) AS ?n) WHERE { << ?s ex:worksFor ?o >> ex:source ?src }"
+        )
+        .await,
+        1,
+        "only alice's worksFor edge is reified"
+    );
+    assert_eq!(
+        count(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(*) AS ?n) WHERE { << ex:bob ex:worksFor ?o >> ex:source ?src }"
+        )
+        .await,
+        0,
+        "bob's edge exists but carries no annotation"
+    );
+
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?s ?o ?src WHERE { << ?s ex:worksFor ?o >> ex:source ?src }",
+    )
+    .await
+    .expect("projected query");
+    let arr = rows.as_array().expect("Select array");
+    assert_eq!(arr.len(), 1, "rows: {rows}");
+    let cols = arr[0].as_array().expect("row");
+    assert!(
+        iri_matches(&cols[0], "ex:alice", "http://example.org/alice"),
+        "subject still binds when read: {rows}"
+    );
+    assert!(
+        iri_matches(&cols[1], "ex:acme", "http://example.org/acme"),
+        "object still binds when read: {rows}"
+    );
+    assert_eq!(cols[2].as_str(), Some("hr"), "{rows}");
+}
