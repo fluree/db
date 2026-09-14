@@ -2,8 +2,10 @@
 //!
 //! Samples per-peer replication state from openraft's `RaftMetrics`
 //! at a fixed interval. When a voter's match log stops advancing
-//! while the leader's own log grows past it, the monitor counts the
-//! peer as lagging; sustained lag past
+//! while the leader's own log grows past it, falls more than
+//! [`LivenessConfig::max_healthy_lag`] entries behind, or never
+//! acknowledges this leader, the monitor counts the peer as lagging;
+//! sustained lag past
 //! [`LivenessConfig::unreachable_after`] triggers a
 //! [`Command::SetWorkerEligibility`] propose with `eligible: false`,
 //! demoting the voter from
@@ -33,23 +35,35 @@ use tracing::{debug, warn};
 /// Default interval between metric samples.
 pub const DEFAULT_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Default time a peer's match log can stay more than
-/// [`DEFAULT_MAX_HEALTHY_LAG`] entries behind the leader before being
-/// proposed as ineligible. Sized to absorb transient slowness —
-/// short GC pauses, a brief network jitter, a replication burst the
-/// peer is catching up on — without demoting healthy peers.
+/// Default time a peer can stay unhealthy before being proposed as
+/// ineligible. Unhealthy means more than [`DEFAULT_MAX_HEALTHY_LAG`]
+/// entries behind the leader, stalled behind pending entries, or
+/// without any acknowledged match on this leader. Sized to absorb
+/// transient slowness — short GC pauses, a brief network jitter, a
+/// replication burst the peer is catching up on — without demoting
+/// healthy peers. A peer that needs longer than this to acknowledge
+/// a single entry or finish a snapshot install is demoted, then
+/// promoted again [`DEFAULT_LIVE_AFTER`] after it catches up; that
+/// costs a worker restart, not data.
 pub const DEFAULT_UNREACHABLE_AFTER: Duration = Duration::from_secs(15);
 
 /// Default maximum number of log entries a peer's match log may trail
-/// the leader's last log and still count as healthy. Measures lag as
-/// *distance*, not "did the match index move at all": a peer matching
-/// one entry per sample while the leader gains thousands is advancing
-/// yet falling further behind, and only a distance measure demotes
-/// it. Set comfortably above the deepest legitimate in-flight
-/// replication window (openraft ships entries in batches, so a
-/// keeping-up follower trails by at most a batch or two) so normal
-/// pipelining never trips it; a peer that stays beyond it for
-/// [`DEFAULT_UNREACHABLE_AFTER`] genuinely can't keep pace.
+/// the leader's last log and still count as healthy. Distance alone is
+/// necessary but not sufficient: within it, the peer must also have
+/// advanced since the last sample or be fully caught up.
+///
+/// The distance bound catches a peer matching one entry per sample
+/// while the leader gains thousands — advancing yet falling further
+/// behind. The progress requirement catches the opposite case on a
+/// quiet cluster: a dead peer one unacknowledged entry behind is well
+/// within any distance bound, yet can strand every branch whose
+/// worker it owns.
+///
+/// Set comfortably above the deepest legitimate in-flight replication
+/// window (openraft ships entries in batches, so a keeping-up follower
+/// trails by at most a batch or two) so normal pipelining never trips
+/// it; a peer that stays beyond it for [`DEFAULT_UNREACHABLE_AFTER`]
+/// genuinely can't keep pace.
 pub const DEFAULT_MAX_HEALTHY_LAG: u64 = 1000;
 
 /// Default minimum time a previously-demoted peer must show
@@ -75,14 +89,17 @@ pub const DEFAULT_REFUSAL_BACKOFF: Duration = Duration::from_secs(30);
 pub struct LivenessConfig {
     /// Interval between metric samples.
     pub sample_interval: Duration,
-    /// How long a peer's match log can stay more than
-    /// [`Self::max_healthy_lag`] entries behind the leader before
-    /// being proposed ineligible.
+    /// How long a peer can stay unhealthy before being proposed
+    /// ineligible: more than [`Self::max_healthy_lag`] entries
+    /// behind, stalled behind pending entries, or with no
+    /// acknowledged match on this leader. See
+    /// [`DEFAULT_UNREACHABLE_AFTER`].
     pub unreachable_after: Duration,
     /// Maximum entries a peer may trail the leader's last log and
     /// still count as keeping up. Lag beyond this — sustained past
     /// [`Self::unreachable_after`] — demotes the peer even if its
-    /// match index is still inching forward. See
+    /// match index is still inching forward. Within it, the peer must
+    /// also advance or be fully caught up. See
     /// [`DEFAULT_MAX_HEALTHY_LAG`].
     pub max_healthy_lag: u64,
     /// How long a previously-demoted peer must show advancement
@@ -125,8 +142,8 @@ struct PeerTracker {
     /// Last `LogId` observed for this peer in the leader's
     /// replication metrics.
     last_observed_log: Option<LogId<NodeId>>,
-    /// Wall-clock when this peer first showed unhealthy lag
-    /// (its match log stuck while the leader's log grew past it).
+    /// Wall-clock when this peer first showed unhealthy lag (too far
+    /// behind, stalled behind pending entries, or no match yet).
     /// `None` while the peer is currently advancing on schedule.
     unreachable_since: Option<Instant>,
     /// Wall-clock when, after the most recent demotion, the peer
@@ -1024,6 +1041,30 @@ mod tests {
                 &cfg
             ),
             None
+        );
+
+        // Without a catch-up, the grace ends at `unreachable_after`.
+        let mut silent = PeerTracker::for_eligible_peer();
+        assert_eq!(tick(&mut silent, None, Some(20), t0, &cfg), None);
+        assert_eq!(
+            tick(
+                &mut silent,
+                None,
+                Some(20),
+                t0 + cfg.unreachable_after / 2,
+                &cfg
+            ),
+            None
+        );
+        assert_eq!(
+            tick(
+                &mut silent,
+                None,
+                Some(20),
+                t0 + cfg.unreachable_after,
+                &cfg
+            ),
+            Some(EligibilityProposal::Demote)
         );
     }
 
