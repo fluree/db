@@ -7,7 +7,7 @@ pub mod inline;
 
 use crate::binding::Batch;
 use crate::context::ExecutionContext;
-use crate::error::Result;
+use crate::error::{QueryError, Result};
 use crate::sort::SortSpec;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
@@ -246,4 +246,25 @@ pub fn trim_batch(out_schema: &Option<Arc<[VarId]>>, batch: Batch) -> Option<Bat
         Some(schema) => Some(batch.retain(Arc::clone(schema))),
         None => Some(batch),
     }
+}
+
+/// Count an operator to exhaustion, preferring its `drain_count`
+/// (count-only, no binding materialization) and falling back to a streaming
+/// `next_batch` row count when the operator declines count-only mode.
+pub(crate) async fn count_operator(
+    op: &mut dyn Operator,
+    ctx: &ExecutionContext<'_>,
+) -> Result<u64> {
+    if let Some(n) = op.drain_count(ctx).await? {
+        return Ok(n);
+    }
+    let mut n: u64 = 0;
+    while let Some(batch) = op.next_batch(ctx).await? {
+        ctx.check_cancelled()?;
+        n = n
+            .checked_add(batch.len() as u64)
+            .ok_or_else(|| QueryError::execution("COUNT(*) overflow while counting operator"))?;
+    }
+    ctx.check_cancelled()?;
+    Ok(n)
 }

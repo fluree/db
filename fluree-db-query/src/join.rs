@@ -4,6 +4,7 @@
 //! where left results drive right scans. It enforces var unification - shared
 //! vars between left and right must match exactly.
 
+mod replay;
 mod wildcard;
 
 use crate::binary_scan::EmitMask;
@@ -464,10 +465,14 @@ pub struct NestedLoopJoinOperator {
     /// draining an entire left batch up front, which makes top-level LIMITs much
     /// more responsive on wide joins like `?s rdf:type <Class> ; ?p ?o`.
     active_right_scan: Option<BoxedOperator>,
-    /// Left-row provenance for `active_right_scan`.
+    /// Left-row provenance for the active right scan or replay.
     active_right_batch_ref: Option<BatchRef>,
-    /// Left-row index for `active_right_scan`.
+    /// Left-row index for the active right scan or replay.
     active_right_left_row: usize,
+    /// Small independent scans can be replayed after the first streamed pass.
+    right_replay: Option<replay::ScanReplay>,
+    active_replay_batch: Option<usize>,
+    logged_replay: bool,
     /// Optional object bounds for range filter pushdown
     object_bounds: Option<ObjectBounds>,
     wildcard_direction: Option<WildcardDirection>,
@@ -782,6 +787,9 @@ impl NestedLoopJoinOperator {
             active_right_scan: None,
             active_right_batch_ref: None,
             active_right_left_row: 0,
+            right_replay: None,
+            active_replay_batch: None,
+            logged_replay: false,
             object_bounds,
             wildcard_direction,
             wildcard_stream: None,
@@ -1175,6 +1183,24 @@ impl NestedLoopJoinOperator {
             .collect()
     }
 
+    /// Ordinary indexed scans whose inputs cannot depend on a driving row.
+    fn independent_scan_eligible(&self, ctx: &ExecutionContext<'_>) -> bool {
+        self.bind_instructions.is_empty()
+            && self.unify_instructions.is_empty()
+            && self.right_scan_inline_ops.is_empty()
+            && !self.left.is_identity_seed()
+            && !crate::execute::fast_paths_disabled()
+            && self.mode.is_current()
+            && ctx.from_t.is_none()
+            && ctx.binary_store.is_some()
+            && ctx.dataset.is_none()
+            && !ctx.is_multi_ledger()
+            && !ctx.eager_materialization
+            && !ctx.reasoning_active
+            && ctx.policy_enforcer.as_ref().is_none_or(|p| p.is_root())
+            && ctx.overlay().is_effectively_empty()
+    }
+
     fn bounds_for_row(
         &self,
         _left_batch: &Batch,
@@ -1242,6 +1268,15 @@ impl Operator for NestedLoopJoinOperator {
         self.active_right_batch_ref = None;
         self.active_right_left_row = 0;
         self.logged_runtime_mode = false;
+        self.active_replay_batch = None;
+        self.logged_replay = false;
+        // No shared variables means substitution cannot change this scan.
+        // Do not cache pushed FILTERs: even a variable-free expression may be
+        // volatile (RAND/UUID) or inspect correlated state through EXISTS.
+        // Keep the initial scope to ordinary indexed single-graph snapshots.
+        self.right_replay = self
+            .independent_scan_eligible(ctx)
+            .then(|| replay::ScanReplay::new(ctx));
 
         tracing::trace!(
             left_schema_cols = self.left_schema.len(),
@@ -1361,6 +1396,27 @@ impl Operator for NestedLoopJoinOperator {
                 continue;
             }
 
+            // Replay one batch at a time through the existing combination and
+            // inline-expression path. Duplicate rows and output backpressure
+            // have exactly the same handling as a freshly opened scan.
+            if let Some(index) = self.active_replay_batch {
+                let batch = self.right_replay.as_ref().and_then(|r| r.batch(index));
+                if let Some(batch) = batch {
+                    self.active_replay_batch = Some(index + 1);
+                    self.pending_output.push_back((
+                        self.active_right_batch_ref
+                            .clone()
+                            .expect("replay left batch"),
+                        self.active_right_left_row,
+                        batch,
+                    ));
+                } else {
+                    self.active_replay_batch = None;
+                    self.active_right_batch_ref = None;
+                }
+                continue;
+            }
+
             // 3. Resume an in-flight right scan for the current left row.
             if let Some(scan) = &mut self.active_right_scan {
                 ctx.check_cancelled()?;
@@ -1369,6 +1425,14 @@ impl Operator for NestedLoopJoinOperator {
 
                 match next {
                     Some(batch) if !batch.is_empty() => {
+                        if let Some(replay) = &mut self.right_replay {
+                            if !replay.record(&batch) {
+                                self.right_replay = None;
+                                tracing::debug!(
+                                    "independent scan replay declined at capacity or binding guard"
+                                );
+                            }
+                        }
                         let batch_ref = self
                             .active_right_batch_ref
                             .clone()
@@ -1382,6 +1446,9 @@ impl Operator for NestedLoopJoinOperator {
                     }
                     Some(_) => continue,
                     None => {
+                        if let Some(replay) = &mut self.right_replay {
+                            replay.finish();
+                        }
                         if let Some(mut scan) = self.active_right_scan.take() {
                             scan.close();
                         }
@@ -1534,6 +1601,20 @@ impl Operator for NestedLoopJoinOperator {
                 // Non-batched path: existing per-row join
                 let batch_idx = self.ensure_current_batch_stored();
                 let batch_ref = BatchRef::Stored(batch_idx);
+                if self
+                    .right_replay
+                    .as_ref()
+                    .is_some_and(replay::ScanReplay::is_complete)
+                {
+                    self.active_replay_batch = Some(0);
+                    self.active_right_batch_ref = Some(batch_ref);
+                    self.active_right_left_row = left_row;
+                    if !self.logged_replay {
+                        tracing::debug!("independent scan replay engaged");
+                        self.logged_replay = true;
+                    }
+                    continue;
+                }
                 let left_batch = self.stored_left_batches.last().unwrap();
                 let bound_pattern =
                     self.substitute_pattern_with_store(left_batch, left_row, cached_gv.as_ref())?;
@@ -1555,8 +1636,54 @@ impl Operator for NestedLoopJoinOperator {
         }
     }
 
+    async fn drain_count(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+        // Only a fresh stream can be counted as a product. Once next_batch has
+        // run, the remaining rows may start in the middle of a driving row.
+        // Pair-dependent FILTER/BIND expressions must use normal row evaluation.
+        if self.state != OperatorState::Open
+            || self.logged_runtime_mode
+            || !self.inline_ops.is_empty()
+            || !self.independent_scan_eligible(ctx)
+        {
+            return Ok(None);
+        }
+        ctx.check_cancelled()?;
+        let left_count = crate::operator::count_operator(self.left.as_mut(), ctx).await?;
+        let right_count = if left_count == 0 {
+            0
+        } else {
+            let mut right = make_right_scan(
+                self.right_pattern.clone(),
+                self.object_bounds.clone(),
+                self.right_emit,
+                Vec::new(),
+                self.right_index_hint,
+                ctx,
+                self.mode,
+            );
+            right.open(ctx).await?;
+            let count = crate::operator::count_operator(right.as_mut(), ctx).await;
+            right.close();
+            count?
+        };
+        let count = left_count
+            .checked_mul(right_count)
+            .ok_or_else(|| QueryError::execution("COUNT(*) overflow in independent join"))?;
+        ctx.check_cancelled()?;
+        self.right_replay = None;
+        self.state = OperatorState::Exhausted;
+        tracing::debug!(
+            left_count,
+            right_count,
+            "independent join count product engaged"
+        );
+        Ok(Some(count))
+    }
+
     fn close(&mut self) {
         self.left.close();
+        self.right_replay = None;
+        self.active_replay_batch = None;
         self.wildcard_stream = None;
         self.current_left_batch = None;
         self.current_left_batch_stored_idx = None;

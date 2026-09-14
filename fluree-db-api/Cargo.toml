@@ -681,3 +681,9 @@ wasm-bindgen-futures = "0.4"
 name = "it_wildcard_batched_join"
 path = "tests/it_wildcard_batched_join.rs"
 required-features = ["native"]
+
+# Standalone: independent scan replay routing and the global fast-path switch.
+[[test]]
+name = "it_independent_scan_replay"
+path = "tests/it_independent_scan_replay.rs"
+required-features = ["native"]
