@@ -23,6 +23,21 @@ pub(crate) fn bind_authorization(
     principal: Option<&DataPrincipal>,
     signed_identity: Option<&str>,
 ) -> Result<FlureeHeaders> {
+    // Both arguments are auth-layer verified — a signed request's DID and a
+    // verified bearer's identity — so this is the one place that may mint the
+    // identity `f:overrideControl` gates on. Same precedence as the policy
+    // selection below: a signed request outranks a bearer token.
+    //
+    // Set before the request-selection early return, so a credential that lets
+    // its holder choose the policy identity still carries the identity it was
+    // itself issued to. That split is what keeps an allow-list honest: a
+    // gateway acting for an end user evaluates policy as that user while
+    // override control still answers to the gateway's own credential.
+    headers.server_identity = signed_identity
+        .map(std::string::ToString::to_string)
+        .or_else(|| principal.and_then(|p| p.identity.clone()))
+        .map(fluree_db_core::VerifiedIdentity::new);
+
     let authorization = if let Some(did) = signed_identity {
         Some(CredentialPolicy::Fixed(
             PolicyAuthorization::from_trusted_options(GovernanceOptions {
@@ -87,9 +102,12 @@ pub(crate) async fn wrap_jsonld_view(
     state: &AppState,
     view: fluree_db_api::GraphDb,
     query: &Value,
+    headers: &FlureeHeaders,
 ) -> Result<fluree_db_api::GraphDb> {
-    let opts = GovernanceOptions::from_json(query)
+    let mut opts = GovernanceOptions::from_json(query)
         .map_err(|e| crate::error::ServerError::bad_request(e.to_string()))?;
+    // `from_json` never reads the verified identity from a body, by contract.
+    opts.server_identity = headers.server_identity.clone();
     wrap_governed_view(state, view, &opts).await
 }
 
@@ -99,7 +117,7 @@ async fn wrap_governed_view(
     opts: &GovernanceOptions,
 ) -> Result<fluree_db_api::GraphDb> {
     if opts.has_any_policy_inputs() {
-        Ok(state.fluree.wrap_policy(view, opts, None).await?)
+        Ok(state.fluree.wrap_policy(view, opts).await?)
     } else {
         Ok(state.fluree.wrap_policy_defaults(view).await?)
     }
@@ -115,10 +133,16 @@ pub(crate) fn bound_governance(
     headers: &FlureeHeaders,
 ) -> Result<GovernanceOptions> {
     let requested = governance_from_headers(identity, headers)?;
-    match &headers.policy_authorization {
-        Some(authorization) => authorization.resolve_options(&requested),
-        None => Ok(requested),
-    }
+    let mut options = match &headers.policy_authorization {
+        Some(authorization) => authorization.resolve_options(&requested)?,
+        None => requested,
+    };
+    // Stamped after resolution, which rebuilds the options from the bound
+    // authority and would otherwise drop it. The verified identity authorizes
+    // config overrides (`f:overrideControl`); it is not a policy selection the
+    // credential can grant, withhold, or narrow.
+    options.server_identity = headers.server_identity.clone();
+    Ok(options)
 }
 
 /// Parse caller header options without applying credential authorization.
@@ -137,5 +161,9 @@ fn governance_from_headers(
         policy: headers.policy.clone(),
         policy_values: policy_values_map,
         default_allow: headers.default_allow,
+        // Deliberately absent: this is the caller's *selection*, and the
+        // verified identity is not selectable. `bound_governance` stamps it
+        // after authorization resolution.
+        ..Default::default()
     })
 }

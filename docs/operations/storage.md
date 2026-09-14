@@ -366,6 +366,16 @@ To turn it back on, set `FLUREE_STORAGE_FSYNC=1` and restart Fluree. The environ
 variable overrides the storage node's `durability` setting and applies only to
 local file storage; it does not disable Raft log flushing.
 
+With FSYNC on, Fluree keeps a short write-ahead log in `.fluree-wal/` under the
+storage root (one per node in a Raft cluster, under `.fluree-wal/owners/`). Log
+segments are written with zeros ahead of use so that each flush carries only
+data. A segment's size follows recent write volume, up to 8 MiB, and flushed
+segments are removed within about a second, so the log typically occupies one
+or two segments. On Linux, removing flushed segments syncs the entire filesystem
+holding the root. Other heavy writers on that filesystem, such as a large import
+or another service, can therefore slow it. Put the storage root on its own
+volume for predictable commit latency.
+
 Writes remain atomic with either setting: readers do not see partially written
 files.
 

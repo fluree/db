@@ -327,14 +327,14 @@ impl OverrideControl {
 
     /// Check if a given request identity is permitted to override.
     ///
-    /// `request_identity` is the server-verified canonical DID string.
+    /// `request_identity` is the auth-layer-verified identity.
     /// `None` means anonymous (no verified identity).
-    pub fn permits_override(&self, request_identity: Option<&str>) -> bool {
+    pub fn permits_override(&self, request_identity: Option<&crate::VerifiedIdentity>) -> bool {
         match self {
             OverrideControl::None => false,
             OverrideControl::AllowAll => true,
             OverrideControl::IdentityRestricted { allowed_identities } => request_identity
-                .map(|id| allowed_identities.contains(id))
+                .map(|id| allowed_identities.contains(id.as_str()))
                 .unwrap_or(false),
         }
     }
@@ -547,13 +547,15 @@ mod tests {
 
     #[test]
     fn permits_override_none_always_false() {
-        assert!(!OverrideControl::None.permits_override(Some("did:key:alice")));
+        assert!(!OverrideControl::None
+            .permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
         assert!(!OverrideControl::None.permits_override(None));
     }
 
     #[test]
     fn permits_override_allow_all_always_true() {
-        assert!(OverrideControl::AllowAll.permits_override(Some("did:key:alice")));
+        assert!(OverrideControl::AllowAll
+            .permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
         assert!(OverrideControl::AllowAll.permits_override(None));
     }
 
@@ -562,8 +564,8 @@ mod tests {
         let ctrl = OverrideControl::IdentityRestricted {
             allowed_identities: identity_set(&["did:key:alice", "did:key:bob"]),
         };
-        assert!(ctrl.permits_override(Some("did:key:alice")));
-        assert!(ctrl.permits_override(Some("did:key:bob")));
+        assert!(ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
+        assert!(ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:bob"))));
     }
 
     #[test]
@@ -571,7 +573,7 @@ mod tests {
         let ctrl = OverrideControl::IdentityRestricted {
             allowed_identities: identity_set(&["did:key:alice"]),
         };
-        assert!(!ctrl.permits_override(Some("did:key:bob")));
+        assert!(!ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:bob"))));
     }
 
     #[test]
@@ -587,7 +589,7 @@ mod tests {
         let ctrl = OverrideControl::IdentityRestricted {
             allowed_identities: HashSet::new(),
         };
-        assert!(!ctrl.permits_override(Some("did:key:alice")));
+        assert!(!ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
         assert!(!ctrl.permits_override(None));
     }
 

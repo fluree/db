@@ -817,11 +817,14 @@ async fn execute_subquery(
             // an actual policy input is present. The identity here is whatever
             // the caller (HTTP handler) resolved through its impersonation gate
             // — this layer stays authn/authz-agnostic, mirroring JSON-LD.
-            let policy_opts = match &merged_opts_val {
+            let mut policy_opts = match &merged_opts_val {
                 Some(opts) => GovernanceOptions::from_json(&serde_json::json!({ "opts": opts }))
                     .map_err(|e| ApiError::query(format!("invalid sub-query opts: {e}")))?,
                 None => GovernanceOptions::default(),
             };
+            // The verified identity for `f:overrideControl` never comes from
+            // the envelope; it rides the execution options from the auth layer.
+            policy_opts.server_identity = execution.server_identity.clone();
             run_sparql_subquery(
                 fluree,
                 &with_snapshot,
