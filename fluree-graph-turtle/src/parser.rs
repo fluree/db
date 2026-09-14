@@ -1556,8 +1556,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         let base = match &self.base {
             Some(b) => b,
             None => {
+                // RFC 3986 §5.1: a relative reference needs a base. Keeping it
+                // verbatim, as this used to, writes a relative IRI into the
+                // store, and a relative IRI cannot identify a node — so the
+                // data is invalid in a way nothing downstream reports.
                 return Err(TurtleError::IriResolution(format!(
-                    "relative IRI '{reference}' without base"
+                    "relative IRI '{reference}' has no base to resolve against; \
+                     add an absolute `@base <http://example.org/> .` before it, or \
+                     write the IRI in full"
                 )));
             }
         };

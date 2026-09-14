@@ -318,6 +318,11 @@ pub async fn compute_derived_facts(
 
     let mut all_flakes: Vec<fluree_db_core::Flake> = Vec::new();
     let mut same_as = FrozenSameAs::empty();
+    // The OWL overlay itself, kept so datalog can read through it directly.
+    // Its flakes are still collected into `all_flakes`, which the final
+    // combined overlay needs, but the *intermediate* overlay datalog reads
+    // does not have to be rebuilt from them.
+    let mut owl_overlay: Option<Arc<fluree_db_reasoner::DerivedFactsOverlay>> = None;
     // Set when an OWL pass was requested and failed; the combined cache entry
     // is keyed as if OWL had run, so it must not be written in that case.
     let mut owl_failed = false;
@@ -384,6 +389,7 @@ pub async fn compute_derived_facts(
                 );
                 // Preserve sameAs from OWL2-RL
                 same_as = result.overlay.same_as().clone();
+                owl_overlay = Some(result.overlay.clone());
             }
             Err(e) => {
                 tracing::warn!(error = %e, "OWL2-RL reasoning failed, continuing without OWL derived facts");
@@ -411,13 +417,13 @@ pub async fn compute_derived_facts(
 
         // If OWL2-RL produced derived facts, run the rules over base + OWL
         // entailments so datalog can chain off them.
-        let datalog_result = if !all_flakes.is_empty() {
-            let mut builder = DerivedFactsBuilder::new();
-            for flake in &all_flakes {
-                builder.push(flake.clone());
-            }
-            let temp_overlay = Arc::new(builder.build(same_as.clone(), overlay.epoch()));
-            let combined = ReasoningOverlay::new(overlay, temp_overlay);
+        let datalog_result = if let Some(owl) = owl_overlay.clone() {
+            // Read straight through the overlay OWL already built rather than
+            // re-sorting and re-permuting every OWL flake into an identical
+            // one. It carries the same facts, the same `sameAs` and the same
+            // epoch: `fluree_db_reasoner` builds it against this base
+            // overlay's epoch, and `same_as` above is a clone of its own.
+            let combined = ReasoningOverlay::new(overlay, owl);
             let combined_db = GraphDbRef::new(snapshot, g_id, &combined, to_t);
             run_fixpoint(combined_db, rule_set, MAX_DATALOG_ITERATIONS, &budget, env).await?
         } else {

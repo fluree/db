@@ -27,6 +27,16 @@ ex:dave ex:name "Dave" .
 "#;
 
 async fn import_dir(files: &[(&str, &str)], alias: &str) -> (fluree_db_api::Fluree, LedgerState) {
+    import_dir_chunked(files, alias, 0).await
+}
+
+/// `chunk_size_mb = 0` derives the chunk size from the budget; any other value
+/// forces it, which is how a fixture can be made to cross a chunk boundary.
+async fn import_dir_chunked(
+    files: &[(&str, &str)],
+    alias: &str,
+    chunk_size_mb: usize,
+) -> (fluree_db_api::Fluree, LedgerState) {
     let db_dir = tempfile::tempdir().expect("db tmpdir");
     let data_dir = tempfile::tempdir().expect("data tmpdir");
     for (name, content) in files {
@@ -40,6 +50,7 @@ async fn import_dir(files: &[(&str, &str)], alias: &str) -> (fluree_db_api::Flur
         .import(data_dir.path())
         .threads(1)
         .memory_budget_mb(256)
+        .chunk_size_mb(chunk_size_mb)
         .cleanup(false)
         .execute()
         .await
@@ -131,4 +142,67 @@ async fn imported_turtle_star_claims_are_queryable() {
         .await
         .expect("plain edge query");
     assert_eq!(rows(&result).len(), 2, "{result:#}");
+}
+
+/// A multi-chunk import: a fixture large enough to be cut up, with star
+/// statements throughout and an escape-bearing prefix IRI in the header.
+///
+/// The other fixtures here are a few hundred bytes, so the import runs as a
+/// single work item and nothing about chunking is exercised at all. This one
+/// forces a 1 MB chunk and writes ~3 MB.
+///
+/// It does NOT reach `fluree-graph-turtle`'s splitter. Nothing outside that
+/// crate calls `extract_prefix_block`, `compute_chunk_boundaries` or
+/// `StreamingTurtleReader` — the importer chunks by its own route — so the
+/// prefix-block extractor's escaped-IRI and `VERSION` handling is pinned
+/// where it actually runs, by
+/// `splitter::tests::escaped_iri_in_a_prefix_directive_does_not_swallow_the_next_statement`,
+/// which drives `extract_prefix_block` and `StreamingTurtleReader` directly.
+/// What this test covers is the importer's own chunking: every edge and every
+/// claim crossing those boundaries exactly once, neither dropped nor
+/// duplicated.
+#[tokio::test]
+async fn a_split_file_keeps_every_claim_exactly_once() {
+    const N: usize = 40_000;
+    // The prefix IRI carries a `\u` escape on purpose: that lexes as its own
+    // token kind, which the extractor's SPARQL-directive terminator arm has to
+    // recognise as the directive's operand. While it did not, the prefix block
+    // ran on to the next `.` and swallowed the first data statement.
+    let mut doc = String::from("VERSION \"1.2\"\n@prefix ex: <http://example.org/caf\\u00E9/> .\n");
+    for i in 0..N {
+        doc.push_str(&format!(
+            "ex:a{i} ex:knows ex:b{i} ~ ex:claim{i} {{| ex:confidence 0.9 |}} .\n"
+        ));
+    }
+    assert!(
+        doc.len() > 2 * 1024 * 1024,
+        "the fixture must exceed one chunk: {} bytes",
+        doc.len()
+    );
+
+    let (fluree, ledger) =
+        import_dir_chunked(&[("big.ttl", &doc)], "it/import-star-split", 1).await;
+
+    let sparql = "PREFIX ex: <http://example.org/caf\u{e9}/>\n\
+                  SELECT (COUNT(*) AS ?n) WHERE { ?s ex:knows ?o }";
+    let result = support::query_sparql_formatted(&fluree, &ledger, sparql)
+        .await
+        .expect("edge count");
+    assert_eq!(
+        rows(&result)[0][0],
+        N.to_string(),
+        "every edge must land exactly once across the split: {result:#}"
+    );
+
+    // And the claims came with them, on both sides of a boundary.
+    let sparql = "PREFIX ex: <http://example.org/caf\u{e9}/>\n\
+                  SELECT (COUNT(*) AS ?n) WHERE { ?s ex:knows ?o {| ex:confidence ?c |} }";
+    let result = support::query_sparql_formatted(&fluree, &ledger, sparql)
+        .await
+        .expect("claim count");
+    assert_eq!(
+        rows(&result)[0][0],
+        N.to_string(),
+        "every claim must survive the split: {result:#}"
+    );
 }
