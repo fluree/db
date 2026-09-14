@@ -57,6 +57,7 @@ fn authorization_events_record_scope_decisions_without_policy_payloads() {
                     .into()
                 }),
                 default_allow: Some(false),
+                ..Default::default()
             });
             let authorization = match mode {
                 "controller" => CredentialPolicy::Request,
