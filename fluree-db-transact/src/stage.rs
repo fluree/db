@@ -1615,6 +1615,97 @@ async fn stage_graph_mgmt(
     .await
 }
 
+/// Which of `candidates` could already have rows in `ledger`.
+///
+/// A subject absent from both the persisted subject dictionary and its
+/// graph's novelty provably has no prior facts, so a scan for it can only
+/// come back empty. Skipping that scan matters because it is not cheap when
+/// it misses: a `Sid` neither dictionary can resolve falls through
+/// `binary_range` into `overlay_only_flakes`, which walks the graph's
+/// **entire** novelty. Freshly minted reifiers — every anonymous `{| … |}`
+/// and `<< … >>` — are exactly that shape, so a bulk Turtle-star insert
+/// otherwise pays one whole-novelty walk per annotation in the file.
+///
+/// `None` means absence cannot be decided here (no binary store on an
+/// already-indexed ledger); callers must then treat every candidate as
+/// possibly present and run their scan, so a real load failure surfaces
+/// rather than silently skipping work.
+///
+/// The novelty walk runs at most once per graph and answers for every
+/// candidate in that graph at once. `generate_upsert_deletions` skips absent
+/// subjects the same way and for the same reason, and #1657 fixed the same
+/// shape in `binary_scan`.
+fn subjects_with_prior_rows(
+    ledger: &LedgerState,
+    candidates: &[(GraphId, Sid)],
+) -> Option<HashSet<(GraphId, Sid)>> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_query::BinaryRangeProvider;
+
+    let binary_store = ledger
+        .snapshot
+        .range_provider
+        .as_ref()
+        .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
+        .map(|brp| Arc::clone(brp.store()));
+
+    // Genesis with nothing indexed: novelty is the only place a subject can
+    // be, so it decides on its own. An indexed ledger whose store failed to
+    // load must stay undecidable — see `generate_upsert_deletions`.
+    let base_index_absent = ledger.snapshot.range_provider.is_none() && ledger.snapshot.t == 0;
+    if binary_store.is_none() && !base_index_absent {
+        return None;
+    }
+
+    let mut present: HashSet<(GraphId, Sid)> = HashSet::new();
+    let mut want_novelty: HashMap<GraphId, HashSet<&Sid>> = HashMap::new();
+
+    for (g_id, sid) in candidates {
+        let in_base = match binary_store.as_deref() {
+            None => false,
+            Some(store) => {
+                if matches!(
+                    store.find_subject_id_by_parts(sid.namespace_code, &sid.name),
+                    Ok(Some(_))
+                ) {
+                    true
+                } else {
+                    // A namespace code the pre-transaction snapshot cannot
+                    // decode was minted by this transaction, so it names no
+                    // base row. Same reasoning as the upsert skip.
+                    match ledger.snapshot.decode_sid(sid) {
+                        Some(iri) => !matches!(store.find_subject_id(&iri), Ok(None)),
+                        None => false,
+                    }
+                }
+            }
+        };
+        if in_base {
+            present.insert((*g_id, sid.clone()));
+        } else {
+            want_novelty.entry(*g_id).or_default().insert(sid);
+        }
+    }
+
+    for (g_id, subjects) in want_novelty {
+        ledger.novelty.for_each_overlay_flake(
+            g_id,
+            IndexType::Spot,
+            None,
+            None,
+            true,
+            ledger.t(),
+            &mut |flake| {
+                if subjects.contains(&flake.s) {
+                    present.insert((g_id, flake.s.clone()));
+                }
+            },
+        );
+    }
+
+    Some(present)
+}
+
 /// Re-attach the graph to flakes read back through a scan.
 ///
 /// Index-decoded flakes carry `g: None` — the graph is the index they came
@@ -1701,29 +1792,52 @@ async fn enforce_single_target_reifiers(
             )
         };
 
+        // Resolve each reifier's graph once, then decide in a single pass
+        // which of them can have a prior bundle at all. Without this the scan
+        // below ran per reifier, and a reifier this transaction just minted
+        // resolves in neither dictionary, so each one walked the graph's whole
+        // novelty: O(new reifiers x novelty) on exactly the bulk Turtle-star
+        // insert this check exists to guard.
+        let mut anchors: Vec<(&Sid, GraphId, Option<Sid>)> = Vec::with_capacity(touched.len());
         for ann_sid in &touched {
-            let mine = &by_reifier[ann_sid];
-            // The bundle lives in a single graph; take it from this txn's
-            // own asserts, which is also what decides `g_id`.
-            let anchor = mine
+            let anchor = by_reifier[ann_sid]
                 .iter()
                 .find(|f| f.op)
                 .expect("touched implies an assert");
-            let g_id = resolve_flake_graph_id(anchor, reverse_graph)?;
-            let g_sid = anchor.g.clone();
+            anchors.push((
+                ann_sid,
+                resolve_flake_graph_id(anchor, reverse_graph)?,
+                anchor.g.clone(),
+            ));
+        }
+        let candidates: Vec<(GraphId, Sid)> = anchors
+            .iter()
+            .map(|(sid, g_id, _)| (*g_id, (*sid).clone()))
+            .collect();
+        let may_have_prior = subjects_with_prior_rows(ledger, &candidates);
+
+        for (ann_sid, g_id, g_sid) in anchors {
+            let mine = &by_reifier[ann_sid];
 
             // Current asserted `f:reifies*` bundle for this SID
-            // (pre-txn snapshot + novelty), as a deduped set.
-            let mut current = fluree_db_core::range_with_overlay(
-                &ledger.snapshot,
-                g_id,
-                ledger.novelty.as_ref(),
-                IndexType::Spot,
-                RangeTest::Eq,
-                RangeMatch::new().with_subject((*ann_sid).clone()),
-                RangeOptions::new().with_to_t(to_t),
-            )
-            .await?;
+            // (pre-txn snapshot + novelty), as a deduped set. A reifier with
+            // no prior rows contributes nothing, so the net bundle is exactly
+            // what this transaction asserts.
+            let mut current = match &may_have_prior {
+                Some(present) if !present.contains(&(g_id, ann_sid.clone())) => Vec::new(),
+                _ => {
+                    fluree_db_core::range_with_overlay(
+                        &ledger.snapshot,
+                        g_id,
+                        ledger.novelty.as_ref(),
+                        IndexType::Spot,
+                        RangeTest::Eq,
+                        RangeMatch::new().with_subject((*ann_sid).clone()),
+                        RangeOptions::new().with_to_t(to_t),
+                    )
+                    .await?
+                }
+            };
             // Index-decoded flakes carry `g: None` — the graph is the index
             // they came from, not a field — while this txn's named-graph
             // flakes carry `g: Some(sid)`. `reifies_key` includes `g`, so

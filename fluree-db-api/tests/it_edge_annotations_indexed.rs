@@ -1720,3 +1720,58 @@ async fn deleting_an_indexed_named_graph_claim_body_cascades_its_bundle() {
         "a bundle whose claim has no body left must not survive as an orphan"
     );
 }
+
+/// A reifier already in the base index is still checked against its stored
+/// bundle.
+///
+/// `enforce_single_target_reifiers` skips its scan for reifiers that resolve
+/// in neither the persisted dictionary nor novelty, because those provably
+/// have no prior bundle and the scan for them degrades into a walk of the
+/// graph's entire novelty. The skip must not extend to a reifier that *does*
+/// resolve: this one is in the base index after the rebuild, so the second
+/// write has to see its stored bundle to notice that it would then reify two
+/// edges at once.
+#[tokio::test]
+async fn an_indexed_reifier_pointed_at_a_second_edge_is_still_refused() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations-indexed:second-edge-refused";
+
+    let committed = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "ex:knows": {
+                    "@id": "ex:bob",
+                    "@annotation": {"@id": "ex:claim1", "ex:confidence": 0.9}
+                }
+            }),
+        )
+        .await
+        .expect("annotated insert");
+
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed = fluree.ledger(ledger_id).await.expect("reload indexed");
+    assert!(indexed.t() >= committed.ledger.t());
+
+    // Same reifier, a different edge, with the first attachment left in place.
+    let err = fluree
+        .insert(
+            indexed,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:carol",
+                "ex:knows": {
+                    "@id": "ex:dave",
+                    "@annotation": {"@id": "ex:claim1", "ex:confidence": 0.5}
+                }
+            }),
+        )
+        .await
+        .expect_err("a reifier on two edges must be refused");
+    assert!(
+        err.to_string().contains("claim1"),
+        "the error must name the reifier: {err}"
+    );
+}
