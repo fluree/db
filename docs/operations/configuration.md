@@ -333,6 +333,19 @@ Enable Cross-Origin Resource Sharing:
 
 When enabled, allows requests from any origin.
 
+### Outbound HTTPS Certificate Trust
+
+The CLI and server's reqwest-based HTTP clients use Rustls with platform
+certificate verification (reqwest 0.13). This includes catalog and OAuth requests,
+remote HTTP connections, and OTLP HTTP exports. Internal certificate authorities
+must be trusted by the operating system or container running Fluree. Ensure
+minimal Linux images include CA certificates, and verify enterprise CA settings
+when upgrading from the previous bundled-root configuration.
+
+AWS SDK storage connections configure their TLS transport separately. See the
+[reqwest migration notes](https://github.com/seanmonstar/reqwest/blob/master/CHANGELOG.md#v0130)
+for the underlying certificate-verification change.
+
 ### Body Limit
 
 Maximum request body size in bytes:

@@ -22,7 +22,7 @@ cid.workspace = true
 multihash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-reqwest = { workspace = true, features = ["rustls-tls", "json", "multipart"] }
+reqwest = { workspace = true, features = ["multipart"] }
 tracing.workspace = true
 
 [dev-dependencies]

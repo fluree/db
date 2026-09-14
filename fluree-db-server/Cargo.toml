@@ -107,13 +107,13 @@ thiserror = { workspace = true }
 # Observability
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-tracing-opentelemetry = { version = "0.32.1", optional = true }
-opentelemetry = { version = "0.31.0", optional = true }
-opentelemetry-otlp = { version = "0.31.0", optional = true, features = [
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true, features = [
     "grpc-tonic",
     "http-proto",
 ] }
-opentelemetry_sdk = { version = "0.31.0", optional = true, features = [
+opentelemetry_sdk = { workspace = true, optional = true, features = [
     "rt-tokio",
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
@@ -252,6 +252,12 @@ path = "tests/grp_bolt.rs"
 [[test]]
 name = "telemetry_test"
 path = "tests/telemetry_test.rs"
+
+# Own process: initializes the global subscriber and OTLP provider.
+[[test]]
+name = "otel_http_export"
+path = "tests/otel_http_export.rs"
+required-features = ["otel"]
 
 [[test]]
 name = "multi_query_tracing_integration"

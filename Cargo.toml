@@ -172,12 +172,24 @@ http = "1.1"
 http-body-util = "0.1"
 bytes = "1.4"
 
-# HTTP client for REST catalog (Iceberg)
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",
+# Shared HTTP client. Callers opt into form/query/stream/multipart as needed.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
     "json",
 ] }
 urlencoding = "2"
+
+# Keep CLI and server telemetry on the same HTTP/SDK stack.
+tracing-opentelemetry = "0.33.0"
+opentelemetry = "0.32.0"
+# Both consumers use the Tokio batch processor, so export over async reqwest.
+# The default blocking client can panic when invoked from that async worker.
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = [
+    "trace",
+    "internal-logs",
+    "reqwest-client",
+] }
+opentelemetry_sdk = "0.32.1"
 
 # Document parsing engine (fluree-doc-parse). Pin by rev; bump
 # `fluree_db_doc::parse::DOC_PARSE_REV` in step so the parse cache invalidates.
