@@ -31,6 +31,28 @@ GRAPH <urn:fluree:mydb:main#config> {
 }
 ```
 
+## Writing from the CLI
+
+`fluree insert` accepts Turtle and JSON-LD but not TriG, so the TriG recipe above is not runnable from the command line. Write the config graph with SPARQL UPDATE through `fluree update` instead:
+
+```bash
+fluree update -l mydb:main --format sparql -e '
+PREFIX f: <https://ns.flur.ee/db#>
+INSERT DATA {
+  GRAPH <urn:fluree:mydb:main#config> {
+    <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+      f:datalogDefaults [
+        f:datalogEnabled true ;
+        f:rulesSource [ a f:GraphRef ; f:graphSource [ f:graphSelector f:defaultGraph ] ] ;
+        f:allowQueryTimeRules true
+      ] ;
+      f:reasoningDefaults [ f:reasoningModes f:Datalog ; f:overrideControl f:OverrideAll ] .
+  }
+}'
+```
+
+`fluree update -f config.ru --format sparql` reads the same statement from a file. The JSON-LD form below works with `fluree insert` unchanged.
+
 ## Writing via SPARQL UPDATE
 
 Use `INSERT DATA` with a `GRAPH` clause:

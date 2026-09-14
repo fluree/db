@@ -221,6 +221,33 @@ pub fn parse_sync_transaction(
     for t in &mut txn.insert_templates {
         t.graph_id = Some(SYNC_GRAPH_LOCAL_ID);
     }
+    // Edge annotations were lowered against a payload with no graph identity,
+    // so their `f:reifies*` bundles carry no `f:reifiesGraph`. Re-homing the
+    // bundle into the target graph without one produces a bundle whose
+    // flake-level graph disagrees with the edge graph it encodes
+    // (`EdgeKey::from_reifies_facts` → `GraphMismatch`, refused at stage).
+    // Anchor every reifier to the sync graph, exactly as the named-`@graph`
+    // lowering does for an annotated edge written inside a graph block.
+    let reifies_subject = fluree_db_core::Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_SUBJECT,
+    );
+    let reifies_graph = fluree_db_core::Sid::new(
+        fluree_vocab::namespaces::FLUREE_DB,
+        fluree_vocab::db::REIFIES_GRAPH,
+    );
+    let anchors: Vec<TripleTemplate> = txn
+        .insert_templates
+        .iter()
+        .filter(|t| matches!(&t.predicate, TemplateTerm::Sid(p) if *p == reifies_subject))
+        .map(|t| {
+            let mut anchor = t.clone();
+            anchor.predicate = TemplateTerm::Sid(reifies_graph.clone());
+            anchor.object = TemplateTerm::Sid(ns_registry.sid_for_iri(graph_iri));
+            anchor
+        })
+        .collect();
+    txn.insert_templates.extend(anchors);
     txn.graph_delta
         .insert(SYNC_GRAPH_LOCAL_ID, graph_iri.to_string());
     txn.sync_graph = Some(graph_iri.to_string());

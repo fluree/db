@@ -61,7 +61,7 @@ pub fn parse_to_json(input: &str) -> Result<JsonValue> {
     let mut sink = GraphCollectorSink::new();
     parse(input, &mut sink)?;
     let graph = sink.into_graph();
-    Ok(graph_to_transaction_json(&graph))
+    graph_to_transaction_json(&graph)
 }
 
 #[cfg(test)]
