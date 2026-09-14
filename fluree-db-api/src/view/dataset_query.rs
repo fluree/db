@@ -12,6 +12,7 @@ use crate::{
     ApiError, ExecutableQuery, Fluree, QueryExecutionOptions, QueryResult, Result, Tracker,
     TrackingOptions,
 };
+use fluree_db_core::VerifiedIdentity;
 use fluree_db_query::execute::{
     execute_prepared, prepare_execution_with_config, ContextConfig, PrepareConfig,
 };
@@ -174,7 +175,9 @@ impl Fluree {
         )?;
 
         // 2. Build executable with optional reasoning override from primary view
-        let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
+        let executable = self
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
+            .await?;
 
         // 4. Execute against merged dataset
         let batches = self
@@ -279,7 +282,9 @@ impl Fluree {
         )?;
 
         // 2. Build executable with optional reasoning override from primary view
-        let executable = self.build_executable_for_dataset(dataset, &parsed).await?;
+        let executable = self
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
+            .await?;
 
         // 4. Execute against merged dataset
         let batches = self
@@ -415,7 +420,7 @@ impl Fluree {
         // does: query preparation completes the ledger's config defaults, so
         // a fault in the config graph surfaces here and is not the caller's.
         let executable = self
-            .build_executable_for_dataset(dataset, &parsed)
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await
             .map_err(|e| {
                 let status = e.status_code();
@@ -539,7 +544,7 @@ impl Fluree {
         // does: query preparation completes the ledger's config defaults, so
         // a fault in the config graph surfaces here and is not the caller's.
         let executable = self
-            .build_executable_for_dataset(dataset, &parsed)
+            .build_executable_for_dataset(dataset, &parsed, options.server_identity.as_ref())
             .await
             .map_err(|e| {
                 let status = e.status_code();
@@ -615,10 +620,15 @@ impl Fluree {
     /// `f:schemaSource` bundle (local, cross-ledger, and inline ontology).
     /// The query-time rule policy gate uses `dataset.any_non_root_policy()`
     /// so a restricted policy on *any* source strips caller-supplied rules.
+    ///
+    /// `server_identity` is the auth-layer-verified caller identity that
+    /// `f:overrideControl` gates on (`QueryExecutionOptions::server_identity`
+    /// at the entry points that carry execution options); `None` is anonymous.
     pub(crate) async fn build_executable_for_dataset(
         &self,
         dataset: &DataSetDb,
         parsed: &fluree_db_query::ir::Query,
+        server_identity: Option<&VerifiedIdentity>,
     ) -> Result<ExecutableQuery> {
         let mut executable = prepare_for_execution(parsed);
 
@@ -630,14 +640,11 @@ impl Fluree {
         // a mode the query itself supplies reaches it.
         match dataset.primary() {
             Some(primary) if !dataset.is_history_mode() => {
-                // Server-verified identity for `f:overrideControl`. `None` until
-                // the request boundary threads it through; see
-                // `complete_config_defaults`.
                 self.apply_reasoning_to_executable(
                     primary,
                     &mut executable,
                     dataset.any_non_root_policy(),
-                    None,
+                    server_identity,
                 )
                 .await?;
             }
