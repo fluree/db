@@ -476,17 +476,15 @@ impl SubqueryOperator {
                     // duplicate keys, and let the existing merge bind the parent.
                     mat.rows.clone()
                 } else {
+                    let bound_columns: Vec<usize> = (0..parent_key.len())
+                        .filter(|col| !unbound_columns.contains(col))
+                        .collect();
                     let mut matches = Vec::new();
                     for (bucket, (key, idxs)) in mat.index.iter().enumerate() {
                         if bucket % 1024 == 0 {
                             ctx.check_cancelled()?;
                         }
-                        if parent_key
-                            .iter()
-                            .zip(key)
-                            .enumerate()
-                            .all(|(col, (p, s))| p == s || unbound_columns.contains(&col))
-                        {
+                        if bound_columns.iter().all(|&col| parent_key[col] == key[col]) {
                             matches.extend(idxs.iter().map(|&i| mat.rows[i].clone()));
                         }
                     }
