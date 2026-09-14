@@ -268,7 +268,9 @@ async fn timing_wal_vs_sync() {
 /// `cargo test -p fluree-db-api --release --test it_wal -- --ignored --nocapture timing_concurrent`
 ///
 /// `FLUREE_TIMING_CLIENTS` (default "1,4,16") and `FLUREE_TIMING_COMMITS`
-/// (per client, default 100) shape the run.
+/// (per client, default 100) shape the run. `FLUREE_TIMING_IDLE_MS` pauses
+/// between the warm-up and the timed run, so a pause past the segment age
+/// times a burst that starts from an idle log.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn timing_concurrent_wal() {
@@ -282,6 +284,12 @@ async fn timing_concurrent_wal() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(100);
+    let idle = Duration::from_millis(
+        std::env::var("FLUREE_TIMING_IDLE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+    );
 
     for durability in [Durability::Wal, Durability::Sync] {
         for &n in &clients {
@@ -310,6 +318,7 @@ async fn timing_concurrent_wal() {
                     handles.push(handle);
                 }
                 let probe = probe(dir.path());
+                tokio::time::sleep(idle).await;
                 let fsyncs_before = probe.fsyncs_issued();
 
                 let started = Instant::now();
@@ -375,6 +384,57 @@ async fn timing_concurrent_wal() {
                 fluree.disconnect().await;
             }
         }
+    }
+}
+
+/// Not a check: a measurement of a writer slower than segment rotation, which
+/// opens a fresh segment for nearly every commit, beside a burst that shares
+/// them. Reports per-commit latency, flushes per commit (retirement
+/// included), and the size of the segments left on disk.
+///
+/// `cargo test -p fluree-db-api --test it_wal -- --ignored --nocapture timing_trickle`
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn timing_trickle_wal() {
+    use std::time::{Duration, Instant};
+
+    const SAMPLES: usize = 20;
+
+    for (mode, pause) in [
+        ("burst", Duration::ZERO),
+        ("trickle", Duration::from_millis(1300)),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let fluree = open(dir.path());
+        fluree.create_ledger(LEDGER).await.expect("create");
+        let handle = fluree.ledger_cached(LEDGER).await.expect("cache");
+        insert(&fluree, &handle, 0).await;
+        let probe = probe(dir.path());
+        let before = probe.fsyncs_issued();
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for n in 1..=SAMPLES {
+            tokio::time::sleep(pause).await;
+            let started = Instant::now();
+            insert(&fluree, &handle, n).await;
+            samples.push(started.elapsed());
+        }
+        let flushes = probe.fsyncs_issued() - before;
+        let segment_bytes: u64 = std::fs::read_dir(dir.path().join(".fluree-wal"))
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension()? == "wal").then(|| path.metadata().ok().map(|m| m.len()))?
+            })
+            .sum();
+        samples.sort();
+        let at = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize];
+        println!(
+            "{mode:<8} commits={SAMPLES} median={:?} p95={:?} flushes/commit={:.2} segment_bytes={segment_bytes}",
+            at(0.5),
+            at(0.95),
+            flushes as f64 / SAMPLES as f64,
+        );
+        fluree.disconnect().await;
     }
 }
 
