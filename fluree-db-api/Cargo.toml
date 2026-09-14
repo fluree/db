@@ -675,3 +675,9 @@ fluree-db-transact = { path = "../fluree-db-transact" }
 tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time", "io-util"] }
 # Executor for `wasm_compat::spawn_detached` (browser event loop).
 wasm-bindgen-futures = "0.4"
+
+# Standalone: wildcard join routing and the process-global fast-path switch.
+[[test]]
+name = "it_wildcard_batched_join"
+path = "tests/it_wildcard_batched_join.rs"
+required-features = ["native"]
