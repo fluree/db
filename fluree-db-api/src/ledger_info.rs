@@ -554,23 +554,30 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
     // fact already in the base index must not be charged again (#1391). One
     // bounded base probe per `(graph, subject, predicate)` novelty touched;
     // this is a per-request metadata call, not a query hot path.
-    let mut stats: IndexStats = match (options.realtime_property_details, ledger.novelty.is_empty())
-    {
-        (_, true) => indexed.clone(),
-        (true, false) => assemble_full_stats_with(
+    // `Arc`-shared so the no-novelty arm — the common one — hands back the
+    // snapshot's own stats instead of deep-copying a class table that is one
+    // entry per distinct class.
+    let mut stats: Arc<IndexStats> = match (
+        options.realtime_property_details,
+        ledger.novelty.is_empty(),
+    ) {
+        (_, true) => Arc::clone(&indexed),
+        (true, false) => Arc::new(
+            assemble_full_stats_with(
             &indexed,
             &ledger.snapshot,
             ledger.novelty.as_ref(),
             ledger.novelty.as_ref(),
             ledger.t(),
             &stats_lookup,
-            NoveltyMerge::Reconciled {
-                site: stats_merge_site::LEDGER_INFO_FULL,
-            },
-        )
-        .await
-        .map_err(|e| LedgerInfoError::ClassLookup(e.to_string()))?,
-        _ => assemble_fast_stats_with(
+                NoveltyMerge::Reconciled {
+                    site: stats_merge_site::LEDGER_INFO_FULL,
+                },
+            )
+            .await
+            .map_err(|e| LedgerInfoError::ClassLookup(e.to_string()))?,
+        ),
+        _ => Arc::new(assemble_fast_stats_with(
             &indexed,
             &ledger.snapshot,
             ledger.novelty.as_ref(),
@@ -579,7 +586,7 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
             NoveltyMerge::Reconciled {
                 site: stats_merge_site::LEDGER_INFO_FAST,
             },
-        ),
+        )),
     };
 
     // Pre-index fallback: if no graph stats from index, try loading the pre-index manifest
@@ -592,7 +599,7 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
             match parse_pre_index_manifest(&bytes) {
                 Ok(graphs) => {
                     tracing::debug!(graphs = graphs.len(), "loaded pre-index stats manifest");
-                    stats.graphs = Some(graphs);
+                    Arc::make_mut(&mut stats).graphs = Some(graphs);
                 }
                 Err(e) => {
                     tracing::warn!("failed to parse pre-index stats manifest: {}", e);

@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::{
-    GraphDbRef, GraphId, OverlayProvider, RuntimePredicateId, RuntimeSmallDicts, Sid, StatsView,
+    GraphDbRef, GraphId, IndexStats, OverlayProvider, RuntimePredicateId, RuntimeSmallDicts, Sid,
+    StatsView,
 };
-use fluree_db_novelty::{assemble_fast_stats, Novelty, StatsAssemblyError, StatsLookup};
+use fluree_db_novelty::{assemble_fast_stats_shared, Novelty, StatsAssemblyError, StatsLookup};
 use std::collections::HashMap;
 use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_128;
@@ -44,7 +45,14 @@ pub(crate) fn cached_stats_view_for_db(
     allow_semantic_elision: bool,
 ) -> Option<Arc<StatsView>> {
     let build_view = || {
-        let indexed = db.snapshot.stats.clone().unwrap_or_default();
+        // `Arc`-shared, never copied: `IndexStats` carries one entry per
+        // distinct class, so on a class-per-subject ledger a by-value clone
+        // here was seconds of small allocations before planning began.
+        let indexed = db
+            .snapshot
+            .stats
+            .clone()
+            .unwrap_or_else(|| Arc::new(IndexStats::default()));
         // Note: downcast_ref::<Novelty>() silently falls through for non-Novelty overlays
         // (e.g. PolicyOverlay). In those cases we skip novelty merging and return only
         // the persisted indexed stats, which is correct since policy overlays don't
@@ -94,7 +102,9 @@ pub(crate) fn cached_stats_view_for_db(
             // reaches every consumer that sums it. See #1721 for both candidate
             // fix directions — and note that reconciling THIS lane is not one
             // of them, for the quadratic reason above.
-            assemble_fast_stats(
+            // Shared: the empty-window and below-published-`t` cases hand
+            // back the same `Arc` rather than a second full copy.
+            assemble_fast_stats_shared(
                 &indexed,
                 db.snapshot,
                 novelty,
@@ -130,7 +140,12 @@ pub(crate) fn cached_stats_view_for_db(
         // historical wire tail) there is no sound set, so the observed sets
         // are cleared: empty means "unknown" and every consumer fails closed.
         // The counts are left alone in all cases.
+        //
+        // This is the one branch that has to own the stats: `make_mut` copies
+        // when the `Arc` is still shared with the snapshot. Current-state
+        // reads — every query on a live ledger — never reach it.
         if db.t < db.snapshot.t {
+            let stats = Arc::make_mut(&mut stats);
             let licensed = stats.historical_since_t.is_some_and(|since| db.t >= since);
             for property in stats.properties.iter_mut().flatten() {
                 if licensed {
@@ -297,7 +312,7 @@ mod tests {
     #[test]
     fn uncached_builder_still_merges_novelty_without_store() {
         let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
-        snapshot.stats = Some(IndexStats {
+        snapshot.stats = Some(Arc::new(IndexStats {
             flakes: 1,
             size: 10,
             properties: Some(vec![PropertyStatEntry {
@@ -313,7 +328,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
-        });
+        }));
 
         let mut novelty = Novelty::new(1);
         novelty
@@ -495,7 +510,7 @@ mod tests {
                 observed_datatypes: vec![ref_tag],
                 historical_datatypes: historical,
             };
-            snapshot.stats = Some(IndexStats {
+            snapshot.stats = Some(Arc::new(IndexStats {
                 flakes: 2,
                 size: 20,
                 properties: Some(vec![
@@ -505,7 +520,7 @@ mod tests {
                 classes: None,
                 graphs: None,
                 historical_since_t: since,
-            });
+            }));
             snapshot
         };
         let novelty = Novelty::new(1); // empty: the base index answers all reads

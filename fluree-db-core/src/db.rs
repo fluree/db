@@ -43,7 +43,7 @@ pub struct LedgerSnapshotMetadata {
     /// Ledger-fixed split mode from the index root.
     pub ns_split_mode: NsSplitMode,
     /// Index statistics (flakes count, total size)
-    pub stats: Option<IndexStats>,
+    pub stats: Option<Arc<IndexStats>>,
     /// Schema (class/property hierarchy)
     pub schema: Option<IndexSchema>,
     /// Per-namespace max local_id watermarks from the index root
@@ -163,8 +163,17 @@ pub struct LedgerSnapshot {
     /// Use `ns_split_mode()` for read access and `set_ns_split_mode()` for mutation.
     ns_split_mode: NsSplitMode,
 
-    /// Index statistics (flakes count, total size)
-    pub stats: Option<IndexStats>,
+    /// Index statistics (flakes count, total size).
+    ///
+    /// `Arc`-wrapped because the class table is unbounded in the number of
+    /// distinct classes — a class-per-subject data model reaches millions of
+    /// `ClassStatEntry`s, each owning its own property/datatype/lang vectors.
+    /// Snapshot clones are on per-query paths (named-graph range-provider
+    /// swaps, staged-transaction previews, historical views), and the planner
+    /// stats view borrows this whole artifact, so a by-value field made every
+    /// one of those a multi-second deep copy. Share it; the indexer replaces
+    /// the whole `Arc` when it publishes.
+    pub stats: Option<Arc<IndexStats>>,
     /// Schema (class/property hierarchy)
     pub schema: Option<IndexSchema>,
 
@@ -991,7 +1000,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         ensure(bytes, pos, stats_len, "stats section")?;
         let (s, _consumed) = stats_wire::decode_stats(&bytes[pos..pos + stats_len])?;
         pos += stats_len;
-        Some(s)
+        Some(Arc::new(s))
     } else {
         None
     };
