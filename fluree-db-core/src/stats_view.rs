@@ -173,7 +173,8 @@ impl StatsView {
             })
             .sum::<usize>();
 
-        // `source` is shared with the snapshot; evicting the view frees none of it.
+        // `source` is not counted: the planner's builder keeps it only when it
+        // is the snapshot's own stats, which evicting the view would not free.
         size_of::<Self>() + properties + classes + properties_by_iri + graph_properties
     }
 
