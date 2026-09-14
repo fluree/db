@@ -3786,6 +3786,23 @@ mem:decision-01m2g43417xqdn66gd72kqp670 a mem:Decision ;
     mem:rationale "Full StarBench ledger: predicate-only chain went from one SPOT point scan per reifier to one POST range plus the body probe (P11 4.9 -> 0.42 s, C11 8.4 -> 0.61 s, S5 6.9 -> 1.8 s); P2 on the elided chain 10.6 s vs 65 s enumerating the reverse arena; C2 162 -> 59 s; P6/P7 (endpoints read) stay on the enumeration. P3 has 3 derives_from rows on plain subjects that P2 must not count, hence the keep-one rule." ;
     mem:alternatives "Keeping the base edge and eliding only rS/rO (unsound: breaks the reifier-to-edge link); eliding inside the hash lane (unneeded, it sweeps the sidecars once)" .
 
+mem:decision-01m2gp3mhwmw089pe9hyctq73t a mem:Decision ;
+    mem:content "Per-row decode costs are taken with bounded per-query memos rather than representation changes: BinaryGraphView memoizes resolve_subject_sid/resolve_subject_iri per view (hits skip the dict-touch fuel charge), the enumerate lane memoizes endpoint ids per operator (misses included), and open_leaf_handle checks the shared mmap cache before resolve_local_path (a stat per leaf on the file store). P4 NDJSON 277 s to 190 s locally. Changing the enumerate lane to emit strings instead of ids was rejected: joins and DISTINCT equality paths assume id space." ;
+    mem:tag "binary-index" ;
+    mem:tag "memo" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:tag "rdf-star" ;
+    mem:tag "starbench" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/read/binary_index_store.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/read/leaflet_cache.rs" ;
+    mem:artifactRef "fluree-db-query/src/annotation_edge_probe.rs" ;
+    mem:branch "perf/rdf12-annotation-chain-planning" ;
+    mem:createdAt "2026-09-14T19:25:37.724270+00:00"^^xsd:dateTime ;
+    mem:rationale "Memos keep every existing representation and plan byte-identical, so non-RDF-star queries cannot regress; the test for each memo was proven non-vacuous by disabling it." ;
+    mem:alternatives "emit Binding::Sid from the enumerate lane; per-formatter memo plumbing; streaming SPARQL results writer" .
+
 mem:fact-01m2erqe12gyekk6nm30j9saz7 a mem:Fact ;
     mem:content "StarBench P4 (`<< ?s ?p ?o >> ?d ?e`, 33.6M rows) OOMed the server at 240 GB while P6 (same rows, bound predicate) fit: `NestedLoopJoinOperator::build_output_batch` pre-allocated every output column at `ctx.batch_size` (Binding ≤ 88 B) and in per-row mode emitted one batch per left row (~22 rows) without shrinking; the delimited response path (`to_tsv_bytes`) retains every batch until it formats → ~56 KB per tiny batch × 21.4M batches. Fixed by sizing columns as min(pending rows, batch_size); dense batches unchanged. Slice A/B via the same collect-then-format code: 17 GB → 3 GB peak for 6.57M rows. Any per-row join with sparse output (unbound-predicate sibling, no batched lane) plus a collect-all consumer had this cost." ;
     mem:tag "batch" ;
@@ -3832,6 +3849,21 @@ mem:fact-01m2g7sf28dwy0gwj8wv6h3eas a mem:Fact ;
     mem:branch "perf/rdf12-annotation-chain-planning" ;
     mem:createdAt "2026-09-14T15:15:24.360022+00:00"^^xsd:dateTime ;
     mem:rationale "Hub-heavy self-joins evaluate str(?a) > str(?b) tens of millions of times over a few thousand distinct subjects; with the memo working S10 8.8 -> 4.2 s, S21 10.9 -> 3.8 s, S11 336 -> 135 s, counts unchanged." .
+
+mem:fact-01m2gp3da2h2nrsrj53sf8e9js a mem:Fact ;
+    mem:content "Wide-result SPARQL SELECTs (StarBench P4, 33.6M rows) are bound by row production, not the result writer: streaming NDJSON was slower than buffered TSV (943 s vs 719 s) and only saved memory. Profile of P4: ~2/3 in the join (per-row wildcard-predicate probe, a stat per leaf open, arena leaf decode, endpoint id lookups), ~1/3 in the sink (subject decode per cell ~13%, JSON writing ~15%). A perfect writer caps at ~15%; the batched wildcard-predicate probe is the real lever." ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:tag "rdf-star" ;
+    mem:tag "serialization" ;
+    mem:tag "starbench" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/format/sparql.rs" ;
+    mem:artifactRef "fluree-db-query/src/annotation_edge_probe.rs" ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:branch "perf/rdf12-annotation-chain-planning" ;
+    mem:createdAt "2026-09-14T19:25:30.306481+00:00"^^xsd:dateTime ;
+    mem:rationale "The writer theory (serde_json Value tree in the standard route) was falsified by the user's NDJSON stream measurement; recorded so nobody rebuilds the writer expecting a 2x on these shapes." .
 
 mem:decision-01kzdzqzsrwt4wbyr5dt9veshp a mem:Decision ;
     mem:content "PR #1422 engine convergence phase 1 (uncommitted on branch pr-1422-review): extracted pub TmEmitContext + emit_row + emit_row_terms from emit_batch in the shared enumerator (behavior-identical; emit_row_terms takes a caller-supplied subject for classify-then-emit callers). build_live_node in r2rml_materialize.rs = NodeCollector (TripleObserver→SubjectNode, rdf:type→@type routing) + emit_row_terms; hand-rolled POM loop deleted. Deltas: templated predicates now emit (were silently dropped); ParentIndexSet::new validates mapping fail-closed; FK edges still drop (parents unindexed) but counted+warned. Phase 2: indexing FK parents needs a window-vs-whole-table answer." ;
