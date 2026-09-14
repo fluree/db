@@ -2135,10 +2135,10 @@ impl Operator for BinaryScanOperator {
                 && !self.mode.is_history()
                 && ctx.to_t >= store_ref.max_t()
                 && !crate::fast_path_common::overlay_has_novelty(ctx)
-                && std::env::var_os("FLUREE_DISABLE_DECIMAL_SEEKS").is_none()
+                && !decimal_seeks_disabled()
             {
                 if let Some(p_id) = filter.p_id {
-                    if predicate_is_decimal_only(store_ref, self.g_id, p_id)? {
+                    if predicate_is_decimal_only(store_ref, self.g_id, p_id) {
                         inferred_dt_sid = Some(Sid::new(namespaces::XSD, xsd_names::DECIMAL));
                     }
                 }
@@ -2204,8 +2204,11 @@ impl Operator for BinaryScanOperator {
                         if let FlakeValue::Decimal(value) = bound_o {
                             if *dt_sid == Sid::new(namespaces::XSD, xsd_names::DECIMAL)
                                 && !self.mode.is_history()
+                                // The arena reflects the index at max_t. It keeps
+                                // retracted values today, but an absent handle only
+                                // proves absence for reads at or after that point.
                                 && ctx.to_t >= store_ref.max_t()
-                                && std::env::var_os("FLUREE_DISABLE_DECIMAL_SEEKS").is_none()
+                                && !decimal_seeks_disabled()
                             {
                                 decimal_object_key(store_ref, self.g_id, filter.p_id, value)
                             } else {
@@ -3896,14 +3899,29 @@ pub(crate) fn encode_bound_object_prefilter(
     }
 }
 
+/// Set `FLUREE_DISABLE_DECIMAL_SEEKS` (read once per process) to restore the
+/// general numeric matcher for bound decimal objects.
+fn decimal_seeks_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("FLUREE_DISABLE_DECIMAL_SEEKS").is_some())
+}
+
 /// A base-only proof. A mixed/unknown leaflet declines, even if the arena itself
 /// contains only decimals: numerically equal inline values must not be missed.
-fn predicate_is_decimal_only(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<bool> {
+/// Joins open a scan per driving row, so the proof is memoized on the store.
+fn predicate_is_decimal_only(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> bool {
+    store
+        .memoized_decimal_only_proof(g_id, p_id, || prove_decimal_only(store, g_id, p_id))
+        .unwrap_or(false)
+}
+
+/// `None` when a leaf directory can't be read: decline without caching.
+fn prove_decimal_only(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Option<bool> {
     use fluree_db_binary_index::format::run_record::RunSortOrder;
     if !store.numbig_is_decimal_only(g_id, p_id)
         || store.branch_for_order(g_id, RunSortOrder::Post).is_none()
     {
-        return Ok(false);
+        return Some(false);
     }
     let decimal_type = OType::NUM_BIG_OVERFLOW.as_u16();
     for leaf in
@@ -3914,23 +3932,21 @@ fn predicate_is_decimal_only(store: &BinaryIndexStore, g_id: GraphId, p_id: u32)
         // boundary leaves can require directory reads, even for huge predicates.
         if leaf.first_key.p_id == p_id && leaf.last_key.p_id == p_id {
             if leaf.first_key.o_type != decimal_type || leaf.last_key.o_type != decimal_type {
-                return Ok(false);
+                return Some(false);
             }
             continue;
         }
-        let dir = store
-            .open_leaf_dir(&leaf.leaf_cid)
-            .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
+        let dir = store.open_leaf_dir(&leaf.leaf_cid).ok()?;
         for entry in &dir.entries {
             if entry.row_count == 0 || entry.p_const.is_some_and(|p| p != p_id) {
                 continue;
             }
             if entry.p_const != Some(p_id) || entry.o_type_const != Some(decimal_type) {
-                return Ok(false);
+                return Some(false);
             }
         }
     }
-    Ok(true)
+    Some(true)
 }
 
 fn decimal_object_key(

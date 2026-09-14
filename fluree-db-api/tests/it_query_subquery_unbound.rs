@@ -120,6 +120,21 @@ async fn grouped_subquery_restricts_partially_bound_composite_keys() {
             VALUES (?p ?price) { (UNDEF 10) (ex:a UNDEF) (UNDEF UNDEF) (ex:missing UNDEF) (ex:a 20) }
             { SELECT ?p ?price (COUNT(*) AS ?n) WHERE { ?p ex:price ?price } GROUP BY ?p ?price }
         }", json!([["a","10","1"],["a","10","1"],["a","10","1"],["b","20","1"]])).await;
+        // A small sliced UNION parent is evaluated first, so the subquery probes
+        // the two-column key [?p ?price] with one column unbound per row. Each
+        // bound column must still restrict the match.
+        check(
+            &fluree,
+            "SELECT ?row ?p ?price ?n WHERE {
+            { SELECT ?row ?p ?price WHERE {
+                { VALUES (?row ?p) { (ex:left ex:a) } }
+                UNION { VALUES (?row ?price) { (ex:right 20) } }
+            } LIMIT 10 }
+            { SELECT ?p ?price (COUNT(*) AS ?n) WHERE { ?p ex:price ?price } GROUP BY ?p ?price }
+        }",
+            json!([["left", "a", "10", "1"], ["right", "b", "20", "1"]]),
+        )
+        .await;
         // The aggregate output is reconciled after the key lookup. Expanding
         // an unbound product must still reject a conflicting bound total.
         check(

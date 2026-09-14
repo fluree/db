@@ -339,6 +339,114 @@ async fn a_stage_behind_a_commit_that_adds_a_shape_is_validated_against_it() {
     fluree.disconnect().await;
 }
 
+/// Each write inserts only while the other's triple is absent, and the two
+/// write different subjects. The parked one's WHERE read the subject the
+/// other wrote, so a re-base would land both, which no serial order allows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stage_whose_where_read_a_subject_written_ahead_is_restaged() {
+    let (_dir, fluree, handle) = open().await;
+    update(&fluree, &handle, "INSERT DATA { ex:seed ex:p 0 }").await;
+
+    let (parked, release) = handle.gate_next_optimistic_stage_for_test();
+    let behind = spawn_update(
+        &fluree,
+        &handle,
+        "INSERT { ex:t ex:q 1 } WHERE { FILTER NOT EXISTS { ex:s ex:p 1 } }",
+    );
+    parked.await.expect("the write parks after staging");
+
+    update(
+        &fluree,
+        &handle,
+        "INSERT { ex:s ex:p 1 } WHERE { FILTER NOT EXISTS { ex:t ex:q 1 } }",
+    )
+    .await;
+    release.send(true).unwrap();
+    behind.await.expect("task");
+
+    assert_eq!(
+        (
+            count(&fluree, &handle, "SELECT ?o WHERE { ex:s ex:p ?o }").await,
+            count(&fluree, &handle, "SELECT ?o WHERE { ex:t ex:q ?o }").await,
+        ),
+        (1, 0),
+        "the parked insert saw the one committed ahead of it"
+    );
+    let stats = handle.write_path_stats();
+    assert_eq!(
+        (stats.rebased, stats.restaged),
+        (0, 1),
+        "a WHERE reads beyond the subjects it writes: {stats:?}"
+    );
+    fluree.disconnect().await;
+}
+
+/// A uniqueness check reads every subject holding the value, not only the
+/// stage's own, so a duplicate committed ahead on another subject reaches
+/// the check only if the stage runs again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stage_checked_for_uniqueness_is_restaged_behind_a_duplicate() {
+    let (_dir, fluree, handle) = open().await;
+    let config = format!(
+        "@prefix f: <https://ns.flur.ee/db#> .
+         @prefix ex: <http://example.org/> .
+         ex:email f:enforceUnique true .
+         GRAPH <{}> {{
+           <urn:config:main> a f:LedgerConfig ; f:transactDefaults <urn:config:transact> .
+           <urn:config:transact> f:uniqueEnabled true .
+         }}",
+        fluree_db_core::config_graph_iri(LEDGER)
+    );
+    fluree
+        .stage(&handle)
+        .upsert_turtle(&config)
+        .execute()
+        .await
+        .expect("enable uniqueness");
+
+    let (parked, release) = handle.gate_next_optimistic_stage_for_test();
+    let behind = {
+        let fluree = fluree.clone();
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            fluree
+                .stage(&handle)
+                .sparql_update(&format!("{PREFIX}INSERT DATA {{ ex:u1 ex:email \"x\" }}"))
+                .execute()
+                .await
+                .map(|r| r.receipt.t)
+        })
+    };
+    parked.await.expect("the write parks after staging");
+
+    update(&fluree, &handle, "INSERT DATA { ex:u2 ex:email \"x\" }").await;
+    release.send(true).unwrap();
+
+    let err = behind
+        .await
+        .expect("task")
+        .expect_err("the value was taken by the write committed ahead of it");
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(
+                fluree_db_transact::TransactError::UniqueConstraintViolation { .. }
+            )
+        ),
+        "rejected for the right reason: {err:?}"
+    );
+    assert_eq!(
+        handle.write_path_stats().rebased,
+        0,
+        "a uniqueness check reads beyond the subjects it writes"
+    );
+    assert_eq!(
+        count(&fluree, &handle, "SELECT ?u WHERE { ?u ex:email \"x\" }").await,
+        1
+    );
+    fluree.disconnect().await;
+}
+
 /// Many SPARQL writers on one ledger all land, and most of them by re-base:
 /// under contention the state has moved by the time a stage takes the lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
