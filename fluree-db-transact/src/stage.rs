@@ -1589,16 +1589,29 @@ async fn enforce_single_target_reifiers(
     use fluree_db_core::is_reserved_reifies_predicate;
     use fluree_db_core::range::{RangeMatch, RangeOptions, RangeTest};
 
-    // Annotation SIDs this txn asserts a `f:reifies*` flake for.
-    // Pure retracts only shrink a bundle, so they can't create a
-    // multi-target; gating on asserts keeps non-annotation and
-    // retract-only transactions at zero scan cost.
-    let mut touched: Vec<Sid> = Vec::new();
-    let mut touched_seen: HashSet<Sid> = HashSet::new();
+    // One pass over `flakes`, grouping every reserved-predicate flake under
+    // its annotation subject. The per-reifier work below then reads only its
+    // own group: re-scanning `flakes` per reifier made the check
+    // O(reifiers x flakes), and since each annotation contributes ~5 flakes
+    // the flake count grows with the reifier count — quadratic on exactly the
+    // shape this check exists for. `stage_flakes` puts it on the bulk Turtle
+    // insert and commit-apply paths, where one transaction can carry every
+    // reifier in a file.
+    //
+    // `touched` keeps the "gate on asserts" property: a reifier is only work
+    // when the txn ASSERTS one of its facts, so pure retracts (which can only
+    // shrink a bundle) and non-annotation transactions stay at zero scan cost.
+    let mut by_reifier: HashMap<&Sid, Vec<&Flake>> = HashMap::new();
+    let mut touched: Vec<&Sid> = Vec::new();
     for f in flakes {
-        if f.op && is_reserved_reifies_predicate(&f.p) && touched_seen.insert(f.s.clone()) {
-            touched.push(f.s.clone());
+        if !is_reserved_reifies_predicate(&f.p) {
+            continue;
         }
+        let group = by_reifier.entry(&f.s).or_default();
+        if f.op && !group.iter().any(|g| g.op) {
+            touched.push(&f.s);
+        }
+        group.push(f);
     }
 
     if !touched.is_empty() {
@@ -1622,27 +1635,39 @@ async fn enforce_single_target_reifiers(
         };
 
         for ann_sid in &touched {
-            // The bundle lives in a single graph (default graph
-            // in v1); take the g_id from this txn's asserts.
-            let g_id = flakes
+            let mine = &by_reifier[ann_sid];
+            // The bundle lives in a single graph; take it from this txn's
+            // own asserts, which is also what decides `g_id`.
+            let anchor = mine
                 .iter()
-                .find(|f| f.op && f.s == *ann_sid && is_reserved_reifies_predicate(&f.p))
-                .map(|f| resolve_flake_graph_id(f, reverse_graph))
-                .transpose()?
-                .unwrap_or(0);
+                .find(|f| f.op)
+                .expect("touched implies an assert");
+            let g_id = resolve_flake_graph_id(anchor, reverse_graph)?;
+            let g_sid = anchor.g.clone();
 
             // Current asserted `f:reifies*` bundle for this SID
             // (pre-txn snapshot + novelty), as a deduped set.
-            let current = fluree_db_core::range_with_overlay(
+            let mut current = fluree_db_core::range_with_overlay(
                 &ledger.snapshot,
                 g_id,
                 ledger.novelty.as_ref(),
                 IndexType::Spot,
                 RangeTest::Eq,
-                RangeMatch::new().with_subject(ann_sid.clone()),
+                RangeMatch::new().with_subject((*ann_sid).clone()),
                 RangeOptions::new().with_to_t(to_t),
             )
             .await?;
+            // Index-decoded flakes carry `g: None` — the graph is the index
+            // they came from, not a field — while this txn's named-graph
+            // flakes carry `g: Some(sid)`. `reifies_key` includes `g`, so
+            // without this stamp an indexed named-graph bundle never matches
+            // the txn's keys: a re-assert would not collapse, and the net
+            // bundle would mix `None` and `Some` and decode as
+            // `MixedFlakeGraphs`. `scan_graph_flakes` stamps for the same
+            // reason.
+            for f in &mut current {
+                f.g = g_sid.clone();
+            }
             let mut net: HashMap<ReifiesKey, Flake> = HashMap::new();
             for f in current {
                 if is_reserved_reifies_predicate(&f.p) {
@@ -1652,13 +1677,10 @@ async fn enforce_single_target_reifiers(
 
             // Fold this txn's effects for the SID: retracts drop
             // the matching fact; asserts add it.
-            for f in flakes
-                .iter()
-                .filter(|f| f.s == *ann_sid && is_reserved_reifies_predicate(&f.p))
-            {
+            for f in mine {
                 let key = reifies_key(f);
                 if f.op {
-                    net.insert(key, f.clone());
+                    net.insert(key, (*f).clone());
                 } else {
                     net.remove(&key);
                 }

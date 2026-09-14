@@ -1469,3 +1469,95 @@ async fn arena_probe_matches_literal_object_annotation() {
         })
         .await;
 }
+
+// =============================================================================
+// Named-graph bundles after indexing: the flake-level `g` seam
+// =============================================================================
+
+/// A named-graph annotation must stay writable once its bundle has been
+/// indexed.
+///
+/// The stage-time single-target invariant compares a reifier's CURRENT bundle
+/// against the one this transaction produces, keyed by (graph, s, p, o, dt).
+/// Index-decoded flakes carry `g: None` — the graph is the index they came
+/// from, not a field on the flake — while a named-graph transaction's flakes
+/// carry `g: Some(sid)`. Without stamping the scanned side, the two never
+/// match: the net bundle mixes `None` and `Some` and decodes as
+/// `MixedFlakeGraphs`, so re-asserting an unchanged annotation, or adding a
+/// property to an existing claim, fails with an invariant violation on a
+/// perfectly legitimate write.
+///
+/// Default-graph annotations are unaffected (both sides are `None`), which is
+/// why this needs a named graph AND a published index to reproduce.
+#[tokio::test]
+async fn indexed_named_graph_annotation_stays_writable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations-indexed:named-graph-rewrite";
+
+    let annotate = |props: JsonValue| {
+        json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "@graph": "ex:claims-graph",
+            "ex:knows": {
+                "@id": "ex:bob",
+                "@annotation": props
+            }
+        })
+    };
+
+    let committed = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &annotate(json!({"@id": "ex:claim1", "ex:confidence": 0.9})),
+        )
+        .await
+        .expect("annotated named-graph insert");
+    assert!(committed.ledger.t() > 0);
+
+    // Move the bundle out of novelty and into the index.
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    // Re-assert the identical annotation against the indexed bundle.
+    let reloaded = fluree.ledger(ledger_id).await.expect("reload indexed");
+    fluree
+        .insert(
+            reloaded,
+            &annotate(json!({"@id": "ex:claim1", "ex:confidence": 0.9})),
+        )
+        .await
+        .expect("re-asserting an unchanged indexed named-graph annotation must be accepted");
+
+    // Add a property to the same claim — the ordinary "enrich a claim" edit.
+    let reloaded = fluree.ledger(ledger_id).await.expect("reload indexed");
+    fluree
+        .insert(
+            reloaded,
+            &annotate(json!({"@id": "ex:claim1", "ex:source": "hr"})),
+        )
+        .await
+        .expect("adding a property to an indexed named-graph claim must be accepted");
+
+    // The invariant itself still holds: re-pointing that reifier at a
+    // different edge is refused.
+    let reloaded = fluree.ledger(ledger_id).await.expect("reload indexed");
+    let err = fluree
+        .insert(
+            reloaded,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:claims-graph",
+                "ex:knows": {
+                    "@id": "ex:carol",
+                    "@annotation": {"@id": "ex:claim1", "ex:confidence": 0.5}
+                }
+            }),
+        )
+        .await
+        .expect_err("re-pointing an indexed reifier at a second edge must still be refused");
+    assert!(
+        err.to_string().contains("claim1"),
+        "the refusal must name the reifier: {err}"
+    );
+}

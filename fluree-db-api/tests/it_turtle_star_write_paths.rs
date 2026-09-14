@@ -335,6 +335,73 @@ async fn sync_named_graph_accepts_turtle_star_payload() {
     assert_eq!((again.asserted, again.retracted), (0, 0), "{again:?}");
 }
 
+#[tokio::test]
+async fn named_graph_annotation_survives_indexing_and_re_sync() {
+    // Sync's own contract across an index boundary: an annotated payload
+    // syncs, gets indexed, still reads back from the index, and an unchanged
+    // re-sync is still a no-op rather than a churn commit.
+    //
+    // Note this does NOT exercise the stage-time single-target invariant on
+    // the indexed bundle: sync's retraction wave cancels the unchanged
+    // reifies facts before the check runs, so nothing is asserted for it to
+    // inspect. The invariant's own indexed-named-graph case is pinned by
+    // `it_edge_annotations_indexed::indexed_named_graph_annotation_stays_writable`,
+    // which reaches it through a plain JSON-LD write.
+    const GRAPH: &str = "http://example.org/graphs/claims";
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/turtle-star-sync:indexed-named-graph";
+    fluree
+        .insert_turtle(
+            genesis_ledger(&fluree, ledger_id),
+            &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
+        )
+        .await
+        .expect("seed ledger");
+
+    let payload = fluree_graph_turtle::parse_to_json(&with_prefixes(
+        "ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 |} .\n",
+    ))
+    .expect("Turtle-star converts");
+    let report = fluree
+        .sync_named_graph(ledger_id, GRAPH, &payload, SyncGraphOpts::default())
+        .await
+        .expect("first sync");
+    assert!(report.committed, "{report:?}");
+
+    // Move the bundle out of novelty and into the index.
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("reload indexed ledger");
+    assert_eq!(
+        confidences(&fluree, &ledger, Some(GRAPH)).await,
+        ["0.9"],
+        "the annotation must still read back from the index"
+    );
+
+    // Re-sync the identical payload against the indexed bundle.
+    let again = fluree
+        .sync_named_graph(ledger_id, GRAPH, &payload, SyncGraphOpts::default())
+        .await
+        .expect("an unchanged re-sync of an INDEXED named-graph annotation must be accepted");
+    assert!(
+        !again.committed,
+        "identical payload must still be a no-op after indexing: {again:?}"
+    );
+
+    // And a genuine re-point of the same reifier is still refused.
+    let repointed = fluree_graph_turtle::parse_to_json(&with_prefixes(
+        "ex:alice ex:knows ex:carol ~ ex:claim1 {| ex:confidence 0.9 |} .\n",
+    ))
+    .expect("Turtle-star converts");
+    let err = fluree
+        .sync_named_graph(ledger_id, GRAPH, &repointed, SyncGraphOpts::default())
+        .await
+        .expect_err("re-pointing an indexed reifier at a different edge must still be refused");
+    assert!(err.to_string().contains("claim1"), "{err}");
+}
+
 /// Every novelty flake written at exactly `t`, for failure diagnostics.
 async fn flakes_at(ledger: &fluree_db_api::LedgerState, t: i64) -> Vec<String> {
     use fluree_db_core::comparator::IndexType;
