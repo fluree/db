@@ -1484,9 +1484,10 @@ pub fn spawn_local_cache_event_listener(
                     commit_t,
                     ..
                 }) => {
-                    // A commit this process installed through the cached
-                    // handle is already in the cache; reconciling it would
-                    // only re-read the record it just wrote.
+                    // A cached handle already at or past this commit, whether
+                    // this process installed it or applied it from the log,
+                    // has nothing to reconcile; doing so would only re-read
+                    // the record.
                     let own = match ledger_manager.get_loaded_handle(&ledger_id).await {
                         Some(handle) => handle.committed_t() >= commit_t,
                         None => false,
