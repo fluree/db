@@ -330,6 +330,153 @@ async fn optional_in_a_jsonld_rule_body_is_rejected_by_name() {
 }
 
 #[tokio::test]
+async fn bang_exists_is_rejected_like_not_exists() {
+    // #1786's defect class has two spellings. `NOT EXISTS { … }` lowers to
+    // `Exists { negated: true }`; `!EXISTS { … }` lowers to `Not` wrapping a
+    // plain `Exists`. The first cut of the monotonicity walk matched only the
+    // first, so negation reached the fixpoint through the second — inside the
+    // change that closes #1786. In a fixpoint that is unsound, not merely
+    // unsupported: if the head predicate appears in the negated pattern, the
+    // answer depends on which round evaluated it, and is then cached.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/reject/bang-exists").await;
+    let message = rejection(
+        &fluree,
+        &ledger,
+        json!([{
+            "@type": "f:sparql",
+            "@value": "PREFIX ex: <http://example.org/> \
+                       CONSTRUCT { ?a ex:trustedKnows ?b } \
+                       WHERE { ?a ex:knows ?b . FILTER(!EXISTS { ?b ex:knows ?c }) }"
+        }]),
+    )
+    .await;
+    assert!(
+        message.contains("NOT EXISTS"),
+        "unexpected rejection message: {message}"
+    );
+}
+
+#[tokio::test]
+async fn double_negated_exists_stays_allowed() {
+    // The check tracks the PARITY of the `Not` wrappers rather than banning
+    // `Exists` outright: `!!EXISTS` is monotone, so it must still run. A
+    // blanket ban would pass the test above while quietly removing a legal
+    // construct.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/allow/double-negated-exists").await;
+    let rules = json!([{
+        "@type": "f:sparql",
+        "@value": "PREFIX ex: <http://example.org/> \
+                   CONSTRUCT { ?a ex:trustedKnows ?b } \
+                   WHERE { ?a ex:knows ?b {| ex:confidence ?c |} \
+                           FILTER(?c > 0.85 && !(!EXISTS { ?a ex:knows ?b })) }"
+    }]);
+    assert_eq!(
+        trusted_pairs(&fluree, &ledger, rules).await,
+        expected_trusted()
+    );
+}
+
+#[tokio::test]
+async fn subquery_aggregate_in_a_rule_body_is_rejected() {
+    // The docs promise "subqueries without aggregates"; the walk recursed into
+    // a subquery's patterns but never looked at its own GROUP BY, so an
+    // aggregating sub-SELECT computed counts inside the fixpoint.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/reject/subquery-group-by").await;
+    let message = rejection(
+        &fluree,
+        &ledger,
+        json!([{
+            "@type": "f:sparql",
+            "@value": "PREFIX ex: <http://example.org/> \
+                       CONSTRUCT { ?a ex:trustedKnows ?b } \
+                       WHERE { { SELECT ?a (COUNT(?b) AS ?n) WHERE { ?a ex:knows ?b } \
+                                 GROUP BY ?a } ?a ex:knows ?b }"
+        }]),
+    )
+    .await;
+    assert!(
+        message.contains("GROUP BY") && message.contains("subquery"),
+        "unexpected rejection message: {message}"
+    );
+}
+
+#[tokio::test]
+async fn subquery_limit_in_a_rule_body_is_rejected() {
+    // Worse than unsupported: which row survives a LIMIT depends on what has
+    // been derived so far, so the rule's output changes with round order.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/reject/subquery-limit").await;
+    let message = rejection(
+        &fluree,
+        &ledger,
+        json!([{
+            "@type": "f:sparql",
+            "@value": "PREFIX ex: <http://example.org/> \
+                       CONSTRUCT { ?a ex:trustedKnows ?b } \
+                       WHERE { { SELECT ?a ?b WHERE { ?a ex:knows ?b } LIMIT 1 } }"
+        }]),
+    )
+    .await;
+    assert!(
+        message.contains("LIMIT") && message.contains("subquery"),
+        "unexpected rejection message: {message}"
+    );
+}
+
+#[tokio::test]
+async fn body_level_limit_is_rejected_rather_than_silently_cleared() {
+    // `build_rule` clears the rule body's own modifiers before execution, so
+    // without a check a LIMIT would run as though it had not been written.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/reject/body-limit").await;
+    let message = rejection(
+        &fluree,
+        &ledger,
+        json!([{
+            "@type": "f:sparql",
+            "@value": "PREFIX ex: <http://example.org/> \
+                       CONSTRUCT { ?a ex:trustedKnows ?b } \
+                       WHERE { ?a ex:knows ?b } LIMIT 1"
+        }]),
+    )
+    .await;
+    assert!(
+        message.contains("LIMIT"),
+        "unexpected rejection message: {message}"
+    );
+}
+
+#[tokio::test]
+async fn head_var_bound_only_in_a_filter_is_rejected() {
+    // Range restriction asks which variables a matched row BINDS. It was
+    // reading `referenced_vars`, which includes filter operands by design, so
+    // a head variable the body only mentions inside a FILTER passed the check
+    // and then derived nothing at runtime, silently.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/reject/filter-only-head-var").await;
+    let message = rejection(
+        &fluree,
+        &ledger,
+        json!([{
+            "@context": {"ex": "http://example.org/"},
+            "where": [
+                {"@id": "?a", "ex:knows": {"@id": "?b"}},
+                ["filter", "(> ?x 0)"]
+            ],
+            "insert": {"@id": "?a", "ex:trustedKnows": "?x"}
+        }]),
+    )
+    .await;
+    assert!(
+        message.contains("?x"),
+        "unexpected rejection message: {message}"
+    );
+}
+
+#[tokio::test]
 async fn not_exists_in_a_rule_body_is_rejected_not_ignored() {
     // Issue #1786: `["not-exists", …]` used to be silently ignored, so the
     // rule derived as if the negation were not there. Now it is rejected.

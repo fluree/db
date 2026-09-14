@@ -30,6 +30,24 @@ pub(super) fn validate_body(query: &Query, snapshot: &LedgerSnapshot, rule: &str
              (a fixpoint cannot evaluate them monotonically)",
         ));
     }
+    // Same reasoning as the subquery arm below, for the rule's own body:
+    // `build_rule` clears these modifiers before execution, so without a check
+    // a `CONSTRUCT … WHERE { … } LIMIT 1` would run as though the LIMIT were
+    // not written — the silent-drop this engine exists to stop.
+    if let Some(what) = query
+        .limit
+        .map(|_| "LIMIT")
+        .or_else(|| query.offset.map(|_| "OFFSET"))
+    {
+        return Err(reject(
+            rule,
+            &format!(
+                "the body uses {what}, which is not allowed in a rule body: which solutions a \
+                 slice keeps depends on how much the fixpoint has derived so far, so the rule \
+                 would derive different facts depending on round order"
+            ),
+        ));
+    }
     walk_patterns(&query.patterns, snapshot, rule)?;
     if let Some(values) = &query.post_values {
         walk_patterns(std::slice::from_ref(values), snapshot, rule)?;
@@ -56,9 +74,9 @@ fn walk_patterns(patterns: &[Pattern], snapshot: &LedgerSnapshot, rule: &str) ->
                      (rules derive over local data only)",
                 ));
             }
-            Pattern::Filter(expr) => check_expr(expr, snapshot, rule)?,
-            Pattern::Bind { expr, .. } => check_expr(expr, snapshot, rule)?,
-            Pattern::Unwind { list, .. } => check_expr(list, snapshot, rule)?,
+            Pattern::Filter(expr) => check_expr(expr, snapshot, rule, false)?,
+            Pattern::Bind { expr, .. } => check_expr(expr, snapshot, rule, false)?,
+            Pattern::Unwind { list, .. } => check_expr(list, snapshot, rule, false)?,
             Pattern::Union(branches) => {
                 for branch in branches {
                     walk_patterns(branch, snapshot, rule)?;
@@ -74,6 +92,36 @@ fn walk_patterns(patterns: &[Pattern], snapshot: &LedgerSnapshot, rule: &str) ->
                 walk_patterns(inner, snapshot, rule)?;
             }
             Pattern::Subquery(sub) => {
+                // A subquery carries its own modifiers, and two of them break a
+                // fixpoint. GROUP BY / aggregates are non-monotonic for the
+                // same reason the top-level check rejects them. LIMIT and
+                // OFFSET are worse than unsupported: which solutions survive a
+                // slice depends on how much has been derived so far, so the
+                // rule's output changes with round order and the result is then
+                // cached. DISTINCT and ORDER BY are safe — neither changes the
+                // solution SET as derivation grows, and heads dedup anyway.
+                if sub.grouping.is_some() {
+                    return Err(reject(
+                        rule,
+                        "a subquery in the body uses GROUP BY / aggregates, which are not \
+                         allowed in a rule body (a fixpoint cannot evaluate them monotonically)",
+                    ));
+                }
+                if let Some(what) = sub
+                    .limit
+                    .map(|_| "LIMIT")
+                    .or_else(|| sub.offset.map(|_| "OFFSET"))
+                {
+                    return Err(reject(
+                        rule,
+                        &format!(
+                            "a subquery in the body uses {what}, which is not allowed in a rule \
+                             body: which solutions a slice keeps depends on how much the fixpoint \
+                             has derived so far, so the rule would derive different facts \
+                             depending on round order"
+                        ),
+                    ));
+                }
                 walk_patterns(&sub.patterns, snapshot, rule)?;
             }
             _ => {}
@@ -93,17 +141,38 @@ fn non_monotonic(rule: &str, construct: &str) -> QueryError {
     )
 }
 
-/// Walk a filter/bind expression: a negated EXISTS is negation; an `IRI(…)`
-/// constant naming an unregistered namespace is fail-open in `!=` form.
-fn check_expr(expr: &Expression, snapshot: &LedgerSnapshot, rule: &str) -> Result<()> {
+/// Walk a filter/bind expression for constructs a fixpoint cannot evaluate.
+///
+/// Two things are rejected. A negated EXISTS is negation, and it spells itself
+/// more than one way: `NOT EXISTS { … }` lowers to `Exists { negated: true }`,
+/// while `!EXISTS { … }` lowers to `Not` wrapping a plain `Exists`. `negated`
+/// carries the parity of the `Not` wrappers seen so far, so both spellings —
+/// and any odd nesting of `Not` around either — are caught, while `!!EXISTS`
+/// stays allowed because it is monotone. And an `IRI(…)` constant naming a
+/// namespace the ledger has never seen is fail-open in `!=` form.
+///
+/// The match is deliberately exhaustive rather than falling through on a
+/// wildcard: every variant that can hold a sub-expression or a pattern is
+/// visited, so a construct cannot hide from the walk inside a container the
+/// walker forgot, which is exactly how `!EXISTS` slipped past the first cut of
+/// this check. A new `Expression` variant is a compile error here until
+/// someone decides what it means in a rule body.
+fn check_expr(
+    expr: &Expression,
+    snapshot: &LedgerSnapshot,
+    rule: &str,
+    negated: bool,
+) -> Result<()> {
     match expr {
-        Expression::Exists { negated: true, .. } => {
-            Err(non_monotonic(rule, "NOT EXISTS inside FILTER"))
-        }
         Expression::Exists {
             patterns,
-            negated: false,
-        } => walk_patterns(patterns, snapshot, rule),
+            negated: inner,
+        } => {
+            if negated ^ *inner {
+                return Err(non_monotonic(rule, "NOT EXISTS inside FILTER"));
+            }
+            walk_patterns(patterns, snapshot, rule)
+        }
         Expression::Call { func, args } => {
             if matches!(func, Function::Iri) {
                 if let [Expression::Const(FlakeValue::String(iri))] = args.as_slice() {
@@ -120,16 +189,65 @@ fn check_expr(expr: &Expression, snapshot: &LedgerSnapshot, rule: &str) -> Resul
                     }
                 }
             }
+            let inner_negated = negated ^ matches!(func, Function::Not);
             for arg in args {
-                check_expr(arg, snapshot, rule)?;
+                check_expr(arg, snapshot, rule, inner_negated)?;
             }
             Ok(())
         }
-        _ => Ok(()),
+        // A pattern comprehension is a correlated subquery evaluated per row;
+        // it has no JSON-LD or SPARQL rule surface today (it is Cypher's), and
+        // its patterns would need the monotonicity walk before it could.
+        Expression::PatternComprehension { .. } => Err(reject(
+            rule,
+            "the body uses a pattern comprehension, which is not allowed in a rule body",
+        )),
+        Expression::Map(entries) => entries
+            .iter()
+            .try_for_each(|(_, v)| check_expr(v, snapshot, rule, negated)),
+        Expression::ListComprehension {
+            list, filter, map, ..
+        } => {
+            check_expr(list, snapshot, rule, negated)?;
+            for part in [filter, map].into_iter().flatten() {
+                check_expr(part, snapshot, rule, negated)?;
+            }
+            Ok(())
+        }
+        Expression::Reduce {
+            init, list, body, ..
+        } => {
+            check_expr(init, snapshot, rule, negated)?;
+            check_expr(list, snapshot, rule, negated)?;
+            check_expr(body, snapshot, rule, negated)
+        }
+        Expression::ListPredicate {
+            list, predicate, ..
+        } => {
+            check_expr(list, snapshot, rule, negated)?;
+            check_expr(predicate, snapshot, rule, negated)
+        }
+        Expression::Member { target, .. } => check_expr(target, snapshot, rule, negated),
+        // Leaves: nothing to walk. `Resolved` is runtime-only and never
+        // reaches a rule body at parse time.
+        Expression::Var(_) | Expression::Const(_) | Expression::Resolved(_) => Ok(()),
     }
 }
 
-/// Every variable the body can bind (deduplicated, in first-seen order).
+/// Every variable the body can BIND (deduplicated, in first-seen order).
+///
+/// `produced_vars`, not `referenced_vars`: the question range restriction asks
+/// is which variables a matched row actually carries a value for, and
+/// `referenced_vars` includes operands a pattern only reads — filter operands
+/// most of all. A head variable mentioned solely inside a `FILTER` passed the
+/// check under `referenced_vars`, then derived nothing at runtime with no
+/// diagnostic. `produced_vars` returns nothing for `Filter`, `Minus`, `Exists`
+/// and `NotExists`, only the target of a `Bind`, and only the SELECT list of a
+/// subquery — the predicate this check's name claims.
+///
+/// The result is also the body's output projection, so it must not be narrower
+/// than the head needs: every head variable is a produced variable by the time
+/// `check_range_restriction` has passed.
 pub(super) fn body_vars(query: &Query) -> Vec<VarId> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -141,10 +259,10 @@ pub(super) fn body_vars(query: &Query) -> Vec<VarId> {
         }
     };
     for pattern in &query.patterns {
-        push(pattern.referenced_vars());
+        push(pattern.produced_vars());
     }
     if let Some(values) = &query.post_values {
-        push(values.referenced_vars());
+        push(values.produced_vars());
     }
     out
 }

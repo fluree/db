@@ -319,7 +319,13 @@ Rejected:
   MINUS, NOT EXISTS (`["not-exists", …]`), GROUP BY / aggregates, SERVICE.
   A fixpoint cannot evaluate negation or left joins soundly without
   stratification.
-- **A head variable the body never binds** (range restriction).
+- **A head variable the body never binds** (range restriction). A variable the
+  body only *reads* — a filter operand, or a variable bound inside an
+  `exists` block — does not count as bound, because a matched row carries no
+  value for it.
+- **`LIMIT` / `OFFSET`**, on the body or on a subquery inside it: which
+  solutions a slice keeps depends on how much the fixpoint has derived so far,
+  so the rule would derive different facts depending on round order.
 - **Filter operands that cannot match**: a bare unquoted word, an undefined
   prefix, or a namespace the ledger has never seen (see
   [Filter operands](#filter-operands)).
@@ -328,7 +334,15 @@ Rejected:
   that is not a string or array expression.
 
 Positive existence checks (`["exists", …]`), UNION, BIND, VALUES, property
-paths and subqueries without aggregates are all allowed.
+paths and subqueries are all allowed. A subquery may use `DISTINCT` and
+`ORDER BY` — neither changes which solutions exist as the fixpoint grows — but
+not `GROUP BY`, aggregates, `LIMIT` or `OFFSET`, which are rejected by name
+like any other non-monotonic construct.
+
+Negation is rejected in every spelling it has. `NOT EXISTS { … }`,
+`["not-exists", …]` and `FILTER(!EXISTS { … })` all name the same construct to
+the engine, and any odd nesting of `!` around an `EXISTS` is negation too.
+`FILTER(!(!EXISTS { … }))` is not, and still runs.
 
 ## Examples
 
