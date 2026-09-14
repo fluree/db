@@ -35,6 +35,8 @@ mod it_query_sparql_path_literal_object;
 mod it_query_sparql_setop_subselect;
 #[path = "it_query_subquery.rs"]
 mod it_query_subquery;
+#[path = "it_query_subquery_unbound.rs"]
+mod it_query_subquery_unbound;
 #[path = "it_query_subselect_correlation.rs"]
 mod it_query_subselect_correlation;
 #[path = "it_query_ti3.rs"]
