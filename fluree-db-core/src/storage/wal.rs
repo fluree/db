@@ -325,18 +325,16 @@ fn decode_segment(bytes: &[u8], expected_first_seq: Option<u64>) -> io::Result<D
     let mut seq = first_seq;
     let mut at = SEGMENT_HEADER;
     let clean = loop {
-        if at == bytes.len() {
+        // Only an entirely zero suffix, however short, is an unused
+        // preallocated tail. A missing/corrupted frame header can also be
+        // zero; if later bytes exist, it runs the same damage look-ahead as
+        // other tears.
+        if bytes[at..].iter().all(|byte| *byte == 0) {
             break true;
         }
         let Some(header) = bytes.get(at..at + FRAME_HEADER) else {
             break false;
         };
-        if header[..4] == [0; 4] {
-            // Only an entirely zero suffix is an unused preallocated tail.
-            // A missing/corrupted frame header can also be zero; if later
-            // bytes exist, run the same damage look-ahead as for other tears.
-            break bytes[at..].iter().all(|byte| *byte == 0);
-        }
         if &header[..4] != FRAME_MAGIC {
             break false;
         }
@@ -3051,14 +3049,19 @@ mod tests {
 
     #[test]
     fn preallocated_zero_tail_is_clean() {
-        let mut bytes = SEGMENT_MAGIC.to_vec();
-        bytes.extend_from_slice(&1u64.to_le_bytes());
-        bytes.extend_from_slice(&encode_frame(1, &Op::Delete { key: "head" }.encode()));
-        bytes.resize(ROTATE_BYTES as usize, 0);
-        let decoded = decode_segment(&bytes, None).unwrap();
-        assert!(decoded.clean);
-        assert_eq!(decoded.ops.len(), 1);
-        assert_eq!(decoded.next_seq, 2);
+        let mut frames = SEGMENT_MAGIC.to_vec();
+        frames.extend_from_slice(&1u64.to_le_bytes());
+        frames.extend_from_slice(&encode_frame(1, &Op::Delete { key: "head" }.encode()));
+        // Down to a tail too short to hold a frame header: a segment that
+        // filled to just short of its fill ends that way.
+        for tail in [1, FRAME_HEADER - 1, ROTATE_BYTES as usize - frames.len()] {
+            let mut bytes = frames.clone();
+            bytes.resize(frames.len() + tail, 0);
+            let decoded = decode_segment(&bytes, None).unwrap();
+            assert!(decoded.clean, "a {tail}-byte zero tail");
+            assert_eq!(decoded.ops.len(), 1);
+            assert_eq!(decoded.next_seq, 2);
+        }
     }
 
     #[test]
