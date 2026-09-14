@@ -3817,6 +3817,22 @@ mem:fact-01m2ftrqed0wjpj52d0xmbk0rw a mem:Fact ;
     mem:createdAt "2026-09-14T11:27:48.685925+00:00"^^xsd:dateTime ;
     mem:rationale "Measured 2026-09-14 on the full BKR-star ledger; explains why every predicate-only and object-bound SPARQL-star shape sits 5-25x behind GraphDB/Stardog even after the planning fixes." .
 
+mem:fact-01m2g7sf28dwy0gwj8wv6h3eas a mem:Fact ;
+    mem:content "STR() of a late-materialized subject is memoized per query (ExecutionContext::subject_iri_str_memo, keyed by store id + subject id, shared across per-graph contexts like the lang-tag memo). eval_str takes the fast path only for a bare variable bound to Binding::EncodedSid; the miss closure must mirror the generic path exactly: an EncodedSid evaluates to ComparableValue::Iri, not Sid. A first version matched only Sid, so every lookup missed and the slow path ran twice (StarBench S10 went 8.8 s -> 15.6 s). Diagnose memo regressions by timing the no-filter and != variants of the same query under identical load." ;
+    mem:tag "filter" ;
+    mem:tag "gotcha" ;
+    mem:tag "memo" ;
+    mem:tag "performance" ;
+    mem:tag "query" ;
+    mem:tag "starbench" ;
+    mem:tag "str" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/context.rs" ;
+    mem:artifactRef "fluree-db-query/src/eval/string.rs" ;
+    mem:branch "perf/rdf12-annotation-chain-planning" ;
+    mem:createdAt "2026-09-14T15:15:24.360022+00:00"^^xsd:dateTime ;
+    mem:rationale "Hub-heavy self-joins evaluate str(?a) > str(?b) tens of millions of times over a few thousand distinct subjects; with the memo working S10 8.8 -> 4.2 s, S21 10.9 -> 3.8 s, S11 336 -> 135 s, counts unchanged." .
+
 mem:decision-01kzdzqzsrwt4wbyr5dt9veshp a mem:Decision ;
     mem:content "PR #1422 engine convergence phase 1 (uncommitted on branch pr-1422-review): extracted pub TmEmitContext + emit_row + emit_row_terms from emit_batch in the shared enumerator (behavior-identical; emit_row_terms takes a caller-supplied subject for classify-then-emit callers). build_live_node in r2rml_materialize.rs = NodeCollector (TripleObserver→SubjectNode, rdf:type→@type routing) + emit_row_terms; hand-rolled POM loop deleted. Deltas: templated predicates now emit (were silently dropped); ParentIndexSet::new validates mapping fail-closed; FK edges still drop (parents unindexed) but counted+warned. Phase 2: indexing FK parents needs a window-vs-whole-table answer." ;
     mem:tag "convergence" ;
