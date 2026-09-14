@@ -18,6 +18,7 @@
 //!   not match patterns.
 
 use fluree_db_core::DatatypeConstraint;
+use fluree_db_core::VerifiedIdentity;
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_novelty::TxnMetaEntry;
 use fluree_db_query::parse::UnresolvedPattern;
@@ -719,6 +720,21 @@ pub struct TxnOpts {
     /// graph's standing validation posture for every other writer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation_mode: Option<fluree_db_core::ledger_config::ValidationMode>,
+
+    /// Auth-layer-verified identity of the caller, the value the SHACL
+    /// group's `f:overrideControl` gates `validation_mode` on.
+    ///
+    /// This is *context*, not a request: it is never read from the
+    /// transaction JSON (`#[serde(skip)]`, and `parse_transaction` does not
+    /// look for it), so a caller cannot satisfy an `f:IdentityRestricted`
+    /// allow-list by writing a DID into `opts`. The stage builders' `server_identity`
+    /// setter is the intended way to set it; the server does so from the
+    /// verified bearer / credential DID, and an embedding application that
+    /// runs its own auth may do the same. `None` is anonymous, which an
+    /// identity-restricted list denies. It rides `TxnOpts` because that is
+    /// what already reaches the validation gate alongside `validation_mode`.
+    #[serde(skip)]
+    pub server_identity: Option<VerifiedIdentity>,
 
     /// Inline `f:enforceUnique` declarations for *this transaction only*.
     ///

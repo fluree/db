@@ -70,7 +70,7 @@ How policies affect transaction operations:
 
 Using policies in Rust applications:
 - `wrap_identity_policy_view` - Identity-based policy lookup via `f:policyClass`
-- `wrap_policy_view` - Inline policies with `QueryConnectionOptions`
+- `wrap_policy_view` - Inline policies with `GovernanceOptions`
 - Policy precedence rules
 - Transaction-side policy enforcement
 - Historical views with policy

@@ -380,7 +380,7 @@ impl BinaryIndexStore {
     ) -> io::Result<Self> {
         tracing::debug!("BinaryIndexStore::load_from_root_v6 starting");
         fluree_db_core::disk_cache::ensure_cache_dir(cache_dir)?;
-        let phase = std::time::Instant::now();
+        let phase = fluree_db_core::clock::Instant::now();
 
         // ── Dict loading ──────────────────────────────────────────────────────────────
         let dicts = build_dictionary_set(
@@ -393,7 +393,7 @@ impl BinaryIndexStore {
         .await?;
 
         let dicts_us = phase.elapsed().as_micros() as u64;
-        let phase = std::time::Instant::now();
+        let phase = fluree_db_core::clock::Instant::now();
 
         // ── Per-graph specialty arenas ───────────────────────────────
         let mut per_graph_arenas = load_per_graph_arenas(
