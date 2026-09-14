@@ -2370,6 +2370,51 @@ ex:bob ex:name \"Bob\" .
     }
 
     #[test]
+    fn test_streaming_star_statements_split_cleanly() {
+        // The production bulk-import path. `StreamingTurtleReader` scans by
+        // line rather than by byte state, so it never had the IRI-state hazard
+        // the byte scanner did — but nothing pinned that it handles RDF 1.2
+        // statements, which is what bulk import now ingests. Each of these
+        // ends its statement on its own line, so each must be its own chunk
+        // and each must parse with its reifier attachment intact.
+        let ttl = "\
+@prefix ex: <http://example.org/> .
+
+ex:s ex:p ex:o ~ ex:claim1 {| ex:confidence 0.9 |} .
+ex:a ex:b ex:c {| ex:note \"ends with a period. really\" |} .
+<< ex:x ex:y ex:z >> ex:source ex:crm .
+ex:t ex:u ex:v .
+";
+        let f = write_temp(ttl);
+        let mut reader = StreamingTurtleReader::new(f.path(), 1, 2, None).unwrap();
+
+        let mut chunks = 0;
+        let mut annotated = 0;
+        while let Some((idx, text)) = recv_as_text(&reader) {
+            let json = crate::parse_to_json(&text)
+                .unwrap_or_else(|e| panic!("chunk {idx} must be valid Turtle-star: {e}\n{text}"));
+            for node in json.as_array().unwrap() {
+                for (key, values) in node.as_object().unwrap() {
+                    if key.starts_with('@') {
+                        continue;
+                    }
+                    annotated += values
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|v| v.get("@annotation").is_some())
+                        .count();
+                }
+            }
+            chunks += 1;
+        }
+
+        assert_eq!(chunks, 4, "expected one chunk per statement");
+        assert_eq!(annotated, 3, "one reifier per star statement, none lost");
+        reader.join().unwrap();
+    }
+
+    #[test]
     fn test_streaming_dot_in_long_string_not_boundary() {
         // Regression: a '.' at end of line inside a triple-quoted string must
         // NOT be treated as a statement boundary by the streaming splitter.

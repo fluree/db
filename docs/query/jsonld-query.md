@@ -616,10 +616,34 @@ operand and compares by identity, so `(= ?p ex:knows)` matches the predicate
 }
 ```
 
+A bare absolute URL is an IRI operand too: `(= ?u http://example.org/page)`
+compares against the IRI, and `(= ?u "http://example.org/page")` against the
+string. **This changed in 4.2.0.** Every unquoted atom used to lower to a
+string, so `(= ?p ex:knows)` could never match a predicate — the bug this
+fixes. A query that compared a *string-valued* property against an unquoted
+URL matched before and does not now; quote the operand to restore it. The
+prefixed-name form cannot break a working query, since the string `"ex:knows"`
+never matched an IRI either way.
+
 A prefixed name whose prefix the query's `@context` does not define stays a
 plain string and never equals an IRI; quote a value (`"ex:knows"`) when you
 mean the literal text. Inside [datalog rules](datalog-rules.md) an undefined
 prefix is an error rather than a silent string.
+
+The distinction lives in the quoting, so it exists only in the s-expression
+string form. In the **array form** every element is a JSON string, with no
+syntax to mark one as unquoted, so `["=", "?p", "ex:knows"]` compares against
+the *string* `"ex:knows"`. Write the s-expression form, or wrap an **absolute**
+IRI in `iri`, when you mean the IRI:
+
+```json
+["filter", "(= ?p ex:knows)"]
+["filter", ["=", "?p", ["iri", "http://example.org/knows"]]]
+```
+
+`iri` does not expand prefixes — like SPARQL's `IRI()`, it resolves against the
+base, not the query's `@context` — so `["iri", "ex:knows"]` builds the IRI
+`ex:knows` and matches nothing.
 
 **Complex Filters:**
 

@@ -562,22 +562,61 @@ async fn datalog_materialization_is_cached_across_identical_queries() {
         "reasoning": "datalog",
         "rules": rules
     });
+    // The hit counter is what makes this test discriminate. Comparing two
+    // runs' tallies does not: a recompute on a four-triple ledger reports an
+    // identical tally. Asserting the cache is non-empty does not either: under
+    // plain `cargo test` any other test in the binary satisfies that. Entry
+    // counts would race — the cache is process-wide and tests run in
+    // parallel — but a hit is attributable, because this ledger's name makes
+    // its key unique to this test.
+    let cache = fluree_db_query::reasoning::global_reasoning_cache();
+    let hits_before = cache.hits();
+
     let first = support::query_jsonld_tracked(&fluree, &ledger, &q)
         .await
         .unwrap();
+    let first_tally = first.reasoning.expect("first run reports reasoning");
+    assert_eq!(first_tally.derived_facts, 2);
+    assert_eq!(
+        cache.hits(),
+        hits_before,
+        "the first run has nothing to hit"
+    );
+
     let second = support::query_jsonld_tracked(&fluree, &ledger, &q)
         .await
         .unwrap();
-    let first_tally = first.reasoning.expect("first run reports reasoning");
     let second_tally = second.reasoning.expect("second run reports reasoning");
-    assert_eq!(first_tally.derived_facts, 2);
     assert_eq!(
         second_tally.derived_facts, first_tally.derived_facts,
         "a cache hit must report the cached materialization's tally"
     );
-    assert!(
-        !fluree_db_query::reasoning::global_reasoning_cache().is_empty(),
-        "the datalog materialization must be inserted into the reasoning cache"
+    assert_eq!(
+        cache.hits(),
+        hits_before + 1,
+        "an identical query must HIT the entry the first run inserted"
+    );
+
+    // A changed rule must miss: the key folds a content hash of the rule set,
+    // so editing a rule cannot serve the previous materialization.
+    let mut wider = q.clone();
+    // 0.4 rather than 0.5: it has to admit a claim on a THIRD edge
+    // (bob->carol at 0.5). Admitting claim1 (0.8) alone would derive the
+    // alice->bob pair a second time and dedup back to the same tally, which
+    // would not distinguish a re-materialization from a hit.
+    wider["rules"][0]["where"][1] = json!(["filter", "(> ?c 0.4)"]);
+    let third = support::query_jsonld_tracked(&fluree, &ledger, &wider)
+        .await
+        .unwrap();
+    let third_tally = third.reasoning.expect("third run reports reasoning");
+    assert_eq!(
+        third_tally.derived_facts, 3,
+        "the widened filter must re-materialize, not reuse the cached closure"
+    );
+    assert_eq!(
+        cache.hits(),
+        hits_before + 1,
+        "a changed rule must MISS rather than serve the previous closure"
     );
 }
 
@@ -676,4 +715,69 @@ async fn jsonld_query_filter_compares_iris_by_identity() {
         results.iter().any(|r| r[1] == json!("ex:source")),
         "`!=` against an IRI must keep the other predicates, got {results:?}"
     );
+}
+
+#[tokio::test]
+async fn filter_iri_operand_forms_across_spellings() {
+    // What an unquoted atom means in a filter, pinned across every spelling,
+    // because the answer differs by form and the difference is silent.
+    //
+    // The s-expression form has quoting, so it can tell an IRI operand from a
+    // string: a prefixed name resolves through the query's `@context`, a bare
+    // absolute URL is an IRI, and a quoted value is a string. The array form
+    // has no such syntax — every element is a JSON string — so a bare atom is
+    // always a string there, and `iri(…)` is the way to mean the IRI. Note
+    // `iri(…)` does NOT expand a prefix (SPARQL's `IRI()` resolves against the
+    // base, not the prefix map), so the array form needs the full IRI.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/filter-forms").await;
+
+    let matching = 3; // alice->bob, bob->carol, carol->dave
+    for (label, filter, expected) in [
+        (
+            "s-expr prefixed name",
+            json!(["filter", "(= ?p ex:knows)"]),
+            matching,
+        ),
+        (
+            "s-expr absolute URL",
+            json!(["filter", "(= ?p http://example.org/knows)"]),
+            matching,
+        ),
+        (
+            "s-expr quoted string",
+            json!(["filter", "(= ?p \"ex:knows\")"]),
+            0,
+        ),
+        (
+            "array bare atom",
+            json!(["filter", ["=", "?p", "ex:knows"]]),
+            0,
+        ),
+        (
+            "array iri() with a prefixed name (not expanded)",
+            json!(["filter", ["=", "?p", ["iri", "ex:knows"]]]),
+            0,
+        ),
+        (
+            "array iri() with an absolute URL",
+            json!(["filter", ["=", "?p", ["iri", "http://example.org/knows"]]]),
+            matching,
+        ),
+    ] {
+        let q = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": ["?s"],
+            "where": [{"@id": "?s", "?p": {"@id": "?o"}}, filter]
+        });
+        let rows = support::query_jsonld(&fluree, &ledger, &q)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: {e}"))
+            .to_jsonld(&ledger.snapshot)
+            .unwrap()
+            .as_array()
+            .map(std::vec::Vec::len)
+            .unwrap_or(0);
+        assert_eq!(rows, expected, "{label}");
+    }
 }

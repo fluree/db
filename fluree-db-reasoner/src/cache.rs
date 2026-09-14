@@ -8,6 +8,7 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -252,6 +253,13 @@ impl ReasoningResult {
 /// The cache stores `Arc<ReasoningResult>` for cheap cloning.
 pub struct ReasoningCache {
     inner: RwLock<LruCache<ReasoningCacheKey, Arc<ReasoningResult>>>,
+    /// Lookups that found an entry. Observability, and the only way a test can
+    /// tell a hit from a recompute: a recompute of the same materialization
+    /// reports an identical tally, and entry counts race against other queries
+    /// sharing the process-wide cache.
+    hits: AtomicU64,
+    /// Lookups that found nothing and had to materialize.
+    misses: AtomicU64,
 }
 
 impl ReasoningCache {
@@ -263,6 +271,8 @@ impl ReasoningCache {
         let cap = NonZeroUsize::new(capacity).expect("capacity must be > 0");
         Self {
             inner: RwLock::new(LruCache::new(cap)),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
@@ -275,7 +285,24 @@ impl ReasoningCache {
     ///
     /// This promotes the entry to most-recently-used.
     pub fn get(&self, key: &ReasoningCacheKey) -> Option<Arc<ReasoningResult>> {
-        self.inner.write().get(key).cloned()
+        let found = self.inner.write().get(key).cloned();
+        let counter = if found.is_some() {
+            &self.hits
+        } else {
+            &self.misses
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        found
+    }
+
+    /// Lookups that found an entry, since process start.
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    /// Lookups that found nothing, since process start.
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
     }
 
     /// Peek at a cached result without updating LRU order

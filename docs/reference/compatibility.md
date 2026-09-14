@@ -49,6 +49,13 @@ Not yet supported:
 
 See [Edge annotations](../concepts/edge-annotations.md).
 
+Base-direction language tags (`"text"@en--ltr`) parse and round-trip, but are
+stored as a single `rdf:langString` whose language is the whole `en--ltr`
+string, rather than as `rdf:dirLangString` with a separate direction. Nothing
+is dropped, but `LANG()` returns `en--ltr`, JSON-LD output carries that in
+`@language`, and `langMatches(?l, "en")` will not match it. First-class
+`rdf:dirLangString` is a future extension.
+
 **Specification:** https://www.w3.org/TR/rdf12-concepts/
 
 ### JSON-LD 1.1

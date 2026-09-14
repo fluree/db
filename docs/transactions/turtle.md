@@ -470,6 +470,8 @@ ex:alice ex:knows ex:carol {| ex:source ex:linkedin |} .
 
 Sending a claims file through `upsert` replaces each claim's body (`ex:confidence`) the way upsert replaces any other predicate value, while the edge and its attachment stay put — the natural way to keep a claims file in sync with a ledger.
 
+**Name your reifiers if the file will be re-sent.** `~ ex:claim1` is an identity, so re-ingesting the file finds the same claim and replaces its body. A bare `{| … |}` block mints a *fresh* anonymous reifier on every ingest, so a second `upsert` of the same file adds a second claim to the edge rather than updating the first, and `fluree sync` commits a delta every run instead of recognizing an unchanged payload.
+
 Rejected with a clear parse or stage error, never silently dropped:
 
 - the parenthesized triple term `<<( :s :p :o )>>` as a value (RDF 1.2 triple terms are not representable yet);
@@ -479,7 +481,7 @@ Rejected with a clear parse or stage error, never silently dropped:
 - an annotation on an `rdf:type` edge (`:s a :C {| … |}`) on the paths that convert Turtle to JSON-LD first (`upsert`, `graph sync`, memory import) — JSON-LD has no place to hang an annotation on a `@type` value. `insert` and SPARQL UPDATE accept it;
 - TriG: annotations inside a `GRAPH { }` block — same rule as SPARQL UPDATE (default graph only); use JSON-LD `@annotation` for named-graph edges.
 
-The RDF 1.2 version directive — `VERSION "1.2"` or `@version "1.2" .` — is accepted anywhere a directive may appear and ignored: the RDF 1.2 surface is always on. Base-direction language tags (`"…"@en--ltr`) are accepted; a direction other than `ltr` / `rtl` is a syntax error.
+The RDF 1.2 version directive — `VERSION "1.2"` or `@version "1.2" .` — is accepted anywhere a directive may appear and ignored: the RDF 1.2 surface is always on. Base-direction language tags (`"…"@en--ltr`) are accepted; a direction other than `ltr` / `rtl` is a syntax error. They are stored as an `rdf:langString` whose language is the whole `en--ltr` string, not yet as `rdf:dirLangString` with a separate direction — so `LANG()` returns `en--ltr` and `langMatches(?l, "en")` will not match it.
 
 Turtle-star output is not produced yet: exports and CONSTRUCT emit annotations in JSON-LD only. For the SPARQL 1.2 UPDATE equivalents see [the cookbook](../guides/cookbook-edge-annotations.md#the-same-patterns-in-sparql-12); for the full model and its limits see the [Edge annotations concept doc](../concepts/edge-annotations.md).
 
