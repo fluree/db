@@ -225,10 +225,6 @@ enum CacheKey {
     ///
     /// Key = xxh3_128 of a canonical ledger-info cache key string.
     LedgerInfo(u128),
-    /// Cached query `StatsView`.
-    ///
-    /// Key = xxh3_128 of a canonical stats-view cache key string.
-    StatsView(u128),
     /// V3 (FLI3) decoded column batch. Content-addressed via `leaf_id`
     /// (derived from leaf CID) — immutable, self-invalidating on rewrite.
     /// `leaflet_idx` selects which leaflet within the leaf.
@@ -378,7 +374,6 @@ enum CachedEntry {
     Bm25Leaflet(Arc<[u8]>),
     VectorShard(Arc<crate::arena::vector::VectorShard>),
     LedgerInfo(Arc<[u8]>),
-    StatsView(Arc<StatsView>),
     /// V3 decoded column batch (base columns, no overlay/replay applied).
     V3Batch(super::column_types::ColumnBatch),
     /// Translated overlay ops for one novelty segment.
@@ -406,7 +401,6 @@ impl CachedEntry {
                     + shard.values.capacity() * std::mem::size_of::<f32>()
             }
             CachedEntry::LedgerInfo(bytes) => bytes.len(),
-            CachedEntry::StatsView(view) => view.byte_size(),
             CachedEntry::V3Batch(batch) => batch.byte_size(),
             CachedEntry::SegmentOps(seg) => seg.byte_size(),
         }
@@ -426,6 +420,9 @@ impl CachedEntry {
 /// `CacheKey` variants, so inserting R1 never evicts or implies R2.
 pub struct LeafletCache {
     inner: Cache<CacheKey, CachedEntry>,
+    /// Query planner `StatsView`s, in a pool of their own. See
+    /// [`stats_view_pool`].
+    stats_views: Cache<u128, Arc<StatsView>>,
 }
 
 impl std::fmt::Debug for LeafletCache {
@@ -433,8 +430,45 @@ impl std::fmt::Debug for LeafletCache {
         f.debug_struct("LeafletCache")
             .field("entries", &self.entry_count())
             .field("bytes", &self.weighted_size_bytes())
+            .field("stats_views", &self.stats_views.entry_count())
+            .field("stats_view_bytes", &self.stats_views.weighted_size())
             .finish()
     }
+}
+
+/// Share of the leaflet budget given to the stats view pool.
+const STATS_VIEW_BUDGET_DIVISOR: u64 = 16;
+
+/// The pool for query planner `StatsView`s.
+///
+/// Views used to share the leaflet pool, and both of its properties made a
+/// query rebuild a view it should have hit — which on a ledger with millions of
+/// classes is a multi-second stall before planning:
+///
+/// - Byte-weighted TinyLFU put a view in competition with decoded leaflets, so
+///   scan pressure alone could evict it with no epoch change, and frequency
+///   admission could refuse a new epoch's view outright while hot leaflets
+///   held the probation queue.
+/// - Views are keyed by overlay epoch, so the newest is the one every query
+///   wants. Recency keeps it; frequency favors the epoch it just replaced.
+///
+/// So this pool is LRU, budgeted separately. A view's weight is capped at half
+/// the budget because moka rejects any entry heavier than the whole cache: a
+/// view that outgrew its share would otherwise never be cached at all. With
+/// the cap the newest view always fits, and no more than two capped views
+/// coexist.
+fn stats_view_pool(leaflet_budget_bytes: u64) -> Cache<u128, Arc<StatsView>> {
+    let budget = (leaflet_budget_bytes / STATS_VIEW_BUDGET_DIVISOR).max(1);
+    let max_weight = (budget / 2).clamp(1, u64::from(u32::MAX)) as usize;
+    let builder = Cache::builder()
+        .weigher(move |_key: &u128, view: &Arc<StatsView>| {
+            view.byte_size().min(max_weight) as u32
+        })
+        .max_capacity(budget);
+    // The wasm32 stand-in is exact-LRU already and has no policy knob.
+    #[cfg(not(target_arch = "wasm32"))]
+    let builder = builder.eviction_policy(moka::policy::EvictionPolicy::lru());
+    builder.build()
 }
 
 /// Run a moka single-flight call (`get_with`/`try_get_with`) under a Tokio
@@ -518,7 +552,9 @@ macro_rules! region_cache_methods {
 impl LeafletCache {
     /// Create a new cache with the given maximum byte budget.
     ///
-    /// One pool, one budget. TinyLFU eviction applies across all entry types.
+    /// One TinyLFU pool and budget for every leaflet-derived entry type. Query
+    /// planner stats views get a separate LRU pool sized from the same budget;
+    /// see [`stats_view_pool`].
     pub fn with_max_bytes(max_bytes: u64) -> Self {
         let inner = Cache::builder()
             .weigher(|_key: &CacheKey, val: &CachedEntry| {
@@ -527,7 +563,10 @@ impl LeafletCache {
             .max_capacity(max_bytes)
             .build();
 
-        Self { inner }
+        Self {
+            inner,
+            stats_views: stats_view_pool(max_bytes),
+        }
     }
 
     /// Create a new cache with the given maximum megabyte budget.
@@ -831,13 +870,10 @@ impl LeafletCache {
 
     /// Get a cached query `StatsView` (read-only, no insertion).
     pub fn get_stats_view(&self, key: u128) -> Option<Arc<StatsView>> {
-        match self.inner.get(&CacheKey::StatsView(key)) {
-            Some(CachedEntry::StatsView(view)) => Some(view),
-            _ => None,
-        }
+        self.stats_views.get(&key)
     }
 
-    /// Get or build a query `StatsView` in the unified cache.
+    /// Get or build a query `StatsView`, single-flight per key.
     pub fn get_or_build_stats_view<F>(&self, key: u128, build_fn: F) -> Arc<StatsView>
     where
         F: FnOnce() -> Arc<StatsView>,
@@ -848,15 +884,7 @@ impl LeafletCache {
         }
         // Miss: run the single-flight wait/init in a blocking region so a
         // waiter promotes a replacement worker (see in_blocking_region).
-        let entry = in_blocking_region(|| {
-            self.inner.get_with(CacheKey::StatsView(key), || {
-                CachedEntry::StatsView(build_fn())
-            })
-        });
-        match entry {
-            CachedEntry::StatsView(view) => view,
-            _ => unreachable!("StatsView key always maps to StatsView entry"),
-        }
+        in_blocking_region(|| self.stats_views.get_with(key, build_fn))
     }
 
     // ========================================================================
@@ -935,6 +963,7 @@ impl LeafletCache {
     /// Invalidate all entries (e.g., after index rebuild).
     pub fn invalidate_all(&self) {
         self.inner.invalidate_all();
+        self.stats_views.invalidate_all();
     }
 
     // Note: `entry_count()` is provided near cache construction for reuse in
@@ -1341,5 +1370,86 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(cache.get_stats_view(key).is_some());
+    }
+
+    /// A view whose `byte_size` is at least `bytes`.
+    fn stats_view_of_bytes(bytes: usize) -> Arc<StatsView> {
+        let mut view = StatsView::default();
+        let name = "p".repeat(200);
+        let mut i = 0u32;
+        while view.byte_size() < bytes {
+            view.properties.insert(
+                Sid::new(100, format!("{name}{i}")),
+                fluree_db_core::PropertyStatData {
+                    count: 1,
+                    ndv_values: 1,
+                    ndv_subjects: 1,
+                },
+            );
+            i += 1;
+        }
+        Arc::new(view)
+    }
+
+    /// 16 MiB of leaflet budget gives the stats view pool 1 MiB, and caps any
+    /// one view's weight at 512 KiB.
+    const POOL_TEST_BUDGET: u64 = 16 * 1024 * 1024;
+
+    #[test]
+    fn stats_view_survives_leaflet_pressure() {
+        let cache = LeafletCache::with_max_bytes(POOL_TEST_BUDGET);
+        let view = cache.get_or_build_stats_view(1, || stats_view_of_bytes(64 * 1024));
+
+        // Four times the leaflet budget in dict leaves.
+        for key in 0..64u128 {
+            cache.insert_dict_leaf(key, Arc::from(vec![0u8; 1024 * 1024]));
+        }
+        cache.inner.run_pending_tasks();
+        cache.stats_views.run_pending_tasks();
+
+        let hit = cache
+            .get_stats_view(1)
+            .expect("leaflet churn must not evict a stats view");
+        assert!(Arc::ptr_eq(&hit, &view));
+    }
+
+    #[test]
+    fn stats_view_larger_than_its_pool_is_still_cached() {
+        let cache = LeafletCache::with_max_bytes(POOL_TEST_BUDGET);
+        let view = cache.get_or_build_stats_view(1, || stats_view_of_bytes(2 * 1024 * 1024));
+        assert!(view.byte_size() > (POOL_TEST_BUDGET / STATS_VIEW_BUDGET_DIVISOR) as usize);
+        cache.stats_views.run_pending_tasks();
+
+        let hit = cache.get_or_build_stats_view(1, || {
+            unreachable!("an oversized view must stay cached, not rebuild per query")
+        });
+        assert!(Arc::ptr_eq(&hit, &view));
+    }
+
+    /// A new overlay epoch's view is the one queries want next, however often
+    /// the view it replaces was read.
+    #[test]
+    fn newest_stats_view_is_kept_over_a_frequently_read_one() {
+        let cache = LeafletCache::with_max_bytes(POOL_TEST_BUDGET);
+        for key in [1u128, 2] {
+            cache.get_or_build_stats_view(key, || stats_view_of_bytes(600 * 1024));
+            cache.stats_views.run_pending_tasks();
+        }
+        for _ in 0..32 {
+            assert!(cache.get_stats_view(1).is_some());
+            assert!(cache.get_stats_view(2).is_some());
+        }
+
+        let newest = cache.get_or_build_stats_view(3, || stats_view_of_bytes(600 * 1024));
+        cache.stats_views.run_pending_tasks();
+
+        let hit = cache
+            .get_stats_view(3)
+            .expect("the newest view must be admitted");
+        assert!(Arc::ptr_eq(&hit, &newest));
+        assert!(
+            cache.get_stats_view(1).is_none(),
+            "the least recently used view makes room"
+        );
     }
 }
