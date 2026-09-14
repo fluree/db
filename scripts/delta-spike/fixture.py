@@ -35,18 +35,30 @@ def verify(root, specification):
             assert ordered(actual.to_pylist(), table["key"]) == expected["rows"], (
                 name, expected["version"], "rows"
             )
-            if name == "fact_order":
+            predicate = expected.get("filter")
+            if predicate is None and name == "fact_order":
+                predicate = {"column": "amount", "minimum": 300, "columns": ["order_id", "amount"]}
+            if predicate:
+                column, minimum, columns = predicate["column"], predicate["minimum"], predicate["columns"]
                 projected = dt.to_pyarrow_table(
-                    columns=["order_id", "amount"], filters=[("amount", ">=", 300)]
+                    columns=columns, filters=[(column, ">=", minimum)]
                 ).to_pylist()
                 wanted = [
-                    {"order_id": r["order_id"], "amount": r["amount"]}
+                    {c: r[c] for c in columns}
                     for r in expected["rows"]
-                    if r["amount"] is not None and r["amount"] >= 300
+                    if r[column] is not None and r[column] >= minimum
                 ]
-                assert ordered(projected, "order_id") == wanted
-                assert dt.to_pyarrow_table(filters=[("order_id", "<", 0)]).num_rows == 0
+                assert ordered(projected, table["key"]) == wanted
+                assert dt.to_pyarrow_table(filters=[(table["key"], "<", 0)]).num_rows == 0
             checks += 1
+        for missing in table.get("missing_data_versions", []):
+            dt = DeltaTable(f"{str(root).rstrip('/')}/{name}", version=missing["version"])
+            try:
+                dt.to_pyarrow_table()
+            except FileNotFoundError as error:
+                assert missing["file"] in str(error), str(error)
+            else:
+                raise AssertionError("missing historical data unexpectedly resolved")
     return checks
 
 
@@ -142,9 +154,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("destination", help="new local fixture directory, or verification table root")
     parser.add_argument("--verify-manifest", type=Path, help="verify existing tables instead of generating them")
+    parser.add_argument("--table", help="verify only this table (requires --verify-manifest)")
     args = parser.parse_args()
     if args.verify_manifest:
         manifest = json.loads(args.verify_manifest.read_text())
+        if args.table:
+            manifest["tables"] = {args.table: manifest["tables"][args.table]}
         print(json.dumps({"reader": f"deltalake-python {deltalake.__version__}", "verified_snapshots": verify(args.destination, manifest["tables"]), "status": "passed"}))
     else:
+        if args.table:
+            parser.error("--table requires --verify-manifest")
         generate(Path(args.destination).resolve())
