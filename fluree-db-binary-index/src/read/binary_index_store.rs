@@ -2658,6 +2658,42 @@ pub struct BinaryGraphView {
     /// into the persisted dictionary that wasn't satisfied by in-memory
     /// novelty) charges 1 fuel = 1000 micro-fuel.
     tracker: Option<fluree_db_core::Tracker>,
+    /// Subjects already resolved through this view. A wide result decodes
+    /// every subject cell through the dictionaries, and the distinct
+    /// subjects are far fewer than the cells; an id names the same node for
+    /// the life of the store and novelty window the view holds.
+    subject_sids: SubjectMemo<Sid>,
+    subject_iris: SubjectMemo<Arc<str>>,
+}
+
+/// Per-view id-to-name memo, bounded by clearing rather than evicting.
+struct SubjectMemo<V>(std::sync::Mutex<rustc_hash::FxHashMap<u64, V>>);
+
+impl<V: Clone> SubjectMemo<V> {
+    const MAX_ENTRIES: usize = 1 << 18;
+
+    fn new() -> Self {
+        Self(std::sync::Mutex::new(rustc_hash::FxHashMap::default()))
+    }
+
+    fn get(&self, s_id: u64) -> Option<V> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&s_id)
+            .cloned()
+    }
+
+    fn put(&self, s_id: u64, value: V) {
+        let mut memo = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if memo.len() >= Self::MAX_ENTRIES {
+            memo.clear();
+        }
+        memo.insert(s_id, value);
+    }
 }
 
 impl BinaryGraphView {
@@ -2668,6 +2704,8 @@ impl BinaryGraphView {
             dict_novelty: None,
             namespace_codes_fallback: None,
             tracker: None,
+            subject_sids: SubjectMemo::new(),
+            subject_iris: SubjectMemo::new(),
         }
     }
 
@@ -2688,6 +2726,8 @@ impl BinaryGraphView {
             dict_novelty,
             namespace_codes_fallback: None,
             tracker: None,
+            subject_sids: SubjectMemo::new(),
+            subject_iris: SubjectMemo::new(),
         }
     }
 
@@ -2840,6 +2880,15 @@ impl BinaryGraphView {
 
     /// Resolve a subject ID to its full IRI string. Novelty-aware.
     pub fn resolve_subject_iri(&self, s_id: u64) -> io::Result<String> {
+        if let Some(iri) = self.subject_iris.get(s_id) {
+            return Ok(iri.to_string());
+        }
+        let iri = self.resolve_subject_iri_uncached(s_id)?;
+        self.subject_iris.put(s_id, Arc::from(iri.as_str()));
+        Ok(iri)
+    }
+
+    fn resolve_subject_iri_uncached(&self, s_id: u64) -> io::Result<String> {
         if let Some(ref dn) = self.dict_novelty {
             if dn.is_initialized() {
                 if let Some(result) = self.resolve_novel_subject_iri(dn, s_id) {
@@ -2884,6 +2933,15 @@ impl BinaryGraphView {
     /// novelty path returns `Sid::new(ns_code, suffix)` directly without
     /// building the full IRI string or doing a prefix trie lookup.
     pub fn resolve_subject_sid(&self, s_id: u64) -> io::Result<Sid> {
+        if let Some(sid) = self.subject_sids.get(s_id) {
+            return Ok(sid);
+        }
+        let sid = self.resolve_subject_sid_uncached(s_id)?;
+        self.subject_sids.put(s_id, sid.clone());
+        Ok(sid)
+    }
+
+    fn resolve_subject_sid_uncached(&self, s_id: u64) -> io::Result<Sid> {
         if let Some(ref dn) = self.dict_novelty {
             if dn.is_initialized() {
                 if let Some(sid) = self.resolve_novel_subject_sid(dn, s_id) {
@@ -4513,6 +4571,51 @@ pub(crate) mod tests {
                 let _ = std::fs::remove_dir_all(cache_dir);
             }
         }
+    }
+
+    #[test]
+    fn subject_decodes_are_memoized_per_view() {
+        use fluree_db_core::tracking::{Tracker, TrackingOptions};
+
+        let cache_dir = temp_cache_dir();
+        let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
+        store.dicts.namespace_codes =
+            Arc::new(HashMap::from([(100, "https://example.org/".to_string())]));
+        store.dicts.subject_forward_packs.insert(
+            100,
+            ForwardPackReader::from_memory(vec![Arc::from(
+                make_subject_pack_bytes(&[(1, b"product")]).into_boxed_slice(),
+            )])
+            .unwrap(),
+        );
+        let s_id = SubjectId::new(100, 1).as_u64();
+        let tracker = Tracker::new(TrackingOptions::all_enabled());
+        let view = BinaryGraphView::new(Arc::new(store), 0).with_tracker(tracker.clone());
+
+        let iri = view.resolve_subject_iri(s_id).unwrap();
+        assert_eq!(iri, "https://example.org/product");
+        let fuel_after_first = tracker.current_micro_fuel().unwrap();
+        assert!(
+            fuel_after_first > 0,
+            "the first decode is a dictionary touch"
+        );
+        for _ in 0..3 {
+            assert_eq!(view.resolve_subject_iri(s_id).unwrap(), iri);
+        }
+        assert_eq!(
+            tracker.current_micro_fuel().unwrap(),
+            fuel_after_first,
+            "repeat decodes of one id must not touch the dictionaries"
+        );
+
+        let sid = view.resolve_subject_sid(s_id).unwrap();
+        let fuel_after_sid = tracker.current_micro_fuel().unwrap();
+        assert!(fuel_after_sid > fuel_after_first);
+        for _ in 0..3 {
+            assert_eq!(view.resolve_subject_sid(s_id).unwrap(), sid);
+        }
+        assert_eq!(tracker.current_micro_fuel().unwrap(), fuel_after_sid);
+        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]
