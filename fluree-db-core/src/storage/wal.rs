@@ -733,6 +733,8 @@ fn writeback(file: &File, fsyncs: &AtomicU64) -> io::Result<()> {
     #[cfg(target_vendor = "apple")]
     {
         use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor belongs to `file`, which is borrowed for the
+        // call; fsync takes no pointers and does not keep the descriptor.
         if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -740,6 +742,8 @@ fn writeback(file: &File, fsyncs: &AtomicU64) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor belongs to `file`, which is borrowed for the
+        // call; sync_file_range takes no pointers and does not keep it.
         if unsafe { libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE) }
             != 0
         {
@@ -757,6 +761,8 @@ fn writeback(file: &File, fsyncs: &AtomicU64) -> io::Result<()> {
 fn syncfs(base: &Path, fsyncs: &AtomicU64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let dir = File::open(base)?;
+    // SAFETY: the descriptor belongs to `dir`, which is open for the call;
+    // syncfs takes no pointers and does not keep the descriptor.
     if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
         return Err(io::Error::last_os_error());
     }
