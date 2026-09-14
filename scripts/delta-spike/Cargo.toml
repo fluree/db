@@ -9,6 +9,7 @@ publish = false
 resolver = "2"
 
 [dependencies]
+fluree-db-tabular = { path = "../../fluree-db-tabular" }
 delta_kernel = { version = "=0.28.0", features = ["arrow-58"] }
 delta_kernel_default_engine = { version = "=0.28.0", default-features = false, features = ["arrow-58", "rustls"] }
 serde = { version = "1", features = ["derive"] }

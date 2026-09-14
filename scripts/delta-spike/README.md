@@ -33,8 +33,8 @@ timestamps, table IDs, and physical filenames can differ between runs.
 The native probe checks current and historical rows, projected scans with an
 `amount >= 300` predicate, empty results, and nonexistent-version rejection.
 It uses Kernel's logical scan execution and applies an exact residual predicate
-after pruning. Arrow batches are serialized to JSON for oracle comparisons;
-a production adapter would stream typed Fluree column batches. The small fixture
+after pruning. Kernel's logical Arrow batches now pass through the real
+`fluree-db-tabular::ColumnBatch` type before JSON oracle comparison. The small fixture
 does not measure throughput or prove policy/count/top-k optimization parity.
 
 ## Read a copy on S3
@@ -151,10 +151,15 @@ minimum reader version 2. This describes the **tested Python read path**, not
 every delta-rs Rust API. Never bypass those guards with raw Parquet reads.
 
 These results favor Kernel's logical scan API for the next integration spike.
-Dependency alignment is still required. Timestamp-to-version resolution is
-also adapter work: the inspected Kernel 0.28 snapshot builder exposes explicit
-`at_version`, while snapshots expose `get_timestamp`; this probe has not tested
-timestamp selection or history after log/checkpoint cleanup.
+Dependency alignment is still required. Correction to the initial timestamp
+assessment: Kernel 0.28 provides `history_manager::latest_version_as_of`, in
+addition to the builder's `at_version` and snapshot's `get_timestamp`. Use that
+existing resolver when wiring timestamp selection; do not implement log-history
+search ourselves. Its `CommitAt` documents in-commit timestamps when enabled,
+otherwise file modification times, which makes copying non-ICT tables relevant
+to time-based queries. `Recreatable` concerns log reconstruction; actual scans
+must still reject missing data files. Timestamp boundaries, cleanup, and copy
+semantics remain untested in this probe.
 
 The completed fixture can use the same isolated S3 upload/read procedure above;
 preserve its relative data paths and deletion-vector sidecars, and keep the
@@ -164,10 +169,58 @@ Feature references: [Spark/Delta compatibility](https://docs.delta.io/releases/)
 [deletion vectors](https://docs.delta.io/delta-deletion-vectors/),
 [column mapping](https://docs.delta.io/delta-column-mapping/).
 
+## Typed Fluree batch boundary
+
+`src/batch_bridge.rs` converts each logical Kernel batch directly to Fluree's
+existing typed column vectors. There is no JSON conversion inside the bridge
+and no intermediate per-cell value enum. This is an allocating conversion,
+including owned strings/bytes, not zero-copy Arrow interchange. The surrounding
+`batches` iterator converts one batch at a time; the oracle consumer alone
+collects all rows. Async scheduling, cancellation and bounded engine prefetch
+still need integration with the query provider's stream contract.
+
+The bridge accepts booleans, signed integers (byte/short widened to i32),
+float/double, strings, bytes, Date32, microsecond timestamps with/without a
+timezone, and Decimal128 with its precision/scale intact. It supports Arrow
+large/view string and byte representations as well. Unsupported projected
+types, including nested collections, fail before scan execution, even for empty
+results. Unsupported columns outside the projection are not converted.
+
+Caller-supplied field IDs survive projection order changes. The probe uses
+Delta column-mapping IDs where present and full-snapshot positions otherwise;
+those fallback positions are **test-only**, not a durable identity scheme for
+unmapped tables. Production registration must persist bindings and define
+historical R2RML behavior across schema changes. A zero-column Arrow batch
+preserves its row count, but this does not yet prove provider COUNT parity.
+
+Six focused tests cover sliced/null scalar arrays, Unicode/binary values,
+decimal precision, timestamp frames, large/view arrays, supplied IDs, invalid
+schemas, and zero-column row counts. Both retained local fixture suites and the
+advanced S3 suite pass through the bridge. These are reader/batch tests; no
+Fluree graph-source registration or policy path is wired yet.
+
+Dependency decision: retain the Arrow-free `fluree-db-tabular` contract. Linking
+it into this standalone experiment adds only that crate and its existing
+`thiserror` dependency; the experiment still has one Arrow version (58.4).
+This lets us develop the batch adapter without changing Fluree's shared types.
+It does **not** eliminate duplicate Arrow versions if the current default engine
+is later linked alongside Iceberg's Arrow 54 in a product binary.
+
+For production, evaluate aligning Iceberg's Arrow/Parquet to 58 with its existing
+scan regressions and performance checks. Separately resolve Kernel's pinned
+`object_store` 0.13 / reqwest 0.12 dependency through an upstream-compatible
+engine/dependency change. A storage wrapper alone does not remove dependencies
+enabled by Kernel's Cargo features; a custom engine also owns JSON/Parquet and
+expression behavior and needs the full fixture suite. The root workspace
+manifest/lockfile and release dependency graph remain unchanged by this probe.
+
+History reference: [Kernel 0.28 history manager source](https://github.com/delta-io/delta-kernel-rs/blob/v0.28.0/kernel/src/history_manager/mod.rs).
+
 Validation commands:
 
 ```sh
 cargo fmt --manifest-path scripts/delta-spike/Cargo.toml -- --check
+cargo test --locked --manifest-path scripts/delta-spike/Cargo.toml
 cargo clippy --locked --manifest-path scripts/delta-spike/Cargo.toml --all-targets -- -D warnings
 ```
 
