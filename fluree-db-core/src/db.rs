@@ -165,14 +165,9 @@ pub struct LedgerSnapshot {
 
     /// Index statistics (flakes count, total size).
     ///
-    /// `Arc`-wrapped because the class table is unbounded in the number of
-    /// distinct classes — a class-per-subject data model reaches millions of
-    /// `ClassStatEntry`s, each owning its own property/datatype/lang vectors.
-    /// Snapshot clones are on per-query paths (named-graph range-provider
-    /// swaps, staged-transaction previews, historical views), and the planner
-    /// stats view borrows this whole artifact, so a by-value field made every
-    /// one of those a multi-second deep copy. Share it; the indexer replaces
-    /// the whole `Arc` when it publishes.
+    /// Shared, because the class table grows with the number of distinct
+    /// classes (millions on a class-per-subject ledger) and snapshots are
+    /// cloned on per-query paths.
     pub stats: Option<Arc<IndexStats>>,
     /// Schema (class/property hierarchy)
     pub schema: Option<IndexSchema>,

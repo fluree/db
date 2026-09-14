@@ -46,14 +46,8 @@ pub(crate) fn cached_stats_view_for_db(
     allow_semantic_elision: bool,
 ) -> Option<Arc<StatsView>> {
     let build_view = || {
-        // Timed on its own: a miss builds before the plan exists, so on a
-        // large class table it otherwise reads as an unexplained gap between
-        // "preparing query execution" and the first plan line.
         let _span = tracing::debug_span!("stats_view_build").entered();
         let started = Instant::now();
-        // `Arc`-shared, never copied: `IndexStats` carries one entry per
-        // distinct class, so on a class-per-subject ledger a by-value clone
-        // here was seconds of small allocations before planning began.
         let indexed = db
             .snapshot
             .stats
@@ -108,8 +102,6 @@ pub(crate) fn cached_stats_view_for_db(
             // reaches every consumer that sums it. See #1721 for both candidate
             // fix directions — and note that reconciling THIS lane is not one
             // of them, for the quadratic reason above.
-            // Shared: the empty-window and below-published-`t` cases hand
-            // back the same `Arc` rather than a second full copy.
             assemble_planner_stats(
                 &indexed,
                 db.snapshot,
@@ -147,9 +139,8 @@ pub(crate) fn cached_stats_view_for_db(
         // are cleared: empty means "unknown" and every consumer fails closed.
         // The counts are left alone in all cases.
         //
-        // This is the one branch that has to own the stats: `make_mut` copies
-        // when the `Arc` is still shared with the snapshot. Current-state
-        // reads — every query on a live ledger — never reach it.
+        // `make_mut` copies here, since the stats are shared with the
+        // snapshot; current-state reads never take this branch.
         if db.t < db.snapshot.t {
             let stats = Arc::make_mut(&mut stats);
             let licensed = stats.historical_since_t.is_some_and(|since| db.t >= since);

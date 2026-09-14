@@ -146,16 +146,8 @@ pub enum NoveltyMerge {
 }
 
 /// Whether merging `novelty` into `indexed` at `to_t` would reproduce `indexed`
-/// unchanged.
-///
-/// Two cases: an empty novelty window has nothing to add, and a `to_t` at or
-/// below the published index `t` is already fully described by the base index
-/// because novelty only ever holds flakes *after* the publish.
-///
-/// This is the guard [`assemble_planner_stats`] uses to hand back the
-/// caller's `Arc` instead of a copy, so it must stay exactly the condition
-/// under which `assemble_fast_stats_inner` returns `indexed.clone()` — both
-/// read it from here for that reason.
+/// unchanged: the window is empty, or `to_t` is at or below the published
+/// index `t`, which novelty never reaches below.
 pub fn merge_is_identity(
     indexed: &IndexStats,
     snapshot: &LedgerSnapshot,
@@ -165,20 +157,12 @@ pub fn merge_is_identity(
     novelty.is_empty() || to_t <= indexed_t(indexed, snapshot)
 }
 
-/// Stats for the query planner: an [`NoveltyMerge::Estimate`] merge over a
-/// shared base, producing only what the planner reads.
+/// Stats for the query planner: an [`NoveltyMerge::Estimate`] merge that
+/// returns `indexed` itself when the merge is an identity.
 ///
-/// Two things differ from [`assemble_fast_stats`], both because `IndexStats`
-/// owns one `ClassStatEntry` per distinct class — a class-per-subject ledger
-/// has millions, each with its own property/datatype/lang vectors:
-///
-/// - The identity case (empty novelty, or a read at or below the published
-///   index `t`) hands back the caller's `Arc`. That is every cold query on a
-///   freshly indexed ledger, where a copy was seconds of small allocations.
-/// - Otherwise the class table carries instance counts only
-///   ([`ClassDetail::CountsOnly`]). Do not hand this result to anything that
-///   reads class property usage or per-graph class tables; use
-///   [`assemble_fast_stats_with`] or [`assemble_full_stats_with`] for those.
+/// The class table carries instance counts only, with no per-class property
+/// usage and no per-graph class tables. Anything that reads those needs
+/// [`assemble_fast_stats_with`] or [`assemble_full_stats_with`] instead.
 pub fn assemble_planner_stats(
     indexed: &Arc<IndexStats>,
     snapshot: &LedgerSnapshot,
@@ -250,16 +234,12 @@ pub fn assemble_fast_stats_with(
 /// How much of the class table a merge produces.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ClassDetail {
-    /// Per-class property usage and per-graph class tables: what ledger-info,
-    /// GraphQL schema derivation, the Cypher catalog shims and policy read.
+    /// Per-class property usage and per-graph class tables, as ledger-info,
+    /// GraphQL, the Cypher catalog shims and policy read them.
     Full,
-    /// Ledger-wide instance counts only, with no property usage and no
-    /// per-graph class tables. The query planner reads nothing else from the
-    /// class table once novelty is present — the one consumer of class
-    /// property usage, the redundant-`rdf:type` coverage proof, is gated on an
-    /// empty novelty window — and attributing every property flake to its
-    /// subject's classes is most of what makes a merge scale with the number
-    /// of distinct classes rather than with the window.
+    /// Ledger-wide instance counts only. The planner reads nothing more once
+    /// novelty is present: its one use of class property usage, the
+    /// redundant-`rdf:type` coverage proof, requires an empty window.
     CountsOnly,
 }
 
@@ -583,9 +563,8 @@ fn assemble_fast_stats_inner(
     type NdvAcc = (HashMap<(FlakeValue, Sid), i64>, HashMap<Sid, i64>);
     let mut ndv_acc: HashMap<(u16, &str), NdvAcc> = HashMap::new();
     let counts_only = class_detail == ClassDetail::CountsOnly;
-    // With per-graph base stats the ledger-wide class table is re-derived from
-    // them after the loop (`union_per_graph_classes`), so the top-level
-    // accumulator would be built from the whole base table only to be dropped.
+    // With per-graph base stats the class table is re-derived by
+    // `union_per_graph_classes` after the loop, so this accumulator is unused.
     let classes_from_graphs = indexed.graphs.as_ref().is_some_and(|g| !g.is_empty());
     let track_class_data = !counts_only && !classes_from_graphs;
     let mut class_data = if track_class_data {
@@ -752,12 +731,14 @@ fn assemble_fast_stats_inner(
         historical_since_t: indexed.historical_since_t,
     };
     if graphs.is_empty() {
-        // No per-graph section to derive from, so the base's is `None` or empty
-        // and passing it through copies nothing.
+        // The base's per-graph section is `None` or empty, so this copies nothing.
         stats.graphs = indexed.graphs.clone();
         stats.classes = match class_detail {
             ClassDetail::Full => {
-                debug_assert!(track_class_data, "per-graph base stats imply non-empty graphs");
+                debug_assert!(
+                    track_class_data,
+                    "per-graph base stats imply non-empty graphs"
+                );
                 finalize_classes(indexed, class_data)
             }
             ClassDetail::CountsOnly => counts_only_classes(indexed, class_count_deltas),
@@ -1295,17 +1276,11 @@ fn get_or_insert_graph_property(
     graph_entry.properties.last_mut().expect("just inserted")
 }
 
-/// Position index over each graph's `GraphStatsEntry::classes`, built the
-/// first time a pass touches that graph.
+/// Position index over each graph's `GraphStatsEntry::classes`, so class
+/// attribution is not a linear scan per novelty flake.
 ///
-/// Attribution looks a class up once per `rdf:type` flake and once per
-/// (property flake, subject class) pair. A linear scan made that
-/// O(novelty x classes): on a ledger that types each subject with its own
-/// class, millions of comparisons for every novelty flake, on every commit.
-///
-/// Positions stay valid only while the vectors are append-only. Both passes
-/// sort them after their loop, so an index must not outlive the pass that
-/// built it.
+/// Positions are valid only while the vectors are append-only. Both passes
+/// sort them afterwards, so an index must not outlive its pass.
 #[derive(Default)]
 struct GraphClassIndex {
     by_graph: HashMap<GraphId, HashMap<Sid, usize>>,
@@ -1703,17 +1678,14 @@ fn finalize_classes(
     }
 }
 
-/// [`ClassDetail::CountsOnly`] class table: the base's instance counts with
-/// the window's `rdf:type` deltas applied, sorted by `class_sid`, carrying no
-/// property usage.
+/// [`ClassDetail::CountsOnly`] class table: base instance counts plus the
+/// window's `rdf:type` deltas, sorted by `class_sid`.
 ///
-/// Every class the window touched is kept, even at zero, because the full
-/// merge keeps them too — the per-graph entry it creates for a touched class
-/// survives into `union_per_graph_classes` — and the planner distinguishes a
-/// known-empty class (`Some(0)`) from an unknown one. The count clamps once on
-/// the ledger-wide total where the full merge clamps each graph as it goes;
-/// the two agree unless a window retracts type assertions that were never
-/// made, which the estimate lane already tolerates for every other count.
+/// Touched classes are kept even at zero, as the full merge keeps them, since
+/// the planner treats a known-empty class differently from an unknown one.
+/// Clamping happens once on the total rather than per graph per flake as in
+/// the full merge; the two differ only when a window retracts type assertions
+/// that were never made.
 fn counts_only_classes(
     indexed: &IndexStats,
     mut deltas: HashMap<Sid, i64>,
@@ -1747,9 +1719,7 @@ fn counts_only_classes(
     }
 }
 
-/// The base's per-graph stats without their class tables, for
-/// [`ClassDetail::CountsOnly`]. Per-graph property stats are bounded by the
-/// schema; the class tables are what scale with the data.
+/// The base's per-graph stats without their class tables.
 fn graphs_without_classes(indexed: &IndexStats) -> Vec<GraphStatsEntry> {
     indexed
         .graphs
@@ -2975,12 +2945,7 @@ mod tests {
             .collect();
         format!(
             "flakes={} size={} since={:?}\nproperties={:?}\nclasses={:?}\ngraphs={:?}",
-            stats.flakes,
-            stats.size,
-            stats.historical_since_t,
-            stats.properties,
-            classes,
-            graphs
+            stats.flakes, stats.size, stats.historical_since_t, stats.properties, classes, graphs
         )
     }
 
@@ -3104,8 +3069,8 @@ mod tests {
                 .graphs
                 .iter()
                 .flatten()
-                .all(|graph| graph.classes.is_none()),
-            "planner stats carry no per-graph class tables"
+                .all(|graph| graph.classes.as_ref().is_none_or(Vec::is_empty)),
+            "planner stats carry no per-graph class entries"
         );
         assert!(
             full.classes

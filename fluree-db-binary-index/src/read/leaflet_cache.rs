@@ -441,29 +441,18 @@ const STATS_VIEW_BUDGET_DIVISOR: u64 = 16;
 
 /// The pool for query planner `StatsView`s.
 ///
-/// Views used to share the leaflet pool, and both of its properties made a
-/// query rebuild a view it should have hit — which on a ledger with millions of
-/// classes is a multi-second stall before planning:
+/// Separate from leaflets so scan pressure cannot evict a view, and LRU rather
+/// than TinyLFU because views are keyed by overlay epoch: the newest is the one
+/// queries want, while frequency admission favors the epoch it replaced.
 ///
-/// - Byte-weighted TinyLFU put a view in competition with decoded leaflets, so
-///   scan pressure alone could evict it with no epoch change, and frequency
-///   admission could refuse a new epoch's view outright while hot leaflets
-///   held the probation queue.
-/// - Views are keyed by overlay epoch, so the newest is the one every query
-///   wants. Recency keeps it; frequency favors the epoch it just replaced.
-///
-/// So this pool is LRU, budgeted separately. A view's weight is capped at half
-/// the budget because moka rejects any entry heavier than the whole cache: a
-/// view that outgrew its share would otherwise never be cached at all. With
-/// the cap the newest view always fits, and no more than two capped views
-/// coexist.
+/// Weight is capped at half the budget because moka never caches an entry
+/// heavier than the whole pool, which would make an oversized view rebuild on
+/// every query.
 fn stats_view_pool(leaflet_budget_bytes: u64) -> Cache<u128, Arc<StatsView>> {
     let budget = (leaflet_budget_bytes / STATS_VIEW_BUDGET_DIVISOR).max(1);
     let max_weight = (budget / 2).clamp(1, u64::from(u32::MAX)) as usize;
     let builder = Cache::builder()
-        .weigher(move |_key: &u128, view: &Arc<StatsView>| {
-            view.byte_size().min(max_weight) as u32
-        })
+        .weigher(move |_key: &u128, view: &Arc<StatsView>| view.byte_size().min(max_weight) as u32)
         .max_capacity(budget);
     // The wasm32 stand-in is exact-LRU already and has no policy knob.
     #[cfg(not(target_arch = "wasm32"))]

@@ -15,12 +15,8 @@ use std::sync::Arc;
 
 /// Resolves a query-side IRI to the `Sid` that `IndexStats` is keyed by.
 ///
-/// Mirrors [`LedgerSnapshot::encode_iri`] exactly — canonical split under the
-/// ledger's split mode, then exact-prefix lookup, falling back to the EMPTY
-/// namespace so a subject stored under a bare name still resolves. Carrying
-/// this (a handful of namespace prefixes) instead of a parallel IRI-keyed copy
-/// of the stats is what keeps the view's build cost proportional to the
-/// namespace table rather than to the number of distinct classes.
+/// Must stay equivalent to [`LedgerSnapshot::encode_iri`], including its
+/// EMPTY-namespace fallback for bare names.
 #[derive(Debug, Clone)]
 pub struct StatsIriEncoder {
     /// IRI prefix -> namespace code, shared with the snapshot.
@@ -93,14 +89,9 @@ pub struct StatsView {
     pub property_ref_only: HashMap<Sid, bool>,
     /// Property IRI -> ref-only flag (see [`Self::property_ref_only`]).
     pub property_ref_only_by_iri: HashMap<Arc<str>, bool>,
-    /// The `IndexStats` this view was derived from, shared with the snapshot.
-    ///
-    /// Kept so the per-class property-usage table can be consulted on demand
-    /// (see [`Self::predicate_subjects_all_in_class_by_iri`]) instead of being
-    /// flattened into an IRI-keyed map at build time. That map cost one string
-    /// format and allocation per `(class, property)` pair — millions of them on
-    /// a ledger that types every subject with its own class — to answer a
-    /// question almost no query asks.
+    /// The `IndexStats` this view was derived from. Per-class property usage
+    /// is read from here on demand rather than copied into the view, since it
+    /// grows with the number of distinct classes.
     pub source: Option<Arc<IndexStats>>,
     /// IRI -> SID resolution for the by-IRI accessors. `None` for views built
     /// without a namespace table, where those accessors report "unknown".
@@ -182,8 +173,7 @@ impl StatsView {
             })
             .sum::<usize>();
 
-        // `source` is deliberately not counted: it is the snapshot's own
-        // `IndexStats`, shared by `Arc`, so evicting this view frees none of it.
+        // `source` is shared with the snapshot; evicting the view frees none of it.
         size_of::<Self>() + properties + classes + properties_by_iri + graph_properties
     }
 
@@ -258,17 +248,12 @@ impl StatsView {
         view
     }
 
-    /// Build from a snapshot's (possibly novelty-merged) `IndexStats`, with
-    /// IRI-keyed property lookups and IRI resolution for class lookups.
+    /// Build from `stats` (which may be a novelty-merged copy) using
+    /// `snapshot`'s namespace table.
     ///
-    /// Only the predicate tables are materialized under IRI keys — they are
-    /// bounded by the schema, not the data. Class lookups by IRI resolve the IRI
-    /// to a SID on each call instead, and the per-class property usage is read
-    /// from `stats` on demand, because both scale with the number of distinct
-    /// classes: a class-per-subject ledger has millions.
-    ///
-    /// Namespace prefixes and split mode come from `snapshot`; `stats` need not
-    /// be the snapshot's own (the planner passes the novelty-merged copy).
+    /// Only predicate lookups are materialized under IRI keys, because those
+    /// are bounded by the schema. Class lookups by IRI encode the IRI per call
+    /// instead, because classes can number in the millions.
     pub fn from_db_stats_with_namespaces(
         stats: &Arc<IndexStats>,
         snapshot: &LedgerSnapshot,
@@ -306,13 +291,10 @@ impl StatsView {
         view
     }
 
-    /// The per-class stats entry for `class_sid`, by binary search.
-    ///
-    /// Every producer of `IndexStats.classes` sorts by `class_sid` — the
-    /// indexer and the novelty merge both finish through
-    /// `union_class_stat_slices`, and the wire codec preserves order. Should a
-    /// table ever arrive out of order the search merely misses, and every
-    /// caller reads a miss as "no proof", so the failure is a declined rewrite.
+    /// The per-class stats entry for `class_sid`, by binary search over the
+    /// class table, which every producer sorts by `class_sid`. A miss reads as
+    /// "no proof" to every caller, so an unsorted table declines rewrites
+    /// rather than licensing wrong ones.
     fn class_entry(&self, class_sid: &Sid) -> Option<&ClassStatEntry> {
         let classes = self.source.as_deref()?.classes.as_deref()?;
         let idx = classes
@@ -1107,7 +1089,10 @@ mod tests {
         });
         let view = StatsView::from_db_stats_with_namespaces(&stats, &snapshot);
 
-        assert_eq!(view.get_class_count_by_iri(&format!("{EX}Person")), Some(25));
+        assert_eq!(
+            view.get_class_count_by_iri(&format!("{EX}Person")),
+            Some(25)
+        );
         assert_eq!(view.get_class_count_by_iri("Bare"), Some(3));
         assert_eq!(view.get_class_count_by_iri(&format!("{EX}Nobody")), None);
         assert_eq!(
