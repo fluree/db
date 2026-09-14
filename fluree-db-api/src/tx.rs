@@ -33,6 +33,42 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+/// Stable id for an upsert payload, used as its blank-node skolem scope.
+///
+/// Streams the JSON through the hasher rather than serializing it to a
+/// `String` first, so a bulk payload does not pay a second full copy of
+/// itself. The TriG blocks fold in their graph IRI and triples but not their
+/// prefix map: prefixes only decide how the triples were expanded, and a
+/// `FxHashMap` has no stable iteration order, which would make the scope
+/// differ between two runs over the same document.
+fn upsert_payload_id(txn_json: &JsonValue, named_graphs: &[NamedGraphBlock]) -> u64 {
+    use std::io::Write;
+    use xxhash_rust::xxh64::Xxh64;
+
+    struct HashWriter(Xxh64);
+    impl Write for HashWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.update(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut w = HashWriter(Xxh64::new(0));
+    let _ = w.write_all(b"fluree:upsert\0");
+    let _ = serde_json::to_writer(&mut w, txn_json);
+    for block in named_graphs {
+        let _ = w.write_all(b"\0graph\0");
+        let _ = w.write_all(block.iri.as_bytes());
+        for triple in &block.triples {
+            let _ = write!(w, "\0{triple:?}");
+        }
+    }
+    w.0.digest()
+}
+
 /// Stages an ordered sequence of transactions into ONE commit, each observing
 /// the previous ones' writes through a *virtual state* — the machinery behind
 /// SPARQL 1.1 `;`-separated updates (roadmap D-10) and the Cypher sequential
@@ -2384,6 +2420,29 @@ impl crate::Fluree {
         policy: Option<&crate::PolicyContext>,
     ) -> Result<StageResult> {
         let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+
+        // Deterministic, payload-scoped blank-node identity for upsert.
+        //
+        // Upsert replaces the values at the slots its payload names, so
+        // applying the same payload twice should leave the same data. That
+        // held only for subjects the payload names: every blank-node-rooted
+        // structure inside it — an anonymous `{| … |}` annotation, an OWL
+        // restriction, an RDF list — was skolemized under a fresh
+        // per-transaction id, so each run minted a new subject and the two
+        // runs accumulated instead of collapsing. Upserting one Turtle file
+        // twice left two copies of every anonymous claim in it.
+        //
+        // Scoping the skolem id to the payload makes the identity a function
+        // of the document, the way graph sync scopes it to the target graph.
+        // Two different payloads still get different scopes, so positional
+        // labels cannot collide across unrelated upserts. A caller-supplied
+        // id still wins.
+        let mut txn_opts = txn_opts;
+        if txn_type == TxnType::Upsert && txn_opts.skolem_txn_id.is_none() {
+            let scope =
+                fluree_db_core::skolem::doc_scope(upsert_payload_id(txn_json, named_graphs));
+            txn_opts.skolem_txn_id = Some(format!("upsert{scope}"));
+        }
 
         // Handle case where default graph is empty but named graphs are present
         // (e.g., TriG with only GRAPH blocks and no default graph triples)

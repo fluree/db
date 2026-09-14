@@ -341,10 +341,10 @@ async fn named_graph_annotation_survives_indexing_and_re_sync() {
     // syncs, gets indexed, still reads back from the index, and an unchanged
     // re-sync is still a no-op rather than a churn commit.
     //
-    // Note this does NOT exercise the stage-time single-target invariant on
-    // the indexed bundle: sync's retraction wave cancels the unchanged
-    // reifies facts before the check runs, so nothing is asserted for it to
-    // inspect. The invariant's own indexed-named-graph case is pinned by
+    // Sync's retraction wave cancels the unchanged reifies facts, so an
+    // identical re-sync asserts nothing for the single-target invariant to
+    // inspect. The re-point at the end of this test does reach it. The
+    // invariant's own indexed-named-graph case is also pinned by
     // `it_edge_annotations_indexed::indexed_named_graph_annotation_stays_writable`,
     // which reaches it through a plain JSON-LD write.
     const GRAPH: &str = "http://example.org/graphs/claims";
@@ -390,16 +390,46 @@ async fn named_graph_annotation_survives_indexing_and_re_sync() {
         "identical payload must still be a no-op after indexing: {again:?}"
     );
 
-    // And a genuine re-point of the same reifier is still refused.
+    // Re-pointing the same reifier at a different edge goes through: sync's
+    // delta retracts the old attachment in the same transaction that asserts
+    // the new one, which is exactly what the single-target invariant asks for.
+    // What the invariant refuses is a reifier on *two* edges at once, pinned
+    // by `one_named_reifier_on_two_edges_is_rejected_on_every_turtle_path`.
     let repointed = fluree_graph_turtle::parse_to_json(&with_prefixes(
         "ex:alice ex:knows ex:carol ~ ex:claim1 {| ex:confidence 0.9 |} .\n",
     ))
     .expect("Turtle-star converts");
-    let err = fluree
+    let moved = fluree
         .sync_named_graph(ledger_id, GRAPH, &repointed, SyncGraphOpts::default())
         .await
-        .expect_err("re-pointing an indexed reifier at a different edge must still be refused");
-    assert!(err.to_string().contains("claim1"), "{err}");
+        .expect("re-pointing an indexed reifier through sync");
+    assert!(moved.committed, "{moved:?}");
+
+    let ledger = fluree
+        .ledger(ledger_id)
+        .await
+        .expect("reload after re-point");
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT ?o WHERE {{ GRAPH <{GRAPH}> {{ ex:alice ex:knows ?o ~ ex:claim1 }} }}"
+    );
+    let result = support::query_sparql(&fluree, &ledger, &sparql)
+        .await
+        .expect("re-pointed claim query");
+    let json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    let objects: Vec<String> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| b["o"]["value"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        objects,
+        ["http://example.org/carol"],
+        "the claim must describe exactly the edge the payload gives it"
+    );
 }
 
 /// Every novelty flake written at exactly `t`, for failure diagnostics.
@@ -416,4 +446,259 @@ async fn flakes_at(ledger: &fluree_db_api::LedgerState, t: i64) -> Vec<String> {
             )
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Ordinary edits to annotated data, on the delta-computing write paths.
+//
+// Sync and upsert both work out an exact delta before staging: sync diffs the
+// payload against the graph's current contents, upsert retracts what it is
+// about to replace. Both therefore *do* retract a prior attachment in the same
+// transaction, which is exactly what the single-target invariant's own error
+// message tells a user to do. These pin that ordinary edits — dropping a line,
+// changing an edge's object, re-pointing a claim — go through.
+// ---------------------------------------------------------------------------
+
+const CLAIMS_GRAPH: &str = "http://example.org/graphs/claims";
+
+/// `SELECT ?s ?o ?conf` over every annotated `ex:knows` edge in the graph.
+async fn annotated_knows(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> Vec<(String, String, String)> {
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/>\n\
+         SELECT ?s ?o ?conf WHERE {{ GRAPH <{CLAIMS_GRAPH}> \
+         {{ ?s ex:knows ?o {{| ex:confidence ?conf |}} }} }} ORDER BY ?s ?o"
+    );
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let result = support::query_sparql(fluree, &ledger, &sparql)
+        .await
+        .expect("annotated-knows query");
+    let json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| {
+            let get = |k: &str| {
+                b[k]["value"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            (get("s"), get("o"), get("conf"))
+        })
+        .collect()
+}
+
+async fn sync(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    turtle: &str,
+) -> std::result::Result<bool, String> {
+    let payload =
+        fluree_graph_turtle::parse_to_json(&with_prefixes(turtle)).expect("Turtle-star converts");
+    fluree
+        .sync_named_graph(ledger_id, CLAIMS_GRAPH, &payload, SyncGraphOpts::default())
+        .await
+        .map(|r| r.committed)
+        .map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+async fn re_syncing_without_a_claims_line_drops_just_that_claim() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/turtle-star-sync:drop-a-line";
+    fluree
+        .insert_turtle(
+            genesis_ledger(&fluree, ledger_id),
+            &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
+        )
+        .await
+        .expect("seed ledger");
+
+    assert!(sync(
+        &fluree,
+        ledger_id,
+        "ex:alice ex:knows ex:bob {| ex:confidence 0.9 |} .\n\
+         ex:bob ex:knows ex:carol {| ex:confidence 0.5 |} .\n",
+    )
+    .await
+    .expect("first sync"));
+    assert_eq!(
+        annotated_knows(&fluree, ledger_id).await,
+        [
+            ("alice".into(), "bob".into(), "0.9".into()),
+            ("bob".into(), "carol".into(), "0.5".into())
+        ]
+    );
+
+    // Drop the first line. Sync's delta retracts that edge and its whole
+    // bundle, and leaves the second line untouched.
+    assert!(sync(
+        &fluree,
+        ledger_id,
+        "ex:bob ex:knows ex:carol {| ex:confidence 0.5 |} .\n",
+    )
+    .await
+    .expect("re-sync without the first line"));
+    assert_eq!(
+        annotated_knows(&fluree, ledger_id).await,
+        [("bob".into(), "carol".into(), "0.5".into())],
+        "dropping a line must drop exactly that claim"
+    );
+}
+
+#[tokio::test]
+async fn re_syncing_an_anonymous_annotated_edge_can_change_its_object() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/turtle-star-sync:change-object";
+    fluree
+        .insert_turtle(
+            genesis_ledger(&fluree, ledger_id),
+            &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
+        )
+        .await
+        .expect("seed ledger");
+
+    assert!(sync(
+        &fluree,
+        ledger_id,
+        "ex:alice ex:knows ex:bob {| ex:confidence 0.9 |} .\n",
+    )
+    .await
+    .expect("first sync"));
+
+    assert!(sync(
+        &fluree,
+        ledger_id,
+        "ex:alice ex:knows ex:carol {| ex:confidence 0.9 |} .\n",
+    )
+    .await
+    .expect("re-sync with a different object"));
+    assert_eq!(
+        annotated_knows(&fluree, ledger_id).await,
+        [("alice".into(), "carol".into(), "0.9".into())],
+        "the edge and its claim must both follow the payload"
+    );
+}
+
+#[tokio::test]
+async fn upserting_a_named_claim_can_change_the_fact_it_describes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star-upsert:repoint");
+
+    let first = fluree
+        .upsert_turtle(ledger0, &with_prefixes("ex:alice ex:age 42 ~ ex:c1 .\n"))
+        .await
+        .expect("first upsert");
+
+    // Upsert replaces `ex:age` on `ex:alice`, so the old edge is retracted in
+    // the same transaction that asserts the new one. The claim follows it.
+    let second = fluree
+        .upsert_turtle(
+            first.ledger,
+            &with_prefixes("ex:alice ex:age 43 ~ ex:c1 .\n"),
+        )
+        .await
+        .expect("re-pointing a claim through upsert");
+
+    let sparql = "PREFIX ex: <http://example.org/>\n\
+                  SELECT ?age WHERE { ex:alice ex:age ?age ~ ex:c1 }";
+    let result = support::query_sparql(&fluree, &second.ledger, sparql)
+        .await
+        .expect("claim query");
+    let json = result
+        .to_sparql_json(&second.ledger.snapshot)
+        .expect("sparql json");
+    let ages: Vec<String> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| b["age"]["value"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(ages, ["43"], "the claim must describe the new fact");
+}
+
+#[tokio::test]
+async fn re_upserting_an_anonymous_annotation_replaces_it_rather_than_duplicating() {
+    // The named-reifier twin of this is
+    // `upsert_turtle_replaces_the_annotation_body_on_re_upsert`. An anonymous
+    // `{| … |}` has no author-supplied identity, so "replace the body, keep
+    // the edge" has to hold on an identity the write path derives itself.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star-upsert:anon-replace");
+    let turtle = with_prefixes("ex:alice ex:knows ex:bob {| ex:confidence 0.9 |} .\n");
+
+    let first = fluree
+        .upsert_turtle(ledger0, &turtle)
+        .await
+        .expect("first upsert");
+    assert_eq!(confidences(&fluree, &first.ledger, None).await, ["0.9"]);
+
+    let second = fluree
+        .upsert_turtle(first.ledger, &turtle)
+        .await
+        .expect("identical re-upsert");
+    assert_eq!(
+        confidences(&fluree, &second.ledger, None).await,
+        ["0.9"],
+        "re-upserting the same anonymous annotation must not accumulate claims"
+    );
+
+    // The boundary, stated deliberately. An anonymous claim has no identity
+    // its author can refer to, so upsert cannot know that a claim with a new
+    // body is meant to *be* the old one. Changing the body therefore adds a
+    // second claim about the same edge rather than replacing the first. Name
+    // the reifier when replacement is what you want — that case is
+    // `upsert_turtle_replaces_the_annotation_body_on_re_upsert`.
+    let third = fluree
+        .upsert_turtle(
+            second.ledger,
+            &with_prefixes("ex:alice ex:knows ex:bob {| ex:confidence 0.95 |} .\n"),
+        )
+        .await
+        .expect("re-upsert with a different body");
+    let mut got = confidences(&fluree, &third.ledger, None).await;
+    got.sort();
+    assert_eq!(
+        got,
+        ["0.9", "0.95"],
+        "a differently-bodied anonymous claim is a new claim, not a replacement"
+    );
+}
+
+#[tokio::test]
+async fn re_upserting_parallel_annotations_is_a_no_op() {
+    // Two claims about one edge. The Turtle-to-JSON-LD adapter states the base
+    // edge once per claim, so the accumulator sees it twice; an identical
+    // re-upsert must still net to nothing rather than committing the surplus.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/turtle-star-upsert:parallel-noop");
+    let turtle = with_prefixes(
+        "ex:alice ex:knows ex:bob ~ ex:c1 {| ex:confidence 0.9 |} \
+         ~ ex:c2 {| ex:confidence 0.7 |} .\n",
+    );
+
+    let first = fluree
+        .upsert_turtle(ledger0, &turtle)
+        .await
+        .expect("first upsert");
+    let t_after_first = first.ledger.t();
+
+    let second = fluree
+        .upsert_turtle(first.ledger, &turtle)
+        .await
+        .expect("identical re-upsert");
+    assert_eq!(
+        second.ledger.t(),
+        t_after_first,
+        "an identical payload must not produce a commit"
+    );
 }

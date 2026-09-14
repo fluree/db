@@ -141,6 +141,28 @@ async fn cascade_attachment_retracts(
         // `f:reifies*` bundle isn't double-retracted.
         let mut cascaded_anns: HashSet<(GraphId, Sid)> = HashSet::new();
 
+        // Reifiers this transaction is *re-pointing*: it asserts at least one
+        // `f:reifies*` fact for them, so they describe some edge after this
+        // transaction and are not orphaned by the base-edge retract below.
+        //
+        // The cascade must leave their bundles alone, because the delta that
+        // reached this point is already complete and already minimal. Sync and
+        // upsert both hand the accumulator the current state as retractions
+        // and the payload as assertions, and matched pairs cancel — so a slot
+        // whose value does not change (typically `f:reifiesPredicate` and
+        // `f:reifiesGraph`) appears in neither list. Cascading the bundle here
+        // would retract exactly those unchanged slots while nothing re-asserts
+        // them, and the surviving bundle would be missing a slot: a re-point
+        // that is entirely well-formed was refused with
+        // `Missing("f:reifiesPredicate")`, and the advice in that error
+        // ("retract the prior attachment in the same transaction") described
+        // what the caller had already done.
+        let repointed: HashSet<Sid> = flakes
+            .iter()
+            .filter(|f| f.op && is_reserved_reifies_predicate(&f.p))
+            .map(|f| f.s.clone())
+            .collect();
+
         for flake in flakes {
             if flake.op {
                 continue; // assertion, not a retract — nothing to cascade
@@ -171,6 +193,13 @@ async fn cascade_attachment_retracts(
             for cand in &candidates {
                 let ann_sid = cand.s.clone();
                 if !seen.insert(ann_sid.clone()) {
+                    continue;
+                }
+                if repointed.contains(&ann_sid) {
+                    // This transaction re-points the reifier; its bundle is
+                    // the transaction's to rewrite, not the cascade's to
+                    // retract. `enforce_single_target_reifiers` still checks
+                    // the result, so a genuinely malformed re-point is caught.
                     continue;
                 }
 
@@ -748,9 +777,18 @@ pub async fn stage(
         // set) rather than by the total WHERE cardinality.
         let mut acc = if pure_delete {
             FlakeAccumulator::pure_delete(64)
-        } else if txn.sync_graph.is_some() {
+        } else if txn.sync_graph.is_some() || txn.txn_type == TxnType::Upsert {
             // The payload is a set: a fact it states twice must not out-vote
-            // the sync wave's single retraction of the current copy.
+            // the single retraction of the current copy that the sync or
+            // upsert wave contributes.
+            //
+            // Upsert needs this for the same reason sync does. The
+            // Turtle-to-JSON-LD adapter states an edge once per reifier
+            // attached to it, so `s p o ~ c1 {| … |} ~ c2 {| … |}` asserts the
+            // base edge twice while the upsert wave retracts the stored copy
+            // once. The surplus assertion survived, and re-upserting a payload
+            // byte-for-byte identical to what was already stored committed a
+            // delta of one flake every time.
             FlakeAccumulator::mixed_set_assertions(64)
         } else {
             FlakeAccumulator::mixed(64)
