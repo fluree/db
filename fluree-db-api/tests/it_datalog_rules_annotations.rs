@@ -708,8 +708,8 @@ async fn datalog_materialization_is_cached_across_identical_queries() {
     // Nothing to assert about the counter here: the first run cannot hit its
     // own key, but a parallel test's hit would show up all the same. The
     // tally below carries the real claim.
-    assert_eq!(
-        first_tally.capped, false,
+    assert!(
+        !first_tally.capped,
         "the first run must complete, or the cached closure would be partial"
     );
 
@@ -722,7 +722,7 @@ async fn datalog_materialization_is_cached_across_identical_queries() {
         "a cache hit must report the cached materialization's tally"
     );
     assert!(
-        cache.hits() >= hits_before + 1,
+        cache.hits() > hits_before,
         "an identical query must HIT the entry the first run inserted"
     );
     let hits_after_second = cache.hits();
