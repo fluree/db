@@ -524,3 +524,92 @@ async fn memory_budget_ignores_seed_facts() {
     );
     assert_eq!(reasoning.derived_facts, 3);
 }
+
+#[tokio::test]
+async fn already_stored_entailments_do_not_trip_the_fact_cap() {
+    // Round 1 registers the seed facts in `base_keys` but not in `seen`, so
+    // `DerivedSet::contains` answered false for them and every rule that
+    // RE-derived an already-stored fact pushed it into the round's delta,
+    // where the in-round cap counted it. A ledger that already stores its own
+    // entailments — the ordinary DBpedia shape, where a `Student` is also
+    // typed `Person`, or symmetric edges stored both ways — could therefore
+    // cap on facts it derives nothing new from, and the truncated closure is
+    // then cached.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/reasoning-budget-stored-entailments:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let mut trig = String::from(
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+         @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         ex:partOf rdf:type owl:SymmetricProperty .\n",
+    );
+    // Both directions already stored: the symmetric rule re-derives each one
+    // and adds nothing.
+    for i in 0..400 {
+        trig.push_str(&format!(
+            "ex:a{i} ex:partOf ex:b{i} .\nex:b{i} ex:partOf ex:a{i} .\n"
+        ));
+    }
+    let _ = apply_trig(&fluree, ledger, &trig).await;
+
+    let mut query = reasoning_query(ledger_id);
+    query["reasoningBudget"] = json!({"maxFacts": 100});
+
+    let resp = run_tracked(&fluree, &query).await;
+    let reasoning = resp
+        .reasoning
+        .expect("tracked reasoning query reports a reasoning block");
+    assert!(
+        !reasoning.capped,
+        "re-deriving 800 already-stored facts must not trip a 100-fact cap: {reasoning:?}"
+    );
+    assert_eq!(
+        reasoning.derived_facts, 0,
+        "nothing is genuinely new: {reasoning:?}"
+    );
+}
+
+#[tokio::test]
+async fn query_memory_budget_survives_config_default_modes() {
+    // When ledger-config modes apply, the query's own reasoning modes are
+    // REPLACED by the config's, and each budget field the query set has to be
+    // carried across that replacement by hand. `maxFacts` and `maxSeconds`
+    // were; `maxMemoryMb` was not, so on any ledger with `f:reasoningDefaults`
+    // a query asking for a memory ceiling silently got the default instead.
+    // The other memory tests use a ledger with no config, so none of them
+    // reach this path.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/reasoning-budget-memory-config-modes:main";
+    seed_chain_of(&fluree, ledger_id, 150).await;
+
+    let config_iri = config_graph_iri(ledger_id);
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <{config_iri}> {{
+            <urn:config:main> rdf:type f:LedgerConfig ;
+                              f:reasoningDefaults <urn:config:reasoning> .
+            <urn:config:reasoning> f:reasoningModes f:owl2rl .
+        }}
+        "
+    );
+    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+    let _ = apply_trig(&fluree, ledger, &trig).await;
+
+    let mut query = reasoning_query(ledger_id);
+    query.as_object_mut().unwrap().remove("reasoning");
+    query["reasoningBudget"] = json!({"maxMemoryMb": 1});
+
+    let resp = run_tracked(&fluree, &query).await;
+    let reasoning = resp
+        .reasoning
+        .expect("tracked reasoning query reports a reasoning block");
+    assert_eq!(
+        reasoning.capped_reason.as_deref(),
+        Some("memory"),
+        "the query's own memory ceiling must survive config mode replacement: {reasoning:?}"
+    );
+}

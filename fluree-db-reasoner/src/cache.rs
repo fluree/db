@@ -155,6 +155,17 @@ pub fn approx_flake_bytes(flake: &fluree_db_core::Flake) -> usize {
     let heap = match &flake.o {
         FlakeValue::String(s) | FlakeValue::Json(s) => s.len(),
         FlakeValue::Ref(sid) => sid.name.len(),
+        // An embedding is the largest thing a derived fact can carry, and
+        // counting it as zero meant a rule that copies vectors was undercounted
+        // by roughly the whole value — the memory cap could not fire where it
+        // was most needed.
+        FlakeValue::Vector(v) => v.len() * std::mem::size_of::<f64>(),
+        FlakeValue::BigInt(_) | FlakeValue::Decimal(_) => {
+            // Boxed arbitrary-precision numbers: the box itself plus a small
+            // allowance for the digit buffer. Exactness is not the point; not
+            // being zero is.
+            std::mem::size_of::<usize>() * 4
+        }
         _ => 0,
     };
     std::mem::size_of::<fluree_db_core::Flake>() + flake.s.name.len() + flake.p.name.len() + heap

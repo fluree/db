@@ -1355,13 +1355,20 @@ impl Fluree {
             // below by `ConfigReasoningBudget::apply` (override control),
             // not by mode precedence.
             if let Some(effective) = db.effective_reasoning(query_has_reasoning, query_disabled) {
-                let (max_facts, max_seconds) = (
+                // Every budget field the query set has to be carried across
+                // the mode replacement, not just the two that existed first:
+                // wrapper modes come from config mode strings and never carry
+                // a budget, so anything dropped here is silently lost and the
+                // query's own ceiling never applies.
+                let (max_facts, max_seconds, max_memory_mb) = (
                     executable.reasoning.modes.max_facts,
                     executable.reasoning.modes.max_seconds,
+                    executable.reasoning.modes.max_memory_mb,
                 );
                 executable.reasoning.modes = effective.clone();
                 executable.reasoning.modes.max_facts = max_facts;
                 executable.reasoning.modes.max_seconds = max_seconds;
+                executable.reasoning.modes.max_memory_mb = max_memory_mb;
             }
         }
 

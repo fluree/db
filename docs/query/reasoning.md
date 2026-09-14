@@ -291,7 +291,11 @@ query-time overrides are allowed. See
 
 Materialization — OWL 2 RL and datalog rules alike — runs under a budget
 (default: 1,000,000 derived facts / 30 seconds). The limits are checked as
-facts are derived, so a single large rule round cannot overshoot them.
+work is dispatched rather than once a round, so a long round is bounded far
+more tightly than it used to be. They are not checked between every derived
+fact everywhere: an OWL 2 RL property chain, and the rules that produce
+`owl:sameAs`, each run to completion before the next check, so a single
+high-fan-out input can still carry a round past a limit before it is noticed.
 
 There is a third limit on the bytes those derived facts occupy. It has no
 default of its own: it is derived from the fact ceiling, at an allowance well

@@ -204,7 +204,12 @@ fn reasoning_budget(modes: &ReasoningModes) -> fluree_db_reasoner::ReasoningBudg
         .max_memory_mb
         .or_else(|| budget_env_var::<u64>("FLUREE_REASONING_MAX_MEMORY_MB"));
     budget.max_memory_bytes = match explicit_memory_mb {
-        Some(mb) => (mb as usize).saturating_mul(1024 * 1024),
+        // Saturating rather than `as`: on a 32-bit target (wasm32) a value
+        // past `usize::MAX` would wrap to something tiny, turning a request
+        // for a huge ceiling into a request for a small one.
+        Some(mb) => usize::try_from(mb)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(1024 * 1024),
         None => fluree_db_reasoner::ReasoningBudget::memory_for_facts(budget.max_facts),
     };
     budget
@@ -234,8 +239,10 @@ fn budget_env_var<T: std::str::FromStr>(name: &str) -> Option<T> {
 pub struct DerivedFactsOutcome {
     /// Combined derived-facts overlay (OWL2-RL and/or datalog), if any.
     pub overlay: Option<Arc<DerivedFactsOverlay>>,
-    /// OWL2-RL materialization diagnostics; `None` when OWL2-RL didn't run
-    /// (datalog-only reasoning) or failed.
+    /// Materialization diagnostics — OWL 2 RL, datalog, or the two merged.
+    /// `None` only when neither ran, or when the OWL pass failed and no rules
+    /// were configured. Datalog-only reasoning reports its own tally here;
+    /// also f:reasoningMaxMemoryMb, which the ledger-config list below omits.
     pub diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
 }
 
@@ -308,6 +315,9 @@ pub async fn compute_derived_facts(
 
     let mut all_flakes: Vec<fluree_db_core::Flake> = Vec::new();
     let mut same_as = FrozenSameAs::empty();
+    // Set when an OWL pass was requested and failed; the combined cache entry
+    // is keyed as if OWL had run, so it must not be written in that case.
+    let mut owl_failed = false;
     let mut diagnostics = None;
 
     // OWL2-RL materialization
@@ -374,6 +384,13 @@ pub async fn compute_derived_facts(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "OWL2-RL reasoning failed, continuing without OWL derived facts");
+                // The combined entry is keyed as owl2rl+datalog. Caching a
+                // datalog-only overlay under it would serve every later
+                // identical query results with no OWL entailments, with no
+                // signal, until the next commit or an eviction — so one
+                // transient storage error during ontology extraction would
+                // persist as quiet under-derivation.
+                owl_failed = true;
             }
         }
     }
@@ -416,9 +433,10 @@ pub async fn compute_derived_facts(
                 duration_ms = dl_diag.duration.as_millis() as u64,
                 "datalog rule materialization hit its budget before reaching \
                  fixpoint; query results may be missing derived facts. \
-                 Raise the budget via f:reasoningMaxFacts/f:reasoningMaxSeconds \
-                 (ledger config), \"reasoningBudget\" (query), or \
-                 FLUREE_REASONING_MAX_FACTS/FLUREE_REASONING_MAX_SECONDS (server)."
+                 Raise the budget via f:reasoningMaxFacts/f:reasoningMaxSeconds/\
+                 f:reasoningMaxMemoryMb (ledger config), \"reasoningBudget\" (query), or \
+                 FLUREE_REASONING_MAX_FACTS/FLUREE_REASONING_MAX_SECONDS/\
+                 FLUREE_REASONING_MAX_MEMORY_MB (server)."
             );
         } else {
             tracing::debug!(
@@ -453,7 +471,15 @@ pub async fn compute_derived_facts(
     let mut builder = DerivedFactsBuilder::with_capacity(all_flakes.len());
     builder.extend(all_flakes);
     let derived_overlay = Arc::new(builder.build(same_as, overlay.epoch()));
-    if let Some(key) = datalog_key {
+    // A time cap depends on machine load — a GC pause, a noisy neighbour, a
+    // cold cache — not on the inputs, so the same query could be served a
+    // different closure depending on what else the box was doing when it first
+    // ran. Fact, memory and iteration caps are deterministic functions of the
+    // inputs, so those are safe to cache.
+    let capped_by_clock = diagnostics
+        .as_ref()
+        .is_some_and(|d| d.capped_reason.as_deref() == Some("time"));
+    if let Some(key) = datalog_key.filter(|_| !owl_failed && !capped_by_clock) {
         cache.insert(
             key,
             Arc::new(ReasoningResult {

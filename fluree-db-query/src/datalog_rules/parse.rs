@@ -557,7 +557,13 @@ fn head_value_object(
         };
         let tag: Arc<str> = Arc::from(fluree_db_core::normalize_lang_tag(lang).as_ref());
         let datatype = DatatypeConstraint::LangTag(tag.clone()).datatype().clone();
-        return Ok(literal(FlakeValue::String(s.clone()), datatype, Some(tag)));
+        return coerced_literal(
+            FlakeValue::String(s.clone()),
+            datatype,
+            Some(tag),
+            snapshot,
+            label,
+        );
     }
     let explicit_dt = match map.get("@type").and_then(|t| t.as_str()) {
         Some("@id") => {
@@ -595,15 +601,81 @@ fn head_value_object(
             ))
         }
     };
-    Ok(literal(value, explicit_dt.unwrap_or(default_dt), None))
+    coerced_literal(
+        value,
+        explicit_dt.unwrap_or(default_dt),
+        None,
+        snapshot,
+        label,
+    )
 }
 
+/// Build a head literal whose value and datatype were derived together, and so
+/// agree by construction (a JSON string with `xsd:string`, a JSON number with
+/// `xsd:integer`). Nothing to reconcile.
 fn literal(value: FlakeValue, datatype: Sid, lang: Option<Arc<str>>) -> HeadTerm {
     HeadTerm::Literal {
         value,
         datatype,
         lang,
     }
+}
+
+/// Build a head literal whose datatype the author DECLARED, coercing the value
+/// to it.
+///
+/// Without this a head writes the value exactly as it was spelled, tagged with
+/// a datatype it does not match: `{"@value": "2024-01-01", "@type": "xsd:date"}`
+/// derived a `FlakeValue::String` whose datatype said `xsd:date`. It reads back
+/// wrong in ways that are hard to attribute — `DATATYPE(?d)` says date, but
+/// `YEAR(?d)` is unbound, range comparisons against real dates do not line up,
+/// and the fact does not dedup against the same value asserted through a
+/// transaction, which coerces. The query lowering has always coerced template
+/// literals; rule heads are templates too, so they go through the same
+/// conversion, at parse time, on both surfaces.
+///
+/// Language-tagged strings are exempt: `rdf:langString` is a string by
+/// definition and has no other representation to coerce to.
+fn coerced_literal(
+    value: FlakeValue,
+    datatype: Sid,
+    lang: Option<Arc<str>>,
+    snapshot: &LedgerSnapshot,
+    label: &str,
+) -> Result<HeadTerm> {
+    if lang.is_some() {
+        return Ok(HeadTerm::Literal {
+            value,
+            datatype,
+            lang,
+        });
+    }
+    let Some(datatype_iri) = snapshot.decode_sid(&datatype) else {
+        // An unregistered datatype cannot be coerced against; the head's
+        // datatype Sid was minted from an IRI the caller already resolved, so
+        // this is only reachable for a namespace the ledger has never seen.
+        return Ok(HeadTerm::Literal {
+            value,
+            datatype,
+            lang,
+        });
+    };
+    let value =
+        crate::parse::lower::coerce_value_by_datatype(value, &datatype_iri).map_err(|e| {
+            invalid(
+                label,
+                format!(
+                    "the insert clause has a literal that is not a valid <{datatype_iri}>: {e}. \
+                 A head derives the value as written, so a value its datatype does not \
+                 accept would be stored mislabelled"
+                ),
+            )
+        })?;
+    Ok(HeadTerm::Literal {
+        value,
+        datatype,
+        lang,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -628,7 +700,7 @@ fn head_from_triple(
                 .map(|d| d.datatype().clone())
                 .unwrap_or_else(|| default_datatype(value));
             let lang = tp.dtc.as_ref().and_then(|d| d.lang_tag().map(Arc::from));
-            literal(value.clone(), datatype, lang)
+            coerced_literal(value.clone(), datatype, lang, snapshot, label)?
         }
     };
     Ok(RuleHead {

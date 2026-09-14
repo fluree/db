@@ -109,9 +109,9 @@ used to skip that head with a warning).
 
 Filter operands keep the fail-closed semantics introduced for #1556: an
 unquoted operand naming a prefix the rule's context does not define, or a
-namespace the ledger has never seen, rejects the rule; a bare word compared
-against a variable that only occurs in IRI position is rejected with the two
-rewrites (quote it for a string, prefix it for an IRI).
+namespace the ledger has never seen, rejects the rule; a bare word is rejected outright, in any position,
+with the two rewrites (quote it for a string, prefix it for an IRI) — the
+linter does not try to infer whether an IRI was plausible there.
 
 Two more fail-closed checks close the silent shapes #1558 catalogued. A
 `@`-prefixed key the query parser gives no meaning to in that position
@@ -154,7 +154,7 @@ OWL-only result stays cached under its own key as before.
 
 The fact cap is checked inside a round, not only between rounds. Memory is now
 accounted: each derived flake adds an estimate of its heap footprint, and
-exceeding `max_memory_bytes` (the documented 100 MB default) caps the
+exceeding `max_memory_bytes` (derived from the fact ceiling) caps the
 materialization with `capped_reason: "memory"`. The derived overlay no longer
 keeps four sorted copies of every flake; it keeps one sorted array and three
 index permutations.

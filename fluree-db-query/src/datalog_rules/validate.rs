@@ -67,16 +67,12 @@ fn walk_patterns(patterns: &[Pattern], snapshot: &LedgerSnapshot, rule: &str) ->
             Pattern::NotExists(_) => {
                 return Err(non_monotonic(rule, "NOT EXISTS (`not-exists`)"));
             }
-            Pattern::Service(_) => {
-                return Err(reject(
-                    rule,
-                    "the body uses SERVICE, which is not allowed in a rule body \
-                     (rules derive over local data only)",
-                ));
-            }
-            Pattern::Filter(expr) => check_expr(expr, snapshot, rule, false)?,
-            Pattern::Bind { expr, .. } => check_expr(expr, snapshot, rule, false)?,
-            Pattern::Unwind { list, .. } => check_expr(list, snapshot, rule, false)?,
+            Pattern::Filter(expr) => check_expr(expr, snapshot, rule, ExprPos::Positive)?,
+            // A bound value is not a truth value: an `EXISTS` here is
+            // negatable later by anything that reads the variable, and the
+            // walk cannot follow it, so `EXISTS` is opaque throughout.
+            Pattern::Bind { expr, .. } => check_expr(expr, snapshot, rule, ExprPos::Opaque)?,
+            Pattern::Unwind { list, .. } => check_expr(list, snapshot, rule, ExprPos::Opaque)?,
             Pattern::Union(branches) => {
                 for branch in branches {
                     walk_patterns(branch, snapshot, rule)?;
@@ -91,6 +87,31 @@ fn walk_patterns(patterns: &[Pattern], snapshot: &LedgerSnapshot, rule: &str) ->
             | Pattern::AnnotationTarget { body: inner, .. } => {
                 walk_patterns(inner, snapshot, rule)?;
             }
+            // Graph-source patterns read data from outside the ledger's own
+            // flakes. Rule bodies run with a default `ContextConfig` (no
+            // graph-source providers), and whatever they would read is not
+            // part of the reasoning cache key, so a derived fact could be
+            // served from cache long after its source changed. Rejected by
+            // name until both are true.
+            //
+            // Defensive: no JSON-LD or SPARQL rule surface builds these today
+            // (full-text search, for one, is a BIND-position scoring function
+            // rather than a where-pattern), so there is nothing to write a
+            // rule against. The protection that matters is the exhaustive
+            // match itself — a surface that starts producing one has to come
+            // back here first.
+            Pattern::R2rml(_) => return Err(non_local(rule, "an R2RML graph source")),
+            Pattern::Service(_) => {
+                return Err(reject(
+                    rule,
+                    "the body uses SERVICE, which is not allowed in a rule body \
+                     (rules derive over local data only)",
+                ))
+            }
+            Pattern::IndexSearch(_) => return Err(non_local(rule, "a full-text index search")),
+            Pattern::VectorSearch(_) => return Err(non_local(rule, "a vector search")),
+            Pattern::GeoSearch(_) => return Err(non_local(rule, "a geo search")),
+            Pattern::S2Search(_) => return Err(non_local(rule, "an S2 cell search")),
             Pattern::Subquery(sub) => {
                 // A subquery carries its own modifiers, and two of them break a
                 // fixpoint. GROUP BY / aggregates are non-monotonic for the
@@ -124,10 +145,29 @@ fn walk_patterns(patterns: &[Pattern], snapshot: &LedgerSnapshot, rule: &str) ->
                 }
                 walk_patterns(&sub.patterns, snapshot, rule)?;
             }
-            _ => {}
+            // Leaves: nothing to walk. Listed rather than matched by a
+            // wildcard so a new `Pattern` variant is a compile error here
+            // until someone decides what it means inside a fixpoint — the
+            // expression walk carries the same property for the same reason.
+            Pattern::Triple(_)
+            | Pattern::Values { .. }
+            | Pattern::PropertyPath(_)
+            | Pattern::ShortestPath(_) => {}
         }
     }
     Ok(())
+}
+
+/// A construct that reads data the fixpoint neither owns nor keys.
+fn non_local(rule: &str, construct: &str) -> QueryError {
+    reject(
+        rule,
+        &format!(
+            "the body uses {construct}, which is not allowed in a rule body: it reads data \
+             the fixpoint does not own, and the reasoning cache key does not cover that data, \
+             so a derived fact could outlive the source it came from"
+        ),
+    )
 }
 
 fn non_monotonic(rule: &str, construct: &str) -> QueryError {
@@ -141,15 +181,53 @@ fn non_monotonic(rule: &str, construct: &str) -> QueryError {
     )
 }
 
+/// Where an expression's truth value ends up, which is what decides whether
+/// an `EXISTS` inside it is monotone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExprPos {
+    /// The value is used directly as a positive truth value — the whole of a
+    /// `FILTER`, or an operand of `AND` / `OR` in such a position. An `EXISTS`
+    /// here only ever admits more rows as the fixpoint derives more, so it is
+    /// monotone and allowed.
+    Positive,
+    /// The value is negated an odd number of times. An `EXISTS` here excludes
+    /// rows, which a fixpoint cannot evaluate soundly without stratification.
+    Negative,
+    /// Anywhere else: a comparison operand, an `IF` branch, a function
+    /// argument, a bound value. The truth value is consumed by something this
+    /// walk does not model, so it cannot show the `EXISTS` is monotone.
+    Opaque,
+}
+
+impl ExprPos {
+    /// Under a `NOT`. Negation flips a truth value; it tells us nothing new
+    /// about one we could not read in the first place.
+    fn negated(self) -> Self {
+        match self {
+            ExprPos::Positive => ExprPos::Negative,
+            ExprPos::Negative => ExprPos::Positive,
+            ExprPos::Opaque => ExprPos::Opaque,
+        }
+    }
+}
+
 /// Walk a filter/bind expression for constructs a fixpoint cannot evaluate.
 ///
-/// Two things are rejected. A negated EXISTS is negation, and it spells itself
-/// more than one way: `NOT EXISTS { … }` lowers to `Exists { negated: true }`,
-/// while `!EXISTS { … }` lowers to `Not` wrapping a plain `Exists`. `negated`
-/// carries the parity of the `Not` wrappers seen so far, so both spellings —
-/// and any odd nesting of `Not` around either — are caught, while `!!EXISTS`
-/// stays allowed because it is monotone. And an `IRI(…)` constant naming a
-/// namespace the ledger has never seen is fail-open in `!=` form.
+/// Two things are rejected. The first is negation, and the point of `ExprPos`
+/// is that negation is not only spelled `NOT`. Counting `Not` wrappers catches
+/// `NOT EXISTS`, `!EXISTS` and any odd nesting, but misses every other way to
+/// consume a truth value: `FILTER(EXISTS {…} = false)`, `IF(EXISTS {…}, false,
+/// true)`, and `BIND(EXISTS {…} AS ?e) FILTER(!?e)` are all negation, and all
+/// three derived facts under a parity-only check. Enumerating the negating
+/// operators cannot work either, since `BIND` lets the negation happen
+/// arbitrarily far away. So the rule is inverted: an `EXISTS` is allowed only
+/// where it is *demonstrably* positive, and every other position rejects. That
+/// is conservative — `FILTER(EXISTS {…} = true)` is monotone and is refused —
+/// but it fails toward a named error rather than a wrong answer that then gets
+/// cached.
+///
+/// The second is an `IRI(…)` constant naming a namespace the ledger has never
+/// seen, which is fail-open in `!=` form.
 ///
 /// The match is deliberately exhaustive rather than falling through on a
 /// wildcard: every variant that can hold a sub-expression or a pattern is
@@ -161,17 +239,30 @@ fn check_expr(
     expr: &Expression,
     snapshot: &LedgerSnapshot,
     rule: &str,
-    negated: bool,
+    pos: ExprPos,
 ) -> Result<()> {
     match expr {
         Expression::Exists {
             patterns,
             negated: inner,
         } => {
-            if negated ^ *inner {
-                return Err(non_monotonic(rule, "NOT EXISTS inside FILTER"));
+            // `NOT EXISTS { … }` lowers with `negated: true`; `!EXISTS { … }`
+            // lowers as `Not` over a plain `Exists` and arrives here already
+            // flipped by `ExprPos::negated`.
+            let effective = if *inner { pos.negated() } else { pos };
+            match effective {
+                ExprPos::Positive => walk_patterns(patterns, snapshot, rule),
+                ExprPos::Negative => Err(non_monotonic(rule, "NOT EXISTS inside FILTER")),
+                ExprPos::Opaque => Err(reject(
+                    rule,
+                    "the body uses EXISTS somewhere its truth value is not read directly — \
+                     as a comparison operand, an IF branch, a function argument, or a bound \
+                     variable. Written that way it can be negated (`EXISTS {…} = false`, \
+                     `IF(EXISTS {…}, false, true)`, `BIND(EXISTS {…} AS ?e) FILTER(!?e)`), and \
+                     a fixpoint cannot evaluate negation soundly without stratification. Use \
+                     EXISTS as the filter condition itself, optionally under AND / OR",
+                )),
             }
-            walk_patterns(patterns, snapshot, rule)
         }
         Expression::Call { func, args } => {
             if matches!(func, Function::Iri) {
@@ -189,9 +280,15 @@ fn check_expr(
                     }
                 }
             }
-            let inner_negated = negated ^ matches!(func, Function::Not);
+            // AND / OR pass a truth value straight through; NOT flips it;
+            // everything else consumes it in a way this walk cannot model.
+            let inner = match func {
+                Function::And | Function::Or => pos,
+                Function::Not => pos.negated(),
+                _ => ExprPos::Opaque,
+            };
             for arg in args {
-                check_expr(arg, snapshot, rule, inner_negated)?;
+                check_expr(arg, snapshot, rule, inner)?;
             }
             Ok(())
         }
@@ -204,30 +301,30 @@ fn check_expr(
         )),
         Expression::Map(entries) => entries
             .iter()
-            .try_for_each(|(_, v)| check_expr(v, snapshot, rule, negated)),
+            .try_for_each(|(_, v)| check_expr(v, snapshot, rule, ExprPos::Opaque)),
         Expression::ListComprehension {
             list, filter, map, ..
         } => {
-            check_expr(list, snapshot, rule, negated)?;
+            check_expr(list, snapshot, rule, ExprPos::Opaque)?;
             for part in [filter, map].into_iter().flatten() {
-                check_expr(part, snapshot, rule, negated)?;
+                check_expr(part, snapshot, rule, ExprPos::Opaque)?;
             }
             Ok(())
         }
         Expression::Reduce {
             init, list, body, ..
         } => {
-            check_expr(init, snapshot, rule, negated)?;
-            check_expr(list, snapshot, rule, negated)?;
-            check_expr(body, snapshot, rule, negated)
+            check_expr(init, snapshot, rule, ExprPos::Opaque)?;
+            check_expr(list, snapshot, rule, ExprPos::Opaque)?;
+            check_expr(body, snapshot, rule, ExprPos::Opaque)
         }
         Expression::ListPredicate {
             list, predicate, ..
         } => {
-            check_expr(list, snapshot, rule, negated)?;
-            check_expr(predicate, snapshot, rule, negated)
+            check_expr(list, snapshot, rule, ExprPos::Opaque)?;
+            check_expr(predicate, snapshot, rule, ExprPos::Opaque)
         }
-        Expression::Member { target, .. } => check_expr(target, snapshot, rule, negated),
+        Expression::Member { target, .. } => check_expr(target, snapshot, rule, ExprPos::Opaque),
         // Leaves: nothing to walk. `Resolved` is runtime-only and never
         // reaches a rule body at parse time.
         Expression::Var(_) | Expression::Const(_) | Expression::Resolved(_) => Ok(()),

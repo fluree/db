@@ -326,6 +326,13 @@ Rejected:
 - **`LIMIT` / `OFFSET`**, on the body or on a subquery inside it: which
   solutions a slice keeps depends on how much the fixpoint has derived so far,
   so the rule would derive different facts depending on round order.
+- **Graph-source patterns** (R2RML, SERVICE, full-text / vector / geo / S2
+  search): they read data the fixpoint does not own and the reasoning cache
+  key does not cover, so a derived fact could outlive the source it came from.
+- **A head literal its datatype cannot accept.** Head literals are coerced to
+  their declared datatype, the same conversion a transaction applies, so a
+  derived `xsd:date` really is a date. A value the datatype rejects fails the
+  rule rather than being stored mislabelled.
 - **Filter operands that cannot match**: a bare unquoted word, an undefined
   prefix, or a namespace the ledger has never seen (see
   [Filter operands](#filter-operands)).
@@ -339,10 +346,20 @@ paths and subqueries are all allowed. A subquery may use `DISTINCT` and
 not `GROUP BY`, aggregates, `LIMIT` or `OFFSET`, which are rejected by name
 like any other non-monotonic construct.
 
-Negation is rejected in every spelling it has. `NOT EXISTS { … }`,
-`["not-exists", …]` and `FILTER(!EXISTS { … })` all name the same construct to
-the engine, and any odd nesting of `!` around an `EXISTS` is negation too.
-`FILTER(!(!EXISTS { … }))` is not, and still runs.
+Negation is rejected in every spelling, and the rule is positional rather than
+a list of negating operators. An `EXISTS` is allowed only where its truth value
+is read directly and positively: as the filter condition itself, or under `AND`
+/ `OR` in such a position. Anywhere else it is rejected — as a comparison
+operand (`FILTER(EXISTS { … } = false)`), as an `IF` branch, as a function
+argument, or bound to a variable (`BIND(EXISTS { … } AS ?e)`), because each of
+those can negate it and a fixpoint cannot evaluate negation soundly without
+stratification. `FILTER(NOT EXISTS { … })`, `["not-exists", …]` and
+`FILTER(!EXISTS { … })` are all the same construct to the engine; an even
+number of `!` is not negation, so `FILTER(!(!EXISTS { … }))` still runs.
+
+The rule is deliberately conservative: `FILTER(EXISTS { … } = true)` is
+monotone and is still refused, because the check cannot tell it from its
+negated twin. It fails toward a named error rather than a wrong answer.
 
 ## Examples
 
@@ -508,7 +525,7 @@ This means:
   Configure it with `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` /
   `f:reasoningMaxMemoryMb` (ledger
   config), `"reasoningBudget"` (query), or `FLUREE_REASONING_MAX_FACTS` /
-  `FLUREE_REASONING_MAX_SECONDS` (server).
+  `FLUREE_REASONING_MAX_SECONDS` / `FLUREE_REASONING_MAX_MEMORY_MB` (server).
 
 ### Execution order
 
@@ -532,7 +549,8 @@ When both OWL 2 RL and Datalog are enabled:
   ordering as any query, so the usual query advice applies: put a selective
   pattern in the body, and prefer bound predicates.
 - **Budget limits apply.** The same time / fact / memory budgets as OWL 2 RL
-  materialization apply to Datalog execution (default: 30s, 1M facts, 100MB).
+  materialization apply to Datalog execution (default: 30s and 1M derived
+  facts, with a memory ceiling derived from the fact ceiling).
 - **Results are cached.** A materialization is cached per ledger state and
   rule set: the same rules (stored or query-time, hashed by content) against
   an unchanged ledger return instantly from the reasoning cache. Any commit

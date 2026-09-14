@@ -203,10 +203,20 @@ impl DerivedSet {
         true
     }
 
-    /// Check if a flake already exists
+    /// Check if a flake is already accounted for — either derived this run or
+    /// present in the base data the fixpoint was seeded with.
+    ///
+    /// Consulting `base_keys` as well as `seen` is what keeps a rule from
+    /// re-proposing a fact the ledger already stores. In round 1 the seed is
+    /// registered only in `base_keys` (it merges into `seen` at the end of the
+    /// round), so without this a ledger that stores its own entailments —
+    /// symmetric edges written both ways, a `Student` also typed `Person` —
+    /// pushed every re-derived fact into the round's delta, where the in-round
+    /// cap counted it. A closure deriving nothing new could report
+    /// `capped: "facts"`, and the truncated result was then cached.
     pub fn contains(&self, s: &Sid, p: &Sid, o: &FlakeValue) -> bool {
         let key = (s.clone(), p.clone(), Self::object_hash(o));
-        self.seen.contains(&key)
+        self.seen.contains(&key) || self.base_keys.contains(&key)
     }
 
     /// Get all flakes with a specific predicate

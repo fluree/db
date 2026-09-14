@@ -358,6 +358,129 @@ async fn bang_exists_is_rejected_like_not_exists() {
 }
 
 #[tokio::test]
+async fn typed_literals_in_a_rule_head_are_coerced_to_their_datatype() {
+    // A head used to write the value exactly as spelled, tagged with a
+    // datatype it did not match: `{"@value": "2024-01-01", "@type": "xsd:date"}`
+    // derived a string labelled `xsd:date`. `DATATYPE()` said date while
+    // `YEAR()` was unbound — the same value asserted through a transaction
+    // coerces, so the derived fact did not even dedup against it. `YEAR()` is
+    // the sharpest probe: it binds only for a real date.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/head-typed-literal").await;
+    let q = json!({
+        "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+        "select": ["?y"],
+        "where": [
+            {"@id": "ex:alice", "ex:joined": "?d"},
+            ["bind", "?y", "(year ?d)"]
+        ],
+        "reasoning": "datalog",
+        "rules": [{
+            "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+            "where": {"@id": "?a", "ex:knows": {"@id": "?b"}},
+            "insert": {"@id": "?a", "ex:joined": {"@value": "2024-01-01", "@type": "xsd:date"}}
+        }]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("query over the derived date")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let cell = rows[0].as_array().map_or(&rows[0], |r| &r[0]);
+    assert_eq!(
+        cell.as_i64(),
+        Some(2024),
+        "YEAR() must bind on the derived date, which it only does for a real \
+         xsd:date rather than a string wearing its label: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn a_head_literal_its_datatype_rejects_fails_the_rule() {
+    // Coercion is also a validity check: a value the declared datatype cannot
+    // accept would otherwise be stored mislabelled.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/head-bad-literal").await;
+    let message = rejection(
+        &fluree,
+        &ledger,
+        json!([{
+            "@context": {"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"},
+            "where": {"@id": "?a", "ex:knows": {"@id": "?b"}},
+            "insert": {"@id": "?a", "ex:joined": {"@value": "not-a-date", "@type": "xsd:date"}}
+        }]),
+    )
+    .await;
+    assert!(
+        message.contains("date"),
+        "unexpected rejection message: {message}"
+    );
+}
+
+#[tokio::test]
+async fn exists_outside_a_positive_position_is_rejected() {
+    // Counting `Not` wrappers is not enough: a truth value can be negated by
+    // anything that reads it. Each of these derived facts under a parity-only
+    // check, and each is negation — the first by comparison, the second by a
+    // branch, the third by carrying the value into a variable and negating it
+    // somewhere the walk cannot follow.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/reject/exists-positions").await;
+    for (label, body) in [
+        (
+            "compared against a boolean",
+            "?a ex:knows ?b . FILTER(EXISTS { ?b ex:knows ?c } = false)",
+        ),
+        (
+            "an IF branch",
+            "?a ex:knows ?b . FILTER(IF(EXISTS { ?b ex:knows ?c }, false, true))",
+        ),
+        (
+            "bound to a variable, negated later",
+            "?a ex:knows ?b . BIND(EXISTS { ?b ex:knows ?c } AS ?e) FILTER(!?e)",
+        ),
+    ] {
+        let message = rejection(
+            &fluree,
+            &ledger,
+            json!([{
+                "@type": "f:sparql",
+                "@value": format!(
+                    "PREFIX ex: <http://example.org/> \
+                     CONSTRUCT {{ ?a ex:trustedKnows ?b }} WHERE {{ {body} }}"
+                )
+            }]),
+        )
+        .await;
+        assert!(
+            message.contains("EXISTS"),
+            "{label}: unexpected rejection message: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn exists_under_and_or_stays_allowed() {
+    // The rule is positional, not a ban: AND and OR pass a truth value
+    // through unchanged, so an EXISTS under them is still monotone and must
+    // still run. Without this, the rejection tests above would also pass
+    // against a blanket ban on EXISTS.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/allow/exists-under-and").await;
+    let rules = json!([{
+        "@type": "f:sparql",
+        "@value": "PREFIX ex: <http://example.org/> \
+                   CONSTRUCT { ?a ex:trustedKnows ?b } \
+                   WHERE { ?a ex:knows ?b {| ex:confidence ?c |} \
+                           FILTER(?c > 0.85 && EXISTS { ?a ex:knows ?b }) }"
+    }]);
+    assert_eq!(
+        trusted_pairs(&fluree, &ledger, rules).await,
+        expected_trusted()
+    );
+}
+
+#[tokio::test]
 async fn double_negated_exists_stays_allowed() {
     // The check tracks the PARITY of the `Not` wrappers rather than banning
     // `Exists` outright: `!!EXISTS` is monotone, so it must still run. A
@@ -714,6 +837,100 @@ async fn jsonld_query_filter_compares_iris_by_identity() {
     assert!(
         results.iter().any(|r| r[1] == json!("ex:source")),
         "`!=` against an IRI must keep the other predicates, got {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn unquoted_atoms_are_iris_only_where_terms_are_compared() {
+    // An unquoted atom means an IRI in exactly one place: as the operand of an
+    // RDF-term identity comparison. Letting the classifier reach every
+    // argument position broke string functions, `(count *)` in HAVING, and —
+    // worst — changed what a `bind` WRITES. Each row below is a position the
+    // classifier must NOT claim.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/atom-positions").await;
+
+    // String functions take strings. `ex:knows` as a string prefix of the
+    // predicate's IRI text would match nothing if it were lowered to an IRI,
+    // and the comparison would be a type error rather than a false.
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?s"],
+        "where": [
+            {"@id": "?s", "?p": {"@id": "?o"}},
+            ["filter", "(strStarts (str ?p) http://example.org/kn)"]
+        ]
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("an unquoted URL inside strStarts stays a string")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        rows.as_array().map(std::vec::Vec::len).unwrap_or(0),
+        3,
+        "strStarts must still match on the IRI's text: {rows}"
+    );
+
+    // `(count *)` in HAVING: `*` is an aggregate marker, not a term.
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?s", "(as (count ?o) ?n)"],
+        "where": {"@id": "?s", "ex:knows": {"@id": "?o"}},
+        "groupBy": ["?s"],
+        "having": "(> (count *) 0)"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("(count *) in HAVING must still parse")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert!(
+        rows.as_array().map(std::vec::Vec::len).unwrap_or(0) > 0,
+        "HAVING (count *) must keep its groups: {rows}"
+    );
+
+    // And the position that decides what a transaction WRITES: a bare URL
+    // bound by `bind` is a literal, as it was before 4.2, not a ref.
+    let written = fluree
+        .insert(
+            genesis_ledger(&fluree, "rules/atom-positions-bind"),
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:a", "ex:seed": 1}),
+        )
+        .await
+        .expect("seed");
+    let updated = fluree
+        .update(
+            written.ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "where": [
+                    {"@id": "?s", "ex:seed": "?v"},
+                    ["bind", "?link", "http://example.org/home"]
+                ],
+                "insert": {"@id": "?s", "ex:link": "?link"}
+            }),
+        )
+        .await
+        .expect("bind update");
+    let rows = support::query_jsonld(
+        &fluree,
+        &updated.ledger,
+        &json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": ["?l"],
+            "where": {"@id": "ex:a", "ex:link": "?l"}
+        }),
+    )
+    .await
+    .expect("read back")
+    .to_jsonld(&updated.ledger.snapshot)
+    .unwrap();
+    let cell = rows[0].as_array().map_or(&rows[0], |r| &r[0]);
+    assert_eq!(
+        cell.as_str(),
+        Some("http://example.org/home"),
+        "a bound bare URL must be written as a literal, not a ref: {rows}"
     );
 }
 

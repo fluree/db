@@ -49,8 +49,15 @@ pub fn parse_s_expression(s: &str) -> Result<UnresolvedExpression> {
         if let Some(callee) = sparql_style_callee(s) {
             return Err(sparql_call_syntax_error(callee, s));
         }
-        // Could be a simple value
-        return parse_s_expression_atom(s);
+        // A bare expression is a VALUE — the whole of a `bind` or `unwind`
+        // operand — not a comparison operand, so it keeps its pre-4.2 string
+        // meaning. Classifying it here would change what a transaction
+        // WRITES: `["bind", "?link", "http://example.org/home"]` would insert
+        // a ref where it used to insert a literal.
+        let mut atom = [parse_s_expression_atom(s)?];
+        demote_iri_atoms(&mut atom);
+        let [atom] = atom;
+        return Ok(atom);
     }
 
     // Remove outer parens
@@ -80,8 +87,13 @@ pub fn parse_s_expression(s: &str) -> Result<UnresolvedExpression> {
         });
     }
 
-    // Parse arguments
-    let args = parse_s_expression_args(rest)?;
+    // Parse arguments, then keep the IRI classification only where an RDF
+    // term comparison is actually being made (see `compares_rdf_terms`).
+    let mut args = parse_s_expression_args(rest)?;
+    if !compares_rdf_terms(&op_lower) {
+        demote_iri_atoms(&mut args);
+    }
+    let args = args;
 
     // Helper closure to clone already-parsed expressions
     let clone_expr = |e: &UnresolvedExpression| -> Result<UnresolvedExpression> { Ok(e.clone()) };
@@ -248,6 +260,45 @@ fn classify_unquoted_atom(s: &str) -> UnresolvedExpression {
         return UnresolvedExpression::Const(UnresolvedFilterValue::Curie(Arc::from(s)));
     }
     UnresolvedExpression::Const(UnresolvedFilterValue::Bare(Arc::from(s)))
+}
+
+/// Operators whose operands are compared as RDF *terms*, and so are the only
+/// places an unquoted atom may mean an IRI.
+///
+/// Everywhere else an unquoted atom is the string it has always been. Without
+/// this restriction the classifier reaches every argument position, which is
+/// both wrong and a regression: `(strStarts (str ?s) http://example.org/p/)`
+/// compares a string against an IRI and matches nothing, `(concat ?a <-> ?b)`
+/// builds `IRI("-")`, `(count *)` in HAVING stops being a `*`, and a
+/// `["bind", "?link", "http://example.org/home"]` writes a ref where it used
+/// to write a literal. Identity comparison is the one position where an IRI
+/// operand is both meaningful and what the author must have meant — a string
+/// could never have matched an IRI-valued variable there.
+fn compares_rdf_terms(op_lower: &str) -> bool {
+    matches!(
+        op_lower,
+        "=" | "eq" | "!=" | "<>" | "ne" | "in" | "not-in" | "notin" | "sameterm"
+    )
+}
+
+/// Demote IRI-ish classifications back to plain strings, one level deep.
+///
+/// Only the immediate operands are touched: a nested expression was already
+/// dispatched by its own operator and carries whatever that position decided.
+fn demote_iri_atoms(args: &mut [UnresolvedExpression]) {
+    for arg in args {
+        if let UnresolvedExpression::Const(value) = arg {
+            let text = match value {
+                UnresolvedFilterValue::Iri(t)
+                | UnresolvedFilterValue::Curie(t)
+                | UnresolvedFilterValue::Bare(t) => Some(t.to_string()),
+                _ => None,
+            };
+            if let Some(text) = text {
+                *arg = UnresolvedExpression::string(text);
+            }
+        }
+    }
 }
 
 /// Parse arguments in an S-expression
@@ -449,7 +500,11 @@ fn list_tokens_to_expr(items: &[SexprToken]) -> Result<UnresolvedExpression> {
     let clone_expr = |e: &UnresolvedExpression| -> Result<UnresolvedExpression> { Ok(e.clone()) };
     let parsed: Result<Vec<UnresolvedExpression>> =
         arg_tokens.iter().map(expr_from_sexpr_token).collect();
-    let args = parsed?;
+    let mut args = parsed?;
+    if !compares_rdf_terms(&op_lower) {
+        demote_iri_atoms(&mut args);
+    }
+    let args = args;
 
     match op_lower.as_str() {
         op @ ("=" | "eq" | "!=" | "<>" | "ne" | "<" | "lt" | "<=" | "le" | ">" | "gt" | ">="
