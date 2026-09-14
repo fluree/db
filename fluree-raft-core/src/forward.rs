@@ -585,6 +585,106 @@ mod tests {
 
     use super::*;
 
+    openraft::declare_raft_types!(
+        pub RelayTestConfig:
+            D = String,
+            R = String,
+            NodeId = NodeId,
+            Node = ClusterNode,
+            Entry = openraft::Entry<RelayTestConfig>,
+            SnapshotData = std::io::Cursor<Vec<u8>>,
+            AsyncRuntime = openraft::TokioRuntime,
+    );
+
+    #[tokio::test]
+    async fn propose_timeout_is_unknown_after_server_receives_command() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let app = axum::Router::new().route(
+            "/propose",
+            axum::routing::post(move |_: axum::body::Bytes| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    // The command has reached the peer, but its response
+                    // takes longer than the caller is willing to wait.
+                    std::future::pending::<String>().await
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = relay_propose::<RelayTestConfig>(
+            &url,
+            &"command".to_owned(),
+            Duration::from_millis(250),
+        )
+        .await;
+        server.abort();
+        assert!(
+            matches!(result, Err(ProposeError::Unknown(_))),
+            "{result:?}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn propose_connection_refused_is_retryable_and_can_recover() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+        drop(listener);
+        let command = "command".to_owned();
+        let result = relay_propose::<RelayTestConfig>(&url, &command, Duration::from_secs(2)).await;
+        assert!(matches!(result, Err(ProposeError::Relay(_))), "{result:?}");
+
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let app = axum::Router::new().route(
+            "/propose",
+            axum::routing::post(|| async { axum::Json("applied") }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = relay_propose::<RelayTestConfig>(&url, &command, Duration::from_secs(2)).await;
+        server.abort();
+        assert_eq!(result.unwrap(), "applied");
+    }
+
+    #[tokio::test]
+    async fn propose_503_requires_an_explicit_complete_rejection() {
+        let mut app = axum::Router::new();
+        for (path, body) in [
+            ("legacy", "not the leader; re-resolve and retry"),
+            ("empty", ""),
+            ("truncated", r#"{"error":"not_leader""#),
+            ("other", r#"{"error":"overloaded"}"#),
+            ("extra", r#"{"error":"not_leader","applied":true}"#),
+        ] {
+            app = app.route(
+                &format!("/{path}/propose"),
+                axum::routing::post(move || async move { (StatusCode::SERVICE_UNAVAILABLE, body) }),
+            );
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for path in ["legacy", "empty", "truncated", "other", "extra"] {
+            let result = relay_propose::<RelayTestConfig>(
+                &format!("{url}/{path}"),
+                &"command".to_owned(),
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ProposeError::Unknown(_))),
+                "{path}: {result:?}"
+            );
+        }
+        server.abort();
+    }
+
     /// A [`LeaderView`] with no Raft behind it.
     struct StubView {
         leader: Option<NodeId>,
@@ -923,7 +1023,9 @@ mod tests {
 
 // ─── Follower-side propose ───────────────────────────────────────────────
 
-/// Why [`propose_via_leader`] could not land a command.
+/// Why [`propose_via_leader`] could not return an application response.
+/// An error does not necessarily mean the command did not commit; see
+/// [`ProposeError::Unknown`].
 #[derive(Debug, thiserror::Error)]
 pub enum ProposeError {
     /// No leader is known — mid-election, or the group has no quorum.
@@ -932,19 +1034,32 @@ pub enum ProposeError {
     /// The membership-recorded leader address failed [`is_valid_leader_url`].
     #[error("leader address rejected: {0}")]
     BadLeaderAddress(String),
-    /// The relay could not reach the leader, or the leader refused.
+    /// Connection establishment failed, or the peer explicitly rejected
+    /// the command as not leader. These attempts cannot commit.
     #[error("propose relay failed: {0}")]
     Relay(String),
-    /// The local or relayed apply failed with an application error.
+    /// The command may have committed, but its result is unavailable.
+    /// Do not automatically replay it. Recovering the original response
+    /// requires application-level request IDs and replicated deduplication.
+    #[error("propose outcome unknown: {0}")]
+    Unknown(String),
+    /// The command could not be encoded or was rejected by the local API.
     #[error("{0}")]
     Apply(String),
 }
 
 /// Propose `cmd` to this group from ANY node: a plain `client_write` when
 /// this node leads, an HTTP relay of the JSON-encoded command to the
-/// leader's network router (`{raft_addr}/propose`) when it does not. One
-/// retry after a relayed "leadership moved" answer, with a fresh leader
-/// lookup in between.
+/// leader's network router (`{raft_addr}/propose`) when it does not. At most
+/// one retry, with a fresh leader lookup, when the previous attempt cannot
+/// commit: connection establishment failed or the peer explicitly rejected
+/// the command as not leader. Ambiguous outcomes are returned as
+/// [`ProposeError::Unknown`] without replaying the command.
+///
+/// A rejection requires a 503 with the JSON body `{"error":"not_leader"}`.
+/// A bare 503 (including an older peer's text response) is conservatively
+/// treated as unknown. During rolling upgrades this can reduce automatic
+/// retries until all peers support the explicit rejection.
 ///
 /// The wire is JSON in both directions — commands are constrained to
 /// postcard-safe shapes by the log, but RESPONSES never ride the log and
@@ -968,11 +1083,11 @@ where
                 let Some(node) = fwd.leader_node else {
                     return Err(ProposeError::NoLeader);
                 };
-                match relay_propose::<C>(&node.raft_addr, &cmd).await {
+                match relay_propose::<C>(&node.raft_addr, &cmd, Duration::from_secs(30)).await {
                     Ok(data) => return Ok(data),
                     Err(e @ ProposeError::Relay(_)) => {
-                        // Leadership may have moved mid-relay; loop for
-                        // one fresh lookup.
+                        // The previous attempt cannot commit. Re-resolve
+                        // leadership before the one permitted retry.
                         last_relay_error = Some(e);
                         continue;
                     }
@@ -983,14 +1098,18 @@ where
                 openraft::error::ClientWriteError::ChangeMembershipError(e),
             )) => return Err(ProposeError::Apply(format!("membership error: {e}"))),
             Err(openraft::error::RaftError::Fatal(f)) => {
-                return Err(ProposeError::Apply(format!("raft fatal: {f}")))
+                return Err(ProposeError::Unknown(format!("raft fatal: {f}")))
             }
         }
     }
     Err(last_relay_error.unwrap_or(ProposeError::NoLeader))
 }
 
-async fn relay_propose<C>(leader_raft_addr: &str, cmd: &C::D) -> Result<C::R, ProposeError>
+async fn relay_propose<C>(
+    leader_raft_addr: &str,
+    cmd: &C::D,
+    timeout: Duration,
+) -> Result<C::R, ProposeError>
 where
     C: crate::config::FlureeRaftConfig,
     C::D: serde::Serialize,
@@ -1003,7 +1122,8 @@ where
         reqwest::Client::builder()
             // Membership-supplied URL: never follow a redirect off it.
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(30))
+            // Keep replay decisions in propose_via_leader.
+            .retry(reqwest::retry::never())
             .build()
             .expect("propose relay client builds")
     });
@@ -1012,27 +1132,41 @@ where
         .map_err(|e| ProposeError::Apply(format!("command encode error: {e}")))?;
     let resp = client
         .post(&url)
+        .timeout(timeout)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(body)
         .send()
         .await
-        .map_err(|e| ProposeError::Relay(format!("POST {url}: {e}")))?;
+        .map_err(|e| {
+            if e.is_connect() {
+                ProposeError::Relay(format!("POST {url}: {e}"))
+            } else {
+                ProposeError::Unknown(format!("POST {url}: {e}"))
+            }
+        })?;
     let status = resp.status();
     let bytes = resp
         .bytes()
         .await
-        .map_err(|e| ProposeError::Relay(format!("read {url}: {e}")))?;
-    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        .map_err(|e| ProposeError::Unknown(format!("read {url}: {e}")))?;
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        && matches!(
+            serde_json::from_slice(&bytes),
+            Ok(crate::network::ProposeRejection::NotLeader {})
+        )
+    {
         return Err(ProposeError::Relay(format!(
             "leader at {url} stepped down mid-relay"
         )));
     }
     if !status.is_success() {
-        return Err(ProposeError::Apply(format!(
+        // Even a 500 can follow a successful apply: the peer may have
+        // failed to serialize the response. Status alone is not proof.
+        return Err(ProposeError::Unknown(format!(
             "{url} answered {status}: {}",
             String::from_utf8_lossy(&bytes)
         )));
     }
     serde_json::from_slice(&bytes)
-        .map_err(|e| ProposeError::Apply(format!("response decode error: {e}")))
+        .map_err(|e| ProposeError::Unknown(format!("response decode error: {e}")))
 }
