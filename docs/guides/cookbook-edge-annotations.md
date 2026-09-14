@@ -271,7 +271,7 @@ curl -X POST "http://localhost:8090/v1/fluree/upsert?ledger=mydb:main" \
   --data-binary '@claims.ttl'
 ```
 
-Name your reifiers (`~ ex:claim1`) when the file will be re-sent: an anonymous `{| |}` block mints a fresh reifier on every ingest, so a re-upsert adds a second claim on the edge instead of updating the first. The same applies to `fluree sync`: with named reifiers an unchanged payload is a no-op, while anonymous ones make every run commit a delta.
+Name your reifiers (`~ ex:claim1`) when the file will be re-sent and you want the claim replaced. An anonymous `{| |}` block has no identity to replace by, so re-sending an unchanged file is a no-op on both `upsert` and `fluree sync`, but re-sending it with a *changed* annotation body replaces the claim on sync and adds a second claim on upsert. See the table in [Turtle transactions](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star) for why the two differ.
 
 The same claim can be layered on afterwards with SPARQL UPDATE when the annotations come from a separate process:
 

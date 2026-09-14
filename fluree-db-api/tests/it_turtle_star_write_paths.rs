@@ -702,3 +702,83 @@ async fn re_upserting_parallel_annotations_is_a_no_op() {
         "an identical payload must not produce a commit"
     );
 }
+
+#[tokio::test]
+async fn an_unchanged_anonymous_claim_re_syncs_as_a_no_op() {
+    // The counterpart to `re_upserting_an_anonymous_annotation_replaces_it_
+    // rather_than_duplicating`, on the other delta-computing path. Sync's
+    // skolem scope is derived from the target graph, so the same source label
+    // mints the same reifier on every run and an unchanged payload cancels.
+    //
+    // The docs said anonymous reifiers make every sync run commit a delta.
+    // This is the test that decides whether that is true.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/turtle-star-sync:anon-noop";
+    fluree
+        .insert_turtle(
+            genesis_ledger(&fluree, ledger_id),
+            &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
+        )
+        .await
+        .expect("seed ledger");
+
+    let turtle = "ex:alice ex:knows ex:bob {| ex:confidence 0.9 |} .\n";
+    assert!(
+        sync(&fluree, ledger_id, turtle).await.expect("first sync"),
+        "the first sync must commit"
+    );
+    assert!(
+        !sync(&fluree, ledger_id, turtle)
+            .await
+            .expect("identical re-sync"),
+        "an unchanged anonymous-annotated payload must be a no-op"
+    );
+    assert_eq!(
+        annotated_knows(&fluree, ledger_id).await,
+        [("alice".into(), "bob".into(), "0.9".into())],
+        "and must leave exactly one claim"
+    );
+}
+
+#[tokio::test]
+async fn a_changed_anonymous_claim_body_is_replaced_on_sync() {
+    // Sync and upsert differ here, and the difference follows from where each
+    // one scopes its blank-node identity.
+    //
+    // Sync's scope is the target graph, so the same source label names the
+    // same reifier across payloads and a changed body lands on the claim that
+    // is already there. Upsert's scope is the payload, so a changed body is a
+    // different payload, mints a different reifier, and adds a second claim —
+    // pinned by `re_upserting_an_anonymous_annotation_replaces_it_rather_than_
+    // duplicating`. Naming the reifier gives replacement on both.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/turtle-star-sync:anon-changed-body";
+    fluree
+        .insert_turtle(
+            genesis_ledger(&fluree, ledger_id),
+            &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
+        )
+        .await
+        .expect("seed ledger");
+
+    sync(
+        &fluree,
+        ledger_id,
+        "ex:alice ex:knows ex:bob {| ex:confidence 0.9 |} .\n",
+    )
+    .await
+    .expect("first sync");
+    sync(
+        &fluree,
+        ledger_id,
+        "ex:alice ex:knows ex:bob {| ex:confidence 0.95 |} .\n",
+    )
+    .await
+    .expect("re-sync with a changed body");
+
+    assert_eq!(
+        annotated_knows(&fluree, ledger_id).await,
+        [("alice".into(), "bob".into(), "0.95".into())],
+        "sync must replace the claim's body, not add a second claim"
+    );
+}
