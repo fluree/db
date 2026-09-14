@@ -1042,6 +1042,23 @@ impl BinaryIndexStore {
 
         let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
 
+        // Fast path 0: the mapping is already shared through the cache, so no
+        // path needs resolving. Both local and promoted leaves land in the same
+        // cache under the same key, and the `stat` behind `resolve_local_path`
+        // was a tenth of a wide nested-loop probe once every leaf it touched
+        // was warm.
+        if let Some(mmap) = self
+            .leaflet_cache
+            .as_ref()
+            .and_then(|cache| cache.get_leaf_mmap(leaf_id))
+        {
+            let _ = mmap;
+            if false {
+                return Err(io::Error::other("x"));
+            }
+            return self.leaf_handle_from_mmap(mmap, leaf_id, sidecar_cid, need_replay);
+        }
+
         // Fast path 1: local filesystem — mmap so the raw bytes stay in OS page
         // cache (only touched pages fault in) with the directory served from the
         // shared cache. Avoids copying the whole (possibly grown) leaf blob and
@@ -1165,6 +1182,18 @@ impl BinaryIndexStore {
         } else {
             load()?
         };
+        self.leaf_handle_from_mmap(mmap, leaf_id, sidecar_cid, need_replay)
+    }
+
+    /// Build the handle for a leaf whose bytes are already mapped, sharing
+    /// the decoded directory through the cache.
+    fn leaf_handle_from_mmap(
+        &self,
+        mmap: Arc<memmap2::Mmap>,
+        leaf_id: u128,
+        sidecar_cid: Option<&ContentId>,
+        need_replay: bool,
+    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
         // Content-addressed directory: parse once per leaf CID, reused across
         // opens. `leaf_id` == xxh3_128(leaf_cid) is the same key `open_leaf_dir`
         // and warm-on-write use.
@@ -4214,6 +4243,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn open_leaf_handle_serves_a_cached_mapping_without_resolving_the_path() {
+        let store = LocalFileContentStore::new();
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            let leaf_bytes = leaf_bytes.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &leaf_bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+        let local_dir = temp_cache_dir();
+        let leaf_path = local_dir.join(format!("{leaf_cid}.fli"));
+        std::fs::write(&leaf_path, &leaf_bytes).expect("write local leaf file");
+        store.local.write().insert(leaf_cid.clone(), leaf_path);
+
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+
+        // The first open resolves the file and maps it into the shared cache.
+        let handle = binary_store
+            .open_leaf_handle(&leaf_cid, None, false)
+            .expect("first local open");
+        assert_eq!(handle.dir().entries.len(), 1);
+        assert_eq!(store.local_path_calls.load(AtomicOrdering::Relaxed), 1);
+        drop(handle);
+
+        // Every later open is served from the mapping: on the file store the
+        // path lookup is a `stat`, paid per leaf touch of a nested-loop probe.
+        for _ in 0..3 {
+            let handle = binary_store
+                .open_leaf_handle(&leaf_cid, None, false)
+                .expect("cached local open");
+            assert_eq!(handle.dir().entries.len(), 1);
+        }
+        assert_eq!(
+            store.local_path_calls.load(AtomicOrdering::Relaxed),
+            1,
+            "a cached mapping must not resolve the local path again"
+        );
+        assert_eq!(store.cas_calls.load(AtomicOrdering::Relaxed), 0);
+
+        let _ = std::fs::remove_dir_all(local_dir);
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
     fn open_leaf_dir_reads_prefix_only_and_caches() {
         let store = CountingContentStore::new();
         let leaf_bytes = build_test_leaf_bytes();
@@ -4277,6 +4357,7 @@ pub(crate) mod tests {
         inner: MemoryContentStore,
         local: Arc<RwLock<HashMap<ContentId, PathBuf>>>,
         cas_calls: Arc<AtomicUsize>,
+        local_path_calls: Arc<AtomicUsize>,
     }
 
     impl LocalFileContentStore {
@@ -4285,6 +4366,7 @@ pub(crate) mod tests {
                 inner: MemoryContentStore::new(),
                 local: Arc::new(RwLock::new(HashMap::new())),
                 cas_calls: Arc::new(AtomicUsize::new(0)),
+                local_path_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -4322,6 +4404,7 @@ pub(crate) mod tests {
         }
 
         fn resolve_local_path(&self, id: &ContentId) -> Option<PathBuf> {
+            self.local_path_calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.local.read().get(id).cloned()
         }
     }
