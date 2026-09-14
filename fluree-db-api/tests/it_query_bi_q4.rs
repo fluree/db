@@ -303,3 +303,55 @@ async fn bi_q4_local_scaling() {
         times[times.len() / 2]
     );
 }
+
+fn physical_ops(node: &Value, out: &mut Vec<String>) {
+    if let Some(op) = node["op"].as_str() {
+        out.push(op.to_owned());
+    }
+    for child in node["children"].as_array().into_iter().flatten() {
+        physical_ops(&child["node"], out);
+    }
+}
+
+fn plans_shared(explain: &Value) -> bool {
+    let mut ops = Vec::new();
+    physical_ops(&explain["plan"]["physical"], &mut ops);
+    assert!(
+        ops.contains(&"GroupAggregateOperator".to_owned()),
+        "{ops:?}"
+    );
+    !ops.contains(&"OptionalOperator".to_owned())
+}
+
+/// EXPLAIN must plan with the executor's policy gate: a root view reports the
+/// shared plan it runs, and a restricted view reports the unshared one.
+#[tokio::test]
+async fn bi_q4_explain_reports_executed_plan() {
+    use fluree_db_api::GovernanceOptions;
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed(&fluree, 120, 12).await;
+    rebuild_and_publish_index(&fluree, "q4:main").await;
+    let ledger = fluree.ledger("q4:main").await.unwrap();
+    let db = crate::support::graphdb_from_ledger(&ledger);
+    let q = query(false).replace(" FROM <q4:main>", "");
+    assert!(plans_shared(&fluree.explain_sparql(&db, &q).await.unwrap()));
+    assert!(plans_shared(
+        &fluree
+            .explain_connection_sparql(&query(false))
+            .await
+            .unwrap()
+    ));
+    let restricted = fluree
+        .wrap_policy(
+            db,
+            &GovernanceOptions {
+                default_allow: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!plans_shared(
+        &fluree.explain_sparql(&restricted, &q).await.unwrap()
+    ));
+}

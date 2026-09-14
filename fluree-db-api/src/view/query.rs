@@ -770,24 +770,24 @@ impl Fluree {
     /// This uses the same default-context behavior as query execution.
     pub async fn explain(&self, db: &GraphDb, query_json: &JsonValue) -> Result<JsonValue> {
         let db = self.prepare_explain_view(db).await?;
-        crate::explain::explain_jsonld_with_default_context(
+        crate::explain::explain_jsonld_for_view(
             &db.snapshot,
             query_json,
             db.default_context.as_ref(),
+            db.is_root(),
         )
-        .await
         .map(|result| explain_policy_notice(result, &db))
     }
 
     /// Explain a SPARQL query plan against a GraphDb.
     pub async fn explain_sparql(&self, db: &GraphDb, sparql: &str) -> Result<JsonValue> {
         let db = self.prepare_explain_view(db).await?;
-        crate::explain::explain_sparql_with_default_context(
+        crate::explain::explain_sparql_for_view(
             &db.snapshot,
             sparql,
             db.default_context.as_ref(),
+            db.is_root(),
         )
-        .await
         .map(|result| explain_policy_notice(result, &db))
     }
 
@@ -803,9 +803,14 @@ impl Fluree {
         params: Option<&fluree_db_cypher::ParamMap>,
     ) -> Result<JsonValue> {
         let db = self.prepare_explain_view(db).await?;
-        crate::explain::explain_cypher(&db.snapshot, cypher, db.default_context.as_ref(), params)
-            .await
-            .map(|result| explain_policy_notice(result, &db))
+        crate::explain::explain_cypher_for_view(
+            &db.snapshot,
+            cypher,
+            db.default_context.as_ref(),
+            params,
+            db.is_root(),
+        )
+        .map(|result| explain_policy_notice(result, &db))
     }
 
     /// Execute a query with tracking.
