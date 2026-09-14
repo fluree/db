@@ -471,7 +471,7 @@ impl Fluree {
     ) -> Result<GraphDb> {
         let view = GraphDb::from_ledger_state(state).with_default_context(default_context.cloned());
         match governance {
-            Some(g) if g.has_any_policy_inputs() => self.wrap_policy(view, g, None).await,
+            Some(g) if g.has_any_policy_inputs() => self.wrap_policy(view, g).await,
             _ => Ok(view),
         }
     }

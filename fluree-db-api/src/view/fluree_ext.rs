@@ -2,6 +2,7 @@
 //!
 //! Provides convenience methods on `Fluree` for loading and wrapping views.
 
+use fluree_db_core::VerifiedIdentity;
 use std::sync::Arc;
 
 use chrono::DateTime;
@@ -773,8 +774,7 @@ impl Fluree {
             .resolved_config()
             .is_some_and(|config| config.policy.is_some())
         {
-            self.wrap_policy(view, &GovernanceOptions::default(), None)
-                .await
+            self.wrap_policy(view, &GovernanceOptions::default()).await
         } else {
             Ok(view)
         }
@@ -783,10 +783,13 @@ impl Fluree {
     /// Build policy from options and wrap a view.
     ///
     /// If the view has a `ResolvedConfig`, config defaults are merged with query
-    /// opts and override control is checked against `server_identity`.
+    /// opts and override control is checked against `opts.server_identity`.
     ///
-    /// `server_identity` is the auth-layer-verified identity — NOT `opts.identity`
-    /// which is the user-settable policy evaluation context.
+    /// `opts.server_identity` is the auth-layer-verified identity — NOT
+    /// `opts.identity`, which is the user-settable policy evaluation context.
+    /// Server routes populate it from the verified credential or bearer; an
+    /// embedding application that runs its own auth may set it. Left `None`,
+    /// `f:IdentityRestricted` override control denies the request.
     ///
     /// # Example
     ///
@@ -794,22 +797,18 @@ impl Fluree {
     /// let view = fluree.db("mydb:main").await?;
     /// let opts = GovernanceOptions {
     ///     identity: Some("did:example:user".into()),
+    ///     server_identity: Some(VerifiedIdentity::new("did:example:user")),
     ///     ..Default::default()
     /// };
-    /// let view = fluree.wrap_policy(view, &opts, None).await?;
+    /// let view = fluree.wrap_policy(view, &opts).await?;
     /// ```
-    pub async fn wrap_policy(
-        &self,
-        view: GraphDb,
-        opts: &GovernanceOptions,
-        server_identity: Option<&str>,
-    ) -> Result<GraphDb> {
+    pub async fn wrap_policy(&self, view: GraphDb, opts: &GovernanceOptions) -> Result<GraphDb> {
         // Callers may construct a view directly from staged/loaded ledger state.
         // Such a view must not bypass ledger override controls just because
         // config has not been attached yet (for example GraphQL read-back).
         let view = self.resolve_and_attach_config(view).await?;
         let effective_opts = if let Some(ref resolved) = view.resolved_config {
-            config_resolver::merge_policy_opts(resolved, opts, server_identity)
+            config_resolver::merge_policy_opts(resolved, opts)
         } else {
             opts.clone()
         };
@@ -970,20 +969,19 @@ impl Fluree {
 
     /// Load a view at head with policy applied.
     ///
-    /// Convenience method that combines `db()` + `wrap_policy()`.
-    /// Passes `None` for server identity (no auth layer plumbing yet).
+    /// Convenience method that combines `db()` + `wrap_policy()`. Override
+    /// control reads `opts.server_identity`.
     pub async fn db_with_policy(
         &self,
         ledger_id: &str,
         opts: &GovernanceOptions,
     ) -> Result<GraphDb> {
         let view = self.db(ledger_id).await?;
-        self.wrap_policy(view, opts, None).await
+        self.wrap_policy(view, opts).await
     }
 
-    /// Load a db at a specific time with policy applied.
-    ///
-    /// Passes `None` for server identity (no auth layer plumbing yet).
+    /// Load a db at a specific time with policy applied. Override control
+    /// reads `opts.server_identity`.
     pub async fn db_at_t_with_policy(
         &self,
         ledger_id: &str,
@@ -991,7 +989,7 @@ impl Fluree {
         opts: &GovernanceOptions,
     ) -> Result<GraphDb> {
         let view = self.db_at_t(ledger_id, target_t).await?;
-        self.wrap_policy(view, opts, None).await
+        self.wrap_policy(view, opts).await
     }
 }
 
@@ -1025,7 +1023,11 @@ impl Fluree {
     ///
     /// `server_identity` is the auth-layer-verified identity (NOT opts.identity).
     /// Pass `None` when no auth layer is present (Phase 1).
-    pub fn apply_config_reasoning(&self, view: GraphDb, server_identity: Option<&str>) -> GraphDb {
+    pub fn apply_config_reasoning(
+        &self,
+        view: GraphDb,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> GraphDb {
         let resolved = match &view.resolved_config {
             Some(r) => r,
             None => return view,
@@ -1070,7 +1072,11 @@ impl Fluree {
     ///
     /// Convenience wrapper that calls both `apply_config_reasoning` and
     /// `apply_config_datalog` in sequence.
-    pub fn apply_config_defaults(&self, view: GraphDb, server_identity: Option<&str>) -> GraphDb {
+    pub fn apply_config_defaults(
+        &self,
+        view: GraphDb,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> GraphDb {
         let view = self.apply_config_reasoning(view, server_identity);
         self.apply_config_datalog(view, server_identity)
     }
@@ -1093,16 +1099,16 @@ impl Fluree {
     ///
     /// `server_identity` is the auth-layer-verified identity that
     /// `f:overrideControl` gates on. It is not `opts.identity`, which is the
-    /// caller-settable policy evaluation context. This is the one place the
-    /// identity reaches the config merges, so threading it from the request
-    /// boundary is a change to the two callers of
-    /// `apply_reasoning_to_executable`, not to this function. Until that is
-    /// done both pass `None`, under which `f:IdentityRestricted` denies every
-    /// override, the same as `f:OverrideNone`.
+    /// caller-settable policy evaluation context. On the query path it
+    /// travels as `QueryExecutionOptions::server_identity` from the request
+    /// boundary through `build_executable_for_view` /
+    /// `build_executable_for_dataset` to here. `None` is anonymous, which
+    /// `f:IdentityRestricted` denies; entry points with no execution options
+    /// (the CLI, internal probes) are anonymous by design.
     pub(crate) async fn complete_config_defaults(
         &self,
         view: &GraphDb,
-        server_identity: Option<&str>,
+        server_identity: Option<&VerifiedIdentity>,
     ) -> Result<GraphDb> {
         let view = self.resolve_and_attach_config(view.clone()).await?;
         Ok(self.apply_config_defaults(view, server_identity))
@@ -1112,7 +1118,11 @@ impl Fluree {
     ///
     /// Stores resolved datalog config on the view. Enforcement happens
     /// at query execution time, not here.
-    pub fn apply_config_datalog(&self, view: GraphDb, server_identity: Option<&str>) -> GraphDb {
+    pub fn apply_config_datalog(
+        &self,
+        view: GraphDb,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> GraphDb {
         let resolved = match &view.resolved_config {
             Some(r) => r,
             None => return view,

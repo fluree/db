@@ -882,9 +882,11 @@ pub async fn run(
                 None => fluree.db_with_default_context(&alias).await?,
             };
 
+            // No auth layer here: `to_options` leaves `server_identity` unset, so an
+            // `f:IdentityRestricted` override control denies CLI requests by design.
             let view = if policy.is_set() {
                 let opts = policy.to_options().map_err(CliError::Usage)?;
-                fluree.wrap_policy(view, &opts, None).await?
+                fluree.wrap_policy(view, &opts).await?
             } else {
                 view
             };
@@ -1467,9 +1469,11 @@ async fn run_cypher_query(
         }
         None => fluree.db_with_default_context(&alias).await?,
     };
+    // No auth layer here: `to_options` leaves `server_identity` unset, so an
+    // `f:IdentityRestricted` override control denies CLI requests by design.
     let view = if policy.is_set() {
         let opts = policy.to_options().map_err(CliError::Usage)?;
-        fluree.wrap_policy(view, &opts, None).await?
+        fluree.wrap_policy(view, &opts).await?
     } else {
         view
     };

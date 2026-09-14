@@ -13,6 +13,7 @@ use crate::{
     ApiError, ExecutableQuery, Fluree, QueryExecutionOptions, QueryResult, Result, Tracker,
     TrackingOptions,
 };
+use fluree_db_core::VerifiedIdentity;
 use fluree_db_query::execute::{
     execute_prepared, prepare_execution_with_config, ContextConfig, PrepareConfig,
 };
@@ -495,6 +496,21 @@ impl Fluree {
         cypher: &str,
         params: Option<&fluree_db_cypher::ParamMap>,
     ) -> Result<QueryResult> {
+        self.query_cypher_with_options(db, cypher, params, &QueryExecutionOptions::default())
+            .await
+    }
+
+    /// [`query_cypher_with_params`](Self::query_cypher_with_params) with
+    /// execution options. Cypher planning consults `server_identity`, the
+    /// auth-layer-verified caller identity that `f:overrideControl` gates on;
+    /// the default is anonymous.
+    pub async fn query_cypher_with_options(
+        &self,
+        db: &GraphDb,
+        cypher: &str,
+        params: Option<&fluree_db_cypher::ParamMap>,
+        options: &QueryExecutionOptions,
+    ) -> Result<QueryResult> {
         let parse_start = fluree_db_core::clock::Instant::now();
         let (vars, mut parsed) = parse_cypher_to_ir(
             cypher,
@@ -509,7 +525,8 @@ impl Fluree {
         maybe_wrap_for_graph_source(db, &mut parsed);
         guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
 
-        self.execute_cypher_ir(db, vars, parsed, parse_ms).await
+        self.execute_cypher_ir(db, vars, parsed, parse_ms, options.server_identity.as_ref())
+            .await
     }
 
     /// Execute an already-constructed Cypher read AST. Used by the
@@ -529,7 +546,9 @@ impl Fluree {
         )?;
         maybe_wrap_for_graph_source(db, &mut parsed);
         guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
-        self.execute_cypher_ir(db, vars, parsed, 0.0).await
+        // Code-built probe ASTs carry no query-time reasoning or datalog
+        // overrides, so override control has nothing to gate: anonymous.
+        self.execute_cypher_ir(db, vars, parsed, 0.0, None).await
     }
 
     /// Execute a constructed Cypher read AST whose leading `InlineRows`
@@ -593,7 +612,9 @@ impl Fluree {
 
         maybe_wrap_for_graph_source(db, &mut parsed);
         guard_graph_source_patterns(db, &parsed, QuerySyntax::Cypher)?;
-        self.execute_cypher_ir(db, vars, parsed, 0.0).await
+        // Code-built probe ASTs carry no query-time reasoning or datalog
+        // overrides, so override control has nothing to gate: anonymous.
+        self.execute_cypher_ir(db, vars, parsed, 0.0, None).await
     }
 
     async fn execute_cypher_ir(
@@ -602,9 +623,12 @@ impl Fluree {
         vars: crate::VarRegistry,
         parsed: fluree_db_query::ir::Query,
         parse_ms: f64,
+        server_identity: Option<&VerifiedIdentity>,
     ) -> Result<QueryResult> {
         let plan_start = fluree_db_core::clock::Instant::now();
-        let executable = self.build_executable_for_view(db, &parsed).await?;
+        let executable = self
+            .build_executable_for_view(db, &parsed, server_identity)
+            .await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
         let tracker = Tracker::disabled();
@@ -691,7 +715,9 @@ impl Fluree {
         guard_graph_source_patterns(db, &parsed, QuerySyntax::of(&input))?;
 
         // 2. Build executable with optional reasoning override
-        let executable = self.build_executable_for_view(db, &parsed).await?;
+        let executable = self
+            .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
+            .await?;
 
         // 4. Execute
         let batches = self
@@ -903,12 +929,13 @@ impl Fluree {
         // ledger's config defaults, so a fault in the config graph surfaces
         // here; a blanket 400 would tell the caller their request was bad
         // when nothing about the request is.
-        let executable = Box::pin(self.build_executable_for_view(db, &parsed))
-            .await
-            .map_err(|e| {
-                let status = e.status_code();
-                crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
-            })?;
+        let executable =
+            Box::pin(self.build_executable_for_view(db, &parsed, options.server_identity.as_ref()))
+                .await
+                .map_err(|e| {
+                    let status = e.status_code();
+                    crate::query::TrackedErrorResponse::new(status, e.to_string(), tracker.tally())
+                })?;
 
         // Execute with tracking
         let batches =
@@ -1058,7 +1085,7 @@ impl Fluree {
         })?;
 
         let executable = self
-            .build_executable_for_view(db, &parsed)
+            .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
             .await
             .map_err(|e| {
                 crate::query::TrackedErrorResponse::new(400, e.to_string(), tracker.tally())
@@ -1284,7 +1311,9 @@ impl Fluree {
         options: &QueryExecutionOptions,
     ) -> Result<(Vec<crate::Batch>, f64, f64)> {
         let plan_start = fluree_db_core::clock::Instant::now();
-        let executable = self.build_executable_for_view(db, parsed).await?;
+        let executable = self
+            .build_executable_for_view(db, parsed, options.server_identity.as_ref())
+            .await?;
         let plan_ms = plan_start.elapsed().as_secs_f64() * 1000.0;
 
         let exec_start = fluree_db_core::clock::Instant::now();
@@ -1298,17 +1327,21 @@ impl Fluree {
         ))
     }
 
+    /// Build an executable for a single view.
+    ///
+    /// `server_identity` is the auth-layer-verified caller identity that
+    /// `f:overrideControl` gates on (`QueryExecutionOptions::server_identity`
+    /// at the entry points that carry execution options); `None` is anonymous.
     pub(crate) async fn build_executable_for_view(
         &self,
         db: &GraphDb,
         parsed: &fluree_db_query::ir::Query,
+        server_identity: Option<&VerifiedIdentity>,
     ) -> Result<ExecutableQuery> {
         // Start with the standard executable
         let mut executable = prepare_for_execution(parsed);
 
-        // Server-verified identity for `f:overrideControl`. `None` until the
-        // request boundary threads it through; see `complete_config_defaults`.
-        self.apply_reasoning_to_executable(db, &mut executable, !db.is_root(), None)
+        self.apply_reasoning_to_executable(db, &mut executable, !db.is_root(), server_identity)
             .await?;
 
         Ok(executable)
@@ -1339,7 +1372,7 @@ impl Fluree {
         db: &GraphDb,
         executable: &mut ExecutableQuery,
         strip_query_rules: bool,
-        server_identity: Option<&str>,
+        server_identity: Option<&VerifiedIdentity>,
     ) -> Result<()> {
         let db = &self.complete_config_defaults(db, server_identity).await?;
 

@@ -3,14 +3,14 @@ use std::sync::Arc;
 
 use crate::query::helpers::{
     charge_query_floor, extract_sparql_dataset_spec, parse_and_validate_sparql, parse_dataset_spec,
-    tracked_query_tracker,
+    parse_dataset_spec_as, tracked_query_tracker,
 };
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
     ApiError, DatasetSpec, Fluree, FormatterConfig, GovernanceOptions, PolicyContext,
     QueryExecutionOptions, QueryResult, Result,
 };
-use fluree_db_core::TrackingOptions;
+use fluree_db_core::{TrackingOptions, VerifiedIdentity};
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
 
 type TrackedResult<T> = std::result::Result<T, crate::query::TrackedErrorResponse>;
@@ -40,7 +40,8 @@ impl Fluree {
         if qc_opts.has_any_policy_inputs() {
             self.build_dataset_view_with_policy(spec, qc_opts).await
         } else {
-            self.build_dataset_view(spec).await
+            self.build_dataset_view_as(spec, qc_opts.server_identity.as_ref())
+                .await
         }
     }
 
@@ -76,7 +77,8 @@ impl Fluree {
         let dataset = if qc_opts.has_any_policy_inputs() {
             self.build_dataset_view_with_policy(spec, qc_opts).await
         } else {
-            self.build_dataset_view(spec).await
+            self.build_dataset_view_as(spec, qc_opts.server_identity.as_ref())
+                .await
         };
         dataset.map_err(|e| crate::query::TrackedErrorResponse::new(500, e.to_string(), None))
     }
@@ -110,7 +112,7 @@ impl Fluree {
         query_json: &JsonValue,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let (spec, qc_opts) = parse_dataset_spec(query_json)?;
+        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())?;
 
         if spec.is_empty() {
             return Err(ApiError::query(
@@ -149,7 +151,7 @@ impl Fluree {
         r2rml: Option<(&dyn R2rmlProvider, &dyn R2rmlTableProvider)>,
         options: QueryExecutionOptions,
     ) -> Result<(QueryResult, Option<DataSetDb>)> {
-        let (spec, qc_opts) = parse_dataset_spec(query_json)?;
+        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())?;
 
         if spec.is_empty() {
             return Err(ApiError::query(
@@ -210,7 +212,7 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let (spec, qc_opts) = parse_dataset_spec(query_json)?;
+        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())?;
 
         if spec.is_empty() {
             return Err(ApiError::query(
@@ -294,7 +296,8 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, qc_opts) = parse_dataset_spec(query_json).map_err(|e| {
+        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())
+            .map_err(|e| {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
         })?;
 
@@ -442,7 +445,8 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let (spec, qc_opts) = parse_dataset_spec(query_json).map_err(|e| {
+        let (spec, qc_opts) = parse_dataset_spec_as(query_json, options.server_identity.as_ref())
+            .map_err(|e| {
             crate::query::TrackedErrorResponse::new(400, e.to_string(), floor.tally())
         })?;
 
@@ -628,7 +632,29 @@ impl Fluree {
     /// Multi-ledger dataset specs are rejected — explain is single-ledger
     /// (consistent with [`Fluree::explain`] taking a `GraphDb`).
     pub async fn explain_connection(&self, query_json: &JsonValue) -> Result<JsonValue> {
-        let (spec, qc_opts) = parse_dataset_spec(query_json)?;
+        self.explain_connection_with_opts(query_json, None).await
+    }
+
+    /// [`explain_connection`](Self::explain_connection) on behalf of an
+    /// auth-layer-verified caller. The SPARQL counterpart takes the whole
+    /// `GovernanceOptions`; the JSON-LD path parses those from the body, so
+    /// only the one field a body cannot carry is passed here.
+    ///
+    /// The plan is computed against a policy-wrapped view, and without this
+    /// an allow-listed caller's explain takes the *denied* branch of
+    /// `merge_policy_opts` while its query takes the permitted one — the two
+    /// plan against different views for the same request. That difference is
+    /// not visible in today's explain output (a policy-wrapped view is never
+    /// root, so both cases withhold statistics and emit the same plan), so
+    /// this is consistency rather than a fix for an observable defect: it
+    /// keeps explain honest if the output ever reflects the policy decision,
+    /// and matches what the SPARQL path already does. `None` is anonymous.
+    pub async fn explain_connection_with_opts(
+        &self,
+        query_json: &JsonValue,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> Result<JsonValue> {
+        let (spec, qc_opts) = parse_dataset_spec_as(query_json, server_identity)?;
 
         if spec.is_empty() {
             return Err(ApiError::query(
@@ -1074,13 +1100,16 @@ impl Fluree {
         // Per-source policy takes precedence
         if let Some(policy_override) = &source.policy_override {
             if policy_override.has_policy() {
-                let opts = policy_override.to_query_connection_options();
-                return self.wrap_policy(view, &opts, None).await;
+                let mut opts = policy_override.to_query_connection_options();
+                // The override comes from the request body; the verified
+                // identity that gates config overrides is request-level.
+                opts.server_identity = global_opts.server_identity.clone();
+                return self.wrap_policy(view, &opts).await;
             }
         }
         // Fall back to global policy if present
         if global_opts.has_any_policy_inputs() {
-            self.wrap_policy(view, global_opts, None).await
+            self.wrap_policy(view, global_opts).await
         } else {
             self.wrap_policy_defaults(view).await
         }

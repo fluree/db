@@ -8,6 +8,7 @@
 use crate::view::{DataSetDb, GraphDb};
 use crate::{dataset, time_resolve, ApiError, DatasetSpec, Fluree, GovernanceOptions, Result};
 use chrono::DateTime;
+use fluree_db_core::VerifiedIdentity;
 
 macro_rules! build_dataset_view_from_spec {
     (
@@ -117,12 +118,29 @@ impl Fluree {
     /// let result = fluree.query_dataset(&dataset, &query).await?;
     /// ```
     pub async fn build_dataset_view(&self, spec: &DatasetSpec) -> Result<DataSetDb> {
+        self.build_dataset_view_as(spec, None).await
+    }
+
+    /// [`Fluree::build_dataset_view`] on behalf of an auth-layer-verified
+    /// caller.
+    ///
+    /// No request-level policy is applied, but a per-source `policy_override`
+    /// still consults the ledger's `f:overrideControl`, and that check gates on
+    /// `server_identity`. Pass the same verified identity a server route would
+    /// place in `GovernanceOptions::server_identity`; `None` means anonymous,
+    /// which `f:IdentityRestricted` denies.
+    pub async fn build_dataset_view_as(
+        &self,
+        spec: &DatasetSpec,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> Result<DataSetDb> {
         build_dataset_view_from_spec!(
             self,
             spec,
             history_transform = |view| self.wrap_policy_defaults(view),
             load_view = |source| self.load_view_from_source(source),
-            apply_policy = |view, source| self.maybe_apply_source_policy(view, source),
+            apply_policy =
+                |view, source| self.maybe_apply_source_policy(view, source, server_identity),
         )
     }
 
@@ -145,7 +163,7 @@ impl Fluree {
         build_dataset_view_from_spec!(
             self,
             spec,
-            history_transform = |view| async { self.wrap_policy(view, opts, None).await },
+            history_transform = |view| async { self.wrap_policy(view, opts).await },
             load_view = |source| self.load_view_from_source(source),
             apply_policy = |view, source| self.apply_policy_with_override(view, source, opts),
         )
@@ -158,11 +176,15 @@ impl Fluree {
         &self,
         view: GraphDb,
         source: &dataset::GraphSource,
+        server_identity: Option<&VerifiedIdentity>,
     ) -> Result<GraphDb> {
         if let Some(policy_override) = &source.policy_override {
             if policy_override.has_policy() {
-                let opts = policy_override.to_query_connection_options();
-                return self.wrap_policy(view, &opts, None).await;
+                let mut opts = policy_override.to_query_connection_options();
+                // The override comes from the request body; the verified
+                // identity that gates config overrides is request-level.
+                opts.server_identity = server_identity.cloned();
+                return self.wrap_policy(view, &opts).await;
             }
         }
         self.wrap_policy_defaults(view).await
@@ -181,12 +203,15 @@ impl Fluree {
         // Per-source policy override takes precedence
         if let Some(policy_override) = &source.policy_override {
             if policy_override.has_policy() {
-                let opts = policy_override.to_query_connection_options();
-                return self.wrap_policy(view, &opts, None).await;
+                let mut opts = policy_override.to_query_connection_options();
+                // The override comes from the request body; the verified
+                // identity that gates config overrides is request-level.
+                opts.server_identity = global_opts.server_identity.clone();
+                return self.wrap_policy(view, &opts).await;
             }
         }
         // Fall back to global policy
-        self.wrap_policy(view, global_opts, None).await
+        self.wrap_policy(view, global_opts).await
     }
 
     /// Build a single `GraphDb` from a `GraphSource`.
