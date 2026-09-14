@@ -4,6 +4,8 @@
 //! where left results drive right scans. It enforces var unification - shared
 //! vars between left and right must match exactly.
 
+mod wildcard;
+
 use crate::binary_scan::EmitMask;
 use crate::binding::{Batch, Binding, RowAccess};
 use crate::context::ExecutionContext;
@@ -24,6 +26,7 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_binary_index::read::batched_lookup::WildcardDirection;
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::clock::Instant;
 use fluree_db_core::o_type::OType;
@@ -585,6 +588,8 @@ pub struct NestedLoopJoinOperator {
     active_right_left_row: usize,
     /// Optional object bounds for range filter pushdown
     object_bounds: Option<ObjectBounds>,
+    wildcard_direction: Option<WildcardDirection>,
+    wildcard_stream: Option<wildcard::WildcardJoin>,
     /// Whether this join is eligible for batched subject join
     batched_eligible: bool,
     /// Whether this join is eligible for batched object join
@@ -848,9 +853,12 @@ impl NestedLoopJoinOperator {
 
         let has_bounds = object_bounds.is_some();
 
-        let batched_eligible = is_batched_eligible(&bind_instructions, &right_pattern);
+        let wildcard_direction = wildcard::eligible(&bind_instructions, &right_pattern, has_bounds);
+        let batched_eligible = is_batched_eligible(&bind_instructions, &right_pattern)
+            || wildcard_direction == Some(WildcardDirection::Outgoing);
         let batched_object_eligible = !batched_eligible
-            && is_batched_object_eligible(&bind_instructions, &right_pattern, has_bounds);
+            && (is_batched_object_eligible(&bind_instructions, &right_pattern, has_bounds)
+                || wildcard_direction == Some(WildcardDirection::IncomingRefs));
         let batched_exists_eligible = !batched_eligible
             && !batched_object_eligible
             && is_batched_subject_exists_eligible(&bind_instructions, &right_pattern);
@@ -898,6 +906,8 @@ impl NestedLoopJoinOperator {
             active_right_batch_ref: None,
             active_right_left_row: 0,
             object_bounds,
+            wildcard_direction,
+            wildcard_stream: None,
             batched_eligible,
             batched_object_eligible,
             batched_exists_eligible,
@@ -1457,6 +1467,12 @@ impl Operator for NestedLoopJoinOperator {
         // Process until we have output or exhaust input
         loop {
             ctx.check_cancelled()?;
+            if let Some(mut stream) = self.wildcard_stream.take() {
+                if let Some(batch) = stream.next_batch(self, ctx)? {
+                    self.wildcard_stream = Some(stream);
+                    return Ok(trim_batch(&self.out_schema, batch));
+                }
+            }
             // 1. Pre-built output from batched flush
             if let Some(batch) = self.batched_output.pop_front() {
                 return Ok(trim_batch(&self.out_schema, batch));
@@ -1592,8 +1608,10 @@ impl Operator for NestedLoopJoinOperator {
                         }
                         // A term handle keys OPST like a ref; per row it would
                         // decode the term only for the scan to re-derive it.
+                        // The wildcard cursor reads refs only.
                         Binding::EncodedLit { o_kind, o_key, .. }
                             if self.batched_object_eligible
+                                && self.wildcard_direction.is_none()
                                 && *o_kind == ObjKind::TRIPLE_TERM.as_u8() =>
                         {
                             Some((OType::TRIPLE_TERM.as_u16(), *o_key))
@@ -1781,6 +1799,7 @@ impl Operator for NestedLoopJoinOperator {
 
     fn close(&mut self) {
         self.left.close();
+        self.wildcard_stream = None;
         self.current_left_batch = None;
         self.current_left_batch_stored_idx = None;
         self.pending_output.clear();
@@ -1939,6 +1958,11 @@ impl NestedLoopJoinOperator {
         }
 
         let accum_len = self.batched_accumulator.len();
+        if let Some(direction) = self.wildcard_direction {
+            self.wildcard_stream = Some(wildcard::WildcardJoin::new(self, ctx));
+            tracing::debug!(?direction, accum_len, "batched wildcard join engaged");
+            return Ok(());
+        }
         if self.batched_object_eligible {
             self.flush_batched_object_accumulator_binary(ctx)
                 .instrument(tracing::debug_span!(
@@ -1992,7 +2016,32 @@ impl NestedLoopJoinOperator {
             Some(pred) => &[pred],
             None => &[],
         };
-        if let Some(plan) = crate::fast_path_common::probe_lane_admission(ctx, preds) {
+        let admitted = crate::fast_path_common::probe_lane_admission(ctx, preds);
+        if self.wildcard_direction.is_some() {
+            // The shared cursor reads persisted state only. Keep the first
+            // query lane restricted to HEAD, one ledger/graph, and no novelty.
+            return Ok(
+                if !matches!(admitted, Some(ProbeLanePlan::Decline))
+                    && !crate::fast_paths_disabled()
+                    && self.mode.is_current()
+                    && ctx.from_t.is_none()
+                    && !ctx.is_multi_ledger()
+                    && !ctx.eager_materialization
+                    && !ctx.reasoning_active
+                    && matches!(ctx.active_graphs(), ActiveGraphs::Single)
+                    && ctx.overlay_free_single_graph()
+                    && ctx
+                        .binary_store
+                        .as_ref()
+                        .is_some_and(|s| ctx.to_t >= s.max_t())
+                {
+                    ProbeLanePlan::Clean
+                } else {
+                    ProbeLanePlan::Decline
+                },
+            );
+        }
+        if let Some(plan) = admitted {
             return Ok(plan);
         }
         if !(self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)

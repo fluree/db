@@ -187,6 +187,12 @@ path = "tests/grp_import.rs"
 name = "grp_triple_terms"
 path = "tests/grp_triple_terms.rs"
 
+# Standalone: wildcard join routing and the process-global fast-path switch.
+[[test]]
+name = "it_wildcard_batched_join"
+path = "tests/it_wildcard_batched_join.rs"
+required-features = ["native"]
+
 # Standalone (NOT in grp_import): re-execs itself and lowers RLIMIT_NOFILE
 # hard+soft in the child, which must not share a process with other tests.
 [[test]]

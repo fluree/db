@@ -2243,7 +2243,8 @@ fn detect_union_star_count_all(
 /// query with fast paths on and off and asserts identical results, and as
 /// an operational escape hatch when triaging a suspected fast-path bug.
 /// It is NOT a tuning knob: runtime operator-internal optimizations
-/// (cursor selection, batched joins) are unaffected.
+/// (cursor selection, fixed-predicate batched joins) are unaffected. The
+/// wildcard-predicate join lane also honors this switch for differential tests.
 static FAST_PATHS_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
