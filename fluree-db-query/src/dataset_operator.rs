@@ -37,7 +37,7 @@ use crate::error::{QueryError, Result};
 use crate::ir::triple::TriplePattern;
 use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::inline::{extend_schema, InlineOperator};
-use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::operator::{count_operator, BoxedOperator, Operator, OperatorState};
 use crate::sort::SortSpec;
 use crate::temporal_mode::TemporalMode;
 use crate::var_registry::VarId;
@@ -503,24 +503,6 @@ fn sid_to_iri_match(
     ))
 }
 
-/// Count a single member to exhaustion, preferring its `drain_count`
-/// (count-only, no binding materialization) and falling back to a streaming
-/// `next_batch` row count when the member declines count-only mode.
-async fn count_member(op: &mut BoxedOperator, ctx: &ExecutionContext<'_>) -> Result<u64> {
-    if let Some(n) = op.drain_count(ctx).await? {
-        return Ok(n);
-    }
-    let mut n: u64 = 0;
-    while let Some(batch) = op.next_batch(ctx).await? {
-        ctx.check_cancelled()?;
-        n = n
-            .checked_add(batch.len() as u64)
-            .ok_or_else(|| QueryError::execution("COUNT(*) overflow in dataset drain_count"))?;
-    }
-    ctx.check_cancelled()?;
-    Ok(n)
-}
-
 #[async_trait]
 impl Operator for DatasetOperator {
     fn schema(&self) -> &[VarId] {
@@ -798,11 +780,14 @@ impl Operator for DatasetOperator {
             let n = match &graphs {
                 ActiveGraphs::Many(g) => {
                     let graph_ctx = ctx.with_graph_ref(g[self.current_member]);
-                    count_member(&mut self.members[self.current_member].operator, &graph_ctx)
-                        .await?
+                    count_operator(
+                        self.members[self.current_member].operator.as_mut(),
+                        &graph_ctx,
+                    )
+                    .await?
                 }
                 ActiveGraphs::Single => {
-                    count_member(&mut self.members[self.current_member].operator, ctx).await?
+                    count_operator(self.members[self.current_member].operator.as_mut(), ctx).await?
                 }
             };
             total = total
