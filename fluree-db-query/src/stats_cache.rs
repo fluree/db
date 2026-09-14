@@ -167,7 +167,7 @@ pub(crate) fn cached_stats_view_for_db(
             }
         }
 
-        let mut view = StatsView::from_db_stats_with_namespaces(&stats, db.snapshot.namespaces());
+        let mut view = StatsView::from_db_stats_with_namespaces(&stats, db.snapshot);
         // Per-(class, predicate) coverage counts may be consulted for semantic
         // elision of redundant `rdf:type` filters — but only when they are
         // exact for the current state. The query stats cache cannot resolve the

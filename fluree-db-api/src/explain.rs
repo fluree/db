@@ -547,9 +547,8 @@ fn explain_from_parsed(
         // Borrow, never clone: `IndexStats` carries the per-class property
         // usage vectors, and on a ledger with a class per subject (BKR-star:
         // 146M flakes) cloning them cost 1.2 s of a 4.7 s explain.
-        let empty = fluree_db_core::IndexStats::default();
-        let base = snapshot.stats.as_deref().unwrap_or(&empty);
-        let mut view = StatsView::from_db_stats_with_namespaces(base, snapshot.namespaces());
+        let base = snapshot.stats.clone().unwrap_or_default();
+        let mut view = StatsView::from_db_stats_with_namespaces(&base, snapshot);
         if let Some(ann) = snapshot.annotation_index.as_ref() {
             view.merge_annotation_stats(&ann.stats, snapshot.namespaces());
         }
