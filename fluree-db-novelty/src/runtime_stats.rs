@@ -13,6 +13,7 @@ use fluree_db_core::{Flake, FlakeMeta, FlakeValue};
 use fluree_vocab::namespaces::FLUREE_COMMIT;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StatsAssemblyError {
@@ -142,6 +143,50 @@ pub enum NoveltyMerge {
     /// check on a shared label is satisfied by *any* of them rather than by the
     /// one whose numbers are under test.
     Reconciled { site: &'static str },
+}
+
+/// Whether merging `novelty` into `indexed` at `to_t` would reproduce `indexed`
+/// unchanged.
+///
+/// Two cases: an empty novelty window has nothing to add, and a `to_t` at or
+/// below the published index `t` is already fully described by the base index
+/// because novelty only ever holds flakes *after* the publish.
+///
+/// This is the guard [`assemble_fast_stats_shared`] uses to hand back the
+/// caller's `Arc` instead of a copy, so it must stay exactly the condition
+/// under which `assemble_fast_stats_inner` returns `indexed.clone()` — both
+/// read it from here for that reason.
+pub fn merge_is_identity(
+    indexed: &IndexStats,
+    snapshot: &LedgerSnapshot,
+    novelty: &Novelty,
+    to_t: i64,
+) -> bool {
+    novelty.is_empty() || to_t <= indexed_t(indexed, snapshot)
+}
+
+/// [`assemble_fast_stats`] over a shared base, returning a shared result.
+///
+/// The identity case — empty novelty, or a read at or below the published
+/// index `t` — is the common one on every cold query, and by far the most
+/// expensive to get wrong: `IndexStats` owns one `ClassStatEntry` per distinct
+/// class, each with its own property/datatype/lang vectors, so a ledger that
+/// types every subject with its own class turns "copy the base stats" into tens
+/// of millions of small allocations. Hand back the caller's `Arc` there and
+/// only materialize when novelty actually changes something.
+pub fn assemble_fast_stats_shared(
+    indexed: &Arc<IndexStats>,
+    snapshot: &LedgerSnapshot,
+    novelty: &Novelty,
+    to_t: i64,
+    lookup: Option<&dyn StatsLookup>,
+) -> Arc<IndexStats> {
+    if merge_is_identity(indexed, snapshot, novelty, to_t) {
+        return Arc::clone(indexed);
+    }
+    Arc::new(assemble_fast_stats(
+        indexed, snapshot, novelty, to_t, lookup,
+    ))
 }
 
 /// Merge novelty into `indexed` with planner-grade [`NoveltyMerge::Estimate`]
@@ -474,7 +519,7 @@ fn assemble_fast_stats_inner(
     // any of this as a statement about `to_t` (`observed_datatypes` is the one
     // that matters, see `StatsView::property_ref_only`) has to handle the
     // historical case itself.
-    if novelty.is_empty() || to_t <= indexed_t(indexed, snapshot) {
+    if merge_is_identity(indexed, snapshot, novelty, to_t) {
         return indexed.clone();
     }
 

@@ -67,7 +67,7 @@ async fn apply_index<S: Storage + Clone + 'static>(
         base_t: root.base_t,
         namespace_codes: root.namespace_codes.into_iter().collect(),
         ns_split_mode: root.ns_split_mode,
-        stats: root.stats,
+        stats: root.stats.map(std::sync::Arc::new),
         schema: root.schema,
         subject_watermarks: root.subject_watermarks,
         string_watermark: root.string_watermark,
