@@ -289,10 +289,14 @@ pub trait GraphSink {
     ///
     /// Parsers MUST check this before emitting any reified-triple event
     /// and reject the input with a clear "deferred / unsupported on this
-    /// path" error when it returns `false`. Defaults to `false` so
-    /// existing sinks (graph collectors, directive preludes, …) keep
-    /// rejecting Turtle-star input instead of silently dropping the
-    /// reifier semantics.
+    /// path" error when it returns `false`. Defaults to `false`, so a sink
+    /// rejects Turtle-star input rather than silently dropping the reifier
+    /// semantics.
+    ///
+    /// `GraphCollectorSink` overrides it: it records attachments as
+    /// [`crate::Graph::reifications`] for the Turtle-to-JSON-LD adapter. Its
+    /// other consumers do not read that list, so each is responsible for
+    /// refusing a non-empty one — the R2RML mapping loader does.
     fn supports_reified_triples(&self) -> bool {
         false
     }

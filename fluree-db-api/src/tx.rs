@@ -2253,6 +2253,26 @@ fn convert_named_graphs_to_templates(
             let subject_term = convert_term(subject, &block.prefixes, ns_registry)?;
             let predicate_term = convert_term(&triple.predicate, &block.prefixes, ns_registry)?;
 
+            // Reserved-predicate firewall. The JSON-LD, SPARQL UPDATE and
+            // Turtle surfaces all refuse a hand-written `f:reifies*`
+            // statement, because an attachment bundle is only well-formed if
+            // the annotation syntax built it. TriG `GRAPH { … }` blocks come
+            // through here instead of `FlakeSink::build_flake`, so they had no
+            // check at all and such a triple landed.
+            if let TemplateTerm::Sid(p) = &predicate_term {
+                if fluree_db_core::is_reserved_reifies_predicate(p) {
+                    let iri = ns_registry.get_prefix(p.namespace_code).map_or_else(
+                        || p.name.to_string(),
+                        |prefix| format!("{prefix}{}", p.name),
+                    );
+                    return Err(ApiError::query(format!(
+                        "'{iri}' is a system-controlled predicate; use the RDF 1.2 annotation \
+                         syntax (`~ <reifier> {{| ... |}}` or `<< s p o >>`) instead of \
+                         writing f:reifies* triples by hand"
+                    )));
+                }
+            }
+
             for obj in &triple.objects {
                 let (object_term, dtc) = convert_object(obj, &block.prefixes, ns_registry)?;
                 let mut template =
@@ -4201,6 +4221,33 @@ mod tests {
             handle.is_pending("turtle:main").await,
             "a Turtle write rejected at max novelty must ask the indexer for a build; \
              without it this write family never asks for the thing that unblocks it"
+        );
+    }
+
+    /// A hand-written `f:reifies*` triple inside a TriG `GRAPH` block is
+    /// refused, the way it is on every other write surface.
+    ///
+    /// This path does not go through `FlakeSink::build_flake`, which is where
+    /// the Turtle firewall lives, so without its own check the statement
+    /// landed and produced an attachment bundle no annotation syntax built.
+    #[test]
+    fn named_graph_block_refuses_a_reserved_reifies_predicate() {
+        let block = NamedGraphBlock {
+            iri: "http://example.org/g1".to_string(),
+            triples: vec![RawTriple {
+                subject: Some(RawTerm::Iri("http://example.org/claim1".to_string())),
+                predicate: RawTerm::Iri(fluree_vocab::reifies_iris::SUBJECT.to_string()),
+                objects: vec![RawObject::Iri("http://example.org/evil".to_string())],
+            }],
+            prefixes: rustc_hash::FxHashMap::default(),
+        };
+        let mut ns = NamespaceRegistry::new();
+        let err = convert_named_graphs_to_templates(&[block], &mut ns)
+            .expect_err("a reserved predicate in a GRAPH block must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system-controlled predicate"),
+            "unexpected error: {msg}"
         );
     }
 
