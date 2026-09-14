@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_core::clock::Instant;
 use fluree_db_core::{
     GraphDbRef, GraphId, IndexStats, OverlayProvider, RuntimePredicateId, RuntimeSmallDicts, Sid,
     StatsView,
@@ -45,6 +46,11 @@ pub(crate) fn cached_stats_view_for_db(
     allow_semantic_elision: bool,
 ) -> Option<Arc<StatsView>> {
     let build_view = || {
+        // Timed on its own: a miss builds before the plan exists, so on a
+        // large class table it otherwise reads as an unexplained gap between
+        // "preparing query execution" and the first plan line.
+        let _span = tracing::debug_span!("stats_view_build").entered();
+        let started = Instant::now();
         // `Arc`-shared, never copied: `IndexStats` carries one entry per
         // distinct class, so on a class-per-subject ledger a by-value clone
         // here was seconds of small allocations before planning began.
@@ -193,6 +199,13 @@ pub(crate) fn cached_stats_view_for_db(
         if let Some(ann) = db.snapshot.annotation_index.as_ref() {
             view.merge_annotation_stats(&ann.stats, db.snapshot.namespaces());
         }
+        tracing::debug!(
+            stats_view_build_ms = started.elapsed().as_secs_f64() * 1000.0,
+            classes = view.classes.len(),
+            properties = view.properties.len(),
+            novelty_merged = novelty.is_some_and(|n| !n.is_empty()) && db.t > db.snapshot.t,
+            "built planner stats view"
+        );
         Arc::new(view)
     };
 
