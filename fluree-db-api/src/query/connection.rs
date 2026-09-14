@@ -10,7 +10,7 @@ use crate::{
     ApiError, DatasetSpec, Fluree, FormatterConfig, GovernanceOptions, PolicyContext,
     QueryExecutionOptions, QueryResult, Result,
 };
-use fluree_db_core::TrackingOptions;
+use fluree_db_core::{TrackingOptions, VerifiedIdentity};
 use fluree_db_query::r2rml::{R2rmlProvider, R2rmlTableProvider};
 
 type TrackedResult<T> = std::result::Result<T, crate::query::TrackedErrorResponse>;
@@ -632,8 +632,29 @@ impl Fluree {
     /// Multi-ledger dataset specs are rejected — explain is single-ledger
     /// (consistent with [`Fluree::explain`] taking a `GraphDb`).
     pub async fn explain_connection(&self, query_json: &JsonValue) -> Result<JsonValue> {
-        // Explain carries no execution options: anonymous for override control.
-        let (spec, qc_opts) = parse_dataset_spec(query_json)?;
+        self.explain_connection_with_opts(query_json, None).await
+    }
+
+    /// [`explain_connection`](Self::explain_connection) on behalf of an
+    /// auth-layer-verified caller. The SPARQL counterpart takes the whole
+    /// `GovernanceOptions`; the JSON-LD path parses those from the body, so
+    /// only the one field a body cannot carry is passed here.
+    ///
+    /// The plan is computed against a policy-wrapped view, and without this
+    /// an allow-listed caller's explain takes the *denied* branch of
+    /// `merge_policy_opts` while its query takes the permitted one — the two
+    /// plan against different views for the same request. That difference is
+    /// not visible in today's explain output (a policy-wrapped view is never
+    /// root, so both cases withhold statistics and emit the same plan), so
+    /// this is consistency rather than a fix for an observable defect: it
+    /// keeps explain honest if the output ever reflects the policy decision,
+    /// and matches what the SPARQL path already does. `None` is anonymous.
+    pub async fn explain_connection_with_opts(
+        &self,
+        query_json: &JsonValue,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> Result<JsonValue> {
+        let (spec, qc_opts) = parse_dataset_spec_as(query_json, server_identity)?;
 
         if spec.is_empty() {
             return Err(ApiError::query(

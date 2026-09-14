@@ -1393,7 +1393,7 @@ pub async fn explain_ledger(
             }
             let result = state
                 .fluree
-                .explain_connection(&query_json)
+                .explain_connection_with_opts(&query_json, headers.server_identity.as_ref())
                 .await
                 .map_err(ServerError::Api)?;
             tracing::info!(
@@ -3551,7 +3551,7 @@ pub async fn explain(
         // dataset-aware connection-explain path so snapshot selection
         // honors `@t:N` rather than silently loading HEAD.
         if requires_dataset_features(&query_json) {
-            let result = match state.fluree.explain_connection(&query_json).await {
+            let result = match state.fluree.explain_connection_with_opts(&query_json, headers.server_identity.as_ref()).await {
                 Ok(result) => {
                     tracing::info!(status = "success", "explain completed (dataset path)");
                     result
