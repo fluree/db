@@ -1147,6 +1147,29 @@ pub(crate) fn annotation_chain_entry_rows(
     Some((edge_first, reifier_first))
 }
 
+/// Reifier candidates the chain's cheapest `f:reifies*` lookup yields with
+/// the child's variables bound — the rows a per-reifier chain must point-check
+/// before the body runs. Unlike [`annotation_chain_entry_rows`] this includes
+/// `f:reifiesPredicate`: its uniform per-predicate estimate is too coarse to
+/// size the wrapper's OUTPUT by, but as a lane entry it is exactly the POST
+/// range a predicate-only chain drives from, and it is never larger than the
+/// truth by more than the endpoint lookups already are.
+pub(crate) fn annotation_chain_probe_rows(
+    patterns: &[Pattern],
+    bound_vars: &HashSet<VarId>,
+    stats: Option<&StatsView>,
+) -> Option<f64> {
+    crate::annotation_edge_probe::recognize_annotation_edge(patterns)?;
+    let rows = patterns[1..=3]
+        .iter()
+        .filter_map(|p| match p {
+            Pattern::Triple(tp) => Some(estimate_triple_row_count(tp, bound_vars, stats)),
+            _ => None,
+        })
+        .fold(f64::INFINITY, f64::min);
+    rows.is_finite().then_some(rows)
+}
+
 /// Cardinality of an expanded edge-annotation chain — `[base edge, three
 /// `f:reifies*` triples, body…]`, the only shape `Pattern::DefaultGraphSource`
 /// wraps. The generic branch model multiplies the chain's triples in

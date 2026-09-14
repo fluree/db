@@ -37,6 +37,7 @@ use crate::seed::{EmptyOperator, SeedOperator};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_binary_index::annotation_arena::DEFAULT_TARGET_ROWS_PER_LEAF;
 use fluree_db_core::{Sid, StatsView};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -67,22 +68,71 @@ enum ChainLane {
     Chain,
 }
 
-/// Pick the lane by entry cost, in rows walked. One scattered point probe
-/// is worth about `PROBE_ROW_EQUIV` sequential rows (the crossover measured
-/// on the StarBench slice, where the typed chain ran 0.74 s per-reifier
-/// against 1.29 s edge-first at 102k edges / 3.8k reifiers); the arena
-/// probe is never allowed to buffer more than `BUFFERED_BASE_MAX_ROWS`.
-fn choose_chain_lane(edge_first: f64, reifier_first: f64, arena_rows: Option<f64>) -> ChainLane {
+/// Entry costs of one wrapper with the child's variables bound, in rows
+/// walked per driving row (see `DefaultGraphSourceOperator::chain_lane`).
+struct LaneInputs {
+    /// Base-edge rows an edge-first lane scans.
+    edge_first: f64,
+    /// Reifier candidates the chain's cheapest `f:reifies*` lookup yields.
+    probe_first: f64,
+    /// Live rows in the sealed arena (`f:reifiesSubject` count), if known.
+    arena_rows: Option<f64>,
+    /// The base-edge subject is a constant or bound by the child.
+    subject_bound: bool,
+    /// The child already binds the reifier.
+    reifier_bound: bool,
+}
+
+/// One whole-leaf decode of the forward arena, in probed-row equivalents.
+/// A leaf is a 4,096-row CBOR blob of string-keyed rows; decoding one costs
+/// ~2.3 ms against ~6 µs per probed edge row (full StarBench ledger, where
+/// 82% of P11's samples were leaf decode).
+const LEAF_ROW_EQUIV: f64 = 400.0;
+
+/// Pick the lane by entry cost. One scattered point probe is worth about
+/// `PROBE_ROW_EQUIV` sequential rows (the crossover measured on the
+/// StarBench slice); the arena probe is never allowed to buffer more than
+/// `BUFFERED_BASE_MAX_ROWS`, and it pays `LEAF_ROW_EQUIV` per leaf it
+/// touches.
+fn choose_chain_lane(inputs: LaneInputs) -> ChainLane {
     const PROBE_ROW_EQUIV: f64 = 16.0;
     const BUFFERED_BASE_MAX_ROWS: f64 = 20_000_000.0;
-    // A reifier needs an edge: the chain never point-probes more reifiers
-    // than the base edge has rows.
-    let chain_cost = reifier_first.min(edge_first) * PROBE_ROW_EQUIV;
-    let arena_cost = if edge_first <= BUFFERED_BASE_MAX_ROWS {
-        edge_first
+    let LaneInputs {
+        edge_first,
+        probe_first,
+        arena_rows,
+        subject_bound,
+        reifier_bound,
+    } = inputs;
+    // A bound reifier makes the chain one point probe per driving row; no
+    // sweep beats that (P22 / C7 / C10 regressed 200× on the arena here).
+    if reifier_bound {
+        return ChainLane::Chain;
+    }
+    let buffered = edge_first <= BUFFERED_BASE_MAX_ROWS;
+    // A bound subject keys into one arena leaf per driving row, while the
+    // chain's `f:reifiesSubject <s>` lookup walks every reifier of that
+    // subject — a hub tail the estimates cannot see (StarBench P23 went
+    // from 46 ms to 192 s on the chain). Keep the point probe.
+    if subject_bound {
+        return if buffered {
+            ChainLane::Arena
+        } else {
+            ChainLane::Chain
+        };
+    }
+    // An unbound subject spreads the edges across the (s, p, o)-ordered
+    // arena, so the probe decodes about one leaf per edge up to the whole
+    // arena — a predicate-wide probe pays the entire arena whatever the
+    // predicate's size (P11 / S5 / C8 / C10 all cost the same 13–15 s).
+    let rows_per_leaf = DEFAULT_TARGET_ROWS_PER_LEAF as f64;
+    let total_leaves = arena_rows.map_or(edge_first, |rows| (rows / rows_per_leaf).max(1.0));
+    let arena_cost = if buffered {
+        edge_first + edge_first.min(total_leaves) * LEAF_ROW_EQUIV
     } else {
         f64::INFINITY
     };
+    let chain_cost = probe_first * PROBE_ROW_EQUIV;
     let enumerate_cost = arena_rows.unwrap_or(f64::INFINITY);
     if arena_cost <= chain_cost && arena_cost <= enumerate_cost {
         ChainLane::Arena
@@ -90,6 +140,19 @@ fn choose_chain_lane(edge_first: f64, reifier_first: f64, arena_rows: Option<f64
         ChainLane::Enumerate
     } else {
         ChainLane::Chain
+    }
+}
+
+/// Diagnostic override: `FLUREE_ANNOTATION_LANE=arena|enumerate|chain` pins
+/// the lane regardless of cost so the same query can be timed on the same
+/// ledger per lane. The runtime gates still apply — a forced arena or
+/// enumeration lane without a sealed arena falls through to the chain.
+fn forced_chain_lane() -> Option<ChainLane> {
+    match std::env::var("FLUREE_ANNOTATION_LANE").ok()?.as_str() {
+        "arena" => Some(ChainLane::Arena),
+        "enumerate" => Some(ChainLane::Enumerate),
+        "chain" => Some(ChainLane::Chain),
+        _ => None,
     }
 }
 
@@ -379,22 +442,47 @@ impl DefaultGraphSourceOperator {
     /// reifier makes the chain a per-row probe no sweep can beat (P22 / C7
     /// / C10 regressed 200× when the arena lane was taken there).
     fn chain_lane(&self, child: &BoxedOperator) -> ChainLane {
+        if let Some(forced) = forced_chain_lane() {
+            return forced;
+        }
         let bound: HashSet<VarId> = child.schema().iter().copied().collect();
-        let Some((edge_first, reifier_first)) = crate::planner::annotation_chain_entry_rows(
-            &self.inner_patterns,
-            &bound,
-            self.stats.as_deref(),
-        ) else {
+        let stats = self.stats.as_deref();
+        let Some(shape) =
+            crate::annotation_edge_probe::recognize_annotation_edge(&self.inner_patterns)
+        else {
             return ChainLane::Arena;
         };
-        let arena_rows = self.stats.as_deref().and_then(|s| {
+        let Some((edge_first, _)) =
+            crate::planner::annotation_chain_entry_rows(&self.inner_patterns, &bound, stats)
+        else {
+            return ChainLane::Arena;
+        };
+        let Some(probe_first) =
+            crate::planner::annotation_chain_probe_rows(&self.inner_patterns, &bound, stats)
+        else {
+            return ChainLane::Arena;
+        };
+        let subject_bound = match &shape.base {
+            Pattern::Triple(tp) => match &tp.s {
+                Ref::Var(v) => bound.contains(v),
+                _ => true,
+            },
+            _ => true,
+        };
+        let arena_rows = stats.and_then(|s| {
             s.get_property(&Sid::new(
                 fluree_vocab::namespaces::FLUREE_DB,
                 fluree_vocab::db::REIFIES_SUBJECT,
             ))
             .map(|p| p.count as f64)
         });
-        choose_chain_lane(edge_first, reifier_first, arena_rows)
+        choose_chain_lane(LaneInputs {
+            edge_first,
+            probe_first,
+            arena_rows,
+            subject_bound,
+            reifier_bound: bound.contains(&shape.ann_var),
+        })
     }
 
     /// Eligibility for the annotation-first enumeration: both base-edge
@@ -720,56 +808,102 @@ impl Operator for DefaultGraphSourceOperator {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_chain_lane, ChainLane};
+    use super::{choose_chain_lane, ChainLane, LaneInputs};
+
+    const FULL_ARENA: Option<f64> = Some(21_400_294.0);
+    const SLICE_ARENA: Option<f64> = Some(300_000.0);
+
+    fn lane(
+        edge_first: f64,
+        probe_first: f64,
+        arena_rows: Option<f64>,
+        subject_bound: bool,
+        reifier_bound: bool,
+    ) -> ChainLane {
+        choose_chain_lane(LaneInputs {
+            edge_first,
+            probe_first,
+            arena_rows,
+            subject_bound,
+            reifier_bound,
+        })
+    }
 
     #[test]
     fn lane_choice_matches_measured_starbench_shapes() {
-        // P2 / P7 / C2: wildcard base edge, 300k-row arena — walk the arena.
+        // P2 / P7 / C2: wildcard base edge — walk the arena, slice and full.
         assert_eq!(
-            choose_chain_lane(1e12, 300_000.0, Some(300_000.0)),
+            lane(1e12, 300_000.0, SLICE_ARENA, false, false),
             ChainLane::Enumerate
         );
-        // Same at full scale (21.4M reifiers).
         assert_eq!(
-            choose_chain_lane(1e12, 21_400_294.0, Some(21_400_294.0)),
+            lane(1e12, 21_400_294.0, FULL_ARENA, false, false),
             ChainLane::Enumerate
         );
-        // P11 at full scale: 952k TREATS edges against a 21.4M arena and
-        // nothing bound, so the endpoint lookups estimate the whole arena
-        // and the edge count caps the chain at 952k probes — edge-first wins.
+        // P11 full scale: 952k TREATS edges spread over ~5,200 leaves, so the
+        // probe decodes the whole arena (14.9 s); the chain drives from
+        // `f:reifiesPredicate TREATS` (31k est.) and ran 5.3 s.
         assert_eq!(
-            choose_chain_lane(952_406.0, 21_400_294.0, Some(21_400_294.0)),
-            ChainLane::Arena
-        );
-        // Slice P11 (102k edges, 300k arena): same call, same answer.
-        assert_eq!(
-            choose_chain_lane(102_555.0, 300_000.0, Some(300_000.0)),
-            ChainLane::Arena
-        );
-        // C7 / P22 / C10: the child already binds the reifier, so the chain
-        // is one probe per driving row — never sweep 952k edges for it.
-        assert_eq!(
-            choose_chain_lane(952_406.0, 1.0, Some(21_400_294.0)),
+            lane(952_406.0, 31_751.0, FULL_ARENA, false, false),
             ChainLane::Chain
         );
-        // P1: reifier bound, wildcard base edge.
+        // Slice P11 (102k edges over 73 leaves): 0.81 s chain vs 1.29 s arena.
         assert_eq!(
-            choose_chain_lane(1e12, 1.0, Some(21_400_294.0)),
+            lane(102_555.0, 3_846.0, SLICE_ARENA, false, false),
             ChainLane::Chain
         );
-        // P5: bound-object wildcard (1000 est.) with ~9 reifiers.
+        // S20 / S21 object-bound `?s PART_OF <o>`: every edge is its own leaf
+        // (1,208 edges → 3.1 s on the arena, 0.19 s on the chain). The
+        // estimate says 11 edges and ~100 reifiers with that object.
         assert_eq!(
-            choose_chain_lane(1000.0, 9.0, Some(300_000.0)),
+            lane(11.0, 100.0, FULL_ARENA, false, false),
+            ChainLane::Chain
+        );
+        // P9 / P18 subject-bound hub (3,345 edges in a couple of leaves):
+        // 50 ms arena vs 200 ms chain. P23 fully bound: 46 ms vs 192 s.
+        assert_eq!(
+            lane(3_345.0, 214.0, FULL_ARENA, true, false),
+            ChainLane::Arena
+        );
+        assert_eq!(lane(1.0, 100.0, FULL_ARENA, true, false), ChainLane::Arena);
+        // P19: subject bound by a 51k-row child — the chain ran out of memory.
+        assert_eq!(lane(12.0, 214.0, FULL_ARENA, true, false), ChainLane::Arena);
+        // C7 / P22 / C10 / P1: the child already binds the reifier, so the
+        // chain is one probe per driving row — never sweep for it.
+        assert_eq!(
+            lane(952_406.0, 1.0, FULL_ARENA, false, true),
+            ChainLane::Chain
+        );
+        assert_eq!(lane(1e12, 1.0, FULL_ARENA, true, true), ChainLane::Chain);
+        // P5 / P13: bound-object wildcard (1000 est.) with ~9 reifiers.
+        assert_eq!(
+            lane(1000.0, 9.0, SLICE_ARENA, false, false),
             ChainLane::Chain
         );
         // No arena statistics at all: never enumerate.
         assert_ne!(
-            choose_chain_lane(1e12, 300_000.0, None),
+            lane(1e12, 300_000.0, None, false, false),
             ChainLane::Enumerate
         );
         // A base edge wider than the buffer ceiling never takes the probe.
         assert_ne!(
-            choose_chain_lane(30_000_000.0, 30_000_000.0, Some(21_400_294.0)),
+            lane(30_000_000.0, 30_000_000.0, FULL_ARENA, false, false),
+            ChainLane::Arena
+        );
+        assert_ne!(
+            lane(30_000_000.0, 30_000_000.0, FULL_ARENA, true, false),
+            ChainLane::Arena
+        );
+    }
+
+    #[test]
+    fn small_arenas_keep_the_edge_first_probe() {
+        // Cypher-scale ledger (190k reified edges ≈ 46 leaves): a typed
+        // relationship over 3k edges can touch at most the whole arena, so
+        // the leaf tax stays bounded and the probe beats 9.5k per-reifier
+        // point checks.
+        assert_eq!(
+            lane(3_000.0, 9_500.0, Some(190_000.0), false, false),
             ChainLane::Arena
         );
     }
