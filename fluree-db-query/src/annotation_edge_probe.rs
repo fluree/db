@@ -53,6 +53,7 @@ use fluree_db_binary_index::annotation_arena::AnnotationArenaReader;
 use fluree_db_core::edge::{id_datatype_sid, EdgeKey};
 use fluree_db_core::storage::ContentStore;
 use fluree_db_core::{AnnotationIndexRoot, FlakeValue, Sid, StatsView};
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -1399,6 +1400,9 @@ pub struct AnnotationEnumerateOperator {
     /// Predicate `Sid → p_id` for this snapshot, so the walk emits
     /// `EncodedPid` like a scan would (the table has a few hundred entries).
     pred_ids: HashMap<Sid, u32>,
+    /// Subject-dictionary ids already resolved for edge subjects and
+    /// objects, which recur across the walk far more than they are distinct.
+    ref_ids: FxHashMap<Sid, Option<u64>>,
     result_buffer: Vec<Vec<Binding>>,
     buffer_pos: usize,
     estimated: Option<usize>,
@@ -1433,6 +1437,7 @@ impl AnnotationEnumerateOperator {
             child_rows: None,
             leaves: None,
             pred_ids: HashMap::new(),
+            ref_ids: FxHashMap::default(),
             result_buffer: Vec::new(),
             buffer_pos: 0,
             estimated,
@@ -1446,36 +1451,69 @@ impl AnnotationEnumerateOperator {
     /// keep the downstream join and aggregate in id space: the materialized
     /// form cost 40% of P2's time in `Arc<str>` clone/drop churn.
     fn ref_binding(sid: &Sid, dicts: &Dicts<'_>) -> Binding {
-        let persisted = dicts.store.and_then(|st| {
-            st.find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                .ok()
-                .flatten()
-        });
-        let novelty = || {
-            dicts
-                .dict_novelty
-                .filter(|dn| dn.is_initialized())
-                .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
-        };
-        match persisted.or_else(novelty) {
+        match Self::lookup_ref_id(sid, dicts) {
             Some(s_id) => Binding::encoded_sid(s_id),
             None => Binding::sid(sid.clone()),
         }
     }
 
+    /// [`ref_binding`](Self::ref_binding) through the operator's memo, for
+    /// the edge positions whose nodes recur across the walk. Each miss is a
+    /// dictionary walk; reifiers are unique per edge and take the direct path.
+    fn memoized_ref_binding(
+        memo: &mut FxHashMap<Sid, Option<u64>>,
+        sid: &Sid,
+        dicts: &Dicts<'_>,
+    ) -> Binding {
+        const MAX_ENTRIES: usize = 1 << 18;
+        let resolved = match memo.get(sid) {
+            Some(hit) => *hit,
+            None => {
+                let looked_up = Self::lookup_ref_id(sid, dicts);
+                if memo.len() >= MAX_ENTRIES {
+                    memo.clear();
+                }
+                memo.insert(sid.clone(), looked_up);
+                looked_up
+            }
+        };
+        match resolved {
+            Some(s_id) => Binding::encoded_sid(s_id),
+            None => Binding::sid(sid.clone()),
+        }
+    }
+
+    fn lookup_ref_id(sid: &Sid, dicts: &Dicts<'_>) -> Option<u64> {
+        let persisted = dicts.store.and_then(|st| {
+            st.find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                .ok()
+                .flatten()
+        });
+        persisted.or_else(|| {
+            dicts
+                .dict_novelty
+                .filter(|dn| dn.is_initialized())
+                .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
+        })
+    }
+
     /// The reified object as a binding, exactly as the base scan would have
     /// bound it: refs encoded, literals with the datatype and language tag
     /// the arena stored from the original flake.
-    fn object_binding(edge: &EdgeKey, dicts: &Dicts<'_>) -> Binding {
+    fn object_binding(
+        memo: &mut FxHashMap<Sid, Option<u64>>,
+        edge: &EdgeKey,
+        dicts: &Dicts<'_>,
+    ) -> Binding {
         match (&edge.o, &edge.lang) {
-            (FlakeValue::Ref(sid), _) => Self::ref_binding(sid, dicts),
+            (FlakeValue::Ref(sid), _) => Self::memoized_ref_binding(memo, sid, dicts),
             (val, Some(lang)) => Binding::lit_lang(val.clone(), lang.as_str()),
             (val, None) => Binding::from_object(val.clone(), edge.dt.clone()),
         }
     }
 
     fn emit(&mut self, edge: &EdgeKey, ann: &Sid, dicts: &Dicts<'_>) {
-        let s_b = Self::ref_binding(&edge.s, dicts);
+        let s_b = Self::memoized_ref_binding(&mut self.ref_ids, &edge.s, dicts);
         let p_b = match self.p_pos {
             EdgePos::Var(_) => Some(match self.pred_ids.get(&edge.p) {
                 Some(p_id) => Binding::EncodedPid { p_id: *p_id },
@@ -1483,7 +1521,7 @@ impl AnnotationEnumerateOperator {
             }),
             EdgePos::Const(_) => None,
         };
-        let o_b = Self::object_binding(edge, dicts);
+        let o_b = Self::object_binding(&mut self.ref_ids, edge, dicts);
         let ann_b = Self::ref_binding(ann, dicts);
         let child_rows = self.child_rows.as_deref().unwrap_or(&[]);
         for child_row in child_rows {
@@ -1651,6 +1689,31 @@ mod tests {
     use crate::ir::TriplePattern;
     use fluree_vocab::db::{REIFIES_OBJECT, REIFIES_PREDICATE, REIFIES_SUBJECT};
     use fluree_vocab::namespaces::FLUREE_DB;
+
+    #[test]
+    fn enumerate_memo_caches_ref_lookups_and_their_misses() {
+        let dicts = Dicts {
+            store: None,
+            dict_novelty: None,
+        };
+        let mut memo = FxHashMap::default();
+        let alice = Sid::new(100, "alice");
+        let direct = AnnotationEnumerateOperator::ref_binding(&alice, &dicts);
+        let first = AnnotationEnumerateOperator::memoized_ref_binding(&mut memo, &alice, &dicts);
+        let second = AnnotationEnumerateOperator::memoized_ref_binding(&mut memo, &alice, &dicts);
+        assert_eq!(
+            memo.len(),
+            1,
+            "one entry per distinct node, misses included"
+        );
+        assert_eq!(memo.get(&alice), Some(&None));
+        for b in [&direct, &first, &second] {
+            assert!(
+                matches!(b, Binding::Sid { sid, .. } if *sid == alice),
+                "unknown nodes fall back to the materialized Sid: {b:?}"
+            );
+        }
+    }
 
     fn v(n: u16) -> VarId {
         VarId(n)
