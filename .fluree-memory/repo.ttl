@@ -3753,6 +3753,69 @@ mem:fact-01kx4zresym4eghmrzn2wcchx5 a mem:Fact ;
     mem:branch "perf/property-path-batched-frontier" ;
     mem:createdAt "2026-07-10T03:04:54.846310+00:00"^^xsd:dateTime .
 
+mem:decision-01m2fztsh4bjg9h36kk6eprt4y a mem:Decision ;
+    mem:content "Annotation lane chooser (choose_chain_lane) keys on bindings first: a child-bound reifier takes the chain; a bound base-edge subject (constant or child-bound) always takes the arena probe because the chain's `f:reifiesSubject <s>` lookup has a hub tail the mean estimates cannot see (StarBench P23 46 ms -> 192 s, P19 OOM when the chain was forced); only an unbound subject is cost-compared, charging the arena ~400 row-equivalents per leaf it touches (min(edges, arena_rows/4096)). Batched existence admits an Explicit(@id) dtc on a ref constant (only the f:reifies* expansion emits it), so rP/rS constant checks batch instead of per-row scan opens. FLUREE_ANNOTATION_LANE=arena|enumerate|chain forces a lane for A/B timing." ;
+    mem:tag "annotation-arena" ;
+    mem:tag "edge-annotation" ;
+    mem:tag "performance" ;
+    mem:tag "planner" ;
+    mem:tag "rdf12" ;
+    mem:tag "starbench" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/default_graph_source.rs" ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:artifactRef "fluree-db-query/src/planner.rs" ;
+    mem:branch "perf/rdf12-annotation-chain-planning" ;
+    mem:createdAt "2026-09-14T12:56:19.236948+00:00"^^xsd:dateTime ;
+    mem:rationale "Measured on the full BKR-star ledger: predicate-only shapes 2-4.6x faster on the chain (P11 14.9 -> 4.9 s), object-bound wrappers 3-9x (S20 3.4 -> 0.69 s), P10 0.12 -> 0.03 s; bound-subject shapes unchanged; S21/S22 within noise (cross-join bound)." ;
+    mem:alternatives "Pure cost comparison for bound subjects (regressed P23/P19 catastrophically); runtime re-decision inside the arena probe after counting leaves (rejected: the replayed chain would inherit the same hub tail)" .
+
+mem:fact-01m2erqe12gyekk6nm30j9saz7 a mem:Fact ;
+    mem:content "StarBench P4 (`<< ?s ?p ?o >> ?d ?e`, 33.6M rows) OOMed the server at 240 GB while P6 (same rows, bound predicate) fit: `NestedLoopJoinOperator::build_output_batch` pre-allocated every output column at `ctx.batch_size` (Binding ≤ 88 B) and in per-row mode emitted one batch per left row (~22 rows) without shrinking; the delimited response path (`to_tsv_bytes`) retains every batch until it formats → ~56 KB per tiny batch × 21.4M batches. Fixed by sizing columns as min(pending rows, batch_size); dense batches unchanged. Slice A/B via the same collect-then-format code: 17 GB → 3 GB peak for 6.57M rows. Any per-row join with sparse output (unbound-predicate sibling, no batched lane) plus a collect-all consumer had this cost." ;
+    mem:tag "batch" ;
+    mem:tag "memory" ;
+    mem:tag "nested-loop-join" ;
+    mem:tag "oom" ;
+    mem:tag "server" ;
+    mem:tag "starbench" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-query/src/join.rs" ;
+    mem:artifactRef "fluree-db-server/src/routes/query.rs" ;
+    mem:branch "perf/rdf12-annotation-chain-planning" ;
+    mem:createdAt "2026-09-14T01:32:54.691338+00:00"^^xsd:dateTime ;
+    mem:rationale "The CLI streams and drops batches, so it never showed the growth (15.9 GB peak for the full P4); only collect-all consumers see it. Measure with `--format csv` and peak RSS, not row counts." .
+
+mem:fact-01m2erqvntergn2f08hw0kvxkp a mem:Fact ;
+    mem:content "Annotation-chain lane choice (`choose_chain_lane`) costs three lanes in rows walked: arena probe = base-edge rows (≤20M buffer cap), enumeration = arena rows (`f:reifiesSubject` merged count), chain = min(reifier estimate, edge rows) × 16. The reifier estimate uses `f:reifiesSubject`/`f:reifiesObject` only: `f:reifiesPredicate`'s bound-object estimate splits the arena evenly across predicates (TREATS: 31k estimated vs 1.1M real) and flipped P11 to the wrong lane. An edge-rows-vs-arena-rows gate sent chains whose reifier was already bound by a sibling (P22/C7/C10) through the arena probe, a 952k-edge cross join: 200× regression. Warm full-scale: C7 0.08 s, P1 0.01 s, P11 14 s (arena), P2 ~60 s (enumerate)." ;
+    mem:tag "annotation-arena" ;
+    mem:tag "edge-annotation" ;
+    mem:tag "planner" ;
+    mem:tag "rdf12" ;
+    mem:tag "starbench" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "docs/design/edge-annotations.md" ;
+    mem:artifactRef "fluree-db-query/src/default_graph_source.rs" ;
+    mem:artifactRef "fluree-db-query/src/planner.rs" ;
+    mem:branch "perf/rdf12-annotation-chain-planning" ;
+    mem:createdAt "2026-09-14T01:33:08.666058+00:00"^^xsd:dateTime ;
+    mem:rationale "Unit test lane_choice_matches_measured_starbench_shapes pins the measured shapes; the first P1 \"40 s\" report was a cold first query (stats-view build + dictionary first use), warm is 20 ms." .
+
+mem:fact-01m2ftrqed0wjpj52d0xmbk0rw a mem:Fact ;
+    mem:content "Annotation arena leaves are whole-leaf CBOR blobs (4,096 rows of Sid-string EdgeKeys); decoding costs ~0.6-0.8 us/row, ~2.5-3.5 ms per touched leaf. The forward arena is keyed (s,p,o), so any subject-unbound probe set touches ~one leaf per edge and a predicate-wide probe decodes all ~5,200 leaves (13 s local, 45 s on Zen 1) regardless of edge count. StarBench P11 spent 82% of samples in AnnotationForwardLeaf::decode; P11/P12/S5/S6/C8/C10 all cost ~14 s flat. choose_chain_lane's arena_cost (= edge rows) omits this leaf tax; the reverse-arena enumeration lane pays the same decode plus find_subject_id_by_parts re-encoding." ;
+    mem:tag "annotation-arena" ;
+    mem:tag "edge-annotation" ;
+    mem:tag "performance" ;
+    mem:tag "planner" ;
+    mem:tag "rdf12" ;
+    mem:tag "starbench" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-binary-index/src/annotation_arena/format.rs" ;
+    mem:artifactRef "fluree-db-binary-index/src/annotation_arena/reader.rs" ;
+    mem:artifactRef "fluree-db-query/src/default_graph_source.rs" ;
+    mem:branch "perf/rdf12-annotation-chain-planning" ;
+    mem:createdAt "2026-09-14T11:27:48.685925+00:00"^^xsd:dateTime ;
+    mem:rationale "Measured 2026-09-14 on the full BKR-star ledger; explains why every predicate-only and object-bound SPARQL-star shape sits 5-25x behind GraphDB/Stardog even after the planning fixes." .
+
 mem:decision-01kzdzqzsrwt4wbyr5dt9veshp a mem:Decision ;
     mem:content "PR #1422 engine convergence phase 1 (uncommitted on branch pr-1422-review): extracted pub TmEmitContext + emit_row + emit_row_terms from emit_batch in the shared enumerator (behavior-identical; emit_row_terms takes a caller-supplied subject for classify-then-emit callers). build_live_node in r2rml_materialize.rs = NodeCollector (TripleObserver→SubjectNode, rdf:type→@type routing) + emit_row_terms; hand-rolled POM loop deleted. Deltas: templated predicates now emit (were silently dropped); ParentIndexSet::new validates mapping fail-closed; FK edges still drop (parents unindexed) but counted+warned. Phase 2: indexing FK parents needs a window-vs-whole-table answer." ;
     mem:tag "convergence" ;
