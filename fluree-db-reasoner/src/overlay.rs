@@ -331,6 +331,11 @@ mod tests {
         Flake::new(sid(s), sid(p), FlakeValue::Long(o), sid(0), t, true, None)
     }
 
+    /// `make_flake` with an explicit datatype, for the object tie-break.
+    fn make_flake_dt(s: u16, p: u16, o: i64, dt: u16, t: i64) -> Flake {
+        Flake::new(sid(s), sid(p), FlakeValue::Long(o), sid(dt), t, true, None)
+    }
+
     #[test]
     fn test_empty_overlay() {
         let overlay = DerivedFactsOverlay::empty();
@@ -393,7 +398,16 @@ mod tests {
         ] {
             builder.push(make_flake(s, p, o, 1));
         }
+        // Every comparator falls through to `t` and then the datatype once
+        // (s, p, o) tie, and flakes that differ only past that point are the
+        // ones a permutation can reorder without any earlier field noticing.
+        // Flakes sharing a `t` and a `dt` never reach those arms, so these
+        // duplicates are what make the tie-break itself part of the test.
+        builder.push(make_flake(1, 1, 7, 9)); // ties (1,1,7) on s/p/o, later t
+        builder.push(make_flake(1, 1, 7, 4)); // and again, between the two
+        builder.push(make_flake_dt(2, 1, 5, 3, 1)); // ties (2,1,5), later dt
         let overlay = builder.build(FrozenSameAs::empty(), 1);
+        assert_eq!(overlay.len(), 9, "duplicates must survive the build");
 
         for index in [
             IndexType::Spot,
@@ -414,20 +428,20 @@ mod tests {
             assert_eq!(via_scan, expected, "full scan order for {index:?}");
 
             // A bounded scan (exclusive left = second flake, inclusive right =
-            // fourth flake) must yield exactly the sorted slice (2..=3].
+            // fifth flake) must yield exactly the sorted slice (2..=4].
             let mut bounded = Vec::new();
             overlay.for_each_overlay_flake(
                 0,
                 index,
                 Some(&expected[1]),
-                Some(&expected[3]),
+                Some(&expected[4]),
                 false,
                 i64::MAX,
                 &mut |f| bounded.push(f.clone()),
             );
             assert_eq!(
                 bounded,
-                expected[2..=3].to_vec(),
+                expected[2..=4].to_vec(),
                 "bounded scan for {index:?}"
             );
         }
