@@ -188,6 +188,13 @@ async fn cascade_attachment_retracts(
                     RangeOptions::new().with_to_t(to_t),
                 )
                 .await?;
+                // `from_reifies_facts` reconciles the bundle's `f:reifiesGraph`
+                // value against the flake-level `g`, so an indexed named-graph
+                // bundle decoded as `GraphMismatch` and the `Err(_) => continue`
+                // below swallowed it: deleting a base edge left the claim that
+                // reifies it live, pointing at a triple that no longer exists.
+                let mut all_ann_flakes = all_ann_flakes;
+                stamp_graph(&mut all_ann_flakes, flake.g.as_ref());
                 let (bundle, metadata): (Vec<Flake>, Vec<Flake>) = all_ann_flakes
                     .into_iter()
                     .partition(|f| is_reserved_reifies_predicate(&f.p));
@@ -304,6 +311,14 @@ async fn cascade_attachment_retracts(
                 RangeOptions::new().with_to_t(to_t),
             )
             .await?;
+            // Same seam as the base-edge pass above: stamp before decoding.
+            // The group's own retracts are this transaction's flakes for this
+            // subject, so they carry the graph the scan dropped.
+            let mut all_flakes = all_flakes;
+            stamp_graph(
+                &mut all_flakes,
+                retract_set.first().and_then(|f| f.g.as_ref()),
+            );
             let (bundle, current_metadata): (Vec<Flake>, Vec<Flake>) = all_flakes
                 .into_iter()
                 .partition(|f| is_reserved_reifies_predicate(&f.p));
@@ -1562,6 +1577,20 @@ async fn stage_graph_mgmt(
     .await
 }
 
+/// Re-attach the graph to flakes read back through a scan.
+///
+/// Index-decoded flakes carry `g: None` — the graph is the index they came
+/// from, not a field on the flake — while a named-graph transaction's own
+/// flakes carry `g: Some(sid)`. Any comparison or decode that reads `g` has to
+/// put it back first, or an indexed named-graph bundle silently fails to line
+/// up with the transaction that is editing it. `scan_graph_flakes` has always
+/// done this; every other scan of a reifier's own facts needs it too.
+fn stamp_graph(flakes: &mut [Flake], g_sid: Option<&Sid>) {
+    for f in flakes {
+        f.g = g_sid.cloned();
+    }
+}
+
 /// Stage-time attachment-bundle invariant: an annotation SID may
 /// reify exactly one edge. Counting this txn's asserted
 /// `f:reifiesSubject` flakes is insufficient — it misses
@@ -1665,9 +1694,7 @@ async fn enforce_single_target_reifiers(
             // bundle would mix `None` and `Some` and decode as
             // `MixedFlakeGraphs`. `scan_graph_flakes` stamps for the same
             // reason.
-            for f in &mut current {
-                f.g = g_sid.clone();
-            }
+            stamp_graph(&mut current, g_sid.as_ref());
             let mut net: HashMap<ReifiesKey, Flake> = HashMap::new();
             for f in current {
                 if is_reserved_reifies_predicate(&f.p) {

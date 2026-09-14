@@ -1561,3 +1561,162 @@ async fn indexed_named_graph_annotation_stays_writable() {
         "the refusal must name the reifier: {err}"
     );
 }
+
+/// Count the reifiers' own `f:reifies*` system facts across every graph.
+///
+/// The two cascade tests below need to tell an *orphaned* bundle from a
+/// *retracted* one, and the annotation query surface cannot: that lane joins
+/// the bundle against its base edge, so once the edge is gone it returns
+/// nothing either way. Reading the system facts directly is the only view
+/// that distinguishes them.
+async fn live_reifies_flakes(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> usize {
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    let mut live = 0;
+    for g_id in 0..6u16 {
+        let flakes = fluree_db_core::range_with_overlay(
+            &ledger.snapshot,
+            g_id,
+            ledger.novelty.as_ref(),
+            fluree_db_core::comparator::IndexType::Spot,
+            fluree_db_core::range::RangeTest::Eq,
+            fluree_db_core::range::RangeMatch::new(),
+            fluree_db_core::range::RangeOptions::new().with_to_t(ledger.t()),
+        )
+        .await
+        .unwrap_or_default();
+        live += flakes
+            .iter()
+            .filter(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
+            .count();
+    }
+    live
+}
+
+/// Deleting a base edge must retract the claim that reifies it, even once the
+/// bundle has been indexed.
+///
+/// `cascade_attachment_retracts` finds the annotation, scans its bundle back,
+/// and decodes it with `EdgeKey::from_reifies_facts` to confirm it really
+/// reifies the edge being deleted. That decode reconciles the bundle's
+/// `f:reifiesGraph` value against the flake-level `g` — and index-decoded
+/// flakes carry `g: None` while the value says `Some(graph)`, so an indexed
+/// named-graph bundle decoded as `GraphMismatch`. The cascade's
+/// `Err(_) => continue` then swallowed it and the claim outlived the edge it
+/// describes, which is a wrong answer rather than untidy storage.
+///
+/// Only this combination is affected. The default graph is fine (both sides
+/// `None`), and a novelty-resident named-graph bundle is fine (both `Some`),
+/// which is why every existing cascade test passed.
+#[tokio::test]
+async fn deleting_an_indexed_named_graph_edge_cascades_to_its_claim() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations-indexed:cascade-named-graph";
+
+    let committed = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:claims-graph",
+                "ex:knows": {
+                    "@id": "ex:bob",
+                    "@annotation": {"@id": "ex:claim1", "ex:confidence": 0.9}
+                }
+            }),
+        )
+        .await
+        .expect("annotated named-graph insert");
+    assert!(committed.ledger.t() > 0);
+
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    // Guards the counter itself: if this read cannot see the bundle at all,
+    // the post-delete assertion below would pass for the wrong reason.
+    let before = live_reifies_flakes(&fluree, ledger_id).await;
+    assert!(
+        before > 0,
+        "the indexed bundle must be visible to this read before the delete"
+    );
+
+    let deleted = fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/>\n\
+             DELETE DATA { GRAPH <http://example.org/claims-graph> \
+             { ex:alice ex:knows ex:bob } }",
+        )
+        .commit()
+        .await
+        .expect("delete the base edge");
+    assert!(deleted.receipt.t > committed.ledger.t());
+
+    assert_eq!(
+        live_reifies_flakes(&fluree, ledger_id).await,
+        0,
+        "the claim's f:reifies* bundle must not outlive the edge it reifies"
+    );
+}
+
+/// The same `g`-asymmetry defect, reached through the *other* cascade pass.
+///
+/// Pass 1 fires when the base edge is deleted. Pass 2 fires when the user
+/// deletes an annotation's last piece of metadata without touching the edge,
+/// which leaves the `f:reifies*` bundle behind with nothing to describe. Both
+/// passes scan the reifier's own facts and decode them, so both hit the
+/// `GraphMismatch` on an indexed named-graph bundle — a fix to one leaves the
+/// other silently broken, which is why this test exists alongside its twin.
+#[tokio::test]
+async fn deleting_an_indexed_named_graph_claim_body_cascades_its_bundle() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations-indexed:cascade-named-graph-orphan";
+
+    let committed = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:claims-graph",
+                "ex:knows": {
+                    "@id": "ex:bob",
+                    // A string, deliberately. A bare `0.9` in the SPARQL below
+                    // is an `xsd:decimal` while JSON-LD stores it as an
+                    // `xsd:double`, so `DELETE DATA` would match nothing, the
+                    // transaction would still commit, and this test would pass
+                    // without the cascade ever running.
+                    "@annotation": {"@id": "ex:claim1", "ex:role": "Engineer"}
+                }
+            }),
+        )
+        .await
+        .expect("annotated named-graph insert");
+
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+
+    assert!(
+        live_reifies_flakes(&fluree, ledger_id).await > 0,
+        "the indexed bundle must be visible to this read before the delete"
+    );
+
+    // Delete the claim's only metadata fact, leaving the edge itself alone.
+    let deleted = fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/>\n\
+             DELETE DATA { GRAPH <http://example.org/claims-graph> \
+             { ex:claim1 ex:role \"Engineer\" } }",
+        )
+        .commit()
+        .await
+        .expect("delete the claim body");
+    assert!(deleted.receipt.t > committed.ledger.t());
+
+    assert_eq!(
+        live_reifies_flakes(&fluree, ledger_id).await,
+        0,
+        "a bundle whose claim has no body left must not survive as an orphan"
+    );
+}

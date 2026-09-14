@@ -192,11 +192,23 @@ fn extract_prefix_block_from_bytes(buf: &[u8]) -> Result<(String, u64), SplitErr
                 in_directive = false;
                 last_directive_end = tok.end;
             }
-            TokenKind::Iri | TokenKind::String | TokenKind::StringEscaped(_)
+            TokenKind::Iri
+            | TokenKind::IriEscaped(_)
+            | TokenKind::String
+            | TokenKind::StringEscaped(_)
                 if in_directive && sparql_directive =>
             {
                 // SPARQL-style directives end after their operand (no dot
                 // required): `PREFIX ns: <iri>`, `BASE <iri>`, `VERSION "1.2"`.
+                //
+                // `IriEscaped` is the same operand: an IRI containing a `\u`
+                // escape lexes as its own token. Without it the directive
+                // never closed, so the prefix block ran on until the next `.`
+                // and swallowed the first data statement — which the prelude
+                // parse ignores and `data_start` skips past. A streaming
+                // import silently dropped that triple; the directory-rechunk
+                // path, which prepends the prefix block to every chunk,
+                // re-asserted it in each one instead.
                 in_directive = false;
                 last_directive_end = tok.end;
             }
@@ -2367,6 +2379,44 @@ ex:bob ex:name \"Bob\" .
 
         assert_eq!(count, 2, "expected 2 chunks for 2 statements");
         reader.join().unwrap();
+    }
+
+    #[test]
+    fn escaped_iri_in_a_prefix_directive_does_not_swallow_the_next_statement() {
+        // A SPARQL-style directive ends at its operand. An IRI carrying a
+        // `\u` escape lexes as a distinct token, and while that token was not
+        // recognised as an operand the directive never closed: the prefix
+        // block ran on to the next `.`, absorbing the first data statement.
+        // Streaming import then dropped it entirely.
+        let ttl = "PREFIX ex: <http://example.org/caf\\u00E9/>\n\
+                   ex:a ex:b ex:c .\n\
+                   ex:d ex:e ex:f .\n";
+        let f = write_temp(ttl);
+        let (prefix, data_start) = extract_prefix_block(f.path()).unwrap();
+        assert!(
+            !prefix.contains("ex:a"),
+            "the prefix block must stop at the directive's IRI: {prefix:?}"
+        );
+
+        let mut reader = StreamingTurtleReader::new(f.path(), 1, 2, None).unwrap();
+        let mut subjects = Vec::new();
+        while let Some((_i, text)) = recv_as_text(&reader) {
+            let json = crate::parse_to_json(&text).expect("chunk parses");
+            for node in json.as_array().unwrap() {
+                subjects.push(node["@id"].as_str().unwrap().to_string());
+            }
+        }
+        reader.join().unwrap();
+        subjects.sort();
+        subjects.dedup();
+        assert_eq!(
+            subjects,
+            vec![
+                "http://example.org/caf\u{e9}/a".to_string(),
+                "http://example.org/caf\u{e9}/d".to_string()
+            ],
+            "both statements must survive the split (data_start={data_start})"
+        );
     }
 
     #[test]
