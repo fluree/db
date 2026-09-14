@@ -1,7 +1,11 @@
 //! Correctness probe, not the production graph-source adapter or a benchmark.
 use std::{collections::BTreeMap, error::Error, fs, sync::Arc};
 
-use delta_kernel::arrow::json::writer::{JsonArray, WriterBuilder};
+mod batch_bridge;
+
+use batch_bridge::BatchBridge;
+use delta_kernel::arrow::datatypes::Schema as ArrowSchema;
+use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::expressions::Expression;
 use delta_kernel::object_store::aws::AmazonS3Builder;
@@ -9,6 +13,7 @@ use delta_kernel::{scan::Scan, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::storage::store_from_url_opts;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
+use fluree_db_tabular::{Column, ColumnBatch};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use url::Url;
@@ -46,27 +51,67 @@ struct Filter {
     columns: Vec<String>,
 }
 
-fn rows(scan: Scan, engine: Arc<Engine>, columns: &[String]) -> Result<Vec<Value>> {
-    let mut writer = WriterBuilder::new()
-        .with_explicit_nulls(true)
-        .build::<_, JsonArray>(Vec::new());
+fn batches(scan: Scan, engine: Arc<Engine>) -> Result<impl Iterator<Item = Result<ColumnBatch>>> {
+    let schema = Arc::new(ArrowSchema::try_from_kernel(
+        scan.logical_schema().as_ref(),
+    )?);
+    // Probe-only bindings: preserve Delta mapping IDs when present. Unmapped
+    // fixtures use full-snapshot positions, never projection positions. A real
+    // provider must persist its own identity bindings for unmapped tables.
+    let ids = scan
+        .logical_schema()
+        .fields()
+        .map(|field| match field.column_mapping_id() {
+            Some(id) => Ok(i32::try_from(id)?),
+            None => {
+                let pos = scan
+                    .snapshot()
+                    .schema()
+                    .fields()
+                    .position(|f| f.name() == field.name())
+                    .ok_or("projected column absent from snapshot")?;
+                Ok(i32::try_from(pos + 1)?)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let bridge = BatchBridge::new(schema, &ids)?;
     // Kernel execute supplies logical rows, including partition values and
     // deletion masks. Do not substitute a raw scan of the directory's Parquet.
-    for result in scan.execute(engine)? {
-        let batch = result.try_into_record_batch()?;
-        let names: Vec<_> = batch
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
+    Ok(scan
+        .execute(engine)?
+        .map(move |result| bridge.convert(&result.try_into_record_batch()?)))
+}
+
+fn rows(scan: Scan, engine: Arc<Engine>, columns: &[String]) -> Result<Vec<Value>> {
+    let mut output = Vec::new();
+    for result in batches(scan, engine)? {
+        let batch = result?;
+        let names: Vec<_> = batch.schema.fields.iter().map(|f| f.name.clone()).collect();
         if names != columns {
             return Err(format!("unexpected columns: {names:?}").into());
         }
-        writer.write(&batch)?;
+        // JSON exists only at the assertion boundary, after typed conversion.
+        for row in 0..batch.num_rows {
+            let mut object = serde_json::Map::new();
+            for (field, column) in batch.schema.fields.iter().zip(&batch.columns) {
+                let value = match column {
+                    Column::Boolean(v) => json!(v[row]),
+                    Column::Int32(v) | Column::Date(v) => json!(v[row]),
+                    Column::Int64(v) | Column::Timestamp(v) | Column::TimestampTz(v) => {
+                        json!(v[row])
+                    }
+                    Column::Float32(v) => json!(v[row]),
+                    Column::Float64(v) => json!(v[row]),
+                    Column::String(v) => json!(v[row]),
+                    Column::Bytes(v) => json!(v[row]),
+                    Column::Decimal { values, .. } => json!(values[row].map(|v| v.to_string())),
+                };
+                object.insert(field.name.clone(), value);
+            }
+            output.push(Value::Object(object));
+        }
     }
-    writer.finish()?;
-    Ok(serde_json::from_slice(&writer.into_inner())?)
+    Ok(output)
 }
 
 fn assert_rows(mut actual: Vec<Value>, mut expected: Vec<Value>, key: &str) -> Result<()> {
