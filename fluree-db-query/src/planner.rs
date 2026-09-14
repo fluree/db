@@ -1121,9 +1121,14 @@ pub fn estimate_pattern(
 
 /// The two entry points of an expanded edge-annotation chain, costed with
 /// `bound_vars` already bound: rows the base-edge scan yields (edge-first)
-/// and rows the most selective `f:reifies*` lookup yields (reifier-first).
-/// `None` when `patterns` is not a recognized chain. Shared by the wrapper's
-/// cardinality estimate and by the delegate's lane choice.
+/// and rows the cheaper of the `f:reifiesSubject` / `f:reifiesObject`
+/// lookups yields (reifier-first). `f:reifiesPredicate` is left out on
+/// purpose: its bound-object estimate divides the arena evenly across
+/// predicates, which put `TREATS` at 31k reifiers when it has 1.1M and
+/// made the lane choice sweep 952k edges per reifier probe the wrong way
+/// round; the endpoint lookups only get small when a binding makes them
+/// small. `None` when `patterns` is not a recognized chain. Shared by the
+/// wrapper's cardinality estimate and by the delegate's lane choice.
 pub(crate) fn annotation_chain_entry_rows(
     patterns: &[Pattern],
     bound_vars: &HashSet<VarId>,
@@ -1135,8 +1140,8 @@ pub(crate) fn annotation_chain_entry_rows(
         _ => None,
     };
     let edge_first = triple_rows(&shape.base)?;
-    let reifier_first = patterns[1..4]
-        .iter()
+    let reifier_first = [&patterns[1], &patterns[3]]
+        .into_iter()
         .filter_map(triple_rows)
         .fold(f64::INFINITY, f64::min);
     Some((edge_first, reifier_first))
@@ -6084,20 +6089,23 @@ mod tests {
             other => panic!("wrapper must be a Source: {other:?}"),
         };
 
-        // Bare chain: the reifiesPredicate lookup (300k / 78 ≈ 3,846) is
-        // the cheaper entry point and bounds the reifier count.
+        // Bare chain: the base edge (102,555 TREATS rows) bounds the reifier
+        // count — the endpoint lookups estimate the whole 300k arena and the
+        // reifiesPredicate lookup is deliberately not consulted (its uniform
+        // per-predicate split said 3,846 where the slice has 98,641).
         let bare = row_count(chain.clone());
         assert!(
-            (3_000.0..5_000.0).contains(&bare),
-            "bare chain ≈ 3,846 reifiers, got {bare}"
+            (100_000.0..110_000.0).contains(&bare),
+            "bare chain ≈ 102,555 reifiers, got {bare}"
         );
-        // With the body nested: reifiers × ~22 derives_from rows each.
+        // With the body nested: reifiers × ~22 derives_from rows each, still
+        // well under the 6.5M-row body triple on its own.
         let mut with_body = chain.clone();
         with_body.push(body.clone());
         let nested = row_count(with_body);
         assert!(
-            (50_000.0..150_000.0).contains(&nested),
-            "chain × body ≈ 85k, got {nested}"
+            (2_000_000.0..2_500_000.0).contains(&nested),
+            "chain × body ≈ 2.26M, got {nested}"
         );
         // And the wrapper drives its body triple, not the other way round.
         let ordered = reorder_patterns(

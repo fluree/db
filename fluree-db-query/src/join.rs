@@ -1560,8 +1560,25 @@ impl NestedLoopJoinOperator {
     /// Build output batch from pending results
     async fn build_output_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
         let batch_size = ctx.batch_size;
+        // Size the columns by what is actually pending, capped at the batch
+        // size. In per-row mode the pending output is one left row's matches
+        // — StarBench P4 (`<< ?s ?p ?o >> ?d ?e`): ~22 rows per reifier over
+        // 21.4M reifiers — and a column pre-allocated at full batch capacity
+        // kept ~360 KB × columns alive per emitted batch. The server retains
+        // every batch of a delimited response until it formats them, which
+        // ran to 240 GB. Dense right batches still get the full capacity.
+        let mut pending_rows = 0usize;
+        for (_, _, right_batch) in &self.pending_output {
+            pending_rows += right_batch.len();
+            if pending_rows >= batch_size {
+                break;
+            }
+        }
+        let capacity = pending_rows
+            .saturating_sub(self.pending_right_row)
+            .clamp(1, batch_size);
         let mut output_columns: Vec<Vec<Binding>> = (0..self.combined_schema.len())
-            .map(|_| Vec::with_capacity(batch_size))
+            .map(|_| Vec::with_capacity(capacity))
             .collect();
 
         let mut rows_added = 0;

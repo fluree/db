@@ -56,6 +56,43 @@ fn resolve_pred_sid(p: &Ref, ctx: &ExecutionContext<'_>) -> Option<Sid> {
     }
 }
 
+/// The physical lane the delegate takes for a recognized chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainLane {
+    /// Forward-arena probe: scan the base edge, probe the arena per row.
+    Arena,
+    /// Annotation-first: stream the reverse arena, no base scan.
+    Enumerate,
+    /// Per-reifier point probes (the hash lane or the generic chain).
+    Chain,
+}
+
+/// Pick the lane by entry cost, in rows walked. One scattered point probe
+/// is worth about `PROBE_ROW_EQUIV` sequential rows (the crossover measured
+/// on the StarBench slice, where the typed chain ran 0.74 s per-reifier
+/// against 1.29 s edge-first at 102k edges / 3.8k reifiers); the arena
+/// probe is never allowed to buffer more than `BUFFERED_BASE_MAX_ROWS`.
+fn choose_chain_lane(edge_first: f64, reifier_first: f64, arena_rows: Option<f64>) -> ChainLane {
+    const PROBE_ROW_EQUIV: f64 = 16.0;
+    const BUFFERED_BASE_MAX_ROWS: f64 = 20_000_000.0;
+    // A reifier needs an edge: the chain never point-probes more reifiers
+    // than the base edge has rows.
+    let chain_cost = reifier_first.min(edge_first) * PROBE_ROW_EQUIV;
+    let arena_cost = if edge_first <= BUFFERED_BASE_MAX_ROWS {
+        edge_first
+    } else {
+        f64::INFINITY
+    };
+    let enumerate_cost = arena_rows.unwrap_or(f64::INFINITY);
+    if arena_cost <= chain_cost && arena_cost <= enumerate_cost {
+        ChainLane::Arena
+    } else if enumerate_cost < chain_cost {
+        ChainLane::Enumerate
+    } else {
+        ChainLane::Chain
+    }
+}
+
 /// What the annotation-first enumeration lane binds (see
 /// `DefaultGraphSourceOperator::enumeration_plan`).
 struct EnumerationPlan {
@@ -175,7 +212,8 @@ impl DefaultGraphSourceOperator {
             .is_some(),
             "annotation delegate gates"
         );
-        if self.annotation_probe_gates_pass(ctx) && self.arena_lane_pays_off(&child) {
+        let lane = self.chain_lane(&child);
+        if self.annotation_probe_gates_pass(ctx) && lane == ChainLane::Arena {
             if let Some(shape) =
                 crate::annotation_edge_probe::recognize_annotation_edge(&self.inner_patterns)
             {
@@ -226,7 +264,7 @@ impl DefaultGraphSourceOperator {
         // larger than the arena). Stream the arena instead of scanning the
         // base edge — see `AnnotationEnumerateOperator` for why no base-edge
         // check is needed under these gates.
-        if self.annotation_probe_gates_pass(ctx) && !self.arena_lane_pays_off(&child) {
+        if self.annotation_probe_gates_pass(ctx) && lane == ChainLane::Enumerate {
             if let Some(shape) =
                 crate::annotation_edge_probe::recognize_annotation_edge(&self.inner_patterns)
             {
@@ -329,27 +367,25 @@ impl DefaultGraphSourceOperator {
         )
     }
 
-    /// The forward-arena probe drains the WHOLE base-edge scan into memory
-    /// and merge-probes the arena with it, so it pays off only while the base
-    /// edge is narrower than the arena itself — the alternative for a wider
-    /// base edge is the enumeration lane, whose cost is the whole arena walk
-    /// (`live_attachment_pairs` rows) whatever the predicate. Driving
-    /// `<< ?s ?p ?o >>` through this lane scanned every flake of the
-    /// StarBench slice (10.6M rows, 24 s) where the reifier-first chain
-    /// touched 300k; at full scale `<< ?s :TREATS ?o >>` (952k edge rows)
-    /// belongs here, not in a 21.4M-row arena walk. Comparing against the
-    /// reifier-first *estimate* instead was wrong on skewed predicates: the
-    /// per-predicate NDV put TREATS at 31,751 reifiers when it has ~1.1M.
-    /// The buffer ceiling is the hash lane's sweep ceiling.
-    fn arena_lane_pays_off(&self, child: &BoxedOperator) -> bool {
-        const BUFFERED_BASE_MAX_ROWS: f64 = 20_000_000.0;
+    /// Which physical lane the chain's entry costs favour. The three lanes
+    /// scale with different things: the forward-arena probe with the base
+    /// edge (it drains the base scan into memory and merge-probes the
+    /// arena), the enumeration with the whole arena (every live pair is
+    /// walked whatever the predicate), and the generic chain with the
+    /// number of reifiers it must point-probe (three scattered lookups
+    /// each). The reifier count is capped by the base-edge count — a reifier
+    /// needs an edge — so the per-predicate NDV cannot put `TREATS` at 31k
+    /// reifiers when it has 1.1M, and a child that already binds the
+    /// reifier makes the chain a per-row probe no sweep can beat (P22 / C7
+    /// / C10 regressed 200× when the arena lane was taken there).
+    fn chain_lane(&self, child: &BoxedOperator) -> ChainLane {
         let bound: HashSet<VarId> = child.schema().iter().copied().collect();
         let Some((edge_first, reifier_first)) = crate::planner::annotation_chain_entry_rows(
             &self.inner_patterns,
             &bound,
             self.stats.as_deref(),
         ) else {
-            return true;
+            return ChainLane::Arena;
         };
         let arena_rows = self.stats.as_deref().and_then(|s| {
             s.get_property(&Sid::new(
@@ -358,12 +394,7 @@ impl DefaultGraphSourceOperator {
             ))
             .map(|p| p.count as f64)
         });
-        match arena_rows {
-            Some(rows) => edge_first <= rows.min(BUFFERED_BASE_MAX_ROWS),
-            // No arena statistics: the generic ratio from before the arena
-            // row count was available.
-            None => edge_first <= reifier_first * 16.0,
-        }
+        choose_chain_lane(edge_first, reifier_first, arena_rows)
     }
 
     /// Eligibility for the annotation-first enumeration: both base-edge
@@ -684,5 +715,62 @@ impl Operator for DefaultGraphSourceOperator {
 
     fn estimated_rows(&self) -> Option<usize> {
         self.estimated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{choose_chain_lane, ChainLane};
+
+    #[test]
+    fn lane_choice_matches_measured_starbench_shapes() {
+        // P2 / P7 / C2: wildcard base edge, 300k-row arena — walk the arena.
+        assert_eq!(
+            choose_chain_lane(1e12, 300_000.0, Some(300_000.0)),
+            ChainLane::Enumerate
+        );
+        // Same at full scale (21.4M reifiers).
+        assert_eq!(
+            choose_chain_lane(1e12, 21_400_294.0, Some(21_400_294.0)),
+            ChainLane::Enumerate
+        );
+        // P11 at full scale: 952k TREATS edges against a 21.4M arena and
+        // nothing bound, so the endpoint lookups estimate the whole arena
+        // and the edge count caps the chain at 952k probes — edge-first wins.
+        assert_eq!(
+            choose_chain_lane(952_406.0, 21_400_294.0, Some(21_400_294.0)),
+            ChainLane::Arena
+        );
+        // Slice P11 (102k edges, 300k arena): same call, same answer.
+        assert_eq!(
+            choose_chain_lane(102_555.0, 300_000.0, Some(300_000.0)),
+            ChainLane::Arena
+        );
+        // C7 / P22 / C10: the child already binds the reifier, so the chain
+        // is one probe per driving row — never sweep 952k edges for it.
+        assert_eq!(
+            choose_chain_lane(952_406.0, 1.0, Some(21_400_294.0)),
+            ChainLane::Chain
+        );
+        // P1: reifier bound, wildcard base edge.
+        assert_eq!(
+            choose_chain_lane(1e12, 1.0, Some(21_400_294.0)),
+            ChainLane::Chain
+        );
+        // P5: bound-object wildcard (1000 est.) with ~9 reifiers.
+        assert_eq!(
+            choose_chain_lane(1000.0, 9.0, Some(300_000.0)),
+            ChainLane::Chain
+        );
+        // No arena statistics at all: never enumerate.
+        assert_ne!(
+            choose_chain_lane(1e12, 300_000.0, None),
+            ChainLane::Enumerate
+        );
+        // A base edge wider than the buffer ceiling never takes the probe.
+        assert_ne!(
+            choose_chain_lane(30_000_000.0, 30_000_000.0, Some(21_400_294.0)),
+            ChainLane::Arena
+        );
     }
 }
