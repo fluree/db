@@ -239,8 +239,10 @@ ordering and the scan layer work from the narrower form:
 
 A pure, unseeded star with no constant object anchor can start from one small
 object `VALUES` table when predicate statistics predict at least a 16-fold
-reduction over its smallest predicate scan. The table must contain at most 64
-rows of fully bound references. The
+reduction over its smallest predicate scan: the seed's estimated work,
+`rows × (1 + count / ndv)` for the probed predicate, must fall below
+`min(estimate) / 16`, where duplicate rows count toward `rows`. The table must
+contain at most 64 rows of fully bound references. The
 planner probes the associated predicate first, joins other `VALUES` as soon as
 all their variables are available, and visits constrained endpoints before
 unconstrained payload columns. It retains the actual `ValuesOperator` joins, so

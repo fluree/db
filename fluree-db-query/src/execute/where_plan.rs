@@ -2309,12 +2309,12 @@ pub fn build_where_operators_seeded_with_needed(
                             let driver = triples.remove(ti);
                             // Test the other endpoints before fetching unrestrained
                             // payload columns. Stable sort preserves other ties.
+                            // Property-join eligibility guarantees distinct object
+                            // vars, so no other triple shares the seed var.
                             triples.sort_by_key(|tp| {
-                                !(tp.o_bound()
-                                    || values.iter().any(|vp| {
-                                        object_values_var(vp)
-                                            .is_some_and(|v| tp.o.as_var() == Some(v))
-                                    }))
+                                !values.iter().any(|vp| {
+                                    object_values_var(vp).is_some_and(|v| tp.o.as_var() == Some(v))
+                                })
                             });
                             triples.insert(0, driver);
                             let ctx = TriplePlanContext {
@@ -4108,6 +4108,109 @@ mod tests {
                 "ValuesOperator", // one seed, never a cartesian product of tables
                 "EmptyOperator",
             ]
+        );
+    }
+
+    #[test]
+    fn object_values_seed_admission_boundaries() {
+        use crate::binding::Binding;
+        let (mut values, triples, mut stats) = object_seed_fixture();
+        values.truncate(1);
+        for (rows, admitted) in [(64, true), (65, false)] {
+            let candidate = [ValuesPattern::new(
+                vec![VarId(1)],
+                vec![vec![Binding::iri("ex:a")]; rows],
+            )];
+            assert_eq!(
+                selective_object_values_seed(&candidate, &triples, Some(&stats)).is_some(),
+                admitted,
+                "{rows} rows"
+            );
+        }
+        // Baseline 100_000 / 16 = 6_250; two rows charge 2 × (1 + count/ndv).
+        let left = stats.properties.get_mut(&Sid::new(100, "left")).unwrap();
+        left.ndv_values = 100;
+        for (count, admitted) in [(312_300, true), (312_400, false)] {
+            stats
+                .properties
+                .get_mut(&Sid::new(100, "left"))
+                .unwrap()
+                .count = count;
+            assert_eq!(
+                selective_object_values_seed(&values, &triples, Some(&stats)).is_some(),
+                admitted,
+                "count {count}"
+            );
+        }
+    }
+
+    /// Predicates of a linear plan's join steps, from the seed upwards.
+    fn plan_join_predicates(node: &crate::plan_node::PlanNode) -> Vec<String> {
+        let mut preds = node
+            .children
+            .iter()
+            .flat_map(|edge| plan_join_predicates(&edge.node))
+            .collect::<Vec<_>>();
+        if let Some(right) = node.details.get("right").and_then(|v| v.as_str()) {
+            let pred = ["payload", "left", "right"]
+                .into_iter()
+                .find(|p| right.contains(p))
+                .unwrap_or(right);
+            preds.push(pred.to_string());
+        }
+        preds
+    }
+
+    fn object_seed_plan(
+        patterns: &[Pattern],
+        stats: StatsView,
+        planning: &PlanningContext,
+    ) -> Vec<String> {
+        let mut needed = HashSet::new();
+        let mut counts = HashMap::new();
+        collect_var_stats(patterns, &mut counts, &mut needed);
+        needed.extend(counts.keys().copied());
+        let op = super::build_where_operators_with_needed(
+            patterns,
+            Some(Arc::new(stats)),
+            &needed,
+            &[],
+            false,
+            None,
+            planning,
+        )
+        .unwrap();
+        plan_join_predicates(&op.describe())
+    }
+
+    /// The payload-last sort relies on the seed var appearing in no other triple.
+    #[test]
+    fn object_values_seed_excludes_repeated_object_vars() {
+        let (_, mut triples, _) = object_seed_fixture();
+        assert!(crate::planner::is_property_join(&triples));
+        triples[2].o = Term::Var(VarId(1));
+        assert!(!crate::planner::is_property_join(&triples));
+    }
+
+    #[test]
+    fn object_values_seed_declined_for_history() {
+        let (values, triples, stats) = object_seed_fixture();
+        let mut patterns: Vec<_> = values
+            .into_iter()
+            .map(|vp| Pattern::Values {
+                vars: vp.vars,
+                rows: vp.rows,
+            })
+            .collect();
+        patterns.extend(triples.into_iter().map(Pattern::Triple));
+        let seeded = ["left", "right", "payload"];
+        assert_eq!(
+            object_seed_plan(&patterns, stats.clone(), &PlanningContext::current()),
+            seeded
+        );
+        assert_ne!(
+            object_seed_plan(&patterns, stats, &PlanningContext::history()),
+            seeded
         );
     }
 
