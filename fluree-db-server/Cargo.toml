@@ -176,6 +176,7 @@ tokio-util = { version = "0.7", features = ["rt", "io"] }
 http-body-util = { workspace = true }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
 tokio = { workspace = true, features = ["test-util"] }
 http-body-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
@@ -188,6 +189,11 @@ fluree-test-support = { path = "../fluree-test-support" }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "policy_http"
+harness = false
+required-features = ["native", "credential"]
 
 # Integration tests are grouped into grp_* harnesses so the crate links a
 # handful of test binaries instead of one per tests/*.rs file. `autotests =

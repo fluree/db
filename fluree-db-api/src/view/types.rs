@@ -196,6 +196,8 @@ pub struct GraphDb {
     /// Carried on `GraphDb` so downstream callers can apply identity gating
     /// at request time without re-reading the config graph.
     pub(crate) resolved_config: Option<ResolvedConfig>,
+    /// Successful resolution found no config; distinct from not yet resolved.
+    pub(crate) config_absent: bool,
 
     // ========================================================================
     // Datalog config (from config graph, applied at query boundary)
@@ -295,6 +297,7 @@ impl GraphDb {
             default_context: None,
             ledger_config: None,
             resolved_config: None,
+            config_absent: false,
             datalog_enabled: true,
             query_time_rules_allowed: true,
             datalog_override_allowed: true,
@@ -517,6 +520,9 @@ impl GraphDb {
     /// let view = view.as_of(50);
     /// ```
     pub fn as_of(mut self, t: i64) -> Self {
+        if self.t != t {
+            self.clear_config_resolution();
+        }
         self.t = t;
         self
     }
@@ -534,6 +540,15 @@ impl GraphDb {
     /// `range_with_overlay()` must ensure the underlying `LedgerSnapshot.range_provider`
     /// is scoped appropriately for the chosen graph.
     pub fn with_graph_id(mut self, graph_id: GraphId) -> Self {
+        if self.graph_id != graph_id {
+            self.clear_config_resolution();
+            // Only the default graph routes to a virtual source's provider.
+            // Its system graphs read the empty genesis snapshot; dropping the
+            // model config must also drop the virtual-data routing tag.
+            if graph_id != fluree_db_core::DEFAULT_GRAPH_ID {
+                self.graph_source_id = None;
+            }
+        }
         self.graph_id = graph_id;
         self
     }
@@ -603,6 +618,17 @@ impl GraphDb {
     pub(crate) fn with_resolved_config(mut self, config: ResolvedConfig) -> Self {
         self.resolved_config = Some(config);
         self
+    }
+
+    fn clear_config_resolution(&mut self) {
+        self.config_absent = false;
+        self.resolved_config = None;
+        self.ledger_config = None;
+        self.rules_source_g_id = None;
+    }
+
+    pub(crate) fn config_is_resolved(&self) -> bool {
+        self.config_absent || self.resolved_config.is_some()
     }
 
     /// Get the full ledger config (if any).

@@ -61,17 +61,12 @@ const CODE_TOKEN_EXPIRED: &str = "Neo.ClientError.Security.TokenExpired";
 /// `principal: None` is an anonymous session (allowed outside Required
 /// mode, mirroring the HTTP extractor); scope checks then allow all.
 struct SessionAuth {
-    /// Policy identity (`fluree.identity ?? sub`) for governance wiring.
-    identity: Option<String>,
     principal: Option<DataPrincipal>,
 }
 
 impl SessionAuth {
     fn anonymous() -> Self {
-        Self {
-            identity: None,
-            principal: None,
-        }
+        Self { principal: None }
     }
 
     /// Bolt sessions outlive the login-time `exp` validation; statements
@@ -94,15 +89,17 @@ impl SessionAuth {
             .is_none_or(|p| p.can_write(ledger_id))
     }
 
-    /// Governance for statements in this session. Bolt has no header
-    /// channel for policy knobs (policy-class, default-allow) by design:
-    /// policy derives entirely from the identity's in-ledger bindings
-    /// (plus the ledger's `#config` defaults, merged downstream).
+    /// Reuse the login-time verified policy selection; statements cannot supply
+    /// policy options. Ledger/action scope and expiry are checked per statement.
     fn governance(&self) -> fluree_db_api::GovernanceOptions {
-        fluree_db_api::GovernanceOptions {
-            identity: self.identity.clone(),
-            ..Default::default()
-        }
+        self.principal
+            .as_ref()
+            .map(|p| {
+                p.policy_authorization
+                    .resolve_options(&Default::default())
+                    .expect("omitted selection is valid for every credential mode")
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -213,6 +210,26 @@ async fn handle_connection(
                     break;
                 }
             };
+            // Until transaction-scoped impersonation is implemented, do not
+            // silently execute an impersonated request as the logged-in user.
+            let impersonated = match &request {
+                Request::Run { extra, .. } | Request::Begin { extra } => extra.get("imp_user"),
+                Request::Route {
+                    extra: Value::Map(extra),
+                    ..
+                } => extra.get("imp_user"),
+                _ => None,
+            }
+            .is_some_and(|value| !matches!(value, Value::Null));
+            if impersonated {
+                write_message(
+                    &Response::failure(CODE_INVALID, "Bolt impersonation is not supported")
+                        .encode(),
+                    &mut out_buf,
+                );
+                close = true;
+                break;
+            }
             match session.on_request(request) {
                 Turn::Reply(replies) => {
                     for reply in replies {
@@ -376,7 +393,6 @@ async fn authenticate(state: &AppState, auth: &AuthRequest) -> Result<SessionAut
         .await
         .map_err(|e| RunFailure::new(CODE_UNAUTHORIZED, e.to_string()))?;
     Ok(SessionAuth {
-        identity: principal.identity.clone(),
         principal: Some(principal),
     })
 }
@@ -591,7 +607,11 @@ async fn try_execute_txn_run(
             .await
             .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     } else {
-        view
+        state
+            .fluree
+            .wrap_policy_defaults(view)
+            .await
+            .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     };
     let result = state
         .fluree
@@ -668,7 +688,11 @@ async fn execute_read(
             .await
             .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     } else {
-        view
+        state
+            .fluree
+            .wrap_policy_defaults(view)
+            .await
+            .map_err(|e| RunFailure::new(CODE_GENERAL, e.to_string()))?
     };
     let result = state
         .fluree

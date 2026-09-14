@@ -161,7 +161,7 @@ A few operational knobs are environment-only (no CLI flag):
 | `FLUREE_MAX_GRAPH_SCAN_FLAKES` | 10,000,000 | Memory backstop for whole-graph transactions (graph sync, `CLEAR`, `DROP`, `COPY`, `MOVE`). Staging materializes the target graph's currently-asserted flakes, so peak memory scales with the graph, not the delta; the scan stops and the transaction fails with a clear resource-limit error once it passes this many flakes. `0` disables. Read per operation, not cached. The streaming-diff follow-up that removes the materialization is [#1691](https://github.com/fluree/db/issues/1691). |
 | `FLUREE_PATH_MAX_VISITED` | 1,000,000 | Visited-node cap for path traversals (variable-length paths, `shortestPath`) — a runaway-closure backstop. Traversals that exceed it fail with a clear resource-limit error; raise for graphs whose legitimate closures are larger (the cap also bounds per-query traversal memory). Read once at startup. |
 | `FLUREE_CYPHER_AST_CACHE` | 512 | Capacity (entries) of the process-wide Cypher parsed-AST cache, keyed on statement text. Repeated statements (parameterized workloads, benchmark loops) skip re-parsing; parameters are substituted into a per-request clone. `0` disables the cache. Read once at startup. |
-| `FLUREE_STORAGE_FSYNC` | on | File-storage durability. On, a write is reported complete once its bytes and the directory entry naming them are flushed to the device, so an acknowledged commit survives power loss. Set to `0`/`false`/`off`/`no` to report completion once the bytes reach the OS page cache instead — faster, but a power loss or kernel panic can lose acknowledged commits. Read once per storage construction, and **overrides** a storage node's `durability` property so a one-off run needs no config edit. Applies only to the local file backend; S3 acknowledges after replication and the Raft log flushes independently. Derived content (index nodes, dictionaries, sketches, arenas) is written page-cache in either setting, since it is recomputable from the commit chain. See [Storage durability](storage.md#durability). |
+| `FLUREE_STORAGE_FSYNC` | on | Filesystem syncing is enabled by default so acknowledged commits survive power loss. Set to `0` (also `false`, `off`, or `no`) before starting Fluree to turn it off; a power loss or kernel panic can then lose acknowledged commits. Set to `1` to turn it back on. Overrides the storage node's `durability` setting. Applies only to local file storage; Raft log flushing is independent. See [Storage durability](storage.md#durability). |
 
 ### Precedence
 
@@ -547,6 +547,7 @@ Protect query/transaction endpoints (including `/v1/fluree/query/{ledger...}`,
 | `--data-auth-mode`                 | `FLUREE_DATA_AUTH_MODE`                 | `none`  |
 | `--data-auth-audience`             | `FLUREE_DATA_AUTH_AUDIENCE`             | None    |
 | `--data-auth-trusted-issuer`       | `FLUREE_DATA_AUTH_TRUSTED_ISSUERS`      | None    |
+| `--data-auth-policy-authority`     | `FLUREE_DATA_AUTH_POLICY_AUTHORITIES`  | None    |
 | `--data-auth-default-policy-class` | `FLUREE_DATA_AUTH_DEFAULT_POLICY_CLASS` | None    |
 
 Modes:
@@ -561,6 +562,13 @@ Bearer token scopes:
 - **Write**: `fluree.ledger.write.all=true` or `fluree.ledger.write.ledgers=[...]`
 
 Back-compat: `fluree.storage.*` claims imply **read** scope for data endpoints.
+
+Applications may select request policies using a credential with
+`"fluree.policy": "request"`, or issue a fixed signed `fluree.policy`
+selection for downstream clients. Both require the verified issuer to be a
+configured policy authority.
+This repeatable setting requires a nonempty data-auth audience; policy authorities also establish ordinary issuer trust. See [Trusted policy authorization](../security/policy-authorization.md)
+for the TOML configuration, claim format, and embedded SDK equivalent.
 
 ```bash
 fluree-server \
@@ -772,6 +780,8 @@ fluree-server \
 ```
 
 > **JWKS support**: When `--jwks-issuer` is configured, storage proxy endpoints accept RS256 OIDC tokens in addition to Ed25519 JWS tokens. The `--jwks-issuer` flag is shared with data, admin, and events endpoints — a single flag enables OIDC across all endpoint groups.
+
+Storage proxy rejects fixed `fluree.policy` delegation and `"fluree.policy": "request"` credentials. Delegated policy selection is supported by the data API, not storage-proxy endpoints. Use separate replication credentials for storage access; see [Trusted policy authorization](../security/policy-authorization.md).
 
 ## Complete Configuration Examples
 

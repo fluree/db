@@ -364,25 +364,9 @@ The flags work in both modes:
 
 ### Remote impersonation: how it's authorized
 
-When you run against a remote server with `--as <iri>`, the server treats the request as **impersonation** and gates it as follows:
+Authenticated requests use verified policy selection. With ordinary or fixed-delegation credentials, `--as`, class, inline-policy, and policy-value options must match that selection; conflicts return HTTP 403. Signed request bodies use their signing identity. A policy-free identity record does not confer delegation authority. Applications with an explicit `"fluree.policy": "request"` credential may select request policies dynamically. Downstream clients use a fixed signed `fluree.policy` selection from a configured policy authority; embedded applications construct a typed context. See [Trusted policy authorization](policy-authorization.md) for configuration, scopes, and migration.
 
-1. Your bearer token's identity is resolved on the target ledger.
-2. If that identity has **no** `f:policyClass` assignments (the `FoundNoPolicies` outcome — your service account is unrestricted on this ledger), the server honors `--as` and runs the query as the target identity.
-3. If your bearer identity is itself policy-constrained (`FoundWithPolicies`) or unknown to this ledger (`NotFound`), the server force-overrides `--as` with your bearer identity. You see your own filtered view, not the target's.
-
-Each successful impersonation is logged at `info` level on the server:
-
-```
-policy impersonation: bearer=<svc-id> target=<as-iri> ledger=<name>
-```
-
-This is the standard service-account pattern: register your CLI/app-server identity in the ledger with no `f:policyClass`, and it gains the right to delegate to any end-user identity for testing or per-request enforcement. Assigning a policy class to that identity revokes the delegation right with no config change.
-
-### Limitations
-
-- Inline policy rules (`opts.policy`) and policy variable bindings (`opts.policy-values`) are not yet exposed as CLI flags — use a JSON-LD query body with an `"opts"` block when you need those.
-- For SPARQL queries against a remote, only `--as`, single-value `--policy-class`, and `--default-allow` are wired (via headers). Multi-value `--policy-class` works on JSON-LD only.
-- Proxy-mode servers fall back to the legacy non-impersonation behavior — the upstream server performs the impersonation check.
+Direct local queries and intentionally anonymous private-server requests retain caller-selected policy options. Explicit caller default-deny can narrow an authenticated selection's default.
 
 ## Related documentation
 

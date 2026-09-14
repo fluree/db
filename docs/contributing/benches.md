@@ -229,6 +229,7 @@ future micro-bench wants to exercise `fluree-db-indexer`,
 | `vector_query` | end-to-end vector similarity through the query engine | `fluree-db-api/benches/vector_query.rs` |
 | `fulltext_query` | full-text scoring through novelty + index | `fluree-db-api/benches/fulltext_query.rs` |
 | `graphql_schema` | GraphQL schema derivation + registration, and the GraphQL request path against the JSON-LD query it lowers to | `fluree-db-api/benches/graphql_schema.rs` |
+| `policy` | verified-claim parsing and request authorization binding | `fluree-db-api/benches/policy_authorization.rs` |
 
 **Reserved categories** (not yet in use; add a row here when you ship
 the first bench under that prefix): `core` (foundational ops —
@@ -481,3 +482,36 @@ When reviewing someone else's bench, check:
   integration test (`fluree-bench-support/tests/workspace_reconcile.rs`)
   and is invoked by the `bench-gate` CI job — there is no library
   function for it.
+
+## Policy authorization
+
+Run `cargo bench -p fluree-db-api --features credential --bench policy_authorization`
+to measure fixed policy binding. It compares ordinary and delegated claim parsing
+and simple/multiple-source normalization, reporting latency and allocation bytes.
+Tracking-allocator overhead is included; signature verification, issuer lookup,
+networking, and database policy evaluation are excluded. Use `CRITERION_HOME` to
+choose the output directory.
+
+Authorization reuses token verification and adds claim parsing, an authority check,
+and request validation/normalization. It adds no ledger lookup, network request,
+or per-fact authorization work. Embedded binding clones query JSON; large inline
+policies increase parsing and cloning cost.
+
+### Full HTTP policy path
+
+Run `cargo bench -p fluree-db-server --bench policy_http` to compare warm,
+in-process HTTP queries with auth disabled, ordinary credentials, fixed
+selections, request selections, and 32 inline rules. Every case must return the
+same one-row result before timing. This benchmark includes signature verification,
+credential validation, body/header binding, config resolution, database execution,
+and response serialization. Socket/TLS costs are excluded. The fixture uses 256
+novelty-resident records with indexing disabled; these numbers do not characterize
+cold storage, indexed workloads, or large federated queries.
+
+Use the same benchmark source, build features, and machine on both revisions
+when comparing the no-auth case against `main`. For a quick correctness check,
+run `cargo test -p fluree-db-server --bench policy_http -- --test`. The bench
+declares `required-features = ["native", "credential"]`; both are default
+features, so it is silently skipped only under `--no-default-features`. Config
+absence is cached on each view, and regression tests verify that wrapping
+followed by execution does not repeat the config scan.

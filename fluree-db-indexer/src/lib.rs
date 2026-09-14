@@ -453,10 +453,20 @@ pub async fn upload_dicts_from_disk(
 /// (notably the Raft cluster's `RaftIndexPublisher`) can implement
 /// just this trait without faking commit / lifecycle writes they
 /// don't drive.
+///
+/// The artifacts are flushed through `store` first. Index output is
+/// written at page-cache durability, so without this the pointer,
+/// which is durable, could name files that never reached the device.
 pub async fn publish_index_result(
+    store: &dyn ContentStore,
     publisher: &dyn IndexPublisher,
     result: &IndexResult,
 ) -> Result<()> {
+    store.sync().await.map_err(|e| {
+        IndexerError::Core(fluree_db_core::Error::io(format!(
+            "flush index artifacts: {e}"
+        )))
+    })?;
     publisher
         .publish_index(&result.ledger_id, result.index_t, &result.root_id)
         .await
@@ -474,5 +484,68 @@ mod tests {
         assert_eq!(stats.leaf_count, 0);
         assert_eq!(stats.branch_count, 0);
         assert_eq!(stats.total_bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod publish_barrier_tests {
+    use super::*;
+    use fluree_db_core::{ContentId, ContentKind, FileStorage, StorageContentStore};
+    use fluree_db_nameservice::IndexPublisher;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A publisher that records how many flushes the storage had issued at
+    /// the moment the pointer was published.
+    #[derive(Debug)]
+    struct FlushesAtPublish {
+        storage: FileStorage,
+        seen: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl IndexPublisher for FlushesAtPublish {
+        async fn publish_index(
+            &self,
+            _ledger_id: &str,
+            _index_t: i64,
+            _index_id: &ContentId,
+        ) -> fluree_db_nameservice::Result<()> {
+            self.seen
+                .store(self.storage.fsyncs_issued(), Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// The pointer is durable; the artifacts it names must be on the device
+    /// before it is published. Remove the flush in `publish_index_result`
+    /// and this fails.
+    #[tokio::test]
+    async fn the_pointer_is_published_only_after_its_artifacts_are_flushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(dir.path());
+        let store = StorageContentStore::new(storage.clone(), "l:main".to_string(), "file");
+        let root_id = store.put(ContentKind::IndexRoot, b"root").await.unwrap();
+        store.put(ContentKind::IndexLeaf, b"leaf").await.unwrap();
+        assert_eq!(storage.fsyncs_issued(), 0, "derived writes do not flush");
+
+        let publisher = FlushesAtPublish {
+            storage: storage.clone(),
+            seen: AtomicU64::new(0),
+        };
+        let result = IndexResult {
+            root_id,
+            index_t: 1,
+            ledger_id: "l:main".to_string(),
+            stats: IndexStats::default(),
+            fuel: None,
+        };
+        publish_index_result(&store, &publisher, &result)
+            .await
+            .unwrap();
+        assert!(
+            publisher.seen.load(Ordering::Relaxed) >= 2,
+            "both artifacts and their directories were flushed before publish, saw {}",
+            publisher.seen.load(Ordering::Relaxed)
+        );
     }
 }

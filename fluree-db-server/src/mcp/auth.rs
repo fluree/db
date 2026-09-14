@@ -88,6 +88,12 @@ fn verify_mcp_token(
     let payload: EventsTokenPayload = serde_json::from_str(&verified.payload)
         .map_err(|e| ServerError::unauthorized(format!("Invalid claims: {e}")))?;
 
+    if payload.fluree_policy.is_some() {
+        return Err(ServerError::unauthorized(
+            "Policy delegation and controller credentials are not supported by MCP",
+        ));
+    }
+
     // 3. Validate standard claims (exp, iss matches signing key)
     // We don't require specific audience for MCP
     payload

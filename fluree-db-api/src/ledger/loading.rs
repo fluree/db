@@ -303,13 +303,11 @@ impl Fluree {
     ) -> Result<()> {
         use fluree_db_binary_index::collect_root_cas_ids_expanded;
         use fluree_db_binary_index::format::index_root::IndexRoot;
-        use fluree_db_core::storage::content_address;
         use fluree_db_core::CODEC_FLUREE_DICT_BLOB;
 
         let storage = self.backend().admin_storage_cloned().ok_or_else(|| {
             ApiError::internal("copy_index_to_branch requires managed storage backend")
         })?;
-        let method = storage.storage_method();
         // Branch-aware source store so the copy can read inherited index
         // artifacts when `source_id` itself is a branch with ancestors.
         let source_store = fluree_db_nameservice::branched_content_store_for_id(
@@ -372,7 +370,6 @@ impl Fluree {
         stream::iter(all_cids.into_iter().map(|cid| {
             let kind = cid.content_kind().expect("filtered above");
             let hex = cid.digest_hex();
-            let dst_addr = content_address(method, kind, target_id, &hex);
             let storage = storage.clone();
             let source_store = source_store.clone();
             let cid_display = cid.to_string();
@@ -383,15 +380,24 @@ impl Fluree {
                         "failed to read index artifact {cid_display} from {source_label}: {e}"
                     ))
                 })?;
+                // Content-addressed write, so derived kinds take the derived
+                // durability instead of the instance's: page-cache now, one
+                // batched flush below before the pointer is published.
                 storage
-                    .write_bytes(&dst_addr, &bytes)
+                    .content_write_bytes_with_hash(kind, target_id, &hex, &bytes)
                     .await
+                    .map(|_| ())
                     .map_err(ApiError::from)
             }
         }))
         .buffer_unordered(COPY_CONCURRENCY)
         .try_for_each(|()| async { Ok(()) })
         .await?;
+        storage.sync().await.map_err(|e| {
+            ApiError::internal(format!(
+                "failed to flush index artifacts copied to {target_id}: {e}"
+            ))
+        })?;
 
         tracing::info!(
             source = %source_id, target = %target_id,

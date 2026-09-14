@@ -13,6 +13,10 @@ Fluree's authentication model, covering:
 - Replication vs query access boundary
 - Token verification paths (Ed25519 + OIDC/JWKS)
 
+### [Trusted policy authorization](policy-authorization.md)
+
+Application-selected policy contexts for embedded hosts and signed, scoped gateway delegation.
+
 ## Data Encryption
 
 ### [Storage Encryption](encryption.md)

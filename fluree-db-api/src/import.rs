@@ -3910,7 +3910,13 @@ where
         .await?;
 
         // Publish index CID to nameservice so the server can find the root.
+        // The artifacts go to the device first: the pointer is durable and
+        // must never name files that did not make it.
         if config.publish {
+            storage
+                .sync()
+                .await
+                .map_err(|e| ImportError::Storage(format!("flush index artifacts: {e}")))?;
             nameservice
                 .publish_index(alias, index_result.index_t, &index_result.root_id)
                 .await

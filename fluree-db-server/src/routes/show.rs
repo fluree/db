@@ -121,12 +121,22 @@ async fn show_local(
             }
         }
 
-        // Extract identity and policy class for flake-level filtering.
-        // Identity comes from the bearer token; policy_class from server
-        // config. Unlike the query endpoints, show does not accept
-        // per-request policy overrides (no signed body or header injection).
-        let identity = bearer.0.as_ref().and_then(|p| p.identity.clone());
-        let policy_class = data_auth.default_policy_class.as_deref();
+        // Keep the entire verified selection: reconstructing it from identity
+        // alone can widen a delegated view to the identity's local policy set.
+        let headers = crate::routes::policy_auth::bind_authorization(
+            &state,
+            headers,
+            bearer.0.as_ref(),
+            None,
+        )?;
+        let governance = if bearer.0.is_some() {
+            crate::routes::policy_auth::bound_governance(headers.identity.as_deref(), &headers)?
+        } else {
+            fluree_db_api::GovernanceOptions {
+                policy_class: data_auth.default_policy_class.map(|c| vec![c]),
+                ..Default::default()
+            }
+        };
 
         // Proxy storage mode cannot decode commits (no local index).
         if state.config.is_proxy_storage_mode() {
@@ -146,8 +156,7 @@ async fn show_local(
             fluree
                 .graph(&alias)
                 .commit_t(t)
-                .identity(identity.as_deref())
-                .policy_class(policy_class)
+                .governance(&governance)
                 .execute()
                 .await
                 .map_err(ServerError::Api)?
@@ -155,8 +164,7 @@ async fn show_local(
             fluree
                 .graph(&alias)
                 .commit_prefix(commit_ref)
-                .identity(identity.as_deref())
-                .policy_class(policy_class)
+                .governance(&governance)
                 .execute()
                 .await
                 .map_err(ServerError::Api)?

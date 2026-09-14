@@ -24,6 +24,8 @@ struct TokenClaims<'a> {
 
 /// Permission settings for the token.
 struct TokenPermissions<'a> {
+    /// Allow request policy selection within the data scopes.
+    policy_select: bool,
     /// Grant all permissions.
     all: bool,
     /// Ledgers for events access.
@@ -51,6 +53,7 @@ pub fn run(action: TokenAction) -> CliResult<()> {
                 identity: args.identity.as_deref(),
             };
             let permissions = TokenPermissions {
+                policy_select: args.policy_select,
                 all: args.all,
                 events_ledgers: &args.events_ledgers,
                 storage_ledgers: &args.storage_ledgers,
@@ -145,6 +148,10 @@ fn run_create(
 
     if let Some(id) = token_claims.identity {
         claims["fluree.identity"] = json!(id);
+    }
+
+    if permissions.policy_select {
+        claims["fluree.policy"] = json!("request");
     }
 
     // Events permissions

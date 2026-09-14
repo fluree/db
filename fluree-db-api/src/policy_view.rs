@@ -286,10 +286,8 @@ pub(crate) async fn resolve_cross_ledger_policy_restrictions(
     virtual_source: bool,
 ) -> Result<Vec<fluree_db_policy::PolicyRestriction>> {
     const DEFAULT_POLICY_CLASS_IRI: &str = fluree_vocab::policy_iris::ACCESS_POLICY;
-    let filter: std::collections::HashSet<String> = if let Some(classes) = effective_opts
-        .policy_class
-        .as_ref()
-        .filter(|v| !v.is_empty())
+    let filter: std::collections::HashSet<String> = if let Some(classes) =
+        effective_opts.policy_class.as_ref()
     {
         classes.iter().cloned().collect()
     } else if let Some(classes) = config_policy_class.filter(|v| !v.is_empty()) {

@@ -31,6 +31,7 @@ fluree token create --private-key <KEY> [OPTIONS]
 | `--subject <SUB>` | Subject claim (`sub`) - identity of the token holder |
 | `--audience <AUD>` | Audience claim (`aud`) - repeatable for multiple audiences |
 | `--identity <ID>` | Fluree identity claim (`fluree.identity`) - takes precedence over `sub` for policy |
+| `--policy-select` | Allow request policy selection (`"fluree.policy": "request"`); requires `--audience` and an issuer trusted as a policy authority by the server |
 | `--all` | Grant full access to all ledgers (events, storage, read, and write) |
 | `--events-ledger <ALIAS>` | Grant events access to specific ledger (repeatable) |
 | `--storage-ledger <ALIAS>` | Grant storage access to specific ledger (repeatable) |
