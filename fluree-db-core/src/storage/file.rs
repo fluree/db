@@ -527,6 +527,9 @@ pub struct FileStorage {
     flushing: Arc<tokio::sync::Mutex<()>>,
     #[cfg(test)]
     after_checkpoint: AfterCheckpoint,
+    /// Parent directories this storage has created or seen, so a write does
+    /// not `mkdir` its parent every time (see [`Self::ensure_parent_dir`]).
+    known_dirs: Arc<parking_lot::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
 }
 
 #[cfg(test)]
@@ -601,6 +604,32 @@ impl FileStorage {
             flushing: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
             after_checkpoint: AfterCheckpoint::default(),
+            known_dirs: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
+        }
+    }
+
+    /// Create `path`'s parent directory unless this storage already did.
+    ///
+    /// Every write used to `create_dir_all` its parent, a syscall per write
+    /// that answered "already there" essentially always. A directory that
+    /// disappears after being remembered (a dropped ledger) surfaces as a
+    /// not-found write; callers that can retry forget it with
+    /// [`Self::forget_dir`] and try once more.
+    fn ensure_parent_dir(&self, path: &Path) -> std::io::Result<()> {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        if self.known_dirs.lock().contains(parent) {
+            return Ok(());
+        }
+        std::fs::create_dir_all(parent)?;
+        self.known_dirs.lock().insert(parent.to_path_buf());
+        Ok(())
+    }
+
+    fn forget_dir(&self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            self.known_dirs.lock().remove(parent);
         }
     }
 
@@ -771,10 +800,13 @@ impl FileStorage {
         self
     }
 
-    /// Device flushes issued by this storage since it was constructed, counting
+    /// Flush calls issued by this storage since it was constructed, counting
     /// both the staged file and its parent directory, and under
-    /// [`Durability::Wal`] every flush of the root's WAL, including
-    /// the background ones that retire its segments.
+    /// [`Durability::Wal`] every flush of the root's WAL, including the
+    /// background ones that retire its segments. On Apple platforms a
+    /// retirement batch hands each file to the drive with `fsync(2)` and
+    /// commits them with one `F_FULLFSYNC`; both count, though only the
+    /// latter is a drive-cache flush.
     ///
     /// Stays at zero under [`Durability::PageCache`] and for derived content in
     /// any mode. Exposed because a flush leaves no trace in the bytes on
@@ -1029,6 +1061,18 @@ impl FileStorage {
     #[cfg(test)]
     pub(crate) fn set_after_checkpoint_hook_for_test(&self, f: impl Fn() + Send + Sync + 'static) {
         *self.after_checkpoint.0.lock().unwrap() = Some(Box::new(f));
+    }
+
+    /// Delay every WAL device flush by `delay`, so a test can widen the
+    /// window in which concurrent commits pile up behind one flush.
+    /// Attaches the log.
+    #[doc(hidden)]
+    pub fn slow_wal_sync_for_test(&self, delay: std::time::Duration) -> Result<()> {
+        let _root = futures::executor::block_on(self.root_gate()?.write_owned());
+        if let Some(log) = self.attach_wal_locked(true)? {
+            log.slow_sync(delay);
+        }
+        Ok(())
     }
 
     /// Durability for a write of `kind`.
@@ -1472,6 +1516,7 @@ impl StorageWrite for FileStorage {
         let unflushed = Arc::clone(&self.unflushed);
         tokio::task::spawn_blocking(move || {
             let _one_at_a_time = one_at_a_time;
+            let started = std::time::Instant::now();
             let flushed = match &log {
                 Some(log) => log.flush().map_err(|e| format!("flush WAL: {e}")),
                 None => Ok(()),
@@ -1480,6 +1525,13 @@ impl StorageWrite for FileStorage {
                 wal::flush_keys(&base, &keys, &fsyncs)
                     .map_err(|e| format!("flush derived content: {e}"))
             });
+            tracing::debug!(
+                target: "fluree::write_path",
+                keys = keys.len(),
+                flush_us = started.elapsed().as_micros() as u64,
+                ok = flushed.is_ok(),
+                "storage flush"
+            );
             match flushed {
                 Ok(()) => Ok(()),
                 Err(e) => {
@@ -1597,15 +1649,13 @@ impl FileStorage {
         tokio::task::spawn_blocking(move || {
             let operation = storage.begin_operation(durability, &key)?;
             let (policy, log) = storage.write_plan(&operation, bytes.len())?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    crate::error::Error::io(format!(
-                        "Failed to create directory {}: {}",
-                        parent.display(),
-                        e
-                    ))
-                })?;
-            }
+            storage.ensure_parent_dir(&path).map_err(|e| {
+                crate::error::Error::io(format!(
+                    "Failed to create directory for {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
             // Logged before it lands, and not flushed: the head publication
             // that follows flushes the log, and a crash before then leaves an
             // unreferenced file at worst. The guard keeps the record's segment
@@ -1625,7 +1675,17 @@ impl FileStorage {
             };
             // Overwrites if present, which is idempotent for content-addressed
             // writes: the address is derived from these bytes.
-            if let Err(e) = write_atomic(&path, &bytes, &policy) {
+            let written = match write_atomic(&path, &bytes, &policy) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // The remembered parent is gone; recreate it and retry once.
+                    storage.forget_dir(&path);
+                    storage
+                        .ensure_parent_dir(&path)
+                        .and_then(|()| write_atomic(&path, &bytes, &policy))
+                }
+                other => other,
+            };
+            if let Err(e) = written {
                 if let (Some(log), Some(appended)) = (&log, &appended) {
                     log.cancel(appended.seq, &key).map_err(|cancel| {
                         crate::error::Error::io(format!(
@@ -1663,11 +1723,9 @@ impl FileStorage {
             let (policy, log) = storage
                 .write_plan(&operation, bytes.len())
                 .map_err(|e| StorageExtError::io(e.to_string()))?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    StorageExtError::io(format!("mkdir {}: {}", parent.display(), e))
-                })?;
-            }
+            storage
+                .ensure_parent_dir(&path)
+                .map_err(|e| StorageExtError::io(format!("mkdir for {}: {}", path.display(), e)))?;
             // The same sidecar lock a compare-and-swap on this key holds and
             // replay takes: between the link and the record no other writer
             // may advance the file, or the log would carry their transition
@@ -1720,11 +1778,9 @@ impl FileStorage {
             let operation = storage
                 .begin_operation(storage.durability, &key)
                 .map_err(|e| StorageExtError::io(e.to_string()))?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    StorageExtError::io(format!("mkdir {}: {}", parent.display(), e))
-                })?;
-            }
+            storage
+                .ensure_parent_dir(&path)
+                .map_err(|e| StorageExtError::io(format!("mkdir for {}: {}", path.display(), e)))?;
 
             // Use a separate lock file so that the atomic rename of the data
             // file doesn't invalidate the lock (rename replaces the directory
@@ -1864,14 +1920,23 @@ impl StorageCas for FileStorage {
             .map_err(|e| StorageExtError::io(e.to_string()))?;
 
         // Phase 1: acquire lock + read (blocking)
+        let phase = std::time::Instant::now();
         let (current, locked) = self.blocking_locked_read(key, path).await?;
+        let read_us = phase.elapsed().as_micros() as u64;
 
         // Phase 2: call closure on async task
         match f(current.as_deref())? {
             CasAction::Write(new_bytes) => {
                 // Phase 3: write under same lock (blocking)
+                let phase = std::time::Instant::now();
                 self.blocking_locked_write(locked, current, new_bytes)
                     .await?;
+                tracing::debug!(
+                    target: "fluree::write_path",
+                    read_us,
+                    write_us = phase.elapsed().as_micros() as u64,
+                    "cas phases"
+                );
                 Ok(CasOutcome::Written)
             }
             CasAction::Abort(t) => Ok(CasOutcome::Aborted(t)),

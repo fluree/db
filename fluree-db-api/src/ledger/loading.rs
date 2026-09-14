@@ -16,6 +16,7 @@ impl Fluree {
             state,
             &self.binary_store_cache_dir(),
             Some(Arc::clone(self.leaflet_cache())),
+            None,
         )
         .await?;
         Ok(())

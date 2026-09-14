@@ -275,6 +275,16 @@ name = "it_wal"
 path = "tests/it_wal.rs"
 required-features = ["native"]
 
+[[test]]
+name = "it_concurrent_writers"
+path = "tests/it_concurrent_writers.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_optimistic_rebase"
+path = "tests/it_optimistic_rebase.rs"
+required-features = ["native"]
+
 # Own binary: installs a process-global tracing probe over overlay-translation
 # WARN events emitted while a transaction's SHACL pass queries the staged view.
 [[test]]

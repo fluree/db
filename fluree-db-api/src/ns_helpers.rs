@@ -49,6 +49,10 @@ pub fn sync_store_and_snapshot_ns(
                      but commit chain has {existing_prefix:?} — possible indexer/publisher bug"
                 )));
             }
+            // Present and agreeing: nothing to insert. Skipping the insert
+            // matters on a ledger with tens of thousands of namespaces,
+            // where this loop runs on every index publish.
+            continue;
         }
         // Reverse check: same prefix, different code?
         if let Some(&existing_code) = snapshot.namespace_reverse().get(prefix.as_str()) {
