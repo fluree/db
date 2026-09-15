@@ -144,7 +144,7 @@ async fn run_remote(
             .get("count")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0) as usize;
-        print_truncation(commits.len(), total);
+        print_truncation(commits.len(), total, limit);
     }
 
     Ok(())
@@ -197,7 +197,7 @@ async fn run_local(
     }
 
     if summaries.len() < total {
-        print_truncation(summaries.len(), total);
+        print_truncation(summaries.len(), total, limit);
     }
 
     Ok(())
@@ -229,8 +229,19 @@ fn print_commit(t: i64, short: &str, time: &str, flake_count: usize, oneline: bo
     }
 }
 
-fn print_truncation(shown: usize, total: usize) {
-    eprintln!("(showing {shown} of {total} commits — pass -n to widen, or --all)");
+fn print_truncation(shown: usize, total: usize, limit: Option<usize>) {
+    // `--all` sends no limit, and the server still applies its own hard cap.
+    // Telling that caller to "pass --all" is advice to repeat what they just
+    // did; the honest line is that the cap is the server's.
+    match limit {
+        Some(_) => {
+            eprintln!("(showing {shown} of {total} commits — pass -n to widen, or --all)")
+        }
+        None => eprintln!(
+            "(showing {shown} of {total} commits — the server caps a single response; \
+             narrow the range or page with -n)"
+        ),
+    }
 }
 
 /// The on-screen id for a commit: the first [`ABBREV_LEN`] hex digest characters.
@@ -281,16 +292,14 @@ fn commit_id_of(address: &str) -> String {
         return address[pos + 7..].to_string();
     }
 
-    // Fallback: the last path segment, or the address itself.
-    if let Some(last) = address.rsplit('/').next() {
-        return last
-            .strip_suffix(".fcv2")
-            .or_else(|| last.strip_suffix(".json"))
-            .unwrap_or(last)
-            .to_string();
-    }
-
-    address.to_string()
+    // Fallback: the last path segment, which for an address with no `/` is
+    // the whole string — `rsplit` always yields at least one item, so there is
+    // no separate "or the address itself" case to handle.
+    let last = address.rsplit('/').next().unwrap_or(address);
+    last.strip_suffix(".fcv2")
+        .or_else(|| last.strip_suffix(".json"))
+        .unwrap_or(last)
+        .to_string()
 }
 
 #[cfg(test)]

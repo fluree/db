@@ -2637,6 +2637,79 @@ async fn fql_within_ledger_from_named_dataset_parity() {
 /// this ADDRESSING surface. The connection path — which resolves a `FROM`
 /// source through `db()`/`parse_graph_ref` — never had the filter, so the same
 /// IRI resolved on one surface and was refused on the other. The negative half
+/// Policy is the access control, on the surface the reversal actually opens.
+///
+/// The whole case for re-admitting `FROM <urn:fluree:{ledger}#config>` is that
+/// reachability is explicitness and *policy* decides who may read — so the
+/// claim has to hold on the **ledger-scoped** path, which is the one
+/// `8d8870ba1` gated. The PR's supporting measurement was taken on the
+/// connection path; this pins the same property where the gate was relaxed,
+/// through `apply_graph_selector` and the reserved-graph admission, so a
+/// future change to dataset-member policy wrapping fails here rather than
+/// silently widening what the reversal exposed.
+#[tokio::test]
+async fn policy_still_governs_a_reserved_graph_admitted_by_full_iri() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl-policy:main").await;
+    let config_iri = fluree_db_core::config_graph_iri("wl-policy:main");
+
+    // A marker in the config graph, and defaults that deny everything.
+    let trig = format!(
+        r#"@prefix schema: <http://schema.org/> .
+           @prefix f: <https://ns.flur.ee/db#> .
+           @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+           GRAPH <{config_iri}> {{
+               <urn:config:main> rdf:type f:LedgerConfig .
+               <urn:config:main> schema:name "CONFIG-MARKER" .
+               <urn:config:main> f:policyDefaults <urn:config:policy> .
+               <urn:config:policy> f:defaultAllow false .
+           }}"#
+    );
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write")
+        .ledger;
+
+    let sparql = format!(
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?n FROM <{config_iri}> WHERE {{ ?s schema:name ?n }}"
+    );
+
+    // Unwrapped, the marker is readable — otherwise a zero-row result below
+    // would prove nothing about policy.
+    let open = support::query_sparql(&fluree, &ledger, &sparql)
+        .await
+        .expect("unwrapped FROM <#config>")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&open),
+        normalize_rows(&json!([["CONFIG-MARKER"]])),
+        "without policy the reserved graph is readable — the control for the assertion below"
+    );
+
+    // Wrapped in the ledger's own defaults, the same query returns nothing.
+    let db = fluree
+        .wrap_policy_defaults(support::graphdb_from_ledger(&ledger))
+        .await
+        .expect("wrap policy defaults");
+    let denied = fluree
+        .query(&db, &sparql)
+        .await
+        .expect("policy-wrapped FROM <#config>")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&denied),
+        normalize_rows(&json!([])),
+        "f:defaultAllow false must deny the reserved graph on the ledger-scoped path too"
+    );
+}
+
 /// is `sparql_reserved_graphs_stay_unreachable_when_not_named_in_full`.
 #[tokio::test]
 async fn sparql_from_admits_this_ledgers_reserved_graphs_by_full_iri() {
