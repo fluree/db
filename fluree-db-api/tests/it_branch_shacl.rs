@@ -558,6 +558,34 @@ async fn preview_conforms_where_merge_would_succeed() {
         .expect("merge succeeds as previewed");
 }
 
+/// A fast-forward adopts commits that were validated when they were
+/// authored, so the preview neither validates nor reports a verdict that
+/// depends on validation. Without this, the condition that skips validation
+/// on a fast-forward is unpinned: removing it changes no test.
+#[tokio::test]
+async fn preview_fast_forward_carries_no_validation() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _main = seed_alice_with_shape(&fluree).await;
+
+    // Only dev advances, so the merge is a fast-forward.
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree
+        .update(dev, &replace_name("ex:alice", "B"))
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with("mydb", "dev", None, MergePreviewOpts::default())
+        .await
+        .expect("preview");
+    assert!(preview.fast_forward);
+    assert!(
+        preview.validation.is_none(),
+        "a fast-forward adopts already-validated commits"
+    );
+    assert!(preview.mergeable);
+}
+
 /// Opting out leaves the field absent and `mergeable` back to the
 /// strategy-only answer, for count-only previews.
 #[tokio::test]
