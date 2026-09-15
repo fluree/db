@@ -216,6 +216,80 @@ async fn imported_trig_with_a_version_directive_keeps_its_prefixes() {
     );
 }
 
+/// The imported `f:reifies*` flakes under `graph`, across every reifier.
+async fn reifies_flakes_in(
+    fluree: &fluree_db_api::Fluree,
+    alias: &str,
+    graph: &str,
+) -> Vec<fluree_db_core::Flake> {
+    let ledger = fluree.ledger(alias).await.expect("reload");
+    let g_id = ledger
+        .snapshot
+        .graph_registry
+        .graph_id_for_iri(graph)
+        .expect("named graph registered");
+    fluree_db_core::range_with_overlay(
+        &ledger.snapshot,
+        g_id,
+        ledger.novelty.as_ref(),
+        fluree_db_core::comparator::IndexType::Spot,
+        fluree_db_core::range::RangeTest::Eq,
+        fluree_db_core::range::RangeMatch::new(),
+        fluree_db_core::range::RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan named graph")
+    .into_iter()
+    .filter(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
+    .collect()
+}
+
+/// TriG import writes the bundle into the named graph whether or not it
+/// carries `f:reifiesGraph`, so a graph-scoped annotation query cannot tell
+/// the two apart. The edge identity can: the bundle must decode to the
+/// block's graph, and deleting that edge must cascade to it.
+#[tokio::test]
+async fn imported_trig_star_bundle_carries_its_graph_and_cascades() {
+    let alias = "it/import-trig-star:graph-anchored";
+    let trig = format!(
+        "@prefix ex: <http://example.org/> .\n\
+         GRAPH <{CLAIMS_GRAPH}> {{ ex:alice ex:knows ex:bob ~ ex:claim1 {{| ex:role \"Engineer\" |}} . }}\n"
+    );
+    let (fluree, ledger) = import_dir(&[("claims.trig", &trig)], alias).await;
+
+    let graph_sid = ledger.snapshot.encode_iri(CLAIMS_GRAPH).expect("graph sid");
+    let mut bundle = reifies_flakes_in(&fluree, alias, CLAIMS_GRAPH).await;
+    // Index-decoded flakes carry `g: None`; stamp the scanned graph the way
+    // the cascade in `stage()` does before decoding.
+    for f in &mut bundle {
+        f.g = Some(graph_sid.clone());
+    }
+    let key = fluree_db_core::edge::EdgeKey::from_reifies_facts(&bundle)
+        .unwrap_or_else(|e| panic!("imported bundle must decode: {e:?}; {bundle:#?}"));
+    assert_eq!(
+        key.g,
+        Some(graph_sid),
+        "imported bundle must be anchored to its GRAPH block"
+    );
+
+    fluree
+        .graph(alias)
+        .transact()
+        .sparql_update(&format!(
+            "PREFIX ex: <http://example.org/>\n\
+             DELETE DATA {{ GRAPH <{CLAIMS_GRAPH}> {{ ex:alice ex:knows ex:bob }} }}"
+        ))
+        .commit()
+        .await
+        .expect("delete the imported base edge");
+
+    let remaining = reifies_flakes_in(&fluree, alias, CLAIMS_GRAPH).await;
+    assert!(
+        remaining.is_empty(),
+        "the claim's bundle must not outlive the edge it reifies: {remaining:#?}"
+    );
+}
+
 /// A multi-chunk import: a fixture large enough to be cut up, with star
 /// statements throughout and an escape-bearing prefix IRI in the header.
 ///
