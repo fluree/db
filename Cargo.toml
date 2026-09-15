@@ -280,3 +280,10 @@ inherits = "release"
 [profile.wasm-release]
 inherits = "release"
 opt-level = "s"
+
+# openraft 0.9.25 + per-campaign election-timeout resampling (upstream
+# databendlabs/openraft#1838, on 0.10 only). 0.9 samples one timeout per
+# process, so two surviving voters can split every vote after a leader loss.
+# Drop this once a 0.9 release on crates.io carries the fix.
+[patch.crates-io]
+openraft = { git = "https://github.com/fluree/openraft", rev = "53f0341425c5ae6d82a0e454f554b77afc6c69e7" }
