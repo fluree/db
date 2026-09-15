@@ -2066,16 +2066,10 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
                 continue;
             };
             let anns: Vec<Binding> = maps
-                .s_to_anns
-                .get(&s)
-                .map(|cands| {
-                    cands
-                        .iter()
-                        .filter(|ann| maps.matches(ann, &p, &o))
-                        .map(|ann| Binding::sid(ann.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
+                .anns_for(&s, &p, &o)
+                .iter()
+                .map(|ann| Binding::sid(ann.clone()))
+                .collect();
             if anns.is_empty() {
                 pending.push((row, Vec::new()));
             } else {

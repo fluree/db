@@ -192,8 +192,7 @@ impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
             // base-index scan is still authoritative, so allow forcing
             // past the sticky-bit gate. EXPERIMENTAL — not a substitute
             // for fixing the bit to track actual seals/retracts.
-            let force_bootstrap = std::env::var("FLUREE_FORCE_ANNOTATION_BOOTSTRAP")
-                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+            let force_bootstrap = force_annotation_bootstrap();
             let load_view = manager.get_loaded_view(ledger_id).await;
             let bootstrap_eligible = load_view
                 .as_ref()
@@ -255,23 +254,103 @@ async fn scan_base_index_for_attachment_events(
         bool,
     )>,
 > {
+    let view = manager.get_loaded_view(ledger_id).await?;
+    scan_base_index_for_attachment_events_in(
+        &view.snapshot,
+        view.novelty.as_ref(),
+        view.t,
+        ledger_id,
+    )
+    .await
+}
+
+/// True when `FLUREE_FORCE_ANNOTATION_BOOTSTRAP` asks to run the base-index
+/// bootstrap even though the sticky `had_annotation_arena` bit is set.
+/// EXPERIMENTAL — not a substitute for fixing the bit to track actual
+/// seals/retracts.
+#[cfg(not(target_arch = "wasm32"))]
+fn force_annotation_bootstrap() -> bool {
+    std::env::var("FLUREE_FORCE_ANNOTATION_BOOTSTRAP")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Attachment-event coverage for a reindex that has no provider to ask —
+/// the CLI's client carries no `LedgerManager`, so `Fluree::reindex` used
+/// to hand the indexer `None` and every `fluree create --from` of an
+/// annotation-bearing file ended with no arena while printing "sealed".
+///
+/// Derived from an already-loaded `LedgerState` exactly the way
+/// [`ApiAttachmentEventsProvider`] derives it from the running handle: the
+/// novelty's attachment events under the same `snapshot.t == 0` coverage
+/// rule, and the base-index bootstrap scan when the overlay holds no
+/// events and the snapshot is a never-sealed bulk import.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn attachment_events_from_state(
+    state: &fluree_db_ledger::LedgerState,
+) -> Option<AttachmentEventCoverage> {
+    let events: Vec<_> = state.novelty.attachments.iter_event_pairs().collect();
+    let snapshot = state.snapshot.as_ref();
+    tracing::debug!(
+        ledger_id = %snapshot.ledger_id,
+        snapshot_t = snapshot.t,
+        novelty_events = events.len(),
+        has_annotations = snapshot.has_annotations,
+        arena = snapshot.annotation_index.is_some(),
+        had_annotation_arena = snapshot.had_annotation_arena,
+        range_provider = snapshot.range_provider.is_some(),
+        "attachment_events_from_state"
+    );
+    if events.is_empty() {
+        let bootstrap_eligible = snapshot.has_annotations
+            && snapshot.annotation_index.is_none()
+            && (force_annotation_bootstrap() || !snapshot.had_annotation_arena);
+        if bootstrap_eligible {
+            if let Some(events) = scan_base_index_for_attachment_events_in(
+                snapshot,
+                &*state.novelty,
+                state.t(),
+                &snapshot.ledger_id,
+            )
+            .await
+            {
+                return Some(AttachmentEventCoverage::Authoritative(events));
+            }
+        }
+    }
+    Some(if snapshot.t == 0 {
+        AttachmentEventCoverage::Authoritative(events)
+    } else {
+        AttachmentEventCoverage::Augment(events)
+    })
+}
+
+/// The base-index bootstrap scan over an explicit snapshot + overlay (see
+/// [`scan_base_index_for_attachment_events`] for the contract).
+#[cfg(not(target_arch = "wasm32"))]
+async fn scan_base_index_for_attachment_events_in(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    overlay: &dyn fluree_db_core::OverlayProvider,
+    t: i64,
+    ledger_id: &str,
+) -> Option<
+    Vec<(
+        fluree_db_core::edge::EdgeKey,
+        fluree_db_core::Sid,
+        i64,
+        bool,
+    )>,
+> {
     use fluree_db_core::comparator::IndexType;
     use fluree_db_core::edge::EdgeKey;
     use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
     use fluree_db_core::Sid;
     use std::collections::{BTreeMap, HashSet};
 
-    let view = manager.get_loaded_view(ledger_id).await?;
-
-    if !view.snapshot.has_annotations {
+    if !snapshot.has_annotations {
         return None;
     }
-    view.snapshot.range_provider.as_ref()?;
-    tracing::debug!(
-        ledger_id,
-        t = view.t,
-        "scan_base_index_for_attachment_events"
-    );
+    snapshot.range_provider.as_ref()?;
+    tracing::debug!(ledger_id, t, "scan_base_index_for_attachment_events");
 
     // Annotation flakes may live in the default graph (g_id=0) or
     // any named graph. Always include g_id=0 — `GraphRegistry::iter_entries`
@@ -279,13 +358,12 @@ async fn scan_base_index_for_attachment_events(
     // graph the registry knows about.
     let mut graph_ids: HashSet<fluree_db_core::GraphId> = HashSet::new();
     graph_ids.insert(0);
-    for (id, _) in view.snapshot.graph_registry.iter_entries() {
+    for (id, _) in snapshot.graph_registry.iter_entries() {
         graph_ids.insert(id);
     }
     let graph_ids: Vec<fluree_db_core::GraphId> = graph_ids.into_iter().collect();
 
-    let overlay: &dyn fluree_db_core::OverlayProvider = view.novelty.as_ref();
-    let to_t = view.t.max(view.snapshot.t);
+    let to_t = t.max(snapshot.t);
 
     let mut events: Vec<(EdgeKey, Sid, i64, bool)> = Vec::new();
     let mut seen: HashSet<(fluree_db_core::GraphId, Sid, i64)> = HashSet::new();
@@ -303,12 +381,12 @@ async fn scan_base_index_for_attachment_events(
         // trips `from_reifies_facts`'s Duplicate check and gets dropped.
         let mut by_ann: BTreeMap<(Sid, i64), Vec<fluree_db_core::Flake>> = BTreeMap::new();
         for p_iri in fluree_vocab::reifies_iris::ALL {
-            let Some(p_sid) = view.snapshot.encode_iri(p_iri) else {
+            let Some(p_sid) = snapshot.encode_iri(p_iri) else {
                 // Predicate IRI never observed on this ledger — skip.
                 continue;
             };
             let flakes = match range_with_overlay(
-                &view.snapshot,
+                snapshot,
                 g_id,
                 overlay,
                 IndexType::Psot,

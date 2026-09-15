@@ -232,6 +232,61 @@ impl Default for EmptyOperator {
     }
 }
 
+/// Replays already-materialized batches as an operator — the seed for a
+/// subplan that has to run over rows another operator has already drained
+/// (the annotation hash lane buffers its whole driving stream before it can
+/// tell whether the sweep pays off, and hands the rows to the generic chain
+/// through this when it does not).
+pub struct BatchReplayOperator {
+    schema: Arc<[VarId]>,
+    batches: std::collections::VecDeque<Batch>,
+    state: OperatorState,
+}
+
+impl BatchReplayOperator {
+    pub fn new(schema: Arc<[VarId]>, batches: Vec<Batch>) -> Self {
+        Self {
+            schema,
+            batches: batches.into(),
+            state: OperatorState::Created,
+        }
+    }
+}
+
+#[async_trait]
+impl Operator for BatchReplayOperator {
+    fn schema(&self) -> &[VarId] {
+        &self.schema
+    }
+
+    async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> Result<()> {
+        self.state = OperatorState::Open;
+        Ok(())
+    }
+
+    async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if self.state != OperatorState::Open {
+            return Ok(None);
+        }
+        match self.batches.pop_front() {
+            Some(batch) => Ok(Some(batch)),
+            None => {
+                self.state = OperatorState::Exhausted;
+                Ok(None)
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        self.batches.clear();
+        self.state = OperatorState::Closed;
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        Some(self.batches.iter().map(Batch::len).sum())
+    }
+}
+
 #[async_trait]
 impl Operator for EmptyOperator {
     fn is_identity_seed(&self) -> bool {

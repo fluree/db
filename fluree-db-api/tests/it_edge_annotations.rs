@@ -5844,6 +5844,310 @@ async fn copy_with_explicit_reifier_reads_scoped_per_graph() {
 }
 
 #[tokio::test]
+async fn count_shapes_read_only_the_reifies_lookups_they_need() {
+    // Without a sealed arena the wrapper runs the generic `f:reifies*`
+    // chain, which drops the base-edge check and every lookup whose
+    // position nothing reads (`elide_redundant_chain`). The answers must
+    // not move: a plain subject that merely carries the body predicate
+    // (`ex:carol ex:source`) is not a reifier, endpoints that are read
+    // still bind, and a constant endpoint still constrains.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:elided-count";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "ex:source": "hr" }
+                },
+                "ex:score": {
+                    "@value": 42,
+                    "@annotation": { "ex:source": "exam" }
+                }
+            },
+            { "@id": "ex:bob", "ex:worksFor": { "@id": "ex:acme" } },
+            { "@id": "ex:carol", "ex:source": "manual" }
+        ]
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed insert");
+    let ledger = committed.ledger;
+
+    let count = |sparql: &'static str| {
+        let fluree = &fluree;
+        let ledger = &ledger;
+        async move {
+            let rows = support::query_sparql_formatted(fluree, ledger, sparql)
+                .await
+                .expect("count query");
+            rows.as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|row| row.as_array())
+                .and_then(|cols| cols.first())
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_else(|| panic!("count row: {rows}"))
+        }
+    };
+
+    assert_eq!(
+        count(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(*) AS ?n) WHERE { << ?s ?p ?o >> ex:source ?src }"
+        )
+        .await,
+        2,
+        "two reified edges; ex:carol's ex:source is not an annotation"
+    );
+    assert_eq!(
+        count(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(*) AS ?n) WHERE { << ?s ex:worksFor ?o >> ex:source ?src }"
+        )
+        .await,
+        1,
+        "only alice's worksFor edge is reified"
+    );
+    assert_eq!(
+        count(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(*) AS ?n) WHERE { << ex:bob ex:worksFor ?o >> ex:source ?src }"
+        )
+        .await,
+        0,
+        "bob's edge exists but carries no annotation"
+    );
+
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?s ?o ?src WHERE { << ?s ex:worksFor ?o >> ex:source ?src }",
+    )
+    .await
+    .expect("projected query");
+    let arr = rows.as_array().expect("Select array");
+    assert_eq!(arr.len(), 1, "rows: {rows}");
+    let cols = arr[0].as_array().expect("row");
+    assert!(
+        iri_matches(&cols[0], "ex:alice", "http://example.org/alice"),
+        "subject still binds when read: {rows}"
+    );
+    assert!(
+        iri_matches(&cols[1], "ex:acme", "http://example.org/acme"),
+        "object still binds when read: {rows}"
+    );
+    assert_eq!(cols[2].as_str(), Some("hr"), "{rows}");
+}
+
+/// An annotated `ex:worksFor` edge plus two annotated `ex:knows` edges, one of
+/// them a self-loop, for the elided-chain tests below.
+async fn seed_elided_chain_edges(ledger_id: &str) -> (MemoryFluree, MemoryLedger) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "ex:source": "hr" }
+        },
+        "ex:knows": [
+            { "@id": "ex:alice", "@annotation": { "ex:source": "self" } },
+            { "@id": "ex:bob", "@annotation": { "ex:source": "crm" } }
+        ]
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed insert");
+    (fluree, committed.ledger)
+}
+
+/// SPARQL solutions as one `var -> lexical value` map per row.
+async fn sparql_solutions(
+    fluree: &MemoryFluree,
+    ledger: &MemoryLedger,
+    sparql: &str,
+) -> Vec<std::collections::BTreeMap<String, String>> {
+    let result = support::query_sparql(fluree, ledger, sparql)
+        .await
+        .expect("sparql query");
+    let json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|row| {
+            row.as_object()
+                .expect("binding row")
+                .iter()
+                .map(|(var, term)| {
+                    let value = term["value"].as_str().expect("term value");
+                    (var.clone(), value.to_string())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn wildcard_select_binds_the_quoted_triple_variables() {
+    // `SELECT *` has no projection-pushdown set, so the chain elision reads
+    // its needed variables off the WHERE walk, which has to see into the
+    // quoted triple. When it did not, the triple's own variables counted as
+    // unread, their `f:reifies*` lookups were dropped, and the rows came back
+    // without them (W3C sparql12 eval-triple-terms basic-4, basic-5,
+    // pattern-7, pattern-8).
+    let (fluree, ledger) = seed_elided_chain_edges("it/edge-annotations:elided-wildcard").await;
+
+    // basic-4: a variable predicate inside the quoted triple.
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/>
+           SELECT * WHERE { << ex:alice ?p ex:acme >> ?q "hr" }"#,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(
+        rows[0].get("p").map(String::as_str),
+        Some("http://example.org/worksFor"),
+        "{rows:#?}"
+    );
+    assert_eq!(
+        rows[0].get("q").map(String::as_str),
+        Some("http://example.org/source"),
+        "{rows:#?}"
+    );
+
+    // basic-5: a variable object.
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/>
+           SELECT * WHERE { << ex:alice ex:worksFor ?o >> ?q "hr" }"#,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(
+        rows[0].get("o").map(String::as_str),
+        Some("http://example.org/acme"),
+        "{rows:#?}"
+    );
+
+    // Every position a variable, ordered by the body's.
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT * WHERE { << ?s ?p ?o >> ex:source ?src } ORDER BY ?src",
+    )
+    .await;
+    assert_eq!(rows.len(), 3, "{rows:#?}");
+    for var in ["s", "p", "o", "src"] {
+        assert!(
+            rows.iter().all(|row| row.contains_key(var)),
+            "?{var} unbound: {rows:#?}"
+        );
+    }
+    let objects: Vec<&str> = rows.iter().map(|row| row["o"].as_str()).collect();
+    assert_eq!(
+        objects,
+        [
+            "http://example.org/bob",
+            "http://example.org/acme",
+            "http://example.org/alice"
+        ]
+    );
+
+    // JSON-LD twin.
+    let rows = support::query_jsonld_formatted(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": ctx(),
+            "select": "*",
+            "where": {
+                "@id": "?s",
+                "ex:worksFor": {
+                    "@id": "?o",
+                    "@annotation": { "ex:source": "?src" }
+                }
+            }
+        }),
+    )
+    .await
+    .expect("jsonld wildcard query");
+    let arr = rows.as_array().expect("Select array");
+    assert_eq!(arr.len(), 1, "rows: {rows}");
+    let row = arr[0].as_object().expect("wildcard row object");
+    assert!(
+        row.get("?s")
+            .is_some_and(|v| iri_matches(v, "ex:alice", "http://example.org/alice")),
+        "?s unbound: {rows}"
+    );
+    assert!(
+        row.get("?o")
+            .is_some_and(|v| iri_matches(v, "ex:acme", "http://example.org/acme")),
+        "?o unbound: {rows}"
+    );
+    assert_eq!(row.get("?src").and_then(JsonValue::as_str), Some("hr"));
+}
+
+#[tokio::test]
+async fn a_repeated_quoted_triple_variable_still_equates_its_positions() {
+    // `<< ?s ex:knows ?s >>` with nothing reading ?s: the elided chain drops
+    // the base edge, so the subject and object lookups joining on ?s are all
+    // that keeps alice-knows-bob from matching.
+    let (fluree, ledger) = seed_elided_chain_edges("it/edge-annotations:elided-self-loop").await;
+
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT (COUNT(*) AS ?n) WHERE { << ?s ex:knows ?s >> ex:source ?src }",
+    )
+    .await
+    .expect("self-loop count");
+    assert_eq!(
+        rows[0][0].as_i64(),
+        Some(1),
+        "only alice knows herself: {rows}"
+    );
+
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?src WHERE { << ?s ex:knows ?s >> ex:source ?src }",
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["src"], "self");
+
+    // JSON-LD twin.
+    let rows = support::query_jsonld_formatted(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": ctx(),
+            "select": ["?src"],
+            "where": {
+                "@id": "?s",
+                "ex:knows": {
+                    "@id": "?s",
+                    "@annotation": { "ex:source": "?src" }
+                }
+            }
+        }),
+    )
+    .await
+    .expect("jsonld self-loop query");
+    assert_eq!(rows, json!([["self"]]), "only alice knows herself");
+}
+
+#[tokio::test]
 async fn one_reifier_on_the_same_edge_in_two_graphs_writes_in_one_transaction() {
     // `add_same_edge_same_reifier_succeeds` establishes that this state is
     // legal and that graph management produces it: `COPY <g1> TO <g2>`
