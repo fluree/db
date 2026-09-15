@@ -391,24 +391,10 @@ where
             let (_, t) = matching_commits[0];
             Ok(t)
         }
-        _ => {
-            // Multiple matches - ambiguous prefix
-            let commit_ids: Vec<String> = matching_commits
-                .iter()
-                .take(5)
-                .map(|(sid, _)| format!("fluree:commit:sha256:{}", sid.name))
-                .collect();
-            Err(ApiError::query(format!(
-                "Ambiguous commit prefix: {}. Multiple commits match: {:?}{}",
-                normalized,
-                commit_ids,
-                if matching_commits.len() > 5 {
-                    " ..."
-                } else {
-                    ""
-                }
-            )))
-        }
+        _ => Err(crate::ledger_view::ambiguous_commit_prefix(
+            normalized,
+            matching_commits.iter().map(|(sid, _)| sid.name.as_ref()),
+        )),
     }
 }
 

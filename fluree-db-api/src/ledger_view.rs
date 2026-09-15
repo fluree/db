@@ -299,6 +299,32 @@ pub(crate) fn normalize_commit_ref(input: &str) -> Result<String> {
     Ok(stripped.to_string())
 }
 
+/// The error for a prefix that matched more than one commit.
+///
+/// Full hex digests, deliberately. This is the one message whose entire job is
+/// to let someone retype something longer, and every candidate here matched the
+/// prefix that was queried — so truncating to a fixed width at or below that
+/// prefix's length prints the same string once per candidate and tells the
+/// reader nothing. `ledger_view` truncated to seven, which meant any query of
+/// seven characters or more produced a list of identical stubs.
+///
+/// Shared with `time_resolve::commit_to_t` so the two resolvers describe the
+/// same situation the same way.
+///
+/// Both callers stop scanning once a second match appears, so this reports the
+/// candidates it saw rather than claiming to enumerate them all.
+pub(crate) fn ambiguous_commit_prefix<'a>(
+    prefix: &str,
+    hex_digests: impl IntoIterator<Item = &'a str>,
+) -> ApiError {
+    let candidates: Vec<&str> = hex_digests.into_iter().collect();
+    ApiError::query(format!(
+        "Ambiguous commit prefix '{prefix}': it matches at least {:?}. \
+         Retype it with enough characters to pick one out.",
+        candidates
+    ))
+}
+
 /// Resolve a commit hex-digest prefix to a full [`CommitId`].
 ///
 /// Uses a bounded SPOT index scan on commit subjects (same approach as
@@ -375,19 +401,10 @@ async fn resolve_commit_prefix(
                 &digest,
             ))
         }
-        _ => {
-            let ids: Vec<_> = matches
-                .iter()
-                .take(5)
-                .map(|h| &h[..7.min(h.len())])
-                .collect();
-            Err(ApiError::query(format!(
-                "Ambiguous commit prefix '{}': matches {:?}{}",
-                normalized,
-                ids,
-                if matches.len() > 5 { " ..." } else { "" }
-            )))
-        }
+        _ => Err(ambiguous_commit_prefix(
+            normalized,
+            matches.iter().map(String::as_str),
+        )),
     }
 }
 
@@ -603,6 +620,42 @@ mod tests {
         assert_eq!(
             normalize_commit_ref(&full).expect("a full CID resolves"),
             cid.digest_hex()
+        );
+    }
+
+    /// An ambiguity message has to distinguish the things it is ambiguous
+    /// between.
+    ///
+    /// Every candidate matched the queried prefix, so any fixed-width
+    /// truncation at or below that prefix's length renders them identically.
+    /// The old form truncated to seven, which made a query of seven or more
+    /// characters print the same stub once per candidate — exactly the case the
+    /// message exists to resolve. Asserting "the rendered candidates differ" is
+    /// what that form cannot satisfy.
+    #[test]
+    fn an_ambiguity_message_distinguishes_its_candidates() {
+        // Two digests sharing a 12-character head, as a real collision would.
+        let shared = "0a9ccca1e1bc";
+        let a = format!("{shared}aa{}", "0".repeat(50));
+        let b = format!("{shared}bb{}", "0".repeat(50));
+
+        let msg = ambiguous_commit_prefix(shared, [a.as_str(), b.as_str()]).to_string();
+
+        assert!(
+            msg.contains(&a) && msg.contains(&b),
+            "both candidates must appear in full: {msg}"
+        );
+        // The property the old rendering could not have: what is printed for
+        // one candidate is not what is printed for the other.
+        let rendered: Vec<&str> = msg.match_indices(shared).map(|(i, _)| &msg[i..]).collect();
+        assert!(
+            rendered.len() >= 3,
+            "expected the prefix plus both candidates: {msg}"
+        );
+        assert_ne!(a, b);
+        assert!(
+            !msg.contains(&format!("{:?}", [&shared[..7], &shared[..7]])),
+            "must not degenerate into a list of identical stubs: {msg}"
         );
     }
 
