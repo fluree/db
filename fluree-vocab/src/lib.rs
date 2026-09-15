@@ -2293,6 +2293,12 @@ pub mod config_iris {
     /// materialization is capped (incomplete closure)
     pub const REASONING_MAX_SECONDS: &str = "https://ns.flur.ee/db#reasoningMaxSeconds";
 
+    /// `f:reasoningMaxMemoryMb` — integer, max megabytes of derived facts
+    /// before materialization is capped (incomplete closure). Defaults to a
+    /// ceiling derived from `f:reasoningMaxFacts`, so the fact cap normally
+    /// binds first and this one only catches abnormally large facts.
+    pub const REASONING_MAX_MEMORY_MB: &str = "https://ns.flur.ee/db#reasoningMaxMemoryMb";
+
     /// `f:ontologyImportMap` — list of OntologyImportBinding
     pub const ONTOLOGY_IMPORT_MAP: &str = "https://ns.flur.ee/db#ontologyImportMap";
 

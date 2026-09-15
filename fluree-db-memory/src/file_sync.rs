@@ -366,12 +366,22 @@ async fn transact_batch(store: &MemoryStore, data: serde_json::Value) -> Result<
         });
         store.transact_insert(&doc).await?;
     } else {
-        // Chunk by byte size
-        let mut chunk = Vec::new();
+        // Chunk by byte size, over groups rather than single nodes.
+        //
+        // A blank-node subject only has meaning alongside whatever refers to
+        // it, because a blank-node label is scoped to its transaction: each
+        // batch commits separately, so the same label in two batches
+        // skolemizes to two different subjects. An anonymous annotation is
+        // exactly this shape — its body is a blank-node subject and the
+        // `@annotation` that names it sits on another node — so a boundary
+        // falling between them left the body stranded under an id nothing
+        // pointed at. Grouping keeps a blank subject with its referrer.
+        let nodes = group_blank_subjects_with_referrers(nodes);
+        let mut chunk: Vec<Value> = Vec::new();
         let mut chunk_bytes = 0usize;
 
-        for node in nodes {
-            let node_bytes = node.to_string().len();
+        for group in nodes {
+            let node_bytes: usize = group.iter().map(|n| n.to_string().len()).sum();
             if !chunk.is_empty() && chunk_bytes + node_bytes > MAX_BATCH_BYTES {
                 let doc = serde_json::json!({
                     "@context": context,
@@ -382,7 +392,7 @@ async fn transact_batch(store: &MemoryStore, data: serde_json::Value) -> Result<
                 chunk_bytes = 0;
             }
             chunk_bytes += node_bytes;
-            chunk.push(node);
+            chunk.extend(group);
         }
 
         if !chunk.is_empty() {
@@ -395,6 +405,124 @@ async fn transact_batch(store: &MemoryStore, data: serde_json::Value) -> Result<
     }
 
     Ok(())
+}
+
+/// Group each node with the blank-node subjects it refers to, transitively.
+///
+/// Returns groups in input order, each group emitted at the position of its
+/// first member. A blank-node subject nothing refers to forms its own group,
+/// so nothing is dropped.
+fn group_blank_subjects_with_referrers(
+    nodes: Vec<serde_json::Value>,
+) -> Vec<Vec<serde_json::Value>> {
+    use serde_json::Value;
+    use std::collections::{HashMap, HashSet};
+
+    fn node_id(node: &Value) -> Option<&str> {
+        node.get("@id").and_then(Value::as_str)
+    }
+
+    /// Every `@id` reachable from this value, at any depth.
+    fn collect_refs<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+        match value {
+            Value::Object(map) => {
+                for (k, v) in map {
+                    if k == "@id" {
+                        if let Some(s) = v.as_str() {
+                            out.push(s);
+                        }
+                    } else {
+                        collect_refs(v, out);
+                    }
+                }
+            }
+            Value::Array(arr) => arr.iter().for_each(|v| collect_refs(v, out)),
+            _ => {}
+        }
+    }
+
+    let blank_at: HashMap<&str, usize> = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| {
+            node_id(n)
+                .filter(|id| id.starts_with("_:"))
+                .map(|id| (id, i))
+        })
+        .collect();
+    if blank_at.is_empty() {
+        return nodes.into_iter().map(|n| vec![n]).collect();
+    }
+
+    // Walk each node's references to the blank subjects it pulls in.
+    let mut pulled_by: Vec<Vec<usize>> = Vec::with_capacity(nodes.len());
+    for node in &nodes {
+        let mut want: Vec<usize> = Vec::new();
+        let mut queue: Vec<&str> = Vec::new();
+        let mut refs = Vec::new();
+        collect_refs(node, &mut refs);
+        queue.extend(refs.into_iter().filter(|r| r.starts_with("_:")));
+        let mut seen: HashSet<usize> = HashSet::new();
+        while let Some(id) = queue.pop() {
+            let Some(&idx) = blank_at.get(id) else {
+                continue;
+            };
+            if !seen.insert(idx) {
+                continue;
+            }
+            want.push(idx);
+            let mut nested = Vec::new();
+            collect_refs(&nodes[idx], &mut nested);
+            queue.extend(nested.into_iter().filter(|r| r.starts_with("_:")));
+        }
+        pulled_by.push(want);
+    }
+
+    // Referrers claim their blanks first. Walking in plain input order would
+    // let a blank subject that sorts ahead of its referrer form its own group,
+    // which is the split this function exists to prevent. Non-blank referrers
+    // go first, then blank ones (a body that itself refers to another body),
+    // then whatever is left over as singletons.
+    let is_blank = |i: usize| {
+        node_id(&nodes[i])
+            .map(|id| id.starts_with("_:"))
+            .unwrap_or(false)
+    };
+    let mut order: Vec<usize> = (0..nodes.len())
+        .filter(|&i| !pulled_by[i].is_empty() && !is_blank(i))
+        .collect();
+    order.extend((0..nodes.len()).filter(|&i| !pulled_by[i].is_empty() && is_blank(i)));
+    order.extend((0..nodes.len()).filter(|&i| pulled_by[i].is_empty()));
+
+    let mut placed: HashSet<usize> = HashSet::new();
+    let mut groups: Vec<Vec<Value>> = Vec::new();
+    let mut slots: Vec<Vec<usize>> = Vec::new();
+    for i in order {
+        if placed.contains(&i) {
+            continue;
+        }
+        let mut members = vec![i];
+        placed.insert(i);
+        for &idx in &pulled_by[i] {
+            if placed.insert(idx) {
+                members.push(idx);
+            }
+        }
+        slots.push(members);
+    }
+
+    // Materialize: move each node out exactly once.
+    let mut owned: Vec<Option<Value>> = nodes.into_iter().map(Some).collect();
+    for members in slots {
+        let group: Vec<Value> = members
+            .into_iter()
+            .filter_map(|i| owned[i].take())
+            .collect();
+        if !group.is_empty() {
+            groups.push(group);
+        }
+    }
+    groups
 }
 
 /// Check if a `.ttl` file has actual memory subject blocks (not just prefixes).
@@ -433,6 +561,39 @@ mod hex {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_blank_annotation_body_stays_with_the_node_that_names_it() {
+        // The importer splits large payloads into separate transactions, and a
+        // blank-node label only means something inside one transaction. An
+        // anonymous annotation's body is a blank-node subject while the
+        // `@annotation` naming it sits on a different node, so a split between
+        // the two used to skolemize them to different subjects and strand the
+        // body. They must land in the same group.
+        let nodes = vec![
+            serde_json::json!({"@id": "_:b1", "ex:source": "hr"}),
+            serde_json::json!({"@id": "mem:unrelated", "ex:name": "filler"}),
+            serde_json::json!({
+                "@id": "mem:fact-1",
+                "ex:knows": {"@id": "ex:bob", "@annotation": {"@id": "_:b1"}}
+            }),
+        ];
+        let groups = super::group_blank_subjects_with_referrers(nodes);
+
+        let with_body = groups
+            .iter()
+            .find(|g| g.iter().any(|n| n["@id"] == "mem:fact-1"))
+            .expect("the referring node must be in some group");
+        assert!(
+            with_body.iter().any(|n| n["@id"] == "_:b1"),
+            "the blank body must travel with its referrer: {with_body:?}"
+        );
+
+        // Nothing is dropped or duplicated.
+        let total: usize = groups.iter().map(Vec::len).sum();
+        assert_eq!(total, 3, "{groups:?}");
+    }
+
     use super::*;
 
     #[tokio::test]

@@ -194,13 +194,15 @@ impl TestManifest {
             }
         }
 
-        // Extract kinds (rdf:type values, excluding generic types)
+        // Extract kinds (rdf:type values, excluding generic types): the
+        // SPARQL manifests type tests in the `mf:` namespace, the RDF
+        // syntax manifests (Turtle, N-Triples, …) in `rdft:`.
         let kinds: Vec<String> = self
             .graph
             .iter()
             .filter(|t| t.s == subject && t.p.as_iri() == Some(rdf::TYPE))
             .filter_map(|t| t.o.as_iri().map(String::from))
-            .filter(|iri| iri.starts_with(mf::NS))
+            .filter(|iri| iri.starts_with(mf::NS) || iri.starts_with(rdft::NS))
             .collect();
 
         let name = self.object_for(&subject, mf::NAME).and_then(term_to_string);

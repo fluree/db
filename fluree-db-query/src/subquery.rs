@@ -561,9 +561,13 @@ impl SubqueryOperator {
         let mut columns: Vec<Vec<Binding>> =
             (0..self.in_schema.len()).map(|_| Vec::new()).collect();
         // Charge the output columns as they grow, and release on handoff.
-        // Tiny results do not reserve a full 1024-row window.
+        // Tiny results do not reserve a full 1024-row window. Accounting stops
+        // at the handoff deliberately: downstream operators do not charge the
+        // batches they receive, so the counter under-reports by at most one
+        // in-flight batch per subquery operator rather than leaking a charge.
         let mut output_memory = MemoryCharge::new(ctx);
         let mut output_capacity = 0;
+        let mut row_capacity = 0;
         let mut emitted = 0;
         let mut visited = 0usize;
         while emitted < SUBQUERY_BATCH_SIZE {
@@ -646,8 +650,10 @@ impl SubqueryOperator {
                 for (col, binding) in columns.iter_mut().zip(row) {
                     col.push(binding);
                 }
-                let capacity: usize = columns.iter().map(Vec::capacity).sum();
-                if capacity > output_capacity {
+                // Re-sum only when a column reallocates.
+                if columns.first().is_some_and(|col| col.len() > row_capacity) {
+                    row_capacity = columns[0].capacity();
+                    let capacity: usize = columns.iter().map(Vec::capacity).sum();
                     output_memory.add(
                         ctx,
                         (capacity - output_capacity)
@@ -1269,6 +1275,42 @@ mod tests {
                 "{error:?}"
             );
             assert!(op.materialized.is_none() && op.inner.is_none() && op.parent_batch.is_none());
+            assert_eq!(ctx.mem_used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn output_batch_growth_is_charged_against_budget() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation};
+        let snapshot = LedgerSnapshot::genesis("test/main");
+        let vars = VarRegistry::new();
+        let rows = SUBQUERY_BATCH_SIZE;
+        // Admits the retained inner batch plus a partial output window, but
+        // not a full one.
+        let limit = (rows + rows / 2) * crate::context::BINDING_EST_BYTES;
+        for (budget, fits) in [(limit, false), (4 * limit, true)] {
+            let cancel = QueryCancellation::new();
+            cancel.set_memory_limit(budget);
+            let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel);
+            let mut op = SubqueryOperator::new(
+                Box::new(EmptyOperator::new()),
+                values_subquery(rows, vec![VarId(0)]),
+                None,
+                PlanningContext::current(),
+            );
+            op.open(&ctx).await.unwrap();
+            let result = op.next_batch(&ctx).await;
+            if fits {
+                assert_eq!(result.unwrap().unwrap().len(), rows);
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(error, QueryError::MemoryBudgetExceeded { .. }),
+                    "{error:?}"
+                );
+            }
+            op.close();
             assert_eq!(ctx.mem_used(), 0);
         }
     }
