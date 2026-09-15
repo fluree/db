@@ -487,7 +487,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         } else {
             Err(TurtleError::parse(
                 self.current().start as usize,
-                format!("expected {:?}, found {:?}", kind, self.current().kind),
+                format!("expected {kind}, found {}", self.current().kind),
             ))
         }
     }
@@ -508,7 +508,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         if !self.check(&TokenKind::Dot) {
             return Err(TurtleError::parse(
                 self.current().start as usize,
-                format!("expected Dot, found {:?}", self.current().kind),
+                format!("expected '.', found {}", self.current().kind),
             ));
         }
         self.sink.end_statement();
@@ -568,7 +568,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                         if opens_long {
                             "a long string".to_string()
                         } else {
-                            format!("{:?}", self.current().kind)
+                            self.current().kind.to_string()
                         }
                     ),
                 ))
@@ -816,7 +816,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
-                format!("expected subject, found {:?}", self.current().kind),
+                format!("expected subject, found {}", self.current().kind),
             )),
         }
     }
@@ -876,7 +876,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             }
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
-                format!("expected predicate, found {:?}", self.current().kind),
+                format!("expected predicate, found {}", self.current().kind),
             )),
         }
     }
@@ -1028,7 +1028,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
-                format!("expected object, found {:?}", self.current().kind),
+                format!("expected object, found {}", self.current().kind),
             )),
         }
     }
@@ -1116,7 +1116,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             }
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
-                format!("expected literal, found {:?}", self.current().kind),
+                format!("expected literal, found {}", self.current().kind),
             )),
         }
     }
@@ -1215,7 +1215,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             }
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
-                format!("expected datatype IRI, found {:?}", self.current().kind),
+                format!("expected datatype IRI, found {}", self.current().kind),
             )),
         }
     }
@@ -1351,7 +1351,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
                 format!(
-                    "expected triple-term subject (IRI or blank node), found {:?}",
+                    "expected triple-term subject (IRI or blank node), found {}",
                     self.current().kind
                 ),
             )),
@@ -1368,7 +1368,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 self.current().start as usize,
                 format!(
                     "collections, blank-node property lists, and reified triples are \
-                     not allowed inside a triple term, found {:?}",
+                     not allowed inside a triple term, found {}",
                     self.current().kind
                 ),
             )),
@@ -1497,7 +1497,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 self.current().start as usize,
                 format!(
                     "expected reified-triple subject (IRI, blank node, or nested \
-                     '<< … >>'), found {:?}",
+                     '<< … >>'), found {}",
                     self.current().kind
                 ),
             )),
@@ -1515,7 +1515,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 self.current().start as usize,
                 format!(
                     "collections and blank-node property lists are not allowed \
-                     inside a reified triple, found {:?}",
+                     inside a reified triple, found {}",
                     self.current().kind
                 ),
             )),
@@ -2518,6 +2518,29 @@ mod tests {
         )
         .expect_err("nested triple term is a value with no representation");
         assert!(err.to_string().contains("deferred"), "{err}");
+    }
+
+    #[test]
+    fn syntax_errors_spell_tokens_as_written() {
+        for (input, expected) in [
+            (
+                ":r rdf:reifies <<( :a :b :c ) >> .",
+                "expected ')>>', found ')'",
+            ),
+            (":a :b :c", "expected '.', found end of input"),
+            (":a :b :c :d .", "expected '.', found a prefixed name"),
+            ("GRAPH :g { :a :b :c . }", "expected subject, found 'GRAPH'"),
+            (":a :b .", "expected object, found '.'"),
+        ] {
+            let mut sink = StarSink::default();
+            let err = parse(
+                &format!("{P}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n{input}"),
+                &mut sink,
+            )
+            .expect_err(input)
+            .to_string();
+            assert!(err.contains(expected), "[{input}] got: {err}");
+        }
     }
 
     #[test]

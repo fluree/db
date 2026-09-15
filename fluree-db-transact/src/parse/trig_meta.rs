@@ -698,7 +698,7 @@ impl<'a> TrigMetaParser<'a> {
                 Ok(self.resolve_iri(&iri))
             }
             _ => Err(TransactError::Parse(format!(
-                "expected IRI, found {:?}",
+                "expected IRI, found {}",
                 self.current().kind
             ))),
         }
@@ -758,7 +758,7 @@ impl<'a> TrigMetaParser<'a> {
             }
             _ => {
                 return Err(TransactError::Parse(format!(
-                    "expected graph IRI, found {:?}",
+                    "expected graph IRI, found {}",
                     self.current().kind
                 )))
             }
@@ -911,7 +911,7 @@ impl<'a> TrigMetaParser<'a> {
         };
         if !self.check(&TokenKind::ReifiedTripleEnd) {
             return Err(TransactError::Parse(format!(
-                "expected '>>' to close reified triple, found {:?}",
+                "expected '>>' to close reified triple, found {}",
                 self.current().kind
             )));
         }
@@ -948,7 +948,7 @@ impl<'a> TrigMetaParser<'a> {
         };
         if !self.check(&TokenKind::TripleTermEnd) {
             return Err(TransactError::Parse(format!(
-                "expected ')>>' to close triple term, found {:?}",
+                "expected ')>>' to close triple term, found {}",
                 self.current().kind
             )));
         }
@@ -1025,7 +1025,7 @@ impl<'a> TrigMetaParser<'a> {
                     }
                     if !self.check(&TokenKind::AnnotationClose) {
                         return Err(TransactError::Parse(format!(
-                            "expected '|}}' to close annotation block, found {:?}",
+                            "expected '|}}' to close annotation block, found {}",
                             self.current().kind
                         )));
                     }
@@ -1115,7 +1115,7 @@ impl<'a> TrigMetaParser<'a> {
             TokenKind::ReifiedTripleStart => self.parse_reified_triple(),
             TokenKind::TripleTermStart => Err(self.triple_term_value_error()),
             _ => Err(TransactError::Parse(format!(
-                "expected subject, found {:?}",
+                "expected subject, found {}",
                 self.current().kind
             ))),
         }
@@ -1150,7 +1150,7 @@ impl<'a> TrigMetaParser<'a> {
                 Ok(TermValue::Iri(fluree_vocab::rdf::TYPE.to_string()))
             }
             _ => Err(TransactError::Parse(format!(
-                "expected predicate, found {:?}",
+                "expected predicate, found {}",
                 self.current().kind
             ))),
         }
@@ -1286,7 +1286,7 @@ impl<'a> TrigMetaParser<'a> {
             }),
             TokenKind::TripleTermStart => Err(self.triple_term_value_error()),
             _ => Err(TransactError::Parse(format!(
-                "expected object, found {:?}",
+                "expected object, found {}",
                 self.current().kind
             ))),
         }
@@ -1334,7 +1334,7 @@ impl<'a> TrigMetaParser<'a> {
                     }
                     _ => {
                         return Err(TransactError::Parse(format!(
-                            "expected datatype IRI, found {:?}",
+                            "expected datatype IRI, found {}",
                             self.current().kind
                         )))
                     }

@@ -118,7 +118,7 @@ async fn sparql_data_writes_refuse_the_txn_meta_graph() {
 /// being assumed covered by the shared chokepoint.
 ///
 /// `upsert_turtle`, not `insert_turtle`: `insert` on TriG hits the documented
-/// `expected subject, found KwGraph` trap (`docs/transactions/turtle.md`),
+/// `expected subject, found 'GRAPH'` trap (`docs/transactions/turtle.md`),
 /// which is unrelated to this guard.
 #[tokio::test]
 async fn trig_data_writes_refuse_the_txn_meta_graph() {
