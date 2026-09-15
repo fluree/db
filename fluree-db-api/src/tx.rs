@@ -2281,7 +2281,15 @@ fn convert_named_graphs_to_templates(
         prefixes
             .get(prefix)
             .map(|ns| format!("{ns}{local}"))
-            .ok_or_else(|| ApiError::query(format!("undefined prefix: {prefix}")))
+            .ok_or_else(|| {
+                // Same class as the reserved-predicate refusal below: a
+                // mistake in a user-authored TriG file, not an engine fault.
+                // `ApiError::query` rendered it as "Internal error: Query
+                // error: …", which reads like a bug in Fluree.
+                ApiError::Transact(fluree_db_transact::TransactError::Parse(format!(
+                    "undefined prefix: {prefix}"
+                )))
+            })
     }
 
     // Helper to convert RawTerm to TemplateTerm
@@ -2370,10 +2378,11 @@ fn convert_named_graphs_to_templates(
 
         // Convert each triple in this graph block
         for triple in &block.triples {
-            let subject = triple
-                .subject
-                .as_ref()
-                .ok_or_else(|| ApiError::query("named graph triple missing subject"))?;
+            let subject = triple.subject.as_ref().ok_or_else(|| {
+                ApiError::Transact(fluree_db_transact::TransactError::Parse(
+                    "named graph triple missing subject".to_string(),
+                ))
+            })?;
             let subject_term = convert_term(subject, &block.prefixes, ns_registry)?;
             let predicate_term = convert_term(&triple.predicate, &block.prefixes, ns_registry)?;
 
@@ -4418,6 +4427,73 @@ mod tests {
             msg.contains("system-controlled predicate"),
             "unexpected error: {msg}"
         );
+        assert_transact_not_query(&err, "reserved f:reifies* predicate");
+    }
+
+    /// Every refusal in `convert_named_graphs_to_templates` is a transact
+    /// error, not a query one.
+    ///
+    /// All of them reject user-authored TriG at write time, but through
+    /// `ApiError::query` they arrived as `Internal error: Query error: …`,
+    /// which reads like a fault in the engine rather than a mistake in the
+    /// file — and maps to the wrong HTTP class, since `ApiError::Transact(_)`
+    /// is what `fluree-db-server/src/error.rs` maps to
+    /// `errors::INVALID_TRANSACTION` / 422.
+    ///
+    /// Asserted on the variant rather than the message, because the message is
+    /// identical either way: a text assertion passes whichever type comes back
+    /// and so pins nothing.
+    fn assert_transact_not_query(err: &ApiError, label: &str) {
+        assert!(
+            matches!(err, ApiError::Transact(_)),
+            "{label} must surface as ApiError::Transact, got: {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            !rendered.starts_with("Internal error: Query error:"),
+            "{label} must not render as an engine fault; got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_undefined_prefix_in_a_graph_block_is_a_transact_error() {
+        let block = NamedGraphBlock {
+            iri: "http://example.org/g1".to_string(),
+            triples: vec![RawTriple {
+                subject: Some(RawTerm::PrefixedName {
+                    prefix: "nope".to_string(),
+                    local: "a".to_string(),
+                }),
+                predicate: RawTerm::Iri("http://example.org/p".to_string()),
+                objects: vec![RawObject::Iri("http://example.org/b".to_string())],
+            }],
+            prefixes: rustc_hash::FxHashMap::default(),
+        };
+        let mut ns = NamespaceRegistry::new();
+        let err = convert_named_graphs_to_templates(&[block], &mut ns)
+            .expect_err("an undefined prefix must be refused");
+        assert!(
+            err.to_string().contains("undefined prefix"),
+            "unexpected error: {err}"
+        );
+        assert_transact_not_query(&err, "undefined prefix");
+    }
+
+    #[test]
+    fn a_graph_block_triple_without_a_subject_is_a_transact_error() {
+        let block = NamedGraphBlock {
+            iri: "http://example.org/g1".to_string(),
+            triples: vec![RawTriple {
+                subject: None,
+                predicate: RawTerm::Iri("http://example.org/p".to_string()),
+                objects: vec![RawObject::Iri("http://example.org/b".to_string())],
+            }],
+            prefixes: rustc_hash::FxHashMap::default(),
+        };
+        let mut ns = NamespaceRegistry::new();
+        let err = convert_named_graphs_to_templates(&[block], &mut ns)
+            .expect_err("a subjectless triple must be refused");
+        assert_transact_not_query(&err, "named graph triple missing subject");
     }
 
     /// TriG named-graph blocks (upsert/insert-turtle path): a stable
