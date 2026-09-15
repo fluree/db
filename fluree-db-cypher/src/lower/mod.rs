@@ -86,7 +86,9 @@ fn lower_with_context<E: IriEncoder>(
 ) -> Result<Query> {
     match &ast.statement {
         Statement::Query(q) => {
-            ctx.set_annotation_dependent(annotation_use::annotation_dependent_vars(q));
+            // The per-scope sets are installed by `stmt::lower_single_branch`,
+            // the one place every `Query` node — top level, UNION branch and
+            // `CALL` body alike — passes through.
             let mut query = stmt::lower_query(ctx, q)?;
             absorb_shortest_path_node_filters(&mut query.patterns);
             Ok(query)

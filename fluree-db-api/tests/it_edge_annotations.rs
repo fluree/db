@@ -4075,6 +4075,184 @@ async fn turtle_star_reified_triple_matches_jsonld_annotation() {
 }
 
 #[tokio::test]
+async fn turtle_rdf_reifies_triple_term_matches_jsonld_annotation() {
+    // The RDF 1.2 spelling every asserting form desugars to, and the only
+    // star construct N-Triples has: `r rdf:reifies <<( s p o )>>` plus the
+    // reifier's own property.
+    assert_turtle_star_matches_jsonld(
+        "it/turtle-star:rdf-reifies-triple-term",
+        json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "ex:q": { "@id": "ex:z" } }
+            }
+        }),
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         ex:r rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .\n\
+         ex:r ex:q ex:z .\n",
+        "http://example.org/alice",
+        "http://example.org/worksFor",
+    )
+    .await;
+}
+
+/// TriG-star inside a `GRAPH { }` block ↔ JSON-LD `@graph` + `@annotation`:
+/// same named-graph bundle (f:reifiesGraph present, flakes in the graph),
+/// and the annotation is visible to a named-graph-scoped query.
+#[tokio::test]
+async fn trig_star_in_graph_block_matches_jsonld_named_graph_annotation() {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::edge::EdgeKey;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+    use fluree_vocab::reifies_iris;
+    use std::collections::BTreeMap;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/trig-star:named-graph";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let graph_iri = "http://example.org/hr-graph";
+
+    let jsonld_committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:hr-graph",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "ex:q": { "@id": "ex:z" } }
+                }
+            }),
+        )
+        .await
+        .expect("JSON-LD named-graph @annotation insert");
+    let t_jsonld = jsonld_committed.ledger.t();
+
+    let trig = "@prefix ex: <http://example.org/> .\n\
+                GRAPH ex:hr-graph { ex:alice ex:worksFor ex:acme {| ex:q ex:z |} . }\n";
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .upsert_turtle(trig)
+        .commit()
+        .await
+        .expect("TriG-star upsert inside a GRAPH block");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    let t_trig = ledger.t();
+    assert!(t_trig > t_jsonld);
+
+    // Both bundles live in the named graph: scan under its g_id.
+    let g_id = ledger
+        .snapshot
+        .graph_registry
+        .graph_id_for_iri(graph_iri)
+        .expect("named graph registered");
+    let graph_sid = ledger.snapshot.encode_iri(graph_iri).expect("graph sid");
+    let subject_sid = ledger
+        .snapshot
+        .encode_iri("http://example.org/alice")
+        .expect("subject sid");
+    let reifies_subject_pid = ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .expect("f:reifiesSubject sid");
+    let pointers = range_with_overlay(
+        &ledger.snapshot,
+        g_id,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subject_pid, FlakeValue::Ref(subject_sid.clone())),
+        RangeOptions::new().with_to_t(t_trig),
+    )
+    .await
+    .expect("scan named-graph f:reifiesSubject pointers");
+    let mut bundles: BTreeMap<(fluree_db_core::Sid, i64), Vec<fluree_db_core::Flake>> =
+        BTreeMap::new();
+    for ptr in &pointers {
+        let ann_flakes = range_with_overlay(
+            &ledger.snapshot,
+            g_id,
+            ledger.novelty.as_ref(),
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::subject(ptr.s.clone()),
+            RangeOptions::new().with_to_t(t_trig),
+        )
+        .await
+        .expect("scan annotation subject");
+        for f in ann_flakes {
+            if fluree_db_core::is_reserved_reifies_predicate(&f.p) {
+                bundles.entry((ptr.s.clone(), f.t)).or_default().push(f);
+            }
+        }
+    }
+    let mut jl: Vec<_> = bundles
+        .iter()
+        .filter(|((_, t), _)| *t == t_jsonld)
+        .map(|(_, b)| bundle_body(b))
+        .collect();
+    let mut tt: Vec<_> = bundles
+        .iter()
+        .filter(|((_, t), _)| *t == t_trig)
+        .map(|(_, b)| bundle_body(b))
+        .collect();
+    assert_eq!(
+        jl.len(),
+        1,
+        "one JSON-LD bundle in the named graph: {bundles:#?}"
+    );
+    assert_eq!(
+        tt.len(),
+        1,
+        "one TriG-star bundle in the named graph: {bundles:#?}"
+    );
+    jl.sort();
+    tt.sort();
+    assert_eq!(
+        jl, tt,
+        "TriG-star bundle must be bit-identical to the JSON-LD @graph/@annotation bundle"
+    );
+    for ((ann, _), bundle) in &bundles {
+        let key = EdgeKey::from_reifies_facts(bundle)
+            .unwrap_or_else(|e| panic!("bundle for {ann:?} failed to decode: {e:?}"));
+        assert_eq!(
+            key.g.as_ref(),
+            Some(&graph_sid),
+            "bundle for {ann:?} is graph-anchored"
+        );
+        assert_eq!(key.s, subject_sid);
+    }
+
+    // User-visible: a query scoped to the named graph hydrates both.
+    let query = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}#{graph_iri}"),
+        "select": ["?q"],
+        "where": {
+            "@id": "ex:alice",
+            "ex:worksFor": { "@id": "ex:acme", "@annotation": { "ex:q": "?q" } }
+        }
+    });
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("named-graph annotation query");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let rows = rows.as_array().expect("array");
+    assert_eq!(
+        rows.len(),
+        2,
+        "one row per annotation (JSON-LD + TriG): {rows:?}"
+    );
+}
+
+#[tokio::test]
 async fn turtle_star_lang_tagged_literal_matches_jsonld_annotation() {
     // Language-tagged base object: both surfaces must emit f:reifiesLang
     // and carry m.lang on the f:reifiesObject flake (BUGS-2 symmetry).
@@ -5939,6 +6117,212 @@ async fn count_shapes_read_only_the_reifies_lookups_they_need() {
         "object still binds when read: {rows}"
     );
     assert_eq!(cols[2].as_str(), Some("hr"), "{rows}");
+}
+
+/// An annotated `ex:worksFor` edge plus two annotated `ex:knows` edges, one of
+/// them a self-loop, for the elided-chain tests below.
+async fn seed_elided_chain_edges(ledger_id: &str) -> (MemoryFluree, MemoryLedger) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "ex:source": "hr" }
+        },
+        "ex:knows": [
+            { "@id": "ex:alice", "@annotation": { "ex:source": "self" } },
+            { "@id": "ex:bob", "@annotation": { "ex:source": "crm" } }
+        ]
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed insert");
+    (fluree, committed.ledger)
+}
+
+/// SPARQL solutions as one `var -> lexical value` map per row.
+async fn sparql_solutions(
+    fluree: &MemoryFluree,
+    ledger: &MemoryLedger,
+    sparql: &str,
+) -> Vec<std::collections::BTreeMap<String, String>> {
+    let result = support::query_sparql(fluree, ledger, sparql)
+        .await
+        .expect("sparql query");
+    let json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|row| {
+            row.as_object()
+                .expect("binding row")
+                .iter()
+                .map(|(var, term)| {
+                    let value = term["value"].as_str().expect("term value");
+                    (var.clone(), value.to_string())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn wildcard_select_binds_the_quoted_triple_variables() {
+    // `SELECT *` has no projection-pushdown set, so the chain elision reads
+    // its needed variables off the WHERE walk, which has to see into the
+    // quoted triple. When it did not, the triple's own variables counted as
+    // unread, their `f:reifies*` lookups were dropped, and the rows came back
+    // without them (W3C sparql12 eval-triple-terms basic-4, basic-5,
+    // pattern-7, pattern-8).
+    let (fluree, ledger) = seed_elided_chain_edges("it/edge-annotations:elided-wildcard").await;
+
+    // basic-4: a variable predicate inside the quoted triple.
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/>
+           SELECT * WHERE { << ex:alice ?p ex:acme >> ?q "hr" }"#,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(
+        rows[0].get("p").map(String::as_str),
+        Some("http://example.org/worksFor"),
+        "{rows:#?}"
+    );
+    assert_eq!(
+        rows[0].get("q").map(String::as_str),
+        Some("http://example.org/source"),
+        "{rows:#?}"
+    );
+
+    // basic-5: a variable object.
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/>
+           SELECT * WHERE { << ex:alice ex:worksFor ?o >> ?q "hr" }"#,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(
+        rows[0].get("o").map(String::as_str),
+        Some("http://example.org/acme"),
+        "{rows:#?}"
+    );
+
+    // Every position a variable, ordered by the body's.
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT * WHERE { << ?s ?p ?o >> ex:source ?src } ORDER BY ?src",
+    )
+    .await;
+    assert_eq!(rows.len(), 3, "{rows:#?}");
+    for var in ["s", "p", "o", "src"] {
+        assert!(
+            rows.iter().all(|row| row.contains_key(var)),
+            "?{var} unbound: {rows:#?}"
+        );
+    }
+    let objects: Vec<&str> = rows.iter().map(|row| row["o"].as_str()).collect();
+    assert_eq!(
+        objects,
+        [
+            "http://example.org/bob",
+            "http://example.org/acme",
+            "http://example.org/alice"
+        ]
+    );
+
+    // JSON-LD twin.
+    let rows = support::query_jsonld_formatted(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": ctx(),
+            "select": "*",
+            "where": {
+                "@id": "?s",
+                "ex:worksFor": {
+                    "@id": "?o",
+                    "@annotation": { "ex:source": "?src" }
+                }
+            }
+        }),
+    )
+    .await
+    .expect("jsonld wildcard query");
+    let arr = rows.as_array().expect("Select array");
+    assert_eq!(arr.len(), 1, "rows: {rows}");
+    let row = arr[0].as_object().expect("wildcard row object");
+    assert!(
+        row.get("?s")
+            .is_some_and(|v| iri_matches(v, "ex:alice", "http://example.org/alice")),
+        "?s unbound: {rows}"
+    );
+    assert!(
+        row.get("?o")
+            .is_some_and(|v| iri_matches(v, "ex:acme", "http://example.org/acme")),
+        "?o unbound: {rows}"
+    );
+    assert_eq!(row.get("?src").and_then(JsonValue::as_str), Some("hr"));
+}
+
+#[tokio::test]
+async fn a_repeated_quoted_triple_variable_still_equates_its_positions() {
+    // `<< ?s ex:knows ?s >>` with nothing reading ?s: the elided chain drops
+    // the base edge, so the subject and object lookups joining on ?s are all
+    // that keeps alice-knows-bob from matching.
+    let (fluree, ledger) = seed_elided_chain_edges("it/edge-annotations:elided-self-loop").await;
+
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT (COUNT(*) AS ?n) WHERE { << ?s ex:knows ?s >> ex:source ?src }",
+    )
+    .await
+    .expect("self-loop count");
+    assert_eq!(
+        rows[0][0].as_i64(),
+        Some(1),
+        "only alice knows herself: {rows}"
+    );
+
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?src WHERE { << ?s ex:knows ?s >> ex:source ?src }",
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["src"], "self");
+
+    // JSON-LD twin.
+    let rows = support::query_jsonld_formatted(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": ctx(),
+            "select": ["?src"],
+            "where": {
+                "@id": "?s",
+                "ex:knows": {
+                    "@id": "?s",
+                    "@annotation": { "ex:source": "?src" }
+                }
+            }
+        }),
+    )
+    .await
+    .expect("jsonld self-loop query");
+    assert_eq!(rows, json!([["self"]]), "only alice knows herself");
 }
 
 #[tokio::test]

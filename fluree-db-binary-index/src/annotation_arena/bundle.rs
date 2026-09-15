@@ -274,21 +274,43 @@ pub fn build_arenas_from_event_pairs(
 /// over the annotation-only forward rows.
 fn detect_multi_target_annotations(forward: &[AnnotationForwardRow]) -> (u64, Option<Sid>) {
     use std::collections::HashMap;
-    let mut live_edges_per_ann: HashMap<&Sid, u32> = HashMap::new();
+    // Counted per `(graph, annotation)`, not per annotation. The invariant is
+    // one edge per reifier *within a graph*: the same reifier IRI describing
+    // an edge in two named graphs is a state graph management produces on
+    // purpose, since `COPY <g1> TO <g2>` duplicates annotated edges with their
+    // reifier IRIs. Counting across graphs flagged that as a violation, so a
+    // correct ledger warned about itself after any copy of an annotated graph.
+    //
+    // This is the read-side twin of the staging check: the same `(graph,
+    // reifier)` key, for the same reason, is derived at length in
+    // `fluree-db-transact`'s `enforce_single_target_reifiers`. Change one and
+    // the other has to move with it, or the arena reports as malformed a
+    // ledger the transaction path accepted.
+    let mut live_edges_per_ann: HashMap<(Option<&Sid>, &Sid), u32> = HashMap::new();
     for i in 0..forward.len() {
         let last_in_group = i + 1 == forward.len()
             || forward[i].edge != forward[i + 1].edge
             || forward[i].ann != forward[i + 1].ann;
         if last_in_group && forward[i].op {
-            *live_edges_per_ann.entry(&forward[i].ann).or_insert(0) += 1;
+            *live_edges_per_ann
+                .entry((forward[i].edge.g.as_ref(), &forward[i].ann))
+                .or_insert(0) += 1;
         }
     }
     let mut offenders: Vec<&Sid> = live_edges_per_ann
         .iter()
         .filter(|(_, &c)| c > 1)
-        .map(|(a, _)| *a)
+        .map(|((_, a), _)| *a)
         .collect();
+    // Sort BEFORE dedup. The map is keyed by `(graph, reifier)` but the
+    // report names reifiers, so one reifier that violates in two graphs
+    // arrives here twice. `Vec::dedup` only collapses *adjacent* equals, and
+    // the source is `HashMap::iter`, whose order is not stable across runs —
+    // deduping first therefore collapsed those two entries only when the hash
+    // order happened to put them side by side, and the reported count for one
+    // fixed input varied run to run.
     offenders.sort_unstable();
+    offenders.dedup();
     (
         offenders.len() as u64,
         offenders.first().map(|s| (*s).clone()),
@@ -304,10 +326,11 @@ fn report_multi_target(forward: &[AnnotationForwardRow]) -> u64 {
         tracing::warn!(
             multi_target_annotations = count,
             example = ?example,
-            "arena build: annotation @id(s) reify multiple live edges (single-target \
-             invariant violated). Fluree's transaction path rejects this at stage time, \
-             so it indicates malformed f:reifies* data introduced by bulk import; the \
-             reverse lookup will return multiple edges for these annotations"
+            "arena build: annotation @id(s) reify multiple live edges in one graph \
+             (single-target invariant violated); the reverse lookup will return \
+             multiple edges for these annotations. The transaction paths refuse \
+             this, so it points at f:reifies* data that did not come through one \
+             — bulk import, or a commit replayed from an older build"
         );
     }
     count
@@ -850,5 +873,98 @@ mod tests {
         assert!(out.reverse_leaves.is_empty());
         assert_eq!(out.max_t, 0);
         assert_eq!(out.skipped_bundles, 0);
+    }
+}
+
+#[cfg(test)]
+mod multi_target_graph_tests {
+    use super::*;
+    use fluree_db_core::{FlakeValue, Sid};
+
+    fn row(graph: Option<&str>, ann: &str, obj: &str) -> AnnotationForwardRow {
+        AnnotationForwardRow {
+            edge: fluree_db_core::edge::EdgeKey {
+                g: graph.map(|g| Sid::new(14, g)),
+                s: Sid::new(11, "alice"),
+                p: Sid::new(11, "knows"),
+                o: FlakeValue::Ref(Sid::new(11, obj)),
+                dt: fluree_db_core::id_datatype_sid(),
+                lang: None,
+                list_i: None,
+            },
+            ann: Sid::new(20, ann),
+            t: 1,
+            op: true,
+        }
+    }
+
+    /// One reifier on the same edge in two graphs is not a violation.
+    ///
+    /// `COPY <g1> TO <g2>` duplicates annotated edges with their reifier IRIs,
+    /// so this is a state graph management produces on purpose. Counting live
+    /// edges per annotation across graphs flagged it, which meant a correct
+    /// ledger warned about itself after any copy of an annotated graph — and
+    /// the warning said the transaction path rejects this, which it does not.
+    #[test]
+    fn the_same_reifier_in_two_graphs_is_not_multi_target() {
+        let mut forward = vec![
+            row(Some("g1"), "claim1", "bob"),
+            row(Some("g2"), "claim1", "bob"),
+        ];
+        forward.sort_by(|a, b| (&a.edge, &a.ann, a.t, a.op).cmp(&(&b.edge, &b.ann, b.t, b.op)));
+        let (count, _) = detect_multi_target_annotations(&forward);
+        assert_eq!(count, 0, "one edge per graph is the invariant");
+    }
+
+    /// Two different edges in the SAME graph is still a violation.
+    #[test]
+    fn two_edges_in_one_graph_is_still_multi_target() {
+        let mut forward = vec![
+            row(Some("g1"), "claim1", "bob"),
+            row(Some("g1"), "claim1", "carol"),
+        ];
+        forward.sort_by(|a, b| (&a.edge, &a.ann, a.t, a.op).cmp(&(&b.edge, &b.ann, b.t, b.op)));
+        let (count, example) = detect_multi_target_annotations(&forward);
+        assert_eq!(count, 1, "two live edges for one reifier in one graph");
+        assert_eq!(example, Some(Sid::new(20, "claim1")));
+    }
+
+    /// And in the default graph, where `g` is `None` on both sides.
+    #[test]
+    fn two_edges_in_the_default_graph_is_still_multi_target() {
+        let mut forward = vec![row(None, "claim1", "bob"), row(None, "claim1", "carol")];
+        forward.sort_by(|a, b| (&a.edge, &a.ann, a.t, a.op).cmp(&(&b.edge, &b.ann, b.t, b.op)));
+        let (count, _) = detect_multi_target_annotations(&forward);
+        assert_eq!(count, 1);
+    }
+
+    /// One reifier that offends in two graphs is still ONE offender, on every
+    /// run.
+    ///
+    /// The counter is keyed by `(graph, reifier)` while the report names
+    /// reifiers, so `claim1` reaches the offender list once per graph. Because
+    /// the list is built from `HashMap::iter`, whose order is reseeded per
+    /// map, deduping before sorting collapsed that pair only when the hash
+    /// order happened to place the two entries adjacently — the same fixed
+    /// input reported 2 or 3 depending on the run. A single pass is therefore
+    /// a coin flip, and the loop is what makes the assertion mean something.
+    #[test]
+    fn the_offender_count_does_not_vary_between_runs() {
+        for _ in 0..500 {
+            let mut forward = vec![
+                row(Some("g1"), "claim1", "bob"),
+                row(Some("g1"), "claim1", "carol"),
+                row(Some("g2"), "claim1", "bob"),
+                row(Some("g2"), "claim1", "carol"),
+                row(Some("g1"), "claim2", "bob"),
+                row(Some("g1"), "claim2", "carol"),
+            ];
+            forward.sort_by(|a, b| (&a.edge, &a.ann, a.t, a.op).cmp(&(&b.edge, &b.ann, b.t, b.op)));
+            let (count, _) = detect_multi_target_annotations(&forward);
+            assert_eq!(
+                count, 2,
+                "claim1 offends in two graphs but is one offender; claim2 is the other"
+            );
+        }
     }
 }

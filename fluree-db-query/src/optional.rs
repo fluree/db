@@ -1912,12 +1912,6 @@ pub struct AnnotationValueOptionalBuilder {
     o_src: crate::annotation_edge_probe::EdgePos,
     stats: Option<Arc<StatsView>>,
     planning: PlanningContext,
-    /// Sidecar maps, built on the first `build_batch` and reused for every
-    /// later required batch of this operator's execution. The builder lives
-    /// for exactly one query run against one snapshot/overlay/`to_t`, so
-    /// the maps cannot go stale; without this cache a 54k-row result
-    /// re-drained the whole sidecar ~55 times (once per required batch).
-    maps: std::sync::Mutex<Option<Arc<crate::annotation_edge_probe::AnnotationSidecarMaps>>>,
 }
 
 impl AnnotationValueOptionalBuilder {
@@ -1976,33 +1970,34 @@ impl AnnotationValueOptionalBuilder {
             o_src: shape.o_pos,
             stats,
             planning,
-            maps: std::sync::Mutex::new(None),
         })
     }
 
     /// The sidecar maps for this execution, drained on first use.
+    ///
+    /// The memo lives on the `ExecutionContext`, not on this builder: the
+    /// drain costs O(#annotations in the ledger) whatever the result size, and
+    /// a bounded variable-length Cypher range plans one of these builders per
+    /// hop of per chain (`*1..3` six, `*1..5` fifteen). A per-operator cache
+    /// answers the repeat within one operator — a 54k-row result re-drained
+    /// the whole sidecar ~55 times, once per required batch — but leaves the
+    /// repeat *across* operators, which is the larger multiple and the one a
+    /// user can grow just by widening the range.
     async fn sidecar_maps(
         &self,
         ctx: &ExecutionContext<'_>,
         view: Option<&fluree_db_binary_index::BinaryGraphView>,
     ) -> Result<Arc<crate::annotation_edge_probe::AnnotationSidecarMaps>> {
-        if let Some(m) = self.maps.lock().expect("sidecar maps lock").clone() {
-            return Ok(m);
-        }
-        let built = Arc::new(
-            crate::annotation_edge_probe::AnnotationSidecarMaps::build(
-                &self.r_subj,
-                &self.r_pred,
-                &self.r_obj,
-                self.stats.clone(),
-                &self.planning,
-                ctx,
-                view,
-            )
-            .await?,
-        );
-        *self.maps.lock().expect("sidecar maps lock") = Some(built.clone());
-        Ok(built)
+        crate::annotation_edge_probe::AnnotationSidecarMaps::shared(
+            &self.r_subj,
+            &self.r_pred,
+            &self.r_obj,
+            self.stats.clone(),
+            &self.planning,
+            ctx,
+            view,
+        )
+        .await
     }
 
     fn row_sid(

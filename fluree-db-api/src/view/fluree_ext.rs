@@ -11,7 +11,9 @@ use crate::view::{GraphDb, ReasoningModePrecedence};
 use crate::{config_resolver, time_resolve, ApiError, Fluree, GovernanceOptions, Result, TimeSpec};
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::ids::GraphId;
-use fluree_db_core::{ContentStore, DictNovelty, IndexType, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID};
+use fluree_db_core::{
+    ContentStore, DictNovelty, IndexType, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID,
+};
 use fluree_db_query::ir::ReasoningModes;
 use fluree_db_query::BinaryRangeProvider;
 use tracing::Instrument;
@@ -27,6 +29,8 @@ enum GraphRef {
     Default,
     /// Transaction metadata graph (g_id = 1)
     TxnMeta,
+    /// Ledger config graph (g_id = 2)
+    Config,
     /// User-defined named graph by exact IRI
     Named(String),
 }
@@ -41,6 +45,7 @@ impl Fluree {
     /// Supported fragments:
     /// - *(none)* → default graph (g_id = 0)
     /// - `#txn-meta` → txn metadata graph (g_id = 1)
+    /// - `#config` → ledger config graph (g_id = 2)
     /// - `#<iri>` → user-defined named graph by exact IRI
     fn parse_graph_ref(ledger_id: &str) -> Result<(&str, GraphRef)> {
         // Strip urn:fluree: prefix so full IRIs resolve to the same ledger alias.
@@ -57,6 +62,21 @@ impl Fluree {
                 }
                 match frag {
                     "txn-meta" => Ok((ledger_id, GraphRef::TxnMeta)),
+                    // The config graph is reserved and slot-addressed exactly
+                    // like `txn-meta`; the baseline gave `txn-meta` a fragment
+                    // arm and `config` none, so `#config` fell through to an
+                    // exact-IRI lookup for the bare fragment `"config"`, which
+                    // cannot match — the graph is registered under its full
+                    // `urn:fluree:<ledger>#config` IRI. Every documented
+                    // `--ledger mydb:main#config` and connection-path
+                    // `FROM <urn:fluree:mydb:main#config>` therefore failed
+                    // with "Unknown named graph '#config'".
+                    //
+                    // This is an ADDRESSING surface: the fragment is only
+                    // reachable once a ledger has already been named, so it is
+                    // explicit by construction. See the reserved-graph contract
+                    // table on `resolve_within_ledger_graph` in `view/query.rs`.
+                    "config" => Ok((ledger_id, GraphRef::Config)),
                     // Any other fragment is treated as a graph IRI (exact match).
                     other => Ok((ledger_id, GraphRef::Named(other.to_string()))),
                 }
@@ -73,6 +93,7 @@ impl Fluree {
         let g_id: GraphId = match graph_ref {
             GraphRef::Default => DEFAULT_GRAPH_ID,
             GraphRef::TxnMeta => TXN_META_GRAPH_ID,
+            GraphRef::Config => CONFIG_GRAPH_ID,
             GraphRef::Named(iri) => view
                 .snapshot
                 .graph_registry
@@ -612,6 +633,7 @@ impl Fluree {
         let graph_ref = match selector {
             crate::dataset::GraphSelector::Default => GraphRef::Default,
             crate::dataset::GraphSelector::TxnMeta => GraphRef::TxnMeta,
+            crate::dataset::GraphSelector::Config => GraphRef::Config,
             crate::dataset::GraphSelector::Iri(iri) => GraphRef::Named(iri.clone()),
         };
         Self::select_graph(view, graph_ref)

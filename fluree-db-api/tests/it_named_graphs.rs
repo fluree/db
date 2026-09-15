@@ -3077,3 +3077,43 @@ async fn test_using_multi_default_union_is_a_set() {
          blank), not one per USING member: {rows}"
     );
 }
+
+#[tokio::test]
+async fn the_config_graph_is_addressable_by_its_full_iri() {
+    // `#config` is reserved the way `#txn-meta` is, but only `txn-meta` had an
+    // arm — so `#config` fell through to an exact-IRI lookup for the bare
+    // fragment, which cannot match: the graph is registered under its full
+    // `urn:fluree:<ledger>#config` IRI. Every `FROM <…#config>` in the docs
+    // failed with "Unknown named graph '#config'".
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/named-graphs:config-addressable";
+
+    let committed = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:alice",
+                "ex:knows": {"@id": "ex:bob"}
+            }),
+        )
+        .await
+        .expect("seed");
+    assert!(committed.ledger.t() > 0);
+
+    // Addressing the config graph resolves rather than erroring. It may hold
+    // nothing on a ledger that was never configured; what is pinned here is
+    // that the reference resolves to the reserved graph at all.
+    let view = fluree
+        .db(&format!("urn:fluree:{ledger_id}#config"))
+        .await
+        .expect("the config graph must be addressable by its full IRI");
+    assert_eq!(view.graph_id, fluree_db_core::CONFIG_GRAPH_ID);
+
+    // The alias form resolves to the same graph.
+    let aliased = fluree
+        .db(&format!("{ledger_id}#config"))
+        .await
+        .expect("the alias form resolves too");
+    assert_eq!(aliased.graph_id, fluree_db_core::CONFIG_GRAPH_ID);
+}

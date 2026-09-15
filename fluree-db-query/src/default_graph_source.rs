@@ -170,7 +170,10 @@ fn choose_chain_lane(inputs: LaneInputs) -> ChainLane {
 /// cascades). So once a reifies lookup has bound the reifier, the base edge
 /// never removes a row, and a reifies lookup whose position is a variable
 /// nobody reads is a cardinality-one no-op. A constant position stays: it is
-/// the constraint. A variable predicate that is read stays too, and keeps
+/// the constraint. A variable in two positions, or naming the reifier, counts
+/// as read: its lookups carry the equality the base scan enforced
+/// (`<< ?s :p ?s >>` must not match `:a :p :b`). A variable predicate that is
+/// read stays too, and keeps
 /// the base edge with it — the base scan binds it as a predicate, the
 /// reifies lookup as a plain ref. At least one lookup always remains, so a
 /// reifier bound by the body still has to be a reifier (P3 has three
@@ -192,6 +195,17 @@ pub(crate) fn elide_redundant_chain(
     referenced.extend(child_bound.iter().copied());
     let mut counts: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
     crate::execute::collect_var_stats(&shape.body, &mut counts, &mut referenced);
+    // A variable in two base positions, or naming the reifier, is an
+    // equality the base scan enforced; keeping its lookups keeps it.
+    let mut seen: HashSet<VarId> = HashSet::from([shape.ann_var]);
+    for v in [base.s.as_var(), base.p.as_var(), base.o.as_var()]
+        .into_iter()
+        .flatten()
+    {
+        if !seen.insert(v) {
+            referenced.insert(v);
+        }
+    }
 
     if base.p.as_var().is_some_and(|v| referenced.contains(&v)) {
         return None;
@@ -215,6 +229,20 @@ pub(crate) fn elide_redundant_chain(
     }
     kept.extend(shape.body.iter().cloned());
     Some(kept)
+}
+
+/// Whether the hash sidecar lane may take a recognized chain. It drains the
+/// three `f:reifies*` predicates and sweeps the base edge before answering a
+/// row, which beats per-row probes only against a large or unknown driving
+/// stream and a bounded sweep. A child that already binds the reifier keeps
+/// the chain, as in [`choose_chain_lane`]: the chain is then one point probe
+/// per row, while the lane walks every swept edge per row when the edge
+/// subject is unbound. A constant annotation value driving
+/// `<< ?s :p ?o >> :q "v"` went from 22 s to 55 s on a 20k-edge ledger that way.
+fn hash_lane_admits(driving_rows: Option<usize>, sweep_bounded: bool, reifier_bound: bool) -> bool {
+    !reifier_bound
+        && sweep_bounded
+        && driving_rows.is_none_or(|n| n >= HASH_ANNOTATION_MIN_DRIVING_ROWS)
 }
 
 /// Diagnostic override: `FLUREE_ANNOTATION_LANE=arena|enumerate|chain` pins
@@ -459,13 +487,13 @@ impl DefaultGraphSourceOperator {
                     pred => resolve_pred_sid(pred, ctx)
                         .map(crate::annotation_edge_probe::EdgePos::Const),
                 };
-                let driving_large_or_unknown = child
-                    .estimated_rows()
-                    .is_none_or(|n| n >= HASH_ANNOTATION_MIN_DRIVING_ROWS);
-                let sweep_bounded = self.base_sweep_bounded(&shape);
+                let admitted = hash_lane_admits(
+                    child.estimated_rows(),
+                    self.base_sweep_bounded(&shape),
+                    child_bound.contains(&shape.ann_var),
+                );
                 if let (
                     Some(p_pos),
-                    true,
                     true,
                     Pattern::Triple(base_tp),
                     Pattern::Triple(r_subj),
@@ -473,8 +501,7 @@ impl DefaultGraphSourceOperator {
                     Pattern::Triple(r_obj),
                 ) = (
                     p_pos,
-                    driving_large_or_unknown,
-                    sweep_bounded,
+                    admitted,
                     &self.inner_patterns[0],
                     &self.inner_patterns[1],
                     &self.inner_patterns[2],
@@ -909,7 +936,9 @@ impl Operator for DefaultGraphSourceOperator {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_chain_lane, elide_redundant_chain, ChainLane, LaneInputs};
+    use super::{
+        choose_chain_lane, elide_redundant_chain, hash_lane_admits, ChainLane, LaneInputs,
+    };
     use crate::ir::{Pattern, Ref, Term, TriplePattern};
     use crate::var_registry::VarId;
     use fluree_db_core::Sid;
@@ -1051,6 +1080,58 @@ mod tests {
     }
 
     #[test]
+    fn hash_lane_leaves_a_bound_reifier_to_the_chain() {
+        // 2,857 body rows binding the reifier: the lane would walk every
+        // swept edge per row, the chain probes once per row.
+        assert!(!hash_lane_admits(Some(2_857), true, true));
+        assert!(!hash_lane_admits(None, true, true));
+        // The same stream binding the edge subject instead is the lane's case.
+        assert!(hash_lane_admits(Some(2_857), true, false));
+        assert!(hash_lane_admits(None, true, false));
+        // Small streams and unbounded sweeps stay on the chain.
+        assert!(!hash_lane_admits(Some(10), true, false));
+        assert!(!hash_lane_admits(Some(2_857), false, false));
+    }
+
+    #[test]
+    fn a_repeated_variable_keeps_the_lookups_that_equate_it() {
+        let typed = Ref::Sid(Sid::new(9, "P"));
+        // `<< ?s :P ?s >>` with nothing reading ?s: once the base edge is
+        // gone, the subject and object lookups joining on ?s are the only
+        // thing that still requires the two positions to be equal.
+        let elided = elide_redundant_chain(
+            &chain(Ref::Var(S), typed.clone(), Term::Var(S)),
+            &set(&[]),
+            &set(&[]),
+        )
+        .expect("recognized chain");
+        assert_eq!(
+            reifies_names(&elided),
+            vec![REIFIES_SUBJECT, REIFIES_PREDICATE, REIFIES_OBJECT]
+        );
+        // A reifier that is also the edge's object keeps
+        // `?ann f:reifiesObject ?ann`.
+        let elided = elide_redundant_chain(
+            &chain(Ref::Var(S), typed, Term::Var(ANN)),
+            &set(&[]),
+            &set(&[]),
+        )
+        .expect("recognized chain");
+        assert_eq!(
+            reifies_names(&elided),
+            vec![REIFIES_PREDICATE, REIFIES_OBJECT]
+        );
+        // A variable predicate repeated in another position counts as read,
+        // which blocks the rewrite.
+        assert!(elide_redundant_chain(
+            &chain(Ref::Var(S), Ref::Var(S), Term::Var(O)),
+            &set(&[]),
+            &set(&[]),
+        )
+        .is_none());
+    }
+
+    #[test]
     fn wildcard_count_keeps_one_lookup_so_the_body_alone_cannot_qualify() {
         // P2: `<< ?s ?p ?o >> :q ?x` COUNT(*) — every position unread, but a
         // plain subject with `:q` must still not count as a reifier.
@@ -1132,6 +1213,9 @@ mod tests {
             ChainLane::Chain
         );
         assert_eq!(lane(1e12, 1.0, FULL_ARENA, true, true), ChainLane::Chain);
+        // The same bound reifier behind a bound subject whose edges fit the
+        // buffer: without the reifier rule the subject rule takes the arena.
+        assert_eq!(lane(3_345.0, 1.0, FULL_ARENA, true, true), ChainLane::Chain);
         // P5 / P13: bound-object wildcard (1000 est.) with ~9 reifiers.
         assert_eq!(
             lane(1000.0, 9.0, SLICE_ARENA, false, false),

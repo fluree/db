@@ -147,8 +147,10 @@ ORDER BY / SKIP / LIMIT
   of fixed single-typed directed hops (`p = (a)-[:R1]->(b)<-[:R2]-(c)`) — the
   path value is built from the bound nodes and per-hop relationship values.
   Deferred: a variable-length or undirected segment inside a multi-hop path
-  value, binding over a type alternation, and property filters on a
-  var-length relationship.
+  value, binding over a type alternation, and the **inline** property-map form
+  on a bound var-length range (`-[rs:T*1..3 {p: v}]->`) — bind the range
+  without it and filter the bound relationships instead: `-[rs:T*1..3]->` with
+  `WHERE all(r IN rs WHERE r.p = v)`.
 - **Untyped** variable-length paths `-[*]->`, `-[*m..n]->` (no relationship
   type): a *wildcard* transitive path that follows **any** node→node edge per
   hop — excluding `rdf:type` (its object is a class, not a node) and the
@@ -178,8 +180,63 @@ ORDER BY / SKIP / LIMIT
   reified edge), `relationships(p)`, or a bound var-length relationship.
   `type(r)` is the relationship type string, `startNode(r)` / `endNode(r)` its
   endpoints, `properties(r)` / `r.prop` its edge properties (present only for a
-  reified/annotated edge — a plain path edge has none). Rendered as a
+  reified/annotated edge — an unreified one has none). Whether that property
+  surface is reachable at all depends on the route that bound `r`; see **Edge
+  properties over a variable-length relationship** below. Rendered as a
   `{start, type, end}` object.
+- **Edge properties over a variable-length relationship.** A **bounded,
+  single-typed, directed** range (`-[rs:T*1..3]->`, or the same range under
+  `MATCH p = …`) expands to a chain of real triple patterns, so every hop keeps
+  its own edge identity. Over such a range `all(r IN rs WHERE r.p)`,
+  `[r IN rs | r.p]`, `UNWIND rs AS r … r.p` and `relationships(p)` all read the
+  hop's own annotation. An unreified hop has no annotation, so its element
+  reads `null` and the path is still returned — `any(...)` sees the hops that
+  do have one.
+
+  A `WITH` that **aggregates** cannot carry that identity list across its
+  projection — the list is neither a group key nor an aggregate output — so
+  `relationships(p)` after one falls back to the path value: `size(...)`,
+  `type(r)` and the endpoints stay correct, and the per-hop properties read
+  `null`. Project the properties you need *before* the aggregating `WITH`
+  (`WITH p, [r IN relationships(p) | r.confidence] AS confs, count(*) AS c`
+  reads them first, then groups).
+
+  Because a reified edge yields one value per annotation, **a hop carrying two
+  parallel claims doubles the rows, and a k-hop chain multiplies k-fold**.
+  Parallel relationships are distinct relationships, so this is the same
+  contract a single `-[r:T]->` hop already has.
+
+  Binding the **path alone** takes that route too, so it multiplies the same
+  way: `MATCH p = (a)-[:T*1..2]->(b) RETURN b.name` yields one row per
+  combination of parallel claims along the path, matching what the one-hop form
+  `p = (a)-[:T]->(b)` already did. A range that binds **neither** `p` nor a
+  relationship variable has nothing to carry identity and still answers once
+  per reachable node — that is the spelling to use when the claims are not
+  wanted.
+
+  The ranges resolved by **path enumeration** — unbounded, untyped,
+  undirected, a zero lower bound, or deeper than 16 hops — do not retain
+  per-hop edge identity, so a property read over their elements is **refused**,
+  naming the edit that moves the pattern onto the bounded route. A **multi-hop
+  path value** (`p = (a)-[:T]->(b)-[:U]->(c)`) is refused for the same reason —
+  it is assembled from synthesized relationship values — and its message names
+  per-hop relationship variables (`(a)-[r1:T]->(b)-[r2:U]->(c)`, which keeps
+  `p` bound alongside them) plus, when every hop shares one type, the
+  equivalent `-[:T*N..N]->` range.
+
+  The refusal follows a `WITH … AS` rename and an `UNWIND` alias back to the
+  variable the pattern bound, so spelling the read through
+  `WITH rs AS xs … all(r IN xs WHERE r.p)` does not slip past it. It covers a
+  hop pulled straight out of the list too — `properties(rs[0])`,
+  `keys(head(relationships(p)))` — because that reads the same element. (The
+  `rs[0].prop` spelling is refused on every route by a separate rule: a
+  property accessor needs a bare-variable target.) `properties(nodes(p)[0])` is
+  unaffected, like every other read of a path node.
+
+  The **value** surface is unaffected on every route: `nodes(p)` (path nodes
+  are real subjects, not edges), `length(p)`, `size(relationships(p))` and
+  `type(r)` / `startNode(r)` / `endNode(r)` over the elements all answer
+  without needing an annotation.
 - Scalar functions:
   - **Casts / general:** `toString`, `toInteger`, `toFloat`, `coalesce`.
   - **String:** `toUpper`, `toLower`, `substring` (0-indexed; 2- and 3-arg),

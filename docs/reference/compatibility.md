@@ -31,21 +31,21 @@ quoted triple (`<< s p o >> f:t ?t`, `f:op ?op`) for transaction-time and
 assert/retract introspection.
 
 Turtle 1.2 annotation syntax is accepted on ingest — `{| ... |}` annotation
-tails, the `~` reifier and `<< s p o >>` reified triples — on every Turtle
-write path (insert, upsert, import, graph sync). All forms assert the base
-triple: Fluree reifies asserted edges, so `<< s p o >>` is asserting here
-where RDF 1.2 makes it non-asserting. The `VERSION "1.2"` / `@version`
+tails, the `~` reifier, `<< s p o >>` reified triples and
+`r rdf:reifies <<( s p o )>>` — on every Turtle write path (insert, upsert,
+import, graph sync), inside TriG `GRAPH { }` blocks, and in N-Triples and
+N-Quads files. All forms assert the base triple: Fluree reifies asserted
+edges, so `<< s p o >>` is asserting here where RDF 1.2 makes it
+non-asserting. The `VERSION "1.2"` / `@version`
 directive and `--ltr` / `--rtl` base-direction language tags are accepted.
 The vendored W3C RDF 1.1 and RDF 1.2 Turtle suites run in CI
 (`testsuite-sparql/tests/w3c_rdf.rs`), with known gaps in the skip register.
 
 Not yet supported:
-- Triple terms as arbitrary object values (only as the `rdf:reifies` object);
-  the `<<( ... )>>` form is rejected on ingest, and the RDF 1.2 Turtle
-  evaluation suite is registered as expected-fail for that reason
+- Triple terms as arbitrary object values: `<<( ... )>>` is accepted on
+  ingest only as the object of `rdf:reifies`
 - Triple terms in subject position and nested triple terms
 - Multiple triples reified by a single annotation
-- TriG 1.2 annotations inside `GRAPH { }` blocks (default graph only)
 
 See [Edge annotations](../concepts/edge-annotations.md).
 

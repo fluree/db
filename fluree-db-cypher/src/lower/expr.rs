@@ -337,6 +337,33 @@ pub fn lower_expr<E: IriEncoder>(
                 call.args.iter().map(|a| lower_expr(ctx, a, aux)).collect();
             let args = args?;
 
+            // `relationships(p)` over a path bound by a bounded fixed-chain
+            // expansion resolves to the identity-carrying list that expansion
+            // bound alongside the path value. Computing it from the path value
+            // instead would rebuild `RelValue`s from `(start, predicate, end)`
+            // triples, which carry no reifier — so `r.prop` over the result
+            // would read nothing. See `LoweringContext::register_path_rel_list`.
+            if name == "relationships" {
+                if let [Expression::Var(pv)] = args.as_slice() {
+                    if let Some(list) = ctx.path_rel_list(*pv) {
+                        // Coalesce rather than replace: a `WITH` that projects
+                        // the path variable without the list (an aggregating
+                        // one, whose group keys we cannot extend) drops the
+                        // list, and an unbound `Expression::Var` would read as
+                        // null where the path-derived list still answers
+                        // `size()`, `type()` and the endpoints correctly. The
+                        // fallback is exactly today's behavior.
+                        return Ok(Expression::call(
+                            Function::Coalesce,
+                            vec![
+                                Expression::Var(list),
+                                Expression::call(Function::Relationships, args),
+                            ],
+                        ));
+                    }
+                }
+            }
+
             // Functions that remap onto an existing IR primitive with adjusted
             // arguments rather than a straight name → Function mapping.
             match name.as_str() {

@@ -211,6 +211,113 @@ async fn upsert_turtle_and_insert_turtle_agree_on_the_claim_graph() {
 }
 
 #[tokio::test]
+async fn rdf_reifies_triple_term_is_accepted_by_upsert_and_sync() {
+    // The canonical RDF 1.2 spelling reaches the converted paths through the
+    // same collector events as `~ r`, so it must land the same claim.
+    let turtle = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+                  ex:claim1 rdf:reifies <<( ex:alice ex:knows ex:bob )>> .\n\
+                  ex:claim1 ex:confidence 0.9 .\n";
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let upserted = fluree
+        .upsert_turtle(
+            genesis_ledger(&fluree, "it/turtle-star-upsert:rdf-reifies"),
+            &with_prefixes(turtle),
+        )
+        .await
+        .expect("upsert_turtle with rdf:reifies <<( )>>");
+    assert_eq!(confidences(&fluree, &upserted.ledger, None).await, ["0.9"]);
+
+    let ledger_id = "it/turtle-star-sync:rdf-reifies";
+    fluree
+        .insert_turtle(
+            genesis_ledger(&fluree, ledger_id),
+            &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
+        )
+        .await
+        .expect("seed ledger");
+    assert!(sync(&fluree, ledger_id, turtle)
+        .await
+        .expect("sync with rdf:reifies <<( )>>"));
+    assert_eq!(
+        annotated_knows(&fluree, ledger_id).await,
+        [("alice".into(), "bob".into(), "0.9".into())]
+    );
+}
+
+#[tokio::test]
+async fn upserting_trig_that_moves_an_anonymous_annotation_adds_a_claim() {
+    // The two payloads differ only in which object carries the anonymous
+    // `{| … |}`, so their GRAPH blocks hold identical triples and differ only
+    // in the reifier attachment. The upsert skolem scope must still tell them
+    // apart: a different payload mints a different reifier, and the first
+    // claim stays on the edge it was written for.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/trig-star-upsert:moved-anonymous-annotation";
+    fluree
+        .insert_turtle(
+            genesis_ledger(&fluree, ledger_id),
+            &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
+        )
+        .await
+        .expect("seed ledger");
+
+    for block in [
+        "ex:alice ex:knows ex:bob {| ex:confidence 0.9 |}, ex:carol .",
+        "ex:alice ex:knows ex:bob, ex:carol {| ex:confidence 0.9 |} .",
+    ] {
+        let trig = with_prefixes(&format!("GRAPH <{CLAIMS_GRAPH}> {{ {block} }}\n"));
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .upsert_turtle(&trig)
+            .commit()
+            .await
+            .unwrap_or_else(|e| panic!("TriG-star upsert of `{block}`: {e}"));
+    }
+
+    assert_eq!(
+        annotated_knows(&fluree, ledger_id).await,
+        [
+            ("alice".into(), "bob".into(), "0.9".into()),
+            ("alice".into(), "carol".into(), "0.9".into())
+        ],
+    );
+}
+
+#[tokio::test]
+async fn upserting_trig_with_a_version_directive_keeps_the_prefixes_after_it() {
+    // `VERSION "1.2"` carries no trailing dot, so a TriG scanner that skips
+    // unknown statements to the next `.` folds the following `@prefix` into it.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/trig-star-upsert:version-directive";
+    fluree
+        .insert_turtle(
+            genesis_ledger(&fluree, ledger_id),
+            &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
+        )
+        .await
+        .expect("seed ledger");
+
+    let trig = format!(
+        "VERSION \"1.2\"\n{PREFIXES}\
+         GRAPH <{CLAIMS_GRAPH}> {{ ex:alice ex:knows ex:bob {{| ex:confidence 0.9 |}} . }}\n"
+    );
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .upsert_turtle(&trig)
+        .commit()
+        .await
+        .expect("TriG with a VERSION directive must upsert");
+
+    assert_eq!(
+        annotated_knows(&fluree, ledger_id).await,
+        [("alice".into(), "bob".into(), "0.9".into())]
+    );
+}
+
+#[tokio::test]
 async fn annotated_type_edge_is_accepted_by_insert_and_refused_by_upsert() {
     let fluree = FlureeBuilder::memory().build_memory();
     let turtle = with_prefixes("ex:alice a ex:Person {| ex:source \"hr\" |} ; a ex:Employee .\n");

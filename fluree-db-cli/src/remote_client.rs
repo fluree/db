@@ -2276,6 +2276,7 @@ impl RemoteLedgerClient {
         branch: &str,
         payload: &RevertPayload,
         strategy: Option<&str>,
+        include_validation: Option<bool>,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
         let mut url = self.op_url("revert-preview", ledger);
         let mut sep = '?';
@@ -2333,6 +2334,10 @@ impl RemoteLedgerClient {
                 urlencoding::encode(s).into_owned(),
             );
         }
+        if let Some(b) = include_validation {
+            push(&mut url, &mut sep, "include_validation", b.to_string());
+        }
+
         self.send_json(reqwest::Method::GET, &url, "application/json", None)
             .await
     }
@@ -2368,6 +2373,7 @@ impl RemoteLedgerClient {
         include_changes: Option<bool>,
         max_changes: Option<usize>,
         changes_after_subject: Option<&str>,
+        include_validation: Option<bool>,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
         let mut url = self.op_url("merge-preview", ledger);
         let mut sep = '?';
@@ -2430,6 +2436,9 @@ impl RemoteLedgerClient {
                 "changes_after_subject",
                 urlencoding::encode(c).into_owned(),
             );
+        }
+        if let Some(b) = include_validation {
+            push(&mut url, &mut sep, "include_validation", b.to_string());
         }
 
         self.send_json(reqwest::Method::GET, &url, "application/json", None)

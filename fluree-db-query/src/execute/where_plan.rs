@@ -652,6 +652,17 @@ pub fn collect_var_stats(
                 Pattern::DefaultGraphSource { patterns } => {
                     walk(patterns, counts, vars);
                 }
+                // Walks that run before annotation expansion (the `SELECT *`
+                // needed set in `operator_tree`) must still see the edge
+                // positions, the reifier and the body: the chain elision
+                // treats a variable they miss as unread and drops the
+                // `f:reifies*` lookup that binds it.
+                Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => {
+                    for v in p.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
+                }
                 _ => {}
             }
         }
