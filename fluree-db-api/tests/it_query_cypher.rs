@@ -10015,6 +10015,25 @@ async fn cypher_var_length_bound_rel_var_reads_per_hop_annotations() {
         vec![json!(["Bob", [0.9]]), json!(["Carol", [0.9, 0.95]])],
     );
 
+    // The list functions compose: `tail` and `reverse` rewrap the same
+    // elements, so each one still carries its own hop's identity.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..2]->(b:Person)
+               RETURN b.name AS name,
+                      [r IN tail(rs) | r.confidence] AS rest,
+                      [r IN reverse(rs) | r.confidence] AS backwards
+               ORDER BY name"#,
+        )
+        .await,
+        vec![
+            json!(["Bob", [], [0.9]]),
+            json!(["Carol", [0.95], [0.95, 0.9]]),
+        ],
+    );
+
     // `UNWIND rs AS r` makes each element a row variable, so `r.confidence`
     // resolves as an ordinary subject property read against the reifier.
     assert_eq!(
@@ -10287,6 +10306,12 @@ async fn cypher_var_length_enumerated_property_read_refused_with_a_remedy() {
             r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
                WHERE all(r IN relationships(p) WHERE r.confidence > 0.8)
                RETURN b.name AS name"#,
+            "give the range an upper bound",
+        ),
+        // Wrapped in a list function — the guard reads through to `rs`.
+        (
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+               RETURN [r IN tail(rs) | r.confidence] AS confs"#,
             "give the range an upper bound",
         ),
         // Reached through `UNWIND`, where the element is a row variable.
