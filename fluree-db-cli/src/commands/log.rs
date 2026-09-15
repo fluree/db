@@ -235,7 +235,7 @@ fn print_truncation(shown: usize, total: usize, limit: Option<usize>) {
     // did; the honest line is that the cap is the server's.
     match limit {
         Some(_) => {
-            eprintln!("(showing {shown} of {total} commits — pass -n to widen, or --all)")
+            eprintln!("(showing {shown} of {total} commits — pass -n to widen, or --all)");
         }
         None => eprintln!(
             "(showing {shown} of {total} commits — the server caps a single response; \

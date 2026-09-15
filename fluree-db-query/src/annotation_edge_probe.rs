@@ -492,6 +492,141 @@ impl AnnotationSidecarMaps {
             ann_objs,
         })
     }
+
+    /// The drained maps for this shape, built once per execution context and
+    /// shared by every probe operator in the run that would drain the same
+    /// thing.
+    ///
+    /// This is the entry point; [`build`](Self::build) is the miss path. A
+    /// drain costs O(#annotations in the ledger) regardless of how many rows
+    /// the probe answers, so the operator is the wrong unit to cache it at:
+    /// one bounded variable-length Cypher range emits a probe operator per hop
+    /// of per chain (`*1..3` six, `*1..5` fifteen), and caching per operator
+    /// pays the whole sidecar once for each of them.
+    pub(crate) async fn shared(
+        r_subj: &TriplePattern,
+        r_pred: &TriplePattern,
+        r_obj: &TriplePattern,
+        stats: Option<Arc<StatsView>>,
+        planning: &PlanningContext,
+        ctx: &ExecutionContext<'_>,
+        view: Option<&fluree_db_binary_index::BinaryGraphView>,
+    ) -> Result<Arc<Self>> {
+        let key = AnnotationSidecarKey::new(r_subj, r_pred, r_obj, planning, ctx.binary_g_id);
+        if let Some(hit) = ctx.annotation_sidecar_cache.get(&key) {
+            return Ok(hit);
+        }
+        let built = Arc::new(Self::build(r_subj, r_pred, r_obj, stats, planning, ctx, view).await?);
+        // Two probes racing on a miss both drain; `publish` keeps whichever
+        // landed first so every caller ends up on one `Arc`. The maps are
+        // equal either way — the key is the whole of what a drain depends on.
+        Ok(ctx.annotation_sidecar_cache.publish(key, built))
+    }
+}
+
+/// The scan-visible identity of a sidecar drain: what two probe operators must
+/// agree on for one drain's maps to answer both of them.
+///
+/// The three reifies triples differ between probes mostly in their **variable
+/// ids** — a bounded variable-length range mints a fresh reifier variable per
+/// hop, over its own synthetic endpoint variables — and a variable contributes
+/// nothing to what a drain returns. [`drain_pairs`] and [`drain_object_keys`]
+/// plan each triple as a standalone *unseeded* single-pattern scan, so a
+/// variable position filters nothing, and the maps they build are keyed by
+/// `Sid` / [`GroupKeyOwned`], never by the variable a value was read out of. A
+/// **constant** position is a real scan filter (`f:reifiesPredicate <KNOWS>`
+/// for a typed relationship, an IRI-anchored endpoint), and so is a `dtc` — a
+/// `LangTag` constraint narrows the object drain to one language. Erasing
+/// variable identity and keeping everything else is therefore exactly the
+/// equivalence the drain observes.
+///
+/// Two things are deliberately absent because [`recognize_annotation_edge`]
+/// fixes them by construction: the three predicates (checked to be
+/// `f:reifies{Subject,Predicate,Object}`, so position carries them), and the
+/// subject positions (checked to be one shared reifier variable, so the
+/// sharing structure cannot differ between probes).
+#[derive(Clone, PartialEq)]
+pub(crate) struct AnnotationSidecarKey {
+    /// `(object position, datatype constraint)` for the `f:reifiesSubject`,
+    /// `f:reifiesPredicate` and `f:reifiesObject` triples in that order, with
+    /// a variable object collapsed to `None`.
+    filters: [(Option<Term>, Option<fluree_db_core::DatatypeConstraint>); 3],
+    /// The graph the three drains scan. `with_active_graph` keeps the store
+    /// but can retarget `binary_g_id`, so keying on it makes a cross-graph
+    /// alias impossible outright, rather than resting on the structural reason
+    /// the value-only lane is confined to the default graph source today (it
+    /// requires the `DefaultGraphSource` wrapper, which expansion omits inside
+    /// an explicit `Pattern::Graph`).
+    g_id: fluree_db_core::GraphId,
+    /// Temporal planning mode: `is_history()` changes what a scan returns.
+    planning: PlanningContext,
+}
+
+impl AnnotationSidecarKey {
+    fn new(
+        r_subj: &TriplePattern,
+        r_pred: &TriplePattern,
+        r_obj: &TriplePattern,
+        planning: &PlanningContext,
+        g_id: fluree_db_core::GraphId,
+    ) -> Self {
+        fn filter(t: &TriplePattern) -> (Option<Term>, Option<fluree_db_core::DatatypeConstraint>) {
+            let o = match &t.o {
+                Term::Var(_) => None,
+                other => Some(other.clone()),
+            };
+            (o, t.dtc.clone())
+        }
+        Self {
+            filters: [filter(r_subj), filter(r_pred), filter(r_obj)],
+            g_id,
+            planning: *planning,
+        }
+    }
+}
+
+/// Per-query-run memo of drained [`AnnotationSidecarMaps`], keyed by
+/// [`AnnotationSidecarKey`].
+///
+/// Held on [`ExecutionContext`] and scoped exactly like
+/// [`ConstSidCache`](crate::context::ConstSidCache): shared across
+/// `with_active_graph` / `with_default_graph` derivations, which keep the
+/// store, and reset by `with_graph_ref`, which swaps snapshot, overlay and
+/// `to_t`.
+///
+/// A `Vec` scanned linearly rather than a `HashMap`: one query has a handful
+/// of distinct probe shapes at most (every hop of one range shares a key), and
+/// the key holds a [`Term`], whose `Value` arm is a `FlakeValue` — `PartialEq`
+/// but deliberately not `Hash`/`Eq`, since a float object has no lawful hash.
+#[derive(Clone, Default)]
+pub struct AnnotationSidecarCache(Arc<std::sync::Mutex<SidecarEntries>>);
+
+/// The cache's entries: one per distinct drain the run has paid for.
+type SidecarEntries = Vec<(AnnotationSidecarKey, Arc<AnnotationSidecarMaps>)>;
+
+impl AnnotationSidecarCache {
+    fn get(&self, key: &AnnotationSidecarKey) -> Option<Arc<AnnotationSidecarMaps>> {
+        let guard = self.0.lock().expect("annotation sidecar cache lock");
+        guard
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, maps)| maps.clone())
+    }
+
+    /// Record `maps` under `key`, returning whatever is canonical afterwards —
+    /// an entry another task published first, else `maps`.
+    fn publish(
+        &self,
+        key: AnnotationSidecarKey,
+        maps: Arc<AnnotationSidecarMaps>,
+    ) -> Arc<AnnotationSidecarMaps> {
+        let mut guard = self.0.lock().expect("annotation sidecar cache lock");
+        if let Some((_, existing)) = guard.iter().find(|(k, _)| *k == key) {
+            return existing.clone();
+        }
+        guard.push((key, maps.clone()));
+        maps
+    }
 }
 
 /// The probe-side counterpart to [`drain_object_keys`]'s normalization:
@@ -1080,7 +1215,10 @@ impl HashAnnotationEdgeProbeOperator {
             return Ok(());
         }
 
-        let maps = AnnotationSidecarMaps::build(
+        // Through the run-scoped memo, so a query that mixes the required
+        // lane with the value-only OPTIONAL lane (or with a bounded
+        // variable-length range) drains the sidecar once between them.
+        let maps = AnnotationSidecarMaps::shared(
             &self.r_subj,
             &self.r_pred,
             &self.r_obj,
@@ -1387,5 +1525,79 @@ mod tests {
 
         assert!(maps.matches(&ann, &p1, &o1));
         assert!(maps.matches(&ann, &p2, &o2));
+    }
+
+    /// The three reifies triples of one hop of a bounded variable-length
+    /// range, with `hop` selecting the fresh variables the lowering mints per
+    /// hop and `rel_type` the constant relationship predicate.
+    fn hop_reifies(hop: u16, rel_type: &str) -> [TriplePattern; 3] {
+        let ann = v(100 + hop);
+        let start = v(200 + hop);
+        let end = v(200 + hop + 1);
+        [
+            TriplePattern {
+                s: Ref::Var(ann),
+                p: Ref::Sid(pred(REIFIES_SUBJECT)),
+                o: Term::Var(start),
+                dtc: None,
+            },
+            TriplePattern {
+                s: Ref::Var(ann),
+                p: Ref::Sid(pred(REIFIES_PREDICATE)),
+                o: Term::Sid(user_sid(15, rel_type)),
+                dtc: None,
+            },
+            TriplePattern {
+                s: Ref::Var(ann),
+                p: Ref::Sid(pred(REIFIES_OBJECT)),
+                o: Term::Var(end),
+                dtc: None,
+            },
+        ]
+    }
+
+    fn key_for(hop: u16, rel_type: &str, g_id: fluree_db_core::GraphId) -> AnnotationSidecarKey {
+        let [r_subj, r_pred, r_obj] = hop_reifies(hop, rel_type);
+        AnnotationSidecarKey::new(&r_subj, &r_pred, &r_obj, &PlanningContext::default(), g_id)
+    }
+
+    /// Every hop of one bounded range must land on ONE key, or the run-scoped
+    /// memo degenerates to the per-operator cache it replaced: `*1..5` plans
+    /// fifteen probe operators and each would re-drain the whole sidecar.
+    #[test]
+    fn sidecar_key_is_shared_across_the_hops_of_one_range() {
+        let first = key_for(0, "KNOWS", 0);
+        for hop in 1..15 {
+            assert!(
+                key_for(hop, "KNOWS", 0) == first,
+                "hop {hop} must share the first hop's drain"
+            );
+        }
+    }
+
+    /// ...and must NOT be shared where a position is a real scan filter. A
+    /// constant `f:reifiesPredicate` narrows the drain to one relationship
+    /// type, so serving `LIKES` from the `KNOWS` maps would answer a reified
+    /// edge as unreified.
+    #[test]
+    fn sidecar_key_separates_drains_that_filter_differently() {
+        let knows = key_for(0, "KNOWS", 0);
+        assert!(
+            key_for(0, "LIKES", 0) != knows,
+            "a different constant relationship type filters the predicate drain differently"
+        );
+        assert!(
+            key_for(0, "KNOWS", 1) != knows,
+            "a different graph scans different flakes"
+        );
+
+        let [r_subj, r_pred, mut r_obj] = hop_reifies(0, "KNOWS");
+        r_obj.dtc = Some(fluree_db_core::DatatypeConstraint::LangTag("en".into()));
+        let tagged =
+            AnnotationSidecarKey::new(&r_subj, &r_pred, &r_obj, &PlanningContext::default(), 0);
+        assert!(
+            tagged != knows,
+            "a language-tag constraint narrows the object drain to one language"
+        );
     }
 }

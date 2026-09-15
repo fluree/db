@@ -10871,3 +10871,62 @@ async fn cypher_properties_over_an_extracted_hop_is_refused_on_identity_less_rou
         "properties() of the list itself is not an element read"
     );
 }
+
+#[tokio::test]
+async fn cypher_var_length_probes_of_different_types_do_not_share_a_drain() {
+    // Every edge-annotation probe in a run reads its `f:reifies*` sidecar maps
+    // from one execution-scoped memo (a bounded range plans one probe per hop
+    // of per chain, and draining per operator multiplies the whole sidecar by
+    // the hop count). The memo's key therefore has to carry everything a drain
+    // FILTERS on: a typed relationship pins `f:reifiesPredicate` to a constant,
+    // so serving the `LIKES` probe from the `KNOWS` drain would find no
+    // annotation for the LIKES edge and degrade it to the synthesized
+    // relationship value — a silent null where a confidence is stored.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-two-types");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "alice", "@type": "Person", "name": "Alice",
+                     "KNOWS": {"@id": "bob", "@annotation": {"confidence": 0.9}},
+                     "LIKES": {"@id": "carol", "@annotation": {"confidence": 0.1}}},
+                    {"@id": "bob", "@type": "Person", "name": "Bob"},
+                    {"@id": "carol", "@type": "Person", "name": "Carol"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[ks:KNOWS*1..1]->(b)
+               MATCH (a)-[ls:LIKES*1..1]->(c)
+               RETURN [r IN ks | r.confidence] AS k, [r IN ls | r.confidence] AS l"#,
+        )
+        .await,
+        vec![json!([[0.9], [0.1]])],
+    );
+
+    // The same two shapes one range wider, so the sharing the memo DOES do
+    // (six probes per range here, all on one key) is exercised alongside the
+    // separation it must not do.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[ks:KNOWS*1..3]->(b)
+               MATCH (a)-[ls:LIKES*1..3]->(c)
+               RETURN [r IN ks | r.confidence] AS k, [r IN ls | r.confidence] AS l"#,
+        )
+        .await,
+        vec![json!([[0.9], [0.1]])],
+    );
+}
