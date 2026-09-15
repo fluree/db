@@ -1053,10 +1053,6 @@ impl BinaryIndexStore {
             .as_ref()
             .and_then(|cache| cache.get_leaf_mmap(leaf_id))
         {
-            let _ = mmap;
-            if false {
-                return Err(io::Error::other("x"));
-            }
             return self.leaf_handle_from_mmap(mmap, leaf_id, sidecar_cid, need_replay);
         }
 
