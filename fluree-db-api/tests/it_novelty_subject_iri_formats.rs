@@ -1,6 +1,6 @@
 //! Exercise encoded novelty subjects directly at the formatter boundary. This
 //! isolates the Update Q5 failure without replaying hundreds of update mixes.
-use crate::support::{genesis_ledger, query_sparql, rebuild_and_publish_index};
+use crate::support::{genesis_ledger, query_jsonld, query_sparql, rebuild_and_publish_index};
 use fluree_db_api::{format::format_results_string, FlureeBuilder, FormatterConfig};
 use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::dict_novelty::DictNovelty;
@@ -97,7 +97,8 @@ async fn novelty_full_iri_subjects_format_as_xml_json_csv_and_tsv() {
 /// new namespace so it lands in dictionary novelty under `OVERFLOW`. A join
 /// shaped like BSBM Explore Q5 keeps the subject encoded until formatting, so
 /// XML and delimited output resolve it through `BinaryGraphView` rather than
-/// `DictOverlay`; export resolves it through `ExportResolver`.
+/// `DictOverlay`; export resolves it through `ExportResolver`. `STR()` must
+/// return its IRI rather than the internal `code:name` form.
 #[tokio::test]
 async fn overflow_subject_in_novelty_formats_and_exports() {
     use fluree_db_api::export::ExportFormat;
@@ -184,6 +185,33 @@ async fn overflow_subject_in_novelty_formats_and_exports() {
         result.to_tsv(&ledger.snapshot).unwrap(),
         format!("s\tl\n{iri}\tnovel\n")
     );
+
+    // STR() of an overflow subject is its IRI, in novelty and once persisted
+    // (the last base subjects overflowed the namespace table).
+    let row_count =
+        |r: fluree_db_api::QueryResult| -> usize { r.batches.iter().map(Batch::len).sum() };
+    for target in [iri, "http://ns65533.example/s"] {
+        for filter in [
+            format!("STR(?s) = \"{target}\""),
+            format!("xsd:string(?s) = \"{target}\""),
+        ] {
+            let sparql = format!(
+                "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+                 SELECT ?s WHERE {{ ?s <{label}> ?l FILTER({filter}) }}"
+            );
+            let result = query_sparql(&fluree, &ledger, &sparql).await.unwrap();
+            assert_eq!(row_count(result), 1, "{sparql}");
+        }
+        let jsonld = json!({
+            "select": ["?s"],
+            "where": [
+                {"@id": "?s", label: "?l"},
+                ["filter", format!("(= (str ?s) \"{target}\")")]
+            ]
+        });
+        let result = query_jsonld(&fluree, &ledger, &jsonld).await.unwrap();
+        assert_eq!(row_count(result), 1, "{jsonld}");
+    }
 
     let mut buf: Vec<u8> = Vec::new();
     fluree
