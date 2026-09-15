@@ -19,8 +19,10 @@
 //! (`sparql_from_admits_this_ledgers_reserved_graphs_by_full_iri` and its
 //! negative twin); the graph-management row by the transact crate's
 //! `ReservedGraphTarget` tests (`1cb3e8cb2`, `6df4381b3`). This file covers the
-//! ledger-address row, SPARQL↔JSON-LD parity for the `config` selector, and the
-//! `ledger-info` IRI resolver.
+//! ledger-address row on `db_with_default_context` (the `db()` entry point is
+//! covered by `it_named_graphs.rs::the_config_graph_is_addressable_by_its_full_iri`),
+//! SPARQL↔JSON-LD parity for the `config` selector, and the `ledger-info` IRI
+//! resolver.
 
 #![cfg(feature = "native")]
 
@@ -66,17 +68,16 @@ async fn seed(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> fluree_db_api:
 // Ledger-address row
 // ===========================================================================
 
-/// `L#config` addresses the config graph, exactly as `L#txn-meta` has always
-/// addressed the txn-meta graph.
+/// The ledger-address row on the `db_with_default_context` entry point — the
+/// one the server route and the CLI use, which also loads the default context
+/// and re-resolves config after graph selection.
 ///
-/// The v4 baseline (`5985d0f01`) gave `parse_graph_ref` a `"txn-meta"` fragment
-/// arm and no `"config"` arm — an asymmetry no commit, PR, or issue explains.
-/// `#config` therefore fell through to an exact-IRI lookup for the bare word
-/// `"config"`, which cannot match the registered `urn:fluree:{ledger}#config`,
-/// so every documented `--ledger mydb:main#config` failed with
-/// "Unknown named graph '#config'".
+/// `it_named_graphs.rs::the_config_graph_is_addressable_by_its_full_iri` covers
+/// the plain `db()` entry point and both spellings of `#config`; this covers
+/// the other entry point plus the rows that test does not: `#txn-meta`, the
+/// no-fragment default, and the negative. Deliberately not merged with it.
 #[tokio::test]
-async fn ledger_address_reaches_both_reserved_graphs() {
+async fn db_with_default_context_addresses_both_reserved_graphs() {
     let fluree = FlureeBuilder::memory().build_memory();
     let lid = "rg-addr:main";
     let _ledger = seed(&fluree, lid).await;
