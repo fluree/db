@@ -3038,14 +3038,15 @@ pub fn generate_txn_id() -> String {
 /// This is used when generating retraction flakes from query results.
 ///
 /// When a `Materializer` is provided, encoded bindings (`EncodedLit`, `EncodedSid`)
-/// are decoded via the binary index store before conversion. Without a materializer,
-/// encoded bindings return `None` (this can cause upsert to silently skip retractions
-/// for values that live in the binary index — see issue #88).
+/// are decoded via the binary index store before conversion; a value that cannot be
+/// decoded is an error, since skipping it would leave the old value unretracted.
+/// Without a materializer, encoded bindings return `None` (this can cause upsert to
+/// silently skip retractions for values that live in the binary index — see issue #88).
 fn binding_to_flake_object(
     binding: &Binding,
     materializer: Option<&mut fluree_db_query::Materializer>,
-) -> Option<(FlakeValue, Sid)> {
-    match binding {
+) -> Result<Option<(FlakeValue, Sid)>> {
+    Ok(match binding {
         Binding::Sid { sid, .. } => Some((FlakeValue::Ref(sid.clone()), Sid::new(1, "id"))),
         Binding::IriMatch { primary_sid, .. } => {
             Some((FlakeValue::Ref(primary_sid.clone()), Sid::new(1, "id")))
@@ -3053,10 +3054,7 @@ fn binding_to_flake_object(
         Binding::Lit { val, dtc, .. } => Some((val.clone(), dtc.datatype().clone())),
         Binding::EncodedLit { .. } | Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
             match materializer {
-                Some(mat) => {
-                    let materialized = mat.to_term(binding);
-                    binding_to_flake_object(&materialized, None)
-                }
+                Some(mat) => binding_to_flake_object(&mat.to_term(binding)?, None)?,
                 None => None,
             }
         }
@@ -3083,7 +3081,7 @@ fn binding_to_flake_object(
             );
             None
         }
-    }
+    })
 }
 
 /// Convert a TemplateTerm to a Binding for VALUES clause
@@ -3373,9 +3371,10 @@ async fn generate_upsert_deletions(
 
             for batch in &batches {
                 for row in 0..batch.len() {
-                    let flake_obj = batch
-                        .get(row, o_var)
-                        .and_then(|b| binding_to_flake_object(b, materializer.as_mut()));
+                    let flake_obj = match batch.get(row, o_var) {
+                        Some(b) => binding_to_flake_object(b, materializer.as_mut())?,
+                        None => None,
+                    };
                     if let Some((o, dt)) = flake_obj {
                         let flake = match graph_sid.clone() {
                             Some(g) => Flake::new_in_graph(

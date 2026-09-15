@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use fluree_db_core::clock::Instant;
 use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::ns_encoding::{canonical_split, NsLookup, NsSplitMode};
 use fluree_db_core::o_type::{DecodeKind, OType};
@@ -383,7 +384,7 @@ impl BinaryIndexStore {
     ) -> io::Result<Self> {
         tracing::debug!("BinaryIndexStore::load_from_root_v6 starting");
         fluree_db_core::disk_cache::ensure_cache_dir(cache_dir)?;
-        let phase = fluree_db_core::clock::Instant::now();
+        let phase = Instant::now();
 
         // ── Dict loading ──────────────────────────────────────────────────────────────
         let dicts = build_dictionary_set(
@@ -396,7 +397,7 @@ impl BinaryIndexStore {
         .await?;
 
         let dicts_us = phase.elapsed().as_micros() as u64;
-        let phase = fluree_db_core::clock::Instant::now();
+        let phase = Instant::now();
 
         // ── Per-graph specialty arenas ───────────────────────────────
         let mut per_graph_arenas = load_per_graph_arenas(
@@ -406,6 +407,9 @@ impl BinaryIndexStore {
             leaflet_cache.as_ref(),
         )
         .await?;
+
+        let arenas_us = phase.elapsed().as_micros() as u64;
+        let phase = Instant::now();
 
         // ── Graph index routing ────────────────────────────────────
         let mut graph_indexes: HashMap<GraphId, GraphIndex> = HashMap::new();
@@ -482,6 +486,7 @@ impl BinaryIndexStore {
             graphs = graph_indexes.len(),
             leaves = leaf_count,
             dicts_us,
+            arenas_us,
             graphs_us = phase.elapsed().as_micros() as u64,
             "store load phases"
         );
@@ -2421,7 +2426,7 @@ impl BinaryIndexStore {
     /// Returns `Ok(0)` if there is no leaflet cache or no reverse trees to preload.
     pub fn preload_dict_leaves(&self) -> io::Result<usize> {
         // TODO(V3 migration): implement cache warming for dict tree leaves.
-        // The V3 format uses ForwardPack readers (already mmap'd) for forward dicts
+        // The V3 format uses lazy ForwardPack readers for forward dicts
         // and CoW trees for reverse dicts. Reverse-tree leaf preloading can be
         // added when cold-start latency is observed in production.
         //
@@ -2437,7 +2442,7 @@ impl BinaryIndexStore {
     ///
     /// The index root and reverse-dict tree readers are already resident after
     /// [`load_from_root_v6`](Self::load_from_root_v6); this targets the forward
-    /// packs, which are mmapped lazily and otherwise fault in on the first query
+    /// packs, which are opened lazily and otherwise load on the first query
     /// that resolves an IRI/string ID. String packs are warmed first (broadest
     /// query impact), then per-namespace subject packs. Warming stops once the
     /// budget is exhausted.
@@ -2986,6 +2991,7 @@ async fn build_dictionary_set(
     leaflet_cache: Option<&Arc<LeafletCache>>,
     prev: Option<&DictionarySet>,
 ) -> io::Result<DictionarySet> {
+    let started = Instant::now();
     // Predicates (inline in root).
     let (predicates, predicate_reverse) = {
         let mut dict = PredicateDict::new();
@@ -3005,6 +3011,7 @@ async fn build_dictionary_set(
     };
 
     // Subject forward packs.
+    let phase = Instant::now();
     let mut subject_forward_packs = std::collections::BTreeMap::new();
     for (ns_code, ns_refs) in &root.dict_refs.forward_packs.subject_fwd_ns_packs {
         let reader = ForwardPackReader::from_pack_refs_reusing(
@@ -3018,8 +3025,10 @@ async fn build_dictionary_set(
         .await?;
         subject_forward_packs.insert(*ns_code, reader);
     }
+    let subject_forward_us = phase.elapsed().as_micros() as u64;
 
     // Subject reverse tree.
+    let phase = Instant::now();
     let subject_reverse_tree = Some(
         DictTreeReader::from_refs_reusing(
             &cs,
@@ -3030,8 +3039,10 @@ async fn build_dictionary_set(
         )
         .await?,
     );
+    let subject_reverse_us = phase.elapsed().as_micros() as u64;
 
     // String forward packs.
+    let phase = Instant::now();
     let string_forward_packs = ForwardPackReader::from_pack_refs_reusing(
         Arc::clone(&cs),
         cache_dir,
@@ -3041,8 +3052,10 @@ async fn build_dictionary_set(
         prev.map(|p| &p.string_forward_packs),
     )
     .await?;
+    let string_forward_us = phase.elapsed().as_micros() as u64;
 
     // String reverse tree.
+    let phase = Instant::now();
     let string_reverse_tree = Some(
         DictTreeReader::from_refs_reusing(
             &cs,
@@ -3053,6 +3066,8 @@ async fn build_dictionary_set(
         )
         .await?,
     );
+    let string_reverse_us = phase.elapsed().as_micros() as u64;
+    let phase = Instant::now();
 
     // Namespace codes: shared with the previous store when it already holds
     // every entry of the root's table. Codes are never reassigned within a
@@ -3135,6 +3150,19 @@ async fn build_dictionary_set(
     // Subject count from watermarks.
     let subject_count = root.subject_watermarks.iter().sum::<u64>() as u32;
 
+    tracing::debug!(
+        target: "fluree::open",
+        subject_packs = subject_forward_packs.values().map(ForwardPackReader::pack_count).sum::<usize>(),
+        string_packs = string_forward_packs.pack_count(),
+        subject_forward_us,
+        subject_reverse_us,
+        string_forward_us,
+        string_reverse_us,
+        tables_us = phase.elapsed().as_micros() as u64,
+        total_us = started.elapsed().as_micros() as u64,
+        "dictionary load phases"
+    );
+
     Ok(DictionarySet {
         predicates,
         predicate_reverse,
@@ -3178,8 +3206,20 @@ async fn load_per_graph_arenas(
     for ga in graph_arenas {
         let mut numbig = HashMap::new();
         for (p_id, cid) in &ga.numbig {
+            let phase = Instant::now();
             let bytes = fetch_cached_bytes(cs.as_ref(), cid, cache_dir, "nba").await?;
+            let read_us = phase.elapsed().as_micros() as u64;
+            let phase = Instant::now();
             let arena = crate::arena::numbig::read_numbig_arena_from_bytes(&bytes)?;
+            tracing::debug!(
+                target: "fluree::open",
+                g_id = ga.g_id,
+                p_id,
+                bytes = bytes.len(),
+                read_us,
+                decode_us = phase.elapsed().as_micros() as u64,
+                "NumBig arena loaded"
+            );
             numbig.insert(*p_id, arena);
         }
 

@@ -5,6 +5,8 @@ mod support;
 mod it_bounded_overlay_translation;
 #[path = "it_differential_fastpath.rs"]
 mod it_differential_fastpath;
+#[path = "it_materializer_decode_errors.rs"]
+mod it_materializer_decode_errors;
 #[path = "it_nested_select_modifiers.rs"]
 mod it_nested_select_modifiers;
 #[path = "it_query_agent_json.rs"]

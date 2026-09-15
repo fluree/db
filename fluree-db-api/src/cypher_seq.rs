@@ -1705,7 +1705,7 @@ fn extract_rows(mut result: QueryResult, wanted: &[String]) -> Result<Vec<Vec<Bi
             for &var in &var_ids {
                 let b = batch.get(row, var).cloned().unwrap_or(Binding::Unbound);
                 let b = match &mut materializer {
-                    Some(m) => m.to_term(&b),
+                    Some(m) => m.to_term(&b)?,
                     None => b,
                 };
                 cells.push(normalize_binding(b)?);
