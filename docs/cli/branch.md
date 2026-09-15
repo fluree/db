@@ -272,7 +272,7 @@ fluree branch diff <SOURCE> [OPTIONS]
 
 `branch diff` reports ahead/behind commits, fast-forward eligibility, and conflicting `(subject, predicate, graph)` keys without mutating state. With `--conflict-details`, the preview also shows the source and target values for the returned conflict keys and annotates what the selected strategy would do.
 
-By default the preview also stages the merge's resolved change set on the target and validates it against the target's SHACL configuration and shapes, through the same code path `branch merge` uses. The `validation:` line reports `conforms` or the violation report the merge would fail with, and `mergeable:` is `yes` only when the strategy applies and the result conforms. A preview that says `mergeable: yes` therefore means the merge will go through unless the ledger changes in between. Fast-forward previews carry no validation line: the adopted commits were validated when they were authored. Pass `--no-validate` for a cheaper count-only preview.
+By default the preview also stages the merge's resolved change set on the target and validates it against the target's SHACL configuration and shapes, through the same code path `branch merge` uses. The `validation:` line reports `conforms` or the violation report the merge would fail with, and `mergeable:` is `yes` only when the strategy applies and the result conforms. A preview that says `mergeable: yes` therefore means neither the strategy nor the target's shapes will reject the merge. Other conditions still apply at commit time, novelty backpressure among them, so a ledger due for indexing can refuse a merge the preview passed. Fast-forward previews carry no validation line: the adopted commits were validated when they were authored. Pass `--no-validate` for a cheaper count-only preview.
 
 **Examples:**
 
@@ -369,7 +369,7 @@ Accepts either positional commit references (cherry-pick style, one or several) 
 
 A commit must be on the branch's own history, which is the line of commits reached by following each merge's first parent. When the selected commits have nothing to undo, such as one that only registered a graph, no commit is written: the command reports that nothing was reverted and HEAD stays where it was. The genesis commit, a merge commit, and a commit that reached this branch through a merge are all refused: the first two have no single change to undo, and the third belongs to the branch that authored it, where its own history can say what changed after it. Revert it there and merge again.
 
-The revert commit is validated against the branch's SHACL configuration and shapes before it is written. Undoing a commit can remove a value a later shape requires (a `sh:minCount`, say); such a revert is rejected with the same violation report a rejected transaction prints, and the branch is left as it was.
+The revert commit is validated against the branch's SHACL configuration and shapes before it is written. Undoing a commit can remove a value a later shape requires (a `sh:minCount`, say); such a revert is rejected with the same violation report a rejected transaction prints, and the branch is left as it was. With `--preview`, the same staging and validation run without writing anything: `revertable: yes` means neither the strategy nor the branch's shapes will reject the revert, and otherwise the `validation:` line carries the report it would fail with.
 
 | Option | Description |
 |--------|-------------|

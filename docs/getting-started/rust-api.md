@@ -1297,9 +1297,10 @@ lists**, not the cost of computing them:
 conflicts or, when `validation` is present, when the merged state fails the
 target's SHACL shapes. The preview stages the resolved change set and runs
 the same validation `merge_branch` runs, so with `include_validation` on
-(the default) `mergeable=true` means the merge will succeed unless either
-branch changes first. With it off, `mergeable` reflects only the
-conflict/strategy interaction.
+(the default) `mergeable=true` means neither the strategy nor the target's
+shapes will reject the merge. Other conditions still apply when the commit
+is built, novelty backpressure among them. With it off, `mergeable`
+reflects only the conflict/strategy interaction.
 
 All types derive `Serialize` so the response is wire-stable; the HTTP
 endpoint at `GET /v1/fluree/merge-preview/{ledger...}` returns the same struct.

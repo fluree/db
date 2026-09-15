@@ -951,10 +951,12 @@ These rules are not negotiable; the CLI and other clients depend on them:
    `validation` is absent. Fast-forward previews carry no `validation`:
    the adopted commits were validated when authored. Under
    `strategy=abort` with conflicts the merge never reaches validation, so
-   `validation` is absent there too. This rule is what lets a client
-   trust `mergeable=true`: absent a change to either ledger in between,
-   the merge will go through. Warn-mode graphs log and count as
-   conforming, matching transactions. This is still read-only (rule 9).
+   `validation` is absent there too. This rule is what makes
+   `mergeable=true` mean "neither the strategy nor the shapes reject it"
+   rather than "no conflicts were reported"; commit-time conditions such
+   as novelty backpressure are outside it. Warn-mode graphs log and count
+   as conforming, matching transactions. This is still read-only
+   (rule 9).
 
 ### Response (`200 OK`)
 
@@ -1045,10 +1047,12 @@ current asserted values in the same shape returned by `GET /show/*ledger`;
 `resolution` is a label only. `mergeable` is `false` when the chosen strategy
 would abort (currently `strategy=abort` with one or more conflicts) or, when
 `validation` is present, when the merged state fails the target's SHACL
-shapes (rule 12). With validation on, `mergeable=true` means a subsequent
-`POST /merge` with the same strategy will succeed unless either branch
-changes in between; with `include_validation=false` it reflects only the
-conflict/strategy interaction.
+shapes (rule 12). With validation on, `mergeable=true` means neither the
+strategy nor the target's shapes will reject a subsequent `POST /merge`
+with the same strategy. It is not a promise the commit lands: novelty
+backpressure and other commit-time conditions still apply. With
+`include_validation=false` it reflects only the conflict/strategy
+interaction.
 
 ### Error responses
 
