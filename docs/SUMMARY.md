@@ -101,6 +101,7 @@
   - [Remote mounts and serving tiers](design/remote-mounts.md)
   - [ContentId and ContentStore](design/content-id-and-contentstore.md)
   - [Index format](design/index-format.md)
+  - [Datalog rules engine](design/rules-engine.md)
   - [Edge annotations (storage internals)](design/edge-annotations.md)
   - [Cypher sequential writes (multi-clause MERGE composition)](design/cypher-sequential-writes.md)
   - [Spatial index (GeoPoint + S2)](design/spatial-index.md)

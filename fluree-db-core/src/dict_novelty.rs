@@ -32,8 +32,9 @@
 //!   subject reverse tree: `[ns_code BE 2 bytes][suffix UTF-8 bytes]`.
 //! - Watermark vector covers `0..max_ns_code+1`. `watermark_for_ns(code)`
 //!   returns 0 for any code beyond the vector length.
-//! - `NS_OVERFLOW (0xFFFF)` uses dedicated scalar fields to avoid resizing
-//!   per-namespace vectors to 65536 entries.
+//! - `NS_OVERFLOW` (0xFFFF) was meant to use dedicated scalar fields, but the
+//!   real overflow namespace is `namespaces::OVERFLOW` (0xFFFE), which takes
+//!   the ordinary per-namespace path, as in the indexer (#1843).
 //! - `initialized` must be true before any commit on a non-genesis ledger.
 //!   `ensure_initialized()` panics unconditionally (debug and release).
 
@@ -43,8 +44,8 @@ use crate::ns_vec_bi_dict::{lookup_key, NsVecBiDict};
 use crate::vec_bi_dict::VecBiDict;
 use crate::{Flake, FlakeValue};
 
-/// Namespace code reserved for overflow subjects (full IRI as suffix).
-/// Never stored in watermark vectors; always treated as novel.
+/// Does not match `namespaces::OVERFLOW` (0xFFFE); no production path assigns this
+/// code, so the special case below is never taken (#1843).
 const NS_OVERFLOW: u16 = 0xFFFF;
 
 // ---------------------------------------------------------------------------
@@ -109,11 +110,9 @@ impl DictNovelty {
     /// `subject_wm[i]` = max persisted `local_id` for namespace code `i`.
     /// `string_wm` = max persisted `string_id`.
     ///
-    /// If the watermarks vector is long enough to include `NS_OVERFLOW`
-    /// (index 0xFFFF), the overflow entry is extracted to a dedicated scalar
-    /// and the vector is truncated.  In practice watermarks vectors are
-    /// short (only non-zero namespace codes up to the max assigned code),
-    /// so this branch is rarely taken.
+    /// The `NS_OVERFLOW` extraction below is unreachable: the index root
+    /// stores the watermark count as a `u16`, so index 0xFFFF never exists
+    /// (#1843).
     pub fn with_watermarks(subject_wm: Vec<u64>, string_wm: u32) -> Self {
         // Extract overflow watermark if present, and trim vec.
         let overflow_idx = NS_OVERFLOW as usize;

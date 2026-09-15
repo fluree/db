@@ -313,8 +313,9 @@ pub async fn prepare_execution_with_config(
                 db.t,
                 &reasoning,
                 query.reasoning.rules_source_g_id,
+                binary_store,
             )
-            .await;
+            .await?;
 
             // Step 4: Build ontology for OWL2-QL mode (if enabled)
             let reasoning_overlay_for_ontology: Option<ReasoningOverlay<'_>> = derived_outcome

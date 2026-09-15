@@ -33,6 +33,42 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+/// Stable id for an upsert payload, used as its blank-node skolem scope.
+///
+/// Streams the JSON through the hasher rather than serializing it to a
+/// `String` first, so a bulk payload does not pay a second full copy of
+/// itself. The TriG blocks fold in their graph IRI and triples but not their
+/// prefix map: prefixes only decide how the triples were expanded, and a
+/// `FxHashMap` has no stable iteration order, which would make the scope
+/// differ between two runs over the same document.
+fn upsert_payload_id(txn_json: &JsonValue, named_graphs: &[NamedGraphBlock]) -> u64 {
+    use std::io::Write;
+    use xxhash_rust::xxh64::Xxh64;
+
+    struct HashWriter(Xxh64);
+    impl Write for HashWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.update(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut w = HashWriter(Xxh64::new(0));
+    let _ = w.write_all(b"fluree:upsert\0");
+    let _ = serde_json::to_writer(&mut w, txn_json);
+    for block in named_graphs {
+        let _ = w.write_all(b"\0graph\0");
+        let _ = w.write_all(block.iri.as_bytes());
+        for triple in &block.triples {
+            let _ = write!(w, "\0{triple:?}");
+        }
+    }
+    w.0.digest()
+}
+
 /// Stages an ordered sequence of transactions into ONE commit, each observing
 /// the previous ones' writes through a *virtual state* — the machinery behind
 /// SPARQL 1.1 `;`-separated updates (roadmap D-10) and the Cypher sequential
@@ -2341,6 +2377,26 @@ fn convert_named_graphs_to_templates(
             let subject_term = convert_term(subject, &block.prefixes, ns_registry)?;
             let predicate_term = convert_term(&triple.predicate, &block.prefixes, ns_registry)?;
 
+            // Reserved-predicate firewall. The JSON-LD, SPARQL UPDATE and
+            // Turtle surfaces all refuse a hand-written `f:reifies*`
+            // statement, because an attachment bundle is only well-formed if
+            // the annotation syntax built it. TriG `GRAPH { … }` blocks come
+            // through here instead of `FlakeSink::build_flake`, so they had no
+            // check at all and such a triple landed.
+            if let TemplateTerm::Sid(p) = &predicate_term {
+                if fluree_db_core::is_reserved_reifies_predicate(p) {
+                    let iri = ns_registry.get_prefix(p.namespace_code).map_or_else(
+                        || p.name.to_string(),
+                        |prefix| format!("{prefix}{}", p.name),
+                    );
+                    return Err(ApiError::query(format!(
+                        "'{iri}' is a system-controlled predicate; use the RDF 1.2 annotation \
+                         syntax (`~ <reifier> {{| ... |}}` or `<< s p o >>`) instead of \
+                         writing f:reifies* triples by hand"
+                    )));
+                }
+            }
+
             for obj in &triple.objects {
                 let (object_term, dtc) = convert_object(obj, &block.prefixes, ns_registry)?;
                 let mut template =
@@ -2508,6 +2564,29 @@ impl crate::Fluree {
         policy: Option<&crate::PolicyContext>,
     ) -> Result<StageResult> {
         let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
+
+        // Deterministic, payload-scoped blank-node identity for upsert.
+        //
+        // Upsert replaces the values at the slots its payload names, so
+        // applying the same payload twice should leave the same data. That
+        // held only for subjects the payload names: every blank-node-rooted
+        // structure inside it — an anonymous `{| … |}` annotation, an OWL
+        // restriction, an RDF list — was skolemized under a fresh
+        // per-transaction id, so each run minted a new subject and the two
+        // runs accumulated instead of collapsing. Upserting one Turtle file
+        // twice left two copies of every anonymous claim in it.
+        //
+        // Scoping the skolem id to the payload makes the identity a function
+        // of the document, the way graph sync scopes it to the target graph.
+        // Two different payloads still get different scopes, so positional
+        // labels cannot collide across unrelated upserts. A caller-supplied
+        // id still wins.
+        let mut txn_opts = txn_opts;
+        if txn_type == TxnType::Upsert && txn_opts.skolem_txn_id.is_none() {
+            let scope =
+                fluree_db_core::skolem::doc_scope(upsert_payload_id(txn_json, named_graphs));
+            txn_opts.skolem_txn_id = Some(format!("upsert{scope}"));
+        }
 
         // Handle case where default graph is empty but named graphs are present
         // (e.g., TriG with only GRAPH blocks and no default graph triples)
@@ -4302,6 +4381,33 @@ mod tests {
             handle.is_pending("turtle:main").await,
             "a Turtle write rejected at max novelty must ask the indexer for a build; \
              without it this write family never asks for the thing that unblocks it"
+        );
+    }
+
+    /// A hand-written `f:reifies*` triple inside a TriG `GRAPH` block is
+    /// refused, the way it is on every other write surface.
+    ///
+    /// This path does not go through `FlakeSink::build_flake`, which is where
+    /// the Turtle firewall lives, so without its own check the statement
+    /// landed and produced an attachment bundle no annotation syntax built.
+    #[test]
+    fn named_graph_block_refuses_a_reserved_reifies_predicate() {
+        let block = NamedGraphBlock {
+            iri: "http://example.org/g1".to_string(),
+            triples: vec![RawTriple {
+                subject: Some(RawTerm::Iri("http://example.org/claim1".to_string())),
+                predicate: RawTerm::Iri(fluree_vocab::reifies_iris::SUBJECT.to_string()),
+                objects: vec![RawObject::Iri("http://example.org/evil".to_string())],
+            }],
+            prefixes: rustc_hash::FxHashMap::default(),
+        };
+        let mut ns = NamespaceRegistry::new();
+        let err = convert_named_graphs_to_templates(&[block], &mut ns)
+            .expect_err("a reserved predicate in a GRAPH block must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("system-controlled predicate"),
+            "unexpected error: {msg}"
         );
     }
 

@@ -556,6 +556,7 @@ mod tests {
             ontology_import_map: map,
             max_facts: None,
             max_seconds: None,
+            max_memory_mb: None,
             override_control: OverrideControl::default(),
         }
     }

@@ -118,11 +118,12 @@ async fn sparql_rule_with_filter() {
     );
 }
 
-/// A SPARQL rule using constructs the datalog engine cannot execute
-/// (OPTIONAL) is skipped with a warning — it must not derive anything and
-/// must not break other rules.
+/// A SPARQL rule using a non-monotonic construct (OPTIONAL) is rejected
+/// with an error naming the construct and the rule, and the query fails —
+/// a fixpoint cannot evaluate a left join soundly, and silently skipping the
+/// rule would answer over an incomplete rule set.
 #[tokio::test]
-async fn sparql_rule_unsupported_construct_skipped() {
+async fn sparql_rule_unsupported_construct_rejected_loudly() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "datalog/sparql-unsupported");
 
@@ -157,38 +158,19 @@ async fn sparql_rule_unsupported_construct_skipped() {
     });
     let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
 
-    // The good rule still derives; the bad rule derives nothing.
     let q = json!({
         "@context": { "ex": "http://example.org/" },
         "select": "?x",
         "where": {"@id": "?x", "ex:hasA": true},
         "reasoning": "datalog"
     });
-    let rows = support::query_jsonld(&fluree, &ledger, &q)
+    let err = support::query_jsonld(&fluree, &ledger, &q)
         .await
-        .unwrap()
-        .to_jsonld(&ledger.snapshot)
-        .unwrap();
+        .expect_err("a stored rule with OPTIONAL must fail the query, not be skipped");
+    let message = err.to_string();
     assert!(
-        normalize_rows(&rows).contains(&json!("ex:thing")),
-        "good rule should still run when a sibling rule is unsupported, got {rows:?}"
-    );
-
-    let q_bad = json!({
-        "@context": { "ex": "http://example.org/" },
-        "select": ["?x", "?v"],
-        "where": {"@id": "?x", "ex:derived": "?v"},
-        "reasoning": "datalog"
-    });
-    let rows_bad = support::query_jsonld(&fluree, &ledger, &q_bad)
-        .await
-        .unwrap()
-        .to_jsonld(&ledger.snapshot)
-        .unwrap();
-    assert_eq!(
-        rows_bad.as_array().map(Vec::len),
-        Some(0),
-        "unsupported rule must be skipped, not partially applied"
+        message.contains("OPTIONAL") && message.contains("badRule"),
+        "the rejection must name the construct and the rule, got: {message}"
     );
 }
 
