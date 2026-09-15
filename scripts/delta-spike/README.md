@@ -79,11 +79,11 @@ evidence; customer-produced tables are still needed.
 | --- | --- |
 | Kernel 0.28.0 + default engine | Probe selects Arrow/Parquet 58.4; the release also supports Arrow 59. Its `object_store` 0.13.2 dependency brings reqwest 0.12, alongside the engine's reqwest 0.13. Arrow features also enable multiple cloud backends. |
 | Delta-rs Rust 0.32.4 (manifest inspection; Rust API not built here) | Arrow/Parquet 58, `object_store` 0.13.2, and the `buoyant_kernel` 0.22 family. DataFusion 53.1 is optional in the core crate; the Python wheel's contents do not establish production Rust binary size. |
-| Fluree production workspace | Arrow/Parquet 54 and unified reqwest 0.13. Neither candidate can be added as-is while keeping those dependency choices unchanged. |
+| Fluree production workspace | Now aligned to Arrow/Parquet 58.4, with unified reqwest 0.13. Kernel's older storage/HTTP dependency still needs resolution before adoption. |
 
 Kernel's logical scan API remains a promising fit for Fluree's existing query
-engine. Before integrating it, decide how to align Arrow and storage/HTTP
-dependencies: an upstream-compatible upgrade or a custom engine needs evaluation.
+engine. Arrow/Parquet alignment is complete. Before integrating it, resolve the
+storage/HTTP dependencies: an upstream-compatible change or a custom engine needs evaluation.
 Measure the chosen production configuration after that decision. This standalone
 probe intentionally permits duplicate HTTP versions to expose the issue without
 adding them to the product build.
@@ -203,16 +203,57 @@ Dependency decision: retain the Arrow-free `fluree-db-tabular` contract. Linking
 it into this standalone experiment adds only that crate and its existing
 `thiserror` dependency; the experiment still has one Arrow version (58.4).
 This lets us develop the batch adapter without changing Fluree's shared types.
-It does **not** eliminate duplicate Arrow versions if the current default engine
-is later linked alongside Iceberg's Arrow 54 in a product binary.
+The subsequent Iceberg upgrade aligns its Arrow/Parquet dependencies to the same
+58.4 release, removing the earlier 54/58 version mismatch.
 
-For production, evaluate aligning Iceberg's Arrow/Parquet to 58 with its existing
-scan regressions and performance checks. Separately resolve Kernel's pinned
+Production Iceberg now passes its scan and API regressions on Arrow/Parquet 58.4.
+Representative performance checks remain outstanding. Resolve Kernel's pinned
 `object_store` 0.13 / reqwest 0.12 dependency through an upstream-compatible
 engine/dependency change. A storage wrapper alone does not remove dependencies
 enabled by Kernel's Cargo features; a custom engine also owns JSON/Parquet and
-expression behavior and needs the full fixture suite. The root workspace
-manifest/lockfile and release dependency graph remain unchanged by this probe.
+expression behavior and needs the full fixture suite. The root workspace now
+uses Arrow/Parquet 58.4, but Kernel and object_store remain confined to this
+standalone experiment.
+
+The upgrade explicitly selects Parquet's `flate2-rust_backened` feature (upstream
+spelling) to retain the Rust GZIP backend. Its compatibility regression covers
+GZIP/Snappy/Zstd files, delta-packed integers, and time-of-day values normalized
+to Fluree's microsecond integer representation. Millisecond time statistics
+are conservatively declined because their units differ; exact filtering runs
+on normalized values. Local Iceberg history/materialization and R2RML/static
+policy parity tests pass with the upgraded decoder.
+
+Production upgrade checks:
+
+```sh
+cargo test --locked -p fluree-db-iceberg --all-features
+cargo test --locked -p fluree-db-iceberg --no-default-features
+cargo clippy --locked -p fluree-db-iceberg --all-features --all-targets -- -D warnings
+cargo test --locked -p fluree-db-api --features iceberg,sql \
+  --test it_graph_source_r2rml --test it_iceberg_local_fs \
+  --test it_iceberg_policy --test it_iceberg_warehouse_root
+cargo check --locked -p fluree-db-api --no-default-features --target wasm32-unknown-unknown
+```
+
+These pass with 321 feature-enabled Iceberg tests, 286 without default features,
+and 87 API tests (overlapping reader tests are counted per configuration).
+The standalone Iceberg crate's wasm32 build fails in Tokio/mio networking on
+both the upgraded version and the unchanged Arrow 54 revision; the actual
+browser API configuration above passes.
+
+On aarch64-apple-darwin, the same `cargo build --locked --release
+-p fluree-db-server --bin fluree-server --features otel` configuration (defaults
+enabled, LTO and stripping) produced the following host measurements:
+
+| Version | Stripped bytes | Gzip level 9 bytes (`mtime=0`) |
+| --- | ---: | ---: |
+| Arrow/Parquet 54, after reqwest upgrade | 61,022,384 | 27,582,422 |
+| Arrow/Parquet 58.4 and compatibility changes | 63,023,408 | 28,238,897 |
+
+The increase is 2,001,024 bytes (+3.28%), or 656,475 bytes compressed (+2.38%).
+The resulting server passes `--help`. This measures one host release build,
+not Linux/Lambda artifacts or scan performance; Azure and Kernel are not yet
+linked into that server.
 
 History reference: [Kernel 0.28 history manager source](https://github.com/delta-io/delta-kernel-rs/blob/v0.28.0/kernel/src/history_manager/mod.rs).
 

@@ -215,9 +215,13 @@ flate2 = "1"
 # Iceberg format support (manifest Avro, data Parquet)
 apache-avro = "0.21.0"
 # Parquet compression codecs. `snap` (Snappy) is the Spark/Hive default and `zstd`
-# is common; the Apache Iceberg Kafka Connect connector writes GZIP, which needs
-# `flate2`. Keep all enabled so Iceberg data files from any engine decode.
-parquet = { version = "54", default-features = false, features = ["zstd", "snap", "flate2"] }
+# is common; the Apache Iceberg Kafka Connect connector writes GZIP.
+# Select the same Rust flate2 backend used by Parquet 54 explicitly;
+# `flate2-rust_backened` is the upstream feature spelling in Parquet 58.
+parquet = { version = "58.4", default-features = false, features = ["zstd", "snap", "flate2-rust_backened"] }
+# Keep the Iceberg decoder aligned with the Delta Kernel experiment. The shared
+# tabular interface remains Arrow-free; consumers enable Arrow only when needed.
+arrow = { version = "58.4", default-features = false }
 
 # LRU cache for Parquet footers
 lru = "0.12"

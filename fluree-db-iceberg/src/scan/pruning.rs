@@ -276,9 +276,14 @@ pub fn row_group_can_contain(
 /// writer's decimal filters don't prune.
 fn prunable_stats(col: &ColumnChunkMetaData) -> Option<&Statistics> {
     let info = col.column_descr().self_type().get_basic_info();
+    // Time values are exposed as microseconds, but TIME_MILLIS statistics use
+    // milliseconds. Decline these bounds rather than compare different units.
+    if info.converted_type() == parquet::basic::ConvertedType::TIME_MILLIS {
+        return None;
+    }
     let is_decimal = info.converted_type() == parquet::basic::ConvertedType::DECIMAL
         || matches!(
-            info.logical_type(),
+            info.logical_type_ref(),
             Some(parquet::basic::LogicalType::Decimal { .. })
         );
     if is_decimal
