@@ -1629,7 +1629,7 @@ impl BinaryIndexStore {
                 format!("subject local_id {local_id} not found in ns {ns_code}"),
             )
         })?;
-        if ns_code == namespaces::EMPTY || ns_code == namespaces::OVERFLOW {
+        if namespaces::is_full_iri(ns_code) {
             return Ok(suffix);
         }
         let prefix = self.dicts.namespace_codes.get(&ns_code).ok_or_else(|| {
@@ -2934,8 +2934,8 @@ impl BinaryGraphView {
 
     /// Match persisted subject decoding: EMPTY and OVERFLOW names already
     /// contain the full IRI and need no namespace-table entry.
-    fn subject_iri_from_parts(&self, ns_code: u16, suffix: &str) -> io::Result<String> {
-        if ns_code == namespaces::EMPTY || ns_code == namespaces::OVERFLOW {
+    pub fn subject_iri_from_parts(&self, ns_code: u16, suffix: &str) -> io::Result<String> {
+        if namespaces::is_full_iri(ns_code) {
             return Ok(suffix.to_owned());
         }
         self.namespace_prefix(ns_code)

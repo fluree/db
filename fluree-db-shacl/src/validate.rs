@@ -2885,8 +2885,8 @@ async fn value_conforms_to_class(
 /// namespaces this transaction *staged* (absent from the base snapshot) still
 /// decode. `EMPTY` / `OVERFLOW` codes carry the full IRI as the name.
 fn decode_sid_with_ns_map(ns_map: &HashMap<u16, String>, sid: &Sid) -> Option<String> {
-    use fluree_vocab::namespaces::{EMPTY, OVERFLOW};
-    if sid.namespace_code == EMPTY || sid.namespace_code == OVERFLOW {
+    use fluree_vocab::namespaces::is_full_iri;
+    if is_full_iri(sid.namespace_code) {
         return Some(sid.name.to_string());
     }
     ns_map
