@@ -15,7 +15,7 @@ use crate::ir::InlineValues;
 use crate::ir::{GraphMgmtOp, GraphSel, GraphTarget, TemplateTerm, TripleTemplate, Txn, TxnType};
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::comparator::IndexType;
-use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
+use fluree_db_core::graph_registry::{FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID};
 use fluree_db_core::query_bounds::RangeTest;
 use fluree_db_core::range::RangeMatch;
 use fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL;
@@ -731,6 +731,56 @@ pub async fn stage(
             .skolem_txn_id
             .clone()
             .unwrap_or_else(generate_txn_id);
+
+        // B2 (data writes): `#txn-meta` is never a write target.
+        //
+        // `txn.graph_delta` is the transaction's set of *write* targets — a
+        // `GRAPH <iri> { … }` block, a `WITH <iri>` default, a sync target, a
+        // `CREATE GRAPH <iri>`. WHERE-side graph references (`USING [NAMED]`,
+        // a `GRAPH` pattern inside the WHERE) are carried on the where clause
+        // instead, so guarding here refuses writes without touching reads.
+        //
+        // Why it must be refused: `#txn-meta` (g_id 1) holds commit
+        // provenance, and `resolve_commit_prefix` / `commit_to_t` resolve a
+        // user-typed commit prefix by scanning exactly those indexed
+        // `fluree:commit:sha256:<hex>` subjects. They trust what they find, so
+        // a forged record sharing a real commit's prefix permanently shadows
+        // that commit for `fluree show`, `--at`, `@commit:`, `history` and
+        // `branch create --at` — reachable with ordinary write access and
+        // persistent through indexing.
+        //
+        // Checked by IRI shape *and* by what the IRI actually routes to: the
+        // shape check (borrowed from the sync guard below) refuses the
+        // ledger's own system-graph IRI even on a ledger whose registry never
+        // seeded it, and the registry check refuses any other spelling that
+        // resolves to g_id 1.
+        //
+        // `#config` (g_id 2) is DELIBERATELY not covered here.
+        // `docs/ledger-config/README.md` and `docs/ledger-config/writing-config.md`
+        // document maintaining ledger configuration through an ordinary
+        // transaction, so refusing config writes at this site would contradict
+        // shipped documentation. The asymmetry is intentional — it is not an
+        // oversight to tidy up. Graph management (CLEAR/DROP/COPY/MOVE/ADD)
+        // and graph sync refuse BOTH reserved graphs; those paths have their
+        // own guards (`stage_graph_mgmt`, dispatched above; `sync_scan`,
+        // below) because they destroy or re-home a whole graph rather than
+        // adding facts to one.
+        {
+            let ledger_id = ledger.snapshot.ledger_id.as_ref();
+            let txn_meta_iri = fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id);
+            for iri in txn.graph_delta.values() {
+                let routes_to_txn_meta = ledger
+                    .snapshot
+                    .graph_registry
+                    .graph_id_for_iri(iri)
+                    .is_some_and(|g_id| g_id == TXN_META_GRAPH_ID);
+                if *iri == txn_meta_iri || routes_to_txn_meta {
+                    return Err(TransactError::ReservedGraphTarget {
+                        graph_iri: iri.clone(),
+                    });
+                }
+            }
+        }
 
         // Convert graph_delta (g_id -> IRI) to graph_sids (g_id -> Sid) for named graph support
         let graph_sids: HashMap<GraphId, Sid> = txn

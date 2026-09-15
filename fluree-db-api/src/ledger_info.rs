@@ -539,7 +539,11 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
         .and_then(|te| Arc::clone(&te.0).downcast::<BinaryIndexStore>().ok());
 
     // Resolve graph selector to g_id
-    let g_id = resolve_graph_selector(&options.graph, binary_store.as_deref())?;
+    let g_id = resolve_graph_selector(
+        &options.graph,
+        &ledger.snapshot.ledger_id,
+        binary_store.as_deref(),
+    )?;
 
     // Determine graph display name
     let graph_name = graph_display_name(g_id, binary_store.as_deref());
@@ -679,8 +683,20 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
 // ============================================================================
 
 /// Resolve a `GraphSelector` to a numeric `g_id`.
+/// Resolve a [`GraphSelector`] to a concrete `g_id` within `ledger_id`.
+///
+/// The well-known names `"txn-meta"` / `"config"` and the reserved IRIs
+/// `urn:fluree:{ledger_id}#txn-meta` / `#config` resolve to their fixed slots
+/// without a binary store, so `ledger-info` works pre-index.
+///
+/// The reserved IRIs are matched EXACTLY against
+/// [`txn_meta_graph_iri`]/[`config_graph_iri`] for this ledger. They were
+/// previously matched by `ends_with`, so any user graph whose IRI happened to
+/// end in `#config` — or another ledger's config IRI — resolved to this
+/// ledger's g_id 2 and reported governance stats in place of its own.
 pub(crate) fn resolve_graph_selector(
     selector: &GraphSelector,
+    ledger_id: &str,
     store: Option<&BinaryIndexStore>,
 ) -> Result<GraphId> {
     match selector {
@@ -707,12 +723,14 @@ pub(crate) fn resolve_graph_selector(
             if iri == "urn:default" {
                 return Ok(0);
             }
-            // Recognize well-known system graph IRIs so resolution works even
-            // without a binary store (e.g. pre-index).
-            if iri.ends_with("#txn-meta") {
+            // Recognize this ledger's reserved system graph IRIs so resolution
+            // works even without a binary store (e.g. pre-index). Exact match,
+            // not a suffix: a user graph may legitimately be named
+            // `http://example.org/x#config`, and it is its own graph.
+            if *iri == fluree_db_core::txn_meta_graph_iri(ledger_id) {
                 return Ok(1);
             }
-            if iri.ends_with("#config") {
+            if *iri == fluree_db_core::config_graph_iri(ledger_id) {
                 return Ok(2);
             }
             if let Some(store) = store {
@@ -2911,10 +2929,12 @@ mod tests {
         assert_eq!(json["f:graphSourceIndexT"], 42);
     }
 
+    const SEL_LEDGER: &str = "books:main";
+
     #[test]
     fn test_graph_selector_default() {
         assert_eq!(
-            resolve_graph_selector(&GraphSelector::Default, None).unwrap(),
+            resolve_graph_selector(&GraphSelector::Default, SEL_LEDGER, None).unwrap(),
             0
         );
     }
@@ -2922,7 +2942,7 @@ mod tests {
     #[test]
     fn test_graph_selector_by_id() {
         assert_eq!(
-            resolve_graph_selector(&GraphSelector::ById(3), None).unwrap(),
+            resolve_graph_selector(&GraphSelector::ById(3), SEL_LEDGER, None).unwrap(),
             3
         );
     }
@@ -2930,19 +2950,63 @@ mod tests {
     #[test]
     fn test_graph_selector_by_name_default() {
         let sel = GraphSelector::ByName("default".to_string());
-        assert_eq!(resolve_graph_selector(&sel, None).unwrap(), 0);
+        assert_eq!(resolve_graph_selector(&sel, SEL_LEDGER, None).unwrap(), 0);
     }
 
     #[test]
     fn test_graph_selector_by_name_txn_meta() {
         let sel = GraphSelector::ByName("txn-meta".to_string());
-        assert_eq!(resolve_graph_selector(&sel, None).unwrap(), 1);
+        assert_eq!(resolve_graph_selector(&sel, SEL_LEDGER, None).unwrap(), 1);
     }
 
     #[test]
     fn test_graph_selector_by_name_config() {
         let sel = GraphSelector::ByName("config".to_string());
-        assert_eq!(resolve_graph_selector(&sel, None).unwrap(), 2);
+        assert_eq!(resolve_graph_selector(&sel, SEL_LEDGER, None).unwrap(), 2);
+    }
+
+    /// This ledger's own reserved IRIs resolve to their fixed slots with no
+    /// binary store, so `ledger-info` works pre-index.
+    #[test]
+    fn graph_selector_by_iri_resolves_this_ledgers_reserved_graphs() {
+        let txn_meta = GraphSelector::ByIri(fluree_db_core::txn_meta_graph_iri(SEL_LEDGER));
+        assert_eq!(
+            resolve_graph_selector(&txn_meta, SEL_LEDGER, None).unwrap(),
+            1
+        );
+        let config = GraphSelector::ByIri(fluree_db_core::config_graph_iri(SEL_LEDGER));
+        assert_eq!(
+            resolve_graph_selector(&config, SEL_LEDGER, None).unwrap(),
+            2
+        );
+    }
+
+    /// Shipping bug, present since the v4 baseline (`5985d0f01`): the reserved
+    /// IRIs were matched with `ends_with`, so ANY graph IRI ending `#config` /
+    /// `#txn-meta` resolved to this ledger's g_id 2 / 1. A user graph named
+    /// `http://evil.example/x#config` reported the governance graph's stats
+    /// instead of its own, and another ledger's reserved IRI silently resolved
+    /// to this one's.
+    ///
+    /// Without a store these must now be UNRESOLVED, not misresolved.
+    #[test]
+    fn graph_selector_by_iri_does_not_suffix_match_reserved_graphs() {
+        for iri in [
+            "http://evil.example/x#config",
+            "http://evil.example/x#txn-meta",
+            // another ledger's reserved IRIs are not this ledger's graphs
+            &fluree_db_core::config_graph_iri("other:main"),
+            &fluree_db_core::txn_meta_graph_iri("other:main"),
+            // a near-miss on this ledger's own IRI
+            &format!("{}x", fluree_db_core::config_graph_iri(SEL_LEDGER)),
+        ] {
+            let sel = GraphSelector::ByIri(iri.to_string());
+            let resolved = resolve_graph_selector(&sel, SEL_LEDGER, None);
+            assert!(
+                resolved.is_err(),
+                "'{iri}' must not resolve to a reserved slot by suffix; got {resolved:?}"
+            );
+        }
     }
 
     // ── Virtual (R2RML/Iceberg) dataset ledger-info + secret redaction ──

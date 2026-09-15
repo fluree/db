@@ -1560,7 +1560,8 @@ fn base_ledger_id(s: &str) -> Result<String> {
 }
 
 fn refreshable_ledger_id(s: &str) -> Option<String> {
-    if matches!(s, "default" | "txn-meta") || s.contains("://") || s.starts_with("urn:") {
+    if matches!(s, "default" | "txn-meta" | "config") || s.contains("://") || s.starts_with("urn:")
+    {
         return None;
     }
     let (no_frag, _frag) = split_graph_fragment(s);
@@ -1571,7 +1572,8 @@ fn refreshable_ledger_id(s: &str) -> Option<String> {
 }
 
 fn refreshable_ledger_id_and_t(s: &str) -> Option<(String, Option<i64>)> {
-    if matches!(s, "default" | "txn-meta") || s.contains("://") || s.starts_with("urn:") {
+    if matches!(s, "default" | "txn-meta" | "config") || s.contains("://") || s.starts_with("urn:")
+    {
         return None;
     }
     let (no_frag, _frag) = split_graph_fragment(s);
@@ -1771,7 +1773,7 @@ pub(crate) fn collect_sparql_min_t_requirements(
 fn looks_like_graph_selector_only(s: &str) -> bool {
     // Ledger IDs typically look like `name:branch` and do NOT include `://`.
     // Graph IRIs commonly include `://` or `urn:` and should be treated as selectors.
-    matches!(s, "default" | "txn-meta")
+    matches!(s, "default" | "txn-meta" | "config")
         || s.contains("://")
         || s.starts_with("urn:")
         || (!s.contains(':') && !s.contains('@') && !s.contains('#'))
@@ -1846,7 +1848,38 @@ mod ledger_scoped_from_tests {
         );
         assert_eq!(refreshable_ledger_id("books").as_deref(), Some("books"));
         assert!(refreshable_ledger_id("txn-meta").is_none());
+        // `config` is a well-known graph selector, not a ledger named "config".
+        // Without this arm the twin of the `txn-meta` case above returned
+        // `Some("config")` and the refresh path treated a bare
+        // `"from": "config"` as a ledger to look up in the nameservice.
+        assert!(refreshable_ledger_id("config").is_none());
+        assert_eq!(
+            refreshable_ledger_id("books:main@t:42#config").as_deref(),
+            Some("books:main")
+        );
         assert!(refreshable_ledger_id("https://example.org/graph").is_none());
+    }
+
+    /// A bare `"from": "config"` on the ledger-scoped endpoint is a graph
+    /// selector for THIS ledger, exactly like `"txn-meta"` — not a ledger
+    /// named "config" to look up in the nameservice.
+    ///
+    /// `looks_like_graph_selector_only` already classified it correctly, but by
+    /// accident: it fell through to the "no `:`, `@` or `#`" clause rather than
+    /// being named. `refreshable_ledger_id` has no such fallback, so the same
+    /// string WAS treated as a ledger there. The rewrite below is what makes
+    /// `GraphSelector::Config` reachable from the server.
+    #[test]
+    fn bare_config_from_is_rewritten_as_a_graph_selector() {
+        for selector in ["config", "txn-meta", "default"] {
+            let mut q = json!({"from": selector, "select": ["?s"], "where": []});
+            normalize_ledger_scoped_from("books:main", &mut q).expect("normalize");
+            assert_eq!(
+                q["from"],
+                json!({"@id": "books:main", "graph": selector}),
+                "bare \"from\": \"{selector}\" must become a graph selector on this ledger"
+            );
+        }
     }
 
     #[test]

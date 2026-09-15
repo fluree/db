@@ -501,6 +501,12 @@ ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 ; ex:source ex:hr |} .
 ex:alice ex:knows ex:carol {| ex:source ex:linkedin |} .
 ```
 
+**Write the reifier before the annotation block.** `s p o ~ ?claim {| … |}` binds `?claim` to the reifier of the very claim the block matches. Reversing them — `s p o {| … |} ~ ?claim` — is legal but means something else: two *independent* annotation units on the same edge, one matching the body and one binding a reifier, joined. On an edge with two claims that returns four rows rather than two, silently, because each unit matches every claim.
+
+This one is documented rather than refused, and the line is worth stating because Fluree draws it elsewhere too. The reversed form is well-formed SPARQL-star with defined semantics: four rows is the *correct* answer to what was written, and no parser can know the author meant the other thing. Fluree refuses a construct only when there is no correct answer to give — a property read on an enumerated variable-length relationship is refused (see `docs/query/cypher.md`) because the enumeration operator does not retain per-hop edge identity, so every answer, nulls included, would be a fiction. A right answer to the wrong question gets a warning in the docs; no right answer gets an error.
+
+**TriG goes through `upsert`, not `insert`.** `fluree insert` routes a file to the streaming Turtle parser, which has no `GRAPH` keyword and reports `expected subject, found KwGraph`. Named-graph blocks are read by `fluree upsert -f file.trig`.
+
 **Anonymous reifiers have no identity you can refer to, and the two re-send paths differ.** `~ ex:claim1` is an identity: re-ingesting the file finds the same claim and replaces its body, on every path. A bare `{| … |}` block has no such handle, so what happens on a re-send depends on where the path scopes blank-node identity.
 
 | re-sending the same file | `fluree sync` | `upsert` |
@@ -517,7 +523,7 @@ Rejected with a clear parse or stage error, never silently dropped:
 - an annotation on a collection object (`( :a :b ) {| … |}`);
 - one named reifier on two different triples — a reifier denotes exactly one edge (see [the single-target invariant](../concepts/edge-annotations.md#one-annotation-one-edge-single-target-invariant));
 - an annotation on an `rdf:type` edge (`:s a :C {| … |}`) on the paths that convert Turtle to JSON-LD first (`upsert`, `graph sync`, memory import) — JSON-LD has no place to hang an annotation on a `@type` value. `insert` and SPARQL UPDATE accept it;
-- TriG: annotations in the `#txn-meta` graph — its triples become commit metadata, not edges.
+- TriG: annotations in a `<#txn-meta>` block — its triples become commit metadata, not edges.
 
 The RDF 1.2 version directive — `VERSION "1.2"` or `@version "1.2" .` — is accepted anywhere a directive may appear and ignored: the RDF 1.2 surface is always on. Base-direction language tags (`"…"@en--ltr`) are accepted; a direction other than `ltr` / `rtl` is a syntax error. They are stored as an `rdf:langString` whose language is the whole `en--ltr` string, not yet as `rdf:dirLangString` with a separate direction — so `LANG()` returns `en--ltr` and `langMatches(?l, "en")` will not match it.
 

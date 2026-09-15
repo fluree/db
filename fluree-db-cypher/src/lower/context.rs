@@ -40,7 +40,11 @@ pub struct LoweringContext<'a, E: IriEncoder> {
     /// the statement (`e.prop`, `properties(e)`, …). A bound relationship
     /// variable outside this set can bind a synthesized relationship value
     /// from the plain base triple instead of requiring a reifier bundle.
-    annotation_dependent: std::collections::HashSet<String>,
+    scope_uses: super::annotation_use::ScopeUses,
+    /// Path variables bound by a bounded fixed-chain expansion, mapped to the
+    /// identity-carrying relationship list bound alongside them (see
+    /// `Self::register_path_rel_list`).
+    path_rel_lists: std::collections::HashMap<VarId, VarId>,
     /// Allow a bare `MATCH (n)` (no label, property, or relationship) to
     /// lower to a whole-graph distinct-subject scan. Off by default — a full
     /// scan is rarely what a production query intends; benchmarks and ad-hoc
@@ -74,7 +78,8 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             vocab: None,
             overrides: HashMap::new(),
             scopes: Vec::new(),
-            annotation_dependent: std::collections::HashSet::new(),
+            scope_uses: Default::default(),
+            path_rel_lists: std::collections::HashMap::new(),
             allow_full_scan: false,
             reified_edges_possible: true,
             fuse_reachability_chains: false,
@@ -94,16 +99,46 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         self
     }
 
-    /// Record the statement-wide annotation-surface variable set (see
-    /// [`super::annotation_use`]).
-    pub(super) fn set_annotation_dependent(&mut self, vars: std::collections::HashSet<String>) {
-        self.annotation_dependent = vars;
+    /// Install the variable-use sets for the `Query` scope about to be
+    /// lowered, returning the previous ones for the caller to restore. Paired
+    /// save/restore (not a reset) because UNION branches and `CALL` bodies
+    /// nest: see [`super::annotation_use`] for why the sets are per-scope.
+    pub(super) fn swap_scope_uses(
+        &mut self,
+        uses: super::annotation_use::ScopeUses,
+    ) -> super::annotation_use::ScopeUses {
+        std::mem::replace(&mut self.scope_uses, uses)
     }
 
-    /// Whether `name` is used on the relationship annotation surface
-    /// anywhere in the statement.
+    /// Whether `name` is used on the relationship annotation surface in the
+    /// `Query` scope being lowered.
     pub(super) fn is_annotation_dependent(&self, name: &str) -> bool {
-        self.annotation_dependent.contains(name)
+        self.scope_uses.annotation.contains(name)
+    }
+
+    /// Record that the path variable `path` was bound by a bounded fixed-chain
+    /// expansion which also bound `rel_list` to the chain's relationship list.
+    ///
+    /// `Binding::Path.edges` is `(start, predicate, end)` with no reifier slot,
+    /// so `relationships(p)` computed from the path value alone cannot carry
+    /// per-hop edge identity. The fixed chain binds a list that can, and
+    /// `lower/expr.rs` resolves `relationships(p)` to it. The path value still
+    /// serves `nodes(p)`, `length(p)` and `RETURN p`.
+    pub(super) fn register_path_rel_list(&mut self, path: VarId, rel_list: VarId) {
+        self.path_rel_lists.insert(path, rel_list);
+    }
+
+    /// The identity-carrying relationship list bound alongside `path`, if it
+    /// came from a bounded fixed-chain expansion.
+    pub(super) fn path_rel_list(&self, path: VarId) -> Option<VarId> {
+        self.path_rel_lists.get(&path).copied()
+    }
+
+    /// Whether the *elements* of the list bound to `name` have their
+    /// properties read in the `Query` scope being lowered — `all(x IN name
+    /// WHERE x.p)`, `[x IN tail(name) | x.p]`, `UNWIND name AS x … x.p`.
+    pub(super) fn reads_element_properties(&self, name: &str) -> bool {
+        self.scope_uses.element_property.contains(name)
     }
 
     /// Push a new loop-local scope. Pair with [`Self::exit_scope`].
