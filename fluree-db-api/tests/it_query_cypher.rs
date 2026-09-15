@@ -10484,6 +10484,39 @@ async fn cypher_var_length_enumerated_property_read_refused_with_a_remedy() {
                UNWIND rs AS r RETURN r.confidence AS c"#,
             "give the range an upper bound",
         ),
+        // Renamed by a `WITH … AS` alias. The scan attributes the element
+        // reads to the alias, so the refusal has to walk the rename back to
+        // the variable the pattern binds — otherwise the read is silently
+        // lowered onto the enumeration route and answers `[]`.
+        (
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+               WITH b, rs AS xs WHERE all(r IN xs WHERE r.confidence > 0.8)
+               RETURN b.name AS name"#,
+            "give the range an upper bound",
+        ),
+        // The same rename applied to `relationships(p)` over a path variable.
+        (
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
+               WITH b, relationships(p) AS xs WHERE all(r IN xs WHERE r.confidence > 0.8)
+               RETURN b.name AS name"#,
+            "give the range an upper bound",
+        ),
+        // An alias of an alias — the walk back has to run to a fixpoint.
+        (
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+               WITH b, rs AS xs
+               WITH b, xs AS ys WHERE all(r IN ys WHERE r.confidence > 0.8)
+               RETURN b.name AS name"#,
+            "give the range an upper bound",
+        ),
+        // A `WITH` alias consumed by a later `UNWIND`: the two renames have to
+        // compose, which is what makes one pass insufficient.
+        (
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+               WITH b, rs AS xs
+               UNWIND xs AS r RETURN r.confidence AS c"#,
+            "give the range an upper bound",
+        ),
     ] {
         let err = fluree
             .query_cypher(&db, q)
@@ -10499,6 +10532,40 @@ async fn cypher_var_length_enumerated_property_read_refused_with_a_remedy() {
             "must name the remedy `{remedy}`: {err}"
         );
     }
+
+    // The remedy the message names actually works through the same alias: on
+    // the bounded route the expansion keeps per-hop identity, so the renamed
+    // list reads the real annotations rather than being refused.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..2]->(b:Person)
+               WITH b, rs AS xs WHERE all(r IN xs WHERE r.confidence > 0.8)
+               RETURN b.name AS name ORDER BY name"#,
+        )
+        .await,
+        vec![json!(["Bob"]), json!(["Carol"])],
+    );
+
+    // …including through a `WITH` alias: the walk back resolves the alias to
+    // the expression it renamed, and `nodes()` contributes no relationship
+    // variables, so aliasing a node list does not drag `p` into the refusal.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
+               WITH p, nodes(p) AS ns
+               RETURN [n IN ns | n.name] AS names ORDER BY names"#,
+        )
+        .await,
+        vec![
+            json!([["Alice", "Bob"]]),
+            json!([["Alice", "Bob", "Carol"]]),
+            json!([["Alice", "Bob", "Carol", "Dave"]]),
+        ],
+    );
 
     // The same reads over an enumerated path's NODES stay allowed — path nodes
     // are real subject SIDs, so their properties read correctly everywhere.

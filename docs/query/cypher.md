@@ -209,6 +209,10 @@ ORDER BY / SKIP / LIMIT
   per-hop edge identity, so a property read over their elements is **refused**,
   naming the edit that moves the pattern onto the bounded route. `nodes(p)` is
   unaffected on every route: path nodes are real subjects, not edges.
+
+  The refusal follows a `WITH … AS` rename and an `UNWIND` alias back to the
+  variable the pattern bound, so spelling the read through
+  `WITH rs AS xs … all(r IN xs WHERE r.p)` does not slip past it.
 - Scalar functions:
   - **Casts / general:** `toString`, `toInteger`, `toFloat`, `coalesce`.
   - **String:** `toUpper`, `toLower`, `substring` (0-indexed; 2- and 3-arg),

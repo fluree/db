@@ -64,7 +64,8 @@ pub(super) struct ScopeUses {
     pub(super) annotation: HashSet<String>,
     /// Names whose list *elements* are read on the annotation surface:
     /// `all(x IN rs WHERE x.p)`, `[x IN tail(rs) | x.p]`, `reduce(… x IN rs …)`,
-    /// and `UNWIND rs AS x … x.p`.
+    /// `UNWIND rs AS x … x.p`, and any of those reached through a
+    /// `WITH … rs AS xs` rename.
     ///
     /// A variable-length relationship variable binds a *list*, so this — not
     /// [`Self::annotation`] — is what says whether its elements need per-hop
@@ -88,12 +89,57 @@ pub(super) fn scope_uses(q: &Query) -> ScopeUses {
     // the UNWIND expression names.
     let mut unwinds = Vec::new();
     collect_unwind_aliases(q, &mut unwinds);
-    for (alias, list_vars) in unwinds {
-        if out.annotation.contains(&alias) {
-            out.element_property.extend(list_vars);
+    // `WITH b, rs AS xs WHERE all(r IN xs …)` renames the *list itself*, so the
+    // scan attributes the element reads to `xs` and the pattern that binds `rs`
+    // never sees them — the refusal is bypassed and the read is lowered onto a
+    // route that answers `[]`. Map each alias back to the variables its
+    // expression names, using the same `collect_rel_list_vars` walk, so
+    // `WITH nodes(p) AS ns` still contributes nothing.
+    let mut with_aliases = Vec::new();
+    collect_with_aliases(q, &mut with_aliases);
+    // To a fixpoint: an alias of an alias (`rs AS xs` … `xs AS ys`) and a
+    // `WITH` alias later consumed by an `UNWIND` both need the renames to
+    // compose, and clause order does not guarantee one pass resolves them.
+    // Each pass only ever inserts, over a name set bounded by the statement's
+    // own identifiers, so this terminates.
+    loop {
+        let before = out.element_property.len();
+        for (alias, list_vars) in &unwinds {
+            if out.annotation.contains(alias) {
+                out.element_property.extend(list_vars.iter().cloned());
+            }
+        }
+        for (alias, list_vars) in &with_aliases {
+            if out.element_property.contains(alias) {
+                out.element_property.extend(list_vars.iter().cloned());
+            }
+        }
+        if out.element_property.len() == before {
+            break;
         }
     }
     out
+}
+
+/// Every `(alias, variables-named-by-the-aliased-expression)` pair for the
+/// `WITH … AS alias` items in this scope. Same recursion rule as
+/// [`scan_query`].
+fn collect_with_aliases(q: &Query, out: &mut Vec<(String, HashSet<String>)>) {
+    for c in &q.clauses {
+        match c {
+            ReadClause::With(w) => {
+                for item in &w.items {
+                    if let Some(alias) = &item.alias {
+                        let mut list_vars = HashSet::new();
+                        collect_rel_list_vars(&item.expr, &mut list_vars);
+                        out.push((alias.name.clone(), list_vars));
+                    }
+                }
+            }
+            ReadClause::CallSubquery(cs) => collect_with_aliases(&cs.query, out),
+            _ => {}
+        }
+    }
 }
 
 /// Every `(alias, variables-named-by-the-list-expression)` pair for the UNWIND
