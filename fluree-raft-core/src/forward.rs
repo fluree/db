@@ -57,6 +57,11 @@ use std::time::Duration;
 /// resource footprint of a stuck leader.
 const FORWARD_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Connect budget for a relayed proposal. An elapsed connect reports as a
+/// connect error, so a black-holed leader stays retryable instead of
+/// consuming the whole request timeout and then reading as unknown.
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Header carrying the count of follower → leader hops a request
 /// has already accumulated. Each forwarder increments it; the next
 /// forwarder bails if the count is already at [`MAX_FORWARD_HOPS`].
@@ -653,6 +658,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn propose_connect_timeout_is_retryable() {
+        // A listener that never accepts drops SYNs once its backlog is full,
+        // so the next connect hangs like one to a hard-killed host.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(1).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut backlog = Vec::new();
+        let mut filled = false;
+        for _ in 0..64 {
+            match tokio::time::timeout(
+                Duration::from_millis(200),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            {
+                Ok(stream) => backlog.push(stream.unwrap()),
+                Err(_) => {
+                    filled = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            filled,
+            "backlog never filled after {} connects",
+            backlog.len()
+        );
+
+        let started = std::time::Instant::now();
+        let result = relay_propose::<RelayTestConfig>(
+            &format!("http://{addr}"),
+            &"command".to_owned(),
+            RELAY_CONNECT_TIMEOUT * 3,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(matches!(result, Err(ProposeError::Relay(_))), "{result:?}");
+        // Without the connect budget this ends either at the request timeout
+        // (Unknown) or whenever the OS abandons the SYN — both far later.
+        assert!(
+            elapsed < RELAY_CONNECT_TIMEOUT + Duration::from_secs(2),
+            "connect budget did not bound the wait: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn propose_503_requires_an_explicit_complete_rejection() {
         let mut app = axum::Router::new();
         for (path, body) in [
@@ -1122,6 +1174,7 @@ where
         reqwest::Client::builder()
             // Membership-supplied URL: never follow a redirect off it.
             .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(RELAY_CONNECT_TIMEOUT)
             // Keep replay decisions in propose_via_leader.
             .retry(reqwest::retry::never())
             .build()
