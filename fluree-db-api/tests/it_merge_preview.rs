@@ -1266,11 +1266,12 @@ async fn changes_fast_forward_basic() {
 }
 
 #[tokio::test]
-async fn changes_netting_cancels_churn() {
+async fn changes_show_the_net_op_for_churn() {
     let fluree = FlureeBuilder::memory().build_memory();
     setup_branch(&fluree).await;
 
-    // Create bob, then delete him again — the net diff must be empty.
+    // Create bob, then delete him again. The net op is the deletion, which
+    // is what the merge applies, so that is what the preview shows.
     let dev = fluree.ledger("mydb:dev").await.unwrap();
     let dev = fluree
         .insert(
@@ -1300,12 +1301,15 @@ async fn changes_netting_cancels_churn() {
         .unwrap();
 
     let changes = preview.changes.expect("include_changes was set");
-    assert_eq!(changes.assert_count, 0, "churn must cancel");
-    assert_eq!(changes.retract_count, 0);
-    assert_eq!(changes.subject_count, 0);
-    assert!(changes.entries.is_empty());
+    assert_eq!(changes.assert_count, 0);
+    assert_eq!(changes.retract_count, 1, "the deletion is the net op");
+    assert_eq!(changes.subject_count, 1);
+    assert_eq!(changes.entries.len(), 1);
+    let entry = &changes.entries[0];
+    assert_eq!(entry.subject, "http://example.org/ns/bob");
+    assert!(entry.asserts.is_empty());
+    assert_eq!(entry.retracts.len(), 1);
     assert!(!changes.truncated);
-    // The commits themselves are still visible — only the net diff is empty.
     assert!(preview.ahead.count >= 2);
 }
 

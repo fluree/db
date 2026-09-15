@@ -31,7 +31,7 @@ use fluree_db_binary_index::{BinaryIndexStore, LeafletCache};
 use fluree_db_core::db::{LedgerSnapshot, LedgerSnapshotMetadata};
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::ledger_config::LedgerConfig;
-use fluree_db_core::trace_commits_by_id;
+use fluree_db_core::trace_first_parent_commits_by_id;
 use fluree_db_core::{
     ledger_id::normalize_ledger_id, ContentId, ContentStore, Sid, StorageBackend,
 };
@@ -1171,16 +1171,27 @@ pub(crate) async fn load_and_attach_binary_store(
     let cs: Arc<dyn ContentStore> =
         fluree_db_nameservice::branched_content_store_for_record(backend, nameservice, record)
             .await?;
+    let root_started = Instant::now();
     let bytes = cs
         .get(&index_cid)
         .await
         .map_err(|e| ApiError::internal(format!("failed to read index root: {e}")))?;
+    let root_read_us = root_started.elapsed().as_micros() as u64;
+    let decode_started = Instant::now();
 
     // Decode FIR6 root metadata to populate snapshot watermarks.
     // `LedgerSnapshot::from_root_bytes` only parses the header; watermarks are needed for
     // DictNovelty/DictOverlay correctness (especially bound-object filters and overlay merges).
     let root = fluree_db_binary_index::IndexRoot::decode(&bytes)
         .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
+    tracing::debug!(
+        target: "fluree::open",
+        ledger = %record.ledger_id,
+        bytes = bytes.len(),
+        root_read_us,
+        root_decode_us = decode_started.elapsed().as_micros() as u64,
+        "binary index root loaded"
+    );
 
     let mut store = BinaryIndexStore::load_from_root_v6_reusing(
         Arc::clone(&cs),
@@ -2435,12 +2446,15 @@ impl LedgerManager {
                 let cs: Arc<dyn ContentStore> = cs_for_record().await?;
 
                 // Load commits outside any lock.
-                // trace_commits_by_id walks HEAD → oldest, stopping at local_t.
+                // trace_first_parent_commits_by_id walks HEAD → oldest, stopping at local_t.
                 // Collect then reverse to apply oldest → newest.
                 let mut commits = Vec::with_capacity(gap as usize);
                 {
-                    let stream =
-                        trace_commits_by_id(Arc::clone(&cs), commit_head_id.clone(), local_t);
+                    let stream = trace_first_parent_commits_by_id(
+                        Arc::clone(&cs),
+                        commit_head_id.clone(),
+                        local_t,
+                    );
                     futures::pin_mut!(stream);
                     while let Some(result) = futures::StreamExt::next(&mut stream).await {
                         let commit = result.map_err(|e| {

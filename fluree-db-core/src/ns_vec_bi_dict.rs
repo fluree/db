@@ -9,8 +9,9 @@
 //! - **Reverse:** `HashMap<Box<[u8]>, u64>` with key = `[ns_code BE 2B][suffix bytes]`.
 //!   One hash lookup.
 //!
-//! NS_OVERFLOW (`0xFFFF`) subjects use dedicated scalar fields and a separate
-//! Vec to avoid resizing per-namespace vectors to 65536 entries.
+//! The `NS_OVERFLOW` (`0xFFFF`) fields below were meant to keep overflow
+//! subjects out of the per-namespace vectors, but real overflow subjects use
+//! `namespaces::OVERFLOW` (0xFFFE) and take the ordinary path (#1843).
 
 use std::sync::Arc;
 
@@ -18,7 +19,7 @@ use hashbrown::HashMap;
 
 use crate::subject_id::SubjectId;
 
-/// Namespace code reserved for overflow subjects (full IRI as suffix).
+/// Does not match `namespaces::OVERFLOW` (0xFFFE); see the module doc.
 const NS_OVERFLOW: u16 = 0xFFFF;
 
 // ---------------------------------------------------------------------------

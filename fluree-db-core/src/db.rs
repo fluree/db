@@ -16,7 +16,7 @@ use crate::range_provider::RangeProvider;
 use crate::schema_hierarchy::SchemaHierarchy;
 use crate::sid::Sid;
 use crate::storage::StorageRead;
-use fluree_vocab::namespaces::{EMPTY, OVERFLOW};
+use fluree_vocab::namespaces::{is_full_iri, EMPTY, OVERFLOW};
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -494,7 +494,7 @@ impl LedgerSnapshot {
     /// - Registered code: returns `Some(prefix + name)`
     /// - Unknown code: returns `None` (corruption/bug)
     pub fn decode_sid(&self, sid: &Sid) -> Option<String> {
-        if sid.namespace_code == EMPTY || sid.namespace_code == OVERFLOW {
+        if is_full_iri(sid.namespace_code) {
             return Some(sid.name.to_string());
         }
         self.namespace_codes
