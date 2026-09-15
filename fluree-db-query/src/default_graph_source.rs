@@ -170,7 +170,10 @@ fn choose_chain_lane(inputs: LaneInputs) -> ChainLane {
 /// cascades). So once a reifies lookup has bound the reifier, the base edge
 /// never removes a row, and a reifies lookup whose position is a variable
 /// nobody reads is a cardinality-one no-op. A constant position stays: it is
-/// the constraint. A variable predicate that is read stays too, and keeps
+/// the constraint. A variable in two positions, or naming the reifier, counts
+/// as read: its lookups carry the equality the base scan enforced
+/// (`<< ?s :p ?s >>` must not match `:a :p :b`). A variable predicate that is
+/// read stays too, and keeps
 /// the base edge with it — the base scan binds it as a predicate, the
 /// reifies lookup as a plain ref. At least one lookup always remains, so a
 /// reifier bound by the body still has to be a reifier (P3 has three
@@ -192,6 +195,17 @@ pub(crate) fn elide_redundant_chain(
     referenced.extend(child_bound.iter().copied());
     let mut counts: std::collections::HashMap<VarId, usize> = std::collections::HashMap::new();
     crate::execute::collect_var_stats(&shape.body, &mut counts, &mut referenced);
+    // A variable in two base positions, or naming the reifier, is an
+    // equality the base scan enforced; keeping its lookups keeps it.
+    let mut seen: HashSet<VarId> = HashSet::from([shape.ann_var]);
+    for v in [base.s.as_var(), base.p.as_var(), base.o.as_var()]
+        .into_iter()
+        .flatten()
+    {
+        if !seen.insert(v) {
+            referenced.insert(v);
+        }
+    }
 
     if base.p.as_var().is_some_and(|v| referenced.contains(&v)) {
         return None;
@@ -1048,6 +1062,44 @@ mod tests {
             reifies_names(&elided),
             vec![REIFIES_PREDICATE, REIFIES_OBJECT]
         );
+    }
+
+    #[test]
+    fn a_repeated_variable_keeps_the_lookups_that_equate_it() {
+        let typed = Ref::Sid(Sid::new(9, "P"));
+        // `<< ?s :P ?s >>` with nothing reading ?s: once the base edge is
+        // gone, the subject and object lookups joining on ?s are the only
+        // thing that still requires the two positions to be equal.
+        let elided = elide_redundant_chain(
+            &chain(Ref::Var(S), typed.clone(), Term::Var(S)),
+            &set(&[]),
+            &set(&[]),
+        )
+        .expect("recognized chain");
+        assert_eq!(
+            reifies_names(&elided),
+            vec![REIFIES_SUBJECT, REIFIES_PREDICATE, REIFIES_OBJECT]
+        );
+        // A reifier that is also the edge's object keeps
+        // `?ann f:reifiesObject ?ann`.
+        let elided = elide_redundant_chain(
+            &chain(Ref::Var(S), typed, Term::Var(ANN)),
+            &set(&[]),
+            &set(&[]),
+        )
+        .expect("recognized chain");
+        assert_eq!(
+            reifies_names(&elided),
+            vec![REIFIES_PREDICATE, REIFIES_OBJECT]
+        );
+        // A variable predicate repeated in another position counts as read,
+        // which blocks the rewrite.
+        assert!(elide_redundant_chain(
+            &chain(Ref::Var(S), Ref::Var(S), Term::Var(O)),
+            &set(&[]),
+            &set(&[]),
+        )
+        .is_none());
     }
 
     #[test]
