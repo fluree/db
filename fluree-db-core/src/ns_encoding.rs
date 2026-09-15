@@ -30,7 +30,7 @@
 use crate::namespaces::default_namespace_codes;
 use crate::prefix_trie::PrefixTrie;
 use crate::sid::Sid;
-use fluree_vocab::namespaces::{EMPTY, OVERFLOW, USER_START};
+use fluree_vocab::namespaces::{is_full_iri, OVERFLOW, USER_START};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -829,7 +829,7 @@ pub trait NsLookup {
     /// - `OVERFLOW (0xFFFE)`: returns `Some(sid.name)` — full IRI stored as name
     /// - Any other unregistered code: returns `None` (corruption/bug)
     fn decode_sid_strict(&self, sid: &Sid) -> Option<String> {
-        if sid.namespace_code == EMPTY || sid.namespace_code == OVERFLOW {
+        if is_full_iri(sid.namespace_code) {
             return Some(sid.name.to_string());
         }
         let prefix = self.prefix_for_code(sid.namespace_code)?;
@@ -856,6 +856,7 @@ impl NsLookup for NamespaceCodes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_vocab::namespaces::EMPTY;
 
     // ---- NsSplitMode persistence ----
 

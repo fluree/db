@@ -1,6 +1,9 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_novelty_subject_iri_formats.rs"]
+mod it_novelty_subject_iri_formats;
+
 #[path = "it_issue_1721_repro.rs"]
 mod it_issue_1721_repro;
 #[path = "it_issue_1723_sameterm_fold.rs"]
@@ -47,3 +50,6 @@ mod it_query_unwind;
 mod it_query_values;
 #[path = "it_w3c_result_formats.rs"]
 mod it_w3c_result_formats;
+
+#[path = "it_query_subquery_streaming.rs"]
+mod it_query_subquery_streaming;
