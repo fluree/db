@@ -398,7 +398,7 @@ impl crate::Fluree {
     /// This operation performs incremental updates when possible,
     /// falling back to full resync if needed.
     pub async fn sync_vector_index(&self, graph_source_id: &str) -> Result<VectorSyncResult> {
-        use fluree_db_core::trace_commits_by_id;
+        use fluree_db_core::trace_first_parent_commits_by_id;
         use fluree_db_query::bm25::{CompiledPropertyDeps, PropertyDeps};
         use fluree_db_query::vector::usearch::deserialize;
         use futures::StreamExt;
@@ -510,7 +510,8 @@ impl crate::Fluree {
         let commit_store = self
             .content_store_for_record_or_id(ledger.ns_record.as_ref(), &ledger.snapshot.ledger_id)
             .await?;
-        let stream = trace_commits_by_id(commit_store, head_commit_id.clone(), old_watermark);
+        let stream =
+            trace_first_parent_commits_by_id(commit_store, head_commit_id.clone(), old_watermark);
         futures::pin_mut!(stream);
 
         while let Some(result) = stream.next().await {

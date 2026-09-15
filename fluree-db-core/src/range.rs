@@ -453,6 +453,12 @@ fn collect_overlay_only<O: OverlayProvider + ?Sized>(
 /// single transaction, but the segment-aware overlay assembly merges runs
 /// across segments — the rule is here so every path lands on the same answer
 /// rather than on whichever flake sorted last.
+///
+/// The merge and revert fold used to produce these pairs as well, by
+/// concatenating a source range's flakes into a single commit at a single
+/// `t`. It nets per fact now, so new commits carry no such pair, but merge
+/// commits written by the older code still do. The tie-break is what keeps
+/// those readable.
 pub fn resolve_current_flakes(mut flakes: Vec<Flake>, index: IndexType) -> Vec<Flake> {
     flakes.sort_by(index.comparator());
     remove_stale_flakes(flakes)
