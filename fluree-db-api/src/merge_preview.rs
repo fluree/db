@@ -647,23 +647,45 @@ impl crate::Fluree {
             }
         };
 
+        let mut net_flakes = net_flakes;
+
+        // ---- Changes (only if requested). ----------------------------------
+        let changes = if need_changes {
+            // No compactor in stats-only mode even when conflict details
+            // loaded the source state — `max_changes = 0` means no payload.
+            let compactor = if want_change_payload {
+                source_state
+                    .as_ref()
+                    .map(|s| IriCompactor::from_namespaces(s.snapshot.shared_namespaces()))
+            } else {
+                None
+            };
+            let summary = match net_flakes.as_deref() {
+                Some(net) if !net.is_empty() => build_change_summary(
+                    net,
+                    compactor,
+                    opts.max_changes,
+                    opts.changes_after_subject.as_deref(),
+                )?,
+                _ => ChangeSummary::empty(),
+            };
+            Some(summary)
+        } else {
+            None
+        };
+
         // ---- Validation (default on; skipped on fast-forward). -------------
         // The same staging and validation the merge performs, minus the
         // commit: resolve the netted source delta under the strategy, stage
         // it on a clone of the target state, and run the branch-operation
         // validator. Under `Abort` with conflicts the merge never reaches
         // validation, so neither does the preview.
-        let mut net_flakes = net_flakes;
         let validation =
             if need_validation && !opts.conflict_strategy.aborts_on(all_conflict_keys.len()) {
                 let target_state = target_state.as_ref().expect("loaded for validation");
-                // The change summary below still needs the net set when it was
-                // requested; otherwise hand it over without a copy.
-                let net = if need_changes {
-                    net_flakes.clone()
-                } else {
-                    net_flakes.take()
-                };
+                // The change summary above borrowed it; nothing needs it
+                // after this, so hand it over.
+                let net = net_flakes.take();
                 let ns_delta = source_ns_delta.unwrap_or_default();
                 let (_view, outcome) = self
                     .stage_merge(
@@ -681,31 +703,6 @@ impl crate::Fluree {
             } else {
                 None
             };
-
-        // ---- Changes (only if requested). ----------------------------------
-        let changes = if need_changes {
-            // No compactor in stats-only mode even when conflict details
-            // loaded the source state — `max_changes = 0` means no payload.
-            let compactor = if want_change_payload {
-                source_state
-                    .as_ref()
-                    .map(|s| IriCompactor::from_namespaces(s.snapshot.shared_namespaces()))
-            } else {
-                None
-            };
-            let summary = match net_flakes {
-                Some(net) if !net.is_empty() => build_change_summary(
-                    net,
-                    compactor,
-                    opts.max_changes,
-                    opts.changes_after_subject.as_deref(),
-                )?,
-                _ => ChangeSummary::empty(),
-            };
-            Some(summary)
-        } else {
-            None
-        };
 
         let mergeable = !opts.conflict_strategy.aborts_on(conflicts.count)
             && validation.as_ref().is_none_or(|v| v.conforms);
@@ -744,7 +741,7 @@ impl crate::Fluree {
 /// truncation. `compactor: None` is stats-only mode — exact counts, no
 /// entries.
 fn build_change_summary(
-    net_flakes: Vec<Flake>,
+    net_flakes: &[Flake],
     compactor: Option<IriCompactor>,
     max_changes: Option<usize>,
     after_subject: Option<&str>,
@@ -770,13 +767,13 @@ fn build_change_summary(
     // each distinct subject is decoded exactly once rather than once per flake.
     // Sorting by the decoded IRI then gives the deterministic subject order
     // that pagination cursors rely on.
-    let mut by_sid: FxHashMap<fluree_db_core::Sid, Vec<Flake>> = FxHashMap::default();
+    let mut by_sid: FxHashMap<fluree_db_core::Sid, Vec<&Flake>> = FxHashMap::default();
     for f in net_flakes {
         by_sid.entry(f.s.clone()).or_default().push(f);
     }
     let subject_count = by_sid.len();
 
-    let mut by_subject: Vec<(String, Vec<Flake>)> = by_sid
+    let mut by_subject: Vec<(String, Vec<&Flake>)> = by_sid
         .into_iter()
         .map(|(sid, flakes)| Ok((compactor.decode_sid(&sid)?, flakes)))
         .collect::<Result<_>>()?;
@@ -811,7 +808,7 @@ fn build_change_summary(
 
         let mut asserts = Vec::new();
         let mut retracts = Vec::new();
-        for f in &flakes {
+        for &f in &flakes {
             let resolved = resolve_flake(&compactor, f)?;
             if f.op {
                 asserts.push(resolved);
