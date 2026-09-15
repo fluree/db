@@ -1,5 +1,6 @@
 //! Bulk import of Turtle-star: end-to-end from a directory of `.ttl` files
-//! through `ImportSink` to a queryable ledger.
+//! through `ImportSink` to a queryable ledger, plus the TriG and N-Quads
+//! star forms on the named-graph import path.
 //!
 //! `ImportSink` opted in to reified triples when the Turtle parser gained the
 //! RDF 1.2 asserting forms, but until now no test drove the whole import
@@ -142,6 +143,77 @@ async fn imported_turtle_star_claims_are_queryable() {
         .await
         .expect("plain edge query");
     assert_eq!(rows(&result).len(), 2, "{result:#}");
+}
+
+const CLAIMS_GRAPH: &str = "http://example.org/graphs/claims";
+
+/// `(object, confidence)` for every annotated `ex:alice ex:knows` edge, in the
+/// default graph or in `graph`.
+async fn knows_claims(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &LedgerState,
+    graph: Option<&str>,
+) -> Vec<Vec<String>> {
+    let pattern = "ex:alice ex:knows ?o {| ex:confidence ?conf |}";
+    let body = match graph {
+        Some(g) => format!("GRAPH <{g}> {{ {pattern} }}"),
+        None => pattern.to_string(),
+    };
+    let sparql =
+        format!("PREFIX ex: <http://example.org/>\nSELECT ?o ?conf WHERE {{ {body} }} ORDER BY ?o");
+    let result = support::query_sparql_formatted(fluree, ledger, &sparql)
+        .await
+        .expect("annotation query");
+    rows(&result)
+        .into_iter()
+        .map(|mut r| {
+            r[0] = r[0]
+                .rsplit(['/', ':'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            r
+        })
+        .collect()
+}
+
+/// N-Quads has only the `rdf:reifies <<( … )>>` spelling. The importer
+/// regroups labeled statements into TriG blocks, so the claim follows its
+/// statement's graph label.
+#[tokio::test]
+async fn imported_nquads_claims_land_in_their_statement_graph() {
+    const NQUADS: &str = r#"_:r1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>> .
+_:r1 <http://example.org/confidence> "0.9" .
+_:r2 <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://example.org/alice> <http://example.org/knows> <http://example.org/carol> )>> <http://example.org/graphs/claims> .
+_:r2 <http://example.org/confidence> "0.5" <http://example.org/graphs/claims> .
+"#;
+    let (fluree, ledger) =
+        import_dir(&[("claims.nq", NQUADS)], "it/import-nquads-star:claims").await;
+
+    assert_eq!(
+        knows_claims(&fluree, &ledger, None).await,
+        vec![vec!["bob".to_string(), "0.9".to_string()]]
+    );
+    assert_eq!(
+        knows_claims(&fluree, &ledger, Some(CLAIMS_GRAPH)).await,
+        vec![vec!["carol".to_string(), "0.5".to_string()]]
+    );
+}
+
+#[tokio::test]
+async fn imported_trig_with_a_version_directive_keeps_its_prefixes() {
+    let trig = format!(
+        "VERSION \"1.2\"\n\
+         @prefix ex: <http://example.org/> .\n\
+         GRAPH <{CLAIMS_GRAPH}> {{ ex:alice ex:knows ex:bob {{| ex:confidence \"0.9\" |}} . }}\n"
+    );
+    let (fluree, ledger) =
+        import_dir(&[("claims.trig", &trig)], "it/import-trig-star:version").await;
+
+    assert_eq!(
+        knows_claims(&fluree, &ledger, Some(CLAIMS_GRAPH)).await,
+        vec![vec!["bob".to_string(), "0.9".to_string()]]
+    );
 }
 
 /// A multi-chunk import: a fixture large enough to be cut up, with star

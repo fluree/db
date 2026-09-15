@@ -286,6 +286,38 @@ async fn upserting_trig_that_moves_an_anonymous_annotation_adds_a_claim() {
 }
 
 #[tokio::test]
+async fn upserting_trig_with_a_version_directive_keeps_the_prefixes_after_it() {
+    // `VERSION "1.2"` carries no trailing dot, so a TriG scanner that skips
+    // unknown statements to the next `.` folds the following `@prefix` into it.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/trig-star-upsert:version-directive";
+    fluree
+        .insert_turtle(
+            genesis_ledger(&fluree, ledger_id),
+            &with_prefixes("ex:alice ex:name \"Alice\" .\n"),
+        )
+        .await
+        .expect("seed ledger");
+
+    let trig = format!(
+        "VERSION \"1.2\"\n{PREFIXES}\
+         GRAPH <{CLAIMS_GRAPH}> {{ ex:alice ex:knows ex:bob {{| ex:confidence 0.9 |}} . }}\n"
+    );
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .upsert_turtle(&trig)
+        .commit()
+        .await
+        .expect("TriG with a VERSION directive must upsert");
+
+    assert_eq!(
+        annotated_knows(&fluree, ledger_id).await,
+        [("alice".into(), "bob".into(), "0.9".into())]
+    );
+}
+
+#[tokio::test]
 async fn annotated_type_edge_is_accepted_by_insert_and_refused_by_upsert() {
     let fluree = FlureeBuilder::memory().build_memory();
     let turtle = with_prefixes("ex:alice a ex:Person {| ex:source \"hr\" |} ; a ex:Employee .\n");

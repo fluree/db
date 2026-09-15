@@ -557,6 +557,13 @@ impl<'a> TrigMetaParser<'a> {
                 let end_pos = self.tokens[self.pos.saturating_sub(1)].end as usize;
                 self.directives.push((start_pos, end_pos));
             }
+            // `VERSION "1.2"` has no trailing dot, so the default-triple
+            // skipper would swallow the next directive with it.
+            TokenKind::KwVersion | TokenKind::KwSparqlVersion => {
+                self.parse_version_directive()?;
+                let end_pos = self.tokens[self.pos.saturating_sub(1)].end as usize;
+                self.directives.push((start_pos, end_pos));
+            }
             TokenKind::KwGraph => {
                 self.advance(); // consume the GRAPH keyword
                 self.parse_graph_block()?;
@@ -645,6 +652,30 @@ impl<'a> TrigMetaParser<'a> {
 
         let base_iri = self.parse_iri()?;
         self.base = Some(base_iri);
+
+        if !is_sparql && self.check(&TokenKind::Dot) {
+            self.advance();
+        }
+
+        Ok(())
+    }
+
+    /// Skip the RDF 1.2 version directive; the specifier is kept in the
+    /// reconstructed Turtle, whose parser validates it.
+    fn parse_version_directive(&mut self) -> Result<()> {
+        let is_sparql = matches!(self.current().kind, TokenKind::KwSparqlVersion);
+        self.advance(); // consume VERSION/@version
+
+        if !matches!(
+            self.current().kind,
+            TokenKind::String | TokenKind::StringEscaped(_)
+        ) {
+            return Err(TransactError::Parse(format!(
+                "expected a quoted version specifier such as \"1.2\", found {}",
+                self.current().kind
+            )));
+        }
+        self.advance();
 
         if !is_sparql && self.check(&TokenKind::Dot) {
             self.advance();
@@ -757,6 +788,8 @@ impl<'a> TrigMetaParser<'a> {
         self.advance();
 
         let reified = std::mem::take(&mut self.reified);
+        // Only the `<#txn-meta>` sidecar spelling is known here; a write to the
+        // ledger's full txn-meta IRI is refused in `stage()`.
         if graph_iri == TXN_META_GRAPH_IRI && !reified.is_empty() {
             return Err(TransactError::Parse(
                 "RDF 1.2 reifiers and annotations are not allowed in the txn-meta graph; \
@@ -2561,5 +2594,31 @@ ex:alice ex:note "value with a { brace" .
             "default-graph star text must round-trip: {}",
             result.turtle
         );
+    }
+
+    #[test]
+    fn test_trig_version_directive_does_not_swallow_the_next_directive() {
+        for version in ["VERSION \"1.2\"", "@version \"1.2\" ."] {
+            let mut ns = test_registry();
+            let input = format!(
+                "{version}\n{STAR_PREFIX}ex:a ex:b ex:c .\n\
+                 GRAPH ex:g {{ ex:s ex:p ex:o {{| ex:q ex:z |}} . }}\n"
+            );
+            let result = extract_trig_txn_meta(&input, &mut ns)
+                .unwrap_or_else(|e| panic!("[{version}] {e}"));
+            assert_eq!(result.named_graphs.len(), 1, "[{version}]");
+            assert_eq!(result.named_graphs[0].reified.len(), 1, "[{version}]");
+            assert!(
+                result.turtle.starts_with(version),
+                "[{version}] directive must be kept: {}",
+                result.turtle
+            );
+        }
+
+        let mut ns = test_registry();
+        let err = extract_trig_txn_meta("VERSION 1.2\nGRAPH <http://g> { }\n", &mut ns)
+            .expect_err("unquoted version specifier")
+            .to_string();
+        assert!(err.contains("version specifier"), "{err}");
     }
 }
