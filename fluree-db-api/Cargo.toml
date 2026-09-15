@@ -632,6 +632,10 @@ harness = false
 name = "annotation_planner"
 harness = false
 
+[[bench]]
+name = "annotation_varlength_probe"
+harness = false
+
 [[test]]
 name = "it_batched_refs_overlay_lifecycle"
 path = "tests/it_batched_refs_overlay_lifecycle.rs"

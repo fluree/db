@@ -1085,9 +1085,14 @@ pub enum Commands {
         #[arg(long)]
         oneline: bool,
 
-        /// Maximum number of commits to show
+        /// Maximum number of commits to show [default: 100]
         #[arg(short = 'n', long)]
         count: Option<usize>,
+
+        /// Show the whole chain, with no limit. Against a server this is still
+        /// bounded by the server's hard cap.
+        #[arg(long, conflicts_with = "count")]
+        all: bool,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]
