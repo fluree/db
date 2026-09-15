@@ -371,11 +371,20 @@ async fn rebase_rejected_when_replay_violates_shape() {
         .unwrap();
     assert_eq!(names(&fluree, "mydb:dev").await, vec!["A", "B"]);
 
-    // main: install the maxCount-1 shape (alice has one name, conforms).
+    // main: install the maxCount-1 shape (alice has one name, conforms), then
+    // index it. The rebase copies the source's index into the branch, so an
+    // indexed source is what makes "dev is untouched" mean anything.
     fluree
         .insert(main, &alice_name_shape(None))
         .await
         .expect("shape install conforms");
+    support::rebuild_and_publish_index(&fluree, "mydb:main").await;
+    let before = fluree
+        .nameservice()
+        .lookup("mydb:dev")
+        .await
+        .unwrap()
+        .expect("dev record");
 
     let err = fluree
         .rebase_branch("mydb", "dev", ConflictStrategy::default())
@@ -383,7 +392,20 @@ async fn rebase_rejected_when_replay_violates_shape() {
         .expect_err("replaying the second name onto the shape must be rejected");
     assert_shacl_violation(err, "rebase replay");
 
-    // dev is untouched.
+    // dev is untouched, including the index its record points at. Publishing
+    // the source's index onto dev before the replay would leave dev reading
+    // main's index, which holds main's data and main's shape.
+    let after = fluree
+        .nameservice()
+        .lookup("mydb:dev")
+        .await
+        .unwrap()
+        .expect("dev record");
+    assert_eq!(
+        after.index_head_id, before.index_head_id,
+        "a rejected rebase must not move dev's index ref"
+    );
+    assert_eq!(after.index_t, before.index_t);
     assert_eq!(head_t(&fluree, "mydb:dev").await, 2);
     assert_eq!(names(&fluree, "mydb:dev").await, vec!["A", "B"]);
 }

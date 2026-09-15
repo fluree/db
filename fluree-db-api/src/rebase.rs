@@ -441,12 +441,6 @@ impl crate::Fluree {
             }
         }
 
-        // Copy the source index into the branch namespace before replay.
-        // Gives the branch an index to start from when novelty is reindexed
-        // post-rebase (best-effort).
-        self.copy_source_index(&source_id, &branch_id, &source_record)
-            .await;
-
         // Acquire the target branch's write lock when a manager is
         // available, serializing the entire replay against regular
         // transactions on the same branch.
@@ -535,6 +529,19 @@ impl crate::Fluree {
             current_state = next_state;
             replayed += 1;
         }
+
+        // Copy the source index into the branch namespace, now that every
+        // replay has succeeded. This does not merely copy artifacts: it
+        // publishes the index ref onto the BRANCH. Running it before the
+        // replay left a rebase that failed mid-flight (a SHACL violation,
+        // a storage error) with the branch pointing at the source's index,
+        // and since the prepare error returns above the apply path's
+        // rollback, nothing put it back. The branch then loaded the
+        // source's index and its own commits dropped out of every read.
+        // Replay itself reads the source's state, never the copied index,
+        // so nothing above needs this to have happened. Best-effort.
+        self.copy_source_index(&source_id, &branch_id, &source_record)
+            .await;
 
         let new_head_id = pending_replays.last().map(|b| b.commit_id.clone());
         let new_head_t = current_state.t();
