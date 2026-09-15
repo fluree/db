@@ -544,8 +544,12 @@ fn explain_from_parsed(
     // still useful for planning. Without this, `/explain` would report
     // "no stats" while the planner happily uses arena-derived stats.
     let stats_view = if snapshot.stats.is_some() || snapshot.annotation_index.is_some() {
-        let base = snapshot.stats.clone().unwrap_or_default();
-        let mut view = StatsView::from_db_stats_with_namespaces(&base, snapshot.namespaces());
+        // Borrow, never clone: `IndexStats` carries the per-class property
+        // usage vectors, and on a ledger with a class per subject (BKR-star:
+        // 146M flakes) cloning them cost 1.2 s of a 4.7 s explain.
+        let empty = fluree_db_core::IndexStats::default();
+        let base = snapshot.stats.as_ref().unwrap_or(&empty);
+        let mut view = StatsView::from_db_stats_with_namespaces(base, snapshot.namespaces());
         if let Some(ann) = snapshot.annotation_index.as_ref() {
             view.merge_annotation_stats(&ann.stats, snapshot.namespaces());
         }

@@ -620,6 +620,16 @@ impl LeafletCache {
         }
     }
 
+    /// Check if a leaf's shared memory mapping is cached (read-only, no
+    /// insertion). Key is `xxh3_128(leaf_cid.to_bytes())`, as for
+    /// [`try_get_or_load_leaf_mmap`](Self::try_get_or_load_leaf_mmap).
+    pub fn get_leaf_mmap(&self, key: u128) -> Option<Arc<memmap2::Mmap>> {
+        match self.inner.get(&CacheKey::LeafMmap(key)) {
+            Some(CachedEntry::LeafMmap(mmap)) => Some(mmap),
+            _ => None,
+        }
+    }
+
     /// Get or load the shared memory mapping of a leaf file with
     /// single-flight and error propagation. Key should be
     /// `xxh3_128(leaf_cid.to_bytes())` — content-addressed, so entries are
@@ -635,7 +645,7 @@ impl LeafletCache {
         F: FnOnce() -> io::Result<Arc<memmap2::Mmap>>,
     {
         // Fast path: a plain hit must not pay the block_in_place cost.
-        if let Some(CachedEntry::LeafMmap(mmap)) = self.inner.get(&CacheKey::LeafMmap(key)) {
+        if let Some(mmap) = self.get_leaf_mmap(key) {
             return Ok(mmap);
         }
         let result = in_blocking_region(|| {

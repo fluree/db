@@ -176,6 +176,13 @@ pub type ConstSidCache = Arc<Mutex<FxHashMap<ConstSidKey, Option<u64>>>>;
 /// once per distinct id instead of twice per row.
 pub type LangTagCache = Arc<Mutex<FxHashMap<u16, Option<Arc<str>>>>>;
 
+/// Per-query memo: `(store id, subject id)` → the full IRI `STR()` yields for
+/// a late-materialized subject. Shared across per-graph context derivations
+/// like [`LangTagCache`]; keyed by the store as well as the id because a
+/// dataset's ledgers have disjoint id spaces. See
+/// [`ExecutionContext::subject_iri_str_memo`].
+pub type SubjectIriCache = Arc<Mutex<FxHashMap<(u64, u64), Arc<str>>>>;
+
 /// Shared handle to the per-query overlay-ops memo
 /// ([`OverlayOpsCache`](crate::fast_path_common::OverlayOpsCache)).
 pub type SharedOverlayOpsCache = Arc<crate::fast_path_common::OverlayOpsCache>;
@@ -421,6 +428,9 @@ pub struct ExecutionContext<'a> {
     pub const_sid_cache: ConstSidCache,
     /// Per-query memo for binding-level language-tag ids — see [`LangTagCache`].
     pub lang_tag_cache: LangTagCache,
+    /// Per-query memo for `STR()` of late-materialized subjects — see
+    /// [`SubjectIriCache`].
+    pub subject_iri_cache: SubjectIriCache,
     /// Per-query parent-lookup memo (PR-8b): the cross-operator-rebuild extension
     /// of PR-4's per-operator parent cache, so an inner join that rebuilds its
     /// R2RML operator per driving batch (an interposed non-pushable FILTER + LIMIT)
@@ -511,6 +521,7 @@ impl<'a> ExecutionContext<'a> {
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
+            subject_iri_cache: SubjectIriCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -570,6 +581,7 @@ impl<'a> ExecutionContext<'a> {
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
+            subject_iri_cache: SubjectIriCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -633,6 +645,7 @@ impl<'a> ExecutionContext<'a> {
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
+            subject_iri_cache: SubjectIriCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -685,6 +698,7 @@ impl<'a> ExecutionContext<'a> {
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
+            subject_iri_cache: SubjectIriCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -736,6 +750,7 @@ impl<'a> ExecutionContext<'a> {
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
+            subject_iri_cache: SubjectIriCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -789,6 +804,7 @@ impl<'a> ExecutionContext<'a> {
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
+            subject_iri_cache: SubjectIriCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -1280,6 +1296,23 @@ impl<'a> ExecutionContext<'a> {
         resolved
     }
 
+    /// `STR()` of a late-materialized subject, resolved once per distinct id
+    /// per query. A self-join over a hub evaluates `str(?a) > str(?b)` tens of
+    /// millions of times over a few thousand distinct subjects (StarBench
+    /// S10: 34M decodes of ~33k values were 7.6 s of an 8.8 s query), and each
+    /// evaluation walked the dictionary and formatted the prefix again.
+    /// `resolve` runs unlocked on a miss; a `None` from it is not memoized so
+    /// the caller's slow path can report it. Without a binary store there is
+    /// nothing late-materialized to memoize.
+    pub fn subject_iri_str_memo(
+        &self,
+        s_id: u64,
+        resolve: impl FnOnce() -> Option<Arc<str>>,
+    ) -> Option<Arc<str>> {
+        let store_id = self.binary_store.as_deref()?.store_id();
+        memoize_subject_iri(&self.subject_iri_cache, (store_id, s_id), resolve)
+    }
+
     /// Resolve a subject ID to an IRI, using DictNovelty-aware routing.
     ///
     /// Thin wrapper around [`BinaryGraphView::resolve_subject_iri`] which
@@ -1390,6 +1423,7 @@ impl<'a> ExecutionContext<'a> {
             annotation_sidecar_cache: self.annotation_sidecar_cache.clone(),
             const_sid_cache: self.const_sid_cache.clone(),
             lang_tag_cache: self.lang_tag_cache.clone(),
+            subject_iri_cache: self.subject_iri_cache.clone(),
             r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
@@ -1452,6 +1486,7 @@ impl<'a> ExecutionContext<'a> {
             annotation_sidecar_cache: self.annotation_sidecar_cache.clone(),
             const_sid_cache: self.const_sid_cache.clone(),
             lang_tag_cache: self.lang_tag_cache.clone(),
+            subject_iri_cache: self.subject_iri_cache.clone(),
             r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
@@ -1521,6 +1556,7 @@ impl<'a> ExecutionContext<'a> {
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
+            subject_iri_cache: SubjectIriCache::default(),
             // The R2RML parent-lookup memo, by contrast, is SAFE to share here
             // (F19): its key carries `graph_source_id` + `as_of_t`
             // (`R2rmlParentMemoKey`, r2rml/operator.rs), so a lookup cached under
@@ -1628,6 +1664,79 @@ impl<'a> ExecutionContext<'a> {
     pub fn with_graph_id(mut self, g_id: GraphId) -> Self {
         self.binary_g_id = g_id;
         self
+    }
+}
+
+/// The memo behind [`ExecutionContext::subject_iri_str_memo`], keyed by
+/// `(store id, subject id)`. A hit skips `resolve`; a miss runs it unlocked
+/// and stores what it returns; a `None` is not stored. Bounded by clearing
+/// rather than evicting.
+fn memoize_subject_iri(
+    cache: &SubjectIriCache,
+    key: (u64, u64),
+    resolve: impl FnOnce() -> Option<Arc<str>>,
+) -> Option<Arc<str>> {
+    const MAX_ENTRIES: usize = 1 << 18;
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return Some(hit.clone());
+    }
+    let resolved = resolve()?;
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.len() >= MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, resolved.clone());
+    Some(resolved)
+}
+
+#[cfg(test)]
+mod subject_iri_memo_tests {
+    use super::{memoize_subject_iri, SubjectIriCache};
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    #[test]
+    fn resolves_each_store_subject_once_and_never_memoizes_a_miss() {
+        let cache = SubjectIriCache::default();
+        let calls = Cell::new(0);
+        let resolve = |iri: Option<&str>| {
+            calls.set(calls.get() + 1);
+            iri.map(Arc::from)
+        };
+        let alice = Some("http://example.org/alice");
+
+        assert_eq!(
+            memoize_subject_iri(&cache, (1, 7), || resolve(alice)).as_deref(),
+            alice
+        );
+        assert_eq!(
+            memoize_subject_iri(&cache, (1, 7), || resolve(Some("stale"))).as_deref(),
+            alice,
+            "a hit returns the stored IRI without resolving"
+        );
+        assert_eq!(calls.get(), 1);
+
+        // A dataset's ledgers reuse subject ids for different nodes.
+        let bob = Some("http://example.org/bob");
+        assert_eq!(
+            memoize_subject_iri(&cache, (2, 7), || resolve(bob)).as_deref(),
+            bob
+        );
+        assert_eq!(calls.get(), 2);
+
+        // A failed resolve is not stored, so the next call resolves again.
+        assert_eq!(memoize_subject_iri(&cache, (1, 8), || resolve(None)), None);
+        assert_eq!(
+            memoize_subject_iri(&cache, (1, 8), || resolve(alice)).as_deref(),
+            alice
+        );
+        assert_eq!(calls.get(), 4);
     }
 }
 

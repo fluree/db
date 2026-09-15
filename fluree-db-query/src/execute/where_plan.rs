@@ -143,18 +143,29 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool)
             // 2. Three required `f:reifies*` lookup triples that bind
             //    the annotation to the edge.
             let ann_ref = annotation.clone();
+            // `f:reifiesSubject` / `f:reifiesPredicate` objects are refs by
+            // construction, so on a VARIABLE object the `@id` constraint is
+            // a no-op filter — and it costs the batched subject-join lane
+            // (`is_batched_eligible` needs no dtc), which is what turns the
+            // per-reifier probes into one sorted SPOT walk. A constant
+            // object keeps the constraint so the lookup key encodes as a
+            // ref rather than a same-lexical string.
             let id_dt = fluree_db_core::edge::id_datatype_sid();
+            let id_dtc_for = |o: &Ref| match o {
+                Ref::Var(_) => None,
+                _ => Some(fluree_db_core::DatatypeConstraint::Explicit(id_dt.clone())),
+            };
             chain.push(Pattern::Triple(TriplePattern {
                 s: ann_ref.clone(),
                 p: reifies_subject_ref(),
                 o: edge.s.clone().into(),
-                dtc: Some(fluree_db_core::DatatypeConstraint::Explicit(id_dt.clone())),
+                dtc: id_dtc_for(&edge.s),
             }));
             chain.push(Pattern::Triple(TriplePattern {
                 s: ann_ref.clone(),
                 p: reifies_predicate_ref(),
                 o: edge.p.clone().into(),
-                dtc: Some(fluree_db_core::DatatypeConstraint::Explicit(id_dt)),
+                dtc: id_dtc_for(&edge.p),
             }));
             // f:reifiesObject — preserves the original object's
             // datatype constraint via `dtc` so typed-equality matches
@@ -640,6 +651,17 @@ pub fn collect_var_stats(
                 // product over `?src`.
                 Pattern::DefaultGraphSource { patterns } => {
                     walk(patterns, counts, vars);
+                }
+                // Walks that run before annotation expansion (the `SELECT *`
+                // needed set in `operator_tree`) must still see the edge
+                // positions, the reifier and the body: the chain elision
+                // treats a variable they miss as unread and drops the
+                // `f:reifies*` lookup that binds it.
+                Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => {
+                    for v in p.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
                 }
                 _ => {}
             }
@@ -2941,12 +2963,25 @@ pub fn build_where_operators_seeded_with_needed(
                 // to correlate the f:reifies* triple chain with a single
                 // default-graph source under multi-source default queries.
                 let child = require_child(operator, "DEFAULT-GRAPH-SOURCE pattern")?;
+                // Variables anything outside the wrapper still reads: the
+                // post-WHERE pipeline (projection pushdown set when there is
+                // one, else every needed var) plus every later pattern in
+                // this block. Earlier patterns reach the wrapper through the
+                // child's schema. The wrapper drops the `f:reifies*` lookups
+                // whose variable appears in neither.
+                let mut needed_outside: HashSet<VarId> = match required_where_vars {
+                    Some(required) => required.iter().copied().collect(),
+                    None => needed_vars.clone(),
+                };
+                let mut outside_counts: HashMap<VarId, usize> = HashMap::new();
+                collect_var_stats(&patterns[i + 1..], &mut outside_counts, &mut needed_outside);
                 operator = Some(Box::new(
                     crate::default_graph_source::DefaultGraphSourceOperator::new(
                         child,
                         inner_patterns.clone(),
                         *planning,
                         stats.clone(),
+                        needed_outside,
                     ),
                 ));
                 i += 1;
