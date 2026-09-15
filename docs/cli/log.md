@@ -84,18 +84,18 @@ fluree log production --oneline -n 10
 
 ```
 $ fluree log logdemo
-commit ddca65d84c08
-Date:    2026-09-15T02:40:25.527303+00:00
+commit b6888dc89bb2
+Date:    2026-09-15T05:58:52.676621+00:00
 t:       6
 Flakes:  1
 
-commit 0ffb1bb2678a
-Date:    2026-09-15T02:40:25.479820+00:00
+commit b198f5439aa1
+Date:    2026-09-15T05:58:52.621666+00:00
 t:       5
 Flakes:  1
 
-commit 879416d9f4a4
-Date:    2026-09-15T02:40:25.415656+00:00
+commit 0017560963fb
+Date:    2026-09-15T05:58:52.572901+00:00
 t:       4
 Flakes:  1
 ```
@@ -104,12 +104,12 @@ Flakes:  1
 
 ```
 $ fluree log logdemo --oneline
-t=6     ddca65d84c08  2026-09-15T02:40:25.527303+00:00
-t=5     0ffb1bb2678a  2026-09-15T02:40:25.479820+00:00
-t=4     879416d9f4a4  2026-09-15T02:40:25.415656+00:00
-t=3     9c23b9c65161  2026-09-15T02:40:25.365666+00:00
-t=2     d016e150b86c  2026-09-15T02:40:25.305330+00:00
-t=1     cf96b59f4fa9  2026-09-15T02:40:25.191433+00:00
+t=6     b6888dc89bb2  2026-09-15T05:58:52.676621+00:00
+t=5     b198f5439aa1  2026-09-15T05:58:52.621666+00:00
+t=4     0017560963fb  2026-09-15T05:58:52.572901+00:00
+t=3     ad2e480d1628  2026-09-15T05:58:52.517082+00:00
+t=2     dfbfa6eb48ea  2026-09-15T05:58:52.450023+00:00
+t=1     a9834005af34  2026-09-15T05:58:52.366394+00:00
 ```
 
 ### Truncation
@@ -119,22 +119,22 @@ contaminate a piped log:
 
 ```
 $ fluree log logdemo --oneline -n 2
-t=6     ddca65d84c08  2026-09-15T02:40:25.527303+00:00
-t=5     0ffb1bb2678a  2026-09-15T02:40:25.479820+00:00
+t=6     b6888dc89bb2  2026-09-15T05:58:52.676621+00:00
+t=5     b198f5439aa1  2026-09-15T05:58:52.621666+00:00
 (showing 2 of 6 commits — pass -n to widen, or --all)
 ```
 
 ### Feeding an id to another command
 
 ```
-$ fluree show --ledger logdemo ddca65d84c08
+$ fluree show --ledger logdemo b6888dc89bb2
 {
-  "id": "bagaybqabciqn3stf3bgar34nucpfp7z34eupir7ku4w2wzxd6yx2elvthu2mdga",
+  "id": "bagaybqabciqlncenzcn3foxeomxb62nftmihwu776fnj6n5lxl3zdro2nm3g7gi",
   "t": 6,
-  "time": "2026-09-15T02:40:25.527303+00:00",
+  "time": "2026-09-15T05:58:52.676621+00:00",
   "size": 212,
   "parents": [
-    "bagaybqabciqa76y3wjtyvhjxcpohcnygpbiarxnyolzjwtkgh42swikogjinkdi"
+    "bagaybqabciqldghvionkcmw3rylvko6kmpkxfeyamd2qk6xjqaxgj3vvqxrh5mq"
   ],
   "asserts": 1,
   "retracts": 0,
