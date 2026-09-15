@@ -447,7 +447,8 @@ const STATS_VIEW_BUDGET_DIVISOR: u64 = 16;
 ///
 /// Weight is capped at half the budget because moka never caches an entry
 /// heavier than the whole pool, which would make an oversized view rebuild on
-/// every query.
+/// every query. The cap means the real bound is two full-size views, not the
+/// budget: on a ledger with millions of classes that is significant memory.
 fn stats_view_pool(leaflet_budget_bytes: u64) -> Cache<u128, Arc<StatsView>> {
     let budget = (leaflet_budget_bytes / STATS_VIEW_BUDGET_DIVISOR).max(1);
     let max_weight = (budget / 2).clamp(1, u64::from(u32::MAX)) as usize;
