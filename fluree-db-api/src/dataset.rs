@@ -1169,8 +1169,11 @@ fn parse_graph_selector_field(
         },
     };
 
-    // Ambiguity: the identifier already selected a graph via #txn-meta.
-    if identifier.contains("#txn-meta") {
+    // Ambiguity: the identifier already selected a reserved graph by fragment.
+    // Both reserved fragments are checked, not just `#txn-meta`: `#config` is
+    // addressable the same way, so `{"@id": "L#config", "graph": …}` is the
+    // same contradiction and must be refused the same way.
+    if identifier.contains("#txn-meta") || identifier.contains("#config") {
         return Err(DatasetParseError::AmbiguousGraphSelector(
             raw_identifier.to_string(),
         ));
@@ -1178,7 +1181,7 @@ fn parse_graph_selector_field(
 
     let graph_str = graph_val.as_str().ok_or_else(|| {
         DatasetParseError::InvalidGraphSource(format!(
-            "'{key}' must be a string ('default', 'txn-meta', or a graph IRI)"
+            "'{key}' must be a string ('default', 'txn-meta', 'config', or a graph IRI)"
         ))
     })?;
     Ok(Some(GraphSelector::from_str(graph_str)))
@@ -1486,6 +1489,28 @@ mod tests {
     // JSON-LD Query Parsing Tests
 
     use serde_json::json;
+
+    /// Naming a reserved graph twice — once by fragment, once by selector — is
+    /// a contradiction, for `#config` exactly as for `#txn-meta`.
+    ///
+    /// The ambiguity check read only `#txn-meta`, so
+    /// `{"@id": "L#config", "graph": …}` silently took one of the two and ran.
+    /// Both fragments address a reserved graph, so both make an explicit
+    /// selector redundant-or-contradictory in the same way.
+    #[test]
+    fn both_reserved_fragments_conflict_with_an_explicit_graph_selector() {
+        for frag in ["txn-meta", "config"] {
+            let query = json!({
+                "from": {"@id": format!("ledger:main#{frag}"), "graph": "default"},
+                "select": ["?s"],
+                "where": {"@id": "?s"}
+            });
+            assert!(
+                DatasetSpec::from_json(&query).is_err(),
+                "`#{frag}` plus an explicit graph selector must be refused as ambiguous"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_from_single_string() {
