@@ -10432,6 +10432,130 @@ async fn cypher_var_length_parallel_claims_multiply_rows_like_a_single_hop() {
 }
 
 #[tokio::test]
+async fn cypher_multi_hop_path_property_read_refused_with_a_remedy() {
+    // A multi-hop path value is assembled by `MakePathHops` from the chain's
+    // node refs and per-hop `MakeRel` values, and a synthesized relationship
+    // value has no reifier slot — so `[r IN relationships(p) | r.prop]` over
+    // one answers null even when every edge in the chain IS reified. That is a
+    // wrong answer rather than a missing feature (the single-hop path form and
+    // the equivalent `*N..N` range both read the real annotations), so refuse
+    // it and name the spellings that work.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:multi-hop-path-props");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "alice", "@type": "Person", "name": "Alice",
+                     "KNOWS": {"@id": "bob", "@annotation": {"confidence": 0.9}}},
+                    {"@id": "bob", "@type": "Person", "name": "Bob",
+                     "KNOWS": {"@id": "carol", "@annotation": {"confidence": 0.95}},
+                     "WORKS_AT": {"@id": "acme", "@annotation": {"confidence": 0.7}}},
+                    {"@id": "carol", "@type": "Person", "name": "Carol"},
+                    {"@id": "acme", "@type": "Org", "name": "Acme"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // A uniformly-typed chain gets both remedies: per-hop relationship
+    // variables, and the bounded range that expresses the same chain.
+    for q in [
+        r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)-[:KNOWS]->(c)
+           RETURN [r IN relationships(p) | r.confidence] AS confs"#,
+        r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)-[:KNOWS]->(c)
+           WHERE all(r IN relationships(p) WHERE r.confidence > 0.8)
+           RETURN c.name AS name"#,
+        // Through a `WITH … AS` rename, which the alias walk resolves back.
+        r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)-[:KNOWS]->(c)
+           WITH c, relationships(p) AS xs WHERE all(r IN xs WHERE r.confidence > 0.8)
+           RETURN c.name AS name"#,
+    ] {
+        let err = fluree
+            .query_cypher(&db, q)
+            .await
+            .expect_err("multi-hop path property read must be refused")
+            .to_string();
+        assert!(
+            err.contains("carry no per-hop edge identity"),
+            "must say why: {err}"
+        );
+        assert!(
+            err.contains("Bind each hop's relationship variable"),
+            "must name the always-available remedy: {err}"
+        );
+        assert!(
+            err.contains("-[:KNOWS*2..2]->"),
+            "a uniformly-typed chain must also name the range that expresses it: {err}"
+        );
+    }
+
+    // A mixed-type chain has no single range that expresses it, so the message
+    // must not invent one.
+    let err = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)-[:WORKS_AT]->(o)
+               RETURN [r IN relationships(p) | r.confidence] AS confs"#,
+        )
+        .await
+        .expect_err("multi-hop path property read must be refused")
+        .to_string();
+    assert!(
+        err.contains("Bind each hop's relationship variable"),
+        "must still name the remedy that always exists: {err}"
+    );
+    assert!(
+        !err.contains("bounded range"),
+        "no single range expresses a mixed-type chain: {err}"
+    );
+
+    // Remedy 1 — per-hop relationship variables — reads the real annotations,
+    // and `p` stays bound alongside them.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[r1:KNOWS]->(b)-[r2:KNOWS]->(c)
+               RETURN r1.confidence AS c1, r2.confidence AS c2, length(p) AS n"#,
+        )
+        .await,
+        vec![json!([0.9, 0.95, 2])],
+    );
+    // Remedy 2 — the bounded range the message names.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*2..2]->(c)
+               RETURN [r IN relationships(p) | r.confidence] AS confs"#,
+        )
+        .await,
+        vec![json!([[0.9, 0.95]])],
+    );
+
+    // The refusal is scoped to the element *property* surface: everything the
+    // multi-hop path value can actually answer stays available on this route.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)-[:KNOWS]->(c)
+               RETURN size(relationships(p)) AS n, length(p) AS len,
+                      [n IN nodes(p) | n.name] AS ns,
+                      [r IN relationships(p) | type(r)] AS types"#,
+        )
+        .await,
+        vec![json!([2, 2, ["Alice", "Bob", "Carol"], ["KNOWS", "KNOWS"]])],
+    );
+}
+
+#[tokio::test]
 async fn cypher_var_length_enumerated_property_read_refused_with_a_remedy() {
     // The routes resolved by path enumeration carry no per-hop edge identity,
     // so a property read over their elements can only answer null. Refuse it,

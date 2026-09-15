@@ -484,6 +484,58 @@ fn lower_multi_hop_path<E: IriEncoder>(
         }
     }
 
+    // Reading a *property* of one of this path's hops needs per-hop edge
+    // identity, and the path value does not carry it: `MakePathHops` assembles
+    // the chain from node refs and per-hop `MakeRel` values, and a synthesized
+    // relationship value has no reifier slot. So the read answers null even
+    // when every edge in the chain is reified — while the single-hop path form
+    // (which re-enters the var-length machinery as `*1..1`) and the equivalent
+    // `*N..N` range both read the real annotations. That makes it a wrong
+    // answer rather than a missing feature, so refuse it, as the enumeration
+    // route already does for the same reason (`lower_enumerate_path`).
+    //
+    // Scoped to the element property surface: `nodes(p)`, `length(p)`,
+    // `size(relationships(p))`, `type(r)` over the elements and `RETURN p` all
+    // answer correctly on this route and stay available.
+    //
+    // Giving the route identity instead means the same per-hop
+    // `Optional([EdgeAnnotation])` probe the bounded expansion emits. That is
+    // the right eventual shape, but it belongs on top of that probe's cost
+    // model rather than adding a second caller of it; the refusal is what
+    // keeps `docs/query/cypher.md` true until then.
+    //
+    // `part.tail` is empty (`MATCH p = (a)`) or ≥ 2 here — a single hop, fixed
+    // or variable-length, is routed to the var-length machinery by the caller.
+    if !part.tail.is_empty() && ctx.reads_element_properties(&path_var.name) {
+        let hops = part.tail.len();
+        // Every hop is single-typed and directed by this point, so `types[0]`
+        // is the hop's type. Only offer the range remedy when one exists: no
+        // single `-[:T*N..N]->` expresses a mixed-type chain.
+        let range_remedy = if part
+            .tail
+            .windows(2)
+            .all(|w| w[0].0.types[0].name == w[1].0.types[0].name)
+        {
+            format!(
+                ", or write the chain as one bounded range \
+                 (`-[:{t}*{hops}..{hops}]->`), whose expansion keeps each hop's \
+                 annotation",
+                t = part.tail[0].0.types[0].name,
+            )
+        } else {
+            String::new()
+        };
+        return Err(LowerError::unsupported(format!(
+            "reading relationship properties over `{p}` is not supported here: a \
+             multi-hop path value is assembled from synthesized relationship values, \
+             which carry no per-hop edge identity, so every property read would \
+             answer null. Bind each hop's relationship variable instead \
+             (`(a)-[r1:T]->(b)-[r2:U]->(c)`) — `{p}` stays bound alongside them and \
+             `r1.prop` reads that hop's own annotation{range_remedy}",
+            p = path_var.name,
+        )));
+    }
+
     let node_expr = |ctx: &mut LoweringContext<'_, E>, node: &NodePattern| {
         ref_to_expr(&lookup_node_ref(ctx, node)).ok_or_else(|| {
             LowerError::unsupported(
