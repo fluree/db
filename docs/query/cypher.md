@@ -147,8 +147,10 @@ ORDER BY / SKIP / LIMIT
   of fixed single-typed directed hops (`p = (a)-[:R1]->(b)<-[:R2]-(c)`) — the
   path value is built from the bound nodes and per-hop relationship values.
   Deferred: a variable-length or undirected segment inside a multi-hop path
-  value, binding over a type alternation, and property filters on a
-  var-length relationship.
+  value, binding over a type alternation, and the **inline** property-map form
+  on a bound var-length range (`-[rs:T*1..3 {p: v}]->`) — bind the range
+  without it and filter the bound relationships instead: `-[rs:T*1..3]->` with
+  `WHERE all(r IN rs WHERE r.p = v)`.
 - **Untyped** variable-length paths `-[*]->`, `-[*m..n]->` (no relationship
   type): a *wildcard* transitive path that follows **any** node→node edge per
   hop — excluding `rdf:type` (its object is a class, not a node) and the
@@ -178,8 +180,27 @@ ORDER BY / SKIP / LIMIT
   reified edge), `relationships(p)`, or a bound var-length relationship.
   `type(r)` is the relationship type string, `startNode(r)` / `endNode(r)` its
   endpoints, `properties(r)` / `r.prop` its edge properties (present only for a
-  reified/annotated edge — a plain path edge has none). Rendered as a
+  reified/annotated edge — an unreified one has none). Rendered as a
   `{start, type, end}` object.
+- **Edge properties over a variable-length relationship.** A **bounded,
+  single-typed, directed** range (`-[rs:T*1..3]->`, or the same range under
+  `MATCH p = …`) expands to a chain of real triple patterns, so every hop keeps
+  its own edge identity. Over such a range `all(r IN rs WHERE r.p)`,
+  `[r IN rs | r.p]`, `UNWIND rs AS r … r.p` and `relationships(p)` all read the
+  hop's own annotation. An unreified hop has no annotation, so its element
+  reads `null` and the path is still returned — `any(...)` sees the hops that
+  do have one.
+
+  Because a reified edge yields one value per annotation, **a hop carrying two
+  parallel claims doubles the rows, and a k-hop chain multiplies k-fold**.
+  Parallel relationships are distinct relationships, so this is the same
+  contract a single `-[r:T]->` hop already has.
+
+  The ranges resolved by **path enumeration** — unbounded, untyped,
+  undirected, a zero lower bound, or deeper than 16 hops — do not retain
+  per-hop edge identity, so a property read over their elements is **refused**,
+  naming the edit that moves the pattern onto the bounded route. `nodes(p)` is
+  unaffected on every route: path nodes are real subjects, not edges.
 - Scalar functions:
   - **Casts / general:** `toString`, `toInteger`, `toFloat`, `coalesce`.
   - **String:** `toUpper`, `toLower`, `substring` (0-indexed; 2- and 3-arg),

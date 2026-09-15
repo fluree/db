@@ -235,6 +235,11 @@ fn lower_single_branch<E: IriEncoder>(
     // in the projection or ORDER BY, and no clause that could observe or
     // aggregate per-walk rows (WITH / CALL). See
     // `LoweringContext::fuse_reachability_chains`.
+    // Every `Query` node reaches lowering through here — the top level, each
+    // UNION branch, and each `CALL { … }` body — so this is the one place the
+    // annotation-surface / element-property sets need to be scoped. Save and
+    // restore rather than reset: CALL bodies nest inside an enclosing scope.
+    let saved_uses = ctx.swap_scope_uses(super::annotation_use::scope_uses(q));
     let saved_fusion = ctx.fuse_reachability_chains;
     ctx.fuse_reachability_chains = q.return_clause.distinct
         && !q
@@ -258,6 +263,7 @@ fn lower_single_branch<E: IriEncoder>(
         });
     let result = lower_single_branch_inner(ctx, q, outer_scope);
     ctx.fuse_reachability_chains = saved_fusion;
+    ctx.swap_scope_uses(saved_uses);
     result
 }
 
@@ -1162,6 +1168,25 @@ fn const_usize(e: &Option<Expr>) -> Result<Option<usize>> {
 /// WITH's projection items become the subquery's select list.
 /// WITH-induced modifiers (WHERE, ORDER BY, SKIP, LIMIT) and
 /// aggregates apply inside the subquery.
+/// Keep a bounded fixed-chain expansion's identity-carrying relationship list
+/// alive across a `WITH` that projects its path variable. Without this the
+/// list is dropped at the projection boundary, and `relationships(p)` after
+/// the `WITH` falls back to the path value — which carries no per-hop
+/// reifier, so `r.prop` over it reads nothing.
+fn augment_select_with_path_rel_lists<E: IriEncoder>(
+    ctx: &LoweringContext<'_, E>,
+    mut select: Vec<VarId>,
+) -> Vec<VarId> {
+    for path in select.clone() {
+        if let Some(list) = ctx.path_rel_list(path) {
+            if !select.contains(&list) {
+                select.push(list);
+            }
+        }
+    }
+    select
+}
+
 fn lower_with<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     w: &WithClause,
@@ -1244,6 +1269,7 @@ fn lower_with<E: IriEncoder>(
     // ordering references (the synthetic `?#__prop_*` names stay
     // hidden from `RETURN *` via the wildcard formatter filter).
     let augmented_select = augment_select_with_sort_vars(projection.vars, &ordering);
+    let augmented_select = augment_select_with_path_rel_lists(ctx, augmented_select);
     let mut sq = SubqueryPattern::new(augmented_select, inner_patterns);
 
     if !ordering.is_empty() {
