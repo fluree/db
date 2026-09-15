@@ -432,8 +432,9 @@ pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
     // D-4 CONSTRUCT annotation projection: lowering returns "CONSTRUCT
     // projection of edge-annotation metadata is not supported in v1" (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-4",
-    // harness EXPECTED-graph parsing: the expected .ttl embeds `<<( … )>>`
-    // triple-term values (1)
+    // results not isomorphic: the expected graph (`r rdf:reifies <<( … )>>`)
+    // now parses, but CONSTRUCT emits the annotation body without the
+    // reifier's attachment — D-4 annotation projection (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-5",
     // SPARQL lowering: triple-term values in VALUES data not implemented (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-2",
@@ -579,7 +580,8 @@ pub const SPARQL11_HTTP_RDF_UPDATE: &[&str] = &[
 // the conversion behind upsert, graph sync and memory import. Evaluation
 // tests compare the parsed graph with the expected N-Triples up to blank-node
 // isomorphism (Fluree's `list_index` collections are re-expanded to
-// `rdf:first`/`rdf:rest` chains by the handler).
+// `rdf:first`/`rdf:rest` chains, and reifier attachments are compared as
+// well, by the handler).
 
 pub const RDF11_TURTLE: &[&str] = &[
     // numeric literals are canonicalized on ingest (value semantics: `+1`,
@@ -602,49 +604,19 @@ pub const RDF11_TURTLE: &[&str] = &[
 ];
 
 pub const RDF12_TURTLE_SYNTAX: &[&str] = &[
-    // triple terms as values (`<<( s p o )>>`, incl. nested) are deferred:
-    // the graph IR has no triple-term Term, so ingest rejects them with the
-    // specific error (8)
+    // triple terms as values (`<<( s p o )>>` anywhere but the object of
+    // `rdf:reifies`, and nested triple terms) are deferred: the graph IR has
+    // no triple-term Term, so ingest rejects them with the specific error (5)
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#turtle12-3",
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#turtle12-7",
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#turtle12-8",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#nt-ttl12-1",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#nt-ttl12-2",
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#nt-ttl12-3",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#nt-ttl12-bnode-1",
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#nt-ttl12-nested-1",
 ];
 
 pub const RDF12_TURTLE_EVAL: &[&str] = &[
-    // every expected .nt encodes the reifier as `rdf:reifies <<( s p o )>>`,
-    // a triple term the graph IR cannot represent, so the expected graph
-    // does not parse (23)
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-rt-01",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-rt-02",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-rt-03",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-rt-04",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-rt-05",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-rt-06",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-rt-07",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-rt-08",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-bnode-01",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-bnode-02",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-01",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-02",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-03",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-05",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-06",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-07",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-08",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-09",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-10",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-11",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-12",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-reified-triples-annotation-02",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-reified-triples-annotation-03",
-    // action rejected: `<<( … )>>` triple terms as values (4)
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-tt-01",
-    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-tt-02",
+    // action rejected: nested triple terms (`<<( s p <<( … )>> )>>`) are
+    // deferred (2)
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-tt-03",
     "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-tt-04",
     // action rejected: annotation-of-annotation (a `{| |}` or `<< >>` inside an
