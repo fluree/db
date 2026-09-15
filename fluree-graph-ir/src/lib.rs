@@ -39,6 +39,7 @@
 
 pub mod datatype;
 mod graph;
+pub mod json_canonical;
 mod sink;
 mod term;
 mod triple;
@@ -46,6 +47,7 @@ pub mod xsd_double;
 
 pub use datatype::Datatype;
 pub use graph::{Graph, Reification};
+pub use json_canonical::{canonicalize_json, canonicalize_json_value};
 pub use sink::{GraphCollectorSink, GraphSink, SinkError, SinkResult, TermId};
 pub use term::{BlankId, LiteralValue, Term};
 pub use triple::Triple;
