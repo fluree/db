@@ -1796,6 +1796,11 @@ pub enum BranchAction {
         #[arg(long)]
         changes_after: Option<String>,
 
+        /// Skip SHACL validation of the merged state. Validation runs by
+        /// default and its outcome folds into `mergeable`.
+        #[arg(long)]
+        no_validate: bool,
+
         /// Emit the raw JSON preview instead of a human-readable summary
         #[arg(long)]
         json: bool,
@@ -1845,6 +1850,11 @@ pub enum BranchAction {
         /// strategy would let it proceed.
         #[arg(long)]
         preview: bool,
+
+        /// With `--preview`: skip SHACL validation of the inverted state.
+        /// Validation runs by default and folds into `revertable`.
+        #[arg(long)]
+        no_validate: bool,
 
         /// When `--preview` is set: emit the raw JSON `RevertPreview`
         /// instead of a human-readable summary.

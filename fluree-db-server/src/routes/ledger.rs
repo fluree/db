@@ -1980,6 +1980,10 @@ pub struct MergePreviewQuery {
     /// full IRI. Pass the previous response's `changes.next_cursor`.
     #[serde(default)]
     pub changes_after_subject: Option<String>,
+    /// Validate the resolved change set against the target's SHACL shapes and
+    /// fold the outcome into `mergeable`. Defaults to true.
+    #[serde(default)]
+    pub include_validation: Option<bool>,
 }
 
 /// Read-only branch merge preview.
@@ -2080,6 +2084,9 @@ pub async fn merge_preview(
             ));
         }
         opts.changes_after_subject = params.changes_after_subject.clone();
+        if let Some(b) = params.include_validation {
+            opts.include_validation = b;
+        }
 
         let preview = state
             .fluree
@@ -2132,6 +2139,10 @@ pub struct RevertPreviewQuery {
     /// Strategy used for the `revertable` verdict. Defaults to `abort`.
     #[serde(default)]
     pub strategy: Option<String>,
+    /// Validate the inverted state against the branch's SHACL shapes and
+    /// fold the outcome into `revertable`. Defaults to true.
+    #[serde(default)]
+    pub include_validation: Option<bool>,
 }
 
 /// Read-only revert preview.
@@ -2182,6 +2193,9 @@ pub async fn revert_preview(
         }
         if let Some(b) = params.include_conflicts {
             opts.include_conflicts = b;
+        }
+        if let Some(b) = params.include_validation {
+            opts.include_validation = b;
         }
         if let Some(s) = params.strategy.as_deref() {
             opts.conflict_strategy =
