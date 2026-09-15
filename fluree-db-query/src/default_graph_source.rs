@@ -239,6 +239,27 @@ struct EnumerationPlan {
     estimated: Option<usize>,
 }
 
+/// A deliberately narrow cost hint for adjacent mandatory annotation sources.
+/// Constants, repeated variables, datatype constraints and body expressions keep
+/// their existing lane selection, as do predicates whose values are read later
+/// (the latter are rejected by the elision gate at open).
+fn is_nested_wildcard_subject(patterns: &[Pattern], reifier: Option<VarId>) -> bool {
+    let Some(reifier) = reifier else { return false };
+    let Some(shape) = crate::annotation_edge_probe::recognize_annotation_edge(patterns) else {
+        return false;
+    };
+    let Pattern::Triple(base) = &shape.base else {
+        return false;
+    };
+    let (Some(s), Some(p), Some(o)) = (base.s.as_var(), base.p.as_var(), base.o.as_var()) else {
+        return false;
+    };
+    s == reifier
+        && base.dtc.is_none()
+        && shape.body.is_empty()
+        && HashSet::from([s, p, o, shape.ann_var]).len() == 4
+}
+
 pub struct DefaultGraphSourceOperator {
     child: BoxedOperator,
     inner_patterns: Vec<Pattern>,
@@ -267,6 +288,9 @@ pub struct DefaultGraphSourceOperator {
     /// pipeline); an inner position bound to none of them can drop its
     /// `f:reifies*` lookup (see [`elide_redundant_chain`]).
     needed_outside: HashSet<VarId>,
+    /// Cost hint: the preceding annotation source binds this wildcard source's
+    /// subject as a reifier. It never changes which rows qualify.
+    subject_from_reifier: bool,
 }
 
 impl DefaultGraphSourceOperator {
@@ -327,7 +351,16 @@ impl DefaultGraphSourceOperator {
             single_graph_delegate: None,
             estimated,
             needed_outside,
+            subject_from_reifier: false,
         }
+    }
+
+    /// Preserve the ordinary bound-subject arena preference except for a
+    /// broad lookup of annotations on an already-reified edge. The chain can
+    /// test `reifiesSubject` through binary joins before constructing arena keys.
+    pub(crate) fn with_preceding_reifier(mut self, reifier: Option<VarId>) -> Self {
+        self.subject_from_reifier = is_nested_wildcard_subject(&self.inner_patterns, reifier);
+        self
     }
 
     /// Build the single-graph inner subplan. When the chain is a
@@ -361,7 +394,20 @@ impl DefaultGraphSourceOperator {
         } else {
             None
         };
-        let lane = self.chain_lane(&child, elided.is_some());
+        // Keep this as a lane preference, not an emptiness shortcut: the
+        // complete chain runs for both matching and non-matching reifiers.
+        // Elision must be licensed, and explicit diagnostic overrides win.
+        let lane = if self.subject_from_reifier
+            && elided.is_some()
+            && self.annotation_probe_gates_pass(ctx)
+            && !crate::execute::fast_paths_disabled()
+            && forced_chain_lane().is_none()
+        {
+            tracing::debug!("nested annotation subject chain engaged");
+            ChainLane::Chain
+        } else {
+            self.chain_lane(&child, elided.is_some())
+        };
         if self.annotation_probe_gates_pass(ctx) && lane == ChainLane::Arena {
             if let Some(shape) =
                 crate::annotation_edge_probe::recognize_annotation_edge(&self.inner_patterns)
@@ -976,6 +1022,37 @@ mod tests {
             triple(Ref::Var(ANN), reifies(REIFIES_OBJECT), o),
             triple(Ref::Var(ANN), Ref::Sid(Sid::new(9, "q")), Term::Var(X)),
         ]
+    }
+
+    #[test]
+    fn nested_subject_hint_requires_a_plain_wildcard_chain() {
+        let mut patterns = chain(Ref::Var(S), Ref::Var(P), Term::Var(O));
+        patterns.pop(); // No annotation-body expression.
+        assert!(super::is_nested_wildcard_subject(&patterns, Some(S)));
+        assert!(!super::is_nested_wildcard_subject(&patterns, None));
+        assert!(!super::is_nested_wildcard_subject(&patterns, Some(X)));
+        for (s, p, o) in [
+            (Ref::Var(S), Ref::Sid(Sid::new(9, "p")), Term::Var(O)),
+            (Ref::Var(S), Ref::Var(P), Term::Sid(Sid::new(9, "o"))),
+            (Ref::Sid(Sid::new(9, "s")), Ref::Var(P), Term::Var(O)),
+            (Ref::Var(S), Ref::Var(P), Term::Var(S)),
+            (Ref::Var(S), Ref::Var(S), Term::Var(O)),
+        ] {
+            let mut restricted = chain(s, p, o);
+            restricted.pop();
+            assert!(!super::is_nested_wildcard_subject(&restricted, Some(S)));
+        }
+        let mut aliased = chain(Ref::Var(ANN), Ref::Var(P), Term::Var(O));
+        aliased.pop();
+        assert!(!super::is_nested_wildcard_subject(&aliased, Some(ANN)));
+        let body = chain(Ref::Var(S), Ref::Var(P), Term::Var(O));
+        assert!(!super::is_nested_wildcard_subject(&body, Some(S)));
+        if let Pattern::Triple(base) = &mut patterns[0] {
+            base.dtc = Some(fluree_db_core::DatatypeConstraint::Explicit(Sid::new(
+                9, "dt",
+            )));
+        }
+        assert!(!super::is_nested_wildcard_subject(&patterns, Some(S)));
     }
 
     fn reifies_names(patterns: &[Pattern]) -> Vec<String> {

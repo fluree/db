@@ -2964,6 +2964,17 @@ pub fn build_where_operators_seeded_with_needed(
                 };
                 let mut outside_counts: HashMap<VarId, usize> = HashMap::new();
                 collect_var_stats(&patterns[i + 1..], &mut outside_counts, &mut needed_outside);
+                // Only adjacent mandatory annotation sources supply this cost
+                // hint. Do not infer it across OPTIONAL/UNION/GRAPH boundaries
+                // or from a variable that merely appears in the child schema.
+                let previous_reifier = i.checked_sub(1).and_then(|previous| {
+                    if let Pattern::DefaultGraphSource { patterns } = &patterns[previous] {
+                        crate::annotation_edge_probe::recognize_annotation_edge(patterns)
+                            .map(|shape| shape.ann_var)
+                    } else {
+                        None
+                    }
+                });
                 operator = Some(Box::new(
                     crate::default_graph_source::DefaultGraphSourceOperator::new(
                         child,
@@ -2971,7 +2982,8 @@ pub fn build_where_operators_seeded_with_needed(
                         *planning,
                         stats.clone(),
                         needed_outside,
-                    ),
+                    )
+                    .with_preceding_reifier(previous_reifier),
                 ));
                 i += 1;
             }

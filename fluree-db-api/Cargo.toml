@@ -687,3 +687,9 @@ required-features = ["native"]
 name = "it_independent_scan_replay"
 path = "tests/it_independent_scan_replay.rs"
 required-features = ["native"]
+
+# Standalone: annotation lane overrides and the process-global fast-path switch.
+[[test]]
+name = "it_nested_annotation_chain"
+path = "tests/it_nested_annotation_chain.rs"
+required-features = ["native"]
