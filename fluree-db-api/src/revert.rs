@@ -58,6 +58,11 @@ pub struct RevertReport {
     pub new_head_t: i64,
     /// Commit ID of the freshly written revert commit (new HEAD).
     pub new_head_id: CommitId,
+    /// Whether a revert commit was written. `false` when the reverted
+    /// commits have no net effect to undo (one that only registered a graph,
+    /// say): HEAD does not move, no `f:reverts` trail is recorded, and
+    /// `new_head_t` / `new_head_id` describe the unchanged head.
+    pub wrote_commit: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +253,9 @@ impl crate::Fluree {
             .prepare_revert(ledger_name, branch, selection, strategy)
             .await?;
 
+        // Captured before the apply consumes it: an empty net leaves HEAD
+        // where it was, and the report should not imply otherwise.
+        let wrote_commit = commit.is_some();
         let result = self
             .apply_revert(&branch_id, current_head_t, current_head_id, commit)
             .await;
@@ -260,6 +268,7 @@ impl crate::Fluree {
                 strategy: strategy.as_str().to_string(),
                 new_head_t,
                 new_head_id,
+                wrote_commit,
             }),
             Err(e) => {
                 tracing::warn!(
