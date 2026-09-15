@@ -396,13 +396,22 @@ impl From<String> for GraphSource {
 /// A ledger can contain multiple named graphs:
 /// - Default graph (g_id=0): the main data graph
 /// - txn-meta graph (g_id=1): transaction metadata
+/// - config graph (g_id=2): ledger governance/config
 /// - User-defined named graphs: arbitrary IRIs mapped to g_id via registry
+///
+/// `TxnMeta` and `Config` name RESERVED graphs. Selecting one is an explicit,
+/// ledger-qualified act — the selector only exists because a caller wrote it —
+/// so it is permitted here; what stays closed is implicit reachability
+/// (`GRAPH ?g` enumeration, an unnamed `GRAPH <iri>`). See the reserved-graph
+/// contract table on `Fluree::resolve_within_ledger_graph` in `view/query.rs`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GraphSelector {
     /// The ledger's default graph (g_id=0)
     Default,
     /// The built-in transaction metadata graph (g_id=1)
     TxnMeta,
+    /// The ledger's config graph (g_id=2)
+    Config,
     /// A user-defined named graph by IRI
     /// The IRI is resolved to a g_id via the ledger's graph registry
     Iri(String),
@@ -419,6 +428,11 @@ impl GraphSelector {
         Self::TxnMeta
     }
 
+    /// Create a selector for the config graph
+    pub fn config() -> Self {
+        Self::Config
+    }
+
     /// Create a selector for a named graph by IRI
     pub fn iri(iri: impl Into<String>) -> Self {
         Self::Iri(iri.into())
@@ -428,12 +442,19 @@ impl GraphSelector {
     ///
     /// - `"default"` → Default
     /// - `"txn-meta"` → TxnMeta
+    /// - `"config"` → Config
     /// - anything else → Iri(value)
+    ///
+    /// `"config"` is a well-known name like `"txn-meta"`, not a graph IRI:
+    /// without this arm it fell through to `Iri("config")`, an exact-IRI
+    /// lookup for the bare word that can never match the registered
+    /// `urn:fluree:<ledger>#config`.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s {
             "default" => Self::Default,
             "txn-meta" => Self::TxnMeta,
+            "config" => Self::Config,
             _ => Self::Iri(s.to_string()),
         }
     }

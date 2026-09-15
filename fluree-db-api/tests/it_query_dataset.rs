@@ -2624,38 +2624,169 @@ async fn fql_within_ledger_from_named_dataset_parity() {
     );
 }
 
-/// The reserved system graphs — `#txn-meta` (g_id 1) and `#config` (g_id 2) —
-/// are seeded into the graph registry, but must NOT be reachable through
-/// `FROM`/`FROM NAMED`: the plain `GRAPH <iri>` path blocks them via the
-/// `>= FIRST_USER_GRAPH_ID` filter, and the dataset path must match. Before
-/// the fix, `FROM <urn:fluree:{ledger}#config>` resolved and exposed the
-/// governance/config graph's flakes to any query.
+/// **Reserved-graph access contract — the positive half.**
+///
+/// A reserved graph of THIS ledger is reachable through `FROM`/`FROM NAMED`
+/// when the author writes its IRI out in full. Reachability is explicitness;
+/// `f:policyDefaults` on the config graph is the access control
+/// (`docs/ledger-config/README.md`, `writing-config.md`).
+///
+/// This INVERTS `sparql_from_rejects_reserved_system_graphs`, added by
+/// `8d8870ba1` in PR #1462 as a review finding. That commit applied
+/// `single_db_user_graph_id`'s `>= FIRST_USER_GRAPH_ID` ENUMERATION filter to
+/// this ADDRESSING surface. The connection path — which resolves a `FROM`
+/// source through `db()`/`parse_graph_ref` — never had the filter, so the same
+/// IRI resolved on one surface and was refused on the other. The negative half
+/// is `sparql_reserved_graphs_stay_unreachable_when_not_named_in_full`.
 #[tokio::test]
-async fn sparql_from_rejects_reserved_system_graphs() {
+async fn sparql_from_admits_this_ledgers_reserved_graphs_by_full_iri() {
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_within_ledger_dataset(&fluree, "wl-reserved:main").await;
     let config_iri = fluree_db_core::config_graph_iri("wl-reserved:main");
     let txn_meta_iri = fluree_db_core::txn_meta_graph_iri("wl-reserved:main");
 
-    for (clause, iri) in [
-        ("FROM", config_iri.as_str()),
-        ("FROM", txn_meta_iri.as_str()),
-        ("FROM NAMED", config_iri.as_str()),
-        ("FROM NAMED", txn_meta_iri.as_str()),
+    // Put a marker in the config graph so a hit is distinguishable from the
+    // default graph's Alice and <urn:g1>'s Bob.
+    let trig = format!(
+        r#"@prefix schema: <http://schema.org/> .
+           @prefix f: <https://ns.flur.ee/db#> .
+           @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+           GRAPH <{config_iri}> {{
+               <urn:config:main> rdf:type f:LedgerConfig .
+               <urn:config:main> schema:name "CONFIG-MARKER" .
+           }}"#
+    );
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write")
+        .ledger;
+
+    for clause in ["FROM", "FROM NAMED"] {
+        for iri in [config_iri.as_str(), txn_meta_iri.as_str()] {
+            let sparql = format!(
+                "PREFIX schema: <http://schema.org/> \
+                 SELECT ?s {clause} <{iri}> WHERE {{ ?s ?p ?o }}"
+            );
+            support::query_sparql(&fluree, &ledger, &sparql)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{clause} <{iri}> must resolve within this ledger, got: {e}")
+                });
+        }
+    }
+
+    // ...and `FROM <#config>` actually scopes the default graph to the config
+    // graph, rather than resolving to something empty that would pass above.
+    let sparql = format!(
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?n FROM <{config_iri}> WHERE {{ ?s schema:name ?n }}"
+    );
+    let rows = support::query_sparql(&fluree, &ledger, &sparql)
+        .await
+        .expect("FROM <#config>")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["CONFIG-MARKER"]])),
+        "FROM <#config> must scope the default graph to the config graph"
+    );
+
+    // An explicit FROM NAMED makes the reserved graph addressable by
+    // `GRAPH <iri>` — the dataset's named set, not enumeration.
+    let sparql = format!(
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?n FROM NAMED <{config_iri}> \
+         WHERE {{ GRAPH <{config_iri}> {{ ?s schema:name ?n }} }}"
+    );
+    let rows = support::query_sparql(&fluree, &ledger, &sparql)
+        .await
+        .expect("FROM NAMED + GRAPH <#config>")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["CONFIG-MARKER"]])),
+        "an explicitly-named reserved graph must be addressable via GRAPH <iri>"
+    );
+}
+
+/// **Reserved-graph access contract — the negative half.**
+///
+/// This is what keeps the enumeration decision of `cf1c74291` (PR #1292)
+/// honest. Admitting a fully-spelled reserved IRI must open NOTHING else:
+///
+/// - a bare or relative fragment name is not the graph's IRI;
+/// - another ledger's reserved IRI is not in this ledger;
+/// - `GRAPH <iri>` with no `FROM NAMED` still does not reach it;
+/// - `GRAPH ?g` still does not enumerate it.
+#[tokio::test]
+async fn sparql_reserved_graphs_stay_unreachable_when_not_named_in_full() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_within_ledger_dataset(&fluree, "wl-reserved-neg:main").await;
+    let config_iri = fluree_db_core::config_graph_iri("wl-reserved-neg:main");
+    let txn_meta_iri = fluree_db_core::txn_meta_graph_iri("wl-reserved-neg:main");
+
+    // 1. Bare / relative / foreign spellings are refused by FROM.
+    let foreign_config = fluree_db_core::config_graph_iri("some-other:main");
+    for iri in [
+        "config",
+        "#config",
+        "txn-meta",
+        "#txn-meta",
+        foreign_config.as_str(),
     ] {
         let sparql = format!(
             "PREFIX schema: <http://schema.org/> \
-             SELECT ?s {clause} <{iri}> WHERE {{ ?s ?p ?o }}"
+             SELECT ?s FROM <{iri}> WHERE {{ ?s ?p ?o }}"
         );
         let err = support::query_sparql(&fluree, &ledger, &sparql)
             .await
-            .expect_err(&format!("{clause} <{iri}> must be rejected"));
+            .expect_err(&format!("FROM <{iri}> must be rejected"));
         assert!(
             err.to_string().contains("not in this ledger"),
-            "expected the within-ledger rejection for {clause} <{iri}>, got: {err}"
+            "expected the within-ledger rejection for FROM <{iri}>, got: {err}"
         );
     }
+
+    // 2. `GRAPH <reserved>` with no FROM NAMED resolves to nothing. The
+    //    reserved graphs hold data here (txn-meta always does), so an empty
+    //    result is the block, not an artifact of an empty graph.
+    for iri in [config_iri.as_str(), txn_meta_iri.as_str()] {
+        let sparql = format!("SELECT ?s WHERE {{ GRAPH <{iri}> {{ ?s ?p ?o }} }}");
+        let rows = support::query_sparql(&fluree, &ledger, &sparql)
+            .await
+            .unwrap_or_else(|e| panic!("GRAPH <{iri}> should not error, got: {e}"))
+            .to_jsonld(&ledger.snapshot)
+            .expect("to_jsonld");
+        assert_eq!(
+            normalize_rows(&rows),
+            Vec::<serde_json::Value>::new(),
+            "GRAPH <{iri}> with no FROM NAMED must not reach the reserved graph"
+        );
+    }
+
+    // 3. `GRAPH ?g` enumerates user graphs only — P15, the canonical check
+    //    that nothing deliberately closed was opened as a side effect.
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } } ORDER BY ?g",
+    )
+    .await
+    .expect("GRAPH ?g")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["urn:g1"], ["urn:g2"]])),
+        "GRAPH ?g must enumerate user graphs only, never the reserved graphs"
+    );
 }
 
 /// §13.2: the dataset default graph is a SET — `FROM <g> FROM <g>` (the same
