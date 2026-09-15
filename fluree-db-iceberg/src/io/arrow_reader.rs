@@ -22,8 +22,9 @@ use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
     FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int16Array, Int32Array,
     Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, Scalar, StringArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    Time32MillisecondArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
+    UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::compute::filter_record_batch;
 use arrow::compute::kernels::{boolean::and, cast::cast, cmp};
@@ -330,6 +331,14 @@ fn arrow_column_to_values(
             ))
         }
         DataType::Date32 => column!(Date32Array, ColumnValue::Date),
+        DataType::Time32(TimeUnit::Millisecond) => {
+            column!(Time32MillisecondArray, |v| ColumnValue::Int64(
+                i64::from(v) * 1000
+            ))
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            column!(Time64MicrosecondArray, ColumnValue::Int64)
+        }
         DataType::Date64 => column!(Date64Array, |ms| ColumnValue::Date(
             (ms / 86_400_000) as i32
         )),
@@ -537,6 +546,18 @@ fn eval_comparison(
     op: &ComparisonOp,
     value: &LiteralValue,
 ) -> std::result::Result<BooleanArray, ArrowError> {
+    // Our tabular time representation is an integer count of microseconds.
+    // Normalize the column before comparison so a microsecond literal is never
+    // interpreted as milliseconds by an Arrow cast to Time32.
+    let normalized_time = match column.data_type() {
+        DataType::Time32(TimeUnit::Millisecond) => Some(cast(
+            &cast(column, &DataType::Time64(TimeUnit::Microsecond))?,
+            &DataType::Int64,
+        )?),
+        DataType::Time64(TimeUnit::Microsecond) => Some(cast(column, &DataType::Int64)?),
+        _ => None,
+    };
+    let column = normalized_time.as_ref().unwrap_or(column);
     let literal = literal_to_array(value);
     let casted = match cast(&literal, column.data_type()) {
         Ok(c) => c,
@@ -586,6 +607,134 @@ fn literal_to_array(value: &LiteralValue) -> ArrayRef {
 #[cfg(test)]
 mod direct_decode_tests {
     use super::*;
+
+    /// Exercise the production decoder with compressed, delta-packed integer
+    /// pages. Millisecond time values must be normalized before BOTH filtering
+    /// and conversion; comparing raw millisecond statistics to a microsecond
+    /// literal would incorrectly discard the matching row groups.
+    #[test]
+    fn compressed_time_columns_filter_in_microseconds() {
+        use arrow::datatypes::{Field, Schema as ArrowSchema};
+        use bytes::Bytes;
+        use parquet::arrow::ArrowWriter;
+        use parquet::basic::{Compression, Encoding, GzipLevel, ZstdLevel};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+
+        let times: Vec<ArrayRef> = vec![
+            Arc::new(Time32MillisecondArray::from(vec![
+                Some(500),
+                None,
+                Some(1500),
+                Some(2500),
+                Some(3500),
+            ])),
+            Arc::new(Time64MicrosecondArray::from(vec![
+                Some(500_000),
+                None,
+                Some(1_500_000),
+                Some(2_500_000),
+                Some(3_500_000),
+            ])),
+        ];
+        for compression in [
+            Compression::GZIP(GzipLevel::default()),
+            Compression::SNAPPY,
+            Compression::ZSTD(ZstdLevel::default()),
+        ] {
+            for time in &times {
+                let schema = Arc::new(ArrowSchema::new(vec![
+                    Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                        "PARQUET:field_id".to_owned(),
+                        "42".to_owned(),
+                    )])),
+                    Field::new("time", time.data_type().clone(), true).with_metadata(
+                        HashMap::from([("PARQUET:field_id".to_owned(), "87".to_owned())]),
+                    ),
+                ]));
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+                        time.clone(),
+                    ],
+                )
+                .unwrap();
+                let props = WriterProperties::builder()
+                    .set_compression(compression)
+                    .set_dictionary_enabled(false)
+                    .set_encoding(Encoding::DELTA_BINARY_PACKED)
+                    .set_max_row_group_row_count(Some(2))
+                    .build();
+                let mut buf = Vec::new();
+                let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+                writer.write(&batch).unwrap();
+                writer.close().unwrap();
+                let bytes = Bytes::from(buf);
+                let reader = SerializedFileReader::new(bytes.clone()).unwrap();
+                assert_eq!(reader.metadata().num_row_groups(), 3);
+                assert_eq!(
+                    reader.metadata().row_group(0).column(1).compression(),
+                    compression
+                );
+                let row_times: Vec<_> = reader
+                    .get_row_iter(None)
+                    .unwrap()
+                    .map(|row| {
+                        let row = row.unwrap();
+                        let field = row.get_column_iter().nth(1).unwrap().1;
+                        match crate::io::parquet::convert_field_to_column_value(
+                            field,
+                            &FieldType::Int64,
+                        ) {
+                            Some(ColumnValue::Int64(value)) => Some(value),
+                            None => None,
+                            other => panic!("unexpected time value: {other:?}"),
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    row_times,
+                    vec![
+                        Some(500_000),
+                        None,
+                        Some(1_500_000),
+                        Some(2_500_000),
+                        Some(3_500_000)
+                    ]
+                );
+
+                let filter = Expression::Comparison {
+                    field_id: 87,
+                    column: "time".to_owned(),
+                    op: ComparisonOp::GtEq,
+                    value: LiteralValue::Int64(1_750_000),
+                };
+                let batches =
+                    decode_batches_arrow(bytes, &[42, 87], Some(&filter), None, None, None)
+                        .unwrap();
+                let mut actual = Vec::new();
+                for batch in batches {
+                    assert_eq!(
+                        batch.schema.field_by_id(87).unwrap().field_type,
+                        FieldType::Int64
+                    );
+                    for row in 0..batch.num_rows {
+                        actual.push((
+                            batch.column_by_id(42).unwrap().get_i64(row),
+                            batch.column_by_id(87).unwrap().get_i64(row),
+                        ));
+                    }
+                }
+                assert_eq!(
+                    actual,
+                    vec![(Some(4), Some(2_500_000)), (Some(5), Some(3_500_000))],
+                    "{compression:?} / {:?}",
+                    time.data_type()
+                );
+            }
+        }
+    }
 
     /// N2 differential: the direct Arrow->Column decoder must produce a `Column`
     /// value-identical to the two-hop `arrow_column_to_values` +
