@@ -5,6 +5,24 @@ with explicit expected rows. It does not register a Fluree graph source or chang
 the server/CLI dependency graph. Python tools and the Rust probe have separate
 lockfiles. Run commands below from the repository root.
 
+## Prepare the storage compatibility patch
+
+Before running Cargo, prepare the isolated dependency (Python 3 and `patch`
+required):
+
+```sh
+python3 scripts/delta-spike/prepare_storage.py
+```
+
+This downloads the published `object_store` 0.13.2 source archive, checks its
+SHA-256 against the published checksum pinned in the script, and applies
+`patches/object_store-0.13.2-reqwest013.patch` under ignored `.patched/`.
+For offline preparation, pass `--archive /path/to/object_store-0.13.2.crate`.
+Repeated preparation verifies the generated source and refuses to overwrite
+changes. The archive's Apache license and NOTICE are retained. Generated source
+is not committed; the tracked script, patch, and experiment lockfile reproduce
+it. The root workspace has no dependency patch.
+
 ## Generate and read locally
 
 Requirements: the repository's Rust toolchain, `uv`, and Python 3.12 (uv can
@@ -77,16 +95,81 @@ evidence; customer-produced tables are still needed.
 
 | Candidate | Observed dependency considerations |
 | --- | --- |
-| Kernel 0.28.0 + default engine | Probe selects Arrow/Parquet 58.4; the release also supports Arrow 59. Its `object_store` 0.13.2 dependency brings reqwest 0.12, alongside the engine's reqwest 0.13. Arrow features also enable multiple cloud backends. |
+| Kernel 0.28.0 + default engine | Probe selects Arrow/Parquet 58.4; the release also supports Arrow 59. The published `object_store` 0.13.2 brings reqwest 0.12 alongside the engine's reqwest 0.13. The compatibility patch below removes that duplicate in this experiment. Arrow features still enable multiple cloud backends. |
 | Delta-rs Rust 0.32.4 (manifest inspection; Rust API not built here) | Arrow/Parquet 58, `object_store` 0.13.2, and the `buoyant_kernel` 0.22 family. DataFusion 53.1 is optional in the core crate; the Python wheel's contents do not establish production Rust binary size. |
-| Fluree production workspace | Now aligned to Arrow/Parquet 58.4, with unified reqwest 0.13. Kernel's older storage/HTTP dependency still needs resolution before adoption. |
+| Fluree production workspace | Aligned to Arrow/Parquet 58.4 and unified reqwest 0.13. A tested experimental storage backport now exists; production packaging and maintenance remain to be resolved. |
 
 Kernel's logical scan API remains a promising fit for Fluree's existing query
-engine. Arrow/Parquet alignment is complete. Before integrating it, resolve the
-storage/HTTP dependencies: an upstream-compatible change or a custom engine needs evaluation.
-Measure the chosen production configuration after that decision. This standalone
-probe intentionally permits duplicate HTTP versions to expose the issue without
-adding them to the product build.
+engine. Arrow/Parquet alignment is complete. The isolated compatibility backport
+also unifies its HTTP dependencies without replacing Kernel's logical reader.
+Measure the chosen production configuration after deciding how to maintain and
+distribute the storage change.
+
+## Storage/HTTP compatibility result
+
+Rechecked on 2026-09-14: the latest released Kernel remains 0.28.0, and its
+Arrow features select `object_store` 0.13. The inspected main revision
+`03c39a6ecd7f0af24f6cd338c10a9d0aff16ca84` still does so. Parquet 58.4's object-store
+integration also uses 0.13, so upgrading only Kernel to object_store 0.14 would
+not align the types. Released object_store 0.14.1 uses reqwest 0.13 but includes
+broader API changes.
+
+The experiment instead backports the HTTP changes to object_store 0.13.2:
+
+- Use reqwest 0.13's Rustls/platform verifier and `tls_certs_merge` for custom
+  roots and proxy CA configuration. Platform verification replaces the previous
+  native-root-loading path; this is a TLS behavior change that needs target testing.
+- Preserve the optional `tls-webpki-roots` feature by merging bundled DER roots
+  from `webpki-root-certs` into platform trust. Enable the probe's `bundled-roots`
+  feature to exercise this configuration.
+- Retain the 0.13 storage and credential-provider APIs, signing implementation,
+  and Kernel/Parquet scan path. No custom Delta engine or new Azure SDK is added.
+
+The experiment's lockfile now has **one reqwest version, 0.13.5**, and one
+Arrow/Parquet stack, 58.4.0. Removing a duplicate dependency does not establish a
+binary-size saving; no production Delta artifact has been measured yet. Kernel
+still enables AWS, Azure, GCP, and HTTP backends, and signing still uses `ring`.
+
+Validation on aarch64 macOS:
+
+- Upstream object_store library suite with AWS/Azure/GCP/HTTP and bundled roots:
+  **184 passed, four ignored**. These tests do not establish live Azure access.
+- Local transport regressions check encoded object lengths/bytes, exact HTTP
+  ranges even with reqwest gzip enabled, rejection of an untrusted CA, successful
+  custom-CA trust, and rejection of a hostname mismatch.
+- The preparation tests cover repeatability, changed-source preservation,
+  checksum rejection, archive traversal, and symlink rejection.
+- Both retained Delta fixture suites pass locally and on S3 through the patched
+  reader: basic six snapshots/18 scans, advanced seven snapshots/22 scans plus
+  the expected missing-data failure. Eight native tests pass in each root
+  configuration, four preparation tests pass, and all-feature/all-target Clippy
+  passes. Azure credentials/renewal, HTTPS proxy handshakes, other operating
+  systems, and customer tables remain unverified.
+
+```sh
+python3 -m unittest discover -s scripts/delta-spike -p test_prepare_storage.py
+cargo test --locked --manifest-path scripts/delta-spike/Cargo.toml
+cargo test --locked --manifest-path scripts/delta-spike/Cargo.toml --features bundled-roots
+cargo tree --locked --manifest-path scripts/delta-spike/Cargo.toml -i reqwest
+CARGO_TARGET_DIR="$PWD/scripts/delta-spike/target" cargo test \
+  --manifest-path scripts/delta-spike/.patched/object_store-0.13.2/Cargo.toml \
+  --lib --features aws,azure,gcp,http,tls-webpki-roots
+```
+
+The last command tests the upstream package in its own workspace; its dev-only
+lockfile may be regenerated and is excluded from preparation verification.
+The spike itself builds with its tracked lockfile. Test-only certificate and
+TLS-server libraries are confined to the standalone experiment.
+
+Before production integration, select a maintained pinned fork/vendor package
+or an upstream compatible release, preserve attribution, and rerun the provider
+and table suites on supported targets. Avoid a generated, untracked source-path
+requirement in the product build. The backport is a feasible integration path,
+not an upstream release or a completed Azure implementation.
+
+References: [upstream reqwest/crypto migration](https://github.com/apache/arrow-rs-object-store/commit/996e084600a4adc7e14cf34d332d3cb0972547b4),
+[inspected Kernel main manifest](https://github.com/delta-io/delta-kernel-rs/blob/03c39a6ecd7f0af24f6cd338c10a9d0aff16ca84/kernel/Cargo.toml),
+[Parquet 58.4 manifest](https://github.com/apache/arrow-rs/blob/58.4.0/parquet/Cargo.toml).
 
 Still required: timestamp selection, expired-log/checkpoint failures, broader
 type/schema evolution, graph-source
@@ -151,7 +234,7 @@ minimum reader version 2. This describes the **tested Python read path**, not
 every delta-rs Rust API. Never bypass those guards with raw Parquet reads.
 
 These results favor Kernel's logical scan API for the next integration spike.
-Dependency alignment is still required. Correction to the initial timestamp
+Production storage packaging is still required. Correction to the initial timestamp
 assessment: Kernel 0.28 provides `history_manager::latest_version_as_of`, in
 addition to the builder's `at_version` and snapshot's `get_timestamp`. Use that
 existing resolver when wiring timestamp selection; do not implement log-history
@@ -207,9 +290,8 @@ The subsequent Iceberg upgrade aligns its Arrow/Parquet dependencies to the same
 58.4 release, removing the earlier 54/58 version mismatch.
 
 Production Iceberg now passes its scan and API regressions on Arrow/Parquet 58.4.
-Representative performance checks remain outstanding. Resolve Kernel's pinned
-`object_store` 0.13 / reqwest 0.12 dependency through an upstream-compatible
-engine/dependency change. A storage wrapper alone does not remove dependencies
+Representative performance checks remain outstanding. The storage backport
+above resolves Kernel's reqwest duplication within the experiment. A storage wrapper alone does not remove dependencies
 enabled by Kernel's Cargo features; a custom engine also owns JSON/Parquet and
 expression behavior and needs the full fixture suite. The root workspace now
 uses Arrow/Parquet 58.4, but Kernel and object_store remain confined to this

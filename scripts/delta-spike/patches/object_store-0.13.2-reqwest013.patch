@@ -1,0 +1,60 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -82 +82 @@
+-tls-webpki-roots = ["reqwest?/rustls-tls-webpki-roots"]
++tls-webpki-roots = ["dep:webpki-root-certs"]
+@@ -174,3 +174,3 @@
+-version = "0.12"
+-features = [
+-    "rustls-tls-native-roots",
++version = "0.13"
++features = [
++    "rustls",
+@@ -180,0 +181,4 @@
++
++[dependencies.webpki-root-certs]
++version = "1"
++optional = true
+@@ -267 +271 @@
+-version = "0.12"
++version = "0.13"
+@@ -289,0 +294,4 @@
++
++# Keep the compatibility test package independent of the Fluree workspace.
++[workspace]
++resolver = "3"
+--- a/Cargo.toml.orig
++++ b/Cargo.toml.orig
+@@ -57 +57,2 @@
+-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "http2"], optional = true }
++reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"], optional = true }
++webpki-root-certs = { version = "1", optional = true }
+@@ -84 +85 @@
+-tls-webpki-roots = ["reqwest?/rustls-tls-webpki-roots"]
++tls-webpki-roots = ["dep:webpki-root-certs"]
+@@ -96 +97 @@
+-reqwest = { version = "0.12", default-features = false, features = ["gzip"] }
++reqwest = { version = "0.13", default-features = false, features = ["gzip"] }
+@@ -119,0 +121,4 @@
++
++# Keep the compatibility test package independent of the Fluree workspace.
++[workspace]
++resolver = "3"
+--- a/src/client/mod.rs
++++ b/src/client/mod.rs
+@@ -766 +766 @@
+-                builder = builder.add_root_certificate(certificate);
++                builder = builder.tls_certs_merge(std::iter::once(certificate));
+@@ -779 +779,11 @@
+-            builder = builder.add_root_certificate(certificate.0.clone());
++            builder = builder.tls_certs_merge(std::iter::once(certificate.0.clone()));
++        }
++
++        // Preserve the opt-in bundled roots alongside the platform trust store.
++        #[cfg(feature = "tls-webpki-roots")]
++        {
++            let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
++                .iter()
++                .map(|der| reqwest::tls::Certificate::from_der(der.as_ref()).map_err(map_client_error))
++                .collect::<Result<Vec<_>>>()?;
++            builder = builder.tls_certs_merge(roots);
