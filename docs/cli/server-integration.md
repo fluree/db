@@ -918,9 +918,11 @@ These rules are not negotiable; the CLI and other clients depend on them:
 11. **Aggregate change set.** When `include_changes == true`, populate
    `changes` with the source side's `ancestor..source_head` flakes **netted
    per fact** — full fact identity is `(subject, predicate, object,
-   datatype, graph, language tag, list index)`; a fact survives only when
-   its oldest and newest in-range ops agree (net op = newest op), so
-   create-then-delete and delete-then-restore churn never appears. The set
+   datatype, graph, language tag, list index)`; each touched fact keeps its
+   **newest** in-range op, which is its state at the source head and what
+   the merge applies. Do not drop facts whose ops differ across the range:
+   a range that re-asserts a value it inherited and then deletes it must
+   report the deletion. The set
    is strategy-independent (raw source-vs-ancestor delta, before conflict
    resolution). `assert_count` / `retract_count` / `subject_count` are
    exact and unaffected by the cap. `entries` groups changes by subject,

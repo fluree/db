@@ -29,7 +29,7 @@ fluree branch drop experiment
 
 - **Branches are isolated** — Transactions on one branch are invisible to others
 - **Branches are cheap** — Creating a branch doesn't copy data; it creates a new commit pointer
-- **Merge is fast-forward** — The target branch must not have diverged. If it has, rebase first
+- **Merge takes two shapes** — If the target hasn't advanced since the fork, the merge fast-forwards and the source's commits become the target's line. If it has, the merge folds the source's changes into one commit on the target, resolving overlapping edits by `--strategy`
 - **Source branch survives merge** — After merging, the branch can continue receiving transactions
 
 ## Patterns
@@ -213,7 +213,7 @@ Each branch has its own transaction history. Query any branch at any point in ti
 fluree query --ledger mydb:experiment --at 3 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
 ```
 
-Each branch numbers its transactions on its own clock, starting from the point where it forked, so `--at 3` on `experiment` and `--at 3` on `main` are unrelated states. A merge lands on the target as a single commit at the target's next transaction number, carrying the whole resolved change from the source. Reads below that number return what the target held at the time: merging never rewrites a branch's earlier history, and a branch's state at any `--at` is the fold of its own line of commits, not of the branches merged into it.
+Each branch numbers its transactions on its own clock, starting from the point where it forked, so `--at 3` on `experiment` and `--at 3` on `main` are unrelated states. A merge lands on the target as a single commit at the target's next transaction number, carrying the whole resolved change from the source, or, for a fast-forward, the source's commits simply become the target's line with their `t` values already on the target's clock. Reads below that number return what the target held at the time: merging never rewrites a branch's earlier history, and a branch's state at any `--at` is the fold of its own line of commits, not of the branches merged into it.
 
 ### Branch at a historical point
 

@@ -936,6 +936,15 @@ fn print_revert_preview_json(result: &serde_json::Value, as_json: bool) -> CliRe
 }
 
 fn print_revert_report_local(report: &fluree_db_api::RevertReport) {
+    if !report.wrote_commit {
+        println!(
+            "Nothing to revert on '{}': the {} commit(s) selected have no net effect, so HEAD stays at t={}.",
+            report.branch,
+            report.reverted_commits.len(),
+            report.new_head_t,
+        );
+        return;
+    }
     println!(
         "Reverted {} commit(s) on '{}' (t={}, {} conflicts, strategy={}).",
         report.reverted_commits.len(),
@@ -968,6 +977,17 @@ fn print_revert_result(result: &serde_json::Value) -> CliResult<()> {
         .and_then(serde_json::Value::as_array)
         .map_or(0, Vec::len);
 
+    // Older servers omit the field; they only ever reported written commits.
+    let wrote_commit = result
+        .get("wrote_commit")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if !wrote_commit {
+        println!(
+            "Nothing to revert on '{branch}': the {reverted_count} commit(s) selected have no net effect, so HEAD stays at t={new_t}.",
+        );
+        return Ok(());
+    }
     println!(
         "Reverted {reverted_count} commit(s) on '{branch}' (t={new_t}, {conflict_count} conflicts, strategy={strategy}).",
     );

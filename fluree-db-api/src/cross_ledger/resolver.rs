@@ -234,7 +234,7 @@ async fn materialize(
                 canonical_ledger_id,
                 graph_iri,
                 resolved_t,
-                ctx.fluree,
+                ctx,
             )
             .await?;
             Ok(ResolvedGraph {
@@ -249,7 +249,7 @@ async fn materialize(
                 canonical_ledger_id,
                 graph_iri,
                 resolved_t,
-                ctx.fluree,
+                ctx,
             )
             .await?;
             Ok(ResolvedGraph {
@@ -264,7 +264,7 @@ async fn materialize(
                 canonical_ledger_id,
                 graph_iri,
                 resolved_t,
-                ctx.fluree,
+                ctx,
             )
             .await?;
             Ok(ResolvedGraph {
@@ -279,7 +279,7 @@ async fn materialize(
                 canonical_ledger_id,
                 graph_iri,
                 resolved_t,
-                ctx.fluree,
+                ctx,
             )
             .await?;
             Ok(ResolvedGraph {
@@ -294,7 +294,7 @@ async fn materialize(
                 canonical_ledger_id,
                 graph_iri,
                 resolved_t,
-                ctx.fluree,
+                ctx,
             )
             .await?;
             Ok(ResolvedGraph {

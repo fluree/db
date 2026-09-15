@@ -29,6 +29,8 @@ pub struct ConfigReasoningBudget {
     pub max_facts: Option<u64>,
     /// `f:reasoningMaxSeconds` — max materialization wall-clock seconds.
     pub max_seconds: Option<u64>,
+    /// `f:reasoningMaxMemoryMb` — max megabytes of derived facts.
+    pub max_memory_mb: Option<u64>,
     /// Whether these values override a query-supplied budget.
     pub force: bool,
 }
@@ -39,9 +41,11 @@ impl ConfigReasoningBudget {
         if self.force {
             modes.max_facts = self.max_facts;
             modes.max_seconds = self.max_seconds;
+            modes.max_memory_mb = self.max_memory_mb;
         } else {
             modes.max_facts = modes.max_facts.or(self.max_facts);
             modes.max_seconds = modes.max_seconds.or(self.max_seconds);
+            modes.max_memory_mb = modes.max_memory_mb.or(self.max_memory_mb);
         }
     }
 }

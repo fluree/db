@@ -283,8 +283,18 @@ async fn repro_upsert_repeated_ids_create_duplicate_subject_ids() {
                 assert_eq!(encoded_ids, vec![persisted_id]);
             }
 
-            // Avoid unused warning for the transact result (we still want the commit to occur).
-            assert!(r2.receipt.t >= 2);
+            // Re-applying an identical payload is now a no-op, which is a
+            // stronger result than this test originally checked. Upsert's
+            // assertion side has set semantics, so a payload that states one
+            // fact many times (this one repeats each `@id`) contributes one
+            // assertion rather than many, and its blank-node skolem scope is
+            // derived from the payload rather than freshly per transaction.
+            // Everything therefore cancels against the upsert wave's single
+            // retraction, and there is no surplus delta left to commit.
+            assert_eq!(
+                r2.receipt.t, 1,
+                "an identical re-upsert must not produce a commit"
+            );
         })
         .await;
 }

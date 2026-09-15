@@ -32,8 +32,9 @@
 //!   subject reverse tree: `[ns_code BE 2 bytes][suffix UTF-8 bytes]`.
 //! - Watermark vector covers `0..max_ns_code+1`. `watermark_for_ns(code)`
 //!   returns 0 for any code beyond the vector length.
-//! - `NS_OVERFLOW (0xFFFF)` uses dedicated scalar fields to avoid resizing
-//!   per-namespace vectors to 65536 entries.
+//! - `NS_OVERFLOW` (0xFFFF) was meant to use dedicated scalar fields, but the
+//!   real overflow namespace is `namespaces::OVERFLOW` (0xFFFE), which takes
+//!   the ordinary per-namespace path, as in the indexer (#1843).
 //! - `initialized` must be true before any commit on a non-genesis ledger.
 //!   `ensure_initialized()` panics unconditionally (debug and release).
 
@@ -43,8 +44,8 @@ use crate::ns_vec_bi_dict::{lookup_key, NsVecBiDict};
 use crate::vec_bi_dict::VecBiDict;
 use crate::{Flake, FlakeValue};
 
-/// Namespace code reserved for overflow subjects (full IRI as suffix).
-/// Never stored in watermark vectors; always treated as novel.
+/// Does not match `namespaces::OVERFLOW` (0xFFFE); no production path assigns this
+/// code, so the special case below is never taken (#1843).
 const NS_OVERFLOW: u16 = 0xFFFF;
 
 // ---------------------------------------------------------------------------
@@ -109,11 +110,9 @@ impl DictNovelty {
     /// `subject_wm[i]` = max persisted `local_id` for namespace code `i`.
     /// `string_wm` = max persisted `string_id`.
     ///
-    /// If the watermarks vector is long enough to include `NS_OVERFLOW`
-    /// (index 0xFFFF), the overflow entry is extracted to a dedicated scalar
-    /// and the vector is truncated.  In practice watermarks vectors are
-    /// short (only non-zero namespace codes up to the max assigned code),
-    /// so this branch is rarely taken.
+    /// The `NS_OVERFLOW` extraction below is unreachable: the index root
+    /// stores the watermark count as a `u16`, so index 0xFFFF never exists
+    /// (#1843).
     pub fn with_watermarks(subject_wm: Vec<u64>, string_wm: u32) -> Self {
         // Extract overflow watermark if present, and trim vec.
         let overflow_idx = NS_OVERFLOW as usize;
@@ -137,6 +136,42 @@ impl DictNovelty {
             },
             initialized: true,
         }
+    }
+
+    /// Drop every entry introduced at or before commit `t` and move the
+    /// persisted watermarks up to a newer index root's — what an index
+    /// publish covering `t` does to the dictionary novelty instead of
+    /// rebuilding it from the remaining flakes.
+    ///
+    /// Sound because a flake that remains (t > index `t`) can only name an
+    /// entry introduced at or before `t` if the index persisted it, and an
+    /// entry introduced after `t` is not in the index. The kept entries are
+    /// renumbered contiguously above the new watermarks, which is the only
+    /// invariant their ids carry. `None` (and no change) on an
+    /// uninitialized or layered dictionary. Returns `(subjects, strings)`
+    /// dropped.
+    pub fn retire_seen_through(
+        &mut self,
+        t: i64,
+        subject_wm: &[u64],
+        string_wm: u32,
+    ) -> Option<(usize, usize)> {
+        if !self.initialized || self.subjects.parent.is_some() || self.strings.parent.is_some() {
+            return None;
+        }
+        let overflow_idx = NS_OVERFLOW as usize;
+        let (trimmed_wm, overflow_wm) = if subject_wm.len() > overflow_idx {
+            (&subject_wm[..overflow_idx], subject_wm[overflow_idx])
+        } else {
+            (subject_wm, 0)
+        };
+        let subjects = self
+            .subjects
+            .inner
+            .retire_seen_through(t, trimmed_wm, overflow_wm);
+        let strings = self.strings.inner.retire_seen_through(t, string_wm + 1);
+        self.strings.watermark = string_wm;
+        Some((subjects, strings))
     }
 
     /// An empty delta over `parent` (see the module doc on layers).
@@ -195,18 +230,18 @@ impl DictNovelty {
         for flake in flakes {
             // Subject
             self.subjects
-                .assign_or_lookup(flake.s.namespace_code, &flake.s.name);
+                .assign_or_lookup_at(flake.s.namespace_code, &flake.s.name, flake.t);
 
             // Object references
             if let FlakeValue::Ref(ref sid) = flake.o {
                 self.subjects
-                    .assign_or_lookup(sid.namespace_code, &sid.name);
+                    .assign_or_lookup_at(sid.namespace_code, &sid.name, flake.t);
             }
 
             // String values
             match &flake.o {
                 FlakeValue::String(s) | FlakeValue::Json(s) => {
-                    self.strings.assign_or_lookup(s);
+                    self.strings.assign_or_lookup_at(s, flake.t);
                 }
                 _ => {}
             }
@@ -249,11 +284,22 @@ impl SubjectDictNovelty {
     /// Otherwise allocates a new sid64 with the next local_id for this
     /// namespace.
     pub fn assign_or_lookup(&mut self, ns_code: u16, suffix: &str) -> u64 {
+        self.assign_or_lookup_at(ns_code, suffix, i64::MAX)
+    }
+
+    /// [`Self::assign_or_lookup`] recording the commit `t` that introduces
+    /// a new entry, so an index publish covering `t` can retire it.
+    pub fn assign_or_lookup_at(&mut self, ns_code: u16, suffix: &str, t: i64) -> u64 {
         let key = lookup_key(ns_code, suffix);
         if let Some(id) = self.find_by_key(&key) {
+            // An entry of this layer keeps the earliest t it is seen at; a
+            // parent's entry is the parent's to date.
+            if self.inner.find_by_key(&key).is_some() {
+                self.inner.note_seen_at(id, t);
+            }
             return id;
         }
-        self.inner.insert_new(ns_code, suffix, key)
+        self.inner.insert_new_at(ns_code, suffix, key, t)
     }
 
     /// Reverse lookup: find sid64 by `(ns_code, suffix)`.
@@ -364,10 +410,20 @@ impl Default for StringDictNovelty {
 impl StringDictNovelty {
     /// Look up or assign a string_id for `value`, here or in a parent.
     pub fn assign_or_lookup(&mut self, value: &str) -> u32 {
+        self.assign_or_lookup_at(value, i64::MAX)
+    }
+
+    /// [`Self::assign_or_lookup`] recording the commit `t` that introduces
+    /// a new entry, so an index publish covering `t` can retire it.
+    pub fn assign_or_lookup_at(&mut self, value: &str, t: i64) -> u32 {
         if let Some(id) = self.find_string(value) {
+            if self.inner.find(value).is_some() {
+                // Keeps the earliest t this layer has seen the entry at.
+                self.inner.assign_or_lookup_at(value, t);
+            }
             return id;
         }
-        self.inner.assign_or_lookup(value)
+        self.inner.assign_or_lookup_at(value, t)
     }
 
     /// Reverse lookup: find string_id by value.
@@ -831,5 +887,34 @@ mod tests {
         assert_eq!(dn.strings.len(), 1);
         assert!(!dn.subjects.is_empty());
         assert!(!dn.strings.is_empty());
+    }
+
+    /// A publish covering `t` drops what commits through `t` introduced,
+    /// renumbers the rest above the new watermarks, and refuses a layer.
+    #[test]
+    fn retire_seen_through_drops_by_commit() {
+        let mut d = DictNovelty::with_watermarks(vec![0, 3], 2);
+        d.subjects.assign_or_lookup_at(1, "t1-a", 1);
+        d.subjects.assign_or_lookup_at(1, "t2-b", 2);
+        d.strings.assign_or_lookup_at("t1-x", 1);
+        d.strings.assign_or_lookup_at("t2-y", 2);
+
+        let (subjects, strings) = d.retire_seen_through(1, &[0, 9], 7).unwrap();
+        assert_eq!((subjects, strings), (1, 1));
+        assert_eq!(d.subjects.find_subject(1, "t1-a"), None);
+        let b = d.subjects.find_subject(1, "t2-b").unwrap();
+        assert_eq!(SubjectId::from_u64(b).local_id(), 10);
+        assert_eq!(d.subjects.resolve_subject(b), Some((1, "t2-b")));
+        assert_eq!(d.strings.find_string("t1-x"), None);
+        assert_eq!(d.strings.find_string("t2-y"), Some(8));
+        assert_eq!(d.strings.resolve_string(8), Some("t2-y"));
+        assert_eq!(d.strings.watermark(), 7);
+        assert_eq!(d.subjects.watermark_for_ns(1), 9);
+
+        let mut layer = DictNovelty::layered_over(Arc::new(d));
+        assert!(
+            layer.retire_seen_through(5, &[0, 9], 7).is_none(),
+            "a layer never retires"
+        );
     }
 }

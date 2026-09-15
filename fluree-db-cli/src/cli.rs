@@ -156,6 +156,9 @@ impl PolicyArgs {
             },
             policy: self.resolve_policy()?,
             policy_values: self.resolve_policy_values()?,
+            // The CLI has no auth layer, so there is no verified identity to carry:
+            // `f:IdentityRestricted` override control always denies CLI requests.
+            server_identity: None,
             // Neither flag stays unset so the ledger's `f:defaultAllow` can
             // apply; `--no-default-allow` is the explicit fail-closed spelling.
             default_allow: self.default_allow_opt(),

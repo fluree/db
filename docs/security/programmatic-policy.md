@@ -125,10 +125,10 @@ When you call `wrap_identity_policy_view`:
 
 For cases where policies should not be stored in the database, use inline policies with explicit `?$identity` binding.
 
-### QueryConnectionOptions Pattern
+### GovernanceOptions Pattern
 
 ```rust
-use fluree_db_api::{QueryConnectionOptions, wrap_policy_view};
+use fluree_db_api::{GovernanceOptions, wrap_policy_view};
 use std::collections::HashMap;
 
 let policy = json!([{
@@ -144,13 +144,13 @@ let policy = json!([{
     })).unwrap()
 }]);
 
-let opts = QueryConnectionOptions {
+let opts = GovernanceOptions {
     policy: Some(policy),
     policy_values: Some(HashMap::from([(
         "?$identity".to_string(),
         json!({"@id": "http://example.org/identity/alice"}),
     )])),
-    default_allow: true,
+    default_allow: Some(true),
     ..Default::default()
 };
 
@@ -336,7 +336,7 @@ match result {
 For time-travel queries with policy, load a historical graph and apply policy as a view overlay:
 
 ```rust
-use fluree_db_api::{GraphDb, QueryConnectionOptions};
+use fluree_db_api::{GovernanceOptions, GraphDb};
 
 // Load a historical view
 let graph = fluree.view_at_t("mydb:main", 100).await?;
@@ -384,18 +384,19 @@ Creates a policy-wrapped view using identity-based `f:policyClass` lookup.
 ```rust
 pub async fn wrap_policy_view<'a>(
     ledger: &'a LedgerState,
-    opts: &QueryConnectionOptions,
+    opts: &GovernanceOptions,
 ) -> Result<PolicyWrappedView<'a>>
 ```
 
-Creates a policy-wrapped view from query connection options.
+Creates a policy-wrapped view from governance options.
 
-**QueryConnectionOptions fields:**
+**GovernanceOptions fields:**
 - `identity`: Identity IRI for `f:policyClass` lookup
 - `policy`: Inline policy JSON
 - `policy_class`: Policy class IRIs to query
 - `policy_values`: Variable bindings for policy queries
-- `default_allow`: Default access when no policies match
+- `default_allow`: Default access when no policies match. Tri-state: `None` lets the ledger's configured `f:defaultAllow` fill it in, `Some(v)` is an explicit request value. Unset on both sides is fail-closed.
+- `server_identity`: The auth-layer-verified caller identity, and the only thing `f:overrideControl` gates on. Never parsed from a request body or header. An application embedding this API is the auth layer for its deployment and sets it from the identity it verified; left unset, `f:IdentityRestricted` denies the override. See [Override control](../ledger-config/override-control.md#identity-verification).
 
 ### PolicyWrappedView
 

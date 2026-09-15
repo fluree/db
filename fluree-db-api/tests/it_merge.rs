@@ -1067,6 +1067,90 @@ async fn merge_take_source_keeps_value_both_sides_asserted() {
     assert_eq!(query_all_names(&fluree, "mydb:main").await, vec!["C"]);
 }
 
+/// A redundant re-assert of a value that already exists still lands in the
+/// commit (only novelty dedups it), so the fold must not read
+/// "assert … retract" as created-then-destroyed: the deletion is real.
+#[tokio::test]
+async fn merge_carries_deletion_after_redundant_reassert() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let ctx = json!({"ex": "http://example.org/ns/"});
+    let alice = json!({"@context": ctx, "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]});
+    let main = fluree.insert(ledger, &alice).await.unwrap().ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    // dev: re-insert Alice (already present), then delete her.
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    let dev = fluree.insert(dev, &alice).await.unwrap().ledger;
+    fluree
+        .update(
+            dev,
+            &json!({"@context": ctx, "delete": {"@id": "ex:alice", "ex:name": "Alice"}}),
+        )
+        .await
+        .unwrap();
+    assert!(query_all_names(&fluree, "mydb:dev").await.is_empty());
+
+    fluree
+        .insert(
+            main,
+            &json!({"@context": ctx, "@graph": [{"@id": "ex:bob", "ex:name": "Bob"}]}),
+        )
+        .await
+        .unwrap();
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(!report.fast_forward);
+    assert_eq!(report.conflict_count, 0);
+
+    assert_eq!(query_all_names(&fluree, "mydb:main").await, vec!["Bob"]);
+}
+
+/// Same shape with a replace instead of a delete: the target must end with
+/// the new value only, not the old one alongside it.
+#[tokio::test]
+async fn merge_after_redundant_reassert_then_replace_has_no_phantom() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let ctx = json!({"ex": "http://example.org/ns/"});
+    let alice = json!({"@context": ctx, "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]});
+    let main = fluree.insert(ledger, &alice).await.unwrap().ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    let dev = fluree.insert(dev, &alice).await.unwrap().ledger;
+    fluree
+        .update(dev, &replace_name("ex:alice", "B"))
+        .await
+        .unwrap();
+    assert_eq!(query_all_names(&fluree, "mydb:dev").await, vec!["B"]);
+
+    fluree
+        .insert(
+            main,
+            &json!({"@context": ctx, "@graph": [{"@id": "ex:bob", "ex:name": "Bob"}]}),
+        )
+        .await
+        .unwrap();
+    fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        query_all_names(&fluree, "mydb:main").await,
+        vec!["B", "Bob"]
+    );
+}
+
 // =============================================================================
 // Fast-forward merge keeps the target's own graph registry
 // =============================================================================

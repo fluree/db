@@ -30,6 +30,8 @@ pub struct DerivedSet {
     is_base: Vec<bool>,
     /// Number of entries in `flakes` flagged as base facts.
     base_count: usize,
+    /// Approximate heap footprint of every flake held, for the memory budget.
+    approx_bytes: usize,
 }
 
 impl DerivedSet {
@@ -38,7 +40,7 @@ impl DerivedSet {
     }
 
     /// Compute a hash key for a flake's object
-    fn object_hash(o: &FlakeValue) -> u64 {
+    pub(crate) fn object_hash(o: &FlakeValue) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         match o {
@@ -168,6 +170,16 @@ impl DerivedSet {
         self.is_base.push(is_base);
 
         self.seen.insert(key);
+        // Seed facts are excluded from the memory total for the same reason
+        // `derived_len` excludes them from the fact total: they are the base
+        // data the fixpoint was handed, not closure it produced, and
+        // `into_derived_flakes` drops them from the overlay this budget
+        // bounds. Charging them made the memory cap fire on the seed delta —
+        // every fact of every rule-relevant predicate — from round two
+        // onward, capping closures far below their fact budget.
+        if !is_base {
+            self.approx_bytes += crate::cache::approx_flake_bytes(&flake);
+        }
         let idx = self.flakes.len();
 
         // Index by predicate
@@ -191,10 +203,20 @@ impl DerivedSet {
         true
     }
 
-    /// Check if a flake already exists
+    /// Check if a flake is already accounted for — either derived this run or
+    /// present in the base data the fixpoint was seeded with.
+    ///
+    /// Consulting `base_keys` as well as `seen` is what keeps a rule from
+    /// re-proposing a fact the ledger already stores. In round 1 the seed is
+    /// registered only in `base_keys` (it merges into `seen` at the end of the
+    /// round), so without this a ledger that stores its own entailments —
+    /// symmetric edges written both ways, a `Student` also typed `Person` —
+    /// pushed every re-derived fact into the round's delta, where the in-round
+    /// cap counted it. A closure deriving nothing new could report
+    /// `capped: "facts"`, and the truncated result was then cached.
     pub fn contains(&self, s: &Sid, p: &Sid, o: &FlakeValue) -> bool {
         let key = (s.clone(), p.clone(), Self::object_hash(o));
-        self.seen.contains(&key)
+        self.seen.contains(&key) || self.base_keys.contains(&key)
     }
 
     /// Get all flakes with a specific predicate
@@ -229,6 +251,13 @@ impl DerivedSet {
     /// Number of genuinely derived facts (total minus re-added base facts).
     pub fn derived_len(&self) -> usize {
         self.flakes.len() - self.base_count
+    }
+
+    /// Approximate heap footprint of the DERIVED flakes — the population
+    /// `into_derived_flakes` yields and `derived_len` counts (see
+    /// [`crate::approx_flake_bytes`]).
+    pub fn approx_bytes(&self) -> usize {
+        self.approx_bytes
     }
 
     /// Check if empty

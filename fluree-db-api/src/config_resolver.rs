@@ -20,6 +20,7 @@
 //! Identity gating happens at the request boundary (not here) because
 //! the server-verified identity is only available per-request.
 
+use fluree_db_core::VerifiedIdentity;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -331,8 +332,9 @@ pub fn configured_fulltext_properties_for_indexer(
 
 /// Merge config policy defaults with query-time opts.
 ///
-/// `server_identity` is the auth-layer-verified identity (NOT `opts.identity`
-/// which is the user-settable policy evaluation context).
+/// Override control is checked against `opts.server_identity`, the
+/// auth-layer-verified identity, never against `opts.identity`, which is the
+/// user-settable policy evaluation context.
 ///
 /// Algorithm:
 /// 1. No config policy → return opts unchanged
@@ -346,11 +348,7 @@ pub fn configured_fulltext_properties_for_indexer(
 /// never spoke, so config governs; `Some(v)` is an explicit request value and
 /// survives, because the only thing entitled to overrule an explicit caller
 /// value is override control saying so.
-pub fn merge_policy_opts(
-    resolved: &ResolvedConfig,
-    opts: &GovernanceOptions,
-    server_identity: Option<&str>,
-) -> GovernanceOptions {
+pub fn merge_policy_opts(resolved: &ResolvedConfig, opts: &GovernanceOptions) -> GovernanceOptions {
     let policy = match &resolved.policy {
         Some(p) => p,
         None => return opts.clone(),
@@ -363,6 +361,7 @@ pub fn merge_policy_opts(
     }
 
     let query_selects_policy = opts.selects_policy_set();
+    let server_identity = opts.server_identity.as_ref();
     let override_denied =
         query_selects_policy && !policy.override_control.permits_override(server_identity);
 
@@ -370,7 +369,7 @@ pub fn merge_policy_opts(
 
     if override_denied {
         tracing::warn!(
-            server_identity,
+            server_identity = ?server_identity,
             "Query-time policy override denied by config override control — applying config defaults"
         );
 
@@ -431,7 +430,7 @@ pub fn merge_policy_opts(
 ///   - Denied → `Force`
 pub fn merge_reasoning(
     resolved: &ResolvedConfig,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
 ) -> Option<(Vec<String>, ReasoningModePrecedence)> {
     let reasoning = resolved.reasoning.as_ref()?;
     let modes = reasoning.modes.as_ref()?;
@@ -461,15 +460,19 @@ pub fn merge_reasoning(
 /// of these values.
 pub fn config_reasoning_budget(
     resolved: &ResolvedConfig,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
 ) -> Option<ConfigReasoningBudget> {
     let reasoning = resolved.reasoning.as_ref()?;
-    if reasoning.max_facts.is_none() && reasoning.max_seconds.is_none() {
+    if reasoning.max_facts.is_none()
+        && reasoning.max_seconds.is_none()
+        && reasoning.max_memory_mb.is_none()
+    {
         return None;
     }
     Some(ConfigReasoningBudget {
         max_facts: reasoning.max_facts,
         max_seconds: reasoning.max_seconds,
+        max_memory_mb: reasoning.max_memory_mb,
         force: !reasoning.override_control.permits_override(server_identity),
     })
 }
@@ -507,7 +510,7 @@ pub struct EffectiveShaclConfig {
 pub fn merge_shacl_opts(
     resolved: &ResolvedConfig,
     requested_mode: Option<ValidationMode>,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
 ) -> Option<EffectiveShaclConfig> {
     let shacl = resolved.shacl.as_ref()?;
     let config_mode = shacl.validation_mode.unwrap_or(ValidationMode::Reject);
@@ -521,7 +524,7 @@ pub fn merge_shacl_opts(
                 ValidationMode::Warn
             } else {
                 tracing::warn!(
-                    server_identity,
+                    server_identity = ?server_identity,
                     "Transaction-requested SHACL warn mode denied by config override control \
                      — keeping configured reject posture"
                 );
@@ -563,7 +566,7 @@ pub struct EffectiveDatalogConfig {
 /// when `false`, config settings are forced.
 pub fn merge_datalog_opts(
     resolved: &ResolvedConfig,
-    server_identity: Option<&str>,
+    server_identity: Option<&VerifiedIdentity>,
 ) -> Option<EffectiveDatalogConfig> {
     let datalog = resolved.datalog.as_ref()?;
     let override_allowed = datalog.override_control.permits_override(server_identity);
@@ -697,6 +700,7 @@ impl MergeableGroup for ReasoningDefaults {
             ontology_import_map: import_map,
             max_facts: self.max_facts.or(base.max_facts),
             max_seconds: self.max_seconds.or(base.max_seconds),
+            max_memory_mb: self.max_memory_mb.or(base.max_memory_mb),
             override_control: base.override_control.effective_min(&self.override_control),
         }
     }
@@ -1241,6 +1245,14 @@ async fn read_reasoning_defaults(
         config_iris::REASONING_MAX_SECONDS,
     )
     .await?;
+    let max_memory_mb = read_budget_field(
+        snapshot,
+        overlay,
+        to_t,
+        &group_sid,
+        config_iris::REASONING_MAX_MEMORY_MB,
+    )
+    .await?;
     let override_control = read_override_control(snapshot, overlay, to_t, &group_sid).await?;
 
     Ok(Some(ReasoningDefaults {
@@ -1250,6 +1262,7 @@ async fn read_reasoning_defaults(
         ontology_import_map,
         max_facts,
         max_seconds,
+        max_memory_mb,
         override_control,
     }))
 }
@@ -2193,9 +2206,13 @@ mod tests {
         // OverrideNone: softening denied, configured posture kept.
         let cfg = resolved_with(OverrideControl::None);
         assert_eq!(
-            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), Some("did:key:alice"))
-                .unwrap()
-                .validation_mode,
+            merge_shacl_opts(
+                &cfg,
+                Some(ValidationMode::Warn),
+                Some(&VerifiedIdentity::new("did:key:alice"))
+            )
+            .unwrap()
+            .validation_mode,
             ValidationMode::Reject
         );
         // ...but strengthening a Warn posture never needs permission.
@@ -2220,15 +2237,23 @@ mod tests {
             allowed_identities: HashSet::from([std::sync::Arc::from("did:key:remediator")]),
         });
         assert_eq!(
-            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), Some("did:key:remediator"))
-                .unwrap()
-                .validation_mode,
+            merge_shacl_opts(
+                &cfg,
+                Some(ValidationMode::Warn),
+                Some(&VerifiedIdentity::new("did:key:remediator"))
+            )
+            .unwrap()
+            .validation_mode,
             ValidationMode::Warn
         );
         assert_eq!(
-            merge_shacl_opts(&cfg, Some(ValidationMode::Warn), Some("did:key:intruder"))
-                .unwrap()
-                .validation_mode,
+            merge_shacl_opts(
+                &cfg,
+                Some(ValidationMode::Warn),
+                Some(&VerifiedIdentity::new("did:key:intruder"))
+            )
+            .unwrap()
+            .validation_mode,
             ValidationMode::Reject
         );
         assert_eq!(
@@ -2366,7 +2391,7 @@ mod tests {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, None);
+        let merged = merge_policy_opts(&resolved, &opts);
         assert_eq!(merged.identity.as_deref(), Some("did:key:alice"));
     }
 
@@ -2381,7 +2406,7 @@ mod tests {
             ..Default::default()
         };
         let opts = GovernanceOptions::default();
-        let merged = merge_policy_opts(&resolved, &opts, None);
+        let merged = merge_policy_opts(&resolved, &opts);
         assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
             merged.policy_class.as_deref(),
@@ -2403,7 +2428,7 @@ mod tests {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, None);
+        let merged = merge_policy_opts(&resolved, &opts);
         // Query opts kept because AllowAll permits override
         assert_eq!(merged.identity.as_deref(), Some("did:key:alice"));
     }
@@ -2421,9 +2446,10 @@ mod tests {
         };
         let opts = GovernanceOptions {
             identity: Some("did:key:alice".into()),
+            server_identity: Some(VerifiedIdentity::new("did:key:alice")),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, Some("did:key:alice"));
+        let merged = merge_policy_opts(&resolved, &opts);
         // Config defaults applied despite query specifying identity
         assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
@@ -2446,9 +2472,10 @@ mod tests {
         };
         let opts = GovernanceOptions {
             identity: Some("did:key:user".into()),
+            server_identity: Some(VerifiedIdentity::new("did:key:admin")),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, Some("did:key:admin"));
+        let merged = merge_policy_opts(&resolved, &opts);
         // Server identity is admin → override permitted
         assert_eq!(merged.identity.as_deref(), Some("did:key:user"));
     }
@@ -2468,9 +2495,10 @@ mod tests {
         };
         let opts = GovernanceOptions {
             identity: Some("did:key:user".into()),
+            server_identity: Some(VerifiedIdentity::new("did:key:non-admin")),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, Some("did:key:non-admin"));
+        let merged = merge_policy_opts(&resolved, &opts);
         // Server identity is not admin → override denied
         assert_eq!(merged.default_allow, Some(false));
         assert_eq!(
@@ -2501,7 +2529,7 @@ mod tests {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, None);
+        let merged = merge_policy_opts(&resolved, &opts);
         assert_eq!(merged.identity.as_deref(), Some("did:key:alice"));
         assert_eq!(
             merged.default_allow,
@@ -2528,7 +2556,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            merge_policy_opts(&open_config, &deny, None).default_allow,
+            merge_policy_opts(&open_config, &deny).default_allow,
             Some(false)
         );
 
@@ -2546,7 +2574,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            merge_policy_opts(&closed_config, &allow, None).default_allow,
+            merge_policy_opts(&closed_config, &allow).default_allow,
             Some(true)
         );
     }
@@ -2566,7 +2594,7 @@ mod tests {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, None);
+        let merged = merge_policy_opts(&resolved, &opts);
         assert_eq!(merged.default_allow, None);
         assert!(
             !merged.effective_default_allow(),
@@ -2582,10 +2610,7 @@ mod tests {
             identity: Some("did:key:alice".into()),
             ..Default::default()
         };
-        assert_eq!(
-            merge_policy_opts(&resolved, &opts, None).default_allow,
-            None
-        );
+        assert_eq!(merge_policy_opts(&resolved, &opts).default_allow, None);
     }
 
     /// Either explicit default engages enforcement; absent remains no input.
@@ -2638,7 +2663,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            merge_policy_opts(&resolved, &opts, None).default_allow,
+            merge_policy_opts(&resolved, &opts).default_allow,
             Some(false),
             "config f:defaultAllow true must not clobber an explicit request false"
         );
@@ -2670,7 +2695,7 @@ mod tests {
             "an explicit deny default engages enforcement"
         );
         assert_eq!(
-            merge_policy_opts(&resolved, &opts, None).default_allow,
+            merge_policy_opts(&resolved, &opts).default_allow,
             Some(false)
         );
     }
@@ -2692,7 +2717,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            merge_policy_opts(&resolved, &opts, None).default_allow,
+            merge_policy_opts(&resolved, &opts).default_allow,
             Some(false)
         );
     }
@@ -2715,8 +2740,9 @@ mod tests {
                 serde_json::json!({"@id": "did:key:manager"}),
             )])),
             default_allow: Some(true),
+            ..Default::default()
         };
-        let merged = merge_policy_opts(&resolved, &opts, None);
+        let merged = merge_policy_opts(&resolved, &opts);
         assert_eq!(merged.identity, opts.identity);
         assert!(
             merged.policy_class.is_none()
@@ -2730,7 +2756,6 @@ mod tests {
                 default_allow: Some(true),
                 ..Default::default()
             },
-            None,
         );
         assert!(anonymous.has_any_policy_inputs());
         assert!(!anonymous.effective_default_allow());
@@ -2786,7 +2811,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (_modes, prec) = merge_reasoning(&resolved, Some("did:key:admin")).unwrap();
+        let (_modes, prec) =
+            merge_reasoning(&resolved, Some(&VerifiedIdentity::new("did:key:admin"))).unwrap();
         assert_eq!(prec, ReasoningModePrecedence::DefaultUnlessQueryOverrides);
     }
 
@@ -2802,7 +2828,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let (_modes, prec) = merge_reasoning(&resolved, Some("did:key:user")).unwrap();
+        let (_modes, prec) =
+            merge_reasoning(&resolved, Some(&VerifiedIdentity::new("did:key:user"))).unwrap();
         assert_eq!(prec, ReasoningModePrecedence::Force);
     }
 
@@ -2890,12 +2917,12 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !config_reasoning_budget(&resolved, Some("did:key:admin"))
+            !config_reasoning_budget(&resolved, Some(&VerifiedIdentity::new("did:key:admin")))
                 .unwrap()
                 .force
         );
         assert!(
-            config_reasoning_budget(&resolved, Some("did:key:user"))
+            config_reasoning_budget(&resolved, Some(&VerifiedIdentity::new("did:key:user")))
                 .unwrap()
                 .force
         );

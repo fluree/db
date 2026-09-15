@@ -707,3 +707,40 @@ async fn revert_refuses_commit_that_arrived_through_a_merge() {
         "the error should say the commit arrived through a merge: {err}"
     );
 }
+
+/// A commit that only registers a graph carries no flakes to invert, so the
+/// revert has nothing to apply: no commit is written and HEAD stays put. The
+/// report says so rather than implying a revert landed at the current `t`.
+#[tokio::test]
+async fn revert_with_empty_net_effect_reports_that_nothing_was_written() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap();
+
+    let created = fluree
+        .graph("mydb:main")
+        .transact()
+        .sparql_update("CREATE GRAPH <http://example.org/g1>")
+        .commit()
+        .await
+        .expect("CREATE GRAPH commits");
+    let head_before = fluree.ledger("mydb:main").await.unwrap().t();
+
+    let report = fluree
+        .revert_commit(
+            "mydb",
+            "main",
+            CommitRef::Exact(created.receipt.commit_id.clone()),
+            ConflictStrategy::TakeSource,
+        )
+        .await
+        .expect("reverting a registration-only commit is allowed");
+
+    assert!(!report.wrote_commit, "nothing to invert, so no commit");
+    assert_eq!(report.new_head_t, head_before, "HEAD must not move");
+    assert_eq!(fluree.ledger("mydb:main").await.unwrap().t(), head_before);
+    assert_eq!(query_all_names(&fluree, "mydb:main").await, vec!["Alice"]);
+}

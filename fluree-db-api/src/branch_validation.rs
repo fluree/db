@@ -226,8 +226,13 @@ impl crate::Fluree {
             origin_validated_replay: false,
         };
 
+        // The flag says whether validation actually ran, which the
+        // transaction path threads into commit provenance. A branch
+        // operation only needs to know whether anything rejected it, and a
+        // pass that was skipped (SHACL disabled, or no shapes) rejects
+        // nothing.
         match apply_shacl_policy_to_staged_view(view, ctx, tx_config).await {
-            Ok(()) => Ok(BranchOpValidation::default()),
+            Ok(_ran) => Ok(BranchOpValidation::default()),
             Err(TransactError::ShaclViolation(report)) => Ok(BranchOpValidation {
                 report: Some(report),
             }),

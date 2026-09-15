@@ -123,6 +123,10 @@ impl ContentStore for MeteredContentStore {
         self.inner.has(id).await
     }
 
+    async fn sync(&self) -> StorageResult<()> {
+        self.inner.sync().await
+    }
+
     async fn get(&self, id: &ContentId) -> StorageResult<Vec<u8>> {
         self.inner.get(id).await
     }

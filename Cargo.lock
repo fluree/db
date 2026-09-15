@@ -3424,6 +3424,7 @@ dependencies = [
  "geo-types",
  "getrandom 0.2.17",
  "hashbrown 0.16.1",
+ "indexmap 2.13.0",
  "lru 0.12.5",
  "md-5",
  "moka",

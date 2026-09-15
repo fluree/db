@@ -120,7 +120,19 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     tp.span,
                 ));
             }
-            result.push(self.lower_triple_pattern(tp)?);
+            // Carry the declared datatype into the template.
+            // `lower_triple_pattern` ends at `TriplePattern::new(s, p, o)`,
+            // which leaves `dtc: None` — fine for a WHERE pattern, where the
+            // constraint would change what matches, but a CONSTRUCT template
+            // is written, not matched. A datalog rule head reads this template
+            // and falls back to a datatype guessed from the value when `dtc`
+            // is absent, so `"2024-01-01"^^xsd:date` in a rule head stored
+            // `xsd:string`: `DATATYPE()` said string and `YEAR()` was unbound,
+            // while the identical head written in JSON-LD stored a real date.
+            let s = self.lower_subject(&tp.subject)?;
+            let p = self.lower_predicate(&tp.predicate)?;
+            let (o, dtc) = self.lower_object_with_constraint(&tp.object)?;
+            result.push(TriplePattern { s, p, o, dtc });
         }
         Ok(result)
     }
