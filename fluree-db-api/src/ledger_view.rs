@@ -319,9 +319,8 @@ pub(crate) fn ambiguous_commit_prefix<'a>(
 ) -> ApiError {
     let candidates: Vec<&str> = hex_digests.into_iter().collect();
     ApiError::query(format!(
-        "Ambiguous commit prefix '{prefix}': it matches at least {:?}. \
-         Retype it with enough characters to pick one out.",
-        candidates
+        "Ambiguous commit prefix '{prefix}': it matches at least {candidates:?}. \
+         Retype it with enough characters to pick one out."
     ))
 }
 
