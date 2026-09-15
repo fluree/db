@@ -2389,11 +2389,20 @@ fn convert_named_graphs_to_templates(
                         || p.name.to_string(),
                         |prefix| format!("{prefix}{}", p.name),
                     );
-                    return Err(ApiError::query(format!(
-                        "'{iri}' is a system-controlled predicate; use the RDF 1.2 annotation \
-                         syntax (`~ <reifier> {{| ... |}}` or `<< s p o >>`) instead of \
-                         writing f:reifies* triples by hand"
-                    )));
+                    // A transact error, not a query one: this is user-authored
+                    // input being refused at write time, and `ApiError::query`
+                    // rendered it as "Internal error: Query error: …", which
+                    // reads like a bug in the engine rather than a problem with
+                    // the statement. `ApiError::Transact(_)` maps to
+                    // `errors::INVALID_TRANSACTION` / HTTP 422
+                    // (`fluree-db-server/src/error.rs`).
+                    return Err(ApiError::Transact(
+                        fluree_db_transact::TransactError::UnsupportedFeature(format!(
+                            "'{iri}' is a system-controlled predicate; use the RDF 1.2 \
+                             annotation syntax (`~ <reifier> {{| ... |}}` or \
+                             `<< s p o >>`) instead of writing f:reifies* triples by hand"
+                        )),
+                    ));
                 }
             }
 
