@@ -181,8 +181,11 @@ pub(crate) fn cached_stats_view_for_db(
         // root-policy — facts the stats builder cannot see here. It is folded
         // into the cache key below, so a trusted view is never reused for a
         // non-vouched (policy/dataset) execution at the same overlay epoch.
-        view.class_coverage_trustworthy =
-            allow_semantic_elision && novelty.is_some_and(Novelty::is_empty);
+        // The vouch admits `as_of` reads, whose class counts are still the
+        // published index's, so a read below the index `t` gets no proof.
+        view.class_coverage_trustworthy = allow_semantic_elision
+            && novelty.is_some_and(Novelty::is_empty)
+            && db.t >= db.snapshot.t;
         // `source` only serves the coverage proof. When that is off, `stats` may
         // be a merged or time-travel copy the cache weight does not count, so
         // do not keep it alive.
@@ -389,6 +392,16 @@ mod tests {
         assert!(!merged.predicate_subjects_all_in_class_by_iri(p, c));
         assert!(merged.source.is_none(), "a merged copy is not retained");
         assert_eq!(merged.get_class_count_by_iri(c), Some(4));
+
+        snapshot.t = 2;
+        let time_travel =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &empty, 1), None, true)
+                .expect("view");
+        assert!(
+            !time_travel.predicate_subjects_all_in_class_by_iri(p, c),
+            "class coverage at the index t does not hold below it"
+        );
+        assert!(time_travel.source.is_none());
     }
 
     #[test]
