@@ -263,10 +263,7 @@ async fn ref_only_survives_a_published_index_round_trip() {
         .stats
         .clone()
         .expect("a published index carries stats");
-    let view = fluree_db_core::StatsView::from_db_stats_with_namespaces(
-        &stats,
-        ledger.snapshot.namespaces(),
-    );
+    let view = fluree_db_core::StatsView::from_db_stats_with_namespaces(&stats, &ledger.snapshot);
     let ns = "http://example.org/ns/";
     assert_eq!(
         view.is_property_ref_only_by_iri(&format!("{ns}knows")),

@@ -862,10 +862,14 @@ fn user_iri(sid: &Sid, snapshot: &LedgerSnapshot) -> Option<String> {
 /// every fact predates that build stays in the schema regardless of `to_t`. The
 /// schema is therefore a superset for a time-traveled view — queries against a
 /// type that did not yet exist return nothing rather than misreporting.
-fn merged_stats(snapshot: &LedgerSnapshot, overlay: &dyn OverlayProvider, to_t: i64) -> IndexStats {
+fn merged_stats(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Arc<IndexStats> {
     let indexed = snapshot.stats.clone().unwrap_or_default();
     match overlay.as_any().downcast_ref::<Novelty>() {
-        Some(novelty) => assemble_fast_stats_with(
+        Some(novelty) => Arc::new(assemble_fast_stats_with(
             &indexed,
             snapshot,
             novelty,
@@ -874,7 +878,7 @@ fn merged_stats(snapshot: &LedgerSnapshot, overlay: &dyn OverlayProvider, to_t: 
             NoveltyMerge::Reconciled {
                 site: stats_merge_site::GRAPHQL_SCHEMA,
             },
-        ),
+        )),
         None => indexed,
     }
 }

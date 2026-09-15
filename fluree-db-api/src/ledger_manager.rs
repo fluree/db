@@ -726,7 +726,7 @@ impl LedgerHandle {
             base_t: root.base_t,
             namespace_codes: root.namespace_codes.into_iter().collect(),
             ns_split_mode: root.ns_split_mode,
-            stats: root.stats,
+            stats: root.stats.map(Arc::new),
             schema: root.schema,
             subject_watermarks: root.subject_watermarks,
             string_watermark: root.string_watermark,
@@ -1208,7 +1208,7 @@ pub(crate) async fn load_and_attach_binary_store(
         snap.subject_watermarks = root.subject_watermarks;
         snap.string_watermark = root.string_watermark;
         if root.stats.is_some() && snap.stats.is_none() {
-            snap.stats = root.stats;
+            snap.stats = root.stats.map(Arc::new);
             tracing::debug!("loaded stats from FIR6 root");
         }
         if root.schema.is_some() && snap.schema.is_none() {

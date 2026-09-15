@@ -3788,23 +3788,49 @@ mod tests {
 
     // --- redundant rdf:type elision ---------------------------------------
 
-    fn coverage_stats(pred: &str, class: &str, total: u64, covered: u64, trust: bool) -> StatsView {
-        let mut v = StatsView {
-            class_coverage_trustworthy: trust,
-            ..Default::default()
+    const EX: &str = "http://example.org/";
+    const EX_P: &str = "http://example.org/p";
+    const EX_C: &str = "http://example.org/C";
+
+    /// A view built the way the planner builds it — through
+    /// `from_db_stats_with_namespaces` over a snapshot that registers `EX` —
+    /// where `total` flakes of `ex:p` exist and `covered` of them have an
+    /// `ex:C` subject. Going through the real builder is what makes these tests
+    /// exercise the IRI -> SID resolution the coverage check depends on.
+    fn coverage_stats(total: u64, covered: u64, trust: bool) -> StatsView {
+        use fluree_db_core::{
+            ClassPropertyUsage, ClassStatEntry, IndexStats, LedgerSnapshot, PropertyStatEntry,
         };
-        v.properties_by_iri.insert(
-            Arc::from(pred),
-            PropertyStatData {
+        let ref_tag = fluree_db_core::ValueTypeTag::JSON_LD_ID.as_u8();
+        let mut snapshot = LedgerSnapshot::genesis("coverage:main");
+        snapshot
+            .insert_namespace_code(100, EX.to_string())
+            .expect("register ex namespace");
+        let stats = Arc::new(IndexStats {
+            properties: Some(vec![PropertyStatEntry {
+                sid: (100, "p".to_string()),
                 count: total,
                 ndv_values: 0,
                 ndv_subjects: 0,
-            },
-        );
-        let mut by_class = HashMap::new();
-        by_class.insert(Arc::from(class), covered);
-        v.predicate_class_subject_counts_by_iri
-            .insert(Arc::from(pred), by_class);
+                last_modified_t: 1,
+                datatypes: vec![(ref_tag, total)],
+                observed_datatypes: vec![ref_tag],
+                historical_datatypes: vec![],
+            }]),
+            classes: Some(vec![ClassStatEntry {
+                class_sid: Sid::new(100, "C"),
+                count: covered,
+                properties: vec![ClassPropertyUsage {
+                    property_sid: Sid::new(100, "p"),
+                    datatypes: vec![(ref_tag, covered)],
+                    langs: vec![],
+                    ref_classes: vec![],
+                }],
+            }]),
+            ..Default::default()
+        });
+        let mut v = StatsView::from_db_stats_with_namespaces(&stats, &snapshot);
+        v.class_coverage_trustworthy = trust;
         v
     }
 
@@ -3826,8 +3852,8 @@ mod tests {
 
     #[test]
     fn elides_redundant_type_when_predicate_subjects_all_in_class() {
-        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
-        let patterns = pred_then_type("ex:p", "ex:C");
+        let stats = coverage_stats(10, 10, true);
+        let patterns = pred_then_type(EX_P, EX_C);
         let out =
             elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
                 .expect("redundant rdf:type should be elided");
@@ -3841,8 +3867,8 @@ mod tests {
     #[test]
     fn keeps_selective_type_filter() {
         // Predicate has 10 flakes but only 5 from class C -> not covering -> keep.
-        let stats = coverage_stats("ex:p", "ex:C", 10, 5, true);
-        let patterns = pred_then_type("ex:p", "ex:C");
+        let stats = coverage_stats(10, 5, true);
+        let patterns = pred_then_type(EX_P, EX_C);
         assert!(
             elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
                 .is_none()
@@ -3851,8 +3877,8 @@ mod tests {
 
     #[test]
     fn no_elision_when_coverage_untrustworthy() {
-        let stats = coverage_stats("ex:p", "ex:C", 10, 10, false);
-        let patterns = pred_then_type("ex:p", "ex:C");
+        let stats = coverage_stats(10, 10, false);
+        let patterns = pred_then_type(EX_P, EX_C);
         assert!(
             elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
                 .is_none()
@@ -3861,8 +3887,8 @@ mod tests {
 
     #[test]
     fn no_elision_in_history_mode() {
-        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
-        let patterns = pred_then_type("ex:p", "ex:C");
+        let stats = coverage_stats(10, 10, true);
+        let patterns = pred_then_type(EX_P, EX_C);
         assert!(
             elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::history())
                 .is_none()
@@ -3873,11 +3899,11 @@ mod tests {
     fn no_elision_when_type_is_sole_binder() {
         // `?0 rdf:type <C>` with no other predicate on ?0: the type triple is the
         // only thing binding ?0, so dropping it would change semantics.
-        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
+        let stats = coverage_stats(10, 10, true);
         let patterns = vec![Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
             Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
-            Term::Iri(Arc::from("ex:C")),
+            Term::Iri(Arc::from(EX_C)),
         ))];
         assert!(
             elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())

@@ -781,7 +781,6 @@ mod tests {
             properties,
             classes: HashMap::new(),
             properties_by_iri: HashMap::new(),
-            classes_by_iri: HashMap::new(),
             graph_properties: HashMap::new(),
             ..Default::default()
         };
@@ -811,7 +810,6 @@ mod tests {
             properties: HashMap::new(),
             classes,
             properties_by_iri: HashMap::new(),
-            classes_by_iri: HashMap::new(),
             graph_properties: HashMap::new(),
             ..Default::default()
         };
@@ -896,7 +894,6 @@ mod tests {
             properties,
             classes: HashMap::new(),
             properties_by_iri: HashMap::new(),
-            classes_by_iri: HashMap::new(),
             graph_properties: HashMap::new(),
             ..Default::default()
         };
