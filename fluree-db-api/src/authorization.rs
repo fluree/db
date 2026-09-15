@@ -15,6 +15,23 @@ use crate::{ApiError, GovernanceOptions, Result};
 /// or bypass configured policy-override controls. The host must authorize every
 /// ledger/source named by the request separately. A single instance applies the
 /// same policy selection to all sources in the query.
+///
+/// # It does not carry the verified identity
+///
+/// The wrapped [`GovernanceOptions`] has a `server_identity` field, but nothing
+/// that builds a `PolicyAuthorization` populates it, and both
+/// [`Self::constrain_options`] and `CredentialPolicy::resolve_options` rebuild
+/// their result from the bound authority rather than from the request. So
+/// anything derived from an authorization is anonymous for `f:overrideControl`,
+/// and a transport that wraps policy straight from [`Self::options`] silently
+/// gets the fail-closed answer for every identity-restricted ledger.
+///
+/// That is deliberate: a credential decides which policies a caller may
+/// *select*, while the verified identity says who the caller provably is, and
+/// the second is not the credential's to grant or withhold. A transport carries
+/// it alongside and stamps it onto the options **after** resolution — see
+/// `routes::policy_auth::bound_governance`, which does this for every HTTP
+/// transport, and `bolt.rs`, which does it per session.
 #[derive(Debug, Clone)]
 pub struct PolicyAuthorization {
     options: GovernanceOptions,

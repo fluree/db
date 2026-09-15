@@ -3,6 +3,7 @@
 //! The `ExecutionContext` provides access to database state and configuration
 //! needed by operators during execution.
 
+use crate::annotation_edge_probe::AnnotationSidecarCache;
 use crate::bm25::{Bm25IndexProvider, Bm25SearchProvider};
 use crate::dataset::{ActiveGraph, ActiveGraphs, DataSet};
 use crate::error::QueryError;
@@ -411,6 +412,17 @@ pub struct ExecutionContext<'a> {
     /// as the multi-ledger dataset lane does. `None` everywhere else: the
     /// common paths pay one `Option` check per scan open.
     pub scan_provenance_ledger: Option<Arc<str>>,
+    /// Per-query memo: drained `f:reifies*` sidecar maps, shared by every
+    /// edge-annotation probe operator in the run whose drain would return the
+    /// same thing (see
+    /// [`AnnotationSidecarCache`]).
+    ///
+    /// A drain is O(#annotations in the ledger) and independent of the result
+    /// size, and a bounded variable-length Cypher range emits one probe
+    /// operator per hop of per chain — `*1..3` six, `*1..5` fifteen. Caching
+    /// per operator therefore multiplies the whole sidecar by the hop count;
+    /// caching per run costs what one hop costs.
+    pub annotation_sidecar_cache: AnnotationSidecarCache,
     /// Per-query memo: constant filter operands → internal subject id, so a
     /// `<const> != ?var` FILTER resolves the constant once, not per row.
     pub const_sid_cache: ConstSidCache,
@@ -506,6 +518,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
+            annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
@@ -565,6 +578,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: db.snapshot,
             scan_provenance_ledger: None,
+            annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
@@ -628,6 +642,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: db.snapshot,
             scan_provenance_ledger: None,
+            annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
@@ -680,6 +695,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
+            annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
@@ -731,6 +747,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
+            annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
@@ -784,6 +801,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: false,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
+            annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
@@ -1402,6 +1420,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             scan_provenance_ledger: self.scan_provenance_ledger.clone(),
+            annotation_sidecar_cache: self.annotation_sidecar_cache.clone(),
             const_sid_cache: self.const_sid_cache.clone(),
             lang_tag_cache: self.lang_tag_cache.clone(),
             subject_iri_cache: self.subject_iri_cache.clone(),
@@ -1464,6 +1483,7 @@ impl<'a> ExecutionContext<'a> {
             reasoning_active: self.reasoning_active,
             original_snapshot: self.original_snapshot,
             scan_provenance_ledger: self.scan_provenance_ledger.clone(),
+            annotation_sidecar_cache: self.annotation_sidecar_cache.clone(),
             const_sid_cache: self.const_sid_cache.clone(),
             lang_tag_cache: self.lang_tag_cache.clone(),
             subject_iri_cache: self.subject_iri_cache.clone(),
@@ -1533,6 +1553,7 @@ impl<'a> ExecutionContext<'a> {
             // `const_sid_cache` is mandatory: its key is the const IRI ALONE
             // (store-implicit), so sharing the parent's would alias an s_id
             // resolved in one graph/store into another.
+            annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),

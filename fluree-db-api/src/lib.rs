@@ -40,6 +40,7 @@ pub use authorization::PolicyAuthorization;
 pub mod block_fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
+mod branch_validation;
 mod commit_data;
 pub mod commit_transfer;
 pub mod config_resolver;
@@ -184,11 +185,12 @@ pub use ledger_manager::{
     LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult, RemoteWatermark,
     UpdatePlan, WritePathStats,
 };
-pub use ledger_view::{CommitRef, LedgerView};
+pub use ledger_view::{CommitRef, LedgerView, COMMIT_PREFIX_MIN_LEN};
 pub use merge::{MergeReport, StagedMerge};
 pub use merge_preview::{
     AncestorRef, BranchDelta, ChangeSummary, ConflictDetail, ConflictResolutionPreview,
-    ConflictSummary, MergePreview, MergePreviewOpts, SubjectChange, DEFAULT_MAX_CHANGES,
+    ConflictSummary, MergePreview, MergePreviewOpts, SubjectChange, ValidationSummary,
+    DEFAULT_MAX_CHANGES,
 };
 pub use pack::{
     compute_missing_index_artifacts, full_ledger_pack_request, validate_pack_request, PackChunk,

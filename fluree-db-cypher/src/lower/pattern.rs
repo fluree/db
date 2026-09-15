@@ -484,6 +484,58 @@ fn lower_multi_hop_path<E: IriEncoder>(
         }
     }
 
+    // Reading a *property* of one of this path's hops needs per-hop edge
+    // identity, and the path value does not carry it: `MakePathHops` assembles
+    // the chain from node refs and per-hop `MakeRel` values, and a synthesized
+    // relationship value has no reifier slot. So the read answers null even
+    // when every edge in the chain is reified — while the single-hop path form
+    // (which re-enters the var-length machinery as `*1..1`) and the equivalent
+    // `*N..N` range both read the real annotations. That makes it a wrong
+    // answer rather than a missing feature, so refuse it, as the enumeration
+    // route already does for the same reason (`lower_enumerate_path`).
+    //
+    // Scoped to the element property surface: `nodes(p)`, `length(p)`,
+    // `size(relationships(p))`, `type(r)` over the elements and `RETURN p` all
+    // answer correctly on this route and stay available.
+    //
+    // Giving the route identity instead means the same per-hop
+    // `Optional([EdgeAnnotation])` probe the bounded expansion emits. That is
+    // the right eventual shape, but it belongs on top of that probe's cost
+    // model rather than adding a second caller of it; the refusal is what
+    // keeps `docs/query/cypher.md` true until then.
+    //
+    // `part.tail` is empty (`MATCH p = (a)`) or ≥ 2 here — a single hop, fixed
+    // or variable-length, is routed to the var-length machinery by the caller.
+    if !part.tail.is_empty() && ctx.reads_element_properties(&path_var.name) {
+        let hops = part.tail.len();
+        // Every hop is single-typed and directed by this point, so `types[0]`
+        // is the hop's type. Only offer the range remedy when one exists: no
+        // single `-[:T*N..N]->` expresses a mixed-type chain.
+        let range_remedy = if part
+            .tail
+            .windows(2)
+            .all(|w| w[0].0.types[0].name == w[1].0.types[0].name)
+        {
+            format!(
+                ", or write the chain as one bounded range \
+                 (`-[:{t}*{hops}..{hops}]->`), whose expansion keeps each hop's \
+                 annotation",
+                t = part.tail[0].0.types[0].name,
+            )
+        } else {
+            String::new()
+        };
+        return Err(LowerError::unsupported(format!(
+            "reading relationship properties over `{p}` is not supported here: a \
+             multi-hop path value is assembled from synthesized relationship values, \
+             which carry no per-hop edge identity, so every property read would \
+             answer null. Bind each hop's relationship variable instead \
+             (`(a)-[r1:T]->(b)-[r2:U]->(c)`) — `{p}` stays bound alongside them and \
+             `r1.prop` reads that hop's own annotation{range_remedy}",
+            p = path_var.name,
+        )));
+    }
+
     let node_expr = |ctx: &mut LoweringContext<'_, E>, node: &NodePattern| {
         ref_to_expr(&lookup_node_ref(ctx, node)).ok_or_else(|| {
             LowerError::unsupported(
@@ -608,9 +660,10 @@ fn lower_var_length_rel<E: IriEncoder>(
         }
         if rel.var.is_some() || path_var.is_some() {
             return Err(LowerError::unsupported(
-                "binding a relationship/path variable on a property-filtered \
-                 variable-length range is deferred — filter via WHERE on the bound \
-                 relationships instead",
+                "binding a relationship or path variable on a property-filtered \
+                 variable-length range (`-[rs:T*1..3 {p: v}]->`) is deferred — drop the \
+                 inline filter and filter the bound relationships instead: \
+                 `-[rs:T*1..3]->` with `WHERE all(r IN rs WHERE r.p = v)`",
             ));
         }
     }
@@ -730,6 +783,22 @@ fn lower_var_length_rel<E: IriEncoder>(
             let rel_var_id = rel.var.as_ref().map(|v| ctx.intern_var(&v.name));
             let path_var_id = path_var.map(|v| ctx.intern_var(&v.name));
 
+            // One identity-carrying relationship list per chain, shared by the
+            // relationship variable and by `relationships(p)`. Allocated once
+            // outside the `k` loop so every chain binds the SAME variable —
+            // each chain is a Union branch, and a per-branch variable would
+            // leave `relationships(p)` unbound in all but the last. Building
+            // it twice would also fan the rows out twice on a hop carrying
+            // parallel annotations.
+            let rel_list_var = match rel_var_id {
+                Some(rv) => Some(rv),
+                None if path_var_id.is_some() => Some(ctx.fresh_synth()),
+                None => None,
+            };
+            if let (Some(pv), Some(lv)) = (path_var_id, rel_list_var) {
+                ctx.register_path_rel_list(pv, lv);
+            }
+
             let mut chains: Vec<Vec<Pattern>> = Vec::with_capacity((hi - lo + 1) as usize);
             for k in lo..=hi {
                 let (mut chain, nodes) = build_fixed_chain(
@@ -742,11 +811,16 @@ fn lower_var_length_rel<E: IriEncoder>(
                     rel.props.as_ref(),
                 )?;
                 if let Some(pred) = &pred_sid {
-                    if let Some(rv) = rel_var_id {
-                        chain.push(Pattern::Bind {
-                            var: rv,
-                            expr: build_rel_list_expr(&nodes, pred, rel.direction)?,
-                        });
+                    if let Some(lv) = rel_list_var {
+                        let expr = build_rel_list_expr(
+                            ctx,
+                            &nodes,
+                            pred,
+                            &type_iri,
+                            rel.direction,
+                            &mut chain,
+                        )?;
+                        chain.push(Pattern::Bind { var: lv, expr });
                     }
                     if let Some(pv) = path_var_id {
                         chain.push(Pattern::Bind {
@@ -764,6 +838,36 @@ fn lower_var_length_rel<E: IriEncoder>(
             }
             Ok(())
         }
+    }
+}
+
+/// The concrete edit that moves `rel` off the enumeration route and onto the
+/// bounded fixed-chain expansion, named in the user's own terms. Mirrors the
+/// three call sites that route here: untyped-with-binding, unbounded-with-
+/// binding, and a bounded range that is undirected, zero-lower-bound, or
+/// deeper than `MAX_BOUNDED_HOPS`.
+fn enumeration_remedy(rel: &RelPattern) -> String {
+    let mut fixes: Vec<&str> = Vec::new();
+    if rel.types.is_empty() {
+        fixes.push("name a relationship type (`-[rs:TYPE*1..3]->`)");
+    }
+    if matches!(rel.direction, Direction::Either) {
+        fixes.push("give the pattern a direction (`->` or `<-`)");
+    }
+    match rel.length.as_ref().and_then(|l| l.max) {
+        None => fixes.push("give the range an upper bound (`*1..3`)"),
+        Some(hi) if hi > MAX_BOUNDED_HOPS => {
+            fixes.push("lower the upper bound to 16 hops or fewer");
+        }
+        Some(_) => {}
+    }
+    if rel.length.as_ref().map_or(1, |l| l.min.unwrap_or(1)) == 0 {
+        fixes.push("start the range at 1 rather than 0 (`*1..3`)");
+    }
+    match fixes.len() {
+        0 => "Rewrite it as a bounded single-typed directed range".to_string(),
+        1 => format!("To read them, {}", fixes[0]),
+        _ => format!("To read them, {}", fixes.join(", and ")),
     }
 }
 
@@ -787,6 +891,37 @@ fn lower_enumerate_path<E: IriEncoder>(
     out: &mut Vec<Pattern>,
     path_var: Option<&Variable>,
 ) -> Result<()> {
+    // Reading a *property* of an enumerated hop needs per-hop edge identity,
+    // and this operator does not retain it: `Binding::Path.edges` is
+    // `(start, predicate, end)` with no reifier slot, so every element's
+    // property surface is empty and the read would silently answer null. The
+    // bounded fixed-chain expansion does retain it (`build_rel_list_expr`), so
+    // the remedy is always a range that route can take.
+    //
+    // A later fix would give the operator the reifier per hop rather than
+    // probing per hop per enumerated path (un-batched work under no path-count
+    // bound). The house idiom is already here: `ShortestPathPattern` carries a
+    // `needs_relationships` flag the operator honors, and
+    // `absorb_shortest_path_node_filters` (`lower/mod.rs`) shows how a filter
+    // over path elements is pushed into the operator rather than evaluated
+    // after it.
+    for v in rel.var.iter().chain(path_var) {
+        if ctx.reads_element_properties(&v.name) {
+            return Err(LowerError::unsupported(format!(
+                "reading relationship properties over `{}` is not supported here: this \
+                 variable-length pattern is resolved by path enumeration, which does not \
+                 retain per-hop edge identity, so every property read would answer null. \
+                 {} — a bounded single-typed directed range keeps each hop's annotation, \
+                 so `all(r IN {} WHERE r.prop = v)`, `[r IN {} | r.prop]` and `UNWIND {} \
+                 AS r … r.prop` all work over it",
+                v.name,
+                enumeration_remedy(rel),
+                v.name,
+                v.name,
+                v.name,
+            )));
+        }
+    }
     if rel.types.len() > 1 {
         return Err(LowerError::unsupported(
             "binding a relationship/path variable over a type alternation (`[:A|B*]`) is \
@@ -1006,16 +1141,54 @@ fn build_fixed_chain<E: IriEncoder>(
     Ok((chain, nodes))
 }
 
-/// Build `MakeList([MakeRel(start, pred, end), …])` over a fixed chain's nodes,
-/// one relationship per hop. Directed orientation: `Outgoing` keeps the chain
-/// order (subject → object); `Incoming` flips each hop so the relationship's
-/// start/end match the stored edge.
-fn build_rel_list_expr(
+/// Whether a per-edge annotation probe can bind anything in this view:
+/// `f:reifies*` must be in the dictionary, and the caller must not have proved
+/// (index stats + overlay) that no `f:reifies*` fact exists. When it cannot,
+/// every relationship value is the synthesized one and the probe is pure cost.
+fn annotation_probe_possible<E: IriEncoder>(ctx: &LoweringContext<'_, E>) -> bool {
+    ctx.reified_edges_possible
+        && ctx
+            .encoder
+            .encode_iri(fluree_vocab::reifies_iris::SUBJECT)
+            .is_some()
+}
+
+/// Build the relationship-list value for a fixed chain — one element per hop —
+/// giving every hop its own **edge identity**.
+///
+/// Each element is `coalesce(?ann_i, MakeRel(start, pred, end))`, with a
+/// per-hop `Optional([EdgeAnnotation])` probe pushed into `chain`. This is
+/// exactly the single-hop contract from `push_rel_triple`, applied per hop:
+/// when a hop's edge is reified the element **is** the reifier node — a
+/// `Binding::Sid`, so `r.prop`, `properties(r)` and `keys(r)` resolve through
+/// the evaluator's node arm — and when it is not, the element degrades to the
+/// synthesized relationship value, whose property surface is empty.
+///
+/// Two properties of this shape are contracts, not incidentals:
+///
+/// - **The `Optional` wrapper is load-bearing.** A bare `EdgeAnnotation` would
+///   drop every path containing an unreified hop. `all(…)` would exclude those
+///   paths anyway, but `[r IN rs | r.conf]` and `any(…)` must still see them.
+/// - **Row multiplicity follows edge multiplicity.** `Pattern::EdgeAnnotation`
+///   yields one row per `(edge, annotation)` pair, so a hop carrying two
+///   parallel claims doubles the rows and a k-hop chain multiplies k-fold.
+///   That is Cypher's answer — parallel relationships are distinct
+///   relationships — and it is what a single `-[r:T]->` hop already does.
+///
+/// Directed orientation: `Outgoing` keeps the chain order (subject → object);
+/// `Incoming` flips each hop so the relationship's start/end match the stored
+/// edge. An undirected hop never reaches here (the `props`/binding gates route
+/// it to path enumeration).
+fn build_rel_list_expr<E: IriEncoder>(
+    ctx: &mut LoweringContext<'_, E>,
     nodes: &[Ref],
     pred_sid: &fluree_db_core::Sid,
+    type_iri: &str,
     direction: Direction,
+    chain: &mut Vec<Pattern>,
 ) -> Result<Expression> {
     let pred_const = Expression::Const(FlakeValue::Ref(pred_sid.clone()));
+    let probe = annotation_probe_possible(ctx);
     let mut rels = Vec::with_capacity(nodes.len().saturating_sub(1));
     for w in nodes.windows(2) {
         let (a, b) = match direction {
@@ -1027,10 +1200,26 @@ fn build_rel_list_expr(
                 "binding a variable-length relationship over IRI-anchored endpoints is deferred",
             ));
         };
-        rels.push(Expression::call(
-            Function::MakeRel,
-            vec![sa, pred_const.clone(), sb],
-        ));
+        let rel_value = Expression::call(Function::MakeRel, vec![sa, pred_const.clone(), sb]);
+        if probe {
+            let ann = ctx.fresh_synth();
+            let edge = TriplePattern::new(
+                a.clone(),
+                ctx.iri_ref(type_iri.to_string()),
+                b.clone().into(),
+            );
+            chain.push(Pattern::Optional(vec![Pattern::EdgeAnnotation {
+                edge,
+                annotation: Ref::Var(ann),
+                body: Vec::new(),
+            }]));
+            rels.push(Expression::call(
+                Function::Coalesce,
+                vec![Expression::Var(ann), rel_value],
+            ));
+        } else {
+            rels.push(rel_value);
+        }
     }
     Ok(Expression::call(Function::MakeList, rels))
 }
@@ -1220,15 +1409,8 @@ fn push_rel_triple<E: IriEncoder>(
                     out.push(Pattern::Filter(untyped_edge_set_filter(ctx, *pv, &o)));
                 }
                 // Skip the per-edge annotation probe when no edge in this
-                // view can be reified: `f:reifies*` absent from the
-                // dictionary, or the caller proved (index stats + overlay)
-                // that no `f:reifies*` fact exists.
-                let expr = if ctx.reified_edges_possible
-                    && ctx
-                        .encoder
-                        .encode_iri(fluree_vocab::reifies_iris::SUBJECT)
-                        .is_some()
-                {
+                // view can be reified (see `annotation_probe_possible`).
+                let expr = if annotation_probe_possible(ctx) {
                     let ann = ctx.fresh_synth();
                     out.push(Pattern::Optional(vec![Pattern::EdgeAnnotation {
                         edge: TriplePattern::new(s, pred, edge_o),
