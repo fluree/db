@@ -39,6 +39,12 @@
 //!   therefore propagate *up* into the enclosing scope, where the relationship
 //!   pattern that binds the name is lowered.
 //!
+//! The one binding form the scan does model is the **loop-local** variable of a
+//! list iteration (`all(x IN L …)`, `[x IN L | …]`, `reduce(… x IN L …)`):
+//! `lower/expr.rs` binds it with `bind_local`, so it can never name a row
+//! variable, and its name is dropped at the iteration boundary rather than
+//! escaping into the enclosing scope.
+//!
 //! Residual, stated rather than fixed: a `WITH` that rebinds a name inside one
 //! branch still false-positives, and a name bound *inside* a `CALL` body that
 //! shadows an outer relationship variable propagates up. Both need a
@@ -299,6 +305,15 @@ fn scan_list_iteration(var: &str, list: &Expr, bodies: &[&Expr], out: &mut Scope
     if body_uses.annotation.contains(var) {
         collect_rel_list_vars(list, &mut out.element_property);
     }
+    // The loop variable is loop-local and can never name a row variable, so
+    // its name must not escape into the enclosing scope's annotation set: a
+    // same-named relationship variable elsewhere in the scope would be lowered
+    // annotation-dependent and silently drop its unreified rows. Removing it
+    // after the `contains` check above keeps the element-property conclusion
+    // this body just licensed. A nested iteration that shadows the same name
+    // has already removed its own binding by the time we see its uses, so what
+    // remains here belongs to *this* loop variable.
+    body_uses.annotation.remove(var);
     out.annotation.extend(body_uses.annotation);
     out.element_property.extend(body_uses.element_property);
 }

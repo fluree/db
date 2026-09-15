@@ -9984,6 +9984,76 @@ async fn cypher_union_branch_rel_var_name_collision_keeps_both_branches() {
 }
 
 #[tokio::test]
+async fn cypher_list_iteration_loop_var_does_not_capture_a_same_named_rel_var() {
+    // The loop variable of a list iteration is loop-local — `lower/expr.rs`
+    // binds it with `bind_local`, so it can never name a row variable. Letting
+    // its name escape into the scope's annotation set makes a same-named
+    // *relationship* variable elsewhere in the scope lower as
+    // annotation-dependent: the bare `EdgeAnnotation` lane, which matches only
+    // reified edges and silently drops the unreified rows.
+    //
+    // Alice -0.9-> Bob is reified; Bob -> Carol is plain. `r` is both the loop
+    // variable of the `all(...)` and the relationship variable of the hop that
+    // has to match the plain edge.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:loop-var-name-collision");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "alice", "@type": "Person", "name": "Alice",
+                     "KNOWS": {"@id": "bob", "@annotation": {"confidence": 0.9}}},
+                    {"@id": "bob", "@type": "Person", "name": "Bob",
+                     "KNOWS": {"@id": "carol"}},
+                    {"@id": "carol", "@type": "Person", "name": "Carol"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let q = |loop_var: &str| {
+        format!(
+            r#"MATCH (b:Person {{name: "Bob"}})-[r:KNOWS]->(c:Person)
+               MATCH (a:Person {{name: "Alice"}})-[rs:KNOWS*1..1]->(b)
+               WHERE all({loop_var} IN rs WHERE {loop_var}.confidence > 0.5)
+               RETURN c.name AS name"#
+        )
+    };
+    // The control: a loop variable that collides with nothing.
+    assert_eq!(
+        cypher_rows(&fluree, &db, &q("x")).await,
+        vec![json!(["Carol"])],
+    );
+    // The same query with the loop variable renamed to collide with the row
+    // variable `r` must answer identically — the two are different variables.
+    assert_eq!(
+        cypher_rows(&fluree, &db, &q("r")).await,
+        vec![json!(["Carol"])],
+        "the loop variable of `all(...)` must not make the row variable `r` \
+         annotation-dependent and drop the unreified Bob->Carol edge"
+    );
+
+    // Same collision through a list comprehension rather than a predicate —
+    // the other `scan_list_iteration` call site.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (b:Person {name: "Bob"})-[r:KNOWS]->(c:Person)
+               MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..1]->(b)
+               RETURN c.name AS name, [r IN rs | r.confidence] AS confs"#,
+        )
+        .await,
+        vec![json!(["Carol", [0.9]])],
+    );
+}
+
+#[tokio::test]
 async fn cypher_var_length_bound_rel_var_reads_per_hop_annotations() {
     let fluree = FlureeBuilder::memory().build_memory();
     let l = seed_claims_chain(&fluree, "it/cypher:varlen-hop-annotations").await;
