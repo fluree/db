@@ -185,7 +185,7 @@ pub use ledger_manager::{
     LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult, RemoteWatermark,
     UpdatePlan, WritePathStats,
 };
-pub use ledger_view::{CommitRef, LedgerView};
+pub use ledger_view::{CommitRef, LedgerView, COMMIT_PREFIX_MIN_LEN};
 pub use merge::{MergeReport, StagedMerge};
 pub use merge_preview::{
     AncestorRef, BranchDelta, ChangeSummary, ConflictDetail, ConflictResolutionPreview,

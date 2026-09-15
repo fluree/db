@@ -502,24 +502,26 @@ Authorization: Bearer <token>   (when data auth is enabled)
 
 ```json
 {
-  "ledger_id": "mydb:main",
+  "ledger_id": "logdemo:main",
   "commits": [
     {
-      "t": 12,
-      "commit_id": "bafy...",
-      "time": "2026-04-25T12:00:00Z",
-      "asserts": 3,
+      "t": 6,
+      "commit_id": "bagaybqabciqn3stf3bgar34nucpfp7z34eupir7ku4w2wzxd6yx2elvthu2mdga",
+      "time": "2026-09-15T02:40:25.527303+00:00",
+      "asserts": 1,
       "retracts": 0,
-      "flake_count": 3,
+      "flake_count": 1,
       "message": null
     }
   ],
-  "count": 12,
-  "truncated": false
+  "count": 6,
+  "truncated": true
 }
 ```
 
 `commits` is strictly newest-first by `t` and capped by `limit`. `count` is the full chain length; `truncated == count > commits.len()`. `message` is extracted from `txn_meta` when an `f:message` entry with a string value is present, otherwise `null`. Each summary mirrors `fluree_db_core::CommitSummary`.
+
+**`commit_id` spelling:** this is the full base32 CID, the canonical wire form of a `ContentId`. It is *not* what `fluree log` prints — that is the commit's hex SHA-256 digest, which is what the commit prefix resolvers scan and therefore the only abbreviable spelling. Both name the same commit; a full CID from this response can be passed wherever a commit reference is accepted, but a *truncated* one cannot, because every commit CID opens with the same twelve-character header.
 
 **Branch-aware walk:** The walk loads commit envelopes via a branch-aware content store so it can cross fork points — pre-fork commits live under the source branch's namespace.
 
