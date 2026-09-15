@@ -1174,5 +1174,5 @@ where
         })
     })
     .await
-    .map_err(|e| IndexerError::StorageWrite(format!("index build task panicked: {e}")))?
+    .map_err(|e| IndexerError::from_join("index build task", e))?
 }

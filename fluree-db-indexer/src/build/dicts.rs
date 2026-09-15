@@ -119,7 +119,7 @@ async fn upload_incremental_reverse_tree_core(
         )
     })
     .await
-    .map_err(|e| IndexerError::StorageWrite(format!("reverse tree task panicked: {e}")))?
+    .map_err(|e| IndexerError::from_join("reverse tree task", e))?
     .map_err(|e| IndexerError::StorageWrite(format!("incremental reverse tree: {e}")))?;
 
     // 5. Async upload new leaf artifacts.

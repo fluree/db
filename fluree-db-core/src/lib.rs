@@ -79,6 +79,8 @@ pub mod stats_wire;
 pub mod storage;
 pub mod subject_id;
 pub mod sysmem;
+#[cfg(feature = "native")]
+pub mod task;
 pub mod temporal;
 pub mod tracking;
 pub mod value;
