@@ -453,13 +453,46 @@ ex:dataset-import-2024-01-22 a ex:DatasetImport ;
 
 ## Edge annotations (RDF 1.2 / Turtle-star)
 
-The Turtle parser accepts the RDF 1.2 *asserting* annotation forms on every Turtle write path — `insert`, `upsert`, bulk `import`, `fluree graph sync`, and the memory importer:
+The Turtle parser (which also reads N-Triples) accepts the RDF 1.2 *asserting* forms on every Turtle write path — `insert`, `upsert`, bulk `import`, `fluree graph sync`, and the memory importer. All of them produce the same on-disk `f:reifies*` bundle that the JSON-LD `@annotation` and SPARQL 1.2 `{| |}` surfaces write, so cascade retracts, hydration, and the annotation arena treat every surface as one, and the annotations are queryable from every query surface:
 
-- `:s :p :o {| :q :v |}` — an annotation block on a triple (fresh anonymous reifier);
-- `:s :p :o ~ :r {| :q :v |}` — a named reifier (`~ :r` on its own attaches the reifier without a body);
-- `<< :s :p :o >> :q :v` — a reified triple in subject or object position.
+```turtle
+@prefix ex:  <http://example.org/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
 
-Fluree's model reifies **asserted** edges, so every form above asserts the base triple `:s :p :o` and attaches the reifier to it — `<< … >>` is not the non-asserting form it is in plain RDF 1.2. The reifier's own triples (the annotation body) are ordinary RDF about the reifier. On disk the result is the same `f:reifies*` bundle that the JSON-LD `@annotation` and SPARQL 1.2 `{| |}` surfaces write, so the annotations are queryable from every query surface.
+# Annotation block — fresh anonymous reifier
+ex:alice ex:worksFor ex:acme {| ex:role "Engineer" ; ex:since "2024-01-01"^^xsd:date |} .
+
+# Named reifier, with or without a block
+ex:alice ex:knows ex:bob ~ ex:friendship1 {| ex:since 2019 |} .
+ex:alice ex:knows ex:carol ~ ex:friendship2 .
+
+# Reified triple in subject or object position (the reifier is the node)
+<< ex:alice ex:worksFor ex:acme ~ ex:emp1 >> ex:confidence 0.97 .
+ex:doc ex:cites << ex:alice ex:worksFor ex:acme ~ ex:emp1 >> .
+
+# The canonical RDF 1.2 spelling every form above desugars to — and the only
+# star construct N-Triples has
+ex:emp1 rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
+```
+
+Two rules to know:
+
+- **The reified triple is asserted.** RDF 1.2 says `<< s p o >>` and `r rdf:reifies <<( s p o )>>` do *not* put `s p o` in the graph; Fluree's annotations describe a live edge, so ingest asserts the base triple as well and attaches the reifier to it. The reifier's own triples (the annotation body) are ordinary RDF about the reifier. Each anonymous `<< s p o >>` / `{| |}` occurrence mints a fresh reifier — two textual occurrences are two annotations.
+- **`<<( ... )>>` is accepted only as the object of `rdf:reifies`.** As a plain value (`ex:doc ex:mentions <<( ... )>>`), nested inside another triple term, or inside an annotation body, it is rejected with a specific "deferred" error rather than silently dropped.
+
+TriG and N-Quads accept the same forms inside `GRAPH { }` blocks (and on N-Quads statements with a graph label). The annotation is written into that graph and carries the edge's graph identity, exactly as JSON-LD `@graph` + `@annotation` does:
+
+```trig
+@prefix ex: <http://example.org/> .
+
+GRAPH ex:hr {
+  ex:alice ex:worksFor ex:acme {| ex:role "Engineer" |} .
+  << ex:alice ex:knows ex:bob ~ ex:f1 >> ex:confidence 0.9 .
+}
+```
+
+Sending a claims file through `upsert` replaces each claim's body (`ex:confidence`) the way upsert replaces any other predicate value, while the edge and its attachment stay put — the natural way to keep a claims file in sync with a ledger.
 
 ```turtle
 @prefix ex: <http://example.org/> .
@@ -468,13 +501,11 @@ ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 ; ex:source ex:hr |} .
 ex:alice ex:knows ex:carol {| ex:source ex:linkedin |} .
 ```
 
-Sending a claims file through `upsert` replaces each claim's body (`ex:confidence`) the way upsert replaces any other predicate value, while the edge and its attachment stay put — the natural way to keep a claims file in sync with a ledger.
-
 **Write the reifier before the annotation block.** `s p o ~ ?claim {| … |}` binds `?claim` to the reifier of the very claim the block matches. Reversing them — `s p o {| … |} ~ ?claim` — is legal but means something else: two *independent* annotation units on the same edge, one matching the body and one binding a reifier, joined. On an edge with two claims that returns four rows rather than two, silently, because each unit matches every claim.
 
 This one is documented rather than refused, and the line is worth stating because Fluree draws it elsewhere too. The reversed form is well-formed SPARQL-star with defined semantics: four rows is the *correct* answer to what was written, and no parser can know the author meant the other thing. Fluree refuses a construct only when there is no correct answer to give — a property read on an enumerated variable-length relationship is refused (see `docs/query/cypher.md`) because the enumeration operator does not retain per-hop edge identity, so every answer, nulls included, would be a fiction. A right answer to the wrong question gets a warning in the docs; no right answer gets an error.
 
-**TriG goes through `upsert`, not `insert`.** `fluree insert` routes a file to the streaming Turtle parser, which has no `GRAPH` keyword and reports `expected subject, found KwGraph`. Named-graph blocks are read by `fluree upsert -f file.trig`.
+**TriG goes through `upsert`, not `insert`.** `fluree insert` routes a file to the streaming Turtle parser, which has no `GRAPH` keyword and reports `expected subject, found 'GRAPH'`. Named-graph blocks are read by `fluree upsert -f file.trig`.
 
 **Anonymous reifiers have no identity you can refer to, and the two re-send paths differ.** `~ ex:claim1` is an identity: re-ingesting the file finds the same claim and replaces its body, on every path. A bare `{| … |}` block has no such handle, so what happens on a re-send depends on where the path scopes blank-node identity.
 
@@ -487,16 +518,16 @@ This one is documented rather than refused, and the line is worth stating becaus
 
 Rejected with a clear parse or stage error, never silently dropped:
 
-- the parenthesized triple term `<<( :s :p :o )>>` as a value (RDF 1.2 triple terms are not representable yet);
-- an annotation block nested inside an annotation body (`{| :q :v {| … |} |}`);
+- the parenthesized triple term `<<( :s :p :o )>>` anywhere other than the object of `rdf:reifies` (RDF 1.2 triple terms as values are not representable yet), and a triple term nested inside another;
+- an annotation block nested inside an annotation body (`{| :q :v {| … |} |}`), and an annotation tail on an `rdf:reifies <<( … )>>` statement (it would annotate the reification itself);
 - an annotation on a collection object (`( :a :b ) {| … |}`);
 - one named reifier on two different triples — a reifier denotes exactly one edge (see [the single-target invariant](../concepts/edge-annotations.md#one-annotation-one-edge-single-target-invariant));
 - an annotation on an `rdf:type` edge (`:s a :C {| … |}`) on the paths that convert Turtle to JSON-LD first (`upsert`, `graph sync`, memory import) — JSON-LD has no place to hang an annotation on a `@type` value. `insert` and SPARQL UPDATE accept it;
-- TriG: annotations inside a `GRAPH { }` block — same rule as SPARQL UPDATE (default graph only); use JSON-LD `@annotation` for named-graph edges.
+- TriG: annotations in a `<#txn-meta>` block — its triples become commit metadata, not edges.
 
 The RDF 1.2 version directive — `VERSION "1.2"` or `@version "1.2" .` — is accepted anywhere a directive may appear and ignored: the RDF 1.2 surface is always on. Base-direction language tags (`"…"@en--ltr`) are accepted; a direction other than `ltr` / `rtl` is a syntax error. They are stored as an `rdf:langString` whose language is the whole `en--ltr` string, not yet as `rdf:dirLangString` with a separate direction — so `LANG()` returns `en--ltr` and `langMatches(?l, "en")` will not match it.
 
-Turtle-star output is not produced yet: exports and CONSTRUCT emit annotations in JSON-LD only. For the SPARQL 1.2 UPDATE equivalents see [the cookbook](../guides/cookbook-edge-annotations.md#the-same-patterns-in-sparql-12); for the full model and its limits see the [Edge annotations concept doc](../concepts/edge-annotations.md).
+Turtle-star output is not produced yet: exports and CONSTRUCT emit annotations in JSON-LD only. For the SPARQL 1.2 UPDATE equivalents see [the cookbook](../guides/cookbook-edge-annotations.md#the-same-patterns-in-sparql-12); for the full model — `rdf:reifies` for annotation-rooted queries, the per-operation rules for SPARQL UPDATE templates, and the deferred shapes — see the [Edge annotations concept doc](../concepts/edge-annotations.md).
 
 ## Comparing Formats
 

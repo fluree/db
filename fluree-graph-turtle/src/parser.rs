@@ -58,6 +58,11 @@ pub struct Parser<'a, 'input, S> {
     prefixes: FxHashMap<String, String>,
     /// Base IRI for relative IRI resolution
     base: Option<String>,
+    /// `rdf:reifies` as interned by the sink, recorded the first time the
+    /// document mentions it. Lets `parse_object_list` recognise the RDF 1.2
+    /// `r rdf:reifies <<( s p o )>>` spelling by `TermId` equality without
+    /// interning `rdf:reifies` into documents that never use it.
+    reifies_term: Option<TermId>,
     /// Nesting depth of `{| … |}` annotation bodies currently being parsed.
     /// Non-zero means we are inside an annotation body, where further star
     /// constructs (annotation-of-annotation, reified triples) are the
@@ -131,6 +136,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             rdf_rest_term: None,
             prefixes: FxHashMap::default(),
             base: None,
+            reifies_term: None,
             annotation_depth: 0,
             nesting_depth: 0,
             options,
@@ -288,6 +294,9 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         self.iri_cache_misses += 1;
         let id = self.sink.term_iri(iri);
         self.iri_term_cache.insert(Arc::<str>::from(iri), id);
+        if iri == rdf::REIFIES {
+            self.reifies_term = Some(id);
+        }
         id
     }
 
@@ -478,7 +487,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         } else {
             Err(TurtleError::parse(
                 self.current().start as usize,
-                format!("expected {:?}, found {:?}", kind, self.current().kind),
+                format!("expected {kind}, found {}", self.current().kind),
             ))
         }
     }
@@ -499,7 +508,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         if !self.check(&TokenKind::Dot) {
             return Err(TurtleError::parse(
                 self.current().start as usize,
-                format!("expected Dot, found {:?}", self.current().kind),
+                format!("expected '.', found {}", self.current().kind),
             ));
         }
         self.sink.end_statement();
@@ -559,7 +568,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                         if opens_long {
                             "a long string".to_string()
                         } else {
-                            format!("{:?}", self.current().kind)
+                            self.current().kind.to_string()
                         }
                     ),
                 ))
@@ -807,7 +816,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
-                format!("expected subject, found {:?}", self.current().kind),
+                format!("expected subject, found {}", self.current().kind),
             )),
         }
     }
@@ -867,7 +876,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             }
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
-                format!("expected predicate, found {:?}", self.current().kind),
+                format!("expected predicate, found {}", self.current().kind),
             )),
         }
     }
@@ -912,6 +921,9 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                         }
                         None => self.reject_annotation_on_collection()?,
                     }
+                }
+                TokenKind::TripleTermStart if Some(predicate) == self.reifies_term => {
+                    self.parse_reifies_triple_term(subject)?;
                 }
                 _ => {
                     let object = self.parse_object()?;
@@ -1016,7 +1028,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
-                format!("expected object, found {:?}", self.current().kind),
+                format!("expected object, found {}", self.current().kind),
             )),
         }
     }
@@ -1104,7 +1116,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             }
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
-                format!("expected literal, found {:?}", self.current().kind),
+                format!("expected literal, found {}", self.current().kind),
             )),
         }
     }
@@ -1203,7 +1215,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             }
             _ => Err(TurtleError::parse(
                 self.current().start as usize,
-                format!("expected datatype IRI, found {:?}", self.current().kind),
+                format!("expected datatype IRI, found {}", self.current().kind),
             )),
         }
     }
@@ -1283,9 +1295,86 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         TurtleError::parse(
             self.current().start as usize,
             "RDF 1.2 triple terms as values ('<<( … )>>') are deferred in Turtle \
-             ingest; only the asserting forms are supported (reified triples \
-             '<< s p o >>' with optional '~ reifier', and annotation blocks '{| … |}')",
+             ingest except as the object of rdf:reifies; the supported forms are \
+             'r rdf:reifies <<( s p o )>>', reified triples '<< s p o >>' with \
+             optional '~ reifier', and annotation blocks '{| … |}'",
         )
+    }
+
+    /// `r rdf:reifies <<( s p o )>>` — the RDF 1.2 spelling every asserting
+    /// form desugars to, and the only star construct N-Triples/N-Quads have.
+    /// The `<<(` token is current and `subject` is the reifier. Emits exactly
+    /// what `<< s p o ~ r >>` emits (base triple asserted, then the reifier
+    /// attachment), so both spellings produce one on-disk shape.
+    ///
+    /// Grammar: `tripleTerm ::= '<<(' ttSubject predicate ttObject ')>>'`,
+    /// `ttSubject ::= iri | BlankNode`, `ttObject ::= iri | BlankNode |
+    /// literal | tripleTerm`. A nested triple term in object position is a
+    /// value with no Fluree representation and keeps the deferred error.
+    fn parse_reifies_triple_term(&mut self, reifier: TermId) -> Result<()> {
+        self.with_nesting(|p| {
+            p.check_star_allowed("triple term ('<<( … )>>')")?;
+            p.expect(&TokenKind::TripleTermStart)?;
+            let subject = p.parse_tt_subject()?;
+            let predicate = p.parse_predicate()?;
+            let object = p.parse_tt_object()?;
+            p.expect(&TokenKind::TripleTermEnd)?;
+            p.sink_emit_triple(subject, predicate, object)?;
+            p.sink_emit_reified_triple(subject, predicate, object, reifier)
+        })?;
+        // An annotation tail here would reify the `rdf:reifies` triple
+        // itself — the annotation-of-annotation shape, deferred like the
+        // nested `{| |}` case.
+        if matches!(
+            self.current().kind,
+            TokenKind::Tilde | TokenKind::AnnotationOpen
+        ) {
+            return Err(TurtleError::parse(
+                self.current().start as usize,
+                "an annotation tail on an 'rdf:reifies <<( … )>>' statement would \
+                 reify the reification itself (annotation-of-annotation), which is \
+                 deferred; annotate the base triple instead",
+            ));
+        }
+        Ok(())
+    }
+
+    /// ttSubject ::= iri | BlankNode
+    fn parse_tt_subject(&mut self) -> Result<TermId> {
+        match self.current().kind.clone() {
+            TokenKind::Iri
+            | TokenKind::IriEscaped(_)
+            | TokenKind::PrefixedName
+            | TokenKind::PrefixedNameNs
+            | TokenKind::BlankNodeLabel
+            | TokenKind::Anon => self.parse_reifier_term(),
+            _ => Err(TurtleError::parse(
+                self.current().start as usize,
+                format!(
+                    "expected triple-term subject (IRI or blank node), found {}",
+                    self.current().kind
+                ),
+            )),
+        }
+    }
+
+    /// ttObject ::= iri | BlankNode | literal | tripleTerm
+    fn parse_tt_object(&mut self) -> Result<TermId> {
+        match self.current().kind.clone() {
+            TokenKind::LBracket
+            | TokenKind::LParen
+            | TokenKind::Nil
+            | TokenKind::ReifiedTripleStart => Err(TurtleError::parse(
+                self.current().start as usize,
+                format!(
+                    "collections, blank-node property lists, and reified triples are \
+                     not allowed inside a triple term, found {}",
+                    self.current().kind
+                ),
+            )),
+            TokenKind::TripleTermStart => Err(self.triple_term_deferred_error()),
+            _ => self.parse_object(),
+        }
     }
 
     /// Guard shared by every star construct: the sink must support
@@ -1408,7 +1497,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 self.current().start as usize,
                 format!(
                     "expected reified-triple subject (IRI, blank node, or nested \
-                     '<< … >>'), found {:?}",
+                     '<< … >>'), found {}",
                     self.current().kind
                 ),
             )),
@@ -1426,7 +1515,7 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
                 self.current().start as usize,
                 format!(
                     "collections and blank-node property lists are not allowed \
-                     inside a reified triple, found {:?}",
+                     inside a reified triple, found {}",
                     self.current().kind
                 ),
             )),
@@ -2374,6 +2463,111 @@ mod tests {
     fn star_annotation_trailing_semicolon() {
         let sink = parse_star(&format!("{P}:a :b :c {{| :q :z ; |}} ."));
         assert_eq!(sink.reified.len(), 1);
+    }
+
+    #[test]
+    fn star_rdf_reifies_triple_term_object() {
+        // N-Triples 1.2 shape: `:r rdf:reifies <<( :a :b :c )>> .` is the
+        // same event as `<< :a :b :c ~ :r >>`.
+        let sink = parse_star(&format!(
+            "{P}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+             :r rdf:reifies <<( :a :b :c )>> ."
+        ));
+        assert_eq!(sink.reified.len(), 1);
+        let (s, p, o, r) = &sink.reified[0];
+        assert_eq!((s, p, o), (&iri("a"), &iri("b"), &iri("c")));
+        assert_eq!(r, &iri("r"));
+        // Base triple asserted; no ordinary `rdf:reifies` triple emitted.
+        assert_eq!(sink.triples, vec![(iri("a"), iri("b"), iri("c"))]);
+    }
+
+    #[test]
+    fn star_rdf_reifies_full_iri_and_bnode_reifier() {
+        // Absolute-IRI predicate (as N-Triples writes it) and a blank-node
+        // reifier that stays label-stable across statements.
+        let sink = parse_star(&format!(
+            "{P}_:r <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( :a :b \"x\"@en )>> .\n\
+             _:r :q :z ."
+        ));
+        assert_eq!(sink.reified.len(), 1);
+        let (s, p, o, r) = &sink.reified[0];
+        assert_eq!((s, p), (&iri("a"), &iri("b")));
+        assert_eq!(o, &RecTerm::Literal("x".to_string()));
+        assert!(matches!(r, RecTerm::Blank(_)));
+        assert!(sink.triples.contains(&(r.clone(), iri("q"), iri("z"))));
+    }
+
+    #[test]
+    fn star_rdf_reifies_matches_tilde_spelling() {
+        let prefix = format!("{P}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n");
+        let a = parse_star(&format!("{prefix}:r rdf:reifies <<( :a :b :c )>> ."));
+        let b = parse_star(&format!("{prefix}:a :b :c ~ :r ."));
+        assert_eq!(a.reified, b.reified);
+        assert_eq!(a.triples, b.triples);
+    }
+
+    #[test]
+    fn star_rdf_reifies_nested_triple_term_still_deferred() {
+        let mut sink = StarSink::default();
+        let err = parse(
+            &format!(
+                "{P}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+                 :r rdf:reifies <<( :s :p <<( :x :y 1 )>> )>> ."
+            ),
+            &mut sink,
+        )
+        .expect_err("nested triple term is a value with no representation");
+        assert!(err.to_string().contains("deferred"), "{err}");
+    }
+
+    #[test]
+    fn syntax_errors_spell_tokens_as_written() {
+        for (input, expected) in [
+            (
+                ":r rdf:reifies <<( :a :b :c ) >> .",
+                "expected ')>>', found ')'",
+            ),
+            (":a :b :c", "expected '.', found end of input"),
+            (":a :b :c :d .", "expected '.', found a prefixed name"),
+            ("GRAPH :g { :a :b :c . }", "expected subject, found 'GRAPH'"),
+            (":a :b .", "expected object, found '.'"),
+        ] {
+            let mut sink = StarSink::default();
+            let err = parse(
+                &format!("{P}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n{input}"),
+                &mut sink,
+            )
+            .expect_err(input)
+            .to_string();
+            assert!(err.contains(expected), "[{input}] got: {err}");
+        }
+    }
+
+    #[test]
+    fn star_rdf_reifies_rejects_annotation_tail() {
+        let mut sink = StarSink::default();
+        let err = parse(
+            &format!(
+                "{P}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+                 :r rdf:reifies <<( :a :b :c )>> {{| :q :z |}} ."
+            ),
+            &mut sink,
+        )
+        .expect_err("annotating the reification statement is deferred");
+        assert!(
+            err.to_string().contains("annotation-of-annotation"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn star_triple_term_under_other_predicate_still_deferred() {
+        // `<<( )>>` is only a value under rdf:reifies; `:q <<( … )>>` (the
+        // W3C data-0-tripleterms shape) keeps the deferred error.
+        let mut sink = StarSink::default();
+        let err = parse(&format!("{P}:a :q <<( :a :b :c )>> ."), &mut sink)
+            .expect_err("triple term under a non-reifies predicate");
+        assert!(err.to_string().contains("triple terms as values"), "{err}");
     }
 
     #[test]

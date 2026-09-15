@@ -37,10 +37,10 @@ use serde_json::Value as JsonValue;
 ///
 /// Streams the JSON through the hasher rather than serializing it to a
 /// `String` first, so a bulk payload does not pay a second full copy of
-/// itself. The TriG blocks fold in their graph IRI and triples but not their
-/// prefix map: prefixes only decide how the triples were expanded, and a
-/// `FxHashMap` has no stable iteration order, which would make the scope
-/// differ between two runs over the same document.
+/// itself. The TriG blocks fold in their graph IRI, triples and reifier
+/// attachments but not their prefix map: prefixes only decide how the triples
+/// were expanded, and a `FxHashMap` has no stable iteration order, which
+/// would make the scope differ between two runs over the same document.
 fn upsert_payload_id(txn_json: &JsonValue, named_graphs: &[NamedGraphBlock]) -> u64 {
     use std::io::Write;
     use xxhash_rust::xxh64::Xxh64;
@@ -64,6 +64,9 @@ fn upsert_payload_id(txn_json: &JsonValue, named_graphs: &[NamedGraphBlock]) -> 
         let _ = w.write_all(block.iri.as_bytes());
         for triple in &block.triples {
             let _ = write!(w, "\0{triple:?}");
+        }
+        for reified in &block.reified {
+            let _ = write!(w, "\0{reified:?}");
         }
     }
     w.0.digest()
@@ -2426,6 +2429,54 @@ fn convert_named_graphs_to_templates(
                 templates.push(template);
             }
         }
+
+        // TriG-star: one `f:reifies*` bundle per reifier attachment, in the
+        // same graph as the edge it reifies — the shape the JSON-LD
+        // `@annotation` sibling produces (f:reifiesGraph present, no
+        // f:reifiesDatatype, f:reifiesLang for language-tagged objects).
+        if !block.reified.is_empty() {
+            use fluree_db_core::namespaces::{
+                reifies_graph_sid, reifies_lang_sid, reifies_object_sid, reifies_predicate_sid,
+                reifies_subject_sid,
+            };
+            let graph_sid = ns_registry.sid_for_iri(&block.iri);
+            for r in &block.reified {
+                let ann = convert_term(&r.reifier, &block.prefixes, ns_registry)?;
+                let s = convert_term(&r.subject, &block.prefixes, ns_registry)?;
+                let p = convert_term(&r.predicate, &block.prefixes, ns_registry)?;
+                let (o, dtc) = convert_object(&r.object, &block.prefixes, ns_registry)?;
+                let lang = match &dtc {
+                    Some(DatatypeConstraint::LangTag(lang)) => Some(lang.to_string()),
+                    _ => None,
+                };
+                let mut push = |pred: &fluree_db_core::Sid,
+                                obj: TemplateTerm,
+                                dtc: Option<DatatypeConstraint>| {
+                    let mut t =
+                        TripleTemplate::new(ann.clone(), TemplateTerm::Sid(pred.clone()), obj)
+                            .with_graph_id(g_id);
+                    if let Some(d) = dtc {
+                        t = t.with_dtc(d);
+                    }
+                    templates.push(t);
+                };
+                push(
+                    reifies_graph_sid(),
+                    TemplateTerm::Sid(graph_sid.clone()),
+                    None,
+                );
+                push(reifies_subject_sid(), s, None);
+                push(reifies_predicate_sid(), p, None);
+                if let Some(lang) = lang {
+                    push(
+                        reifies_lang_sid(),
+                        TemplateTerm::Value(fluree_db_core::FlakeValue::String(lang)),
+                        None,
+                    );
+                }
+                push(reifies_object_sid(), o, dtc);
+            }
+        }
     }
 
     Ok((templates, graph_delta))
@@ -4417,6 +4468,7 @@ mod tests {
                 predicate: RawTerm::Iri(fluree_vocab::reifies_iris::SUBJECT.to_string()),
                 objects: vec![RawObject::Iri("http://example.org/evil".to_string())],
             }],
+            reified: Vec::new(),
             prefixes: rustc_hash::FxHashMap::default(),
         };
         let mut ns = NamespaceRegistry::new();
@@ -4467,6 +4519,7 @@ mod tests {
                 predicate: RawTerm::Iri("http://example.org/p".to_string()),
                 objects: vec![RawObject::Iri("http://example.org/b".to_string())],
             }],
+            reified: Vec::new(),
             prefixes: rustc_hash::FxHashMap::default(),
         };
         let mut ns = NamespaceRegistry::new();
@@ -4488,6 +4541,7 @@ mod tests {
                 predicate: RawTerm::Iri("http://example.org/p".to_string()),
                 objects: vec![RawObject::Iri("http://example.org/b".to_string())],
             }],
+            reified: Vec::new(),
             prefixes: rustc_hash::FxHashMap::default(),
         };
         let mut ns = NamespaceRegistry::new();
@@ -4509,6 +4563,7 @@ mod tests {
                 predicate: RawTerm::Iri("http://example.org/knows".to_string()),
                 objects: vec![RawObject::Iri("_:other".to_string())],
             }],
+            reified: Vec::new(),
             prefixes: rustc_hash::FxHashMap::default(),
         };
         let mut ns = NamespaceRegistry::new();
