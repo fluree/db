@@ -3692,7 +3692,7 @@ mem:fact-01m2dhdd5ewaa1k1nqrg7f1g3n a mem:Fact ;
     mem:artifactRef "fluree-db-query/src/default_graph_source.rs" ;
     mem:artifactRef "fluree-db-query/src/seed.rs" ;
     mem:branch "perf/lazy-local-dictionary-open" ;
-    mem:createdAt "2026-09-13T14:05:51.662738+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-13T14:05:51.662738Z"^^xsd:dateTime ;
     mem:rationale "Typed shapes run within 2× on either lane; gates avoid catastrophic cases rather than pick an optimum. Open: streaming arena-enumeration lane for unbound shapes at 21M reifiers, DefaultGraphSourceOperator::estimated_rows is None, C1 nested-reifier short-circuit." .
 
 mem:fact-01m2dhddbgmgvxaks02yw8qsqn a mem:Fact ;
@@ -3708,7 +3708,7 @@ mem:fact-01m2dhddbgmgvxaks02yw8qsqn a mem:Fact ;
     mem:artifactRef "fluree-db-cli/src/commands/create.rs" ;
     mem:artifactRef "fluree-db-cli/src/context.rs" ;
     mem:branch "perf/lazy-local-dictionary-open" ;
-    mem:createdAt "2026-09-13T14:05:51.856996+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-13T14:05:51.856996Z"^^xsd:dateTime ;
     mem:rationale "The StarBench slice ledger had no arena at all; regression test reindex_seals_arena_without_ledger_caching pins the fix." .
 
 mem:fact-01m2dhem5zjt5nh1zvfsrvejqs a mem:Fact ;
@@ -3722,7 +3722,7 @@ mem:fact-01m2dhem5zjt5nh1zvfsrvejqs a mem:Fact ;
     mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
     mem:artifactRef "fluree-db-query/src/planner.rs" ;
     mem:branch "perf/lazy-local-dictionary-open" ;
-    mem:createdAt "2026-09-13T14:06:31.615201+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-13T14:06:31.615201Z"^^xsd:dateTime ;
     mem:rationale "RDF-1.2-only code; non-annotation explain plans byte-identical. Slice: P11/S6/C8/C11 timeout→<1s, P2 >60s→3.9s. To see the real chain order use RUST_LOG=fluree_db_query::default_graph_source=debug,fluree_db_query::binary_scan=debug with `fluree query -v`. Tests bound_reifier_* / annotation_wrapper_estimate_* fail with the fixes reverted." .
 
 mem:fact-01kx4zr6ed32yj966mpngvqhcg a mem:Fact ;
@@ -3766,12 +3766,12 @@ mem:decision-01m2fztsh4bjg9h36kk6eprt4y a mem:Decision ;
     mem:artifactRef "fluree-db-query/src/join.rs" ;
     mem:artifactRef "fluree-db-query/src/planner.rs" ;
     mem:branch "perf/rdf12-annotation-chain-planning" ;
-    mem:createdAt "2026-09-14T12:56:19.236948+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-14T12:56:19.236948Z"^^xsd:dateTime ;
     mem:rationale "Measured on the full BKR-star ledger: predicate-only shapes 2-4.6x faster on the chain (P11 14.9 -> 4.9 s), object-bound wrappers 3-9x (S20 3.4 -> 0.69 s), P10 0.12 -> 0.03 s; bound-subject shapes unchanged; S21/S22 within noise (cross-join bound)." ;
     mem:alternatives "Pure cost comparison for bound subjects (regressed P23/P19 catastrophically); runtime re-decision inside the arena probe after counting leaves (rejected: the replayed chain would inherit the same hub tail)" .
 
 mem:decision-01m2g43417xqdn66gd72kqp670 a mem:Decision ;
-    mem:content "The generic f:reifies* chain elides redundant checks (elide_redundant_chain): the base-edge existence check is dropped, and each reifies lookup whose position is a variable nothing reads (projection-pushdown set, later siblings, wrapper body, child-bound vars) is dropped; constants stay; at least one lookup always stays (a body-bound reifier must still be a reifier); a READ variable predicate blocks the rewrite (base scan binds a predicate id, the reifies lookup a plain ref). Sound because every reifier has exactly one rS/rP/rO in the edge's own graph plus an asserted base triple; gated on current mode, root policy, single ledger. Elided chain costs 2 rows/reifier, enumeration 12/pair." ;
+    mem:content "The generic f:reifies* chain elides redundant checks (elide_redundant_chain): the base-edge existence check is dropped, and each reifies lookup whose position is a variable nothing reads (projection-pushdown set, later siblings, wrapper body, child-bound vars) is dropped; constants stay; at least one lookup always stays (a body-bound reifier must still be a reifier); a READ variable predicate blocks the rewrite (base scan binds a predicate id, the reifies lookup a plain ref). Sound because every reifier has exactly one rS/rP/rO in the edge's own graph plus an asserted base triple, PROVIDED two easy-to-miss reads are counted: (1) a variable repeated across positions, or naming the reifier, keeps its lookups, which are the only equality left once the base edge is gone (<< ?s :p ?s >> double-counted without this); (2) under SELECT * the read set is collect_var_stats over the UN-expanded WHERE clause, which must walk EdgeAnnotation/AnnotationTarget or the quoted triple's own variables come back unbound (W3C sparql12 eval-triple-terms basic-4/5, pattern-7/8 failed in CI). Gated on root policy, single ledger, non-history query (past-t snapshots qualify: bundle and base edge commit and cascade together). Elided chain costs 2 rows/reifier, enumeration 12/pair." ;
     mem:tag "edge-annotation" ;
     mem:tag "performance" ;
     mem:tag "planner" ;
@@ -3782,7 +3782,8 @@ mem:decision-01m2g43417xqdn66gd72kqp670 a mem:Decision ;
     mem:artifactRef "fluree-db-query/src/default_graph_source.rs" ;
     mem:artifactRef "fluree-db-query/src/execute/where_plan.rs" ;
     mem:branch "perf/rdf12-annotation-chain-planning" ;
-    mem:createdAt "2026-09-14T14:10:46.439856+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-14T14:10:46.439856Z"^^xsd:dateTime ;
+    mem:updatedAt "2026-09-15T20:48:34.851521+00:00"^^xsd:dateTime ;
     mem:rationale "Full StarBench ledger: predicate-only chain went from one SPOT point scan per reifier to one POST range plus the body probe (P11 4.9 -> 0.42 s, C11 8.4 -> 0.61 s, S5 6.9 -> 1.8 s); P2 on the elided chain 10.6 s vs 65 s enumerating the reverse arena; C2 162 -> 59 s; P6/P7 (endpoints read) stay on the enumeration. P3 has 3 derives_from rows on plain subjects that P2 must not count, hence the keep-one rule." ;
     mem:alternatives "Keeping the base edge and eliding only rS/rO (unsound: breaks the reifier-to-edge link); eliding inside the hash lane (unneeded, it sweeps the sidecars once)" .
 
@@ -3799,7 +3800,7 @@ mem:decision-01m2gp3mhwmw089pe9hyctq73t a mem:Decision ;
     mem:artifactRef "fluree-db-binary-index/src/read/leaflet_cache.rs" ;
     mem:artifactRef "fluree-db-query/src/annotation_edge_probe.rs" ;
     mem:branch "perf/rdf12-annotation-chain-planning" ;
-    mem:createdAt "2026-09-14T19:25:37.724270+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-14T19:25:37.72427Z"^^xsd:dateTime ;
     mem:rationale "Memos keep every existing representation and plan byte-identical, so non-RDF-star queries cannot regress; the test for each memo was proven non-vacuous by disabling it." ;
     mem:alternatives "emit Binding::Sid from the enumerate lane; per-formatter memo plumbing; streaming SPARQL results writer" .
 
@@ -3815,7 +3816,7 @@ mem:fact-01m2erqe12gyekk6nm30j9saz7 a mem:Fact ;
     mem:artifactRef "fluree-db-query/src/join.rs" ;
     mem:artifactRef "fluree-db-server/src/routes/query.rs" ;
     mem:branch "perf/rdf12-annotation-chain-planning" ;
-    mem:createdAt "2026-09-14T01:32:54.691338+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-14T01:32:54.691338Z"^^xsd:dateTime ;
     mem:rationale "The CLI streams and drops batches, so it never showed the growth (15.9 GB peak for the full P4); only collect-all consumers see it. Measure with `--format csv` and peak RSS, not row counts." .
 
 mem:fact-01m2ftrqed0wjpj52d0xmbk0rw a mem:Fact ;
@@ -3831,7 +3832,7 @@ mem:fact-01m2ftrqed0wjpj52d0xmbk0rw a mem:Fact ;
     mem:artifactRef "fluree-db-binary-index/src/annotation_arena/reader.rs" ;
     mem:artifactRef "fluree-db-query/src/default_graph_source.rs" ;
     mem:branch "perf/rdf12-annotation-chain-planning" ;
-    mem:createdAt "2026-09-14T11:27:48.685925+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-14T11:27:48.685925Z"^^xsd:dateTime ;
     mem:rationale "Measured 2026-09-14 on the full BKR-star ledger; explains why every predicate-only and object-bound SPARQL-star shape sits 5-25x behind GraphDB/Stardog even after the planning fixes." .
 
 mem:fact-01m2g7sf28dwy0gwj8wv6h3eas a mem:Fact ;
@@ -3847,7 +3848,7 @@ mem:fact-01m2g7sf28dwy0gwj8wv6h3eas a mem:Fact ;
     mem:artifactRef "fluree-db-query/src/context.rs" ;
     mem:artifactRef "fluree-db-query/src/eval/string.rs" ;
     mem:branch "perf/rdf12-annotation-chain-planning" ;
-    mem:createdAt "2026-09-14T15:15:24.360022+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-14T15:15:24.360022Z"^^xsd:dateTime ;
     mem:rationale "Hub-heavy self-joins evaluate str(?a) > str(?b) tens of millions of times over a few thousand distinct subjects; with the memo working S10 8.8 -> 4.2 s, S21 10.9 -> 3.8 s, S11 336 -> 135 s, counts unchanged." .
 
 mem:fact-01m2gp3da2h2nrsrj53sf8e9js a mem:Fact ;
@@ -3862,7 +3863,7 @@ mem:fact-01m2gp3da2h2nrsrj53sf8e9js a mem:Fact ;
     mem:artifactRef "fluree-db-query/src/annotation_edge_probe.rs" ;
     mem:artifactRef "fluree-db-query/src/join.rs" ;
     mem:branch "perf/rdf12-annotation-chain-planning" ;
-    mem:createdAt "2026-09-14T19:25:30.306481+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-09-14T19:25:30.306481Z"^^xsd:dateTime ;
     mem:rationale "The writer theory (serde_json Value tree in the standard route) was falsified by the user's NDJSON stream measurement; recorded so nobody rebuilds the writer expecting a 2x on these shapes." .
 
 mem:decision-01kzdzqzsrwt4wbyr5dt9veshp a mem:Decision ;
