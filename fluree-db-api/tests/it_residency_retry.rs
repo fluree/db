@@ -18,6 +18,11 @@
 //! 3. ledger LOAD prefetches novelty's overlay-translation miss sources
 //!    (F8: reverse-dict leaves), so translation lookups are pure hits.
 //!
+//! Formatting is NOT inside the production loop: late-materialized bindings
+//! resolve forward packs when the caller formats, after the query call has
+//! returned, so the harness recovers those misses around `to_jsonld` the
+//! same way it recovers ledger load.
+//!
 //! Every test asserts a positive "miss fired" marker; recovery is never
 //! inferred from the absence of an error.
 //!
@@ -34,7 +39,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use fluree_db_api::{FlureeBuilder, GraphDb, NameServiceMode, QueryResult};
 use fluree_db_binary_index::read::need_fetch::fetch_wants;
-use fluree_db_core::storage::residency::{MissRegister, Want};
+use fluree_db_core::storage::residency::{FetchKind, MissRegister, Want};
 use fluree_db_core::storage::{
     ContentAddressedWrite, ContentStore, ContentWriteResult, MemoryStorage, StorageMethod,
     StorageRead, StorageWrite,
@@ -295,10 +300,34 @@ fn rows_of(result: &QueryResult, ledger: &fluree_db_api::LedgerState) -> Vec<Jso
     normalize_rows(&result.to_jsonld(&ledger.snapshot).expect("to_jsonld"))
 }
 
+/// Format a residency-mode result, recovering the misses late
+/// materialization records. Returns the rows and the wants recovered.
+async fn rows_with_recovery(
+    result: &QueryResult,
+    ledger: &fluree_db_api::LedgerState,
+    storage: &ResidencyStorage,
+) -> (Vec<JsonValue>, Vec<Want>) {
+    let cs = recovery_store(storage);
+    let mut recovery = Recovery {
+        rounds: 0,
+        wants: Vec::new(),
+    };
+    loop {
+        match result.to_jsonld(&ledger.snapshot) {
+            Ok(json) => return (normalize_rows(&json), recovery.wants),
+            Err(e) => {
+                let recovered = recover_once(&cs, storage, &mut recovery, &e).await;
+                assert!(recovered, "non-residency formatting error: {e:?}");
+            }
+        }
+    }
+}
+
 // ============================================================================
 // 1. Operator (scan) path through the PRODUCTION loop: one direct query
-//    call completes — leaf misses consumed in-frame by the scan operator,
-//    forward-pack misses by the query-entry loop.
+//    call completes — leaf misses consumed in-frame by the scan operator.
+//    The selected strings stay encoded until formatting, so their forward
+//    pack is first needed after the call returns.
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
@@ -341,7 +370,18 @@ async fn scan_query_completes_through_production_loop() {
         storage.register.is_empty(),
         "every recorded want must have been drained by a retry frame"
     );
-    assert_eq!(rows_of(&result, &ledger_b), expected, "identical results");
+
+    // A cold resident tier must miss the forward pack at formatting time;
+    // without this marker the test cannot tell recovery from a warm pack.
+    let (rows, format_wants) = rows_with_recovery(&result, &ledger_b, &storage).await;
+    assert!(
+        format_wants
+            .iter()
+            .any(|want| want.kind == FetchKind::ForwardPack),
+        "formatting must miss a forward pack (positive marker): {format_wants:?}"
+    );
+    assert!(storage.register.is_empty(), "formatting wants drained");
+    assert_eq!(rows, expected, "identical results");
 }
 
 // ============================================================================
