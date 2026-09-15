@@ -454,18 +454,19 @@ pub(crate) fn validate_value_dt_pair(val: &FlakeValue, dt: &Sid) -> Result<()> {
 }
 
 /// Shared core of the two `emit_reified_triple` impls (`FlakeSink` /
-/// `ImportSink`): a resolved Turtle-star reifier attachment → validated →
-/// the `EdgeKey::to_reifies_facts_jsonld_compatible` bundle. The
-/// construction sequence lives in exactly one place so the
-/// bit-identical-bundles guarantee (Turtle-star ≡ JSON-LD `@annotation`
-/// at the flake level; cascade retracts cancel either surface) cannot
-/// drift between the transactional and bulk-import sinks — each sink
-/// keeps only its own error channel and emission (Vec-extend vs
-/// commit-writer/spool).
+/// `ImportSink`) and of TriG bulk import: a resolved reifier attachment →
+/// validated → the `EdgeKey::to_reifies_facts_jsonld_compatible` bundle,
+/// so the bit-identical-bundles guarantee (Turtle-star ≡ JSON-LD
+/// `@annotation` at the flake level; cascade retracts cancel either
+/// surface) cannot drift between those callers — each keeps only its own
+/// error channel and emission (Vec-extend vs commit-writer/spool).
+/// Transactional TriG (`convert_named_graphs_to_templates` in
+/// `fluree-db-api`) is a second builder emitting templates; its parity is
+/// pinned by `trig_star_in_graph_block_matches_jsonld_named_graph_annotation`.
 ///
-/// Plain-Turtle surfaces are default-graph only (named graphs are TriG,
-/// a different ingest path) → `g = None`; list-occurrence annotations are
-/// deferred in v1 → `list_i = None`.
+/// `g` is `None` for the Turtle sinks (default graph) and the block's graph
+/// for TriG import; list-occurrence annotations are deferred in v1 →
+/// `list_i = None`.
 ///
 /// The validation is the same late hard guard as `build_flake` /
 /// `push_triple`: a bad (value, dt) pair must fail the whole ingest, not
@@ -473,6 +474,7 @@ pub(crate) fn validate_value_dt_pair(val: &FlakeValue, dt: &Sid) -> Result<()> {
 /// guard already, so this only fires on shapes the base emission also
 /// rejected.
 pub(crate) fn reified_triple_bundle(
+    g: Option<Sid>,
     s: Sid,
     p: Sid,
     o: FlakeValue,
@@ -484,7 +486,7 @@ pub(crate) fn reified_triple_bundle(
     let lang = dtc.lang_tag().map(std::string::ToString::to_string);
     validate_value_dt_pair(&o, &dt)?;
     let key = fluree_db_core::edge::EdgeKey {
-        g: None,
+        g,
         s,
         p,
         o,

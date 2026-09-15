@@ -204,18 +204,41 @@ User queries against the config graph go through **policy enforcement**. If `f:d
 The config graph is written and queried through normal CLI transaction and query commands:
 
 ```bash
-# Write config via TriG
-fluree insert --ledger mydb:main --format trig config.trig
+# Write config via SPARQL UPDATE.
+# `fluree insert` takes Turtle or JSON-LD, not TriG, so it cannot target a
+# named graph; see "Writing from the CLI" in writing-config.md.
+fluree update --ledger mydb:main --format sparql -e '
+PREFIX f: <https://ns.flur.ee/db#>
+INSERT DATA {
+  GRAPH <urn:fluree:mydb:main#config> {
+    <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+      f:shaclDefaults [ f:shaclEnabled true ] .
+  }
+}'
 
-# Query the config graph via SPARQL
-fluree query --ledger mydb:main --format sparql \
+# Query the config graph by naming it in FROM. The query language is
+# auto-detected; `fluree query --format` selects the OUTPUT format.
+fluree query --ledger mydb:main \
   'PREFIX f: <https://ns.flur.ee/db#>
    SELECT ?s ?p ?o
    FROM <urn:fluree:mydb:main#config>
    WHERE { ?s ?p ?o }'
+
+# Or address the config graph directly as a ledger fragment.
+fluree query --ledger mydb:main#config 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
 ```
 
 No special CLI commands are needed — config is data, written and queried like any other named graph.
+
+A reserved graph has to be named in full. `FROM <config>` and `FROM <#config>`
+are not the config graph's IRI and are rejected, and `GRAPH ?g` never
+enumerates the reserved graphs — naming one is always something the query
+author did on purpose.
+
+Reachability is not access. Adding `f:policyDefaults [ f:defaultAllow false ]`
+to the config above makes the `FROM` query return zero rows instead of three,
+without changing what the query is allowed to name — see "Config graph query
+returns empty results" above.
 
 ## In this section
 

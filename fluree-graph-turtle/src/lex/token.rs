@@ -184,9 +184,11 @@ pub enum TokenKind {
     /// `>>` — reified-triple close
     ReifiedTripleEnd,
     /// `<<(` — triple-term open (RDF 1.2 triple terms as values).
-    /// Lexed so the parser can reject it with a specific deferred error;
-    /// no closing `)>>` token is needed because parsing stops here.
+    /// Accepted by the parser only as the object of `rdf:reifies`; any
+    /// other position is rejected with a specific deferred error.
     TripleTermStart,
+    /// `)>>` — triple-term close
+    TripleTermEnd,
     /// `{|` — annotation block open
     AnnotationOpen,
     /// `|}` — annotation block close
@@ -201,51 +203,55 @@ pub enum TokenKind {
     Eof,
 }
 
+/// User-facing description for parse errors: punctuation and keywords are
+/// quoted as written, value tokens are named by kind.
 impl std::fmt::Display for TokenKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TokenKind::Iri => write!(f, "<IRI>"),
-            TokenKind::IriEscaped(s) => write!(f, "<{s}>"),
-            TokenKind::PrefixedNameNs => write!(f, "prefixedNs:"),
-            TokenKind::PrefixedName => write!(f, "prefixed:name"),
-            TokenKind::BlankNodeLabel => write!(f, "_:blank"),
-            TokenKind::Anon => write!(f, "[]"),
-            TokenKind::Nil => write!(f, "()"),
-            TokenKind::String => write!(f, "\"string\""),
-            TokenKind::LongString => write!(f, "\"\"\"string\"\"\""),
-            TokenKind::StringEscaped(s) => write!(f, "\"{s}\""),
-            TokenKind::Integer(n) => write!(f, "{n}"),
-            TokenKind::IntegerOverflow => write!(f, "integer"),
-            TokenKind::Decimal => write!(f, "decimal"),
-            TokenKind::Double(n) => write!(f, "{n:e}"),
-            TokenKind::LangTag => write!(f, "@lang"),
-            TokenKind::KwPrefix => write!(f, "@prefix"),
-            TokenKind::KwBase => write!(f, "@base"),
-            TokenKind::KwSparqlPrefix => write!(f, "PREFIX"),
-            TokenKind::KwSparqlBase => write!(f, "BASE"),
-            TokenKind::KwVersion => write!(f, "@version"),
-            TokenKind::KwSparqlVersion => write!(f, "VERSION"),
-            TokenKind::KwA => write!(f, "a"),
-            TokenKind::KwTrue => write!(f, "true"),
-            TokenKind::KwFalse => write!(f, "false"),
-            TokenKind::KwGraph => write!(f, "GRAPH"),
-            TokenKind::Dot => write!(f, "."),
-            TokenKind::Comma => write!(f, ","),
-            TokenKind::Semicolon => write!(f, ";"),
-            TokenKind::DoubleCaret => write!(f, "^^"),
-            TokenKind::LBracket => write!(f, "["),
-            TokenKind::RBracket => write!(f, "]"),
-            TokenKind::LParen => write!(f, "("),
-            TokenKind::RParen => write!(f, ")"),
-            TokenKind::LBrace => write!(f, "{{"),
-            TokenKind::RBrace => write!(f, "}}"),
-            TokenKind::ReifiedTripleStart => write!(f, "<<"),
-            TokenKind::ReifiedTripleEnd => write!(f, ">>"),
-            TokenKind::TripleTermStart => write!(f, "<<("),
-            TokenKind::AnnotationOpen => write!(f, "{{|"),
-            TokenKind::AnnotationClose => write!(f, "|}}"),
-            TokenKind::Tilde => write!(f, "~"),
-            TokenKind::Eof => write!(f, "EOF"),
-        }
+        let text = match self {
+            TokenKind::Iri | TokenKind::IriEscaped(_) => return f.write_str("an IRI"),
+            TokenKind::PrefixedNameNs | TokenKind::PrefixedName => {
+                return f.write_str("a prefixed name")
+            }
+            TokenKind::BlankNodeLabel => return f.write_str("a blank node label"),
+            TokenKind::String | TokenKind::StringEscaped(_) => {
+                return f.write_str("a string literal")
+            }
+            TokenKind::LongString => return f.write_str("a long string literal"),
+            TokenKind::Integer(_) | TokenKind::IntegerOverflow => return f.write_str("an integer"),
+            TokenKind::Decimal => return f.write_str("a decimal"),
+            TokenKind::Double(_) => return f.write_str("a double"),
+            TokenKind::LangTag => return f.write_str("a language tag"),
+            TokenKind::Eof => return f.write_str("end of input"),
+            TokenKind::Anon => "[]",
+            TokenKind::Nil => "()",
+            TokenKind::KwPrefix => "@prefix",
+            TokenKind::KwBase => "@base",
+            TokenKind::KwSparqlPrefix => "PREFIX",
+            TokenKind::KwSparqlBase => "BASE",
+            TokenKind::KwVersion => "@version",
+            TokenKind::KwSparqlVersion => "VERSION",
+            TokenKind::KwA => "a",
+            TokenKind::KwTrue => "true",
+            TokenKind::KwFalse => "false",
+            TokenKind::KwGraph => "GRAPH",
+            TokenKind::Dot => ".",
+            TokenKind::Comma => ",",
+            TokenKind::Semicolon => ";",
+            TokenKind::DoubleCaret => "^^",
+            TokenKind::LBracket => "[",
+            TokenKind::RBracket => "]",
+            TokenKind::LParen => "(",
+            TokenKind::RParen => ")",
+            TokenKind::LBrace => "{",
+            TokenKind::RBrace => "}",
+            TokenKind::ReifiedTripleStart => "<<",
+            TokenKind::ReifiedTripleEnd => ">>",
+            TokenKind::TripleTermStart => "<<(",
+            TokenKind::TripleTermEnd => ")>>",
+            TokenKind::AnnotationOpen => "{|",
+            TokenKind::AnnotationClose => "|}",
+            TokenKind::Tilde => "~",
+        };
+        write!(f, "'{text}'")
     }
 }

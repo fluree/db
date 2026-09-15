@@ -3,6 +3,8 @@ mod support;
 
 #[path = "it_branch.rs"]
 mod it_branch;
+#[path = "it_branch_shacl.rs"]
+mod it_branch_shacl;
 #[path = "it_branch_time_travel.rs"]
 mod it_branch_time_travel;
 #[path = "it_drop_ledger.rs"]

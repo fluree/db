@@ -924,8 +924,24 @@ async fn run_bulk_import(
             .await
         {
             Ok(_) => {
+                // Report what actually landed: the reindex can complete
+                // without sealing anything (no attachment-event coverage),
+                // and an unsealed ledger answers quoted-triple queries
+                // through the slow generic join chain.
+                let sealed = fluree
+                    .ledger(ledger)
+                    .await
+                    .map(|state| state.snapshot.annotation_index.is_some())
+                    .unwrap_or(false);
                 if !quiet {
-                    eprintln!("{} Annotation arena sealed.", "info:".cyan().bold());
+                    if sealed {
+                        eprintln!("{} Annotation arena sealed.", "info:".cyan().bold());
+                    } else {
+                        eprintln!(
+                            "{} Annotation arena was not sealed (no attachment events resolved); quoted-triple queries fall back to the generic join chain until `fluree reindex` seals it.",
+                            "warning:".yellow().bold()
+                        );
+                    }
                 }
             }
             Err(e) => {

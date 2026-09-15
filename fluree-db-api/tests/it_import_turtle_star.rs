@@ -1,5 +1,6 @@
 //! Bulk import of Turtle-star: end-to-end from a directory of `.ttl` files
-//! through `ImportSink` to a queryable ledger.
+//! through `ImportSink` to a queryable ledger, plus the TriG and N-Quads
+//! star forms on the named-graph import path.
 //!
 //! `ImportSink` opted in to reified triples when the Turtle parser gained the
 //! RDF 1.2 asserting forms, but until now no test drove the whole import
@@ -142,6 +143,151 @@ async fn imported_turtle_star_claims_are_queryable() {
         .await
         .expect("plain edge query");
     assert_eq!(rows(&result).len(), 2, "{result:#}");
+}
+
+const CLAIMS_GRAPH: &str = "http://example.org/graphs/claims";
+
+/// `(object, confidence)` for every annotated `ex:alice ex:knows` edge, in the
+/// default graph or in `graph`.
+async fn knows_claims(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &LedgerState,
+    graph: Option<&str>,
+) -> Vec<Vec<String>> {
+    let pattern = "ex:alice ex:knows ?o {| ex:confidence ?conf |}";
+    let body = match graph {
+        Some(g) => format!("GRAPH <{g}> {{ {pattern} }}"),
+        None => pattern.to_string(),
+    };
+    let sparql =
+        format!("PREFIX ex: <http://example.org/>\nSELECT ?o ?conf WHERE {{ {body} }} ORDER BY ?o");
+    let result = support::query_sparql_formatted(fluree, ledger, &sparql)
+        .await
+        .expect("annotation query");
+    rows(&result)
+        .into_iter()
+        .map(|mut r| {
+            r[0] = r[0]
+                .rsplit(['/', ':'])
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            r
+        })
+        .collect()
+}
+
+/// N-Quads has only the `rdf:reifies <<( … )>>` spelling. The importer
+/// regroups labeled statements into TriG blocks, so the claim follows its
+/// statement's graph label.
+#[tokio::test]
+async fn imported_nquads_claims_land_in_their_statement_graph() {
+    const NQUADS: &str = r#"_:r1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://example.org/alice> <http://example.org/knows> <http://example.org/bob> )>> .
+_:r1 <http://example.org/confidence> "0.9" .
+_:r2 <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://example.org/alice> <http://example.org/knows> <http://example.org/carol> )>> <http://example.org/graphs/claims> .
+_:r2 <http://example.org/confidence> "0.5" <http://example.org/graphs/claims> .
+"#;
+    let (fluree, ledger) =
+        import_dir(&[("claims.nq", NQUADS)], "it/import-nquads-star:claims").await;
+
+    assert_eq!(
+        knows_claims(&fluree, &ledger, None).await,
+        vec![vec!["bob".to_string(), "0.9".to_string()]]
+    );
+    assert_eq!(
+        knows_claims(&fluree, &ledger, Some(CLAIMS_GRAPH)).await,
+        vec![vec!["carol".to_string(), "0.5".to_string()]]
+    );
+}
+
+#[tokio::test]
+async fn imported_trig_with_a_version_directive_keeps_its_prefixes() {
+    let trig = format!(
+        "VERSION \"1.2\"\n\
+         @prefix ex: <http://example.org/> .\n\
+         GRAPH <{CLAIMS_GRAPH}> {{ ex:alice ex:knows ex:bob {{| ex:confidence \"0.9\" |}} . }}\n"
+    );
+    let (fluree, ledger) =
+        import_dir(&[("claims.trig", &trig)], "it/import-trig-star:version").await;
+
+    assert_eq!(
+        knows_claims(&fluree, &ledger, Some(CLAIMS_GRAPH)).await,
+        vec![vec!["bob".to_string(), "0.9".to_string()]]
+    );
+}
+
+/// The imported `f:reifies*` flakes under `graph`, across every reifier.
+async fn reifies_flakes_in(
+    fluree: &fluree_db_api::Fluree,
+    alias: &str,
+    graph: &str,
+) -> Vec<fluree_db_core::Flake> {
+    let ledger = fluree.ledger(alias).await.expect("reload");
+    let g_id = ledger
+        .snapshot
+        .graph_registry
+        .graph_id_for_iri(graph)
+        .expect("named graph registered");
+    fluree_db_core::range_with_overlay(
+        &ledger.snapshot,
+        g_id,
+        ledger.novelty.as_ref(),
+        fluree_db_core::comparator::IndexType::Spot,
+        fluree_db_core::range::RangeTest::Eq,
+        fluree_db_core::range::RangeMatch::new(),
+        fluree_db_core::range::RangeOptions::new().with_to_t(ledger.t()),
+    )
+    .await
+    .expect("scan named graph")
+    .into_iter()
+    .filter(|f| fluree_db_core::is_reserved_reifies_predicate(&f.p))
+    .collect()
+}
+
+/// TriG import writes the bundle into the named graph whether or not it
+/// carries `f:reifiesGraph`, so a graph-scoped annotation query cannot tell
+/// the two apart. The edge identity can: the bundle must decode to the
+/// block's graph, and deleting that edge must cascade to it.
+#[tokio::test]
+async fn imported_trig_star_bundle_carries_its_graph_and_cascades() {
+    let alias = "it/import-trig-star:graph-anchored";
+    let trig = format!(
+        "@prefix ex: <http://example.org/> .\n\
+         GRAPH <{CLAIMS_GRAPH}> {{ ex:alice ex:knows ex:bob ~ ex:claim1 {{| ex:role \"Engineer\" |}} . }}\n"
+    );
+    let (fluree, ledger) = import_dir(&[("claims.trig", &trig)], alias).await;
+
+    let graph_sid = ledger.snapshot.encode_iri(CLAIMS_GRAPH).expect("graph sid");
+    let mut bundle = reifies_flakes_in(&fluree, alias, CLAIMS_GRAPH).await;
+    // Index-decoded flakes carry `g: None`; stamp the scanned graph the way
+    // the cascade in `stage()` does before decoding.
+    for f in &mut bundle {
+        f.g = Some(graph_sid.clone());
+    }
+    let key = fluree_db_core::edge::EdgeKey::from_reifies_facts(&bundle)
+        .unwrap_or_else(|e| panic!("imported bundle must decode: {e:?}; {bundle:#?}"));
+    assert_eq!(
+        key.g,
+        Some(graph_sid),
+        "imported bundle must be anchored to its GRAPH block"
+    );
+
+    fluree
+        .graph(alias)
+        .transact()
+        .sparql_update(&format!(
+            "PREFIX ex: <http://example.org/>\n\
+             DELETE DATA {{ GRAPH <{CLAIMS_GRAPH}> {{ ex:alice ex:knows ex:bob }} }}"
+        ))
+        .commit()
+        .await
+        .expect("delete the imported base edge");
+
+    let remaining = reifies_flakes_in(&fluree, alias, CLAIMS_GRAPH).await;
+    assert!(
+        remaining.is_empty(),
+        "the claim's bundle must not outlive the edge it reifies: {remaining:#?}"
+    );
 }
 
 /// A multi-chunk import: a fixture large enough to be cut up, with star

@@ -1516,6 +1516,93 @@ GRAPH <http://example.org/graphs/audit> {
     );
 }
 
+/// TriG-star inside a `GRAPH` block on the bulk-import path: the reifier
+/// bundle is spooled into the named graph's index and the annotation is
+/// visible to a named-graph-scoped query.
+#[tokio::test]
+async fn import_trig_star_named_graph_annotation_is_queryable() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+
+    let trig = r#"@prefix ex: <http://example.org/> .
+@prefix schema: <http://schema.org/> .
+
+ex:alice schema:name "Alice" .
+
+GRAPH <http://example.org/graphs/audit> {
+    ex:event1 schema:actor ex:alice {| ex:confidence "high" |} .
+    ex:event2 schema:actor ex:alice ~ ex:claim2 {| ex:confidence "low"@en |} .
+    ex:claim2 ex:source ex:sensor .
+}
+"#;
+
+    let path = data_dir.path().join("data.trig");
+    {
+        let mut f = std::fs::File::create(&path).expect("create trig");
+        f.write_all(trig.as_bytes()).expect("write trig");
+    }
+
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    fluree
+        .create("test/trig-star:main")
+        .import(&path)
+        .threads(1)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("trig-star import should succeed");
+
+    let ledger = fluree
+        .ledger("test/trig-star:main")
+        .await
+        .expect("load ledger");
+
+    let named_alias = "test/trig-star:main#http://example.org/graphs/audit";
+    let q = json!({
+        "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
+        "from": named_alias,
+        "select": ["?e", "?c"],
+        "where": {
+            "@id": "?e",
+            "schema:actor": {"@id": "ex:alice", "@annotation": {"ex:confidence": "?c"}}
+        }
+    });
+    let qr = fluree
+        .query_connection(&q)
+        .await
+        .expect("named-graph annotation query");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("jsonld");
+    let mut rows = json.as_array().expect("array").clone();
+    rows.sort_by_key(std::string::ToString::to_string);
+    assert_eq!(
+        rows,
+        vec![
+            json!(["ex:event1", "high"]),
+            json!(["ex:event2", {"@value": "low", "@language": "en"}]),
+        ],
+        "both annotated edges hydrate in the named graph, lang tag intact; got {json}"
+    );
+
+    // The named reifier is an ordinary node in the same graph.
+    let q2 = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": named_alias,
+        "select": ["?src"],
+        "where": {"@id": "ex:claim2", "ex:source": "?src"}
+    });
+    let qr = fluree.query_connection(&q2).await.expect("reifier query");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(
+        extract_nth_column(&json, 0),
+        vec!["ex:sensor"],
+        "got {json}"
+    );
+}
+
 #[tokio::test]
 async fn import_trig_compact_named_graph_is_queryable() {
     // Issue #1278: the compact W3C TriG form `<iri> { ... }` (no GRAPH keyword)

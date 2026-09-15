@@ -143,18 +143,29 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool)
             // 2. Three required `f:reifies*` lookup triples that bind
             //    the annotation to the edge.
             let ann_ref = annotation.clone();
+            // `f:reifiesSubject` / `f:reifiesPredicate` objects are refs by
+            // construction, so on a VARIABLE object the `@id` constraint is
+            // a no-op filter — and it costs the batched subject-join lane
+            // (`is_batched_eligible` needs no dtc), which is what turns the
+            // per-reifier probes into one sorted SPOT walk. A constant
+            // object keeps the constraint so the lookup key encodes as a
+            // ref rather than a same-lexical string.
             let id_dt = fluree_db_core::edge::id_datatype_sid();
+            let id_dtc_for = |o: &Ref| match o {
+                Ref::Var(_) => None,
+                _ => Some(fluree_db_core::DatatypeConstraint::Explicit(id_dt.clone())),
+            };
             chain.push(Pattern::Triple(TriplePattern {
                 s: ann_ref.clone(),
                 p: reifies_subject_ref(),
                 o: edge.s.clone().into(),
-                dtc: Some(fluree_db_core::DatatypeConstraint::Explicit(id_dt.clone())),
+                dtc: id_dtc_for(&edge.s),
             }));
             chain.push(Pattern::Triple(TriplePattern {
                 s: ann_ref.clone(),
                 p: reifies_predicate_ref(),
                 o: edge.p.clone().into(),
-                dtc: Some(fluree_db_core::DatatypeConstraint::Explicit(id_dt)),
+                dtc: id_dtc_for(&edge.p),
             }));
             // f:reifiesObject — preserves the original object's
             // datatype constraint via `dtc` so typed-equality matches
@@ -640,6 +651,17 @@ pub fn collect_var_stats(
                 // product over `?src`.
                 Pattern::DefaultGraphSource { patterns } => {
                     walk(patterns, counts, vars);
+                }
+                // Walks that run before annotation expansion (the `SELECT *`
+                // needed set in `operator_tree`) must still see the edge
+                // positions, the reifier and the body: the chain elision
+                // treats a variable they miss as unread and drops the
+                // `f:reifies*` lookup that binds it.
+                Pattern::EdgeAnnotation { .. } | Pattern::AnnotationTarget { .. } => {
+                    for v in p.referenced_vars() {
+                        bump_count(counts, v);
+                        vars.insert(v);
+                    }
                 }
                 _ => {}
             }
@@ -2941,12 +2963,25 @@ pub fn build_where_operators_seeded_with_needed(
                 // to correlate the f:reifies* triple chain with a single
                 // default-graph source under multi-source default queries.
                 let child = require_child(operator, "DEFAULT-GRAPH-SOURCE pattern")?;
+                // Variables anything outside the wrapper still reads: the
+                // post-WHERE pipeline (projection pushdown set when there is
+                // one, else every needed var) plus every later pattern in
+                // this block. Earlier patterns reach the wrapper through the
+                // child's schema. The wrapper drops the `f:reifies*` lookups
+                // whose variable appears in neither.
+                let mut needed_outside: HashSet<VarId> = match required_where_vars {
+                    Some(required) => required.iter().copied().collect(),
+                    None => needed_vars.clone(),
+                };
+                let mut outside_counts: HashMap<VarId, usize> = HashMap::new();
+                collect_var_stats(&patterns[i + 1..], &mut outside_counts, &mut needed_outside);
                 operator = Some(Box::new(
                     crate::default_graph_source::DefaultGraphSourceOperator::new(
                         child,
                         inner_patterns.clone(),
                         *planning,
                         stats.clone(),
+                        needed_outside,
                     ),
                 ));
                 i += 1;
@@ -3753,23 +3788,49 @@ mod tests {
 
     // --- redundant rdf:type elision ---------------------------------------
 
-    fn coverage_stats(pred: &str, class: &str, total: u64, covered: u64, trust: bool) -> StatsView {
-        let mut v = StatsView {
-            class_coverage_trustworthy: trust,
-            ..Default::default()
+    const EX: &str = "http://example.org/";
+    const EX_P: &str = "http://example.org/p";
+    const EX_C: &str = "http://example.org/C";
+
+    /// A view built the way the planner builds it — through
+    /// `from_db_stats_with_namespaces` over a snapshot that registers `EX` —
+    /// where `total` flakes of `ex:p` exist and `covered` of them have an
+    /// `ex:C` subject. Going through the real builder is what makes these tests
+    /// exercise the IRI -> SID resolution the coverage check depends on.
+    fn coverage_stats(total: u64, covered: u64, trust: bool) -> StatsView {
+        use fluree_db_core::{
+            ClassPropertyUsage, ClassStatEntry, IndexStats, LedgerSnapshot, PropertyStatEntry,
         };
-        v.properties_by_iri.insert(
-            Arc::from(pred),
-            PropertyStatData {
+        let ref_tag = fluree_db_core::ValueTypeTag::JSON_LD_ID.as_u8();
+        let mut snapshot = LedgerSnapshot::genesis("coverage:main");
+        snapshot
+            .insert_namespace_code(100, EX.to_string())
+            .expect("register ex namespace");
+        let stats = Arc::new(IndexStats {
+            properties: Some(vec![PropertyStatEntry {
+                sid: (100, "p".to_string()),
                 count: total,
                 ndv_values: 0,
                 ndv_subjects: 0,
-            },
-        );
-        let mut by_class = HashMap::new();
-        by_class.insert(Arc::from(class), covered);
-        v.predicate_class_subject_counts_by_iri
-            .insert(Arc::from(pred), by_class);
+                last_modified_t: 1,
+                datatypes: vec![(ref_tag, total)],
+                observed_datatypes: vec![ref_tag],
+                historical_datatypes: vec![],
+            }]),
+            classes: Some(vec![ClassStatEntry {
+                class_sid: Sid::new(100, "C"),
+                count: covered,
+                properties: vec![ClassPropertyUsage {
+                    property_sid: Sid::new(100, "p"),
+                    datatypes: vec![(ref_tag, covered)],
+                    langs: vec![],
+                    ref_classes: vec![],
+                }],
+            }]),
+            ..Default::default()
+        });
+        let mut v = StatsView::from_db_stats_with_namespaces(&stats, &snapshot);
+        v.class_coverage_trustworthy = trust;
         v
     }
 
@@ -3791,8 +3852,8 @@ mod tests {
 
     #[test]
     fn elides_redundant_type_when_predicate_subjects_all_in_class() {
-        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
-        let patterns = pred_then_type("ex:p", "ex:C");
+        let stats = coverage_stats(10, 10, true);
+        let patterns = pred_then_type(EX_P, EX_C);
         let out =
             elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
                 .expect("redundant rdf:type should be elided");
@@ -3806,8 +3867,8 @@ mod tests {
     #[test]
     fn keeps_selective_type_filter() {
         // Predicate has 10 flakes but only 5 from class C -> not covering -> keep.
-        let stats = coverage_stats("ex:p", "ex:C", 10, 5, true);
-        let patterns = pred_then_type("ex:p", "ex:C");
+        let stats = coverage_stats(10, 5, true);
+        let patterns = pred_then_type(EX_P, EX_C);
         assert!(
             elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
                 .is_none()
@@ -3816,8 +3877,8 @@ mod tests {
 
     #[test]
     fn no_elision_when_coverage_untrustworthy() {
-        let stats = coverage_stats("ex:p", "ex:C", 10, 10, false);
-        let patterns = pred_then_type("ex:p", "ex:C");
+        let stats = coverage_stats(10, 10, false);
+        let patterns = pred_then_type(EX_P, EX_C);
         assert!(
             elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
                 .is_none()
@@ -3826,8 +3887,8 @@ mod tests {
 
     #[test]
     fn no_elision_in_history_mode() {
-        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
-        let patterns = pred_then_type("ex:p", "ex:C");
+        let stats = coverage_stats(10, 10, true);
+        let patterns = pred_then_type(EX_P, EX_C);
         assert!(
             elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::history())
                 .is_none()
@@ -3838,11 +3899,11 @@ mod tests {
     fn no_elision_when_type_is_sole_binder() {
         // `?0 rdf:type <C>` with no other predicate on ?0: the type triple is the
         // only thing binding ?0, so dropping it would change semantics.
-        let stats = coverage_stats("ex:p", "ex:C", 10, 10, true);
+        let stats = coverage_stats(10, 10, true);
         let patterns = vec![Pattern::Triple(TriplePattern::new(
             Ref::Var(VarId(0)),
             Ref::Iri(Arc::from(fluree_vocab::rdf::TYPE)),
-            Term::Iri(Arc::from("ex:C")),
+            Term::Iri(Arc::from(EX_C)),
         ))];
         assert!(
             elide_redundant_type_filters(&patterns, Some(&stats), &PlanningContext::current())
