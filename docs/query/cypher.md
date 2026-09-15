@@ -191,6 +191,14 @@ ORDER BY / SKIP / LIMIT
   reads `null` and the path is still returned — `any(...)` sees the hops that
   do have one.
 
+  A `WITH` that **aggregates** cannot carry that identity list across its
+  projection — the list is neither a group key nor an aggregate output — so
+  `relationships(p)` after one falls back to the path value: `size(...)`,
+  `type(r)` and the endpoints stay correct, and the per-hop properties read
+  `null`. Project the properties you need *before* the aggregating `WITH`
+  (`WITH p, [r IN relationships(p) | r.confidence] AS confs, count(*) AS c`
+  reads them first, then groups).
+
   Because a reified edge yields one value per annotation, **a hop carrying two
   parallel claims doubles the rows, and a k-hop chain multiplies k-fold**.
   Parallel relationships are distinct relationships, so this is the same

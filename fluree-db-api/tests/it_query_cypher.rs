@@ -10179,6 +10179,100 @@ async fn cypher_var_length_relationships_of_bounded_path_reads_per_hop_annotatio
 }
 
 #[tokio::test]
+async fn cypher_aggregating_with_drops_the_identity_list_instead_of_grouping_it() {
+    // An aggregating `WITH` fixes its group keys before the projection is
+    // built, so the identity-carrying relationship list cannot ride along: it
+    // is not a group key, and carrying it anyway delivers a `Binding::Grouped`
+    // to the RETURN, which trips `debug_assert!(false, "Grouped binding in
+    // filter evaluation")` in the engine's evaluator. Drop the list instead
+    // and let `relationships(p)` coalesce back to the path value — the
+    // fallback `lower/expr.rs` already documents. The path value carries no
+    // reifier, so the per-hop properties read null while `size()`, `type()`
+    // and the endpoints stay correct.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:varlen-aggregating-with").await;
+    let db = graphdb_from_ledger(&l);
+
+    // Bounded range under a path variable, then an aggregating WITH.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+               WITH p, count(*) AS c
+               RETURN c AS c, size(relationships(p)) AS n,
+                      [r IN relationships(p) | r.confidence] AS confs
+               ORDER BY n"#,
+        )
+        .await,
+        vec![
+            json!([1, 1, [JsonValue::Null]]),
+            json!([1, 2, [JsonValue::Null, JsonValue::Null]]),
+        ],
+        "the list is dropped at an aggregating WITH; `relationships(p)` falls \
+         back to the reifier-less path value rather than grouping the list"
+    );
+
+    // The fixed one-hop path form routes through the same machinery
+    // (`single_fixed_hop` re-enters it as `*1..1`), so it needs the same drop.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b:Person)
+               WITH p, count(*) AS c
+               RETURN c AS c, [r IN relationships(p) | r.confidence] AS confs"#,
+        )
+        .await,
+        vec![json!([1, [JsonValue::Null]])],
+    );
+
+    // An aggregate over the list itself, reached through `size()` only.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+               WITH p, count(*) AS c
+               RETURN sum(size(relationships(p))) AS total"#,
+        )
+        .await,
+        vec![json!([3])],
+    );
+
+    // The contrast that must keep working: a NON-aggregating WITH still
+    // carries the list, so the same read answers the real per-hop annotations.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+               WITH p, b
+               RETURN b.name AS name, [r IN relationships(p) | r.confidence] AS confs
+               ORDER BY name"#,
+        )
+        .await,
+        vec![json!(["Bob", [0.9]]), json!(["Carol", [0.9, 0.95]])],
+    );
+
+    // And the workaround `docs/query/cypher.md` names: read the properties
+    // into a projected value *before* grouping, and the aggregating WITH
+    // carries that instead of the list.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+               WITH b, [r IN relationships(p) | r.confidence] AS confs, count(*) AS c
+               RETURN b.name AS name, confs AS confs, c AS c
+               ORDER BY name"#,
+        )
+        .await,
+        vec![json!(["Bob", [0.9], 1]), json!(["Carol", [0.9, 0.95], 1]),],
+    );
+}
+
+#[tokio::test]
 async fn cypher_var_length_unreified_hops_degrade_to_null_not_dropped() {
     // Alice -0.9-> Bob reified; Bob -> Carol plain. The per-hop probe is
     // `Optional`, so a path containing an unreified hop still matches and that

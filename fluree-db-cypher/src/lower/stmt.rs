@@ -1173,6 +1173,12 @@ fn const_usize(e: &Option<Expr>) -> Result<Option<usize>> {
 /// list is dropped at the projection boundary, and `relationships(p)` after
 /// the `WITH` falls back to the path value — which carries no per-hop
 /// reifier, so `r.prop` over it reads nothing.
+///
+/// **Only valid for a non-aggregating `WITH`.** A grouping projection has
+/// already fixed its group keys, so a variable added to `select` here is
+/// neither a key nor an aggregate output and reaches the outer scope as a
+/// `Binding::Grouped` — which the evaluator asserts against. The caller gates
+/// on that; see `lower_with`.
 fn augment_select_with_path_rel_lists<E: IriEncoder>(
     ctx: &LoweringContext<'_, E>,
     mut select: Vec<VarId>,
@@ -1202,6 +1208,10 @@ fn lower_with<E: IriEncoder>(
     // Captured before `projection` is partially moved below; used to reject an
     // ORDER BY on a collect() list (sorting a list value is unsound in v1).
     let list_outputs = projection.list_outputs.clone();
+    // Same reason: `projection.aggregates` is moved into `Grouping::assemble`
+    // below, but the select-list augmentation that runs after it has to know
+    // whether this `WITH` groups.
+    let has_aggregates = !projection.aggregates.is_empty();
 
     // WITH WHERE routing:
     //
@@ -1269,7 +1279,19 @@ fn lower_with<E: IriEncoder>(
     // ordering references (the synthetic `?#__prop_*` names stay
     // hidden from `RETURN *` via the wildcard formatter filter).
     let augmented_select = augment_select_with_sort_vars(projection.vars, &ordering);
-    let augmented_select = augment_select_with_path_rel_lists(ctx, augmented_select);
+    // An aggregating `WITH` cannot carry the identity list. `Grouping::assemble`
+    // has fixed the group keys by this point, so a list pushed into `select`
+    // here is neither a key nor an aggregate output: it arrives at the RETURN
+    // as `Binding::Grouped` and trips the evaluator's grouped-binding
+    // assertion on any read of it. Dropping it is the documented fallback —
+    // `relationships(p)` coalesces back to the path value, which answers
+    // `size()`, `type()` and the endpoints correctly and reads `null` for the
+    // per-hop properties it cannot carry (see `lower/expr.rs`).
+    let augmented_select = if has_aggregates {
+        augmented_select
+    } else {
+        augment_select_with_path_rel_lists(ctx, augmented_select)
+    };
     let mut sq = SubqueryPattern::new(augmented_select, inner_patterns);
 
     if !ordering.is_empty() {
