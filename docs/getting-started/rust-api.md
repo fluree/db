@@ -1183,10 +1183,11 @@ async fn main() -> Result<()> {
 #### The aggregate change set (`include_changes`)
 
 For a merge-request "Changes" panel, `include_changes` returns the **net**
-set of facts the merge would apply — the source side's commits since the
-common ancestor folded per fact, with internally-cancelling assert/retract
-pairs removed. A branch with 40 commits that ultimately changes 12 facts
-reviews as 12 facts:
+set of facts the merge would apply: the source side's commits since the
+common ancestor folded per fact, each keeping its newest op. A branch with
+40 commits that ultimately touches 12 facts reviews as 12 facts, and a fact
+the branch created and then deleted shows as the deletion the merge
+applies:
 
 ```rust
 use fluree_db_api::{FlureeBuilder, MergePreviewOpts, Result};
