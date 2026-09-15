@@ -226,7 +226,12 @@ ORDER BY / SKIP / LIMIT
 
   The refusal follows a `WITH … AS` rename and an `UNWIND` alias back to the
   variable the pattern bound, so spelling the read through
-  `WITH rs AS xs … all(r IN xs WHERE r.p)` does not slip past it.
+  `WITH rs AS xs … all(r IN xs WHERE r.p)` does not slip past it. It covers a
+  hop pulled straight out of the list too — `properties(rs[0])`,
+  `keys(head(relationships(p)))` — because that reads the same element. (The
+  `rs[0].prop` spelling is refused on every route by a separate rule: a
+  property accessor needs a bare-variable target.) `properties(nodes(p)[0])` is
+  unaffected, like every other read of a path node.
 
   The **value** surface is unaffected on every route: `nodes(p)` (path nodes
   are real subjects, not edges), `length(p)`, `size(relationships(p))` and

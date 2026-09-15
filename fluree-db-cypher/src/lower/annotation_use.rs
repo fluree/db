@@ -64,8 +64,8 @@ pub(super) struct ScopeUses {
     pub(super) annotation: HashSet<String>,
     /// Names whose list *elements* are read on the annotation surface:
     /// `all(x IN rs WHERE x.p)`, `[x IN tail(rs) | x.p]`, `reduce(… x IN rs …)`,
-    /// `UNWIND rs AS x … x.p`, and any of those reached through a
-    /// `WITH … rs AS xs` rename.
+    /// `UNWIND rs AS x … x.p`, `properties(rs[0])` / `keys(head(rs))`, and any
+    /// of those reached through a `WITH … rs AS xs` rename.
     ///
     /// A variable-length relationship variable binds a *list*, so this — not
     /// [`Self::annotation`] — is what says whether its elements need per-hop
@@ -257,6 +257,21 @@ fn scan_expr(e: &Expr, out: &mut ScopeUses) {
             if name == "properties" || name == "keys" {
                 for a in &c.args {
                     collect_vars(a, &mut out.annotation);
+                    // `properties(rs[0])` / `keys(head(relationships(p)))` read
+                    // an *element* of a relationship list, so they are
+                    // element-property reads — the conclusion
+                    // `scan_list_iteration` draws for a loop body, reached here
+                    // without a loop variable. `annotation` alone cannot carry
+                    // it: that set is keyed on row variables and is inert for
+                    // the list or path variable named here, so the read would
+                    // slip past both identity guards and answer null.
+                    //
+                    // Additive — `annotation` above is left exactly as it was,
+                    // so no lane selection changes. `element_property`'s only
+                    // consumers are the two refusals.
+                    if let Some(list) = element_extraction_source(a) {
+                        collect_rel_list_vars(list, &mut out.element_property);
+                    }
                 }
             }
             for a in &c.args {
@@ -374,6 +389,27 @@ fn scan_case(c: &CaseExpr, out: &mut ScopeUses) {
     }
     if let Some(e) = &c.else_branch {
         scan_expr(e, out);
+    }
+}
+
+/// The list expression an *element extraction* draws from, if `e` is one.
+///
+/// `rs[0]`, `head(rs)` and `last(relationships(p))` each yield a single
+/// relationship out of a list. A read on the result is a read of that list's
+/// elements, so the list's variables — not the extraction expression — are
+/// what needs per-hop edge identity.
+///
+/// Deliberately narrow. `tail(rs)` and a bare `rs` yield a *list*, not an
+/// element, so `properties(rs)` stays unmarked: it is not an element read, and
+/// answering it with the identity refusal would name a remedy that has nothing
+/// to do with what was asked.
+fn element_extraction_source(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::Index(list, _, _) => Some(list),
+        Expr::Call(c) if matches!(c.name.to_ascii_lowercase().as_str(), "head" | "last") => {
+            c.args.first()
+        }
+        _ => None,
     }
 }
 

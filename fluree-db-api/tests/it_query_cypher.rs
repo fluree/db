@@ -10762,3 +10762,112 @@ async fn cypher_var_length_enumerated_property_read_refused_with_a_remedy() {
         "the refusal must name the bound form that works: {err}"
     );
 }
+
+#[tokio::test]
+async fn cypher_properties_over_an_extracted_hop_is_refused_on_identity_less_routes() {
+    // `rs[0]`, `head(rs)` and `last(relationships(p))` pull a single hop out of
+    // a relationship list, so `properties(...)` / `keys(...)` over one is a
+    // read of the LIST'S ELEMENTS — the same conclusion `scan_list_iteration`
+    // draws for a loop body, reached without a loop variable. The scan filed
+    // those variables under `annotation`, which is keyed on row variables and
+    // is inert for a path or list variable, so the read slipped past both
+    // identity guards and answered null on the routes that carry no per-hop
+    // reifier.
+    //
+    // The `.prop` spelling needs nothing: a property accessor already requires
+    // a bare-variable target, so `relationships(p)[0].confidence` is an
+    // actionable error on every route. `properties()` and `keys()` have no
+    // such restriction, which is what left this one open.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:extracted-hop-properties").await;
+    let db = graphdb_from_ledger(&l);
+
+    for q in [
+        // Enumeration route, reached by indexing and by `head`/`last`.
+        r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
+           RETURN properties(relationships(p)[0]) AS ps"#,
+        r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
+           RETURN keys(relationships(p)[0]) AS ks"#,
+        r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+           RETURN properties(head(rs)) AS ps"#,
+        r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+           RETURN properties(last(rs)) AS ps"#,
+        // …and through a `WITH … AS` rename, composing with the alias walk.
+        r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
+           WITH b, relationships(p) AS xs RETURN properties(xs[0]) AS ps"#,
+    ] {
+        let err = fluree
+            .query_cypher(&db, q)
+            .await
+            .expect_err("properties() over an enumerated hop must be refused")
+            .to_string();
+        assert!(
+            err.contains("does not retain per-hop edge identity"),
+            "must say why: {err}"
+        );
+    }
+
+    // The multi-hop path value route answers with its own message.
+    let err = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)-[:KNOWS]->(c)
+               RETURN properties(relationships(p)[0]) AS ps"#,
+        )
+        .await
+        .expect_err("properties() over a multi-hop path hop must be refused")
+        .to_string();
+    assert!(
+        err.contains("carry no per-hop edge identity"),
+        "must say why: {err}"
+    );
+
+    // NOT refused: extracting a NODE. Path nodes are real subjects on every
+    // route, and the walk that decides this skips `nodes()`, so an extracted
+    // node keeps reading its properties.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
+               RETURN properties(nodes(p)[0]) AS ps LIMIT 1"#,
+        )
+        .await,
+        vec![json!([{"name": "Alice"}])],
+    );
+
+    // NOT refused: the bounded route retains per-hop identity, so the same
+    // extraction reads the hop's real annotation there. This is the asymmetry
+    // the refusal exists to make visible rather than silent.
+    let bounded = r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..1]->(b:Person)"#;
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            &format!("{bounded} RETURN properties(rs[0]) AS ps"),
+        )
+        .await,
+        vec![json!([{"confidence": 0.9}])],
+    );
+    assert_eq!(
+        cypher_rows(&fluree, &db, &format!("{bounded} RETURN keys(rs[0]) AS ks")).await,
+        vec![json!([["confidence"]])],
+    );
+
+    // NOT refused: `properties(rs)` asks for the properties of the LIST, not of
+    // an element. It is not an element-property read, so it must not pick up
+    // the identity refusal and its misleading remedy.
+    assert!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+                   RETURN properties(rs) AS ps"#,
+            )
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .is_none_or(|e| !e.contains("per-hop edge identity")),
+        "properties() of the list itself is not an element read"
+    );
+}
