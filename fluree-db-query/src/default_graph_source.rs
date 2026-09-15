@@ -1184,6 +1184,9 @@ mod tests {
             ChainLane::Chain
         );
         assert_eq!(lane(1e12, 1.0, FULL_ARENA, true, true), ChainLane::Chain);
+        // The same bound reifier behind a bound subject whose edges fit the
+        // buffer: without the reifier rule the subject rule takes the arena.
+        assert_eq!(lane(3_345.0, 1.0, FULL_ARENA, true, true), ChainLane::Chain);
         // P5 / P13: bound-object wildcard (1000 est.) with ~9 reifiers.
         assert_eq!(
             lane(1000.0, 9.0, SLICE_ARENA, false, false),

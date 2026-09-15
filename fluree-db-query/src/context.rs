@@ -1291,26 +1291,8 @@ impl<'a> ExecutionContext<'a> {
         s_id: u64,
         resolve: impl FnOnce() -> Option<Arc<str>>,
     ) -> Option<Arc<str>> {
-        const MAX_ENTRIES: usize = 1 << 18;
-        let key = (self.binary_store.as_deref()?.store_id(), s_id);
-        if let Some(hit) = self
-            .subject_iri_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-        {
-            return Some(hit.clone());
-        }
-        let resolved = resolve()?;
-        let mut cache = self
-            .subject_iri_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cache.len() >= MAX_ENTRIES {
-            cache.clear();
-        }
-        cache.insert(key, resolved.clone());
-        Some(resolved)
+        let store_id = self.binary_store.as_deref()?.store_id();
+        memoize_subject_iri(&self.subject_iri_cache, (store_id, s_id), resolve)
     }
 
     /// Resolve a subject ID to an IRI, using DictNovelty-aware routing.
@@ -1661,6 +1643,79 @@ impl<'a> ExecutionContext<'a> {
     pub fn with_graph_id(mut self, g_id: GraphId) -> Self {
         self.binary_g_id = g_id;
         self
+    }
+}
+
+/// The memo behind [`ExecutionContext::subject_iri_str_memo`], keyed by
+/// `(store id, subject id)`. A hit skips `resolve`; a miss runs it unlocked
+/// and stores what it returns; a `None` is not stored. Bounded by clearing
+/// rather than evicting.
+fn memoize_subject_iri(
+    cache: &SubjectIriCache,
+    key: (u64, u64),
+    resolve: impl FnOnce() -> Option<Arc<str>>,
+) -> Option<Arc<str>> {
+    const MAX_ENTRIES: usize = 1 << 18;
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return Some(hit.clone());
+    }
+    let resolved = resolve()?;
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.len() >= MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, resolved.clone());
+    Some(resolved)
+}
+
+#[cfg(test)]
+mod subject_iri_memo_tests {
+    use super::{memoize_subject_iri, SubjectIriCache};
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    #[test]
+    fn resolves_each_store_subject_once_and_never_memoizes_a_miss() {
+        let cache = SubjectIriCache::default();
+        let calls = Cell::new(0);
+        let resolve = |iri: Option<&str>| {
+            calls.set(calls.get() + 1);
+            iri.map(Arc::from)
+        };
+        let alice = Some("http://example.org/alice");
+
+        assert_eq!(
+            memoize_subject_iri(&cache, (1, 7), || resolve(alice)).as_deref(),
+            alice
+        );
+        assert_eq!(
+            memoize_subject_iri(&cache, (1, 7), || resolve(Some("stale"))).as_deref(),
+            alice,
+            "a hit returns the stored IRI without resolving"
+        );
+        assert_eq!(calls.get(), 1);
+
+        // A dataset's ledgers reuse subject ids for different nodes.
+        let bob = Some("http://example.org/bob");
+        assert_eq!(
+            memoize_subject_iri(&cache, (2, 7), || resolve(bob)).as_deref(),
+            bob
+        );
+        assert_eq!(calls.get(), 2);
+
+        // A failed resolve is not stored, so the next call resolves again.
+        assert_eq!(memoize_subject_iri(&cache, (1, 8), || resolve(None)), None);
+        assert_eq!(
+            memoize_subject_iri(&cache, (1, 8), || resolve(alice)).as_deref(),
+            alice
+        );
+        assert_eq!(calls.get(), 4);
     }
 }
 
