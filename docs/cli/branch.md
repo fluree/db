@@ -378,7 +378,8 @@ The revert commit is validated against the branch's SHACL configuration and shap
 | `--to <COMMIT>` | Range end (inclusive); requires `--from` |
 | `--branch <BRANCH>` | Branch the revert commit is written to (defaults to the active branch) |
 | `--strategy <STRATEGY>` | Conflict resolution: `abort` (default), `take-source`, `take-branch` |
-| `--preview` | Show what the revert would do — resolved commit list, conflict count, whether the strategy would proceed — without writing a commit |
+| `--preview` | Show what the revert would do — resolved commit list, conflict count, the SHACL outcome, and whether it would proceed — without writing a commit |
+| `--no-validate` | With `--preview`: skip SHACL validation of the inverted state. Validation runs by default and folds into `revertable` |
 | `--json` | With `--preview`: emit the raw JSON `RevertPreview` instead of a summary |
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `--remote <REMOTE>` | Execute against a remote server (by remote name) |

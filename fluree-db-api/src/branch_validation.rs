@@ -113,6 +113,32 @@ impl crate::Fluree {
             .await
     }
 
+    /// Revert's staging, shared by the revert itself and its preview:
+    /// resolve `inverted` under `strategy` against `target_state`, then stage
+    /// and validate the result.
+    ///
+    /// `None` when the strategy leaves nothing to apply, such as
+    /// `TakeBranch` with full overlap. There is no commit to build then, and
+    /// nothing that could be rejected.
+    pub(crate) async fn stage_revert(
+        &self,
+        target_state: LedgerState,
+        inverted: Vec<Flake>,
+        conflicts: &[ConflictKey],
+        strategy: &ConflictStrategy,
+        namespace_delta: &HashMap<u16, String>,
+    ) -> Result<Option<(StagedLedger, BranchOpValidation)>> {
+        let staged = self
+            .apply_two_way_strategy(inverted, conflicts, strategy, &target_state)
+            .await?;
+        if staged.is_empty() {
+            return Ok(None);
+        }
+        self.stage_validated(target_state, staged, namespace_delta, "revert")
+            .await
+            .map(Some)
+    }
+
     /// Validate a staged view against the target ledger's SHACL
     /// configuration and shapes. `reverse_graph` is the map the view was
     /// built with.

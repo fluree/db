@@ -12,7 +12,8 @@
 
 use crate::support;
 use fluree_db_api::{
-    ApiError, CommitRef, ConflictStrategy, FlureeBuilder, MergePreviewOpts, TransactError,
+    ApiError, CommitRef, ConflictStrategy, FlureeBuilder, MergePreviewOpts, RevertPreviewOpts,
+    TransactError,
 };
 use fluree_db_core::graph_registry::config_graph_iri;
 use serde_json::json;
@@ -680,5 +681,142 @@ async fn preview_reports_conflict_when_sibling_namespaces_collide() {
     assert!(
         matches!(err, ApiError::BranchConflict(_)),
         "expected BranchConflict, got: {err:?}"
+    );
+}
+
+// =============================================================================
+// Revert preview
+// =============================================================================
+
+/// Seed a branch whose shape makes one commit unrevertable: `ex:alice` must
+/// keep exactly one name, so undoing the commit that gave her one is
+/// rejected. Returns the commit that asserted the name and the one that
+/// added an unrelated subject.
+async fn seed_revert_fixture(
+    fluree: &fluree_db_api::Fluree,
+) -> (fluree_db_api::CommitId, fluree_db_api::CommitId) {
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let r0 = fluree
+        .insert(ledger, &insert_name("ex:carol", "Carol"))
+        .await
+        .unwrap();
+    let alice = fluree
+        .insert(r0.ledger, &insert_name("ex:alice", "A"))
+        .await
+        .unwrap();
+    let shaped = fluree
+        .insert(alice.ledger, &alice_name_shape(Some(1)))
+        .await
+        .expect("shape install conforms");
+    let bob = fluree
+        .insert(shaped.ledger, &insert_name("ex:bob", "Bob"))
+        .await
+        .unwrap();
+    (alice.receipt.commit_id, bob.receipt.commit_id)
+}
+
+/// The preview runs the revert's own staging, so where the revert is
+/// rejected the preview says so and carries the same report.
+#[tokio::test]
+async fn revert_preview_reports_violation_where_revert_would_fail() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (alice_commit, _bob_commit) = seed_revert_fixture(&fluree).await;
+
+    let preview = fluree
+        .revert_commit_preview_with(
+            "mydb",
+            "main",
+            CommitRef::Exact(alice_commit.clone()),
+            RevertPreviewOpts {
+                conflict_strategy: ConflictStrategy::TakeSource,
+                ..RevertPreviewOpts::default()
+            },
+        )
+        .await
+        .expect("preview");
+
+    let validation = preview.validation.expect("validation runs by default");
+    assert!(!validation.conforms);
+    let report = validation
+        .report
+        .expect("a rejected preview carries the report");
+    assert!(
+        report.contains("MinCountConstraintComponent"),
+        "report should name the constraint: {report}"
+    );
+    assert!(!preview.revertable);
+
+    // The revert agrees with the preview.
+    let err = fluree
+        .revert_commit(
+            "mydb",
+            "main",
+            CommitRef::Exact(alice_commit),
+            ConflictStrategy::TakeSource,
+        )
+        .await
+        .expect_err("revert is rejected");
+    assert_shacl_violation(err, "revert after preview");
+}
+
+/// Where the revert conforms, the preview says so and stays revertable.
+#[tokio::test]
+async fn revert_preview_conforms_where_revert_would_succeed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (_alice_commit, bob_commit) = seed_revert_fixture(&fluree).await;
+
+    let preview = fluree
+        .revert_commit_preview_with(
+            "mydb",
+            "main",
+            CommitRef::Exact(bob_commit.clone()),
+            RevertPreviewOpts {
+                conflict_strategy: ConflictStrategy::TakeSource,
+                ..RevertPreviewOpts::default()
+            },
+        )
+        .await
+        .expect("preview");
+
+    let validation = preview.validation.expect("validation runs by default");
+    assert!(validation.conforms, "report: {:?}", validation.report);
+    assert!(preview.revertable);
+
+    fluree
+        .revert_commit(
+            "mydb",
+            "main",
+            CommitRef::Exact(bob_commit),
+            ConflictStrategy::TakeSource,
+        )
+        .await
+        .expect("revert succeeds as previewed");
+    assert_eq!(names(&fluree, "mydb:main").await, vec!["A", "Carol"]);
+}
+
+/// Opting out leaves the field absent and `revertable` back to the
+/// strategy-only answer.
+#[tokio::test]
+async fn revert_preview_validation_can_be_skipped() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (alice_commit, _bob) = seed_revert_fixture(&fluree).await;
+
+    let preview = fluree
+        .revert_commit_preview_with(
+            "mydb",
+            "main",
+            CommitRef::Exact(alice_commit),
+            RevertPreviewOpts {
+                conflict_strategy: ConflictStrategy::TakeSource,
+                include_validation: false,
+                ..RevertPreviewOpts::default()
+            },
+        )
+        .await
+        .expect("preview");
+    assert!(preview.validation.is_none());
+    assert!(
+        preview.revertable,
+        "strategy-only answer when validation is skipped"
     );
 }
