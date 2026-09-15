@@ -206,6 +206,14 @@ ORDER BY / SKIP / LIMIT
   Parallel relationships are distinct relationships, so this is the same
   contract a single `-[r:T]->` hop already has.
 
+  Binding the **path alone** takes that route too, so it multiplies the same
+  way: `MATCH p = (a)-[:T*1..2]->(b) RETURN b.name` yields one row per
+  combination of parallel claims along the path, matching what the one-hop form
+  `p = (a)-[:T]->(b)` already did. A range that binds **neither** `p` nor a
+  relationship variable has nothing to carry identity and still answers once
+  per reachable node — that is the spelling to use when the claims are not
+  wanted.
+
   The ranges resolved by **path enumeration** — unbounded, untyped,
   undirected, a zero lower bound, or deeper than 16 hops — do not retain
   per-hop edge identity, so a property read over their elements is **refused**,

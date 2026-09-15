@@ -10429,6 +10429,45 @@ async fn cypher_var_length_parallel_claims_multiply_rows_like_a_single_hop() {
         vec![json!(["Carol", [0.4, 0.7]]), json!(["Carol", [0.9, 0.7]]),],
         "row multiplicity is the product of the per-hop claim counts",
     );
+
+    // Binding a path variable ALONE — no relationship variable and no property
+    // read anywhere — takes the same identity-carrying route, so it multiplies
+    // the same way. This is the visible change to existing path queries over
+    // reified ledgers, and it matches what `p = (a)-[:T]->(b)` already did for
+    // one hop.
+    assert_eq!(
+        sorted(
+            cypher_rows(
+                &fluree,
+                &db,
+                r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+                   RETURN b.name AS name"#,
+            )
+            .await
+        ),
+        vec![
+            json!(["Bob"]),
+            json!(["Bob"]),
+            json!(["Carol"]),
+            json!(["Carol"]),
+        ],
+        "a bound path multiplies on parallel claims exactly as a bound rel var does",
+    );
+    // Binding neither keeps one row per (start, end): with nothing to carry
+    // identity there is no per-claim fan-out, so an unbound range is the
+    // spelling that still answers once per reachable node.
+    assert_eq!(
+        sorted(
+            cypher_rows(
+                &fluree,
+                &db,
+                r#"MATCH (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+                   RETURN b.name AS name"#,
+            )
+            .await
+        ),
+        vec![json!(["Bob"]), json!(["Carol"])],
+    );
 }
 
 #[tokio::test]
