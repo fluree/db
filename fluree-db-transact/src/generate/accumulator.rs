@@ -34,6 +34,10 @@ pub struct FlakeAccumulator {
     inner: AccInner,
     input_count: u64,
     capacity_hint: usize,
+    /// Mixed mode only: count each asserted fact at most once, so a payload
+    /// that states the same fact twice cannot out-vote one retraction of it.
+    /// See [`FlakeAccumulator::mixed_set_assertions`].
+    set_assertions: bool,
 }
 
 /// Dedup is keyed by **(graph, fact)**, not fact alone.
@@ -70,6 +74,7 @@ impl FlakeAccumulator {
             inner: AccInner::PureRetract(FxHashMap::default()),
             input_count: 0,
             capacity_hint,
+            set_assertions: false,
         }
     }
 
@@ -79,6 +84,23 @@ impl FlakeAccumulator {
             inner: AccInner::Mixed(FxHashMap::default()),
             input_count: 0,
             capacity_hint,
+            set_assertions: false,
+        }
+    }
+
+    /// Mixed accumulator whose assertion side has set semantics: pushing the
+    /// same fact twice counts as one assertion.
+    ///
+    /// Graph sync needs this. Its payload is "the graph's desired contents",
+    /// a set, and the sync wave retracts every current fact exactly once so
+    /// that unchanged facts cancel. A payload that states one fact twice —
+    /// the JSON-LD parallel-annotation shape does this for the base edge of
+    /// every edge with several annotations — would otherwise leave a surplus
+    /// assertion and commit a no-op delta on every re-sync.
+    pub fn mixed_set_assertions(capacity_hint: usize) -> Self {
+        Self {
+            set_assertions: true,
+            ..Self::mixed(capacity_hint)
         }
     }
 
@@ -116,7 +138,7 @@ impl FlakeAccumulator {
                     let inner = graphs.entry(f.g.clone()).or_insert_with(|| {
                         FxHashMap::with_capacity_and_hasher(hint, FxBuildHasher)
                     });
-                    push_into_mixed(inner, f);
+                    push_into_mixed(self.set_assertions, inner, f);
                 }
             }
         }
@@ -145,7 +167,7 @@ impl FlakeAccumulator {
                     let inner = graphs.entry(f.g.clone()).or_insert_with(|| {
                         FxHashMap::with_capacity_and_hasher(hint, FxBuildHasher)
                     });
-                    push_into_mixed(inner, f);
+                    push_into_mixed(self.set_assertions, inner, f);
                 }
             }
         }
@@ -193,10 +215,12 @@ impl FlakeAccumulator {
 /// the map's key, one copy lives in the bucket as the survivor candidate).
 /// Subsequent pushes for the same fact are clone-free: the bucket's survivor
 /// slot is overwritten via `Some(flake)` and the previous survivor is dropped.
-fn push_into_mixed(map: &mut FxHashMap<Flake, FlakeBucket>, flake: Flake) {
+fn push_into_mixed(set_assertions: bool, map: &mut FxHashMap<Flake, FlakeBucket>, flake: Flake) {
     if let Some(bucket) = map.get_mut(&flake) {
         if flake.op {
-            bucket.assert_count = bucket.assert_count.saturating_add(1);
+            if !(set_assertions && bucket.assert_count > 0) {
+                bucket.assert_count = bucket.assert_count.saturating_add(1);
+            }
             bucket.assertion = Some(flake);
         } else {
             bucket.retract_count = bucket.retract_count.saturating_add(1);
@@ -337,6 +361,35 @@ mod tests {
         let out = acc.finalize();
         assert_eq!(out.len(), 1);
         assert!(out[0].op, "the survivor must be an assertion");
+    }
+
+    #[test]
+    fn mixed_set_assertions_lets_one_retraction_cancel_a_repeated_assert() {
+        // The graph-sync shape: the payload states a fact twice, the sync
+        // wave retracts the current copy once. Under counting semantics one
+        // surplus assertion survives and a no-op re-sync commits; under set
+        // semantics the fact is unchanged and nothing survives.
+        let mut counting = FlakeAccumulator::mixed(2);
+        counting.push_assertions(vec![flake(1, 1, 100, 5, true), flake(1, 1, 100, 5, true)]);
+        counting.push_retractions(vec![flake(1, 1, 100, 5, false)]);
+        assert_eq!(counting.finalize().len(), 1);
+
+        let mut set = FlakeAccumulator::mixed_set_assertions(2);
+        set.push_assertions(vec![flake(1, 1, 100, 5, true), flake(1, 1, 100, 5, true)]);
+        set.push_retractions(vec![flake(1, 1, 100, 5, false)]);
+        assert!(
+            set.finalize().is_empty(),
+            "unchanged fact must net to nothing"
+        );
+
+        // A genuinely new fact still survives, and a fact the payload drops
+        // is still retracted.
+        let mut set = FlakeAccumulator::mixed_set_assertions(2);
+        set.push_assertions(vec![flake(1, 1, 101, 5, true), flake(1, 1, 101, 5, true)]);
+        set.push_retractions(vec![flake(1, 1, 100, 5, false)]);
+        let out = set.finalize();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.iter().filter(|f| f.op).count(), 1);
     }
 
     #[test]

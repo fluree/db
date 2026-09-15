@@ -55,7 +55,16 @@ Query parameters:
 | `allowEmpty=true` | Confirm an explicitly empty payload (`"@graph": []`), which clears the graph |
 
 The payload is JSON-LD (`application/json`). Convert Turtle exports
-client-side (e.g. `fluree-graph-turtle`'s `parse_to_json`) for now.
+client-side (e.g. `fluree-graph-turtle`'s `parse_to_json`, which is what
+`fluree sync -f export.ttl` does) for now. The conversion carries RDF 1.2
+annotations (`{| … |}`, `~ reifier`, `<< s p o >>`) as `@annotation` blocks,
+and sync anchors each reifier bundle to the target graph, so a claims file
+syncs like any other Turtle.
+
+The payload is a set: a fact it states more than once (the JSON-LD
+parallel-annotation shape repeats the base edge once per annotation) is one
+assertion, so an unchanged payload is a no-op even when it carries several
+claims on one edge.
 
 A dry run responds with the delta report:
 

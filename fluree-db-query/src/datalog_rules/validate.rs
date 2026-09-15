@@ -1,0 +1,650 @@
+//! Rule validation: the monotonicity rule, range restriction, and the
+//! fail-closed filter-operand checks.
+//!
+//! Every rejection is an error naming the rule and the construct. A rule that
+//! quietly derives less than it was written to is the worst outcome — see
+//! docs/design/rules-engine.md.
+
+use super::{HeadTerm, RuleHead};
+use crate::error::{QueryError, Result};
+use crate::ir::{Expression, Function, Pattern, Query, Ref, Term};
+use crate::parse::ast::{UnresolvedExpression, UnresolvedFilterValue, UnresolvedPattern};
+use crate::var_registry::{VarId, VarRegistry};
+use fluree_db_core::value::FlakeValue;
+use fluree_db_core::LedgerSnapshot;
+use serde_json::Value as JsonValue;
+use std::collections::HashSet;
+
+fn reject(rule: &str, what: &str) -> QueryError {
+    QueryError::InvalidQuery(format!("datalog rule {rule}: {what}"))
+}
+
+/// Reject non-monotonic constructs anywhere in the body, and IRI filter
+/// operands whose namespace the ledger has never seen (they could never match
+/// a stored term, so an exclusion filter on them would keep every row).
+pub(super) fn validate_body(
+    query: &Query,
+    snapshot: &LedgerSnapshot,
+    rule: &str,
+    origin: super::parse::RuleOrigin,
+) -> Result<()> {
+    if query.grouping.is_some() {
+        return Err(reject(
+            rule,
+            "the body uses GROUP BY / aggregates, which are not allowed in a rule body \
+             (a fixpoint cannot evaluate them monotonically)",
+        ));
+    }
+    // Same reasoning as the subquery arm below, for the rule's own body:
+    // `build_rule` clears these modifiers before execution, so without a check
+    // a `CONSTRUCT … WHERE { … } LIMIT 1` would run as though the LIMIT were
+    // not written — the silent-drop this engine exists to stop.
+    if let Some(what) = query
+        .limit
+        .map(|_| "LIMIT")
+        .or_else(|| query.offset.map(|_| "OFFSET"))
+    {
+        return Err(reject(
+            rule,
+            &format!(
+                "the body uses {what}, which is not allowed in a rule body: which solutions a \
+                 slice keeps depends on how much the fixpoint has derived so far, so the rule \
+                 would derive different facts depending on round order"
+            ),
+        ));
+    }
+    walk_patterns(&query.patterns, snapshot, rule, origin)?;
+    if let Some(values) = &query.post_values {
+        walk_patterns(std::slice::from_ref(values), snapshot, rule, origin)?;
+    }
+    Ok(())
+}
+
+fn walk_patterns(
+    patterns: &[Pattern],
+    snapshot: &LedgerSnapshot,
+    rule: &str,
+    origin: super::parse::RuleOrigin,
+) -> Result<()> {
+    for pattern in patterns {
+        match pattern {
+            Pattern::Optional(_) => {
+                return Err(non_monotonic(rule, "OPTIONAL"));
+            }
+            Pattern::Minus(_) => {
+                return Err(non_monotonic(rule, "MINUS"));
+            }
+            Pattern::NotExists(_) => {
+                return Err(non_monotonic(rule, "NOT EXISTS (`not-exists`)"));
+            }
+            Pattern::Filter(expr) => check_expr(expr, snapshot, rule, ExprPos::Positive, origin)?,
+            // A bound value is not a truth value: an `EXISTS` here is
+            // negatable later by anything that reads the variable, and the
+            // walk cannot follow it, so `EXISTS` is opaque throughout.
+            Pattern::Bind { expr, .. } => {
+                check_expr(expr, snapshot, rule, ExprPos::Opaque, origin)?;
+            }
+            Pattern::Unwind { list, .. } => {
+                check_expr(list, snapshot, rule, ExprPos::Opaque, origin)?;
+            }
+            Pattern::Union(branches) => {
+                for branch in branches {
+                    walk_patterns(branch, snapshot, rule, origin)?;
+                }
+            }
+            Pattern::Exists(inner)
+            | Pattern::Graph {
+                patterns: inner, ..
+            }
+            | Pattern::DefaultGraphSource { patterns: inner }
+            | Pattern::EdgeAnnotation { body: inner, .. }
+            | Pattern::AnnotationTarget { body: inner, .. } => {
+                walk_patterns(inner, snapshot, rule, origin)?;
+            }
+            // Graph-source patterns read data from outside the ledger's own
+            // flakes. Rule bodies run with a default `ContextConfig` (no
+            // graph-source providers), and whatever they would read is not
+            // part of the reasoning cache key, so a derived fact could be
+            // served from cache long after its source changed. Rejected by
+            // name until both are true.
+            //
+            // Defensive: no JSON-LD or SPARQL rule surface builds these today
+            // (full-text search, for one, is a BIND-position scoring function
+            // rather than a where-pattern), so there is nothing to write a
+            // rule against. The protection that matters is the exhaustive
+            // match itself — a surface that starts producing one has to come
+            // back here first.
+            Pattern::R2rml(_) => return Err(non_local(rule, "an R2RML graph source")),
+            Pattern::Service(_) => {
+                return Err(reject(
+                    rule,
+                    "the body uses SERVICE, which is not allowed in a rule body \
+                     (rules derive over local data only)",
+                ))
+            }
+            Pattern::IndexSearch(_) => return Err(non_local(rule, "a full-text index search")),
+            Pattern::VectorSearch(_) => return Err(non_local(rule, "a vector search")),
+            Pattern::GeoSearch(_) => return Err(non_local(rule, "a geo search")),
+            Pattern::S2Search(_) => return Err(non_local(rule, "an S2 cell search")),
+            Pattern::Subquery(sub) => {
+                // A subquery carries its own modifiers, and two of them break a
+                // fixpoint. GROUP BY / aggregates are non-monotonic for the
+                // same reason the top-level check rejects them. LIMIT and
+                // OFFSET are worse than unsupported: which solutions survive a
+                // slice depends on how much has been derived so far, so the
+                // rule's output changes with round order and the result is then
+                // cached. DISTINCT and ORDER BY are safe — neither changes the
+                // solution SET as derivation grows, and heads dedup anyway.
+                if sub.grouping.is_some() {
+                    return Err(reject(
+                        rule,
+                        "a subquery in the body uses GROUP BY / aggregates, which are not \
+                         allowed in a rule body (a fixpoint cannot evaluate them monotonically)",
+                    ));
+                }
+                if let Some(what) = sub
+                    .limit
+                    .map(|_| "LIMIT")
+                    .or_else(|| sub.offset.map(|_| "OFFSET"))
+                {
+                    return Err(reject(
+                        rule,
+                        &format!(
+                            "a subquery in the body uses {what}, which is not allowed in a rule \
+                             body: which solutions a slice keeps depends on how much the fixpoint \
+                             has derived so far, so the rule would derive different facts \
+                             depending on round order"
+                        ),
+                    ));
+                }
+                walk_patterns(&sub.patterns, snapshot, rule, origin)?;
+            }
+            // Leaves: nothing to walk. Listed rather than matched by a
+            // wildcard so a new `Pattern` variant is a compile error here
+            // until someone decides what it means inside a fixpoint — the
+            // expression walk carries the same property for the same reason.
+            Pattern::Triple(_)
+            | Pattern::Values { .. }
+            | Pattern::PropertyPath(_)
+            | Pattern::ShortestPath(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// A construct that reads data the fixpoint neither owns nor keys.
+fn non_local(rule: &str, construct: &str) -> QueryError {
+    reject(
+        rule,
+        &format!(
+            "the body uses {construct}, which is not allowed in a rule body: it reads data \
+             the fixpoint does not own, and the reasoning cache key does not cover that data, \
+             so a derived fact could outlive the source it came from"
+        ),
+    )
+}
+
+fn non_monotonic(rule: &str, construct: &str) -> QueryError {
+    reject(
+        rule,
+        &format!(
+            "the body uses {construct}, which is not allowed in a rule body: a fixpoint \
+             cannot evaluate negation or left joins soundly without stratification, so \
+             the rule is rejected rather than run over a wrong answer"
+        ),
+    )
+}
+
+/// Where an expression's truth value ends up, which is what decides whether
+/// an `EXISTS` inside it is monotone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExprPos {
+    /// The value is used directly as a positive truth value — the whole of a
+    /// `FILTER`, or an operand of `AND` / `OR` in such a position. An `EXISTS`
+    /// here only ever admits more rows as the fixpoint derives more, so it is
+    /// monotone and allowed.
+    Positive,
+    /// The value is negated an odd number of times. An `EXISTS` here excludes
+    /// rows, which a fixpoint cannot evaluate soundly without stratification.
+    Negative,
+    /// Anywhere else: a comparison operand, an `IF` branch, a function
+    /// argument, a bound value. The truth value is consumed by something this
+    /// walk does not model, so it cannot show the `EXISTS` is monotone.
+    Opaque,
+}
+
+impl ExprPos {
+    /// Under a `NOT`. Negation flips a truth value; it tells us nothing new
+    /// about one we could not read in the first place.
+    fn negated(self) -> Self {
+        match self {
+            ExprPos::Positive => ExprPos::Negative,
+            ExprPos::Negative => ExprPos::Positive,
+            ExprPos::Opaque => ExprPos::Opaque,
+        }
+    }
+}
+
+/// Walk a filter/bind expression for constructs a fixpoint cannot evaluate.
+///
+/// Two things are rejected. The first is negation, and the point of `ExprPos`
+/// is that negation is not only spelled `NOT`. Counting `Not` wrappers catches
+/// `NOT EXISTS`, `!EXISTS` and any odd nesting, but misses every other way to
+/// consume a truth value: `FILTER(EXISTS {…} = false)`, `IF(EXISTS {…}, false,
+/// true)`, and `BIND(EXISTS {…} AS ?e) FILTER(!?e)` are all negation, and all
+/// three derived facts under a parity-only check. Enumerating the negating
+/// operators cannot work either, since `BIND` lets the negation happen
+/// arbitrarily far away. So the rule is inverted: an `EXISTS` is allowed only
+/// where it is *demonstrably* positive, and every other position rejects. That
+/// is conservative — `FILTER(EXISTS {…} = true)` is monotone and is refused —
+/// but it fails toward a named error rather than a wrong answer that then gets
+/// cached.
+///
+/// The second is an `IRI(…)` constant naming a namespace the ledger has never
+/// seen, which is fail-open in `!=` form.
+///
+/// The match is deliberately exhaustive rather than falling through on a
+/// wildcard: every variant that can hold a sub-expression or a pattern is
+/// visited, so a construct cannot hide from the walk inside a container the
+/// walker forgot, which is exactly how `!EXISTS` slipped past the first cut of
+/// this check. A new `Expression` variant is a compile error here until
+/// someone decides what it means in a rule body.
+fn check_expr(
+    expr: &Expression,
+    snapshot: &LedgerSnapshot,
+    rule: &str,
+    pos: ExprPos,
+    origin: super::parse::RuleOrigin,
+) -> Result<()> {
+    match expr {
+        Expression::Exists {
+            patterns,
+            negated: inner,
+        } => {
+            // `NOT EXISTS { … }` lowers with `negated: true`; `!EXISTS { … }`
+            // lowers as `Not` over a plain `Exists` and arrives here already
+            // flipped by `ExprPos::negated`.
+            let effective = if *inner { pos.negated() } else { pos };
+            match effective {
+                ExprPos::Positive => walk_patterns(patterns, snapshot, rule, origin),
+                ExprPos::Negative => Err(non_monotonic(rule, "NOT EXISTS inside FILTER")),
+                ExprPos::Opaque => Err(reject(
+                    rule,
+                    "the body uses EXISTS somewhere its truth value is not read directly — \
+                     as a comparison operand, an IF branch, a function argument, or a bound \
+                     variable. Written that way it can be negated (`EXISTS {…} = false`, \
+                     `IF(EXISTS {…}, false, true)`, `BIND(EXISTS {…} AS ?e) FILTER(!?e)`), and \
+                     a fixpoint cannot evaluate negation soundly without stratification. Use \
+                     EXISTS as the filter condition itself, optionally under AND / OR",
+                )),
+            }
+        }
+        Expression::Call { func, args } => {
+            if matches!(func, Function::Iri) {
+                if let [Expression::Const(FlakeValue::String(iri))] = args.as_slice() {
+                    if snapshot.encode_iri_strict(iri).is_none() {
+                        // Whether a namespace exists is ledger state, not
+                        // something about the rule's text, so this check can
+                        // flip a STORED rule between valid and invalid while
+                        // the rule sits untouched — and one invalid stored rule
+                        // fails every datalog query on the ledger.
+                        // `FILTER(?src != <http://blocked.example/x>)` is
+                        // perfectly correct, and true for every row, but was
+                        // refused until some `blocked.example` data happened to
+                        // arrive. A query-time rule has none of that: the
+                        // author is present, the feedback is immediate, and
+                        // nothing persists, so it still refuses.
+                        let message = format!(
+                            "filter operand <{iri}> names a namespace this ledger has never \
+                             seen, so it can never equal a stored term (quote the operand if \
+                             you meant a string literal)"
+                        );
+                        match origin {
+                            super::parse::RuleOrigin::QueryTime => {
+                                return Err(reject(rule, &message))
+                            }
+                            super::parse::RuleOrigin::Stored => tracing::warn!(
+                                rule,
+                                "{message}; the rule still runs, but a comparison against \
+                                 it cannot match"
+                            ),
+                        }
+                    }
+                }
+            }
+            // AND / OR pass a truth value straight through; NOT flips it;
+            // everything else consumes it in a way this walk cannot model.
+            let inner = match func {
+                Function::And | Function::Or => pos,
+                Function::Not => pos.negated(),
+                _ => ExprPos::Opaque,
+            };
+            for arg in args {
+                check_expr(arg, snapshot, rule, inner, origin)?;
+            }
+            Ok(())
+        }
+        // A pattern comprehension is a correlated subquery evaluated per row;
+        // it has no JSON-LD or SPARQL rule surface today (it is Cypher's), and
+        // its patterns would need the monotonicity walk before it could.
+        Expression::PatternComprehension { .. } => Err(reject(
+            rule,
+            "the body uses a pattern comprehension, which is not allowed in a rule body",
+        )),
+        Expression::Map(entries) => entries
+            .iter()
+            .try_for_each(|(_, v)| check_expr(v, snapshot, rule, ExprPos::Opaque, origin)),
+        Expression::ListComprehension {
+            list, filter, map, ..
+        } => {
+            check_expr(list, snapshot, rule, ExprPos::Opaque, origin)?;
+            for part in [filter, map].into_iter().flatten() {
+                check_expr(part, snapshot, rule, ExprPos::Opaque, origin)?;
+            }
+            Ok(())
+        }
+        Expression::Reduce {
+            init, list, body, ..
+        } => {
+            check_expr(init, snapshot, rule, ExprPos::Opaque, origin)?;
+            check_expr(list, snapshot, rule, ExprPos::Opaque, origin)?;
+            check_expr(body, snapshot, rule, ExprPos::Opaque, origin)
+        }
+        Expression::ListPredicate {
+            list, predicate, ..
+        } => {
+            check_expr(list, snapshot, rule, ExprPos::Opaque, origin)?;
+            check_expr(predicate, snapshot, rule, ExprPos::Opaque, origin)
+        }
+        Expression::Member { target, .. } => {
+            check_expr(target, snapshot, rule, ExprPos::Opaque, origin)
+        }
+        // Leaves: nothing to walk. `Resolved` is runtime-only and never
+        // reaches a rule body at parse time.
+        Expression::Var(_) | Expression::Const(_) | Expression::Resolved(_) => Ok(()),
+    }
+}
+
+/// Every variable the body can BIND (deduplicated, in first-seen order).
+///
+/// `produced_vars`, not `referenced_vars`: the question range restriction asks
+/// is which variables a matched row actually carries a value for, and
+/// `referenced_vars` includes operands a pattern only reads — filter operands
+/// most of all. A head variable mentioned solely inside a `FILTER` passed the
+/// check under `referenced_vars`, then derived nothing at runtime with no
+/// diagnostic. `produced_vars` returns nothing for `Filter`, `Minus`, `Exists`
+/// and `NotExists`, only the target of a `Bind`, and only the SELECT list of a
+/// subquery — the predicate this check's name claims.
+///
+/// The result is also the body's output projection, so it must not be narrower
+/// than the head needs: every head variable is a produced variable by the time
+/// `check_range_restriction` has passed.
+pub(super) fn body_vars(query: &Query) -> Vec<VarId> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut push = |ids: Vec<VarId>| {
+        for id in ids {
+            if seen.insert(id) {
+                out.push(id);
+            }
+        }
+    };
+    for pattern in &query.patterns {
+        push(pattern.produced_vars());
+    }
+    if let Some(values) = &query.post_values {
+        push(values.produced_vars());
+    }
+    out
+}
+
+/// Range restriction: a head may only use variables the body binds.
+pub(super) fn check_range_restriction(
+    heads: &[RuleHead],
+    body_vars: &[VarId],
+    vars: &VarRegistry,
+    rule: &str,
+) -> Result<()> {
+    let bound: HashSet<VarId> = body_vars.iter().copied().collect();
+    let mut unbound: Vec<&str> = Vec::new();
+    for head in heads {
+        for term in [&head.subject, &head.predicate, &head.object] {
+            if let HeadTerm::Var(v) = term {
+                if !bound.contains(v) {
+                    let name = vars.try_name(*v).unwrap_or("?");
+                    if !unbound.contains(&name) {
+                        unbound.push(name);
+                    }
+                }
+            }
+        }
+    }
+    if unbound.is_empty() {
+        return Ok(());
+    }
+    Err(reject(
+        rule,
+        &format!(
+            "the insert pattern uses {} which the where clause never binds; every \
+             variable used in `insert` must also appear in `where` (a where/insert \
+             typo is the usual cause)",
+            unbound
+                .iter()
+                .map(|v| format!("`{v}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    ))
+}
+
+/// Fail-closed checks on the JSON-LD rule's filters before lowering.
+///
+/// - An unquoted `prefix:name` operand whose prefix the rule's `@context`
+///   does not define would lower as a string and never equal an IRI (`=`
+///   derives nothing, `!=` keeps every row).
+/// - An unquoted bare word is ambiguous between a string and a local name;
+///   against an IRI-bound variable a string comparison fails invisibly in both
+///   directions, so it is rejected with both rewrites.
+pub(super) fn lint_unresolved_filters(patterns: &[UnresolvedPattern], rule: &str) -> Result<()> {
+    for pattern in patterns {
+        match pattern {
+            UnresolvedPattern::Filter(expr)
+            | UnresolvedPattern::Bind { expr, .. }
+            | UnresolvedPattern::Unwind { expr, .. } => lint_unresolved_expr(expr, rule)?,
+            UnresolvedPattern::Optional(inner)
+            | UnresolvedPattern::Minus(inner)
+            | UnresolvedPattern::Exists(inner)
+            | UnresolvedPattern::NotExists(inner)
+            | UnresolvedPattern::Graph {
+                patterns: inner, ..
+            }
+            | UnresolvedPattern::EdgeAnnotation { body: inner, .. }
+            | UnresolvedPattern::AnnotationTarget { body: inner, .. } => {
+                lint_unresolved_filters(inner, rule)?;
+            }
+            UnresolvedPattern::Union(branches) => {
+                for branch in branches {
+                    lint_unresolved_filters(branch, rule)?;
+                }
+            }
+            UnresolvedPattern::Subquery(sub) => lint_unresolved_filters(&sub.patterns, rule)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn lint_unresolved_expr(expr: &UnresolvedExpression, rule: &str) -> Result<()> {
+    match expr {
+        UnresolvedExpression::Const(UnresolvedFilterValue::Curie(atom)) => Err(reject(
+            rule,
+            &format!(
+                "filter operand `{atom}` uses a prefix the rule's @context does not define; \
+                 an unresolved operand can never equal an IRI, so the rule is rejected \
+                 rather than run with a filter that cannot match. Define the prefix in \
+                 the rule's @context, or write \"{atom}\" (quoted) for a string literal"
+            ),
+        )),
+        UnresolvedExpression::Const(UnresolvedFilterValue::Bare(word)) => Err(reject(
+            rule,
+            &format!(
+                "filter operand `{word}` is a bare word, which is ambiguous between a \
+                 string and a local name (against an IRI-bound variable a string \
+                 comparison fails invisibly in both directions). Write \"{word}\" \
+                 (quoted) to compare against the string, or a prefixed IRI such as \
+                 ex:{word} to compare against the IRI"
+            ),
+        )),
+        UnresolvedExpression::And(items) | UnresolvedExpression::Or(items) => {
+            items.iter().try_for_each(|e| lint_unresolved_expr(e, rule))
+        }
+        UnresolvedExpression::Not(inner) => lint_unresolved_expr(inner, rule),
+        UnresolvedExpression::In { expr, values, .. } => {
+            lint_unresolved_expr(expr, rule)?;
+            values
+                .iter()
+                .try_for_each(|e| lint_unresolved_expr(e, rule))
+        }
+        UnresolvedExpression::Call { args, .. } => {
+            args.iter().try_for_each(|e| lint_unresolved_expr(e, rule))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Warn when a filter compares a variable that occurs only in IRI positions
+/// (subject or predicate) against a quoted string. RDFterm-equal makes that a
+/// clean `false`, so the rule derives nothing with no other signal.
+pub(super) fn warn_iri_vs_literal(query: &Query, vars: &VarRegistry, rule: &str) {
+    let mut iri_position: HashSet<VarId> = HashSet::new();
+    let mut literal_capable: HashSet<VarId> = HashSet::new();
+    collect_positions(&query.patterns, &mut iri_position, &mut literal_capable);
+    let iri_only: HashSet<VarId> = iri_position.difference(&literal_capable).copied().collect();
+    if iri_only.is_empty() {
+        return;
+    }
+    for pattern in &query.patterns {
+        if let Pattern::Filter(expr) = pattern {
+            warn_expr(expr, &iri_only, vars, rule);
+        }
+    }
+}
+
+fn collect_positions(
+    patterns: &[Pattern],
+    iri_position: &mut HashSet<VarId>,
+    literal_capable: &mut HashSet<VarId>,
+) {
+    for pattern in patterns {
+        match pattern {
+            Pattern::Triple(tp) => {
+                if let Ref::Var(v) = &tp.s {
+                    iri_position.insert(*v);
+                }
+                if let Ref::Var(v) = &tp.p {
+                    iri_position.insert(*v);
+                }
+                if let Term::Var(v) = &tp.o {
+                    literal_capable.insert(*v);
+                }
+            }
+            Pattern::EdgeAnnotation { edge, body, .. }
+            | Pattern::AnnotationTarget { edge, body, .. } => {
+                collect_positions(
+                    std::slice::from_ref(&Pattern::Triple(edge.clone())),
+                    iri_position,
+                    literal_capable,
+                );
+                collect_positions(body, iri_position, literal_capable);
+            }
+            Pattern::Union(branches) => {
+                for branch in branches {
+                    collect_positions(branch, iri_position, literal_capable);
+                }
+            }
+            Pattern::Graph { patterns, .. } | Pattern::DefaultGraphSource { patterns } => {
+                collect_positions(patterns, iri_position, literal_capable);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn warn_expr(expr: &Expression, iri_only: &HashSet<VarId>, vars: &VarRegistry, rule: &str) {
+    if let Expression::Call { func, args } = expr {
+        if matches!(func, Function::Eq | Function::Ne) {
+            if let [a, b] = args.as_slice() {
+                let pair = match (a, b) {
+                    (Expression::Var(v), Expression::Const(FlakeValue::String(s)))
+                    | (Expression::Const(FlakeValue::String(s)), Expression::Var(v)) => {
+                        Some((*v, s))
+                    }
+                    _ => None,
+                };
+                if let Some((v, s)) = pair {
+                    if iri_only.contains(&v) {
+                        tracing::warn!(
+                            rule,
+                            var = vars.try_name(v).unwrap_or("?"),
+                            operand = %s,
+                            "datalog rule filter compared an IRI against a literal: a quoted \
+                             operand is a string literal and never equals an IRI — if the \
+                             operand was meant to name an IRI, write it unquoted as a \
+                             prefixed or absolute IRI (`ex:knows`, not `\"ex:knows\"`)"
+                        );
+                    }
+                }
+            }
+        }
+        for arg in args {
+            warn_expr(arg, iri_only, vars, rule);
+        }
+    }
+}
+
+/// Keyword keys a rule body may use, by object shape. The standard query
+/// parser ignores an unknown `@`-key on a node pattern (the pattern simply
+/// never matches), which in a rule means "derive nothing, silently" — the
+/// failure mode #1558 reports. A rule is rejected instead.
+const NODE_KEYWORDS: &[&str] = &[
+    "@id",
+    "@type",
+    "@context",
+    "@annotation",
+    "@edge",
+    "@reifies",
+];
+const VALUE_OBJECT_KEYWORDS: &[&str] = &["@value", "@type", "@language", "@annotation", "@edge"];
+
+/// Walk the raw `where` JSON and reject any `@`-prefixed key the query parser
+/// does not give a meaning to in that position.
+pub(super) fn reject_unknown_keyword_keys(value: &JsonValue, label: &str) -> Result<()> {
+    match value {
+        JsonValue::Object(map) => {
+            let allowed: &[&str] = if map.contains_key("@value") {
+                VALUE_OBJECT_KEYWORDS
+            } else {
+                NODE_KEYWORDS
+            };
+            for (key, child) in map {
+                if key.starts_with('@') && !allowed.contains(&key.as_str()) {
+                    return Err(QueryError::InvalidQuery(format!(
+                        "datalog rule {label}: `{key}` is not a where-pattern keyword the \
+                         rule engine understands (node patterns take {}; value objects take {}); \
+                         the rule is rejected rather than run with the key ignored",
+                        NODE_KEYWORDS.join(", "),
+                        VALUE_OBJECT_KEYWORDS.join(", ")
+                    )));
+                }
+                if key != "@context" {
+                    reject_unknown_keyword_keys(child, label)?;
+                }
+            }
+            Ok(())
+        }
+        JsonValue::Array(items) => items
+            .iter()
+            .try_for_each(|item| reject_unknown_keyword_keys(item, label)),
+        _ => Ok(()),
+    }
+}

@@ -516,9 +516,62 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         match self.current().kind {
             TokenKind::KwPrefix | TokenKind::KwSparqlPrefix => self.parse_prefix_directive(),
             TokenKind::KwBase | TokenKind::KwSparqlBase => self.parse_base_directive(),
+            TokenKind::KwVersion | TokenKind::KwSparqlVersion => self.parse_version_directive(),
             TokenKind::Eof => Ok(()),
             _ => self.parse_triples(),
         }
+    }
+
+    /// Parse the RDF 1.2 `VERSION "1.2"` / `@version "1.2" .` directive.
+    ///
+    /// The specifier must be a short string (`"…"` or `'…'`); a bare number
+    /// or a long string is a syntax error (W3C turtle12-version-bad-*). The
+    /// value itself is not interpreted: the RDF 1.2 surface is always on.
+    fn parse_version_directive(&mut self) -> Result<()> {
+        let is_sparql_style = matches!(self.current().kind, TokenKind::KwSparqlVersion);
+        self.advance()?; // consume @version or VERSION
+
+        // `StringEscaped` is the escape-bearing slow path for *every* string
+        // lexer, long forms included, so the token kind alone cannot tell
+        // `"1.2"` from `"""1\u002E2"""`. Only an escape-free long string
+        // lexes as `LongString` and got rejected; one carrying any escape
+        // passed, in both the `@version` and SPARQL-style `VERSION` spellings.
+        // The span is what distinguishes them: a long string opens with three
+        // identical quotes.
+        let tok = self.current();
+        let opens_long = {
+            let text = &self.input[tok.start as usize..tok.end as usize];
+            text.starts_with("\"\"\"") || text.starts_with("'''")
+        };
+        match tok.kind {
+            TokenKind::String | TokenKind::StringEscaped(_) if !opens_long => {}
+            _ => {
+                return Err(TurtleError::parse(
+                    self.current().start as usize,
+                    format!(
+                        "expected a short quoted version specifier such as \"1.2\" after {}, \
+                         found {}",
+                        if is_sparql_style {
+                            "VERSION"
+                        } else {
+                            "@version"
+                        },
+                        if opens_long {
+                            "a long string".to_string()
+                        } else {
+                            format!("{:?}", self.current().kind)
+                        }
+                    ),
+                ))
+            }
+        }
+        self.advance()?;
+
+        // Consume trailing dot (required for @version, not for VERSION)
+        if !is_sparql_style {
+            return self.end_statement_at_dot();
+        }
+        Ok(())
     }
 
     /// Parse @prefix or PREFIX directive.
@@ -664,14 +717,17 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         let is_sparql_style = matches!(self.current().kind, TokenKind::KwSparqlBase);
         self.advance()?; // consume @base or BASE
 
-        // Get base IRI
+        // Get base IRI. A relative base (`@base <foo/>`) resolves against
+        // the base in scope, like any other IRI reference (RFC 3986 §5.1;
+        // W3C turtle-subm-27).
         let base_iri = match self.current().kind.clone() {
             TokenKind::Iri => {
                 let s = self.current().start;
                 let e = self.current().end;
-                self.iri_content(s, e).to_string()
+                let iri = self.iri_content(s, e);
+                self.resolve_iri(iri)?
             }
-            TokenKind::IriEscaped(iri) => iri.to_string(),
+            TokenKind::IriEscaped(iri) => self.resolve_iri(&iri)?,
             _ => {
                 return Err(TurtleError::parse(
                     self.current().start as usize,
@@ -695,12 +751,18 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
 
     /// Parse a triple statement.
     fn parse_triples(&mut self) -> Result<()> {
-        let bnode_list_subject = matches!(self.current().kind, TokenKind::LBracket);
+        let optional_predicates = matches!(
+            self.current().kind,
+            TokenKind::LBracket | TokenKind::ReifiedTripleStart
+        );
         let subject = self.parse_subject()?;
-        // Turtle grammar: `blankNodePropertyList predicateObjectList? '.'` —
-        // the predicate-object list is optional when the subject is a
-        // `[...]` property list (its triples were emitted inside the list).
-        if !(bnode_list_subject && matches!(self.current().kind, TokenKind::Dot)) {
+        // Turtle grammar: `blankNodePropertyList predicateObjectList? '.'` and
+        // (RDF 1.2) `reifiedTriple predicateObjectList? '.'` — the
+        // predicate-object list is optional when the subject already emitted
+        // its own triples: a `[...]` property list, or a `<< s p o >>` whose
+        // base triple and reifier attachment the subject parse emitted (W3C
+        // turtle12-syntax-basic-04/06).
+        if !(optional_predicates && matches!(self.current().kind, TokenKind::Dot)) {
             self.parse_predicate_object_list(subject)?;
         }
         self.end_statement_at_dot()
@@ -757,7 +819,12 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
             self.parse_object_list(subject, predicate)?;
 
             if matches!(self.current().kind, TokenKind::Semicolon) {
-                self.advance()?;
+                // `predicateObjectList ::= verb objectList (';' (verb objectList)?)*`
+                // — every `;` may carry an empty group, so `;;` and a
+                // trailing `;` are both grammatical (W3C repeated_semis_*).
+                while matches!(self.current().kind, TokenKind::Semicolon) {
+                    self.advance()?;
+                }
                 if matches!(
                     self.current().kind,
                     TokenKind::Dot
@@ -1435,13 +1502,13 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         // literal slot until `end_statement`, and the whole annotation tail is
         // inside one statement.
         //
-        // Unreachable today — star constructs require
-        // `supports_reified_triples()`, and the only recycling sink
-        // (`GraphCollectorSink`) returns false, so no sink both recycles and
-        // accepts these events. It becomes live the moment a writer sink
-        // supports both. A sink that does must either keep literal ids valid
-        // for the whole statement (what `end_statement` already promises) or
-        // this function must materialize `object` before parsing the body.
+        // `GraphCollectorSink` both recycles literal slots and accepts these
+        // events, so this is live: it is sound only because that sink retires
+        // literal slots at `end_statement` and never inside a statement (what
+        // the protocol promises), so `object` stays valid across the body.
+        // `star_two_annotations_on_one_literal_object_keep_the_object` pins
+        // it. A sink that recycles within a statement would need this
+        // function to materialize `object` before parsing the body.
         let mut pending: Option<TermId> = None;
         loop {
             match self.current().kind {
@@ -1489,8 +1556,14 @@ impl<'a, 'input, S: GraphSink> Parser<'a, 'input, S> {
         let base = match &self.base {
             Some(b) => b,
             None => {
+                // RFC 3986 §5.1: a relative reference needs a base. Keeping it
+                // verbatim, as this used to, writes a relative IRI into the
+                // store, and a relative IRI cannot identify a node — so the
+                // data is invalid in a way nothing downstream reports.
                 return Err(TurtleError::IriResolution(format!(
-                    "relative IRI '{reference}' without base"
+                    "relative IRI '{reference}' has no base to resolve against; \
+                     add an absolute `@base <http://example.org/> .` before it, or \
+                     write the IRI in full"
                 )));
             }
         };
@@ -2344,23 +2417,135 @@ mod tests {
         assert!(err.to_string().contains("collection objects"));
     }
 
+    /// A sink that keeps the trait default (`supports_reified_triples` =
+    /// false): the shape of every sink that has not opted in.
+    #[derive(Default)]
+    struct PlainSink(StarSink);
+
+    impl GraphSink for PlainSink {
+        fn on_base(&mut self, base_iri: &str) {
+            self.0.on_base(base_iri);
+        }
+        fn on_prefix(&mut self, prefix: &str, namespace_iri: &str) {
+            self.0.on_prefix(prefix, namespace_iri);
+        }
+        fn term_iri(&mut self, iri: &str) -> TermId {
+            self.0.term_iri(iri)
+        }
+        fn term_blank(&mut self, label: Option<&str>) -> TermId {
+            self.0.term_blank(label)
+        }
+        fn term_literal(
+            &mut self,
+            value: &str,
+            datatype: Datatype,
+            language: Option<&str>,
+        ) -> TermId {
+            self.0.term_literal(value, datatype, language)
+        }
+        fn term_literal_value(&mut self, value: LiteralValue, datatype: Datatype) -> TermId {
+            self.0.term_literal_value(value, datatype)
+        }
+        fn emit_triple(
+            &mut self,
+            subject: TermId,
+            predicate: TermId,
+            object: TermId,
+        ) -> fluree_graph_ir::SinkResult {
+            self.0.emit_triple(subject, predicate, object)
+        }
+    }
+
     #[test]
     fn star_rejected_on_unsupporting_sink() {
-        // GraphCollectorSink does not support reified triples — the parser
-        // must reject with a clear deferred error, never silently drop
-        // reifier semantics.
-        let mut sink = GraphCollectorSink::new();
+        // A sink that has not opted in to reified triples — the parser must
+        // reject with a clear deferred error, never silently drop reifier
+        // semantics.
+        let mut sink = PlainSink::default();
         let err = parse(&format!("{P}<<:a :b :c>> :q :z ."), &mut sink)
-            .expect_err("collector sink must reject star input");
+            .expect_err("plain sink must reject star input");
         let msg = err.to_string();
         assert!(msg.contains("not supported on this ingest path"), "{msg}");
 
-        let mut sink = GraphCollectorSink::new();
+        let mut sink = PlainSink::default();
         let err = parse(&format!("{P}:a :b :c {{| :q :z |}} ."), &mut sink)
-            .expect_err("collector sink must reject annotation blocks");
+            .expect_err("plain sink must reject annotation blocks");
         assert!(err
             .to_string()
             .contains("not supported on this ingest path"));
+    }
+
+    #[test]
+    fn star_bare_reified_triple_statement() {
+        // `<< s p o >> .` with no predicate-object list: asserts the base
+        // triple and attaches a fresh anonymous reifier, nothing more.
+        let sink = parse_star(&format!("{P}:s :p :o .\n<<:s :p :o>> ."));
+        assert_eq!(sink.reified.len(), 1);
+        assert!(matches!(sink.reified[0].3, RecTerm::Blank(_)));
+        assert_eq!(sink.triples.len(), 2, "{:?}", sink.triples);
+    }
+
+    #[test]
+    fn star_collector_sink_records_reifications() {
+        // The collector (the Turtle→JSON-LD path behind upsert, graph sync
+        // and memory import) accepts every asserting star form and keeps
+        // the reifier attachments alongside the triples.
+        let mut sink = GraphCollectorSink::new();
+        parse(
+            &format!(
+                "{P}:a :b :c {{| :q :z |}} .\n\
+                 :a :b :d ~ :named .\n\
+                 <<:a :b :e>> :q :z ."
+            ),
+            &mut sink,
+        )
+        .expect("collector accepts star input");
+        let graph = sink.into_graph();
+        let reifs = graph.reifications();
+        assert_eq!(reifs.len(), 3, "{reifs:?}");
+        let named = reifs
+            .iter()
+            .find(|r| r.reifier == Term::iri("http://example/named"))
+            .expect("named reifier recorded");
+        assert_eq!(named.triple.o, Term::iri("http://example/d"));
+        // The anonymous reifiers are distinct blank nodes.
+        let anon: Vec<_> = reifs
+            .iter()
+            .filter(|r| r.reifier != Term::iri("http://example/named"))
+            .map(|r| r.reifier.clone())
+            .collect();
+        assert_eq!(anon.len(), 2);
+        assert_ne!(anon[0], anon[1]);
+        assert!(
+            anon.iter().all(|t| matches!(t, Term::BlankNode(_))),
+            "{anon:?}"
+        );
+        // Every base triple is asserted exactly once; body triples about
+        // the reifiers are ordinary triples.
+        assert_eq!(graph.len(), 5, "{:?}", graph.triples());
+    }
+
+    #[test]
+    fn star_two_annotations_on_one_literal_object_keep_the_object() {
+        // The term-lifetime hazard named in `parse_annotation_tail`: the
+        // literal object id stays live across the first annotation body
+        // (which mints literals of its own) and is re-used for the second
+        // reifier. The collector recycles literal slots only between
+        // statements, so both attachments must still name "lit".
+        let mut sink = GraphCollectorSink::new();
+        parse(
+            &format!("{P}:a :b \"lit\" ~ :r1 {{| :q \"one\" |}} ~ :r2 {{| :q \"two\" |}} ."),
+            &mut sink,
+        )
+        .expect("two annotations on one object");
+        let graph = sink.into_graph();
+        let reifs = graph.reifications();
+        assert_eq!(reifs.len(), 2, "{reifs:?}");
+        for r in reifs {
+            assert_eq!(r.triple.o, Term::string("lit"), "{r:?}");
+        }
+        assert_eq!(reifs[0].reifier, Term::iri("http://example/r1"));
+        assert_eq!(reifs[1].reifier, Term::iri("http://example/r2"));
     }
 
     #[test]
@@ -3357,5 +3542,86 @@ mod tests {
             input.push_str(&format!("ex:s{i} ex:p [ ex:q ( ex:o ) ] .\n"));
         }
         parse_to_graph(&input).expect("sibling nesting must not accumulate");
+    }
+}
+
+#[cfg(test)]
+mod version_directive_tests {
+    use super::*;
+    use fluree_graph_ir::GraphCollectorSink;
+
+    fn parse(doc: &str) -> Result<()> {
+        let mut sink = GraphCollectorSink::new();
+        Parser::new(doc, &mut sink)?.parse()
+    }
+
+    /// The version specifier must be a *short* string.
+    ///
+    /// `StringEscaped` is the escape-bearing slow path for every string
+    /// lexer, so a long string carrying any escape produced the same token
+    /// kind as a short one and slipped through a check that only rejected the
+    /// escape-free `LongString`. The hole covered `'''…'''` and the
+    /// SPARQL-style `VERSION` keyword too.
+    #[test]
+    fn a_long_version_specifier_is_rejected_even_when_it_carries_an_escape() {
+        parse("@version \"1.2\" .\n").expect("a short specifier is the accepted form");
+
+        for bad in [
+            "@version \"\"\"1.2\"\"\" .\n",
+            "@version \"\"\"1\\u002E2\"\"\" .\n",
+            "@version '''1\\u002E2''' .\n",
+            "VERSION \"\"\"1\\u002E2\"\"\"\n",
+        ] {
+            let err = parse(bad).expect_err("a long specifier must be a syntax error");
+            assert!(
+                err.to_string().contains("short quoted version specifier"),
+                "input {bad:?} gave: {err}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod lang_tag_error_tests {
+    use super::*;
+    use fluree_graph_ir::GraphCollectorSink;
+
+    fn parse_err(doc: &str) -> String {
+        let mut sink = GraphCollectorSink::new();
+        match Parser::new(doc, &mut sink).and_then(Parser::parse) {
+            Err(e) => e.to_string(),
+            Ok(()) => panic!("expected {doc:?} to be rejected"),
+        }
+    }
+
+    /// A rejected language tag says what is wrong with it.
+    ///
+    /// The generic lexer error reported the token's start offset but named the
+    /// character at the *remaining* input, which the directive scan had
+    /// already advanced past the whole tag. `"x"@en--LTR .` therefore produced
+    /// "unexpected character ' '" with a caret on the `@`, and said nothing
+    /// about language tags. Uppercase `--LTR` is a plausible-looking spelling,
+    /// so naming the required one is the whole fix.
+    #[test]
+    fn a_rejected_language_tag_explains_itself() {
+        let doc = "<http://e/s> <http://e/p> \"x\"@en--LTR .\n";
+        let msg = parse_err(doc);
+        assert!(
+            msg.contains("--ltr") && msg.contains("base direction"),
+            "should name the required spelling: {msg}"
+        );
+
+        let msg = parse_err("<http://e/s> <http://e/p> \"x\"@1en .\n");
+        assert!(
+            msg.contains("language tag"),
+            "a tag starting with a digit should say so: {msg}"
+        );
+
+        // The valid spellings still parse.
+        let mut sink = GraphCollectorSink::new();
+        Parser::new("<http://e/s> <http://e/p> \"x\"@en--ltr .\n", &mut sink)
+            .unwrap()
+            .parse()
+            .expect("lowercase --ltr is the accepted form");
     }
 }
