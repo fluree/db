@@ -37,10 +37,10 @@ use serde_json::Value as JsonValue;
 ///
 /// Streams the JSON through the hasher rather than serializing it to a
 /// `String` first, so a bulk payload does not pay a second full copy of
-/// itself. The TriG blocks fold in their graph IRI and triples but not their
-/// prefix map: prefixes only decide how the triples were expanded, and a
-/// `FxHashMap` has no stable iteration order, which would make the scope
-/// differ between two runs over the same document.
+/// itself. The TriG blocks fold in their graph IRI, triples and reifier
+/// attachments but not their prefix map: prefixes only decide how the triples
+/// were expanded, and a `FxHashMap` has no stable iteration order, which
+/// would make the scope differ between two runs over the same document.
 fn upsert_payload_id(txn_json: &JsonValue, named_graphs: &[NamedGraphBlock]) -> u64 {
     use std::io::Write;
     use xxhash_rust::xxh64::Xxh64;
@@ -64,6 +64,9 @@ fn upsert_payload_id(txn_json: &JsonValue, named_graphs: &[NamedGraphBlock]) -> 
         let _ = w.write_all(block.iri.as_bytes());
         for triple in &block.triples {
             let _ = write!(w, "\0{triple:?}");
+        }
+        for reified in &block.reified {
+            let _ = write!(w, "\0{reified:?}");
         }
     }
     w.0.digest()
