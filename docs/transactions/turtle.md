@@ -453,7 +453,7 @@ ex:dataset-import-2024-01-22 a ex:DatasetImport ;
 
 ## Edge annotations (RDF 1.2 / Turtle-star)
 
-The Turtle and N-Triples ingest paths read the RDF 1.2 asserting forms directly. All of these produce the same on-disk `f:reifies*` bundle as JSON-LD `@annotation` — bit-identical, so cascade retracts, hydration, and the annotation arena treat both surfaces as one:
+The Turtle parser (which also reads N-Triples) accepts the RDF 1.2 *asserting* forms on every Turtle write path — `insert`, `upsert`, bulk `import`, `fluree graph sync`, and the memory importer. All of them produce the same on-disk `f:reifies*` bundle that the JSON-LD `@annotation` and SPARQL 1.2 `{| |}` surfaces write, so cascade retracts, hydration, and the annotation arena treat every surface as one, and the annotations are queryable from every query surface:
 
 ```turtle
 @prefix ex:  <http://example.org/> .
@@ -478,7 +478,7 @@ ex:emp1 rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .
 
 Two rules to know:
 
-- **The reified triple is asserted.** RDF 1.2 says `<< s p o >>` and `r rdf:reifies <<( s p o )>>` do *not* put `s p o` in the graph; Fluree's annotations describe a live edge, so ingest asserts the base triple as well. Each anonymous `<< s p o >>` / `{| |}` occurrence mints a fresh reifier — two textual occurrences are two annotations.
+- **The reified triple is asserted.** RDF 1.2 says `<< s p o >>` and `r rdf:reifies <<( s p o )>>` do *not* put `s p o` in the graph; Fluree's annotations describe a live edge, so ingest asserts the base triple as well and attaches the reifier to it. The reifier's own triples (the annotation body) are ordinary RDF about the reifier. Each anonymous `<< s p o >>` / `{| |}` occurrence mints a fresh reifier — two textual occurrences are two annotations.
 - **`<<( ... )>>` is accepted only as the object of `rdf:reifies`.** As a plain value (`ex:doc ex:mentions <<( ... )>>`), nested inside another triple term, or inside an annotation body, it is rejected with a specific "deferred" error rather than silently dropped.
 
 TriG and N-Quads accept the same forms inside `GRAPH { }` blocks (and on N-Quads statements with a graph label). The annotation is written into that graph and carries the edge's graph identity, exactly as JSON-LD `@graph` + `@annotation` does:
@@ -492,9 +492,36 @@ GRAPH ex:hr {
 }
 ```
 
-Annotations are not allowed in the `#txn-meta` graph — its triples become commit metadata, not edges.
+Sending a claims file through `upsert` replaces each claim's body (`ex:confidence`) the way upsert replaces any other predicate value, while the edge and its attachment stay put — the natural way to keep a claims file in sync with a ledger.
 
-See the [Edge annotations concept doc](../concepts/edge-annotations.md) for the full RDF 1.2 / SPARQL 1.2 surface — `rdf:reifies` for annotation-rooted queries, the per-operation rules for INSERT DATA / DELETE DATA / INSERT WHERE / DELETE WHERE templates, and the deferred shapes that produce parse errors.
+```turtle
+@prefix ex: <http://example.org/> .
+
+ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.9 ; ex:source ex:hr |} .
+ex:alice ex:knows ex:carol {| ex:source ex:linkedin |} .
+```
+
+**Anonymous reifiers have no identity you can refer to, and the two re-send paths differ.** `~ ex:claim1` is an identity: re-ingesting the file finds the same claim and replaces its body, on every path. A bare `{| … |}` block has no such handle, so what happens on a re-send depends on where the path scopes blank-node identity.
+
+| re-sending the same file | `fluree sync` | `upsert` |
+| --- | --- | --- |
+| unchanged payload | no-op | no-op |
+| changed annotation body | the claim's body is replaced | a second claim is added |
+
+`fluree sync` scopes blank-node identity to the target graph, so the same source label names the same reifier across payloads and a changed body lands on the claim already there. `upsert` scopes it to the payload, so a changed body is a different payload, mints a different reifier, and leaves the first claim in place. Name the reifier when you want replacement on both.
+
+Rejected with a clear parse or stage error, never silently dropped:
+
+- the parenthesized triple term `<<( :s :p :o )>>` anywhere other than the object of `rdf:reifies` (RDF 1.2 triple terms as values are not representable yet), and a triple term nested inside another;
+- an annotation block nested inside an annotation body (`{| :q :v {| … |} |}`), and an annotation tail on an `rdf:reifies <<( … )>>` statement (it would annotate the reification itself);
+- an annotation on a collection object (`( :a :b ) {| … |}`);
+- one named reifier on two different triples — a reifier denotes exactly one edge (see [the single-target invariant](../concepts/edge-annotations.md#one-annotation-one-edge-single-target-invariant));
+- an annotation on an `rdf:type` edge (`:s a :C {| … |}`) on the paths that convert Turtle to JSON-LD first (`upsert`, `graph sync`, memory import) — JSON-LD has no place to hang an annotation on a `@type` value. `insert` and SPARQL UPDATE accept it;
+- TriG: annotations in the `#txn-meta` graph — its triples become commit metadata, not edges.
+
+The RDF 1.2 version directive — `VERSION "1.2"` or `@version "1.2" .` — is accepted anywhere a directive may appear and ignored: the RDF 1.2 surface is always on. Base-direction language tags (`"…"@en--ltr`) are accepted; a direction other than `ltr` / `rtl` is a syntax error. They are stored as an `rdf:langString` whose language is the whole `en--ltr` string, not yet as `rdf:dirLangString` with a separate direction — so `LANG()` returns `en--ltr` and `langMatches(?l, "en")` will not match it.
+
+Turtle-star output is not produced yet: exports and CONSTRUCT emit annotations in JSON-LD only. For the SPARQL 1.2 UPDATE equivalents see [the cookbook](../guides/cookbook-edge-annotations.md#the-same-patterns-in-sparql-12); for the full model — `rdf:reifies` for annotation-rooted queries, the per-operation rules for SPARQL UPDATE templates, and the deferred shapes — see the [Edge annotations concept doc](../concepts/edge-annotations.md).
 
 ## Comparing Formats
 

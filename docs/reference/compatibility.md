@@ -30,15 +30,31 @@ Fluree also exposes a non-standard extension that reads commit metadata off a
 quoted triple (`<< s p o >> f:t ?t`, `f:op ?op`) for transaction-time and
 assert/retract introspection.
 
+Turtle 1.2 annotation syntax is accepted on ingest — `{| ... |}` annotation
+tails, the `~` reifier, `<< s p o >>` reified triples and
+`r rdf:reifies <<( s p o )>>` — on every Turtle write path (insert, upsert,
+import, graph sync), inside TriG `GRAPH { }` blocks, and in N-Triples and
+N-Quads files. All forms assert the base triple: Fluree reifies asserted
+edges, so `<< s p o >>` is asserting here where RDF 1.2 makes it
+non-asserting. The `VERSION "1.2"` / `@version`
+directive and `--ltr` / `--rtl` base-direction language tags are accepted.
+The vendored W3C RDF 1.1 and RDF 1.2 Turtle suites run in CI
+(`testsuite-sparql/tests/w3c_rdf.rs`), with known gaps in the skip register.
+
 Not yet supported:
-- Turtle 1.2 / TriG 1.2 annotation syntax on ingest (`{| ... |}` annotation
-  tails, the `~` reifier, and `<<( ... )>>` triple terms) — convert to JSON-LD,
-  or add annotations via SPARQL `INSERT DATA`, instead
-- Triple terms as arbitrary object values (only as the `rdf:reifies` object)
+- Triple terms as arbitrary object values: `<<( ... )>>` is accepted on
+  ingest only as the object of `rdf:reifies`
 - Triple terms in subject position and nested triple terms
 - Multiple triples reified by a single annotation
 
 See [Edge annotations](../concepts/edge-annotations.md).
+
+Base-direction language tags (`"text"@en--ltr`) parse and round-trip, but are
+stored as a single `rdf:langString` whose language is the whole `en--ltr`
+string, rather than as `rdf:dirLangString` with a separate direction. Nothing
+is dropped, but `LANG()` returns `en--ltr`, JSON-LD output carries that in
+`@language`, and `langMatches(?l, "en")` will not match it. First-class
+`rdf:dirLangString` is a future extension.
 
 **Specification:** https://www.w3.org/TR/rdf12-concepts/
 
@@ -463,7 +479,7 @@ Export Fluree data to:
 - SPARQL 1.1 Federation (`SERVICE`)
 - Full SPARQL UPDATE (LOAD, CLEAR, DROP, CREATE, COPY, MOVE, ADD; variable graph names)
 - GeoSPARQL: remaining OGC functions (only `geof:distance` is implemented today)
-- RDF 1.2 / SPARQL 1.2: Turtle 1.2 annotation syntax on ingest; triple-term accessor functions; W3C 1.2 test-suite execution
+- RDF 1.2 / SPARQL 1.2: triple terms as values and the triple-term accessor functions; Turtle-star output; the RDF 1.2 Turtle evaluation suite (blocked on triple terms)
 
 **Storage:**
 - Additional cloud providers (GCP, Azure)

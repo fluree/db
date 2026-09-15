@@ -181,7 +181,7 @@ where
             let walk_started = std::time::Instant::now();
             let (commit_cids, ledger_split_mode) = {
                 // stop_at_t=0 collects all commits (t starts at 1).
-                let (dag, split_mode) = fluree_db_core::collect_dag_cids_with_split_mode(
+                let (dag, split_mode) = fluree_db_core::collect_first_parent_cids_with_split_mode(
                     &content_store,
                     &head_commit_id,
                     0,

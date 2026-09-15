@@ -2488,7 +2488,7 @@ Bearer token required when `data_auth.mode = required`; reads are gated on `bear
 
 **URL:**
 ```
-GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}&include_conflict_details={bool}&strategy={strategy}&include_changes={bool}&max_changes={n}&changes_after_subject={iri}
+GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}&include_conflict_details={bool}&strategy={strategy}&include_changes={bool}&max_changes={n}&changes_after_subject={iri}&include_validation={bool}
 ```
 
 **Path / Query Parameters:**
@@ -2506,6 +2506,7 @@ GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}
 | `include_changes` | bool | No | When true, includes the aggregate **netted** change set the merge would apply (source side, ancestor..source-head) as `changes`. Defaults to false. Costs one full commit load per commit in the source divergence; the walk is shared with the conflict computation when both are requested. |
 | `max_changes` | number | No | Cap on change entries returned, counted in **flakes** and cut at subject boundaries (default 500; server clamps to a hard maximum of 5,000). A single subject larger than the cap is returned whole. `0` is a valid "diff stats" mode: exact counts, no payload. Bounds response size, **not** the replay walk. |
 | `changes_after_subject` | string | No | Pagination cursor: return only subjects whose full IRI sorts strictly after this value. Pass the previous response's `changes.next_cursor`. Each page re-pays the full replay + netting cost. Requires `include_changes=true`. |
+| `include_validation` | bool | No | When true (the default), stages the strategy-resolved change set on the target and validates it against the target's SHACL configuration and shapes exactly as `POST /merge` would, reporting the outcome as `validation` and folding it into `mergeable`. Costs a target-state load plus the validation pass, plus the source replay when `include_changes` is false. Set false for count-only previews. |
 
 **Response body (200 OK):**
 
@@ -2525,6 +2526,7 @@ GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}
   "behind": { "count": 1, "commits": [...], "truncated": false },
   "fast_forward": false,
   "mergeable": true,
+  "validation": { "conforms": true },
   "conflicts": {
     "count": 1,
     "keys": [{ "s": [100, "alice"], "p": [100, "status"], "g": null }],
@@ -2567,7 +2569,8 @@ GET /merge-preview/{ledger-name}?source={source}&target={target}&max_commits={n}
 | `ahead` | object | Commits on source not on target (`count`, `commits`, `truncated`) |
 | `behind` | object | Commits on target not on source |
 | `fast_forward` | bool | True when target HEAD == ancestor (or both heads absent) |
-| `mergeable` | bool | False only when the selected preview strategy would abort, e.g. `strategy=abort` with conflicts. This is a strategy/conflict signal, not full transaction validation. `mergeable=true` does not guarantee a subsequent `POST /merge` will succeed; it only reflects the conflict/strategy interaction at preview time. |
+| `mergeable` | bool | Whether the strategy and the shapes both accept the merge: the selected strategy can be applied without aborting (false for `strategy=abort` with conflicts) **and**, when `validation` is present, the merged state conforms to the target's shapes. Commit-time conditions such as novelty backpressure are outside it. With `include_validation=false` it is the strategy/conflict signal alone. |
+| `validation` | object | Present iff `include_validation=true` (the default) and the merge is not a fast-forward. `{ "conforms": bool, "report"?: string }`, the same SHACL outcome `POST /merge` would produce for this strategy; `report` is present only when `conforms` is false and is the message the merge would fail with. A fast-forward adopts commits already validated when they were authored, so it carries no `validation`. |
 | `conflicts` | object | Overlapping `(s, p, g)` keys touched on both sides since the ancestor. Empty when `fast_forward` or `include_conflicts=false` |
 | `changes` | object | Present iff `include_changes=true`. Aggregate netted change set — see below |
 
@@ -2575,7 +2578,7 @@ Per-commit summaries (`ahead.commits[]` / `behind.commits[]`) are newest-first a
 
 When `include_conflict_details=true`, `conflicts.details[]` contains one entry for each returned conflict key. `source_values` and `target_values` are the current asserted values for that key at each branch HEAD, using the same resolved flake tuple format as `/show`: `[subject, predicate, object, datatype, operation]`, with an optional metadata object as the 6th tuple item. The `resolution` object is an annotation only; preview does not apply the strategy or mutate state.
 
-**The `changes` object** is a git-diff-style rollup of the merge: the source side's `ancestor..source_head` flakes folded per fact (full identity: subject, predicate, object, datatype, graph, language tag, list index), with internally-cancelling assert/retract pairs removed. Intermediate churn — a fact created then deleted within the range, or deleted then restored — never appears. This is the *net commit effect*: what replaying the source range applies, minus pairs that cancel, so a re-assert of a value that already existed before the range still nets as an assert. The change set is strategy-independent (the raw source-vs-ancestor delta, before conflict resolution); under a non-default strategy, conflicting keys resolve per `conflicts.details`.
+**The `changes` object** is a git-diff-style rollup of the merge: the source side's `ancestor..source_head` flakes folded per fact (full identity: subject, predicate, object, datatype, graph, language tag, list index), keeping each touched fact's **newest** op. That op is the fact's state at the source head, which is exactly what the merge applies, so a fact created and then deleted within the range shows as a deletion rather than disappearing from the diff. Nothing is inferred about whether the fact existed before the range: a range can re-assert a value the ledger already holds, so a vanishing pair would hide a real deletion. The change set is strategy-independent (the raw source-vs-ancestor delta, before conflict resolution); under a non-default strategy, conflicting keys resolve per `conflicts.details`.
 
 - `assert_count` / `retract_count` / `subject_count` are exact across the full divergence, never truncated — a UI can render "showing X of Y".
 - `entries[]` groups net changes by subject, subjects ordered by full IRI. Each flake uses the same resolved tuple format as conflict details.

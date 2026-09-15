@@ -140,9 +140,12 @@ WHERE  {
 
 ## Add annotations to data you already ingested
 
-Turtle / N-Triples / TriG / N-Quads ingest paths don't parse annotation tails.
-Load the plain edges first, then layer provenance onto the edges they already
-created with a SPARQL UPDATE that repeats the same `(s, p, o)`:
+A Turtle file that already carries its annotations needs no follow-up: every
+Turtle write path parses the RDF 1.2 tail (see
+[Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)).
+Use this when the provenance arrives separately from the edges — layer it onto
+edges that already exist with a SPARQL UPDATE that repeats the same
+`(s, p, o)`:
 
 ```sparql
 PREFIX ex: <http://example.org/>

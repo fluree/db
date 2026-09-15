@@ -8,6 +8,7 @@ use lru::LruCache;
 use parking_lot::RwLock;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -80,12 +81,26 @@ pub struct ReasoningBudget {
     pub max_memory_bytes: usize,
 }
 
+/// Default fact ceiling: the cap an operator reasons about.
+pub const DEFAULT_MAX_FACTS: usize = 1_000_000;
+
+/// Byte allowance per derived fact used to derive the default memory ceiling.
+///
+/// A derived fact costs roughly `size_of::<Flake>()` (176 bytes on a 64-bit
+/// target) plus its subject, predicate and object names — call it 200 bytes
+/// for ordinary IRIs. The allowance is deliberately well above that so the
+/// FACT cap binds first on ordinary data and the memory cap only fires when
+/// facts are abnormally large (long IRIs, big string or JSON literals). A flat
+/// ceiling instead made memory bind at roughly half the fact cap, so a closure
+/// that completed before could come back silently truncated.
+pub const BYTES_PER_FACT_ALLOWANCE: usize = 512;
+
 impl Default for ReasoningBudget {
     fn default() -> Self {
         Self {
             max_duration: Duration::from_secs(30),
-            max_facts: 1_000_000,
-            max_memory_bytes: 100 * 1024 * 1024, // 100MB
+            max_facts: DEFAULT_MAX_FACTS,
+            max_memory_bytes: Self::memory_for_facts(DEFAULT_MAX_FACTS),
         }
     }
 }
@@ -109,6 +124,15 @@ impl ReasoningBudget {
         }
     }
 
+    /// Memory ceiling coherent with a fact ceiling.
+    ///
+    /// Used whenever no explicit memory budget is configured, so raising
+    /// `max_facts` raises the memory the operator has implicitly accepted
+    /// rather than leaving a flat ceiling to bind first.
+    pub fn memory_for_facts(max_facts: usize) -> usize {
+        max_facts.saturating_mul(BYTES_PER_FACT_ALLOWANCE)
+    }
+
     /// Compute a hash of budget settings for cache key
     pub fn config_hash(&self) -> u64 {
         use std::collections::hash_map::DefaultHasher;
@@ -118,6 +142,33 @@ impl ReasoningBudget {
         self.max_memory_bytes.hash(&mut h);
         h.finish()
     }
+}
+
+/// Rough heap footprint of one derived flake, for the memory budget.
+///
+/// Counts the `Flake` itself plus the heap behind its subject and predicate
+/// names and its object (string / JSON payload, or a reference's name). An
+/// estimate, not an allocator measurement — it exists so a runaway closure is
+/// capped by size and not only by count.
+pub fn approx_flake_bytes(flake: &fluree_db_core::Flake) -> usize {
+    use fluree_db_core::value::FlakeValue;
+    let heap = match &flake.o {
+        FlakeValue::String(s) | FlakeValue::Json(s) => s.len(),
+        FlakeValue::Ref(sid) => sid.name.len(),
+        // An embedding is the largest thing a derived fact can carry, and
+        // counting it as zero meant a rule that copies vectors was undercounted
+        // by roughly the whole value — the memory cap could not fire where it
+        // was most needed.
+        FlakeValue::Vector(v) => v.len() * std::mem::size_of::<f64>(),
+        FlakeValue::BigInt(_) | FlakeValue::Decimal(_) => {
+            // Boxed arbitrary-precision numbers: the box itself plus a small
+            // allowance for the digit buffer. Exactness is not the point; not
+            // being zero is.
+            std::mem::size_of::<usize>() * 4
+        }
+        _ => 0,
+    };
+    std::mem::size_of::<fluree_db_core::Flake>() + flake.s.name.len() + flake.p.name.len() + heap
 }
 
 /// Diagnostics from a reasoning operation
@@ -213,6 +264,13 @@ impl ReasoningResult {
 /// The cache stores `Arc<ReasoningResult>` for cheap cloning.
 pub struct ReasoningCache {
     inner: RwLock<LruCache<ReasoningCacheKey, Arc<ReasoningResult>>>,
+    /// Lookups that found an entry. Observability, and the only way a test can
+    /// tell a hit from a recompute: a recompute of the same materialization
+    /// reports an identical tally, and entry counts race against other queries
+    /// sharing the process-wide cache.
+    hits: AtomicU64,
+    /// Lookups that found nothing and had to materialize.
+    misses: AtomicU64,
 }
 
 impl ReasoningCache {
@@ -224,6 +282,8 @@ impl ReasoningCache {
         let cap = NonZeroUsize::new(capacity).expect("capacity must be > 0");
         Self {
             inner: RwLock::new(LruCache::new(cap)),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 
@@ -236,7 +296,24 @@ impl ReasoningCache {
     ///
     /// This promotes the entry to most-recently-used.
     pub fn get(&self, key: &ReasoningCacheKey) -> Option<Arc<ReasoningResult>> {
-        self.inner.write().get(key).cloned()
+        let found = self.inner.write().get(key).cloned();
+        let counter = if found.is_some() {
+            &self.hits
+        } else {
+            &self.misses
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        found
+    }
+
+    /// Lookups that found an entry, since process start.
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
+    }
+
+    /// Lookups that found nothing, since process start.
+    pub fn misses(&self) -> u64 {
+        self.misses.load(Ordering::Relaxed)
     }
 
     /// Peek at a cached result without updating LRU order
@@ -340,6 +417,16 @@ mod tests {
         let budget = ReasoningBudget::default();
         assert_eq!(budget.max_duration, Duration::from_secs(30));
         assert_eq!(budget.max_facts, 1_000_000);
-        assert_eq!(budget.max_memory_bytes, 100 * 1024 * 1024);
+        assert_eq!(
+            budget.max_memory_bytes,
+            ReasoningBudget::memory_for_facts(1_000_000),
+            "the default memory ceiling must be derived from the default fact \
+             ceiling, so the fact cap binds first on ordinary data"
+        );
+        assert!(
+            budget.max_memory_bytes
+                > budget.max_facts * std::mem::size_of::<fluree_db_core::Flake>(),
+            "a closure of max_facts ordinary flakes must fit under the memory cap"
+        );
     }
 }

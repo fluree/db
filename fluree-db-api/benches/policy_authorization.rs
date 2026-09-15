@@ -35,6 +35,7 @@ fn authorization(claims: &EventsTokenPayload) -> PolicyAuthorization {
             policy: policy.policy.clone(),
             policy_values: policy.policy_values.clone(),
             default_allow: policy.default_allow,
+            ..Default::default()
         },
         Some(PolicyClaim::Request(_)) => panic!("this benchmark measures fixed selections"),
         None => GovernanceOptions {

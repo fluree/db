@@ -16,7 +16,7 @@ use crate::range_provider::RangeProvider;
 use crate::schema_hierarchy::SchemaHierarchy;
 use crate::sid::Sid;
 use crate::storage::StorageRead;
-use fluree_vocab::namespaces::{EMPTY, OVERFLOW};
+use fluree_vocab::namespaces::{is_full_iri, EMPTY, OVERFLOW};
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -149,8 +149,10 @@ pub struct LedgerSnapshot {
     namespace_codes: Arc<HashMap<u16, String>>,
 
     /// Reverse: IRI prefix -> namespace code (for O(1) canonical encode lookup).
-    /// Kept in sync with `namespace_codes` by all mutation paths.
-    namespace_reverse: HashMap<String, u16>,
+    /// Kept in sync with `namespace_codes` by all mutation paths. `Arc`-wrapped
+    /// for the same reason: a transaction's namespace registry layers over
+    /// both tables by refcount bump instead of rebuilding them.
+    namespace_reverse: Arc<HashMap<String, u16>>,
 
     /// Ledger-fixed split mode for canonical IRI encoding.
     ///
@@ -286,11 +288,13 @@ impl std::fmt::Debug for LedgerSnapshot {
 }
 
 /// Build reverse map from code→prefix forward map.
-fn build_namespace_reverse(codes: &HashMap<u16, String>) -> HashMap<String, u16> {
-    codes
-        .iter()
-        .map(|(&code, prefix)| (prefix.clone(), code))
-        .collect()
+fn build_namespace_reverse(codes: &HashMap<u16, String>) -> Arc<HashMap<String, u16>> {
+    Arc::new(
+        codes
+            .iter()
+            .map(|(&code, prefix)| (prefix.clone(), code))
+            .collect(),
+    )
 }
 
 impl LedgerSnapshot {
@@ -490,7 +494,7 @@ impl LedgerSnapshot {
     /// - Registered code: returns `Some(prefix + name)`
     /// - Unknown code: returns `None` (corruption/bug)
     pub fn decode_sid(&self, sid: &Sid) -> Option<String> {
-        if sid.namespace_code == EMPTY || sid.namespace_code == OVERFLOW {
+        if is_full_iri(sid.namespace_code) {
             return Some(sid.name.to_string());
         }
         self.namespace_codes
@@ -515,6 +519,12 @@ impl LedgerSnapshot {
     /// Get the reverse namespace map (prefix → code) for conflict checking.
     pub fn namespace_reverse(&self) -> &HashMap<String, u16> {
         &self.namespace_reverse
+    }
+
+    /// A shareable handle to the reverse namespace map, the twin of
+    /// [`Self::shared_namespaces`].
+    pub fn shared_namespace_reverse(&self) -> Arc<HashMap<String, u16>> {
+        Arc::clone(&self.namespace_reverse)
     }
 
     /// Get the ledger's split mode for canonical IRI encoding.
@@ -565,7 +575,7 @@ impl LedgerSnapshot {
             }
             return Ok(false);
         }
-        self.namespace_reverse.insert(prefix.clone(), code);
+        Arc::make_mut(&mut self.namespace_reverse).insert(prefix.clone(), code);
         Arc::make_mut(&mut self.namespace_codes).insert(code, prefix);
         Ok(true)
     }
@@ -611,7 +621,7 @@ impl LedgerSnapshot {
             }
             // New mapping — insert into both maps.
             Arc::make_mut(&mut self.namespace_codes).insert(code, prefix.clone());
-            self.namespace_reverse.insert(prefix.clone(), code);
+            Arc::make_mut(&mut self.namespace_reverse).insert(prefix.clone(), code);
         }
         self.graph_registry.apply_delta(graph_iris);
         Ok(())

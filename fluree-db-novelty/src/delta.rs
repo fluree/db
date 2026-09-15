@@ -4,14 +4,14 @@
 //! modified between two points, producing a set of [`ConflictKey`]s that
 //! can be checked against branch commits to detect overlapping changes.
 
-use crate::{trace_commits_by_id, Result};
+use crate::{trace_first_parent_commits_by_id, Result};
 use fluree_db_core::{ConflictKey, ContentId, ContentStore, Flake, FlakeValue, Sid};
 use futures::TryStreamExt;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::hash_map::Entry;
+use std::collections::HashMap;
 
-/// Walk the commit chain from `head_id` back to `stop_at_t` and collect
-/// all (subject, predicate, graph) tuples modified in those commits.
+/// Walk the first-parent lineage from `head_id` back to `stop_at_t` and
+/// collect all (subject, predicate, graph) tuples modified in those commits.
 ///
 /// This produces the "source delta" — the set of data points changed on
 /// the source branch since the branch point. During rebase, branch commits
@@ -27,7 +27,7 @@ pub async fn compute_delta_keys<C: ContentStore + Clone + 'static>(
     head_id: ContentId,
     stop_at_t: i64,
 ) -> Result<FxHashSet<ConflictKey>> {
-    let stream = trace_commits_by_id(store, head_id, stop_at_t);
+    let stream = trace_first_parent_commits_by_id(store, head_id, stop_at_t);
     futures::pin_mut!(stream);
 
     let mut keys = FxHashSet::default();
@@ -52,8 +52,8 @@ pub async fn compute_delta_keys<C: ContentStore + Clone + 'static>(
 /// must treat the same triple in two graphs as two distinct facts, and must
 /// keep language-tagged strings and list positions apart, so `g`, `lang`,
 /// and `i` are all part of the key.
-#[derive(PartialEq, Eq, Hash)]
-struct FactKey {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FactKey {
     g: Option<Sid>,
     s: Sid,
     p: Sid,
@@ -64,7 +64,8 @@ struct FactKey {
 }
 
 impl FactKey {
-    fn of(flake: &Flake) -> Self {
+    /// The identity of `flake`'s fact, independent of `t` and `op`.
+    pub fn of(flake: &Flake) -> Self {
         Self {
             g: flake.g.clone(),
             s: flake.s.clone(),
@@ -77,57 +78,42 @@ impl FactKey {
     }
 }
 
-struct NetState {
-    /// Flake of the newest in-range occurrence — the representative emitted
-    /// when the fact survives netting.
-    newest: Flake,
-    /// Op of the oldest in-range occurrence seen so far.
-    oldest_op: bool,
-}
-
 /// Accumulates the net effect of a commit range on each distinct fact.
 ///
 /// Feed flakes in strictly **newest-first** order (reverse-chronological).
-/// Per fact, the net op is the newest op — but a fact only survives netting
-/// when its oldest and newest in-range ops agree:
+/// Per fact the newest op wins: it is the fact's state at the range head,
+/// which is what replaying the range has to reproduce.
 ///
-/// - assert … assert → net assert (created, or re-asserted/replaced)
-/// - retract … retract → net retract (removes pre-range state)
-/// - assert … retract / retract … assert → dropped (the range ends where
-///   it started: created-then-destroyed, or removed-then-restored)
+/// The rule deliberately infers nothing about whether the fact existed
+/// before the range, because a commit stream cannot support that inference:
+/// re-asserting a value the ledger already holds writes a real assert flake,
+/// and only [`Novelty::apply_commit`](crate::Novelty::apply_commit) discards
+/// it at apply time. Reading "assert … retract" as created-then-destroyed
+/// would therefore drop a genuine deletion whenever the range happened to
+/// re-assert the value first, which idempotent loads and upserts do
+/// routinely.
 ///
-/// This is the "net commit effect" contract: what a merge replaying the
-/// range would apply, minus internally-cancelling pairs. It infers pre-range
-/// presence from the oldest op, so a re-assert of a value that already
-/// existed before the range nets as an assert (the merge does apply it).
+/// What this emits instead is at worst redundant, never wrong: a redundant
+/// assert is deduplicated on apply, and a retract of a fact the target does
+/// not hold is a no-op for reads, reindexing and later writes.
 #[derive(Default)]
 pub struct NetChangeAccumulator {
-    map: FxHashMap<FactKey, NetState>,
+    map: FxHashMap<FactKey, Flake>,
 }
 
 impl NetChangeAccumulator {
-    /// Record one flake. Flakes must arrive newest-first.
+    /// Record one flake. Flakes must arrive newest-first, so the first
+    /// occurrence of a fact is the one that decides its net op.
     pub fn push_newest_first(&mut self, flake: &Flake) {
-        match self.map.entry(FactKey::of(flake)) {
-            Entry::Vacant(v) => {
-                v.insert(NetState {
-                    newest: flake.clone(),
-                    oldest_op: flake.op,
-                });
-            }
-            // An older occurrence of the same fact: it becomes the oldest.
-            Entry::Occupied(mut o) => o.get_mut().oldest_op = flake.op,
-        }
+        self.map
+            .entry(FactKey::of(flake))
+            .or_insert_with(|| flake.clone());
     }
 
-    /// Facts that survive netting, each represented by its newest in-range
-    /// flake (so `op` is the net op). Unordered.
+    /// Every fact the range touched, represented by its newest in-range
+    /// flake, so `op` is the fact's state at the range head. Unordered.
     pub fn finish(self) -> Vec<Flake> {
-        self.map
-            .into_values()
-            .filter(|st| st.oldest_op == st.newest.op)
-            .map(|st| st.newest)
-            .collect()
+        self.map.into_values().collect()
     }
 }
 
@@ -135,21 +121,29 @@ impl NetChangeAccumulator {
 /// into the aggregate change set the range applies (see
 /// [`NetChangeAccumulator`] for the netting contract).
 ///
-/// One walk serves both outputs, so callers that need conflict keys *and*
-/// the change set (merge preview with `include_changes`) replay the source
-/// chain once instead of twice.
+/// One walk serves every output, so callers that need conflict keys *and*
+/// the change set (merge preview) replay the source chain once instead of
+/// twice. The third element is the union of the range's namespace deltas,
+/// earliest commit winning on a code collision: the codes a consumer needs
+/// to make the change set's terms encodable before the range is committed.
 pub async fn compute_delta_keys_and_changes<C: ContentStore + Clone + 'static>(
     store: C,
     head_id: ContentId,
     stop_at_t: i64,
-) -> Result<(FxHashSet<ConflictKey>, Vec<Flake>)> {
-    let stream = trace_commits_by_id(store, head_id, stop_at_t);
+) -> Result<(FxHashSet<ConflictKey>, Vec<Flake>, HashMap<u16, String>)> {
+    let stream = trace_first_parent_commits_by_id(store, head_id, stop_at_t);
     futures::pin_mut!(stream);
 
     let mut keys = FxHashSet::default();
     let mut acc = NetChangeAccumulator::default();
+    let mut namespace_delta: HashMap<u16, String> = HashMap::new();
 
     while let Some(commit) = stream.try_next().await? {
+        // Commits stream newest-first, so a plain insert leaves the oldest
+        // commit's prefix in place for a colliding code.
+        for (code, prefix) in commit.namespace_delta {
+            namespace_delta.insert(code, prefix);
+        }
         // Commits stream newest-first; iterate each commit's flakes in
         // reverse so the accumulator sees a strictly reverse-chronological
         // sequence even when one commit touches the same fact twice.
@@ -163,7 +157,7 @@ pub async fn compute_delta_keys_and_changes<C: ContentStore + Clone + 'static>(
         }
     }
 
-    Ok((keys, acc.finish()))
+    Ok((keys, acc.finish(), namespace_delta))
 }
 
 #[cfg(test)]
@@ -212,15 +206,22 @@ mod tests {
     }
 
     #[test]
-    fn assert_then_retract_cancels() {
+    fn assert_then_retract_nets_to_the_retract() {
+        // The assert may be redundant with state the range inherited, so the
+        // retract is the only thing that can be known: the fact is gone at
+        // the range head.
         let out = net(&[flake("a", "v", 1, true), flake("a", "v", 2, false)]);
-        assert!(out.is_empty(), "created-then-destroyed must net to nothing");
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].op);
+        assert_eq!(out[0].t, 2);
     }
 
     #[test]
-    fn retract_then_assert_cancels() {
+    fn retract_then_assert_nets_to_the_assert() {
         let out = net(&[flake("a", "v", 1, false), flake("a", "v", 2, true)]);
-        assert!(out.is_empty(), "removed-then-restored must net to nothing");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].op);
+        assert_eq!(out[0].t, 2);
     }
 
     #[test]
@@ -243,10 +244,11 @@ mod tests {
     }
 
     #[test]
-    fn same_commit_pair_cancels_via_reverse_iteration() {
+    fn same_commit_pair_nets_to_the_retract_via_reverse_iteration() {
         // Both ops at the same t, chronological order assert-then-retract.
         let out = net(&[flake("a", "v", 2, true), flake("a", "v", 2, false)]);
-        assert!(out.is_empty());
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].op);
     }
 
     #[test]

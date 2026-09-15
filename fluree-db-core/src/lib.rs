@@ -84,6 +84,7 @@ pub mod tracking;
 pub mod value;
 pub mod value_id;
 pub mod vec_bi_dict;
+pub mod verified_identity;
 // moka stand-in for wasm32 (clock-free LRU); compiled on native only for its
 // unit tests. See module docs.
 #[cfg(any(target_arch = "wasm32", test))]
@@ -98,11 +99,12 @@ pub use annotation_index::{AnnotationIndexRoot, AnnotationStats};
 pub use cancellation::{QueryCancellation, QueryCancellationReason};
 pub use coerce::{coerce_json_value, coerce_value, CoercionError, CoercionResult};
 pub use commit::{
-    collect_dag_cids, collect_dag_cids_with_split_mode, commit_to_summary, find_common_ancestor,
-    first_t_where_graph_registered, load_commit_by_id, load_commit_envelope_by_id,
-    trace_commit_envelopes_by_id, trace_commits_by_id, walk_commit_summaries, Commit,
-    CommitEnvelope, CommitSummary, CommonAncestor, GraphRegistrationProbe, TxnMetaEntry,
-    TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
+    collect_dag_cids, collect_first_parent_cids, collect_first_parent_cids_with_split_mode,
+    commit_to_summary, find_common_ancestor, first_t_where_graph_registered, load_commit_by_id,
+    load_commit_envelope_by_id, trace_commit_envelopes_by_id, trace_commits_by_id,
+    trace_first_parent_commits_by_id, walk_commit_summaries, Commit, CommitEnvelope, CommitSummary,
+    CommonAncestor, GraphRegistrationProbe, TxnMetaEntry, TxnMetaValue, TxnSignature,
+    MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
 };
 pub use comparator::IndexType;
 pub use conflict_key::ConflictKey;
@@ -221,6 +223,7 @@ pub use value::{
     FlakeValue, GeoPointBits,
 };
 pub use value_id::{ObjKey, ObjKeyError, ObjKind, ObjPair, ValueTypeTag};
+pub use verified_identity::VerifiedIdentity;
 
 /// Prelude module for convenient imports of storage traits and common types.
 ///

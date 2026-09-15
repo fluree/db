@@ -132,6 +132,39 @@ struct GraphSourceIndexFileV2WithT {
     index_t: i64,
 }
 
+fn commit_index_line(t: i64, cid_str: &str) -> String {
+    format!("{{\"t\":{t},\"cid\":\"{cid_str}\"}}\n")
+}
+
+async fn append_commit_index_line(path: &Path, line: &str) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(line.as_bytes()).await?;
+    file.flush().await
+}
+
+/// Run `fut` without the caller waiting on it. Outside a tokio runtime the
+/// work is skipped: it is only ever the best-effort index line, which the
+/// reader recovers from by walking the chain.
+fn spawn_detached<F>(fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(fut);
+        }
+        Err(_) => tracing::debug!("no runtime to append the commit-index line on; skipped"),
+    }
+}
+
 impl FileNameService {
     /// Create a new file-based nameservice
     pub fn new(base_path: impl Into<PathBuf>) -> Self {
@@ -196,19 +229,8 @@ impl FileNameService {
         t: i64,
         cid_str: &str,
     ) -> std::io::Result<()> {
-        use tokio::io::AsyncWriteExt;
         let path = self.commits_path(ledger_name, branch);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let line = format!("{{\"t\":{t},\"cid\":\"{cid_str}\"}}\n");
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await?;
-        file.write_all(line.as_bytes()).await?;
-        file.flush().await
+        append_commit_index_line(&path, &commit_index_line(t, cid_str)).await
     }
 
     /// Recursively walk `root` and return the relative paths of main ns record
@@ -1338,6 +1360,7 @@ impl RefPublisher for FileNameService {
                 let branch_c = branch.clone();
                 let address_c = normalized_address.clone();
 
+                let phase = std::time::Instant::now();
                 let outcome = self
                     .storage
                     .compare_and_swap(&address, |bytes| {
@@ -1360,7 +1383,6 @@ impl RefPublisher for FileNameService {
                         ) {
                             return Ok(CasAction::Abort(conflict));
                         }
-
                         // Monotonic guard: CommitHead requires strict new.t > current.t
                         if let Some(ref cur) = current_ref {
                             if new_clone.t <= cur.t {
@@ -1409,6 +1431,8 @@ impl RefPublisher for FileNameService {
                     CasOutcome::Written => CasResult::Updated,
                     CasOutcome::Aborted(r) => r,
                 };
+                let cas_us = phase.elapsed().as_micros() as u64;
+                let phase = std::time::Instant::now();
 
                 // Mirror the advanced head into the commit-CID index so
                 // incremental indexing can discover the chain without a serial
@@ -1417,16 +1441,29 @@ impl RefPublisher for FileNameService {
                 // / fast_forward_commit). Best-effort; never fail the publish.
                 if matches!(result, CasResult::Updated) {
                     if let Some(cid) = new_clone.id.as_ref() {
-                        let cid_str = cid.to_string();
-                        if let Err(e) = self
-                            .append_commit_index_entry(&ledger_name, &branch, new_clone.t, &cid_str)
-                            .await
-                        {
-                            tracing::debug!(error = %e, ledger_id, t = new_clone.t, "commit-index append failed (non-fatal)");
-                        }
+                        // Appended off this call: the publish is inside a
+                        // ledger's commit window, and the index is a
+                        // discovery accelerator whose reader sorts by `t`
+                        // and falls back to the chain walk for any gap, so
+                        // neither ordering nor timing is load-bearing.
+                        let path = self.commits_path(&ledger_name, &branch);
+                        let line = commit_index_line(new_clone.t, &cid.to_string());
+                        let ledger_id = ledger_id.to_string();
+                        let t = new_clone.t;
+                        spawn_detached(async move {
+                            if let Err(e) = append_commit_index_line(&path, &line).await {
+                                tracing::debug!(error = %e, ledger_id, t, "commit-index append failed (non-fatal)");
+                            }
+                        });
                     }
                 }
 
+                tracing::debug!(
+                    target: "fluree::write_path",
+                    cas_us,
+                    index_us = phase.elapsed().as_micros() as u64,
+                    "publish phases"
+                );
                 Ok(result)
             }
 

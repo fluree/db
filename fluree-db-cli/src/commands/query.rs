@@ -874,6 +874,8 @@ pub async fn run(
             // Load a single view (optionally time-traveled) and execute against it.
             // This avoids the redundant `fluree.ledger()` load (and duplicate BinaryIndexStore load)
             // that previously occurred before the lazy graph query loaded its own view.
+            let load_started = Instant::now();
+            tracing::debug!(target: "fluree::open", ledger = %alias, "CLI database view load starting");
             let view = match at {
                 Some(at_str) => {
                     let spec = parse_time_spec(at_str);
@@ -881,10 +883,18 @@ pub async fn run(
                 }
                 None => fluree.db_with_default_context(&alias).await?,
             };
+            tracing::debug!(
+                target: "fluree::open",
+                ledger = %alias,
+                elapsed_us = load_started.elapsed().as_micros() as u64,
+                "CLI database view ready"
+            );
 
+            // No auth layer here: `to_options` leaves `server_identity` unset, so an
+            // `f:IdentityRestricted` override control denies CLI requests by design.
             let view = if policy.is_set() {
                 let opts = policy.to_options().map_err(CliError::Usage)?;
-                fluree.wrap_policy(view, &opts, None).await?
+                fluree.wrap_policy(view, &opts).await?
             } else {
                 view
             };
@@ -1467,9 +1477,11 @@ async fn run_cypher_query(
         }
         None => fluree.db_with_default_context(&alias).await?,
     };
+    // No auth layer here: `to_options` leaves `server_identity` unset, so an
+    // `f:IdentityRestricted` override control denies CLI requests by design.
     let view = if policy.is_set() {
         let opts = policy.to_options().map_err(CliError::Usage)?;
-        fluree.wrap_policy(view, &opts, None).await?
+        fluree.wrap_policy(view, &opts).await?
     } else {
         view
     };

@@ -10,10 +10,10 @@ use fluree_db_core::{
     range_with_overlay, ConflictKey, ContentId, Flake, IndexType, RangeMatch, RangeOptions,
     RangeTest, DEFAULT_GRAPH_ID,
 };
-use fluree_db_core::{trace_commits_by_id, Commit};
-use fluree_db_ledger::{LedgerState, StagedLedger};
+use fluree_db_core::{trace_first_parent_commits_by_id, Commit};
+use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NsRecordSnapshot;
-use fluree_db_novelty::compute_delta_keys;
+use fluree_db_novelty::{compute_delta_keys, FactKey};
 use fluree_db_transact::{CommitOpts, NamespaceRegistry, StagedCommit};
 use futures::TryStreamExt;
 use rustc_hash::FxHashSet;
@@ -42,6 +42,13 @@ pub enum ConflictStrategy {
 }
 
 impl ConflictStrategy {
+    /// Whether this strategy refuses to proceed given `conflict_count`
+    /// conflicting keys. The one shared answer for merge, revert, and merge
+    /// preview, so the preview cannot drift from what the merge does.
+    pub fn aborts_on(&self, conflict_count: usize) -> bool {
+        matches!(self, Self::Abort) && conflict_count > 0
+    }
+
     /// Parse a canonical strategy name from a string.
     ///
     /// Unlike [`Self::from_str_name`], this intentionally rejects aliases such
@@ -434,12 +441,6 @@ impl crate::Fluree {
             }
         }
 
-        // Copy the source index into the branch namespace before replay.
-        // Gives the branch an index to start from when novelty is reindexed
-        // post-rebase (best-effort).
-        self.copy_source_index(&source_id, &branch_id, &source_record)
-            .await;
-
         // Acquire the target branch's write lock when a manager is
         // available, serializing the entire replay against regular
         // transactions on the same branch.
@@ -528,6 +529,19 @@ impl crate::Fluree {
             current_state = next_state;
             replayed += 1;
         }
+
+        // Copy the source index into the branch namespace, now that every
+        // replay has succeeded. This does not merely copy artifacts: it
+        // publishes the index ref onto the BRANCH. Running it before the
+        // replay left a rebase that failed mid-flight (a SHACL violation,
+        // a storage error) with the branch pointing at the source's index,
+        // and since the prepare error returns above the apply path's
+        // rollback, nothing put it back. The branch then loaded the
+        // source's index and its own commits dropped out of every read.
+        // Replay itself reads the source's state, never the copied index,
+        // so nothing above needs this to have happened. Best-effort.
+        self.copy_source_index(&source_id, &branch_id, &source_record)
+            .await;
 
         let new_head_id = pending_replays.last().map(|b| b.commit_id.clone());
         let new_head_t = current_state.t();
@@ -654,12 +668,18 @@ impl crate::Fluree {
         flakes: Vec<Flake>,
         original_commit: &Commit,
     ) -> Result<StagedCommit> {
-        let reverse_graph = state.snapshot.build_reverse_graph().map_err(|e| {
-            ApiError::internal(format!("Failed to build reverse graph during rebase: {e}"))
-        })?;
-
-        let view = StagedLedger::new(state, flakes, &reverse_graph).map_err(|e| {
-            ApiError::internal(format!("Failed to stage flakes during rebase: {e}"))
+        // A commit that conformed on the branch can violate a shape the
+        // source installed since the fork. Each replay is validated against
+        // the state it lands on; the first violation aborts the whole rebase,
+        // which has published nothing yet, naming the commit it stopped on.
+        let (view, outcome) = self
+            .stage_validated(state, flakes, &original_commit.namespace_delta, "rebase")
+            .await?;
+        outcome.into_result_with(|report| {
+            format!(
+                "replaying commit t={} would violate the source branch's shapes:\n{report}",
+                original_commit.t
+            )
         })?;
 
         let ns_registry = NamespaceRegistry::from_db(view.db());
@@ -715,7 +735,7 @@ impl crate::Fluree {
             ConflictStrategy::TakeBranch => {
                 // Keep branch's flakes + retract source's conflicting values.
                 let retractions = self
-                    .build_source_retractions(conflicting_keys, source_state)
+                    .build_source_retractions(conflicting_keys, source_state, flakes)
                     .await?;
                 let mut result = flakes.to_vec();
                 result.extend(retractions);
@@ -765,7 +785,7 @@ impl crate::Fluree {
         match strategy {
             ConflictStrategy::TakeSource => {
                 let retractions = self
-                    .build_source_retractions(conflicting_keys, opposite_state)
+                    .build_source_retractions(conflicting_keys, opposite_state, &flakes)
                     .await?;
                 let mut result = flakes;
                 result.extend(retractions);
@@ -784,13 +804,19 @@ impl crate::Fluree {
         }
     }
 
-    /// Look up the source state's current flakes for the given conflict keys
-    /// and generate retraction flakes (`op: false`) for each.
+    /// Look up `source_state`'s current flakes for the given conflict keys
+    /// and generate retraction flakes (`op: false`) for each — except values
+    /// that `winning` asserts too. Those land in the same commit at the same
+    /// `t`, where the assert is a no-op (already asserted) and a retract
+    /// would win the tie, wiping a value both sides agree on.
     pub(crate) async fn build_source_retractions(
         &self,
         conflicting_keys: &[ConflictKey],
         source_state: &LedgerState,
+        winning: &[Flake],
     ) -> Result<Vec<Flake>> {
+        let reasserted: FxHashSet<FactKey> =
+            winning.iter().filter(|f| f.op).map(FactKey::of).collect();
         let mut retractions = Vec::new();
 
         for key in conflicting_keys {
@@ -798,9 +824,10 @@ impl crate::Fluree {
                 current_asserted_for_key(source_state, key)
                     .await?
                     .into_iter()
+                    .filter(|flake| !reasserted.contains(&FactKey::of(flake)))
                     .map(|flake| Flake {
                         op: false,
-                        t: 0, // overwritten by commit
+                        t: 0, // restamped by StagedLedger::new
                         ..flake
                     }),
             );
@@ -859,7 +886,7 @@ async fn scan_branch_commits<C: fluree_db_core::ContentStore + Clone + 'static>(
     stop_at_t: i64,
     source_delta: &FxHashSet<ConflictKey>,
 ) -> Result<Vec<CommitSummary>> {
-    let stream = trace_commits_by_id(store, head_id, stop_at_t);
+    let stream = trace_first_parent_commits_by_id(store, head_id, stop_at_t);
     futures::pin_mut!(stream);
 
     let mut summaries = Vec::new();

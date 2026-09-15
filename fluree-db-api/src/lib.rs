@@ -40,6 +40,7 @@ pub use authorization::PolicyAuthorization;
 pub mod block_fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
+mod branch_validation;
 mod commit_data;
 pub mod commit_transfer;
 pub mod config_resolver;
@@ -155,6 +156,7 @@ pub use error::{ApiError, BuilderError, BuilderErrors, Result, TargetTally};
 pub use fluree_db_core::ledger_id::format_ledger_id;
 pub use fluree_db_core::storage::ledger_id_prefix_for_path;
 pub use fluree_db_core::RemoteObject;
+pub use fluree_db_core::VerifiedIdentity;
 pub use fluree_db_core::{
     commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
     ConflictKey, QueryCancellation, QueryCancellationReason,
@@ -181,13 +183,14 @@ pub use ledger_manager::GuardedStagedCommit;
 pub use ledger_manager::{
     FreshnessCheck, FreshnessSource, LedgerHandle, LedgerManager, LedgerManagerConfig,
     LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult, RemoteWatermark,
-    UpdatePlan,
+    UpdatePlan, WritePathStats,
 };
 pub use ledger_view::{CommitRef, LedgerView};
 pub use merge::{MergeReport, StagedMerge};
 pub use merge_preview::{
     AncestorRef, BranchDelta, ChangeSummary, ConflictDetail, ConflictResolutionPreview,
-    ConflictSummary, MergePreview, MergePreviewOpts, SubjectChange, DEFAULT_MAX_CHANGES,
+    ConflictSummary, MergePreview, MergePreviewOpts, SubjectChange, ValidationSummary,
+    DEFAULT_MAX_CHANGES,
 };
 pub use pack::{
     compute_missing_index_artifacts, full_ledger_pack_request, validate_pack_request, PackChunk,
@@ -1479,15 +1482,27 @@ pub fn spawn_local_cache_event_listener(
                 // by raft failover — a write lands, replicates, applies
                 // on every node, yet only the staging node's cache shows
                 // it).
-                Ok(
-                    fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
-                        ledger_id, ..
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerCommitPublished {
+                    ledger_id,
+                    commit_t,
+                    ..
+                }) => {
+                    // A cached handle already at or past this commit, whether
+                    // this process installed it or applied it from the log,
+                    // has nothing to reconcile; doing so would only re-read
+                    // the record.
+                    let own = match ledger_manager.get_loaded_handle(&ledger_id).await {
+                        Some(handle) => handle.committed_t() >= commit_t,
+                        None => false,
+                    };
+                    if !own {
+                        reconcile_cached_ledger(&ledger_manager, &ledger_id).await;
                     }
-                    | fluree_db_nameservice::NameServiceEvent::LedgerCommitPublished {
-                        ledger_id,
-                        ..
-                    },
-                ) => {
+                }
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
+                    ledger_id,
+                    ..
+                }) => {
                     reconcile_cached_ledger(&ledger_manager, &ledger_id).await;
                 }
                 Ok(fluree_db_nameservice::NameServiceEvent::LedgerRetracted { ledger_id }) => {
@@ -4531,7 +4546,11 @@ impl Fluree {
         };
         parsed.limit = None;
 
-        let executable = self.build_executable_for_view(probe_view, &parsed).await?;
+        // A delete-target existence probe is internal bookkeeping, not a caller
+        // request: it runs anonymous for override control by design.
+        let executable = self
+            .build_executable_for_view(probe_view, &parsed, None)
+            .await?;
         let batches = self
             .execute_view_internal(
                 probe_view,

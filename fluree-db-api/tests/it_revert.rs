@@ -604,3 +604,143 @@ async fn revert_records_reverted_commit_ids_in_txn_meta() {
         other => panic!("expected string-valued reverts entry, got {other:?}"),
     }
 }
+
+/// Reverting a range folds every inverted commit into ONE commit at ONE `t`.
+/// A value the range replaced and then restored must net to "unchanged",
+/// not to a same-`t` assert+retract pair that resolves to "gone".
+#[tokio::test]
+async fn revert_range_nets_replace_and_restore() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let replace = |name: &str| {
+        json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "where": {"@id": "ex:alice", "ex:name": "?old"},
+            "delete": {"@id": "ex:alice", "ex:name": "?old"},
+            "insert": {"@id": "ex:alice", "ex:name": name}
+        })
+    };
+
+    let r1 = fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap();
+    let r2 = fluree.update(r1.ledger, &replace("B")).await.unwrap();
+    let r3 = fluree.update(r2.ledger, &replace("Alice")).await.unwrap();
+    assert_eq!(query_all_names(&fluree, "mydb:main").await, vec!["Alice"]);
+
+    // r1..r3 reverts {r2, r3}: Alice -> B -> Alice, net unchanged.
+    let report = fluree
+        .revert_range(
+            "mydb",
+            "main",
+            CommitRef::Exact(r1.receipt.commit_id.clone()),
+            CommitRef::Exact(r3.receipt.commit_id.clone()),
+            ConflictStrategy::TakeSource,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.reverted_commits.len(), 2);
+
+    assert_eq!(query_all_names(&fluree, "mydb:main").await, vec!["Alice"]);
+}
+
+/// A commit that reached this branch through a merge is not on the branch's
+/// first-parent history. Conflict detection walks that history, so such a
+/// commit is never compared against the commits that followed it: reverting
+/// it under `Abort` applies silently even when a later commit changed the
+/// same key. Revert refuses it, as it already refuses merge commits.
+#[tokio::test]
+async fn revert_refuses_commit_that_arrived_through_a_merge() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let main = fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    // dev writes ex:bob; main diverges so the merge is not a fast-forward.
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    let dev_commit = fluree
+        .insert(dev, &doc("ex:bob", "Bob"))
+        .await
+        .unwrap()
+        .receipt
+        .commit_id;
+    fluree
+        .insert(main, &doc("ex:carol", "Carol"))
+        .await
+        .unwrap();
+    fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .expect("merge dev into main");
+
+    // main then changes the same (subject, predicate) the merged-in commit
+    // wrote, which is exactly what conflict detection exists to catch.
+    let main_head = fluree.ledger("mydb:main").await.unwrap();
+    fluree
+        .insert(main_head, &doc("ex:bob", "Bob-2"))
+        .await
+        .unwrap();
+
+    let err = fluree
+        .revert_commit(
+            "mydb",
+            "main",
+            CommitRef::Exact(dev_commit),
+            ConflictStrategy::Abort,
+        )
+        .await
+        .expect_err("reverting a merged-in commit must be refused");
+    assert!(
+        matches!(err, fluree_db_api::ApiError::InvalidBranch(_)),
+        "expected InvalidBranch, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("merge"),
+        "the error should say the commit arrived through a merge: {err}"
+    );
+}
+
+/// A commit that only registers a graph carries no flakes to invert, so the
+/// revert has nothing to apply: no commit is written and HEAD stays put. The
+/// report says so rather than implying a revert landed at the current `t`.
+#[tokio::test]
+async fn revert_with_empty_net_effect_reports_that_nothing_was_written() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    fluree
+        .insert(ledger, &doc("ex:alice", "Alice"))
+        .await
+        .unwrap();
+
+    let created = fluree
+        .graph("mydb:main")
+        .transact()
+        .sparql_update("CREATE GRAPH <http://example.org/g1>")
+        .commit()
+        .await
+        .expect("CREATE GRAPH commits");
+    let head_before = fluree.ledger("mydb:main").await.unwrap().t();
+
+    let report = fluree
+        .revert_commit(
+            "mydb",
+            "main",
+            CommitRef::Exact(created.receipt.commit_id.clone()),
+            ConflictStrategy::TakeSource,
+        )
+        .await
+        .expect("reverting a registration-only commit is allowed");
+
+    assert!(!report.wrote_commit, "nothing to invert, so no commit");
+    assert_eq!(report.new_head_t, head_before, "HEAD must not move");
+    assert_eq!(fluree.ledger("mydb:main").await.unwrap().t(), head_before);
+    assert_eq!(query_all_names(&fluree, "mydb:main").await, vec!["Alice"]);
+}

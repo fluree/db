@@ -4,16 +4,18 @@
 //! merges (target HEAD is the common ancestor) and general merges with
 //! conflict resolution strategies.
 
-use crate::commit_data::{collect_from_commits, CollectedCommitData};
+use crate::commit_data::{collect_from_commits, CollectedCommitData, Fold};
 use crate::error::{ApiError, Result};
 use crate::ledger_manager::GuardedStagedCommit;
 use crate::rebase::ConflictStrategy;
 use fluree_db_core::commit::codec::read_commit_envelope;
 use fluree_db_core::content_kind::ContentKind;
 use fluree_db_core::ledger_id::format_ledger_id;
-use fluree_db_core::{collect_dag_cids, load_commit_by_id, CommonAncestor};
+use fluree_db_core::{
+    collect_dag_cids, collect_first_parent_cids, load_commit_by_id, CommonAncestor,
+};
 use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore};
-use fluree_db_ledger::{LedgerState, StagedLedger};
+use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefKind, RefValue};
 use fluree_db_novelty::compute_delta_keys;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
@@ -585,7 +587,7 @@ impl crate::Fluree {
         let conflict_count = conflicts.len();
 
         // Abort if conflicts exist and strategy is Abort.
-        if strategy == ConflictStrategy::Abort && !conflicts.is_empty() {
+        if strategy.aborts_on(conflicts.len()) {
             return Err(ApiError::BranchConflict(format!(
                 "Merge aborted: {} conflict(s) between {} and {} with abort strategy",
                 conflicts.len(),
@@ -610,22 +612,25 @@ impl crate::Fluree {
             graph_delta,
         } = collect_commit_data(source_store, &source_head_id, ancestor.t).await?;
 
-        // Resolve conflicts via the shared two-way strategy helper.
-        let resolved_flakes = self
-            .apply_two_way_strategy(source_flakes, &conflicts, &strategy, &target_state)
-            .await?;
-
-        // Stage resolved flakes onto target state. An empty flake set is valid
-        // (e.g., TakeBranch drops all source flakes) — we still create the merge
-        // commit to record the parent relationship and prevent future re-merges.
-        let reverse_graph = target_state.snapshot.build_reverse_graph().map_err(|e| {
-            ApiError::internal(format!("Failed to build reverse graph during merge: {e}"))
-        })?;
-
         let current_head_t = target_state.t();
 
-        let view = StagedLedger::new(target_state, resolved_flakes, &reverse_graph)
-            .map_err(|e| ApiError::internal(format!("Failed to stage flakes during merge: {e}")))?;
+        // Resolve conflicts, stage the result onto the target, and validate
+        // it against the target's shapes before any side effect: a merge
+        // that would leave the ledger in a state its own shapes reject fails
+        // here exactly as a transaction producing that state would, with
+        // nothing written and the target untouched. An empty flake set is
+        // valid (e.g., TakeBranch drops all source flakes): the merge commit
+        // still records the parent relationship and prevents re-merges.
+        let (view, outcome) = self
+            .stage_merge(
+                target_state,
+                source_flakes,
+                &conflicts,
+                &strategy,
+                &namespace_delta,
+            )
+            .await?;
+        outcome.into_result()?;
 
         // Create merge commit with the source head as an additional parent,
         // propagating namespace and graph deltas from the source branch.
@@ -785,19 +790,21 @@ impl crate::Fluree {
     }
 }
 
-/// Collect all flakes, namespace deltas, and graph deltas from commits
-/// between `head_id` and `stop_at_t` (exclusive). Walks the DAG newest-first
-/// then folds via [`collect_from_commits`] in oldest-first order so that
-/// earlier commits win on namespace and graph delta key collisions.
+/// Collect the net flakes, namespace deltas, and graph deltas from commits
+/// between `head_id` and `stop_at_t` (exclusive). Walks the first-parent
+/// lineage (a merge commit on the source already carries the folded flakes
+/// of whatever it merged) then folds via [`collect_from_commits`] in
+/// oldest-first order so that earlier commits win on namespace and graph
+/// delta key collisions.
 async fn collect_commit_data(
     store: &impl ContentStore,
     head_id: &ContentId,
     stop_at_t: i64,
 ) -> Result<CollectedCommitData> {
-    let dag = collect_dag_cids(store, head_id, stop_at_t).await?;
+    let dag = collect_first_parent_cids(store, head_id, stop_at_t).await?;
     let mut commits = Vec::with_capacity(dag.len());
     for (_, cid) in dag.iter().rev() {
         commits.push(load_commit_by_id(store, cid).await?);
     }
-    Ok(collect_from_commits(commits, std::convert::identity))
+    Ok(collect_from_commits(commits, Fold::Replay))
 }

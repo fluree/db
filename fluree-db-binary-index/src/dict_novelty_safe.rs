@@ -6,6 +6,7 @@
 
 use crate::BinaryIndexStore;
 use fluree_db_core::{DictNovelty, Flake, FlakeValue, Sid};
+use std::collections::HashSet;
 use std::io;
 
 #[inline]
@@ -36,51 +37,54 @@ pub fn populate_dict_novelty_safe<'a>(
 ) -> io::Result<()> {
     dict_novelty.ensure_initialized();
 
-    for flake in flakes {
-        // Subject
-        let s = &flake.s;
+    // A commit names the same subject and the same strings many times over;
+    // each persisted-dictionary probe is a tree lookup, so an entry is probed
+    // once per call. An entry the novelty layer already knows was settled by
+    // an earlier probe (or minted here), so it is not probed at all.
+    let mut persisted_subjects: HashSet<(u16, &'a str)> = HashSet::new();
+    let mut persisted_strings: HashSet<&'a str> = HashSet::new();
+
+    let mut subject = |dict_novelty: &mut DictNovelty, sid: &'a Sid, t: i64| -> io::Result<()> {
+        if dict_novelty
+            .subjects
+            .find_subject(sid.namespace_code, &sid.name)
+            .is_some()
+            || persisted_subjects.contains(&(sid.namespace_code, &*sid.name))
+        {
+            return Ok(());
+        }
         let persisted = match store {
-            Some(store) => subject_is_persisted(store, s)?,
+            Some(store) => subject_is_persisted(store, sid)?,
             None => false,
         };
-        if !persisted
-            && dict_novelty
-                .subjects
-                .find_subject(s.namespace_code, &s.name)
-                .is_none()
-        {
+        if persisted {
+            persisted_subjects.insert((sid.namespace_code, &sid.name));
+        } else {
             dict_novelty
                 .subjects
-                .assign_or_lookup(s.namespace_code, &s.name);
+                .assign_or_lookup_at(sid.namespace_code, &sid.name, t);
         }
+        Ok(())
+    };
 
-        // Object references
-        if let FlakeValue::Ref(ref sid) = flake.o {
-            let persisted = match store {
-                Some(store) => subject_is_persisted(store, sid)?,
-                None => false,
-            };
-            if !persisted
-                && dict_novelty
-                    .subjects
-                    .find_subject(sid.namespace_code, &sid.name)
-                    .is_none()
-            {
-                dict_novelty
-                    .subjects
-                    .assign_or_lookup(sid.namespace_code, &sid.name);
-            }
-        }
-
-        // String-ish
+    for flake in flakes {
+        subject(dict_novelty, &flake.s, flake.t)?;
         match &flake.o {
+            FlakeValue::Ref(sid) => subject(dict_novelty, sid, flake.t)?,
             FlakeValue::String(s) | FlakeValue::Json(s) => {
+                if dict_novelty.strings.find_string(s).is_some()
+                    || persisted_strings.contains(s.as_str())
+                {
+                    continue;
+                }
                 let persisted = match store {
                     Some(store) => string_is_persisted(store, s)?,
                     None => false,
                 };
-                if !persisted && dict_novelty.strings.find_string(s).is_none() {
-                    dict_novelty.strings.assign_or_lookup(s);
+                if persisted {
+                    persisted_strings.insert(s);
+                } else {
+                    dict_novelty.strings.assign_or_lookup_at(s, flake.t);
                 }
             }
             _ => {}

@@ -718,6 +718,11 @@ impl ComparableValue {
         namespace_codes: Option<&std::collections::HashMap<u16, String>>,
     ) -> Option<ComparableValue> {
         match &self {
+            ComparableValue::Sid(sid)
+                if fluree_vocab::namespaces::is_full_iri(sid.namespace_code) =>
+            {
+                Some(ComparableValue::String(Arc::clone(&sid.name)))
+            }
             ComparableValue::Sid(sid) => {
                 if let Some(prefix) = namespace_codes.and_then(|ns| ns.get(&sid.namespace_code)) {
                     Some(ComparableValue::String(Arc::from(format!(
@@ -1685,6 +1690,20 @@ mod tests {
             sv,
             Some(ComparableValue::String(Arc::from("21:packageType")))
         );
+    }
+
+    #[test]
+    fn test_into_string_value_with_namespaces_full_iri_codes() {
+        use fluree_vocab::namespaces::{EMPTY, OVERFLOW};
+        use std::collections::HashMap;
+        let iri = "http://unregistered.example/s";
+        for ns in [None, Some(HashMap::new())] {
+            for code in [EMPTY, OVERFLOW] {
+                let sv = ComparableValue::Sid(Sid::new(code, iri))
+                    .into_string_value_with_namespaces(ns.as_ref());
+                assert_eq!(sv, Some(ComparableValue::String(Arc::from(iri))));
+            }
+        }
     }
 
     #[test]

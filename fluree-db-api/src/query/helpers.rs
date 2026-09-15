@@ -1,3 +1,4 @@
+use fluree_db_core::VerifiedIdentity;
 use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
@@ -640,6 +641,22 @@ pub(crate) fn parse_dataset_spec(
     query_json: &JsonValue,
 ) -> Result<(DatasetSpec, GovernanceOptions)> {
     DatasetSpec::from_query_json(query_json).map_err(|e| ApiError::query(e.to_string()))
+}
+
+/// [`parse_dataset_spec`] on behalf of an auth-layer-verified caller.
+///
+/// `GovernanceOptions::from_json` never reads `server_identity` from the body,
+/// so the request-level transport (`QueryExecutionOptions::server_identity`)
+/// has to be stamped onto the parsed options here, before anything wraps
+/// policy. Use this rather than `parse_dataset_spec` wherever execution
+/// options are in scope so the stamp cannot be forgotten.
+pub(crate) fn parse_dataset_spec_as(
+    query_json: &JsonValue,
+    server_identity: Option<&VerifiedIdentity>,
+) -> Result<(DatasetSpec, GovernanceOptions)> {
+    let (spec, mut qc_opts) = parse_dataset_spec(query_json)?;
+    qc_opts.server_identity = server_identity.cloned();
+    Ok((spec, qc_opts))
 }
 
 /// Extract dataset spec from a SPARQL AST's dataset clause (FROM / FROM NAMED).
