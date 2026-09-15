@@ -1712,7 +1712,7 @@ pub mod fluree {
 ///
 /// Codes 0 through `USER_START - 1` are reserved for built-in namespaces.
 /// User-defined namespaces are allocated contiguously starting at `USER_START`.
-/// Code `OVERFLOW` (0xFFFF) is reserved for IRIs whose namespace could not
+/// Code `OVERFLOW` (0xFFFE) is reserved for IRIs whose namespace could not
 /// be assigned a code (full IRI stored as the SID name).
 pub mod namespaces {
     /// Code 0: empty / relative IRI prefix (@base resolution)
@@ -1768,6 +1768,13 @@ pub mod namespaces {
     /// Note: 0xFFFF is reserved for `Sid::max()` sentinel, so overflow
     /// uses 0xFFFE.
     pub const OVERFLOW: u16 = 0xFFFE;
+
+    /// Whether a SID name in this namespace already is the full IRI, so
+    /// decoding must not look up a prefix.
+    #[inline]
+    pub const fn is_full_iri(ns_code: u16) -> bool {
+        ns_code == EMPTY || ns_code == OVERFLOW
+    }
 }
 
 /// Common predicate local names (for schema extraction, validation, etc.)

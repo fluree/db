@@ -14,7 +14,7 @@ use fluree_db_query::binary_scan::{
     translate_overlay_flakes_with_untranslated, EphemeralPredicateMap,
 };
 use fluree_graph_ir::canonical_xsd_double;
-use fluree_vocab::xsd;
+use fluree_vocab::{namespaces, xsd};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -163,8 +163,7 @@ impl<'a> ExportResolver<'a> {
                 if let Some(dn) = self.dict_novelty {
                     if dn.is_initialized() {
                         if let Some((ns_code, suffix)) = dn.subjects.resolve_subject(s_id) {
-                            // NS_OVERFLOW (0xFFFF): suffix is the full IRI, no prefix lookup.
-                            if ns_code == 0xFFFF {
+                            if namespaces::is_full_iri(ns_code) {
                                 return Ok(suffix.to_string());
                             }
                             let prefix = self.store.namespace_prefix(ns_code)?;
