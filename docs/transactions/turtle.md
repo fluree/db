@@ -470,6 +470,12 @@ ex:alice ex:knows ex:carol {| ex:source ex:linkedin |} .
 
 Sending a claims file through `upsert` replaces each claim's body (`ex:confidence`) the way upsert replaces any other predicate value, while the edge and its attachment stay put — the natural way to keep a claims file in sync with a ledger.
 
+**Write the reifier before the annotation block.** `s p o ~ ?claim {| … |}` binds `?claim` to the reifier of the very claim the block matches. Reversing them — `s p o {| … |} ~ ?claim` — is legal but means something else: two *independent* annotation units on the same edge, one matching the body and one binding a reifier, joined. On an edge with two claims that returns four rows rather than two, silently, because each unit matches every claim.
+
+This one is documented rather than refused, and the line is worth stating because Fluree draws it elsewhere too. The reversed form is well-formed SPARQL-star with defined semantics: four rows is the *correct* answer to what was written, and no parser can know the author meant the other thing. Fluree refuses a construct only when there is no correct answer to give — a property read on an enumerated variable-length relationship is refused (see `docs/query/cypher.md`) because the enumeration operator does not retain per-hop edge identity, so every answer, nulls included, would be a fiction. A right answer to the wrong question gets a warning in the docs; no right answer gets an error.
+
+**TriG goes through `upsert`, not `insert`.** `fluree insert` routes a file to the streaming Turtle parser, which has no `GRAPH` keyword and reports `expected subject, found KwGraph`. Named-graph blocks are read by `fluree upsert -f file.trig`.
+
 **Anonymous reifiers have no identity you can refer to, and the two re-send paths differ.** `~ ex:claim1` is an identity: re-ingesting the file finds the same claim and replaces its body, on every path. A bare `{| … |}` block has no such handle, so what happens on a re-send depends on where the path scopes blank-node identity.
 
 | re-sending the same file | `fluree sync` | `upsert` |
