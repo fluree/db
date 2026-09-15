@@ -153,6 +153,7 @@ impl ApiFulltextConfigProvider {
             &mut state,
             &self.cache_dir,
             Some(Arc::clone(&self.leaflet_cache)),
+            None,
         )
         .await
         .map_err(|e| format!("load binary index store: {e}"))?;

@@ -53,6 +53,19 @@ impl R2rmlLoader {
         let mut sink = GraphCollectorSink::new();
         parse_turtle(content, &mut sink).map_err(|e| R2rmlError::Parse(e.to_string()))?;
         let graph = sink.into_graph();
+        // The collector accepts RDF 1.2 reifiers and records them as
+        // `Graph::reifications` for the Turtle-to-JSON-LD adapter. Nothing in
+        // R2RML reads them, so a mapping file containing `~ r` or `{| … |}`
+        // would load with its attachments silently discarded. Refuse instead:
+        // a mapping that quietly means something other than what it says is
+        // worse than one that fails to load.
+        if let Some(r) = graph.reifications().first() {
+            return Err(R2rmlError::Unsupported(format!(
+                "RDF 1.2 reifier attachments are not supported in R2RML mapping files \
+                 (found one on <{}>); remove the annotation syntax from the mapping",
+                r.reifier
+            )));
+        }
         Ok(Self { graph })
     }
 
@@ -332,5 +345,30 @@ mod sql_query_tests {
             .compile()
             .unwrap_err();
         assert!(err.to_string().contains("rr:sqlQuery"), "{err}");
+    }
+
+    #[test]
+    fn a_reifier_attachment_in_a_mapping_is_refused_rather_than_dropped() {
+        // The shared Turtle collector accepts RDF 1.2 reifiers so the
+        // Turtle-to-JSON-LD adapter can re-emit them. R2RML never reads that
+        // list, so without this check the mapping below would load as though
+        // the annotation had not been written.
+        let mapping = r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+            <http://example.org/m#T> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "orders" ] ;
+                rr:subjectMap [ rr:template "http://example.org/{id}" ] .
+            ex:a ex:b ex:c {| ex:note "dropped" |} .
+        "#;
+        let err = match R2rmlLoader::from_turtle(mapping) {
+            Err(e) => e,
+            Ok(_) => panic!("a mapping carrying an attachment must not load silently"),
+        };
+        assert!(
+            err.to_string()
+                .contains("reifier attachments are not supported"),
+            "{err}"
+        );
     }
 }

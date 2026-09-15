@@ -72,6 +72,8 @@ async fn push_ledger_local(
         crate::routes::policy_auth::bound_governance(headers.identity.as_deref(), &headers)?
     } else {
         // Preserve the anonymous push defaults, including the server class.
+        // No bearer means no verified identity, so `f:IdentityRestricted`
+        // override control denies this request, as it should.
         GovernanceOptions {
             policy_class: data_auth.default_policy_class.map(|c| vec![c]).or_else(|| {
                 (!headers.policy_class.is_empty()).then(|| headers.policy_class.clone())

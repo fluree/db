@@ -223,11 +223,11 @@ async fn cached_handle_commits_uniquely_own_the_dictionaries() {
     );
     assert_uniquely_owned(&steady, "post-index steady state");
 
-    // --- Phase 5: the lock-held path -------------------------------------
-    // Everything above goes through the optimistic path, which stages against
-    // a snapshot taken before the lock. A SPARQL UPDATE instead holds the
-    // write lock across stage and commit and clones the state through
-    // `clone_state()`; it shares the commit tail, so it must own its
+    // --- Phase 5: SPARQL UPDATE -------------------------------------------
+    // Everything above goes through the optimistic path with a JSON-LD
+    // payload. A SPARQL UPDATE takes the same path through its own lowering
+    // (and, when the ledger moved, a re-base over a `clone_state()` of the
+    // locked state); it shares the commit tail, so it must own its
     // dictionaries too.
     fluree
         .stage(&handle)

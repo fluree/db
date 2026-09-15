@@ -453,12 +453,15 @@ fn plan_patterns_to_json(
 /// field of the response (JSON-LD echoes the original JSON object; SPARQL echoes
 /// the raw SPARQL string).  `where_clause` is optionally included in the
 /// no-stats early-return path (only meaningful for JSON-LD).
+/// `allow_semantic_elision` must match the executor's gate for the same view
+/// (root policy), or the physical plan omits rewrites that execution applies.
 fn explain_from_parsed(
     snapshot: &fluree_db_core::LedgerSnapshot,
     vars: &VarRegistry,
     parsed: &Query,
     query_echo: JsonValue,
     where_clause: Option<JsonValue>,
+    allow_semantic_elision: bool,
 ) -> Result<JsonValue> {
     let compactor = IriCompactor::new(snapshot.shared_namespaces(), &parsed.context);
 
@@ -595,7 +598,8 @@ fn explain_from_parsed(
     // build error (e.g. an unbound select var the executor would reject) is
     // surfaced in-band rather than failing the whole explain.
     let physical_value = {
-        let planning = fluree_db_query::PlanningContext::current();
+        let planning = fluree_db_query::PlanningContext::current()
+            .with_semantic_elision(allow_semantic_elision);
         let stats_arc = stats_view.clone().map(std::sync::Arc::new);
         match fluree_db_query::build_operator_tree(parsed, stats_arc, &planning) {
             Ok(op) => serde_json::to_value(op.describe()).unwrap_or(JsonValue::Null),
@@ -662,7 +666,14 @@ pub async fn explain_jsonld(
         .ok_or_else(|| ApiError::query("Query must be an object"))?;
     let where_clause = query_obj.get("where").cloned();
 
-    explain_from_parsed(snapshot, &vars, &parsed, query_json.clone(), where_clause)
+    explain_from_parsed(
+        snapshot,
+        &vars,
+        &parsed,
+        query_json.clone(),
+        where_clause,
+        false,
+    )
 }
 
 /// Explain a JSON-LD query against a LedgerSnapshot, using a default JSON-LD context.
@@ -674,6 +685,15 @@ pub async fn explain_jsonld_with_default_context(
     query_json: &JsonValue,
     default_context: Option<&JsonValue>,
 ) -> Result<JsonValue> {
+    explain_jsonld_for_view(snapshot, query_json, default_context, false)
+}
+
+pub(crate) fn explain_jsonld_for_view(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    query_json: &JsonValue,
+    default_context: Option<&JsonValue>,
+    allow_semantic_elision: bool,
+) -> Result<JsonValue> {
     let (vars, parsed) = parse_jsonld_query(query_json, snapshot, default_context, None)?;
 
     let query_obj = query_json
@@ -681,7 +701,14 @@ pub async fn explain_jsonld_with_default_context(
         .ok_or_else(|| ApiError::query("Query must be an object"))?;
     let where_clause = query_obj.get("where").cloned();
 
-    explain_from_parsed(snapshot, &vars, &parsed, query_json.clone(), where_clause)
+    explain_from_parsed(
+        snapshot,
+        &vars,
+        &parsed,
+        query_json.clone(),
+        where_clause,
+        allow_semantic_elision,
+    )
 }
 
 /// Explain a SPARQL query against a LedgerSnapshot.
@@ -692,9 +719,7 @@ pub async fn explain_sparql(
     snapshot: &fluree_db_core::LedgerSnapshot,
     sparql: &str,
 ) -> Result<JsonValue> {
-    let (vars, parsed) = parse_sparql_to_ir(sparql, snapshot, None)?;
-
-    explain_from_parsed(snapshot, &vars, &parsed, json!(sparql), None)
+    explain_sparql_for_view(snapshot, sparql, None, false)
 }
 
 /// Explain an openCypher query against a LedgerSnapshot.
@@ -709,6 +734,16 @@ pub async fn explain_cypher(
     default_context: Option<&JsonValue>,
     params: Option<&fluree_db_cypher::ParamMap>,
 ) -> Result<JsonValue> {
+    explain_cypher_for_view(snapshot, cypher, default_context, params, false)
+}
+
+pub(crate) fn explain_cypher_for_view(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    cypher: &str,
+    default_context: Option<&JsonValue>,
+    params: Option<&fluree_db_cypher::ParamMap>,
+    allow_semantic_elision: bool,
+) -> Result<JsonValue> {
     let (vars, parsed) = crate::query::helpers::parse_cypher_to_ir(
         cypher,
         snapshot,
@@ -718,7 +753,14 @@ pub async fn explain_cypher(
         None,
     )?;
 
-    explain_from_parsed(snapshot, &vars, &parsed, json!(cypher), None)
+    explain_from_parsed(
+        snapshot,
+        &vars,
+        &parsed,
+        json!(cypher),
+        None,
+        allow_semantic_elision,
+    )
 }
 
 /// Explain a SPARQL query against a LedgerSnapshot, using a default JSON-LD context.
@@ -730,7 +772,23 @@ pub async fn explain_sparql_with_default_context(
     sparql: &str,
     default_context: Option<&JsonValue>,
 ) -> Result<JsonValue> {
+    explain_sparql_for_view(snapshot, sparql, default_context, false)
+}
+
+pub(crate) fn explain_sparql_for_view(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    sparql: &str,
+    default_context: Option<&JsonValue>,
+    allow_semantic_elision: bool,
+) -> Result<JsonValue> {
     let (vars, parsed) = parse_sparql_to_ir(sparql, snapshot, default_context)?;
 
-    explain_from_parsed(snapshot, &vars, &parsed, json!(sparql), None)
+    explain_from_parsed(
+        snapshot,
+        &vars,
+        &parsed,
+        json!(sparql),
+        None,
+        allow_semantic_elision,
+    )
 }

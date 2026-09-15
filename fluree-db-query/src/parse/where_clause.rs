@@ -48,6 +48,114 @@ fn parse_filter_value(value: &JsonValue) -> Result<super::ast::UnresolvedExpress
     super::parse_filter_value(value)
 }
 
+/// Parse a FILTER / BIND / UNWIND expression and resolve its unquoted
+/// `prefix:name` atoms against the query's `@context`.
+///
+/// The S-expression parser has no context, so it hands such atoms over as
+/// [`UnresolvedFilterValue::Curie`]. An atom whose prefix the context defines
+/// becomes an IRI operand (`(= ?p ex:knows)` compares by term identity, as in
+/// SPARQL); one whose prefix is undefined stays the plain string it always
+/// was, so `(= ?slot 12:30)` is unaffected.
+fn parse_expr_with_ctx(
+    value: &JsonValue,
+    ctx: &JsonLdParseCtx,
+) -> Result<super::ast::UnresolvedExpression> {
+    Ok(resolve_compact_iri_atoms(parse_filter_value(value)?, ctx))
+}
+
+/// Walk an expression tree, expanding [`UnresolvedFilterValue::Curie`] atoms
+/// whose prefix the context knows into [`UnresolvedFilterValue::Iri`].
+pub(crate) fn resolve_compact_iri_atoms(
+    expr: super::ast::UnresolvedExpression,
+    ctx: &JsonLdParseCtx,
+) -> super::ast::UnresolvedExpression {
+    use super::ast::{UnresolvedExpression as E, UnresolvedFilterValue as V};
+    match expr {
+        E::Const(V::Curie(atom)) => match ctx.expand_iri(&atom) {
+            // Expansion changed the text *and* produced something that is
+            // actually an IRI: the prefix was defined and meant a namespace.
+            //
+            // A context may alias a JSON-LD keyword — `{"type": "@type"}` is
+            // ordinary — and expansion then turns `type:admin` into
+            // `@typeadmin`, which is not an IRI and matches nothing. The
+            // author meant the string. Requiring an absolute IRI keeps
+            // keyword aliases out of IRI operand position.
+            Ok(expanded)
+                if expanded.as_str() != atom.as_ref()
+                    && fluree_graph_json_ld::iri::is_absolute(expanded.as_str()) =>
+            {
+                E::Const(V::Iri(Arc::from(expanded.as_str())))
+            }
+            _ => E::Const(V::Curie(atom)),
+        },
+        E::And(items) => E::And(
+            items
+                .into_iter()
+                .map(|e| resolve_compact_iri_atoms(e, ctx))
+                .collect(),
+        ),
+        E::Or(items) => E::Or(
+            items
+                .into_iter()
+                .map(|e| resolve_compact_iri_atoms(e, ctx))
+                .collect(),
+        ),
+        E::Not(inner) => E::Not(Box::new(resolve_compact_iri_atoms(*inner, ctx))),
+        E::In {
+            expr,
+            values,
+            negated,
+        } => E::In {
+            expr: Box::new(resolve_compact_iri_atoms(*expr, ctx)),
+            values: values
+                .into_iter()
+                .map(|e| resolve_compact_iri_atoms(e, ctx))
+                .collect(),
+            negated,
+        },
+        E::Call { func, args } => E::Call {
+            func,
+            args: args
+                .into_iter()
+                .map(|e| resolve_compact_iri_atoms(e, ctx))
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+/// Resolve compact-IRI atoms in the expression positions that sit outside the
+/// WHERE clause: computed SELECT columns and HAVING.
+///
+/// Those two parse their expressions without the `@context`, so an unquoted
+/// `ex:knows` stayed a plain string there while the identical expression in a
+/// FILTER became an IRI operand. `(as (= ?p ex:knows) ?isKnows)` was therefore
+/// always false, and the same comparison in a filter matched. An absolute
+/// `http://…` was an IRI in both, which made the inconsistency easy to miss.
+pub(crate) fn resolve_atoms_outside_where(
+    query: &mut super::ast::UnresolvedQuery,
+    ctx: &JsonLdParseCtx,
+) {
+    use super::ast::{UnresolvedColumn as C, UnresolvedProjection as P};
+
+    let mut fix_column = |col: &mut C| {
+        if let C::Computation { expr, .. } = col {
+            let taken =
+                std::mem::replace(expr, super::ast::UnresolvedExpression::Var(Arc::from("")));
+            *expr = resolve_compact_iri_atoms(taken, ctx);
+        }
+    };
+    match &mut query.select {
+        P::Tuple(cols) => cols.iter_mut().for_each(&mut fix_column),
+        P::Scalar(col) => fix_column(col),
+        P::Wildcard => {}
+    }
+
+    if let Some(having) = query.options.having.take() {
+        query.options.having = Some(resolve_compact_iri_atoms(having, ctx));
+    }
+}
+
 /// Validate that a string looks like a variable (starts with ?)
 fn validate_var_name(name: &str) -> Result<()> {
     if !name.starts_with('?') {
@@ -201,7 +309,7 @@ pub fn parse_where_array_element(
                 })?;
                 validate_var_name(var)?;
 
-                let expr = parse_filter_value(&arr[i + 1])?;
+                let expr = parse_expr_with_ctx(&arr[i + 1], ctx)?;
                 query.patterns.push(UnresolvedPattern::Bind {
                     var: Arc::from(var),
                     expr,
@@ -226,7 +334,7 @@ pub fn parse_where_array_element(
                 ParseError::InvalidWhere("unwind var must be a string".to_string())
             })?;
             validate_var_name(var)?;
-            let expr = parse_filter_value(&arr[2])?;
+            let expr = parse_expr_with_ctx(&arr[2], ctx)?;
             query.patterns.push(UnresolvedPattern::Unwind {
                 var: Arc::from(var),
                 expr,
@@ -333,7 +441,7 @@ pub fn parse_where_array_element(
                         super::filter_data::parse_filter_expr_ctx(expr_val, &pattern_parser)?
                     }
                     // Non-array values (strings, etc.) use the standard parser
-                    _ => parse_filter_value(expr_val)?,
+                    _ => parse_expr_with_ctx(expr_val, ctx)?,
                 };
                 super::filter_common::reject_constant_bool_expr(&filter_expr, "filter")?;
                 query.add_filter(filter_expr);

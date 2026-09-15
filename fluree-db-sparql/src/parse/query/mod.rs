@@ -142,6 +142,8 @@ fn extract_pragmas(comments: &[String]) -> Pragmas {
             pragmas.reasoning_max_facts = Some(pragma_scalar_value(value));
         } else if let Some(value) = strip_keyword_ci(rest, "reasoning-max-seconds") {
             pragmas.reasoning_max_seconds = Some(pragma_scalar_value(value));
+        } else if let Some(value) = strip_keyword_ci(rest, "reasoning-max-memory-mb") {
+            pragmas.reasoning_max_memory_mb = Some(pragma_scalar_value(value));
         } else if let Some(value) = strip_keyword_ci(rest, "reasoning") {
             let value = value.trim_start().strip_prefix(':').unwrap_or(value);
             let modes: Vec<String> = value

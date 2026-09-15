@@ -144,6 +144,7 @@ Controls OWL/RDFS reasoning applied at query time.
 | `f:schemaSource` | `f:GraphRef` | (none) | Graph containing schema triples (`rdfs:subClassOf`, etc.) |
 | `f:reasoningMaxFacts` | integer | 1,000,000 | OWL2-RL materialization budget: max derived facts before the closure is capped |
 | `f:reasoningMaxSeconds` | integer | 30 | OWL2-RL materialization budget: max wall-clock seconds before the closure is capped |
+| `f:reasoningMaxMemoryMb` | integer | derived from `f:reasoningMaxFacts` | Materialization budget: max megabytes of derived facts before the closure is capped |
 | `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
 
 `f:schemaSource` is non-overridable. `f:reasoningModes` and the budget fields

@@ -71,7 +71,8 @@ pub async fn graphql_ledger_tail(
     // client disconnect cancels the whole fan-out, not one field of it.
     let timeout_ms = state.config.query_timeout_ms;
     let limits = graphql_limits(&state);
-    crate::query_control::run_query_task(timeout_ms, move || {
+    let server_identity = headers.server_identity.clone();
+    crate::query_control::run_query_task(timeout_ms, server_identity, move || {
         async move {
             authorize_read(&state, &ledger, &bearer, &credential)?;
             let request = parse_request(&params, &credential, limits)?;

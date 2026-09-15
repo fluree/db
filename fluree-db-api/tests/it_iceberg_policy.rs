@@ -1289,7 +1289,7 @@ async fn authorization_crawl_preserves_policy_across_formatting_terminals() {
                 "@context": context(), "from": source, "select": {"?s": ["*"]},
                 "where": {"@id": "?s", "@type": "ex:Person"}
             });
-            let formatted = fluree
+            let mut formatted = fluree
                 .query_from()
                 .jsonld(&crawl)
                 .authorization(&auth)
@@ -1303,7 +1303,7 @@ async fn authorization_crawl_preserves_policy_across_formatting_terminals() {
                 .execute_formatted_string()
                 .await
                 .unwrap();
-            let tracked = fluree
+            let mut tracked = fluree
                 .query_from()
                 .jsonld(&crawl)
                 .authorization(&auth)
@@ -1311,7 +1311,16 @@ async fn authorization_crawl_preserves_policy_across_formatting_terminals() {
                 .await
                 .unwrap()
                 .result;
-            assert_eq!(formatted, serde_json::from_str::<Value>(&string).unwrap());
+            let mut parsed_string = serde_json::from_str::<Value>(&string).unwrap();
+            // Independent unordered scans may finish reading the Parquet files in
+            // different orders. Normalize results without changing the query plan.
+            for result in [&mut formatted, &mut parsed_string, &mut tracked] {
+                result
+                    .as_array_mut()
+                    .unwrap()
+                    .sort_by(|a, b| a["@id"].as_str().unwrap().cmp(b["@id"].as_str().unwrap()));
+            }
+            assert_eq!(formatted, parsed_string);
             assert_eq!(formatted, tracked);
             assert_eq!(
                 formatted.as_array().unwrap().len(),

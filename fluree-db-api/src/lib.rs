@@ -155,6 +155,7 @@ pub use error::{ApiError, BuilderError, BuilderErrors, Result, TargetTally};
 pub use fluree_db_core::ledger_id::format_ledger_id;
 pub use fluree_db_core::storage::ledger_id_prefix_for_path;
 pub use fluree_db_core::RemoteObject;
+pub use fluree_db_core::VerifiedIdentity;
 pub use fluree_db_core::{
     commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
     ConflictKey, QueryCancellation, QueryCancellationReason,
@@ -181,7 +182,7 @@ pub use ledger_manager::GuardedStagedCommit;
 pub use ledger_manager::{
     FreshnessCheck, FreshnessSource, LedgerHandle, LedgerManager, LedgerManagerConfig,
     LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult, RemoteWatermark,
-    UpdatePlan,
+    UpdatePlan, WritePathStats,
 };
 pub use ledger_view::{CommitRef, LedgerView};
 pub use merge::{MergeReport, StagedMerge};
@@ -861,6 +862,11 @@ where
             self.index.delete(address).await
         }
     }
+
+    async fn sync(&self) -> std::result::Result<(), fluree_db_core::Error> {
+        self.commit.sync().await?;
+        self.index.sync().await
+    }
 }
 
 #[async_trait]
@@ -1043,6 +1049,11 @@ impl StorageWrite for AddressIdentifierResolverStorage {
     async fn delete(&self, address: &str) -> std::result::Result<(), fluree_db_core::Error> {
         self.default.delete(address).await
     }
+
+    /// Writes only ever went to the default storage, so that is what flushes.
+    async fn sync(&self) -> std::result::Result<(), fluree_db_core::Error> {
+        self.default.sync().await
+    }
 }
 
 #[async_trait]
@@ -1192,6 +1203,7 @@ fn build_local_storage_from_config(
             // is startup, so the startup sweep of crash-orphaned staging
             // files is taken here explicitly.
             storage.sweep_orphaned_staging();
+            storage.recover_wal()?;
             if let Some(key_str) = storage_config.aes256_key.as_ref() {
                 let key = decode_encryption_key_base64(key_str.as_ref())?;
                 let encryption_key = EncryptionKey::new(key, 0);
@@ -1315,6 +1327,15 @@ pub struct FlureeBuilder {
     config: ConnectionConfig,
     #[cfg(feature = "native")]
     storage_path: Option<String>,
+    /// Durability for file storage built directly from `storage_path`.
+    /// `None` leaves the choice to `FileStorage::new` (environment, else the
+    /// default). Connection-config builds carry it in the config instead.
+    #[cfg(feature = "native")]
+    storage_durability: Option<fluree_db_core::Durability>,
+    /// Owner of this process's WAL when the storage root is shared by
+    /// several processes. See `FileStorage::with_wal_owner`.
+    #[cfg(feature = "native")]
+    storage_wal_owner: Option<String>,
     /// Optional encryption key (base64-encoded or raw 32 bytes)
     encryption_key: Option<[u8; 32]>,
     /// Optional ledger cache configuration (enables LedgerManager)
@@ -1459,15 +1480,27 @@ pub fn spawn_local_cache_event_listener(
                 // by raft failover — a write lands, replicates, applies
                 // on every node, yet only the staging node's cache shows
                 // it).
-                Ok(
-                    fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
-                        ledger_id, ..
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerCommitPublished {
+                    ledger_id,
+                    commit_t,
+                    ..
+                }) => {
+                    // A cached handle already at or past this commit, whether
+                    // this process installed it or applied it from the log,
+                    // has nothing to reconcile; doing so would only re-read
+                    // the record.
+                    let own = match ledger_manager.get_loaded_handle(&ledger_id).await {
+                        Some(handle) => handle.committed_t() >= commit_t,
+                        None => false,
+                    };
+                    if !own {
+                        reconcile_cached_ledger(&ledger_manager, &ledger_id).await;
                     }
-                    | fluree_db_nameservice::NameServiceEvent::LedgerCommitPublished {
-                        ledger_id,
-                        ..
-                    },
-                ) => {
+                }
+                Ok(fluree_db_nameservice::NameServiceEvent::LedgerIndexPublished {
+                    ledger_id,
+                    ..
+                }) => {
                     reconcile_cached_ledger(&ledger_manager, &ledger_id).await;
                 }
                 Ok(fluree_db_nameservice::NameServiceEvent::LedgerRetracted { ledger_id }) => {
@@ -1569,6 +1602,10 @@ impl FlureeBuilder {
             ledger_cache_config: Some(LedgerManagerConfig::default()),
             indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
+            #[cfg(feature = "native")]
+            storage_durability: None,
+            #[cfg(feature = "native")]
+            storage_wal_owner: None,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -1588,6 +1625,10 @@ impl FlureeBuilder {
             ledger_cache_config: Some(LedgerManagerConfig::default()),
             indexing_config: None,
             novelty_thresholds: None,
+            #[cfg(feature = "native")]
+            storage_durability: None,
+            #[cfg(feature = "native")]
+            storage_wal_owner: None,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -1661,6 +1702,10 @@ impl FlureeBuilder {
             ledger_cache_config: Some(LedgerManagerConfig::default()),
             indexing_config: Some(default_indexing_builder_config()),
             novelty_thresholds: None,
+            #[cfg(feature = "native")]
+            storage_durability: None,
+            #[cfg(feature = "native")]
+            storage_wal_owner: None,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -1871,6 +1916,10 @@ impl FlureeBuilder {
             ledger_cache_config: Some(LedgerManagerConfig::default()),
             indexing_config,
             novelty_thresholds: None,
+            #[cfg(feature = "native")]
+            storage_durability: None,
+            #[cfg(feature = "native")]
+            storage_wal_owner: None,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -1976,6 +2025,42 @@ impl FlureeBuilder {
     /// for the same storage — the transactor writes commits, the other process
     /// produces the index roots. Running without an indexer anywhere will
     /// accumulate novelty until the hard ceiling blocks writes.
+    /// Set when file-storage writes are reported complete.
+    ///
+    /// Applies to storage built from a path. The default is
+    /// [`Durability::Wal`](fluree_db_core::Durability::Wal); a
+    /// deployment whose root is shared by several writers, such as a Raft
+    /// cluster on a network mount, pins [`Durability::Sync`](fluree_db_core::Durability::Sync)
+    /// so no single process owns the root's log.
+    #[cfg(feature = "native")]
+    pub fn with_storage_durability(mut self, durability: fluree_db_core::Durability) -> Self {
+        self.storage_durability = Some(durability);
+        self
+    }
+
+    /// Journal a storage root that other processes journal too, under a log
+    /// this process owns. For a Raft cluster's shared payload store: each
+    /// node passes its own id. See `FileStorage::with_wal_owner`.
+    #[cfg(feature = "native")]
+    pub fn with_storage_wal_owner(mut self, owner: impl Into<String>) -> Self {
+        self.storage_wal_owner = Some(owner.into());
+        self
+    }
+
+    /// Apply the builder's durability and log owner, if chosen, to a storage
+    /// built from `storage_path`.
+    #[cfg(feature = "native")]
+    fn file_storage(&self, path: &str) -> FileStorage {
+        let mut storage = FileStorage::new(path);
+        if let Some(durability) = self.storage_durability {
+            storage = storage.with_durability(durability);
+        }
+        if let Some(owner) = &self.storage_wal_owner {
+            storage = storage.with_wal_owner(owner.clone());
+        }
+        storage
+    }
+
     pub fn without_indexing(mut self) -> Self {
         self.indexing_config = None;
         // An explicit opt-out makes any later discard intentional, not
@@ -2254,13 +2339,16 @@ impl FlureeBuilder {
             .take()
             .ok_or_else(|| ApiError::config("File storage requires a path"))?;
 
-        let storage = FileStorage::new(&path);
+        let storage = self.file_storage(&path);
         // Building the instance is startup: reclaim staging files a crash
         // left behind. Explicit here rather than a side effect of `new`, and
         // once per base path per process — the nameservice below shares this
         // tree and needs no sweep of its own.
         storage.sweep_orphaned_staging();
-        let nameservice = FileNameService::new(&path);
+        // Likewise the WAL: acknowledged writes a crash left unflushed
+        // are applied before anything reads this tree.
+        storage.recover_wal()?;
+        let nameservice = FileNameService::with_storage(storage.clone());
         let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
@@ -2422,15 +2510,16 @@ impl FlureeBuilder {
             .take()
             .ok_or_else(|| ApiError::config("File storage requires a path"))?;
 
-        let file_storage = FileStorage::new(&path);
+        let file_storage = self.file_storage(&path);
         // Startup sweep, before the encryption wrapper hides the concrete
         // storage. Staging debris is on-disk state, not content, so the
         // sweep is the same for an encrypted tree.
         file_storage.sweep_orphaned_staging();
+        file_storage.recover_wal()?;
+        let nameservice = FileNameService::with_storage(file_storage.clone());
         let encryption_key = EncryptionKey::new(key, 0);
         let key_provider = StaticKeyProvider::new(encryption_key);
         let storage = EncryptedStorage::new(file_storage, key_provider);
-        let nameservice = FileNameService::new(&path);
         let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
@@ -3208,10 +3297,20 @@ impl FlureeBuilder {
                 .ok_or_else(|| ApiError::config("File storage requires filePath"))?
                 .clone();
 
-            let file_storage = FileStorage::new(path.as_ref());
+            let mut file_storage = self.file_storage(path.as_ref());
+            // A query peer must recover the preceding writer's tail without
+            // retaining its WAL lock. Any incidental storage writes remain
+            // durable through per-write flushing and cannot reacquire the WAL.
+            if matches!(&nameservice, Some(NameServiceMode::ReadOnly(_)))
+                && file_storage.durability() == fluree_db_core::Durability::Wal
+            {
+                file_storage = file_storage.with_durability(fluree_db_core::Durability::Sync);
+            }
             // Client build is startup: take the explicit sweep of
             // crash-orphaned staging files here, where startup is known.
             file_storage.sweep_orphaned_staging();
+            file_storage.recover_wal()?;
+            let ns_storage = file_storage.clone();
             let base_storage: Arc<dyn Storage> = if let Some(key) = self.encryption_key {
                 let encryption_key = EncryptionKey::new(key, 0);
                 let key_provider = StaticKeyProvider::new(encryption_key);
@@ -3230,7 +3329,7 @@ impl FlureeBuilder {
             let (ns_mode, indexing_mode) = match nameservice {
                 Some(ns) => (ns, tx::IndexingMode::Disabled),
                 None => {
-                    let ns = FileNameService::new(path.as_ref());
+                    let ns = FileNameService::with_storage(ns_storage);
                     let notifying =
                         fluree_db_nameservice::NotifyingNameService::new(ns, event_bus.clone());
                     let indexing_mode = self.start_background_indexing(
@@ -4445,7 +4544,11 @@ impl Fluree {
         };
         parsed.limit = None;
 
-        let executable = self.build_executable_for_view(probe_view, &parsed).await?;
+        // A delete-target existence probe is internal bookkeeping, not a caller
+        // request: it runs anonymous for override control by design.
+        let executable = self
+            .build_executable_for_view(probe_view, &parsed, None)
+            .await?;
         let batches = self
             .execute_view_internal(
                 probe_view,
@@ -4718,6 +4821,24 @@ impl Fluree {
 
         // 3. Clear R2RML cache
         self.r2rml_cache.clear().await;
+
+        // 4. Retire the storage root's WAL, so the root reads the same
+        //    to any binary. Dropping the last handle would do this too, but a
+        //    background task may hold one for the life of the runtime.
+        #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+        if let Some(path) = self.config.index_storage.path.clone() {
+            let checkpoint =
+                tokio::task::spawn_blocking(move || FileStorage::checkpoint_wal(path.as_ref()))
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|r| r.map_err(|e| e.to_string()));
+            if let Err(error) = checkpoint {
+                tracing::warn!(
+                    error,
+                    "WAL checkpoint on disconnect failed; the next open will replay it"
+                );
+            }
+        }
     }
 
     /// Refresh a cached ledger by polling the nameservice

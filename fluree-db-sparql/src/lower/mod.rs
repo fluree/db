@@ -481,6 +481,10 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             "reasoning-max-seconds",
             self.ast.pragmas.reasoning_max_seconds.as_deref(),
         )?;
+        modes.max_memory_mb = self.budget_pragma_value(
+            "reasoning-max-memory-mb",
+            self.ast.pragmas.reasoning_max_memory_mb.as_deref(),
+        )?;
 
         if modes == ReasoningModes::default() {
             return Ok(ReasoningConfig::default());
