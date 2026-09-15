@@ -127,8 +127,9 @@ impl ForwardPackReader {
     /// The root's ID ranges are checked immediately. On first lookup or warming,
     /// each pack is resolved locally before trying remote CAS, opened (heap-read
     /// for small packs, mmap for large ones), and validated against its routing
-    /// range, kind, and namespace. Missing or malformed packs therefore fail on
-    /// use rather than preventing unrelated queries from opening the ledger.
+    /// range, kind, and namespace, so a pack that fails those checks errors on
+    /// use rather than here. Ledger open still reads the reverse dictionary
+    /// trees eagerly, so a missing dictionary still fails at open.
     pub async fn from_pack_refs(
         cs: Arc<dyn ContentStore>,
         cache_dir: &Path,
@@ -315,17 +316,40 @@ impl ForwardPackReader {
     /// Warming is best-effort: a pack that fails to load is skipped, never fatal.
     pub fn prewarm(&self, budget_bytes: u64) -> u64 {
         let mut warmed: u64 = 0;
+        let mut failed = 0usize;
+        let mut first_failure = None;
         for pack in &self.packs {
             if warmed >= budget_bytes {
                 break;
             }
             let bytes = match pack.ensure_loaded(self.load_ctx.as_ref()) {
                 Ok((_meta, bytes)) => bytes,
-                Err(_) => continue,
+                Err(error) => {
+                    failed += 1;
+                    first_failure.get_or_insert((
+                        pack.cid.as_ref(),
+                        pack.first_id,
+                        pack.last_id,
+                        error,
+                    ));
+                    continue;
+                }
             };
             let remaining = budget_bytes - warmed;
             let take = (bytes.len() as u64).min(remaining) as usize;
             warmed += touch_pages(&bytes[..take]);
+        }
+        // Skipped packs fail again on first lookup, but a query layer may turn
+        // that into a placeholder rather than an error; leave one trace here.
+        if let Some((cid, first_id, last_id, error)) = first_failure {
+            tracing::warn!(
+                failed,
+                cid = ?cid.map(ToString::to_string),
+                first_id,
+                last_id,
+                error = %error,
+                "forward dictionary packs failed to load during warming"
+            );
         }
         warmed
     }

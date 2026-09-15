@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use fluree_db_core::clock::Instant;
 use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::ns_encoding::{canonical_split, NsLookup, NsSplitMode};
 use fluree_db_core::o_type::{DecodeKind, OType};
@@ -383,7 +384,7 @@ impl BinaryIndexStore {
     ) -> io::Result<Self> {
         tracing::debug!("BinaryIndexStore::load_from_root_v6 starting");
         fluree_db_core::disk_cache::ensure_cache_dir(cache_dir)?;
-        let phase = fluree_db_core::clock::Instant::now();
+        let phase = Instant::now();
 
         // ── Dict loading ──────────────────────────────────────────────────────────────
         let dicts = build_dictionary_set(
@@ -396,7 +397,7 @@ impl BinaryIndexStore {
         .await?;
 
         let dicts_us = phase.elapsed().as_micros() as u64;
-        let phase = fluree_db_core::clock::Instant::now();
+        let phase = Instant::now();
 
         // ── Per-graph specialty arenas ───────────────────────────────
         let mut per_graph_arenas = load_per_graph_arenas(
@@ -408,7 +409,7 @@ impl BinaryIndexStore {
         .await?;
 
         let arenas_us = phase.elapsed().as_micros() as u64;
-        let phase = std::time::Instant::now();
+        let phase = Instant::now();
 
         // ── Graph index routing ────────────────────────────────────
         let mut graph_indexes: HashMap<GraphId, GraphIndex> = HashMap::new();
@@ -1662,7 +1663,7 @@ impl BinaryIndexStore {
                 format!("subject local_id {local_id} not found in ns {ns_code}"),
             )
         })?;
-        if ns_code == namespaces::EMPTY || ns_code == namespaces::OVERFLOW {
+        if namespaces::is_full_iri(ns_code) {
             return Ok(suffix);
         }
         let prefix = self.dicts.namespace_codes.get(&ns_code).ok_or_else(|| {
@@ -3025,8 +3026,8 @@ impl BinaryGraphView {
 
     /// Match persisted subject decoding: EMPTY and OVERFLOW names already
     /// contain the full IRI and need no namespace-table entry.
-    fn subject_iri_from_parts(&self, ns_code: u16, suffix: &str) -> io::Result<String> {
-        if ns_code == namespaces::EMPTY || ns_code == namespaces::OVERFLOW {
+    pub fn subject_iri_from_parts(&self, ns_code: u16, suffix: &str) -> io::Result<String> {
+        if namespaces::is_full_iri(ns_code) {
             return Ok(suffix.to_owned());
         }
         self.namespace_prefix(ns_code)
@@ -3077,7 +3078,7 @@ async fn build_dictionary_set(
     leaflet_cache: Option<&Arc<LeafletCache>>,
     prev: Option<&DictionarySet>,
 ) -> io::Result<DictionarySet> {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     // Predicates (inline in root).
     let (predicates, predicate_reverse) = {
         let mut dict = PredicateDict::new();
@@ -3097,7 +3098,7 @@ async fn build_dictionary_set(
     };
 
     // Subject forward packs.
-    let phase = std::time::Instant::now();
+    let phase = Instant::now();
     let mut subject_forward_packs = std::collections::BTreeMap::new();
     for (ns_code, ns_refs) in &root.dict_refs.forward_packs.subject_fwd_ns_packs {
         let reader = ForwardPackReader::from_pack_refs_reusing(
@@ -3114,7 +3115,7 @@ async fn build_dictionary_set(
     let subject_forward_us = phase.elapsed().as_micros() as u64;
 
     // Subject reverse tree.
-    let phase = std::time::Instant::now();
+    let phase = Instant::now();
     let subject_reverse_tree = Some(
         DictTreeReader::from_refs_reusing(
             &cs,
@@ -3128,7 +3129,7 @@ async fn build_dictionary_set(
     let subject_reverse_us = phase.elapsed().as_micros() as u64;
 
     // String forward packs.
-    let phase = std::time::Instant::now();
+    let phase = Instant::now();
     let string_forward_packs = ForwardPackReader::from_pack_refs_reusing(
         Arc::clone(&cs),
         cache_dir,
@@ -3141,7 +3142,7 @@ async fn build_dictionary_set(
     let string_forward_us = phase.elapsed().as_micros() as u64;
 
     // String reverse tree.
-    let phase = std::time::Instant::now();
+    let phase = Instant::now();
     let string_reverse_tree = Some(
         DictTreeReader::from_refs_reusing(
             &cs,
@@ -3153,7 +3154,7 @@ async fn build_dictionary_set(
         .await?,
     );
     let string_reverse_us = phase.elapsed().as_micros() as u64;
-    let phase = std::time::Instant::now();
+    let phase = Instant::now();
 
     // Namespace codes: shared with the previous store when it already holds
     // every entry of the root's table. Codes are never reassigned within a
@@ -3292,10 +3293,10 @@ async fn load_per_graph_arenas(
     for ga in graph_arenas {
         let mut numbig = HashMap::new();
         for (p_id, cid) in &ga.numbig {
-            let phase = std::time::Instant::now();
+            let phase = Instant::now();
             let bytes = fetch_cached_bytes(cs.as_ref(), cid, cache_dir, "nba").await?;
             let read_us = phase.elapsed().as_micros() as u64;
-            let phase = std::time::Instant::now();
+            let phase = Instant::now();
             let arena = crate::arena::numbig::read_numbig_arena_from_bytes(&bytes)?;
             tracing::debug!(
                 target: "fluree::open",

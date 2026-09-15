@@ -8,7 +8,6 @@ use crate::ast::term::{
     BlankNodeValue, Iri, IriValue, Literal, LiteralValue, ObjectTerm, PredicateTerm, SubjectTerm,
     Term as SparqlTerm, Var,
 };
-use crate::ast::TriplePattern as SparqlTriplePattern;
 
 use fluree_db_core::ns_encoding::STABLE_BLANK_NODE_LABEL_PREFIX;
 use fluree_db_core::temporal::{
@@ -16,7 +15,7 @@ use fluree_db_core::temporal::{
 };
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use fluree_db_query::binding::Binding;
-use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
+use fluree_db_query::ir::triple::{Ref, Term};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
 use fluree_vocab::namespaces::{EMPTY, FLUREE_DB, XSD};
@@ -65,16 +64,6 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Register a SPARQL variable with the variable registry.
     pub(super) fn register_var(&mut self, v: &Var) -> VarId {
         self.vars.get_or_insert(&format!("?{}", v.name))
-    }
-
-    pub(super) fn lower_triple_pattern(
-        &mut self,
-        tp: &SparqlTriplePattern,
-    ) -> Result<TriplePattern> {
-        let s = self.lower_subject(&tp.subject)?;
-        let p = self.lower_predicate(&tp.predicate)?;
-        let o = self.lower_object(&tp.object)?;
-        Ok(TriplePattern::new(s, p, o))
     }
 
     pub(super) fn lower_subject(&mut self, term: &SubjectTerm) -> Result<Ref> {

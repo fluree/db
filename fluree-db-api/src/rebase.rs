@@ -10,10 +10,10 @@ use fluree_db_core::{
     range_with_overlay, ConflictKey, ContentId, Flake, IndexType, RangeMatch, RangeOptions,
     RangeTest, DEFAULT_GRAPH_ID,
 };
-use fluree_db_core::{trace_commits_by_id, Commit};
+use fluree_db_core::{trace_first_parent_commits_by_id, Commit};
 use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_nameservice::NsRecordSnapshot;
-use fluree_db_novelty::compute_delta_keys;
+use fluree_db_novelty::{compute_delta_keys, FactKey};
 use fluree_db_transact::{CommitOpts, NamespaceRegistry, StagedCommit};
 use futures::TryStreamExt;
 use rustc_hash::FxHashSet;
@@ -715,7 +715,7 @@ impl crate::Fluree {
             ConflictStrategy::TakeBranch => {
                 // Keep branch's flakes + retract source's conflicting values.
                 let retractions = self
-                    .build_source_retractions(conflicting_keys, source_state)
+                    .build_source_retractions(conflicting_keys, source_state, flakes)
                     .await?;
                 let mut result = flakes.to_vec();
                 result.extend(retractions);
@@ -765,7 +765,7 @@ impl crate::Fluree {
         match strategy {
             ConflictStrategy::TakeSource => {
                 let retractions = self
-                    .build_source_retractions(conflicting_keys, opposite_state)
+                    .build_source_retractions(conflicting_keys, opposite_state, &flakes)
                     .await?;
                 let mut result = flakes;
                 result.extend(retractions);
@@ -784,13 +784,19 @@ impl crate::Fluree {
         }
     }
 
-    /// Look up the source state's current flakes for the given conflict keys
-    /// and generate retraction flakes (`op: false`) for each.
+    /// Look up `source_state`'s current flakes for the given conflict keys
+    /// and generate retraction flakes (`op: false`) for each — except values
+    /// that `winning` asserts too. Those land in the same commit at the same
+    /// `t`, where the assert is a no-op (already asserted) and a retract
+    /// would win the tie, wiping a value both sides agree on.
     pub(crate) async fn build_source_retractions(
         &self,
         conflicting_keys: &[ConflictKey],
         source_state: &LedgerState,
+        winning: &[Flake],
     ) -> Result<Vec<Flake>> {
+        let reasserted: FxHashSet<FactKey> =
+            winning.iter().filter(|f| f.op).map(FactKey::of).collect();
         let mut retractions = Vec::new();
 
         for key in conflicting_keys {
@@ -798,9 +804,10 @@ impl crate::Fluree {
                 current_asserted_for_key(source_state, key)
                     .await?
                     .into_iter()
+                    .filter(|flake| !reasserted.contains(&FactKey::of(flake)))
                     .map(|flake| Flake {
                         op: false,
-                        t: 0, // overwritten by commit
+                        t: 0, // restamped by StagedLedger::new
                         ..flake
                     }),
             );
@@ -859,7 +866,7 @@ async fn scan_branch_commits<C: fluree_db_core::ContentStore + Clone + 'static>(
     stop_at_t: i64,
     source_delta: &FxHashSet<ConflictKey>,
 ) -> Result<Vec<CommitSummary>> {
-    let stream = trace_commits_by_id(store, head_id, stop_at_t);
+    let stream = trace_first_parent_commits_by_id(store, head_id, stop_at_t);
     futures::pin_mut!(stream);
 
     let mut summaries = Vec::new();

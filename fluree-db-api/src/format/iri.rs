@@ -219,7 +219,7 @@ impl IriCompactor {
     /// Returns an error if the namespace code is not registered (this indicates
     /// a serious invariant violation: we should never have Sids we cannot decode).
     pub fn decode_sid(&self, sid: &Sid) -> Result<String> {
-        if sid.namespace_code == namespaces::EMPTY || sid.namespace_code == namespaces::OVERFLOW {
+        if namespaces::is_full_iri(sid.namespace_code) {
             return Ok(sid.name.to_string());
         }
         let prefix = self
@@ -236,7 +236,7 @@ impl IriCompactor {
     /// and the general path still pays only one allocation per distinct
     /// Sid instead of one per use.
     pub fn decode_sid_shared(&self, sid: &Sid) -> Result<std::sync::Arc<str>> {
-        if sid.namespace_code == namespaces::EMPTY || sid.namespace_code == namespaces::OVERFLOW {
+        if namespaces::is_full_iri(sid.namespace_code) {
             return Ok(std::sync::Arc::clone(&sid.name));
         }
         let prefix = self
@@ -263,7 +263,7 @@ impl IriCompactor {
     /// consumer that frames `Some(prefix)` as a `<uri>` / `@id` must special-case
     /// the `"_:"` prefix (or `sid.namespace_code == namespaces::BLANK_NODE`).
     pub fn namespace_prefix(&self, sid: &Sid) -> Result<Option<&str>> {
-        if sid.namespace_code == namespaces::EMPTY || sid.namespace_code == namespaces::OVERFLOW {
+        if namespaces::is_full_iri(sid.namespace_code) {
             return Ok(None);
         }
         self.namespace_codes

@@ -208,10 +208,29 @@ pub async fn decode_annotations_for_subject(
         )
         .await
         .expect("scan annotation subject flakes");
+        // Index-decoded flakes carry `g: None` — the graph is the index they
+        // came from, not a field on the flake — while `f:reifiesGraph` names
+        // the graph. `from_reifies_facts` reconciles the two, so without this
+        // stamp an indexed named-graph bundle decodes as `GraphMismatch` and
+        // this helper reports a defect that isn't there. Production scans of a
+        // reifier's own facts stamp for the same reason (`stamp_graph` in
+        // `fluree-db-transact`).
+        let g_sid = subject_flakes.iter().find_map(|f| {
+            (f.op && f.p.name.as_ref() == fluree_vocab::db::REIFIES_GRAPH)
+                .then(|| match &f.o {
+                    FlakeValue::Ref(sid) => Some(sid.clone()),
+                    _ => None,
+                })
+                .flatten()
+        });
         let bundle: Vec<_> = subject_flakes
             .iter()
             .filter(|f| f.op && fluree_db_core::is_reserved_reifies_predicate(&f.p))
             .cloned()
+            .map(|mut f| {
+                f.g = g_sid.clone();
+                f
+            })
             .collect();
         let key = EdgeKey::from_reifies_facts(&bundle).unwrap_or_else(|e| {
             panic!(

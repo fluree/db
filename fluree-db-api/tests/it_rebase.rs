@@ -651,3 +651,49 @@ async fn rebase_nested_branch() {
     // Feature should NOT see Dave (main-only, not in dev's ancestry at branch time)
     // Note: Dave was added to main after dev was created, and dev hasn't been rebased.
 }
+
+/// TakeBranch retracts the source's values under each conflict key before
+/// replaying the branch commit. When both sides made the identical change,
+/// the branch's assert is a no-op and an unfiltered retract would wipe the
+/// value both sides agree on.
+#[tokio::test]
+async fn rebase_take_branch_keeps_value_both_sides_asserted() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let main = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    let replace = |name: &str| {
+        json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "where": {"@id": "ex:alice", "ex:name": "?old"},
+            "delete": {"@id": "ex:alice", "ex:name": "?old"},
+            "insert": {"@id": "ex:alice", "ex:name": name}
+        })
+    };
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree.update(dev, &replace("C")).await.unwrap();
+    fluree.update(main, &replace("C")).await.unwrap();
+
+    let report = fluree
+        .rebase_branch("mydb", "dev", ConflictStrategy::TakeBranch)
+        .await
+        .unwrap();
+    assert_eq!(report.replayed, 1);
+    assert_eq!(report.conflicts.len(), 1);
+
+    assert_eq!(query_all_names(&fluree, "mydb:dev").await, vec!["C"]);
+}

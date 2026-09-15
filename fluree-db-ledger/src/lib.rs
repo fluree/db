@@ -39,7 +39,8 @@ use fluree_db_core::{
 };
 use fluree_db_nameservice::{NameServiceLookup, NsRecord};
 use fluree_db_novelty::{
-    generate_commit_flakes, stamp_graph_on_commit_flakes, trace_commits_by_id, Commit, Novelty,
+    generate_commit_flakes, stamp_graph_on_commit_flakes, trace_first_parent_commits_by_id, Commit,
+    Novelty,
 };
 use futures::StreamExt;
 use std::sync::Arc;
@@ -335,8 +336,11 @@ impl LedgerState {
 
     /// Load novelty from commits since a given index_t.
     ///
-    /// Walks the commit chain backwards from `head_cid` using the content store,
-    /// collecting flakes for all commits with `t > index_t`.
+    /// Walks the first-parent lineage backwards from `head_cid` using the
+    /// content store, collecting flakes for all commits with `t > index_t`.
+    /// Merge parents are not descended into: a merge commit carries the
+    /// folded flakes of the branch it merged, and that branch's commits are
+    /// stamped on its own clock.
     ///
     /// Envelope deltas (namespace codes, graph IRIs) are accumulated and applied
     /// to the snapshot via `apply_envelope_deltas()` after the walk completes.
@@ -368,7 +372,7 @@ impl LedgerState {
         // which depends on namespace_codes from apply_envelope_deltas().
         let mut commit_batches: Vec<(Vec<Flake>, i64)> = Vec::new();
 
-        let stream = trace_commits_by_id(store, head_cid.clone(), index_t);
+        let stream = trace_first_parent_commits_by_id(store, head_cid.clone(), index_t);
         futures::pin_mut!(stream);
 
         let mut head_temporal: Option<HeadTemporal> = None;

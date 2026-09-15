@@ -22,6 +22,7 @@
 //! - **Multi-ledger**: Join keys use canonical IRI strings for correct cross-ledger semantics.
 
 use crate::binding::Binding;
+use crate::error::{QueryError, Result};
 use chrono::{Datelike, Timelike};
 use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
 use fluree_db_core::DatatypeConstraint;
@@ -316,67 +317,36 @@ impl Materializer {
     /// and hash join operations.
     ///
     /// In single-ledger mode, encoded IDs are used directly (no decoding).
-    /// In multi-ledger mode, IRIs are resolved to canonical strings.
-    pub fn join_key<'a>(&'a mut self, binding: &'a Binding) -> JoinKey<'a> {
-        match binding {
+    /// In multi-ledger mode, IRIs are resolved to canonical strings; an ID that
+    /// cannot be decoded is an error rather than a key that silently differs.
+    pub fn join_key<'a>(&'a mut self, binding: &'a Binding) -> Result<JoinKey<'a>> {
+        Ok(match binding {
             Binding::Unbound | Binding::Poisoned => JoinKey::Absent,
 
-            Binding::Sid { sid, .. } => {
-                match self.mode {
-                    JoinKeyMode::SingleLedger => {
-                        // In single-ledger mode, (namespace_code, name) is a valid key
-                        JoinKey::MaterializedSid(sid.namespace_code, Cow::Borrowed(&sid.name))
-                    }
-                    JoinKeyMode::MultiLedger => {
-                        // In multi-ledger mode, namespace codes may differ across ledgers,
-                        // so we must use the full canonical IRI for comparison.
-                        // Unknown namespace code → Absent (strict decode).
-                        match self.graph_view.store().sid_to_iri(sid) {
-                            Some(iri) => JoinKey::IriOwned(Arc::from(iri)),
-                            None => {
-                                tracing::error!(
-                                    ns_code = sid.namespace_code,
-                                    suffix = %sid.name,
-                                    "sid_to_iri: unknown namespace code in materializer join_key \
-                                     — this is a data corruption signal"
-                                );
-                                JoinKey::Absent
-                            }
-                        }
-                    }
+            Binding::Sid { sid, .. } => match self.mode {
+                // In single-ledger mode, (namespace_code, name) is a valid key
+                JoinKeyMode::SingleLedger => {
+                    JoinKey::MaterializedSid(sid.namespace_code, Cow::Borrowed(&sid.name))
                 }
-            }
+                // Namespace codes may differ across ledgers, so compare full IRIs.
+                JoinKeyMode::MultiLedger => JoinKey::IriOwned(Arc::from(self.sid_iri(sid)?)),
+            },
 
             Binding::IriMatch { iri, .. } => JoinKey::Iri(Cow::Borrowed(iri.as_ref())),
 
             Binding::Iri(iri) => JoinKey::Iri(Cow::Borrowed(iri.as_ref())),
 
-            Binding::EncodedSid { s_id, .. } => {
-                match self.mode {
-                    JoinKeyMode::SingleLedger => JoinKey::Sid(*s_id),
-                    JoinKeyMode::MultiLedger => {
-                        // Resolve to canonical IRI for cross-ledger comparison
-                        // Using IriOwned avoids allocation - just clones the Arc
-                        let iri = self.resolve_iri(*s_id);
-                        JoinKey::IriOwned(iri)
-                    }
-                }
-            }
+            Binding::EncodedSid { s_id, .. } => match self.mode {
+                JoinKeyMode::SingleLedger => JoinKey::Sid(*s_id),
+                JoinKeyMode::MultiLedger => JoinKey::IriOwned(self.resolve_iri(*s_id)?),
+            },
 
-            Binding::EncodedPid { p_id } => {
-                match self.mode {
-                    JoinKeyMode::SingleLedger => JoinKey::Pid(*p_id),
-                    JoinKeyMode::MultiLedger => {
-                        // Resolve to canonical IRI
-                        // Using IriOwned avoids allocation - just clones the Arc
-                        if let Some(iri) = self.graph_view.store().resolve_predicate_iri(*p_id) {
-                            JoinKey::IriOwned(Arc::from(iri))
-                        } else {
-                            JoinKey::Pid(*p_id) // Fallback
-                        }
-                    }
+            Binding::EncodedPid { p_id } => match self.mode {
+                JoinKeyMode::SingleLedger => JoinKey::Pid(*p_id),
+                JoinKeyMode::MultiLedger => {
+                    JoinKey::IriOwned(Arc::from(self.predicate_iri(*p_id)?))
                 }
-            }
+            },
 
             Binding::Lit { val, dtc, .. } => JoinKey::MaterializedLit(MaterializedLitKey {
                 val: FlakeValueKey(val.clone()),
@@ -412,7 +382,7 @@ impl Materializer {
             Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
                 JoinKey::Absent
             }
-        }
+        })
     }
 
     // -------------------------------------------------------------------------
@@ -422,9 +392,10 @@ impl Materializer {
     /// Get a comparable value for a binding.
     ///
     /// This returns a `ComparableValue` for use in FILTER expressions and
-    /// ORDER BY comparisons. Returns `None` for unbound/poisoned bindings.
-    pub fn comparable(&mut self, binding: &Binding) -> Option<ComparableValue> {
-        match binding {
+    /// ORDER BY comparisons. Returns `None` for unbound/poisoned bindings and
+    /// an error for an encoded value that cannot be decoded.
+    pub fn comparable(&mut self, binding: &Binding) -> Result<Option<ComparableValue>> {
+        Ok(match binding {
             Binding::Unbound | Binding::Poisoned => None,
 
             Binding::Sid { sid, .. } => Some(ComparableValue::Sid(sid.clone())),
@@ -434,15 +405,12 @@ impl Materializer {
             Binding::Iri(iri) => Some(ComparableValue::Iri(Arc::clone(iri))),
 
             Binding::EncodedSid { s_id, .. } => {
-                let iri = self.resolve_iri(*s_id);
-                Some(ComparableValue::Iri(iri))
+                Some(ComparableValue::Iri(self.resolve_iri(*s_id)?))
             }
 
-            Binding::EncodedPid { p_id } => self
-                .graph_view
-                .store()
-                .resolve_predicate_iri(*p_id)
-                .map(|iri| ComparableValue::Iri(Arc::from(iri))),
+            Binding::EncodedPid { p_id } => {
+                Some(ComparableValue::Iri(Arc::from(self.predicate_iri(*p_id)?)))
+            }
 
             Binding::Lit { val, .. } => flake_value_to_comparable(val),
 
@@ -453,19 +421,15 @@ impl Materializer {
                 dt_id,
                 lang_id,
                 ..
-            } => match self
-                .graph_view
-                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
-            {
-                Ok(val) => flake_value_to_comparable(&val),
-                Err(_) => None,
-            },
+            } => flake_value_to_comparable(
+                &self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?,
+            ),
 
             Binding::Grouped(_) => None,
 
             // A path/list is not a scalar comparable value.
             Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => None,
-        }
+        })
     }
 
     // -------------------------------------------------------------------------
@@ -475,40 +439,22 @@ impl Materializer {
     /// Get a string representation of a binding.
     ///
     /// This is used for SPARQL functions like STR(), REGEX(), CONTAINS().
-    /// Returns `None` for unbound/poisoned bindings.
-    pub fn as_string(&mut self, binding: &Binding) -> Option<Arc<str>> {
-        match binding {
+    /// Returns `None` for unbound/poisoned bindings and an error for an
+    /// encoded value that cannot be decoded.
+    pub fn as_string(&mut self, binding: &Binding) -> Result<Option<Arc<str>>> {
+        Ok(match binding {
             Binding::Unbound | Binding::Poisoned => None,
 
-            Binding::Sid { sid, .. } => {
-                // Decode to full IRI string.
-                // IMPORTANT: `namespace_code:name` is an internal representation and is not a full IRI.
-                // Unknown namespace code → None (strict decode).
-                match self.graph_view.store().sid_to_iri(sid) {
-                    Some(iri) => Some(Arc::from(iri)),
-                    None => {
-                        tracing::error!(
-                            ns_code = sid.namespace_code,
-                            suffix = %sid.name,
-                            "sid_to_iri: unknown namespace code in materializer as_string \
-                             — this is a data corruption signal"
-                        );
-                        None
-                    }
-                }
-            }
+            // `namespace_code:name` is an internal representation, not an IRI.
+            Binding::Sid { sid, .. } => Some(Arc::from(self.sid_iri(sid)?)),
 
             Binding::IriMatch { iri, .. } => Some(Arc::clone(iri)),
 
             Binding::Iri(iri) => Some(Arc::clone(iri)),
 
-            Binding::EncodedSid { s_id, .. } => Some(self.resolve_iri(*s_id)),
+            Binding::EncodedSid { s_id, .. } => Some(self.resolve_iri(*s_id)?),
 
-            Binding::EncodedPid { p_id } => self
-                .graph_view
-                .store()
-                .resolve_predicate_iri(*p_id)
-                .map(Arc::from),
+            Binding::EncodedPid { p_id } => Some(Arc::from(self.predicate_iri(*p_id)?)),
 
             Binding::Lit { val, .. } => Some(Arc::from(val.to_string())),
 
@@ -519,17 +465,16 @@ impl Materializer {
                 dt_id,
                 lang_id,
                 ..
-            } => self
-                .graph_view
-                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
-                .ok()
-                .map(|v| Arc::from(v.to_string())),
+            } => Some(Arc::from(
+                self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?
+                    .to_string(),
+            )),
 
             Binding::Grouped(_) => None,
 
             // No canonical string form for a path/list value.
             Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => None,
-        }
+        })
     }
 
     // -------------------------------------------------------------------------
@@ -543,8 +488,12 @@ impl Materializer {
     /// Calling this during intermediate processing can corrupt hash-based
     /// operator results if the materialized binding is inserted into a hash
     /// structure that contained the original encoded binding.
-    pub fn to_term(&mut self, binding: &Binding) -> Binding {
-        match binding {
+    ///
+    /// An encoded value that cannot be decoded is an error: callers use the
+    /// result to build flakes and rows, where a placeholder would be written
+    /// or joined as if it were real.
+    pub fn to_term(&mut self, binding: &Binding) -> Result<Binding> {
+        Ok(match binding {
             // Already materialized
             Binding::Unbound
             | Binding::Poisoned
@@ -558,15 +507,9 @@ impl Materializer {
             | Binding::List(_)
             | Binding::Map(_) => binding.clone(),
 
-            Binding::EncodedSid { s_id, .. } => {
-                let sid = self.resolve_sid(*s_id);
-                Binding::sid(sid)
-            }
+            Binding::EncodedSid { s_id, .. } => Binding::sid(self.resolve_sid(*s_id)?),
 
-            Binding::EncodedPid { p_id } => {
-                let sid = self.resolve_pid(*p_id);
-                Binding::sid(sid)
-            }
+            Binding::EncodedPid { p_id } => Binding::sid(self.resolve_pid(*p_id)?),
 
             Binding::EncodedLit {
                 o_kind,
@@ -576,23 +519,26 @@ impl Materializer {
                 lang_id,
                 i_val,
                 t,
-            } => match self
-                .graph_view
-                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
-            {
-                Ok(FlakeValue::Ref(sid)) => Binding::sid(sid),
-                Ok(val) => {
+            } => match self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id)? {
+                FlakeValue::Ref(sid) => Binding::sid(sid),
+                val => {
                     // NUM_BIG arena values share one EncodedLit whose dt_id is
                     // hardcoded to decimal — recover xsd:integer vs xsd:decimal
                     // from the decoded value, not dt_id (issue #1329).
-                    let dt_sid = val.overflow_numeric_datatype_sid().unwrap_or_else(|| {
-                        self.graph_view
+                    let dt_sid = match val.overflow_numeric_datatype_sid() {
+                        Some(sid) => sid,
+                        None => self
+                            .graph_view
                             .store()
                             .dt_sids()
                             .get(*dt_id as usize)
                             .cloned()
-                            .unwrap_or_else(|| Sid::new(0, ""))
-                    });
+                            .ok_or_else(|| {
+                                QueryError::dictionary_lookup(format!(
+                                    "materialize literal: unknown dt_id {dt_id}"
+                                ))
+                            })?,
+                    };
                     let meta = self.graph_view.store().decode_meta(*lang_id, *i_val);
                     let dtc = match meta.and_then(|m| m.lang.map(Arc::from)) {
                         Some(lang) => DatatypeConstraint::LangTag(lang),
@@ -606,9 +552,8 @@ impl Materializer {
                         p_id: Some(*p_id),
                     }
                 }
-                Err(_) => Binding::Unbound,
             },
-        }
+        })
     }
 
     // -------------------------------------------------------------------------
@@ -618,68 +563,91 @@ impl Materializer {
     /// Resolve s_id to canonical IRI string (cached).
     ///
     /// Novelty-aware: `BinaryGraphView` handles watermark routing internally.
-    fn resolve_iri(&mut self, s_id: u64) -> Arc<str> {
+    fn resolve_iri(&mut self, s_id: u64) -> Result<Arc<str>> {
         if let Some(cached) = self.iri_cache.get(&s_id) {
-            return Arc::clone(cached);
+            return Ok(Arc::clone(cached));
         }
-
-        let iri = match self.graph_view.resolve_subject_iri(s_id) {
-            Ok(iri) => Arc::from(iri),
-            Err(e) => {
-                tracing::warn!(
-                    s_id,
-                    error = %e,
-                    "resolve_subject_iri failed — fabricating placeholder IRI"
-                );
-                Arc::from(format!("_:unknown_{s_id}"))
-            }
-        };
-
+        let iri: Arc<str> = self
+            .graph_view
+            .resolve_subject_iri(s_id)
+            .map_err(|e| decode_error("resolve subject IRI", format!("s_id={s_id}"), e))?
+            .into();
         self.iri_cache.insert(s_id, Arc::clone(&iri));
-        iri
+        Ok(iri)
     }
 
     /// Resolve s_id to Sid (cached).
     ///
     /// Novelty-aware: uses `resolve_subject_sid` which returns `Sid` directly
     /// for novel subjects (no IRI string allocation or trie lookup).
-    fn resolve_sid(&mut self, s_id: u64) -> Sid {
+    fn resolve_sid(&mut self, s_id: u64) -> Result<Sid> {
         if let Some(cached) = self.sid_cache.get(&s_id) {
-            return cached.clone();
+            return Ok(cached.clone());
         }
-
-        let sid = match self.graph_view.resolve_subject_sid(s_id) {
-            Ok(sid) => sid,
-            Err(_) => Sid::new(0, format!("_:unknown_{s_id}")),
-        };
-
+        let sid = self
+            .graph_view
+            .resolve_subject_sid(s_id)
+            .map_err(|e| decode_error("resolve subject", format!("s_id={s_id}"), e))?;
         self.sid_cache.insert(s_id, sid.clone());
-        sid
+        Ok(sid)
     }
 
     /// Resolve p_id to Sid (cached).
-    fn resolve_pid(&mut self, p_id: u32) -> Sid {
+    fn resolve_pid(&mut self, p_id: u32) -> Result<Sid> {
         if let Some(cached) = self.pid_cache.get(&p_id) {
-            return cached.clone();
+            return Ok(cached.clone());
         }
-
-        let sid = match self.graph_view.store().resolve_predicate_iri(p_id) {
-            Some(iri) => self.graph_view.store().encode_iri(iri),
-            None => {
-                tracing::warn!(
-                    p_id,
-                    "resolve_predicate_iri failed — fabricating placeholder predicate"
-                );
-                Sid::new(0, format!("_:unknown_p_{p_id}"))
-            }
-        };
-
+        let sid = self
+            .graph_view
+            .store()
+            .encode_iri(self.predicate_iri(p_id)?);
         self.pid_cache.insert(p_id, sid.clone());
-        sid
+        Ok(sid)
+    }
+
+    fn predicate_iri(&self, p_id: u32) -> Result<&str> {
+        self.graph_view
+            .store()
+            .resolve_predicate_iri(p_id)
+            .ok_or_else(|| {
+                QueryError::dictionary_lookup(format!("resolve predicate IRI: unknown p_id {p_id}"))
+            })
+    }
+
+    fn sid_iri(&self, sid: &Sid) -> Result<String> {
+        self.graph_view.store().sid_to_iri(sid).ok_or_else(|| {
+            QueryError::dictionary_lookup(format!(
+                "decode Sid: unknown namespace code {} for {:?}",
+                sid.namespace_code, sid.name
+            ))
+        })
+    }
+
+    fn decode_lit(
+        &self,
+        o_kind: u8,
+        o_key: u64,
+        p_id: u32,
+        dt_id: u16,
+        lang_id: u16,
+    ) -> Result<FlakeValue> {
+        self.graph_view
+            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id)
+            .map_err(|e| {
+                decode_error(
+                    "decode literal",
+                    format!("o_kind={o_kind} o_key={o_key} p_id={p_id}"),
+                    e,
+                )
+            })
     }
 }
 
 /// Convert a FlakeValue to a ComparableValue.
+fn decode_error(kind: &str, details: String, err: impl std::fmt::Display) -> QueryError {
+    QueryError::dictionary_lookup(format!("{kind}: {details}: {err}"))
+}
+
 fn flake_value_to_comparable(val: &FlakeValue) -> Option<ComparableValue> {
     match val {
         FlakeValue::String(s) => Some(ComparableValue::String(Arc::from(s.as_str()))),

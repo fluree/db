@@ -175,6 +175,12 @@ pub fn resolve_overlay_ops(ops: &mut Vec<OverlayOp>) {
             // within a txn so the tie is currently unreachable, but the
             // segment-aware assembly merges runs across segments — keep it
             // deterministic rather than dependent on sort position.
+            //
+            // The merge and revert fold was the other producer: it concatenated
+            // a source range's flakes into one commit at one `t`. It now nets
+            // per fact, so the pairs it used to emit stop here, but merge
+            // commits written by the older code keep them on disk. Do not
+            // remove the tie-break on the strength of the accumulator alone.
             let better = ops[read].t > ops[best].t
                 || (ops[read].t == ops[best].t && !ops[read].op && ops[best].op);
             if better {

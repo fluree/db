@@ -152,6 +152,32 @@ impl<'a> FlakeSink<'a> {
     ) -> Option<Flake> {
         let s = self.resolve_sid(subject)?;
         let p = self.resolve_sid(predicate)?;
+
+        // Reserved-predicate firewall (mirrors the JSON-LD and SPARQL UPDATE
+        // surfaces): a user-authored `f:reifies*` statement must not reach
+        // stage. Annotations are minted only through the RDF 1.2 annotation
+        // syntax (`~` / `{| |}` / `<< >>`), which arrives via
+        // `emit_reified_triple` and builds a complete, validated bundle.
+        // Bulk import (`ImportSink`) is the administrative bootstrap path and
+        // deliberately stays permissive so an export round-trips.
+        if fluree_db_core::is_reserved_reifies_predicate(&p) {
+            let iri = format!(
+                "{}{}",
+                self.ns_registry.get_prefix(p.namespace_code).unwrap_or(""),
+                p.name
+            );
+            let e = TransactError::UnsupportedFeature(format!(
+                "'{iri}' is a system-controlled predicate; use the RDF 1.2 annotation \
+                 syntax (`~ <reifier> {{| ... |}}` or `<< s p o >>`) instead of \
+                 writing f:reifies* triples by hand"
+            ));
+            tracing::error!("FlakeSink: reserved predicate, aborting — {e}");
+            if self.invariant_error.is_none() {
+                self.invariant_error = Some(e);
+            }
+            return None;
+        }
+
         let (o, dtc) = self.resolve_object(object)?;
 
         let dt = dtc.datatype().clone();
@@ -545,6 +571,29 @@ mod tests {
         // dt must be xsd:long (declared), not xsd:integer (inferred)
         let expected_dt = ns.sid_for_iri(xsd::LONG);
         assert_eq!(flakes[0].dt, expected_dt);
+    }
+
+    #[test]
+    fn user_authored_reifies_predicate_is_rejected() {
+        // The reserved-predicate firewall: a Turtle statement that names an
+        // `f:reifies*` predicate directly must fail the whole transaction,
+        // exactly like the JSON-LD and SPARQL UPDATE surfaces. Only the
+        // parser's reifier path (`emit_reified_triple`) may mint bundles.
+        let (mut ns, t, txn_id) = make_sink();
+        let mut sink = FlakeSink::new(&mut ns, t, txn_id);
+
+        let claim = sink.term_iri("http://example.org/claim1");
+        let p = sink.term_iri("https://ns.flur.ee/db#reifiesSubject");
+        let alice = sink.term_iri("http://example.org/alice");
+        sink.emit_triple(claim, p, alice).unwrap();
+
+        let err = sink
+            .into_flakes()
+            .expect_err("a hand-written f:reifiesSubject triple must be rejected");
+        assert!(
+            matches!(&err, TransactError::UnsupportedFeature(m) if m.contains("reifiesSubject")),
+            "expected the reserved-predicate error naming the predicate, got {err:?}"
+        );
     }
 
     #[test]

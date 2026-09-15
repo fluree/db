@@ -58,8 +58,11 @@ struct StagedOverlay {
 }
 
 impl StagedOverlay {
+    /// `staged_t` is stamped on every flake in the same pass that resolves
+    /// graph ids — see [`StagedLedger::new`] for why the view owns the stamp.
     fn from_flakes(
-        flakes: Vec<Flake>,
+        mut flakes: Vec<Flake>,
+        staged_t: i64,
         reverse_graph: &HashMap<Sid, GraphId>,
     ) -> Result<Self, LedgerError> {
         if flakes.is_empty() {
@@ -73,11 +76,13 @@ impl StagedOverlay {
             });
         }
 
-        // Pre-compute graph IDs for all flakes — strict, no silent fallback.
-        // Unknown graph Sids are a programming error (reverse_graph is built from
-        // build_reverse_graph() which is total).
+        // Single pass: stamp `t` and pre-compute graph IDs for all flakes —
+        // strict, no silent fallback. Unknown graph Sids are a programming
+        // error (reverse_graph is built from build_reverse_graph() which is
+        // total).
         let mut flake_graph_ids: Vec<GraphId> = Vec::with_capacity(flakes.len());
-        for f in &flakes {
+        for f in &mut flakes {
+            f.t = staged_t;
             let g_id = match &f.g {
                 None => 0,
                 Some(g_sid) => *reverse_graph.get(g_sid).ok_or_else(|| {
@@ -200,6 +205,14 @@ impl StagedLedger {
     /// `reverse_graph` maps graph Sids to GraphIds for per-graph filtering.
     /// Pass an empty map when all flakes are default-graph only.
     ///
+    /// Every staged flake is stamped with `base.t() + 1` — the `t` the
+    /// commit built from this view will carry. A flake's `t` is a position
+    /// on *this* branch's clock, and callers routinely hand in flakes that
+    /// were minted elsewhere: merge and rebase transplant another branch's
+    /// commits, revert inverts historical flakes, take-source synthesizes
+    /// retractions. Stamping here (rather than trusting each caller) is what
+    /// keeps `--at t` reads below a branch operation honest.
+    ///
     /// Returns `Err` if any staged flake has a graph Sid not present in
     /// `reverse_graph` (programming error — the map must be complete).
     pub fn new(
@@ -208,8 +221,9 @@ impl StagedLedger {
         reverse_graph: &HashMap<Sid, GraphId>,
     ) -> Result<Self, LedgerError> {
         let staged_epoch = base.novelty.epoch + 1;
+        let staged_t = base.t() + 1;
         Ok(Self {
-            staged: StagedOverlay::from_flakes(flakes, reverse_graph)?,
+            staged: StagedOverlay::from_flakes(flakes, staged_t, reverse_graph)?,
             staged_epoch,
             content_version: fluree_db_core::overlay::next_overlay_content_version(),
             dicts_cover_staged: false,
@@ -281,8 +295,8 @@ impl StagedLedger {
 
     /// The effective as-of time for this staged view.
     ///
-    /// When staged flakes exist, returns `base.t() + 1` (matching the `t`
-    /// assigned to staged flakes in `stage.rs`). Otherwise returns `base.t()`.
+    /// When staged flakes exist, returns `base.t() + 1` (the `t` stamped on
+    /// every staged flake by [`Self::new`]). Otherwise returns `base.t()`.
     pub fn staged_t(&self) -> i64 {
         if self.has_staged() {
             self.base.t() + 1
@@ -434,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_staged_overlay_empty() {
-        let staged = StagedOverlay::from_flakes(vec![], &HashMap::new()).unwrap();
+        let staged = StagedOverlay::from_flakes(vec![], 1, &HashMap::new()).unwrap();
         assert!(staged.store.is_empty());
     }
 
@@ -446,7 +460,7 @@ mod tests {
             make_flake(2, 1, 100, 1),
         ];
 
-        let staged = StagedOverlay::from_flakes(flakes, &HashMap::new()).unwrap();
+        let staged = StagedOverlay::from_flakes(flakes, 1, &HashMap::new()).unwrap();
 
         // SPOT should be sorted by subject
         let spot_subjects: Vec<u16> = staged
@@ -543,7 +557,7 @@ mod tests {
         )];
 
         // Empty reverse_graph means the graph Sid is unknown — should error
-        let result = StagedOverlay::from_flakes(flakes, &HashMap::new());
+        let result = StagedOverlay::from_flakes(flakes, 1, &HashMap::new());
         assert!(result.is_err());
     }
 }

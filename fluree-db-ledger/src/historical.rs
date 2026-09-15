@@ -34,7 +34,7 @@ use fluree_db_core::{
 use fluree_db_nameservice::NameServiceLookup;
 
 use fluree_db_novelty::{
-    generate_commit_flakes, stamp_graph_on_commit_flakes, trace_commits_by_id, Novelty,
+    generate_commit_flakes, stamp_graph_on_commit_flakes, trace_first_parent_commits_by_id, Novelty,
 };
 use fluree_vocab::namespaces::{FLUREE_COMMIT, JSON_LD, RDF, XSD};
 use fluree_vocab::{rdf_names, xsd_names};
@@ -194,8 +194,8 @@ impl HistoricalLedgerView {
 
     /// Load novelty from commits within a specific range
     ///
-    /// Walks the commit chain backwards from `head_cid` using the content store,
-    /// including only commits where `index_t < commit.t <= target_t`.
+    /// Walks the first-parent lineage backwards from `head_cid` using the
+    /// content store, including only commits where `index_t < commit.t <= target_t`.
     ///
     /// Uses a deferred batch approach: collect flakes during the HEAD→oldest walk,
     /// apply namespace/graph deltas, build reverse_graph, then replay oldest→newest.
@@ -232,7 +232,7 @@ impl HistoricalLedgerView {
         // Collect (data flakes + commit-meta flakes, deferred txn-meta, t) per commit.
         let mut commit_batches: Vec<(Vec<Flake>, Option<DeferredTxnMeta>, i64)> = Vec::new();
 
-        let stream = trace_commits_by_id(store, head_cid.clone(), index_t);
+        let stream = trace_first_parent_commits_by_id(store, head_cid.clone(), index_t);
         futures::pin_mut!(stream);
 
         let mut commit_count = 0;
