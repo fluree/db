@@ -231,6 +231,20 @@ pub(crate) fn elide_redundant_chain(
     Some(kept)
 }
 
+/// Whether the hash sidecar lane may take a recognized chain. It drains the
+/// three `f:reifies*` predicates and sweeps the base edge before answering a
+/// row, which beats per-row probes only against a large or unknown driving
+/// stream and a bounded sweep. A child that already binds the reifier keeps
+/// the chain, as in [`choose_chain_lane`]: the chain is then one point probe
+/// per row, while the lane walks every swept edge per row when the edge
+/// subject is unbound. A constant annotation value driving
+/// `<< ?s :p ?o >> :q "v"` went from 22 s to 55 s on a 20k-edge ledger that way.
+fn hash_lane_admits(driving_rows: Option<usize>, sweep_bounded: bool, reifier_bound: bool) -> bool {
+    !reifier_bound
+        && sweep_bounded
+        && driving_rows.is_none_or(|n| n >= HASH_ANNOTATION_MIN_DRIVING_ROWS)
+}
+
 /// Diagnostic override: `FLUREE_ANNOTATION_LANE=arena|enumerate|chain` pins
 /// the lane regardless of cost so the same query can be timed on the same
 /// ledger per lane. The runtime gates still apply — a forced arena or
@@ -473,13 +487,13 @@ impl DefaultGraphSourceOperator {
                     pred => resolve_pred_sid(pred, ctx)
                         .map(crate::annotation_edge_probe::EdgePos::Const),
                 };
-                let driving_large_or_unknown = child
-                    .estimated_rows()
-                    .is_none_or(|n| n >= HASH_ANNOTATION_MIN_DRIVING_ROWS);
-                let sweep_bounded = self.base_sweep_bounded(&shape);
+                let admitted = hash_lane_admits(
+                    child.estimated_rows(),
+                    self.base_sweep_bounded(&shape),
+                    child_bound.contains(&shape.ann_var),
+                );
                 if let (
                     Some(p_pos),
-                    true,
                     true,
                     Pattern::Triple(base_tp),
                     Pattern::Triple(r_subj),
@@ -487,8 +501,7 @@ impl DefaultGraphSourceOperator {
                     Pattern::Triple(r_obj),
                 ) = (
                     p_pos,
-                    driving_large_or_unknown,
-                    sweep_bounded,
+                    admitted,
                     &self.inner_patterns[0],
                     &self.inner_patterns[1],
                     &self.inner_patterns[2],
@@ -923,7 +936,9 @@ impl Operator for DefaultGraphSourceOperator {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_chain_lane, elide_redundant_chain, ChainLane, LaneInputs};
+    use super::{
+        choose_chain_lane, elide_redundant_chain, hash_lane_admits, ChainLane, LaneInputs,
+    };
     use crate::ir::{Pattern, Ref, Term, TriplePattern};
     use crate::var_registry::VarId;
     use fluree_db_core::Sid;
@@ -1062,6 +1077,20 @@ mod tests {
             reifies_names(&elided),
             vec![REIFIES_PREDICATE, REIFIES_OBJECT]
         );
+    }
+
+    #[test]
+    fn hash_lane_leaves_a_bound_reifier_to_the_chain() {
+        // 2,857 body rows binding the reifier: the lane would walk every
+        // swept edge per row, the chain probes once per row.
+        assert!(!hash_lane_admits(Some(2_857), true, true));
+        assert!(!hash_lane_admits(None, true, true));
+        // The same stream binding the edge subject instead is the lane's case.
+        assert!(hash_lane_admits(Some(2_857), true, false));
+        assert!(hash_lane_admits(None, true, false));
+        // Small streams and unbounded sweeps stay on the chain.
+        assert!(!hash_lane_admits(Some(10), true, false));
+        assert!(!hash_lane_admits(Some(2_857), false, false));
     }
 
     #[test]
