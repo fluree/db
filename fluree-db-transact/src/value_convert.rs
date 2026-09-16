@@ -256,11 +256,11 @@ pub fn parse_xsd_lexical(value: &str, dt_iri: &str) -> Result<Option<FlakeValue>
         xsd::YEAR_MONTH_DURATION => YearMonthDuration::parse(value)
             .map(|v| FlakeValue::YearMonthDuration(Box::new(v)))
             .map_err(|e| format!("invalid xsd:yearMonthDuration lexical `{value}`: {e}"))?,
-        // Canonicalizing gives one term per value (#1781). This converter is
-        // the strict one, so an invalid lexical is an error.
+        // Canonicalizing gives one term per value (#1781). A lexical that is
+        // not valid JSON has no canonical form, and the ingest paths that
+        // accept one keep it as written, so this parser does too.
         rdf::JSON => FlakeValue::Json(
-            fluree_graph_ir::canonicalize_json(value)
-                .map_err(|e| format!("invalid rdf:JSON lexical `{value}`: {e}"))?,
+            fluree_graph_ir::canonicalize_json(value).unwrap_or_else(|_| value.to_string()),
         ),
         // Non-XSD / non-Fluree-recognized datatype. Caller treats
         // the value as a plain string under the (already-registered)
