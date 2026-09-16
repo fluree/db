@@ -43,10 +43,14 @@ use fluree_db_core::{ContentId, Storage};
 use std::collections::HashSet;
 use std::path::Path;
 
-/// Concurrent storage deletes during a sweep. Deletes are independent
-/// round trips, so a serial pass over a large backlog is almost entirely
-/// latency.
-const RELEASE_CONCURRENCY: usize = 32;
+/// Addresses per batch delete. Matches the S3 `DeleteObjects` maximum, so
+/// on an object store a batch is one request.
+const RELEASE_BATCH: usize = 1000;
+
+/// Batches in flight at once. Small on purpose: the S3 backend caps requests
+/// process-wide, and a sweep that took most of that cap starved every
+/// reader for as long as it ran.
+const RELEASE_CONCURRENCY: usize = 4;
 
 /// Concurrent branch chain walks during planning. A chain is a sequence of
 /// dependent reads — each root names the next — so it cannot be walked in
@@ -170,30 +174,27 @@ where
     // orphan is a blob no index chain reaches, so no later walk reads the
     // entry it leaves behind; `evict_cached_cid`'s doc lists this among the
     // states the cache does not clear.
-    let outcomes: Vec<(String, Option<String>)> =
-        futures::stream::iter(plan.orphans.iter().cloned())
-            .map(|address| async move {
-                let error = storage.delete(&address).await.err().map(|e| e.to_string());
-                (address, error)
-            })
-            .buffer_unordered(RELEASE_CONCURRENCY)
-            .collect()
-            .await;
+    let batches: Vec<_> = plan
+        .orphans
+        .chunks(RELEASE_BATCH)
+        .map(|chunk| storage.delete_many(chunk))
+        .collect();
+    let failed: Vec<Vec<(String, fluree_db_core::Error)>> = futures::stream::iter(batches)
+        .buffer_unordered(RELEASE_CONCURRENCY)
+        .collect()
+        .await;
 
     let mut result = SweepResult::default();
-    for (address, error) in outcomes {
-        match error {
-            None => result.reclaimed += 1,
-            Some(error) => {
-                tracing::warn!(
-                    address,
-                    error,
-                    "sweep could not release an orphaned artifact"
-                );
-                result.failures.push((address, error));
-            }
-        }
+    for (address, error) in failed.into_iter().flatten() {
+        let error = error.to_string();
+        tracing::warn!(
+            address,
+            error,
+            "sweep could not release an orphaned artifact"
+        );
+        result.failures.push((address, error));
     }
+    result.reclaimed = plan.orphans.len() - result.failures.len();
     result.failures.sort();
 
     tracing::info!(
