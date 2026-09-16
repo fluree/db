@@ -18,7 +18,7 @@ fluree export [LEDGER] [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--format <FORMAT>` | Output format: `turtle` (or `ttl`), `ntriples` (or `nt`), `jsonld`, `trig`, or `nquads` (default: `turtle`) |
+| `--format <FORMAT>` | Output format: `turtle` (or `ttl`), `ntriples` (or `nt`), `jsonld`, `trig`, `nquads`, or `ledger` (`.flpack` archive). Defaults to `turtle`, or to `ledger` when `-o` names a `.flpack` file. |
 | `--all-graphs` | Export default + all named graphs including system graphs (dataset export). Requires `--format trig` or `--format nquads`. |
 | `--graph <IRI>` | Export a specific named graph by IRI. Mutually exclusive with `--all-graphs`. |
 | `--context <JSON>` | JSON-LD context for prefix declarations. Overrides the ledger's default context. |
@@ -55,13 +55,22 @@ The context format is a JSON object mapping prefixes to namespace IRIs:
 
 ### Prerequisites
 
-All export formats require a binary index. Ledgers that have only been created and inserted into (without an index build) cannot be exported. Run the server to trigger index building first.
+None. Export reads the binary index when there is one and the novelty overlay for anything committed since — so a ledger that has been created and inserted into but never indexed exports the same triples, with no index build and no growth in on-disk footprint.
+
+Export is a read: it never writes to the ledger. If you want an index, build one explicitly with `fluree index <ledger>`.
+
+### Choosing `--format`
+
+`--format` defaults to `turtle`, with one inference: when `-o` names a file ending in `.flpack`, the format defaults to `ledger`, because that extension is what `fluree create --from` reads. Passing an RDF `--format` *and* a `.flpack` output name is refused rather than guessed — writing Turtle into a file named `.flpack` is what `fluree export mydb -o mydb.flpack` used to do silently.
 
 ## Examples
 
 ```bash
 # Export as Turtle (default) — uses ledger's default context for prefixes
 fluree export > backup.ttl
+
+# Export a full ledger archive — `.flpack` implies --format ledger
+fluree export mydb -o mydb.flpack
 
 # Export as Turtle with custom prefixes
 fluree export --context '{"ex": "http://example.org/"}' > backup.ttl

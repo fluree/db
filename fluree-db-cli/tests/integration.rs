@@ -1549,8 +1549,16 @@ fn query_at_time_travel() {
 // v1.1 — Export tests
 // ============================================================================
 
+/// Every export test in this block used to assert a *failure* — the reason the
+/// defects in #1574, #1847 and #1859 all shipped unnoticed. Assertions here
+/// exercise the happy path and, where the point is round-tripping, re-ingest
+/// what was written.
+///
+/// Reading an export back is the only assertion that distinguishes "wrote
+/// something" from "wrote the data": `--all-graphs` produced output for years
+/// while silently dropping a dead system-graph filter, and no test looked.
 #[test]
-fn export_jsonld_requires_index() {
+fn export_jsonld_on_never_indexed_ledger() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     fluree_cmd(&tmp)
@@ -1567,16 +1575,19 @@ fn export_jsonld_requires_index() {
         .assert()
         .success();
 
-    // JSON-LD now uses the streaming binary index path (same as other formats)
+    // A ledger that has been committed to but never indexed holds all of its
+    // rows in the novelty overlay. Export reads through that overlay, so it
+    // needs no index build (#1574).
     fluree_cmd(&tmp)
         .args(["export", "--format", "jsonld"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("no binary index available"));
+        .success()
+        .stdout(predicate::str::contains("http://example.org/thing"))
+        .stdout(predicate::str::contains("gadget"));
 }
 
 #[test]
-fn export_ntriples_requires_index() {
+fn export_ntriples_on_never_indexed_ledger() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     fluree_cmd(&tmp)
@@ -1593,13 +1604,134 @@ fn export_ntriples_requires_index() {
         .assert()
         .success();
 
-    // N-Triples streaming export requires a binary index; un-indexed ledgers
-    // get a clear error.
     fluree_cmd(&tmp)
         .args(["export", "--format", "ntriples"])
         .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<http://example.org/item> <http://example.org/name> \"widget\" .",
+        ));
+}
+
+/// The claim #1574's fix rests on: reading through the novelty overlay is not
+/// an approximation of reading the index, it produces the same triples.
+///
+/// Asserted on the N-Triples line multiset rather than on bytes. Export emits
+/// overlay rows it cannot encode into the binary index's value space — a
+/// language-tagged literal whose tag is not in the persisted dictionary, a
+/// decimal — through a raw-flake tail after the main scan, so subject grouping
+/// and line order differ across an index build. That tail predates this change
+/// and fires on indexed ledgers too (any commit after the last index build);
+/// what must not differ is the data.
+#[test]
+fn export_never_indexed_matches_indexed() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "parity"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "parity",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice a ex:Person ; ex:name \"Alice\" ; ex:age 30 ; ex:knows ex:bob .\n\
+             ex:bob a ex:Person ; ex:label \"Bob\"@en ; ex:score 1.5 .",
+        ])
+        .assert()
+        .success();
+
+    let before = fluree_cmd(&tmp)
+        .args(["export", "parity", "--format", "ntriples"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    fluree_cmd(&tmp)
+        .args(["index", "parity"])
+        .assert()
+        .success();
+
+    let after = fluree_cmd(&tmp)
+        .args(["export", "parity", "--format", "ntriples"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let mut before: Vec<&str> = std::str::from_utf8(&before).unwrap().lines().collect();
+    let mut after: Vec<&str> = std::str::from_utf8(&after).unwrap().lines().collect();
+    before.sort_unstable();
+    after.sort_unstable();
+    assert_eq!(
+        before, after,
+        "never-indexed export must carry the same triples as the same ledger after `fluree index`"
+    );
+    assert_eq!(
+        before.len(),
+        7,
+        "fixture should produce exactly 7 triples; a count change means the \
+         comparison above is no longer covering what it was written for: {before:?}"
+    );
+}
+
+/// The command from #1574's report. `--format` defaults to `turtle`, so this
+/// wrote Turtle into a file named `.flpack` and said nothing.
+#[test]
+fn export_flpack_extension_infers_ledger_format() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "arch"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "arch",
+            "-e",
+            "<http://example.org/a> <http://example.org/p> \"v\" .\n",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "arch", "-o", "arch.flpack"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Archived"));
+
+    // The archive magic, not `@prefix`/`<http` — this is what failed before.
+    let bytes = std::fs::read(tmp.path().join("arch.flpack")).unwrap();
+    assert_eq!(
+        &bytes[..4],
+        b"FPK1",
+        "expected a fluree-pack-v1 archive, got: {:?}",
+        String::from_utf8_lossy(&bytes[..bytes.len().min(40)])
+    );
+}
+
+/// The inference only fills an absent `--format`; an explicit one that
+/// contradicts the extension is a refusal, not a guess.
+#[test]
+fn export_flpack_extension_conflicting_format_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "arch2"])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "arch2", "--format", "turtle", "-o", "x.flpack"])
+        .assert()
         .failure()
-        .stderr(predicate::str::contains("no binary index available"));
+        .stderr(predicate::str::contains(".flpack extension"))
+        .stderr(predicate::str::contains("--format ledger"));
+    assert!(!tmp.path().join("x.flpack").exists());
 }
 
 #[test]
@@ -1627,7 +1759,7 @@ fn export_all_graphs_requires_dataset_format() {
 }
 
 #[test]
-fn export_all_graphs_nquads_requires_index() {
+fn export_all_graphs_nquads_on_never_indexed_ledger() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     fluree_cmd(&tmp)
@@ -1646,13 +1778,13 @@ fn export_all_graphs_nquads_requires_index() {
         .assert()
         .success();
 
-    // N-Quads streaming export requires a binary index; un-indexed ledgers
-    // get a clear error.
     fluree_cmd(&tmp)
         .args(["export", "expdb4", "--all-graphs", "--format", "nquads"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("no binary index available"));
+        .success()
+        .stdout(predicate::str::contains(
+            "<http://example.org/a> <http://example.org/p> \"default\" .",
+        ));
 }
 
 // ============================================================================

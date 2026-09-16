@@ -10,15 +10,45 @@ use fluree_db_api::server_defaults::FlureeDir;
 use std::io::{self, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+/// Format used when `--format` is absent and the output name implies nothing.
+const DEFAULT_RDF_FORMAT: &str = "turtle";
+
 /// Whether the user requested the full ledger archive format.
 fn is_ledger_format(s: &str) -> bool {
     matches!(s.to_ascii_lowercase().as_str(), "ledger" | "flpack")
 }
 
+/// Reconcile `--format` with the `-o` file extension.
+///
+/// `fluree export mydb -o mydb.flpack` ran the *Turtle* writer into a file
+/// named `.flpack`: `--format` defaults to `turtle` and nothing consulted the
+/// output name. `.flpack` is this CLI's own archive extension — the one
+/// `fluree create --from` reads — so it is an unambiguous request for the
+/// archive format. Infer it when `--format` is absent; refuse, naming both
+/// sides, when `--format` is present and contradicts it. Guessing over an
+/// explicit flag would be the same silent-mismatch failure in the other
+/// direction.
+fn resolve_format(explicit: Option<&str>, output: Option<&Path>) -> CliResult<String> {
+    let flpack_output = output
+        .and_then(Path::extension)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("flpack"));
+    match (explicit, flpack_output) {
+        (None, true) => Ok("ledger".to_string()),
+        (None, false) => Ok(DEFAULT_RDF_FORMAT.to_string()),
+        (Some(f), true) if !is_ledger_format(f) => Err(CliError::Usage(format!(
+            "--format {f} writes RDF text, but '{}' has the .flpack extension of a binary \
+             ledger archive; pass --format ledger to write an archive, or name the output \
+             file for the format you asked for",
+            output.unwrap_or(Path::new("")).display()
+        ))),
+        (Some(f), _) => Ok(f.to_string()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     explicit_ledger: Option<&str>,
-    format_str: &str,
+    format_str: Option<&str>,
     output: Option<&Path>,
     no_indexes: bool,
     all_graphs: bool,
@@ -43,6 +73,9 @@ pub async fn run(
             "cannot use both --all-graphs and --graph; choose one".to_string(),
         ));
     }
+
+    let format_str = resolve_format(format_str, output)?;
+    let format_str = format_str.as_str();
 
     if is_ledger_format(format_str) {
         return run_ledger_archive(

@@ -146,16 +146,30 @@ impl<'a> ExportBuilder<'a> {
 
         let ledger = self.fluree.ledger(&self.ledger_id).await?;
 
-        // All formats require binary index
-        let binary_store: Arc<BinaryIndexStore> = ledger
+        // The writers scan through a `BinaryCursor`, so they need a store even
+        // when the ledger has never been indexed. On such a ledger every
+        // committed row is in the novelty overlay attached below, and the
+        // cursor's overlay-only tail emits all of it once its (empty) leaf
+        // range is exhausted — so an empty store, seeded with the snapshot's
+        // namespace table so ID→IRI resolution can complete, exports the same
+        // bytes an indexed ledger does. Building an index here instead would
+        // triple the ledger's on-disk footprint as a side effect of a
+        // read-shaped command.
+        let binary_store: Arc<BinaryIndexStore> = match ledger
             .binary_store
             .as_ref()
             .and_then(|te| te.0.clone().downcast::<BinaryIndexStore>().ok())
-            .ok_or_else(|| {
-                ApiError::Config(
-                    "no binary index available for export (is the ledger indexed?)".to_string(),
-                )
-            })?;
+        {
+            Some(store) => store,
+            None => {
+                let mut store = BinaryIndexStore::empty(self.fluree.binary_store_cache_dir());
+                store
+                    .augment_namespace_codes(&ledger.snapshot.shared_namespaces())
+                    .map_err(io_err)?;
+                store.set_ns_split_mode(ledger.snapshot.ns_split_mode());
+                Arc::new(store)
+            }
+        };
 
         // Resolve the target graph if a specific graph was requested
         let target_graph = if self.graph_iri.is_some() {

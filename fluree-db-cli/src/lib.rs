@@ -552,7 +552,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
             commands::export::run(
                 ledger.as_deref(),
-                &format,
+                format.as_deref(),
                 output.as_deref(),
                 no_indexes,
                 all_graphs,

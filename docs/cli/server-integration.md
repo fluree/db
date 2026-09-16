@@ -2094,18 +2094,18 @@ stream chunked bodies; clients MUST be prepared to read until EOF.
 4. **Graph IRI resolution.** When `graph` is set, resolve via the ledger's
    graph registry; an unknown IRI is a `400` (or `5xx` if you treat it as
    a config error — the reference returns `400` via `ApiError::Config`).
-5. **Index requirement.** Export reads from the binary index. If the
-   ledger has no index, the reference server surfaces `ApiError::Config`
-   ("no binary index available for export (is the ledger indexed?)"),
-   which the error mapper returns as `400 Bad Request`. Document that
-   shape if you implement equivalently — the CLI surfaces the message
-   verbatim.
+5. **Index requirement.** None. Export reads the binary index where one
+   exists and the novelty overlay for everything committed since, so a
+   never-indexed ledger exports the same triples. Earlier reference
+   servers returned `ApiError::Config` ("no binary index available for
+   export (is the ledger indexed?)") as `400 Bad Request` in that case;
+   that response no longer occurs and a client must not depend on it.
 
 ### Error responses
 
 | Status | When |
 |--------|------|
-| `400` | Unknown format; conflicting `all_graphs` + `graph`; `all_graphs` with non-dataset format; unknown graph IRI; malformed JSON; ledger not indexed. |
+| `400` | Unknown format; conflicting `all_graphs` + `graph`; `all_graphs` with non-dataset format; unknown graph IRI; malformed JSON. |
 | `401` / `403` | Admin token required and absent/invalid. |
 | `404` | Ledger does not exist. |
 | `5xx` | Storage / nameservice / encoding errors during walk. |

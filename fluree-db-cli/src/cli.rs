@@ -1030,10 +1030,11 @@ pub enum Commands {
         /// or ledger (`.flpack` archive — full ledger including commits and
         /// indexes, importable via `fluree create --from <file>.flpack`).
         ///
-        /// Note: exporting all graphs requires a dataset-capable format
+        /// Defaults to `turtle`, or to `ledger` when `-o` names a `.flpack`
+        /// file. Exporting all graphs requires a dataset-capable format
         /// (`trig` or `nquads`).
-        #[arg(long, default_value = "turtle")]
-        format: String,
+        #[arg(long)]
+        format: Option<String>,
 
         /// Write output to FILE instead of stdout. Required for --format ledger
         /// when stdout is a TTY (the archive is binary).

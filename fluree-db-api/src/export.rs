@@ -3,6 +3,7 @@
 //! Writes N-Triples, Turtle, N-Quads, or TriG directly to a `Write` sink,
 //! one leaflet-batch at a time.  Memory usage is O(leaflet_size), not O(dataset).
 
+use fluree_db_binary_index::format::branch::BranchManifest;
 use fluree_db_binary_index::read::types::sort_overlay_ops;
 use fluree_db_binary_index::{
     BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnBatch, ColumnProjection, RunSortOrder,
@@ -66,6 +67,22 @@ pub const SYSTEM_GRAPH_CONFIG: GraphId = 2;
 /// Returns `true` if `g_id` is a system-internal graph.
 pub fn is_system_graph(g_id: GraphId) -> bool {
     g_id == SYSTEM_GRAPH_TXN_META || g_id == SYSTEM_GRAPH_CONFIG
+}
+
+/// The SPOT branch to scan for `g_id`, or an empty one.
+///
+/// A graph with no branch is not a graph with no rows: an un-indexed ledger has
+/// no branch for *any* graph while holding its whole contents in the novelty
+/// overlay, and an indexed ledger has no branch for a graph first written after
+/// the last index build. Returning an empty [`BranchManifest`] rather than
+/// bailing lets [`BinaryCursor`] exhaust its (zero-length) leaf range and fall
+/// through to its overlay-only tail, which emits exactly those rows. Bailing
+/// instead is what made `fluree export` fail on a never-indexed ledger.
+fn spot_branch(store: &Arc<BinaryIndexStore>, g_id: GraphId) -> Arc<BranchManifest> {
+    match store.branch_for_order(g_id, RunSortOrder::Spot) {
+        Some(b) => Arc::clone(b),
+        None => Arc::new(BranchManifest { leaves: Vec::new() }),
+    }
 }
 
 /// Configure a `BinaryCursor` with time-travel bounds and novelty overlay.
@@ -363,11 +380,7 @@ pub fn export_graph_turtle<W: Write>(
     prefixes: &PrefixMap,
     writer: &mut W,
 ) -> io::Result<ExportStats> {
-    let branch_ref = match store.branch_for_order(config.g_id, RunSortOrder::Spot) {
-        Some(b) => b,
-        None => return Ok(ExportStats::default()),
-    };
-    let branch = Arc::clone(branch_ref);
+    let branch = spot_branch(store, config.g_id);
 
     let filter = BinaryFilter::default();
     // Full identity projection (incl. OI): when a novelty overlay is attached,
@@ -558,11 +571,7 @@ pub fn export_graph_jsonld<W: Write>(
     prefixes: &PrefixMap,
     writer: &mut W,
 ) -> io::Result<ExportStats> {
-    let branch_ref = match store.branch_for_order(config.g_id, RunSortOrder::Spot) {
-        Some(b) => b,
-        None => return Ok(ExportStats::default()),
-    };
-    let branch = Arc::clone(branch_ref);
+    let branch = spot_branch(store, config.g_id);
 
     let filter = BinaryFilter::default();
     // Full identity projection (incl. OI): when a novelty overlay is attached,
@@ -1068,11 +1077,7 @@ pub fn export_graph_ntriples<W: Write>(
     config: &ExportConfig<'_>,
     writer: &mut W,
 ) -> io::Result<ExportStats> {
-    let branch_ref = match store.branch_for_order(config.g_id, RunSortOrder::Spot) {
-        Some(b) => b,
-        None => return Ok(ExportStats::default()), // no data for this graph
-    };
-    let branch = Arc::clone(branch_ref);
+    let branch = spot_branch(store, config.g_id);
 
     let filter = BinaryFilter::default();
     // Full identity projection (incl. OI): when a novelty overlay is attached,
