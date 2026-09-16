@@ -174,6 +174,12 @@ struct Totals {
     off_model_dropped: usize,
     extraction_cache_hits: usize,
     chunks_failed: usize,
+    /// Keys the model returned that the extraction schema does not carry,
+    /// named so a `--system-prompt` that asks for one is a fix rather than
+    /// a mystery.
+    unknown_keys: std::collections::BTreeSet<String>,
+    /// Entities and relations the parser could not read and dropped whole.
+    dropped_items: usize,
 }
 
 const DEFAULT_CONCURRENCY: usize = 4;
@@ -764,6 +770,8 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                 totals.off_model_dropped += s.off_model_dropped;
                 totals.extraction_cache_hits += x.cache_hits;
                 totals.chunks_failed += x.chunks_failed;
+                totals.dropped_items += s.dropped_items;
+                totals.unknown_keys.extend(s.unknown_keys.iter().cloned());
                 note
             }
             None => String::new(),
@@ -844,6 +852,31 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                 String::new()
             }
         );
+        // Once per run, not once per chunk: a 10k-chunk corpus returning
+        // the same extra key every time would otherwise print 10k lines.
+        if !totals.unknown_keys.is_empty() {
+            let shown: Vec<String> = totals
+                .unknown_keys
+                .iter()
+                .take(3)
+                .map(|k| format!("\"{k}\""))
+                .collect();
+            let rest = totals.unknown_keys.len().saturating_sub(shown.len());
+            println!(
+                "    {} {} key(s) the extraction schema does not carry were ignored: {}{} — nothing was stored for them",
+                "!".yellow(),
+                totals.unknown_keys.len(),
+                shown.join(", "),
+                if rest > 0 { format!(" and {rest} more") } else { String::new() }
+            );
+        }
+        if totals.dropped_items > 0 {
+            println!(
+                "    {} {} item(s) the extraction schema could not read were dropped whole",
+                "!".yellow(),
+                totals.dropped_items
+            );
+        }
     }
     if totals.unescalated > 0 {
         eprintln!(

@@ -442,6 +442,7 @@ Closing paragraph.
                 context: Some("Jane Doe joined Acme".into()),
             }],
             from_cache: false,
+            ..Default::default()
         };
         let inputs: Vec<ChunkInput<'_>> = chunks
             .iter()

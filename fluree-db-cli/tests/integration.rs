@@ -4281,6 +4281,77 @@ fn doc_ingest_reingest_keeps_triples_the_pipeline_did_not_write() {
         .stderr(predicate::str::contains("(1 rows"));
 }
 
+/// What `parse_extraction` tolerates, it now reports — once per run.
+///
+/// The model returns the two keys a custom `--system-prompt` would have
+/// asked for and one relation whose `objectIsLiteral` is a string. Before
+/// this, the keys vanished into serde's default, the malformed relation was
+/// dropped whole, and the run printed `0 dropped` and exited 0.
+#[test]
+fn doc_ingest_reports_the_keys_and_items_the_schema_drops() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    // Two chunks, so "once per run, not once per chunk" is testable at all.
+    let filler = "Jane Doe reviewed the quarterly plan with the Acme team. "
+        .repeat(40)
+        .to_string();
+    std::fs::write(
+        tmp.path().join("docs").join("memo.md"),
+        format!(
+            "# Staffing memo\n\nJane Doe joined Acme as Chief Technology Officer in March.\n\n\
+             {filler}\n\n## Second section\n\n{filler}\n"
+        ),
+    )
+    .unwrap();
+    let (url, calls) = stub_llm(serde_json::json!({
+        "entities": [
+            { "name": "Jane Doe", "type": "schema:Person",
+              "context": "Jane Doe joined Acme as Chief Technology Officer" }
+        ],
+        "relations": [
+            // Keeps its extra keys; the relation still lands.
+            { "subjectName": "Jane Doe", "predicate": "schema:worksFor", "objectName": "Acme",
+              "objectIsLiteral": false,
+              "context": "Jane Doe joined Acme as Chief Technology Officer in March.",
+              "confidence": 0.99, "modality": "asserted" },
+            // One type coercion; the whole relation is unreadable.
+            { "subjectName": "Jane Doe", "predicate": "schema:worksFor", "objectName": "Acme",
+              "objectIsLiteral": "true", "context": "Jane Doe joined Acme" }
+        ]
+    }));
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains(
+                "2 key(s) the extraction schema does not carry were ignored: \
+                 \"confidence\", \"modality\"",
+            )
+            .count(1),
+        )
+        .stdout(
+            predicate::str::contains("item(s) the extraction schema could not read were dropped")
+                .count(1),
+        );
+    // Two chunks were really asked about, so a once-per-chunk message would
+    // have printed twice and the count(1) above would have caught it.
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
 // --- end: `fluree doc ingest` re-ingest ownership (PR-C / #1864) ------------
 
 /// A stub OpenAI-compatible `/embeddings` endpoint. Each input string becomes

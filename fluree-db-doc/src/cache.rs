@@ -226,6 +226,7 @@ mod tests {
             }],
             relations: vec![],
             from_cache: false,
+            ..Default::default()
         };
         cache.store_extraction(&key, &x).unwrap();
         let hit = cache.load_extraction(&key).unwrap();
