@@ -260,6 +260,56 @@ async fn property_rule_sparql_twin() {
     drop(guard);
 }
 
+/// OPTIONAL's batched probe asks the same per-predicate planner, so it is a
+/// third surface the relaxation reaches. A covered optional predicate declines
+/// to the filtered path and leaves the left-join slot unbound.
+#[tokio::test(flavor = "current_thread")]
+async fn property_rule_gates_optional_probe() {
+    let fluree = indexed_people().await;
+    let view = policed_view(&fluree, deny_ssn(), true).await;
+    let (store, guard) = init_test_tracing();
+
+    let ages = run(
+        &fluree,
+        &view,
+        &store,
+        QueryInput::Sparql(
+            "SELECT ?n ?a WHERE { ?s <http://example.org/ns/name> ?n . OPTIONAL { ?s <http://example.org/ns/age> ?a } }",
+        ),
+        PROBE_SITE,
+        Lane::MustFire,
+        "optional probe ex:age",
+    )
+    .await;
+    assert_eq!(row_count(&ages), 3, "{ages}");
+    let ages = ages.to_string();
+    assert!(
+        ages.contains("30") && ages.contains("25") && ages.contains("41"),
+        "optional ages must bind: {ages}"
+    );
+
+    let ssn = run(
+        &fluree,
+        &view,
+        &store,
+        QueryInput::Sparql(
+            "SELECT ?n ?v WHERE { ?s <http://example.org/ns/name> ?n . OPTIONAL { ?s <http://example.org/ns/ssn> ?v } }",
+        ),
+        PROBE_SITE,
+        Lane::MustNotFire,
+        "optional probe ex:ssn",
+    )
+    .await;
+    assert_eq!(row_count(&ssn), 3, "{ssn}");
+    let ssn = ssn.to_string();
+    assert!(
+        !ssn.contains("111") && !ssn.contains("222") && !ssn.contains("333"),
+        "a denied optional predicate must stay unbound: {ssn}"
+    );
+
+    drop(guard);
+}
+
 /// A class rule restricts subjects, not predicates. The view set expands it
 /// into every property the class carries, so a scan of `ex:name` is covered:
 /// the lane must decline and the filtered path must hide the admin.

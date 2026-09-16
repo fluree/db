@@ -2757,10 +2757,12 @@ pub fn star_probe_lane_plan(
     // See subject_probe_lane_plan: policy declines before the overlay-free
     // return (raw leaflet reads bypass per-leaf policy filtering in `Clean`
     // mode too); eager callers keep the per-row path under an overlay. Every
-    // probed predicate must clear on its own.
-    if !pred_sids
-        .iter()
-        .all(|pred_sid| probe_lane_policy_clears(ctx, pred_sid))
+    // probed predicate must clear on its own, and an empty list declines
+    // rather than clearing vacuously.
+    if pred_sids.is_empty()
+        || !pred_sids
+            .iter()
+            .all(|pred_sid| probe_lane_policy_clears(ctx, pred_sid))
     {
         return Ok(ProbeLanePlan::Decline);
     }
