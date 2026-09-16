@@ -938,6 +938,14 @@ impl PolicyContext {
         }
     }
 
+    /// Whether this context already resolved classes for `subject` in `g_id`.
+    pub fn has_cached_subject_classes(&self, g_id: GraphId, subject: &Sid) -> bool {
+        self.class_cache
+            .read()
+            .map(|c| c.contains_key(&(g_id, subject.clone())))
+            .unwrap_or(false)
+    }
+
     /// Get cached subject classes for a subject in a specific graph.
     pub fn get_cached_subject_classes(&self, g_id: GraphId, subject: &Sid) -> Option<Vec<Sid>> {
         self.class_cache
@@ -1385,6 +1393,24 @@ mod tests {
         ctx.cache_subject_classes(3, subject.clone(), vec![make_sid(100, "Employee")]);
 
         assert_eq!(ctx.get_cached_subject_classes(7, &subject), None);
+    }
+
+    #[test]
+    fn has_cached_subject_classes_is_keyed_on_graph_and_subject() {
+        // `populate_class_cache` uses this to skip subjects it already resolved.
+        // It must answer per (graph, subject): a hit in one graph is not a hit
+        // in another, and a different subject in the same graph is a miss.
+        let ctx = PolicyContext::new(PolicyWrapper::root(), None);
+        let alice = make_sid(100, "alice");
+        let bob = make_sid(100, "bob");
+
+        assert!(!ctx.has_cached_subject_classes(3, &alice));
+
+        ctx.cache_subject_classes(3, alice.clone(), vec![make_sid(100, "Employee")]);
+
+        assert!(ctx.has_cached_subject_classes(3, &alice));
+        assert!(!ctx.has_cached_subject_classes(4, &alice));
+        assert!(!ctx.has_cached_subject_classes(3, &bob));
     }
 
     #[test]
