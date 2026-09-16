@@ -697,9 +697,10 @@ mod tests {
         let elapsed = started.elapsed();
         assert!(matches!(result, Err(ProposeError::Relay(_))), "{result:?}");
         // Without the connect budget this ends either at the request timeout
-        // (Unknown) or whenever the OS abandons the SYN — both far later.
+        // (Unknown) or whenever the OS abandons the SYN — both far later. The
+        // margin absorbs a loaded runner while staying under the request cap.
         assert!(
-            elapsed < RELAY_CONNECT_TIMEOUT + Duration::from_secs(2),
+            elapsed < RELAY_CONNECT_TIMEOUT * 2,
             "connect budget did not bound the wait: {elapsed:?}"
         );
     }

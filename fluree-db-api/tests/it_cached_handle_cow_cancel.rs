@@ -37,7 +37,9 @@ fn person(id: &str) -> serde_json::Value {
 /// point where the cache slot is emptied without an intervening await, so the
 /// first moment another task can run is after the slot is already empty.
 async fn await_commit_in_flight(handle: &LedgerHandle) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Bounds "the commit never locked", not "the runner is busy" — nextest
+    // hard-kills a genuine hang at 360s, so patience here costs nothing.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !handle.is_locked() {
         assert!(
             Instant::now() < deadline,
@@ -48,7 +50,7 @@ async fn await_commit_in_flight(handle: &LedgerHandle) {
 }
 
 async fn wait_for_t(handle: &LedgerHandle, want: i64) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let t = handle.t().await;
         if t == want {
