@@ -306,6 +306,16 @@ fn expand_edge_annotation_patterns_inside_graph(patterns: &[Pattern]) -> Vec<Pat
 ///
 /// A filter failing either test stays exactly where it was, and a list with no
 /// wrapper in it returns after one scan, so no unannotated query pays for this.
+///
+/// # Not reachable inside SERVICE
+///
+/// `Pattern::Service` carries both a rewritten `sp.patterns` and a verbatim
+/// `source_body` text slice, and `map_subpatterns` rewrites only the former —
+/// so a sink inside a SERVICE body would desync the two representations. It is
+/// unreachable today because a SERVICE body is shipped as text to the remote
+/// endpoint rather than planned locally, and an RDF 1.2 annotation inside one
+/// is not a supported shape. Noted rather than guarded: if SERVICE bodies ever
+/// gain local planning, this pass needs a `Pattern::Service` exclusion.
 fn sink_filters_into_annotation_chains(patterns: &mut Vec<Pattern>) {
     if !patterns
         .iter()
@@ -692,6 +702,16 @@ pub fn collect_var_stats(
                         vars.insert(v);
                     }
                 }
+                // Load-bearing for edge-annotation elision, not bookkeeping.
+                // `elide_redundant_chain` (`default_graph_source.rs`) drops a
+                // `f:reifies*` lookup whose variable nothing reads, and since
+                // `sink_filters_into_annotation_chains` moves a FILTER *into*
+                // the chain body, this arm is the only thing that reports the
+                // variables that filter reads. Remove it and a query like
+                // `COUNT(*) { ?s :knows ?o {| :conf ?c |} FILTER(?c > 0.5 && ?o != :x) }`
+                // elides `f:reifiesObject`, leaves `?o` unbound inside the
+                // chain and silently returns zero rows. Pinned by
+                // `it_annotation_filter_pushdown.rs`.
                 Pattern::Filter(expr) => {
                     for v in expr.referenced_vars() {
                         bump_count(counts, v);

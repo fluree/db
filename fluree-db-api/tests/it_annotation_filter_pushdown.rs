@@ -51,6 +51,11 @@ const EDGES: usize = 3_000;
 const THRESHOLD: f64 = 0.25;
 const KEPT: usize = 499;
 
+/// `?c > 0.25 && ?o != ex:p2600` — edge `i` has object `ex:p{i+1}`, so this
+/// excludes exactly `i == 2599`, whose confidence 0.2599 is above the
+/// threshold. 499 - 1. Hand-computed.
+const KEPT_EXCLUDING_ONE_OBJECT: usize = 498;
+
 fn ctx() -> JsonValue {
     json!({ "ex": "http://example.org/" })
 }
@@ -85,6 +90,22 @@ fn annotated_count_sparql(filter: Option<f64>) -> String {
         "PREFIX ex: <http://example.org/>
          SELECT (COUNT(*) AS ?n) WHERE {{
            ?s ex:knows ?o {{| ex:confidence ?c |}} {f}
+         }}"
+    )
+}
+
+/// The same COUNT, with the base **object** variable also in the filter. This
+/// is the shape that couples the sink to `elide_redundant_chain`: `?o` is not
+/// projected and not read outside the wrapper, so elision is free to drop the
+/// `f:reifiesObject` lookup — and `?o` survives only because `collect_var_stats`
+/// walks `Pattern::Filter` and puts it back in the referenced set. If that walk
+/// ever goes away, `?o` unbinds inside the chain and every row drops silently.
+fn annotated_count_with_object_var_sparql() -> String {
+    format!(
+        "PREFIX ex: <http://example.org/>
+         SELECT (COUNT(*) AS ?n) WHERE {{
+           ?s ex:knows ?o {{| ex:confidence ?c |}}
+           FILTER(?c > {THRESHOLD} && ?o != ex:p2600)
          }}"
     )
 }
@@ -235,6 +256,42 @@ async fn annotation_body_threshold_reduces_scan_work_on_both_surfaces() {
                  {pinned_kept_fuel} (these were EQUAL before the rewrite)"
             );
 
+            // ---- the cross-module invariant the sink creates ------------
+            // A filter naming the base OBJECT variable passes the sink gate,
+            // because `?o` is produced by the base triple inside the wrapper.
+            // It then lands in a chain whose `f:reifiesObject` lookup is an
+            // elision candidate: with a pure COUNT, `?o` is in neither the
+            // projection nor `needed_outside`, so `elide_redundant_chain`
+            // (`default_graph_source.rs`) may drop that lookup. `?o` stays
+            // bound only because `collect_var_stats` (`where_plan.rs`) walks
+            // `Pattern::Filter` into the referenced set.
+            //
+            // That traversal predates this rewrite and nothing else connects
+            // the two modules, so delete it and every row here drops silently
+            // with no other test going red. This pins it, on every lane.
+            for lane in ["arena", "enumerate", "chain"] {
+                let _pin = LanePin::lane(lane);
+                let (n, _) = sparql_count_and_fuel(
+                    &fluree,
+                    &post,
+                    &annotated_count_with_object_var_sparql(),
+                )
+                .await;
+                assert_eq!(
+                    n as usize, KEPT_EXCLUDING_ONE_OBJECT,
+                    "lane={lane}: the base object variable must stay bound inside \
+                     the chain — 0 here means `f:reifiesObject` was elided while \
+                     the sunk filter still reads `?o`"
+                );
+                // The plain threshold on the same lane, so `enumerate` (which
+                // neither the default lane nor the chain pin exercises) has a
+                // filter-carrying correctness assertion too.
+                let (plain, _) =
+                    sparql_count_and_fuel(&fluree, &post, &annotated_count_sparql(Some(THRESHOLD)))
+                        .await;
+                assert_eq!(plain as usize, KEPT, "lane={lane}: thresholded count");
+            }
+
             // ---- twin surface: JSON-LD ---------------------------------
             let (jl_all, _) =
                 jsonld_rows_and_fuel(&fluree, &post, &annotated_rows_jsonld(None)).await;
@@ -270,13 +327,17 @@ struct LanePin {
 
 impl LanePin {
     fn chain() -> Self {
+        Self::lane("chain")
+    }
+
+    fn lane(name: &str) -> Self {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         let guard = LOCK
             .get_or_init(|| std::sync::Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::var("FLUREE_ANNOTATION_LANE").ok();
-        std::env::set_var("FLUREE_ANNOTATION_LANE", "chain");
+        std::env::set_var("FLUREE_ANNOTATION_LANE", name);
         Self {
             _guard: guard,
             prev,
