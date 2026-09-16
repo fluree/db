@@ -100,7 +100,7 @@ pub fn parse_ledger_id_with_time(ledger_id: &str) -> Result<ParsedLedgerId, Ledg
 /// `fluree_db_api::TimeSpec::parse_at`, which also accepts a bare integer and a
 /// bare ISO-8601 timestamp — can tell "the user reached for a canonical tag and
 /// got it wrong" apart from "the user typed one of the bare forms".
-pub const TIME_TRAVEL_TAGS: [&str; 4] = ["t:", "iso:", "recorded:", "commit:"];
+pub const TIME_TRAVEL_TAGS: [&str; 4] = ["t:", "iso:", "commit:", "recorded:"];
 
 /// Parse a time-travel spec: the part of a ledger address after `@`, or a bare
 /// spec such as a CLI `--at` argument.
