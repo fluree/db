@@ -525,6 +525,17 @@ impl TimeSpec {
     /// typed `--at` / `at=` arguments go through [`TimeSpec::parse_at`], which
     /// layers the CLI's older bare spellings on top without touching this one.
     pub fn parse(spec: &str) -> Result<Self, LedgerIdParseError> {
+        Self::parse_with_sigil(spec, "")
+    }
+
+    /// [`TimeSpec::parse`] for the suffix of a ledger address — identical
+    /// grammar, but errors quote the tag with the `@` the user actually typed
+    /// (`Missing value after '@t:'`, not `'t:'`).
+    pub fn parse_address_suffix(spec: &str) -> Result<Self, LedgerIdParseError> {
+        Self::parse_with_sigil(spec, "@")
+    }
+
+    fn parse_with_sigil(spec: &str, sigil: &str) -> Result<Self, LedgerIdParseError> {
         // `LedgerIdTimeSpec` has no `Latest`: resolving it needs the ledger's
         // current `t`, which the core parser has no access to. Taking it here
         // is what makes `@t:latest` work, and is the case `dataset.rs` used to
@@ -532,7 +543,7 @@ impl TimeSpec {
         if spec == "t:latest" {
             return Ok(TimeSpec::Latest);
         }
-        parse_time_travel_spec(spec, "").map(TimeSpec::from)
+        parse_time_travel_spec(spec, sigil).map(TimeSpec::from)
     }
 
     /// Parse an `--at` / `at=` argument: [`TimeSpec::parse`]'s grammar plus the
@@ -1119,7 +1130,7 @@ fn parse_ledger_id_time_travel(
                     "Ledger ID cannot be empty before '@'".to_string(),
                 ));
             }
-            let spec = TimeSpec::parse(spec)
+            let spec = TimeSpec::parse_address_suffix(spec)
                 .map_err(|e| DatasetParseError::InvalidGraphSource(e.to_string()))?;
             (base, Some(spec))
         }
@@ -1578,16 +1589,41 @@ mod time_spec_grammar_tests {
         }
     }
 
-    /// Error text quotes the tag as the caller's surface spells it — no `@` for
-    /// a bare spec. The address path passes `"@"` and keeps its own wording,
-    /// which `it_query_time_travel.rs` pins.
+    /// Error text quotes the tag as the calling surface spells it: a bare spec
+    /// reports `'t:'`, an address suffix reports `'@t:'`. Routing the address
+    /// path through the bare entry point silently rewrote three published
+    /// messages — caught by
+    /// `it_query_time_travel::time_travel_missing_value_errors`, and pinned
+    /// here at the unit level so the next such slip fails faster.
     #[test]
-    fn parse_error_text_omits_the_address_sigil() {
-        let err = TimeSpec::parse("t:").unwrap_err().to_string();
-        assert!(err.contains("'t:'"), "got: {err}");
+    fn error_text_quotes_the_tag_as_the_calling_surface_spells_it() {
+        for tag in ["t:", "iso:", "commit:", "recorded:"] {
+            assert_eq!(
+                TimeSpec::parse(tag).unwrap_err().to_string(),
+                format!("Missing value after '{tag}'")
+            );
+            assert_eq!(
+                TimeSpec::parse_address_suffix(tag).unwrap_err().to_string(),
+                format!("Missing value after '@{tag}'")
+            );
+        }
+
+        let bare = TimeSpec::parse("nope").unwrap_err().to_string();
         assert!(
-            !err.contains('@'),
-            "bare-spec error must not mention '@': {err}"
+            bare.contains("Expected t:, iso:, recorded:, or commit:"),
+            "got: {bare}"
+        );
+        assert!(
+            !bare.contains('@'),
+            "bare-spec error must not mention '@': {bare}"
+        );
+
+        let addressed = TimeSpec::parse_address_suffix("nope")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            addressed.contains("Expected @t:, @iso:, @recorded:, or @commit:"),
+            "got: {addressed}"
         );
     }
 
@@ -1685,6 +1721,11 @@ mod time_spec_grammar_tests {
                 from_address.unwrap(),
                 TimeSpec::parse(spec).unwrap(),
                 "address suffix @{spec} must mean the same as the bare spec {spec}"
+            );
+            assert_eq!(
+                TimeSpec::parse_address_suffix(spec).unwrap(),
+                TimeSpec::parse(spec).unwrap(),
+                "the two entry points differ only in error text"
             );
         }
     }
