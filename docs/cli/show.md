@@ -12,7 +12,7 @@ fluree show <COMMIT> [OPTIONS]
 
 | Argument | Description |
 |----------|-------------|
-| `<COMMIT>` | Commit identifier: `t:<N>` transaction number, hex-digest prefix (min 6 chars), or full CID |
+| `<COMMIT>` | Commit identifier: `t:<N>` or a bare transaction number, `commit:<prefix>` or a bare hex-digest prefix (min 6 chars), or a full CID — the same forms `branch create --at` accepts |
 
 ## Options
 
@@ -26,7 +26,7 @@ fluree show <COMMIT> [OPTIONS]
 Displays the full decoded contents of a single commit, similar to `git show`. Each flake (assertion or retraction) is rendered with IRIs compacted using the ledger's namespace prefix table.
 
 The commit identifier can be:
-- A **transaction number** prefixed with `t:` (e.g., `t:5`) as shown in `fluree log` output
+- A **transaction number**, bare (`5`) or prefixed with `t:` (e.g., `t:5`), as shown in `fluree log` output
 - An **abbreviated hex digest** (minimum 6 characters) as shown in the storage directory or obtained from the txn-meta graph
 - A **full CID string** (e.g., `bagaybqabciq...`)
 
