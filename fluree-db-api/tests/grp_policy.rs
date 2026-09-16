@@ -21,6 +21,8 @@ mod it_policy_indexed;
 mod it_policy_named_graphs;
 #[path = "it_policy_optional_hashjoin.rs"]
 mod it_policy_optional_hashjoin;
+#[path = "it_policy_predicate_fast_lanes.rs"]
+mod it_policy_predicate_fast_lanes;
 #[path = "it_policy_query_connection.rs"]
 mod it_policy_query_connection;
 #[path = "it_policy_sparql.rs"]

@@ -2028,12 +2028,42 @@ impl Operator for BinaryScanOperator {
         if self.store.is_none() {
             return self.open_range_fallback(ctx).await;
         }
-        // Policy enforcement requires async per-flake checks (including f:query)
-        // and class-cache population. The binary cursor path currently does not
-        // apply policy filtering, so force the range fallback when a non-root
-        // policy enforcer is present.
+        // The cursor path applies no policy filtering (that needs the async
+        // per-flake checks and class cache of the range fallback). Under a
+        // policy it may still run when the scanned predicate is statically
+        // known and the view set provably cannot touch it. A wildcard
+        // predicate would have to clear every predicate, so it falls back.
         if !ctx.allow_unfiltered() {
-            return self.open_range_fallback(ctx).await;
+            use crate::fast_path_common::{
+                policy_lane_for_predicate, PredicateFastPath, POLICY_PREDICATE_SCAN_SITE,
+            };
+            let (_, p_sid, _) =
+                Self::extract_bound_terms_snapshot(ctx.active_snapshot, &self.pattern);
+            let verdict = match p_sid.as_ref() {
+                Some(p) if !self.mode.is_history() => {
+                    policy_lane_for_predicate(ctx, p, POLICY_PREDICATE_SCAN_SITE)
+                }
+                _ => {
+                    crate::fast_path_outcome::stamp_fast_path(
+                        POLICY_PREDICATE_SCAN_SITE,
+                        crate::fast_path_outcome::FastPathOutcome::Fallback(
+                            crate::fast_path_outcome::FastPathFallback::GateDeclined,
+                        ),
+                    );
+                    PredicateFastPath::Decline
+                }
+            };
+            match verdict {
+                PredicateFastPath::Allow => {}
+                // Every flake of this predicate is hidden, so there is nothing
+                // to read: with neither cursor nor range iterator the first
+                // `next_batch` finalizes empty.
+                PredicateFastPath::Empty => {
+                    self.state = OperatorState::Open;
+                    return Ok(());
+                }
+                PredicateFastPath::Decline => return self.open_range_fallback(ctx).await,
+            }
         }
 
         let store = self.store.as_ref().ok_or_else(|| {

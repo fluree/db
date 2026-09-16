@@ -1006,9 +1006,14 @@ impl<'a> ExecutionContext<'a> {
     /// is the range-fallback scan ([`BinaryScanOperator::filter_flakes_by_policy`]);
     /// every fast path and raw-leaflet reader that does *not* route emitted
     /// flakes through that filter MUST gate on `allow_unfiltered()` and decline
-    /// (fall back to the filtered scan) when it returns false. Adding a new
-    /// data-emitting operator that reads the index directly without consulting
-    /// this — or applying its own filter — is a policy leak.
+    /// (fall back to the filtered scan) when it returns false. The one
+    /// sanctioned refinement is per-predicate: a reader of exactly one
+    /// statically known predicate may instead consult
+    /// [`fast_path_common::policy_lane_for_predicate`](crate::fast_path_common::policy_lane_for_predicate),
+    /// which keeps the lane only when the view set provably cannot touch that
+    /// predicate. Adding a new data-emitting operator that reads the index
+    /// directly without consulting one of these — or applying its own filter
+    /// — is a policy leak.
     #[inline]
     pub fn allow_unfiltered(&self) -> bool {
         !self.has_policy()

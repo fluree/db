@@ -105,6 +105,10 @@ What the engine does **not** do is trace a derived fact's *provenance*: a derive
 
 Query-time rule injection (the query's `rules` field) is **admin-only**: under a non-root view policy, caller-supplied datalog rules are stripped before execution, because a rule with a viewable head could launder hidden data the policy author never anticipated. Database-stored rules (`f:rule`) and OWL/RDFS reasoning are administrator-controlled and continue to apply. A policy selection that yields no rules under `default-allow: true` is root — nothing is hidden, so there is nothing to launder and query-supplied rules are not stripped.
 
+### Performance under a policy
+
+Enforcement runs per flake, so the engine's raw-row lanes — the binary index cursor and the batched leaflet probes — cannot be used for a predicate the policy might touch. They stay on for predicates the policy provably cannot touch: a scan or probe of one fixed predicate keeps its lane when no `f:onProperty` rule names it and the default allows, and returns empty without reading anything when the default denies. Any `f:onClass`, `f:onSubject`, or default-target rule can apply to every predicate, so a policy containing one puts every scan on the filtered path. A policy made entirely of property rules therefore costs only on the properties it names.
+
 ## Targeting patterns
 
 ### Property-level (`f:onProperty`)
