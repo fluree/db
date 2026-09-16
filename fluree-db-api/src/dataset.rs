@@ -588,9 +588,29 @@ impl TimeSpec {
             // Looks like ISO-8601 (e.g. "2024-01-15T10:30:00Z").
             return Ok(TimeSpec::AtTime(spec.to_string()));
         }
+        // Same length floor the `commit:` arm applies. Without it the two
+        // spellings of a too-short prefix disagree about *where* they fail:
+        // `commit:abc` is rejected here, while a bare `abc` was accepted and
+        // died at the resolver several layers down with the same complaint.
+        // Both are errors either way, so this only moves the bare one to the
+        // boundary — but "tagged and bare mean the same thing" should be true
+        // of the failures too, not just the successes.
+        if spec.len() < MIN_COMMIT_PREFIX_LEN {
+            return Err(LedgerIdParseError::new(format!(
+                "Commit prefix must be at least {MIN_COMMIT_PREFIX_LEN} characters, got {}. \
+                 {ACCEPTED_TIME_SPEC_SPELLINGS}",
+                spec.len()
+            )));
+        }
         Ok(TimeSpec::AtCommit(spec.to_string()))
     }
 }
+
+/// Shortest commit hex-digest prefix the resolver will scan for, mirrored here
+/// so both the tagged and the bare spelling are rejected at the same boundary.
+/// Must stay in step with the `commit:` arm of
+/// [`fluree_db_core::ledger_id::parse_time_travel_spec`].
+const MIN_COMMIT_PREFIX_LEN: usize = 6;
 
 /// The spellings [`TimeSpec::parse_at`] accepts, quoted back when a user reaches
 /// for a canonical tag and mis-spells it.
@@ -1686,6 +1706,35 @@ mod time_spec_grammar_tests {
             );
         }
         assert!(TimeSpec::parse_at("").is_err());
+    }
+
+    /// The tagged and bare spellings must agree about *failure* too, not just
+    /// success: a too-short prefix is rejected at the CLI boundary either way.
+    /// Before this, `commit:abc` was rejected here while a bare `abc` was
+    /// accepted and died at the resolver with the same complaint several
+    /// layers down.
+    #[test]
+    fn parse_at_rejects_a_short_prefix_in_both_spellings() {
+        for spec in ["abc", "a", "12ab", "abcde"] {
+            let bare = TimeSpec::parse_at(spec).unwrap_err().to_string();
+            let tagged = TimeSpec::parse_at(&format!("commit:{spec}"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                bare.contains("at least 6 characters"),
+                "bare {spec:?} must be rejected at the boundary, got: {bare}"
+            );
+            assert!(tagged.contains("at least 6 characters"), "got: {tagged}");
+        }
+        // Exactly at the floor, both spellings still succeed and agree.
+        assert_eq!(
+            TimeSpec::parse_at("abc123").unwrap(),
+            TimeSpec::AtCommit("abc123".to_string())
+        );
+        assert_eq!(
+            TimeSpec::parse_at("abc123").unwrap(),
+            TimeSpec::parse_at("commit:abc123").unwrap()
+        );
     }
 
     /// An all-digit string of 6+ characters is both a valid `t` and a valid hex
