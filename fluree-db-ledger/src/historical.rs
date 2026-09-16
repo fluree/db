@@ -34,7 +34,8 @@ use fluree_db_core::{
 use fluree_db_nameservice::NameServiceLookup;
 
 use fluree_db_novelty::{
-    generate_commit_flakes, stamp_graph_on_commit_flakes, trace_first_parent_commits_by_id, Novelty,
+    generate_commit_flakes, stamp_commit_flakes_dropping_forgeries,
+    trace_first_parent_commits_by_id, warn_if_forged_commit_flakes_dropped, Novelty,
 };
 use fluree_vocab::namespaces::{FLUREE_COMMIT, JSON_LD, RDF, XSD};
 use fluree_vocab::{rdf_names, xsd_names};
@@ -298,9 +299,12 @@ impl HistoricalLedgerView {
         let txn_meta_graph_sid = snapshot.encode_iri(&txn_meta_iri);
 
         // Stamp commit metadata flakes with txn-meta graph SID
+        // Same pass also drops blob flakes impersonating commit provenance —
+        // see the note in `LedgerState::load_novelty` and #1846.
         if let Some(ref g_sid) = txn_meta_graph_sid {
-            for (flakes, _, _) in &mut commit_batches {
-                stamp_graph_on_commit_flakes(flakes, g_sid);
+            for (flakes, _, t) in &mut commit_batches {
+                let dropped = stamp_commit_flakes_dropping_forgeries(flakes, g_sid);
+                warn_if_forged_commit_flakes_dropped(dropped, ledger_id, *t);
             }
         }
 
