@@ -37,19 +37,22 @@ pub async fn run(
     let entity_iri = config::expand_iri(dirs.data_dir(), entity);
     let predicate_iri = predicate.map(|p| config::expand_iri(dirs.data_dir(), p));
 
+    // Bare ledger ID (e.g. "mydb:main") for the auth-driving path segment, and
+    // the base the body's `from`/`to` hang their time suffix off. `alias` is
+    // whatever the user typed — `resolve_ledger` hands back `-l` verbatim, or
+    // the active ledger straight out of config — so it may already carry a
+    // branch. Normalizing here rather than pasting `:main` on is what makes
+    // `history` work on a branch at all (#1872).
+    let ledger_id = context::to_ledger_id(&alias);
+
     let query = build_history_query(
-        &alias,
+        &ledger_id,
         &entity_iri,
         from,
         to,
         predicate_iri.as_deref(),
         dirs.data_dir(),
     )?;
-
-    // Bare ledger ID (e.g. "mydb:main") for the auth-driving path segment.
-    // The body's `from` carries the time-travel suffix ("mydb:main@t:N");
-    // the server's auth check uses the path, the query engine uses the body.
-    let ledger_id = context::to_ledger_id(&alias);
 
     if let Some(remote_name) = remote_flag {
         let client = context::build_remote_client(remote_name, dirs).await?;
@@ -113,7 +116,7 @@ async fn run_remote(
 
 /// Build a JSON-LD history query for an entity.
 fn build_history_query(
-    alias: &str,
+    ledger_id: &str,
     entity_iri: &str,
     from: &str,
     to: &str,
@@ -121,8 +124,8 @@ fn build_history_query(
     data_dir: &Path,
 ) -> CliResult<serde_json::Value> {
     // Build time specs
-    let from_spec = format_time_spec(alias, from)?;
-    let to_spec = format_time_spec(alias, to)?;
+    let from_spec = format_time_spec(ledger_id, from)?;
+    let to_spec = format_time_spec(ledger_id, to)?;
 
     // Build context from stored prefixes
     let context = config::prefixes_to_context(data_dir);
@@ -173,10 +176,15 @@ fn build_history_query(
 /// t:2` was rejected while `query --at t:2` was rejected *differently*; going
 /// through the shared pair also makes the round trip
 /// `parse_time_spec(x) -> time_spec_to_suffix -> "@…"` total by construction.
-fn format_time_spec(alias: &str, spec: &str) -> CliResult<String> {
+///
+/// `ledger_id` must already be normalized. This used to take the raw alias and
+/// paste `:main` on, which turned `-l mydb:dev` into `mydb:dev:main` — a
+/// three-segment id the nameservice rejects, so `history` failed outright on
+/// every branch but `main` (#1872).
+fn format_time_spec(ledger_id: &str, spec: &str) -> CliResult<String> {
     let parsed = crate::commands::query::parse_time_spec_for("--from/--to", spec)?;
     let suffix = crate::commands::query::time_spec_to_suffix(&parsed);
-    Ok(format!("{alias}:main{suffix}"))
+    Ok(format!("{ledger_id}{suffix}"))
 }
 
 /// Format history results for display.

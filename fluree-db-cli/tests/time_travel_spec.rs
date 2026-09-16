@@ -303,6 +303,92 @@ fn branch_revert_accepts_tagged_and_bare_transaction_numbers() {
 }
 
 // ============================================================================
+// history on a non-main branch (#1872)
+// ============================================================================
+
+/// `history` used to paste `:main` onto whatever alias it was handed, so a
+/// branch-qualified ledger became `hdb:dev:main` — a three-segment id the
+/// nameservice rejects. The command failed outright on every branch but
+/// `main`, by both routes that can reach one, while `fluree query -l hdb:dev`
+/// worked fine on the same ledger.
+#[test]
+fn history_works_on_a_non_main_branch_by_either_route() {
+    let tmp = two_commit_ledger("ttbranch");
+    fluree_cmd(&tmp)
+        .args(["branch", "create", "dev", "--direct"])
+        .assert()
+        .success();
+    // A commit that exists only on `dev`, so reading `main` by mistake is
+    // visible as a missing row rather than passing silently.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "-l",
+            "ttbranch:dev",
+            "--direct",
+            "-e",
+            "@prefix ex: <http://example.org/> .\nex:b ex:val \"on-dev-only\" .",
+        ])
+        .assert()
+        .success();
+
+    // Route 1: explicit -l.
+    fluree_cmd(&tmp)
+        .args([
+            "history",
+            "http://example.org/b",
+            "--direct",
+            "-l",
+            "ttbranch:dev",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("on-dev-only"));
+
+    // Route 2: the active ledger. `fluree branch` has no checkout subcommand,
+    // so `fluree use <name>:<branch>` is the mechanism for selecting a branch.
+    fluree_cmd(&tmp)
+        .args(["use", "ttbranch:dev"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args(["history", "http://example.org/b", "--direct"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("on-dev-only"));
+}
+
+/// The default case must come out byte-identical — `to_ledger_id` appends
+/// `:main` when the alias names no branch, which is what the old hardcoded
+/// `:main` was doing for this path.
+#[test]
+fn history_on_the_default_branch_is_unchanged() {
+    let tmp = two_commit_ledger("ttmain");
+    for args in [
+        vec![
+            "history",
+            "http://example.org/b",
+            "--direct",
+            "-l",
+            "ttmain",
+        ],
+        vec![
+            "history",
+            "http://example.org/b",
+            "--direct",
+            "-l",
+            "ttmain:main",
+        ],
+    ] {
+        fluree_cmd(&tmp)
+            .args(&args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("second"));
+    }
+}
+
+// ============================================================================
 // Help text — the discoverability half of #1805
 // ============================================================================
 
