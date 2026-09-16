@@ -25,7 +25,9 @@ use counter::{Counter, CounterCommand};
 use fluree_raft_core::forward::{LeaderView, ProposeError};
 use fluree_raft_core::group::GroupId;
 use fluree_raft_core::node::NodeId;
-use fluree_raft_core::runtime::{run_periodic, spawn_leader_watcher, DEFAULT_LEADER_TASK_GRACE};
+use fluree_raft_core::runtime::{
+    run_periodic, spawn_leader_watcher, RaftGroupConfig, DEFAULT_LEADER_TASK_GRACE,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -485,4 +487,92 @@ async fn a_follower_propose_relays_to_the_leader_and_applies() {
         })
         .await;
     }
+}
+
+/// Two surviving voters must elect a leader after the third leads and dies.
+///
+/// openraft 0.9 draws one election timeout per process. Survivors whose draws
+/// round to the same election tick start every campaign together, each rejects
+/// the other's same-term vote request, and the split repeats term after term.
+/// The pinned openraft redraws per campaign, which breaks the tie. A 250 ms
+/// window against the 75 ms tick makes a shared tick likely: roughly one
+/// failover in eleven stalls without the redraw, so 48 failovers catch it.
+///
+/// Batches stay small on purpose. With too many clusters at once the runtime
+/// starves, vote responses miss the election window, and survivors stall at
+/// diverging terms — a different failure this test must not report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn surviving_voters_elect_after_leader_loss() {
+    const BATCHES: u64 = 6;
+    const CLUSTERS_PER_BATCH: u64 = 8;
+    for batch in 0..BATCHES {
+        let mut failovers = tokio::task::JoinSet::new();
+        for cluster in 0..CLUSTERS_PER_BATCH {
+            failovers.spawn(fail_over_leader(batch * CLUSTERS_PER_BATCH + cluster));
+        }
+        let mut stalled = Vec::new();
+        while let Some(outcome) = failovers.join_next().await {
+            if let Some(report) = outcome.expect("failover task") {
+                stalled.push(report);
+            }
+        }
+        assert!(
+            stalled.is_empty(),
+            "batch {batch}: {} of {CLUSTERS_PER_BATCH} failovers elected no leader: {stalled:#?}",
+            stalled.len(),
+        );
+    }
+}
+
+/// Form a three-voter group, stop its leader, and wait for a survivor to
+/// lead. Returns the survivors' state if none does within the bound.
+async fn fail_over_leader(cluster: u64) -> Option<String> {
+    fn short_timeouts(config: &mut RaftGroupConfig) {
+        config.transport.rpc_timeout = Duration::from_millis(100);
+        config.raft.election_timeout_min = 250;
+        config.raft.election_timeout_max = 500;
+    }
+
+    let group_id = GroupId::new("counter").expect("valid group id");
+    let nodes: Vec<CounterNode> = vec![
+        start_node(1, &group_id, short_timeouts).await,
+        start_node(2, &group_id, short_timeouts).await,
+        start_node(3, &group_id, short_timeouts).await,
+    ];
+    form_cluster(&nodes).await;
+    let old_leader = leader(&nodes).await.id;
+
+    let voters: BTreeSet<NodeId> = [1, 2, 3].into_iter().collect();
+    for node in &nodes {
+        eventually("every node to follow the leader as a voter", || async {
+            LeaderView::current_leader(&*node.group.raft).await == Some(old_leader)
+                && node.group.state.read().await.voters == voters
+        })
+        .await;
+    }
+
+    let old = nodes
+        .iter()
+        .find(|n| n.id == old_leader)
+        .expect("leader node");
+    old.group.raft.shutdown().await.expect("leader shuts down");
+
+    // Without a redraw a stall is permanent; with one, a repeated tie is rare
+    // after a few campaigns of this length.
+    let survivors: Vec<&CounterNode> = nodes.iter().filter(|n| n.id != old_leader).collect();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if survivors.iter().any(|n| n.group.is_leader()) {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let state: Vec<String> = survivors
+        .iter()
+        .map(|n| {
+            let m = n.group.raft.metrics().borrow().clone();
+            format!("node {} {:?} vote {}", n.id, m.state, m.vote)
+        })
+        .collect();
+    Some(format!("cluster {cluster}: {}", state.join(", ")))
 }
