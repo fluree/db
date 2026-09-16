@@ -16,7 +16,7 @@
 //! Turtle (prefixed names, `a`, numeric shorthands); such entries belong in
 //! the suite's skip register with that reason.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{bail, ensure, Context, Result};
 use fluree_graph_ir::{Graph, GraphCollectorSink, Term as IrTerm};
@@ -26,14 +26,18 @@ use crate::evaluator::TestEvaluator;
 use crate::files::read_file_to_string;
 use crate::manifest::Test;
 use crate::result_comparison::{are_results_isomorphic, format_results_diff};
-use crate::result_format::{
-    ir_term_to_rdf_term, parse_expected_graph, RdfTerm, SparqlResults, Triple,
-};
+use crate::result_format::{ir_term_to_rdf_term, RdfTerm, SparqlResults, Triple};
 use crate::vocab::rdft;
 
 const RDF_FIRST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#first";
 const RDF_REST: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest";
 const RDF_NIL: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#nil";
+
+/// Stand-in predicates that spell a reifier attachment as ordinary triples,
+/// so the isomorphism check sees which triple each reifier names.
+const REIFIES_SUBJECT: &str = "urn:fluree:testsuite:reifies-subject";
+const REIFIES_PREDICATE: &str = "urn:fluree:testsuite:reifies-predicate";
+const REIFIES_OBJECT: &str = "urn:fluree:testsuite:reifies-object";
 
 /// Register handlers for every `rdft:` test type the Turtle parser can serve.
 pub fn register_rdf_tests(evaluator: &mut TestEvaluator) {
@@ -100,10 +104,12 @@ fn evaluate_negative_syntax(test: &Test) -> Result<()> {
 /// `rdft:TestTurtleEval`: parse the action, parse the expected N-Triples,
 /// compare the two graphs up to blank-node isomorphism.
 ///
-/// Reifier attachments (`Graph::reifications`) are not part of the
-/// comparison: the expected `.nt` of every RDF 1.2 star test encodes them as
-/// `rdf:reifies <<( s p o )>>` triple terms, which the graph IR has no term
-/// for, so those documents fail at parse time and are registered as such.
+/// Both documents go through the same parser, reifier attachments included:
+/// the expected `.nt` spells each one `r rdf:reifies <<( s p o )>>`, which
+/// the parser reads as the same attachment an action's `<< s p o >>` or
+/// `{| |}` produces. The parser also asserts `s p o` on both sides (Fluree
+/// reifies asserted edges), so a pass means the action desugars to the
+/// expected attachments under that model, not that the base triple is absent.
 fn evaluate_eval(test: &Test) -> Result<()> {
     let url = action_url(test)?;
     let result_url = test
@@ -120,13 +126,15 @@ fn evaluate_eval(test: &Test) -> Result<()> {
                 test.id
             )
         })?;
-    let expected = parse_expected_graph(result_url).with_context(|| {
-        format!(
-            "Evaluation test failed — could not parse the expected graph.\n\
-             Test: {}\nFile: {result_url}",
-            test.id
-        )
-    })?;
+    let expected = parse_action(result_url)
+        .map(|sink| graph_to_rdf_triples(&sink.into_graph()))
+        .with_context(|| {
+            format!(
+                "Evaluation test failed — could not parse the expected graph.\n\
+                 Test: {}\nFile: {result_url}",
+                test.id
+            )
+        })?;
 
     let expected = SparqlResults::Graph(expected);
     let actual = SparqlResults::Graph(actual);
@@ -142,7 +150,8 @@ fn evaluate_eval(test: &Test) -> Result<()> {
 
 /// Convert a parsed graph to harness triples, re-expanding Fluree's
 /// `list_index` collection encoding into the `rdf:first` / `rdf:rest` chains
-/// the expected N-Triples spell out.
+/// the expected N-Triples spell out, and each reifier attachment into
+/// `REIFIES_*` triples.
 ///
 /// The Turtle parser emits `( a b )` in object position as one triple per
 /// element carrying `list_index` (the transaction layer stores lists that
@@ -163,6 +172,19 @@ fn graph_to_rdf_triples(graph: &Graph) -> Vec<Triple> {
                 predicate: ir_term_to_rdf_term(&t.p),
                 object: ir_term_to_rdf_term(&t.o),
             }),
+        }
+    }
+    for r in graph.reifications() {
+        for (predicate, term) in [
+            (REIFIES_SUBJECT, &r.triple.s),
+            (REIFIES_PREDICATE, &r.triple.p),
+            (REIFIES_OBJECT, &r.triple.o),
+        ] {
+            out.push(Triple {
+                subject: ir_term_to_rdf_term(&r.reifier),
+                predicate: RdfTerm::Iri(predicate.to_string()),
+                object: ir_term_to_rdf_term(term),
+            });
         }
     }
     let mut next_cell = 0usize;
@@ -196,5 +218,10 @@ fn graph_to_rdf_triples(graph: &Graph) -> Vec<Triple> {
             });
         }
     }
+    // An RDF graph is a set. The parser emits a base triple again for each
+    // `rdf:reifies <<( s p o )>>`, so an expected graph that also states
+    // `s p o .` would otherwise differ from the action by a duplicate.
+    let mut seen = HashSet::new();
+    out.retain(|t| seen.insert(t.clone()));
     out
 }

@@ -392,7 +392,20 @@ fn is_batched_subject_exists_eligible(
     let no_obj_bind = !bind_instructions
         .iter()
         .any(|b| b.position == PatternPosition::Object);
-    let no_constraint = right_pattern.dtc.is_none();
+    // An `f:reifies*` chain tags a constant ref object with an explicit `@id`
+    // datatype so the lookup key encodes as a ref. The probe compares a ref
+    // constant against ref values only (`term_matches_probe_value`), so that
+    // constraint is already enforced and must not cost the lane: without it
+    // every reifier candidate of a predicate-only or object-bound quoted
+    // triple opened its own point scan.
+    let no_constraint = match &right_pattern.dtc {
+        None => true,
+        Some(fluree_db_core::DatatypeConstraint::Explicit(dt)) => {
+            matches!(&right_pattern.o, Term::Sid(_) | Term::Iri(_))
+                && *dt == fluree_db_core::edge::id_datatype_sid()
+        }
+        Some(_) => false,
+    };
 
     has_subject_bind && pred_fixed && obj_fixed && no_obj_bind && no_constraint
 }
@@ -1560,8 +1573,25 @@ impl NestedLoopJoinOperator {
     /// Build output batch from pending results
     async fn build_output_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
         let batch_size = ctx.batch_size;
+        // Size the columns by what is actually pending, capped at the batch
+        // size. In per-row mode the pending output is one left row's matches
+        // — StarBench P4 (`<< ?s ?p ?o >> ?d ?e`): ~22 rows per reifier over
+        // 21.4M reifiers — and a column pre-allocated at full batch capacity
+        // kept ~360 KB × columns alive per emitted batch. The server retains
+        // every batch of a delimited response until it formats them, which
+        // ran to 240 GB. Dense right batches still get the full capacity.
+        let mut pending_rows = 0usize;
+        for (_, _, right_batch) in &self.pending_output {
+            pending_rows += right_batch.len();
+            if pending_rows >= batch_size {
+                break;
+            }
+        }
+        let capacity = pending_rows
+            .saturating_sub(self.pending_right_row)
+            .clamp(1, batch_size);
         let mut output_columns: Vec<Vec<Binding>> = (0..self.combined_schema.len())
-            .map(|_| Vec::with_capacity(batch_size))
+            .map(|_| Vec::with_capacity(capacity))
             .collect();
 
         let mut rows_added = 0;
@@ -4352,6 +4382,48 @@ mod tests {
         assert_eq!(join.right_index_hint, Some(IndexType::Opst));
         assert_eq!(join.right_scan_inline_ops.len(), 1);
         assert!(join.inline_ops.is_empty());
+    }
+
+    #[test]
+    fn batched_existence_admits_id_typed_ref_constants_only() {
+        use fluree_db_core::{DatatypeConstraint, FlakeValue};
+        let bound_subject = vec![BindInstruction {
+            position: PatternPosition::Subject,
+            left_col: 0,
+        }];
+        let id_dt = fluree_db_core::edge::id_datatype_sid();
+        let mut reifies_pred = TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(7, "reifiesPredicate")),
+            Term::Sid(Sid::new(100, "TREATS")),
+        );
+        // The `@id` tag an f:reifies* chain puts on a ref constant is
+        // already what the ref-only probe comparison enforces.
+        reifies_pred.dtc = Some(DatatypeConstraint::Explicit(id_dt.clone()));
+        assert!(is_batched_subject_exists_eligible(
+            &bound_subject,
+            &reifies_pred
+        ));
+
+        // Any other explicit datatype still needs the per-row scan's filter.
+        let mut typed_literal = reifies_pred.clone();
+        typed_literal.o = Term::Value(FlakeValue::Long(1));
+        typed_literal.dtc = Some(DatatypeConstraint::Explicit(Sid::new(
+            fluree_vocab::namespaces::XSD,
+            "integer",
+        )));
+        assert!(!is_batched_subject_exists_eligible(
+            &bound_subject,
+            &typed_literal
+        ));
+
+        // An `@id` tag on a literal constant is not a ref comparison.
+        let mut id_tagged_literal = reifies_pred.clone();
+        id_tagged_literal.o = Term::Value(FlakeValue::Long(1));
+        assert!(!is_batched_subject_exists_eligible(
+            &bound_subject,
+            &id_tagged_literal
+        ));
     }
 
     #[test]

@@ -946,18 +946,19 @@ mod inner {
                 return Ok(());
             };
 
-            let bundle =
-                match crate::generate::flakes::reified_triple_bundle(s, p, o, &dtc, &ann, self.t) {
-                    Ok(bundle) => bundle,
-                    Err(e) => {
-                        if self.encode_error.is_none() {
-                            let msg = format!("invariant violation in reifier bundle: {e}");
-                            tracing::error!("ImportSink: {msg}");
-                            self.encode_error = Some(CommitCodecError::InvalidOp(msg));
-                        }
-                        return Ok(());
+            let bundle = match crate::generate::flakes::reified_triple_bundle(
+                None, s, p, o, &dtc, &ann, self.t,
+            ) {
+                Ok(bundle) => bundle,
+                Err(e) => {
+                    if self.encode_error.is_none() {
+                        let msg = format!("invariant violation in reifier bundle: {e}");
+                        tracing::error!("ImportSink: {msg}");
+                        self.encode_error = Some(CommitCodecError::InvalidOp(msg));
                     }
-                };
+                    return Ok(());
+                }
+            };
             for flake in bundle {
                 if let Err(e) = self.writer.push_flake(&flake) {
                     if self.encode_error.is_none() {

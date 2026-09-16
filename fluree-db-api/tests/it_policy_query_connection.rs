@@ -1089,7 +1089,7 @@ async fn scoped_explain_withholds_statistics_for_every_language() {
     let mut view = GraphDb::from_ledger_state(&ledger);
     let predicate = view.snapshot.encode_iri("http://schema.org/name").unwrap();
     // Deliberately distinctive stored counts: policy must not disclose them.
-    std::sync::Arc::make_mut(&mut view.snapshot).stats = Some(IndexStats {
+    std::sync::Arc::make_mut(&mut view.snapshot).stats = Some(std::sync::Arc::new(IndexStats {
         flakes: 987_654,
         properties: Some(vec![PropertyStatEntry {
             sid: (predicate.namespace_code, predicate.name.to_string()),
@@ -1102,7 +1102,7 @@ async fn scoped_explain_withholds_statistics_for_every_language() {
             historical_datatypes: vec![],
         }]),
         ..Default::default()
-    });
+    }));
     let scoped = fluree
         .wrap_policy(
             view.clone(),

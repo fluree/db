@@ -53,6 +53,7 @@ use fluree_db_binary_index::annotation_arena::AnnotationArenaReader;
 use fluree_db_core::edge::{id_datatype_sid, EdgeKey};
 use fluree_db_core::storage::ContentStore;
 use fluree_db_core::{AnnotationIndexRoot, FlakeValue, Sid, StatsView};
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -209,6 +210,14 @@ pub struct AnnotationEdgeProbeOperator {
 /// Output rows emitted per `next_batch` once the probe pass has filled
 /// the buffer. Keeps any single output batch bounded.
 const PROBE_OUTPUT_CHUNK: usize = 4096;
+
+/// Below this many bound driving subjects the generic (well-ordered)
+/// `f:reifies*` chain — three narrow per-row probes — beats draining the
+/// whole annotation sidecar into hash maps and sweeping the base predicate.
+/// Checked twice: at plan time against the driving estimate (an unknown
+/// estimate admits the lane) and again at runtime by
+/// [`HashAnnotationEdgeProbeOperator`] against the buffered stream itself.
+pub(crate) const HASH_ANNOTATION_MIN_DRIVING_ROWS: usize = 256;
 
 impl AnnotationEdgeProbeOperator {
     pub(crate) fn new(
@@ -443,28 +452,75 @@ pub(crate) fn binding_sid(
 }
 
 /// The three `f:reifies*` lookups, drained once through ordinary planned
-/// scans (overlay-merged and policy-filtered like any scan) and
-/// hash-indexed. Shared by the value-only OPTIONAL lane
+/// scans (overlay-merged and policy-filtered like any scan) and indexed by
+/// the full reified edge `(s, p, o)`. Shared by the value-only OPTIONAL lane
 /// ([`crate::optional::AnnotationValueOptionalBuilder`]) and the required
 /// lane ([`HashAnnotationEdgeProbeOperator`]).
+///
+/// Keyed by the whole edge, not the subject alone: a subject-keyed map made
+/// every lookup walk all reifiers sharing that subject and test each one's
+/// predicate and object, which on a hub-heavy graph is a sum of squared
+/// reified out-degrees (one StarBench BKR subject carries 3,345 `TREATS`
+/// edges by itself) — the P11 timeout.
 pub(crate) struct AnnotationSidecarMaps {
-    pub(crate) s_to_anns: HashMap<Sid, Vec<Sid>>,
-    ann_preds: HashMap<Sid, Vec<Sid>>,
-    /// Object keyed by [`GroupKeyOwned`] (representation-normalized), so
-    /// ref objects AND literal objects (a literal-valued reified edge)
-    /// both match across encoded/materialized binding representations.
-    ann_objs: HashMap<Sid, Vec<GroupKeyOwned>>,
+    /// `s → p → o → live reifiers`. The object level is keyed by
+    /// [`GroupKeyOwned`] (representation-normalized), so ref objects AND
+    /// literal objects (a literal-valued reified edge) both match across
+    /// encoded/materialized binding representations.
+    edge_to_anns: HashMap<Sid, HashMap<Sid, HashMap<GroupKeyOwned, Vec<Sid>>>>,
 }
 
 impl AnnotationSidecarMaps {
-    pub(crate) fn matches(&self, ann: &Sid, p: &Sid, o: &GroupKeyOwned) -> bool {
-        self.ann_preds
-            .get(ann)
-            .is_some_and(|preds| preds.contains(p))
-            && self.ann_objs.get(ann).is_some_and(|objs| objs.contains(o))
+    /// Live reifiers of the edge `(s, p, o)`; empty when it has none.
+    pub(crate) fn anns_for(&self, s: &Sid, p: &Sid, o: &GroupKeyOwned) -> &[Sid] {
+        self.edge_to_anns
+            .get(s)
+            .and_then(|by_p| by_p.get(p))
+            .and_then(|by_o| by_o.get(o))
+            .map_or(&[], Vec::as_slice)
     }
 
-    /// Drain the three reifies triples and build the lookup maps.
+    /// Compose the per-slot `(reifier, value)` pairs into the edge-keyed
+    /// map. A reifier missing any slot attaches to nothing. A multi-target
+    /// reifier (legacy / replayed-from-corrupt-history ledgers) attaches to
+    /// every `subject × predicate × object` combination — the same answer
+    /// the per-slot containment test it replaces gave.
+    pub(crate) fn from_slot_pairs(
+        subj_pairs: Vec<(Sid, Sid)>,
+        pred_pairs: Vec<(Sid, Sid)>,
+        obj_pairs: Vec<(Sid, GroupKeyOwned)>,
+    ) -> Self {
+        let mut ann_subjs: HashMap<Sid, Vec<Sid>> = HashMap::new();
+        for (ann, s) in subj_pairs {
+            ann_subjs.entry(ann).or_default().push(s);
+        }
+        let mut ann_preds: HashMap<Sid, Vec<Sid>> = HashMap::new();
+        for (ann, p) in pred_pairs {
+            ann_preds.entry(ann).or_default().push(p);
+        }
+        let mut edge_to_anns: HashMap<Sid, HashMap<Sid, HashMap<GroupKeyOwned, Vec<Sid>>>> =
+            HashMap::new();
+        for (ann, o) in obj_pairs {
+            let (Some(subjs), Some(preds)) = (ann_subjs.get(&ann), ann_preds.get(&ann)) else {
+                continue;
+            };
+            for s in subjs {
+                for p in preds {
+                    edge_to_anns
+                        .entry(s.clone())
+                        .or_default()
+                        .entry(p.clone())
+                        .or_default()
+                        .entry(o.clone())
+                        .or_default()
+                        .push(ann.clone());
+                }
+            }
+        }
+        Self { edge_to_anns }
+    }
+
+    /// Drain the three reifies triples and build the lookup map.
     pub(crate) async fn build(
         r_subj: &TriplePattern,
         r_pred: &TriplePattern,
@@ -474,23 +530,145 @@ impl AnnotationSidecarMaps {
         ctx: &ExecutionContext<'_>,
         view: Option<&fluree_db_binary_index::BinaryGraphView>,
     ) -> Result<Self> {
-        let mut s_to_anns: HashMap<Sid, Vec<Sid>> = HashMap::new();
-        for (ann, s) in drain_pairs(r_subj, stats.clone(), planning, ctx, view).await? {
-            s_to_anns.entry(s).or_default().push(ann);
+        let subj_pairs = drain_pairs(r_subj, stats.clone(), planning, ctx, view).await?;
+        let pred_pairs = drain_pairs(r_pred, stats.clone(), planning, ctx, view).await?;
+        let obj_pairs = drain_object_keys(r_obj, stats, planning, ctx, view).await?;
+        Ok(Self::from_slot_pairs(subj_pairs, pred_pairs, obj_pairs))
+    }
+
+    /// The drained maps for this shape, built once per execution context and
+    /// shared by every probe operator in the run that would drain the same
+    /// thing.
+    ///
+    /// This is the entry point; [`build`](Self::build) is the miss path. A
+    /// drain costs O(#annotations in the ledger) regardless of how many rows
+    /// the probe answers, so the operator is the wrong unit to cache it at:
+    /// one bounded variable-length Cypher range emits a probe operator per hop
+    /// of per chain (`*1..3` six, `*1..5` fifteen), and caching per operator
+    /// pays the whole sidecar once for each of them.
+    pub(crate) async fn shared(
+        r_subj: &TriplePattern,
+        r_pred: &TriplePattern,
+        r_obj: &TriplePattern,
+        stats: Option<Arc<StatsView>>,
+        planning: &PlanningContext,
+        ctx: &ExecutionContext<'_>,
+        view: Option<&fluree_db_binary_index::BinaryGraphView>,
+    ) -> Result<Arc<Self>> {
+        let key = AnnotationSidecarKey::new(r_subj, r_pred, r_obj, planning, ctx.binary_g_id);
+        if let Some(hit) = ctx.annotation_sidecar_cache.get(&key) {
+            return Ok(hit);
         }
-        let mut ann_preds: HashMap<Sid, Vec<Sid>> = HashMap::new();
-        for (ann, pred) in drain_pairs(r_pred, stats.clone(), planning, ctx, view).await? {
-            ann_preds.entry(ann).or_default().push(pred);
+        let built = Arc::new(Self::build(r_subj, r_pred, r_obj, stats, planning, ctx, view).await?);
+        // Two probes racing on a miss both drain; `publish` keeps whichever
+        // landed first so every caller ends up on one `Arc`. The maps are
+        // equal either way — the key is the whole of what a drain depends on.
+        Ok(ctx.annotation_sidecar_cache.publish(key, built))
+    }
+}
+
+/// The scan-visible identity of a sidecar drain: what two probe operators must
+/// agree on for one drain's maps to answer both of them.
+///
+/// The three reifies triples differ between probes mostly in their **variable
+/// ids** — a bounded variable-length range mints a fresh reifier variable per
+/// hop, over its own synthetic endpoint variables — and a variable contributes
+/// nothing to what a drain returns. [`drain_pairs`] and [`drain_object_keys`]
+/// plan each triple as a standalone *unseeded* single-pattern scan, so a
+/// variable position filters nothing, and the maps they build are keyed by
+/// `Sid` / [`GroupKeyOwned`], never by the variable a value was read out of. A
+/// **constant** position is a real scan filter (`f:reifiesPredicate <KNOWS>`
+/// for a typed relationship, an IRI-anchored endpoint), and so is a `dtc` — a
+/// `LangTag` constraint narrows the object drain to one language. Erasing
+/// variable identity and keeping everything else is therefore exactly the
+/// equivalence the drain observes.
+///
+/// Two things are deliberately absent because [`recognize_annotation_edge`]
+/// fixes them by construction: the three predicates (checked to be
+/// `f:reifies{Subject,Predicate,Object}`, so position carries them), and the
+/// subject positions (checked to be one shared reifier variable, so the
+/// sharing structure cannot differ between probes).
+#[derive(Clone, PartialEq)]
+pub(crate) struct AnnotationSidecarKey {
+    /// `(object position, datatype constraint)` for the `f:reifiesSubject`,
+    /// `f:reifiesPredicate` and `f:reifiesObject` triples in that order, with
+    /// a variable object collapsed to `None`.
+    filters: [(Option<Term>, Option<fluree_db_core::DatatypeConstraint>); 3],
+    /// The graph the three drains scan. `with_active_graph` keeps the store
+    /// but can retarget `binary_g_id`, so keying on it makes a cross-graph
+    /// alias impossible outright, rather than resting on the structural reason
+    /// the value-only lane is confined to the default graph source today (it
+    /// requires the `DefaultGraphSource` wrapper, which expansion omits inside
+    /// an explicit `Pattern::Graph`).
+    g_id: fluree_db_core::GraphId,
+    /// Temporal planning mode: `is_history()` changes what a scan returns.
+    planning: PlanningContext,
+}
+
+impl AnnotationSidecarKey {
+    fn new(
+        r_subj: &TriplePattern,
+        r_pred: &TriplePattern,
+        r_obj: &TriplePattern,
+        planning: &PlanningContext,
+        g_id: fluree_db_core::GraphId,
+    ) -> Self {
+        fn filter(t: &TriplePattern) -> (Option<Term>, Option<fluree_db_core::DatatypeConstraint>) {
+            let o = match &t.o {
+                Term::Var(_) => None,
+                other => Some(other.clone()),
+            };
+            (o, t.dtc.clone())
         }
-        let mut ann_objs: HashMap<Sid, Vec<GroupKeyOwned>> = HashMap::new();
-        for (ann, obj) in drain_object_keys(r_obj, stats, planning, ctx, view).await? {
-            ann_objs.entry(ann).or_default().push(obj);
+        Self {
+            filters: [filter(r_subj), filter(r_pred), filter(r_obj)],
+            g_id,
+            planning: *planning,
         }
-        Ok(Self {
-            s_to_anns,
-            ann_preds,
-            ann_objs,
-        })
+    }
+}
+
+/// Per-query-run memo of drained [`AnnotationSidecarMaps`], keyed by
+/// [`AnnotationSidecarKey`].
+///
+/// Held on [`ExecutionContext`] and scoped exactly like
+/// [`ConstSidCache`](crate::context::ConstSidCache): shared across
+/// `with_active_graph` / `with_default_graph` derivations, which keep the
+/// store, and reset by `with_graph_ref`, which swaps snapshot, overlay and
+/// `to_t`.
+///
+/// A `Vec` scanned linearly rather than a `HashMap`: one query has a handful
+/// of distinct probe shapes at most (every hop of one range shares a key), and
+/// the key holds a [`Term`], whose `Value` arm is a `FlakeValue` — `PartialEq`
+/// but deliberately not `Hash`/`Eq`, since a float object has no lawful hash.
+#[derive(Clone, Default)]
+pub struct AnnotationSidecarCache(Arc<std::sync::Mutex<SidecarEntries>>);
+
+/// The cache's entries: one per distinct drain the run has paid for.
+type SidecarEntries = Vec<(AnnotationSidecarKey, Arc<AnnotationSidecarMaps>)>;
+
+impl AnnotationSidecarCache {
+    fn get(&self, key: &AnnotationSidecarKey) -> Option<Arc<AnnotationSidecarMaps>> {
+        let guard = self.0.lock().expect("annotation sidecar cache lock");
+        guard
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, maps)| maps.clone())
+    }
+
+    /// Record `maps` under `key`, returning whatever is canonical afterwards —
+    /// an entry another task published first, else `maps`.
+    fn publish(
+        &self,
+        key: AnnotationSidecarKey,
+        maps: Arc<AnnotationSidecarMaps>,
+    ) -> Arc<AnnotationSidecarMaps> {
+        let mut guard = self.0.lock().expect("annotation sidecar cache lock");
+        if let Some((_, existing)) = guard.iter().find(|(k, _)| *k == key) {
+            return existing.clone();
+        }
+        guard.push((key, maps.clone()));
+        maps
     }
 }
 
@@ -1080,7 +1258,32 @@ impl HashAnnotationEdgeProbeOperator {
             return Ok(());
         }
 
-        let maps = AnnotationSidecarMaps::build(
+        // Runtime lane choice. The plan-time gate admits this lane on an
+        // estimate that is often unknown; with the whole driving stream in
+        // hand, decide on what it actually holds. The three drains and the
+        // base sweep pay off only against MANY bound driving subjects, each
+        // of which would otherwise cost three scattered point probes. A
+        // handful of rows — a seed, or the matches of a selective sibling —
+        // runs the generic chain over the buffered rows instead: StarBench
+        // P1 swept the whole graph for 9 s to enrich 3 rows.
+        let child_rows: usize = child_batches.iter().map(Batch::len).sum();
+        if child_rows < HASH_ANNOTATION_MIN_DRIVING_ROWS
+            || (!keep_all && driving.len() < HASH_ANNOTATION_MIN_DRIVING_ROWS)
+        {
+            tracing::debug!(
+                rows = child_rows,
+                driving = driving.len(),
+                keep_all,
+                "annotation required-lane: driving stream below the sweep threshold; running the generic chain over the buffered rows"
+            );
+            return self.probe_generic(ctx, child_batches).await;
+        }
+
+        let started = std::time::Instant::now();
+        // Through the run-scoped memo, so a query that mixes the required
+        // lane with the value-only OPTIONAL lane (or with a bounded
+        // variable-length range) drains the sidecar once between them.
+        let maps = AnnotationSidecarMaps::shared(
             &self.r_subj,
             &self.r_pred,
             &self.r_obj,
@@ -1090,7 +1293,16 @@ impl HashAnnotationEdgeProbeOperator {
             view,
         )
         .await?;
+        let maps_ms = started.elapsed().as_millis();
         let edges = self.sweep_base_edges(ctx, view, &driving, keep_all).await?;
+        let swept: usize = edges.values().map(Vec::len).sum();
+        tracing::debug!(
+            maps_ms,
+            sweep_ms = started.elapsed().as_millis() - maps_ms,
+            swept,
+            keep_all,
+            "annotation required-lane hash probe: maps built, base edges swept"
+        );
 
         for batch in std::mem::take(&mut child_batches) {
             ctx.check_cancelled()?;
@@ -1153,19 +1365,11 @@ impl HashAnnotationEdgeProbeOperator {
                     if o_key.as_ref().is_some_and(|k| *k != edge.o_key) {
                         continue;
                     }
-                    let Some(cands) = maps.s_to_anns.get(&edge.s_sid) else {
-                        continue;
-                    };
-                    let matching: Vec<Sid> = cands
-                        .iter()
-                        .filter(|ann| {
-                            bound_ann.as_ref().is_none_or(|t| *t == **ann)
-                                && maps.matches(ann, &edge.p_sid, &edge.o_key)
-                        })
-                        .cloned()
-                        .collect();
-                    for ann in matching {
-                        self.emit_row(&batch, row, edge, &ann);
+                    for ann in maps.anns_for(&edge.s_sid, &edge.p_sid, &edge.o_key) {
+                        if bound_ann.as_ref().is_some_and(|t| t != ann) {
+                            continue;
+                        }
+                        self.emit_row(&batch, row, edge, ann);
                     }
                 }
             }
@@ -1173,8 +1377,52 @@ impl HashAnnotationEdgeProbeOperator {
         tracing::debug!(
             driving = driving.len(),
             rows = self.result_buffer.len(),
+            total_ms = started.elapsed().as_millis(),
             "annotation required-lane hash probe complete"
         );
+        Ok(())
+    }
+
+    /// Generic-chain fallback over the buffered driving rows: the base edge
+    /// and the three `f:reifies*` lookups plan as ordinary joins seeded by
+    /// the replayed child stream (same results as the sweep, per-row
+    /// probes instead), and each output row is re-shaped to this
+    /// operator's schema.
+    async fn probe_generic(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        child_batches: Vec<Batch>,
+    ) -> Result<()> {
+        let replay = Box::new(crate::seed::BatchReplayOperator::new(
+            Arc::from(self.child.schema().to_vec().into_boxed_slice()),
+            child_batches,
+        ));
+        let chain = [
+            Pattern::Triple(self.base.clone()),
+            Pattern::Triple(self.r_subj.clone()),
+            Pattern::Triple(self.r_pred.clone()),
+            Pattern::Triple(self.r_obj.clone()),
+        ];
+        let mut op = crate::execute::build_where_operators_seeded(
+            Some(replay),
+            &chain,
+            self.stats.clone(),
+            None,
+            &self.planning,
+        )?;
+        op.open(ctx).await?;
+        while let Some(batch) = op.next_batch(ctx).await? {
+            ctx.check_cancelled()?;
+            for row in 0..batch.len() {
+                let rb: Vec<Binding> = self
+                    .schema
+                    .iter()
+                    .map(|v| batch.get(row, *v).cloned().unwrap_or(Binding::Unbound))
+                    .collect();
+                self.result_buffer.push(rb);
+            }
+        }
+        op.close();
         Ok(())
     }
 
@@ -1245,12 +1493,365 @@ impl Operator for HashAnnotationEdgeProbeOperator {
     }
 }
 
+/// Annotation-first enumeration: stream every live attachment out of the
+/// forward arena and bind the reified edge's positions plus the reifier,
+/// without scanning the base edge at all.
+///
+/// The physical answer to `<< ?s ?p ?o >> :q ?x` (and to `<< ?s :P ?o >>`
+/// when `:P` is wider than the arena). The edge-first lanes scan the base
+/// edge and probe per row, which for a wildcard base edge means every flake
+/// in the graph; the generic chain instead re-probes the base edge once per
+/// reifier — 33.6M fully-bound point lookups on full-scale StarBench P2
+/// (757 s). Here the arena's reverse leaves are read once, in reifier order, one
+/// leaf at a time, and each live `(edge, ann)` pair becomes a row per
+/// driving row, encoded through the dictionaries like scan output.
+///
+/// No base-edge visibility check is needed under this lane's gates (root
+/// policy, current state, empty overlay): every write surface asserts the
+/// base triple it annotates — Turtle-star ingest, JSON-LD `@annotation`,
+/// SPARQL UPDATE — `@reifies`-rooted inserts are rejected, and a base-edge
+/// retract cascades to its attachments, so a live arena row implies a live
+/// default-graph edge. Named-graph attachments (`EdgeKey.g = Some`) are
+/// skipped, as the arena probe lane skips them.
+/// The dictionaries the enumeration lane encodes through.
+struct Dicts<'a> {
+    store: Option<&'a fluree_db_binary_index::BinaryIndexStore>,
+    dict_novelty: Option<&'a fluree_db_core::dict_novelty::DictNovelty>,
+}
+
+pub struct AnnotationEnumerateOperator {
+    child: BoxedOperator,
+    /// Constant relationship predicate to filter the walk by, or the
+    /// variable the walk binds; the schema records where it lands.
+    p_pos: EdgePos,
+    schema: Arc<[VarId]>,
+    state: OperatorState,
+    root: Option<AnnotationIndexRoot>,
+    store: Option<Arc<dyn ContentStore>>,
+    as_of_t: i64,
+    /// Buffered driving rows (normally the one seed row); every live pair is
+    /// emitted once per driving row. `None` until the child is drained.
+    child_rows: Option<Vec<Vec<Binding>>>,
+    /// Reverse-arena leaves still to walk, in reifier order. `None` until
+    /// the branch is read.
+    leaves: Option<std::collections::VecDeque<fluree_db_core::ContentId>>,
+    /// Predicate `Sid → p_id` for this snapshot, so the walk emits
+    /// `EncodedPid` like a scan would (the table has a few hundred entries).
+    pred_ids: HashMap<Sid, u32>,
+    /// Subject-dictionary ids already resolved for edge subjects and
+    /// objects, which recur across the walk far more than they are distinct.
+    ref_ids: FxHashMap<Sid, Option<u64>>,
+    result_buffer: Vec<Vec<Binding>>,
+    buffer_pos: usize,
+    estimated: Option<usize>,
+}
+
+impl AnnotationEnumerateOperator {
+    pub(crate) fn new(
+        child: BoxedOperator,
+        ann_var: VarId,
+        s_var: VarId,
+        p_pos: EdgePos,
+        o_var: VarId,
+        estimated: Option<usize>,
+    ) -> Self {
+        // Child columns, then the edge positions this lane binds, then the
+        // reifier — the order `emit` fills.
+        let mut schema_vec: Vec<VarId> = child.schema().to_vec();
+        schema_vec.push(s_var);
+        if let EdgePos::Var(v) = &p_pos {
+            schema_vec.push(*v);
+        }
+        schema_vec.push(o_var);
+        schema_vec.push(ann_var);
+        Self {
+            child,
+            p_pos,
+            schema: Arc::from(schema_vec.into_boxed_slice()),
+            state: OperatorState::Created,
+            root: None,
+            store: None,
+            as_of_t: 0,
+            child_rows: None,
+            leaves: None,
+            pred_ids: HashMap::new(),
+            ref_ids: FxHashMap::default(),
+            result_buffer: Vec::new(),
+            buffer_pos: 0,
+            estimated,
+        }
+    }
+
+    /// A ref position as the scan would bind it: `EncodedSid` through the
+    /// persisted subject dictionary (or dictionary novelty), falling back to
+    /// the materialized `Sid` only when the subject is unknown to both —
+    /// which the lane's empty-overlay gate makes unexpected. Encoded rows
+    /// keep the downstream join and aggregate in id space: the materialized
+    /// form cost 40% of P2's time in `Arc<str>` clone/drop churn.
+    fn ref_binding(sid: &Sid, dicts: &Dicts<'_>) -> Binding {
+        match Self::lookup_ref_id(sid, dicts) {
+            Some(s_id) => Binding::encoded_sid(s_id),
+            None => Binding::sid(sid.clone()),
+        }
+    }
+
+    /// [`ref_binding`](Self::ref_binding) through the operator's memo, for
+    /// the edge positions whose nodes recur across the walk. Each miss is a
+    /// dictionary walk; reifiers are unique per edge and take the direct path.
+    fn memoized_ref_binding(
+        memo: &mut FxHashMap<Sid, Option<u64>>,
+        sid: &Sid,
+        dicts: &Dicts<'_>,
+    ) -> Binding {
+        const MAX_ENTRIES: usize = 1 << 18;
+        let resolved = match memo.get(sid) {
+            Some(hit) => *hit,
+            None => {
+                let looked_up = Self::lookup_ref_id(sid, dicts);
+                if memo.len() >= MAX_ENTRIES {
+                    memo.clear();
+                }
+                memo.insert(sid.clone(), looked_up);
+                looked_up
+            }
+        };
+        match resolved {
+            Some(s_id) => Binding::encoded_sid(s_id),
+            None => Binding::sid(sid.clone()),
+        }
+    }
+
+    fn lookup_ref_id(sid: &Sid, dicts: &Dicts<'_>) -> Option<u64> {
+        let persisted = dicts.store.and_then(|st| {
+            st.find_subject_id_by_parts(sid.namespace_code, &sid.name)
+                .ok()
+                .flatten()
+        });
+        persisted.or_else(|| {
+            dicts
+                .dict_novelty
+                .filter(|dn| dn.is_initialized())
+                .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
+        })
+    }
+
+    /// The reified object as a binding, exactly as the base scan would have
+    /// bound it: refs encoded, literals with the datatype and language tag
+    /// the arena stored from the original flake.
+    fn object_binding(
+        memo: &mut FxHashMap<Sid, Option<u64>>,
+        edge: &EdgeKey,
+        dicts: &Dicts<'_>,
+    ) -> Binding {
+        match (&edge.o, &edge.lang) {
+            (FlakeValue::Ref(sid), _) => Self::memoized_ref_binding(memo, sid, dicts),
+            (val, Some(lang)) => Binding::lit_lang(val.clone(), lang.as_str()),
+            (val, None) => Binding::from_object(val.clone(), edge.dt.clone()),
+        }
+    }
+
+    fn emit(&mut self, edge: &EdgeKey, ann: &Sid, dicts: &Dicts<'_>) {
+        let s_b = Self::memoized_ref_binding(&mut self.ref_ids, &edge.s, dicts);
+        let p_b = match self.p_pos {
+            EdgePos::Var(_) => Some(match self.pred_ids.get(&edge.p) {
+                Some(p_id) => Binding::EncodedPid { p_id: *p_id },
+                None => Binding::sid(edge.p.clone()),
+            }),
+            EdgePos::Const(_) => None,
+        };
+        let o_b = Self::object_binding(&mut self.ref_ids, edge, dicts);
+        let ann_b = Self::ref_binding(ann, dicts);
+        let child_rows = self.child_rows.as_deref().unwrap_or(&[]);
+        for child_row in child_rows {
+            let mut row: Vec<Binding> = Vec::with_capacity(self.schema.len());
+            row.extend(child_row.iter().cloned());
+            row.push(s_b.clone());
+            if let Some(p_b) = &p_b {
+                row.push(p_b.clone());
+            }
+            row.push(o_b.clone());
+            row.push(ann_b.clone());
+            self.result_buffer.push(row);
+        }
+    }
+
+    /// Emit up to [`PROBE_OUTPUT_CHUNK`] buffered output rows as one batch.
+    fn drain_chunk(&mut self) -> Option<Batch> {
+        if self.buffer_pos >= self.result_buffer.len() {
+            return None;
+        }
+        let end = (self.buffer_pos + PROBE_OUTPUT_CHUNK).min(self.result_buffer.len());
+        let mut columns: Vec<Vec<Binding>> = (0..self.schema.len())
+            .map(|_| Vec::with_capacity(end - self.buffer_pos))
+            .collect();
+        for row in &self.result_buffer[self.buffer_pos..end] {
+            for (col, b) in row.iter().enumerate() {
+                columns[col].push(b.clone());
+            }
+        }
+        self.buffer_pos = end;
+        Batch::new(self.schema.clone(), columns).ok()
+    }
+}
+
+#[async_trait]
+impl Operator for AnnotationEnumerateOperator {
+    fn schema(&self) -> &[VarId] {
+        &self.schema
+    }
+
+    async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
+        self.root = ctx.active_snapshot.annotation_index.clone();
+        self.store = ctx.active_snapshot.content_store.clone();
+        self.as_of_t = ctx.to_t;
+        self.pred_ids = ctx
+            .graph_view()
+            .map(|view| {
+                view.store()
+                    .p_sid_table()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, sid)| (sid.clone(), i as u32))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.child.open(ctx).await?;
+        self.state = OperatorState::Open;
+        self.child_rows = None;
+        self.leaves = None;
+        self.result_buffer.clear();
+        self.buffer_pos = 0;
+        Ok(())
+    }
+
+    async fn next_batch(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        if self.state != OperatorState::Open {
+            return Ok(None);
+        }
+        if self.child_rows.is_none() {
+            let mut rows: Vec<Vec<Binding>> = Vec::new();
+            while let Some(batch) = self.child.next_batch(ctx).await? {
+                for row in 0..batch.len() {
+                    rows.push(
+                        self.child
+                            .schema()
+                            .iter()
+                            .map(|v| batch.get(row, *v).cloned().unwrap_or(Binding::Unbound))
+                            .collect(),
+                    );
+                }
+            }
+            if rows.is_empty() {
+                self.state = OperatorState::Exhausted;
+                return Ok(None);
+            }
+            self.child_rows = Some(rows);
+        }
+        let (Some(root), Some(store)) = (self.root.as_ref(), self.store.as_ref()) else {
+            // Gates guarantee both are present; defensive only.
+            self.state = OperatorState::Exhausted;
+            return Ok(None);
+        };
+        if self.leaves.is_none() {
+            // Reverse arena: reifier order is dictionary order, so the
+            // encodes below and the batched probes above walk the subject
+            // dictionary and PSOT sequentially instead of at random.
+            let entries = AnnotationArenaReader::new(root, store.as_ref())
+                .reverse_leaf_entries()
+                .await
+                .map_err(|e| QueryError::execution(format!("annotation arena walk: {e}")))?;
+            self.leaves = Some(entries.into_iter().map(|e| e.leaf_cid).collect());
+        }
+        let view = ctx.graph_view();
+        let dicts = Dicts {
+            store: view
+                .as_ref()
+                .map(fluree_db_binary_index::BinaryGraphView::store),
+            dict_novelty: ctx.dict_novelty.as_deref(),
+        };
+        loop {
+            if let Some(batch) = self.drain_chunk() {
+                return Ok(Some(batch));
+            }
+            ctx.check_cancelled()?;
+            let Some(cid) = self
+                .leaves
+                .as_mut()
+                .and_then(std::collections::VecDeque::pop_front)
+            else {
+                self.state = OperatorState::Exhausted;
+                return Ok(None);
+            };
+            self.result_buffer.clear();
+            self.buffer_pos = 0;
+            let pairs = {
+                let (Some(root), Some(store)) = (self.root.as_ref(), self.store.as_ref()) else {
+                    self.state = OperatorState::Exhausted;
+                    return Ok(None);
+                };
+                AnnotationArenaReader::new(root, store.as_ref())
+                    .live_pairs_in_reverse_leaf(&cid, self.as_of_t)
+                    .await
+                    .map_err(|e| QueryError::execution(format!("annotation arena walk: {e}")))?
+            };
+            for (edge, ann) in &pairs {
+                if edge.g.is_some() {
+                    continue;
+                }
+                if let EdgePos::Const(p) = &self.p_pos {
+                    if edge.p != *p {
+                        continue;
+                    }
+                }
+                self.emit(edge, ann, &dicts);
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        self.child.close();
+        self.child_rows = None;
+        self.leaves = None;
+        self.result_buffer.clear();
+        self.state = OperatorState::Closed;
+    }
+
+    fn estimated_rows(&self) -> Option<usize> {
+        self.estimated
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ir::TriplePattern;
     use fluree_vocab::db::{REIFIES_OBJECT, REIFIES_PREDICATE, REIFIES_SUBJECT};
     use fluree_vocab::namespaces::FLUREE_DB;
+
+    #[test]
+    fn enumerate_memo_caches_ref_lookups_and_their_misses() {
+        let dicts = Dicts {
+            store: None,
+            dict_novelty: None,
+        };
+        let mut memo = FxHashMap::default();
+        let alice = Sid::new(100, "alice");
+        let direct = AnnotationEnumerateOperator::ref_binding(&alice, &dicts);
+        let first = AnnotationEnumerateOperator::memoized_ref_binding(&mut memo, &alice, &dicts);
+        let second = AnnotationEnumerateOperator::memoized_ref_binding(&mut memo, &alice, &dicts);
+        assert_eq!(
+            memo.len(),
+            1,
+            "one entry per distinct node, misses included"
+        );
+        assert_eq!(memo.get(&alice), Some(&None));
+        for b in [&direct, &first, &second] {
+            assert!(
+                matches!(b, Binding::Sid { sid, .. } if *sid == alice),
+                "unknown nodes fall back to the materialized Sid: {b:?}"
+            );
+        }
+    }
 
     fn v(n: u16) -> VarId {
         VarId(n)
@@ -1374,18 +1975,114 @@ mod tests {
     #[test]
     fn annotation_sidecar_maps_preserve_multi_target_values() {
         let ann = Sid::new(1, "ann");
+        let s = Sid::new(3, "s");
         let p1 = Sid::new(2, "p1");
         let p2 = Sid::new(2, "p2");
         let ok = |s: &Sid| binding_to_group_key_normalized(&Binding::sid(s.clone()), None, None);
         let o1 = ok(&Sid::new(3, "o1"));
         let o2 = ok(&Sid::new(3, "o2"));
-        let maps = AnnotationSidecarMaps {
-            s_to_anns: HashMap::new(),
-            ann_preds: HashMap::from([(ann.clone(), vec![p1.clone(), p2.clone()])]),
-            ann_objs: HashMap::from([(ann.clone(), vec![o1.clone(), o2.clone()])]),
-        };
+        let maps = AnnotationSidecarMaps::from_slot_pairs(
+            vec![(ann.clone(), s.clone())],
+            vec![(ann.clone(), p1.clone()), (ann.clone(), p2.clone())],
+            vec![(ann.clone(), o1.clone()), (ann.clone(), o2.clone())],
+        );
 
-        assert!(maps.matches(&ann, &p1, &o1));
-        assert!(maps.matches(&ann, &p2, &o2));
+        assert_eq!(maps.anns_for(&s, &p1, &o1), std::slice::from_ref(&ann));
+        assert_eq!(maps.anns_for(&s, &p2, &o2), std::slice::from_ref(&ann));
+        // Every pred × obj combination, as the per-slot containment test did.
+        assert_eq!(maps.anns_for(&s, &p1, &o2), std::slice::from_ref(&ann));
+        assert!(maps.anns_for(&Sid::new(3, "other"), &p1, &o1).is_empty());
+    }
+
+    #[test]
+    fn annotation_sidecar_maps_keep_same_subject_edges_apart() {
+        // Two reifiers on edges that share a subject must not see each
+        // other: the lookup is by the full (s, p, o) edge.
+        let (a1, a2) = (Sid::new(1, "a1"), Sid::new(1, "a2"));
+        let s = Sid::new(3, "hub");
+        let p = Sid::new(2, "TREATS");
+        let ok = |s: &Sid| binding_to_group_key_normalized(&Binding::sid(s.clone()), None, None);
+        let (o1, o2) = (ok(&Sid::new(3, "o1")), ok(&Sid::new(3, "o2")));
+        let maps = AnnotationSidecarMaps::from_slot_pairs(
+            vec![(a1.clone(), s.clone()), (a2.clone(), s.clone())],
+            vec![(a1.clone(), p.clone()), (a2.clone(), p.clone())],
+            vec![(a1.clone(), o1.clone()), (a2.clone(), o2.clone())],
+        );
+        assert_eq!(maps.anns_for(&s, &p, &o1), [a1]);
+        assert_eq!(maps.anns_for(&s, &p, &o2), [a2]);
+    }
+
+    /// The three reifies triples of one hop of a bounded variable-length
+    /// range, with `hop` selecting the fresh variables the lowering mints per
+    /// hop and `rel_type` the constant relationship predicate.
+    fn hop_reifies(hop: u16, rel_type: &str) -> [TriplePattern; 3] {
+        let ann = v(100 + hop);
+        let start = v(200 + hop);
+        let end = v(200 + hop + 1);
+        [
+            TriplePattern {
+                s: Ref::Var(ann),
+                p: Ref::Sid(pred(REIFIES_SUBJECT)),
+                o: Term::Var(start),
+                dtc: None,
+            },
+            TriplePattern {
+                s: Ref::Var(ann),
+                p: Ref::Sid(pred(REIFIES_PREDICATE)),
+                o: Term::Sid(user_sid(15, rel_type)),
+                dtc: None,
+            },
+            TriplePattern {
+                s: Ref::Var(ann),
+                p: Ref::Sid(pred(REIFIES_OBJECT)),
+                o: Term::Var(end),
+                dtc: None,
+            },
+        ]
+    }
+
+    fn key_for(hop: u16, rel_type: &str, g_id: fluree_db_core::GraphId) -> AnnotationSidecarKey {
+        let [r_subj, r_pred, r_obj] = hop_reifies(hop, rel_type);
+        AnnotationSidecarKey::new(&r_subj, &r_pred, &r_obj, &PlanningContext::default(), g_id)
+    }
+
+    /// Every hop of one bounded range must land on ONE key, or the run-scoped
+    /// memo degenerates to the per-operator cache it replaced: `*1..5` plans
+    /// fifteen probe operators and each would re-drain the whole sidecar.
+    #[test]
+    fn sidecar_key_is_shared_across_the_hops_of_one_range() {
+        let first = key_for(0, "KNOWS", 0);
+        for hop in 1..15 {
+            assert!(
+                key_for(hop, "KNOWS", 0) == first,
+                "hop {hop} must share the first hop's drain"
+            );
+        }
+    }
+
+    /// ...and must NOT be shared where a position is a real scan filter. A
+    /// constant `f:reifiesPredicate` narrows the drain to one relationship
+    /// type, so serving `LIKES` from the `KNOWS` maps would answer a reified
+    /// edge as unreified.
+    #[test]
+    fn sidecar_key_separates_drains_that_filter_differently() {
+        let knows = key_for(0, "KNOWS", 0);
+        assert!(
+            key_for(0, "LIKES", 0) != knows,
+            "a different constant relationship type filters the predicate drain differently"
+        );
+        assert!(
+            key_for(0, "KNOWS", 1) != knows,
+            "a different graph scans different flakes"
+        );
+
+        let [r_subj, r_pred, mut r_obj] = hop_reifies(0, "KNOWS");
+        r_obj.dtc = Some(fluree_db_core::DatatypeConstraint::LangTag("en".into()));
+        let tagged =
+            AnnotationSidecarKey::new(&r_subj, &r_pred, &r_obj, &PlanningContext::default(), 0);
+        assert!(
+            tagged != knows,
+            "a language-tag constraint narrows the object drain to one language"
+        );
     }
 }

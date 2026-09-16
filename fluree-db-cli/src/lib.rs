@@ -571,6 +571,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             ledger,
             oneline,
             count,
+            all,
             remote,
         } => {
             let fluree_dir = config::require_fluree_dir_or_global(config_path)?;
@@ -578,6 +579,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 ledger.as_deref(),
                 oneline,
                 count,
+                all,
                 &fluree_dir,
                 remote.as_deref(),
                 direct,

@@ -43,7 +43,7 @@ pub struct LedgerSnapshotMetadata {
     /// Ledger-fixed split mode from the index root.
     pub ns_split_mode: NsSplitMode,
     /// Index statistics (flakes count, total size)
-    pub stats: Option<IndexStats>,
+    pub stats: Option<Arc<IndexStats>>,
     /// Schema (class/property hierarchy)
     pub schema: Option<IndexSchema>,
     /// Per-namespace max local_id watermarks from the index root
@@ -163,8 +163,12 @@ pub struct LedgerSnapshot {
     /// Use `ns_split_mode()` for read access and `set_ns_split_mode()` for mutation.
     ns_split_mode: NsSplitMode,
 
-    /// Index statistics (flakes count, total size)
-    pub stats: Option<IndexStats>,
+    /// Index statistics (flakes count, total size).
+    ///
+    /// Shared, because the class table grows with the number of distinct
+    /// classes (millions on a class-per-subject ledger) and snapshots are
+    /// cloned on per-query paths.
+    pub stats: Option<Arc<IndexStats>>,
     /// Schema (class/property hierarchy)
     pub schema: Option<IndexSchema>,
 
@@ -991,7 +995,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         ensure(bytes, pos, stats_len, "stats section")?;
         let (s, _consumed) = stats_wire::decode_stats(&bytes[pos..pos + stats_len])?;
         pos += stats_len;
-        Some(s)
+        Some(Arc::new(s))
     } else {
         None
     };

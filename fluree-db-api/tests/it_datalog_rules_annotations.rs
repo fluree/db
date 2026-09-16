@@ -1309,3 +1309,386 @@ async fn a_sparql_head_literal_its_datatype_rejects_fails_the_rule() {
         "the refusal must name the value and its datatype: {message}"
     );
 }
+
+// =============================================================================
+// `@json` literals are opaque documents
+//
+// JSON-LD 1.1 defines the `@value` of a `@json` literal as a document carried
+// verbatim — the transactor serializes the whole thing into one `rdf:JSON`
+// flake. Nothing inside it is a keyword this parser owns. Four walkers in
+// `parse/edge_annotations.rs` read into documents; these pin the contract that
+// all four stop at the same place, because guarding one of them is what made
+// the delete below a silent no-op.
+// =============================================================================
+
+fn ex_f_context() -> serde_json::Value {
+    json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"})
+}
+
+/// A stored-rule body that reads claims. `with_annotation` is the only
+/// difference between the control and the subject in the delete pair below.
+fn rule_body(with_annotation: bool) -> serde_json::Value {
+    let object = if with_annotation {
+        json!({"@id": "?b", "@annotation": {"ex:confidence": "?conf"}})
+    } else {
+        json!({"@id": "?b"})
+    };
+    json!({
+        "@context": {"ex": "http://example.org/"},
+        "where": [{"@id": "?a", "ex:knows": object}],
+        "insert": {"@id": "?a", "ex:trustedKnows": {"@id": "?b"}}
+    })
+}
+
+/// How many `f:rule` literals the given subject still carries.
+async fn stored_rule_count(fluree: &MemoryFluree, ledger: &MemoryLedger, subject: &str) -> usize {
+    let q = json!({
+        "@context": ex_f_context(),
+        "select": ["?r"],
+        "where": {"@id": subject, "f:rule": "?r"}
+    });
+    support::query_jsonld(fluree, ledger, &q)
+        .await
+        .expect("rule-count query")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap()
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn a_stored_json_rule_may_read_annotations() {
+    // The documented shape for a stored datalog rule is a `@json` literal, and
+    // a rule that reads claims has `@annotation` in its body — so storing the
+    // rule that answers "which edges do my claims make trustworthy?" was
+    // refused with the annotation-of-annotation deferral. A `@json` value is
+    // an opaque JSON document, not JSON-LD, so nothing inside it is a keyword
+    // this parser owns.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/stored-json-reads-claims").await;
+
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ex_f_context(),
+                "@id": "ex:trustedRule",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?a", "ex:knows": {
+                                "@id": "?b",
+                                "@annotation": {"ex:confidence": "?conf"}
+                            }},
+                            ["filter", "(> ?conf 0.85)"]
+                        ],
+                        "insert": {"@id": "?a", "ex:trustedKnows": {"@id": "?b"}}
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("a stored rule whose body reads annotations must be storable")
+        .ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?a", "?b"],
+        "where": {"@id": "?a", "ex:trustedKnows": {"@id": "?b"}},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("the stored rule runs")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        rows.as_array().map(Vec::len).unwrap_or(0),
+        2,
+        "claim2 (0.9) and claim4 (0.95) clear 0.85; claim1 (0.8) and claim3 (0.5) do not: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_stored_json_rule_works_whether_or_not_its_payload_holds_a_keyword() {
+    // The blocking half. Two rules differing ONLY in whether the `@json`
+    // payload contains `@annotation`, given the same delete. The delete
+    // pre-pass used to recurse through `@value` into the payload, lift the
+    // `@annotation` out of it, and strip the predicate that carried it — so
+    // the literal in the delete template no longer equaled the literal in the
+    // store. The transaction committed and retracted nothing: no error, no
+    // signal, wrong answer. The control proves `@json` deletion is not broken
+    // in general and isolates the keyword as the only variable.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/json-delete-control-pair").await;
+
+    let plain = rule_body(false);
+    let annotated = rule_body(true);
+
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ex_f_context(),
+                "@graph": [
+                    {"@id": "ex:rulePlain", "f:rule": {"@type": "@json", "@value": plain}},
+                    {"@id": "ex:ruleAnn", "f:rule": {"@type": "@json", "@value": annotated}}
+                ]
+            }),
+        )
+        .await
+        .expect("both rules must store")
+        .ledger;
+
+    assert_eq!(
+        stored_rule_count(&fluree, &ledger, "ex:rulePlain").await,
+        1,
+        "control rule must be stored before the delete"
+    );
+    assert_eq!(
+        stored_rule_count(&fluree, &ledger, "ex:ruleAnn").await,
+        1,
+        "annotated rule must be stored before the delete"
+    );
+
+    let mut ledger = ledger;
+    for subject in ["ex:rulePlain", "ex:ruleAnn"] {
+        let payload = rule_body(subject == "ex:ruleAnn");
+        let update = json!({
+            "@context": ex_f_context(),
+            "where": {"@id": subject, "f:rule": "?r"},
+            "delete": {"@id": subject, "f:rule": {"@type": "@json", "@value": payload}}
+        });
+        ledger = fluree
+            .update(ledger, &update)
+            .await
+            .unwrap_or_else(|e| panic!("delete of {subject} must commit: {e}"))
+            .ledger;
+    }
+
+    assert_eq!(
+        stored_rule_count(&fluree, &ledger, "ex:rulePlain").await,
+        0,
+        "control: a @json rule with no keyword in its payload deletes"
+    );
+    assert_eq!(
+        stored_rule_count(&fluree, &ledger, "ex:ruleAnn").await,
+        0,
+        "the same delete must retract the rule whose payload contains @annotation — \
+         a committed transaction that retracts nothing is the silent wrong answer"
+    );
+}
+
+#[tokio::test]
+async fn a_json_rule_survives_a_delete_that_also_retracts_a_real_annotation() {
+    // The delete pre-pass only runs when the document carries a keyword the
+    // lowering passes would rewrite. Put a real `@annotation` delete in the
+    // same transaction and it does run — and then the walk into the `@json`
+    // payload is the only thing between the delete template and the literal it
+    // has to equal. This is the shape the control pair above cannot reach
+    // once the opaque payload stops opening the pass by itself: two
+    // independent gates make the simple case legal, and only this one holds
+    // the delete walker to its own rule.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/json-delete-with-annotation").await;
+
+    let annotated = rule_body(true);
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ex_f_context(),
+                "@id": "ex:ruleAnn",
+                "f:rule": {"@type": "@json", "@value": annotated}
+            }),
+        )
+        .await
+        .expect("the rule must store")
+        .ledger;
+    assert_eq!(
+        stored_rule_count(&fluree, &ledger, "ex:ruleAnn").await,
+        1,
+        "rule must be stored before the delete"
+    );
+
+    let update = json!({
+        "@context": ex_f_context(),
+        "where": {"@id": "ex:ruleAnn", "f:rule": "?r"},
+        "delete": [
+            {"@id": "ex:ruleAnn", "f:rule": {"@type": "@json", "@value": rule_body(true)}},
+            {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob",
+                                             "@annotation": {"@id": "ex:claim1"}}}
+        ]
+    });
+    let ledger = fluree
+        .update(ledger, &update)
+        .await
+        .expect("the combined delete must commit")
+        .ledger;
+
+    assert_eq!(
+        stored_rule_count(&fluree, &ledger, "ex:ruleAnn").await,
+        0,
+        "the rule must be retracted even though the same transaction opened the \
+         delete pre-pass with an unrelated @annotation"
+    );
+
+    // By-id annotation deletes retract the occurrence, not the annotation
+    // body — so ask which claims still reify alice→bob. claim1 is gone,
+    // claim2 remains.
+    let claim_q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?c"],
+        "where": {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob",
+                                                  "@annotation": {"@id": "?c"}}}
+    });
+    let claims = support::query_jsonld(&fluree, &ledger, &claim_q)
+        .await
+        .expect("claim query")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let remaining = normalize_rows(&claims);
+    assert_eq!(
+        remaining,
+        vec![json!(["ex:claim2"])],
+        "the annotation delete in the same transaction must still have taken effect: {claims}"
+    );
+}
+
+#[tokio::test]
+async fn a_deferred_keyword_beside_a_json_literal_is_still_refused() {
+    // Only the payload is opaque. A sibling of `@value` is ordinary JSON-LD
+    // the parser owns, so a deferred keyword nested in one is still the
+    // deferred shape. This is what pins the decision to put the skip inside
+    // the scanner and delete the `@json` branch at the call site: a call-site
+    // branch that scans siblings one way and the payload another has to
+    // re-state this rule at every site that grows one.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/json-sibling-refused").await;
+
+    let err = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": ex_f_context(),
+                "@id": "ex:doc",
+                "f:rule": {
+                    "@type": "@json",
+                    "@value": {"anything": 1},
+                    "ex:sibling": {"ex:inner": {"@reifies": {"@id": "ex:someEdge"}}}
+                }
+            }),
+        )
+        .await
+        .expect_err("a nested @reifies in a non-@value sibling must stay refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("@reifies"),
+        "the refusal must name the deferred keyword it found: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_context_aliased_json_type_is_opaque_too() {
+    // `{"type": "@type"}` is among the most ordinary things a JSON-LD context
+    // does, and the expander resolves the key through the context before
+    // deciding the literal is `@json`. A predicate that compares the raw key
+    // `"@type"` against the raw value `"@json"` disagrees with the expander on
+    // exactly this document, and the original bug survives under the alias.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/json-aliased-type").await;
+
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "f": "https://ns.flur.ee/db#",
+                    "type": "@type"
+                },
+                "@id": "ex:trustedRule",
+                "f:rule": {
+                    "type": "@json",
+                    "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": [
+                            {"@id": "?a", "ex:knows": {
+                                "@id": "?b",
+                                "@annotation": {"ex:confidence": "?conf"}
+                            }},
+                            ["filter", "(> ?conf 0.85)"]
+                        ],
+                        "insert": {"@id": "?a", "ex:trustedKnows": {"@id": "?b"}}
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("a @json literal typed through a context alias must be opaque too")
+        .ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?a", "?b"],
+        "where": {"@id": "?a", "ex:trustedKnows": {"@id": "?b"}},
+        "reasoning": "datalog"
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("the stored rule runs")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        rows.as_array().map(Vec::len).unwrap_or(0),
+        2,
+        "the alias must not change what the rule derives: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn a_json_literal_can_still_carry_an_annotation() {
+    // Characterization, not a guard: the wrapper is a literal like any other
+    // and annotating a literal is supported. Note that it does NOT pin the
+    // payload skip — `@annotation` in predicate position is stripped by
+    // `intercept_annotations_for_predicate` before any walker sees the
+    // wrapper, so this stays green whatever the opacity rule is. The tests
+    // above are the ones that hold that rule.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = claims_ledger(&fluree, "rules/json-literal-annotated").await;
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:doc",
+                "ex:payload": {
+                    "@type": "@json",
+                    "@value": {"anything": 1},
+                    "@annotation": {"@id": "ex:claimJ", "ex:confidence": 0.9}
+                }
+            }),
+        )
+        .await
+        .expect("an annotation on a @json literal is supported")
+        .ledger;
+
+    let q = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?c"],
+        "where": {"@id": "ex:doc", "ex:payload": {"@value": "?v", "@annotation": {"@id": "?c"}}}
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("the annotation on the literal is queryable")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        rows.as_array().map(Vec::len).unwrap_or(0),
+        1,
+        "the claim on the @json literal must be readable: {rows}"
+    );
+}

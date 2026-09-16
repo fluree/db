@@ -4,12 +4,44 @@
 //! built from `IndexStats` at query time.
 
 use crate::annotation_index::AnnotationStats;
+use crate::db::LedgerSnapshot;
 use crate::ids::{GraphId, RuntimePredicateId};
-use crate::index_stats::IndexStats;
+use crate::index_stats::{ClassStatEntry, IndexStats};
+use crate::ns_encoding::{canonical_split, NsSplitMode};
 use crate::sid::Sid;
 use crate::value_id::ValueTypeTag;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Resolves a query-side IRI to the `Sid` that `IndexStats` is keyed by.
+///
+/// Must stay equivalent to [`LedgerSnapshot::encode_iri`], including its
+/// EMPTY-namespace fallback for bare names.
+#[derive(Debug, Clone)]
+pub struct StatsIriEncoder {
+    /// IRI prefix -> namespace code, shared with the snapshot.
+    reverse: Arc<HashMap<String, u16>>,
+    split_mode: NsSplitMode,
+}
+
+impl StatsIriEncoder {
+    /// Build an encoder from a snapshot's namespace table.
+    pub fn from_snapshot(snapshot: &LedgerSnapshot) -> Self {
+        Self {
+            reverse: snapshot.shared_namespace_reverse(),
+            split_mode: snapshot.ns_split_mode(),
+        }
+    }
+
+    /// Encode an IRI to the SID the stats tables are keyed by.
+    pub fn encode(&self, iri: &str) -> Sid {
+        let (prefix, suffix) = canonical_split(iri, self.split_mode);
+        match self.reverse.get(prefix) {
+            Some(&code) => Sid::new(code, suffix),
+            None => Sid::new(fluree_vocab::namespaces::EMPTY, iri),
+        }
+    }
+}
 
 /// Pre-built stats lookup for query optimization.
 ///
@@ -26,10 +58,6 @@ pub struct StatsView {
     /// This is derived from `properties` using the db's namespace table.
     /// It exists to support planners that keep IRIs unencoded (e.g. cross-ledger-aware planning).
     pub properties_by_iri: HashMap<Arc<str>, PropertyStatData>,
-    /// Class IRI -> instance count
-    ///
-    /// This is derived from `classes` using the db's namespace table.
-    pub classes_by_iri: HashMap<Arc<str>, u64>,
     /// Graph-scoped property stats keyed by runtime predicate IDs.
     ///
     /// Populated from `IndexStats.graphs` when present. Provides per-graph
@@ -61,17 +89,13 @@ pub struct StatsView {
     pub property_ref_only: HashMap<Sid, bool>,
     /// Property IRI -> ref-only flag (see [`Self::property_ref_only`]).
     pub property_ref_only_by_iri: HashMap<Arc<str>, bool>,
-    /// Predicate IRI -> (class IRI -> count of that predicate's flakes whose
-    /// SUBJECT is an instance of the class), summed across graphs. Sourced from
-    /// `IndexStats.classes[*].properties[*].datatypes`.
-    ///
-    /// Enables sound elision of a redundant `?s rdf:type <C>`: when `?s` is the
-    /// subject of predicate P and the count here for `(P, C)` equals P's total
-    /// flake count, every P-subject is provably a C, so the type filter removes
-    /// nothing. The aggregate (cross-graph) equality implies per-graph coverage,
-    /// so it is sound for any single-graph current-state read. Only consult via
-    /// [`Self::predicate_subjects_all_in_class_by_iri`], which honors the gate.
-    pub predicate_class_subject_counts_by_iri: HashMap<Arc<str>, HashMap<Arc<str>, u64>>,
+    /// The `IndexStats` this view was derived from. Per-class property usage
+    /// is read from here on demand rather than copied into the view, since it
+    /// grows with the number of distinct classes.
+    pub source: Option<Arc<IndexStats>>,
+    /// IRI -> SID resolution for the by-IRI accessors. `None` for views built
+    /// without a namespace table, where those accessors report "unknown".
+    pub iri_encoder: Option<StatsIriEncoder>,
     /// True only when the class/property counts reflect exact current state with
     /// no overlay gap — novelty empty and no policy visibility layer. Set by the
     /// query stats-cache builder; defaults `false` so any caller that does not
@@ -133,11 +157,6 @@ impl StatsView {
             .keys()
             .map(|iri| iri.len() + size_of::<PropertyStatData>())
             .sum::<usize>();
-        let classes_by_iri = self
-            .classes_by_iri
-            .keys()
-            .map(|iri| iri.len() + size_of::<u64>())
-            .sum::<usize>();
         let graph_properties = self
             .graph_properties
             .values()
@@ -154,25 +173,9 @@ impl StatsView {
             })
             .sum::<usize>();
 
-        let predicate_class_subject_counts = self
-            .predicate_class_subject_counts_by_iri
-            .iter()
-            .map(|(pred, by_class)| {
-                pred.len()
-                    + by_class
-                        .keys()
-                        .map(|cls| cls.len() + size_of::<u64>())
-                        .sum::<usize>()
-            })
-            .sum::<usize>();
-
-        size_of::<Self>()
-            + properties
-            + classes
-            + properties_by_iri
-            + classes_by_iri
-            + graph_properties
-            + predicate_class_subject_counts
+        // `source` is not counted: the planner's builder keeps it only when it
+        // is the snapshot's own stats, which evicting the view would not free.
+        size_of::<Self>() + properties + classes + properties_by_iri + graph_properties
     }
 
     /// Build from IndexStats.
@@ -246,16 +249,18 @@ impl StatsView {
         view
     }
 
-    /// Build from IndexStats, also deriving IRI-keyed maps using a namespace table.
+    /// Build from `stats` (which may be a novelty-merged copy) using
+    /// `snapshot`'s namespace table.
     ///
-    /// This does **not** change how stats are persisted (still SID-keyed in `IndexStats`).
-    /// It just builds additional lookup maps that allow planning code to consult stats
-    /// when query terms are represented as IRIs rather than SIDs.
+    /// Only predicate lookups are materialized under IRI keys, because those
+    /// are bounded by the schema. Class lookups by IRI encode the IRI per call
+    /// instead, because classes can number in the millions.
     pub fn from_db_stats_with_namespaces(
-        stats: &IndexStats,
-        namespace_codes: &HashMap<u16, String>,
+        stats: &Arc<IndexStats>,
+        snapshot: &LedgerSnapshot,
     ) -> Self {
         let mut view = StatsView::from_db_stats(stats);
+        let namespace_codes = snapshot.namespaces();
 
         // Derive IRI-keyed property stats.
         // If a SID's namespace code is missing, skip it.
@@ -263,14 +268,6 @@ impl StatsView {
             if let Some(prefix) = namespace_codes.get(&sid.namespace_code) {
                 let iri: Arc<str> = Arc::from(format!("{}{}", prefix, sid.name));
                 view.properties_by_iri.insert(iri, *data);
-            }
-        }
-
-        // Derive IRI-keyed class stats.
-        for (sid, count) in &view.classes {
-            if let Some(prefix) = namespace_codes.get(&sid.namespace_code) {
-                let iri: Arc<str> = Arc::from(format!("{}{}", prefix, sid.name));
-                view.classes_by_iri.insert(iri, *count);
             }
         }
 
@@ -282,39 +279,42 @@ impl StatsView {
             }
         }
 
-        // Derive predicate -> (class -> subject-flake count) from the raw
-        // per-class property usage. `from_db_stats` keeps only class instance
-        // counts, so read the usage straight off `stats.classes` here, where the
-        // namespace table is available to resolve both SIDs to IRIs.
-        let iri_for = |sid: &Sid| -> Option<Arc<str>> {
-            namespace_codes
-                .get(&sid.namespace_code)
-                .map(|prefix| Arc::<str>::from(format!("{}{}", prefix, sid.name)))
-        };
-        if let Some(ref classes) = stats.classes {
-            for class in classes {
-                let Some(class_iri) = iri_for(&class.class_sid) else {
-                    continue;
-                };
-                for prop in &class.properties {
-                    let Some(pred_iri) = iri_for(&prop.property_sid) else {
-                        continue;
-                    };
-                    let count: u64 = prop.datatypes.iter().map(|&(_, c)| c).sum();
-                    if count == 0 {
-                        continue;
-                    }
-                    *view
-                        .predicate_class_subject_counts_by_iri
-                        .entry(pred_iri)
-                        .or_default()
-                        .entry(class_iri.clone())
-                        .or_insert(0) += count;
-                }
-            }
+        #[cfg(debug_assertions)]
+        if let Some(classes) = stats.classes.as_deref() {
+            debug_assert!(
+                classes.windows(2).all(|w| w[0].class_sid < w[1].class_sid),
+                "IndexStats.classes must be strictly sorted by class_sid"
+            );
         }
 
+        view.source = Some(Arc::clone(stats));
+        view.iri_encoder = Some(StatsIriEncoder::from_snapshot(snapshot));
         view
+    }
+
+    /// The per-class stats entry for `class_sid`, by binary search over the
+    /// class table, which every producer sorts by `class_sid`. A miss reads as
+    /// "no proof" to every caller, so an unsorted table declines rewrites
+    /// rather than licensing wrong ones.
+    fn class_entry(&self, class_sid: &Sid) -> Option<&ClassStatEntry> {
+        let classes = self.source.as_deref()?.classes.as_deref()?;
+        let idx = classes
+            .binary_search_by(|entry| entry.class_sid.cmp(class_sid))
+            .ok()?;
+        Some(&classes[idx])
+    }
+
+    /// Flakes of `property_sid` whose subject is an instance of `class_sid`,
+    /// summed across graphs. Zero when either is unknown to stats.
+    fn class_property_flakes(&self, class_sid: &Sid, property_sid: &Sid) -> u64 {
+        self.class_entry(class_sid)
+            .and_then(|entry| {
+                entry
+                    .properties
+                    .iter()
+                    .find(|usage| &usage.property_sid == property_sid)
+            })
+            .map_or(0, |usage| usage.datatypes.iter().map(|&(_, c)| c).sum())
     }
 
     /// Whether stats prove that **every** subject of `pred_iri` is an instance of
@@ -335,12 +335,11 @@ impl StatsView {
         if total == 0 {
             return false;
         }
-        let covered = self
-            .predicate_class_subject_counts_by_iri
-            .get(pred_iri)
-            .and_then(|by_class| by_class.get(class_iri))
-            .copied()
-            .unwrap_or(0);
+        let Some(encoder) = self.iri_encoder.as_ref() else {
+            return false;
+        };
+        let covered =
+            self.class_property_flakes(&encoder.encode(class_iri), &encoder.encode(pred_iri));
         covered == total
     }
 
@@ -371,9 +370,11 @@ impl StatsView {
         self.classes.get(sid).copied()
     }
 
-    /// Get class instance count by IRI.
+    /// Get class instance count by IRI. `None` when the view has no namespace
+    /// table to resolve the IRI with, or the class is unknown to stats.
     pub fn get_class_count_by_iri(&self, iri: &str) -> Option<u64> {
-        self.classes_by_iri.get(iri).copied()
+        let sid = self.iri_encoder.as_ref()?.encode(iri);
+        self.get_class_count(&sid)
     }
 
     /// Check if any property statistics are available.
@@ -1032,5 +1033,124 @@ mod tests {
 
         let count = view.get_class_count(&class_sid).unwrap();
         assert_eq!(count, 25);
+    }
+
+    const EX: &str = "http://example.org/";
+
+    fn ex_snapshot() -> LedgerSnapshot {
+        let mut snapshot = LedgerSnapshot::genesis("stats-view:main");
+        snapshot
+            .insert_namespace_code(100, EX.to_string())
+            .expect("register ex namespace");
+        snapshot
+    }
+
+    fn usage(property: &str, flakes: u64) -> crate::index_stats::ClassPropertyUsage {
+        crate::index_stats::ClassPropertyUsage {
+            property_sid: Sid::new(100, property),
+            datatypes: vec![(ValueTypeTag::JSON_LD_ID.as_u8(), flakes)],
+            langs: vec![],
+            ref_classes: vec![],
+        }
+    }
+
+    fn ex_property(name: &str, count: u64) -> PropertyStatEntry {
+        PropertyStatEntry {
+            sid: (100, name.to_string()),
+            count,
+            ndv_values: 0,
+            ndv_subjects: 0,
+            last_modified_t: 1,
+            datatypes: vec![],
+            observed_datatypes: vec![],
+            historical_datatypes: vec![],
+        }
+    }
+
+    /// Class lookups by IRI resolve through the snapshot's namespace table, the
+    /// same way `LedgerSnapshot::encode_iri` does — including the bare-name
+    /// EMPTY-namespace fallback — rather than through a prebuilt IRI map.
+    #[test]
+    fn class_count_by_iri_resolves_through_namespace_table() {
+        let snapshot = ex_snapshot();
+        let stats = Arc::new(IndexStats {
+            classes: Some(vec![
+                ClassStatEntry {
+                    class_sid: Sid::new(fluree_vocab::namespaces::EMPTY, "Bare"),
+                    count: 3,
+                    properties: vec![],
+                },
+                ClassStatEntry {
+                    class_sid: Sid::new(100, "Person"),
+                    count: 25,
+                    properties: vec![],
+                },
+            ]),
+            ..Default::default()
+        });
+        let view = StatsView::from_db_stats_with_namespaces(&stats, &snapshot);
+
+        assert_eq!(
+            view.get_class_count_by_iri(&format!("{EX}Person")),
+            Some(25)
+        );
+        assert_eq!(view.get_class_count_by_iri("Bare"), Some(3));
+        assert_eq!(view.get_class_count_by_iri(&format!("{EX}Nobody")), None);
+        assert_eq!(
+            view.get_class_count_by_iri("http://unregistered.example/Person"),
+            None,
+            "an IRI in an unregistered namespace must not alias a registered class"
+        );
+
+        // A view built without a namespace table cannot resolve IRIs at all.
+        assert_eq!(
+            StatsView::from_db_stats(&stats).get_class_count_by_iri(&format!("{EX}Person")),
+            None
+        );
+    }
+
+    /// The coverage proof behind `rdf:type` elision reads the per-class
+    /// property usage from the shared source stats. It must hold exactly when
+    /// the class accounts for every flake of the predicate, and fail closed on
+    /// anything it cannot prove.
+    #[test]
+    fn predicate_coverage_reads_class_usage_from_source() {
+        let snapshot = ex_snapshot();
+        let stats = Arc::new(IndexStats {
+            properties: Some(vec![ex_property("knows", 10), ex_property("name", 10)]),
+            classes: Some(vec![
+                ClassStatEntry {
+                    class_sid: Sid::new(100, "Org"),
+                    count: 1,
+                    properties: vec![usage("name", 4)],
+                },
+                ClassStatEntry {
+                    class_sid: Sid::new(100, "Person"),
+                    count: 10,
+                    properties: vec![usage("knows", 10), usage("name", 6)],
+                },
+            ]),
+            ..Default::default()
+        });
+        let mut view = StatsView::from_db_stats_with_namespaces(&stats, &snapshot);
+        let knows = format!("{EX}knows");
+        let name = format!("{EX}name");
+        let person = format!("{EX}Person");
+        let org = format!("{EX}Org");
+
+        assert!(
+            !view.predicate_subjects_all_in_class_by_iri(&knows, &person),
+            "never licensed without the current-state vouch"
+        );
+
+        view.class_coverage_trustworthy = true;
+        assert!(view.predicate_subjects_all_in_class_by_iri(&knows, &person));
+        assert!(
+            !view.predicate_subjects_all_in_class_by_iri(&name, &person),
+            "Person contributes 6 of 10 name flakes"
+        );
+        assert!(!view.predicate_subjects_all_in_class_by_iri(&knows, &org));
+        assert!(!view.predicate_subjects_all_in_class_by_iri(&knows, &format!("{EX}Nobody")));
+        assert!(!view.predicate_subjects_all_in_class_by_iri(&format!("{EX}unknown"), &person));
     }
 }

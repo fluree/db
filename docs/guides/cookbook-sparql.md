@@ -56,10 +56,11 @@ Each row is one change to Alice's salary over the range. Filter to just the
 retractions with `FILTER(?op = false)`, or bound the window with ISO datetimes
 (`FROM <mydb:main@iso:2024-01-01T00:00:00Z> TO <mydb:main@iso:2024-12-31T23:59:59Z>`).
 
-> **Two `<<` forms, different jobs.** The bare `<< s p o >>` above is Fluree's
-> flake-metadata term for `f:t` / `f:op`. The parenthesized `<<( s p o )>>` is
-> the RDF 1.2 *triple term* used with `rdf:reifies` (next section). They don't
-> compose.
+> **Two `<<` forms, different jobs.** The bare `<< s p o >>` above, paired with
+> `f:t` / `f:op`, is Fluree's flake-metadata term. With any other predicate, or
+> with a `~ reifier`, it is the RDF 1.2 *reified triple* and denotes the
+> reifier node — the same thing `rdf:reifies <<( s p o )>>` (next section)
+> binds. The two readings don't compose in one pattern.
 
 ## Annotate an edge
 

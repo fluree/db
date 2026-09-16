@@ -12,7 +12,9 @@
 //
 // ## Matrix
 //
-//   formats:   jsonld, turtle
+//   formats:   jsonld, turtle, trig (the same Turtle body inside one
+//              `GRAPH <g> { … }` block — exercises the named-graph
+//              structured path, which Turtle and JSON-LD never touch)
 //   txn counts: 10, 100
 //   nodes/txn:  10, 100, 1000
 //
@@ -78,6 +80,8 @@ type BenchLedger = fluree_db_api::LedgerState;
 struct PregenData {
     jsonld_txns: Vec<JsonValue>,
     turtle_txns: Vec<String>,
+    /// `turtle_txns` with the body wrapped in a single named-graph block.
+    trig_txns: Vec<String>,
     /// Total flakes produced by inserting all transactions (calibrated once).
     total_flakes: u64,
 }
@@ -94,11 +98,14 @@ fn pregen(
 ) -> PregenData {
     let mut jsonld_txns = Vec::with_capacity(txn_count);
     let mut turtle_txns = Vec::with_capacity(txn_count);
+    let mut trig_txns = Vec::with_capacity(txn_count);
 
     for txn_idx in 0..txn_count {
         let data = generate_txn_data(txn_idx, nodes_per_txn);
         jsonld_txns.push(txn_data_to_jsonld(&data));
-        turtle_txns.push(txn_data_to_turtle(&data));
+        let turtle = txn_data_to_turtle(&data);
+        trig_txns.push(turtle_to_trig(&turtle));
+        turtle_txns.push(turtle);
     }
 
     // Calibration: insert all txns once via Turtle (cheapest path) to count flakes.
@@ -127,8 +134,29 @@ fn pregen(
     PregenData {
         jsonld_txns,
         turtle_txns,
+        trig_txns,
         total_flakes,
     }
+}
+
+/// Wrap a Turtle document's statements in one `GRAPH <g> { … }` block,
+/// keeping the `@prefix` directives at document scope (TriG requires it).
+fn turtle_to_trig(turtle: &str) -> String {
+    let mut out = String::with_capacity(turtle.len() + 64);
+    let mut body = String::with_capacity(turtle.len());
+    for line in turtle.lines() {
+        if line.starts_with("@prefix") {
+            out.push_str(line);
+            out.push('\n');
+        } else {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    out.push_str("GRAPH <http://example.org/ns/bench-graph> {\n");
+    out.push_str(&body);
+    out.push_str("}\n");
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +208,28 @@ async fn run_turtle_inserts(
         ledger = result.ledger;
     }
     ledger
+}
+
+/// TriG goes through the transact builder's `upsert_turtle`: the plain
+/// `insert_turtle_with_opts` path and the builder's `insert_turtle` fast path
+/// both skip `GRAPH`-block extraction. The ledger is addressed by alias, so no
+/// `LedgerState` is threaded through.
+async fn run_trig_inserts(
+    fluree: &BenchFluree,
+    alias: &str,
+    txns: &[String],
+    index_config: &IndexConfig,
+) {
+    for txn in txns {
+        fluree
+            .graph(alias)
+            .transact()
+            .upsert_turtle(txn)
+            .index_config(index_config.clone())
+            .commit()
+            .await
+            .unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +407,17 @@ fn bench_insert_formats(c: &mut Criterion) {
                     });
                 },
             );
+
+            // --- TriG (one named-graph block) ---
+            group.bench_with_input(BenchmarkId::new("trig", &param_label), &data, |b, data| {
+                b.iter(|| {
+                    let alias = next_ledger_alias("trig");
+                    rt.block_on(async {
+                        let _ = fluree.create_ledger(&alias).await.unwrap();
+                        run_trig_inserts(&fluree, &alias, &data.trig_txns, &index_config).await;
+                    });
+                });
+            });
 
             // Collect a single timed run for the summary table.
             let jsonld_ms = time_jsonld_run(&rt, &fluree, &data.jsonld_txns, &index_config);

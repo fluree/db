@@ -1087,6 +1087,173 @@ async fn reindex_seals_arena_when_caching_enabled_no_provider_in_opts() {
     assert_eq!(stats.live_attachment_pairs, 1);
 }
 
+#[tokio::test]
+async fn reindex_seals_arena_without_ledger_caching() {
+    // The CLI builds its client `without_ledger_caching()`, so
+    // `Fluree::reindex` has no `LedgerManager` and therefore no
+    // attachment-events provider to ask. That is the configuration behind
+    // `fluree create --from <turtle-star>`, whose one-shot seal pass ended
+    // with `annotation_index = None` while printing "Annotation arena
+    // sealed" — every quoted-triple query on the imported ledger then took
+    // the generic join chain. The reindex must derive coverage from the
+    // ledger state it loads anyway.
+    use fluree_db_api::ReindexOptions;
+
+    let fluree = FlureeBuilder::memory()
+        .without_ledger_caching()
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:reindex-seals-arena-no-cache";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    fluree
+        .insert(ledger0, &annotated_insert())
+        .await
+        .expect("annotated insert");
+
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex must succeed");
+
+    let post = fluree.ledger(ledger_id).await.expect("reload");
+    assert!(post.snapshot.has_annotations, "sticky bit set");
+    let stats = &post
+        .snapshot
+        .annotation_index
+        .as_ref()
+        .expect(
+            "reindex without a ledger manager must still seal the arena from the \
+             ledger state's attachment events",
+        )
+        .stats;
+    assert_eq!(stats.distinct_annotations, 1);
+    assert_eq!(stats.live_attachment_pairs, 1);
+}
+
+#[tokio::test]
+async fn wildcard_annotation_query_streams_from_the_arena() {
+    // StarBench P2 shape, `<< ?s ?p ?o >> :q ?x`, over a sealed arena: the
+    // annotation-first lane emits every live attachment straight from the
+    // forward arena — ref, plain-literal and language-tagged objects — with
+    // no base-edge scan. Rows must be exactly the annotated edges, with the
+    // object's datatype and language tag intact; the unannotated edge must
+    // not appear.
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(fluree_db_api::LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/edge-annotations-indexed:wildcard-enumeration";
+
+    let (local, handle) =
+        support::start_background_indexer_with_attachments(&fluree, IndexerConfig::small());
+
+    local
+        .run_until(async move {
+            let ledger0 = genesis_ledger(&fluree, ledger_id);
+            let after_insert = fluree
+                .insert(
+                    ledger0,
+                    &json!({
+                        "@context": ctx(),
+                        "@graph": [
+                            {
+                                "@id": "ex:alice",
+                                "ex:worksFor": {
+                                    "@id": "ex:acme",
+                                    "@annotation": {"ex:source": "hr"}
+                                },
+                                "ex:score": {
+                                    "@value": 42,
+                                    "@annotation": {"ex:source": "exam"}
+                                },
+                                "ex:motto": {
+                                    "@value": "carpe diem",
+                                    "@language": "la",
+                                    "@annotation": {"ex:source": "wall"}
+                                }
+                            },
+                            {"@id": "ex:bob", "ex:worksFor": {"@id": "ex:acme"}}
+                        ]
+                    }),
+                )
+                .await
+                .expect("annotated insert");
+            let _ = fluree
+                .ledger_cached(ledger_id)
+                .await
+                .expect("cached load before reindex");
+
+            support::trigger_index_and_wait(&handle, ledger_id, after_insert.receipt.t).await;
+            support::wait_for_index_application(&fluree, ledger_id, after_insert.receipt.t).await;
+
+            let post = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("reload after reindex");
+            assert!(
+                post.snapshot.annotation_index.is_some(),
+                "arena must be sealed for this test to exercise the enumeration lane"
+            );
+
+            let sparql = r"
+                PREFIX ex: <http://example.org/>
+                SELECT ?s ?p ?o ?src WHERE {
+                  << ?s ?p ?o >> ex:source ?src .
+                }
+                ORDER BY ?src
+            ";
+            let result = support::query_sparql(&fluree, &post, sparql)
+                .await
+                .expect("wildcard annotation query");
+            let rows = result.to_sparql_json(&post.snapshot).expect("sparql json");
+            let bindings = rows["results"]["bindings"]
+                .as_array()
+                .expect("bindings array")
+                .clone();
+            let cell = |b: &JsonValue, v: &str| b[v]["value"].as_str().unwrap_or("").to_string();
+            let got: Vec<(String, String, String, String)> = bindings
+                .iter()
+                .map(|b| (cell(b, "s"), cell(b, "p"), cell(b, "o"), cell(b, "src")))
+                .collect();
+            let ex = |l: &str| format!("http://example.org/{l}");
+            assert_eq!(
+                got,
+                vec![
+                    (
+                        ex("alice"),
+                        ex("score"),
+                        "42".to_string(),
+                        "exam".to_string()
+                    ),
+                    (ex("alice"), ex("worksFor"), ex("acme"), "hr".to_string()),
+                    (
+                        ex("alice"),
+                        ex("motto"),
+                        "carpe diem".to_string(),
+                        "wall".to_string()
+                    ),
+                ],
+                "exactly the annotated edges, in ?src order: {bindings:#?}"
+            );
+            let motto = bindings
+                .iter()
+                .find(|b| b["src"]["value"] == "wall")
+                .expect("language-tagged row");
+            assert_eq!(
+                motto["o"]["xml:lang"], "la",
+                "language tag must survive the arena round-trip: {motto:#?}"
+            );
+            let score = bindings
+                .iter()
+                .find(|b| b["src"]["value"] == "exam")
+                .expect("integer row");
+            assert_eq!(
+                score["o"]["datatype"], "http://www.w3.org/2001/XMLSchema#integer",
+                "datatype must survive the arena round-trip: {score:#?}"
+            );
+        })
+        .await;
+}
+
 /// #1467: a reification-aware COPY of a named-graph annotation must survive a
 /// reindex. The attachment indexer decodes each bundle via
 /// `EdgeKey::from_reifies_facts` at seal time
