@@ -23,11 +23,11 @@ fluree sweep [LEDGER] [--dry-run] [--remote <NAME>]
 
 ## Description
 
-Index builds leave superseded artifacts behind. The garbage collector normally reclaims them: each index root carries a manifest naming what the previous version replaced, and the collector releases exactly those. That only reaches artifacts some manifest records, and only **branch-local** ones — index roots, leaves, and branch manifests.
+Index builds leave superseded artifacts behind. The garbage collector normally reclaims them: each index root carries a manifest naming what the previous version replaced, and the collector releases exactly those. That only reaches artifacts some manifest records.
 
-A sweep finds the rest, and it is the only thing that reclaims **dictionary blobs**. It enumerates what storage actually holds, subtracts everything reachable from a live index chain, and releases the remainder. The usual source of such artifacts is a reindex published by Fluree **4.1.4 or earlier**, which severed the chain and left every earlier index version unreachable — so a ledger reindexed on one of those versions can hold a large volume of blobs no retention policy can ever truncate.
+A sweep finds the rest. It enumerates what storage actually holds, subtracts everything reachable from a live index chain, and releases the remainder. Two sources account for most of it: a reindex published by Fluree **4.1.4 or earlier**, which severed the chain and left every earlier index version unreachable, and dictionary blobs whose manifests were consumed on Fluree **4.2.0 or earlier**, which left every dictionary blob to the sweep. A ledger with a long history on one of those versions can hold many times its live index in blobs no retention policy can reach.
 
-A sweep covers **every branch** of a ledger, which is why `LEDGER` names the ledger rather than a branch — a branch-qualified alias is rejected. Dictionary blobs live in a namespace shared by all of a ledger's branches, so releasing one is only safe with every branch's index accounted for. That is exactly why background GC leaves dictionaries alone: it walks a single branch and holds no exclusion over the others, whereas a sweep holds every branch and unions their reachable sets. Soft-dropped branches count as live, so dropping a branch without purging it stays reversible.
+A sweep covers **every branch** of a ledger, which is why `LEDGER` names the ledger rather than a branch — a branch-qualified alias is rejected. Dictionary blobs live in a namespace shared by all of a ledger's branches, so releasing one is only safe with every branch's index accounted for. Background GC accounts for the other branches by reading their chains before it releases a dictionary blob; a sweep holds every branch and unions their reachable sets, which is what lets it release blobs no manifest names any more. Soft-dropped branches count as live, so dropping a branch without purging it stays reversible.
 
 Only index artifacts are considered. Commits, transactions, and config blobs are reachable through the commit chain rather than the index chain, so a sweep cannot establish that they are unreferenced and never touches them.
 
@@ -69,7 +69,7 @@ Artifacts that resist deletion are reported rather than treated as failures — 
 
 - **Disk usage far exceeds the data** — the ledger directory is many times the size of its commits.
 - **After reindexing on Fluree 4.1.4 or earlier** — those reindexes orphaned every earlier index version, and only a sweep reclaims them.
-- **Periodically on write-heavy ledgers** — dictionaries are reclaimed only by a sweep and are often the largest part of index storage, so this is routine maintenance rather than a one-off repair. Running it when nothing is reclaimable is a safe no-op.
+- **After upgrading from Fluree 4.2.0 or earlier** — those versions left every dictionary blob the collector replaced in storage, often the largest part of a ledger's index footprint. One sweep clears the backlog; afterwards the collector keeps up and a sweep is a repair rather than routine maintenance. Running it when nothing is reclaimable is a safe no-op.
 
 ## See Also
 

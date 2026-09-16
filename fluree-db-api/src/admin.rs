@@ -11,17 +11,26 @@
 
 use crate::{error::ApiError, tx::IndexingMode, Result};
 use fluree_db_core::tracking::{Tracker, TrackingOptions};
+use fluree_db_core::ContentId;
 use fluree_db_core::{
     address_path::{ledger_id_to_path_prefix, shared_prefix_for_path},
     format_ledger_id, DEFAULT_BRANCH,
 };
 use fluree_db_indexer::{
     clean_garbage, execute_sweep, plan_sweep, rebuild_index_from_commits_with_tracker,
-    BranchIndexHead, CleanGarbageConfig, MaintenanceGuard, SweepPlan, SweepResult,
+    shared_blob_policy_for, shared_refs_of_branches, siblings_of, BranchIndexHead,
+    CleanGarbageConfig, MaintenanceGuard, SharedBlobPolicy, SweepPlan, SweepResult,
 };
 use fluree_db_nameservice::{GraphSourceType, NsRecord};
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+/// The ledger name a ledger id belongs to, for keying the collector lock.
+fn ledger_name_of(ledger_id: &str) -> String {
+    fluree_db_core::ledger_id::split_ledger_id(ledger_id)
+        .map(|(name, _)| name)
+        .unwrap_or_else(|_| ledger_id.to_string())
+}
 
 // =============================================================================
 // Drop Mode and Status Types
@@ -1178,6 +1187,13 @@ impl crate::Fluree {
 
     /// Cancel indexing, delete storage artifacts, purge nameservice record,
     /// and disconnect from cache. Returns the parent's new child count.
+    ///
+    /// Dictionary blobs live in the ledger-wide `@shared/dicts/` namespace,
+    /// so the branch prefix delete does not reach them. The ones only this
+    /// branch's index chain referenced go last, once the record is gone: a
+    /// sibling's collector pass may already have deferred them to this branch
+    /// (see the module docs on `fluree_db_indexer::gc`), after which nothing
+    /// else names them.
     async fn purge_branch(
         &self,
         ledger_id: &str,
@@ -1189,9 +1205,15 @@ impl crate::Fluree {
             handle.wait_for_idle(ledger_id).await;
         }
 
-        // Branch path: only the per-branch artifacts. `@shared/dicts/` is
-        // never wiped from a branch drop — sibling/parent branches may still
-        // reference them; final cleanup happens in `drop_ledger`.
+        // Decided before the branch's roots are deleted: the chain is what
+        // says which blobs it referenced.
+        let unique_dicts = self
+            .shared_blobs_unique_to(ledger_id, record, &mut report.warnings)
+            .await;
+
+        // Branch path: only the per-branch artifacts. The rest of
+        // `@shared/dicts/` stays — sibling/parent branches reference it — and
+        // is wiped by `drop_ledger` once every branch is gone.
         let (count, warnings) = self.drop_artifacts(ledger_id, record).await;
         report.artifacts_deleted += count;
         report.warnings.extend(warnings);
@@ -1202,7 +1224,91 @@ impl crate::Fluree {
             mgr.disconnect(ledger_id).await;
         }
 
+        if !unique_dicts.is_empty() {
+            // Not concurrently with a sibling's collector pass, which decides
+            // from the same listing this did.
+            let _gc_guard = match &self.indexing_mode {
+                IndexingMode::Background(handle) => {
+                    Some(handle.hold_gc(&ledger_name_of(ledger_id)).await)
+                }
+                _ => None,
+            };
+            let failures = self
+                .content_store(ledger_id)
+                .release_many(&unique_dicts)
+                .await;
+            let released = unique_dicts.len() - failures.len();
+            report.artifacts_deleted += released;
+            for (cid, error) in failures {
+                warn!(ledger_id, %cid, %error, "Failed to release a dropped branch's dictionary blob");
+                report
+                    .warnings
+                    .push(format!("Failed to release dictionary blob {cid}: {error}"));
+            }
+            info!(
+                ledger_id,
+                released, "Released dictionary blobs only the dropped branch referenced"
+            );
+        }
+
         Ok(parent_new_count)
+    }
+
+    /// Dictionary blobs `ledger_id`'s index chain references that no other
+    /// branch of its ledger reaches, retracted branches included.
+    ///
+    /// Any failure to read a chain or list the branches returns nothing and
+    /// records a warning: releasing on an incomplete picture could take a
+    /// dictionary a surviving branch still reads, whereas leaving the blobs
+    /// costs disk until a sweep.
+    async fn shared_blobs_unique_to(
+        &self,
+        ledger_id: &str,
+        record: Option<&NsRecord>,
+        warnings: &mut Vec<String>,
+    ) -> Vec<ContentId> {
+        let Some(head) = record.and_then(|r| r.index_head_id.clone()) else {
+            return Vec::new();
+        };
+        let backend = self.backend();
+        let own = BranchIndexHead {
+            ledger_id: ledger_id.to_string(),
+            index_head_id: Some(head),
+        };
+        let referenced = match shared_refs_of_branches(backend, &[own], None).await {
+            Ok(refs) => refs,
+            Err(e) => {
+                warnings.push(format!(
+                    "Could not read the branch's index chain; its dictionary blobs are left for a sweep: {e}"
+                ));
+                return Vec::new();
+            }
+        };
+        if referenced.is_empty() {
+            return Vec::new();
+        }
+        let records = match self.nameservice().all_records().await {
+            Ok(records) => records,
+            Err(e) => {
+                warnings.push(format!(
+                    "Could not list branches; the branch's dictionary blobs are left for a sweep: {e}"
+                ));
+                return Vec::new();
+            }
+        };
+        let survivors = siblings_of(&records, ledger_id);
+        let elsewhere = match shared_refs_of_branches(backend, &survivors, None).await {
+            Ok(refs) => refs,
+            Err(e) => {
+                warnings.push(format!(
+                    "Could not read a sibling branch's index chain; the branch's dictionary blobs are left for a sweep: {e}"
+                ));
+                return Vec::new();
+            }
+        };
+        let mut unique: Vec<ContentId> = referenced.difference(&elsewhere).cloned().collect();
+        unique.sort();
+        unique
     }
 
     /// Recursively drop retracted ancestor branches that have zero children.
@@ -2131,12 +2237,44 @@ impl crate::Fluree {
         } else {
             let gc_store = self.content_store(&ledger_id);
             let gc_root_id = index_result.root_id.clone();
-            let gc_config = CleanGarbageConfig {
-                max_old_indexes: Some(gc_max_old_indexes),
-                min_time_garbage_mins: Some(gc_min_time_mins),
-                ..Default::default()
+            let gc_backend = self.backend().clone();
+            let gc_ledger_id = ledger_id.clone();
+            // Listed here rather than in the task: the listing needs `self`,
+            // and a reindex is rare enough that one listing per reindex is
+            // the right cost. A listing that fails defers every shared blob.
+            let gc_records = match self.nameservice().all_records().await {
+                Ok(records) => Some(records),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "could not list branches for the collector's sibling check; deferring shared blobs"
+                    );
+                    None
+                }
+            };
+            let gc_handle = match &self.indexing_mode {
+                IndexingMode::Background(handle) => Some(handle.clone()),
+                _ => None,
             };
             tokio::spawn(async move {
+                // Serialised with the worker's own passes on this ledger's
+                // branches where a worker exists; see `IndexerHandle::hold_gc`.
+                let _gc_guard = match &gc_handle {
+                    Some(handle) => Some(handle.hold_gc(&ledger_name_of(&gc_ledger_id)).await),
+                    None => None,
+                };
+                let shared_blobs = match gc_records {
+                    Some(records) => {
+                        shared_blob_policy_for(&gc_backend, &records, &gc_ledger_id, None).await
+                    }
+                    None => SharedBlobPolicy::Defer,
+                };
+                let gc_config = CleanGarbageConfig {
+                    max_old_indexes: Some(gc_max_old_indexes),
+                    min_time_garbage_mins: Some(gc_min_time_mins),
+                    shared_blobs,
+                    ..Default::default()
+                };
                 if let Err(e) = clean_garbage(gc_store.as_ref(), &gc_root_id, gc_config).await {
                     tracing::warn!(
                         error = %e,
