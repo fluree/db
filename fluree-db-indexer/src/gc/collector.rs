@@ -79,19 +79,56 @@ struct NodePartition {
     shared_released: usize,
     /// Shared blobs the manifests named that stay in storage.
     shared_deferred: usize,
+    /// Items a manifest named as garbage that a root this pass still
+    /// retains references directly. See [`retained_refs`] for why a CID a
+    /// manifest named can be live again.
+    resurrected: usize,
+}
+
+/// Every CAS id directly referenced by a root this pass retains —
+/// `index_chain[..keep_count]`, newest-first, so the roots that survive the
+/// pass and everything a query against any of them can still read.
+///
+/// A manifest names a CID as garbage relative to the *one* root it replaced
+/// it in. Content addressing does not know that: two builds that happen to
+/// produce byte-identical output get the same CID, whatever the manifests in
+/// between said about it. Reverse-dictionary leaves hit this routinely under
+/// a monotonic key pattern (ULID, UUIDv7, sequential ids) — a leaf that
+/// receives one new entry per build is re-hashed and its old CID garbaged
+/// every build, and the half a later split keeps is byte-identical to one of
+/// those earlier states, reviving a CID an already-consumed manifest named.
+/// Checked directly against `all_cas_ids()` rather than expanded, since a
+/// resurrected CID this pass must not delete is exactly one still directly
+/// reachable from a surviving root — nothing behind a named-graph or
+/// annotation branch manifest changes that.
+fn retained_refs(
+    index_chain: &[IndexChainEntry],
+    keep_count: usize,
+) -> std::collections::HashSet<ContentId> {
+    index_chain[..keep_count.min(index_chain.len())]
+        .iter()
+        .flat_map(|entry| entry.root.all_cas_ids())
+        .collect()
 }
 
 /// Split manifest items into what this pass releases and what it leaves.
 ///
-/// Branch-local artifacts are always released. A dictionary blob is released
+/// A CID [`retained_refs`] reports live is skipped regardless of policy —
+/// see its doc for why a garbage-named CID can still be needed. Otherwise,
+/// branch-local artifacts are always released. A dictionary blob is released
 /// under [`SharedBlobPolicy::Release`] unless a sibling branch still reaches
 /// it, and never under [`SharedBlobPolicy::Defer`]. See the module docs on
 /// [`crate::gc`] for why the sibling set decides.
-fn partition_nodes(items: &[String], policy: &SharedBlobPolicy) -> NodePartition {
+fn partition_nodes(
+    items: &[String],
+    policy: &SharedBlobPolicy,
+    retained: &std::collections::HashSet<ContentId>,
+) -> NodePartition {
     let mut out = NodePartition {
         release: Vec::with_capacity(items.len()),
         shared_released: 0,
         shared_deferred: 0,
+        resurrected: 0,
     };
     for item in items {
         let cid = match item.parse::<ContentId>() {
@@ -105,6 +142,14 @@ fn partition_nodes(items: &[String], policy: &SharedBlobPolicy) -> NodePartition
                 continue;
             }
         };
+        if retained.contains(&cid) {
+            out.resurrected += 1;
+            tracing::debug!(
+                %cid,
+                "garbage-named CID is still referenced by a retained root; not releasing"
+            );
+            continue;
+        }
         if !is_shared_across_branches(&cid) {
             out.release.push(cid);
             continue;
@@ -432,8 +477,10 @@ pub async fn clean_garbage(
         return Ok(CleanGarbageResult::default());
     }
 
-    // 3. Release the nodes the manifests named.
-    let partition = partition_nodes(&named, &config.shared_blobs);
+    // 3. Release the nodes the manifests named, protecting anything a
+    // retained root still references directly (see `retained_refs`).
+    let retained = retained_refs(&index_chain, keep_count);
+    let partition = partition_nodes(&named, &config.shared_blobs, &retained);
     let release_started = std::time::Instant::now();
     let node_failures = release_batched(store, &partition.release, "garbage node").await;
     let shared_failed = node_failures
@@ -446,6 +493,7 @@ pub async fn clean_garbage(
         released = deleted_count,
         shared_released = partition.shared_released - shared_failed,
         shared_deferred = partition.shared_deferred,
+        resurrected = partition.resurrected,
         elapsed_ms = release_started.elapsed().as_millis() as u64,
         "GC garbage node release complete"
     );
@@ -481,12 +529,13 @@ pub async fn clean_garbage(
     }
 
     let shared_released = partition.shared_released - shared_failed;
-    if indexes_cleaned > 0 || deleted_count > 0 {
+    if indexes_cleaned > 0 || deleted_count > 0 || partition.resurrected > 0 {
         tracing::info!(
             indexes_cleaned = indexes_cleaned,
             nodes_deleted = deleted_count,
             shared_released,
             shared_deferred = partition.shared_deferred,
+            resurrected = partition.resurrected,
             unnameable_indexes = unnameable_indexes,
             age_guard_overridden = age_guard_overridden,
             retained_count = keep_count,
@@ -497,6 +546,7 @@ pub async fn clean_garbage(
     Ok(CleanGarbageResult {
         indexes_cleaned,
         nodes_deleted: deleted_count,
+        resurrected: partition.resurrected,
         age_guard_overridden,
         shared_released,
         shared_deferred: partition.shared_deferred,
@@ -684,6 +734,18 @@ mod tests {
             garbage,
             ContentId::new(ContentKind::IndexLeaf, b"dummy"),
         )
+    }
+
+    /// Like [`minimal_fir6`], but with the given CID (rather than a fixed
+    /// dummy) as the dict tree branch, so `all_cas_ids()` reports it — what
+    /// resurrection tests need to make a root "reference" a specific CID.
+    fn minimal_fir6_with_dict(
+        t: i64,
+        prev_index: Option<BinaryPrevIndexRef>,
+        garbage: Option<BinaryGarbageRef>,
+        dict_branch: ContentId,
+    ) -> Vec<u8> {
+        crate::gc::test_support::minimal_fir6_for(LEDGER, t, prev_index, garbage, dict_branch)
     }
 
     /// Helper: create a CID and its derived memory-storage address.
@@ -919,6 +981,121 @@ mod tests {
     /// allows: never under `Defer`, always with no siblings, and not while a
     /// sibling still reaches it. The branch-local leaf beside it goes
     /// regardless.
+    /// A garbage-named CID that reappears on a RETAINED root must not be
+    /// released, even though it is unambiguously named as garbage by an
+    /// older manifest. This is the shape a reverse-dict leaf split produces
+    /// under a monotonic key pattern: a leaf re-hashed every build has its
+    /// old CID garbaged every build, and the half a later split keeps can be
+    /// byte-identical to one of those earlier states — the same CID an
+    /// already-consumed manifest named, now live again via a root this pass
+    /// keeps. See `retained_refs`.
+    #[tokio::test]
+    async fn a_garbage_named_cid_still_live_on_a_retained_root_is_not_released() {
+        let dict_kind = ContentKind::DictBlob {
+            dict: fluree_db_core::DictKind::Graphs,
+        };
+        let (resurrected, resurrected_addr) = cid_and_addr(dict_kind, b"leaf state N");
+        let storage = MemoryStorage::new();
+        storage
+            .write_bytes(&resurrected_addr, b"leaf state N")
+            .await
+            .unwrap();
+
+        // t=1: the leaf's first appearance, referenced directly as this
+        // root's dict tree branch (all_cas_ids() includes tree.branch).
+        let (cid1, addr1) = cid_and_addr(ContentKind::IndexRoot, b"root1");
+        let root1 = minimal_fir6_with_dict(1, None, None, resurrected.clone());
+
+        // t=2: the leaf gets touched (re-hashed), garbaging the t=1 CID —
+        // exactly what happens to a growing leaf every build.
+        let (cid2, addr2) = cid_and_addr(ContentKind::IndexRoot, b"root2");
+        let (garb_cid2, garb_addr2) = cid_and_addr(ContentKind::GarbageRecord, b"garb2");
+        let (touched, touched_addr) = cid_and_addr(dict_kind, b"leaf state N+1");
+        let old_ts = current_timestamp_ms() - (60 * 60 * 1000);
+        let root2 = minimal_fir6_with_dict(
+            2,
+            Some(BinaryPrevIndexRef {
+                t: 1,
+                id: cid1.clone(),
+            }),
+            Some(BinaryGarbageRef {
+                id: garb_cid2.clone(),
+            }),
+            touched.clone(),
+        );
+        let garbage2 = format!(
+            r#"{{"ledger_id": "{LEDGER}", "t": 2, "garbage": ["{resurrected}"], "created_at_ms": {old_ts}}}"#
+        );
+
+        // t=3: RETAINED (inside keep_count). The leaf resurrects: content
+        // identical to t=1's state, so it gets the same CID again.
+        let (cid3, addr3) = cid_and_addr(ContentKind::IndexRoot, b"root3");
+        let root3 = minimal_fir6_with_dict(
+            3,
+            Some(BinaryPrevIndexRef {
+                t: 2,
+                id: cid2.clone(),
+            }),
+            None,
+            resurrected.clone(),
+        );
+
+        // t=4: head, also retained.
+        let (cid4, addr4) = cid_and_addr(ContentKind::IndexRoot, b"root4");
+        let root4 = minimal_fir6_with_dict(
+            4,
+            Some(BinaryPrevIndexRef {
+                t: 3,
+                id: cid3.clone(),
+            }),
+            None,
+            resurrected.clone(),
+        );
+
+        for (addr, bytes) in [
+            (&addr1, root1.as_slice()),
+            (&addr2, root2.as_slice()),
+            (&addr3, root3.as_slice()),
+            (&addr4, root4.as_slice()),
+            (&garb_addr2, garbage2.as_bytes()),
+            (&touched_addr, b"leaf state N+1".as_slice()),
+        ] {
+            storage.write_bytes(addr, bytes).await.unwrap();
+        }
+
+        // max_old_indexes=1 -> keep_count=2 -> retained {t=4, t=3}, t=1 and
+        // t=2 are gc-eligible. Single branch, so the shared-blob policy
+        // would otherwise release everything a manifest names.
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(1),
+            min_time_garbage_mins: Some(30),
+            shared_blobs: SharedBlobPolicy::Release {
+                referenced_elsewhere: std::collections::HashSet::new(),
+            },
+            ..Default::default()
+        };
+        let store = test_store(&storage);
+        let result = clean_garbage(&store, &cid4, config).await.unwrap();
+
+        assert_eq!(result.indexes_cleaned, 2, "t=1 and t=2 both go");
+        assert_eq!(
+            result.resurrected, 1,
+            "the manifest names the resurrected CID exactly once"
+        );
+        assert_eq!(
+            result.shared_released, 0,
+            "the resurrected CID must not count as released"
+        );
+        assert!(
+            store.has(&resurrected).await.unwrap(),
+            "root t=3 and t=4 still reference this CID; it must survive"
+        );
+        assert!(!store.has(&cid1).await.unwrap());
+        assert!(!store.has(&cid2).await.unwrap());
+        assert!(store.has(&cid3).await.unwrap());
+        assert!(store.has(&cid4).await.unwrap());
+    }
+
     #[tokio::test]
     async fn shared_blobs_follow_the_policy() {
         let dict_kind = ContentKind::DictBlob {

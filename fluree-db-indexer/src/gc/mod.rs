@@ -44,6 +44,27 @@
 //! orphaned off the chain, are reachable only by [`plan_sweep`], which
 //! enumerates storage rather than walking chains.
 //!
+//! ## A manifest's "garbage" can still be live
+//!
+//! A manifest names a CID relative to the one build that replaced it.
+//! Content addressing does not know that: a later build that happens to
+//! produce byte-identical output gets the *same* CID, whatever an earlier
+//! manifest said about it. Reverse-dictionary leaves hit this routinely
+//! under a monotonic key pattern (ULID, UUIDv7, sequential ids, timestamp
+//! suffixes): a leaf receiving one new entry per build is re-hashed and its
+//! old CID garbaged every build, and the half a later split keeps is
+//! byte-identical to one of the leaf's own earlier states — reviving a CID
+//! an already-consumed manifest named.
+//!
+//! Before releasing anything a manifest names, `retained_refs` (in
+//! `gc::collector`) checks it against `all_cas_ids()` of every root this
+//! pass retains — every root a query or a future build can still read —
+//! and skips it if any of them still reference it directly. That closes the
+//! case above. It does not close a build publishing a *new* root during
+//! this pass, between the chain snapshot the check uses and the release
+//! call: same single-process caveat as [`plan_sweep`] and
+//! `MaintenanceGuard`.
+//!
 //! ## Garbage Record Format
 //!
 //! Garbage records are CAS-written JSON containing sorted/deduped CID strings
@@ -188,6 +209,15 @@ pub struct CleanGarbageResult {
     /// every one under [`SharedBlobPolicy::Defer`], or those a sibling
     /// branch still reaches under [`SharedBlobPolicy::Release`].
     pub shared_deferred: usize,
+    /// Items a manifest named as garbage that a root this pass retains
+    /// still references directly, so they were left in storage regardless
+    /// of policy. Non-zero on a healthy pass — see `retained_refs` in
+    /// `gc::collector` for why a garbage-named CID can be live again. What
+    /// it does not cover: a build publishing a new root *during* this pass,
+    /// between its chain snapshot and the release call, can still lose a
+    /// CID this check would have protected. Single-process deployments
+    /// only, same caveat as the storage sweep and `MaintenanceGuard`.
+    pub resurrected: usize,
 }
 
 /// Write a garbage record to storage.
