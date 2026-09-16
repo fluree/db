@@ -1819,6 +1819,69 @@ fn export_never_indexed_groups_each_subject_once() {
     );
 }
 
+/// A subject reachable *only* through untranslated rows must still get a
+/// well-formed block of its own.
+///
+/// This is the other half of the grouping fix and a different code path:
+/// `ex:carol`'s single property is a language-tagged literal, so with no
+/// persisted dictionary nothing of hers translates, she never enters the
+/// cursor's stream at all, and she can only be emitted by the pass that
+/// drains what the base stream never reached. The sibling test covers
+/// subjects that appear on *both* sides; this one covers a subject that
+/// appears on neither until that pass runs. Getting it wrong drops her
+/// entirely or emits her as a bare one-line statement.
+#[test]
+fn export_never_indexed_blocks_a_subject_only_in_untranslated_rows() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "only"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "only",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice a ex:Person .\n\
+             ex:carol ex:label \"Carol\"@fr .",
+        ])
+        .assert()
+        .success();
+
+    let turtle = String::from_utf8(
+        fluree_cmd(&tmp)
+            .args(["export", "only", "--format", "turtle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+
+    // Block form — subject alone on its line, predicate indented beneath —
+    // rather than the one-line statement the stranded tail used to emit.
+    assert!(
+        turtle
+            .contains("<http://example.org/carol>\n    <http://example.org/label> \"Carol\"@fr .",),
+        "carol must get her own block, not a bare statement:\n{turtle}"
+    );
+
+    let jsonld = String::from_utf8(
+        fluree_cmd(&tmp)
+            .args(["export", "only", "--format", "jsonld"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        jsonld.contains("\"@id\": \"http://example.org/carol\""),
+        "carol must reach the JSON-LD output at all:\n{jsonld}"
+    );
+}
+
 /// The command from #1574's report. `--format` defaults to `turtle`, so this
 /// wrote Turtle into a file named `.flpack` and said nothing.
 #[test]
