@@ -123,6 +123,75 @@ async fn datalog_grandparent_rule() {
     );
 }
 
+/// `{"opts": {"reasoning": ...}}` was silently ignored: no error, no
+/// reasoning, an empty result set. `opts` is an open bag carrying several
+/// genuine query-level knobs (`objectVarParsing`, `includeSystemFacts`, `t`,
+/// `maxFuel`), so guessing that `reasoning` lives there is reasonable, and the
+/// failure gave the user nothing to go on. It is now accepted as an alias,
+/// with the top level canonical and winning. Reported alongside fluree/db#1863.
+#[tokio::test]
+async fn datalog_reasoning_honored_inside_opts() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "datalog/opts-reasoning");
+
+    let rule_data = json!({
+        "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+        "@id": "ex:grandparentRule",
+        "f:rule": {
+            "@type": "@json",
+            "@value": {
+                "@context": {"ex": "http://example.org/"},
+                "where": {"@id": "?person", "ex:parent": {"ex:parent": "?grandparent"}},
+                "insert": {"@id": "?person", "ex:grandparent": {"@id": "?grandparent"}}
+            }
+        }
+    });
+    let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+
+    let family_data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [
+            {"@id": "ex:alice", "ex:parent": {"@id": "ex:bob"}},
+            {"@id": "ex:bob", "ex:parent": {"@id": "ex:charlie"}}
+        ]
+    });
+    let ledger = fluree.insert(ledger, &family_data).await.unwrap().ledger;
+
+    let via_opts = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?grandparent",
+        "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+        "opts": {"reasoning": "datalog"}
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &via_opts)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    let results = normalize_rows(&rows);
+    assert!(
+        results.contains(&json!("ex:charlie")),
+        "opts.reasoning should enable datalog, got {results:?}"
+    );
+
+    // Control: with no reasoning requested anywhere, nothing is derived — so
+    // the assertion above cannot pass for some unrelated reason.
+    let no_reasoning = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?grandparent",
+        "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"}
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &no_reasoning)
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert!(
+        normalize_rows(&rows).is_empty(),
+        "reasoning is opt-in; nothing should be derived without it"
+    );
+}
+
 #[tokio::test]
 async fn datalog_sibling_rule() {
     // Test: Define a sibling rule that derives sibling relationships
