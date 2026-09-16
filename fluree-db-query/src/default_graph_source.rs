@@ -952,6 +952,22 @@ impl Operator for DefaultGraphSourceOperator {
     /// and is the single most useful fact about an annotated plan. It is
     /// labelled as a preference, and `lane-final` says where the real answer
     /// lives: the `annotation delegate lane` tracing event at DEBUG.
+    ///
+    /// **`lane-preference` is not evidence of the lane that executed, and must
+    /// not be used as one.** It is [`Self::chain_lane`]'s answer, computed
+    /// *before* the runtime gates and — when `FLUREE_ANNOTATION_LANE` is set —
+    /// simply that variable echoed back, so as a check it confirms its own
+    /// input. Execution then runs the arena or enumeration lane only if all
+    /// five of [`Self::annotation_probe_gates_pass`] hold (sealed arena,
+    /// content store, not a history query, **drained overlay**, root-or-no
+    /// policy); any one of them falls through to the hash or generic lane
+    /// with no signal here. A single uncommitted flake fails the overlay
+    /// condition, which is the easiest of the five to trip by accident.
+    ///
+    /// For what actually ran, use the tracing events — `annotation delegate
+    /// gates` prints each condition individually and `annotation delegate
+    /// lane` names the lane. Both need `RUST_LOG=debug` **and** the CLI's
+    /// `-v`; `RUST_LOG` alone emits nothing.
     fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
         let mut m = serde_json::Map::new();
         let Some(shape) =
