@@ -627,6 +627,21 @@ impl StorageWrite for ProxyStorage {
             "ProxyStorage is read-only (deletes must go to the transaction server)".to_string(),
         ))
     }
+
+    async fn delete_many(&self, addresses: &[String]) -> Vec<(String, CoreError)> {
+        addresses
+            .iter()
+            .map(|address| {
+                (
+                    address.clone(),
+                    CoreError::storage(
+                        "ProxyStorage is read-only (deletes must go to the transaction server)"
+                            .to_string(),
+                    ),
+                )
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
