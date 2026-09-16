@@ -822,7 +822,10 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
     println!();
     println!(
         "{} {} ingested, {} unchanged, {} failed — {} chunks, {} pages, {} crop(s) read, {} parse(s) from cache, {:.1}s{}",
-        if totals.failed == 0 { "done:".green() } else { "done with errors:".yellow() },
+        // A chunk failure is not a document failure — the document landed
+        // and the next run retries just that chunk — but a run where every
+        // chunk of every document failed still printed a green `done:`.
+        if totals.failed == 0 && totals.chunks_failed == 0 { "done:".green() } else { "done with errors:".yellow() },
         totals.ingested,
         totals.skipped,
         totals.failed,

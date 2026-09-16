@@ -3839,18 +3839,38 @@ fn doc_search_without_index_explains() {
 /// same JSON, fenced the way models fence it however they are asked not
 /// to. Returns its base URL and the count of requests it served.
 fn stub_llm(answer: serde_json::Value) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-    stub_llm_with_status(answer, 200)
+    let (url, calls, _) = stub_llm_capturing(answer, 200);
+    (url, calls)
 }
 
 fn stub_llm_with_status(
     answer: serde_json::Value,
     status: u16,
 ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let (url, calls, _) = stub_llm_capturing(answer, status);
+    (url, calls)
+}
+
+/// The same stub, keeping every request body it was sent. What the binary
+/// actually puts on the wire is the only thing that answers "does this call
+/// work against that provider", and asserting on it costs no network.
+type CapturedBodies = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+fn stub_llm_capturing(
+    answer: serde_json::Value,
+    status: u16,
+) -> (
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    CapturedBodies,
+) {
     use std::io::{BufRead, BufReader, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let served = calls.clone();
+    let bodies: CapturedBodies = Default::default();
+    let captured = bodies.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
@@ -3868,6 +3888,9 @@ fn stub_llm_with_status(
             }
             let mut body = vec![0u8; content_length];
             reader.read_exact(&mut body).ok();
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                captured.lock().unwrap().push(v);
+            }
             served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let content = format!("```json\n{answer}\n```");
             let reply = serde_json::json!({
@@ -3882,7 +3905,7 @@ fn stub_llm_with_status(
             );
         }
     });
-    (url, calls)
+    (url, calls, bodies)
 }
 
 fn write_extraction_fixtures(tmp: &TempDir) {
@@ -4148,7 +4171,12 @@ fn doc_ingest_tolerates_a_failed_chunk_and_retries_it_next_run() {
         .stdout(predicate::str::contains(
             "1 ingested, 0 unchanged, 0 failed",
         ))
-        .stdout(predicate::str::contains("1 chunk(s) failed"));
+        .stdout(predicate::str::contains("1 chunk(s) failed"))
+        // The headline is no longer green. `failed` still counts documents
+        // and the exit code is still 0 — both load-bearing for the retry
+        // loop below — but a run where every chunk of every document failed
+        // used to print a green `done:`.
+        .stdout(predicate::str::contains("done with errors:"));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     // Not "unchanged": the chunk is asked about again.
     ingest()
@@ -4350,6 +4378,55 @@ fn doc_ingest_reports_the_keys_and_items_the_schema_drops() {
     // Two chunks were really asked about, so a once-per-chunk message would
     // have printed twice and the count(1) above would have caught it.
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// What the shipping binary actually puts on the wire, end to end.
+///
+/// Not `chat_body` in isolation: this is the request as transmitted, so a
+/// regression anywhere between `[doc.llm]` and the socket is caught. The
+/// key set is matched exactly, because the bug class is a field that
+/// should not be there and no presence assertion can see one.
+#[test]
+fn doc_ingest_wire_body_carries_only_the_fields_every_model_accepts() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, _calls, bodies) =
+        stub_llm_capturing(serde_json::json!({ "entities": [], "relations": [] }), 200);
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+        ])
+        .assert()
+        .success();
+
+    let sent = bodies.lock().unwrap();
+    assert_eq!(sent.len(), 1, "one chunk, one call");
+    let body = &sent[0];
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .expect("a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["max_completion_tokens", "messages", "model"],
+        "the transmitted body carries a field no model was asked for: {body}"
+    );
+    assert_eq!(body["max_completion_tokens"], 8000);
+    assert_eq!(body["model"], "stub");
 }
 
 // --- end: `fluree doc ingest` re-ingest ownership (PR-C / #1864) ------------

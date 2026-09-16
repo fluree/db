@@ -324,7 +324,6 @@ impl Extractor {
             system: Some(&self.system_prompt),
             parts: vec![Part::Text(user)],
             intent: "extraction",
-            json: true,
             max_tokens: MAX_TOKENS,
         })?;
         answer.ok_or_else(|| DocError::Model("extraction answer was empty".into()))
