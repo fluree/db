@@ -2050,14 +2050,17 @@ async fn explicit_request_default_allow_false_overrides_config_over_http() {
 }
 
 /// The seam between the tri-state `f:defaultAllow` change and the enforcement
-/// signal: `denies_all_data` is derived from the *effective* `default_allow`,
-/// so a ledger that opens itself through config must flip the bit even though
-/// the request never mentions `default-allow`.
+/// signal: the signal is derived from the *effective* `default_allow`, so a
+/// ledger that opens itself through config must change it even though the
+/// request never mentions `default-allow`.
 ///
 /// Neither half could test this alone — before the tri-state change the config
 /// value never reached an identity-carrying request at all, and the signal
 /// reads whatever the policy wrapper ended up with. Both orientations are
-/// pinned so the bit can't silently decouple from the config it reports on.
+/// pinned so the signal can't silently decouple from the config it reports on:
+/// an identity with no rules under a configured allow can be denied nothing,
+/// so the context is root and no enforcement is reported; under a configured
+/// deny it is enforced and denies all data.
 #[tokio::test]
 async fn enforcement_signal_follows_configured_default_allow() {
     async fn tracked_config_query(
@@ -2091,8 +2094,9 @@ async fn enforcement_signal_follows_configured_default_allow() {
         json_body(resp).await
     }
 
-    // Configured open: enforcement is still active (an identity was supplied),
-    // but the configuration does grant a view of the data.
+    // Configured open: the identity selects no rules and the configuration
+    // allows by default, so nothing can be denied — the context is root and
+    // the request runs unenforced.
     let (_tmp, state) = policy_test_state().await;
     let app =
         setup_default_allow_config_ledger(build_router(state), "policy-cfg-sig-open:main", true)
@@ -2110,10 +2114,10 @@ async fn enforcement_signal_follows_configured_default_allow() {
         Some(3),
         "config default-allow true opens the ledger to this identity; got: {json}"
     );
-    assert_eq!(
-        json["policy_enforcement"],
-        serde_json::json!({"enforced": true, "denies_all_data": false}),
-        "enforced, but the config grants a view; got: {json}"
+    assert!(
+        json.get("policy_enforcement")
+            .is_none_or(JsonValue::is_null),
+        "zero rules under a configured allow is root, so no enforcement is claimed; got: {json}"
     );
 
     // Configured closed: same request, opposite bit.

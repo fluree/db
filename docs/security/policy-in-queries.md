@@ -103,7 +103,7 @@ What the engine does **not** do is trace a derived fact's *provenance*: a derive
 
 **So when you enable reasoning under a non-root policy, your policy must cover the derived properties and classes.** Either deny them explicitly, or run with `default-allow: false` so any predicate you did not explicitly allow — including reasoning-introduced ones — is hidden by default. Inline per-query ontologies (`f:schemaSource`) are subject to the same rule: any class/property they entail must be covered by your policy.
 
-Query-time rule injection (the query's `rules` field) is **admin-only**: under a non-root view policy, caller-supplied datalog rules are stripped before execution, because a rule with a viewable head could launder hidden data the policy author never anticipated. Database-stored rules (`f:rule`) and OWL/RDFS reasoning are administrator-controlled and continue to apply.
+Query-time rule injection (the query's `rules` field) is **admin-only**: under a non-root view policy, caller-supplied datalog rules are stripped before execution, because a rule with a viewable head could launder hidden data the policy author never anticipated. Database-stored rules (`f:rule`) and OWL/RDFS reasoning are administrator-controlled and continue to apply. A policy selection that yields no rules under `default-allow: true` is root — nothing is hidden, so there is nothing to launder and query-supplied rules are not stripped.
 
 ## Targeting patterns
 
@@ -266,7 +266,7 @@ to carry it) — and the response gains two siblings:
 | Field | Meaning |
 |---|---|
 | `policy` | Per-policy counters, `{policy-id: {executed, allowed}}`. A policy appears only once it actually runs, so this map is **empty whenever no policy ran** — which happens both when nothing is enforced and when enforcement grants nothing. |
-| `policy_enforcement.enforced` | The request executed under a non-root policy context. The field is **absent entirely** when it did not, so its presence alone answers "was this request enforced?" |
+| `policy_enforcement.enforced` | The request executed under a non-root policy context. The field is **absent entirely** when it did not, so its presence alone answers "was this request enforced?" A selection that yields no rules under `default-allow: true` is root, so the field is absent for it too. |
 | `policy_enforcement.denies_all_data` | The effective view-policy set is empty and `default-allow` is false: under this request's policy configuration, **no data flake could have been returned**. |
 | `policy_enforcement.unevaluable_policies` | Ids of `f:query` policies a virtual graph source (Iceberg / SQL) could not evaluate and therefore denied. Omitted when empty; never set on a native ledger. |
 
@@ -306,8 +306,9 @@ as "no *data* flake could have been returned", not "nothing was returned".
 
 **Reading an empty result.** With tracking on:
 
-- `policy_enforcement` absent → the request was unenforced. An empty result is
-  an empty result.
+- `policy_enforcement` absent → the request was unenforced: no policy input,
+  or an input that selected no rules under `default-allow: true`. An empty
+  result is an empty result.
 - `enforced: true`, `denies_all_data: true` → the caller's policy configuration
   grants no view of the data at all. This is the common misconfiguration:
   supplying an identity that has no `f:policyClass` assignments, on a ledger
