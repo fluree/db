@@ -1970,10 +1970,6 @@ impl UntranslatedBySubject {
         }
     }
 
-    fn is_empty(&self) -> bool {
-        self.by_subject.is_empty() && self.unresolved.is_empty()
-    }
-
     /// Rows for `s_iri`, removed so the closing pass cannot emit them twice.
     fn take(&mut self, s_iri: &str) -> Option<Vec<Flake>> {
         self.by_subject.remove(s_iri)

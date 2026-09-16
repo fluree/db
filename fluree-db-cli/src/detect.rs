@@ -83,12 +83,18 @@ fn is_dataset_format(s: &str) -> bool {
 }
 
 /// One message for both routes into the same dead end.
+///
+/// Still names every format the flag accepts, because a user who reached this
+/// error guessed wrong once already — see
+/// `the_usage_error_names_every_format_the_flag_accepts`, whose reasoning
+/// applies to this branch exactly as much as to the generic one.
 fn dataset_format_help(fmt: &str) -> String {
+    let help = colored::Colorize::bold(colored::Colorize::cyan("help:"));
     format!(
         "'{fmt}' is a dataset format and carries named graphs, which insert cannot place\n  \
-         {} import it with `fluree create <ledger> --from <file>.{fmt}`, which reads \
-         named graphs",
-        colored::Colorize::bold(colored::Colorize::cyan("help:"))
+         {help} import it with `fluree create <ledger> --from <file>.{fmt}`, which reads \
+         named graphs\n  \
+         {help} insert accepts: turtle (ttl), jsonld (json-ld, json)"
     )
 }
 
@@ -229,15 +235,49 @@ mod tests {
                 "--format {fmt} must be accepted"
             );
         }
-        let err = super::detect_data_format(None, "", Some("trig"))
-            .expect_err("trig is not a data format the flag accepts")
-            .to_string();
-        for fmt in accepted {
+        // `trig` takes the dataset-format branch, and `rdfxml` the generic
+        // one. Both are errors a user reaches by guessing, so both owe the
+        // full list.
+        for guess in ["trig", "rdfxml"] {
+            let err = match super::detect_data_format(None, "", Some(guess)) {
+                Ok(_) => panic!("'{guess}' is not a data format the flag accepts"),
+                Err(e) => e.to_string(),
+            };
+            for fmt in accepted {
+                assert!(
+                    err.contains(fmt),
+                    "the usage error for '{guess}' must name '{fmt}'; got: {err}"
+                );
+            }
+        }
+    }
+
+    /// A dataset file is not an unknown format — it is a known one that
+    /// `insert` structurally cannot take, so it gets the command that can
+    /// rather than a list to guess from again.
+    #[test]
+    fn a_dataset_format_names_create_from() {
+        for fmt in ["trig", "nq", "nquads", "n-quads"] {
+            let err = super::detect_data_format(None, "", Some(fmt))
+                .expect_err("a dataset format is not insertable")
+                .to_string();
             assert!(
-                err.contains(fmt),
-                "the usage error must name '{fmt}'; got: {err}"
+                err.contains("fluree create <ledger> --from"),
+                "'{fmt}' must name the command that works; got: {err}"
             );
         }
+        // And by extension, which is the route an exported file arrives by.
+        let err = super::detect_data_format(
+            Some(std::path::Path::new("dump.trig")),
+            "GRAPH <http://example.org/g> { }",
+            None,
+        )
+        .expect_err("a .trig file is not insertable")
+        .to_string();
+        assert!(
+            err.contains("fluree create <ledger> --from"),
+            "a .trig path must name the command that works; got: {err}"
+        );
     }
 
     use super::*;
