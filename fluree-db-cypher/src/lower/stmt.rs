@@ -305,7 +305,11 @@ fn lower_single_branch_inner<E: IriEncoder>(
                 narrowed = true;
             }
             ReadClause::Unwind(u) => {
-                patterns.push(lower_unwind(ctx, u)?);
+                // `&patterns` ends before the push; `lower_unwind` needs the
+                // clause-entry scope to decide whether the constant-list
+                // shortcut is sound.
+                let unwound = lower_unwind(ctx, u, &patterns)?;
+                patterns.push(unwound);
             }
             ReadClause::CallSubquery(call) => {
                 // Pipeline clause: outer rows flow INTO the subquery and its
@@ -494,6 +498,38 @@ impl ProjectionState {
         }
     }
 
+    /// Claim an output column name for this clause, rejecting a second item
+    /// that would produce the same one.
+    ///
+    /// Covers bare and unaliased items as well as aliases: `RETURN a, a`,
+    /// `RETURN a AS a, a` and `RETURN a.name, a.name` all emit two headers
+    /// backed by one `VarId`, which any client keying results by column name
+    /// reads as one column. Neo4j rejects all of them ("Multiple result
+    /// columns with the same name are not supported"). The unaliased label
+    /// comes from `projection_label`, which is pure — the synthetic
+    /// `?#__ret_N` fallback is skipped because it is unique by construction
+    /// and asking for it here would double-bump the counter.
+    fn claim_output<E: IriEncoder>(
+        &mut self,
+        ctx: &mut LoweringContext<'_, E>,
+        id: VarId,
+    ) -> Result<()> {
+        if self.assigned.insert(id) {
+            return Ok(());
+        }
+        let clause = self.clause;
+        let name = ctx
+            .vars
+            .try_name(id)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("?v{}", id.0));
+        Err(LowerError::generic(format!(
+            "{clause} produces the output name `{name}` twice — two projected columns cannot \
+             share one name, the second would silently overwrite the first. Give each item a \
+             distinct name (e.g. `AS {name}2`)."
+        )))
+    }
+
     /// Reject a `RETURN` / `WITH` alias that would assign onto a variable the
     /// clause already has in scope, or onto one an earlier item in the same
     /// clause already assigned.
@@ -537,15 +573,8 @@ impl ProjectionState {
             return Ok(());
         };
         let alias_id = ctx.intern_var(&alias.name);
+        self.claim_output(ctx, alias_id)?;
         let clause = self.clause;
-        if !self.assigned.insert(alias_id) {
-            return Err(LowerError::generic(format!(
-                "{clause} assigns `{name}` twice — two projected columns cannot share one \
-                 output name, the second would silently overwrite the first. Give each item \
-                 a distinct name (e.g. `AS {name}2`).",
-                name = alias.name
-            )));
-        }
         let is_identity = matches!(&item.expr, Expr::Var(v) if v.name == alias.name);
         if !is_identity && self.in_scope.contains(&alias_id) {
             return Err(LowerError::generic(format!(
@@ -572,6 +601,7 @@ impl ProjectionState {
             }
             if item.alias.is_none() {
                 let id = ctx.intern_var(&v.name);
+                self.claim_output(ctx, id)?;
                 self.vars.push(id);
                 self.group_keys.push(id);
                 return Ok(());
@@ -581,6 +611,12 @@ impl ProjectionState {
         // alias and emits a `Bind` (or an aggregate spec) onto it, so the
         // collision guard belongs here — once, ahead of all of them.
         self.check_alias(ctx, item)?;
+        if item.alias.is_none() {
+            if let Some(label) = projection_label(&item.expr) {
+                let id = ctx.intern_var(&label);
+                self.claim_output(ctx, id)?;
+            }
+        }
         if let Expr::Call(call) = &item.expr {
             if is_aggregate(&call.name) {
                 let output_var =
@@ -1696,12 +1732,47 @@ fn visible_vars_from_patterns<E: IriEncoder>(
 fn lower_unwind<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     u: &UnwindClause,
+    scope: &[Pattern],
 ) -> Result<Pattern> {
     let alias = ctx.intern_var(&u.alias.name);
 
     // A constant inline list lowers to `Values` (one row per element). Any
     // other (runtime) expression — `UNWIND nodes(path) AS n`, `UNWIND range(..)`
     // — lowers to a `Pattern::Unwind` that the operator explodes per input row.
+    //
+    // `UNWIND … AS v` introduces a NEW binding, so an alias that is already
+    // bound is the same collision fluree/db#1857 is about, one clause over —
+    // and it was silently dropping every row:
+    //
+    //     MATCH (a)-[r:KNOWS]->(b) UNWIND [1, 2, 3] AS a RETURN a   -> 0 rows
+    //     MATCH (a)-[r:KNOWS]->(b) UNWIND range(1, 3) AS a RETURN a -> 0 rows
+    //     MATCH (a)-[r:KNOWS]->(b) UNWIND labels(a) AS a RETURN a   -> 3 rows
+    //
+    // The boundary is NOT constant-list vs runtime expression, which is the
+    // obvious guess and is wrong — `range(1, 3)` is a runtime expression and
+    // still drops. It is whether the list expression REFERENCES the alias.
+    // `labels(a)` does, so the planner must keep the `Unwind` downstream of
+    // the MATCH, where `UnwindOperator` shadows the column as openCypher
+    // wants. An uncorrelated list can float above the MATCH, where the alias
+    // is not yet in the child schema, so the operator appends a new column
+    // instead of shadowing and the join against the bound value matches
+    // nothing.
+    //
+    // So the one case that works does so by accident of plan ordering, which
+    // is not a property the lowering can promise. Rejecting the whole shape is
+    // one rule rather than a rule about plan shape, and it is what the rest of
+    // this change does with the same collision. No in-repo query uses the
+    // shape. Making it work for real means keeping an uncorrelated `Unwind`
+    // pinned below its MATCH, which is a planner change, not a lowering one.
+    if visible_vars_from_patterns(ctx, scope).contains(&alias) {
+        return Err(LowerError::generic(format!(
+            "UNWIND alias `{}` is already bound by an earlier clause — UNWIND introduces a \
+             new binding, so assigning onto a bound name silently drops every row. Unwind \
+             into a name that is not already bound (e.g. `AS {}_item`).",
+            u.alias.name, u.alias.name
+        )));
+    }
+
     match &u.expr {
         Expr::List(items, _) if items.iter().all(|i| matches!(i, Expr::Lit(_))) => {
             let mut rows: Vec<Vec<Binding>> = Vec::with_capacity(items.len());
