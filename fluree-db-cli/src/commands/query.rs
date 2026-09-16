@@ -155,20 +155,25 @@ fn format_tally_suffix(
 
 /// Parse a `--at` value into a `TimeSpec`.
 ///
-/// Accepts:
-/// - Integer → `TimeSpec::AtT(n)`
-/// - ISO-8601 datetime string (contains `-` and `:`) → `TimeSpec::AtTime(s)`
-/// - Otherwise → `TimeSpec::AtCommit(s)` (commit CID prefix)
-pub fn parse_time_spec(at: &str) -> fluree_db_api::TimeSpec {
-    if let Ok(t) = at.parse::<i64>() {
-        fluree_db_api::TimeSpec::at_t(t)
-    } else if at.contains('-') && at.contains(':') {
-        // Looks like ISO-8601 timestamp (e.g., "2024-01-15T10:30:00Z")
-        fluree_db_api::TimeSpec::at_time(at.to_string())
-    } else {
-        // Treat as commit CID prefix
-        fluree_db_api::TimeSpec::at_commit(at.to_string())
-    }
+/// The grammar lives in [`fluree_db_api::TimeSpec::parse_at`] — the same
+/// canonical suffix grammar a ledger address uses (`mydb:main@t:5`) minus the
+/// `@`, plus the bare integer / bare ISO-8601 / bare commit-prefix spellings
+/// the CLI has always taken. This wrapper exists only to put the failure into
+/// `CliError::Usage`, which renders it without the API layer's framing.
+///
+/// Before #1805 this was a local three-way heuristic whose catch-all arm turned
+/// every tagged spelling — `t:2`, `t:latest`, `iso:…`, `recorded:…`, even
+/// `commit:…` — into a commit prefix named after the tag. Do not reintroduce a
+/// parser here; extend the shared one.
+pub fn parse_time_spec(at: &str) -> CliResult<fluree_db_api::TimeSpec> {
+    parse_time_spec_for("--at", at)
+}
+
+/// [`parse_time_spec`], but naming the option in the error. `fluree history`
+/// spells the same grammar `--from` / `--to`.
+pub fn parse_time_spec_for(flag: &str, value: &str) -> CliResult<fluree_db_api::TimeSpec> {
+    fluree_db_api::TimeSpec::parse_at(value)
+        .map_err(|e| CliError::Usage(format!("invalid {flag} value: {e}")))
 }
 
 /// Format a Duration for human display.
@@ -200,7 +205,11 @@ fn format_count(n: usize) -> String {
     result
 }
 
-fn time_spec_to_suffix(spec: &fluree_db_api::TimeSpec) -> String {
+/// Render a `TimeSpec` as the `@`-suffix a ledger address carries.
+///
+/// The exact inverse of [`parse_time_spec`] on the canonical spellings; the
+/// round trip is pinned by `time_spec_suffix_round_trips_through_parse`.
+pub(crate) fn time_spec_to_suffix(spec: &fluree_db_api::TimeSpec) -> String {
     match spec {
         fluree_db_api::TimeSpec::Latest => "@t:latest".to_string(),
         fluree_db_api::TimeSpec::AtT(t) => format!("@t:{t}"),
@@ -524,7 +533,7 @@ pub async fn run(
                     (detect::QueryFormat::JsonLd, at) => {
                         let mut json_query: serde_json::Value = serde_json::from_str(&content)?;
                         if let Some(at_str) = at {
-                            let spec = parse_time_spec(at_str);
+                            let spec = parse_time_spec(at_str)?;
                             let suffix = time_spec_to_suffix(&spec);
                             let from_id =
                                 attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
@@ -585,7 +594,7 @@ pub async fn run(
                                     .to_string(),
                             ));
                         }
-                        let spec = parse_time_spec(at_str);
+                        let spec = parse_time_spec(at_str)?;
                         let suffix = time_spec_to_suffix(&spec);
                         let from_iri =
                             attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
@@ -641,7 +650,7 @@ pub async fn run(
                                 .to_string(),
                         ));
                     }
-                    let spec = parse_time_spec(at_str);
+                    let spec = parse_time_spec(at_str)?;
                     let suffix = time_spec_to_suffix(&spec);
                     let from_iri = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
                     let injected = inject_sparql_from_before_where(&content, &from_iri).ok_or_else(
@@ -660,7 +669,7 @@ pub async fn run(
                     // time-suffixed `from` into the body and POST to the
                     // ledger-scoped explain endpoint. Path drives auth,
                     // body's `from` drives snapshot selection.
-                    let spec = parse_time_spec(at_str);
+                    let spec = parse_time_spec(at_str)?;
                     let suffix = time_spec_to_suffix(&spec);
                     let from_id = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
                     let mut json_query: serde_json::Value = serde_json::from_str(&content)?;
@@ -698,7 +707,7 @@ pub async fn run(
                                 .to_string(),
                         ));
                     }
-                    let spec = parse_time_spec(at_str);
+                    let spec = parse_time_spec(at_str)?;
                     let suffix = time_spec_to_suffix(&spec);
                     let from_iri = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
                     let injected = inject_sparql_from_before_where(&content, &from_iri).ok_or_else(
@@ -721,7 +730,7 @@ pub async fn run(
                 (detect::QueryFormat::JsonLd, Some(at_str), false) => {
                     // Remote time-travel via ledger-scoped JSON-LD: path
                     // drives auth, body's `from` carries the @t:N suffix.
-                    let spec = parse_time_spec(at_str);
+                    let spec = parse_time_spec(at_str)?;
                     let suffix = time_spec_to_suffix(&spec);
                     let from_id = attach_time_suffix_preserving_fragment(&remote_alias, &suffix);
                     let mut json_query: serde_json::Value = serde_json::from_str(&content)?;
@@ -878,7 +887,7 @@ pub async fn run(
             tracing::debug!(target: "fluree::open", ledger = %alias, "CLI database view load starting");
             let view = match at {
                 Some(at_str) => {
-                    let spec = parse_time_spec(at_str);
+                    let spec = parse_time_spec(at_str)?;
                     fluree.db_at_with_default_context(&alias, spec).await?
                 }
                 None => fluree.db_with_default_context(&alias).await?,
@@ -1186,7 +1195,7 @@ fn inject_remote_time_travel_sparql(
                 .to_string(),
         ));
     }
-    let spec = parse_time_spec(at_str);
+    let spec = parse_time_spec(at_str)?;
     let suffix = time_spec_to_suffix(&spec);
     let from_iri = attach_time_suffix_preserving_fragment(remote_alias, &suffix);
     inject_sparql_from_before_where(sparql, &from_iri).ok_or_else(|| {
@@ -1288,7 +1297,7 @@ async fn run_local_ndjson_stream_dataset(
     } else {
         fluree_db_api::GovernanceOptions::default()
     };
-    let time_spec = at.map(parse_time_spec);
+    let time_spec = at.map(parse_time_spec).transpose()?;
 
     let (mut dataset, input) = match query_format {
         detect::QueryFormat::Sparql => {
@@ -1472,7 +1481,7 @@ async fn run_cypher_query(
 
     let view = match at {
         Some(at_str) => {
-            let spec = parse_time_spec(at_str);
+            let spec = parse_time_spec(at_str)?;
             fluree.db_at_with_default_context(&alias, spec).await?
         }
         None => fluree.db_with_default_context(&alias).await?,
@@ -2012,14 +2021,108 @@ mod tests {
     use super::{
         attach_time_suffix_preserving_fragment, base_ledger_id, cli_delimited_config,
         cli_sparql_json_config, format_tally_suffix, inject_sparql_from_before_where,
-        json_path_display_format, json_path_formatter_config, jsonld_from_targets,
-        query_targets_foreign_source, reject_graph_source_unsupported,
+        json_path_display_format, json_path_formatter_config, jsonld_from_targets, parse_time_spec,
+        query_targets_foreign_source, reject_graph_source_unsupported, time_spec_to_suffix,
     };
     use crate::detect::QueryFormat;
     use crate::output::OutputFormatKind;
     use fluree_db_api::{PolicyEnforcement, PolicyStats};
 
     const POLICY_ONLY: (bool, bool, bool) = (false, false, true);
+
+    // ---- #1805: `--at` time-spec parsing -----------------------------------
+    //
+    // `parse_time_spec` had zero tests before this. It was an infallible
+    // three-way heuristic — integer, then "contains `-` and `:`", then *every
+    // other string* as a commit prefix — so `--at t:2` reached the resolver as
+    // the literal `"t:2"` and died on "Commit prefix must be at least 6
+    // characters, got 3". The grammar now lives in
+    // `fluree_db_api::TimeSpec::parse_at`; these pin the CLI boundary.
+
+    use fluree_db_api::TimeSpec;
+
+    /// The CLI's own output grammar must be an input it accepts.
+    ///
+    /// `time_spec_to_suffix` renders the `@`-suffix the CLI puts on a ledger
+    /// address; `parse_time_spec` reads what the user typed. This round trip
+    /// would have caught #1805 at write time: the old parser turned
+    /// `time_spec_to_suffix(AtT(2))` = `"@t:2"` back into
+    /// `AtCommit("t:2")` — the exact string that showed up on the wire as
+    /// `@commit:t:2`.
+    #[test]
+    fn time_spec_suffix_round_trips_through_parse() {
+        let all = [
+            TimeSpec::Latest,
+            TimeSpec::AtT(2),
+            TimeSpec::AtT(0),
+            TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string()),
+            TimeSpec::AtRecorded("2024-01-15T10:30:00Z".to_string()),
+            TimeSpec::AtCommit("abc123def".to_string()),
+        ];
+        for spec in all {
+            let suffix = time_spec_to_suffix(&spec);
+            let bare = suffix
+                .strip_prefix('@')
+                .unwrap_or_else(|| panic!("suffix {suffix:?} must start with '@'"));
+            assert_eq!(
+                parse_time_spec(bare).unwrap(),
+                spec,
+                "round trip failed for {spec:?} via {suffix:?}"
+            );
+        }
+    }
+
+    /// Both spellings of every shared form must reach the same `TimeSpec`.
+    #[test]
+    fn tagged_and_bare_spellings_agree() {
+        assert_eq!(
+            parse_time_spec("t:2").unwrap(),
+            parse_time_spec("2").unwrap()
+        );
+        assert_eq!(
+            parse_time_spec("t:latest").unwrap(),
+            parse_time_spec("latest").unwrap()
+        );
+        assert_eq!(
+            parse_time_spec("iso:2024-01-15T10:30:00Z").unwrap(),
+            parse_time_spec("2024-01-15T10:30:00Z").unwrap()
+        );
+        assert_eq!(
+            parse_time_spec("commit:abc123def").unwrap(),
+            parse_time_spec("abc123def").unwrap()
+        );
+    }
+
+    /// `recorded:` is the axis the write side could already emit
+    /// (`time_spec_to_suffix` renders `@recorded:`) but no CLI input could
+    /// produce — `--at recorded:<ts>` hit the catch-all and became a commit
+    /// prefix. Pinned separately because it is the one spelling with no
+    /// pre-#1805 spelling at all.
+    #[test]
+    fn recorded_axis_is_reachable_from_the_cli() {
+        assert_eq!(
+            parse_time_spec("recorded:2024-01-15T10:30:00Z").unwrap(),
+            TimeSpec::AtRecorded("2024-01-15T10:30:00Z".to_string())
+        );
+    }
+
+    /// A malformed tagged spec is a usage error naming the accepted spellings,
+    /// not a silent reinterpretation as a commit prefix.
+    #[test]
+    fn malformed_tagged_spec_is_a_usage_error_that_names_the_flag() {
+        let err = parse_time_spec("t:abc").unwrap_err().to_string();
+        assert!(err.contains("--at"), "error must name the flag: {err}");
+        assert!(
+            err.contains("Accepted: t:<N>"),
+            "error must list the accepted spellings: {err}"
+        );
+
+        // `fluree history` spells the same grammar differently.
+        let err = super::super::query::parse_time_spec_for("--from/--to", "t:abc")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--from/--to"), "got: {err}");
+    }
 
     #[test]
     fn policy_footer_reports_counts_when_policies_ran() {

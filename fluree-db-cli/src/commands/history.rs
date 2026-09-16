@@ -44,7 +44,7 @@ pub async fn run(
         to,
         predicate_iri.as_deref(),
         dirs.data_dir(),
-    );
+    )?;
 
     // Bare ledger ID (e.g. "mydb:main") for the auth-driving path segment.
     // The body's `from` carries the time-travel suffix ("mydb:main@t:N");
@@ -119,10 +119,10 @@ fn build_history_query(
     to: &str,
     predicate: Option<&str>,
     data_dir: &Path,
-) -> serde_json::Value {
+) -> CliResult<serde_json::Value> {
     // Build time specs
-    let from_spec = format_time_spec(alias, from);
-    let to_spec = format_time_spec(alias, to);
+    let from_spec = format_time_spec(alias, from)?;
+    let to_spec = format_time_spec(alias, to)?;
 
     // Build context from stored prefixes
     let context = config::prefixes_to_context(data_dir);
@@ -155,29 +155,28 @@ fn build_history_query(
         serde_json::json!(["?p", "?v", "?t", "?op"])
     };
 
-    serde_json::json!({
+    Ok(serde_json::json!({
         "@context": context,
         "from": from_spec,
         "to": to_spec,
         "select": select,
         "where": where_clause,
         "orderBy": "?t"
-    })
+    }))
 }
 
-/// Format a time specification for the query.
-fn format_time_spec(alias: &str, spec: &str) -> String {
-    if spec == "latest" {
-        format!("{alias}:main@t:latest")
-    } else if let Ok(_t) = spec.parse::<i64>() {
-        format!("{alias}:main@t:{spec}")
-    } else if spec.contains('-') && spec.contains(':') {
-        // ISO-8601 timestamp
-        format!("{alias}:main@iso:{spec}")
-    } else {
-        // Assume commit CID prefix
-        format!("{alias}:main@commit:{spec}")
-    }
+/// Render a `--from` / `--to` value as the time-travel suffix on a ledger
+/// address, which is what a history query's `from`/`to` fields carry.
+///
+/// Parsing and rendering both come from `commands::query` (#1805). This used to
+/// be an independent copy of the `--at` heuristic, which meant `history --to
+/// t:2` was rejected while `query --at t:2` was rejected *differently*; going
+/// through the shared pair also makes the round trip
+/// `parse_time_spec(x) -> time_spec_to_suffix -> "@…"` total by construction.
+fn format_time_spec(alias: &str, spec: &str) -> CliResult<String> {
+    let parsed = crate::commands::query::parse_time_spec_for("--from/--to", spec)?;
+    let suffix = crate::commands::query::time_spec_to_suffix(&parsed);
+    Ok(format!("{alias}:main{suffix}"))
 }
 
 /// Format history results for display.
