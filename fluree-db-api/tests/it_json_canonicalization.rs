@@ -209,3 +209,49 @@ async fn spacing_and_nested_order_do_not_change_the_stored_value() {
         "the document and its pre-serialized twin are one fact"
     );
 }
+
+/// A typed literal inside a TriG named graph reaches a different converter
+/// than the JSON-LD path. It is canonicalized too.
+#[tokio::test]
+async fn trig_named_graph_literals_are_canonical() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let trig = r#"
+        @prefix ex:  <http://example.org/ns/> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+        GRAPH <http://example.org/g> {
+            ex:config ex:items "{ \"b\" : 2, \"a\" : 1 }"^^rdf:JSON .
+        }
+    "#;
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(trig)
+        .execute()
+        .await
+        .expect("trig insert");
+
+    let ledger = fluree.ledger("mydb:main").await.unwrap();
+    let q = json!({
+        "@context": ctx(),
+        "from": "mydb:main#http://example.org/g",
+        "select": ["?v"],
+        "where": {"@id": "ex:config", "ex:items": "?v"}
+    });
+    let result = fluree.query_connection(&q).await.expect("query");
+    let rows = result
+        .to_jsonld_async(ledger.as_graph_db_ref(0))
+        .await
+        .expect("to_jsonld");
+    let values = support::normalize_rows(&rows);
+    assert_eq!(
+        values.len(),
+        1,
+        "expected the one value TriG wrote: {rows:?}"
+    );
+    let stored = match &values[0].as_array().expect("row")[0] {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).expect("serializable"),
+    };
+    assert_eq!(stored, r#"{"a":1,"b":2}"#);
+}
