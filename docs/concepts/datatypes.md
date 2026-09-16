@@ -201,6 +201,19 @@ Beyond XSD, Fluree supports RDF-specific datatypes:
 
 **rdf:JSON** stores JSON data as typed literals. This is useful for storing complex structured data that doesn't fit the RDF model.
 
+A JSON literal is stored in canonical form, per [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785). JSON-LD 1.1 requires this. Members are sorted by key, insignificant whitespace is dropped, and numbers are rendered as ECMAScript renders them.
+
+A literal's value is its text. Without canonical form, `{"a":1,"b":2}` and `{"b":2,"a":1}` would be two different facts. A delete, an upsert, or a merge that matched one would miss the other.
+
+Two consequences are worth knowing:
+
+- **A value reads back canonicalized, not as written.** Members come back in key order. A number written as `1.0` reads back as `1`. The JSON is the same. Only its spelling changes.
+- **Integers keep their exact value.** RFC 8785 treats every number as a double, which rounds integers past 2^53. Fluree keeps them exact instead.
+
+`@value` may be a JSON document or a string holding one. Either is canonicalized. A string that is not valid JSON is stored as written.
+
+Ledgers written before canonicalization keep the text their writers produced. Those values stay readable, and new writes are canonical. A delete that names a literal value matches the canonical form, so remove an older value by binding it in a `where` clause instead of naming its text.
+
 ### Geographic Data
 
 ```json

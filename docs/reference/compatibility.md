@@ -71,6 +71,7 @@ Fluree supports JSON-LD 1.1:
 - @language for language tags
 - Nested objects
 - Arrays
+- @json literals, stored in the canonical form the Object-to-RDF transformation requires (RFC 8785). Integers past 2^53 are kept exact rather than rounded through a double
 
 **Specification:** https://www.w3.org/TR/json-ld11/
 
