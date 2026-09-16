@@ -625,7 +625,7 @@ impl<'a> CypherLowering<'a> {
 
         // Labels — `?n rdf:type <label>`.
         for Label { name, .. } in &n.labels {
-            let label_iri = self.resolve_iri(name);
+            let label_iri = self.resolve_label(name)?;
             out.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
                 s: subj.clone(),
                 p: UnresolvedTerm::Iri(Arc::from(rdf::TYPE)),
@@ -1022,7 +1022,7 @@ impl<'a> CypherLowering<'a> {
                     let subj = self.var_term(&target.name);
                     let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
                     for label in labels {
-                        let iri = self.resolve_iri(label);
+                        let iri = self.resolve_label(label)?;
                         let label_sid = self.ns.sid_for_iri(&iri);
                         self.insert_templates.push(TripleTemplate::new(
                             subj.clone(),
@@ -1144,7 +1144,7 @@ impl<'a> CypherLowering<'a> {
                     let subj = self.var_term(&target.name);
                     let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
                     for label in labels {
-                        let iri = self.resolve_iri(label);
+                        let iri = self.resolve_label(label)?;
                         let label_sid = self.ns.sid_for_iri(&iri);
                         self.delete_templates.push(TripleTemplate::new(
                             subj.clone(),
@@ -1508,7 +1508,7 @@ impl<'a> CypherLowering<'a> {
     ) -> Result<Vec<UnresolvedPattern>, LowerCypherError> {
         let mut guard = Vec::new();
         for Label { name, .. } in &node.labels {
-            let label_iri = self.resolve_iri(name);
+            let label_iri = self.resolve_label(name)?;
             guard.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
                 s: probe.clone(),
                 p: UnresolvedTerm::Iri(Arc::from(rdf::TYPE)),
@@ -1593,7 +1593,7 @@ impl<'a> CypherLowering<'a> {
                 }
                 let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
                 for label in labels {
-                    let iri = self.resolve_iri(label);
+                    let iri = self.resolve_label(label)?;
                     let sid = self.ns.sid_for_iri(&iri);
                     self.insert_templates.push(TripleTemplate::new(
                         subj.clone(),
@@ -1720,7 +1720,7 @@ impl<'a> CypherLowering<'a> {
         // Labels — emit (n, rdf:type, label_iri).
         let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
         for Label { name, .. } in &n.labels {
-            let iri = self.resolve_iri(name);
+            let iri = self.resolve_label(name)?;
             let label_sid = self.ns.sid_for_iri(&iri);
             self.insert_templates.push(TripleTemplate::new(
                 subj.clone(),
@@ -2044,6 +2044,15 @@ impl<'a> CypherLowering<'a> {
             // never allocates for them).
             None => name.to_string(),
         }
+    }
+
+    /// Resolve a node label, rejecting the same reserved names a predicate
+    /// rejects. See `LoweringContext::resolve_label` in `fluree-db-cypher`;
+    /// the write path had the same gap at six sites, and ``SET n:`@type` ``
+    /// was the sharp end — it committed, after which `labels(n)` read back
+    /// `["Person", "@type"]`.
+    fn resolve_label(&self, name: &str) -> Result<String, LowerCypherError> {
+        self.resolve_predicate(name)
     }
 
     /// Resolve and reject reserved predicates — Fluree's own `f:reifies*`

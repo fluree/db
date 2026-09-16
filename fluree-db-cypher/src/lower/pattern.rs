@@ -316,7 +316,7 @@ fn lower_node<E: IriEncoder>(
 
     // Labels — emit `s rdf:type <label-iri>` for each.
     for Label { name, .. } in &n.labels {
-        let iri = ctx.resolve_iri(name);
+        let iri = ctx.resolve_label(name)?;
         let pred = ctx.iri_ref(ctx.rdf_type_iri().to_string());
         let obj = ctx.iri_term(iri);
         out.push(Pattern::Triple(TriplePattern::new(subj.clone(), pred, obj)));

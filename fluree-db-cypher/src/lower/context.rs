@@ -241,6 +241,18 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         Ok(iri)
     }
 
+    /// Resolve a node label, rejecting the same reserved names a predicate
+    /// rejects.
+    ///
+    /// A label lowers to the OBJECT of an `rdf:type` triple rather than to a
+    /// predicate, so the label sites reached `resolve_iri` directly and routed
+    /// around the reserved-name check: ``MATCH (n:`@id`)`` read as zero rows
+    /// and ``SET n:`@type` `` committed a junk class. Delegating keeps one
+    /// choke point per crate instead of a second copy of the check.
+    pub fn resolve_label(&self, name: &str) -> Result<String> {
+        self.resolve_predicate(name)
+    }
+
     /// rdf:type IRI.
     pub fn rdf_type_iri(&self) -> &'static str {
         rdf::TYPE

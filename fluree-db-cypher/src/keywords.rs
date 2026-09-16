@@ -6,10 +6,13 @@
 //! them is a property in the Cypher sense — a Cypher node variable *is* the
 //! node, and its labels are `labels(n)`.
 //!
-//! Left unchecked they lower as ordinary predicates, which fails silently in
-//! both directions: a read returns `null` (the property is simply absent) and
-//! a write stores a literal predicate spelled `@id`, leaving the node's real
-//! identity untouched. Rejecting is safe because a bare `@id` is not a legal
+//! Left unchecked they fail silently in both directions, in two positions.
+//! As a property key they lower as ordinary predicates: a read returns `null`
+//! (the property is simply absent) and a write stores a literal predicate
+//! spelled `@id`, leaving the node's real identity untouched. As a node label
+//! they lower as the object of an `rdf:type` triple: ``MATCH (n:`@id`)`` reads
+//! as zero rows, and ``SET n:`@type` `` commits, after which `labels(n)` reads
+//! back `["Person", "@type"]`. Rejecting is safe because a bare `@id` is not a legal
 //! Cypher identifier — it has to be backticked — so no ordinary property name
 //! can collide with this set.
 //!
@@ -49,7 +52,8 @@ pub fn reserved_keyword_message(key: &str) -> Option<String> {
         _ => return None,
     };
     Some(format!(
-        "`{key}` is a reserved JSON-LD keyword, not a Cypher property — {advice}."
+        "`{key}` is a reserved JSON-LD keyword, not a usable Cypher name (property key, \
+         label, or relationship type) — {advice}."
     ))
 }
 
