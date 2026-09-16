@@ -26,7 +26,7 @@
 //! subject and key columns decoded, no bindings for rows outside the
 //! envelope). Whenever the walk cannot answer a batch — leaflets are not
 //! authoritative on their own (novelty overlay, time-travel, a dataset scope,
-//! a restricting policy), a bound is not numeric (the walk keys inline
+//! a policy that can touch the predicate), a bound is not numeric (the walk keys inline
 //! numerics only), or the envelope would cover too many rows for the driving
 //! stream — the batch is answered by the same batched subject probes the
 //! nested loop would have used. If that lane declines too, one seeded
@@ -56,8 +56,9 @@ use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::execute::build_where_operators_seeded;
 use crate::fast_path_common::{
-    leaf_entries_for_predicate, root_or_no_policy, subject_probe_lane_plan, try_normalize_pred_sid,
-    ProbeLanePlan, ProbeOps,
+    classify_predicates_under_policy, leaf_entries_for_predicate, policy_lane_for_predicate,
+    subject_probe_lane_plan, try_normalize_pred_sid, PredicateFastPath, ProbeLanePlan, ProbeOps,
+    POLICY_PREDICATE_SCAN_SITE,
 };
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
@@ -287,8 +288,9 @@ enum WalkOutcome {
     Built(RangeIndex),
     /// The envelope covers more rows than the driving stream justifies.
     Capped,
-    /// Leaflets are not authoritative here (overlay, time-travel, dataset,
-    /// policy) or the predicate cannot be resolved.
+    /// Leaflets are not authoritative here (overlay, time-travel, dataset, a
+    /// policy that can touch the predicate) or the predicate cannot be
+    /// resolved.
     Declined,
 }
 
@@ -465,6 +467,32 @@ impl RangeSemiJoinOperator {
         }
     }
 
+    /// Whether the view policy will make the walk and probe lanes decline for
+    /// some condition, so `open` should dedup the driving side up front as the
+    /// generic plan would. A plan-shaping check only: it must not stamp, or a
+    /// routing test would see a decline the lanes never took.
+    fn policy_blocks_lanes(&self, ctx: &ExecutionContext<'_>) -> bool {
+        if ctx.allow_unfiltered() {
+            return false;
+        }
+        let Some(store) = ctx.binary_store.as_ref() else {
+            return true;
+        };
+        let pred_sids: Option<Vec<fluree_db_core::Sid>> = self
+            .conditions
+            .iter()
+            .map(|cond| try_normalize_pred_sid(store, &cond.predicate))
+            .collect();
+        let Some(pred_sids) = pred_sids else {
+            return true;
+        };
+        let refs: Vec<&fluree_db_core::Sid> = pred_sids.iter().collect();
+        !matches!(
+            classify_predicates_under_policy(ctx, &refs),
+            PredicateFastPath::Allow
+        )
+    }
+
     fn input(&self) -> &dyn Operator {
         match &self.fallback_dedup {
             Some(dedup) => dedup,
@@ -609,7 +637,6 @@ impl RangeSemiJoinOperator {
             || ctx.from_t.is_some()
             || !ctx.overlay_free_single_graph()
             || ctx.to_t < store.max_t()
-            || !root_or_no_policy(ctx)
         {
             return Ok(WalkOutcome::Declined);
         }
@@ -617,14 +644,25 @@ impl RangeSemiJoinOperator {
         let Some(pred_sid) = try_normalize_pred_sid(store, &cond.predicate) else {
             return Ok(WalkOutcome::Declined);
         };
-        let g_id = ctx.binary_g_id;
-        // Overlay-free and the predicate is not in the index: nothing can match.
-        let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-            return Ok(WalkOutcome::Built(RangeIndex {
+        let empty = || {
+            Ok(WalkOutcome::Built(RangeIndex {
                 envelope: envelope.clone(),
                 values: ValueIndex::with_capacity(0),
                 rows: 0,
-            }));
+            }))
+        };
+        // The walk reads leaflets raw, like the scan's cursor lane, so it runs
+        // only where the view policy provably cannot touch this predicate.
+        match policy_lane_for_predicate(ctx, &pred_sid, POLICY_PREDICATE_SCAN_SITE) {
+            PredicateFastPath::Allow => {}
+            // Every value of this predicate is hidden: no subject can pass.
+            PredicateFastPath::Empty => return empty(),
+            PredicateFastPath::Decline => return Ok(WalkOutcome::Declined),
+        }
+        let g_id = ctx.binary_g_id;
+        // Overlay-free and the predicate is not in the index: nothing can match.
+        let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+            return empty();
         };
         let bounds = ObjectBounds {
             lower: envelope.lower.clone().map(|v| (v, true)),
@@ -1093,7 +1131,7 @@ impl Operator for RangeSemiJoinOperator {
         }
         self.restore_child();
         if ctx.binary_store.is_none()
-            || !root_or_no_policy(ctx)
+            || self.policy_blocks_lanes(ctx)
             || ctx.is_multi_ledger()
             || ctx.eager_materialization
         {

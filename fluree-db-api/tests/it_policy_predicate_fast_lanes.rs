@@ -61,10 +61,63 @@ async fn indexed_people() -> Fluree {
     fluree
 }
 
+/// Alice (age 30, team t0) among `CROWD` people whose ages cycle through
+/// 0..100 and teams through `TEAMS`, over a persisted index: enough driving
+/// rows for the range semi-join fold, whose planner wants a few hundred.
+const CROWD_LEDGER: &str = "policy/predicate-lanes-crowd:main";
+const CROWD: usize = 1200;
+const TEAMS: usize = 2;
+
+async fn indexed_crowd() -> Fluree {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, CROWD_LEDGER);
+    let no_background = IndexConfig {
+        reindex_min_bytes: 1_000_000_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    let mut graph = vec![
+        json!({"@id": "ex:alice", "@type": "ex:User", "ex:name": "Alice", "ex:age": 30, "ex:ssn": "111", "ex:team": "t0"}),
+    ];
+    graph.extend((0..CROWD).map(|i| {
+        json!({
+            "@id": format!("ex:p{i}"),
+            "@type": "ex:User",
+            "ex:name": format!("Person {i}"),
+            "ex:age": i % 100,
+            "ex:ssn": format!("{i}"),
+            "ex:team": format!("t{}", i % TEAMS)
+        })
+    }));
+    fluree
+        .insert_with_opts(
+            ledger,
+            &json!({"@context": {"ex": EX}, "@graph": graph}),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &no_background,
+        )
+        .await
+        .expect("insert crowd");
+    fluree
+        .reindex(CROWD_LEDGER, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    fluree
+}
+
 async fn policed_view(fluree: &Fluree, policy: JsonValue, default_allow: bool) -> GraphDb {
+    policed_view_on(fluree, LEDGER, policy, default_allow).await
+}
+
+async fn policed_view_on(
+    fluree: &Fluree,
+    ledger: &str,
+    policy: JsonValue,
+    default_allow: bool,
+) -> GraphDb {
     let view = fluree
         .db_with_policy(
-            LEDGER,
+            ledger,
             &GovernanceOptions {
                 policy: Some(policy),
                 default_allow: Some(default_allow),
@@ -305,6 +358,74 @@ async fn property_rule_gates_optional_probe() {
     assert!(
         !ssn.contains("111") && !ssn.contains("222") && !ssn.contains("333"),
         "a denied optional predicate must stay unbound: {ssn}"
+    );
+
+    drop(guard);
+}
+
+/// The range semi-join's leaflet walk reads a predicate's POST leaflets raw,
+/// so it asks the same per-predicate gate as the scan. Alice's teammates
+/// within ten years of 30: the team join produces the subject ahead of the
+/// age pattern, and `VALUES` binds the anchor before any triple is placed
+/// (the reorderer would otherwise defer a disconnected anchor probe past the
+/// fold). The walk answers when the policy cannot touch `ex:age`, and falls
+/// back to the filtered probes (which hide every age) when it can.
+#[tokio::test(flavor = "current_thread")]
+async fn property_rule_gates_range_semijoin_walk() {
+    const TEAMMATES_WITHIN_TEN: &str = "PREFIX ex: <http://example.org/ns/>\n\
+        SELECT DISTINCT ?n WHERE {\n\
+          VALUES ?o { 30 }\n\
+          ex:alice ex:team ?t .\n\
+          ?s ex:team ?t .\n\
+          ?s ex:name ?n .\n\
+          ?s ex:age ?a .\n\
+          FILTER (?a < (?o + 10) && ?a > (?o - 10))\n\
+        }";
+    const SEMIJOIN_SITE: &str = "range-semijoin";
+    // Alice plus every teammate whose age lands strictly inside 20..40.
+    let expected = 1
+        + (0..CROWD)
+            .filter(|i| i % TEAMS == 0 && (21..40).contains(&(i % 100)))
+            .count();
+
+    let fluree = indexed_crowd().await;
+    let untouched = policed_view_on(&fluree, CROWD_LEDGER, deny_ssn(), true).await;
+    let (store, guard) = init_test_tracing();
+
+    let rows = run(
+        &fluree,
+        &untouched,
+        &store,
+        QueryInput::Sparql(TEAMMATES_WITHIN_TEN),
+        SEMIJOIN_SITE,
+        Lane::MustFire,
+        "range walk ex:age",
+    )
+    .await;
+    assert_eq!(row_count(&rows), expected, "{rows}");
+
+    let deny_age = json!([{
+        "@id": format!("{EX}denyAge"),
+        "f:action": "f:view",
+        "f:required": true,
+        "f:onProperty": [{"@id": format!("{EX}age")}],
+        "f:allow": false
+    }]);
+    let covered = policed_view_on(&fluree, CROWD_LEDGER, deny_age, true).await;
+    let rows = run(
+        &fluree,
+        &covered,
+        &store,
+        QueryInput::Sparql(TEAMMATES_WITHIN_TEN),
+        SEMIJOIN_SITE,
+        Lane::MustNotFire,
+        "range walk ex:age under a rule on ex:age",
+    )
+    .await;
+    assert_eq!(
+        row_count(&rows),
+        0,
+        "a denied predicate must not pass anyone through the range: {rows}"
     );
 
     drop(guard);
