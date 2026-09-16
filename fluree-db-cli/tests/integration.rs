@@ -4158,6 +4158,131 @@ fn doc_ingest_tolerates_a_failed_chunk_and_retries_it_next_run() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
 
+// --- begin: `fluree doc ingest` re-ingest ownership (PR-C / #1864) ----------
+// Owned by the doc-pipeline change; keep additions inside this block.
+
+/// Re-ingest retracts what the pipeline wrote and nothing else.
+///
+/// It used to issue `DELETE { ?s ?p ?o }` over every node stamped with the
+/// document plus the document node itself, so a trust weight on the source
+/// or a reviewer's note on a relation was destroyed on the next run — with
+/// the run reporting success and exiting 0.
+///
+/// The assertion is the end-to-end property, deliberately: a write-path
+/// assertion on the generated SPARQL would have passed against the bug.
+#[test]
+fn doc_ingest_reingest_keeps_triples_the_pipeline_did_not_write() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, calls) = stub_llm(serde_json::json!({
+        "entities": [
+            { "name": "Jane Doe", "type": "schema:Person",
+              "context": "Jane Doe joined Acme as Chief Technology Officer" }
+        ],
+        "relations": [
+            { "subjectName": "Jane Doe", "predicate": "schema:worksFor", "objectName": "Acme",
+              "objectIsLiteral": false,
+              "context": "Jane Doe joined Acme as Chief Technology Officer in March." }
+        ]
+    }));
+    let ingest = || {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_DOC_LLM_URL", &url)
+            .env("FLUREE_DOC_LLM_MODEL", "stub")
+            .args([
+                "doc",
+                "ingest",
+                "docs",
+                "-l",
+                "memos",
+                "--model",
+                "ont/model.ttl",
+                "--entities",
+                "ont/entities.ttl",
+            ]);
+        cmd
+    };
+    ingest().assert().success();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // What a user curates out of band: source trust on the document node —
+    // where the design puts it, because it has to be revisable — and a
+    // review note on a relation node the pipeline mints and re-mints.
+    fluree_cmd(&tmp)
+        .args([
+            "update",
+            "memos",
+            "-e",
+            r#"{"@context":{"ex":"https://example.org/","rdfs":"http://www.w3.org/2000/01/rdf-schema#"},
+                "insert":[
+                  {"@id":"urn:fluree:doc:memo.md","ex:trust":0.9},
+                  {"@id":"urn:fluree:doc:memo.md/relation/0",
+                   "ex:reviewedConfidence":1.0,"rdfs:comment":"checked by hand"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let curated = r"PREFIX ex: <https://example.org/>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT ?s ?p ?o WHERE {
+          VALUES ?p { ex:trust ex:reviewedConfidence rdfs:comment } ?s ?p ?o }";
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", curated])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(3 rows"));
+
+    // Change the source so the document is re-ingested rather than skipped.
+    let memo = tmp.path().join("docs").join("memo.md");
+    let mut text = std::fs::read_to_string(&memo).unwrap();
+    text.push_str("\nJane Doe also chairs the safety committee.\n");
+    std::fs::write(&memo, text).unwrap();
+    ingest()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 ingested"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    // The property. All three survive: two namespaces the pipeline does not
+    // write, on the two node kinds it owns.
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", curated])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(3 rows"))
+        .stdout(predicate::str::contains("urn:fluree:doc:memo.md"))
+        .stdout(predicate::str::contains("checked by hand"));
+
+    // And the sweep still sweeps: one hash and one chunk, not two of each.
+    // A sweep narrowed until it retracts nothing would pass the assertion
+    // above, so pin the other side too.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "memos",
+            "-e",
+            r"PREFIX doc: <https://ns.flur.ee/doc#>
+               SELECT ?h WHERE { <urn:fluree:doc:memo.md> doc:sha256 ?h }",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(1 rows"));
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "memos",
+            "-e",
+            r"PREFIX doc: <https://ns.flur.ee/doc#>
+               SELECT ?c WHERE { ?c a doc:Chunk ; doc:sourceDocument <urn:fluree:doc:memo.md> }",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(1 rows"));
+}
+
+// --- end: `fluree doc ingest` re-ingest ownership (PR-C / #1864) ------------
+
 /// A stub OpenAI-compatible `/embeddings` endpoint. Each input string becomes
 /// a 3-dim vector counting two marker words, so similarity is predictable and
 /// the assertions below are about ranking, not about a model.
