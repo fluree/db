@@ -746,6 +746,13 @@ here to stay:
   this shows on ordinary `a / b`.
 - **No implicit per-statement transaction id.** Immutability and time-travel
   (`f:t`, history queries) replace those semantics.
+- **`@id`, `@type` and the other JSON-LD keywords are not properties.** A node
+  variable already *is* the node, so ``n.`@id` `` and ``n.`@type` `` are rejected and
+  the error names the accessor that works — `id(n)` / `elementId(n)` for
+  identity, `labels(n)` for types, `SET n:Label` to add one. They were
+  previously read as ordinary, absent properties (always `null`); on the write
+  path they stored a literal predicate spelled `@id` while leaving the node's
+  real identity untouched.
 
 **Deferred (fringe / on request)** — rejected with a clear error until a use
 case pulls them in; each has a workaround:
@@ -757,6 +764,19 @@ case pulls them in; each has a workaround:
   `x.date.month`) and mixing `.*` with named selectors in a map projection.
 - `ORDER BY` over a list/map value, and `neo4j://` cluster routing (use
   `bolt://` direct).
+- **Re-projecting a bound name.** `RETURN expr AS v` / `WITH expr AS v` where
+  `v` is already bound by an earlier clause is rejected; alias to a fresh name.
+  Neo4j accepts `WITH n.name AS n` as a projection into a new scope, so this is
+  the one place Fluree is stricter than openCypher rather than more lenient.
+  The reason is the promise at the top of this section: variable names are a
+  bijection onto the shared IR's variable ids, so the alias resolved to the
+  bound variable and the projection became a silent equality filter — zero rows
+  on a read, and a successful transaction that wrote nothing on a write. An
+  error beats that. Re-projection needs a column-label channel in the shared
+  IR; the identity projection `RETURN v AS v` stays legal, as does aliasing a
+  name that a *later* clause binds (`WITH pair[0] AS x … OPTIONAL MATCH (x)…`).
+  Two projection items may not share one output name either (`AS x, … AS x`),
+  which matches Neo4j.
 
 Everything else — the full clause/pattern/expression surface, the write path,
 procedures, and Bolt driver support — works; when in doubt, try it and read the
