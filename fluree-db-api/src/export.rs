@@ -395,7 +395,7 @@ pub fn write_prefix_declarations<W: Write>(prefixes: &PrefixMap, writer: &mut W)
 ///
 /// Uses subject grouping (`;` between predicates of the same subject)
 /// and prefixed names where possible.
-pub fn export_graph_turtle<W: Write>(
+pub async fn export_graph_turtle<W: Write>(
     store: &Arc<BinaryIndexStore>,
     config: &ExportConfig<'_>,
     prefixes: &PrefixMap,
@@ -586,7 +586,7 @@ fn write_turtle_object<W: Write>(
 /// - Other typed literals → `{"@value": "...", "@type": "..."}`
 /// - Refs → `{"@id": "iri"}`
 /// - Single-cardinality properties are unwrapped (not in `[]`)
-pub fn export_graph_jsonld<W: Write>(
+pub async fn export_graph_jsonld<W: Write>(
     store: &Arc<BinaryIndexStore>,
     config: &ExportConfig<'_>,
     prefixes: &PrefixMap,
@@ -1093,7 +1093,7 @@ fn escape_json_string(s: &str) -> String {
 /// Stream triples/quads from the SPOT index of one graph to `writer`.
 ///
 /// Includes novelty overlay and respects `to_t` for time-travel export.
-pub fn export_graph_ntriples<W: Write>(
+pub async fn export_graph_ntriples<W: Write>(
     store: &Arc<BinaryIndexStore>,
     config: &ExportConfig<'_>,
     writer: &mut W,

@@ -254,6 +254,7 @@ impl<'a> ExportBuilder<'a> {
                     dict_novelty: Some(dict_novelty),
                 };
                 let stats = export::export_graph_turtle(&binary_store, &config, &prefixes, writer)
+                    .await
                     .map_err(io_err)?;
                 accumulate(&mut total_stats, stats);
             }
@@ -267,6 +268,7 @@ impl<'a> ExportBuilder<'a> {
                     dict_novelty: Some(dict_novelty),
                 };
                 let stats = export::export_graph_ntriples(&binary_store, &config, writer)
+                    .await
                     .map_err(io_err)?;
                 accumulate(&mut total_stats, stats);
             }
@@ -282,6 +284,7 @@ impl<'a> ExportBuilder<'a> {
                         dict_novelty: Some(dict_novelty),
                     };
                     let stats = export::export_graph_ntriples(&binary_store, &config, writer)
+                        .await
                         .map_err(io_err)?;
                     accumulate(&mut total_stats, stats);
                 } else {
@@ -294,6 +297,7 @@ impl<'a> ExportBuilder<'a> {
                         dict_novelty: Some(dict_novelty),
                     };
                     let stats = export::export_graph_ntriples(&binary_store, &config, writer)
+                        .await
                         .map_err(io_err)?;
                     accumulate(&mut total_stats, stats);
 
@@ -310,6 +314,7 @@ impl<'a> ExportBuilder<'a> {
                             };
                             let stats =
                                 export::export_graph_ntriples(&binary_store, &config, writer)
+                                    .await
                                     .map_err(io_err)?;
                             accumulate(&mut total_stats, stats);
                         }
@@ -336,6 +341,7 @@ impl<'a> ExportBuilder<'a> {
                     };
                     let stats =
                         export::export_graph_turtle(&binary_store, &config, &prefixes, writer)
+                            .await
                             .map_err(io_err)?;
                     accumulate(&mut total_stats, stats);
 
@@ -351,6 +357,7 @@ impl<'a> ExportBuilder<'a> {
                     };
                     let stats =
                         export::export_graph_turtle(&binary_store, &config, &prefixes, writer)
+                            .await
                             .map_err(io_err)?;
                     accumulate(&mut total_stats, stats);
 
@@ -376,6 +383,7 @@ impl<'a> ExportBuilder<'a> {
                                 &prefixes,
                                 writer,
                             )
+                            .await
                             .map_err(io_err)?;
                             accumulate(&mut total_stats, stats);
 
@@ -397,6 +405,7 @@ impl<'a> ExportBuilder<'a> {
                     dict_novelty: Some(dict_novelty),
                 };
                 let stats = export::export_graph_jsonld(&binary_store, &config, &prefixes, writer)
+                    .await
                     .map_err(io_err)?;
                 accumulate(&mut total_stats, stats);
 

@@ -1570,7 +1570,7 @@ where
     // Quick gate uses — so they cost O(classes), never a whole-twin scan.
     let twin_start = std::time::Instant::now();
     let twin_raw = dir.join("twin.nt");
-    spool_twin_ntriples_indexed(ledger, &twin_raw)?;
+    spool_twin_ntriples_indexed(ledger, &twin_raw).await?;
     let mut twin_class_count: BTreeMap<String, u64> =
         classes.iter().map(|c| (c.clone(), 0)).collect();
     for class in &classes {
@@ -1842,7 +1842,7 @@ impl TripleObserver for FileWritingObserver {
 /// committed-but-not-yet-indexed twin triples are read too (e.g. the negative gate's
 /// post-build injected corruption). Per-class counts are NOT collected here — the
 /// caller derives them from bounded COUNT queries.
-fn spool_twin_ntriples_indexed(
+async fn spool_twin_ntriples_indexed(
     ledger: &crate::LedgerState,
     path: &Path,
 ) -> Result<(), MaterializeError> {
@@ -1870,6 +1870,7 @@ fn spool_twin_ntriples_indexed(
         .map_err(|e| R2rmlError::Materialization(format!("twin spool create: {e}")))?;
     let mut writer = CanonicalizingLineWriter::new(std::io::BufWriter::new(file));
     crate::export::export_graph_ntriples(&binary_store, &config, &mut writer)
+        .await
         .map_err(|e| R2rmlError::Materialization(format!("twin index export: {e}")))?;
     writer.finish()
 }
