@@ -955,11 +955,7 @@ pub async fn run(
 
                 // Render the formatted result through the existing output pipeline so
                 // --format {json,typed-json,table} continues to apply.
-                let display_format = match output_format {
-                    OutputFormatKind::TypedJson => OutputFormatKind::TypedJson,
-                    _ if query_format == detect::QueryFormat::JsonLd => OutputFormatKind::Json,
-                    _ => output_format,
-                };
+                let display_format = json_path_display_format(query_format, output_format);
                 let output =
                     output::format_result(&response.result, display_format, query_format, None)?;
                 println!("{}", output.text);
@@ -1069,11 +1065,7 @@ pub async fn run(
                 );
             } else {
                 // JSON-LD queries can produce nested expansion results; always render as JSON.
-                let display_format = match output_format {
-                    OutputFormatKind::TypedJson => OutputFormatKind::TypedJson,
-                    _ if query_format == detect::QueryFormat::JsonLd => OutputFormatKind::Json,
-                    _ => output_format,
-                };
+                let display_format = json_path_display_format(query_format, output_format);
 
                 // Graph results (SPARQL CONSTRUCT/DESCRIBE) don't have a meaningful table view.
                 let display_format = if query_format == detect::QueryFormat::Sparql
