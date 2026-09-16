@@ -25,6 +25,7 @@ pub struct ExportBuilder<'a> {
     ledger_id: String,
     format: ExportFormat,
     all_graphs: bool,
+    system_graphs: bool,
     graph_iri: Option<String>,
     context_override: Option<serde_json::Value>,
     time_spec: Option<TimeSpec>,
@@ -37,6 +38,7 @@ impl<'a> ExportBuilder<'a> {
             ledger_id,
             format: ExportFormat::Turtle,
             all_graphs: false,
+            system_graphs: false,
             graph_iri: None,
             context_override: None,
             time_spec: None,
@@ -49,11 +51,26 @@ impl<'a> ExportBuilder<'a> {
         self
     }
 
-    /// Export all named graphs (dataset export), including system graphs.
+    /// Export the default graph plus every user-visible named graph.
     ///
-    /// Only valid with `TriG` or `NQuads` formats.
+    /// Only valid with `TriG` or `NQuads` formats. The ledger's system graphs
+    /// (`#txn-meta`, `#config`) are excluded — see [`export::is_system_graph`]
+    /// — unless [`Self::system_graphs`] is also set.
     pub fn all_graphs(mut self) -> Self {
         self.all_graphs = true;
+        self
+    }
+
+    /// Also emit the ledger's system graphs under `all_graphs()`.
+    ///
+    /// Diagnostic only. The resulting file is not portable: `#txn-meta` and
+    /// `#config` are named for the ledger that produced them, so re-importing
+    /// it into a ledger of the same name routes those triples into reserved
+    /// graph ids (#1846) and into a differently-named one lands a foreign
+    /// ledger's commit history in a user graph. Use `--format ledger` to move
+    /// a ledger.
+    pub fn system_graphs(mut self) -> Self {
+        self.system_graphs = true;
         self
     }
 
@@ -92,6 +109,12 @@ impl<'a> ExportBuilder<'a> {
                 "cannot use both all_graphs() and graph() — choose one".to_string(),
             ));
         }
+        if self.system_graphs && !self.all_graphs {
+            return Err(ApiError::Config(
+                "system_graphs() selects nothing on its own; combine it with all_graphs()"
+                    .to_string(),
+            ));
+        }
         if self.all_graphs {
             match self.format {
                 ExportFormat::TriG | ExportFormat::NQuads => {}
@@ -125,6 +148,34 @@ impl<'a> ExportBuilder<'a> {
             Ok(None) => Ok(PrefixMap::from_context(&serde_json::Value::Null)),
             Err(_) => Ok(PrefixMap::from_context(&serde_json::Value::Null)),
         }
+    }
+
+    /// The named graphs an `all_graphs()` export covers.
+    ///
+    /// `is_system_graph` was written with the doc comment "System graph IDs
+    /// excluded from dataset exports" and then never called from anywhere, so
+    /// `--all-graphs` shipped emitting `#txn-meta` and `#config` from the v4
+    /// baseline onward. This is the call site it was missing.
+    fn selected_named_graphs<'r>(&self, registry: &'r GraphRegistry) -> Vec<(u16, &'r str)> {
+        registry
+            .iter_entries()
+            .filter(|(g_id, _)| self.system_graphs || !export::is_system_graph(*g_id))
+            .collect()
+    }
+
+    /// User-visible named graphs this export does not cover.
+    ///
+    /// Zero under `all_graphs()`. Under a single-graph or default-graph-only
+    /// export it is every other user graph in the registry — the number the
+    /// caller needs to say so out loud.
+    fn omitted_named_graph_count(&self, registry: &GraphRegistry, target: Option<u16>) -> u64 {
+        if self.all_graphs {
+            return 0;
+        }
+        registry
+            .iter_entries()
+            .filter(|(g_id, _)| !export::is_system_graph(*g_id) && Some(*g_id) != target)
+            .count() as u64
     }
 
     /// Resolve a graph IRI to a `(g_id, iri)` pair via the graph registry.
@@ -204,8 +255,7 @@ impl<'a> ExportBuilder<'a> {
                 };
                 let stats = export::export_graph_turtle(&binary_store, &config, &prefixes, writer)
                     .map_err(io_err)?;
-                total_stats.triples_written += stats.triples_written;
-                total_stats.rows_skipped += stats.rows_skipped;
+                accumulate(&mut total_stats, stats);
             }
 
             ExportFormat::NTriples => {
@@ -218,8 +268,7 @@ impl<'a> ExportBuilder<'a> {
                 };
                 let stats = export::export_graph_ntriples(&binary_store, &config, writer)
                     .map_err(io_err)?;
-                total_stats.triples_written += stats.triples_written;
-                total_stats.rows_skipped += stats.rows_skipped;
+                accumulate(&mut total_stats, stats);
             }
 
             ExportFormat::NQuads => {
@@ -234,8 +283,7 @@ impl<'a> ExportBuilder<'a> {
                     };
                     let stats = export::export_graph_ntriples(&binary_store, &config, writer)
                         .map_err(io_err)?;
-                    total_stats.triples_written += stats.triples_written;
-                    total_stats.rows_skipped += stats.rows_skipped;
+                    accumulate(&mut total_stats, stats);
                 } else {
                     // Default graph (no graph term)
                     let config = ExportConfig {
@@ -247,11 +295,12 @@ impl<'a> ExportBuilder<'a> {
                     };
                     let stats = export::export_graph_ntriples(&binary_store, &config, writer)
                         .map_err(io_err)?;
-                    total_stats.triples_written += stats.triples_written;
-                    total_stats.rows_skipped += stats.rows_skipped;
+                    accumulate(&mut total_stats, stats);
 
                     if self.all_graphs {
-                        for (g_id, iri) in ledger.snapshot.graph_registry.iter_entries() {
+                        for (g_id, iri) in
+                            self.selected_named_graphs(&ledger.snapshot.graph_registry)
+                        {
                             let config = ExportConfig {
                                 g_id,
                                 graph_iri: Some(iri.to_string()),
@@ -262,8 +311,7 @@ impl<'a> ExportBuilder<'a> {
                             let stats =
                                 export::export_graph_ntriples(&binary_store, &config, writer)
                                     .map_err(io_err)?;
-                            total_stats.triples_written += stats.triples_written;
-                            total_stats.rows_skipped += stats.rows_skipped;
+                            accumulate(&mut total_stats, stats);
                         }
                     }
                 }
@@ -289,8 +337,7 @@ impl<'a> ExportBuilder<'a> {
                     let stats =
                         export::export_graph_turtle(&binary_store, &config, &prefixes, writer)
                             .map_err(io_err)?;
-                    total_stats.triples_written += stats.triples_written;
-                    total_stats.rows_skipped += stats.rows_skipped;
+                    accumulate(&mut total_stats, stats);
 
                     writeln!(writer, "}}").map_err(io_err)?;
                 } else {
@@ -305,12 +352,13 @@ impl<'a> ExportBuilder<'a> {
                     let stats =
                         export::export_graph_turtle(&binary_store, &config, &prefixes, writer)
                             .map_err(io_err)?;
-                    total_stats.triples_written += stats.triples_written;
-                    total_stats.rows_skipped += stats.rows_skipped;
+                    accumulate(&mut total_stats, stats);
 
                     // Named graphs in GRAPH { } blocks
                     if self.all_graphs {
-                        for (g_id, iri) in ledger.snapshot.graph_registry.iter_entries() {
+                        for (g_id, iri) in
+                            self.selected_named_graphs(&ledger.snapshot.graph_registry)
+                        {
                             write!(writer, "\nGRAPH ").map_err(io_err)?;
                             export::write_turtle_iri(writer, iri, &prefixes).map_err(io_err)?;
                             writeln!(writer, " {{").map_err(io_err)?;
@@ -329,8 +377,7 @@ impl<'a> ExportBuilder<'a> {
                                 writer,
                             )
                             .map_err(io_err)?;
-                            total_stats.triples_written += stats.triples_written;
-                            total_stats.rows_skipped += stats.rows_skipped;
+                            accumulate(&mut total_stats, stats);
 
                             writeln!(writer, "}}").map_err(io_err)?;
                         }
@@ -351,14 +398,17 @@ impl<'a> ExportBuilder<'a> {
                 };
                 let stats = export::export_graph_jsonld(&binary_store, &config, &prefixes, writer)
                     .map_err(io_err)?;
-                total_stats.triples_written += stats.triples_written;
-                total_stats.rows_skipped += stats.rows_skipped;
+                accumulate(&mut total_stats, stats);
 
                 export::write_jsonld_footer(writer).map_err(io_err)?;
             }
         }
 
         writer.flush().map_err(io_err)?;
+        total_stats.named_graphs_omitted = self.omitted_named_graph_count(
+            &ledger.snapshot.graph_registry,
+            target_graph.as_ref().map(|(g_id, _)| *g_id),
+        );
         Ok(total_stats)
     }
 
@@ -368,6 +418,19 @@ impl<'a> ExportBuilder<'a> {
         let mut writer = BufWriter::new(stdout);
         self.write_to(&mut writer).await
     }
+}
+
+/// Fold one graph's scan into the running totals.
+///
+/// A graph counts toward `graphs_written` only if it produced a triple: an
+/// empty `GRAPH { }` block is a graph in the registry, not a graph of data,
+/// and reporting it would overstate what the export carries.
+fn accumulate(total: &mut ExportStats, stats: ExportStats) {
+    if stats.triples_written > 0 {
+        total.graphs_written += 1;
+    }
+    total.triples_written += stats.triples_written;
+    total.rows_skipped += stats.rows_skipped;
 }
 
 fn io_err(e: io::Error) -> ApiError {

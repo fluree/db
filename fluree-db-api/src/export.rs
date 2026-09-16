@@ -39,10 +39,24 @@ pub struct ExportConfig<'a> {
 }
 
 /// Counters returned after export completes.
+///
+/// The CLI and the HTTP route both surface these. Before they did, an export
+/// that quietly dropped every named graph in the ledger was indistinguishable
+/// from one that had nothing to drop — the complaint in #1847 was precisely
+/// that "nothing in the output suggested anything was missing".
 #[derive(Debug, Default)]
 pub struct ExportStats {
     pub triples_written: u64,
+    /// Rows the writers could not represent: an unresolvable predicate id, or
+    /// a value that decoded to `FlakeValue::Null`.
     pub rows_skipped: u64,
+    /// Graphs that contributed at least one triple, counting the default
+    /// graph. Accumulated by the builder, not the per-graph writers.
+    pub graphs_written: u64,
+    /// User-visible named graphs in the ledger's registry that this export did
+    /// not cover, because no graph selector asked for them. System graphs are
+    /// not counted: they are never user data.
+    pub named_graphs_omitted: u64,
 }
 
 /// Output format for streaming export.
@@ -65,6 +79,13 @@ pub const SYSTEM_GRAPH_TXN_META: GraphId = 1;
 pub const SYSTEM_GRAPH_CONFIG: GraphId = 2;
 
 /// Returns `true` if `g_id` is a system-internal graph.
+///
+/// `#txn-meta` and `#config` carry a ledger's own commit metadata and
+/// configuration under IRIs derived from its name. Exporting them as ordinary
+/// named graphs produces a file that either collides with the target ledger's
+/// reserved graph ids on re-import (#1846) or lands a foreign ledger's commit
+/// history in a user graph, so `--all-graphs` filters them out unless
+/// `system_graphs()` is set.
 pub fn is_system_graph(g_id: GraphId) -> bool {
     g_id == SYSTEM_GRAPH_TXN_META || g_id == SYSTEM_GRAPH_CONFIG
 }

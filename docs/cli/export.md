@@ -19,7 +19,8 @@ fluree export [LEDGER] [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--format <FORMAT>` | Output format: `turtle` (or `ttl`), `ntriples` (or `nt`), `jsonld`, `trig`, `nquads`, or `ledger` (`.flpack` archive). Defaults to `turtle`, or to `ledger` when `-o` names a `.flpack` file. |
-| `--all-graphs` | Export default + all named graphs including system graphs (dataset export). Requires `--format trig` or `--format nquads`. |
+| `--all-graphs` | Export the default graph plus every named graph (dataset export). Requires `--format trig` or `--format nquads`. The ledger's system graphs are excluded — see `--system-graphs`. |
+| `--system-graphs` | Also emit the ledger's system graphs (`#txn-meta`, `#config`) under `--all-graphs`. Diagnostic only. |
 | `--graph <IRI>` | Export a specific named graph by IRI. Mutually exclusive with `--all-graphs`. |
 | `--context <JSON>` | JSON-LD context for prefix declarations. Overrides the ledger's default context. |
 | `--context-file <FILE>` | Read context from a JSON file. Overrides the ledger's default context. |
@@ -38,6 +39,24 @@ Exports the full native ledger — all commits, transaction blobs, indexes, and 
 The `.flpack` format uses the `fluree-pack-v1` binary wire protocol (the same format used by `fluree clone` and `fluree pull` for network transfers).
 
 All formats (Turtle, N-Triples, N-Quads, TriG, JSON-LD) read directly from the binary SPOT index with a novelty overlay, so export always includes the latest committed transactions — even those not yet persisted to index. Memory usage stays constant regardless of dataset size. JSON-LD streams one subject at a time, so memory is O(largest subject), not O(dataset).
+
+### Named graphs
+
+`--all-graphs` is opt-in even for `trig` and `nquads`. Without it, a dataset-format export carries only the default graph — so every export prints a summary to **stderr**, and names the flag when it left graphs behind:
+
+```
+$ fluree export mydb --format trig > mydb.trig
+✓ Exported 'mydb' (1 triples, 1 graphs)
+  warning: 1 named graph not exported; pass --all-graphs to include it
+```
+
+stdout carries only the RDF, so redirecting it still produces a clean file.
+
+### System graphs
+
+Every ledger has two system graphs, `urn:fluree:<ledger>:main#txn-meta` (commit metadata) and `…#config`. `--all-graphs` does not export them, because a file that contains them is not portable: their IRIs name the ledger that produced them, so re-importing into a ledger of the same name routes those triples onto the target's own reserved graph ids where they are unreachable, and importing into a differently-named ledger lands a foreign ledger's commit history in an ordinary user graph.
+
+`--system-graphs` emits them anyway, for diagnostics. Use `--format ledger` to move a ledger — it carries commits rather than re-serializing triples, and round-trips losslessly.
 
 ### Prefixes / Context
 
@@ -133,6 +152,8 @@ ex:bob
 
 ### TriG (all graphs)
 
+The default graph is written as top-level triples; each named graph gets a `GRAPH` block. System graphs are not included.
+
 ```trig
 @prefix ex: <http://example.org/> .
 
@@ -197,6 +218,9 @@ let stats = fluree.export("mydb")
     .all_graphs()
     .write_to(&mut writer)
     .await?;
+// stats.triples_written, stats.graphs_written, stats.rows_skipped,
+// stats.named_graphs_omitted — the last is non-zero when the ledger has
+// named graphs this export did not cover.
 
 // Turtle with custom prefixes
 let stats = fluree.export("mydb")

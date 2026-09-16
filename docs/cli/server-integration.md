@@ -2037,6 +2037,7 @@ Content-Type: application/json
 {
   "format": "turtle",
   "all_graphs": false,
+  "system_graphs": false,
   "graph": "http://example.org/people",
   "context": { "ex": "http://example.org/" },
   "at": "t:42"
@@ -2046,7 +2047,8 @@ Content-Type: application/json
 | Field | Type | Required | Server default | Description |
 |-------|------|----------|----------------|-------------|
 | `format` | string | No | `"turtle"` | One of: `turtle`/`ttl`, `ntriples`/`nt`, `nquads`/`n-quads`, `trig`, `jsonld`/`json-ld`/`json`. Case-insensitive. |
-| `all_graphs` | bool | No | `false` | Export every named graph as a dataset. Requires `format` ∈ `trig` / `nquads`. Mutually exclusive with `graph`. |
+| `all_graphs` | bool | No | `false` | Export every user-visible named graph as a dataset. Requires `format` ∈ `trig` / `nquads`. Mutually exclusive with `graph`. The ledger's system graphs (`#txn-meta`, `#config`) are excluded. |
+| `system_graphs` | bool | No | `false` | Also emit the system graphs under `all_graphs`. Diagnostic only — the result is named for the source ledger and does not re-import cleanly. |
 | `graph` | string | No | — | IRI of a single named graph to export. Mutually exclusive with `all_graphs`. |
 | `context` | object | No | ledger default | Prefix map for Turtle/TriG/JSON-LD output. Either a bare object (`{ "ex": "..." }`) or `{ "@context": {...} }`. Falls back to the ledger's stored default context when absent. |
 | `at` | string | No | latest | Time spec — integer (`"42"`), ISO-8601 datetime (`"2026-01-15T10:30:00Z"`), or commit CID prefix (`"bafy…"`). Identical to the local `--at` flag. |
@@ -2088,6 +2090,8 @@ stream chunked bodies; clients MUST be prepared to read until EOF.
 2. **Dataset/format coupling.** When `all_graphs == true`, `format` must be
    `trig` or `nquads`; otherwise return `400` with a message that mentions
    the dataset format requirement (the local CLI surfaces the same error).
+   `system_graphs == true` without `all_graphs` is also a `400`: it selects
+   nothing on its own.
 3. **Time spec parsing.** Same rules as the merge-preview / show
    contracts: parse as integer first (`t`), then as ISO-8601 if it
    contains both `-` and `:`, else as a commit CID prefix.
@@ -2105,7 +2109,7 @@ stream chunked bodies; clients MUST be prepared to read until EOF.
 
 | Status | When |
 |--------|------|
-| `400` | Unknown format; conflicting `all_graphs` + `graph`; `all_graphs` with non-dataset format; unknown graph IRI; malformed JSON. |
+| `400` | Unknown format; conflicting `all_graphs` + `graph`; `all_graphs` with non-dataset format; `system_graphs` without `all_graphs`; unknown graph IRI; malformed JSON. |
 | `401` / `403` | Admin token required and absent/invalid. |
 | `404` | Ledger does not exist. |
 | `5xx` | Storage / nameservice / encoding errors during walk. |

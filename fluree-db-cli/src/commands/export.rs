@@ -5,7 +5,7 @@ use crate::context;
 use crate::error::{CliError, CliResult};
 use crate::remote_client::RemoteLedgerClient;
 use colored::Colorize;
-use fluree_db_api::export::ExportFormat;
+use fluree_db_api::export::{ExportFormat, ExportStats};
 use fluree_db_api::server_defaults::FlureeDir;
 use std::io::{self, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -52,6 +52,7 @@ pub async fn run(
     output: Option<&Path>,
     no_indexes: bool,
     all_graphs: bool,
+    system_graphs: bool,
     graph: Option<&str>,
     context_expr: Option<&str>,
     context_file: Option<&Path>,
@@ -100,6 +101,7 @@ pub async fn run(
             format_str,
             output,
             all_graphs,
+            system_graphs,
             graph,
             context_expr,
             context_file,
@@ -118,6 +120,7 @@ pub async fn run(
                 format_str,
                 output,
                 all_graphs,
+                system_graphs,
                 graph,
                 context_expr,
                 context_file,
@@ -135,6 +138,7 @@ pub async fn run(
         format_str,
         output,
         all_graphs,
+        system_graphs,
         graph,
         context_expr,
         context_file,
@@ -405,6 +409,7 @@ async fn run_remote_rdf(
     format_str: &str,
     output: Option<&Path>,
     all_graphs: bool,
+    system_graphs: bool,
     graph: Option<&str>,
     context_expr: Option<&str>,
     context_file: Option<&Path>,
@@ -416,6 +421,9 @@ async fn run_remote_rdf(
     let mut body = serde_json::json!({ "format": format_str });
     if all_graphs {
         body["all_graphs"] = serde_json::Value::Bool(true);
+    }
+    if system_graphs {
+        body["system_graphs"] = serde_json::Value::Bool(true);
     }
     if let Some(iri) = graph {
         body["graph"] = serde_json::Value::String(iri.to_string());
@@ -441,6 +449,7 @@ async fn run_local_rdf(
     format_str: &str,
     output: Option<&Path>,
     all_graphs: bool,
+    system_graphs: bool,
     graph: Option<&str>,
     context_expr: Option<&str>,
     context_file: Option<&Path>,
@@ -465,6 +474,9 @@ async fn run_local_rdf(
     if all_graphs {
         builder = builder.all_graphs();
     }
+    if system_graphs {
+        builder = builder.system_graphs();
+    }
     if let Some(iri) = graph {
         builder = builder.graph(iri);
     }
@@ -475,25 +487,87 @@ async fn run_local_rdf(
         builder = builder.context(&ctx);
     }
 
-    match output {
+    let stats = match output {
         Some(path) => {
             let file = std::fs::File::create(path).map_err(|e| {
                 CliError::Config(format!("failed to create '{}': {e}", path.display()))
             })?;
             let mut writer = BufWriter::new(file);
-            builder.write_to(&mut writer).await?;
+            let stats = builder.write_to(&mut writer).await?;
             writer
                 .flush()
                 .map_err(|e| CliError::Config(format!("failed to flush output: {e}")))?;
+            stats
         }
         None => {
             let stdout = io::stdout().lock();
             let mut writer = BufWriter::new(stdout);
-            builder.write_to(&mut writer).await?;
+            builder.write_to(&mut writer).await?
         }
-    }
+    };
 
+    report_rdf_stats(alias, format, &stats, all_graphs || graph.is_some());
     Ok(())
+}
+
+/// Summarize an RDF export on stderr, mirroring what `--format ledger`
+/// already prints.
+///
+/// The RDF path discarded `ExportStats` entirely, so a `--format trig` export
+/// that dropped every named graph in the ledger printed exactly what a
+/// complete one did. Output goes to stderr so `fluree export > file.ttl`
+/// still produces a clean file.
+fn report_rdf_stats(alias: &str, format: ExportFormat, stats: &ExportStats, graphs_selected: bool) {
+    eprintln!(
+        "{} Exported '{}' ({} triples, {} graphs)",
+        "✓".green(),
+        alias,
+        stats.triples_written,
+        stats.graphs_written,
+    );
+    if stats.rows_skipped > 0 {
+        eprintln!(
+            "  {} {} rows skipped (unresolvable predicate or value)",
+            "warning:".yellow(),
+            stats.rows_skipped,
+        );
+    }
+    if stats.named_graphs_omitted > 0 && !graphs_selected {
+        let (noun, pronoun) = if stats.named_graphs_omitted == 1 {
+            ("graph", "it")
+        } else {
+            ("graphs", "them")
+        };
+        let remedy = match format {
+            // A dataset format asked for and not given its graphs is the
+            // trap in #1847: the format exists to carry them.
+            ExportFormat::TriG | ExportFormat::NQuads => {
+                format!("pass --all-graphs to include {pronoun}")
+            }
+            _ => format!(
+                "{} cannot carry named graphs; use --format trig or --format nquads",
+                format_name(format)
+            ),
+        };
+        eprintln!(
+            "  {} {} named {} not exported; {}",
+            "warning:".yellow(),
+            stats.named_graphs_omitted,
+            noun,
+            remedy,
+        );
+    }
+}
+
+/// The `--format` spelling for an `ExportFormat`, for use in messages.
+fn format_name(format: ExportFormat) -> &'static str {
+    match format {
+        ExportFormat::Turtle => "turtle",
+        ExportFormat::NTriples => "ntriples",
+        ExportFormat::NQuads => "nquads",
+        ExportFormat::TriG => "trig",
+        ExportFormat::JsonLd => "jsonld",
+    }
 }
 
 fn write_bytes_to_sink(bytes: &[u8], output: Option<&Path>) -> CliResult<()> {

@@ -1046,11 +1046,20 @@ pub enum Commands {
         #[arg(long)]
         no_indexes: bool,
 
-        /// Export all named graphs (dataset export), including system graphs.
+        /// Export the default graph plus every named graph (dataset export).
         ///
         /// Use `--format trig` or `--format nquads` when this flag is set.
+        /// The ledger's own system graphs (`#txn-meta`, `#config`) are
+        /// excluded; see `--system-graphs`.
         #[arg(long)]
         all_graphs: bool,
+
+        /// Also emit the ledger's system graphs (`#txn-meta`, `#config`)
+        /// under `--all-graphs`. Diagnostic only — the result is named for
+        /// this ledger and does not re-import cleanly anywhere. Use
+        /// `--format ledger` to move a ledger.
+        #[arg(long, requires = "all_graphs")]
+        system_graphs: bool,
 
         /// Export a specific named graph by IRI.
         ///

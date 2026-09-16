@@ -1787,6 +1787,187 @@ fn export_all_graphs_nquads_on_never_indexed_ledger() {
         ));
 }
 
+/// A ledger with one triple in the default graph and one in a named graph,
+/// built through the bulk-import path (`insert` has no TriG reader).
+fn seed_two_graphs(tmp: &TempDir, ledger: &str) {
+    let src = tmp.path().join(format!("{ledger}-src"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.trig"),
+        "<http://example.org/default1> <http://example.org/p> \"in-default\" .\n\
+         GRAPH <http://example.org/g1> { \
+             <http://example.org/s> <http://example.org/p> \"in-g1\" . }\n",
+    )
+    .unwrap();
+    fluree_cmd(tmp)
+        .args(["create", ledger, "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+}
+
+/// `--all-graphs` emits user graphs and *not* the ledger's own `#txn-meta` /
+/// `#config`.
+///
+/// `is_system_graph` was written for this filter and never called, so this
+/// output carried a foreign ledger's commit history from the v4 baseline
+/// onward — and `docs/cli/export.md` was written to describe that as intended.
+#[test]
+fn export_all_graphs_excludes_system_graphs() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_two_graphs(&tmp, "sysg");
+
+    fluree_cmd(&tmp)
+        .args(["export", "sysg", "--format", "trig", "--all-graphs"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("GRAPH <http://example.org/g1>"))
+        .stdout(predicate::str::contains("in-g1"))
+        .stdout(predicate::str::contains("#txn-meta").not())
+        .stdout(predicate::str::contains("#config").not());
+}
+
+/// The escape hatch, for the diagnostic case only.
+#[test]
+fn export_system_graphs_flag_emits_them() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_two_graphs(&tmp, "sysg2");
+
+    fluree_cmd(&tmp)
+        .args([
+            "export",
+            "sysg2",
+            "--format",
+            "trig",
+            "--all-graphs",
+            "--system-graphs",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("#txn-meta"));
+
+    // It is a modifier on --all-graphs, not a selector.
+    fluree_cmd(&tmp)
+        .args(["export", "sysg2", "--format", "trig", "--system-graphs"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--all-graphs"));
+}
+
+/// #1847's actual complaint: "nothing in the output to suggest anything is
+/// missing". A dataset format is chosen precisely to carry graphs, so
+/// producing triples-only without saying so is the trap.
+#[test]
+fn export_reports_stats_and_warns_on_dropped_graphs() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_two_graphs(&tmp, "statsg");
+
+    // Dataset format, no selector: name the flag that would fix it.
+    fluree_cmd(&tmp)
+        .args(["export", "statsg", "--format", "trig"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("1 named graph not exported"))
+        .stderr(predicate::str::contains("pass --all-graphs to include it"));
+
+    // Turtle cannot represent a named graph at all, so --all-graphs is the
+    // wrong advice there; the format is.
+    fluree_cmd(&tmp)
+        .args(["export", "statsg", "--format", "turtle"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("turtle cannot carry named graphs"));
+
+    // With every graph selected there is nothing to warn about, and the
+    // stats line accounts for both graphs.
+    fluree_cmd(&tmp)
+        .args(["export", "statsg", "--format", "trig", "--all-graphs"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(2 triples, 2 graphs)"))
+        .stderr(predicate::str::contains("not exported").not());
+}
+
+/// Export → re-ingest → compare, into a ledger of the *same name*.
+///
+/// This is the round trip #1847 was filed about, and the same-name target is
+/// the part that matters: an `--all-graphs` export carrying `#txn-meta` lands
+/// those triples on the target's own reserved graph ids, where they are
+/// unreachable (#1846). Filtering system graphs on export removes the common
+/// way to produce such a file.
+#[test]
+fn export_all_graphs_round_trips_into_a_same_named_ledger() {
+    let src_home = TempDir::new().unwrap();
+    fluree_cmd(&src_home).arg("init").assert().success();
+    seed_two_graphs(&src_home, "rt");
+
+    let out = src_home.path().join("rt.trig");
+    fluree_cmd(&src_home)
+        .args(["export", "rt", "--format", "trig", "--all-graphs", "-o"])
+        .arg(&out)
+        .assert()
+        .success();
+
+    // A second store, so the target can carry the same ledger name.
+    let dst_home = TempDir::new().unwrap();
+    fluree_cmd(&dst_home).arg("init").assert().success();
+    fluree_cmd(&dst_home)
+        .args(["create", "rt", "--from"])
+        .arg(&out)
+        .assert()
+        .success();
+
+    fluree_cmd(&dst_home)
+        .args([
+            "query",
+            "rt",
+            "--sparql",
+            "SELECT ?o WHERE { GRAPH <http://example.org/g1> { ?s ?p ?o } }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("in-g1"));
+
+    fluree_cmd(&dst_home)
+        .args([
+            "query",
+            "rt",
+            "--sparql",
+            "SELECT ?o WHERE { <http://example.org/default1> <http://example.org/p> ?o }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("in-default"));
+
+    // The same file into a *differently* named ledger. This is the direction
+    // that can observe a leaked system graph: `urn:fluree:rt:main#txn-meta`
+    // does not collide with `other`'s reserved ids, so it would land as an
+    // ordinary user graph holding a foreign ledger's commit history. (Into
+    // the same-named ledger above it collides instead and vanishes — which
+    // is #1846, and is why that target cannot be the assertion.)
+    fluree_cmd(&dst_home)
+        .args(["create", "other", "--from"])
+        .arg(&out)
+        .assert()
+        .success();
+
+    fluree_cmd(&dst_home)
+        .args([
+            "query",
+            "other",
+            "--sparql",
+            "SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("g1"))
+        .stdout(predicate::str::contains("txn-meta").not())
+        .stdout(predicate::str::contains("urn:fluree").not());
+}
+
 // ============================================================================
 // v1.1 — Config tests
 // ============================================================================

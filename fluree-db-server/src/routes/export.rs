@@ -30,8 +30,13 @@ pub struct ExportRequest {
     /// `jsonld`/`json-ld`/`json`. Default: `turtle`.
     pub format: Option<String>,
     /// Export all named graphs. Requires a dataset format (`trig` or `nquads`).
+    /// The ledger's system graphs are excluded unless `system_graphs` is set.
     #[serde(default)]
     pub all_graphs: bool,
+    /// Also emit the ledger's system graphs (`#txn-meta`, `#config`) under
+    /// `all_graphs`. Diagnostic only — see `ExportBuilder::system_graphs`.
+    #[serde(default)]
+    pub system_graphs: bool,
     /// Export a single named graph by IRI. Mutually exclusive with `all_graphs`.
     pub graph: Option<String>,
     /// Override the JSON-LD prefix context. Either a bare object (`{ "ex": "..." }`)
@@ -102,6 +107,9 @@ async fn export_local(
         if req.all_graphs {
             builder = builder.all_graphs();
         }
+        if req.system_graphs {
+            builder = builder.system_graphs();
+        }
         if let Some(iri) = req.graph.as_deref() {
             builder = builder.graph(iri);
         }
@@ -117,6 +125,9 @@ async fn export_local(
         tracing::info!(
             status = "success",
             triples = stats.triples_written,
+            graphs = stats.graphs_written,
+            rows_skipped = stats.rows_skipped,
+            named_graphs_omitted = stats.named_graphs_omitted,
             bytes = buf.len(),
             "ledger export complete"
         );
