@@ -17,6 +17,8 @@ mod it_policy_fquery;
 mod it_policy_identity_based;
 #[path = "it_policy_indexed.rs"]
 mod it_policy_indexed;
+#[path = "it_policy_modify_target_resolution.rs"]
+mod it_policy_modify_target_resolution;
 #[path = "it_policy_named_graphs.rs"]
 mod it_policy_named_graphs;
 #[path = "it_policy_optional_hashjoin.rs"]
@@ -25,6 +27,8 @@ mod it_policy_optional_hashjoin;
 mod it_policy_query_connection;
 #[path = "it_policy_sparql.rs"]
 mod it_policy_sparql;
+#[path = "it_policy_target_resolution.rs"]
+mod it_policy_target_resolution;
 #[path = "it_policy_time_travel.rs"]
 mod it_policy_time_travel;
 #[path = "it_policy_tracking.rs"]

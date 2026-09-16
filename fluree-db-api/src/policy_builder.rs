@@ -811,9 +811,6 @@ pub(crate) async fn load_policy_restriction(
     // Collect properties using explicit predicate queries
     // (wildcard ?pred would be filtered by scan layer for fluree:ledger predicates)
     let mut allow: Option<bool> = None;
-    let mut on_property: HashSet<Sid> = HashSet::new();
-    let mut on_subject: HashSet<Sid> = HashSet::new();
-    let mut on_class: HashSet<Sid> = HashSet::new();
     let mut required = false;
     let mut message: Option<String> = None;
     let mut policy_query_source: Option<(String, PolicyQueryLanguage)> = None;
@@ -904,63 +901,46 @@ pub(crate) async fn load_policy_restriction(
         (action, verbs)
     };
 
-    // f:onProperty (can have multiple values)
-    {
-        let pred_sid =
-            resolve_system_iri_to_sid(snapshot, policy_iris::ON_PROPERTY, "f:onProperty")?;
-        let bindings = query_predicate(
-            snapshot,
-            overlay,
-            to_t,
-            policy_sid,
-            &pred_sid,
-            policy_graphs,
-        )
-        .await?;
-        for binding in bindings {
-            if let Some(sid) = binding.as_sid() {
-                on_property.insert(sid.clone());
-            }
-        }
-    }
-
-    // f:onSubject (can have multiple values)
-    {
-        let pred_sid = resolve_system_iri_to_sid(snapshot, policy_iris::ON_SUBJECT, "f:onSubject")?;
-        let bindings = query_predicate(
-            snapshot,
-            overlay,
-            to_t,
-            policy_sid,
-            &pred_sid,
-            policy_graphs,
-        )
-        .await?;
-        for binding in bindings {
-            if let Some(sid) = binding.as_sid() {
-                on_subject.insert(sid.clone());
-            }
-        }
-    }
-
-    // f:onClass (can have multiple values)
-    {
-        let pred_sid = resolve_system_iri_to_sid(snapshot, policy_iris::ON_CLASS, "f:onClass")?;
-        let bindings = query_predicate(
-            snapshot,
-            overlay,
-            to_t,
-            policy_sid,
-            &pred_sid,
-            policy_graphs,
-        )
-        .await?;
-        for binding in bindings {
-            if let Some(sid) = binding.as_sid() {
-                on_class.insert(sid.clone());
-            }
-        }
-    }
+    // Targeting predicates (each can have multiple values).
+    //
+    // A stored target is only usable as a node reference. A literal object —
+    // `f:onClass "http://example.org/Confidential"` rather than
+    // `{"@id": ...}` — has no Sid, and skipping it silently leaves the rule
+    // with no targeting at all, which is `TargetMode::Default`: it then
+    // applies to every flake. A stored "allow only instances of X" becomes a
+    // universal grant on both the read and the write side, and unlike the
+    // inline path there is no `had_on_*` flag here to even log about it.
+    // `collect_stored_targets` refuses instead of widening.
+    let on_property = collect_stored_targets(
+        snapshot,
+        overlay,
+        to_t,
+        policy_sid,
+        policy_graphs,
+        policy_iris::ON_PROPERTY,
+        "f:onProperty",
+    )
+    .await?;
+    let on_subject = collect_stored_targets(
+        snapshot,
+        overlay,
+        to_t,
+        policy_sid,
+        policy_graphs,
+        policy_iris::ON_SUBJECT,
+        "f:onSubject",
+    )
+    .await?;
+    let on_class = collect_stored_targets(
+        snapshot,
+        overlay,
+        to_t,
+        policy_sid,
+        policy_graphs,
+        policy_iris::ON_CLASS,
+        "f:onClass",
+    )
+    .await?;
 
     // f:required
     {
@@ -1137,6 +1117,60 @@ pub(crate) async fn load_policy_restriction(
     Ok(Some(restriction))
 }
 
+/// Read one stored `f:on*` targeting predicate into resolved SIDs.
+///
+/// Returns an empty set when the predicate is absent — an untargeted default
+/// policy is a supported shape. When the predicate *is* present, at least one
+/// of its objects must be a node reference.
+///
+/// The refusal is the point. Only a `Binding` with a Sid can become a target;
+/// a literal object is dropped. If every object is a literal the rule keeps
+/// `TargetMode::Default`, lands in the default bucket
+/// (`fluree-db-policy/src/index.rs`) and applies to *every* flake — so a stored
+/// "allow only instances of X" silently becomes a universal grant, for reads
+/// and for writes. That is a widening, and widening on malformed input is not
+/// something this loader is allowed to do.
+async fn collect_stored_targets(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn fluree_db_core::OverlayProvider,
+    to_t: i64,
+    policy_sid: &Sid,
+    policy_graphs: &[fluree_db_core::GraphId],
+    predicate_iri: &str,
+    label: &str,
+) -> Result<HashSet<Sid>> {
+    let pred_sid = resolve_system_iri_to_sid(snapshot, predicate_iri, label)?;
+    let bindings = query_predicate(
+        snapshot,
+        overlay,
+        to_t,
+        policy_sid,
+        &pred_sid,
+        policy_graphs,
+    )
+    .await?;
+    if bindings.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let targets: HashSet<Sid> = bindings
+        .iter()
+        .filter_map(|b| b.as_sid().cloned())
+        .collect();
+    if targets.is_empty() {
+        let policy_id = snapshot
+            .decode_sid(policy_sid)
+            .unwrap_or_else(|| policy_sid.name.to_string());
+        return Err(ApiError::query(format!(
+            "Invalid policy '{policy_id}': {label} is present but names no node \
+             reference. Targets must be IRI references (`{{\"@id\": ...}}`), not \
+             literals — a literal is dropped, which would leave the policy \
+             untargeted and applying to everything."
+        )));
+    }
+    Ok(targets)
+}
+
 /// Query for a specific predicate on a subject and return all object bindings.
 ///
 /// Uses an explicit predicate SID (not a variable) to avoid the scan layer's
@@ -1227,6 +1261,11 @@ fn parse_inline_policy(
             .map(std::string::ToString::to_string)
             .unwrap_or_else(|| format!("inline-policy-{idx}"));
 
+        // Reject keys this parser cannot honor *before* reading any of them —
+        // an unrecognized key is not an ignorable field here, it silently
+        // changes what the rule targets. See `validate_policy_keys`.
+        validate_policy_keys(obj, &id)?;
+
         // Extract f:allow (optional). If absent, policy may be driven by f:query.
         let allow: Option<bool> = obj
             .get("f:allow")
@@ -1303,104 +1342,15 @@ fn parse_inline_policy(
 
         let (action, verbs) = parse_action_value(action_value);
 
-        // Extract targets - track whether targeting was specified for validation
-        let mut on_property: HashSet<Sid> = HashSet::new();
-        let mut on_subject: HashSet<Sid> = HashSet::new();
-        let mut on_class: HashSet<Sid> = HashSet::new();
-        let mut had_on_property = false;
-        let mut had_on_subject = false;
-        let mut had_on_class = false;
-
-        // f:onProperty
-        if let Some(props) = obj
-            .get("f:onProperty")
-            .or_else(|| obj.get(&format!("{}onProperty", fluree::DB)))
-        {
-            had_on_property = true;
-            for iri in extract_iris(props) {
-                match resolve_iri_to_sid(snapshot, &iri) {
-                    Ok(sid) => {
-                        on_property.insert(sid);
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            policy = %id,
-                            iri = %iri,
-                            key = "f:onProperty",
-                            "IRI could not be resolved - namespace may not be registered"
-                        );
-                    }
-                }
-            }
-        }
-
-        // f:onSubject
-        if let Some(subjs) = obj
-            .get("f:onSubject")
-            .or_else(|| obj.get(&format!("{}onSubject", fluree::DB)))
-        {
-            had_on_subject = true;
-            for iri in extract_iris(subjs) {
-                match resolve_iri_to_sid(snapshot, &iri) {
-                    Ok(sid) => {
-                        on_subject.insert(sid);
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            policy = %id,
-                            iri = %iri,
-                            key = "f:onSubject",
-                            "IRI could not be resolved"
-                        );
-                    }
-                }
-            }
-        }
-
-        // f:onClass
-        if let Some(classes) = obj
-            .get("f:onClass")
-            .or_else(|| obj.get(&format!("{}onClass", fluree::DB)))
-        {
-            had_on_class = true;
-            for iri in extract_iris(classes) {
-                match resolve_iri_to_sid(snapshot, &iri) {
-                    Ok(sid) => {
-                        on_class.insert(sid);
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            policy = %id,
-                            iri = %iri,
-                            key = "f:onClass",
-                            "IRI could not be resolved"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Validate: if targeting was specified but all IRIs failed to resolve,
-        // this is likely a configuration error. We log a warning but allow the
-        // policy to proceed (it will effectively be inactive).
-        if had_on_property && on_property.is_empty() {
-            tracing::warn!(
-                policy = %id,
-                "f:onProperty specified but no IRIs could be resolved - policy will not match any property"
-            );
-        }
-        if had_on_subject && on_subject.is_empty() {
-            tracing::warn!(
-                policy = %id,
-                "f:onSubject specified but no IRIs could be resolved - policy will not match any subject"
-            );
-        }
-        if had_on_class && on_class.is_empty() {
-            tracing::warn!(
-                policy = %id,
-                "f:onClass specified but no IRIs could be resolved - policy will not match any class"
-            );
-        }
+        // Extract targets.
+        //
+        // Targeting that is written but resolves to nothing is rejected, not
+        // silently kept: an inert rule is harmless as a grant and a data leak
+        // as a restriction, and nothing here knows which one it is holding.
+        // See `resolve_policy_target_iri_to_sid`.
+        let on_property = parse_policy_targets(snapshot, obj, &id, "onProperty")?;
+        let on_subject = parse_policy_targets(snapshot, obj, &id, "onSubject")?;
+        let on_class = parse_policy_targets(snapshot, obj, &id, "onClass")?;
 
         // f:required
         let required = obj
@@ -1541,6 +1491,165 @@ fn make_policy_query_value(
 /// transactions encode such IRIs.
 fn resolve_iri_to_sid(snapshot: &LedgerSnapshot, iri: &str) -> Result<Sid> {
     Ok(snapshot.encode_iri(iri).unwrap_or_else(|| Sid::new(0, iri)))
+}
+
+/// Policy terms this parser understands on an inline policy node.
+///
+/// Local names only; the canonical spellings are `f:<term>` and
+/// `<https://ns.flur.ee/db#><term>`.
+const INLINE_POLICY_TERMS: &[&str] = &[
+    "allow",
+    "query",
+    "queryState",
+    "action",
+    "onProperty",
+    "onSubject",
+    "onClass",
+    "required",
+    "exMessage",
+];
+
+/// The local name of a prefixed name or IRI: everything after the last `#`,
+/// `/` or `:`.
+fn iri_local_name(key: &str) -> &str {
+    // All three delimiters are single-byte ASCII, so `i + 1` stays on a
+    // char boundary.
+    key.rfind(['#', '/', ':']).map_or(key, |i| &key[i + 1..])
+}
+
+/// Reject inline-policy keys this parser would otherwise drop on the floor.
+///
+/// Policy node keys are matched as literal strings — there is no JSON-LD
+/// expansion here, because `GovernanceOptions` carries no `@context`. An
+/// unrecognized key is therefore not a harmless extra field: it takes whatever
+/// it was supposed to say with it. A dropped `f:onClass` leaves the rule with
+/// no targeting at all, which is `TargetMode::Default` — the bucket
+/// `PolicySet::policy_entries_for_flake` adds to *every* candidate list. "Allow
+/// only instances of X" silently becomes "allow everything".
+///
+/// Two spellings are refused:
+///
+/// * a key in the fluree-db namespace (`f:` or the absolute form) whose term is
+///   not one this parser reads — a typo such as `f:onClas`;
+/// * a key whose local name *is* a policy term but which is spelled through
+///   some other prefix — `fluree:onClass` names the identical IRI and is
+///   declared in the request `@context`, and was still not recognized.
+///
+/// Everything else passes: JSON-LD keywords, and descriptive vocabulary from
+/// other namespaces whose local names are not policy terms.
+fn validate_policy_keys(obj: &serde_json::Map<String, JsonValue>, policy_id: &str) -> Result<()> {
+    for key in obj.keys() {
+        if key.starts_with('@') {
+            continue;
+        }
+
+        let fluree_term = key
+            .strip_prefix("f:")
+            .or_else(|| key.strip_prefix(fluree::DB));
+        if let Some(term) = fluree_term {
+            if !INLINE_POLICY_TERMS.contains(&term) {
+                return Err(ApiError::query(format!(
+                    "Invalid policy '{policy_id}': unknown fluree policy term '{key}'. \
+                     Policy keys are matched literally and an unrecognized one would \
+                     silently drop what it was meant to say. Supported terms: {}",
+                    INLINE_POLICY_TERMS.join(", ")
+                )));
+            }
+            continue;
+        }
+
+        let local = iri_local_name(key);
+        if INLINE_POLICY_TERMS.contains(&local) {
+            return Err(ApiError::query(format!(
+                "Invalid policy '{policy_id}': policy key '{key}' is not expanded against \
+                 the request @context. Write it as 'f:{local}' or '{}{local}'.",
+                fluree::DB
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Read one `f:on*` targeting key into resolved SIDs.
+///
+/// Returns an empty set when the key is absent (an untargeted default policy is
+/// a supported shape). When the key *is* present, it must resolve to at least
+/// one target: written-but-empty targeting is the same collapse as an
+/// unresolvable IRI, reached by a different spelling.
+fn parse_policy_targets(
+    snapshot: &LedgerSnapshot,
+    obj: &serde_json::Map<String, JsonValue>,
+    policy_id: &str,
+    term: &str,
+) -> Result<HashSet<Sid>> {
+    let key = format!("f:{term}");
+    let Some(value) = obj
+        .get(&key)
+        .or_else(|| obj.get(&format!("{}{term}", fluree::DB)))
+    else {
+        return Ok(HashSet::new());
+    };
+
+    let iris = extract_iris(value);
+    if iris.is_empty() {
+        return Err(ApiError::query(format!(
+            "Invalid policy '{policy_id}': '{key}' is present but names no IRI. \
+             Remove the key to write an untargeted policy."
+        )));
+    }
+
+    iris.iter()
+        .map(|iri| resolve_policy_target_iri_to_sid(snapshot, iri, &key, policy_id))
+        .collect()
+}
+
+/// Resolve an inline policy *target* IRI **strictly**.
+///
+/// Targeting is the one policy input where lenient resolution is unsafe in a
+/// direction fail-closed defaults do not cover.
+/// [`resolve_iri_to_sid`] cannot fail: `encode_iri()` falls back to
+/// `Sid(EMPTY, "<the whole string>")` for any IRI whose namespace is not
+/// registered. That SID is well-formed and disjoint from every SID the ledger
+/// holds, so a prefixed name such as `ex:Confidential` parsed cleanly and
+/// produced a rule that targeted nothing — inert, with no error and no failed
+/// request. Inert is harmless for a grant and a data leak for a restriction,
+/// and the surviving grant beside it returns the rows the restriction was
+/// written to hide.
+///
+/// Rejecting here rather than downstream is deliberate. It is not the
+/// evaluator's applicability filter that the collapse has to survive:
+/// `PolicySet::covers_predicate` reads the *built buckets* and feeds a raw-row
+/// fast path that skips per-flake filtering entirely, so a guard in
+/// `evaluate_flake*` would leave that lane holding the same wrong verdict.
+/// Failing the request means no `PolicySet` is built at all, which covers every
+/// consumer — including ones that do not exist yet.
+///
+/// The reason is the one [`resolve_identity_iri_to_sid`] and
+/// [`resolve_policy_class_iri_to_sid`] already give: silent EMPTY-namespace
+/// encoding makes the lookup a no-op and effectively disables enforcement.
+/// Targeting needs a narrower test than those two, though — see below.
+///
+/// Note what is *not* rejected. `encode_iri_registered` rejects exactly one
+/// thing: a namespace prefix this ledger has never seen, whose fallback SID no
+/// flake can carry. A target naming a class with no instances resolves fine and
+/// stays legitimately narrow, and a bare schemeless name — Cypher's default
+/// property resolution, which the transaction layer stores under the same
+/// registered EMPTY prefix — resolves to the SID the data actually holds.
+/// `encode_iri_strict` would reject that second case too, which is why it is
+/// the wrong tool here even though it is right for identity and policy-class.
+fn resolve_policy_target_iri_to_sid(
+    snapshot: &LedgerSnapshot,
+    iri: &str,
+    key: &str,
+    policy_id: &str,
+) -> Result<Sid> {
+    snapshot.encode_iri_registered(iri).ok_or_else(|| {
+        ApiError::query(format!(
+            "Invalid policy '{policy_id}': {key} target '{iri}' names a namespace this \
+             ledger does not know, so it can never match. Policy targets are not \
+             expanded against the request @context — write an absolute IRI."
+        ))
+    })
 }
 
 /// Resolve an identity IRI to a SID **strictly**.

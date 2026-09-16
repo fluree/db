@@ -450,6 +450,33 @@ impl LedgerSnapshot {
         }
     }
 
+    /// Encode an IRI to a SID, returning `None` only when the IRI's canonical
+    /// namespace prefix is not registered on this snapshot.
+    ///
+    /// This is the middle ground between [`encode_iri`](Self::encode_iri) and
+    /// [`encode_iri_strict`](Self::encode_iri_strict), and the right choice
+    /// when a `None` must mean *"this SID can never match anything here"*
+    /// rather than *"this is not a well-known IRI"*.
+    ///
+    /// The two rejected-by-`encode_iri_strict` cases are not the same thing:
+    ///
+    /// * A bare schemeless name (`"secret"`, Cypher's default property
+    ///   resolution) canonically splits to the **registered** EMPTY prefix, and
+    ///   the transaction layer encodes stored data the same way. Its SID is the
+    ///   canonical one and matches real flakes, so this accepts it.
+    /// * An IRI naming a namespace this ledger has never seen
+    ///   (`"ex:Confidential"`, `"http://never-seen.example/ns/x"`) falls back to
+    ///   `Sid(EMPTY, "<the whole string>")`, which is disjoint from every SID
+    ///   the ledger holds. This rejects it.
+    ///
+    /// `encode_iri_strict` conflates the two and rejects both.
+    pub fn encode_iri_registered(&self, iri: &str) -> Option<Sid> {
+        let (canonical_prefix, canonical_suffix) = canonical_split(iri, self.ns_split_mode);
+        self.namespace_reverse
+            .get(canonical_prefix)
+            .map(|&code| Sid::new(code, canonical_suffix))
+    }
+
     /// Shared IRI → SID encoding using canonical splitting and exact-prefix lookup.
     ///
     /// Uses `canonical_split(iri, mode)` + exact-prefix lookup. If the
@@ -1191,6 +1218,64 @@ mod tests {
 
         let iri = db.decode_sid(&sid).unwrap();
         assert_eq!(iri, "http://example.org/Alice");
+    }
+
+    /// `encode_iri_registered` separates the two cases `encode_iri_strict`
+    /// conflates: a bare name under the registered EMPTY prefix (which stored
+    /// data also encodes that way, so the SID matches real flakes) from an
+    /// unregistered namespace (whose fallback SID matches nothing).
+    ///
+    /// Policy targeting depends on that distinction: rejecting the first case
+    /// breaks Cypher's bare-name property resolution, and accepting the second
+    /// leaves a restriction silently inert.
+    #[test]
+    fn encode_iri_registered_accepts_bare_names_and_rejects_unknown_namespaces() {
+        let mut ns = HashMap::new();
+        ns.insert(0u16, String::new());
+        ns.insert(100u16, "http://example.org/".to_string());
+        let db = LedgerSnapshot::new_meta(LedgerSnapshotMetadata {
+            ledger_id: "test:main".into(),
+            t: 1,
+            base_t: 0,
+            namespace_codes: ns,
+            ns_split_mode: NsSplitMode::default(),
+            stats: None,
+            schema: None,
+            subject_watermarks: vec![],
+            string_watermark: 0,
+            graph_iris: vec![],
+            has_annotations: false,
+            annotation_index: None,
+            had_annotation_arena: false,
+            has_list_meta: None,
+        })
+        .unwrap();
+
+        // Registered namespace: same answer as the lenient encoder.
+        assert_eq!(
+            db.encode_iri_registered("http://example.org/Alice"),
+            db.encode_iri("http://example.org/Alice")
+        );
+
+        // Bare schemeless name: canonical EMPTY prefix, which IS registered.
+        // `encode_iri_strict` rejects this; `encode_iri_registered` must not.
+        let bare = db.encode_iri_registered("secret").expect("bare name");
+        assert_eq!(bare, db.encode_iri("secret").unwrap());
+        assert_eq!(bare.namespace_code, fluree_vocab::namespaces::EMPTY);
+        assert!(db.encode_iri_strict("secret").is_none());
+
+        // Prefixed name whose prefix is not a registered namespace: the lenient
+        // encoder produces a SID no flake can carry, so this must be rejected.
+        assert!(db.encode_iri_registered("ex:Confidential").is_none());
+        assert_eq!(
+            db.encode_iri("ex:Confidential").unwrap().namespace_code,
+            fluree_vocab::namespaces::EMPTY
+        );
+
+        // Absolute IRI in a namespace this snapshot has never seen.
+        assert!(db
+            .encode_iri_registered("http://never-seen.example/ns/title")
+            .is_none());
     }
 
     #[test]
