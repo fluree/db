@@ -1571,3 +1571,54 @@ fn issue1857_alias_matching_a_later_pattern_var_is_accepted() {
         "an alias bound only by a LATER clause must lower"
     );
 }
+
+#[test]
+fn issue1857_reserved_jsonld_property_key_is_rejected() {
+    // `@id` / `@type` are not Cypher properties. Unchecked they lower as
+    // ordinary predicates: the read is always null and the write stores a
+    // literal predicate spelled `@id`. Every syntactic position that resolves
+    // a property key must reject them, and the message must name the accessor
+    // that does work — discoverability is the whole point of the change.
+    for (src, accessor) in [
+        ("MATCH (a:Person) RETURN a.`@id` AS v", "id(n)"),
+        ("MATCH (a:Person) RETURN a.`@type` AS t", "labels(n)"),
+        ("MATCH (a)-[r:KNOWS]->(b) RETURN r.`@id` AS v", "id(n)"),
+        (
+            r#"MATCH (a:Person {`@id`: "alice"}) RETURN a.name AS n"#,
+            "id(n)",
+        ),
+        ("MATCH (a)-[r:KNOWS {`@id`: \"x\"}]->(b) RETURN a", "id(n)"),
+        ("MATCH (a:Person) RETURN [x IN [a] | x.`@id`] AS v", "id(n)"),
+    ] {
+        let msg = lower_error(src);
+        assert!(
+            msg.contains("reserved JSON-LD keyword") && msg.contains(accessor),
+            "message must name the keyword and the working accessor: {msg} (for {src})"
+        );
+        assert!(
+            !msg.contains("unsupported in v1"),
+            "this is a user error, not a deferred feature: {msg}"
+        );
+    }
+}
+
+#[test]
+fn issue1857_ordinary_property_keys_are_unaffected() {
+    // The reserved set is exact — a property merely *named* like a keyword
+    // without the `@` must still lower.
+    for src in [
+        "MATCH (a:Person) RETURN a.id AS v",
+        "MATCH (a:Person) RETURN a.type AS v",
+        "MATCH (a:Person) RETURN a.value AS v",
+        r#"MATCH (a:Person {id: "alice"}) RETURN a.name AS n"#,
+    ] {
+        let out = parse_cypher(src);
+        assert!(!out.has_errors(), "parse errors: {:?}", out.diagnostics);
+        let ast = out.ast.expect("ast");
+        let mut vars = VarRegistry::new();
+        assert!(
+            lower_cypher(&ast, &NoEncoder, &mut vars).is_ok(),
+            "ordinary property key must still lower: {src}"
+        );
+    }
+}

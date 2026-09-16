@@ -2046,7 +2046,19 @@ impl<'a> CypherLowering<'a> {
         }
     }
 
+    /// Resolve and reject reserved predicates — Fluree's own `f:reifies*`
+    /// system predicates, and the JSON-LD keywords (`@id`, `@type`, …) that
+    /// are not Cypher properties.
+    ///
+    /// The keyword check matters more here than on the read side: unchecked,
+    /// `CREATE (n {`@id`: "x"})` and `SET n.`@type` = "T"` COMMIT, storing a
+    /// literal predicate spelled `@id` / `@type` while leaving the node's real
+    /// identity and labels untouched. It runs on the *bare* name, before
+    /// `@vocab` expansion. See `fluree_db_cypher::keywords`.
     fn resolve_predicate(&self, name: &str) -> Result<String, LowerCypherError> {
+        if let Some(msg) = fluree_db_cypher::reserved_keyword_message(name) {
+            return Err(LowerCypherError::rejected(msg));
+        }
         let iri = self.resolve_iri(name);
         if reifies_iris::ALL.iter().any(|x| *x == iri) {
             return Err(LowerCypherError::ReservedPredicate(iri));

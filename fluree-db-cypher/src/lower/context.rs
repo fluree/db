@@ -221,8 +221,19 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         }
     }
 
-    /// Resolve and reject reserved-system predicates.
+    /// Resolve and reject reserved predicates — Fluree's own `f:reifies*`
+    /// system predicates, and the JSON-LD keywords (`@id`, `@type`, …) that
+    /// are not Cypher properties.
+    ///
+    /// The keyword check runs on the *bare* name, before `@vocab` expansion:
+    /// with a vocab set, `@id` would otherwise resolve to `<vocab>@id` and
+    /// lower as an ordinary predicate. Reading it yields `null` and writing it
+    /// stores a literal predicate spelled `@id` — see
+    /// [`crate::keywords`] for why rejecting is safe.
     pub fn resolve_predicate(&self, name: &str) -> Result<String> {
+        if let Some(msg) = crate::keywords::reserved_keyword_message(name) {
+            return Err(LowerError::generic(msg));
+        }
         let iri = self.resolve_iri(name);
         if fluree_vocab::reifies_iris::ALL.iter().any(|x| *x == iri) {
             return Err(LowerError::ReservedPredicate(iri));

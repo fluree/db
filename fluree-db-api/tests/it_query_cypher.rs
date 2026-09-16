@@ -11108,3 +11108,94 @@ async fn issue1857_alias_collision_does_not_silently_noop_a_write() {
         "write-path error must name the collision: {msg}"
     );
 }
+
+#[tokio::test]
+async fn issue1857_reserved_jsonld_key_is_rejected_on_read_and_write() {
+    // Part (b) of #1857. `n.`@id`` used to read as an absent property (null on
+    // every row); on the write path it was worse — `SET n.`@id` = "x"` and
+    // `CREATE (n {`@id`: "x"})` COMMITTED, storing a literal predicate spelled
+    // `@id` and leaving the node's real identity untouched.
+    //
+    // Ordering note: this must not land before the alias guard above. Making
+    // `@id` resolve instead of rejecting would have turned
+    // `RETURN a.`@id` AS a` from a plausible-looking wrong answer into zero
+    // rows, since the computed IRI would no longer be unbound.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-reserved-keys").await;
+    let db = graphdb_from_ledger(&l);
+
+    for (q, accessor) in [
+        (r#"MATCH (a:Person) RETURN a.`@id` AS v"#, "id(n)"),
+        (r#"MATCH (a:Person) RETURN a.`@type` AS t"#, "labels(n)"),
+        (
+            r#"MATCH (a:Person {`@id`: "alice"}) RETURN a.name AS n"#,
+            "id(n)",
+        ),
+    ] {
+        let msg = cypher_query_error(&fluree, &db, q).await;
+        assert!(
+            msg.contains("reserved JSON-LD keyword") && msg.contains(accessor),
+            "read error must name the keyword and the accessor: {msg} (for {q})"
+        );
+    }
+
+    // The documented accessors keep working — the error points somewhere real.
+    assert_eq!(
+        cypher_rows(&fluree, &db, r#"MATCH (a:Person) RETURN id(a) AS v"#)
+            .await
+            .len(),
+        4,
+    );
+    assert_eq!(
+        cypher_rows(&fluree, &db, r#"MATCH (a:Person) RETURN labels(a) AS l"#)
+            .await
+            .len(),
+        4,
+    );
+}
+
+#[tokio::test]
+async fn issue1857_reserved_jsonld_key_write_is_rejected_not_stored() {
+    // Split from the read half so each is independently non-vacuous. Before
+    // the guard every statement below COMMITTED and `keys(n)` came back
+    // containing a literal `@id` / `@type`, while the node's real identity and
+    // labels were untouched — a persisted wrong answer, not just a null read.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-reserved-write").await;
+
+    for stmt in [
+        r#"MATCH (n:Person {name: "Alice"}) SET n.`@id` = "zzz""#,
+        r#"MATCH (n:Person {name: "Alice"}) SET n.`@type` = "Q""#,
+        r#"CREATE (n:P {`@id`: "zzz", name: "N"})"#,
+        r#"MERGE (n:P {`@id`: "zzz"}) SET n.name = "N""#,
+    ] {
+        let err = fluree
+            .transact_cypher(l.clone(), stmt)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("write must be rejected, not committed: {stmt}"));
+        assert!(
+            err.to_string().contains("reserved JSON-LD keyword"),
+            "write error must name the keyword: {err} (for {stmt})"
+        );
+    }
+
+    // The working spellings still commit: identity comes from the pattern, a
+    // type from a label.
+    let res = fluree
+        .transact_cypher(l.clone(), r#"MATCH (n:Person {name: "Alice"}) SET n:Staff"#)
+        .await
+        .expect("SET n:Label must still work");
+    let db = graphdb_from_ledger(&res.ledger);
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (n:Staff) RETURN id(n) AS i, labels(n) AS l"#,
+        )
+        .await
+        .len(),
+        1,
+        "SET n:Staff is the documented way to add a type"
+    );
+}
