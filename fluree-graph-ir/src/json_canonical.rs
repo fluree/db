@@ -270,7 +270,7 @@ mod tests {
         // Both "810553441865041.2" and "810553441865041.3" round trip to this
         // double. ECMAScript takes the even one; Rust's own formatting takes
         // the other.
-        let f = f64::from_bits(4829839628448721546);
+        let f = f64::from_bits(4_829_839_628_448_721_546);
         assert_eq!(format!("{f}"), "810553441865041.3");
         assert_eq!(canon(&format!("[{f}]")), "[810553441865041.2]");
     }
@@ -282,8 +282,8 @@ mod tests {
         let mut bits: u64 = 0x1234_5678_9abc_def0;
         for _ in 0..20_000 {
             bits = bits
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let f = f64::from_bits(bits);
             if !f.is_finite() {
                 continue;
