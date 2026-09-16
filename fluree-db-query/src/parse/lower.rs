@@ -94,6 +94,10 @@ pub(crate) fn lower_query<E: IriEncoder>(
         patterns.extend(lowered);
     }
 
+    // fluree/db#1857 (JSON-LD twin): a `["bind", "?v", …]` whose target is
+    // already bound is silently an equality filter, not a projection.
+    check_bind_targets(&patterns, &std::collections::HashSet::new(), vars)?;
+
     // Resolve aggregate output VarIds up front so we can classify each
     // SELECT-clause computation as pre- or post-aggregation. Mirrors
     // `fluree_db_sparql::lower::select::lower_select_expression_binds` so
@@ -185,6 +189,76 @@ pub(crate) fn lower_query<E: IriEncoder>(
         include_system_facts: ast.options.include_system_facts,
         cypher_vocab: None,
     })
+}
+
+/// Reject a `BIND` whose target variable is already bound in the same scope.
+///
+/// `BindOperator` implements SPARQL BIND with deliberate clobber prevention
+/// (`crate::bind`): when the target already carries a value, the row survives
+/// only if the computed value equals it. Binding onto a bound variable is
+/// therefore silently `FILTER(?v = expr)` — on JSON-LD's `["bind", "?v", …]`
+/// that reads as an unexplained empty result. SPARQL rejects the same shape at
+/// parse time (`BindTargetAlreadyInScope`, SPARQL 1.1 §10.1) and has its own
+/// lowering, so this pass covers the surfaces that reach
+/// [`lower_query`]: JSON-LD/FQL and datalog rule bodies.
+///
+/// Scope rules, which are the whole difficulty:
+///
+/// - Only *preceding siblings* count. A `UNION` branch is checked against the
+///   set as it stood before the union, never against its sibling branch, so
+///   `["union", [{…"?nm"}], [{…}, ["bind","?nm",…]]]` — a legitimate way to
+///   give both branches the same output column — still lowers.
+/// - Bodies with their own scope (`Subquery`, `Exists`/`NotExists`, `Minus`,
+///   `Service`) are not descended into. That can only miss a collision, never
+///   invent one.
+/// - Lowering-internal binds (`?__`-prefixed: property-path expansions,
+///   node-map metadata accessors) are exempt, mirroring the Cypher guard's
+///   treatment of `?#__`. A user variable cannot carry that prefix.
+///
+/// The identity bind `["bind","?v","?v"]` is exempt, as `v AS v` is on the
+/// Cypher side: it recomputes the value it already holds, so no row is dropped
+/// and nothing is lost. It works today, and rejecting it would break a shape
+/// that is merely redundant rather than wrong.
+fn check_bind_targets(
+    patterns: &[Pattern],
+    enclosing: &std::collections::HashSet<VarId>,
+    vars: &VarRegistry,
+) -> Result<()> {
+    let mut produced = enclosing.clone();
+    for pattern in patterns {
+        match pattern {
+            Pattern::Bind { var, expr } => {
+                let name = vars.try_name(*var).unwrap_or("");
+                let is_identity = matches!(expr, Expression::Var(v) if v == var);
+                if produced.contains(var) && !is_identity && !name.starts_with("?__") {
+                    return Err(ParseError::InvalidWhere(format!(
+                        "bind target {name} is already bound by an earlier pattern — binding \
+                         onto a bound variable silently filters to rows where the two values \
+                         happen to match, rather than projecting. Bind to a fresh variable."
+                    )));
+                }
+                produced.insert(*var);
+            }
+            Pattern::Union(branches) => {
+                for branch in branches {
+                    check_bind_targets(branch, &produced, vars)?;
+                }
+                produced.extend(pattern.produced_vars());
+            }
+            Pattern::Optional(inner) | Pattern::DefaultGraphSource { patterns: inner } => {
+                check_bind_targets(inner, &produced, vars)?;
+                produced.extend(pattern.produced_vars());
+            }
+            Pattern::Graph {
+                patterns: inner, ..
+            } => {
+                check_bind_targets(inner, &produced, vars)?;
+                produced.extend(pattern.produced_vars());
+            }
+            _ => produced.extend(pattern.produced_vars()),
+        }
+    }
+    Ok(())
 }
 
 fn lower_column<E: IriEncoder>(
