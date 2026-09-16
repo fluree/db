@@ -440,6 +440,7 @@ Closing paragraph.
                 object_name: Some("Acme".into()),
                 object_is_literal: true,
                 context: Some("Jane Doe joined Acme".into()),
+                assertion_mode: None,
             }],
             from_cache: false,
             ..Default::default()

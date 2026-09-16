@@ -180,6 +180,8 @@ struct Totals {
     unknown_keys: std::collections::BTreeSet<String>,
     /// Entities and relations the parser could not read and dropped whole.
     dropped_items: usize,
+    /// Relations whose `assertionMode` was not one of the four modes.
+    assertion_mode_rejected: usize,
 }
 
 const DEFAULT_CONCURRENCY: usize = 4;
@@ -771,6 +773,7 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                 totals.extraction_cache_hits += x.cache_hits;
                 totals.chunks_failed += x.chunks_failed;
                 totals.dropped_items += s.dropped_items;
+                totals.assertion_mode_rejected += s.assertion_mode_rejected;
                 totals.unknown_keys.extend(s.unknown_keys.iter().cloned());
                 note
             }
@@ -878,6 +881,14 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                 "    {} {} item(s) the extraction schema could not read were dropped whole",
                 "!".yellow(),
                 totals.dropped_items
+            );
+        }
+        if totals.assertion_mode_rejected > 0 {
+            println!(
+                "    {} {} relation(s) named an assertionMode outside {}; nothing was stored for them",
+                "!".yellow(),
+                totals.assertion_mode_rejected,
+                fluree_db_doc::extract::AssertionMode::ALL.join(" / ")
             );
         }
     }

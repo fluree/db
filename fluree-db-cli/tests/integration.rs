@@ -4429,6 +4429,79 @@ fn doc_ingest_wire_body_carries_only_the_fields_every_model_accepts() {
     assert_eq!(body["model"], "stub");
 }
 
+/// `doc:assertionMode` end to end, from a custom `--system-prompt` to the
+/// ledger. The shipped prompt is untouched — it ships verbatim with hosted
+/// extraction — so the only path today is a caller's own prompt, and that
+/// path has to actually work.
+#[test]
+fn doc_ingest_stores_assertion_mode_from_a_custom_prompt() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    std::fs::write(
+        tmp.path().join("prompt.txt"),
+        "Extract entities and relations as JSON.\n\
+         For each relation add \"assertionMode\": how the source states it — \
+         \"asserted\", \"hedged\", \"attributed\" or \"negated\".\n\
+         {guidance}## MODEL\n{model}",
+    )
+    .unwrap();
+    let (url, _calls) = stub_llm(serde_json::json!({
+        "entities": [
+            { "name": "Jane Doe", "type": "schema:Person",
+              "context": "Jane Doe joined Acme as Chief Technology Officer" }
+        ],
+        "relations": [
+            { "subjectName": "Jane Doe", "predicate": "schema:worksFor", "objectName": "Acme",
+              "objectIsLiteral": false, "assertionMode": "Hedged",
+              "context": "Jane Doe joined Acme as Chief Technology Officer in March." },
+            { "subjectName": "Jane Doe", "predicate": "schema:jobTitle",
+              "objectName": "Chief Technology Officer", "objectIsLiteral": true,
+              "assertionMode": "probably", "context": "as Chief Technology Officer" }
+        ]
+    }));
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+            "--system-prompt",
+            "prompt.txt",
+        ])
+        .assert()
+        .success()
+        // An out-of-enum value is refused out loud, not dropped quietly.
+        .stdout(predicate::str::contains(
+            "1 relation(s) named an assertionMode outside \
+             asserted / hedged / attributed / negated",
+        ))
+        // And is not reported as an ignored key: the schema carries it.
+        .stdout(predicate::str::contains("assertionMode\"").not());
+
+    // Stored on the review node beside the verdict, normalised, and only
+    // for the relation whose mode was one of the four.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "memos",
+            "-e",
+            r"PREFIX doc: <https://ns.flur.ee/doc#>
+              SELECT ?m ?v WHERE { ?r a doc:Relation ; doc:assertionMode ?m ; doc:verdict ?v }",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(1 rows"))
+        .stdout(predicate::str::contains("hedged"));
+}
+
 // --- end: `fluree doc ingest` re-ingest ownership (PR-C / #1864) ------------
 
 /// A stub OpenAI-compatible `/embeddings` endpoint. Each input string becomes

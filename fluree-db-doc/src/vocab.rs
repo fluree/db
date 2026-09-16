@@ -63,6 +63,15 @@ pub const VERDICT: &str = "doc:verdict";
 /// True when a direct edge was written for the relation, so a re-ingest
 /// knows which edges to reconsider.
 pub const ASSERTED: &str = "doc:asserted";
+/// `asserted`, `hedged`, `attributed` or `negated`: how the source text
+/// states the relation, when the extraction was asked for it.
+///
+/// A classification of text the model is holding, not an introspection —
+/// "does the source assert this, hedge it, attribute it to a third party,
+/// or negate it" is answerable from the excerpt, where "how confident are
+/// you" is a self-report. An enum for the same reason `doc:verdict` is one:
+/// it cannot be thresholded as though it were a probability.
+pub const ASSERTION_MODE: &str = "doc:assertionMode";
 pub const EXCERPT: &str = "doc:excerpt";
 pub const ORIGINAL_PREDICATE: &str = "doc:originalPredicate";
 pub const REPAIR_NOTE: &str = "doc:repairNote";
