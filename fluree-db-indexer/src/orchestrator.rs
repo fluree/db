@@ -1869,15 +1869,48 @@ impl BackgroundIndexerWorker {
                 // build failed. Best-effort signal — disabled tracker or
                 // a failure before the first write reports None / 0.
                 let partial_fuel = build_tracker.tally().and_then(|t| t.fuel);
-                warn!(
-                    ledger_id = %ledger_id,
-                    partial_fuel = ?partial_fuel,
-                    error = %e,
-                    "Indexing failed, will retry"
-                );
-                self.schedule_retry(ledger_id, &e.to_string()).await;
+                self.on_build_error(ledger_id, e, partial_fuel).await;
             }
         }
+    }
+
+    /// Terminal handling for a build that returned `Err`. A cancelled task
+    /// means the runtime is shutting down under the worker (`spawn_blocking`
+    /// refuses work once the blocking pool closes) — not a failed build, so
+    /// no warning, no backoff, no `last_error`. Waiters resolve `Cancelled`;
+    /// the next process start re-derives pending work from `commit_t >
+    /// index_t`. Every other error is a failure and goes to backoff.
+    async fn on_build_error(
+        &self,
+        ledger_id: &str,
+        error: crate::error::IndexerError,
+        partial_fuel: Option<f64>,
+    ) {
+        if let crate::error::IndexerError::Cancelled(task) = &error {
+            info!(
+                ledger_id = %ledger_id,
+                task = %task,
+                "Index build cancelled by runtime shutdown; not scheduling retry"
+            );
+            let mut states = self.states.lock().await;
+            if let Some(state) = states.get_mut(ledger_id) {
+                state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
+                state.pending_min_t = None;
+                state.next_retry_at = None;
+                // An earlier attempt's error would otherwise outlive the
+                // failure it described, reported against an idle ledger.
+                state.last_error = None;
+                state.phase = IndexPhase::Idle;
+            }
+            return;
+        }
+        warn!(
+            ledger_id = %ledger_id,
+            partial_fuel = ?partial_fuel,
+            error = %error,
+            "Indexing failed, will retry"
+        );
+        self.schedule_retry(ledger_id, &error.to_string()).await;
     }
 
     /// Schedule a retry with exponential backoff
@@ -3052,6 +3085,79 @@ mod tests {
             assert!(state.next_retry_at.is_none());
             assert_eq!(state.retry_count, 0);
         }
+    }
+
+    /// A build whose task was cancelled (runtime shutdown) is not a failed
+    /// build: no backoff, no `last_error`, waiters resolve `Cancelled`.
+    #[tokio::test]
+    async fn cancelled_build_does_not_schedule_retry() {
+        let storage = MemoryStorage::new();
+        let ns = Arc::new(MemoryNameService::new());
+        let (worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(storage)),
+            ns,
+            IndexerConfig::small(),
+        );
+        let completion = handle.trigger("test:main", 1).await;
+
+        // Shutdown can cancel a ledger that already failed once and is sitting
+        // in backoff; without this the assertions below hold vacuously.
+        {
+            let mut states = handle.trigger.states.lock().await;
+            let state = states.get_mut("test:main").expect("state exists");
+            state.last_error = Some("earlier failure".to_string());
+            state.next_retry_at = Some(tokio::time::Instant::now() + Duration::from_secs(30));
+        }
+
+        worker
+            .on_build_error(
+                "test:main",
+                crate::error::IndexerError::Cancelled("index build task".into()),
+                None,
+            )
+            .await;
+
+        {
+            let states = handle.trigger.states.lock().await;
+            let state = states.get("test:main").expect("state exists");
+            assert_eq!(state.retry_count, 0);
+            assert!(state.next_retry_at.is_none());
+            assert!(state.last_error.is_none());
+            assert!(state.pending_min_t.is_none());
+            assert_eq!(state.phase, IndexPhase::Idle);
+        }
+        assert!(matches!(completion.wait().await, IndexOutcome::Cancelled));
+    }
+
+    /// Counterpart: any other build error still goes through backoff.
+    #[tokio::test]
+    async fn failed_build_schedules_retry() {
+        let storage = MemoryStorage::new();
+        let ns = Arc::new(MemoryNameService::new());
+        let (worker, handle) = BackgroundIndexerWorker::new(
+            StorageBackend::Managed(Arc::new(storage)),
+            ns,
+            IndexerConfig::small(),
+        );
+        let _completion = handle.trigger("test:main", 1).await;
+
+        worker
+            .on_build_error(
+                "test:main",
+                crate::error::IndexerError::StorageWrite("boom".into()),
+                None,
+            )
+            .await;
+
+        let states = handle.trigger.states.lock().await;
+        let state = states.get("test:main").expect("state exists");
+        assert_eq!(state.retry_count, 1);
+        assert!(state.next_retry_at.is_some());
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("Storage write error: boom")
+        );
+        assert_eq!(state.phase, IndexPhase::Pending);
     }
 
     #[tokio::test]
