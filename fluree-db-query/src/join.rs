@@ -1737,6 +1737,12 @@ impl NestedLoopJoinOperator {
     /// object. Decline cases route to the overlay-correct per-row fallback
     /// BEFORE any accumulation, so a flush never reroutes mid-stream.
     fn compute_batched_overlay_mode(&self, ctx: &ExecutionContext<'_>) -> Result<ProbeLanePlan> {
+        // A history range needs every event with its `t` and `op`; the
+        // batched lanes emit current facts. Before the overlay-free return for
+        // the same reason as the policy gate below.
+        if self.mode.is_history() || crate::fast_path_common::probe_lane_history_declines(ctx) {
+            return Ok(ProbeLanePlan::Decline);
+        }
         // BEFORE the overlay-free return: the batched lanes read raw leaflets in
         // `Clean` mode too and never run per-leaf `filter_flakes` policy
         // filtering, so a restrictive policy must decline regardless of novelty

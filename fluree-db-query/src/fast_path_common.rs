@@ -2589,12 +2589,24 @@ pub(crate) fn root_or_no_policy(ctx: &ExecutionContext<'_>) -> bool {
     ctx.allow_unfiltered()
 }
 
+/// True under a history-range query. The probe lanes read current leaflet
+/// state and emit one row per fact; a history range needs every assert and
+/// retract event in the window with its `t` and `op`, which only the scan's
+/// history mode produces. Checked before the overlay-free return, which
+/// would otherwise admit the lane on a clean graph.
+pub(crate) fn probe_lane_history_declines(ctx: &ExecutionContext<'_>) -> bool {
+    ctx.from_t.is_some()
+}
+
 /// Plan a single-predicate PSOT subject probe under the active overlay.
 pub fn subject_probe_lane_plan(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     pred_sid: &Sid,
 ) -> Result<ProbeLanePlan> {
+    if probe_lane_history_declines(ctx) {
+        return Ok(ProbeLanePlan::Decline);
+    }
     // BEFORE the overlay-free return: the probe lanes read raw leaflets in
     // `Clean` mode too, so a restrictive policy must decline regardless of
     // novelty state.
@@ -2645,6 +2657,9 @@ pub fn object_probe_lane_plan(
     store: &Arc<BinaryIndexStore>,
     pred_sid: &Sid,
 ) -> Result<ProbeLanePlan> {
+    if probe_lane_history_declines(ctx) {
+        return Ok(ProbeLanePlan::Decline);
+    }
     // See subject_probe_lane_plan: policy declines before the overlay-free
     // return (raw leaflet reads bypass per-leaf policy filtering in `Clean`
     // mode too); eager callers keep the per-row path under an overlay.
@@ -2693,6 +2708,9 @@ pub fn star_probe_lane_plan(
     store: &Arc<BinaryIndexStore>,
     pred_sids: &[&Sid],
 ) -> Result<ProbeLanePlan> {
+    if probe_lane_history_declines(ctx) {
+        return Ok(ProbeLanePlan::Decline);
+    }
     // See subject_probe_lane_plan: policy declines before the overlay-free
     // return (raw leaflet reads bypass per-leaf policy filtering in `Clean`
     // mode too); eager callers keep the per-row path under an overlay.
