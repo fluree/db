@@ -212,7 +212,28 @@ Two consequences are worth knowing:
 
 `@value` may be a JSON document or a string holding one. Either is canonicalized. A string that is not valid JSON is stored as written.
 
-Ledgers written before canonicalization keep the text their writers produced. Those values stay readable, and new writes are canonical. A delete that names a literal value matches the canonical form, so remove an older value by binding it in a `where` clause instead of naming its text.
+Ledgers written before canonicalization keep the text their writers produced. Reindexing does not change that: it rebuilds the index from the commits, and the commits hold the original text. Those values stay readable, and new writes are canonical.
+
+Two things follow for a ledger with older values.
+
+- **Naming a value no longer matches it.** A literal in a `where`, a `delete`, or a `FILTER` is canonicalized before it is compared, so it misses a value stored under another spelling. Bind the value with a variable instead.
+- **Re-asserting a value can leave two of them.** An upsert writes the canonical spelling. If its delete names the old text, the delete misses and both spellings end up on the subject. Any duplicates the missing canonicalization already created stay as they are.
+
+Repair a subject by binding the old value and writing it back:
+
+```json
+{
+  "@context": {"ex": "http://example.org/ns/"},
+  "where": {"@id": "ex:config", "ex:items": "?old"},
+  "delete": {"@id": "ex:config", "ex:items": "?old"},
+  "insert": {
+    "@id": "ex:config",
+    "ex:items": {"@value": [{"name": "alpha", "qty": 1}], "@type": "@json"}
+  }
+}
+```
+
+The `where` clause binds every spelling on that property, so this collapses duplicates as well. History keeps the original text; only the current state changes. `fluree validate` finds the properties worth repairing wherever a shape constrains them.
 
 ### Geographic Data
 
