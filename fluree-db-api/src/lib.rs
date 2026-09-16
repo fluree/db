@@ -58,6 +58,7 @@ pub mod dataset;
 mod error;
 pub mod explain;
 pub mod export;
+pub mod export_annotations;
 pub mod export_builder;
 pub mod format;
 pub mod graph;

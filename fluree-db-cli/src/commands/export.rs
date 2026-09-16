@@ -54,6 +54,7 @@ pub async fn run(
     all_graphs: bool,
     system_graphs: bool,
     graph: Option<&str>,
+    raw_reifies: bool,
     context_expr: Option<&str>,
     context_file: Option<&Path>,
     at: Option<&str>,
@@ -103,6 +104,7 @@ pub async fn run(
             all_graphs,
             system_graphs,
             graph,
+            raw_reifies,
             context_expr,
             context_file,
             at,
@@ -122,6 +124,7 @@ pub async fn run(
                 all_graphs,
                 system_graphs,
                 graph,
+                raw_reifies,
                 context_expr,
                 context_file,
                 at,
@@ -140,6 +143,7 @@ pub async fn run(
         all_graphs,
         system_graphs,
         graph,
+        raw_reifies,
         context_expr,
         context_file,
         at,
@@ -411,6 +415,7 @@ async fn run_remote_rdf(
     all_graphs: bool,
     system_graphs: bool,
     graph: Option<&str>,
+    raw_reifies: bool,
     context_expr: Option<&str>,
     context_file: Option<&Path>,
     at: Option<&str>,
@@ -424,6 +429,9 @@ async fn run_remote_rdf(
     }
     if system_graphs {
         body["system_graphs"] = serde_json::Value::Bool(true);
+    }
+    if raw_reifies {
+        body["raw_reifies"] = serde_json::Value::Bool(true);
     }
     if let Some(iri) = graph {
         body["graph"] = serde_json::Value::String(iri.to_string());
@@ -451,6 +459,7 @@ async fn run_local_rdf(
     all_graphs: bool,
     system_graphs: bool,
     graph: Option<&str>,
+    raw_reifies: bool,
     context_expr: Option<&str>,
     context_file: Option<&Path>,
     at: Option<&str>,
@@ -476,6 +485,9 @@ async fn run_local_rdf(
     }
     if system_graphs {
         builder = builder.system_graphs();
+    }
+    if raw_reifies {
+        builder = builder.raw_reifies();
     }
     if let Some(iri) = graph {
         builder = builder.graph(iri);
@@ -525,6 +537,22 @@ fn report_rdf_stats(alias: &str, format: ExportFormat, stats: &ExportStats, grap
         stats.triples_written,
         stats.graphs_written,
     );
+    if stats.annotations_unresolved > 0 {
+        eprintln!(
+            "  {} {} edge annotations could not be resolved and are NOT in the output; \
+             re-run with --raw-reifies to emit them as f:reifies* triples",
+            "warning:".yellow(),
+            stats.annotations_unresolved,
+        );
+    }
+    if stats.annotations_out_of_scope > 0 {
+        eprintln!(
+            "  {} {} annotation markers point at reifiers outside this export; \
+             their properties are not in the output",
+            "warning:".yellow(),
+            stats.annotations_out_of_scope,
+        );
+    }
     if stats.rows_skipped > 0 {
         eprintln!(
             "  {} {} rows skipped (unresolvable predicate or value)",

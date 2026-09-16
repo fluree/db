@@ -22,6 +22,7 @@ fluree export [LEDGER] [OPTIONS]
 | `--all-graphs` | Export the default graph plus every named graph (dataset export). Requires `--format trig` or `--format nquads`. The ledger's system graphs are excluded — see `--system-graphs`. |
 | `--system-graphs` | Also emit the ledger's system graphs (`#txn-meta`, `#config`) under `--all-graphs`. Diagnostic only. |
 | `--graph <IRI>` | Export a specific named graph by IRI. Mutually exclusive with `--all-graphs`. |
+| `--raw-reifies` | Emit edge annotations as raw `f:reifies*` system triples instead of RDF 1.2 annotation syntax (pre-4.2 output). |
 | `--context <JSON>` | JSON-LD context for prefix declarations. Overrides the ledger's default context. |
 | `--context-file <FILE>` | Read context from a JSON file. Overrides the ledger's default context. |
 | `--at <TIME>` | Export data as of a specific point in time. Accepts a transaction number (`5`), ISO-8601 datetime (`2024-01-15T10:30:00Z`), or commit CID prefix (`abc123def456`). If omitted, exports at the latest committed time (including data committed but not yet persisted to index). |
@@ -57,6 +58,40 @@ stdout carries only the RDF, so redirecting it still produces a clean file.
 Every ledger has two system graphs, `urn:fluree:<ledger>:main#txn-meta` (commit metadata) and `…#config`. `--all-graphs` does not export them, because a file that contains them is not portable: their IRIs name the ledger that produced them, so re-importing into a ledger of the same name routes those triples onto the target's own reserved graph ids where they are unreachable, and importing into a differently-named ledger lands a foreign ledger's commit history in an ordinary user graph.
 
 `--system-graphs` emits them anyway, for diagnostics. Use `--format ledger` to move a ledger — it carries commits rather than re-serializing triples, and round-trips losslessly.
+
+### Edge annotations (RDF 1.2)
+
+An edge annotation attaches a reifier to one specific triple: `ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.8 |}`. Fluree stores that as seven reserved `f:reifies*` system facts plus the reifier's own properties. Export used to emit those system facts verbatim — output no other RDF 1.2 tool understands, and which Fluree's own insert and update surfaces reject as system-controlled predicates.
+
+Export now emits annotation syntax by default:
+
+| Format | Output |
+|---|---|
+| `turtle`, `trig` | `ex:alice ex:knows ex:bob ~ ex:claim1 ~ ex:claim2 .` |
+| `ntriples`, `nquads` | `<ex:claim1> <rdf:reifies> <<( <ex:alice> <ex:knows> <ex:bob> )>> .` |
+| `jsonld` | `{"@id": "ex:bob", "@annotation": {"@id": "ex:claim1"}}` |
+
+The reifier's own properties are emitted where the scan reaches them, as an ordinary subject later in the stream — not inlined in a `{| … |}` body. Both spellings mean the same thing in RDF 1.2 and both re-import identically; keeping the body out of line is what lets export stay one streaming pass over the index.
+
+```turtle
+ex:alice
+    ex:knows ex:bob ~ ex:claim1 .
+ex:claim1
+    ex:confidence "0.8"^^xsd:decimal .
+```
+
+`--raw-reifies` restores the pre-4.2 output. That output only re-imports through `fluree create --from`; the insert and update surfaces reject hand-written `f:reifies*` triples.
+
+A ledger that has never carried an annotation pays nothing for any of this: export reads one flag on the snapshot and runs the scan it always ran.
+
+**Known limit.** Annotations written *inside a named graph* are not represented in the output yet — the forward lookup export uses is blind to them, though SPARQL reads them fine. Export says so rather than dropping them quietly:
+
+```
+  warning: 1 edge annotations could not be resolved and are NOT in the output;
+           re-run with --raw-reifies to emit them as f:reifies* triples
+```
+
+`FLUREE_EXPORT_ANNOTATION_SCAN=1` forces the base-index scan in place of the sealed annotation arena. The two sources should agree; this is how to check without rebuilding an index.
 
 ### Prefixes / Context
 

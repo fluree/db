@@ -13,6 +13,7 @@
 //! ```
 
 use crate::export::{self, ExportConfig, ExportFormat, ExportStats, PrefixMap};
+use crate::export_annotations::AnnotationProbe;
 use crate::{time_resolve, ApiError, Fluree, Result, TimeSpec};
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::GraphRegistry;
@@ -26,6 +27,7 @@ pub struct ExportBuilder<'a> {
     format: ExportFormat,
     all_graphs: bool,
     system_graphs: bool,
+    raw_reifies: bool,
     graph_iri: Option<String>,
     context_override: Option<serde_json::Value>,
     time_spec: Option<TimeSpec>,
@@ -39,6 +41,7 @@ impl<'a> ExportBuilder<'a> {
             format: ExportFormat::Turtle,
             all_graphs: false,
             system_graphs: false,
+            raw_reifies: false,
             graph_iri: None,
             context_override: None,
             time_spec: None,
@@ -80,6 +83,18 @@ impl<'a> ExportBuilder<'a> {
     /// Mutually exclusive with `all_graphs()`.
     pub fn graph(mut self, iri: &str) -> Self {
         self.graph_iri = Some(iri.to_string());
+        self
+    }
+
+    /// Emit edge annotations as the raw `f:reifies*` system facts, the output
+    /// every release before RDF 1.2 annotation syntax produced.
+    ///
+    /// Kept as an escape hatch for consumers pinned to those bytes. Note that
+    /// Fluree's own JSON-LD and Turtle write surfaces reject hand-written
+    /// `f:reifies*` triples, so this output is re-ingestible only through the
+    /// bulk-import path.
+    pub fn raw_reifies(mut self) -> Self {
+        self.raw_reifies = true;
         self
     }
 
@@ -239,6 +254,27 @@ impl<'a> ExportBuilder<'a> {
         let overlay: &dyn fluree_db_core::OverlayProvider = ledger.novelty.as_ref();
         let dict_novelty = &ledger.dict_novelty;
 
+        // Forward annotation lookup, chosen once for the whole export. `None`
+        // on a ledger that has never carried an annotation — and on
+        // `raw_reifies()`, which keeps the pre-RDF-1.2 output byte for byte.
+        let annotations = if self.raw_reifies {
+            None
+        } else {
+            AnnotationProbe::for_ledger(&ledger, to_t).await?
+        };
+        // `EdgeKey.g` for a graph being scanned. Computed per graph rather
+        // than per row, and not at all when nothing will probe it.
+        let graph_sid_of = |g_id: u16| -> Option<fluree_db_core::Sid> {
+            if annotations.is_none() || g_id == 0 {
+                return None;
+            }
+            ledger
+                .snapshot
+                .graph_registry
+                .iri_for_graph_id(g_id)
+                .map(|iri| binary_store.encode_iri(iri))
+        };
+
         let mut total_stats = ExportStats::default();
 
         match self.format {
@@ -252,6 +288,8 @@ impl<'a> ExportBuilder<'a> {
                     to_t,
                     overlay: Some(overlay),
                     dict_novelty: Some(dict_novelty),
+                    annotations: annotations.as_ref(),
+                    graph_sid: graph_sid_of(target_graph.as_ref().map_or(0, |(g_id, _)| *g_id)),
                 };
                 let stats = export::export_graph_turtle(&binary_store, &config, &prefixes, writer)
                     .await
@@ -266,6 +304,8 @@ impl<'a> ExportBuilder<'a> {
                     to_t,
                     overlay: Some(overlay),
                     dict_novelty: Some(dict_novelty),
+                    annotations: annotations.as_ref(),
+                    graph_sid: graph_sid_of(target_graph.as_ref().map_or(0, |(g_id, _)| *g_id)),
                 };
                 let stats = export::export_graph_ntriples(&binary_store, &config, writer)
                     .await
@@ -282,6 +322,8 @@ impl<'a> ExportBuilder<'a> {
                         to_t,
                         overlay: Some(overlay),
                         dict_novelty: Some(dict_novelty),
+                        annotations: annotations.as_ref(),
+                        graph_sid: graph_sid_of(*g_id),
                     };
                     let stats = export::export_graph_ntriples(&binary_store, &config, writer)
                         .await
@@ -295,6 +337,8 @@ impl<'a> ExportBuilder<'a> {
                         to_t,
                         overlay: Some(overlay),
                         dict_novelty: Some(dict_novelty),
+                        annotations: annotations.as_ref(),
+                        graph_sid: graph_sid_of(0),
                     };
                     let stats = export::export_graph_ntriples(&binary_store, &config, writer)
                         .await
@@ -311,6 +355,8 @@ impl<'a> ExportBuilder<'a> {
                                 to_t,
                                 overlay: Some(overlay),
                                 dict_novelty: Some(dict_novelty),
+                                annotations: annotations.as_ref(),
+                                graph_sid: graph_sid_of(g_id),
                             };
                             let stats =
                                 export::export_graph_ntriples(&binary_store, &config, writer)
@@ -338,6 +384,8 @@ impl<'a> ExportBuilder<'a> {
                         to_t,
                         overlay: Some(overlay),
                         dict_novelty: Some(dict_novelty),
+                        annotations: annotations.as_ref(),
+                        graph_sid: graph_sid_of(*g_id),
                     };
                     let stats =
                         export::export_graph_turtle(&binary_store, &config, &prefixes, writer)
@@ -354,6 +402,8 @@ impl<'a> ExportBuilder<'a> {
                         to_t,
                         overlay: Some(overlay),
                         dict_novelty: Some(dict_novelty),
+                        annotations: annotations.as_ref(),
+                        graph_sid: graph_sid_of(0),
                     };
                     let stats =
                         export::export_graph_turtle(&binary_store, &config, &prefixes, writer)
@@ -376,6 +426,8 @@ impl<'a> ExportBuilder<'a> {
                                 to_t,
                                 overlay: Some(overlay),
                                 dict_novelty: Some(dict_novelty),
+                                annotations: annotations.as_ref(),
+                                graph_sid: graph_sid_of(g_id),
                             };
                             let stats = export::export_graph_turtle(
                                 &binary_store,
@@ -403,6 +455,8 @@ impl<'a> ExportBuilder<'a> {
                     to_t,
                     overlay: Some(overlay),
                     dict_novelty: Some(dict_novelty),
+                    annotations: annotations.as_ref(),
+                    graph_sid: graph_sid_of(target_graph.as_ref().map_or(0, |(g_id, _)| *g_id)),
                 };
                 let stats = export::export_graph_jsonld(&binary_store, &config, &prefixes, writer)
                     .await
@@ -414,6 +468,10 @@ impl<'a> ExportBuilder<'a> {
         }
 
         writer.flush().map_err(io_err)?;
+        if let Some(probe) = annotations.as_ref() {
+            total_stats.annotations_out_of_scope = probe.out_of_scope_count();
+            total_stats.annotations_unresolved = probe.unresolved_count();
+        }
         total_stats.named_graphs_omitted = self.omitted_named_graph_count(
             &ledger.snapshot.graph_registry,
             target_graph.as_ref().map(|(g_id, _)| *g_id),

@@ -326,8 +326,15 @@ pub(crate) async fn attachment_events_from_state(
 
 /// The base-index bootstrap scan over an explicit snapshot + overlay (see
 /// [`scan_base_index_for_attachment_events`] for the contract).
+///
+/// Also the read-side fallback for `fluree export` on a ledger whose arena was
+/// never sealed. The sticky-bit gate that guards the *seal* caller
+/// ([`attachment_events_from_state`]) does not apply to a reader: it exists so
+/// a live-only scan cannot re-seal an arena and drop retract history the
+/// indexer owns, and export writes no arena — it needs the bundles currently
+/// asserted at `t`, which is exactly what this returns.
 #[cfg(not(target_arch = "wasm32"))]
-async fn scan_base_index_for_attachment_events_in(
+pub(crate) async fn scan_base_index_for_attachment_events_in(
     snapshot: &fluree_db_core::LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
     t: i64,

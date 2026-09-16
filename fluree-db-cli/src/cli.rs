@@ -1067,6 +1067,15 @@ pub enum Commands {
         #[arg(long)]
         graph: Option<String>,
 
+        /// Emit edge annotations as raw `f:reifies*` system triples instead of
+        /// RDF 1.2 annotation syntax — the output of every release before 4.2.
+        ///
+        /// For consumers pinned to those bytes. Fluree's own write surfaces
+        /// reject hand-written `f:reifies*` triples, so this output only
+        /// re-imports through `fluree create --from`.
+        #[arg(long)]
+        raw_reifies: bool,
+
         /// JSON-LD context for prefix declarations (overrides ledger default).
         ///
         /// Pass as inline JSON: `--context '{"ex": "http://example.org/"}'`

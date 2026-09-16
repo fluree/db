@@ -3,12 +3,14 @@
 //! Writes N-Triples, Turtle, N-Quads, or TriG directly to a `Write` sink,
 //! one leaflet-batch at a time.  Memory usage is O(leaflet_size), not O(dataset).
 
+use crate::export_annotations::AnnotationProbe;
 use fluree_db_binary_index::format::branch::BranchManifest;
 use fluree_db_binary_index::read::types::sort_overlay_ops;
 use fluree_db_binary_index::{
     BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnBatch, ColumnProjection, RunSortOrder,
 };
 use fluree_db_core::dict_novelty::DictNovelty;
+use fluree_db_core::edge::EdgeKey;
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{DecodeKind, Flake, GraphId, OType, OverlayProvider, Sid};
 use fluree_db_query::binary_scan::{
@@ -36,6 +38,14 @@ pub struct ExportConfig<'a> {
     pub overlay: Option<&'a dyn OverlayProvider>,
     /// Dictionary novelty for resolving IDs from committed-but-not-yet-indexed transactions.
     pub dict_novelty: Option<&'a Arc<DictNovelty>>,
+    /// Forward annotation lookup. `None` means this export emits the raw
+    /// `f:reifies*` system facts as ordinary triples (`--raw-reifies`, or a
+    /// ledger that has never carried an annotation) and the writers run
+    /// exactly the loop they ran before RDF 1.2 output existed.
+    pub annotations: Option<&'a AnnotationProbe<'a>>,
+    /// SID of the graph being scanned, as `EdgeKey.g` recorded it. `None` for
+    /// the default graph. Only read when `annotations` is `Some`.
+    pub graph_sid: Option<Sid>,
 }
 
 /// Counters returned after export completes.
@@ -46,6 +56,10 @@ pub struct ExportConfig<'a> {
 /// that "nothing in the output suggested anything was missing".
 #[derive(Debug, Default)]
 pub struct ExportStats {
+    /// Base triples written. Annotation markers are not counted: RDF 1.2
+    /// spells the same reifier as a suffix in Turtle and as its own
+    /// `rdf:reifies` statement in N-Triples, so a count that moved with the
+    /// format would say nothing about the data.
     pub triples_written: u64,
     /// Rows the writers could not represent: an unresolvable predicate id, or
     /// a value that decoded to `FlakeValue::Null`.
@@ -57,6 +71,20 @@ pub struct ExportStats {
     /// not cover, because no graph selector asked for them. System graphs are
     /// not counted: they are never user data.
     pub named_graphs_omitted: u64,
+    /// Reifiers named by an annotation marker in the output whose own
+    /// description is not in the output.
+    ///
+    /// `EdgeKey` carries a graph, and a bundle may live in a different graph
+    /// from the edge it reifies, so a `--graph <IRI>` export can legitimately
+    /// emit `~ <r>` while `<r>`'s own triples fall outside the selection. That
+    /// is reported rather than silently dropped — and rather than suppressed,
+    /// which would lose the fact that the edge is annotated at all.
+    pub annotations_out_of_scope: u64,
+    /// Annotation bundles the export dropped without emitting a marker for
+    /// them — the count that means the output is not a faithful
+    /// serialization. See `AnnotationProbe::unresolved_count` for the one case
+    /// that reaches it today.
+    pub annotations_unresolved: u64,
 }
 
 /// Output format for streaming export.
@@ -217,6 +245,43 @@ impl<'a> ExportResolver<'a> {
         }
     }
 
+    /// Resolve a subject ID to the `Sid` the write path stored it under.
+    ///
+    /// Mirrors `BinaryGraphView::resolve_subject_sid_uncached`: a novel id
+    /// (above its namespace's watermark) resolves straight from `DictNovelty`
+    /// to `Sid(ns_code, suffix)`, which is the exact value the transaction
+    /// wrote; anything persisted round-trips through the subject dictionary.
+    /// Exactness matters because the resulting `EdgeKey` is a seek key into
+    /// arena leaves sorted by the derived `Ord` — a Sid that differs in any
+    /// position lands on the wrong span and reports "no annotations" rather
+    /// than failing.
+    fn resolve_subject_sid(&self, s_id: u64) -> io::Result<Sid> {
+        if let Some(dn) = self.dict_novelty {
+            if dn.is_initialized() {
+                let sid64 = fluree_db_core::subject_id::SubjectId::from_u64(s_id);
+                if sid64.local_id() > dn.subjects.watermark_for_ns(sid64.ns_code()) {
+                    if let Some((ns_code, suffix)) = dn.subjects.resolve_subject(s_id) {
+                        return Ok(Sid::new(ns_code, suffix));
+                    }
+                }
+            }
+        }
+        let iri = self.resolve_subject_iri(s_id)?;
+        Ok(self
+            .store
+            .find_subject_sid(&iri)?
+            .unwrap_or_else(|| self.store.encode_iri(&iri)))
+    }
+
+    /// Resolve a predicate ID to its `Sid`. The ephemeral map holds the
+    /// original `Sid` for novelty-only predicates, so no re-encoding is needed
+    /// on that branch.
+    fn resolve_predicate_sid(&self, p_id: u32) -> Option<Sid> {
+        self.store
+            .predicate_sid(p_id)
+            .or_else(|| self.ephemeral_preds_reverse.get(&p_id).cloned())
+    }
+
     /// Resolve a predicate ID to an IRI string.
     ///
     /// Falls back to the ephemeral predicate map for novelty-only predicates.
@@ -283,6 +348,130 @@ impl<'a> ExportResolver<'a> {
         let sid = self.store.encode_iri(&iri);
         Ok(FlakeValue::Ref(sid))
     }
+}
+
+impl crate::export_annotations::ReifierSubject for ExportResolver<'_> {
+    fn reifier_sid(&self, s_id: u64) -> io::Result<Sid> {
+        self.resolve_subject_sid(s_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RDF 1.2 annotations
+// ---------------------------------------------------------------------------
+
+/// Per-export state for annotation emission: which predicate ids to suppress,
+/// and the bookkeeping behind `ExportStats::annotations_out_of_scope`.
+///
+/// Built once per graph scan; absent entirely when the export is not emitting
+/// annotation syntax, so the common path allocates nothing.
+struct AnnotationContext<'a> {
+    probe: &'a AnnotationProbe<'a>,
+    /// `p_id`s of the seven `f:reifies*` predicates in this store's id space,
+    /// persisted and ephemeral. Hoisted out of the row loop: suppression is
+    /// then a scan of at most fourteen `u32`s, not an IRI comparison.
+    reifies_p_ids: Vec<u32>,
+    graph_sid: Option<Sid>,
+}
+
+impl<'a> AnnotationContext<'a> {
+    fn new(resolver: &ExportResolver<'_>, config: &'a ExportConfig<'a>) -> Option<Self> {
+        let probe = config.annotations?;
+        let mut reifies_p_ids: Vec<u32> = fluree_vocab::reifies_iris::ALL
+            .iter()
+            .filter_map(|iri| resolver.store.find_predicate_id(iri))
+            .collect();
+        // Novelty-only predicates never reach the persisted dictionary; on a
+        // never-indexed ledger *every* `f:reifies*` id is ephemeral.
+        reifies_p_ids.extend(
+            resolver
+                .ephemeral_preds_reverse
+                .iter()
+                .filter(|(_, sid)| fluree_db_core::namespaces::is_reserved_reifies_predicate(sid))
+                .map(|(p_id, _)| *p_id),
+        );
+        Some(Self {
+            probe,
+            reifies_p_ids,
+            graph_sid: config.graph_sid.clone(),
+        })
+    }
+
+    #[inline]
+    fn is_reifies_row(&self, p_id: u32) -> bool {
+        self.reifies_p_ids.contains(&p_id)
+    }
+}
+
+/// Live reifiers for every row of `batch`, row-aligned.
+///
+/// Returns an empty vec when the export is not emitting annotation syntax;
+/// callers treat a missing entry as "no reifiers", so no writer needs a
+/// branch on the mode.
+///
+/// This re-decodes each row's subject, predicate and object to build its
+/// `EdgeKey` — work the row writer then does again. That duplication is
+/// deliberate path separation: it happens only for ledgers that carry
+/// annotations, and it keeps the row writers' existing loop untouched for
+/// every ledger that does not.
+async fn batch_reifiers(
+    resolver: &ExportResolver<'_>,
+    ann: Option<&AnnotationContext<'_>>,
+    batch: &ColumnBatch,
+    g_id: GraphId,
+) -> io::Result<Vec<Vec<Sid>>> {
+    let Some(ann) = ann else {
+        return Ok(Vec::new());
+    };
+    let mut edges: Vec<EdgeKey> = Vec::new();
+    let mut edge_row: Vec<usize> = Vec::new();
+    for row in 0..batch.row_count {
+        let p_id = batch.p_id.get_or(row, 0);
+        if ann.is_reifies_row(p_id) {
+            continue; // the bundle itself is never an annotated edge
+        }
+        let o_type = batch.o_type.get_or(row, 0);
+        let o_key = batch.o_key.get(row);
+        let Some(p) = resolver.resolve_predicate_sid(p_id) else {
+            continue;
+        };
+        let Ok(s) = resolver.resolve_subject_sid(batch.s_id.get(row)) else {
+            continue;
+        };
+        let Ok(o) = resolver.decode_value(o_type, o_key, p_id, g_id) else {
+            continue;
+        };
+        if matches!(o, FlakeValue::Null) {
+            continue;
+        }
+        let Some(dt) = resolver.store.resolve_datatype_sid(o_type) else {
+            continue;
+        };
+        edges.push(EdgeKey {
+            g: ann.graph_sid.clone(),
+            s,
+            p,
+            o,
+            dt,
+            lang: resolver.store.resolve_lang_tag(o_type).map(str::to_owned),
+            // v1 stores `None` for every edge; list-occurrence annotations
+            // are deferred (see `EdgeKey::list_i`).
+            list_i: None,
+        });
+        edge_row.push(row);
+    }
+    let per_edge = ann.probe.live_reifiers(&edges).await?;
+    let mut out = vec![Vec::new(); batch.row_count];
+    for (i, row) in edge_row.into_iter().enumerate() {
+        out[row] = per_edge[i].clone();
+    }
+    Ok(out)
+}
+
+/// Reifiers for one row, or the empty slice.
+#[inline]
+fn row_reifiers(reifiers: &[Vec<Sid>], row: usize) -> &[Sid] {
+    reifiers.get(row).map_or(&[], Vec::as_slice)
 }
 
 // ---------------------------------------------------------------------------
@@ -419,13 +608,17 @@ pub async fn export_graph_turtle<W: Write>(
     );
     let (ephemeral_preds, untranslated) = apply_time_travel(&mut cursor, config, store);
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
+    let ann = AnnotationContext::new(&resolver, config);
 
     let mut stats = ExportStats::default();
     let mut prev_subject: Option<String> = None;
 
     while let Some(batch) = cursor.next_batch()? {
+        let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
         write_turtle_batch(
             &resolver,
+            ann.as_ref(),
+            &reifiers,
             &batch,
             config.g_id,
             prefixes,
@@ -449,8 +642,11 @@ pub async fn export_graph_turtle<W: Write>(
 }
 
 /// Write a batch of rows as Turtle, grouping by subject.
+#[allow(clippy::too_many_arguments)]
 fn write_turtle_batch<W: Write>(
     resolver: &ExportResolver,
+    ann: Option<&AnnotationContext<'_>>,
+    reifiers: &[Vec<Sid>],
     batch: &ColumnBatch,
     g_id: GraphId,
     prefixes: &PrefixMap,
@@ -463,6 +659,17 @@ fn write_turtle_batch<W: Write>(
         let p_id = batch.p_id.get_or(row, 0);
         let o_type = batch.o_type.get_or(row, 0);
         let o_key = batch.o_key.get(row);
+
+        // The `f:reifies*` bundle is the on-disk encoding of an annotation,
+        // not a triple the ledger was asked to hold. It is replaced by the
+        // `~ <r>` markers emitted below, and re-emitting it too would produce
+        // a file the write path refuses to ingest.
+        if let Some(ann) = ann {
+            if ann.is_reifies_row(p_id) {
+                ann.probe.note_bundle_in_scope(resolver, s_id);
+                continue;
+            }
+        }
 
         let s_iri = resolver.resolve_subject_iri(s_id)?;
         let p_iri = match resolver.resolve_predicate_iri(p_id) {
@@ -504,6 +711,22 @@ fn write_turtle_batch<W: Write>(
 
         // Write object
         write_turtle_object(writer, &value, resolver.store, o_type, prefixes)?;
+
+        // RDF 1.2 reifier markers: `s p o ~ <r1> ~ <r2>`. The reifiers' own
+        // property blocks are left where the scan puts them, later in the
+        // stream as ordinary subjects — inlining a `{| … |}` body would need
+        // a random seek per reifier, out of scan order, at the exact moment
+        // the base edge is written.
+        if let Some(ann) = ann {
+            for reifier in row_reifiers(reifiers, row) {
+                let Some(iri) = resolver.store.sid_to_iri(reifier) else {
+                    continue;
+                };
+                writer.write_all(b" ~ ")?;
+                write_turtle_iri_or_bnode(writer, &iri, prefixes)?;
+                ann.probe.note_reifier_named(reifier);
+            }
+        }
 
         stats.triples_written += 1;
     }
@@ -610,6 +833,7 @@ pub async fn export_graph_jsonld<W: Write>(
     );
     let (ephemeral_preds, untranslated) = apply_time_travel(&mut cursor, config, store);
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
+    let ann = AnnotationContext::new(&resolver, config);
 
     let mut stats = ExportStats::default();
 
@@ -620,11 +844,19 @@ pub async fn export_graph_jsonld<W: Write>(
     let mut first_node = true;
 
     while let Some(batch) = cursor.next_batch()? {
+        let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
         for row in 0..batch.row_count {
             let s_id = batch.s_id.get(row);
             let p_id = batch.p_id.get_or(row, 0);
             let o_type = batch.o_type.get_or(row, 0);
             let o_key = batch.o_key.get(row);
+
+            if let Some(ann) = ann.as_ref() {
+                if ann.is_reifies_row(p_id) {
+                    ann.probe.note_bundle_in_scope(&resolver, s_id);
+                    continue;
+                }
+            }
 
             let s_iri = resolver.resolve_subject_iri(s_id)?;
             let p_iri = match resolver.resolve_predicate_iri(p_id) {
@@ -642,6 +874,21 @@ pub async fn export_graph_jsonld<W: Write>(
 
             // Convert to JSON-LD value
             let jval = flake_to_jsonld(&value, store, o_type, prefixes);
+            // One value per reifier, each carrying `@annotation` — the JSON-LD
+            // shape `parse/edge_annotations.rs` ingests. Repeating the base
+            // value is how the keyword attaches to an edge: two reifiers on
+            // one edge are two annotated occurrences of the same triple, which
+            // re-ingest to one triple and two bundles.
+            let jvals = match ann.as_ref() {
+                Some(ann) => annotated_jsonld_values(
+                    &resolver,
+                    ann,
+                    &jval,
+                    row_reifiers(&reifiers, row),
+                    prefixes,
+                ),
+                None => vec![jval],
+            };
 
             // Check if we've moved to a new subject
             let same_subject = current_subject.as_deref() == Some(&s_iri);
@@ -658,9 +905,9 @@ pub async fn export_graph_jsonld<W: Write>(
             // Append value to the right predicate bucket
             let compact_p = compact_iri(&p_iri, prefixes);
             if let Some(entry) = current_props.iter_mut().find(|(k, _)| *k == compact_p) {
-                entry.1.push(jval);
+                entry.1.extend(jvals);
             } else {
-                current_props.push((compact_p, vec![jval]));
+                current_props.push((compact_p, jvals));
             }
 
             stats.triples_written += 1;
@@ -778,6 +1025,48 @@ fn flake_to_jsonld_raw(
         // Temporal / other types always encode into V3 ops.
         _ => None,
     }
+}
+
+/// One JSON-LD value per reifier, each carrying an `@annotation` block; the
+/// bare value when the edge has none.
+///
+/// A scalar value (`"ex:name": "Alice"`) has nowhere to hang a keyword, so an
+/// annotated one is promoted to its `{"@value": …}` object form. `{"@id": …}`
+/// objects take the keyword directly.
+fn annotated_jsonld_values(
+    resolver: &ExportResolver,
+    ann: &AnnotationContext<'_>,
+    jval: &serde_json::Value,
+    reifiers: &[Sid],
+    prefixes: &PrefixMap,
+) -> Vec<serde_json::Value> {
+    if reifiers.is_empty() {
+        return vec![jval.clone()];
+    }
+    let mut out = Vec::with_capacity(reifiers.len());
+    for reifier in reifiers {
+        let Some(r_iri) = resolver.store.sid_to_iri(reifier) else {
+            continue;
+        };
+        let mut obj = match jval {
+            serde_json::Value::Object(map) => map.clone(),
+            scalar => {
+                let mut map = serde_json::Map::new();
+                map.insert("@value".to_string(), scalar.clone());
+                map
+            }
+        };
+        obj.insert(
+            "@annotation".to_string(),
+            serde_json::json!({ "@id": compact_iri(&r_iri, prefixes) }),
+        );
+        out.push(serde_json::Value::Object(obj));
+        ann.probe.note_reifier_named(reifier);
+    }
+    if out.is_empty() {
+        out.push(jval.clone());
+    }
+    out
 }
 
 /// Write the JSON-LD document header: `{"@context": {...}, "@graph": [`
@@ -1116,6 +1405,7 @@ pub async fn export_graph_ntriples<W: Write>(
     );
     let (ephemeral_preds, untranslated) = apply_time_travel(&mut cursor, config, store);
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
+    let ann = AnnotationContext::new(&resolver, config);
 
     let mut stats = ExportStats::default();
     let graph_term = config.graph_iri.as_deref().map(|iri| {
@@ -1127,8 +1417,11 @@ pub async fn export_graph_ntriples<W: Write>(
     });
 
     while let Some(batch) = cursor.next_batch()? {
+        let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
         write_batch(
             &resolver,
+            ann.as_ref(),
+            &reifiers,
             &batch,
             config.g_id,
             graph_term.as_deref(),
@@ -1150,8 +1443,11 @@ pub async fn export_graph_ntriples<W: Write>(
 // Batch → N-Triples / N-Quads
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn write_batch<W: Write>(
     resolver: &ExportResolver,
+    ann: Option<&AnnotationContext<'_>>,
+    reifiers: &[Vec<Sid>],
     batch: &ColumnBatch,
     g_id: GraphId,
     graph_term: Option<&str>,
@@ -1163,6 +1459,13 @@ fn write_batch<W: Write>(
         let p_id = batch.p_id.get_or(row, 0);
         let o_type = batch.o_type.get_or(row, 0);
         let o_key = batch.o_key.get(row);
+
+        if let Some(ann) = ann {
+            if ann.is_reifies_row(p_id) {
+                ann.probe.note_bundle_in_scope(resolver, s_id);
+                continue;
+            }
+        }
 
         // Resolve subject
         let s_iri = resolver.resolve_subject_iri(s_id)?;
@@ -1203,6 +1506,33 @@ fn write_batch<W: Write>(
 
         writer.write_all(b" .\n")?;
         stats.triples_written += 1;
+
+        // N-Triples has no annotation sugar, by design. The standards-correct
+        // spelling is a triple term as the object of `rdf:reifies`, which
+        // Fluree's Turtle and N-Quads readers both accept.
+        if let Some(ann) = ann {
+            for reifier in row_reifiers(reifiers, row) {
+                let Some(r_iri) = resolver.store.sid_to_iri(reifier) else {
+                    continue;
+                };
+                write_iri_or_bnode(writer, &r_iri)?;
+                writer.write_all(b" <")?;
+                write_escaped_iri(writer, fluree_vocab::rdf::REIFIES)?;
+                writer.write_all(b"> <<( ")?;
+                write_iri_or_bnode(writer, &s_iri)?;
+                writer.write_all(b" <")?;
+                write_escaped_iri(writer, &p_iri)?;
+                writer.write_all(b"> ")?;
+                write_object(writer, &value, resolver.store, o_type)?;
+                writer.write_all(b" )>>")?;
+                if let Some(g) = graph_term {
+                    writer.write_all(b" ")?;
+                    writer.write_all(g.as_bytes())?;
+                }
+                writer.write_all(b" .\n")?;
+                ann.probe.note_reifier_named(reifier);
+            }
+        }
     }
     Ok(())
 }

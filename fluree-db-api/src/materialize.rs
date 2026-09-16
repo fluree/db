@@ -1864,6 +1864,12 @@ async fn spool_twin_ntriples_indexed(
         to_t: ledger.t(),
         overlay: Some(overlay),
         dict_novelty: Some(&ledger.dict_novelty),
+        // The twin spool is an internal byte-comparison artifact, not a
+        // published serialization: it must keep emitting whatever the index
+        // holds, one row per line, so the source side it diffs against lines
+        // up. RDF 1.2 annotation rewriting would change the line set.
+        annotations: None,
+        graph_sid: None,
     };
 
     let file = std::fs::File::create(path)

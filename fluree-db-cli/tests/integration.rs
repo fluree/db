@@ -1969,6 +1969,341 @@ fn export_all_graphs_round_trips_into_a_same_named_ledger() {
 }
 
 // ============================================================================
+// #1859 — RDF 1.2 annotation syntax
+// ============================================================================
+
+/// One edge, two reifiers, each with properties. Built by `insert` + `index`,
+/// which leaves the annotation arena **unsealed** — so this fixture exercises
+/// the base-index scan fallback, the path a plain `fluree index` produces.
+fn seed_annotated_indexed(tmp: &TempDir, ledger: &str) {
+    fluree_cmd(tmp).args(["create", ledger]).assert().success();
+    fluree_cmd(tmp)
+        .args([
+            "insert",
+            ledger,
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice ex:knows ex:bob\n\
+                 ~ ex:claim1 {| ex:confidence 0.8 ; ex:source ex:sourceA |}\n\
+                 ~ ex:claim2 {| ex:confidence 0.9 ; ex:source ex:sourceB |} .",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(tmp).args(["index", ledger]).assert().success();
+}
+
+/// The same data through `create --from`, which runs an auto-seal reindex —
+/// so this fixture exercises the **sealed annotation arena** instead.
+fn seed_annotated_sealed(tmp: &TempDir, ledger: &str) {
+    let src = tmp.path().join(format!("{ledger}-src"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.ttl"),
+        "@prefix ex: <http://example.org/> .\n\
+         ex:alice ex:knows ex:bob\n\
+             ~ ex:claim1 {| ex:confidence 0.8 ; ex:source ex:sourceA |}\n\
+             ~ ex:claim2 {| ex:confidence 0.9 ; ex:source ex:sourceB |} .\n",
+    )
+    .unwrap();
+    fluree_cmd(tmp)
+        .args(["create", ledger, "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+}
+
+/// Fluree exported a form Fluree refuses to ingest: `f:reifies*` is
+/// system-controlled on every write surface, and export emitted it as ordinary
+/// triples on all five RDF formats.
+#[test]
+fn export_turtle_emits_annotation_syntax() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_annotated_sealed(&tmp, "ann");
+
+    fluree_cmd(&tmp)
+        .args(["export", "ann", "--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("~ ex:claim1"))
+        .stdout(predicate::str::contains("~ ex:claim2"))
+        // All seven `f:reifies*` predicates are suppressed, not the three the
+        // issue happened to show.
+        .stdout(predicate::str::contains("ns.flur.ee/db#reifies").not())
+        // The reifiers' own properties stay in the stream as ordinary
+        // subjects. That is what keeps the fix to one pass.
+        .stdout(predicate::str::contains("ex:confidence"));
+}
+
+/// Same assertions against the arena-less ledger a plain `fluree index`
+/// leaves behind. Without this the suite would only ever see a sealed arena,
+/// and the fallback would be untested on the commoner workflow.
+#[test]
+fn export_turtle_emits_annotation_syntax_without_a_sealed_arena() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_annotated_indexed(&tmp, "annu");
+
+    fluree_cmd(&tmp)
+        .args(["export", "annu", "--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("~ <http://example.org/claim1>"))
+        .stdout(predicate::str::contains("ns.flur.ee/db#reifies").not());
+}
+
+/// And against a ledger with no index at all, where the attachment overlay is
+/// the whole history.
+#[test]
+fn export_turtle_emits_annotation_syntax_on_a_never_indexed_ledger() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "annn"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "annn",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.8 |} .",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "annn", "--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("~ <http://example.org/claim1>"))
+        .stdout(predicate::str::contains("ns.flur.ee/db#reifies").not());
+}
+
+#[test]
+fn export_ntriples_emits_reifies_triple_terms() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_annotated_sealed(&tmp, "ann2");
+
+    fluree_cmd(&tmp)
+        .args(["export", "ann2", "--format", "ntriples"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<http://example.org/claim1> \
+             <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> \
+             <<( <http://example.org/alice> <http://example.org/knows> \
+             <http://example.org/bob> )>> .",
+        ))
+        .stdout(predicate::str::contains("ns.flur.ee/db#reifies").not());
+}
+
+#[test]
+fn export_jsonld_emits_annotation_blocks() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_annotated_sealed(&tmp, "ann3");
+
+    fluree_cmd(&tmp)
+        .args(["export", "ann3", "--format", "jsonld"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("@annotation"))
+        .stdout(predicate::str::contains("claim1"))
+        .stdout(predicate::str::contains("ns.flur.ee/db#reifies").not());
+}
+
+/// The escape hatch: pre-4.2 bytes, for anyone consuming them.
+#[test]
+fn export_raw_reifies_keeps_the_system_facts() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    seed_annotated_sealed(&tmp, "ann4");
+
+    fluree_cmd(&tmp)
+        .args(["export", "ann4", "--format", "turtle", "--raw-reifies"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reifiesSubject"))
+        .stdout(predicate::str::contains(" ~ ").not());
+}
+
+/// Export → re-ingest → query, per format.
+///
+/// The load-bearing assertion is the *absence* of `f:reifies*` in the bytes
+/// (asserted above) plus this. A test that only checked "the annotation is
+/// queryable after re-import" would pass against the bug: the raw `f:reifies*`
+/// form genuinely round-trips through the bulk-import path, which is exactly
+/// why the defect survived. Do not simplify this pair back into one.
+#[test]
+fn export_annotations_round_trip_in_every_format() {
+    let src = TempDir::new().unwrap();
+    fluree_cmd(&src).arg("init").assert().success();
+    seed_annotated_sealed(&src, "rtann");
+
+    for (fmt, ext) in [("turtle", "ttl"), ("ntriples", "nt"), ("jsonld", "jsonld")] {
+        let out = src.path().join(format!("rtann.{ext}"));
+        fluree_cmd(&src)
+            .args(["export", "rtann", "--format", fmt, "-o"])
+            .arg(&out)
+            .assert()
+            .success();
+
+        let dst = TempDir::new().unwrap();
+        fluree_cmd(&dst).arg("init").assert().success();
+        fluree_cmd(&dst)
+            .args(["create", "rtann", "--from"])
+            .arg(&out)
+            .assert()
+            .success();
+
+        // Both reifiers still reify that edge, read back through the RDF 1.2
+        // query surface rather than by naming `f:reifies*`.
+        fluree_cmd(&dst)
+            .args([
+                "query",
+                "rtann",
+                "--sparql",
+                "SELECT ?r ?c WHERE { \
+                   <http://example.org/alice> <http://example.org/knows> \
+                   <http://example.org/bob> ~ ?r . \
+                   ?r <http://example.org/confidence> ?c }",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("claim1"))
+            .stdout(predicate::str::contains("claim2"));
+    }
+}
+
+/// The bundle is up to seven predicates, not the three the issue showed: a
+/// plain literal adds `reifiesDatatype`, a language-tagged one adds
+/// `reifiesLang`. Each object shape has to reach the output.
+#[test]
+fn export_annotation_object_shapes() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let src = tmp.path().join("shapes-src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.ttl"),
+        "@prefix ex: <http://example.org/> .\n\
+         ex:alice ex:knows ex:bob ~ ex:cRef {| ex:src ex:a |} .\n\
+         ex:alice ex:name \"Alice\" ~ ex:cLit {| ex:src ex:b |} .\n\
+         ex:alice ex:label \"Alice\"@en ~ ex:cLang {| ex:src ex:c |} .\n",
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["create", "shapes", "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+
+    let text = String::from_utf8(
+        fluree_cmd(&tmp)
+            .args(["export", "shapes", "--format", "turtle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    for reifier in ["cRef", "cLit", "cLang"] {
+        assert!(
+            text.contains(&format!("~ ex:{reifier}")),
+            "missing annotation marker for {reifier} in:\n{text}"
+        );
+    }
+    assert!(
+        !text.contains("ns.flur.ee/db#reifies"),
+        "reifies bundle leaked:\n{text}"
+    );
+}
+
+/// A ledger with no annotations must not pay for, or be changed by, any of
+/// this — the fast path has to be proven taken, not assumed.
+#[test]
+fn export_without_annotations_is_unchanged() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "plain"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "plain",
+            "-e",
+            "<http://example.org/a> <http://example.org/p> \"v\" .\n",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp).args(["index", "plain"]).assert().success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "plain", "--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<http://example.org/a>\n    <http://example.org/p> \"v\" .",
+        ))
+        .stdout(predicate::str::contains("~").not());
+}
+
+/// An annotation written inside a named graph is not represented in the
+/// output today: the forward lookup export uses is blind to named graphs,
+/// though the rows are in the ledger and SPARQL reads them. Export must say
+/// so — suppressing the `f:reifies*` rows and then emitting no marker is
+/// exactly the silent truncation this work exists to remove.
+#[test]
+fn export_reports_annotations_it_could_not_resolve() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let src = tmp.path().join("gann-src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.trig"),
+        "@prefix ex: <http://example.org/> .\n\
+         GRAPH <http://example.org/g1> { \
+             ex:x ex:p ex:y ~ ex:cG {| ex:src ex:d |} . }\n",
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["create", "gann", "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "gann", "--format", "trig", "--all-graphs"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "1 edge annotations could not be resolved",
+        ))
+        .stderr(predicate::str::contains("--raw-reifies"));
+
+    // And the named remedy works: the bundle comes out verbatim.
+    fluree_cmd(&tmp)
+        .args([
+            "export",
+            "gann",
+            "--format",
+            "trig",
+            "--all-graphs",
+            "--raw-reifies",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reifiesSubject"));
+}
+
+// ============================================================================
 // v1.1 — Config tests
 // ============================================================================
 

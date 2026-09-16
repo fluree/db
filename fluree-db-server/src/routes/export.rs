@@ -37,6 +37,10 @@ pub struct ExportRequest {
     /// `all_graphs`. Diagnostic only — see `ExportBuilder::system_graphs`.
     #[serde(default)]
     pub system_graphs: bool,
+    /// Emit edge annotations as raw `f:reifies*` triples instead of RDF 1.2
+    /// annotation syntax. Escape hatch for consumers pinned to pre-4.2 bytes.
+    #[serde(default)]
+    pub raw_reifies: bool,
     /// Export a single named graph by IRI. Mutually exclusive with `all_graphs`.
     pub graph: Option<String>,
     /// Override the JSON-LD prefix context. Either a bare object (`{ "ex": "..." }`)
@@ -110,6 +114,9 @@ async fn export_local(
         if req.system_graphs {
             builder = builder.system_graphs();
         }
+        if req.raw_reifies {
+            builder = builder.raw_reifies();
+        }
         if let Some(iri) = req.graph.as_deref() {
             builder = builder.graph(iri);
         }
@@ -128,6 +135,8 @@ async fn export_local(
             graphs = stats.graphs_written,
             rows_skipped = stats.rows_skipped,
             named_graphs_omitted = stats.named_graphs_omitted,
+            annotations_out_of_scope = stats.annotations_out_of_scope,
+            annotations_unresolved = stats.annotations_unresolved,
             bytes = buf.len(),
             "ledger export complete"
         );
