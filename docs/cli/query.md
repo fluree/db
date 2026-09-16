@@ -31,7 +31,7 @@ the positional auto-detection (e.g. `fluree query --ledger mydb:main 'SELECT …
 | `--sparql` | Force SPARQL query format |
 | `--jsonld` | Force JSON-LD query format |
 | `--cypher` | Force openCypher query format (local ledgers only) |
-| `--at <TIME>` | Query at a specific point in time. `t:<N>` (transaction number), `t:latest` or `latest`, `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>` (min 6 chars). A bare transaction number, ISO-8601 timestamp or commit prefix also works; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. |
+| `--at <TIME>` | Query at a specific point in time. `t:<N>` (transaction number), `t:latest` or `latest`, `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. |
 | `--normalize-arrays` | Always wrap multi-value properties in arrays (graph-crawl JSON-LD queries only) |
 | `--bench` | Benchmark mode: time execution only and print the first 5 rows as a table (no full-result JSON formatting) |
 | `--explain` | Print the query plan without executing it |

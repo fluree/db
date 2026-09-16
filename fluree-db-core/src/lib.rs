@@ -144,7 +144,7 @@ pub use index_stats::{
 pub use ledger_id::{
     format_ledger_id, normalize_ledger_id, parse_ledger_id_with_time, parse_time_travel_spec,
     split_ledger_id, split_time_travel_suffix, validate_branch_name, LedgerIdParseError,
-    LedgerIdTimeSpec, ParsedLedgerId, DEFAULT_BRANCH, TIME_TRAVEL_TAGS,
+    LedgerIdTimeSpec, ParsedLedgerId, COMMIT_PREFIX_MIN_LEN, DEFAULT_BRANCH, TIME_TRAVEL_TAGS,
 };
 pub use namespaces::{
     default_namespace_codes, is_owl_class_class, is_owl_datatype_property_class,

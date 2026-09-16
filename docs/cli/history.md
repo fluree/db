@@ -19,7 +19,7 @@ fluree history <ENTITY> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
-| `--from <TIME>` | Start of time range (default: `1`). `t:<N>` (transaction number), `t:latest` or `latest`, `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>` (min 6 chars). A bare transaction number, ISO-8601 timestamp or commit prefix also works; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. |
+| `--from <TIME>` | Start of time range (default: `1`). `t:<N>` (transaction number), `t:latest` or `latest`, `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. |
 | `--to <TIME>` | End of time range (default: `latest`). Same spellings as `--from`. |
 | `-p, --predicate <PRED>` | Filter to specific predicate |
 | `--format <FORMAT>` | Output format: `json`, `table`, or `csv` (default: `table`) |

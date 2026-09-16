@@ -65,6 +65,25 @@ impl CommitRef {
     /// **A bare integer is a `t`, not a prefix.** `123456` is simultaneously a
     /// valid `t` and a valid 6-character hex prefix. `commit:123456` forces the
     /// prefix reading; `t:123456` forces the other.
+    ///
+    /// # Why there is no [`COMMIT_PREFIX_MIN_LEN`] check here
+    ///
+    /// [`TimeSpec::parse_at`](crate::TimeSpec::parse_at) rejects a too-short
+    /// prefix at the boundary and this deliberately does not, which looks like
+    /// an inconsistency. It is not, for two reasons.
+    ///
+    /// The floor is already applied to every [`CommitRef::Prefix`]:
+    /// [`LedgerView::resolve_commit`] routes it through
+    /// [`normalize_commit_ref`], which enforces the same constant with the same
+    /// message. A check here would be a second application on that path, not a
+    /// missing one.
+    ///
+    /// More decisively, it would measure the wrong string. `normalize_commit_ref`
+    /// strips `fluree:commit:` / `sha256:` and decodes canonical CIDs *before*
+    /// measuring; this function does none of that. `sha256:abc` is ten
+    /// characters here and three there, so a parse-time floor would pass a
+    /// string the resolver correctly rejects — a check that looks like it
+    /// happened and did not. The length rule belongs where the stripping does.
     pub fn parse(s: &str) -> Result<Self> {
         if let Some(t_str) = s.strip_prefix("t:") {
             let t: i64 = t_str
@@ -236,12 +255,11 @@ impl LedgerView {
 /// hex prefix of six characters or more can collide with it.
 pub(crate) const COMMIT_CID_CONSTANT_HEAD: &str = "bagaybqabciq";
 
-/// The shortest commit hex prefix either resolver will scan for.
-///
-/// Exported because anything that *prints* an abbreviated commit id has to
-/// clear it, or its output cannot be pasted back in. `fluree log`'s
-/// `ABBREV_LEN` is checked against this so the two cannot drift apart.
-pub const COMMIT_PREFIX_MIN_LEN: usize = 6;
+// The shortest commit hex prefix either resolver will scan for. Defined in
+// `fluree-db-core` so the address grammar (`parse_time_travel_spec`) can apply
+// the same floor without depending on this crate; re-exported here, and from
+// the crate root, because this is where callers expect to find it.
+pub use fluree_db_core::ledger_id::COMMIT_PREFIX_MIN_LEN;
 
 /// The hex digest a commit resolver scans for, from any spelling a user types.
 ///

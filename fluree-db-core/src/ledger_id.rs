@@ -94,6 +94,18 @@ pub fn parse_ledger_id_with_time(ledger_id: &str) -> Result<ParsedLedgerId, Ledg
     Ok(ParsedLedgerId { name, branch, time })
 }
 
+/// Shortest commit hex-digest prefix any surface will accept.
+///
+/// The rule belongs to the prefix *scan* — below this a prefix stops being
+/// selective — so `fluree_db_api::ledger_view::normalize_commit_ref` is its
+/// authority and applies it after stripping `fluree:commit:` / `sha256:` and
+/// decoding canonical CIDs. It lives here because the address grammar
+/// ([`parse_time_travel_spec`]) has to reject `@commit:abc` without a ledger in
+/// hand, and `fluree-db-api` cannot be depended on from this crate. Re-exported
+/// as `fluree_db_api::COMMIT_PREFIX_MIN_LEN`, which is where callers should
+/// reach for it.
+pub const COMMIT_PREFIX_MIN_LEN: usize = 6;
+
 /// The tags [`parse_time_travel_spec`] recognises, in the order it tries them.
 ///
 /// Exposed so surfaces that layer their own spellings on top of this grammar —
@@ -106,7 +118,8 @@ pub const TIME_TRAVEL_TAGS: [&str; 4] = ["t:", "iso:", "commit:", "recorded:"];
 /// spec such as a CLI `--at` argument.
 ///
 /// Accepts `t:<N>`, `iso:<timestamp>`, `recorded:<timestamp>` and
-/// `commit:<prefix>` (at least 6 characters). `t:latest` is deliberately *not*
+/// `commit:<prefix>` (at least [`COMMIT_PREFIX_MIN_LEN`] characters). `t:latest` is
+/// deliberately *not*
 /// accepted: [`LedgerIdTimeSpec`] has no "latest" variant because resolving one
 /// needs the ledger's current `t`, which this layer does not have. Callers that
 /// support it (`fluree_db_api::TimeSpec::parse`) take it before delegating here.
@@ -142,10 +155,10 @@ pub fn parse_time_travel_spec(
                 "Missing value after '{sigil}commit:'"
             )));
         }
-        if val.len() < 6 {
-            return Err(LedgerIdParseError::new(
-                "Commit prefix must be at least 6 characters",
-            ));
+        if val.len() < COMMIT_PREFIX_MIN_LEN {
+            return Err(LedgerIdParseError::new(format!(
+                "Commit prefix must be at least {COMMIT_PREFIX_MIN_LEN} characters"
+            )));
         }
         Ok(LedgerIdTimeSpec::AtCommit(val.to_string()))
     } else if let Some(val) = spec.strip_prefix("recorded:") {
