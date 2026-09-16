@@ -94,6 +94,74 @@ pub fn parse_ledger_id_with_time(ledger_id: &str) -> Result<ParsedLedgerId, Ledg
     Ok(ParsedLedgerId { name, branch, time })
 }
 
+/// The tags [`parse_time_travel_spec`] recognises, in the order it tries them.
+///
+/// Exposed so surfaces that layer their own spellings on top of this grammar —
+/// `fluree_db_api::TimeSpec::parse_at`, which also accepts a bare integer and a
+/// bare ISO-8601 timestamp — can tell "the user reached for a canonical tag and
+/// got it wrong" apart from "the user typed one of the bare forms".
+pub const TIME_TRAVEL_TAGS: [&str; 4] = ["t:", "iso:", "recorded:", "commit:"];
+
+/// Parse a time-travel spec: the part of a ledger address after `@`, or a bare
+/// spec such as a CLI `--at` argument.
+///
+/// Accepts `t:<N>`, `iso:<timestamp>`, `recorded:<timestamp>` and
+/// `commit:<prefix>` (at least 6 characters). `t:latest` is deliberately *not*
+/// accepted: [`LedgerIdTimeSpec`] has no "latest" variant because resolving one
+/// needs the ledger's current `t`, which this layer does not have. Callers that
+/// support it (`fluree_db_api::TimeSpec::parse`) take it before delegating here.
+///
+/// `sigil` is what the calling surface writes in front of a tag when it quotes
+/// one back to the user: `"@"` for a ledger address, `""` for a bare spec. It
+/// reaches error text only, so `mydb@t:` and `--at t:` each report the spelling
+/// that was actually typed rather than the other surface's.
+pub fn parse_time_travel_spec(
+    spec: &str,
+    sigil: &str,
+) -> Result<LedgerIdTimeSpec, LedgerIdParseError> {
+    if let Some(val) = spec.strip_prefix("t:") {
+        if val.is_empty() {
+            return Err(LedgerIdParseError::new(format!(
+                "Missing value after '{sigil}t:'"
+            )));
+        }
+        let t: i64 = val.parse().map_err(|_| {
+            LedgerIdParseError::new(format!("Invalid integer for {sigil}t: '{val}'"))
+        })?;
+        Ok(LedgerIdTimeSpec::AtT(t))
+    } else if let Some(val) = spec.strip_prefix("iso:") {
+        if val.is_empty() {
+            return Err(LedgerIdParseError::new(format!(
+                "Missing value after '{sigil}iso:'"
+            )));
+        }
+        Ok(LedgerIdTimeSpec::AtIso(val.to_string()))
+    } else if let Some(val) = spec.strip_prefix("commit:") {
+        if val.is_empty() {
+            return Err(LedgerIdParseError::new(format!(
+                "Missing value after '{sigil}commit:'"
+            )));
+        }
+        if val.len() < 6 {
+            return Err(LedgerIdParseError::new(
+                "Commit prefix must be at least 6 characters",
+            ));
+        }
+        Ok(LedgerIdTimeSpec::AtCommit(val.to_string()))
+    } else if let Some(val) = spec.strip_prefix("recorded:") {
+        if val.is_empty() {
+            return Err(LedgerIdParseError::new(format!(
+                "Missing value after '{sigil}recorded:'"
+            )));
+        }
+        Ok(LedgerIdTimeSpec::AtRecorded(val.to_string()))
+    } else {
+        Err(LedgerIdParseError::new(format!(
+            "Invalid time travel format: '{spec}'. Expected {sigil}t:, {sigil}iso:, {sigil}recorded:, or {sigil}commit: prefix"
+        )))
+    }
+}
+
 /// Split a ledger ID string into its base and optional time-travel suffix.
 ///
 /// This does not interpret `:`; it only handles `@t:`, `@iso:`, `@recorded:`, and `@commit:`.
@@ -110,41 +178,9 @@ pub fn split_time_travel_suffix(
             ));
         }
 
-        let time = if let Some(val) = time_str.strip_prefix("t:") {
-            if val.is_empty() {
-                return Err(LedgerIdParseError::new("Missing value after '@t:'"));
-            }
-            let t: i64 = val
-                .parse()
-                .map_err(|_| LedgerIdParseError::new(format!("Invalid integer for @t: '{val}'")))?;
-            Some(LedgerIdTimeSpec::AtT(t))
-        } else if let Some(val) = time_str.strip_prefix("iso:") {
-            if val.is_empty() {
-                return Err(LedgerIdParseError::new("Missing value after '@iso:'"));
-            }
-            Some(LedgerIdTimeSpec::AtIso(val.to_string()))
-        } else if let Some(val) = time_str.strip_prefix("commit:") {
-            if val.is_empty() {
-                return Err(LedgerIdParseError::new("Missing value after '@commit:'"));
-            }
-            if val.len() < 6 {
-                return Err(LedgerIdParseError::new(
-                    "Commit prefix must be at least 6 characters",
-                ));
-            }
-            Some(LedgerIdTimeSpec::AtCommit(val.to_string()))
-        } else if let Some(val) = time_str.strip_prefix("recorded:") {
-            if val.is_empty() {
-                return Err(LedgerIdParseError::new("Missing value after '@recorded:'"));
-            }
-            Some(LedgerIdTimeSpec::AtRecorded(val.to_string()))
-        } else {
-            return Err(LedgerIdParseError::new(format!(
-                "Invalid time travel format: '{time_str}'. Expected @t:, @iso:, @recorded:, or @commit: prefix"
-            )));
-        };
+        let time = parse_time_travel_spec(time_str, "@")?;
 
-        Ok((base.to_string(), time))
+        Ok((base.to_string(), Some(time)))
     } else {
         Ok((ledger_id.to_string(), None))
     }

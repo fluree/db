@@ -44,24 +44,42 @@ pub enum CommitRef {
 impl CommitRef {
     /// Parse a user-supplied commit reference string.
     ///
-    /// - `"t:N"` → [`CommitRef::T`] with transaction number `N`
+    /// - `"t:N"` or a bare integer → [`CommitRef::T`] with transaction number `N`
+    /// - `"commit:<prefix>"` or a bare hex digest prefix → [`CommitRef::Prefix`]
+    ///   (the `fluree:commit:` / `sha256:` prefixed hex forms are handled by the
+    ///   prefix resolver)
     /// - a valid multibase CID (e.g., `"bagaybqabciq..."`) → [`CommitRef::Exact`]
-    /// - anything else → [`CommitRef::Prefix`] (hex digest prefixes, and the
-    ///   `fluree:commit:` / `sha256:` prefixed hex forms, are all handled by
-    ///   the prefix resolver)
     ///
     /// A CID counts only in its canonical spelling — see
     /// [`ContentId::parse_canonical`] for why. A hex digest taken as a CID here
     /// would become [`CommitRef::Exact`] of a commit nobody named, skipping the
-    /// prefix scan entirely.
+    /// prefix scan entirely. A bare integer is checked first, and cannot collide:
+    /// a canonical CID always carries its multibase prefix letter.
+    ///
+    /// The bare integer and `commit:` spellings exist so that every surface
+    /// spelling a *commit* accepts the same strings as one spelling a *point in
+    /// time* ([`crate::TimeSpec::parse_at`]) wherever the two overlap. Before
+    /// #1805 they were exactly inverted: `branch create --at t:2` worked and
+    /// rejected `2`, while `query --at 2` worked and rejected `t:2`.
+    ///
+    /// **A bare integer is a `t`, not a prefix.** `123456` is simultaneously a
+    /// valid `t` and a valid 6-character hex prefix. `commit:123456` forces the
+    /// prefix reading; `t:123456` forces the other.
     pub fn parse(s: &str) -> Result<Self> {
         if let Some(t_str) = s.strip_prefix("t:") {
             let t: i64 = t_str
                 .parse()
                 .map_err(|_| ApiError::query(format!("invalid t value in commit ref '{s}'")))?;
             Ok(CommitRef::T(t))
+        } else if let Some(prefix) = s.strip_prefix("commit:") {
+            if prefix.is_empty() {
+                return Err(ApiError::query(format!("empty commit prefix in '{s}'")));
+            }
+            Ok(CommitRef::Prefix(prefix.to_string()))
         } else if s.is_empty() {
             Err(ApiError::query("empty commit reference"))
+        } else if let Ok(t) = s.parse::<i64>() {
+            Ok(CommitRef::T(t))
         } else if let Some(cid) = ContentId::parse_canonical(s) {
             Ok(CommitRef::Exact(cid))
         } else {
@@ -504,6 +522,62 @@ async fn resolve_t_to_commit_id(
 mod tests {
     use super::*;
     use fluree_db_core::ContentKind;
+
+    /// `--at` used to mean two contradictory things: `branch create --at t:2`
+    /// worked and rejected `2`, while `query --at 2` worked and rejected `t:2`
+    /// (#1805). The two grammars denote different things — a commit versus a
+    /// point in time — so they stay separate, but every spelling they *share*
+    /// must parse the same way on both. These pin the commit half.
+    #[test]
+    fn parse_accepts_a_bare_transaction_number() {
+        assert_eq!(CommitRef::parse("2").unwrap(), CommitRef::T(2));
+        assert_eq!(CommitRef::parse("0").unwrap(), CommitRef::T(0));
+        assert_eq!(
+            CommitRef::parse("2").unwrap(),
+            CommitRef::parse("t:2").unwrap(),
+            "bare and tagged spellings of t=2 must agree"
+        );
+    }
+
+    #[test]
+    fn parse_accepts_the_commit_tag() {
+        assert_eq!(
+            CommitRef::parse("commit:abc123").unwrap(),
+            CommitRef::Prefix("abc123".to_string())
+        );
+        assert_eq!(
+            CommitRef::parse("commit:abc123").unwrap(),
+            CommitRef::parse("abc123").unwrap(),
+            "tagged and bare spellings of a hex prefix must agree"
+        );
+        assert!(CommitRef::parse("commit:").is_err());
+    }
+
+    /// An all-digit string of 6+ characters is both a valid `t` and a valid hex
+    /// prefix; `t` wins, matching what `--at` has always done. `commit:` is the
+    /// escape hatch, and without it the ambiguity would be unresolvable.
+    #[test]
+    fn parse_resolves_the_digits_ambiguity_toward_t() {
+        assert_eq!(CommitRef::parse("123456").unwrap(), CommitRef::T(123_456));
+        assert_eq!(
+            CommitRef::parse("commit:123456").unwrap(),
+            CommitRef::Prefix("123456".to_string())
+        );
+    }
+
+    /// Accepting a bare integer must not shadow the CID arm. It cannot: a
+    /// canonical CID always carries its multibase prefix letter, so it never
+    /// parses as `i64`.
+    #[test]
+    fn bare_integer_arm_does_not_shadow_a_canonical_cid() {
+        let cid = ContentId::new(ContentKind::Commit, b"digits-arm-probe");
+        let s = cid.to_string();
+        assert!(
+            s.parse::<i64>().is_err(),
+            "a CID must not parse as an integer: {s}"
+        );
+        assert!(matches!(CommitRef::parse(&s).unwrap(), CommitRef::Exact(_)));
+    }
 
     /// `parse` must accept the multibase CID string produced by
     /// `ContentId::Display` and return [`CommitRef::Exact`]. If it falls

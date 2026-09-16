@@ -31,7 +31,9 @@
 //! let result = fluree.query_dataset(&dataset, &query).await?;
 //! ```
 
-use fluree_db_core::ledger_id::{split_time_travel_suffix, LedgerIdTimeSpec};
+use fluree_db_core::ledger_id::{
+    parse_time_travel_spec, LedgerIdParseError, LedgerIdTimeSpec, TIME_TRAVEL_TAGS,
+};
 use fluree_db_core::VerifiedIdentity;
 use fluree_db_sparql::ast::{DatasetClause as SparqlDatasetClause, IriValue};
 
@@ -505,6 +507,95 @@ impl TimeSpec {
     /// Create latest specification
     pub fn latest() -> Self {
         Self::Latest
+    }
+
+    /// Parse the canonical time-travel grammar: a ledger address's `@` suffix
+    /// (`mydb:main@t:5`) with the `@` removed.
+    ///
+    /// | spelling | meaning |
+    /// |---|---|
+    /// | `t:<N>` | transaction number `N` |
+    /// | `t:latest` | the ledger's current head |
+    /// | `iso:<timestamp>` | commit *event* time (`db:time`) |
+    /// | `recorded:<timestamp>` | wall-clock time the commit was recorded (`db:receivedAt`) |
+    /// | `commit:<prefix>` | commit hex-digest prefix, at least 6 characters |
+    ///
+    /// This is an address grammar, so it is deliberately strict — widening it
+    /// here widens what `ledger@<spec>` accepts on every query surface. User
+    /// typed `--at` / `at=` arguments go through [`TimeSpec::parse_at`], which
+    /// layers the CLI's older bare spellings on top without touching this one.
+    pub fn parse(spec: &str) -> Result<Self, LedgerIdParseError> {
+        // `LedgerIdTimeSpec` has no `Latest`: resolving it needs the ledger's
+        // current `t`, which the core parser has no access to. Taking it here
+        // is what makes `@t:latest` work, and is the case `dataset.rs` used to
+        // special-case in its own copy of this logic.
+        if spec == "t:latest" {
+            return Ok(TimeSpec::Latest);
+        }
+        parse_time_travel_spec(spec, "").map(TimeSpec::from)
+    }
+
+    /// Parse an `--at` / `at=` argument: [`TimeSpec::parse`]'s grammar plus the
+    /// three bare spellings the CLI and `POST /export` accepted before the
+    /// canonical tags were wired up.
+    ///
+    /// Beyond the tagged forms it accepts, in this order:
+    ///
+    /// - `latest` — the untagged spelling of `t:latest`, which `fluree history
+    ///   --to` has always taken.
+    /// - a bare integer → `AtT`
+    /// - a string containing both `-` and `:` → `AtTime` (an ISO-8601 timestamp)
+    /// - anything else → `AtCommit` (a bare hex-digest prefix)
+    ///
+    /// **A bare integer is a `t`, not a commit prefix.** `123456` is both a
+    /// valid `t` and a valid 6-character hex prefix; this grammar resolves the
+    /// ambiguity in favour of `t` because that is what `--at` has always done.
+    /// `commit:123456` forces the prefix reading and `t:123456` forces the
+    /// other — which is the point of having the tags.
+    ///
+    /// A spec that *starts with* a canonical tag is never reinterpreted as one
+    /// of the bare forms: `--at t:abc` is a malformed `t:`, not a commit prefix
+    /// named `t:abc`. Silently falling through was the whole of #1805.
+    pub fn parse_at(spec: &str) -> Result<Self, LedgerIdParseError> {
+        if spec == "latest" {
+            return Ok(TimeSpec::Latest);
+        }
+        if TIME_TRAVEL_TAGS.iter().any(|tag| spec.starts_with(tag)) {
+            return Self::parse(spec).map_err(|e| {
+                LedgerIdParseError::new(format!("{e}. {ACCEPTED_TIME_SPEC_SPELLINGS}"))
+            });
+        }
+        if spec.is_empty() {
+            return Err(LedgerIdParseError::new(format!(
+                "Empty time spec. {ACCEPTED_TIME_SPEC_SPELLINGS}"
+            )));
+        }
+        if let Ok(t) = spec.parse::<i64>() {
+            return Ok(TimeSpec::AtT(t));
+        }
+        if spec.contains('-') && spec.contains(':') {
+            // Looks like ISO-8601 (e.g. "2024-01-15T10:30:00Z").
+            return Ok(TimeSpec::AtTime(spec.to_string()));
+        }
+        Ok(TimeSpec::AtCommit(spec.to_string()))
+    }
+}
+
+/// The spellings [`TimeSpec::parse_at`] accepts, quoted back when a user reaches
+/// for a canonical tag and mis-spells it.
+pub const ACCEPTED_TIME_SPEC_SPELLINGS: &str =
+    "Accepted: t:<N>, t:latest, latest, iso:<ISO-8601>, recorded:<ISO-8601>, \
+     commit:<hex-prefix>, a bare transaction number, a bare ISO-8601 timestamp, \
+     or a bare commit hex-digest prefix";
+
+impl From<LedgerIdTimeSpec> for TimeSpec {
+    fn from(spec: LedgerIdTimeSpec) -> Self {
+        match spec {
+            LedgerIdTimeSpec::AtT(t) => TimeSpec::AtT(t),
+            LedgerIdTimeSpec::AtIso(value) => TimeSpec::AtTime(value),
+            LedgerIdTimeSpec::AtCommit(value) => TimeSpec::AtCommit(value),
+            LedgerIdTimeSpec::AtRecorded(value) => TimeSpec::AtRecorded(value),
+        }
     }
 }
 
@@ -1018,26 +1109,22 @@ fn parse_ledger_id_time_travel(
     };
     let fragment_suffix = fragment.map(|f| format!("#{f}")).unwrap_or_default();
 
-    // Check for @t:latest special case before standard parsing
-    if let Some(base) = before_fragment.strip_suffix("@t:latest") {
-        if base.is_empty() {
-            return Err(DatasetParseError::InvalidGraphSource(
-                "Ledger ID cannot be empty before '@'".to_string(),
-            ));
+    // The suffix grammar itself lives in `TimeSpec::parse`, shared with the
+    // CLI's `--at` and the server's `at=` (#1805). All this layer does is find
+    // the `@` and re-attach the fragment.
+    let (identifier, time_spec) = match before_fragment.split_once('@') {
+        Some((base, spec)) => {
+            if base.is_empty() {
+                return Err(DatasetParseError::InvalidGraphSource(
+                    "Ledger ID cannot be empty before '@'".to_string(),
+                ));
+            }
+            let spec = TimeSpec::parse(spec)
+                .map_err(|e| DatasetParseError::InvalidGraphSource(e.to_string()))?;
+            (base, Some(spec))
         }
-        let identifier = format!("{base}{fragment_suffix}");
-        return Ok((identifier, Some(TimeSpec::Latest)));
-    }
-
-    let (identifier, time) = split_time_travel_suffix(before_fragment)
-        .map_err(|e| DatasetParseError::InvalidGraphSource(e.to_string()))?;
-
-    let time_spec = time.map(|spec| match spec {
-        LedgerIdTimeSpec::AtT(t) => TimeSpec::AtT(t),
-        LedgerIdTimeSpec::AtIso(value) => TimeSpec::AtTime(value),
-        LedgerIdTimeSpec::AtCommit(value) => TimeSpec::AtCommit(value),
-        LedgerIdTimeSpec::AtRecorded(value) => TimeSpec::AtRecorded(value),
-    });
+        None => (before_fragment, None),
+    };
 
     Ok((format!("{identifier}{fragment_suffix}"), time_spec))
 }
@@ -1433,6 +1520,208 @@ pub fn sparql_dataset_ledger_ids(sparql: &str) -> Result<Vec<String>, DatasetPar
     }
 
     Ok(ledger_ids)
+}
+
+#[cfg(test)]
+mod time_spec_grammar_tests {
+    //! The `--at` / `at=` / `@`-suffix grammar (#1805).
+    //!
+    //! Before this, three surfaces hand-rolled a heuristic that recognised a
+    //! bare integer and a bare ISO-8601 timestamp and swept *everything else*
+    //! into `AtCommit` — so `t:2` reached the commit-prefix resolver as the
+    //! literal string `"t:2"` and failed with "Commit prefix must be at least
+    //! 6 characters, got 3". Every tagged spelling below is a case that used
+    //! to do that.
+
+    use super::*;
+
+    /// Every canonical tag, on the strict grammar an address uses.
+    #[test]
+    fn parse_accepts_every_canonical_tag() {
+        assert_eq!(TimeSpec::parse("t:2").unwrap(), TimeSpec::AtT(2));
+        assert_eq!(TimeSpec::parse("t:0").unwrap(), TimeSpec::AtT(0));
+        assert_eq!(TimeSpec::parse("t:latest").unwrap(), TimeSpec::Latest);
+        assert_eq!(
+            TimeSpec::parse("iso:2024-01-15T10:30:00Z").unwrap(),
+            TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string())
+        );
+        assert_eq!(
+            TimeSpec::parse("recorded:2024-01-15T10:30:00Z").unwrap(),
+            TimeSpec::AtRecorded("2024-01-15T10:30:00Z".to_string())
+        );
+        assert_eq!(
+            TimeSpec::parse("commit:abc123def").unwrap(),
+            TimeSpec::AtCommit("abc123def".to_string())
+        );
+    }
+
+    /// The address grammar must stay strict: it is what `ledger@<spec>` accepts
+    /// on every query surface, so the CLI's bare compatibility spellings must
+    /// not leak into it.
+    #[test]
+    fn parse_rejects_the_bare_cli_spellings() {
+        for bare in ["2", "latest", "2024-01-15T10:30:00Z", "abc123def"] {
+            assert!(
+                TimeSpec::parse(bare).is_err(),
+                "address grammar must reject the bare spelling {bare:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_malformed_tagged_specs() {
+        for bad in ["t:", "t:abc", "iso:", "commit:", "commit:abc", "recorded:"] {
+            assert!(
+                TimeSpec::parse(bad).is_err(),
+                "expected {bad:?} to be an error"
+            );
+        }
+    }
+
+    /// Error text quotes the tag as the caller's surface spells it — no `@` for
+    /// a bare spec. The address path passes `"@"` and keeps its own wording,
+    /// which `it_query_time_travel.rs` pins.
+    #[test]
+    fn parse_error_text_omits_the_address_sigil() {
+        let err = TimeSpec::parse("t:").unwrap_err().to_string();
+        assert!(err.contains("'t:'"), "got: {err}");
+        assert!(
+            !err.contains('@'),
+            "bare-spec error must not mention '@': {err}"
+        );
+    }
+
+    /// The `--at` grammar is the canonical one plus three bare spellings.
+    #[test]
+    fn parse_at_accepts_canonical_and_legacy_spellings() {
+        // Canonical — every one of these was broken before #1805.
+        assert_eq!(TimeSpec::parse_at("t:2").unwrap(), TimeSpec::AtT(2));
+        assert_eq!(TimeSpec::parse_at("t:latest").unwrap(), TimeSpec::Latest);
+        assert_eq!(
+            TimeSpec::parse_at("iso:2024-01-15T10:30:00Z").unwrap(),
+            TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string())
+        );
+        assert_eq!(
+            TimeSpec::parse_at("recorded:2024-01-15T10:30:00Z").unwrap(),
+            TimeSpec::AtRecorded("2024-01-15T10:30:00Z".to_string())
+        );
+        assert_eq!(
+            TimeSpec::parse_at("commit:abc123def").unwrap(),
+            TimeSpec::AtCommit("abc123def".to_string())
+        );
+
+        // Legacy bare spellings, which must keep working.
+        assert_eq!(TimeSpec::parse_at("2").unwrap(), TimeSpec::AtT(2));
+        assert_eq!(TimeSpec::parse_at("latest").unwrap(), TimeSpec::Latest);
+        assert_eq!(
+            TimeSpec::parse_at("2024-01-15T10:30:00Z").unwrap(),
+            TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string())
+        );
+        assert_eq!(
+            TimeSpec::parse_at("abc123def").unwrap(),
+            TimeSpec::AtCommit("abc123def".to_string())
+        );
+    }
+
+    /// `t:2` and `2` must denote the same instant — the equivalence the CLI's
+    /// integration tests assert row-for-row.
+    #[test]
+    fn parse_at_tagged_and_bare_integers_agree() {
+        for t in [0_i64, 1, 42, 123_456] {
+            assert_eq!(
+                TimeSpec::parse_at(&t.to_string()).unwrap(),
+                TimeSpec::parse_at(&format!("t:{t}")).unwrap(),
+                "bare and tagged spellings of t={t} must agree"
+            );
+        }
+    }
+
+    /// A string that *starts with* a canonical tag is never reinterpreted as a
+    /// bare form. This is the actual bug: the old heuristic's catch-all turned
+    /// `t:abc` into `AtCommit("t:abc")` and let it fail downstream, three
+    /// layers from the typo.
+    #[test]
+    fn parse_at_never_falls_back_to_a_prefix_for_a_tagged_spec() {
+        for bad in ["t:abc", "iso:", "commit:abc", "recorded:", "t:"] {
+            let err = TimeSpec::parse_at(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("Accepted: t:<N>"),
+                "{bad:?} must report the accepted spellings, got: {err}"
+            );
+        }
+        assert!(TimeSpec::parse_at("").is_err());
+    }
+
+    /// An all-digit string of 6+ characters is both a valid `t` and a valid hex
+    /// prefix. `--at` has always resolved that in favour of `t`; `commit:`
+    /// is the documented escape hatch, and this pins both halves.
+    #[test]
+    fn parse_at_resolves_the_digits_ambiguity_toward_t() {
+        assert_eq!(
+            TimeSpec::parse_at("123456").unwrap(),
+            TimeSpec::AtT(123_456)
+        );
+        assert_eq!(
+            TimeSpec::parse_at("commit:123456").unwrap(),
+            TimeSpec::AtCommit("123456".to_string())
+        );
+    }
+
+    /// The address path and the `--at` path are the same grammar modulo the
+    /// `@`, which is the property that made "call the shared parser" the fix.
+    #[test]
+    fn address_suffix_and_bare_spec_agree_on_the_canonical_grammar() {
+        for spec in [
+            "t:7",
+            "t:latest",
+            "iso:2024-01-15T10:30:00Z",
+            "recorded:2024-01-15T10:30:00Z",
+            "commit:abc123def",
+        ] {
+            let (identifier, from_address) =
+                parse_ledger_id_time_travel(&format!("mydb:main@{spec}")).unwrap();
+            assert_eq!(identifier, "mydb:main");
+            assert_eq!(
+                from_address.unwrap(),
+                TimeSpec::parse(spec).unwrap(),
+                "address suffix @{spec} must mean the same as the bare spec {spec}"
+            );
+        }
+    }
+
+    /// `@t:latest` used to be special-cased above the parser in this file; it
+    /// now lives in `TimeSpec::parse`, including with a fragment selector.
+    #[test]
+    fn address_latest_still_parses_with_and_without_a_fragment() {
+        let (id, spec) = parse_ledger_id_time_travel("mydb:main@t:latest").unwrap();
+        assert_eq!((id.as_str(), spec), ("mydb:main", Some(TimeSpec::Latest)));
+
+        let (id, spec) = parse_ledger_id_time_travel("mydb:main@t:latest#txn-meta").unwrap();
+        assert_eq!(
+            (id.as_str(), spec),
+            ("mydb:main#txn-meta", Some(TimeSpec::Latest))
+        );
+
+        assert!(parse_ledger_id_time_travel("@t:latest").is_err());
+    }
+
+    #[test]
+    fn from_ledger_id_time_spec_maps_every_variant() {
+        use fluree_db_core::ledger_id::LedgerIdTimeSpec;
+        assert_eq!(TimeSpec::from(LedgerIdTimeSpec::AtT(3)), TimeSpec::AtT(3));
+        assert_eq!(
+            TimeSpec::from(LedgerIdTimeSpec::AtIso("x".into())),
+            TimeSpec::AtTime("x".into())
+        );
+        assert_eq!(
+            TimeSpec::from(LedgerIdTimeSpec::AtRecorded("x".into())),
+            TimeSpec::AtRecorded("x".into())
+        );
+        assert_eq!(
+            TimeSpec::from(LedgerIdTimeSpec::AtCommit("abc123".into())),
+            TimeSpec::AtCommit("abc123".into())
+        );
+    }
 }
 
 #[cfg(test)]
