@@ -316,6 +316,11 @@ path = "tests/it_count_datatype_pin.rs"
 name = "it_fastpath_1652_regression"
 path = "tests/it_fastpath_1652_regression.rs"
 
+# Own binary for the same reason (kill switch + routing assertions).
+[[test]]
+name = "it_fastpath_1863_regression"
+path = "tests/it_fastpath_1863_regression.rs"
+
 # Own binary: toggles the process-global fast-path kill switch.
 [[test]]
 name = "it_datetime_component_presence"
