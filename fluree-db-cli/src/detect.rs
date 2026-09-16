@@ -28,6 +28,7 @@ pub fn detect_data_format(
         return match fmt.to_lowercase().as_str() {
             "turtle" | "ttl" => Ok(DataFormat::Turtle),
             "jsonld" | "json-ld" | "json" => Ok(DataFormat::JsonLd),
+            other if is_dataset_format(other) => Err(CliError::Usage(dataset_format_help(other))),
             other => Err(CliError::Usage(format!(
                 "unknown data format '{other}'\n  {} valid formats: turtle (ttl), jsonld (json-ld, json)",
                 colored::Colorize::bold(colored::Colorize::cyan("help:"))
@@ -58,6 +59,14 @@ pub fn detect_data_format(
                 // `.nt` (N-Triples) is a Turtle subset — same parser.
                 "ttl" | "nt" => Ok(DataFormat::Turtle),
                 "json" | "jsonld" => Ok(DataFormat::JsonLd),
+                // A dataset file would otherwise sniff as Turtle and die
+                // inside the parser on its first `GRAPH`, which tells the
+                // reader nothing. Now that `fluree export --format trig`
+                // produces these routinely, feeding one straight back is the
+                // obvious next move and it deserves the actual answer.
+                other if is_dataset_format(other) => {
+                    Err(CliError::Usage(dataset_format_help(other)))
+                }
                 _ => sniff_data_format(content),
             };
         }
@@ -65,6 +74,22 @@ pub fn detect_data_format(
 
     // Content sniffing
     sniff_data_format(content)
+}
+
+/// Dataset serializations: they carry named graphs, which `insert`/`upsert`
+/// have no way to place.
+fn is_dataset_format(s: &str) -> bool {
+    matches!(s, "trig" | "nq" | "nquads" | "n-quads")
+}
+
+/// One message for both routes into the same dead end.
+fn dataset_format_help(fmt: &str) -> String {
+    format!(
+        "'{fmt}' is a dataset format and carries named graphs, which insert cannot place\n  \
+         {} import it with `fluree create <ledger> --from <file>.{fmt}`, which reads \
+         named graphs",
+        colored::Colorize::bold(colored::Colorize::cyan("help:"))
+    )
 }
 
 fn sniff_data_format(content: &str) -> CliResult<DataFormat> {

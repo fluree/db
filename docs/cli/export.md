@@ -25,7 +25,7 @@ fluree export [LEDGER] [OPTIONS]
 | `--raw-reifies` | Emit edge annotations as raw `f:reifies*` system triples instead of RDF 1.2 annotation syntax (pre-4.2 output). |
 | `--context <JSON>` | JSON-LD context for prefix declarations. Overrides the ledger's default context. |
 | `--context-file <FILE>` | Read context from a JSON file. Overrides the ledger's default context. |
-| `--at <TIME>` | Export data as of a specific point in time. Accepts a transaction number (`5`), ISO-8601 datetime (`2024-01-15T10:30:00Z`), or commit CID prefix (`abc123def456`). If omitted, exports at the latest committed time (including data committed but not yet persisted to index). |
+| `--at <TIME>` | Export data as of a specific point in time. `t:<N>` (transaction number), `t:latest` or `latest`, `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>` (min 6 chars). A bare transaction number, ISO-8601 timestamp or commit prefix also works; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. If omitted, exports at the latest committed time (including data committed but not yet persisted to index). |
 
 ## Formats
 

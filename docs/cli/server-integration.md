@@ -1054,6 +1054,18 @@ backpressure and other commit-time conditions still apply. With
 `include_validation=false` it reflects only the conflict/strategy
 interaction.
 
+### Response headers
+
+A successful export reports what it left out, so a client is not left inferring
+completeness from a `200`. Each header is present only when its count is
+non-zero, so a clean export carries none of them.
+
+| Header | Meaning |
+|--------|---------|
+| `x-fluree-export-named-graphs-omitted` | User-visible named graphs the ledger holds that this export did not cover — set when a dataset format ran without `all_graphs`. |
+| `x-fluree-export-annotations-unresolved` | Edge annotations that could not be represented and are **not** in the body. Re-request with `raw_reifies` to get them as `f:reifies*` triples. |
+| `x-fluree-export-rows-skipped` | Rows the writer could not represent (unresolvable predicate id, or a value that decoded to null). |
+
 ### Error responses
 
 | Status | When |
@@ -2051,7 +2063,7 @@ Content-Type: application/json
 | `system_graphs` | bool | No | `false` | Also emit the system graphs under `all_graphs`. Diagnostic only — the result is named for the source ledger and does not re-import cleanly. |
 | `graph` | string | No | — | IRI of a single named graph to export. Mutually exclusive with `all_graphs`. |
 | `context` | object | No | ledger default | Prefix map for Turtle/TriG/JSON-LD output. Either a bare object (`{ "ex": "..." }`) or `{ "@context": {...} }`. Falls back to the ledger's stored default context when absent. |
-| `at` | string | No | latest | Time spec — integer (`"42"`), ISO-8601 datetime (`"2026-01-15T10:30:00Z"`), or commit CID prefix (`"bafy…"`). Identical to the local `--at` flag. |
+| `at` | string | No | latest | Time spec — `t:<N>` (transaction number), `t:latest` or `latest`, `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>` (min 6 chars). A bare transaction number, ISO-8601 timestamp or commit prefix also works; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. Identical to the local `--at` flag. |
 
 An empty body is accepted and treated as all-default (Turtle export at HEAD).
 
@@ -2092,9 +2104,19 @@ stream chunked bodies; clients MUST be prepared to read until EOF.
    the dataset format requirement (the local CLI surfaces the same error).
    `system_graphs == true` without `all_graphs` is also a `400`: it selects
    nothing on its own.
-3. **Time spec parsing.** Same rules as the merge-preview / show
-   contracts: parse as integer first (`t`), then as ISO-8601 if it
-   contains both `-` and `:`, else as a commit CID prefix.
+3. **Time spec parsing.** Accept the tagged forms `t:<N>`, `t:latest`,
+   `iso:<ISO-8601>`, `recorded:<ISO-8601>` and `commit:<hex-prefix>` (min 6
+   characters) — the same grammar a ledger address carries after `@`, minus
+   the `@`. For compatibility also accept three untagged forms, tried in this
+   order: `latest`; a bare integer (a `t`); a string containing both `-` and
+   `:` (an ISO-8601 timestamp); anything else as a commit hex-digest prefix.
+   A string beginning with a tag is never reinterpreted as an untagged form —
+   `"t:abc"` is a malformed `t:`, so return `400` rather than looking up a
+   commit prefix named `t:abc`. Note that a bare integer resolves to a `t`
+   even when it is also a valid hex prefix; `commit:` forces the other
+   reading. The merge-preview / show contracts take the same spellings
+   wherever the two grammars overlap, but name a *commit*, so they have no
+   `iso:`, `recorded:` or `latest` forms.
 4. **Graph IRI resolution.** When `graph` is set, resolve via the ledger's
    graph registry; an unknown IRI is a `400` (or `5xx` if you treat it as
    a config error — the reference returns `400` via `ApiError::Config`).

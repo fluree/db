@@ -424,6 +424,15 @@ impl LedgerState {
         // routes by graph Sid with no index filter, which is what makes such a
         // record *live* on a replica that has not indexed yet — precisely
         // where `resolve_commit_prefix` reads. See #1846.
+        //
+        // Skipping the drop when `encode_iri` yields `None` is not fail-open,
+        // despite the shape: the `reverse_graph` seeding a few lines below is
+        // gated on the *same* expression, so a `None` also means no routing
+        // entry for the txn-meta graph Sid exists. A forged flake then has
+        // nowhere to route and cannot reach `TXN_META_GRAPH_ID` — the thing
+        // the drop protects against is unreachable in exactly the case the
+        // drop is skipped. The two must stay gated together; splitting them
+        // would turn this into a real fail-open.
         let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(ledger_id);
         if let Some(g_sid) = snapshot.encode_iri(&txn_meta_iri) {
             for (flakes, t) in &mut commit_batches {

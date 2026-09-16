@@ -1681,6 +1681,144 @@ fn export_never_indexed_matches_indexed() {
     );
 }
 
+/// The shape half of the same claim: an index build must not change which
+/// subjects open a block.
+///
+/// Triple-set equality (above) cannot see this — the pre-fix output carried
+/// every triple and still split subjects. Intra-block *predicate order* does
+/// still differ, because untranslated rows append to the block rather than
+/// sorting into `p_id` position, and that is not asserted here: it carries no
+/// meaning in Turtle. Grouping does.
+#[test]
+fn export_subject_grouping_is_the_same_indexed_or_not() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "shape"])
+        .assert()
+        .success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "shape",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice a ex:Person ; ex:name \"Alice\" ; ex:age 30 ; ex:knows ex:bob .\n\
+             ex:bob a ex:Person ; ex:label \"Bob\"@en ; ex:score 1.5 .",
+        ])
+        .assert()
+        .success();
+
+    let openers = |tmp: &TempDir| -> Vec<String> {
+        let out = fluree_cmd(tmp)
+            .args(["export", "shape", "--format", "turtle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let text = String::from_utf8(out).unwrap();
+        let mut v: Vec<String> = text
+            .lines()
+            .filter(|l| l.starts_with('<'))
+            .map(|l| l.trim_end().to_string())
+            .collect();
+        v.sort();
+        v
+    };
+
+    let before = openers(&tmp);
+    fluree_cmd(&tmp).args(["index", "shape"]).assert().success();
+    let after = openers(&tmp);
+
+    assert_eq!(
+        before, after,
+        "an index build must not change which subjects open a block"
+    );
+    assert_eq!(before.len(), 2, "expected two subjects, got {before:?}");
+}
+
+/// A never-indexed export must group each subject into one block, the same as
+/// an indexed one.
+///
+/// Rows that miss V3 translation bypass the cursor's sorted merge, and a
+/// never-indexed ledger is the case that maximizes them — there is no
+/// persisted dictionary to encode a string, a language tag or a decimal
+/// against. Emitting them after the stream reopened a subject block that had
+/// already closed, so `ex:bob` appeared twice with `"Bob"@en` stranded at the
+/// end of the file. #1574 is what made that the normal case rather than the
+/// edge one, so the fix and this test belong with it.
+///
+/// **Assert the grouping, not the exit code.** The split output is valid
+/// Turtle, carries every triple, and re-imports correctly — so a test that
+/// checks the command succeeded, or that compares triple *sets*, passes
+/// against the bug. Only the block structure distinguishes them.
+#[test]
+fn export_never_indexed_groups_each_subject_once() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp)
+        .args(["create", "grouped"])
+        .assert()
+        .success();
+    // A language-tagged literal and a decimal are both untranslatable without
+    // a persisted dictionary, so `ex:bob` has rows on both sides of the split.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "grouped",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice a ex:Person ; ex:name \"Alice\" ; ex:age 30 ; ex:knows ex:bob .\n\
+             ex:bob a ex:Person ; ex:name \"Bob\"@en ; ex:score 1.5 .",
+        ])
+        .assert()
+        .success();
+
+    let turtle = String::from_utf8(
+        fluree_cmd(&tmp)
+            .args(["export", "grouped", "--format", "turtle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+
+    // A block opener starts at column 0; continuations are indented.
+    let mut openers: Vec<&str> = turtle
+        .lines()
+        .filter(|l| l.starts_with('<'))
+        .map(str::trim_end)
+        .collect();
+    openers.sort_unstable();
+    assert_eq!(
+        openers,
+        vec!["<http://example.org/alice>", "<http://example.org/bob>"],
+        "each subject must open exactly one block; got:\n{turtle}"
+    );
+
+    // JSON-LD has the same failure mode as a repeated `@id` node object.
+    let jsonld = String::from_utf8(
+        fluree_cmd(&tmp)
+            .args(["export", "grouped", "--format", "jsonld"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        jsonld
+            .matches("\"@id\": \"http://example.org/bob\"")
+            .count(),
+        1,
+        "ex:bob must be one node object, not two:\n{jsonld}"
+    );
+}
+
 /// The command from #1574's report. `--format` defaults to `turtle`, so this
 /// wrote Turtle into a file named `.flpack` and said nothing.
 #[test]
@@ -1966,6 +2104,43 @@ fn export_all_graphs_round_trips_into_a_same_named_ledger() {
         .stdout(predicate::str::contains("g1"))
         .stdout(predicate::str::contains("txn-meta").not())
         .stdout(predicate::str::contains("urn:fluree").not());
+}
+
+/// `fluree export --format trig` now produces dataset files routinely, so
+/// feeding one back to `insert` is the obvious next thing to try. It cannot
+/// work — `insert` has nowhere to put a named graph — but it used to fail
+/// inside the Turtle parser with `expected subject, found 'GRAPH'`, which
+/// names neither the cause nor the command that does work.
+#[test]
+fn insert_of_a_dataset_file_names_create_from() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "ds"]).assert().success();
+    let src = tmp.path().join("data.trig");
+    std::fs::write(
+        &src,
+        "GRAPH <http://example.org/g1> { \
+         <http://example.org/s> <http://example.org/p> \"v\" . }\n",
+    )
+    .unwrap();
+
+    // By extension.
+    fluree_cmd(&tmp)
+        .args(["insert", "ds", "-f"])
+        .arg(&src)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("dataset format"))
+        .stderr(predicate::str::contains("fluree create <ledger> --from"));
+
+    // And by an explicit --format, which took a different path to the same
+    // dead end.
+    fluree_cmd(&tmp)
+        .args(["insert", "ds", "--format", "trig", "-f"])
+        .arg(&src)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("fluree create <ledger> --from"));
 }
 
 // ============================================================================

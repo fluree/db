@@ -141,10 +141,34 @@ async fn export_local(
             "ledger export complete"
         );
 
+        // Tell the client what the export left out. Without this, #1847's
+        // complaint — "nothing in the output to suggest anything is missing" —
+        // is fixed on the CLI and still true over HTTP: the same builder that
+        // makes the CLI print `warning: 1 named graph not exported` returns a
+        // bare 200 here. Headers rather than a body field, because the body is
+        // the RDF document and must stay parseable by an ordinary RDF client.
+        // Only emitted when non-zero, so a clean export is byte-for-byte what
+        // it was.
         let content_type = content_type_for(format);
-        let resp = Response::builder()
+        let mut builder = Response::builder()
             .status(200)
-            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CONTENT_TYPE, content_type);
+        if stats.named_graphs_omitted > 0 {
+            builder = builder.header(
+                "x-fluree-export-named-graphs-omitted",
+                stats.named_graphs_omitted,
+            );
+        }
+        if stats.annotations_unresolved > 0 {
+            builder = builder.header(
+                "x-fluree-export-annotations-unresolved",
+                stats.annotations_unresolved,
+            );
+        }
+        if stats.rows_skipped > 0 {
+            builder = builder.header("x-fluree-export-rows-skipped", stats.rows_skipped);
+        }
+        let resp = builder
             .body(Body::from(buf))
             .map_err(|e| ServerError::internal(format!("failed to build response: {e}")))?;
         Ok(resp)

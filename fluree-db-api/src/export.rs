@@ -613,6 +613,11 @@ pub async fn export_graph_turtle<W: Write>(
     let mut stats = ExportStats::default();
     let mut prev_subject: Option<String> = None;
 
+    // Untranslated overlay rows are folded into the subject block they belong
+    // to rather than appended after the stream, so a subject never opens twice
+    // (see `UntranslatedBySubject`).
+    let mut untranslated = UntranslatedBySubject::new(store, untranslated);
+
     while let Some(batch) = cursor.next_batch()? {
         let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
         write_turtle_batch(
@@ -623,18 +628,28 @@ pub async fn export_graph_turtle<W: Write>(
             config.g_id,
             prefixes,
             &mut prev_subject,
+            &mut untranslated,
             &mut stats,
             writer,
         )?;
     }
 
-    // Close last subject if any
-    if prev_subject.is_some() {
+    // Close last subject if any, folding in its untranslated rows first.
+    if let Some(s_iri) = prev_subject.take() {
+        if let Some(flakes) = untranslated.take(&s_iri) {
+            write_untranslated_turtle_continuations(
+                &resolver, &flakes, prefixes, &mut stats, writer,
+            )?;
+        }
         writeln!(writer, " .")?;
     }
 
-    // Emit untranslated overlay flakes as standalone Turtle statements.
-    for flake in &untranslated {
+    // Subjects the base stream never reached get their own blocks.
+    let (remaining, unresolved) = untranslated.into_remaining();
+    for (s_iri, flakes) in &remaining {
+        write_untranslated_turtle_block(&resolver, s_iri, flakes, prefixes, &mut stats, writer)?;
+    }
+    for flake in &unresolved {
         write_raw_flake_turtle(&resolver, flake, prefixes, &mut stats, writer)?;
     }
 
@@ -651,6 +666,7 @@ fn write_turtle_batch<W: Write>(
     g_id: GraphId,
     prefixes: &PrefixMap,
     prev_subject: &mut Option<String>,
+    untranslated: &mut UntranslatedBySubject,
     stats: &mut ExportStats,
     writer: &mut W,
 ) -> io::Result<()> {
@@ -691,8 +707,14 @@ fn write_turtle_batch<W: Write>(
             // Continue same subject — semicolon separator
             write!(writer, " ;\n    ")?;
         } else {
-            // New subject — close previous if any
-            if prev_subject.is_some() {
+            // New subject — close previous if any, folding in the untranslated
+            // rows that belong to it so the block is written once.
+            if let Some(prev) = prev_subject.take() {
+                if let Some(flakes) = untranslated.take(&prev) {
+                    write_untranslated_turtle_continuations(
+                        resolver, &flakes, prefixes, stats, writer,
+                    )?;
+                }
                 writeln!(writer, " .")?;
             }
             // Write subject
@@ -842,6 +864,7 @@ pub async fn export_graph_jsonld<W: Write>(
     let mut current_subject: Option<String> = None;
     let mut current_props: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
     let mut first_node = true;
+    let mut untranslated = UntranslatedBySubject::new(store, untranslated);
 
     while let Some(batch) = cursor.next_batch()? {
         let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
@@ -893,9 +916,18 @@ pub async fn export_graph_jsonld<W: Write>(
             // Check if we've moved to a new subject
             let same_subject = current_subject.as_deref() == Some(&s_iri);
             if !same_subject {
-                // Flush previous subject
-                if let Some(ref subj_iri) = current_subject {
-                    write_jsonld_node(writer, subj_iri, &current_props, prefixes, first_node)?;
+                // Flush previous subject, folding in its untranslated rows.
+                if let Some(subj_iri) = current_subject.take() {
+                    if let Some(flakes) = untranslated.take(&subj_iri) {
+                        merge_untranslated_jsonld(
+                            &flakes,
+                            store,
+                            prefixes,
+                            &mut current_props,
+                            &mut stats,
+                        );
+                    }
+                    write_jsonld_node(writer, &subj_iri, &current_props, prefixes, first_node)?;
                     first_node = false;
                 }
                 current_subject = Some(s_iri);
@@ -914,48 +946,63 @@ pub async fn export_graph_jsonld<W: Write>(
         }
     }
 
-    // Flush last subject
-    if let Some(ref subj_iri) = current_subject {
-        write_jsonld_node(writer, subj_iri, &current_props, prefixes, first_node)?;
+    // Flush last subject, folding in its untranslated rows.
+    if let Some(subj_iri) = current_subject.take() {
+        if let Some(flakes) = untranslated.take(&subj_iri) {
+            merge_untranslated_jsonld(&flakes, store, prefixes, &mut current_props, &mut stats);
+        }
+        write_jsonld_node(writer, &subj_iri, &current_props, prefixes, first_node)?;
         first_node = false;
     }
 
-    // Emit untranslated overlay flakes as additional JSON-LD nodes, grouped by
-    // subject (a repeated @id node object is valid JSON-LD; it merges on parse).
-    // (subject IRI, [(predicate, [values])]) — mirrors the cursor accumulator.
-    type JsonLdNode = (String, Vec<(String, Vec<serde_json::Value>)>);
-    let mut raw_nodes: Vec<JsonLdNode> = Vec::new();
-    for flake in &untranslated {
-        let (Some(s_iri), Some(p_iri)) = (store.sid_to_iri(&flake.s), store.sid_to_iri(&flake.p))
-        else {
-            stats.rows_skipped += 1;
+    // Subjects the base stream never reached get their own node objects. Rows
+    // whose subject IRI does not resolve cannot be placed and are counted as
+    // skipped, matching every other writer.
+    let (remaining, unresolved) = untranslated.into_remaining();
+    for (subj_iri, flakes) in &remaining {
+        let mut props: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+        merge_untranslated_jsonld(flakes, store, prefixes, &mut props, &mut stats);
+        if props.is_empty() {
             continue;
-        };
-        let Some(jval) = flake_to_jsonld_raw(flake, store, prefixes) else {
+        }
+        write_jsonld_node(writer, subj_iri, &props, prefixes, first_node)?;
+        first_node = false;
+    }
+    stats.rows_skipped += unresolved.len() as u64;
+
+    Ok(stats)
+}
+
+/// Fold a subject's untranslated rows into the property list about to be
+/// written for that subject, so the node object is emitted once.
+///
+/// Mirrors the accumulator in `export_graph_jsonld`: same predicate bucketing,
+/// same compaction. A repeated `@id` node object is legal JSON-LD and merges
+/// on parse, but it is still a shape that depends on index state, which is
+/// what `UntranslatedBySubject` exists to remove.
+fn merge_untranslated_jsonld(
+    flakes: &[Flake],
+    store: &BinaryIndexStore,
+    prefixes: &PrefixMap,
+    props: &mut Vec<(String, Vec<serde_json::Value>)>,
+    stats: &mut ExportStats,
+) {
+    for flake in flakes {
+        let (Some(p_iri), Some(jval)) = (
+            store.sid_to_iri(&flake.p),
+            flake_to_jsonld_raw(flake, store, prefixes),
+        ) else {
             stats.rows_skipped += 1;
             continue;
         };
         let compact_p = compact_iri(&p_iri, prefixes);
-        let node = match raw_nodes.iter_mut().find(|(s, _)| *s == s_iri) {
-            Some(n) => n,
-            None => {
-                raw_nodes.push((s_iri, Vec::new()));
-                raw_nodes.last_mut().unwrap()
-            }
-        };
-        if let Some(entry) = node.1.iter_mut().find(|(k, _)| *k == compact_p) {
+        if let Some(entry) = props.iter_mut().find(|(k, _)| *k == compact_p) {
             entry.1.push(jval);
         } else {
-            node.1.push((compact_p, vec![jval]));
+            props.push((compact_p, vec![jval]));
         }
         stats.triples_written += 1;
     }
-    for (subj_iri, props) in &raw_nodes {
-        write_jsonld_node(writer, subj_iri, props, prefixes, first_node)?;
-        first_node = false;
-    }
-
-    Ok(stats)
 }
 
 /// JSON-LD value for an untranslated overlay flake, deriving the language tag
@@ -1875,6 +1922,146 @@ fn write_raw_flake_ntriples<W: Write>(
     }
     writer.write_all(b" .\n")?;
     stats.triples_written += 1;
+    Ok(())
+}
+
+/// Overlay rows that missed V3 translation, indexed by the subject they belong
+/// to.
+///
+/// `apply_time_travel` hands the cursor the overlay ops it could encode and
+/// returns the rest; those bypass the cursor's sorted merge entirely, as
+/// `surviving_untranslated`'s own contract says. Emitting them after the stream
+/// stranded each one outside the subject block it belongs to, so a subject
+/// could open twice in the same file.
+///
+/// That was always reachable — any commit after the last index build can
+/// produce an untranslated row — but #1574 made it the normal case rather than
+/// the edge one: a never-indexed ledger has no persisted dictionary to encode
+/// against, so most of the ledger misses translation. Export's output *shape*
+/// would then depend on whether the ledger happened to be indexed, which is
+/// the one property a faithful-round-trip change cannot afford to add.
+///
+/// Keying by subject lets each writer fold a subject's untranslated rows into
+/// that subject's block as it closes, and emit whatever the base stream never
+/// reached as its own blocks afterwards. Memory is unchanged: these flakes were
+/// already held for the whole export as a `Vec`.
+struct UntranslatedBySubject {
+    by_subject: BTreeMap<String, Vec<Flake>>,
+    /// Rows whose subject IRI does not resolve. They cannot be grouped, and
+    /// the per-row writers already count them as skipped; kept separate so
+    /// that stays the writers' decision rather than being silently dropped
+    /// here.
+    unresolved: Vec<Flake>,
+}
+
+impl UntranslatedBySubject {
+    fn new(store: &BinaryIndexStore, flakes: Vec<Flake>) -> Self {
+        let mut by_subject: BTreeMap<String, Vec<Flake>> = BTreeMap::new();
+        let mut unresolved = Vec::new();
+        for flake in flakes {
+            match store.sid_to_iri(&flake.s) {
+                Some(s_iri) => by_subject.entry(s_iri).or_default().push(flake),
+                None => unresolved.push(flake),
+            }
+        }
+        Self {
+            by_subject,
+            unresolved,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_subject.is_empty() && self.unresolved.is_empty()
+    }
+
+    /// Rows for `s_iri`, removed so the closing pass cannot emit them twice.
+    fn take(&mut self, s_iri: &str) -> Option<Vec<Flake>> {
+        self.by_subject.remove(s_iri)
+    }
+
+    /// Subjects the base stream never reached, in IRI order for determinism.
+    fn into_remaining(self) -> (Vec<(String, Vec<Flake>)>, Vec<Flake>) {
+        (self.by_subject.into_iter().collect(), self.unresolved)
+    }
+}
+
+/// Write one untranslated row's `predicate object` pair into `out`.
+///
+/// Returns `false` when the value variant is not representable, which is the
+/// caller's cue to count a skipped row and emit nothing.
+fn write_raw_po_turtle(
+    resolver: &ExportResolver,
+    flake: &Flake,
+    prefixes: &PrefixMap,
+    out: &mut Vec<u8>,
+) -> io::Result<bool> {
+    let Some(p_iri) = resolver.store.sid_to_iri(&flake.p) else {
+        return Ok(false);
+    };
+    if p_iri == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" {
+        out.write_all(b"a")?;
+    } else {
+        write_turtle_iri(out, &p_iri, prefixes)?;
+    }
+    out.write_all(b" ")?;
+    write_raw_object(out, resolver.store, flake, Some(prefixes))
+}
+
+/// Append untranslated rows to the Turtle block that is currently open.
+fn write_untranslated_turtle_continuations<W: Write>(
+    resolver: &ExportResolver,
+    flakes: &[Flake],
+    prefixes: &PrefixMap,
+    stats: &mut ExportStats,
+    writer: &mut W,
+) -> io::Result<()> {
+    for flake in flakes {
+        let mut body: Vec<u8> = Vec::new();
+        if !write_raw_po_turtle(resolver, flake, prefixes, &mut body)? {
+            stats.rows_skipped += 1;
+            continue;
+        }
+        write!(writer, " ;\n    ")?;
+        writer.write_all(&body)?;
+        stats.triples_written += 1;
+    }
+    Ok(())
+}
+
+/// Emit a whole subject block for untranslated rows the base stream never
+/// reached.
+fn write_untranslated_turtle_block<W: Write>(
+    resolver: &ExportResolver,
+    s_iri: &str,
+    flakes: &[Flake],
+    prefixes: &PrefixMap,
+    stats: &mut ExportStats,
+    writer: &mut W,
+) -> io::Result<()> {
+    // Render the rows first: a subject whose every row is unrepresentable must
+    // not leave a dangling subject term behind.
+    let mut bodies: Vec<Vec<u8>> = Vec::new();
+    for flake in flakes {
+        let mut body: Vec<u8> = Vec::new();
+        if write_raw_po_turtle(resolver, flake, prefixes, &mut body)? {
+            bodies.push(body);
+        } else {
+            stats.rows_skipped += 1;
+        }
+    }
+    let Some((first, rest)) = bodies.split_first() else {
+        return Ok(());
+    };
+    write_turtle_iri_or_bnode(writer, s_iri, prefixes)?;
+    write!(writer, "\n    ")?;
+    writer.write_all(first)?;
+    stats.triples_written += 1;
+    for body in rest {
+        write!(writer, " ;\n    ")?;
+        writer.write_all(body)?;
+        stats.triples_written += 1;
+    }
+    writeln!(writer, " .")?;
     Ok(())
 }
 
