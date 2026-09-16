@@ -6,9 +6,10 @@
 //! proceed — without writing a commit. Mirrors
 //! [`crate::Fluree::merge_preview`] for the merge path.
 
+use crate::commit_data::{collect_from_commits, CollectedCommitData, Fold};
 use crate::error::{ApiError, Result};
 use crate::ledger_view::CommitRef;
-use crate::merge_preview::{DEFAULT_MAX_COMMITS, DEFAULT_MAX_CONFLICT_KEYS};
+use crate::merge_preview::{ValidationSummary, DEFAULT_MAX_COMMITS, DEFAULT_MAX_CONFLICT_KEYS};
 use crate::rebase::ConflictStrategy;
 use crate::revert::{RevertContext, RevertSelection};
 use fluree_db_core::{commit_to_summary, load_commit_by_id, CommitSummary, ConflictKey};
@@ -35,10 +36,17 @@ pub struct RevertPreviewOpts {
     /// contains `reverted_commits` and `reverted_count` but `conflicts` will
     /// be empty.
     pub include_conflicts: bool,
-    /// Strategy used to compute the `revertable` verdict. `Abort` means the
-    /// preview reports `revertable = false` whenever conflicts exist;
-    /// `TakeSource`/`TakeBranch` always report `revertable = true`.
+    /// Strategy used to resolve the reverted flakes and to compute the
+    /// `revertable` verdict. `Abort` means the preview reports
+    /// `revertable = false` whenever conflicts exist.
     pub conflict_strategy: ConflictStrategy,
+    /// When `true` (the default), stage the inverted state the revert would
+    /// write and validate it against the branch's SHACL configuration and
+    /// shapes, exactly as the revert does. The outcome is reported in
+    /// [`RevertPreview::validation`] and folded into
+    /// [`RevertPreview::revertable`]. Costs a branch-state load, a load of
+    /// each reverted commit, and the validation pass.
+    pub include_validation: bool,
 }
 
 impl Default for RevertPreviewOpts {
@@ -48,6 +56,7 @@ impl Default for RevertPreviewOpts {
             max_conflict_keys: Some(DEFAULT_MAX_CONFLICT_KEYS),
             include_conflicts: true,
             conflict_strategy: ConflictStrategy::Abort,
+            include_validation: true,
         }
     }
 }
@@ -86,8 +95,15 @@ pub struct RevertPreview {
     pub truncated: bool,
     /// Conflicts the revert would encounter.
     pub conflicts: RevertConflictSummary,
-    /// Whether the chosen strategy would let the revert proceed.
+    /// Whether the revert would go through: the chosen strategy proceeds,
+    /// and the inverted state conforms to the branch's shapes when
+    /// validation ran.
     pub revertable: bool,
+    /// SHACL outcome for the inverted state. Present iff
+    /// [`RevertPreviewOpts::include_validation`] was set and the strategy
+    /// did not already abort on conflicts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation: Option<ValidationSummary>,
 }
 
 impl crate::Fluree {
@@ -205,6 +221,7 @@ impl crate::Fluree {
         }
 
         let RevertContext {
+            branch_id,
             branch_store,
             plan,
             conflict_keys,
@@ -212,6 +229,10 @@ impl crate::Fluree {
         } = self
             .build_revert_context(ledger_name, branch, selection)
             .await?;
+
+        // The full set drives resolution; `conflicts` below is the capped
+        // view of it that the response carries.
+        let all_conflict_keys = conflict_keys.clone();
 
         // Build per-commit summaries up to the requested cap. The full count
         // is `plan.ordered_commits.len()`; the cap only bounds the slice we
@@ -248,7 +269,49 @@ impl crate::Fluree {
             RevertConflictSummary::empty()
         };
 
-        let revertable = opts.conflict_strategy != ConflictStrategy::Abort || conflicts.count == 0;
+        // Stage the inverted state the revert would write and run the same
+        // validation, so the preview and the revert cannot disagree. Skipped
+        // when the strategy aborts on conflicts, because the revert never
+        // reaches staging there either.
+        let validation =
+            if opts.include_validation && !opts.conflict_strategy.aborts_on(conflicts.count) {
+                let mut commits = Vec::with_capacity(plan.ordered_commits.len());
+                for commit_id in plan.ordered_commits.iter().rev() {
+                    commits.push(load_commit_by_id(&branch_store, commit_id).await?);
+                }
+                let CollectedCommitData {
+                    flakes: inverted,
+                    namespace_delta,
+                    ..
+                } = collect_from_commits(commits, Fold::Undo);
+                let branch_state = self.ledger(&branch_id).await?;
+                let staged = self
+                    .stage_revert(
+                        branch_state,
+                        inverted,
+                        &all_conflict_keys,
+                        &opts.conflict_strategy,
+                        &namespace_delta,
+                    )
+                    .await?;
+                Some(match staged {
+                    Some((_view, outcome)) => ValidationSummary {
+                        conforms: outcome.conforms(),
+                        report: outcome.report,
+                    },
+                    // The strategy left nothing to apply, so nothing can reject
+                    // it.
+                    None => ValidationSummary {
+                        conforms: true,
+                        report: None,
+                    },
+                })
+            } else {
+                None
+            };
+
+        let revertable = !opts.conflict_strategy.aborts_on(conflicts.count)
+            && validation.as_ref().is_none_or(|v| v.conforms);
 
         Ok(RevertPreview {
             branch: branch.to_string(),
@@ -257,6 +320,7 @@ impl crate::Fluree {
             truncated,
             conflicts,
             revertable,
+            validation,
         })
     }
 }

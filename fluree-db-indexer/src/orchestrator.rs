@@ -1897,6 +1897,9 @@ impl BackgroundIndexerWorker {
                 state.resolve_waiters_below(i64::MAX, IndexOutcome::Cancelled);
                 state.pending_min_t = None;
                 state.next_retry_at = None;
+                // An earlier attempt's error would otherwise outlive the
+                // failure it described, reported against an idle ledger.
+                state.last_error = None;
                 state.phase = IndexPhase::Idle;
             }
             return;
@@ -3096,6 +3099,15 @@ mod tests {
             IndexerConfig::small(),
         );
         let completion = handle.trigger("test:main", 1).await;
+
+        // Shutdown can cancel a ledger that already failed once and is sitting
+        // in backoff; without this the assertions below hold vacuously.
+        {
+            let mut states = handle.trigger.states.lock().await;
+            let state = states.get_mut("test:main").expect("state exists");
+            state.last_error = Some("earlier failure".to_string());
+            state.next_retry_at = Some(tokio::time::Instant::now() + Duration::from_secs(30));
+        }
 
         worker
             .on_build_error(

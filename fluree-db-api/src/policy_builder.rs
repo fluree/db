@@ -413,16 +413,16 @@ async fn build_policy_context_from_opts_inner(
     // runtime class check, which is not. Left on the estimate lane anyway —
     // an uncached per-query builder cannot afford base probes — but the
     // exposure is a count-drift one, not a no-op.
-    let stats: Option<IndexStats> = if let Some(novelty) = novelty_for_stats {
+    let stats: Option<Arc<IndexStats>> = if let Some(novelty) = novelty_for_stats {
         let indexed = snapshot.stats.clone().unwrap_or_default();
         let lookup = PolicyStatsLookup { overlay };
-        Some(
+        Some(Arc::new(
             fluree_db_novelty::assemble_full_stats(
                 &indexed, snapshot, overlay, novelty, to_t, &lookup,
             )
             .await
             .map_err(|e| ApiError::internal(format!("policy stats assembly failed: {e}")))?,
-        )
+        ))
     } else {
         snapshot.stats.clone()
     };
@@ -459,13 +459,13 @@ async fn build_policy_context_from_opts_inner(
 
     let view_set = build_policy_set(
         restrictions.clone(),
-        stats.as_ref(),
+        stats.as_deref(),
         PolicyAction::View,
         hierarchy.as_ref(),
     );
     let modify_set = build_policy_set(
         restrictions,
-        stats.as_ref(),
+        stats.as_deref(),
         PolicyAction::Modify,
         hierarchy.as_ref(),
     );

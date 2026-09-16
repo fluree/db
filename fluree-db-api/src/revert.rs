@@ -30,7 +30,7 @@ use fluree_db_core::{
     trace_first_parent_commits_by_id, BranchedContentStore, CommitId, ConflictKey, ContentStore,
     NonEmpty,
 };
-use fluree_db_ledger::{LedgerState, StagedLedger};
+use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NsRecordSnapshot;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
 use fluree_vocab::namespaces::FLUREE_DB;
@@ -217,7 +217,7 @@ impl crate::Fluree {
             .build_revert_context(ledger_name, branch, selection)
             .await?;
 
-        if strategy == ConflictStrategy::Abort && !ctx.conflict_keys.is_empty() {
+        if strategy.aborts_on(ctx.conflict_keys.len()) {
             return Err(ApiError::BranchConflict(format!(
                 "Revert aborted: {} conflict(s) on {} with abort strategy",
                 ctx.conflict_keys.len(),
@@ -456,21 +456,27 @@ impl crate::Fluree {
             .lock_or_load(&branch_id, branch_store.clone(), branch_record)
             .await?;
 
-        let staged = self
-            .apply_two_way_strategy(inverted, &conflict_keys, &strategy, &target_state)
-            .await?;
-
         let current_head_t = target_state.t();
         let current_head_id = target_state
             .head_commit_id
             .clone()
             .ok_or_else(|| ApiError::internal("branch has no head commit id"))?;
 
-        // If every reverted flake was a conflict and the strategy dropped
-        // them all (e.g. TakeBranch with full overlap), there is nothing to
-        // commit. Return a no-op outcome rather than letting build_commit
-        // reject the empty transaction.
-        if staged.is_empty() {
+        // Undoing a commit can remove a value a later shape requires, so the
+        // inverted state is validated like any transaction producing it.
+        // `None` means the strategy dropped everything (`TakeBranch` with
+        // full overlap, say): a no-op outcome, rather than letting
+        // `build_commit` reject an empty transaction.
+        let staged_view = self
+            .stage_revert(
+                target_state,
+                inverted,
+                &conflict_keys,
+                &strategy,
+                &namespace_delta,
+            )
+            .await?;
+        let Some((view, outcome)) = staged_view else {
             return Ok(StagedRevert {
                 branch_id: branch_id.to_string(),
                 branch: branch.to_string(),
@@ -482,7 +488,8 @@ impl crate::Fluree {
                 current_head_id,
                 commit: None,
             });
-        }
+        };
+        outcome.into_result()?;
 
         let txn_meta: Vec<TxnMetaEntry> = plan
             .ordered_commits
@@ -495,14 +502,6 @@ impl crate::Fluree {
                 )
             })
             .collect();
-
-        let reverse_graph = target_state.snapshot.build_reverse_graph().map_err(|e| {
-            ApiError::internal(format!("Failed to build reverse graph during revert: {e}"))
-        })?;
-
-        let view = StagedLedger::new(target_state, staged, &reverse_graph).map_err(|e| {
-            ApiError::internal(format!("Failed to stage flakes during revert: {e}"))
-        })?;
 
         let ns_registry = NamespaceRegistry::from_db(view.db());
         let mut commit_opts = CommitOpts::default().with_txn_meta(txn_meta);

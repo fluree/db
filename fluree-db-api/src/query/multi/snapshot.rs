@@ -445,6 +445,20 @@ mod tests {
         assert_eq!(query["from"], "ledgerB");
     }
 
+    /// `#config` twin of `jsonld_named_graph_fragment_preserved`.
+    #[test]
+    fn jsonld_config_graph_fragment_preserved() {
+        let snap = snapshot(&[("ledgerA", 42)]);
+        let mut query = json!({
+            "from": "ledgerA#config",
+            "select": {"?s": ["*"]},
+            "where": []
+        });
+        apply_snapshot_to_jsonld(&mut query, &snap);
+        assert_eq!(query["from"]["@id"], "ledgerA#config");
+        assert_eq!(query["from"]["t"], 42);
+    }
+
     #[test]
     fn jsonld_named_graph_fragment_preserved() {
         // Fragment suffix is part of the identifier; the bare ledger id is
@@ -534,6 +548,20 @@ mod tests {
         let out = apply_snapshot_to_sparql(sparql, &snap);
         assert!(
             out.contains("FROM <ledgerA@t:42#txn-meta>"),
+            "expected fragment preserved with t spliced before, got: {out}"
+        );
+    }
+
+    /// `#config` twin of the `#txn-meta` case above. Both reserved fragments
+    /// travel the same splice path, and the snapshot applier must not treat
+    /// either as part of the ledger id it looks up.
+    #[test]
+    fn sparql_config_fragment_iri_gets_t_spliced_before_fragment() {
+        let snap = snapshot(&[("ledgerA", 42)]);
+        let sparql = "SELECT ?x FROM <ledgerA#config> WHERE { ?x ?p ?o }";
+        let out = apply_snapshot_to_sparql(sparql, &snap);
+        assert!(
+            out.contains("FROM <ledgerA@t:42#config>"),
             "expected fragment preserved with t spliced before, got: {out}"
         );
     }

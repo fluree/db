@@ -1,9 +1,11 @@
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_core::clock::Instant;
 use fluree_db_core::{
-    GraphDbRef, GraphId, OverlayProvider, RuntimePredicateId, RuntimeSmallDicts, Sid, StatsView,
+    GraphDbRef, GraphId, IndexStats, OverlayProvider, RuntimePredicateId, RuntimeSmallDicts, Sid,
+    StatsView,
 };
-use fluree_db_novelty::{assemble_fast_stats, Novelty, StatsAssemblyError, StatsLookup};
+use fluree_db_novelty::{assemble_planner_stats, Novelty, StatsAssemblyError, StatsLookup};
 use std::collections::HashMap;
 use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_128;
@@ -44,7 +46,13 @@ pub(crate) fn cached_stats_view_for_db(
     allow_semantic_elision: bool,
 ) -> Option<Arc<StatsView>> {
     let build_view = || {
-        let indexed = db.snapshot.stats.clone().unwrap_or_default();
+        let _span = tracing::debug_span!("stats_view_build").entered();
+        let started = Instant::now();
+        let indexed = db
+            .snapshot
+            .stats
+            .clone()
+            .unwrap_or_else(|| Arc::new(IndexStats::default()));
         // Note: downcast_ref::<Novelty>() silently falls through for non-Novelty overlays
         // (e.g. PolicyOverlay). In those cases we skip novelty merging and return only
         // the persisted indexed stats, which is correct since policy overlays don't
@@ -94,7 +102,7 @@ pub(crate) fn cached_stats_view_for_db(
             // reaches every consumer that sums it. See #1721 for both candidate
             // fix directions — and note that reconciling THIS lane is not one
             // of them, for the quadratic reason above.
-            assemble_fast_stats(
+            assemble_planner_stats(
                 &indexed,
                 db.snapshot,
                 novelty,
@@ -130,7 +138,11 @@ pub(crate) fn cached_stats_view_for_db(
         // historical wire tail) there is no sound set, so the observed sets
         // are cleared: empty means "unknown" and every consumer fails closed.
         // The counts are left alone in all cases.
+        //
+        // `make_mut` copies here, since the stats are shared with the
+        // snapshot; current-state reads never take this branch.
         if db.t < db.snapshot.t {
+            let stats = Arc::make_mut(&mut stats);
             let licensed = stats.historical_since_t.is_some_and(|since| db.t >= since);
             for property in stats.properties.iter_mut().flatten() {
                 if licensed {
@@ -152,7 +164,7 @@ pub(crate) fn cached_stats_view_for_db(
             }
         }
 
-        let mut view = StatsView::from_db_stats_with_namespaces(&stats, db.snapshot.namespaces());
+        let mut view = StatsView::from_db_stats_with_namespaces(&stats, db.snapshot);
         // Per-(class, predicate) coverage counts may be consulted for semantic
         // elision of redundant `rdf:type` filters — but only when they are
         // exact for the current state. The query stats cache cannot resolve the
@@ -169,8 +181,17 @@ pub(crate) fn cached_stats_view_for_db(
         // root-policy — facts the stats builder cannot see here. It is folded
         // into the cache key below, so a trusted view is never reused for a
         // non-vouched (policy/dataset) execution at the same overlay epoch.
-        view.class_coverage_trustworthy =
-            allow_semantic_elision && novelty.is_some_and(Novelty::is_empty);
+        // The vouch admits `as_of` reads, whose class counts are still the
+        // published index's, so a read below the index `t` gets no proof.
+        view.class_coverage_trustworthy = allow_semantic_elision
+            && novelty.is_some_and(Novelty::is_empty)
+            && db.t >= db.snapshot.t;
+        // `source` only serves the coverage proof. When that is off, `stats` may
+        // be a merged or time-travel copy the cache weight does not count, so
+        // do not keep it alive.
+        if !view.class_coverage_trustworthy {
+            view.source = None;
+        }
         // Overlay arena-derived stats for `f:reifies*` predicates so the
         // join planner gets tight selectivity estimates on snapshots
         // with a built annotation index. See
@@ -178,6 +199,13 @@ pub(crate) fn cached_stats_view_for_db(
         if let Some(ann) = db.snapshot.annotation_index.as_ref() {
             view.merge_annotation_stats(&ann.stats, db.snapshot.namespaces());
         }
+        tracing::debug!(
+            stats_view_build_ms = started.elapsed().as_secs_f64() * 1000.0,
+            classes = view.classes.len(),
+            properties = view.properties.len(),
+            novelty_merged = novelty.is_some_and(|n| !n.is_empty()) && db.t > db.snapshot.t,
+            "built planner stats view"
+        );
         Arc::new(view)
     };
 
@@ -294,10 +322,92 @@ mod tests {
         )
     }
 
+    /// The redundant-`rdf:type` coverage proof reads class usage through the
+    /// view's retained `source` and IRI encoder. The builder must keep both
+    /// when the proof is licensed, or the elision silently stops firing; and
+    /// drop `source` otherwise, since its weight is not counted.
+    #[test]
+    fn builder_keeps_class_usage_only_for_a_licensed_coverage_proof() {
+        use fluree_db_core::{ClassPropertyUsage, ClassStatEntry, ValueTypeTag};
+        let ref_tag = ValueTypeTag::JSON_LD_ID.as_u8();
+        let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("coverage-builder:main");
+        snapshot
+            .insert_namespace_code(100, "http://example.org/".to_string())
+            .expect("register ex namespace");
+        snapshot.stats = Some(Arc::new(IndexStats {
+            properties: Some(vec![PropertyStatEntry {
+                sid: (100, "p".to_string()),
+                count: 4,
+                ndv_values: 4,
+                ndv_subjects: 4,
+                last_modified_t: 0,
+                datatypes: vec![(ref_tag, 4)],
+                observed_datatypes: vec![ref_tag],
+                historical_datatypes: vec![],
+            }]),
+            classes: Some(vec![ClassStatEntry {
+                class_sid: Sid::new(100, "C"),
+                count: 4,
+                properties: vec![ClassPropertyUsage {
+                    property_sid: Sid::new(100, "p"),
+                    datatypes: vec![(ref_tag, 4)],
+                    langs: vec![],
+                    ref_classes: vec![],
+                }],
+            }]),
+            ..Default::default()
+        }));
+        let (p, c) = ("http://example.org/p", "http://example.org/C");
+        let empty = Novelty::new(1);
+
+        let licensed =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &empty, 0), None, true)
+                .expect("view");
+        assert!(licensed.predicate_subjects_all_in_class_by_iri(p, c));
+        assert!(
+            Arc::ptr_eq(
+                licensed.source.as_ref().expect("source kept"),
+                snapshot.stats.as_ref().expect("stats")
+            ),
+            "the licensed view shares the snapshot's stats rather than a copy"
+        );
+
+        let unvouched =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &empty, 0), None, false)
+                .expect("view");
+        assert!(!unvouched.predicate_subjects_all_in_class_by_iri(p, c));
+        assert!(unvouched.source.is_none());
+
+        let mut window = Novelty::new(1);
+        window
+            .apply_commit(
+                vec![prop_flake(Sid::new(100, "s"), Sid::new(100, "q"), 1, 2)],
+                2,
+                &HashMap::new(),
+            )
+            .unwrap();
+        let merged =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &window, 2), None, true)
+                .expect("view");
+        assert!(!merged.predicate_subjects_all_in_class_by_iri(p, c));
+        assert!(merged.source.is_none(), "a merged copy is not retained");
+        assert_eq!(merged.get_class_count_by_iri(c), Some(4));
+
+        snapshot.t = 2;
+        let time_travel =
+            cached_stats_view_for_db(GraphDbRef::new(&snapshot, 0, &empty, 1), None, true)
+                .expect("view");
+        assert!(
+            !time_travel.predicate_subjects_all_in_class_by_iri(p, c),
+            "class coverage at the index t does not hold below it"
+        );
+        assert!(time_travel.source.is_none());
+    }
+
     #[test]
     fn uncached_builder_still_merges_novelty_without_store() {
         let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
-        snapshot.stats = Some(IndexStats {
+        snapshot.stats = Some(Arc::new(IndexStats {
             flakes: 1,
             size: 10,
             properties: Some(vec![PropertyStatEntry {
@@ -313,7 +423,7 @@ mod tests {
             classes: None,
             graphs: None,
             historical_since_t: None,
-        });
+        }));
 
         let mut novelty = Novelty::new(1);
         novelty
@@ -495,7 +605,7 @@ mod tests {
                 observed_datatypes: vec![ref_tag],
                 historical_datatypes: historical,
             };
-            snapshot.stats = Some(IndexStats {
+            snapshot.stats = Some(Arc::new(IndexStats {
                 flakes: 2,
                 size: 20,
                 properties: Some(vec![
@@ -505,7 +615,7 @@ mod tests {
                 classes: None,
                 graphs: None,
                 historical_since_t: since,
-            });
+            }));
             snapshot
         };
         let novelty = Novelty::new(1); // empty: the base index answers all reads

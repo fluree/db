@@ -281,9 +281,12 @@ impl crate::Fluree {
         }
         let handle = self.ledger_cached(ledger_id).await?;
         let view = handle.snapshot().await;
-        let g_id =
-            crate::ledger_info::resolve_graph_selector(&req.graph, view.binary_store.as_deref())
-                .map_err(|e| ApiError::NotFound(e.to_string()))?;
+        let g_id = crate::ledger_info::resolve_graph_selector(
+            &req.graph,
+            &view.snapshot.ledger_id,
+            view.binary_store.as_deref(),
+        )
+        .map_err(|e| ApiError::NotFound(e.to_string()))?;
         let snapshot = &view.snapshot;
 
         // Subject → group key. Each grouping property is scanned into its

@@ -2001,6 +2001,32 @@ impl crate::Fluree {
                     let _ = self.ledger_cached(&ledger_id).await;
                     indexer_config.attachment_events = provider.attachment_events(&ledger_id).await;
                 }
+                // No provider (the CLI's client carries no ledger manager) or
+                // the provider found nothing: derive coverage from the ledger
+                // state loaded above the way the provider would, including the
+                // base-index bootstrap for a fresh bulk import. Without this
+                // the indexer receives `None`, seals no arena, and every
+                // quoted-triple query on the imported ledger takes the
+                // generic join chain.
+                #[cfg(not(target_arch = "wasm32"))]
+                if indexer_config.attachment_events.is_none() {
+                    if let Some(state) = ledger_state.as_ref() {
+                        indexer_config.attachment_events =
+                            crate::indexer_attachment_provider::attachment_events_from_state(state)
+                                .await;
+                    }
+                }
+                match indexer_config.attachment_events.as_ref() {
+                    Some(fluree_db_indexer::AttachmentEventCoverage::Authoritative(ev)) => {
+                        info!(ledger_id = %ledger_id, events = ev.len(), "reindex: sealing annotation arena from authoritative attachment events");
+                    }
+                    Some(fluree_db_indexer::AttachmentEventCoverage::Augment(ev)) => {
+                        info!(ledger_id = %ledger_id, events = ev.len(), "reindex: augmenting the previous annotation arena");
+                    }
+                    Some(fluree_db_indexer::AttachmentEventCoverage::Unknown) | None => {
+                        tracing::warn!(ledger_id = %ledger_id, "reindex: no attachment-event coverage resolved; annotation arena will not be sealed this pass");
+                    }
+                }
             }
         }
 
