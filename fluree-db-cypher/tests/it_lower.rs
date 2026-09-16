@@ -1505,7 +1505,6 @@ fn issue1857_with_alias_colliding_with_pattern_var_is_rejected() {
     for src in [
         "MATCH (a)-[r:KNOWS]->(b) WITH a.name AS a RETURN a",
         "MATCH (a)-[r:KNOWS]->(b) WITH r.confidence AS r RETURN r",
-        "MATCH (a)-[r:KNOWS]->(b) WITH a, b.name AS a RETURN a",
     ] {
         let msg = lower_error(src);
         assert!(
@@ -1513,6 +1512,14 @@ fn issue1857_with_alias_colliding_with_pattern_var_is_rejected() {
             "WITH must be named as the offending clause: {msg} (for {src})"
         );
     }
+    // Carrying `a` forward AND aliasing onto it in the same clause trips the
+    // duplicate-output-name arm first, which is the more precise complaint:
+    // the collision is between two items of this clause, not with the MATCH.
+    let msg = lower_error("MATCH (a)-[r:KNOWS]->(b) WITH a, b.name AS a RETURN a");
+    assert!(
+        msg.starts_with("WITH produces the output name `a` twice"),
+        "expected the duplicate-column complaint: {msg}"
+    );
 }
 
 #[test]
@@ -1522,11 +1529,14 @@ fn issue1857_duplicate_projection_alias_is_rejected() {
     // one VarId and drop every row.
     let msg = lower_error("MATCH (a)-[r:KNOWS]->(b) RETURN a.name AS x, b.name AS x");
     assert!(
-        msg.contains("assigns `x` twice"),
+        msg.contains("output name `x` twice"),
         "message must name the duplicated output column: {msg}"
     );
     let msg = lower_error("MATCH (a)-[r:KNOWS]->(b) WITH a.name AS x, b.name AS x RETURN x");
-    assert!(msg.starts_with("WITH assigns `x` twice"), "{msg}");
+    assert!(
+        msg.starts_with("WITH produces the output name `x` twice"),
+        "{msg}"
+    );
 }
 
 #[test]
@@ -1621,4 +1631,80 @@ fn issue1857_ordinary_property_keys_are_unaffected() {
             "ordinary property key must still lower: {src}"
         );
     }
+}
+
+#[test]
+fn issue1857_reserved_jsonld_key_as_node_label_is_rejected() {
+    // Labels lower to the OBJECT of an `rdf:type` triple, not to a predicate,
+    // so they resolved through `resolve_iri` and routed around the reserved-
+    // name check. `MATCH (n:`@id`)` read as zero rows and `SET n:`@type``
+    // committed a junk class — the same persisted-junk outcome the property
+    // check exists to remove, one position over.
+    for src in [
+        "MATCH (n:`@id`) RETURN n",
+        "MATCH (n:`@type`) RETURN n",
+        "MATCH (n:Person)-[r:KNOWS]->(m:`@id`) RETURN n",
+    ] {
+        let msg = lower_error(src);
+        assert!(
+            msg.contains("reserved JSON-LD keyword"),
+            "label position must reject the keyword: {msg} (for {src})"
+        );
+    }
+    // A label merely spelled like one is untouched.
+    let out = parse_cypher("MATCH (n:Type) RETURN n");
+    let ast = out.ast.expect("ast");
+    let mut vars = VarRegistry::new();
+    assert!(lower_cypher(&ast, &NoEncoder, &mut vars).is_ok());
+}
+
+#[test]
+fn issue1857_unwind_onto_a_bound_var_is_rejected() {
+    // Same collision as the projection alias, one clause over. It silently
+    // dropped every row, and the boundary is not the obvious one: `range(1,3)`
+    // is a runtime expression and still dropped, while `labels(a)` worked —
+    // the difference is whether the list references the alias, which is a
+    // property of plan ordering rather than of the statement.
+    for src in [
+        "MATCH (a)-[r:KNOWS]->(b) UNWIND [1, 2, 3] AS a RETURN a",
+        "MATCH (a)-[r:KNOWS]->(b) UNWIND range(1, 3) AS a RETURN a",
+        "MATCH (a)-[r:KNOWS]->(b) UNWIND labels(a) AS a RETURN a",
+    ] {
+        let msg = lower_error(src);
+        assert!(
+            msg.starts_with("UNWIND alias `a` is already bound"),
+            "UNWIND onto a bound alias must be rejected: {msg} (for {src})"
+        );
+    }
+    // A fresh alias is untouched, and still takes the constant-list shortcut.
+    let q = lower("MATCH (a)-[r:KNOWS]->(b) UNWIND [1, 2, 3] AS fresh RETURN fresh");
+    assert!(
+        q.patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Values { .. })),
+        "a fresh alias must keep the constant-list shortcut: {:?}",
+        q.patterns
+    );
+}
+
+#[test]
+fn issue1857_duplicate_output_name_from_bare_items_is_rejected() {
+    // `check_alias` only saw aliased items, so a bare or unaliased item could
+    // still produce a second column with the same header.
+    for src in [
+        "MATCH (a)-[r:KNOWS]->(b) RETURN a, a",
+        "MATCH (a)-[r:KNOWS]->(b) RETURN a AS a, a",
+        "MATCH (a)-[r:KNOWS]->(b) RETURN a.name, a.name",
+    ] {
+        let msg = lower_error(src);
+        assert!(
+            msg.contains("twice"),
+            "duplicate output name must be rejected: {msg} (for {src})"
+        );
+    }
+    // Distinct columns over the same variable stay legal.
+    let out = parse_cypher("MATCH (a)-[r:KNOWS]->(b) RETURN a, a.name");
+    let ast = out.ast.expect("ast");
+    let mut vars = VarRegistry::new();
+    assert!(lower_cypher(&ast, &NoEncoder, &mut vars).is_ok());
 }

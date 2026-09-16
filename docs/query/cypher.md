@@ -746,13 +746,17 @@ here to stay:
   this shows on ordinary `a / b`.
 - **No implicit per-statement transaction id.** Immutability and time-travel
   (`f:t`, history queries) replace those semantics.
-- **`@id`, `@type` and the other JSON-LD keywords are not properties.** A node
+- **`@id`, `@type` and the other JSON-LD keywords are not Cypher names.** A node
   variable already *is* the node, so ``n.`@id` `` and ``n.`@type` `` are rejected and
   the error names the accessor that works — `id(n)` / `elementId(n)` for
-  identity, `labels(n)` for types, `SET n:Label` to add one. They were
-  previously read as ordinary, absent properties (always `null`); on the write
-  path they stored a literal predicate spelled `@id` while leaving the node's
-  real identity untouched.
+  identity, `labels(n)` for types, `SET n:Label` to add one. The rejection
+  covers every position a bare name can occupy: property keys, inline property
+  maps, annotation property maps, **node labels**, and relationship types, on
+  both the read and write paths. As a property key they were previously read as
+  ordinary absent properties (always `null`) and written as a literal predicate
+  spelled `@id`; as a label ``MATCH (n:`@id`)`` read as zero rows and
+  ``SET n:`@type` `` committed, after which `labels(n)` read back
+  `["Person", "@type"]`.
 
 **Deferred (fringe / on request)** — rejected with a clear error until a use
 case pulls them in; each has a workaround:
@@ -775,8 +779,19 @@ case pulls them in; each has a workaround:
   error beats that. Re-projection needs a column-label channel in the shared
   IR; the identity projection `RETURN v AS v` stays legal, as does aliasing a
   name that a *later* clause binds (`WITH pair[0] AS x … OPTIONAL MATCH (x)…`).
-  Two projection items may not share one output name either (`AS x, … AS x`),
-  which matches Neo4j.
+  Two projection items may not share one output name either — including bare
+  and unaliased ones, so `RETURN a, a` and `RETURN a.name, a.name` are rejected
+  alongside `AS x, … AS x`. That matches Neo4j ("Multiple result columns with
+  the same name are not supported").
+- **`UNWIND <list> AS v` where `v` is already bound** is rejected, for the same
+  reason: `UNWIND` introduces a new binding, and assigning onto a bound name
+  silently dropped every row. One sub-case — a list expression that *references*
+  the alias, such as `UNWIND labels(a) AS a` — happened to work, because
+  referencing `a` forces the operator to stay below the `MATCH` where it shadows
+  correctly; an uncorrelated list floats above it and the collision drops the
+  rows instead. That is a property of plan ordering rather than of the
+  statement, so both forms are rejected rather than one being blessed. Unwind
+  into a fresh name.
 
 Everything else — the full clause/pattern/expression surface, the write path,
 procedures, and Bolt driver support — works; when in doubt, try it and read the
