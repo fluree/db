@@ -94,10 +94,6 @@ pub(crate) fn lower_query<E: IriEncoder>(
         patterns.extend(lowered);
     }
 
-    // fluree/db#1857 (JSON-LD twin): a `["bind", "?v", …]` whose target is
-    // already bound is silently an equality filter, not a projection.
-    check_bind_targets(&patterns, &std::collections::HashSet::new(), vars)?;
-
     // Resolve aggregate output VarIds up front so we can classify each
     // SELECT-clause computation as pre- or post-aggregation. Mirrors
     // `fluree_db_sparql::lower::select::lower_select_expression_binds` so
@@ -116,6 +112,10 @@ pub(crate) fn lower_query<E: IriEncoder>(
     // in source order.
     let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
     let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
+    // Targets that reached `patterns` via a `(as <expr> ?v)` select expression
+    // rather than a WHERE-clause `["bind", …]`, so the #1857 guard below can
+    // name the spelling the author actually wrote.
+    let mut select_alias_binds: std::collections::HashSet<VarId> = std::collections::HashSet::new();
     for column in ast.select.columns() {
         if let UnresolvedColumn::Computation { expr, alias } = column {
             let (placement, alias_var, lowered_expr) = lower_select_expr_bind(
@@ -133,6 +133,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
                     post_binds.push((alias_var, lowered_expr));
                 }
                 SelectExprPlacement::Pre => {
+                    select_alias_binds.insert(alias_var);
                     patterns.push(Pattern::Bind {
                         var: alias_var,
                         expr: lowered_expr,
@@ -141,6 +142,23 @@ pub(crate) fn lower_query<E: IriEncoder>(
             }
         }
     }
+
+    // fluree/db#1857 (JSON-LD twin). Runs HERE, after the SELECT-clause
+    // desugaring above, not straight after the pattern loop: a scalar select
+    // expression `(as <expr> ?v)` desugars to a `Pattern::Bind` on `?v`
+    // (`docs/query/jsonld-query.md:181`), and that alias path — not the
+    // WHERE-clause `["bind", …]` — is FQL's closest analogue of the Cypher
+    // `RETURN expr AS v` bug. Checking before the desugar would leave the
+    // nearer twin silently broken while closing the further one.
+    //
+    // Post-placed select binds ride in `grouping` rather than `patterns` and
+    // are not reached; they target aggregate outputs, which are minted fresh.
+    check_bind_targets(
+        &patterns,
+        &std::collections::HashSet::new(),
+        vars,
+        &select_alias_binds,
+    )?;
 
     // Lower the reasoning config, ordering, and grouping (each is its own axis).
     // Post-aggregation binds collected above ride inside the grouping phase.
@@ -223,6 +241,7 @@ fn check_bind_targets(
     patterns: &[Pattern],
     enclosing: &std::collections::HashSet<VarId>,
     vars: &VarRegistry,
+    select_alias_binds: &std::collections::HashSet<VarId>,
 ) -> Result<()> {
     let mut produced = enclosing.clone();
     for pattern in patterns {
@@ -231,28 +250,44 @@ fn check_bind_targets(
                 let name = vars.try_name(*var).unwrap_or("");
                 let is_identity = matches!(expr, Expression::Var(v) if v == var);
                 if produced.contains(var) && !is_identity && !name.starts_with("?__") {
-                    return Err(ParseError::InvalidWhere(format!(
-                        "bind target {name} is already bound by an earlier pattern — binding \
-                         onto a bound variable silently filters to rows where the two values \
-                         happen to match, rather than projecting. Bind to a fresh variable."
-                    )));
+                    // Same defect either way, but the author wrote one of two
+                    // spellings and the message should name the one they used,
+                    // mirroring SPARQL's split between V5
+                    // (`BindTargetAlreadyInScope`) and V6
+                    // (`SelectAliasAlreadyBound`).
+                    return Err(if select_alias_binds.contains(var) {
+                        ParseError::InvalidSelect(format!(
+                            "select alias {name} is already bound by the where clause — a \
+                             scalar select expression desugars to a bind, so assigning onto a \
+                             bound variable silently filters to rows where the two values \
+                             happen to match, rather than projecting. Alias to a fresh \
+                             variable."
+                        ))
+                    } else {
+                        ParseError::InvalidWhere(format!(
+                            "bind target {name} is already bound by an earlier pattern — \
+                             binding onto a bound variable silently filters to rows where the \
+                             two values happen to match, rather than projecting. Bind to a \
+                             fresh variable."
+                        ))
+                    });
                 }
                 produced.insert(*var);
             }
             Pattern::Union(branches) => {
                 for branch in branches {
-                    check_bind_targets(branch, &produced, vars)?;
+                    check_bind_targets(branch, &produced, vars, select_alias_binds)?;
                 }
                 produced.extend(pattern.produced_vars());
             }
             Pattern::Optional(inner) | Pattern::DefaultGraphSource { patterns: inner } => {
-                check_bind_targets(inner, &produced, vars)?;
+                check_bind_targets(inner, &produced, vars, select_alias_binds)?;
                 produced.extend(pattern.produced_vars());
             }
             Pattern::Graph {
                 patterns: inner, ..
             } => {
-                check_bind_targets(inner, &produced, vars)?;
+                check_bind_targets(inner, &produced, vars, select_alias_binds)?;
                 produced.extend(pattern.produced_vars());
             }
             _ => produced.extend(pattern.produced_vars()),
