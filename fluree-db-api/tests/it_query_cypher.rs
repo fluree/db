@@ -10930,3 +10930,181 @@ async fn cypher_var_length_probes_of_different_types_do_not_share_a_drain() {
         vec![json!([[0.9], [0.1]])],
     );
 }
+
+// ===========================================================================
+// fluree/db#1857 — RETURN/WITH alias colliding with a bound pattern variable.
+//
+// Keep new tests for this issue inside this block; other issue slates append
+// their own blocks below.
+//
+// Before the lowering guard, `RETURN expr AS v` where `v` is already bound
+// interned to `v`'s own VarId (the VarRegistry is a name<->id bijection) and
+// emitted `Pattern::Bind` onto it. `BindOperator`'s clobber prevention then
+// made the projection silently `WHERE v = expr`: every row dropped when the
+// expression evaluated to a value, or the stale binding kept when it
+// evaluated to null. The same lowering backs the read half of a Cypher
+// write, so `WITH … AS q SET p.marker = q` committed successfully and wrote
+// nothing.
+// ===========================================================================
+
+/// Run a Cypher query expected to fail, returning the rendered error.
+async fn cypher_query_error(
+    fluree: &fluree_db_api::Fluree,
+    db: &fluree_db_api::GraphDb,
+    q: &str,
+) -> String {
+    match fluree.query_cypher(db, q).await {
+        Ok(_) => panic!("expected query to be rejected: {q}"),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn issue1857_return_alias_colliding_with_pattern_var_is_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-return-alias").await;
+    let db = graphdb_from_ledger(&l);
+
+    // Control: a fresh alias projects the property, three rows.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a)-[r:KNOWS]->(b) RETURN a.name AS aname"#,
+        )
+        .await
+        .len(),
+        3,
+        "fresh alias must keep working"
+    );
+
+    // Collision: rejected, and the message names the variable. Asserting only
+    // `is_err()` would pass against any unrelated error.
+    for (q, name) in [
+        (r#"MATCH (a)-[r:KNOWS]->(b) RETURN r.confidence AS r"#, "r"),
+        (r#"MATCH (a)-[r:KNOWS]->(b) RETURN a.name AS a"#, "a"),
+        (r#"MATCH (a)-[r:KNOWS]->(b) RETURN a.name AS b"#, "b"),
+        (r#"MATCH (a)-[r:KNOWS]->(b) RETURN id(a) AS a"#, "a"),
+    ] {
+        let msg = cypher_query_error(&fluree, &db, q).await;
+        assert!(
+            msg.contains(&format!("`{name}`")) && msg.contains("already bound"),
+            "error must name the collision: {msg} (for {q})"
+        );
+    }
+
+    // Duplicate output name: neither `x` is a pattern variable, but both
+    // projection items resolve to one VarId, which used to drop every row.
+    let msg = cypher_query_error(
+        &fluree,
+        &db,
+        r#"MATCH (a)-[r:KNOWS]->(b) RETURN a.name AS x, b.name AS x"#,
+    )
+    .await;
+    assert!(msg.contains("assigns `x` twice"), "{msg}");
+}
+
+#[tokio::test]
+async fn issue1857_with_alias_colliding_with_pattern_var_is_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-with-alias").await;
+    let db = graphdb_from_ledger(&l);
+
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a)-[r:KNOWS]->(b) WITH a.name AS aname RETURN aname"#,
+        )
+        .await
+        .len(),
+        3,
+        "fresh WITH alias must keep working"
+    );
+
+    for q in [
+        r#"MATCH (a)-[r:KNOWS]->(b) WITH a.name AS a RETURN a"#,
+        r#"MATCH (a)-[r:KNOWS]->(b) WITH r.confidence AS r RETURN r"#,
+    ] {
+        let msg = cypher_query_error(&fluree, &db, q).await;
+        assert!(
+            msg.contains("WITH alias") && msg.contains("already bound"),
+            "error must name WITH as the offending clause: {msg} (for {q})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue1857_identity_alias_still_projects_every_row() {
+    // `v AS v` binds v to itself — the benign shape the guard must not break.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-identity-alias").await;
+    let db = graphdb_from_ledger(&l);
+
+    for q in [
+        r#"MATCH (a)-[r:KNOWS]->(b) RETURN a AS a"#,
+        r#"MATCH (a)-[r:KNOWS]->(b) RETURN r AS r"#,
+    ] {
+        assert_eq!(
+            cypher_rows(&fluree, &db, q).await.len(),
+            3,
+            "identity projection must keep returning every row: {q}"
+        );
+    }
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a)-[r:KNOWS]->(b) WITH a AS a, b AS b RETURN a.name AS n"#,
+        )
+        .await
+        .len(),
+        3,
+        "WITH a AS a, b AS b is the idiomatic scope carry"
+    );
+}
+
+#[tokio::test]
+async fn issue1857_alias_collision_does_not_silently_noop_a_write() {
+    // The read half of a Cypher write lowers through the same projection
+    // code, so the collision used to produce a transaction that COMMITTED,
+    // returned no error, and wrote nothing.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-write-noop").await;
+
+    // Control: a fresh alias writes one marker per KNOWS edge.
+    let written = fluree
+        .transact_cypher(
+            l.clone(),
+            r#"MATCH (p:Person)-[:KNOWS]->(q) WITH p, q.name AS qn SET p.marker = qn"#,
+        )
+        .await
+        .expect("fresh alias must commit");
+    let db = graphdb_from_ledger(&written.ledger);
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (p:Person) WHERE p.marker IS NOT NULL RETURN p.marker AS m"#,
+        )
+        .await
+        .len(),
+        3,
+        "control write must land three markers"
+    );
+
+    // Collision: must be rejected outright, not committed as a no-op.
+    let err = fluree
+        .transact_cypher(
+            l.clone(),
+            r#"MATCH (p:Person)-[:KNOWS]->(q) WITH p, q.name AS q SET p.marker = q"#,
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("colliding alias must be rejected, not silently commit nothing"));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("`q`") && msg.contains("already bound"),
+        "write-path error must name the collision: {msg}"
+    );
+}

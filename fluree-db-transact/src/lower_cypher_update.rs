@@ -448,6 +448,47 @@ impl<'a> CypherLowering<'a> {
     /// path, since aggregate calls aren't in the filter-expression surface),
     /// `DISTINCT`, and `ORDER BY` / `SKIP` / `LIMIT` — these need a query-level
     /// grouping or slice the single-Txn write model doesn't carry.
+    /// Reject a `WITH … AS v` before a write clause when `v` is already bound
+    /// by a preceding read clause, or already assigned by an earlier item in
+    /// the same `WITH`.
+    ///
+    /// Same defect as the read-path guard in `fluree-db-cypher`
+    /// (`lower/stmt.rs`, `ProjectionState::check_alias`), reached through a
+    /// second, independent lowering: the alias interns to the already-bound
+    /// variable's own VarId, so the projection emits a `Pattern::Bind` onto a
+    /// bound variable and `BindOperator`'s clobber prevention turns it into
+    /// `WHERE v = expr`. On the write path that is strictly worse than a wrong
+    /// answer — every row is dropped, so the Update's WHERE matches nothing and
+    /// the transaction COMMITS, reports no error, and writes nothing.
+    ///
+    /// `self.bound_vars` is still the pre-`WITH` scope here (it is narrowed to
+    /// `horizon` only after the whole projection is lowered), so this is the
+    /// clause-entry snapshot the check needs. The pass-through forms `WITH a`
+    /// and `WITH a AS a` never reach here — they carry the binding forward
+    /// unchanged rather than assigning onto it.
+    fn check_with_alias(
+        &self,
+        alias: &str,
+        horizon: &std::collections::HashSet<String>,
+    ) -> Result<(), LowerCypherError> {
+        if horizon.contains(alias) {
+            return Err(LowerCypherError::rejected(format!(
+                "WITH assigns `{alias}` twice — two projected columns cannot share one output \
+                 name, the second would silently overwrite the first. Give each item a distinct \
+                 name (e.g. `AS {alias}2`)."
+            )));
+        }
+        if self.bound_vars.contains(alias) {
+            return Err(LowerCypherError::rejected(format!(
+                "WITH alias `{alias}` is already bound by an earlier clause — assigning onto it \
+                 would silently drop every row, so the write would commit without error and \
+                 without writing anything. Alias to a name that is not already bound (e.g. \
+                 `AS {alias}_value`)."
+            )));
+        }
+        Ok(())
+    }
+
     fn lower_with_clause(&mut self, w: &WithClause) -> Result<(), LowerCypherError> {
         if w.distinct {
             return Err(LowerCypherError::unsupported(
@@ -479,6 +520,7 @@ impl<'a> CypherLowering<'a> {
                         }
                         // Rename (`WITH a AS b`).
                         Some(a) => {
+                            self.check_with_alias(&a, &horizon)?;
                             binds.push(UnresolvedPattern::Bind {
                                 var: Arc::from(var_name(&a).as_str()),
                                 expr: UnresolvedExpression::var(var_name(&v.name)),
@@ -497,6 +539,7 @@ impl<'a> CypherLowering<'a> {
                              (`<expr> AS name`)",
                         ));
                     };
+                    self.check_with_alias(&a, &horizon)?;
                     let mut aux = Vec::new();
                     let expr = self.lower_filter_expr(other, &mut aux)?;
                     self.where_patterns.append(&mut aux);

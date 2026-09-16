@@ -368,7 +368,7 @@ fn lower_return<E: IriEncoder>(
     r: &ReturnClause,
     patterns: &mut Vec<Pattern>,
 ) -> Result<LoweredReturn> {
-    let mut projection = ProjectionState::new();
+    let mut projection = ProjectionState::new(ctx, "RETURN", patterns, &r.items);
     for item in &r.items {
         projection.add_item(ctx, patterns, item)?;
     }
@@ -446,10 +446,39 @@ struct ProjectionState {
     /// Counter for synthetic per-aggregate output vars lifted out of composite
     /// expressions (`?#__agg_N`).
     agg_name_counter: u32,
+    /// The clause keyword this projection belongs to (`"RETURN"` / `"WITH"`),
+    /// used only to word the alias-collision errors.
+    clause: &'static str,
+    /// Variables already bound when the clause was *entered* — the snapshot the
+    /// alias guard tests against. See [`ProjectionState::check_alias`] for why
+    /// this is a clause-entry snapshot rather than a read of the registry or a
+    /// per-item recomputation.
+    in_scope: std::collections::HashSet<VarId>,
+    /// Output VarIds assigned by an earlier `AS` item in this same clause, so a
+    /// projection that names one output column twice is rejected rather than
+    /// silently emitting one column under two headers.
+    assigned: std::collections::HashSet<VarId>,
 }
 
 impl ProjectionState {
-    fn new() -> Self {
+    /// `items` is read only to decide whether the clause-entry scope snapshot
+    /// is needed at all: a projection with no `AS` item can never collide, so
+    /// the `visible_vars_from_patterns` walk is skipped entirely. Mirrors
+    /// `check_select_aliases` in `fluree-db-sparql`, which returns before its
+    /// in-scope walk for the same reason.
+    fn new<E: IriEncoder>(
+        ctx: &LoweringContext<'_, E>,
+        clause: &'static str,
+        patterns: &[Pattern],
+        items: &[ProjectionItem],
+    ) -> Self {
+        let in_scope = if items.iter().any(|i| i.alias.is_some()) {
+            visible_vars_from_patterns(ctx, patterns)
+                .into_iter()
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         Self {
             vars: Vec::new(),
             group_keys: Vec::new(),
@@ -459,7 +488,75 @@ impl ProjectionState {
             list_outputs: std::collections::HashSet::new(),
             post_binds: Vec::new(),
             agg_name_counter: 0,
+            clause,
+            in_scope,
+            assigned: std::collections::HashSet::new(),
         }
+    }
+
+    /// Reject a `RETURN` / `WITH` alias that would assign onto a variable the
+    /// clause already has in scope, or onto one an earlier item in the same
+    /// clause already assigned.
+    ///
+    /// An alias interns through the statement-wide `VarRegistry`, which is a
+    /// name↔id *bijection* (`fluree-db-query/src/var_registry.rs`). So
+    /// `RETURN expr AS v` where `v` is already bound does not mint a new
+    /// column — it emits a `Pattern::Bind` onto the *bound* variable, and
+    /// `BindOperator`'s deliberate clobber prevention
+    /// (`fluree-db-query/src/bind.rs`) then either drops the row (the computed
+    /// value differs from the existing binding) or keeps the old value (the
+    /// computed value is unbound). Either way the projection is silently
+    /// `WHERE v = expr`, projecting `v`. This is the same failure the
+    /// CALL-subquery guard in `lower_call_branch` diagnoses and rejects; it
+    /// was simply never generalized to the top-level projection.
+    ///
+    /// Three details this guard has to get right:
+    ///
+    /// 1. `in_scope` is snapshotted at **clause entry**, not read from the
+    ///    registry. `WITH pair[0] AS x, pair[1] AS y … OPTIONAL MATCH (x)-[…]->(y)`
+    ///    is legal and common: the pattern binds `x`/`y` *after* the alias
+    ///    assigns them. A registry-wide check would reject it.
+    /// 2. The snapshot is taken **once per clause**, not per item — `add_item`
+    ///    pushes its own auxiliary `Optional`/`Bind` patterns into the same
+    ///    list, so a per-item recomputation would see item N-1's own bind as
+    ///    "already in scope".
+    /// 3. The identity projection `v AS v` is exempt from the in-scope arm. It
+    ///    binds `v` to itself, so the computed value always equals the existing
+    ///    one and no row is dropped; `WITH a AS a, b AS b` is the idiomatic way
+    ///    to carry names across a scope boundary.
+    ///
+    /// Synthetic `?#__*` variables cannot false-trigger: an alias is a
+    /// user-written identifier, and `visible_vars_from_patterns` filters the
+    /// synthetic names out of the snapshot anyway.
+    fn check_alias<E: IriEncoder>(
+        &mut self,
+        ctx: &mut LoweringContext<'_, E>,
+        item: &ProjectionItem,
+    ) -> Result<()> {
+        let Some(alias) = &item.alias else {
+            return Ok(());
+        };
+        let alias_id = ctx.intern_var(&alias.name);
+        let clause = self.clause;
+        if !self.assigned.insert(alias_id) {
+            return Err(LowerError::generic(format!(
+                "{clause} assigns `{name}` twice — two projected columns cannot share one \
+                 output name, the second would silently overwrite the first. Give each item \
+                 a distinct name (e.g. `AS {name}2`).",
+                name = alias.name
+            )));
+        }
+        let is_identity = matches!(&item.expr, Expr::Var(v) if v.name == alias.name);
+        if !is_identity && self.in_scope.contains(&alias_id) {
+            return Err(LowerError::generic(format!(
+                "{clause} alias `{name}` is already bound by an earlier clause — assigning \
+                 onto it would silently drop rows or discard the projected value instead of \
+                 returning it. Alias to a name that is not already bound (e.g. \
+                 `AS {name}_value`).",
+                name = alias.name
+            )));
+        }
+        Ok(())
     }
 
     fn add_item<E: IriEncoder>(
@@ -480,6 +577,10 @@ impl ProjectionState {
                 return Ok(());
             }
         }
+        // Every remaining path below mints the item's output VarId from the
+        // alias and emits a `Bind` (or an aggregate spec) onto it, so the
+        // collision guard belongs here — once, ahead of all of them.
+        self.check_alias(ctx, item)?;
         if let Expr::Call(call) = &item.expr {
             if is_aggregate(&call.name) {
                 let output_var =
@@ -1198,7 +1299,7 @@ fn lower_with<E: IriEncoder>(
     w: &WithClause,
     mut inner_patterns: Vec<Pattern>,
 ) -> Result<SubqueryPattern> {
-    let mut projection = ProjectionState::new();
+    let mut projection = ProjectionState::new(ctx, "WITH", &inner_patterns, &w.items);
     for item in &w.items {
         projection.add_item(ctx, &mut inner_patterns, item)?;
     }
