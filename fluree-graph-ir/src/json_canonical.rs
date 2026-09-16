@@ -75,8 +75,11 @@ fn utf16_cmp(a: &str, b: &str) -> Ordering {
 /// scheme. Short forms where they exist, `\u00XX` for other control
 /// characters, nothing else escaped.
 fn write_string(s: &str, out: &mut String) {
-    let escaped = Value::String(s.to_string()).to_string();
-    out.push_str(&escaped);
+    match serde_json::to_string(s) {
+        Ok(escaped) => out.push_str(&escaped),
+        // Serializing a `&str` cannot fail.
+        Err(_) => out.push_str("\"\""),
+    }
 }
 
 fn write_number(n: &Number, out: &mut String) {
@@ -94,26 +97,90 @@ fn write_number(n: &Number, out: &mut String) {
 
 /// Format a double as ECMAScript's `Number::toString` does.
 ///
-/// Rust's `Display` prints the shortest form that round trips and agrees with
-/// ECMAScript wherever neither uses an exponent. ECMAScript switches to
-/// exponents at different bounds, and signs a positive one.
+/// Rust's `{:e}` supplies the shortest digit string that round trips, which
+/// is the same digit string ECMAScript starts from. Two things still differ.
+/// When two shortest strings round trip, ECMAScript takes the even one, and
+/// Rust does not. ECMAScript also switches to exponential notation at its own
+/// bounds, which are expressed here in terms of `n`, the position of the
+/// decimal point.
 fn ecmascript_number(f: f64) -> String {
     if f == 0.0 {
         // Covers -0.0, which ECMAScript prints as "0".
         return "0".to_string();
     }
-    let abs = f.abs();
-    if (1e-6..1e21).contains(&abs) {
-        return format!("{f}");
+    let (digits, n) = shortest_digits(f.abs());
+    let rendered = render(&digits, n);
+    if f < 0.0 {
+        format!("-{rendered}")
+    } else {
+        rendered
     }
-    // `{:e}` prints `1e21`, `1.5e300`, `1e-7`. ECMAScript signs a positive
-    // exponent.
-    let exponential = format!("{f:e}");
-    match exponential.split_once('e') {
-        Some((mantissa, exponent)) if !exponent.starts_with('-') => {
-            format!("{mantissa}e+{exponent}")
+}
+
+/// The shortest digit string that round trips, and `n` such that the value is
+/// `0.digits * 10^n`.
+fn shortest_digits(abs: f64) -> (String, i32) {
+    let exponential = format!("{abs:e}");
+    let (mantissa, exponent) = exponential
+        .split_once('e')
+        .expect("`{:e}` always writes an exponent");
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let exponent: i32 = exponent.parse().expect("`{:e}` writes a decimal exponent");
+    let n = exponent + 1;
+    (even_tie(digits, n, abs), n)
+}
+
+/// Break a tie the way ECMAScript does.
+///
+/// Two digit strings of the same length can both round trip to `abs`. Rust
+/// returns whichever its algorithm reaches; ECMAScript requires the even one.
+fn even_tie(digits: String, n: i32, abs: f64) -> String {
+    let Ok(value) = digits.parse::<u128>() else {
+        return digits;
+    };
+    if value % 2 == 0 {
+        return digits;
+    }
+    let width = digits.len();
+    let scale = n - width as i32;
+    for candidate in [value - 1, value + 1] {
+        let candidate = candidate.to_string();
+        if candidate.len() != width {
+            continue;
         }
-        _ => exponential,
+        if format!("{candidate}e{scale}").parse::<f64>() == Ok(abs) {
+            return candidate;
+        }
+    }
+    digits
+}
+
+/// Place the decimal point per ECMAScript, given `k` digits and the point
+/// position `n`.
+fn render(digits: &str, n: i32) -> String {
+    let k = digits.len() as i32;
+    if (k..=21).contains(&n) {
+        // Integral: pad with zeros out to the point.
+        return format!("{digits}{}", "0".repeat((n - k) as usize));
+    }
+    if (1..=21).contains(&n) {
+        let (int, frac) = digits.split_at(n as usize);
+        return format!("{int}.{frac}");
+    }
+    if (-5..=0).contains(&n) {
+        return format!("0.{}{digits}", "0".repeat((-n) as usize));
+    }
+    let (first, rest) = digits.split_at(1);
+    let mantissa = if rest.is_empty() {
+        first.to_string()
+    } else {
+        format!("{first}.{rest}")
+    };
+    let exponent = n - 1;
+    if exponent >= 0 {
+        format!("{mantissa}e+{exponent}")
+    } else {
+        format!("{mantissa}e{exponent}")
     }
 }
 
@@ -196,6 +263,35 @@ mod tests {
             canon("[333333333333333314832.0]"),
             "[333333333333333300000]"
         );
+    }
+
+    #[test]
+    fn ties_pick_the_even_digit_string() {
+        // Both "810553441865041.2" and "810553441865041.3" round trip to this
+        // double. ECMAScript takes the even one; Rust's own formatting takes
+        // the other.
+        let f = f64::from_bits(4829839628448721546);
+        assert_eq!(format!("{f}"), "810553441865041.3");
+        assert_eq!(canon(&format!("[{f}]")), "[810553441865041.2]");
+    }
+
+    #[test]
+    fn every_double_round_trips_through_its_canonical_form() {
+        // A deterministic sweep: whatever spelling is chosen, it must parse
+        // back to the same double.
+        let mut bits: u64 = 0x1234_5678_9abc_def0;
+        for _ in 0..20_000 {
+            bits = bits
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let f = f64::from_bits(bits);
+            if !f.is_finite() {
+                continue;
+            }
+            let text = ecmascript_number(f);
+            let parsed: f64 = text.parse().expect("canonical form parses");
+            assert_eq!(parsed.to_bits(), f.to_bits(), "{f} rendered as {text}");
+        }
     }
 
     #[test]
