@@ -837,8 +837,15 @@ pub async fn run(
                 limit
             };
 
+            // A JSON-LD SELECT result is an array of *arrays*, which the
+            // JSON-LD table renderer cannot column-ise — it must be shown as
+            // JSON. Every other `format_result` call site coerces through this
+            // helper; this one (the untracked-remote convergence point) did
+            // not, which is why `--remote ... --format table` rendered `++`/
+            // `||` for JSON-LD while `--format json` and SPARQL were fine.
+            let display_format = json_path_display_format(query_format, output_format);
             let output =
-                output::format_result(&result, output_format, query_format, effective_limit)?;
+                output::format_result(&result, display_format, query_format, effective_limit)?;
             println!("{}", output.text);
             if let Some((fuel, time, policy, enforcement)) = tracked_tally {
                 let tally_suffix = format_tally_suffix(
