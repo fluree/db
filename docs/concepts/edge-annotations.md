@@ -296,6 +296,44 @@ The explicit-ID-doesn't-cascade rule protects user-named resources from accident
 
 ## Retraction semantics
 
+### Which spelling does what
+
+Two independent rules meet here, and the combination surprises people.
+
+**1. The annotation form asserts the base triple, so deleting it retracts the base edge.** Both `s p o ~ :r {| … |}` and the bare `s p o ~ :r` expand to the base triple *plus* the reification: RDF 1.2 Turtle §2.11.1 defines the syntax as one that both reifies **and asserts** a triple, and SPARQL 1.2 Update §3.1.2 admits the same production into `DELETE DATA`. So `DELETE DATA { :alice :knows :bob ~ :claim1 {| … |} }` is a base-edge retraction. This is what the specs require — a store that kept the edge here would be the one diverging.
+
+**2. Retracting a base edge cascades to every reifier attached to it**, including reifiers the delete never named. This rule is Fluree's own. Neither RDF 1.2 nor SPARQL 1.2 entails it, and SPARQL 1.2 Update §3.1.2 Example 6 makes the converse point — deleting a *reifying* triple leaves the asserted triple in place. Fluree cascades because an edge's claims should not outlive the edge it describes. It is stated here so that a reader who checks the spec, finds Fluree retracting more than was named, and concludes there is a second bug, knows it is deliberate.
+
+Seeded with one edge and two independent claims about it:
+
+```turtle
+:alice :knows :bob ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} .
+:alice :knows :bob ~ :claim2 {| :confidence 0.6 ; :source :sourceB |} .
+```
+
+| you write | edge | `:claim1` body | `:claim2` body | still attached |
+| --- | --- | --- | --- | --- |
+| `DELETE DATA { :alice :knows :bob ~ :claim1 {\| :confidence 0.8 ; :source :sourceA \|} }` | **gone** | gone | survives | none |
+| `DELETE DATA { :alice :knows :bob ~ :claim1 }` | **gone** | **survives** | **survives** | none |
+| `DELETE WHERE { :alice :knows :bob ~ ?c {\| :confidence ?f \|} }` | **gone** | `:source` only | `:source` only | none |
+| `DELETE DATA { :alice :knows :bob }` | **gone** | survives | survives | none |
+| `upsert` restating the edge with a different object | object replaced | survives | survives | none |
+| `DELETE DATA { :claim1 :confidence 0.8 ; :source :sourceA }` | survives | gone | survives | `:claim2` |
+| JSON-LD `delete` with `"@annotation": {"@id": ":claim1"}` | survives | survives | survives | `:claim2` |
+| `DELETE DATA { :alice :knows :bob {\| … \|} }` | *refused* — an anonymous block has no addressable identity to delete | | | |
+
+Three rows deserve calling out:
+
+- **`~ :claim1` with no body block is the sharpest edge in the table.** It reads like "detach claim1" and does close to the opposite: the edge goes, *both* claims are detached, and *both* bodies are left standing — well-formed RDF about reifiers that no longer reify anything.
+- **A variable reifier matches every claim on the edge.** `~ ?c {| :confidence ?f |}` strips the body properties the block names from *all* of them. The result is not "claim1 withdrawn" but "every claim partially gutted, and the edge gone".
+- **The cascade is not delete-specific.** An `upsert` that changes the object retracts the old edge and fires the identical cascade, with no delete written anywhere.
+
+So:
+
+- To **withdraw one claim**, retract its body facts — `DELETE DATA { :claim1 :confidence 0.8 ; :source :sourceA }`. The edge and every other claim stay put, and the now-empty attachment is retired for you.
+- To **detach one claim but keep its body** as ordinary RDF, use the JSON-LD `@annotation` delete. It is the only spelling that means exactly that.
+- To **remove the edge and everything about it**, delete the base edge and set `opts.lpgEdgeLifecycle: true` (see LPG mode below) so the bodies go too.
+
 ### RDF mode (default)
 
 Retracting a base edge removes the attachment and any owned facts on **anonymous** annotations. Explicit-IRI annotations keep their non-attachment facts — only the attachment row is retracted.
