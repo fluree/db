@@ -18,6 +18,8 @@ Under `.fluree/cache/doc/`, keyed so that a re-run pays only for what actually c
 - **Reading cache** — keyed on the crop's pixels, the prompt and the model, not on the document. A parser upgrade re-routes pages, but a crop whose pixels did not change is answered without a model call. This is where the money is.
 - **Extraction cache** — keyed on the exact ask: the model, the ontology and guidance, the known entities found in the chunk, and the chunk's text. Changing the ontology invalidates exactly the language-model stage; a re-run into a fresh ledger with the same inputs makes no calls.
 
+The extraction key also carries a version, covering how the ask is *carried* rather than what it says: the request body, which the prompts do not mention. A release that changes it bumps the version, so answers given while the request was malformed are re-asked rather than served back from disk. That costs one full re-extraction of every cached corpus on the upgrade, once.
+
 `--no-cache` bypasses all three. Deleting the directory is always safe.
 
 ## Indexes follow

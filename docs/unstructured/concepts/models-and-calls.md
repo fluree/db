@@ -29,6 +29,8 @@ api_key = "$OPENAI_API_KEY"
 
 `api` selects the wire shape for generation calls: `chat` is `/chat/completions` with `image_url` parts, what OpenAI, Ollama, vLLM and LM Studio serve; `responses` is the Responses API with `input_image` parts, what the Fluree AI gateway serves. Embeddings use `/embeddings` either way. Each field can be overridden by `FLUREE_DOC_{EMBEDDING,LLM,VLM}_{URL,MODEL,API_KEY,DIMENSIONS,API}`.
 
+Both shapes send a deliberately minimal body — the model, the turns, and an output budget. No `temperature`, no `response_format`, no `max_tokens`: each is a field some current model refuses, and none of them is load-bearing. There is nothing to configure about this, and when an endpoint refuses something anyway the 400 is read and the call retried. See [What is sent on the wire](../reference/configuration.md#what-is-sent-on-the-wire).
+
 With `doc.remote = "<remote>"`, any slot not set gets the remote's gateway URL, the stored login as its bearer token, `api = "responses"`, and a model of `auto` for `vlm` and `llm` (the gateway picks by intent) or `text-embedding-3-small` for embeddings.
 
 ## Which calls are made

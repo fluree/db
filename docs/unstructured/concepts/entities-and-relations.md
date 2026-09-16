@@ -65,11 +65,102 @@ Read a `doc:` ledger's direct edges as *what a document stated*, not as what is 
 
 Every edge has a `doc:Relation` beside it carrying the excerpt, the verdict, the chunk and the source document, so the provenance of any claim is one hop away. A consumer that needs assertions rather than claims should read the reified nodes and apply its own trust rule — by source document, by verdict, or by corroboration across documents. `--relations reified` writes the evidence without the edges, which is the right mode when the corpus is not trusted.
 
+## Deciding what to trust
+
+Two signals are already on every relation node, both grounded in something checkable rather than in a model's opinion of itself, and both queryable with no extra ingest work.
+
+**Corroboration** — how many independent documents state the same triple. The relation node carries `rdf:subject`, `rdf:predicate`, `rdf:object` and `doc:sourceDocument`, so counting sources per statement is one group-by.
+
+**`doc:verdict`** — whether the predicate is one your ontology actually declares, as spelled (`valid`) or after an unambiguous repair (`repaired`), or not at all (`rejected`).
+
+Composed, they give a traversal filter that admits only statements more than one source makes with a predicate the ontology has:
+
+```sparql
+PREFIX doc: <https://ns.flur.ee/doc#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?s ?p ?o (COUNT(DISTINCT ?src) AS ?sources) WHERE {
+  ?s ?p ?o .
+  ?rel a doc:Relation ;
+       rdf:subject ?s ; rdf:predicate ?p ; rdf:object ?o ;
+       doc:asserted true ; doc:verdict "valid" ;
+       doc:sourceDocument ?src .
+}
+GROUP BY ?s ?p ?o
+HAVING (COUNT(DISTINCT ?src) >= 2)
+```
+
+Keep the `GROUP BY`. An ungrouped aggregate over the same shape is a different query plan and is not what this was measured against.
+
+### Source trust goes on the document node
+
+There is no `doc:` term for "how much do I trust this source", because it is your judgement and not a fact the pipeline can observe. Write it yourself, on the document node, in your own vocabulary:
+
+```sparql
+PREFIX ex: <https://example.org/>
+INSERT DATA {
+  <urn:fluree:doc:policy-manual.pdf> ex:trust 1.0 .
+  <urn:fluree:doc:forum-thread.html> ex:trust 0.3
+}
+```
+
+and compose it with the evidence at query time, where the relation node's `doc:sourceDocument` is the join:
+
+```sparql
+PREFIX doc: <https://ns.flur.ee/doc#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX ex:  <https://example.org/>
+SELECT ?s ?p ?o (SUM(?t) AS ?score) WHERE {
+  ?rel a doc:Relation ;
+       rdf:subject ?s ; rdf:predicate ?p ; rdf:object ?o ;
+       doc:verdict "valid" ;
+       doc:sourceDocument ?src .
+  ?src ex:trust ?t .
+}
+GROUP BY ?s ?p ?o
+ORDER BY DESC(?score)
+```
+
+On the document node rather than baked onto the edge, and that is the whole point: **a trust judgement is the thing most likely to change.** One triple on one document node re-scores every claim that document ever made, including claims ingested years apart. A number written onto each derived edge at ingest time cannot be revised at all without rewriting every edge, and once written it is no longer decomposable — nothing can tell whether `0.4` meant "the source is unreliable", "the sentence hedged", or "they barely know each other".
+
+Store the factors and multiply at query time. That way each one can be corrected on its own.
+
+A re-ingest of the document leaves your triples alone. It retracts what the pipeline itself wrote — the `doc:`, `nif:` and `po:` terms, `rdf:type`, the reification triple and `rdfs:label` — and nothing else, on the document node and on every node stamped with it. Anything in your own vocabulary survives. (`rdfs:label` and extra `@type` values on a pipeline node do not: the emitters write those.)
+
+### Trust filtering is a query concern, not a policy one
+
+A policy cannot express "show me only edges above this score". Policy targets bind `?$this` to the **subject**, so the decision is all-or-nothing per subject: a person with one well-supported edge and one thin one is either entirely visible or entirely hidden. Filter in the query, as above.
+
+## Assertion mode
+
+`doc:assertionMode` records **how the source states a relation**: `asserted`, `hedged`, `attributed` or `negated`. It sits on the relation node beside `doc:verdict`.
+
+It exists because corroboration and verdict, between them, cannot tell a hedged claim from a certain one. Two documents stating that Alice knows Bob — one saying *"because she is his wife"*, one saying *"reportedly may know"* — produce relation nodes that are otherwise identical.
+
+**What it is not.** It is not a confidence score and must not be read as one. It says nothing about whether the source is right, nothing about how strong the relationship is, and nothing about how sure the model was. `attributed` is not "less true than" `asserted`; a well-attributed claim from a named authority may be your best evidence. There is deliberately no ordering and no number, for the same reason `doc:verdict` has neither.
+
+**Asking for it.** The shipped prompt does not, because that prompt text goes out verbatim with Fluree AI's hosted extraction. Add it with your own `--system-prompt`, which keeps the `{model}` and `{guidance}` slots:
+
+```text
+For each relation, alongside the fields above, add:
+  - "assertionMode": how the source states this relation. Exactly one of
+      "asserted"   — the text states it plainly
+      "hedged"     — "may", "reportedly", "is thought to", "appears to"
+      "attributed" — the text reports someone else saying it
+      "negated"    — the text denies it
+    Classify what the excerpt does, not how sure you are.
+```
+
+A value outside those four is refused and counted in the run summary, not stored: an unrecognised mode that silently disappeared would be indistinguishable from a prompt that never asked.
+
+**Why a classification and not a confidence.** "How confident are you?" asks the model to grade itself, which it is bad at, and folds three independent questions — did the text really say this, how hedged was it, how strong is the relation — into one number whose meaning is set by whatever prompt produced it. "Does the source assert, hedge, attribute or negate this?" is a question about text the model is holding, and it is the one axis this pipeline could not already express. If your prompt asks for a `confidence` field anyway, the run will tell you it was ignored.
+
 ## Re-runs
 
 The document node records a fingerprint of the ontology, the gazetteer sources, the language model, the guidance and the relation mode. A document is unchanged only when that fingerprint is too, so editing the ontology re-extracts and editing nothing skips.
 
 A re-ingest retracts the document's mentions and relation nodes and re-derives them. Minted entity nodes are shared between documents and are not retracted. An edge the earlier extraction asserted is kept only while some other relation, from any document, still supports it; otherwise it goes with the relation that produced it.
+
+What it retracts is scoped to what the pipeline writes: the `doc:`, `nif:` and `po:` namespaces, plus `rdf:type`, `rdf:subject`/`rdf:predicate`/`rdf:object` and `rdfs:label`. Triples you added yourself on the document node or on a relation node survive, which is what makes [source trust](#source-trust-goes-on-the-document-node) usable.
 
 Each chunk's answer is cached on the exact ask: the model, the ontology, the guidance, the known entities and the text. Re-running over an unchanged corpus with an unchanged setup makes no model calls.
 

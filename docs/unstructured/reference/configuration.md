@@ -36,7 +36,33 @@ api = "chat"
 
 Environment variables override the file per field: `FLUREE_DOC_{EMBEDDING,LLM,VLM}_{URL,MODEL,API_KEY,DIMENSIONS,API}`.
 
+There are deliberately **no per-endpoint capability settings** — nothing to declare about which JSON mode, token-limit field or temperature a model takes. See [What is sent on the wire](#what-is-sent-on-the-wire).
+
 An absent `[doc]` table means unconfigured: the pipeline runs deterministic and offline. A present but malformed one is an error.
+
+### What is sent on the wire
+
+A generation request carries the model, the messages and an output budget, and nothing else:
+
+```json
+{ "model": "gpt-5-mini",
+  "messages": [ … ],
+  "max_completion_tokens": 8000 }
+```
+
+That is the whole body, and the omissions are the point. Every optional field is a field some current model refuses:
+
+| Not sent | Why |
+|---|---|
+| `temperature` | gpt-5 and the o-series reject any value but their own default. `0` — what this used to send for determinism — is already the default on every endpoint that accepts it, so the field bought nothing where it worked and broke the call where it did not. |
+| `response_format` | `json_object` mode only guarantees syntactic JSON, not a schema. The prompt already asks for JSON and the parser already tolerates fences and prose around it. Anthropic's OpenAI-compatible route returns a 400 on the field today, against its own published table saying it is ignored. |
+| `max_tokens` | The deprecated spelling of the budget, and the one gpt-5 and the o-series reject. `max_completion_tokens` is accepted across the Chat Completions range. |
+
+**If an endpoint refuses something anyway, it is asked again.** A 400 naming a field is the endpoint describing its own dialect, which is better evidence than any table shipped in a binary: a server too old to know `max_completion_tokens` says so, and the request is retried once with `max_tokens` instead. Only known refusals are handled — an unrecognised 400 is reported to you verbatim rather than silently rewritten.
+
+Nothing here is configurable, on purpose. A per-endpoint capability setting is only right until you repoint `url` at a different server, has to be re-derived by hand each time the endpoint or model changes, and can only be as accurate as the vendor table someone transcribed it from — which, in the Anthropic case above, is wrong today.
+
+The gateway route (`api = "responses"`) has always sent this minimal shape and is unchanged.
 
 ## Extraction
 
