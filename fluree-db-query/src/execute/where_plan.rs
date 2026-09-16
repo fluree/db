@@ -77,6 +77,7 @@ pub fn expand_edge_annotation_patterns(patterns: &[Pattern]) -> Vec<Pattern> {
     for p in patterns {
         expand_one_into(p.clone(), &mut out, false);
     }
+    sink_filters_into_annotation_chains(&mut out);
     out
 }
 
@@ -246,6 +247,7 @@ fn expand_one_into(pattern: Pattern, out: &mut Vec<Pattern>, inside_graph: bool)
                 for p in inner {
                     expand_one_into(p, &mut out, was_inside);
                 }
+                sink_filters_into_annotation_chains(&mut out);
                 out
             });
             out.push(expanded);
@@ -263,7 +265,107 @@ fn expand_edge_annotation_patterns_inside_graph(patterns: &[Pattern]) -> Vec<Pat
     for p in patterns {
         expand_one_into(p.clone(), &mut out, true);
     }
+    sink_filters_into_annotation_chains(&mut out);
     out
+}
+
+/// Move a `FILTER` into the [`Pattern::DefaultGraphSource`] wrapper that binds
+/// every variable it mentions.
+///
+/// [`expand_edge_annotation_patterns`] wraps each expanded annotation chain in
+/// `DefaultGraphSource`, and [`collect_inner_join_block`] stops at any
+/// non-triple pattern — so a `FILTER` written beside an annotation
+/// (`?s :knows ?o {| :confidence ?c |} FILTER(?c > 0.97)`) starts a block of
+/// its own with no triples in it. [`extract_bounds_from_filters`] needs an
+/// object variable from the *same* block, finds none, and the threshold is
+/// left as a `FilterOperator` above the wrapper: every annotation is read and
+/// materialized before a single row is discarded, so a selective threshold
+/// costs exactly what no threshold costs.
+///
+/// Moving the filter inside puts it in the chain's *body*, which every
+/// annotation lane plans through the ordinary block builder — so the body scan
+/// picks up the same `ObjectBounds` pushdown an unannotated triple has always
+/// had. Nothing new is taught to the scan layer.
+///
+/// # Why this is sound
+///
+/// The wrapper binds no variable of its own and unions its per-source inner
+/// results row-wise, so `filter(union(a, b))` is `union(filter(a), filter(b))`.
+/// Two conditions keep that argument trivial:
+///
+/// - Every variable the filter mentions is produced by a **top-level triple
+///   inside the wrapper**. The filter therefore cannot observe a binding the
+///   wrapper does not make, and cannot cross an `OPTIONAL`'s left-join
+///   boundary — an `OPTIONAL` nested in the chain produces its variables
+///   through a sub-pattern, not a top-level triple, so it never passes.
+/// - The expression contains no `EXISTS` / pattern comprehension
+///   ([`contains_exists`]). Those resolve asynchronously against the execution
+///   context, and inside the wrapper that context is switched to one source at
+///   a time — an `EXISTS` moved inside would see one source where it used to
+///   see the whole default graph.
+///
+/// A filter failing either test stays exactly where it was, and a list with no
+/// wrapper in it returns after one scan, so no unannotated query pays for this.
+fn sink_filters_into_annotation_chains(patterns: &mut Vec<Pattern>) {
+    if !patterns
+        .iter()
+        .any(|p| matches!(p, Pattern::DefaultGraphSource { .. }))
+    {
+        return;
+    }
+
+    // Variables each wrapper's top-level triples bind, positionally.
+    let bindable: Vec<Option<HashSet<VarId>>> = patterns
+        .iter()
+        .map(|p| match p {
+            Pattern::DefaultGraphSource { patterns } => Some(
+                patterns
+                    .iter()
+                    .filter_map(Pattern::as_triple)
+                    .flat_map(TriplePattern::produced_vars)
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect();
+
+    // `(filter index, wrapper index)`, in source order.
+    let mut moves: Vec<(usize, usize)> = Vec::new();
+    for (i, p) in patterns.iter().enumerate() {
+        let Pattern::Filter(expr) = p else { continue };
+        if contains_exists(expr) {
+            continue;
+        }
+        let vars = expr.referenced_vars();
+        if vars.is_empty() {
+            continue;
+        }
+        // The earliest wrapper binding all of them: the filter then runs as
+        // early as it legally can, which is the point of the exercise. A
+        // variable shared by two wrappers is an equijoin between them, so
+        // constraining the first constrains both.
+        if let Some(w) = bindable.iter().position(|b| {
+            b.as_ref()
+                .is_some_and(|bound| vars.iter().all(|v| bound.contains(v)))
+        }) {
+            moves.push((i, w));
+        }
+    }
+    if moves.is_empty() {
+        return;
+    }
+
+    // Append in source order so sibling filters keep their relative order,
+    // then remove the originals back-to-front so earlier indices stay valid.
+    for &(fi, wi) in &moves {
+        let f = patterns[fi].clone();
+        if let Pattern::DefaultGraphSource { patterns: inner } = &mut patterns[wi] {
+            inner.push(f);
+        }
+    }
+    for &(fi, _) in moves.iter().rev() {
+        patterns.remove(fi);
+    }
 }
 
 fn reifies_subject_ref() -> Ref {
@@ -6111,6 +6213,132 @@ mod tests {
         let chain = unwrap_default_graph_source(&expanded[0]);
         let reifies_obj = find_reifies_object_triple(chain);
         assert!(reifies_obj.dtc.is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // Edge-annotation expansion — sinking a body FILTER into the wrapper
+    //
+    // `collect_inner_join_block` stops at the `DefaultGraphSource` wrapper, so
+    // a FILTER left outside it is in a block with no triples and
+    // `extract_bounds_from_filters` can never see the body's object variable.
+    // These pin *where the filter lands*, which is what decides whether the
+    // threshold reaches the scan at all.
+    // ---------------------------------------------------------------------
+
+    /// `?s <knows> ?o {| <conf> ?c |}` — `?c` is `VarId(3)`, the reifier
+    /// `VarId(1)`, `?s` `VarId(0)`, `?o` `VarId(2)`.
+    fn annotated_hop(s: u16, ann: u16, o: u16, body_var: u16) -> Pattern {
+        Pattern::EdgeAnnotation {
+            edge: TriplePattern {
+                s: Ref::Var(VarId(s)),
+                p: Ref::Sid(Sid::new(100, "knows")),
+                o: Term::Var(VarId(o)),
+                dtc: None,
+            },
+            annotation: Ref::Var(VarId(ann)),
+            body: vec![Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(ann)),
+                Ref::Sid(Sid::new(100, "confidence")),
+                Term::Var(VarId(body_var)),
+            ))],
+        }
+    }
+
+    fn gt(var: u16, v: f64) -> Pattern {
+        Pattern::Filter(Expression::call(
+            crate::ir::Function::Gt,
+            vec![
+                Expression::Var(VarId(var)),
+                Expression::Const(FlakeValue::Double(v)),
+            ],
+        ))
+    }
+
+    fn filter_count(patterns: &[Pattern]) -> usize {
+        patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::Filter(_)))
+            .count()
+    }
+
+    #[test]
+    fn sink_moves_annotation_body_filter_inside_the_wrapper() {
+        let patterns = vec![annotated_hop(0, 1, 2, 3), gt(3, 0.97)];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        assert_eq!(expanded.len(), 1, "the FILTER must not remain a sibling");
+        let chain = unwrap_default_graph_source(&expanded[0]);
+        // base + 3 f:reifies* + body triple + the sunk FILTER
+        assert_eq!(chain.len(), 6);
+        assert_eq!(filter_count(chain), 1);
+        assert!(
+            matches!(chain[5], Pattern::Filter(_)),
+            "the FILTER sinks to the end of the chain, where the body is: {chain:?}"
+        );
+    }
+
+    #[test]
+    fn sink_declines_a_filter_on_a_variable_the_wrapper_does_not_bind() {
+        // `?x` (VarId 9) is bound by a sibling triple, not by the chain.
+        let outside = Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(0)),
+            Ref::Sid(Sid::new(100, "age")),
+            Term::Var(VarId(9)),
+        ));
+        let patterns = vec![annotated_hop(0, 1, 2, 3), outside, gt(9, 30.0)];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        assert_eq!(filter_count(&expanded), 1, "FILTER stays outside");
+        assert_eq!(filter_count(unwrap_default_graph_source(&expanded[0])), 0);
+    }
+
+    #[test]
+    fn sink_declines_a_filter_carrying_exists() {
+        // EXISTS resolves against the execution context, and inside the
+        // wrapper that context is one default-graph source at a time.
+        let exists = Pattern::Filter(Expression::Exists {
+            patterns: vec![Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(3)),
+                Ref::Sid(Sid::new(100, "seen")),
+                Term::Var(VarId(8)),
+            ))],
+            negated: false,
+        });
+        let patterns = vec![annotated_hop(0, 1, 2, 3), exists];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        assert_eq!(filter_count(&expanded), 1, "EXISTS filter stays outside");
+        assert_eq!(filter_count(unwrap_default_graph_source(&expanded[0])), 0);
+    }
+
+    #[test]
+    fn sink_routes_each_hops_filter_to_its_own_chain() {
+        // The 2-hop confidence traversal: each threshold must reach the scan
+        // of the hop it constrains, not be applied once at the top.
+        let patterns = vec![
+            annotated_hop(0, 1, 2, 3),
+            gt(3, 0.5),
+            annotated_hop(2, 4, 5, 6),
+            gt(6, 0.5),
+        ];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        assert_eq!(expanded.len(), 2, "two wrappers, no leftover FILTERs");
+        assert_eq!(filter_count(unwrap_default_graph_source(&expanded[0])), 1);
+        assert_eq!(filter_count(unwrap_default_graph_source(&expanded[1])), 1);
+    }
+
+    #[test]
+    fn sink_leaves_an_unannotated_pattern_list_untouched() {
+        let patterns = vec![
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(VarId(0)),
+                Ref::Sid(Sid::new(100, "age")),
+                Term::Var(VarId(1)),
+            )),
+            gt(1, 30.0),
+        ];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        // `Pattern` has no `PartialEq`; compare the shape that matters.
+        assert_eq!(expanded.len(), 2);
+        assert!(matches!(expanded[0], Pattern::Triple(_)));
+        assert!(matches!(expanded[1], Pattern::Filter(_)));
     }
 
     // ========================================================================
