@@ -2581,12 +2581,122 @@ pub enum ProbeLanePlan {
     Decline,
 }
 
-/// True when no policy enforcer is active (or it is root). The batched
-/// leaflet probes read base leaflets directly and never run the per-leaf
-/// `filter_flakes` policy filtering that scan operators apply — engaging
-/// them under a restrictive policy would leak rows the policy hides.
-pub(crate) fn root_or_no_policy(ctx: &ExecutionContext<'_>) -> bool {
-    ctx.allow_unfiltered()
+/// Routing-stamp site for the binary scan's cursor lane under a policy.
+pub(crate) const POLICY_PREDICATE_SCAN_SITE: &str = "policy_predicate_scan";
+/// Routing-stamp site for the batched leaflet probe lanes under a policy.
+pub(crate) const POLICY_PREDICATE_PROBE_SITE: &str = "policy_predicate_probe";
+
+/// Whether a reader that emits raw index rows of ONE statically known
+/// predicate, without per-leaf policy filtering, may run under the view
+/// policy. Unstamped: for decisions that only shape a plan (whether to dedup
+/// ahead of a lane, say) and must not show up as a routing outcome. Readers
+/// use [`policy_lane_for_predicate`], which stamps.
+///
+/// Unpoliced contexts return `Allow` from the first check, so the ordinary
+/// query path pays nothing new. Under a non-root policy the predicate is
+/// classified against the view set ([`cursor_fast_path_for_predicate`]).
+/// `Empty` and `Decline` both mean the caller must not read raw rows;
+/// callers that have no empty result to emit treat `Empty` as `Decline`.
+///
+/// The view set is keyed in the namespace space of the snapshot it was built
+/// against, and a pattern SID is encoded against `original_snapshot`. When a
+/// per-graph context has swapped in a different snapshot the code may not
+/// name the same IRI, so classification is refused rather than risk clearing
+/// the wrong predicate.
+pub(crate) fn classify_predicate_under_policy(
+    ctx: &ExecutionContext<'_>,
+    pred_sid: &Sid,
+) -> PredicateFastPath {
+    if ctx.allow_unfiltered() {
+        return PredicateFastPath::Allow;
+    }
+    if std::ptr::eq(ctx.original_snapshot, ctx.active_snapshot) {
+        cursor_fast_path_for_predicate(ctx, pred_sid)
+    } else {
+        PredicateFastPath::Decline
+    }
+}
+
+/// [`classify_predicate_under_policy`] over a set the reader touches as a
+/// whole: every predicate must clear. An empty set declines rather than
+/// clearing vacuously; any `Decline` wins over any `Empty`, and `Empty` over
+/// `Allow`. Readers whose members are independent (a union of per-predicate
+/// counts, say) classify each member on its own instead.
+pub(crate) fn classify_predicates_under_policy(
+    ctx: &ExecutionContext<'_>,
+    pred_sids: &[&Sid],
+) -> PredicateFastPath {
+    if ctx.allow_unfiltered() {
+        return PredicateFastPath::Allow;
+    }
+    if pred_sids.is_empty() {
+        return PredicateFastPath::Decline;
+    }
+    let mut verdict = PredicateFastPath::Allow;
+    for pred_sid in pred_sids {
+        match classify_predicate_under_policy(ctx, pred_sid) {
+            PredicateFastPath::Decline => return PredicateFastPath::Decline,
+            PredicateFastPath::Empty => verdict = PredicateFastPath::Empty,
+            PredicateFastPath::Allow => {}
+        }
+    }
+    verdict
+}
+
+fn stamp_policy_lane(site: &'static str, verdict: PredicateFastPath) {
+    crate::fast_path_outcome::stamp_fast_path(
+        site,
+        match verdict {
+            PredicateFastPath::Allow | PredicateFastPath::Empty => {
+                crate::fast_path_outcome::FastPathOutcome::Proceed
+            }
+            PredicateFastPath::Decline => crate::fast_path_outcome::FastPathOutcome::Fallback(
+                crate::fast_path_outcome::FastPathFallback::GateDeclined,
+            ),
+        },
+    );
+}
+
+/// Per-predicate policy gate for a raw-row reader of ONE predicate:
+/// [`classify_predicate_under_policy`] with the decision stamped on `site`
+/// so a routing test can pin it. Unpoliced contexts stamp nothing.
+pub(crate) fn policy_lane_for_predicate(
+    ctx: &ExecutionContext<'_>,
+    pred_sid: &Sid,
+    site: &'static str,
+) -> PredicateFastPath {
+    if ctx.allow_unfiltered() {
+        return PredicateFastPath::Allow;
+    }
+    let verdict = classify_predicate_under_policy(ctx, pred_sid);
+    stamp_policy_lane(site, verdict);
+    verdict
+}
+
+/// [`policy_lane_for_predicate`] for a reader that touches a set of
+/// predicates as a whole ([`classify_predicates_under_policy`]), stamped
+/// once for the set.
+pub(crate) fn policy_lane_for_predicates(
+    ctx: &ExecutionContext<'_>,
+    pred_sids: &[&Sid],
+    site: &'static str,
+) -> PredicateFastPath {
+    if ctx.allow_unfiltered() {
+        return PredicateFastPath::Allow;
+    }
+    let verdict = classify_predicates_under_policy(ctx, pred_sids);
+    stamp_policy_lane(site, verdict);
+    verdict
+}
+
+/// [`policy_lane_for_predicate`] for the probe lanes: `Allow` keeps the lane,
+/// anything else declines it (the lanes have no empty result to short-circuit
+/// to; the per-row fallback filters and finds nothing).
+fn probe_lane_policy_clears(ctx: &ExecutionContext<'_>, pred_sid: &Sid) -> bool {
+    matches!(
+        policy_lane_for_predicate(ctx, pred_sid, POLICY_PREDICATE_PROBE_SITE),
+        PredicateFastPath::Allow
+    )
 }
 
 /// Plan a single-predicate PSOT subject probe under the active overlay.
@@ -2596,9 +2706,9 @@ pub fn subject_probe_lane_plan(
     pred_sid: &Sid,
 ) -> Result<ProbeLanePlan> {
     // BEFORE the overlay-free return: the probe lanes read raw leaflets in
-    // `Clean` mode too, so a restrictive policy must decline regardless of
-    // novelty state.
-    if !root_or_no_policy(ctx) {
+    // `Clean` mode too, so a policy that can touch this predicate must
+    // decline regardless of novelty state.
+    if !probe_lane_policy_clears(ctx, pred_sid) {
         return Ok(ProbeLanePlan::Decline);
     }
     if ctx.overlay_free_single_graph() {
@@ -2648,7 +2758,7 @@ pub fn object_probe_lane_plan(
     // See subject_probe_lane_plan: policy declines before the overlay-free
     // return (raw leaflet reads bypass per-leaf policy filtering in `Clean`
     // mode too); eager callers keep the per-row path under an overlay.
-    if !root_or_no_policy(ctx) {
+    if !probe_lane_policy_clears(ctx, pred_sid) {
         return Ok(ProbeLanePlan::Decline);
     }
     if ctx.overlay_free_single_graph() {
@@ -2695,8 +2805,12 @@ pub fn star_probe_lane_plan(
 ) -> Result<ProbeLanePlan> {
     // See subject_probe_lane_plan: policy declines before the overlay-free
     // return (raw leaflet reads bypass per-leaf policy filtering in `Clean`
-    // mode too); eager callers keep the per-row path under an overlay.
-    if !root_or_no_policy(ctx) {
+    // mode too); eager callers keep the per-row path under an overlay. The
+    // star reads every predicate at once, so the whole set must clear.
+    if !matches!(
+        policy_lane_for_predicates(ctx, pred_sids, POLICY_PREDICATE_PROBE_SITE),
+        PredicateFastPath::Allow
+    ) {
         return Ok(ProbeLanePlan::Decline);
     }
     if ctx.overlay_free_single_graph() {
