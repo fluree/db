@@ -26,10 +26,20 @@
 //! The lane is pinned deliberately. The `arena` lane the planner currently
 //! prefers drives from the base edge and probes per row, and does not exploit
 //! object bounds on the resulting bound-subject body lookup — a separate
-//! defect, tracked with the lane-selection issue. The `chain` lane plans the
-//! whole chain as one block, which is where the bounds bite. Pinning is what
-//! keeps this test from passing by silently taking a lane that never had the
-//! problem.
+//! defect, tracked with the lane-selection issue. Pinning `chain` runs the
+//! generic path, which plans the whole chain as one block — that is where the
+//! bounds bite. Note the naming: `ChainLane::Chain` means "neither arena nor
+//! enumerate" and the engine reports the execution as `generic`, so seeing
+//! `lane="generic"` after pinning `chain` is expected and not a demotion.
+//! Pinning is what keeps this test from passing by silently taking a lane that
+//! never had the problem — and the fired-lane assertion is what keeps the
+//! pinning itself honest.
+//!
+//! Which check guards what, since three of them look redundant and are not:
+//! stamp 1 pins that the threshold is planned inside the chain; stamp 2
+//! (`pinned_kept_fuel < pinned_all_fuel`) catches a dropped override, because a
+//! demoted arm cannot show the threshold reducing scan work; and the fired-lane
+//! assertion in the loop is the only one that certifies *which* lane ran.
 //!
 //! Twin surfaces: SPARQL and JSON-LD share the IR, and the rewrite lives in
 //! `fluree-db-query`, so both are covered here.
@@ -237,7 +247,7 @@ async fn annotation_body_threshold_reduces_scan_work_on_both_surfaces() {
             );
 
             // ---- stamp 2: it reaches the scan ---------------------------
-            // Pinned to the chain lane; see the module header for why.
+            // Pinned to `chain` (which executes as `generic`); module header for why.
             let (pinned_all, pinned_all_fuel, pinned_kept, pinned_kept_fuel) = {
                 let _lane = LanePin::chain();
                 let (a, af) =
@@ -247,8 +257,8 @@ async fn annotation_body_threshold_reduces_scan_work_on_both_surfaces() {
                         .await;
                 (a, af, k, kf)
             };
-            assert_eq!(pinned_all as usize, EDGES, "chain lane, unfiltered count");
-            assert_eq!(pinned_kept as usize, KEPT, "chain lane, thresholded count");
+            assert_eq!(pinned_all as usize, EDGES, "chain pin, unfiltered count");
+            assert_eq!(pinned_kept as usize, KEPT, "chain pin, thresholded count");
             assert!(
                 pinned_kept_fuel < pinned_all_fuel,
                 "a threshold keeping {KEPT}/{EDGES} rows must cut scan work, not just \
@@ -269,9 +279,23 @@ async fn annotation_body_threshold_reduces_scan_work_on_both_surfaces() {
             // That traversal predates this rewrite and nothing else connects
             // the two modules, so delete it and every row here drops silently
             // with no other test going red. This pins it, on every lane.
-            let mut per_lane_fuel: Vec<(&str, f64)> = Vec::new();
-            for lane in ["arena", "enumerate", "chain"] {
+            // (pin, the lane the engine actually reports for that pin).
+            //
+            // `chain` maps to `generic`, and that is not a demotion: there is no
+            // execution branch keyed on `ChainLane::Chain`. The variant means only
+            // "neither arena nor enumerate", after which control reaches the hash
+            // branch (admitted at >= 256 driving rows) and otherwise the generic
+            // chain. Pinning `chain` therefore cannot produce a `chain`-labelled
+            // execution on any shape. Encoding that here rather than in prose is
+            // the point: if it ever changes, this fails.
+            let (store, _tracing_guard) = support::span_capture::init_test_tracing();
+            for (lane, expected_fired) in [
+                ("arena", "arena"),
+                ("enumerate", "enumerate"),
+                ("chain", "generic"),
+            ] {
                 let _pin = LanePin::lane(lane);
+                let before = store.find_events("annotation delegate lane").len();
                 let (n, obj_fuel) = sparql_count_and_fuel(
                     &fluree,
                     &post,
@@ -291,43 +315,30 @@ async fn annotation_body_threshold_reduces_scan_work_on_both_surfaces() {
                     sparql_count_and_fuel(&fluree, &post, &annotated_count_sparql(Some(THRESHOLD)))
                         .await;
                 assert_eq!(plain as usize, KEPT, "lane={lane}: thresholded count");
-                per_lane_fuel.push((lane, obj_fuel));
-            }
 
-            // Three correct answers on three pins do NOT establish that three
-            // lanes ran, and that gap is the whole subject of this file.
-            // `FLUREE_ANNOTATION_LANE` is honoured where the lane is *selected*
-            // and silently ignored where it is *executed*: when any of the five
-            // runtime gates fails, both arena-requiring lanes fall through and
-            // every arm above still returns the right rows. An override that
-            // never reached this process does the same. Either way the loop
-            // passes while measuring one lane three times.
-            //
-            // Fuel is the check that can fail: it is bit-identical across runs
-            // and reproduces across machines, and the lanes have lane-specific
-            // cost profiles, so three pins that really took three lanes cannot
-            // report one number.
-            //
-            // Distinctness rather than three pinned constants, deliberately. It
-            // catches a full demotion (all three collapse), a partial one (two
-            // collapse) and a dropped override (all three identical) equally
-            // well, without hard-coding values that an unrelated change to fuel
-            // accounting would break for reasons having nothing to do with
-            // lanes. Row counts above already pin fixture integrity. Observed
-            // when written, for manual comparison: arena 37.02, enumerate 4,
-            // chain 40.01.
-            for (i, (lane_a, fuel_a)) in per_lane_fuel.iter().enumerate() {
-                for (lane_b, fuel_b) in per_lane_fuel.iter().skip(i + 1) {
-                    assert_ne!(
-                        fuel_a.to_bits(),
-                        fuel_b.to_bits(),
-                        "lanes `{lane_a}` and `{lane_b}` burned identical fuel \
-                         ({fuel_a}), so this test is measuring one lane twice, not \
-                         two lanes. Either a runtime gate demoted them both or the \
-                         FLUREE_ANNOTATION_LANE override never reached the query \
-                         process. Full triple: {per_lane_fuel:?}"
-                    );
-                }
+                // The lane that actually executed, from the engine's own event.
+                // This is what distinguishes "three lanes ran" from "one lane ran
+                // three times" — pairwise-distinct fuel cannot, because a pin that
+                // falls through to a fourth path with its own cost still yields
+                // three distinct numbers and a mislabelled cell.
+                let fired: Vec<String> = store.find_events("annotation delegate lane")[before..]
+                    .iter()
+                    .filter_map(|e| e.fields.get("lane").cloned())
+                    .collect();
+                assert!(
+                    !fired.is_empty(),
+                    "lane={lane}: no `annotation delegate lane` event was captured, so \
+                     nothing here establishes which lane ran. An absent marker must \
+                     fail rather than pass — if the event moved, this assertion is \
+                     what needs updating, not deleting."
+                );
+                assert!(
+                    fired.iter().all(|f| f == expected_fired),
+                    "lane={lane}: expected the engine to report `{expected_fired}`, got \
+                     {fired:?} (fuel {obj_fuel}). Either a runtime gate demoted the \
+                     pin, or the FLUREE_ANNOTATION_LANE override never reached the \
+                     query process, or the pin-to-lane mapping changed."
+                );
             }
 
             // ---- twin surface: JSON-LD ---------------------------------
