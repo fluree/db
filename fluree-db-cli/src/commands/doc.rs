@@ -549,7 +549,9 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
             max_chars: args.max_chars,
         },
         cache,
-        vlm,
+        // The reader is shared, not handed over: the run reports at the end
+        // how many of its calls the endpoint refused and had to be resent.
+        vlm: vlm.clone(),
     };
 
     if let Some(out) = &args.out_dir {
@@ -891,6 +893,19 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                 fluree_db_doc::extract::AssertionMode::ALL.join(" / ")
             );
         }
+    }
+    // Outside the extraction block on purpose: crop reading uses the same
+    // wire shape, so a run with no `--model` can still have been adjusted.
+    let recoveries = extraction
+        .as_ref()
+        .and_then(|x| x.extractor.as_ref())
+        .map_or(0, |x| x.recoveries())
+        + vlm.as_ref().map_or(0, |v| v.recoveries());
+    if recoveries > 0 {
+        println!(
+            "    {} {recoveries} call(s) were refused and resent with an adjusted request; the endpoint does not take every field this sends",
+            "!".yellow()
+        );
     }
     if totals.unescalated > 0 {
         eprintln!(

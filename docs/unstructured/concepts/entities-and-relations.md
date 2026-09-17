@@ -124,7 +124,9 @@ On the document node rather than baked onto the edge, and that is the whole poin
 
 Store the factors and multiply at query time. That way each one can be corrected on its own.
 
-A re-ingest of the document leaves your triples alone. It retracts what the pipeline itself wrote — the `doc:`, `nif:` and `po:` terms, `rdf:type`, the reification triple and `rdfs:label` — and nothing else, on the document node and on every node stamped with it. Anything in your own vocabulary survives. (`rdfs:label` and extra `@type` values on a pipeline node do not: the emitters write those.)
+A re-ingest of the document leaves your triples alone. It retracts what the pipeline itself wrote — the `doc:`, `nif:` and `po:` terms, `rdf:type`, the reification triple and `rdfs:label` — and nothing else, on the document node and on every node stamped with it. Anything in your own vocabulary survives.
+
+**`doc:`, `nif:` and `po:` are reserved.** The boundary is the predicate, not who wrote it: a predicate in one of those three namespaces, on the document node or on any node stamped with it, is pipeline-owned and a re-ingest will retract it — including one you added yourself. So curate under your own namespace (`ex:trust`, above), not under `doc:`. `rdfs:label` and extra `@type` values on a pipeline node are reserved for the same reason: the emitters write both.
 
 ### Trust filtering is a query concern, not a policy one
 
@@ -160,7 +162,7 @@ The document node records a fingerprint of the ontology, the gazetteer sources, 
 
 A re-ingest retracts the document's mentions and relation nodes and re-derives them. Minted entity nodes are shared between documents and are not retracted. An edge the earlier extraction asserted is kept only while some other relation, from any document, still supports it; otherwise it goes with the relation that produced it.
 
-What it retracts is scoped to what the pipeline writes: the `doc:`, `nif:` and `po:` namespaces, plus `rdf:type`, `rdf:subject`/`rdf:predicate`/`rdf:object` and `rdfs:label`. Triples you added yourself on the document node or on a relation node survive, which is what makes [source trust](#source-trust-goes-on-the-document-node) usable.
+What it retracts is scoped to what the pipeline writes: the `doc:`, `nif:` and `po:` namespaces, plus `rdf:type`, `rdf:subject`/`rdf:predicate`/`rdf:object` and `rdfs:label`. Those namespaces are reserved, so the scope is by predicate rather than by author — a `doc:` predicate you wrote yourself is retracted too. Triples in your own vocabulary survive, which is what makes [source trust](#source-trust-goes-on-the-document-node) usable.
 
 Each chunk's answer is cached on the exact ask: the model, the ontology, the guidance, the known entities and the text. Re-running over an unchanged corpus with an unchanged setup makes no model calls.
 

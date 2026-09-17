@@ -328,6 +328,12 @@ impl Extractor {
         self.client.model()
     }
 
+    /// Extraction calls the endpoint refused once and accepted after the
+    /// request was adjusted. See [`LlmClient::recoveries`].
+    pub fn recoveries(&self) -> usize {
+        self.client.recoveries()
+    }
+
     /// Changes when the endpoint model, the ontology, the guidance or
     /// either prompt template does.
     pub fn fingerprint(&self) -> String {

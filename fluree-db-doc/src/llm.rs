@@ -41,6 +41,13 @@ pub struct LlmClient {
     agent: ureq::Agent,
     endpoint: ModelEndpoint,
     api_key: Option<String>,
+    /// Calls this client retried with an adjusted body after a 400. A run
+    /// that silently downgraded every request has to be distinguishable
+    /// from one that downgraded none, and `tracing::debug!` alone is not:
+    /// the operator would have to have had debug logging on to find out.
+    ///
+    /// Atomic because one client is shared across the chunk workers.
+    recoveries: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for LlmClient {
@@ -65,7 +72,13 @@ impl LlmClient {
             agent,
             endpoint,
             api_key,
+            recoveries: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// How many calls this client had to adjust and resend, over its life.
+    pub fn recoveries(&self) -> usize {
+        self.recoveries.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn model(&self) -> &str {
@@ -115,6 +128,8 @@ impl LlmClient {
                     if status == 400 && !recovered {
                         if let Some(fixed) = recover(&mut body, &text) {
                             tracing::debug!("{url}: retrying with {fixed}");
+                            self.recoveries
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             recovered = true;
                             continue;
                         }

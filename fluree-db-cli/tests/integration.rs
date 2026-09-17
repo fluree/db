@@ -4502,6 +4502,98 @@ fn doc_ingest_stores_assertion_mode_from_a_custom_prompt() {
         .stdout(predicate::str::contains("hedged"));
 }
 
+/// A downgraded request is visible in the run's own output, not only in
+/// `tracing::debug!`. A corpus where every call was silently adjusted must
+/// not read the same as one where none was.
+#[test]
+fn doc_ingest_says_when_the_endpoint_refused_and_the_request_was_resent() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+
+    // A server that speaks only the deprecated budget field: it names
+    // `max_completion_tokens` in a 400 and accepts the resend.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+    let captured = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let mut len = 0usize;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; len];
+            reader.read_exact(&mut body).ok();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let old_spelling = parsed.get("max_tokens").is_some();
+            captured.lock().unwrap().push(parsed);
+            let (status, reply) = if old_spelling {
+                (
+                    200,
+                    serde_json::json!({ "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": "{\"entities\":[],\"relations\":[]}" } }] })
+                    .to_string(),
+                )
+            } else {
+                (
+                    400,
+                    serde_json::json!({ "error": {
+                    "message": "Unrecognized request argument supplied: max_completion_tokens" } })
+                    .to_string(),
+                )
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+        }
+    });
+
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("1 call(s) were refused and resent with an adjusted request")
+                .count(1),
+        );
+
+    // Both requests really happened, and the second carried the spelling
+    // the 400 asked for — so the message is not reporting a phantom.
+    let sent = seen.lock().unwrap();
+    assert_eq!(sent.len(), 2, "one refusal, one resend: {sent:?}");
+    assert_eq!(sent[0]["max_completion_tokens"], 8000);
+    assert!(sent[0].get("max_tokens").is_none());
+    assert_eq!(sent[1]["max_tokens"], 8000);
+    assert!(sent[1].get("max_completion_tokens").is_none());
+}
+
 // --- end: `fluree doc ingest` re-ingest ownership (PR-C / #1864) ------------
 
 /// A stub OpenAI-compatible `/embeddings` endpoint. Each input string becomes

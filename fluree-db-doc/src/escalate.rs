@@ -50,6 +50,12 @@ impl std::fmt::Debug for VlmReader {
 }
 
 impl VlmReader {
+    /// Crop-reading calls the endpoint refused once and accepted after the
+    /// request was adjusted. See [`crate::llm::LlmClient::recoveries`].
+    pub fn recoveries(&self) -> usize {
+        self.client.recoveries()
+    }
+
     pub fn new(endpoint: ModelEndpoint, cache: Option<DocCache>, max_crops: usize) -> Result<Self> {
         Ok(Self {
             client: LlmClient::new(endpoint),
