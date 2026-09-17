@@ -132,27 +132,64 @@ fn shortest_digits(abs: f64) -> (String, i32) {
 
 /// Break a tie the way ECMAScript does.
 ///
-/// Two digit strings of the same length can both round trip to `abs`. Rust
-/// returns whichever its algorithm reaches; ECMAScript requires the even one.
+/// Rust's shortest form is already the closest decimal of that length, so it
+/// needs correcting only when two are exactly equally close. That happens when
+/// the exact expansion of `abs` continues past the k-th digit with a single
+/// `5`. ECMAScript then takes the even candidate.
 fn even_tie(digits: String, n: i32, abs: f64) -> String {
     let Ok(value) = digits.parse::<u128>() else {
         return digits;
     };
-    if value % 2 == 0 {
+    let width = digits.len();
+    // Cheap filter first. In a tie both candidates round trip, so a value
+    // whose neighbours do not cannot be one.
+    let scale = n - width as i32;
+    let neighbour_round_trips = [value.wrapping_sub(1), value + 1].iter().any(|candidate| {
+        let candidate = candidate.to_string();
+        candidate.len() == width && format!("{candidate}e{scale}").parse::<f64>() == Ok(abs)
+    });
+    if !neighbour_round_trips {
         return digits;
     }
-    let width = digits.len();
-    let scale = n - width as i32;
-    for candidate in [value - 1, value + 1] {
-        let candidate = candidate.to_string();
-        if candidate.len() != width {
-            continue;
+    match exact_tie_head(abs, n, width) {
+        // The head is the first k digits of the exact expansion. The tie is
+        // between it and its successor; ECMAScript takes the even one.
+        Some(head) if head % 2 == 0 => head.to_string(),
+        Some(head) => {
+            let even = (head + 1).to_string();
+            if even.len() == width {
+                even
+            } else {
+                // The successor carried into another digit, so the pair is not
+                // two strings of this length after all.
+                digits
+            }
         }
-        if format!("{candidate}e{scale}").parse::<f64>() == Ok(abs) {
-            return candidate;
-        }
+        None => digits,
     }
-    digits
+}
+
+/// The first `k` digits of `abs`'s exact expansion, when the expansion
+/// continues with exactly one `5`. `None` when `abs` is not such a midpoint.
+///
+/// A double's expansion is finite, at most 767 significant digits, so
+/// formatting to 780 prints it exactly and pads with zeros.
+fn exact_tie_head(abs: f64, n: i32, k: usize) -> Option<u128> {
+    let exact = format!("{abs:.*e}", 780);
+    let (mantissa, exponent) = exact.split_once('e')?;
+    let exponent: i32 = exponent.parse().ok()?;
+    if exponent + 1 != n {
+        // The shortest form rounded across a power of ten, so its digits do
+        // not line up with the expansion's.
+        return None;
+    }
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let (head, rest) = digits.split_at(k);
+    let mut rest = rest.bytes();
+    if rest.next() != Some(b'5') || !rest.all(|b| b == b'0') {
+        return None;
+    }
+    head.parse().ok()
 }
 
 /// Place the decimal point per ECMAScript, given `k` digits and the point
