@@ -223,6 +223,10 @@ pub struct IndexerConfig {
     /// one per ledger that goes idle while behind. Builds are serialized per
     /// worker, so the cost is throughput rather than a stampede.
     ///
+    /// The same tick runs a collector pass over every ledger whose chain may
+    /// exceed retention, one ledger at a time, and once at start-up. That is
+    /// what collects a ledger that stops publishing; see [`crate::gc`].
+    ///
     /// Default: 300 s.
     pub catchup_interval: Duration,
 

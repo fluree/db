@@ -524,3 +524,136 @@ async fn s3_testcontainers_hard_drop_clears_ledger() {
         .await
         .expect("re-create ledger after hard drop");
 }
+
+/// The collector and a fork drop, end to end on S3 + DynamoDB with the worker
+/// running. Exercises what differs from the file backends: batch releases as
+/// `DeleteObjects` against the shared dictionary prefix, sibling discovery
+/// through DynamoDB's eventually consistent listing index, and each sibling's
+/// head through a consistent `lookup`.
+// Multi-threaded, as a server is: an insert after the first build probes the
+// persisted dictionaries synchronously, and on remote storage that read needs
+// a runtime thread other than the one blocked on it. On a current-thread
+// runtime the probe times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg(feature = "native")]
+async fn s3_testcontainers_collector_and_fork_drop_keep_every_referenced_dictionary() {
+    let (_lock, _container, endpoint) = start_localstack("s3,dynamodb").await;
+    let sdk_config = sdk_config_for_localstack(&endpoint).await;
+    let bucket = "fluree-gc-e2e";
+    let table = "fluree-gc-e2e-ns";
+    ensure_bucket(&sdk_config, bucket).await;
+    ensure_dynamodb_table(&sdk_config, table).await;
+
+    let storage = S3Storage::new(
+        &sdk_config,
+        S3Config {
+            bucket: bucket.to_string(),
+            prefix: Some("gc".to_string()),
+            endpoint: None,
+            force_path_style: None,
+            timeout_ms: Some(30_000),
+            max_retries: None,
+            retry_base_delay_ms: None,
+            retry_max_delay_ms: None,
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .expect("S3Storage::new");
+    let nameservice = DynamoDbNameService::new(
+        &sdk_config,
+        DynamoDbConfig {
+            table_name: table.to_string(),
+            region: None,
+            endpoint: None,
+            timeout_ms: Some(30_000),
+        },
+    )
+    .await
+    .expect("DynamoDbNameService::new");
+
+    let mut fluree = build_fluree(storage, nameservice.clone());
+    // Spawned, as the server does, rather than on a `LocalSet`: the blocking
+    // region a remote dictionary read enters is not allowed inside one.
+    let (worker, handle) = fluree_db_api::BackgroundIndexerWorker::new(
+        fluree.backend().clone(),
+        Arc::new(nameservice),
+        support::collecting_indexer_config(),
+    );
+    let worker = tokio::spawn(worker.run());
+    fluree.set_indexing_mode(tx::IndexingMode::Background(handle.clone()));
+
+    support::run_collector_and_fork_drop_scenario(&fluree, &handle, "gc-e2e").await;
+    worker.abort();
+}
+
+/// `delete_many` issues one `DeleteObjects` per thousand keys: every key in a
+/// batch spanning two requests goes, a key that never existed is not a
+/// failure, and nothing outside the batch is touched.
+#[tokio::test]
+async fn s3_testcontainers_delete_many_batches_across_requests() {
+    use fluree_db_core::{StorageRead, StorageWrite};
+    use futures::StreamExt;
+
+    let (_lock, _container, endpoint) = start_localstack("s3").await;
+    let sdk_config = sdk_config_for_localstack(&endpoint).await;
+    let bucket = "fluree-delete-many";
+    ensure_bucket(&sdk_config, bucket).await;
+
+    let storage = S3Storage::new(
+        &sdk_config,
+        S3Config {
+            bucket: bucket.to_string(),
+            prefix: Some("test".to_string()),
+            endpoint: None,
+            force_path_style: None,
+            timeout_ms: Some(30_000),
+            max_retries: None,
+            retry_base_delay_ms: None,
+            retry_max_delay_ms: None,
+            max_concurrent_requests: None,
+        },
+    )
+    .await
+    .expect("S3Storage::new");
+
+    let address = |i: usize| format!("fluree:s3://batch/main/index/objects/leaves/{i:05}.fli");
+    let doomed: Vec<String> = (0..1003).map(address).collect();
+    let survivor = address(9000);
+    let writes: Vec<_> = doomed
+        .iter()
+        .chain(std::iter::once(&survivor))
+        .map(|addr| storage.write_bytes(addr, b"x"))
+        .collect();
+    let written: Vec<_> = futures::stream::iter(writes)
+        .buffer_unordered(16)
+        .collect()
+        .await;
+    assert!(written.iter().all(Result::is_ok), "seed writes succeed");
+    assert_eq!(list_all_keys(&sdk_config, bucket).await, 1004);
+
+    let mut batch = doomed.clone();
+    batch.push(address(9999));
+    let failures = storage.delete_many(&batch).await;
+    assert!(
+        failures.is_empty(),
+        "a missing key is not a failure: {failures:?}"
+    );
+    assert_eq!(
+        list_all_keys(&sdk_config, bucket).await,
+        1,
+        "both DeleteObjects requests landed"
+    );
+    assert_eq!(storage.read_bytes(&survivor).await.expect("survivor"), b"x");
+}
+
+/// Object count in `bucket`, paginated: `list_object_keys` reads one page.
+async fn list_all_keys(sdk_config: &aws_config::SdkConfig, bucket: &str) -> usize {
+    let s3 = aws_sdk_s3::Client::new(sdk_config);
+    let mut pages = s3.list_objects_v2().bucket(bucket).into_paginator().send();
+    let mut count = 0;
+    while let Some(page) = pages.next().await {
+        count += page.expect("list_objects_v2").contents().len();
+    }
+    count
+}

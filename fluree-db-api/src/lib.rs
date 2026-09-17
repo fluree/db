@@ -865,6 +865,16 @@ where
         }
     }
 
+    async fn delete_many(&self, addresses: &[String]) -> Vec<(String, fluree_db_core::Error)> {
+        let (commit, index): (Vec<String>, Vec<String>) = addresses
+            .iter()
+            .cloned()
+            .partition(|address| Self::route_to_commit(address));
+        let mut failures = self.commit.delete_many(&commit).await;
+        failures.extend(self.index.delete_many(&index).await);
+        failures
+    }
+
     async fn sync(&self) -> std::result::Result<(), fluree_db_core::Error> {
         self.commit.sync().await?;
         self.index.sync().await
@@ -1050,6 +1060,10 @@ impl StorageWrite for AddressIdentifierResolverStorage {
     /// Deletes always go to the default storage
     async fn delete(&self, address: &str) -> std::result::Result<(), fluree_db_core::Error> {
         self.default.delete(address).await
+    }
+
+    async fn delete_many(&self, addresses: &[String]) -> Vec<(String, fluree_db_core::Error)> {
+        self.default.delete_many(addresses).await
     }
 
     /// Writes only ever went to the default storage, so that is what flushes.
