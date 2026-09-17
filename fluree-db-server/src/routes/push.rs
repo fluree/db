@@ -96,6 +96,7 @@ async fn push_ledger_local(
         ledger_id: ledger,
         commits: parsed.commits.into_iter().map(|b| b.0).collect(),
         blobs: parsed.blobs.into_iter().map(|(k, v)| (k, v.0)).collect(),
+        merged_commits: parsed.merged_commits.into_iter().map(|b| b.0).collect(),
         governance,
     };
 

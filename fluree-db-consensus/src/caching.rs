@@ -2777,6 +2777,7 @@ ex:alice ex:name "Alice" ."#;
             ledger_id: "test/committer:main".to_string(),
             commits,
             blobs: std::collections::HashMap::new(),
+            merged_commits: Vec::new(),
             governance: GovernanceOptions::default(),
         }
     }
