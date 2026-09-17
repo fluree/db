@@ -76,7 +76,9 @@ impl LiteralValue {
 
     /// Create a JSON literal value from a canonical string
     ///
-    /// The string should already be canonicalized (e.g., via `json_ld::normalize_data()`).
+    /// The string must already be canonical: see
+    /// [`canonicalize_json`](crate::canonicalize_json), which is what every
+    /// ingest path runs a JSON literal through.
     pub fn json_canonical(canonical: impl AsRef<str>) -> Self {
         LiteralValue::Json(Arc::from(canonical.as_ref()))
     }
