@@ -545,7 +545,7 @@ fn explain_from_parsed(
     // "no stats" while the planner happily uses arena-derived stats.
     let stats_view = if snapshot.stats.is_some() || snapshot.annotation_index.is_some() {
         let base = snapshot.stats.clone().unwrap_or_default();
-        let mut view = StatsView::from_db_stats_with_namespaces(&base, snapshot.namespaces());
+        let mut view = StatsView::from_db_stats_with_namespaces(&base, snapshot);
         if let Some(ann) = snapshot.annotation_index.as_ref() {
             view.merge_annotation_stats(&ann.stats, snapshot.namespaces());
         }

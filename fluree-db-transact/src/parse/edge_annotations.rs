@@ -52,7 +52,7 @@
 
 use crate::error::{Result, TransactError};
 use fluree_graph_json_ld::{expand_iri, parse_context, ParsedContext, TypeValue};
-use fluree_vocab::reifies_iris;
+use fluree_vocab::{rdf, reifies_iris};
 use serde_json::{json, Map, Value};
 
 const ANNOTATION_KEY: &str = "@annotation";
@@ -414,9 +414,19 @@ fn scan_user_authored_reifies_iris(value: &Value, context: &ParsedContext) -> Re
             };
             let effective = merged.as_ref().unwrap_or(context);
 
+            // A `@json` literal's payload never becomes triples — it is
+            // serialized whole into a single `rdf:JSON` flake value — so
+            // no key inside it can carry a system predicate into the
+            // store, and the firewall has nothing to guard there. See
+            // [`opaque_subtree`].
+            let opaque = opaque_subtree(map, Some(effective));
+
             for (k, v) in map {
                 // `@context` is structural, not a predicate.
                 if k == "@context" {
+                    continue;
+                }
+                if opaque && k == "@value" {
                     continue;
                 }
                 let expanded_key = if k.starts_with('@') {
@@ -521,11 +531,24 @@ pub fn run_user_authored_reifies_firewall(doc: &Value, top_ctx: &ParsedContext) 
 /// walks for the common non-annotated transaction. The firewall is a
 /// separate concern and must still run unconditionally — it guards against
 /// user-authored `f:reifies*` IRIs, which this scan does not look for.
+///
+/// Opaque subtrees ([`opaque_subtree`]) don't count: a keyword that exists
+/// only inside a `@json` document is not a block the lowering passes would
+/// rewrite, so letting it open the pass is pure work. This runs before the
+/// document's `@context` is parsed, so it recognizes only the canonical
+/// `@type` spelling — an aliased one falls through and opens the pass,
+/// which costs a walk and changes no answer.
 pub fn document_has_annotation_keys(doc: &Value) -> bool {
     match doc {
-        Value::Object(map) => map.iter().any(|(k, v)| {
-            is_annotation_key(k) || k == REIFIES_KEY || document_has_annotation_keys(v)
-        }),
+        Value::Object(map) => {
+            let opaque = opaque_subtree(map, None);
+            map.iter().any(|(k, v)| {
+                if opaque && k == "@value" {
+                    return false;
+                }
+                is_annotation_key(k) || k == REIFIES_KEY || document_has_annotation_keys(v)
+            })
+        }
         Value::Array(items) => items.iter().any(document_has_annotation_keys),
         _ => false,
     }
@@ -772,6 +795,23 @@ fn walk_delete_for_annotations(
             Ok(())
         }
         Value::Object(map) => {
+            // Value/list/variable wrappers are not node-maps, so their
+            // structural keys are not predicates and their contents are
+            // not delete templates. Mirrors the assertion-side walker's
+            // early return in `lower_object_with_subject`.
+            //
+            // Reaching this arm at all means the wrapper survived the
+            // first pass — i.e. it carried no `@annotation`, since one
+            // that did would have been lifted and its predicate stripped
+            // by `lift_annotations_under_predicate`. What the walk would
+            // otherwise do is descend through `@value` into a `@json`
+            // document and lift a keyword out of it, rewriting the
+            // literal the delete was supposed to match. The delete then
+            // commits and retracts nothing.
+            if is_jsonld_value_object(map) {
+                return Ok(());
+            }
+
             // Merge any per-node `@context` into the parent context.
             // Symmetric with the insert walker — without this, a
             // node-local term coercion would apply at expansion time
@@ -1091,7 +1131,7 @@ fn build_annotation_delete(
 
         // Reject nested annotations / @reifies inside the selector
         // body — same deferral rule as inserts.
-        scan_nested_annotation_keywords(&Value::Object(ann_map.clone()))?;
+        scan_annotation_keywords_in_map(&ann_map, ctx)?;
 
         // Build the WHERE pattern as a flat triple-pattern node. The
         // body properties (remaining in `ann_map`) act as selector
@@ -1194,32 +1234,54 @@ pub(crate) struct WalkCtx<'a> {
 /// Recursively reject `@annotation` / `@edge` / `@reifies` anywhere
 /// inside `value`. Used to enforce the annotation-of-annotation
 /// deferral on annotation bodies.
-fn scan_nested_annotation_keywords(value: &Value) -> Result<()> {
+///
+/// Stops at the `@value` of an opaque subtree ([`opaque_subtree`]).
+/// That skip lives here, in the scanner, rather than at any of its
+/// callers: opacity is a property of the document, and a rule that
+/// only one call site knows is a rule the other call sites break.
+/// Only `@value` is skipped, so a deferred keyword in a *sibling* of
+/// the payload — which is ordinary JSON-LD, not part of the opaque
+/// document — is refused exactly as before.
+fn scan_nested_annotation_keywords(value: &Value, ctx: &ParsedContext) -> Result<()> {
     match value {
-        Value::Object(map) => {
-            for (k, v) in map {
-                if is_annotation_key(k) {
-                    return Err(TransactError::UnsupportedFeature(format!(
-                        "{k} nested inside an @annotation body is the deferred \
-                         annotation-of-annotation shape (v1)"
-                    )));
-                }
-                if k == REIFIES_KEY {
-                    return Err(TransactError::UnsupportedFeature(
-                        "@reifies nested inside an @annotation body is the \
-                         deferred nested-triple-term shape (v1)"
-                            .to_string(),
-                    ));
-                }
-                scan_nested_annotation_keywords(v)?;
-            }
-        }
+        Value::Object(map) => scan_annotation_keywords_in_map(map, ctx),
         Value::Array(items) => {
             for item in items {
-                scan_nested_annotation_keywords(item)?;
+                scan_nested_annotation_keywords(item, ctx)?;
             }
+            Ok(())
         }
-        _ => {}
+        _ => Ok(()),
+    }
+}
+
+/// [`scan_nested_annotation_keywords`] over a map the caller already
+/// holds. Every call site has one, and routing through `&Value` meant
+/// cloning the whole subtree just to borrow it back.
+fn scan_annotation_keywords_in_map(map: &Map<String, Value>, ctx: &ParsedContext) -> Result<()> {
+    // The keyword checks below run on the map's own keys before the
+    // payload skip, so an `@annotation` **on** a wrapper is still
+    // refused — that wrapper key is JSON-LD the parser owns, whatever
+    // the payload beside it is.
+    let opaque = opaque_subtree(map, Some(ctx));
+    for (k, v) in map {
+        if is_annotation_key(k) {
+            return Err(TransactError::UnsupportedFeature(format!(
+                "{k} nested inside an @annotation body is the deferred \
+                 annotation-of-annotation shape (v1)"
+            )));
+        }
+        if k == REIFIES_KEY {
+            return Err(TransactError::UnsupportedFeature(
+                "@reifies nested inside an @annotation body is the \
+                 deferred nested-triple-term shape (v1)"
+                    .to_string(),
+            ));
+        }
+        if opaque && k == "@value" {
+            continue;
+        }
+        scan_nested_annotation_keywords(v, ctx)?;
     }
     Ok(())
 }
@@ -1276,6 +1338,7 @@ fn build_annotation_sibling(
     object: &ReifiedObjectShape,
     ann_block: Value,
     base_graph: Option<&str>,
+    json_ld: &ParsedContext,
     ctx: &mut LowerCtx,
 ) -> Result<Option<Value>> {
     let base_subject_id = base_subject_id.ok_or_else(|| {
@@ -1311,7 +1374,7 @@ fn build_annotation_sibling(
 
     // Reject nested @annotation / @edge / @reifies anywhere in the body
     // — annotation-of-annotation is the deferred shape (v1).
-    scan_nested_annotation_keywords(&Value::Object(ann_map.clone()))?;
+    scan_annotation_keywords_in_map(&ann_map, json_ld)?;
 
     // Annotation subject: explicit @id or a fresh blank node.
     let ann_id = if let Some(Value::String(s)) = ann_map.get("@id") {
@@ -1609,6 +1672,67 @@ fn is_jsonld_value_object(map: &Map<String, Value>) -> bool {
         || map.contains_key("@variable")
 }
 
+/// True when `map`'s `@value` is a subtree this parser must not read
+/// into.
+///
+/// Today that is exactly one shape: a JSON-LD 1.1 `@json` literal,
+/// whose `@value` is a JSON document carried verbatim rather than
+/// JSON-LD to interpret. Nothing inside it is a keyword this module
+/// owns — the whole document is serialized into a single `rdf:JSON`
+/// flake value — so every walker in this file consults this one
+/// predicate rather than special-casing `@json` at its own site. Four
+/// of them read into documents; guarding one leaves three.
+///
+/// The accepted `@type` spellings mirror the transactor's own literal
+/// parser (`jsonld::parse_literal_value_with_meta`): the keyword
+/// `@json`, or any IRI that expands to `rdf:JSON`. Deciding this by
+/// comparing the raw key `"@type"` against the raw value `"@json"` is
+/// what let the original bug survive its first fix: the expander
+/// resolves both through the context, so `{"type": "@type"}` — among
+/// the most ordinary things a JSON-LD context does — produced a
+/// literal the expander called opaque and this file did not. The key
+/// honors `type_key` for the same reason [`ensure_subject_id`] honors
+/// `id_key`.
+///
+/// `ctx` is `None` for the one caller that runs before the document's
+/// context is parsed ([`document_has_annotation_keys`]). That degrades
+/// in the safe direction: an aliased or compact spelling is not
+/// recognized, the subtree is treated as ordinary, and the caller does
+/// more work rather than less.
+///
+/// **Known gap:** term-level coercion (`"rule": {"@type": "@json"}` in
+/// the context, with no `@type` in the document) also produces a
+/// `@json` literal at expansion time. That is a property of the
+/// enclosing *predicate*, not of the object, so no map-shaped
+/// predicate can see it; closing it means threading the predicate
+/// through all four walkers.
+fn opaque_subtree(map: &Map<String, Value>, ctx: Option<&ParsedContext>) -> bool {
+    if !map.contains_key("@value") {
+        return false;
+    }
+    let type_val = map.get("@type").or_else(|| {
+        let alias = ctx?.type_key.as_str();
+        if alias == "@type" {
+            None
+        } else {
+            map.get(alias)
+        }
+    });
+    let Some(type_iri) = type_val.and_then(Value::as_str) else {
+        return false;
+    };
+    if type_iri == "@json" || type_iri == rdf::JSON {
+        return true;
+    }
+    // Compact / aliased datatype IRIs resolve the same way the literal
+    // parser resolves them. Non-strict: an unresolvable datatype is
+    // some other type's problem, not this predicate's.
+    ctx.is_some_and(|c| {
+        super::jsonld::expand_datatype_iri(type_iri, c, false)
+            .is_ok_and(|expanded| expanded == rdf::JSON)
+    })
+}
+
 /// Extract a per-node graph selector. Returns the raw IRI / variable
 /// string when present, `None` otherwise. Per-node `@graph` differs
 /// from envelope `@graph` (which is an array of nodes) — this only
@@ -1638,8 +1762,28 @@ fn lower_object_with_subject(
     // occurrence shape), and `@variable` wrappers could be misused
     // to embed a deferred shape. We scan the wrapper once and
     // reject any deferred mention before returning.
+    //
+    // The scanner decides for itself what it may not read into (see
+    // [`opaque_subtree`]); there is deliberately no `@json` branch
+    // here. A wrapper may declare the alias it is typed with, so
+    // merge its own `@context` first — the walker's merge below is
+    // past this return. An unparseable one is an error everywhere
+    // else in this module, and the firewall scan has already rejected
+    // it by the time we get here.
     if is_jsonld_value_object(map) {
-        scan_nested_annotation_keywords(&Value::Object(map.clone()))?;
+        let wrapper_ctx: Option<ParsedContext> = match map.get("@context") {
+            Some(local_ctx) => Some(
+                fluree_graph_json_ld::parse_context_with_base(walk.json_ld, local_ctx).map_err(
+                    |e| {
+                        TransactError::Parse(format!(
+                            "failed to parse nested @context during edge-annotation lowering: {e}"
+                        ))
+                    },
+                )?,
+            ),
+            None => None,
+        };
+        scan_annotation_keywords_in_map(map, wrapper_ctx.as_ref().unwrap_or(walk.json_ld))?;
         return Ok(());
     }
 
@@ -1918,6 +2062,7 @@ fn intercept_annotations_for_predicate(
                 &shape,
                 ann_block,
                 walk.graph,
+                walk.json_ld,
                 ctx,
             )?;
             if let Some(node) = synth {

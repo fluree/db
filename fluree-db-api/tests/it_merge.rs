@@ -156,7 +156,9 @@ async fn assert_fast_forward_loses_race(source_commits: usize) {
             .merge_branch("mydb", "dev", None, ConflictStrategy::default())
             .await
     });
-    tokio::time::timeout(Duration::from_secs(10), pause.entered.notified())
+    // Bounds a merge that never reaches the CAS, not a busy runner; nextest
+    // hard-kills a genuine hang at 360s.
+    tokio::time::timeout(Duration::from_secs(60), pause.entered.notified())
         .await
         .expect("merge must reach the prepared-head CAS");
 
@@ -175,7 +177,7 @@ async fn assert_fast_forward_loses_race(source_commits: usize) {
         .unwrap()
         .unwrap();
     pause.resume.notify_one();
-    let error = tokio::time::timeout(Duration::from_secs(10), merging)
+    let error = tokio::time::timeout(Duration::from_secs(60), merging)
         .await
         .unwrap()
         .unwrap()

@@ -30,7 +30,11 @@ fn explain_policy_notice(mut result: JsonValue, view: &GraphDb) -> JsonValue {
     if let Some(plan) = result.get_mut("plan").and_then(JsonValue::as_object_mut) {
         plan.insert(
             "reason".into(),
-            JsonValue::String("Statistics withheld by policy; estimates are heuristic".into()),
+            JsonValue::String(
+                "Statistics hidden from this explain by policy; execution still plans \
+                 with them. Estimates shown are heuristic."
+                    .into(),
+            ),
         );
     }
     result
@@ -1225,14 +1229,69 @@ impl Fluree {
     /// - the ledger alias → the default graph (g_id 0), mirroring
     ///   `ExecutionContext::single_db_user_graph_id`, which reserves the alias
     ///   for the default graph;
-    /// - a registered named-graph IRI → that graph's g_id.
+    /// - a registered named-graph IRI → that graph's g_id;
+    /// - this ledger's own reserved-graph IRI, written out in full → that
+    ///   reserved graph.
     ///
     /// Reuses [`apply_graph_selector`](Self::apply_graph_selector) — the same
     /// within-ledger selection primitive behind `fluree.db("ledger:main#graph")`
     /// and the JSON-LD `@graph` dataset source — so all three surfaces resolve
     /// and re-scope a graph identically.
+    ///
+    /// # The reserved-graph access contract
+    ///
+    /// **Reachability is explicitness; policy is the access control.** A
+    /// reserved graph may be READ when the author names it in full; it may
+    /// never appear implicitly, be enumerated, be destroyed, or seed
+    /// governance. `docs/ledger-config/README.md` and
+    /// `docs/ledger-config/writing-config.md` state the same model: the config
+    /// graph is a queryable graph, and a `f:policyDefaults` block — not
+    /// unreachability — is what keeps it private.
+    ///
+    /// | surface | `#config` | `#txn-meta` |
+    /// |---|---|---|
+    /// | ledger address (`L#config`, `--ledger`, `db()`) | reachable | reachable |
+    /// | SPARQL `FROM` / `FROM NAMED`, JSON-LD `from`/`from-named` | reachable **by full IRI only** | reachable by full IRI only |
+    /// | `GRAPH <iri>` with no `FROM NAMED` | blocked (empty) | blocked (empty) |
+    /// | `GRAPH ?g` enumeration | blocked | blocked |
+    /// | `GRAPH <iri>` named by an explicit `FROM NAMED` | reachable | reachable |
+    /// | `GRAPH <iri>` in a transaction | writable | writable (see note) |
+    /// | graph-management verbs (CLEAR/DROP/COPY/MOVE/ADD) | refused | refused |
+    /// | cross-ledger `f:graphSelector` / `f:schemaSource` / `owl:imports` | refused | refused |
+    ///
+    /// The two "blocked" rows are enforced elsewhere, deliberately, and must
+    /// stay that way: `ExecutionContext::single_db_user_graph_id` and
+    /// `single_db_user_graph_iris` (`fluree-db-query/src/context.rs`) filter
+    /// `>= FIRST_USER_GRAPH_ID`, so a wildcard never sweeps governance into
+    /// results (`cf1c74291`, PR #1292). Graph management is refused by
+    /// `TransactError::ReservedGraphTarget` (`1cb3e8cb2`, `6df4381b3`).
+    ///
+    /// **Addressing is not enumeration.** `8d8870ba1` (PR #1462) applied the
+    /// enumeration filter to this addressing surface on the reasoning that the
+    /// two should be "gated identically". They are different kinds of surface:
+    /// enumeration answers "what is here?" and must not volunteer governance;
+    /// addressing answers "give me exactly this", and the author has already
+    /// named the ledger and the graph. `single_db_user_graph_id` itself makes
+    /// the distinction — it returns `None` outright when `dataset.is_some()`,
+    /// i.e. it excuses itself precisely when an explicit `FROM`/`FROM NAMED`
+    /// clause is in play. Admitting a fully-spelled reserved IRI here restores
+    /// parity with the connection path, where `load_view_from_source` resolves
+    /// a source through `db()` → `parse_graph_ref` and has always accepted
+    /// `#config`/`#txn-meta`.
+    ///
+    /// "In full" is load-bearing: only this ledger's exact
+    /// `urn:fluree:{ledger}#config` / `#txn-meta` is admitted. A bare
+    /// `config`, a relative `#config`, and another ledger's reserved IRI all
+    /// still fall through to the "not in this ledger" rejection.
+    ///
+    /// Note on the transaction row: both reserved graphs are writable through
+    /// `GRAPH <iri>` in an ordinary `INSERT DATA` today — verified, not
+    /// designed. Writing `#config` is the documented way to configure a
+    /// ledger; `#txn-meta` being writable is an open question this function
+    /// does not decide.
     fn resolve_within_ledger_graph(&self, db: &GraphDb, iri: &str) -> Result<Option<GraphDb>> {
         use crate::dataset::GraphSelector;
+        use fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
 
         if iri == db.snapshot.ledger_id.as_str() || iri == db.ledger_id.as_ref() {
             return Ok(Some(Self::apply_graph_selector(
@@ -1241,16 +1300,35 @@ impl Fluree {
             )?));
         }
 
+        // A reserved graph of THIS ledger, spelled in full. Compared against
+        // the canonical IRI builders rather than matched by fragment or
+        // suffix, so `http://evil.example/x#config` is an ordinary user graph
+        // and another ledger's `#config` is not in this ledger at all. Both
+        // spellings of the ledger id are accepted because the caller may hold
+        // either (`db.ledger_id` is the requested alias, `snapshot.ledger_id`
+        // the canonical one) and the registry is seeded from the canonical.
+        let reserved_selector = [db.snapshot.ledger_id.as_str(), db.ledger_id.as_ref()]
+            .into_iter()
+            .find_map(|lid| {
+                if iri == fluree_db_core::config_graph_iri(lid) {
+                    Some(GraphSelector::Config)
+                } else if iri == fluree_db_core::txn_meta_graph_iri(lid) {
+                    Some(GraphSelector::TxnMeta)
+                } else {
+                    None
+                }
+            });
+        if let Some(selector) = reserved_selector {
+            // Reserved slots always exist, so this does not consult the
+            // registry — exactly as the ledger-address surface does not.
+            return Ok(Some(Self::apply_graph_selector(db.clone(), &selector)?));
+        }
+
         // Registered USER named graph in this ledger (registry, with the same
-        // binary-store fallback `select_graph` uses). The registry also seeds
-        // the reserved system graphs — `#txn-meta` (g_id 1) and `#config`
-        // (g_id 2) — which must NOT be reachable through `FROM`/`FROM NAMED`:
-        // the plain `GRAPH <iri>` path already blocks them via
-        // `single_db_user_graph_id`'s `>= FIRST_USER_GRAPH_ID` filter, so gate
-        // this path identically (a reserved IRI falls through to the
-        // "not in this ledger" rejection below).
-        let is_user_graph =
-            |g: fluree_db_core::GraphId| g >= fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID;
+        // binary-store fallback `select_graph` uses). The `>= FIRST_USER_GRAPH_ID`
+        // filter still stands here: it is what stops a NON-canonical spelling
+        // that happens to resolve to a reserved slot from reaching one.
+        let is_user_graph = |g: fluree_db_core::GraphId| g >= FIRST_USER_GRAPH_ID;
         let known = db
             .snapshot
             .graph_registry

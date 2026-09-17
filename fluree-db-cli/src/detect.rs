@@ -29,7 +29,7 @@ pub fn detect_data_format(
             "turtle" | "ttl" => Ok(DataFormat::Turtle),
             "jsonld" | "json-ld" | "json" => Ok(DataFormat::JsonLd),
             other => Err(CliError::Usage(format!(
-                "unknown data format '{other}'\n  {} valid formats: turtle, jsonld",
+                "unknown data format '{other}'\n  {} valid formats: turtle (ttl), jsonld (json-ld, json)",
                 colored::Colorize::bold(colored::Colorize::cyan("help:"))
             ))),
         };
@@ -187,6 +187,34 @@ fn sniff_query_format(content: &str) -> CliResult<QueryFormat> {
 
 #[cfg(test)]
 mod tests {
+    /// Every spelling the match arms accept is named by the error that lists
+    /// them.
+    ///
+    /// The message advertised two of the five, so `--format ttl`, `json-ld`
+    /// and `json` all worked while the only text telling a user what to type
+    /// said they did not exist. A user who reached this error had already
+    /// guessed wrong once; sending them to a shorter list than the code
+    /// accepts is the one moment where being incomplete costs the most.
+    #[test]
+    fn the_usage_error_names_every_format_the_flag_accepts() {
+        let accepted = ["turtle", "ttl", "jsonld", "json-ld", "json"];
+        for fmt in accepted {
+            assert!(
+                super::detect_data_format(None, "", Some(fmt)).is_ok(),
+                "--format {fmt} must be accepted"
+            );
+        }
+        let err = super::detect_data_format(None, "", Some("trig"))
+            .expect_err("trig is not a data format the flag accepts")
+            .to_string();
+        for fmt in accepted {
+            assert!(
+                err.contains(fmt),
+                "the usage error must name '{fmt}'; got: {err}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

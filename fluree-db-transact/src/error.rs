@@ -163,14 +163,27 @@ pub enum TransactError {
     #[error("Transaction invariant violation: {0}")]
     InvariantViolation(String),
 
-    /// A SPARQL/builder graph-management operation (CLEAR/DROP/COPY/MOVE/ADD)
-    /// resolved a target, source, or destination to a reserved system graph:
+    /// A transaction named a reserved system graph as a write target:
     /// `urn:fluree:{ledger}#config` (g_id 2) or `#txn-meta` (g_id 1). These
     /// graphs are Fluree-internal — `#config` seeds SHACL/uniqueness governance
     /// and cross-ledger rules, `#txn-meta` holds commit metadata — and are never
-    /// part of the W3C dataset, so they must never be a graph-management target.
-    /// Mirrors the cross-ledger resolver's reserved-graph guard.
-    #[error("graph-management operation targets reserved system graph <{graph_iri}>; refusing")]
+    /// part of the W3C dataset. Mirrors the cross-ledger resolver's
+    /// reserved-graph guard.
+    ///
+    /// Raised from two kinds of site, with deliberately different coverage:
+    ///
+    /// - **Whole-graph verbs** — SPARQL/builder graph management
+    ///   (CLEAR/DROP/COPY/MOVE/ADD target, source, or destination) and graph
+    ///   sync — refuse **both** reserved graphs. They destroy or re-home a
+    ///   graph wholesale, which no user operation may do to either.
+    /// - **Ordinary data writes** (`GRAPH <iri> { … }`, `WITH <iri>`,
+    ///   `CREATE GRAPH <iri>`) refuse **`#txn-meta` only**. Forged commit
+    ///   records steer `resolve_commit_prefix` / `commit_to_t`, so a record
+    ///   sharing a real commit's prefix shadows that commit on every
+    ///   commit-lookup surface. `#config` stays writable because
+    ///   `docs/ledger-config/` documents maintaining ledger configuration
+    ///   through an ordinary transaction; that asymmetry is intentional.
+    #[error("transaction targets reserved system graph <{graph_iri}>; refusing")]
     ReservedGraphTarget {
         /// The reserved graph IRI the operation attempted to target.
         graph_iri: String,

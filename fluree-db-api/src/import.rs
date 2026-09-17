@@ -31,6 +31,7 @@
 //! even though chunk parsing is parallel.
 
 use crate::error::ApiError;
+use fluree_db_core::task::TaskFailure;
 use fluree_db_core::{
     ContentId, ContentKind, ContentStore, FuelExceededError, RemoteObject, Storage, StorageRead,
     Tracker, TrackingTally,
@@ -4181,7 +4182,9 @@ where
                 tokio::task::spawn_blocking(move || rx.lock().unwrap().recv())
                     .await
                     .map_err(|e| {
-                        ImportError::Transact(format!("parsed-chunk receive task panicked: {e}"))
+                        ImportError::Transact(
+                            TaskFailure::from(e).describe("parsed-chunk receive task"),
+                        )
                     })?
             };
             let (idx, parsed) = match recv_result {
@@ -5024,7 +5027,7 @@ where
                 tokio::task::spawn_blocking(move || rx.lock().unwrap().recv())
                     .await
                     .map_err(|e| {
-                        ImportError::Transact(format!("chunk receive task panicked: {e}"))
+                        ImportError::Transact(TaskFailure::from(e).describe("chunk receive task"))
                     })?
             };
             let (idx, doc, raw_bytes) = match payload {
@@ -5661,7 +5664,9 @@ where
         let await_start = Instant::now();
         let info = handle
             .await
-            .map_err(|e| ImportError::RunGeneration(format!("sort/write task panicked: {e}")))?
+            .map_err(|e| {
+                ImportError::RunGeneration(TaskFailure::from(e).describe("sort/write task"))
+            })?
             .map_err(ImportError::Io)?;
         tracing::info!(
             chunk = info.chunk_idx,
@@ -5681,7 +5686,9 @@ where
     if let Some(handle) = meta_chunk_handle {
         let meta_sorted_info = handle
             .await
-            .map_err(|e| ImportError::RunGeneration(format!("meta chunk task panicked: {e}")))?
+            .map_err(|e| {
+                ImportError::RunGeneration(TaskFailure::from(e).describe("meta chunk task"))
+            })?
             .map_err(ImportError::Io)?;
         sorted_commit_infos.push(meta_sorted_info);
     }
@@ -5861,7 +5868,9 @@ where
     let (subj_stats_serial, subj_handle) = if vocab_merge_serial {
         let stats = subj_handle
             .await
-            .map_err(|e| ImportError::RunGeneration(format!("subject vocab merge panicked: {e}")))?
+            .map_err(|e| {
+                ImportError::RunGeneration(TaskFailure::from(e).describe("subject vocab merge"))
+            })?
             .map_err(vocab_merge_error)?;
         (Some(stats), None)
     } else {
@@ -5885,7 +5894,9 @@ where
     let (str_stats_serial, str_handle) = if vocab_merge_serial {
         let stats = str_handle
             .await
-            .map_err(|e| ImportError::RunGeneration(format!("string vocab merge panicked: {e}")))?
+            .map_err(|e| {
+                ImportError::RunGeneration(TaskFailure::from(e).describe("string vocab merge"))
+            })?
             .map_err(vocab_merge_error)?;
         (Some(stats), None)
     } else {
@@ -5903,7 +5914,9 @@ where
         (Some(stats), _) => stats,
         (None, Some(handle)) => handle
             .await
-            .map_err(|e| ImportError::RunGeneration(format!("subject vocab merge panicked: {e}")))?
+            .map_err(|e| {
+                ImportError::RunGeneration(TaskFailure::from(e).describe("subject vocab merge"))
+            })?
             .map_err(vocab_merge_error)?,
         (None, None) => unreachable!("serial mode stores stats, concurrent mode stores handle"),
     };
@@ -5911,13 +5924,17 @@ where
         (Some(stats), _) => stats,
         (None, Some(handle)) => handle
             .await
-            .map_err(|e| ImportError::RunGeneration(format!("string vocab merge panicked: {e}")))?
+            .map_err(|e| {
+                ImportError::RunGeneration(TaskFailure::from(e).describe("string vocab merge"))
+            })?
             .map_err(vocab_merge_error)?,
         (None, None) => unreachable!("serial mode stores stats, concurrent mode stores handle"),
     };
     let (unified_lang_dict, lang_remaps) = lang_handle
         .await
-        .map_err(|e| ImportError::RunGeneration(format!("language vocab merge panicked: {e}")))?
+        .map_err(|e| {
+            ImportError::RunGeneration(TaskFailure::from(e).describe("language vocab merge"))
+        })?
         .map_err(|e| ImportError::RunGeneration(format!("lang remap: {e}")))?;
 
     let total_unique_subjects = subj_stats.total_unique;
@@ -6568,7 +6585,7 @@ where
                     let stage = stage_marker.load(std::sync::atomic::Ordering::Relaxed);
                     emit_index_progress(stage, &mut current_stage, &mut stage_start);
                     break result
-                        .map_err(|e| ImportError::IndexBuild(format!("build task panicked: {e}")))??;
+                        .map_err(|e| ImportError::IndexBuild(TaskFailure::from(e).describe("build task")))??;
                 }
                 () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                     let stage = stage_marker.load(std::sync::atomic::Ordering::Relaxed);

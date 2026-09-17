@@ -275,7 +275,10 @@ where
 ///
 /// # Algorithm
 ///
-/// 1. Normalize the prefix (strip `fluree:commit:` and `sha256:` if present)
+/// 1. Normalize the prefix to a hex digest via
+///    [`normalize_commit_ref`](crate::ledger_view::normalize_commit_ref) —
+///    shared with `ledger_view::resolve_commit_prefix`, the other copy of this
+///    scan, so the two surfaces accept exactly the same spellings
 /// 2. Bounded SPOT scan: `[Sid(FLUREE_COMMIT, prefix), Sid(FLUREE_COMMIT, prefix~))`
 /// 3. Track unique commit subjects
 /// 4. Return `flake.t` from the single match (or error on 0 / >1)
@@ -284,12 +287,14 @@ where
 ///
 /// * `snapshot` - The database snapshot to query
 /// * `overlay` - Optional overlay provider (novelty) for uncommitted data
-/// * `commit_prefix` - Commit CID prefix to match (hex digest, with or without standard prefixes)
+/// * `commit_prefix` - Commit CID prefix to match (hex digest, a full CID, or
+///   either with the `fluree:commit:` / `sha256:` wrapper)
 /// * `current_t` - Current head transaction number
 ///
 /// # Errors
 ///
 /// - If prefix is too short (< 6 chars) or too long (> 64 chars)
+/// - If the prefix is an abbreviated CID rather than a hex digest
 /// - If no commit matches the prefix
 /// - If multiple commits match (ambiguous prefix)
 pub async fn commit_to_t<O>(
@@ -301,29 +306,9 @@ pub async fn commit_to_t<O>(
 where
     O: OverlayProvider + ?Sized,
 {
-    // Step 1: Normalize the commit prefix
-    // Strip "fluree:commit:" prefix if present
-    let normalized = commit_prefix
-        .strip_prefix("fluree:commit:")
-        .unwrap_or(commit_prefix);
-    // Strip "sha256:" prefix if present
-    let normalized = normalized.strip_prefix("sha256:").unwrap_or(normalized);
-
-    // Validation: minimum 6 characters for useful prefix matching
-    if normalized.len() < 6 {
-        return Err(ApiError::query(format!(
-            "Commit prefix must be at least 6 characters, got {}",
-            normalized.len()
-        )));
-    }
-
-    // SHA-256 in hex is 64 characters
-    if normalized.len() > 64 {
-        return Err(ApiError::query(format!(
-            "Commit prefix too long ({} chars). SHA-256 in hex is 64 characters.",
-            normalized.len()
-        )));
-    }
+    // Step 1: Normalize the commit prefix to the hex digest the index is keyed on.
+    let normalized = crate::ledger_view::normalize_commit_ref(commit_prefix)?;
+    let normalized = normalized.as_str();
 
     // Step 2: Create bounded SPOT scan
     // Commit subjects use the FLUREE_COMMIT namespace with hex hash as name
@@ -406,24 +391,10 @@ where
             let (_, t) = matching_commits[0];
             Ok(t)
         }
-        _ => {
-            // Multiple matches - ambiguous prefix
-            let commit_ids: Vec<String> = matching_commits
-                .iter()
-                .take(5)
-                .map(|(sid, _)| format!("fluree:commit:sha256:{}", sid.name))
-                .collect();
-            Err(ApiError::query(format!(
-                "Ambiguous commit prefix: {}. Multiple commits match: {:?}{}",
-                normalized,
-                commit_ids,
-                if matching_commits.len() > 5 {
-                    " ..."
-                } else {
-                    ""
-                }
-            )))
-        }
+        _ => Err(crate::ledger_view::ambiguous_commit_prefix(
+            normalized,
+            matching_commits.iter().map(|(sid, _)| sid.name.as_ref()),
+        )),
     }
 }
 

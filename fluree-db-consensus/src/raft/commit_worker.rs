@@ -47,6 +47,7 @@ use fluree_db_api::{
     ApiError, Base64Bytes, Fluree, PushCommitsRequest, RefreshOpts, StagedMerge, StagedPush,
     StagedRebase, StagedRevert,
 };
+use fluree_db_core::task::panic_message;
 use fluree_db_core::ContentId;
 use fluree_db_ledger::IndexConfig;
 use fluree_db_nameservice::{CommitPublisher, NameServiceError};
@@ -1547,19 +1548,6 @@ fn stage_failure(message: &str) -> WorkerError {
     WorkerError::Transient(message.into())
 }
 
-/// Best-effort string extraction from a `catch_unwind` payload —
-/// covers the `panic!("literal")` and `panic!("{fmt}")` cases that
-/// produce `&'static str` and `String` payloads respectively.
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&'static str>() {
-        return (*s).to_string();
-    }
-    if let Some(s) = payload.downcast_ref::<String>() {
-        return s.clone();
-    }
-    "non-string panic payload".to_string()
-}
-
 fn submission_to_stage(err: SubmissionError) -> WorkerError {
     WorkerError::Transient(err.to_string())
 }
@@ -2029,24 +2017,6 @@ mod tests {
         // Voter 3 is in the fallback, but not in the eligible set.
         let desired = desired_owners_under_lock(&shared, 3, &[1, 2, 3]).await;
         assert!(desired.is_empty());
-    }
-
-    #[test]
-    fn panic_message_extracts_static_str() {
-        let payload: Box<dyn std::any::Any + Send> = Box::new("kaboom");
-        assert_eq!(panic_message(payload), "kaboom");
-    }
-
-    #[test]
-    fn panic_message_extracts_string() {
-        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("formatted: 42"));
-        assert_eq!(panic_message(payload), "formatted: 42");
-    }
-
-    #[test]
-    fn panic_message_falls_back_for_unknown_payload() {
-        let payload: Box<dyn std::any::Any + Send> = Box::new(42u32);
-        assert_eq!(panic_message(payload), "non-string panic payload");
     }
 
     /// `abort_and_await` must return only after every aborted task

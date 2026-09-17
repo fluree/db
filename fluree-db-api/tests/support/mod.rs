@@ -503,8 +503,10 @@ pub async fn wait_for_index_application(
         .await
         .expect("notify after reindex");
 
-    // Poll the cached handle's snapshot.t (the *indexed* t).
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Poll the cached handle's snapshot.t (the *indexed* t). The deadline
+    // bounds a broken path, not a loaded runner — nextest hard-kills a true
+    // hang at 360s, so a short budget here only buys flakes.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let handle = fluree
             .ledger_cached(&canonical)

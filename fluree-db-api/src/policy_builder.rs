@@ -413,16 +413,16 @@ async fn build_policy_context_from_opts_inner(
     // runtime class check, which is not. Left on the estimate lane anyway —
     // an uncached per-query builder cannot afford base probes — but the
     // exposure is a count-drift one, not a no-op.
-    let stats: Option<IndexStats> = if let Some(novelty) = novelty_for_stats {
+    let stats: Option<Arc<IndexStats>> = if let Some(novelty) = novelty_for_stats {
         let indexed = snapshot.stats.clone().unwrap_or_default();
         let lookup = PolicyStatsLookup { overlay };
-        Some(
+        Some(Arc::new(
             fluree_db_novelty::assemble_full_stats(
                 &indexed, snapshot, overlay, novelty, to_t, &lookup,
             )
             .await
             .map_err(|e| ApiError::internal(format!("policy stats assembly failed: {e}")))?,
-        )
+        ))
     } else {
         snapshot.stats.clone()
     };
@@ -459,22 +459,28 @@ async fn build_policy_context_from_opts_inner(
 
     let view_set = build_policy_set(
         restrictions.clone(),
-        stats.as_ref(),
+        stats.as_deref(),
         PolicyAction::View,
         hierarchy.as_ref(),
     );
     let modify_set = build_policy_set(
         restrictions,
-        stats.as_ref(),
+        stats.as_deref(),
         PolicyAction::Modify,
         hierarchy.as_ref(),
     );
 
-    // Check if this is a root policy (unrestricted access).
+    // Root (unrestricted) lets every consumer skip enforcement: the cursor and
+    // probe fast paths, the per-flake filter, explain's statistics stripping,
+    // and the tracking record. That is sound exactly when no rule exists and
+    // the default allows, because then no read or write can be denied.
     //
-    // is_root = true ONLY when no explicit policy inputs (identity / policy-class / policy)
-    // were provided. When an identity IS specified but has no matching policies, is_root must
-    // be false so that `default_allow` (not a blanket bypass) governs access.
+    // With no explicit policy input an unset default counts as allow (the
+    // legacy no-policy case). Once any input selects policy — identity, class
+    // list, inline rules, policy values, or a configured cross-ledger source —
+    // root additionally requires an explicit `default_allow: true`: an unset
+    // default resolves to deny below, and a configured source that selects
+    // zero rules under deny must keep denying.
     let has_explicit_policy_input = opts.identity.is_some()
         || opts.policy_class.is_some()
         || opts.policy.is_some()
@@ -483,10 +489,13 @@ async fn build_policy_context_from_opts_inner(
             .as_ref()
             .is_some_and(|values| !values.is_empty())
         || has_cross_ledger_source;
-    let is_root = !has_explicit_policy_input
-        && opts.default_allow != Some(false)
-        && view_set.restrictions.is_empty()
-        && modify_set.restrictions.is_empty();
+    let no_rules = view_set.restrictions.is_empty() && modify_set.restrictions.is_empty();
+    let is_root = no_rules
+        && if has_explicit_policy_input {
+            opts.default_allow == Some(true)
+        } else {
+            opts.default_allow != Some(false)
+        };
 
     // `default_allow` is honored as the caller set it, including for unknown identities.
     // An identity IRI that has no subject node in the ledger yields empty restrictions,

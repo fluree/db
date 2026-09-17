@@ -354,7 +354,7 @@ async fn run_update_branch(
     let (cow_join, upload_res) = tokio::join!(cow, uploader);
     let upload_totals = upload_res?;
     let meta = cow_join
-        .map_err(|e| IndexerError::StorageWrite(format!("branch update task panicked: {e}")))?
+        .map_err(|e| IndexerError::from_join("branch update task", e))?
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
     tracing::debug!(
