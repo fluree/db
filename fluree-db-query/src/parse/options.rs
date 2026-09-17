@@ -473,6 +473,21 @@ pub fn parse_reasoning(
     //
     // A budget alone enables no mode, but it must be carried so a
     // ledger-config default mode runs under it — hence it counts as present.
+    //
+    // PRECEDENCE IS ALL-OR-NOTHING, NOT PER KEY. Any one top-level reasoning
+    // key makes the top level the whole source, so
+    // `{"reasoningBudget": {…}, "opts": {"reasoning": "datalog"}}` runs with no
+    // reasoning at all: the budget is a modifier rather than a mode, but it
+    // still wins the source election and the `opts` mode is dropped in silence.
+    // That is deliberate — a per-key merge would let one request draw modes
+    // from two places at once, which is harder to predict than one source
+    // winning outright — and it is pinned by
+    // `opts_ignored_when_any_top_level_reasoning_key_present`.
+    //
+    // It is, however, the same silently-ignored shape as the defect that
+    // motivated this alias (fluree/db#1863), one level down. Changing it to a
+    // per-key merge is a behavior change with its own compatibility surface,
+    // so it is tracked separately rather than folded in here.
     if REASONING_KEYS.iter().any(|k| obj.contains_key(*k)) {
         return reasoning_from(obj);
     }
