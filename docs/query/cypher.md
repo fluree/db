@@ -776,9 +776,14 @@ case pulls them in; each has a workaround:
   bijection onto the shared IR's variable ids, so the alias resolved to the
   bound variable and the projection became a silent equality filter — zero rows
   on a read, and a successful transaction that wrote nothing on a write. An
-  error beats that. Re-projection needs a column-label channel in the shared
-  IR; the identity projection `RETURN v AS v` stays legal, as does aliasing a
-  name that a *later* clause binds (`WITH pair[0] AS x … OPTIONAL MATCH (x)…`).
+  error beats that. Re-projection is deferred rather than impossible: it needs
+  a column-label channel — which probably does not have to reach the shared IR,
+  since the result type is api-side and a Cypher-only field already precedents
+  it — plus a name-to-variable rebinding layer, because `ORDER BY` resolves
+  projection aliases by surface expression and would otherwise sort by the
+  original binding. Tracked in #1870. The identity projection `RETURN v AS v`
+  stays legal, as does aliasing a name that a *later* clause binds
+  (`WITH pair[0] AS x … OPTIONAL MATCH (x)…`).
   Two projection items may not share one output name either — including bare
   and unaliased ones, so `RETURN a, a` and `RETURN a.name, a.name` are rejected
   alongside `AS x, … AS x`. That matches Neo4j ("Multiple result columns with
