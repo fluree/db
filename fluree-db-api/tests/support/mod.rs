@@ -794,3 +794,174 @@ pub async fn load_people(fluree: &MemoryFluree) -> Result<String, Box<dyn std::e
     fluree.insert(ledger, &insert_txn).await?;
     Ok(ledger_id.to_string())
 }
+
+// =============================================================================
+// Collector end-to-end scenario (shared by the file and the S3 + DynamoDB suites)
+// =============================================================================
+
+/// Indexer settings under which every publish past the second collects:
+/// one old version kept, no age guard.
+#[cfg(feature = "native")]
+pub fn collecting_indexer_config() -> fluree_db_indexer::IndexerConfig {
+    fluree_db_indexer::IndexerConfig {
+        gc_max_old_indexes: 1,
+        gc_min_time_mins: 0,
+        ..fluree_db_indexer::IndexerConfig::small()
+    }
+}
+
+/// Drive a ledger and a fork of it through builds the running worker
+/// collects behind, then drop the fork, and check after each stage that
+/// every dictionary blob a surviving chain references is still in storage.
+///
+/// Subject ids are sequential on purpose: that is the key pattern under
+/// which a reverse-dictionary leaf split recreates a blob an earlier
+/// manifest named as garbage.
+///
+/// `fluree` must be in background indexing mode on `handle`, whose worker
+/// is running with [`collecting_indexer_config`].
+#[cfg(feature = "native")]
+pub async fn run_collector_and_fork_drop_scenario(
+    fluree: &fluree_db_api::Fluree,
+    handle: &fluree_db_indexer::IndexerHandle,
+    ledger_name: &str,
+) {
+    use fluree_db_core::ContentStore;
+    use fluree_db_indexer::{shared_refs_of_branches, BranchIndexHead};
+    use std::time::Duration;
+
+    let main_id = format!("{ledger_name}:main");
+    let dev_id = format!("{ledger_name}:dev");
+    let index_cfg = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 0,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    // One transaction of sequential subjects, then a build through the worker.
+    let round = |ledger_id: String, round: usize| {
+        let index_cfg = index_cfg.clone();
+        async move {
+            let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
+            let subjects: Vec<_> = (0..40)
+                .map(|i| json!({"@id": format!("ex:item-{:06}", round * 1000 + i), "ex:val": i}))
+                .collect();
+            let tx = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": subjects
+            });
+            let result = fluree
+                .insert_with_opts(
+                    ledger,
+                    &tx,
+                    fluree_db_transact::TxnOpts::default(),
+                    fluree_db_transact::CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert");
+            let completion = handle.trigger(&ledger_id, result.receipt.t).await;
+            match tokio::time::timeout(Duration::from_secs(120), completion.wait())
+                .await
+                .expect("build timed out: a release window must not wedge the worker")
+            {
+                fluree_db_api::IndexOutcome::Completed { .. } => {}
+                other => panic!("build on {ledger_id} did not complete: {other:?}"),
+            }
+        }
+    };
+
+    // Every dictionary blob `ledger_id`'s whole chain references is present.
+    let assert_dicts_present = |ledger_id: String, stage: &'static str| async move {
+        // Let a pass the last publish spawned finish before looking.
+        drop(handle.hold_gc(ledger_name).await);
+        let head = fluree
+            .nameservice()
+            .lookup(&ledger_id)
+            .await
+            .expect("lookup")
+            .expect("record")
+            .index_head_id;
+        let refs = shared_refs_of_branches(
+            fluree.backend(),
+            &[BranchIndexHead {
+                ledger_id: ledger_id.clone(),
+                index_head_id: head,
+            }],
+            None,
+        )
+        .await
+        .expect("walk chain");
+        assert!(
+            !refs.is_empty(),
+            "{stage}: {ledger_id} references no dictionaries"
+        );
+        let store = fluree.content_store(&ledger_id);
+        for cid in &refs {
+            assert!(
+                store.has(cid).await.expect("has"),
+                "{stage}: {ledger_id} still references dictionary blob {cid}, which is gone"
+            );
+        }
+    };
+
+    fluree.create_ledger(ledger_name).await.expect("create");
+    let first_root = {
+        round(main_id.clone(), 0).await;
+        fluree
+            .nameservice()
+            .lookup(&main_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .index_head_id
+            .expect("first build published")
+    };
+    for r in 1..4 {
+        round(main_id.clone(), r).await;
+    }
+    assert_dicts_present(main_id.clone(), "main alone").await;
+
+    // The collector really ran: the first version is past retention.
+    let store = fluree.content_store(&main_id);
+    let mut collected = false;
+    for _ in 0..100 {
+        if !store.has(&first_root).await.expect("has") {
+            collected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        collected,
+        "the collector never released the first index version"
+    );
+
+    // Fork, build on the fork, then keep building on main: main's passes now
+    // name blobs the fork's copied root still reads.
+    fluree
+        .create_branch(ledger_name, "dev", None, None)
+        .await
+        .expect("create branch");
+    for r in 10..12 {
+        round(dev_id.clone(), r).await;
+    }
+    for r in 4..7 {
+        round(main_id.clone(), r).await;
+    }
+    assert_dicts_present(main_id.clone(), "after fork").await;
+    assert_dicts_present(dev_id.clone(), "after fork").await;
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(120),
+        fluree.drop_branch(ledger_name, "dev"),
+    )
+    .await
+    .expect("branch drop timed out")
+    .expect("branch drop");
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_dicts_present(main_id.clone(), "after fork drop").await;
+
+    // And the worker still builds once the drop's window has closed.
+    round(main_id.clone(), 7).await;
+    assert_dicts_present(main_id.clone(), "after a build following the drop").await;
+}

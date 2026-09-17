@@ -17,9 +17,9 @@ use fluree_db_core::{
     format_ledger_id, DEFAULT_BRANCH,
 };
 use fluree_db_indexer::{
-    execute_sweep, plan_garbage, plan_sweep, rebuild_index_from_commits_with_tracker,
-    release_garbage_plan, shared_refs_of_branches, siblings_of, BranchIndexHead,
-    CleanGarbageConfig, MaintenanceGuard, SweepPlan, SweepResult,
+    current_sibling_heads, execute_sweep, plan_garbage, plan_sweep,
+    rebuild_index_from_commits_with_tracker, release_garbage_plan, shared_refs_of_branches,
+    siblings_of, BranchIndexHead, CleanGarbageConfig, MaintenanceGuard, SweepPlan, SweepResult,
 };
 use fluree_db_nameservice::{GraphSourceType, NsRecord};
 use std::collections::HashSet;
@@ -1322,7 +1322,27 @@ impl crate::Fluree {
                 return Vec::new();
             }
         };
-        let survivors = siblings_of(&records, ledger_id);
+        // The listing's branches plus any this process built that the listing
+        // does not show yet (DynamoDB lists through an eventually consistent
+        // index), each head re-read.
+        let mut candidates: Vec<String> = siblings_of(&records, ledger_id)
+            .into_iter()
+            .map(|b| b.ledger_id)
+            .collect();
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            candidates.extend(handle.built_branches(&ledger_name_of(ledger_id)));
+        }
+        let survivors = match current_sibling_heads(self.nameservice(), ledger_id, &candidates)
+            .await
+        {
+            Ok(survivors) => survivors,
+            Err(e) => {
+                warnings.push(format!(
+                        "Could not read a sibling branch's record; the branch's dictionary blobs are left for a sweep: {e}"
+                    ));
+                return Vec::new();
+            }
+        };
         let elsewhere = match shared_refs_of_branches(backend, &survivors, None).await {
             Ok(refs) => refs,
             Err(e) => {
@@ -2299,11 +2319,34 @@ impl crate::Fluree {
                         }
                         _ => None,
                     };
+                    // A reindex is rare enough for a full listing; the
+                    // worker's own passes avoid one. A failed listing
+                    // defers every shared blob.
+                    let siblings = match gc_nameservice.all_records().await {
+                        Ok(records) => {
+                            let mut ids: Vec<String> = siblings_of(&records, &gc_ledger_id)
+                                .into_iter()
+                                .map(|b| b.ledger_id)
+                                .collect();
+                            if let Some(handle) = &gc_handle {
+                                ids.extend(handle.built_branches(&ledger_name_of(&gc_ledger_id)));
+                            }
+                            Some(ids)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "could not list branches for the collector's sibling check; deferring shared blobs"
+                            );
+                            None
+                        }
+                    };
                     release_garbage_plan(
                         plan,
                         &gc_backend,
                         gc_nameservice.as_ref(),
                         &gc_ledger_id,
+                        siblings.as_deref(),
                         None,
                     )
                     .await

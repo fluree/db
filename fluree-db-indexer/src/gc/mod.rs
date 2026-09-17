@@ -38,9 +38,14 @@
 //! Two passes on branches of one ledger must not overlap: each could see the
 //! other's not-yet-released old root still referencing a blob, both would
 //! defer it, and both would consume the manifests that named it. The worker
-//! serialises passes per ledger name for that reason. The sibling listing is
-//! taken fresh for every release, never cached: a fork minutes old can
-//! already have built, and its root can name a blob this pass would release.
+//! serialises passes per ledger name for that reason.
+//!
+//! Which branches are siblings comes from a listing that may be minutes old,
+//! because `all_records()` is O(ledgers) on every nameservice backend, plus
+//! every branch this process has built since, which is the only way a fork
+//! the listing predates can reference more than its source did. Each
+//! sibling's *head* is never cached: it is one consistent `lookup`, made as
+//! the pass releases. See [`current_sibling_heads`].
 //!
 //! Blobs named by manifests the collector has already consumed, and anything
 //! orphaned off the chain, are reachable only by [`plan_sweep`], which
@@ -61,14 +66,16 @@
 //! Before releasing anything a manifest names, `retained_refs` (in
 //! `gc::collector`) checks it against `all_cas_ids()` of every root this
 //! pass retains — every root a query or a future build can still read —
-//! and skips it if any of them still reference it directly.
+//! and skips it if any of them still reference it directly. "Retains" means
+//! every root the pass leaves in the chain, which under a live age guard is
+//! more than the retention count.
 //!
 //! A build can revive a CID at any moment, so a snapshot is not enough: a
 //! pass is split into [`plan_garbage`], which reads a snapshot and releases
 //! nothing, and [`GarbagePlan::release`], which the worker runs inside a
 //! release window — no branch of the ledger building, the one in flight
-//! waited out — after re-reading this branch's head and the sibling
-//! listing ([`release_garbage_plan`]). Roots published since the snapshot
+//! waited out — after re-reading this branch's head and every sibling's
+//! ([`release_garbage_plan`]). Roots published since the snapshot
 //! join the retained set, and the sibling refs are as of the window. A
 //! branch drop releases inside the same window. What is left is the
 //! single-process caveat [`plan_sweep`] and `MaintenanceGuard` carry: a
@@ -129,7 +136,9 @@ pub(crate) mod test_support;
 
 pub use collector::{clean_garbage, plan_garbage, release_garbage_plan, GarbagePlan};
 pub use record::GarbageRecord;
-pub use siblings::{shared_blob_policy_for, shared_refs_of_branches, siblings_of};
+pub use siblings::{
+    current_sibling_heads, shared_blob_policy_for, shared_refs_of_branches, siblings_of,
+};
 pub use sweep::{execute_sweep, plan_sweep, BranchIndexHead, SweepPlan, SweepResult};
 
 use crate::error::Result;

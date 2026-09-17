@@ -690,3 +690,29 @@ async fn drop_ledger_disconnects_from_cache() {
         "Ledger should be evicted from cache after drop"
     );
 }
+
+/// The collector and a fork drop, end to end on file storage and the file
+/// nameservice with the worker running: real builds, passes releasing behind
+/// them inside release windows, and nothing a surviving chain references lost.
+#[tokio::test]
+async fn collector_and_fork_drop_keep_every_referenced_dictionary_on_file_storage() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(&path).build().expect("build");
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        crate::support::collecting_indexer_config(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            crate::support::run_collector_and_fork_drop_scenario(&fluree, &handle, "gc-e2e").await;
+        })
+        .await;
+}

@@ -54,10 +54,10 @@ pub use config::{
 pub use drop::collect_ledger_cids;
 pub use error::{IndexerError, Result};
 pub use gc::{
-    clean_garbage, execute_sweep, plan_garbage, plan_sweep, release_garbage_plan,
-    shared_blob_policy_for, shared_refs_of_branches, siblings_of, write_garbage_record,
-    BranchIndexHead, CleanGarbageConfig, CleanGarbageResult, GarbagePlan, GarbageRecord,
-    SharedBlobPolicy, SweepPlan, SweepResult, DEFAULT_MAX_OLD_INDEXES,
+    clean_garbage, current_sibling_heads, execute_sweep, plan_garbage, plan_sweep,
+    release_garbage_plan, shared_blob_policy_for, shared_refs_of_branches, siblings_of,
+    write_garbage_record, BranchIndexHead, CleanGarbageConfig, CleanGarbageResult, GarbagePlan,
+    GarbageRecord, SharedBlobPolicy, SweepPlan, SweepResult, DEFAULT_MAX_OLD_INDEXES,
     DEFAULT_MIN_TIME_GARBAGE_MINS,
 };
 pub use orchestrator::{

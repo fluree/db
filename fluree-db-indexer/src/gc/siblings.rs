@@ -10,8 +10,8 @@ use crate::error::Result;
 use crate::gc::collector::{is_shared_across_branches, PrevIndexChainWalk};
 use crate::gc::{BranchIndexHead, SharedBlobPolicy};
 use fluree_db_core::{ContentId, StorageBackend};
-use fluree_db_nameservice::NsRecord;
-use std::collections::HashSet;
+use fluree_db_nameservice::{NameServiceLookup, NsRecord};
+use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
 /// The other branches of `ledger_id`'s ledger, as the sweep and the collector
@@ -84,8 +84,45 @@ pub async fn shared_refs_of_branches(
     Ok(refs)
 }
 
-/// The policy a collector pass on `ledger_id` should run under, given a
-/// listing of the ledger's records.
+/// The heads, as of now, of the branches in `candidates` that are siblings of
+/// `ledger_id`: same ledger name, not `ledger_id` itself, still recorded.
+/// Retracted branches are kept, as in [`siblings_of`].
+///
+/// One `lookup` per sibling, which every backend answers with a consistent
+/// read. `candidates` must name every sibling whose chain can reference a
+/// blob `ledger_id`'s pass would release; a branch that no longer exists is
+/// harmless. Any lookup failure fails the whole call: a set missing a
+/// sibling would release blobs it still reads.
+pub async fn current_sibling_heads(
+    nameservice: &(impl NameServiceLookup + ?Sized),
+    ledger_id: &str,
+    candidates: &[String],
+) -> fluree_db_nameservice::Result<Vec<BranchIndexHead>> {
+    let Ok((name, _)) = fluree_db_core::ledger_id::split_ledger_id(ledger_id) else {
+        return Ok(Vec::new());
+    };
+    let siblings: BTreeSet<&String> = candidates
+        .iter()
+        .filter(|id| {
+            id.as_str() != ledger_id
+                && fluree_db_core::ledger_id::split_ledger_id(id)
+                    .is_ok_and(|(candidate, _)| candidate == name)
+        })
+        .collect();
+    let mut heads = Vec::with_capacity(siblings.len());
+    for id in siblings {
+        if let Some(record) = nameservice.lookup(id).await? {
+            heads.push(BranchIndexHead {
+                ledger_id: record.ledger_id,
+                index_head_id: record.index_head_id,
+            });
+        }
+    }
+    Ok(heads)
+}
+
+/// The policy a collector pass on `ledger_id` should run under, given its
+/// sibling branches' heads.
 ///
 /// No siblings means nothing is referenced elsewhere and every blob the
 /// manifests name is released. Otherwise the siblings' chains are walked;
@@ -93,17 +130,16 @@ pub async fn shared_refs_of_branches(
 /// guess, and the next pass tries again.
 pub async fn shared_blob_policy_for(
     backend: &StorageBackend,
-    records: &[NsRecord],
+    siblings: &[BranchIndexHead],
     ledger_id: &str,
     artifact_cache_dir: Option<&Path>,
 ) -> SharedBlobPolicy {
-    let siblings = siblings_of(records, ledger_id);
     if siblings.is_empty() {
         return SharedBlobPolicy::Release {
             referenced_elsewhere: HashSet::new(),
         };
     }
-    match shared_refs_of_branches(backend, &siblings, artifact_cache_dir).await {
+    match shared_refs_of_branches(backend, siblings, artifact_cache_dir).await {
         Ok(referenced_elsewhere) => {
             tracing::debug!(
                 ledger_id,
@@ -167,6 +203,42 @@ mod tests {
             .collect();
         siblings.sort();
         assert_eq!(siblings, vec!["db:dev", "db:old"]);
+    }
+
+    /// Candidates are narrowed to the ledger's other branches, each read
+    /// through the nameservice now: a head newer than the candidate list, a
+    /// retracted branch kept, a branch that no longer exists dropped.
+    #[tokio::test]
+    async fn current_sibling_heads_reads_each_sibling_from_the_nameservice() {
+        use fluree_db_nameservice::memory::MemoryNameService;
+        use fluree_db_nameservice::{IndexPublisher, LedgerLifecycle};
+
+        let ns = MemoryNameService::new();
+        let head = ContentId::new(ContentKind::IndexRoot, b"dev head");
+        for id in ["db:main", "db:dev", "db:old", "other:main"] {
+            ns.create_ledger(id).unwrap();
+        }
+        ns.publish_index("db:dev", 7, &head).await.unwrap();
+        ns.retract("db:old").await.unwrap();
+
+        let candidates: Vec<String> = [
+            "db:dev",
+            "db:dev",
+            "db:main",
+            "db:old",
+            "db:gone",
+            "other:main",
+        ]
+        .map(String::from)
+        .to_vec();
+        let mut heads = current_sibling_heads(&ns, "db:main", &candidates)
+            .await
+            .unwrap();
+        heads.sort_by(|a, b| a.ledger_id.cmp(&b.ledger_id));
+
+        let ids: Vec<&str> = heads.iter().map(|h| h.ledger_id.as_str()).collect();
+        assert_eq!(ids, vec!["db:dev", "db:old"]);
+        assert_eq!(heads[0].index_head_id, Some(head));
     }
 
     /// The union covers every root on a sibling's chain, and the walk stays
@@ -259,7 +331,7 @@ mod tests {
 
         let alone = vec![record("db:main", None, false)];
         assert!(matches!(
-            shared_blob_policy_for(&backend, &alone, "db:main", None).await,
+            shared_blob_policy_for(&backend, &siblings_of(&alone, "db:main"), "db:main", None).await,
             SharedBlobPolicy::Release { referenced_elsewhere } if referenced_elsewhere.is_empty()
         ));
 
@@ -270,7 +342,13 @@ mod tests {
             record("db:dev", Some(missing), false),
         ];
         assert!(matches!(
-            shared_blob_policy_for(&backend, &with_unreadable, "db:main", None).await,
+            shared_blob_policy_for(
+                &backend,
+                &siblings_of(&with_unreadable, "db:main"),
+                "db:main",
+                None
+            )
+            .await,
             SharedBlobPolicy::Defer
         ));
     }
