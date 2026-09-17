@@ -115,11 +115,7 @@ pub async fn populate_class_cache(
     // operator populates per batch and hydration re-asks per subject fetch, so
     // without this every subject pays the index lookup (a leaflet decode) at
     // least twice.
-    let uncached: Vec<Sid> = subjects
-        .iter()
-        .filter(|s| !policy_ctx.has_cached_subject_classes(g_id, s))
-        .cloned()
-        .collect();
+    let uncached = policy_ctx.retain_uncached(g_id, subjects);
     if uncached.is_empty() {
         return Ok(());
     }

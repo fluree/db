@@ -76,6 +76,14 @@ pub struct PolicyContext {
     /// different `rdf:type` values in different named graphs, and an `f:onClass`
     /// decision made against another graph's classes is simply wrong. Keying on
     /// `Sid` alone made the result depend on which graph populated the entry first.
+    ///
+    /// Entries are written once and never refreshed (`populate_class_cache`
+    /// skips subjects already present), so a context must never outlive a
+    /// single (ledger, graph, `t`): `GraphId` is ledger-local and `Sid`
+    /// namespaces are per-ledger, and a stale or borrowed entry does not
+    /// miss — it answers, and an `f:onClass` decision made from it is
+    /// silently wrong. Sharing one context across concurrent queries at one
+    /// state is fine; reusing it across states is not.
     class_cache: ClassCache,
 }
 
@@ -946,6 +954,20 @@ impl PolicyContext {
             .unwrap_or(false)
     }
 
+    /// Filter `subjects` down to those this context has not resolved in `g_id`,
+    /// taking the cache lock once rather than per subject.
+    pub fn retain_uncached(&self, g_id: GraphId, subjects: &[Sid]) -> Vec<Sid> {
+        match self.class_cache.read() {
+            Ok(cache) => subjects
+                .iter()
+                .filter(|s| !cache.contains_key(&(g_id, (*s).clone())))
+                .cloned()
+                .collect(),
+            // Poisoned: resolve everything, same as a miss.
+            Err(_) => subjects.to_vec(),
+        }
+    }
+
     /// Get cached subject classes for a subject in a specific graph.
     pub fn get_cached_subject_classes(&self, g_id: GraphId, subject: &Sid) -> Option<Vec<Sid>> {
         self.class_cache
@@ -1411,6 +1433,28 @@ mod tests {
         assert!(ctx.has_cached_subject_classes(3, &alice));
         assert!(!ctx.has_cached_subject_classes(4, &alice));
         assert!(!ctx.has_cached_subject_classes(3, &bob));
+    }
+
+    #[test]
+    fn retain_uncached_keeps_only_subjects_missing_from_the_graphs_cache() {
+        // The batch filter `populate_class_cache` runs under one lock must agree
+        // with the per-subject accessor: cached in this graph drops out, cached
+        // in another graph or not at all stays, order and duplicates preserved.
+        let ctx = PolicyContext::new(PolicyWrapper::root(), None);
+        let alice = make_sid(100, "alice");
+        let bob = make_sid(100, "bob");
+        let carol = make_sid(100, "carol");
+
+        ctx.cache_subject_classes(3, alice.clone(), vec![make_sid(100, "Employee")]);
+        ctx.cache_subject_classes(4, bob.clone(), vec![make_sid(100, "Patient")]);
+
+        let asked = vec![alice.clone(), bob.clone(), carol.clone(), bob.clone()];
+        assert_eq!(
+            ctx.retain_uncached(3, &asked),
+            vec![bob.clone(), carol, bob],
+            "alice is cached in graph 3 and must be skipped; bob is cached only in graph 4"
+        );
+        assert!(ctx.retain_uncached(3, &[alice]).is_empty());
     }
 
     #[test]
