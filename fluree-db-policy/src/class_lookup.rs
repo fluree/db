@@ -115,14 +115,14 @@ pub async fn populate_class_cache(
     // operator populates per batch and hydration re-asks per subject fetch, so
     // without this every subject pays the index lookup (a leaflet decode) at
     // least twice.
-    let uncached = policy_ctx.retain_uncached(g_id, subjects);
+    let uncached = policy_ctx.retain_uncached(g_id, db.t, subjects);
     if uncached.is_empty() {
         return Ok(());
     }
     let class_map = lookup_subject_classes(&uncached, db).await?;
 
     for (subject, classes) in class_map {
-        policy_ctx.cache_subject_classes(g_id, subject, classes);
+        policy_ctx.cache_subject_classes(g_id, db.t, subject, classes);
     }
 
     Ok(())

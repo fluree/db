@@ -5,6 +5,8 @@ mod support;
 mod it_policy_allow;
 #[path = "it_policy_class.rs"]
 mod it_policy_class;
+#[path = "it_policy_class_cache_sequential.rs"]
+mod it_policy_class_cache_sequential;
 #[path = "it_policy_cross_ledger.rs"]
 mod it_policy_cross_ledger;
 #[path = "it_policy_cypher_conditions.rs"]

@@ -56,9 +56,10 @@ impl<'a> FlakeEvalParams<'a> {
     }
 }
 
-/// Shared (graph, subject) -> classes cache for runtime class-membership
-/// checks. See the `class_cache` field docs for why the graph is in the key.
-type ClassCache = Arc<RwLock<std::collections::HashMap<(GraphId, Sid), Vec<Sid>>>>;
+/// Shared (graph, t, subject) -> classes cache for runtime class-membership
+/// checks. See the `class_cache` field docs for why the graph and `t` are in
+/// the key.
+type ClassCache = Arc<RwLock<std::collections::HashMap<(GraphId, i64, Sid), Vec<Sid>>>>;
 
 /// Policy context for evaluation
 ///
@@ -70,20 +71,26 @@ pub struct PolicyContext {
     pub wrapper: PolicyWrapper,
     /// The grounded identity (always has a value, even if random)
     pub identity: Sid,
-    /// Cache of (graph, subject) -> classes for runtime class membership checks.
+    /// Cache of (graph, t, subject) -> classes for runtime class membership
+    /// checks.
     ///
     /// Keyed on the graph as well as the subject: the same subject IRI can carry
     /// different `rdf:type` values in different named graphs, and an `f:onClass`
     /// decision made against another graph's classes is simply wrong. Keying on
     /// `Sid` alone made the result depend on which graph populated the entry first.
     ///
-    /// Entries are written once and never refreshed (`populate_class_cache`
-    /// skips subjects already present), so a context must never outlive a
-    /// single (ledger, graph, `t`): `GraphId` is ledger-local and `Sid`
-    /// namespaces are per-ledger, and a stale or borrowed entry does not
+    /// Keyed on `t` because entries are written once and never refreshed
+    /// (`populate_class_cache` skips subjects already present) while one
+    /// context can legitimately span several states: the sequential stager
+    /// hands the same context to every op of a `;`-separated update and
+    /// advances `t` between them, so an op that re-types a subject must not
+    /// let the next op read the previous classes. A stale entry does not
     /// miss — it answers, and an `f:onClass` decision made from it is
-    /// silently wrong. Sharing one context across concurrent queries at one
-    /// state is fine; reusing it across states is not.
+    /// silently wrong.
+    ///
+    /// What the key does not cover: a context must never span two ledgers.
+    /// `GraphId` is ledger-local and `Sid` namespaces are per-ledger, so an
+    /// entry borrowed from another ledger collides rather than misses.
     class_cache: ClassCache,
 }
 
@@ -940,27 +947,27 @@ impl PolicyContext {
     }
 
     /// Cache subject classes for repeated lookups, within one graph.
-    pub fn cache_subject_classes(&self, g_id: GraphId, subject: Sid, classes: Vec<Sid>) {
+    pub fn cache_subject_classes(&self, g_id: GraphId, t: i64, subject: Sid, classes: Vec<Sid>) {
         if let Ok(mut cache) = self.class_cache.write() {
-            cache.insert((g_id, subject), classes);
+            cache.insert((g_id, t, subject), classes);
         }
     }
 
     /// Whether this context already resolved classes for `subject` in `g_id`.
-    pub fn has_cached_subject_classes(&self, g_id: GraphId, subject: &Sid) -> bool {
+    pub fn has_cached_subject_classes(&self, g_id: GraphId, t: i64, subject: &Sid) -> bool {
         self.class_cache
             .read()
-            .map(|c| c.contains_key(&(g_id, subject.clone())))
+            .map(|c| c.contains_key(&(g_id, t, subject.clone())))
             .unwrap_or(false)
     }
 
     /// Filter `subjects` down to those this context has not resolved in `g_id`,
     /// taking the cache lock once rather than per subject.
-    pub fn retain_uncached(&self, g_id: GraphId, subjects: &[Sid]) -> Vec<Sid> {
+    pub fn retain_uncached(&self, g_id: GraphId, t: i64, subjects: &[Sid]) -> Vec<Sid> {
         match self.class_cache.read() {
             Ok(cache) => subjects
                 .iter()
-                .filter(|s| !cache.contains_key(&(g_id, (*s).clone())))
+                .filter(|s| !cache.contains_key(&(g_id, t, (*s).clone())))
                 .cloned()
                 .collect(),
             // Poisoned: resolve everything, same as a miss.
@@ -969,11 +976,16 @@ impl PolicyContext {
     }
 
     /// Get cached subject classes for a subject in a specific graph.
-    pub fn get_cached_subject_classes(&self, g_id: GraphId, subject: &Sid) -> Option<Vec<Sid>> {
+    pub fn get_cached_subject_classes(
+        &self,
+        g_id: GraphId,
+        t: i64,
+        subject: &Sid,
+    ) -> Option<Vec<Sid>> {
         self.class_cache
             .read()
             .ok()
-            .and_then(|cache| cache.get(&(g_id, subject.clone())).cloned())
+            .and_then(|cache| cache.get(&(g_id, t, subject.clone())).cloned())
     }
 }
 
@@ -1389,16 +1401,16 @@ mod tests {
         let employee = make_sid(100, "Employee");
         let patient = make_sid(100, "Patient");
 
-        ctx.cache_subject_classes(3, subject.clone(), vec![employee.clone()]);
-        ctx.cache_subject_classes(4, subject.clone(), vec![patient.clone()]);
+        ctx.cache_subject_classes(3, 1, subject.clone(), vec![employee.clone()]);
+        ctx.cache_subject_classes(4, 1, subject.clone(), vec![patient.clone()]);
 
         assert_eq!(
-            ctx.get_cached_subject_classes(3, &subject),
+            ctx.get_cached_subject_classes(3, 1, &subject),
             Some(vec![employee]),
             "graph 3's classes were clobbered by the graph 4 population"
         );
         assert_eq!(
-            ctx.get_cached_subject_classes(4, &subject),
+            ctx.get_cached_subject_classes(4, 1, &subject),
             Some(vec![patient]),
             "graph 4 did not get its own entry"
         );
@@ -1412,9 +1424,9 @@ mod tests {
         let ctx = PolicyContext::new(PolicyWrapper::root(), None);
         let subject = make_sid(100, "alice");
 
-        ctx.cache_subject_classes(3, subject.clone(), vec![make_sid(100, "Employee")]);
+        ctx.cache_subject_classes(3, 1, subject.clone(), vec![make_sid(100, "Employee")]);
 
-        assert_eq!(ctx.get_cached_subject_classes(7, &subject), None);
+        assert_eq!(ctx.get_cached_subject_classes(7, 1, &subject), None);
     }
 
     #[test]
@@ -1426,13 +1438,13 @@ mod tests {
         let alice = make_sid(100, "alice");
         let bob = make_sid(100, "bob");
 
-        assert!(!ctx.has_cached_subject_classes(3, &alice));
+        assert!(!ctx.has_cached_subject_classes(3, 1, &alice));
 
-        ctx.cache_subject_classes(3, alice.clone(), vec![make_sid(100, "Employee")]);
+        ctx.cache_subject_classes(3, 1, alice.clone(), vec![make_sid(100, "Employee")]);
 
-        assert!(ctx.has_cached_subject_classes(3, &alice));
-        assert!(!ctx.has_cached_subject_classes(4, &alice));
-        assert!(!ctx.has_cached_subject_classes(3, &bob));
+        assert!(ctx.has_cached_subject_classes(3, 1, &alice));
+        assert!(!ctx.has_cached_subject_classes(4, 1, &alice));
+        assert!(!ctx.has_cached_subject_classes(3, 1, &bob));
     }
 
     #[test]
@@ -1445,16 +1457,16 @@ mod tests {
         let bob = make_sid(100, "bob");
         let carol = make_sid(100, "carol");
 
-        ctx.cache_subject_classes(3, alice.clone(), vec![make_sid(100, "Employee")]);
-        ctx.cache_subject_classes(4, bob.clone(), vec![make_sid(100, "Patient")]);
+        ctx.cache_subject_classes(3, 1, alice.clone(), vec![make_sid(100, "Employee")]);
+        ctx.cache_subject_classes(4, 1, bob.clone(), vec![make_sid(100, "Patient")]);
 
         let asked = vec![alice.clone(), bob.clone(), carol.clone(), bob.clone()];
         assert_eq!(
-            ctx.retain_uncached(3, &asked),
+            ctx.retain_uncached(3, 1, &asked),
             vec![bob.clone(), carol, bob],
             "alice is cached in graph 3 and must be skipped; bob is cached only in graph 4"
         );
-        assert!(ctx.retain_uncached(3, &[alice]).is_empty());
+        assert!(ctx.retain_uncached(3, 1, &[alice]).is_empty());
     }
 
     #[test]
