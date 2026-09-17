@@ -340,6 +340,8 @@ impl Committer for LocalCommitter {
             // The staged bundle carries every blob it resolved; a gap it
             // could not resolve is not distinguished here yet.
             missing_blobs: Vec::new(),
+            // The consensus surface does not carry merged-in commits yet.
+            merged_commits: Vec::new(),
         };
 
         let response = self

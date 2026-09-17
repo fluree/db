@@ -586,7 +586,7 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
 
     // Import incrementally (validates chain, ancestry, writes blobs, advances head, updates novelty).
     let result = fluree
-        .import_commits_incremental(&ledger_id, to_import, all_blobs)
+        .import_commits_incremental(&ledger_id, to_import, Vec::new(), all_blobs)
         .await
         .map_err(|e| CliError::Config(format!("pull failed (import): {e}")))?;
 
@@ -798,6 +798,7 @@ pub async fn run_push(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
         commits,
         blobs,
         missing_blobs,
+        merged_commits: Vec::new(),
     };
     let resp = client
         .push_commits(remote_ledger_id, &req)
@@ -991,6 +992,7 @@ pub async fn run_publish(
         commits,
         blobs,
         missing_blobs,
+        merged_commits: Vec::new(),
     };
     let resp = client
         .push_commits(&remote_ledger_id, &req)

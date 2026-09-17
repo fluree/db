@@ -121,6 +121,7 @@ async fn push_preserves_signed_policy_and_rejected_commit_can_be_retried_with_a_
         commits: vec![Base64Bytes(bytes)],
         blobs: Default::default(),
         missing_blobs: vec![],
+        merged_commits: vec![],
     })
     .unwrap();
     for allow in [false, true] {

@@ -210,6 +210,16 @@ pub struct PushCommitsRequest {
     /// stranding those ledgers.
     #[serde(default)]
     pub missing_blobs: Vec<String>,
+    /// Commit v2 blobs that merges in `commits` brought in, parents before
+    /// children. The receiver stores these commits and never replays them.
+    /// A merge commit already carries the combined changes of the branch it
+    /// merged, so replaying that branch's commits would apply them twice.
+    ///
+    /// Storing them is still required. They are what a later walk of the
+    /// commit DAG reads, and a merge commit whose parent is absent breaks
+    /// every such walk.
+    #[serde(default)]
+    pub merged_commits: Vec<Base64Bytes>,
 }
 
 /// Response body for a successful push.
@@ -358,8 +368,16 @@ impl Fluree {
         preflight_strict_next_t_and_prev(&current_ref, &decoded)
             .map_err(PushError::into_api_error)?;
 
+        // 2.1) Decode the commits the chain's merges brought in, and check
+        //      that no parent the bundle names is missing here.
+        let merged = decode_merged_commits(&request).map_err(PushError::into_api_error)?;
+        let content_store = self.branched_content_store(base_state.ledger_id()).await?;
+        validate_ancestry_present(content_store.as_ref(), &decoded, &merged)
+            .await
+            .map_err(PushError::into_api_error)?;
+
         // 3) Validate referenced blobs are provided (if any) and pre-validate hashes.
-        validate_required_blobs(&decoded, &request.blobs, &request.missing_blobs)
+        validate_required_blobs(&decoded, &merged, &request.blobs, &request.missing_blobs)
             .map_err(PushError::into_api_error)?;
 
         // 4) Validate each commit against evolving server view.
@@ -565,7 +583,20 @@ impl Fluree {
             .backend()
             .admin_storage_cloned()
             .ok_or_else(|| ApiError::config("push_commits requires a managed storage backend"))?;
-        write_required_blobs(&storage, base_state.ledger_id(), &request.blobs, &decoded)
+        write_required_blobs(
+            &storage,
+            base_state.ledger_id(),
+            &request.blobs,
+            &decoded,
+            &merged,
+        )
+        .await
+        .map_err(PushError::into_api_error)?;
+
+        // Merged-in commits are written first. They are the parents, and a
+        // failure part way through then leaves no stored commit whose parent
+        // is absent.
+        write_commit_blobs(&storage, base_state.ledger_id(), &merged)
             .await
             .map_err(PushError::into_api_error)?;
 
@@ -839,8 +870,11 @@ fn decode_and_validate_commit_chain(
         let commit = fluree_db_core::commit::codec::read_commit(&bytes)
             .map_err(|e| PushError::Invalid(format!("invalid commit[{idx}]: {e}")))?;
 
-        // Reject empty commits (no flakes) - keep semantics clear.
-        if commit.flakes.is_empty() {
+        // Reject empty commits (no flakes) - keep semantics clear. A merge
+        // commit is exempt: it records the merge even when the strategy
+        // resolved every flake away, and dropping it would let the same
+        // branch be merged again.
+        if commit.flakes.is_empty() && commit.parents.len() < 2 {
             return Err(PushError::Invalid(format!(
                 "invalid commit[{idx}]: empty commit (no flakes)"
             )));
@@ -865,14 +899,16 @@ fn decode_and_validate_commit_chain(
             }
         }
 
-        // Chain validation: at least one parent reference must match the prior
-        // commit's hash. For normal commits this is the single parent; for merge
-        // commits one parent is the prior commit and others are pre-existing.
+        // Chain validation: the first parent must be the prior commit. A
+        // merge commit's remaining parents are the branches it merged, and
+        // they arrive in `merged_commits`. Accepting a match on one of those
+        // would let a push rewrite the branch's own line of descent, which
+        // is the line this receiver replays.
         if let Some(prev_hash_hex) = &prev_hash {
             let ok = commit
                 .parents
-                .iter()
-                .any(|r| r.digest_hex() == *prev_hash_hex);
+                .first()
+                .is_some_and(|r| r.digest_hex() == *prev_hash_hex);
             if !ok {
                 return Err(PushError::Invalid(format!(
                     "commit chain previous mismatch at commit[{idx}]: expected previous digest '{prev_hash_hex}'"
@@ -893,6 +929,74 @@ fn decode_and_validate_commit_chain(
     Ok(out)
 }
 
+/// Decode the commits that merges in the bundle brought in.
+///
+/// These commits carry none of the chain's rules. They belong to other
+/// branches, so their `t` values come from other clocks and need not be
+/// contiguous with anything. The receiver stores them without replaying
+/// them.
+fn decode_merged_commits(
+    request: &PushCommitsRequest,
+) -> std::result::Result<Vec<PushCommitDecoded>, PushError> {
+    request
+        .merged_commits
+        .iter()
+        .enumerate()
+        .map(|(idx, b64)| {
+            let bytes = b64.0.clone();
+            let commit = fluree_db_core::commit::codec::read_commit(&bytes)
+                .map_err(|e| PushError::Invalid(format!("invalid merged_commits[{idx}]: {e}")))?;
+            let digest_hex = fluree_db_core::sha256_hex(&bytes);
+            Ok(PushCommitDecoded {
+                commit,
+                bytes,
+                digest_hex,
+            })
+        })
+        .collect()
+}
+
+/// Check that every parent the bundle references is either in the bundle or
+/// already in storage.
+///
+/// A commit whose parent is missing breaks every later walk of the DAG:
+/// verification, merge, and export all read parents. The push is rejected
+/// instead, which leaves the branch where it was.
+///
+/// `store` is branch-aware. A merge parent of a branch push often lives in
+/// the source branch's namespace rather than the pushed branch's own.
+async fn validate_ancestry_present<S: fluree_db_core::ContentStore + ?Sized>(
+    store: &S,
+    chain: &[PushCommitDecoded],
+    merged: &[PushCommitDecoded],
+) -> std::result::Result<(), PushError> {
+    let bundled: HashSet<&str> = chain
+        .iter()
+        .chain(merged)
+        .map(|c| c.digest_hex.as_str())
+        .collect();
+
+    for c in chain.iter().chain(merged) {
+        for parent in &c.commit.parents {
+            if bundled.contains(parent.digest_hex().as_str()) {
+                continue;
+            }
+            let present = store
+                .has(parent)
+                .await
+                .map_err(|e| PushError::Internal(format!("failed to read {parent}: {e}")))?;
+            if !present {
+                return Err(PushError::Invalid(format!(
+                    "commit {} references parent {parent}, which is neither in the push nor in storage",
+                    c.digest_hex
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn preflight_strict_next_t_and_prev(
     current: &RefValue,
     decoded: &[PushCommitDecoded],
@@ -907,12 +1011,18 @@ fn preflight_strict_next_t_and_prev(
         )));
     }
 
-    // Validate that at least one parent reference matches the current head CID.
+    // Validate that the first parent is the current head CID. As in
+    // `decode_and_validate_commit_chain`, a match on a merge parent is not
+    // enough: the branch's line of descent has to continue from the head.
     if let Some(expected_id) = &current.id {
-        let ok = first.commit.parents.iter().any(|r| r == expected_id);
+        let ok = first
+            .commit
+            .parents
+            .first()
+            .is_some_and(|r| r == expected_id);
         if !ok {
             return Err(PushError::Conflict(format!(
-                "first commit previous mismatch: no parent matches expected head {expected_id:?}"
+                "first commit previous mismatch: first parent is not the expected head {expected_id:?}"
             )));
         }
     } else if !first.commit.parents.is_empty() {
@@ -937,15 +1047,11 @@ fn preflight_strict_next_t_and_prev(
 /// attach `blobs`.
 fn validate_required_blobs(
     decoded: &[PushCommitDecoded],
+    merged: &[PushCommitDecoded],
     provided: &HashMap<String, Base64Bytes>,
     declared_missing: &[String],
 ) -> std::result::Result<(), PushError> {
-    let mut required: HashSet<String> = HashSet::new();
-    for c in decoded {
-        if let Some(txn_cid) = &c.commit.txn {
-            required.insert(txn_cid.to_string());
-        }
-    }
+    let required = required_txn_cids(decoded, merged);
 
     let declared: HashSet<&str> = declared_missing.iter().map(String::as_str).collect();
     for addr in &required {
@@ -966,6 +1072,18 @@ fn validate_required_blobs(
     }
 
     Ok(())
+}
+
+/// The txn blob CIDs a bundle's commits reference.
+fn required_txn_cids(
+    decoded: &[PushCommitDecoded],
+    merged: &[PushCommitDecoded],
+) -> HashSet<String> {
+    decoded
+        .iter()
+        .chain(merged)
+        .filter_map(|c| c.commit.txn.as_ref().map(ToString::to_string))
+        .collect()
 }
 
 async fn build_policy_ctx_for_push(
@@ -1109,17 +1227,12 @@ async fn write_required_blobs<S>(
     ledger_id: &str,
     provided: &HashMap<String, Base64Bytes>,
     decoded: &[PushCommitDecoded],
+    merged: &[PushCommitDecoded],
 ) -> std::result::Result<(), PushError>
 where
     S: Storage + Send + Sync,
 {
-    // Build required set (txn CID strings, for now).
-    let mut required: HashSet<String> = HashSet::new();
-    for c in decoded {
-        if let Some(txn_cid) = &c.commit.txn {
-            required.insert(txn_cid.to_string());
-        }
-    }
+    let required = required_txn_cids(decoded, merged);
 
     for addr in &required {
         let txn_id: ContentId = addr
@@ -2094,11 +2207,14 @@ impl Fluree {
     /// Validates the commit chain, verifies ancestry against the local head,
     /// writes blobs to CAS, advances `CommitHead`, and updates in-memory novelty.
     ///
-    /// `commits` must be ordered oldest → newest.
+    /// `commits` must be ordered oldest → newest. `merged_commits` carries
+    /// the commits that merges in `commits` brought in, parents before
+    /// children. See [`PushCommitsRequest::merged_commits`].
     pub async fn import_commits_incremental(
         &self,
         ledger_id: &str,
         commits: Vec<Base64Bytes>,
+        merged_commits: Vec<Base64Bytes>,
         blobs: HashMap<String, Base64Bytes>,
     ) -> Result<CommitImportResult> {
         if commits.is_empty() {
@@ -2128,6 +2244,7 @@ impl Fluree {
             commits,
             blobs: blobs.clone(),
             missing_blobs: Vec::new(),
+            merged_commits,
         };
 
         // 3) Decode and validate chain.
@@ -2138,15 +2255,34 @@ impl Fluree {
         preflight_strict_next_t_and_prev(&current_ref, &decoded)
             .map_err(PushError::into_api_error)?;
 
+        // 4.1) Decode the commits the chain's merges brought in, and check
+        //      that no parent the bundle names is missing here.
+        let merged = decode_merged_commits(&request).map_err(PushError::into_api_error)?;
+        let content_store = self.branched_content_store(base_state.ledger_id()).await?;
+        validate_ancestry_present(content_store.as_ref(), &decoded, &merged)
+            .await
+            .map_err(PushError::into_api_error)?;
+
         // 5) Validate referenced blobs are provided.
-        validate_required_blobs(&decoded, &request.blobs, &request.missing_blobs)
+        validate_required_blobs(&decoded, &merged, &request.blobs, &request.missing_blobs)
             .map_err(PushError::into_api_error)?;
 
         // 6) Write blobs + commit bytes to local CAS.
         let storage = self.backend().admin_storage_cloned().ok_or_else(|| {
             ApiError::config("push_commits_strict requires a managed storage backend")
         })?;
-        write_required_blobs(&storage, base_state.ledger_id(), &request.blobs, &decoded)
+        write_required_blobs(
+            &storage,
+            base_state.ledger_id(),
+            &request.blobs,
+            &decoded,
+            &merged,
+        )
+        .await
+        .map_err(PushError::into_api_error)?;
+
+        // Parents before children, as in `prepare_push`.
+        write_commit_blobs(&storage, base_state.ledger_id(), &merged)
             .await
             .map_err(PushError::into_api_error)?;
 
