@@ -269,9 +269,10 @@ async fn annotation_body_threshold_reduces_scan_work_on_both_surfaces() {
             // That traversal predates this rewrite and nothing else connects
             // the two modules, so delete it and every row here drops silently
             // with no other test going red. This pins it, on every lane.
+            let mut per_lane_fuel: Vec<(&str, f64)> = Vec::new();
             for lane in ["arena", "enumerate", "chain"] {
                 let _pin = LanePin::lane(lane);
-                let (n, _) = sparql_count_and_fuel(
+                let (n, obj_fuel) = sparql_count_and_fuel(
                     &fluree,
                     &post,
                     &annotated_count_with_object_var_sparql(),
@@ -290,6 +291,43 @@ async fn annotation_body_threshold_reduces_scan_work_on_both_surfaces() {
                     sparql_count_and_fuel(&fluree, &post, &annotated_count_sparql(Some(THRESHOLD)))
                         .await;
                 assert_eq!(plain as usize, KEPT, "lane={lane}: thresholded count");
+                per_lane_fuel.push((lane, obj_fuel));
+            }
+
+            // Three correct answers on three pins do NOT establish that three
+            // lanes ran, and that gap is the whole subject of this file.
+            // `FLUREE_ANNOTATION_LANE` is honoured where the lane is *selected*
+            // and silently ignored where it is *executed*: when any of the five
+            // runtime gates fails, both arena-requiring lanes fall through and
+            // every arm above still returns the right rows. An override that
+            // never reached this process does the same. Either way the loop
+            // passes while measuring one lane three times.
+            //
+            // Fuel is the check that can fail: it is bit-identical across runs
+            // and reproduces across machines, and the lanes have lane-specific
+            // cost profiles, so three pins that really took three lanes cannot
+            // report one number.
+            //
+            // Distinctness rather than three pinned constants, deliberately. It
+            // catches a full demotion (all three collapse), a partial one (two
+            // collapse) and a dropped override (all three identical) equally
+            // well, without hard-coding values that an unrelated change to fuel
+            // accounting would break for reasons having nothing to do with
+            // lanes. Row counts above already pin fixture integrity. Observed
+            // when written, for manual comparison: arena 37.02, enumerate 4,
+            // chain 40.01.
+            for (i, (lane_a, fuel_a)) in per_lane_fuel.iter().enumerate() {
+                for (lane_b, fuel_b) in per_lane_fuel.iter().skip(i + 1) {
+                    assert_ne!(
+                        fuel_a.to_bits(),
+                        fuel_b.to_bits(),
+                        "lanes `{lane_a}` and `{lane_b}` burned identical fuel \
+                         ({fuel_a}), so this test is measuring one lane twice, not \
+                         two lanes. Either a runtime gate demoted them both or the \
+                         FLUREE_ANNOTATION_LANE override never reached the query \
+                         process. Full triple: {per_lane_fuel:?}"
+                    );
+                }
             }
 
             // ---- twin surface: JSON-LD ---------------------------------
