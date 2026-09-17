@@ -290,6 +290,25 @@ struct PlannedRelease {
     past_ceiling: bool,
 }
 
+/// What a pass has decided to release, before anything is released.
+///
+/// Planning reads a snapshot of the chain and takes as long as the chain is
+/// deep; [`release`](Self::release) is the only step that can lose data, and
+/// it is short. Splitting them lets a caller keep index builds out of the
+/// release step alone — see [`release`](Self::release) for why that matters.
+pub struct GarbagePlan {
+    /// The head the chain snapshot was walked from.
+    snapshot_head: ContentId,
+    planned: Vec<PlannedRelease>,
+    /// Every item the eligible manifests name.
+    named: Vec<String>,
+    /// [`retained_refs`] over the snapshot.
+    retained: HashSet<ContentId>,
+    unnameable_indexes: usize,
+    keep_count: usize,
+    cache_dir: Option<std::path::PathBuf>,
+}
+
 /// Clean garbage from old index versions.
 ///
 /// This function implements the expected GC semantics:
@@ -339,6 +358,14 @@ struct PlannedRelease {
 /// manifest for the sweep: at most a chunk's worth of small blobs, whose
 /// nodes were already released.
 ///
+/// # Concurrent builds
+///
+/// This plans and releases back to back against one snapshot, which is only
+/// sound where nothing can publish to the ledger meanwhile. The worker and
+/// the API instead call [`plan_garbage`] and release through
+/// [`release_garbage_plan`] with builds held off; see
+/// [`GarbagePlan::release`].
+///
 /// # Safety
 ///
 /// This function is idempotent - running it multiple times is safe.
@@ -349,6 +376,25 @@ pub async fn clean_garbage(
     current_root_id: &ContentId,
     config: CleanGarbageConfig,
 ) -> Result<CleanGarbageResult> {
+    match plan_garbage(store, current_root_id, &config).await? {
+        Some(plan) => {
+            plan.release(store, current_root_id, &config.shared_blobs)
+                .await
+        }
+        None => Ok(CleanGarbageResult::default()),
+    }
+}
+
+/// Steps 1-2 of [`clean_garbage`]: walk the chain and decide what goes.
+/// Releases nothing. `None` when the pass has nothing to release.
+///
+/// `config.shared_blobs` is not read here; the policy is an argument to
+/// [`GarbagePlan::release`], so a caller can compute it as late as possible.
+pub async fn plan_garbage(
+    store: &dyn ContentStore,
+    current_root_id: &ContentId,
+    config: &CleanGarbageConfig,
+) -> Result<Option<GarbagePlan>> {
     let max_old_indexes = config.max_old_indexes.unwrap_or(DEFAULT_MAX_OLD_INDEXES) as usize;
     let min_age_mins = config
         .min_time_garbage_mins
@@ -384,7 +430,7 @@ pub async fn clean_garbage(
 
     if index_chain.len() <= keep_count {
         // Not enough indexes to trigger GC
-        return Ok(CleanGarbageResult::default());
+        return Ok(None);
     }
 
     // 2. Plan: consult every gc-eligible entry from oldest to newest.
@@ -474,83 +520,192 @@ pub async fn clean_garbage(
     }
 
     if planned.is_empty() {
-        return Ok(CleanGarbageResult::default());
+        return Ok(None);
     }
 
-    // 3. Release the nodes the manifests named, protecting anything a
-    // retained root still references directly (see `retained_refs`).
-    let retained = retained_refs(&index_chain, keep_count);
-    let partition = partition_nodes(&named, &config.shared_blobs, &retained);
-    let release_started = std::time::Instant::now();
-    let node_failures = release_batched(store, &partition.release, "garbage node").await;
-    let shared_failed = node_failures
-        .iter()
-        .filter(|(id, _)| is_shared_across_branches(id))
-        .count();
-    let deleted_count = partition.release.len() - node_failures.len();
-    tracing::debug!(
-        versions = planned.len(),
-        released = deleted_count,
-        shared_released = partition.shared_released - shared_failed,
-        shared_deferred = partition.shared_deferred,
-        resurrected = partition.resurrected,
-        elapsed_ms = release_started.elapsed().as_millis() as u64,
-        "GC garbage node release complete"
-    );
+    Ok(Some(GarbagePlan {
+        snapshot_head: current_root_id.clone(),
+        planned,
+        named,
+        retained: retained_refs(&index_chain, keep_count),
+        unnameable_indexes,
+        keep_count,
+        cache_dir: config.artifact_cache_dir.clone(),
+    }))
+}
 
-    // 4. Release the superseded manifests and roots, oldest-first.
-    let mut indexes_cleaned = 0;
-    let mut age_guard_overridden = 0;
-    for chunk in planned.chunks(ROOT_RELEASE_CHUNK) {
-        let mut ids = Vec::with_capacity(chunk.len() * 2);
-        for entry in chunk {
-            if let Some(garbage_id) = &entry.garbage_id {
-                ids.push(garbage_id.clone());
+impl GarbagePlan {
+    /// Steps 3-4 of [`clean_garbage`]: release the planned nodes, then the
+    /// superseded manifests and roots.
+    ///
+    /// `head` is the branch's index head **now** and `shared_blobs` the policy
+    /// **now**, both of which may be newer than the snapshot the plan was made
+    /// from. A build that published since can have revived a CID the plan
+    /// names (see [`retained_refs`]), so every root from `head` back to the
+    /// snapshot is added to the retained set before anything is released.
+    ///
+    /// That closes the window only if no build can publish, or upload a blob
+    /// it is about to publish, between the caller reading `head` and this
+    /// returning. The indexer worker guarantees it with a release window
+    /// over every branch of the ledger; a caller without one has the
+    /// single-process caveat `MaintenanceGuard` documents.
+    pub async fn release(
+        mut self,
+        store: &dyn ContentStore,
+        head: &ContentId,
+        shared_blobs: &SharedBlobPolicy,
+    ) -> Result<CleanGarbageResult> {
+        let published_since = self.retain_published_since(store, head).await?;
+        let Self {
+            planned,
+            named,
+            retained,
+            unnameable_indexes,
+            keep_count,
+            ..
+        } = self;
+
+        // 3. Release the nodes the manifests named, protecting anything a
+        // retained root still references directly (see `retained_refs`).
+        let partition = partition_nodes(&named, shared_blobs, &retained);
+        let release_started = std::time::Instant::now();
+        let node_failures = release_batched(store, &partition.release, "garbage node").await;
+        let shared_failed = node_failures
+            .iter()
+            .filter(|(id, _)| is_shared_across_branches(id))
+            .count();
+        let deleted_count = partition.release.len() - node_failures.len();
+        tracing::debug!(
+            versions = planned.len(),
+            released = deleted_count,
+            shared_released = partition.shared_released - shared_failed,
+            shared_deferred = partition.shared_deferred,
+            resurrected = partition.resurrected,
+            retained_refs = retained.len(),
+            published_since,
+            elapsed_ms = release_started.elapsed().as_millis() as u64,
+            "GC garbage node release complete"
+        );
+
+        // 4. Release the superseded manifests and roots, oldest-first.
+        let mut indexes_cleaned = 0;
+        let mut age_guard_overridden = 0;
+        for chunk in planned.chunks(ROOT_RELEASE_CHUNK) {
+            let mut ids = Vec::with_capacity(chunk.len() * 2);
+            for entry in chunk {
+                if let Some(garbage_id) = &entry.garbage_id {
+                    ids.push(garbage_id.clone());
+                }
+                ids.push(entry.root_id.clone());
             }
-            ids.push(entry.root_id.clone());
-        }
-        let failures = store.release_many(&ids).await;
-        for (cid, error) in &failures {
-            tracing::debug!(
-                %cid,
-                error = %error,
-                "Failed to release old db-root or manifest (may already be released)"
-            );
-        }
-        let failed: HashSet<&ContentId> = failures.iter().map(|(id, _)| id).collect();
-        for entry in chunk {
-            if !failed.contains(&entry.root_id) {
-                indexes_cleaned += 1;
-                if entry.past_ceiling {
-                    age_guard_overridden += 1;
+            let failures = store.release_many(&ids).await;
+            for (cid, error) in &failures {
+                tracing::debug!(
+                    %cid,
+                    error = %error,
+                    "Failed to release old db-root or manifest (may already be released)"
+                );
+            }
+            let failed: HashSet<&ContentId> = failures.iter().map(|(id, _)| id).collect();
+            for entry in chunk {
+                if !failed.contains(&entry.root_id) {
+                    indexes_cleaned += 1;
+                    if entry.past_ceiling {
+                        age_guard_overridden += 1;
+                    }
                 }
             }
         }
-    }
 
-    let shared_released = partition.shared_released - shared_failed;
-    if indexes_cleaned > 0 || deleted_count > 0 || partition.resurrected > 0 {
-        tracing::info!(
-            indexes_cleaned = indexes_cleaned,
-            nodes_deleted = deleted_count,
+        let shared_released = partition.shared_released - shared_failed;
+        if indexes_cleaned > 0 || deleted_count > 0 || partition.resurrected > 0 {
+            tracing::info!(
+                indexes_cleaned = indexes_cleaned,
+                nodes_deleted = deleted_count,
+                shared_released,
+                shared_deferred = partition.shared_deferred,
+                resurrected = partition.resurrected,
+                unnameable_indexes = unnameable_indexes,
+                age_guard_overridden = age_guard_overridden,
+                retained_count = keep_count,
+                "Garbage collection complete"
+            );
+        }
+
+        Ok(CleanGarbageResult {
+            indexes_cleaned,
+            nodes_deleted: deleted_count,
+            resurrected: partition.resurrected,
+            age_guard_overridden,
             shared_released,
-            shared_deferred = partition.shared_deferred,
-            resurrected = partition.resurrected,
-            unnameable_indexes = unnameable_indexes,
-            age_guard_overridden = age_guard_overridden,
-            retained_count = keep_count,
-            "Garbage collection complete"
-        );
+            shared_deferred: partition.shared_deferred,
+        })
     }
 
-    Ok(CleanGarbageResult {
-        indexes_cleaned,
-        nodes_deleted: deleted_count,
-        resurrected: partition.resurrected,
-        age_guard_overridden,
-        shared_released,
-        shared_deferred: partition.shared_deferred,
-    })
+    /// Add to the retained set every root from `head` back to the snapshot
+    /// head, returning how many there were. A chain that never reaches the
+    /// snapshot — a reindex replaced it — is added whole.
+    async fn retain_published_since(
+        &mut self,
+        store: &dyn ContentStore,
+        head: &ContentId,
+    ) -> Result<usize> {
+        let mut published_since = 0;
+        if *head == self.snapshot_head {
+            return Ok(published_since);
+        }
+        let mut walk = PrevIndexChainWalk::new(store, head, self.cache_dir.as_deref());
+        while let Some(entry) = walk.next_entry().await? {
+            if entry.root_id == self.snapshot_head {
+                break;
+            }
+            self.retained.extend(entry.root.all_cas_ids());
+            published_since += 1;
+        }
+        Ok(published_since)
+    }
+}
+
+/// Release `plan` from the ledger's state as of now. Where an indexer worker
+/// exists the caller holds the `ReleaseWindow` that makes "now" hold still;
+/// see `IndexerHandle::open_release_window`.
+///
+/// Both inputs the plan's snapshot can have aged out of are re-read: this
+/// branch's head, and the listing the sibling check walks. Neither may be
+/// cached — a build seconds old, on this branch or on a fork seconds old,
+/// can already reference a blob the plan names.
+///
+/// A ledger that is gone, or has no index head, releases nothing. A listing
+/// that cannot be taken defers every shared blob rather than guess.
+pub async fn release_garbage_plan(
+    plan: GarbagePlan,
+    backend: &fluree_db_core::StorageBackend,
+    nameservice: &(impl fluree_db_nameservice::NameServiceLookup + ?Sized),
+    ledger_id: &str,
+    cache_dir: Option<&Path>,
+) -> Result<CleanGarbageResult> {
+    let head = nameservice
+        .lookup(ledger_id)
+        .await
+        .map_err(|e| crate::error::IndexerError::NameService(e.to_string()))?
+        .and_then(|record| record.index_head_id);
+    let Some(head) = head else {
+        tracing::debug!(ledger_id, "ledger has no index head; releasing nothing");
+        return Ok(CleanGarbageResult::default());
+    };
+    let shared_blobs = match nameservice.all_records().await {
+        Ok(records) => super::shared_blob_policy_for(backend, &records, ledger_id, cache_dir).await,
+        Err(e) => {
+            tracing::warn!(
+                ledger_id,
+                error = %e,
+                "could not list branches for the collector's sibling check; deferring shared blobs"
+            );
+            SharedBlobPolicy::Defer
+        }
+    };
+    let store = backend.content_store(ledger_id);
+    plan.release(store.as_ref(), &head, &shared_blobs).await
 }
 
 /// Collect the whole prev-index chain, newest root first, reading storage
@@ -1094,6 +1249,80 @@ mod tests {
         assert!(!store.has(&cid2).await.unwrap());
         assert!(store.has(&cid3).await.unwrap());
         assert!(store.has(&cid4).await.unwrap());
+    }
+
+    /// The same revival, by a build that publishes *after* the pass planned.
+    /// No root in the plan's snapshot references the CID, so only the walk
+    /// from the head as of the release back to the snapshot can protect it.
+    #[tokio::test]
+    async fn a_cid_revived_by_a_root_published_after_the_plan_is_not_released() {
+        let dict_kind = ContentKind::DictBlob {
+            dict: fluree_db_core::DictKind::Graphs,
+        };
+        let (revived, revived_addr) = cid_and_addr(dict_kind, b"leaf state N");
+        let (touched, touched_addr) = cid_and_addr(dict_kind, b"leaf state N+1");
+        let old_ts = current_timestamp_ms() - (60 * 60 * 1000);
+        let prev = |t: i64, id: &ContentId| Some(BinaryPrevIndexRef { t, id: id.clone() });
+
+        let (cid1, addr1) = cid_and_addr(ContentKind::IndexRoot, b"root1");
+        let (cid2, addr2) = cid_and_addr(ContentKind::IndexRoot, b"root2");
+        let (cid3, addr3) = cid_and_addr(ContentKind::IndexRoot, b"root3");
+        let (cid4, addr4) = cid_and_addr(ContentKind::IndexRoot, b"root4");
+        let (garb_cid2, garb_addr2) = cid_and_addr(ContentKind::GarbageRecord, b"garb2");
+        let root1 = minimal_fir6_with_dict(1, None, None, revived.clone());
+        let root2 = minimal_fir6_with_dict(
+            2,
+            prev(1, &cid1),
+            Some(BinaryGarbageRef {
+                id: garb_cid2.clone(),
+            }),
+            touched.clone(),
+        );
+        let root3 = minimal_fir6_with_dict(3, prev(2, &cid2), None, touched.clone());
+        // Published after the plan: the leaf splits back to its t=1 bytes.
+        let root4 = minimal_fir6_with_dict(4, prev(3, &cid3), None, revived.clone());
+        let garbage2 = format!(
+            r#"{{"ledger_id": "{LEDGER}", "t": 2, "garbage": ["{revived}"], "created_at_ms": {old_ts}}}"#
+        );
+
+        let storage = MemoryStorage::new();
+        for (addr, bytes) in [
+            (&addr1, root1.as_slice()),
+            (&addr2, root2.as_slice()),
+            (&addr3, root3.as_slice()),
+            (&garb_addr2, garbage2.as_bytes()),
+            (&revived_addr, b"leaf state N".as_slice()),
+            (&touched_addr, b"leaf state N+1".as_slice()),
+        ] {
+            storage.write_bytes(addr, bytes).await.unwrap();
+        }
+
+        let config = CleanGarbageConfig {
+            max_old_indexes: Some(1),
+            min_time_garbage_mins: Some(30),
+            ..Default::default()
+        };
+        let store = test_store(&storage);
+        let plan = plan_garbage(&store, &cid3, &config)
+            .await
+            .unwrap()
+            .expect("t=1 is past retention");
+
+        storage.write_bytes(&addr4, &root4).await.unwrap();
+
+        let release_all = SharedBlobPolicy::Release {
+            referenced_elsewhere: std::collections::HashSet::new(),
+        };
+        let result = plan.release(&store, &cid4, &release_all).await.unwrap();
+
+        assert_eq!(result.indexes_cleaned, 1, "t=1 goes");
+        assert_eq!(result.resurrected, 1);
+        assert_eq!(result.shared_released, 0);
+        assert!(
+            store.has(&revived).await.unwrap(),
+            "the head published after the plan references this CID; it must survive"
+        );
+        assert!(!store.has(&cid1).await.unwrap());
     }
 
     #[tokio::test]

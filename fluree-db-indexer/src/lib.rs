@@ -54,15 +54,16 @@ pub use config::{
 pub use drop::collect_ledger_cids;
 pub use error::{IndexerError, Result};
 pub use gc::{
-    clean_garbage, execute_sweep, plan_sweep, shared_blob_policy_for, shared_refs_of_branches,
-    siblings_of, write_garbage_record, BranchIndexHead, CleanGarbageConfig, CleanGarbageResult,
-    GarbageRecord, SharedBlobPolicy, SweepPlan, SweepResult, DEFAULT_MAX_OLD_INDEXES,
+    clean_garbage, execute_sweep, plan_garbage, plan_sweep, release_garbage_plan,
+    shared_blob_policy_for, shared_refs_of_branches, siblings_of, write_garbage_record,
+    BranchIndexHead, CleanGarbageConfig, CleanGarbageResult, GarbagePlan, GarbageRecord,
+    SharedBlobPolicy, SweepPlan, SweepResult, DEFAULT_MAX_OLD_INDEXES,
     DEFAULT_MIN_TIME_GARBAGE_MINS,
 };
 pub use orchestrator::{
     current_index_request_correlation, with_index_request_correlation, BackgroundIndexerWorker,
     GcGuard, IndexCompletion, IndexOutcome, IndexPhase, IndexRequestCorrelation,
-    IndexStatusSnapshot, IndexerHandle, IndexerOrchestrator, MaintenanceGuard,
+    IndexStatusSnapshot, IndexerHandle, IndexerOrchestrator, MaintenanceGuard, ReleaseWindow,
 };
 #[cfg(feature = "embedded-orchestrator")]
 pub use orchestrator::{

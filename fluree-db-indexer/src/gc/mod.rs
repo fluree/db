@@ -38,7 +38,9 @@
 //! Two passes on branches of one ledger must not overlap: each could see the
 //! other's not-yet-released old root still referencing a blob, both would
 //! defer it, and both would consume the manifests that named it. The worker
-//! serialises passes per ledger name for that reason.
+//! serialises passes per ledger name for that reason. The sibling listing is
+//! taken fresh for every release, never cached: a fork minutes old can
+//! already have built, and its root can name a blob this pass would release.
 //!
 //! Blobs named by manifests the collector has already consumed, and anything
 //! orphaned off the chain, are reachable only by [`plan_sweep`], which
@@ -59,11 +61,18 @@
 //! Before releasing anything a manifest names, `retained_refs` (in
 //! `gc::collector`) checks it against `all_cas_ids()` of every root this
 //! pass retains — every root a query or a future build can still read —
-//! and skips it if any of them still reference it directly. That closes the
-//! case above. It does not close a build publishing a *new* root during
-//! this pass, between the chain snapshot the check uses and the release
-//! call: same single-process caveat as [`plan_sweep`] and
-//! `MaintenanceGuard`.
+//! and skips it if any of them still reference it directly.
+//!
+//! A build can revive a CID at any moment, so a snapshot is not enough: a
+//! pass is split into [`plan_garbage`], which reads a snapshot and releases
+//! nothing, and [`GarbagePlan::release`], which the worker runs inside a
+//! release window — no branch of the ledger building, the one in flight
+//! waited out — after re-reading this branch's head and the sibling
+//! listing ([`release_garbage_plan`]). Roots published since the snapshot
+//! join the retained set, and the sibling refs are as of the window. A
+//! branch drop releases inside the same window. What is left is the
+//! single-process caveat [`plan_sweep`] and `MaintenanceGuard` carry: a
+//! second process indexing the same storage is not excluded.
 //!
 //! ## Garbage Record Format
 //!
@@ -118,7 +127,7 @@ mod sweep;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use collector::clean_garbage;
+pub use collector::{clean_garbage, plan_garbage, release_garbage_plan, GarbagePlan};
 pub use record::GarbageRecord;
 pub use siblings::{shared_blob_policy_for, shared_refs_of_branches, siblings_of};
 pub use sweep::{execute_sweep, plan_sweep, BranchIndexHead, SweepPlan, SweepResult};

@@ -17,11 +17,12 @@ use fluree_db_core::{
     format_ledger_id, DEFAULT_BRANCH,
 };
 use fluree_db_indexer::{
-    clean_garbage, execute_sweep, plan_sweep, rebuild_index_from_commits_with_tracker,
-    shared_blob_policy_for, shared_refs_of_branches, siblings_of, BranchIndexHead,
-    CleanGarbageConfig, MaintenanceGuard, SharedBlobPolicy, SweepPlan, SweepResult,
+    execute_sweep, plan_garbage, plan_sweep, rebuild_index_from_commits_with_tracker,
+    release_garbage_plan, shared_refs_of_branches, siblings_of, BranchIndexHead,
+    CleanGarbageConfig, MaintenanceGuard, SweepPlan, SweepResult,
 };
 use fluree_db_nameservice::{GraphSourceType, NsRecord};
+use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -1205,10 +1206,10 @@ impl crate::Fluree {
             handle.wait_for_idle(ledger_id).await;
         }
 
-        // Decided before the branch's roots are deleted: the chain is what
-        // says which blobs it referenced.
-        let unique_dicts = self
-            .shared_blobs_unique_to(ledger_id, record, &mut report.warnings)
+        // Read before the branch's roots are deleted: the chain is what says
+        // which blobs it referenced.
+        let own_dicts = self
+            .shared_blobs_of(ledger_id, record, &mut report.warnings)
             .await;
 
         // Branch path: only the per-branch artifacts. The rest of
@@ -1224,15 +1225,32 @@ impl crate::Fluree {
             mgr.disconnect(ledger_id).await;
         }
 
-        if !unique_dicts.is_empty() {
+        if !own_dicts.is_empty() {
             // Not concurrently with a sibling's collector pass, which decides
-            // from the same listing this did.
-            let _gc_guard = match &self.indexing_mode {
+            // from the same chains this does, and with every surviving
+            // branch's builds held off: what the survivors reference is only
+            // true while none of them can publish. See
+            // `IndexerHandle::open_release_window`.
+            let _quiet = match &self.indexing_mode {
                 IndexingMode::Background(handle) => {
-                    Some(handle.hold_gc(&ledger_name_of(ledger_id)).await)
+                    let gc_guard = handle.hold_gc(&ledger_name_of(ledger_id)).await;
+                    match handle.open_release_window(&gc_guard).await {
+                        Some(window) => Some((window, gc_guard)),
+                        None => {
+                            report.warnings.push(
+                                "A branch of the ledger is held for maintenance; the dropped \
+                                 branch's dictionary blobs are left for a sweep"
+                                    .to_string(),
+                            );
+                            return Ok(parent_new_count);
+                        }
+                    }
                 }
                 _ => None,
             };
+            let unique_dicts = self
+                .unreferenced_by_survivors(ledger_id, own_dicts, &mut report.warnings)
+                .await;
             let failures = self
                 .content_store(ledger_id)
                 .release_many(&unique_dicts)
@@ -1254,39 +1272,47 @@ impl crate::Fluree {
         Ok(parent_new_count)
     }
 
-    /// Dictionary blobs `ledger_id`'s index chain references that no other
-    /// branch of its ledger reaches, retracted branches included.
+    /// Dictionary blobs `ledger_id`'s index chain references.
     ///
-    /// Any failure to read a chain or list the branches returns nothing and
-    /// records a warning: releasing on an incomplete picture could take a
-    /// dictionary a surviving branch still reads, whereas leaving the blobs
-    /// costs disk until a sweep.
-    async fn shared_blobs_unique_to(
+    /// Here and in [`Self::unreferenced_by_survivors`], any failure to read a
+    /// chain or list the branches returns nothing and records a warning:
+    /// releasing on an incomplete picture could take a dictionary a surviving
+    /// branch still reads, whereas leaving the blobs costs disk until a sweep.
+    async fn shared_blobs_of(
         &self,
         ledger_id: &str,
         record: Option<&NsRecord>,
         warnings: &mut Vec<String>,
-    ) -> Vec<ContentId> {
+    ) -> HashSet<ContentId> {
         let Some(head) = record.and_then(|r| r.index_head_id.clone()) else {
-            return Vec::new();
+            return HashSet::new();
         };
         let backend = self.backend();
         let own = BranchIndexHead {
             ledger_id: ledger_id.to_string(),
             index_head_id: Some(head),
         };
-        let referenced = match shared_refs_of_branches(backend, &[own], None).await {
+        match shared_refs_of_branches(backend, &[own], None).await {
             Ok(refs) => refs,
             Err(e) => {
                 warnings.push(format!(
                     "Could not read the branch's index chain; its dictionary blobs are left for a sweep: {e}"
                 ));
-                return Vec::new();
+                HashSet::new()
             }
-        };
-        if referenced.is_empty() {
-            return Vec::new();
         }
+    }
+
+    /// The blobs in `referenced` that no surviving branch of `ledger_id`'s
+    /// ledger reaches, retracted branches included. Listed and walked now
+    /// rather than earlier: the caller holds the survivors quiet.
+    async fn unreferenced_by_survivors(
+        &self,
+        ledger_id: &str,
+        referenced: HashSet<ContentId>,
+        warnings: &mut Vec<String>,
+    ) -> Vec<ContentId> {
+        let backend = self.backend();
         let records = match self.nameservice().all_records().await {
             Ok(records) => records,
             Err(e) => {
@@ -2239,43 +2265,52 @@ impl crate::Fluree {
             let gc_root_id = index_result.root_id.clone();
             let gc_backend = self.backend().clone();
             let gc_ledger_id = ledger_id.clone();
-            // Listed here rather than in the task: the listing needs `self`,
-            // and a reindex is rare enough that one listing per reindex is
-            // the right cost. A listing that fails defers every shared blob.
-            let gc_records = match self.nameservice().all_records().await {
-                Ok(records) => Some(records),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "could not list branches for the collector's sibling check; deferring shared blobs"
-                    );
-                    None
-                }
-            };
+            let gc_nameservice = self.nameservice_mode.as_arc_reader();
             let gc_handle = match &self.indexing_mode {
                 IndexingMode::Background(handle) => Some(handle.clone()),
                 _ => None,
             };
             tokio::spawn(async move {
-                // Serialised with the worker's own passes on this ledger's
-                // branches where a worker exists; see `IndexerHandle::hold_gc`.
-                let _gc_guard = match &gc_handle {
-                    Some(handle) => Some(handle.hold_gc(&ledger_name_of(&gc_ledger_id)).await),
-                    None => None,
-                };
-                let shared_blobs = match gc_records {
-                    Some(records) => {
-                        shared_blob_policy_for(&gc_backend, &records, &gc_ledger_id, None).await
-                    }
-                    None => SharedBlobPolicy::Defer,
-                };
                 let gc_config = CleanGarbageConfig {
                     max_old_indexes: Some(gc_max_old_indexes),
                     min_time_garbage_mins: Some(gc_min_time_mins),
-                    shared_blobs,
                     ..Default::default()
                 };
-                if let Err(e) = clean_garbage(gc_store.as_ref(), &gc_root_id, gc_config).await {
+                let pass = async {
+                    // Serialised with the worker's own passes on this ledger's
+                    // branches where a worker exists, and released with its
+                    // builds held off; see `IndexerHandle::open_release_window`.
+                    let gc_guard = match &gc_handle {
+                        Some(handle) => Some(handle.hold_gc(&ledger_name_of(&gc_ledger_id)).await),
+                        None => None,
+                    };
+                    let Some(plan) =
+                        plan_garbage(gc_store.as_ref(), &gc_root_id, &gc_config).await?
+                    else {
+                        return Ok(());
+                    };
+                    let _window = match (&gc_handle, &gc_guard) {
+                        (Some(handle), Some(guard)) => {
+                            match handle.open_release_window(guard).await {
+                                Some(window) => Some(window),
+                                // Held for maintenance; the periodic pass retries.
+                                None => return Ok(()),
+                            }
+                        }
+                        _ => None,
+                    };
+                    release_garbage_plan(
+                        plan,
+                        &gc_backend,
+                        gc_nameservice.as_ref(),
+                        &gc_ledger_id,
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+                };
+                let result: fluree_db_indexer::Result<()> = pass.await;
+                if let Err(e) = result {
                     tracing::warn!(
                         error = %e,
                         root_id = %gc_root_id,
