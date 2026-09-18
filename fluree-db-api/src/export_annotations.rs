@@ -175,7 +175,7 @@ impl<'a> AnnotationProbe<'a> {
         // Kill switch: take the base-index scan even when an arena is
         // sealed. The two sources should agree; this is how you find out
         // when they do not, without rebuilding an index.
-        if std::env::var("FLUREE_EXPORT_ANNOTATION_SCAN").is_ok() {
+        if force_base_index_scan() {
             let mut probe = Self::new(None, novelty, as_of_t);
             probe.scanned = scan_bundles(ledger, as_of_t).await;
             return Ok(Some(probe));
@@ -260,6 +260,31 @@ impl<'a> AnnotationProbe<'a> {
     }
 }
 
+/// Whether `FLUREE_EXPORT_ANNOTATION_SCAN` asks for the base-index scan in
+/// place of a sealed arena.
+///
+/// Reads the *value*, not merely the presence. This flag is positively
+/// named, so `=0` has to mean off — it previously tested `.is_ok()`, which
+/// made `FLUREE_EXPORT_ANNOTATION_SCAN=0` *enable* the scan and silently
+/// trade a correct arena read for the fallback. The `FLUREE_DISABLE_*` flags
+/// in this tree are presence-only and named so that presence-only is
+/// correct; this one is not one of those. Matches
+/// `indexer_attachment_provider::force_annotation_bootstrap`, the other
+/// positively-named flag in the crate.
+fn force_base_index_scan() -> bool {
+    env_flag_enabled(
+        std::env::var("FLUREE_EXPORT_ANNOTATION_SCAN")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The parse behind [`force_base_index_scan`], separated from the read so it
+/// can be tested without mutating a process-global.
+fn env_flag_enabled(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 /// Recover `EdgeKey -> reifiers` from the base index for an unsealed ledger.
 ///
 /// Best effort by design: the underlying scan reports its own failures as "no
@@ -301,4 +326,26 @@ async fn scan_bundles(_ledger: &LedgerState, _as_of_t: i64) -> HashMap<EdgeKey, 
 /// resolver, which owns the store and dictionary-novelty handles.
 pub(crate) trait ReifierSubject {
     fn reifier_sid(&self, s_id: u64) -> io::Result<Sid>;
+}
+
+#[cfg(test)]
+mod env_flag_tests {
+    use super::env_flag_enabled;
+
+    /// A positively-named flag has to read its value. `=0` meaning "on" is
+    /// the defect this guards, and the docs promise `=1` means force.
+    #[test]
+    fn only_affirmative_values_enable_the_scan() {
+        assert!(env_flag_enabled(Some("1")));
+        assert!(env_flag_enabled(Some("true")));
+        assert!(env_flag_enabled(Some("TRUE")));
+
+        assert!(!env_flag_enabled(Some("0")), "`=0` must not enable it");
+        assert!(!env_flag_enabled(Some("false")));
+        assert!(
+            !env_flag_enabled(Some("")),
+            "set-but-empty is not an opt-in"
+        );
+        assert!(!env_flag_enabled(None), "unset is off");
+    }
 }
