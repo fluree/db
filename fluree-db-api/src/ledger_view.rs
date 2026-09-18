@@ -581,6 +581,26 @@ mod tests {
             CommitRef::parse("commit:123456").unwrap(),
             CommitRef::Prefix("123456".to_string())
         );
+
+        // A bare *negative* integer is a `t` too, where it used to fall through
+        // to `Prefix("-5")`. Strictly a better error path — a negative `t`
+        // fails cleanly downstream and `-5` was never a valid hex prefix, so
+        // nothing that used to resolve stops resolving — but it is a behaviour
+        // change in the same class as the ambiguity above, and it needs the
+        // test more, not less: on the CLI clap consumes `-5` as a flag before
+        // this is reached, so the arm is exercised only through the library and
+        // `routes/ledger.rs`, which the integration suite never walks.
+        assert_eq!(CommitRef::parse("-5").unwrap(), CommitRef::T(-5));
+        assert_eq!(
+            CommitRef::parse("-5").unwrap(),
+            CommitRef::parse("t:-5").unwrap(),
+            "bare and tagged spellings must agree on the sign too"
+        );
+        assert_eq!(
+            CommitRef::parse("commit:-5").unwrap(),
+            CommitRef::Prefix("-5".to_string()),
+            "`commit:` still forces the prefix reading"
+        );
     }
 
     /// Accepting a bare integer must not shadow the CID arm. It cannot: a
