@@ -1,8 +1,16 @@
-//! Push commit ingestion endpoint: `POST /v1/fluree/push/*ledger`.
+//! Push commit ingestion endpoints: `POST /v1/fluree/push/*ledger` and
+//! `POST /v1/fluree/push-merges/*ledger`.
 //!
 //! Accepts precomputed commit v2 bytes from a client, validates them against the
 //! current ledger state (strict sequencing + retraction invariant + policy + SHACL),
 //! stores the commit blobs, and advances commit head via CAS.
+//!
+//! A push whose commits include a merge also carries the commits that merge
+//! brought in, and it goes to `push-merges`. A server predating that endpoint
+//! answers it with 404 rather than storing the merge commits without their
+//! parents, which is what it would do with the extra field on `push`. The
+//! `push` endpoint refuses such a body for the same reason: a client that
+//! sends one there cannot tell those two servers apart.
 
 use crate::config::ServerRole;
 use crate::error::{Result, ServerError};
@@ -15,6 +23,14 @@ use fluree_db_api::{GovernanceOptions, PushCommitsRequest, PushCommitsResponse, 
 use fluree_db_consensus::PushRequest;
 use std::sync::Arc;
 
+/// Whether the endpoint a request arrived on takes the commits a merge
+/// brought in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MergedCommits {
+    Accepted,
+    Refused,
+}
+
 /// Push commits to a ledger (ledger in path tail).
 ///
 /// `POST /v1/fluree/push/<ledger...>`
@@ -24,6 +40,46 @@ pub async fn push_ledger_tail(
     headers: FlureeHeaders,
     MaybeDataBearer(bearer): MaybeDataBearer,
     request: Request,
+) -> Response {
+    push_tail(
+        state,
+        ledger,
+        headers,
+        bearer,
+        request,
+        MergedCommits::Refused,
+    )
+    .await
+}
+
+/// Push commits to a ledger, including the commits its merges brought in.
+///
+/// `POST /v1/fluree/push-merges/<ledger...>`
+pub async fn push_merges_ledger_tail(
+    State(state): State<Arc<AppState>>,
+    Path(ledger): Path<String>,
+    headers: FlureeHeaders,
+    MaybeDataBearer(bearer): MaybeDataBearer,
+    request: Request,
+) -> Response {
+    push_tail(
+        state,
+        ledger,
+        headers,
+        bearer,
+        request,
+        MergedCommits::Accepted,
+    )
+    .await
+}
+
+async fn push_tail(
+    state: Arc<AppState>,
+    ledger: String,
+    headers: FlureeHeaders,
+    bearer: Option<crate::extract::DataPrincipal>,
+    request: Request,
+    merged: MergedCommits,
 ) -> Response {
     // In peer mode, forward to transaction server.
     if state.config.server_role == ServerRole::Peer {
@@ -39,7 +95,7 @@ pub async fn push_ledger_tail(
         };
     }
 
-    push_ledger_local(state, ledger, headers, bearer, request)
+    push_ledger_local(state, ledger, headers, bearer, request, merged)
         .await
         .into_response()
 }
@@ -50,6 +106,7 @@ async fn push_ledger_local(
     headers: FlureeHeaders,
     bearer: Option<crate::extract::DataPrincipal>,
     request: Request,
+    merged: MergedCommits,
 ) -> Result<axum::Json<PushCommitsResponse>> {
     // Enforce data auth rules (Bearer token only for push in this first cut).
     let data_auth = state.config.data_auth();
@@ -90,6 +147,13 @@ async fn push_ledger_local(
         .await
         .map_err(|e| ServerError::bad_request(format!("failed to read request body: {e}")))?;
     let parsed: PushCommitsRequest = serde_json::from_slice(&bytes)?;
+
+    if merged == MergedCommits::Refused && !parsed.merged_commits.is_empty() {
+        return Err(ServerError::bad_request(format!(
+            "this push carries the commits its merges brought in; send it to \
+             POST /v1/fluree/push-merges/{ledger}"
+        )));
+    }
 
     let req = PushRequest {
         idempotency_key,
