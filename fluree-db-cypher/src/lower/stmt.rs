@@ -300,7 +300,8 @@ fn lower_single_branch_inner<E: IriEncoder>(
                 patterns.push(Pattern::Optional(inner));
             }
             ReadClause::With(w) => {
-                let subq = lower_with(ctx, w, std::mem::take(&mut patterns))?;
+                let outer = if narrowed { &[][..] } else { outer_scope };
+                let subq = lower_with(ctx, w, std::mem::take(&mut patterns), outer)?;
                 patterns.push(Pattern::Subquery(subq));
                 narrowed = true;
             }
@@ -308,7 +309,8 @@ fn lower_single_branch_inner<E: IriEncoder>(
                 // `&patterns` ends before the push; `lower_unwind` needs the
                 // clause-entry scope to decide whether the constant-list
                 // shortcut is sound.
-                let unwound = lower_unwind(ctx, u, &patterns)?;
+                let outer = if narrowed { &[][..] } else { outer_scope };
+                let unwound = lower_unwind(ctx, u, &patterns, outer)?;
                 patterns.push(unwound);
             }
             ReadClause::CallSubquery(call) => {
@@ -338,8 +340,12 @@ fn lower_single_branch_inner<E: IriEncoder>(
         }
     }
 
-    let (output, ordering, limit, offset, group_keys, aggregates, post_binds) =
-        lower_return(ctx, &q.return_clause, &mut patterns)?;
+    let (output, ordering, limit, offset, group_keys, aggregates, post_binds) = lower_return(
+        ctx,
+        &q.return_clause,
+        &mut patterns,
+        if narrowed { &[] } else { outer_scope },
+    )?;
 
     // When the projection mixes aggregates with non-aggregate items,
     // the non-aggregates become GROUP BY keys (Cypher's implicit
@@ -371,8 +377,9 @@ fn lower_return<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     r: &ReturnClause,
     patterns: &mut Vec<Pattern>,
+    outer: &[VarId],
 ) -> Result<LoweredReturn> {
-    let mut projection = ProjectionState::new(ctx, "RETURN", patterns, &r.items);
+    let mut projection = ProjectionState::new(ctx, "RETURN", patterns, outer, &r.items);
     for item in &r.items {
         projection.add_item(ctx, patterns, item)?;
     }
@@ -474,11 +481,20 @@ impl ProjectionState {
         ctx: &LoweringContext<'_, E>,
         clause: &'static str,
         patterns: &[Pattern],
+        outer: &[VarId],
         items: &[ProjectionItem],
     ) -> Self {
+        // `outer` is the enclosing scope a `CALL { … }` body imports. It is
+        // not in `patterns` — a CALL body starts with `patterns = []` and the
+        // imported variables are seeded per parent row by `SubqueryOperator`
+        // — so without it an imported name was invisible here, and
+        // `CALL (a) { WITH a.name AS a RETURN a AS z }` clobber-dropped every
+        // row. That is fluree/db#1857's own shape, inside the construct whose
+        // pre-existing guard this change generalises.
         let in_scope = if items.iter().any(|i| i.alias.is_some()) {
             visible_vars_from_patterns(ctx, patterns)
                 .into_iter()
+                .chain(outer.iter().copied())
                 .collect()
         } else {
             std::collections::HashSet::new()
@@ -1334,8 +1350,9 @@ fn lower_with<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     w: &WithClause,
     mut inner_patterns: Vec<Pattern>,
+    outer: &[VarId],
 ) -> Result<SubqueryPattern> {
-    let mut projection = ProjectionState::new(ctx, "WITH", &inner_patterns, &w.items);
+    let mut projection = ProjectionState::new(ctx, "WITH", &inner_patterns, outer, &w.items);
     for item in &w.items {
         projection.add_item(ctx, &mut inner_patterns, item)?;
     }
@@ -1733,6 +1750,7 @@ fn lower_unwind<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     u: &UnwindClause,
     scope: &[Pattern],
+    outer: &[VarId],
 ) -> Result<Pattern> {
     let alias = ctx.intern_var(&u.alias.name);
 
@@ -1764,7 +1782,9 @@ fn lower_unwind<E: IriEncoder>(
     // this change does with the same collision. No in-repo query uses the
     // shape. Making it work for real means keeping an uncorrelated `Unwind`
     // pinned below its MATCH, which is a planner change, not a lowering one.
-    if visible_vars_from_patterns(ctx, scope).contains(&alias) {
+    // `outer` covers a name a `CALL { … }` body imports — see
+    // `ProjectionState::new`.
+    if outer.contains(&alias) || visible_vars_from_patterns(ctx, scope).contains(&alias) {
         return Err(LowerError::generic(format!(
             "UNWIND alias `{}` is already bound by an earlier clause — UNWIND introduces a \
              new binding, so assigning onto a bound name silently drops every row. Unwind \
