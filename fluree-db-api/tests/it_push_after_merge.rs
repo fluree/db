@@ -1,4 +1,4 @@
-//! Pushing a branch whose history contains a general merge.
+//! Pushing and pulling a branch whose history contains a general merge.
 //!
 //! The receiver replays the branch's first-parent line. The commits that the
 //! line's merges brought in travel beside it and are stored without being
@@ -6,8 +6,8 @@
 
 use crate::support;
 use fluree_db_api::{
-    Base64Bytes, ConflictStrategy, FlureeBuilder, GovernanceOptions, IndexConfig,
-    PushCommitsRequest,
+    Base64Bytes, ConflictStrategy, ExportCommitsRequest, FlureeBuilder, GovernanceOptions,
+    IndexConfig, PushCommitsRequest,
 };
 use fluree_db_core::{collect_dag_cids, plan_commit_transfer, ContentId, ContentStore};
 use serde_json::json;
@@ -240,4 +240,109 @@ async fn push_is_rejected_when_a_merged_commit_is_missing() {
         message.contains("neither in the push nor in storage"),
         "unexpected error: {message}"
     );
+}
+
+/// A target ledger holding main's first two commits, the head a puller has
+/// before the merge. Returns that head.
+async fn target_before_merge(fluree: &support::MemoryFluree, target: &str) -> ContentId {
+    let mut bundle = build_bundle(fluree, "mydb:main").await;
+    bundle.commits.truncate(2);
+    bundle.merged_commits.clear();
+    fluree.create_ledger(target).await.unwrap();
+    fluree
+        .push_commits(
+            target,
+            bundle,
+            &GovernanceOptions::default(),
+            &index_config(),
+        )
+        .await
+        .unwrap()
+        .head
+        .commit_id
+}
+
+async fn export_lineage(
+    fluree: &support::MemoryFluree,
+    cursor_id: Option<ContentId>,
+    base_id: Option<ContentId>,
+    limit: usize,
+) -> fluree_db_api::Result<fluree_db_api::ExportCommitsResponse> {
+    let handle = fluree.ledger_cached("mydb:main").await.unwrap();
+    fluree
+        .export_commit_range(
+            &handle,
+            &ExportCommitsRequest {
+                cursor_id,
+                base_id,
+                limit: Some(limit),
+                lineage: true,
+                ..Default::default()
+            },
+        )
+        .await
+}
+
+#[tokio::test]
+async fn lineage_export_pulls_a_merge() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    merged_history(&fluree).await;
+    let target = "it/pull-merge-tgt:main";
+    let base = target_before_merge(&fluree, target).await;
+
+    let page = export_lineage(&fluree, None, Some(base), 100)
+        .await
+        .unwrap();
+    assert!(page.lineage, "the export echoes the mode");
+    assert_eq!(page.commits.len(), 1, "only the merge is above the base");
+    assert_eq!(page.merged_commits.len(), 1, "dev's commit");
+    assert_eq!(page.next_cursor_id, None);
+
+    let result = fluree
+        .import_commits_incremental(target, page.commits, page.merged_commits, page.blobs)
+        .await
+        .expect("import should be accepted");
+    assert_eq!(result.head_t, 3);
+    assert_eq!(names(&fluree, target).await, ["Alice", "Bob", "Carol"]);
+}
+
+#[tokio::test]
+async fn lineage_export_pages_the_line() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    merged_history(&fluree).await;
+
+    let mut lines = 0;
+    let mut merged = 0;
+    let mut cursor = None;
+    loop {
+        let page = export_lineage(&fluree, cursor, None, 1).await.unwrap();
+        assert_eq!(page.count, 1);
+        lines += page.commits.len();
+        merged += page.merged_commits.len();
+        match page.next_cursor_id {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(lines, 3, "alice, carol, and the merge, down to genesis");
+    assert_eq!(merged, 1, "dev's commit, on the merge's page");
+}
+
+#[tokio::test]
+async fn lineage_export_rejects_a_base_off_the_line() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    merged_history(&fluree).await;
+
+    // Dev's head is a merge parent of main's head, not on main's line.
+    let dev_head = fluree
+        .ledger("mydb:dev")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .unwrap();
+    let error = export_lineage(&fluree, None, Some(dev_head), 100)
+        .await
+        .expect_err("a diverged base should be refused");
+    assert!(error.to_string().contains("diverged"), "{error}");
 }

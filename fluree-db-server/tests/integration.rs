@@ -1811,6 +1811,7 @@ async fn sparql_update_templates_support_graph_iri_blocks() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -1918,6 +1919,7 @@ async fn sparql_update_with_clause_scopes_default_templates_and_where() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2022,6 +2024,7 @@ async fn sparql_update_using_clause_scopes_where_default_graph() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2145,6 +2148,7 @@ async fn sparql_update_multiple_using_clauses_merge_default_graph_for_where() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2255,6 +2259,7 @@ async fn sparql_update_using_named_clause_restricts_where_named_graphs() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2310,6 +2315,7 @@ async fn sparql_update_using_named_clause_restricts_where_named_graphs() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2424,6 +2430,7 @@ async fn sparql_update_multiple_using_named_clauses_allow_multiple_named_graphs_
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await

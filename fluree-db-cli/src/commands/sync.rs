@@ -524,15 +524,25 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
         }
     }
 
-    // Fetch pages (newest→oldest) until we reach local history.
+    // Fetch pages (newest→oldest) until we reach local history. The request
+    // asks for the first-parent line and the commits its merges brought in.
+    // A server predating that mode answers with every parent in one list,
+    // which imports only when the history has no merge.
     let mut all_commits: Vec<fluree_db_api::Base64Bytes> = Vec::new();
+    let mut merged_pages: Vec<Vec<fluree_db_api::Base64Bytes>> = Vec::new();
     let mut all_blobs: std::collections::HashMap<String, fluree_db_api::Base64Bytes> =
         std::collections::HashMap::new();
     let mut cursor: Option<String> = None;
+    let mut lineage = true;
 
     loop {
         let page = client
-            .fetch_commits(remote_ledger_id, cursor.as_deref(), 100)
+            .fetch_commits(
+                remote_ledger_id,
+                cursor.as_deref(),
+                local_ref.id.as_ref(),
+                100,
+            )
             .await
             .map_err(|e| {
                 let msg = e.to_string();
@@ -541,26 +551,28 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                 })
             })?;
 
-        for commit in &page.commits {
-            all_commits.push(commit.clone());
-        }
+        lineage &= page.lineage;
+        all_commits.extend(page.commits.iter().cloned());
+        merged_pages.push(page.merged_commits.clone());
         for (addr, blob) in &page.blobs {
             all_blobs
                 .entry(addr.clone())
                 .or_insert_with(|| blob.clone());
         }
 
-        // If this page reached our local history, stop fetching.
-        if page.oldest_t <= local_ref.t + 1 {
+        // A `lineage` export stops at our head by itself. The default export
+        // has to be cut off once a page reaches our history.
+        if !page.lineage && page.oldest_t <= local_ref.t + 1 {
             break;
         }
         match page.next_cursor_id {
             Some(cid) => cursor = Some(cid.to_string()),
-            None => break, // Reached genesis.
+            None => break, // Reached our head, or genesis.
         }
     }
 
-    // Filter to only commits with t > local_t, then reverse to oldest→newest.
+    // Keep only commits with t > local_t in the default export. A `lineage`
+    // export holds nothing else. Then reverse to oldest→newest.
     use fluree_db_core::commit::codec::format::{CommitHeader, HEADER_LEN};
     let mut to_import: Vec<fluree_db_api::Base64Bytes> = Vec::new();
     for commit in &all_commits {
@@ -569,11 +581,21 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
         }
         let header = CommitHeader::read_from(&commit.0)
             .map_err(|e| CliError::Config(format!("invalid commit in pull response: {e}")))?;
-        if header.t > local_ref.t {
+        if lineage || header.t > local_ref.t {
             to_import.push(commit.clone());
         }
     }
     to_import.reverse(); // oldest→newest
+
+    // Older pages first, so parents stay ahead of children. A commit that
+    // merges on two pages brought in arrives twice and is kept once.
+    let mut seen = std::collections::HashSet::new();
+    let merged_commits: Vec<fluree_db_api::Base64Bytes> = merged_pages
+        .into_iter()
+        .rev()
+        .flatten()
+        .filter(|commit| seen.insert(fluree_db_core::sha256_hex(&commit.0)))
+        .collect();
 
     if to_import.is_empty() {
         println!("{} '{}' is already up to date", "✓".green(), ledger_id);
@@ -585,7 +607,7 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
 
     // Import incrementally (validates chain, ancestry, writes blobs, advances head, updates novelty).
     let result = fluree
-        .import_commits_incremental(&ledger_id, to_import, Vec::new(), all_blobs)
+        .import_commits_incremental(&ledger_id, to_import, merged_commits, all_blobs)
         .await
         .map_err(|e| CliError::Config(format!("pull failed (import): {e}")))?;
 
@@ -1264,7 +1286,7 @@ pub async fn run_clone(
         let mut cursor: Option<String> = None;
         loop {
             let page = client
-                .fetch_commits(&ledger_id, cursor.as_deref(), 500)
+                .fetch_commits(&ledger_id, cursor.as_deref(), None, 500)
                 .await
                 .map_err(|e| {
                     let msg = e.to_string();

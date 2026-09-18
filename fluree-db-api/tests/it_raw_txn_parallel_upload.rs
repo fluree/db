@@ -244,6 +244,7 @@ async fn verify_and_export_tolerate_missing_txn_blob() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(10),
+                ..Default::default()
             },
         )
         .await
@@ -294,6 +295,7 @@ async fn push_accepts_commits_whose_txn_blob_is_missing() {
                     cursor: None,
                     cursor_id: None,
                     limit: Some(10),
+                    ..Default::default()
                 },
             )
             .await

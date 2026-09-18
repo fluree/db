@@ -1425,7 +1425,7 @@ const EXPORT_MAX_LIMIT: usize = 500;
 const EXPORT_DEFAULT_LIMIT: usize = 100;
 
 /// Query parameters for paginated commit export.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExportCommitsRequest {
     /// Commit cursor to start from.
     ///
@@ -1444,6 +1444,19 @@ pub struct ExportCommitsRequest {
     /// Maximum commits per page. Clamped to server max (500).
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Export the branch's first-parent line as `commits`, and the commits
+    /// its merges brought in as `merged_commits`.
+    ///
+    /// Without it, `commits` walks every parent, and a history containing a
+    /// merge cannot be imported. The flag is opt-in so that a client
+    /// predating it keeps the format it understands. A response that does
+    /// not echo `lineage` came from a server predating it.
+    #[serde(default)]
+    pub lineage: bool,
+    /// The client's head, in `lineage` mode. The export stops above it.
+    /// When `None`, it runs to genesis.
+    #[serde(default)]
+    pub base_id: Option<ContentId>,
 }
 
 /// Paginated response containing commit blobs (newest → oldest).
@@ -1477,6 +1490,15 @@ pub struct ExportCommitsResponse {
     pub count: usize,
     /// Actual limit used (after server clamping).
     pub effective_limit: usize,
+    /// Echoes [`ExportCommitsRequest::lineage`]. A server predating that flag
+    /// leaves it `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lineage: bool,
+    /// In `lineage` mode, the commits that merges in `commits` brought in,
+    /// parents before children. See
+    /// [`PushCommitsRequest::merged_commits`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_commits: Vec<Base64Bytes>,
 }
 
 /// Export a paginated range of commits from a ledger.
@@ -1535,6 +1557,19 @@ impl Fluree {
         } else {
             head_commit_id.clone()
         };
+
+        if request.lineage {
+            return export_lineage_page(
+                content_store.as_ref(),
+                &start_cid,
+                request.base_id.as_ref(),
+                ledger_id,
+                head_commit_id,
+                head_t,
+                effective_limit,
+            )
+            .await;
+        }
 
         let mut commits = Vec::with_capacity(effective_limit);
         let mut blobs: HashMap<String, Base64Bytes> = HashMap::new();
@@ -1633,8 +1668,101 @@ impl Fluree {
             next_cursor_id,
             count,
             effective_limit,
+            lineage: false,
+            merged_commits: Vec::new(),
         })
     }
+}
+
+/// Read commits in order, with their `t`, collecting each one's txn blob
+/// into `blobs`. A txn blob missing from storage is listed in
+/// `missing_blobs`, as in the default export.
+async fn read_export_commits(
+    store: &dyn fluree_db_core::ContentStore,
+    cids: &[ContentId],
+    blobs: &mut HashMap<String, Base64Bytes>,
+    missing_blobs: &mut Vec<String>,
+) -> Result<Vec<(i64, Base64Bytes)>> {
+    let mut out = Vec::with_capacity(cids.len());
+    for cid in cids {
+        let bytes = store
+            .get(cid)
+            .await
+            .map_err(|e| ApiError::internal(format!("failed to read commit {cid}: {e}")))?;
+        let envelope = fluree_db_core::commit::codec::read_commit_envelope(&bytes)
+            .map_err(|e| ApiError::internal(format!("invalid commit {cid}: {e}")))?;
+        if let Some(txn_cid) = &envelope.txn {
+            let key = txn_cid.to_string();
+            if let std::collections::hash_map::Entry::Vacant(entry) = blobs.entry(key.clone()) {
+                match store.get(txn_cid).await {
+                    Ok(txn_bytes) => {
+                        entry.insert(Base64Bytes(txn_bytes));
+                    }
+                    Err(fluree_db_core::Error::NotFound(_)) => {
+                        tracing::warn!(
+                            commit = %cid,
+                            txn_cid = %key,
+                            "commit references a txn blob that is missing from storage; exporting without it"
+                        );
+                        missing_blobs.push(key);
+                    }
+                    Err(e) => {
+                        return Err(ApiError::internal(format!(
+                            "failed to read txn blob {key}: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+        out.push((envelope.t, Base64Bytes(bytes)));
+    }
+    Ok(out)
+}
+
+/// One page of a `lineage` export: up to `limit` commits of the first-parent
+/// line, plus the commits their merges brought in.
+async fn export_lineage_page(
+    store: &dyn fluree_db_core::ContentStore,
+    from: &ContentId,
+    base: Option<&ContentId>,
+    ledger_id: &str,
+    head_commit_id: ContentId,
+    head_t: i64,
+    limit: usize,
+) -> Result<ExportCommitsResponse> {
+    let page = fluree_db_core::plan_commit_transfer_page(store, from, base, limit)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to plan export from {from}: {e}")))?
+        .ok_or_else(|| {
+            ApiError::http(
+                409,
+                "base_id is not on this branch's first-parent line; the histories have diverged",
+            )
+        })?;
+
+    let mut blobs = HashMap::new();
+    let mut missing_blobs = Vec::new();
+    // Newest first, as in the default export.
+    let lineage: Vec<ContentId> = page.plan.lineage.iter().rev().cloned().collect();
+    let commits = read_export_commits(store, &lineage, &mut blobs, &mut missing_blobs).await?;
+    let merged_commits =
+        read_export_commits(store, &page.plan.merged, &mut blobs, &mut missing_blobs).await?;
+
+    Ok(ExportCommitsResponse {
+        ledger: ledger_id.to_string(),
+        head_commit_id,
+        head_t,
+        newest_t: commits.first().map_or(0, |(t, _)| *t),
+        oldest_t: commits.last().map_or(0, |(t, _)| *t),
+        count: commits.len(),
+        commits: commits.into_iter().map(|(_, bytes)| bytes).collect(),
+        blobs,
+        missing_blobs,
+        next_cursor_id: page.next,
+        effective_limit: limit,
+        lineage: true,
+        merged_commits: merged_commits.into_iter().map(|(_, bytes)| bytes).collect(),
+    })
 }
 
 // ============================================================================
@@ -1682,7 +1810,9 @@ impl Fluree {
         let mut blobs_stored = 0usize;
 
         // Write commit blobs to local CAS (v4: CID = SHA-256 of full blob).
-        for b64 in &response.commits {
+        // A `lineage` page carries the commits its merges brought in
+        // separately. Clone stores them like any other.
+        for b64 in response.commits.iter().chain(&response.merged_commits) {
             let bytes = &b64.0;
             storage
                 .content_write_bytes(ContentKind::Commit, ledger_id, bytes)

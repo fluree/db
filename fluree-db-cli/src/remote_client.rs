@@ -2619,16 +2619,28 @@ impl RemoteLedgerClient {
     /// Uses address-cursor pagination. Pass `cursor: None` for the first page
     /// (starts from head). Each response includes `next_cursor` for the next page,
     /// or `None` when genesis has been reached.
+    ///
+    /// Requests `lineage` mode: the first-parent line as `commits`, and the
+    /// commits its merges brought in as `merged_commits`. The export stops
+    /// above `base`, or runs to genesis when it is `None`. A server predating
+    /// that mode ignores the request and answers with `lineage` unset.
     pub async fn fetch_commits(
         &self,
         ledger: &str,
         cursor: Option<&str>,
+        base: Option<&fluree_db_core::ContentId>,
         limit: usize,
     ) -> Result<ExportCommitsResponse, RemoteLedgerError> {
         let mut url = self.op_url("commits", ledger);
-        url.push_str(&format!("?limit={limit}"));
+        url.push_str(&format!("?limit={limit}&lineage=true"));
         if let Some(c) = cursor {
             url.push_str(&format!("&cursor={}", urlencoding::encode(c)));
+        }
+        if let Some(base) = base {
+            url.push_str(&format!(
+                "&base_id={}",
+                urlencoding::encode(&base.to_string())
+            ));
         }
 
         let resp = self
@@ -3370,6 +3382,32 @@ mod tests {
                 .unwrap()
                 .starts_with("GET /.well-known/fluree.json "));
         }
+    }
+
+    /// Pull asks for the first-parent line, stopping above the local head.
+    #[tokio::test]
+    async fn fetch_commits_requests_the_line_above_the_base() {
+        let page = r#"{"ledger":"mydb:main",
+            "head_commit_id":"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            "head_t":2,"commits":[],"newest_t":0,"oldest_t":0,"next_cursor_id":null,
+            "count":0,"effective_limit":100,"lineage":true}"#;
+        let (base_url, server) = serve_once(page).await;
+        let base: fluree_db_core::ContentId =
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+                .parse()
+                .unwrap();
+        let response = RemoteLedgerClient::new(&base_url, None)
+            .fetch_commits("mydb:main", None, Some(&base), 100)
+            .await
+            .expect("fetch should succeed");
+        assert!(response.lineage);
+
+        let request_line = server.await.unwrap();
+        assert!(request_line.contains("lineage=true"), "{request_line}");
+        assert!(
+            request_line.contains(&format!("base_id={base}")),
+            "{request_line}"
+        );
     }
 
     /// Two pushes that differ only in their merged commits must not share

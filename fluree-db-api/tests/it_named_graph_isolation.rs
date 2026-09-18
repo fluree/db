@@ -602,6 +602,7 @@ async fn push_roundtrip_named_graph_retractions() {
                         cursor: None,
                         cursor_id: None,
                         limit: Some(100),
+                        ..Default::default()
                     },
                 )
                 .await
