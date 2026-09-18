@@ -816,7 +816,14 @@ async fn push_endpoint_accepts_single_commit_and_advances_head() {
 /// Build a ledger at t=1 and the pieces of a push that merges a side
 /// commit into it: the merge commit's bytes and the side commit's bytes.
 async fn merge_push_fixture(ledger: &str) -> (TempDir, Arc<AppState>, PushCommitsRequest) {
-    let (tmp, state) = test_state().await;
+    merge_push_fixture_on(test_state().await, ledger).await
+}
+
+/// [`merge_push_fixture`] on a server the caller configured.
+async fn merge_push_fixture_on(
+    (tmp, state): (TempDir, Arc<AppState>),
+    ledger: &str,
+) -> (TempDir, Arc<AppState>, PushCommitsRequest) {
     let app = build_router(state.clone());
 
     let create_body = serde_json::json!({ "ledger": ledger });
@@ -3440,6 +3447,79 @@ async fn commits_endpoint_cursor_stability() {
     assert_eq!(page2.newest_t, 2, "cursor should resume at t=2");
     assert_eq!(page2.oldest_t, 1, "should reach genesis");
     assert!(page2.next_cursor_id.is_none(), "genesis reached");
+}
+
+/// Lineage mode over HTTP: the query parameters reach the export, and the
+/// response carries the line and the merged-in commits separately.
+#[tokio::test]
+async fn commits_endpoint_exports_the_line_in_lineage_mode() {
+    let ledger = "export-lineage:main";
+    let (_tmp, state, push_req) =
+        merge_push_fixture_on(test_state_with_storage_proxy().await, ledger).await;
+    let app = build_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/push-merges/{ledger}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let token = storage_auth::storage_all_token();
+    let export = |query: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/v1/fluree/commits/{ledger}?{query}"))
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            json_body(resp).await
+        }
+    };
+
+    // Down to genesis: the base commit and the merge, plus the side commit.
+    let (status, json) = export("lineage=true".to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let page: ExportCommitsResponse = serde_json::from_value(json).unwrap();
+    assert!(page.lineage);
+    assert_eq!(page.commits.len(), 2);
+    assert_eq!(page.merged_commits.len(), 1);
+    assert_eq!(page.next_cursor_id, None);
+
+    // Above the base: only the merge, plus the side commit.
+    let base_cid = ContentId::new(ContentKind::Commit, &page.commits[1].0);
+    let (status, json) = export(format!("lineage=true&base_id={base_cid}")).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let page: ExportCommitsResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(page.commits.len(), 1);
+    assert_eq!(page.newest_t, 2);
+    assert_eq!(page.merged_commits.len(), 1);
+
+    // A base off the line: the side commit.
+    let side_cid = ContentId::new(ContentKind::Commit, &page.merged_commits[0].0);
+    let (status, _json) = export(format!("lineage=true&base_id={side_cid}")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Without the flag, the default format: no `lineage`, no split.
+    let (status, json) = export("limit=10".to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(json.get("lineage").is_none(), "{json}");
+    assert!(json.get("merged_commits").is_none(), "{json}");
 }
 
 #[tokio::test]

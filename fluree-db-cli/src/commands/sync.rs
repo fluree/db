@@ -528,12 +528,8 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
     // asks for the first-parent line and the commits its merges brought in.
     // A server predating that mode answers with every parent in one list,
     // which imports only when the history has no merge.
-    let mut all_commits: Vec<fluree_db_api::Base64Bytes> = Vec::new();
-    let mut merged_pages: Vec<Vec<fluree_db_api::Base64Bytes>> = Vec::new();
-    let mut all_blobs: std::collections::HashMap<String, fluree_db_api::Base64Bytes> =
-        std::collections::HashMap::new();
+    let mut pages: Vec<fluree_db_api::ExportCommitsResponse> = Vec::new();
     let mut cursor: Option<String> = None;
-    let mut lineage = true;
 
     loop {
         let page = client
@@ -551,51 +547,27 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
                 })
             })?;
 
-        lineage &= page.lineage;
-        all_commits.extend(page.commits.iter().cloned());
-        merged_pages.push(page.merged_commits.clone());
-        for (addr, blob) in &page.blobs {
-            all_blobs
-                .entry(addr.clone())
-                .or_insert_with(|| blob.clone());
-        }
-
         // A `lineage` export stops at our head by itself. The default export
         // has to be cut off once a page reaches our history.
-        if !page.lineage && page.oldest_t <= local_ref.t + 1 {
+        let reached_local = !page.lineage && page.oldest_t <= local_ref.t + 1;
+        let next = page.next_cursor_id.clone();
+        pages.push(page);
+        if reached_local {
             break;
         }
-        match page.next_cursor_id {
+        match next {
             Some(cid) => cursor = Some(cid.to_string()),
             None => break, // Reached our head, or genesis.
         }
     }
 
-    // Keep only commits with t > local_t in the default export. A `lineage`
-    // export holds nothing else. Then reverse to oldest→newest.
-    use fluree_db_core::commit::codec::format::{CommitHeader, HEADER_LEN};
-    let mut to_import: Vec<fluree_db_api::Base64Bytes> = Vec::new();
-    for commit in &all_commits {
-        if commit.0.len() < HEADER_LEN {
-            continue;
-        }
-        let header = CommitHeader::read_from(&commit.0)
-            .map_err(|e| CliError::Config(format!("invalid commit in pull response: {e}")))?;
-        if lineage || header.t > local_ref.t {
-            to_import.push(commit.clone());
+    let (to_import, merged_commits) = pull_import_set(&pages, local_ref.t)?;
+    let mut all_blobs = std::collections::HashMap::new();
+    for page in pages {
+        for (addr, blob) in page.blobs {
+            all_blobs.entry(addr).or_insert(blob);
         }
     }
-    to_import.reverse(); // oldest→newest
-
-    // Older pages first, so parents stay ahead of children. A commit that
-    // merges on two pages brought in arrives twice and is kept once.
-    let mut seen = std::collections::HashSet::new();
-    let merged_commits: Vec<fluree_db_api::Base64Bytes> = merged_pages
-        .into_iter()
-        .rev()
-        .flatten()
-        .filter(|commit| seen.insert(fluree_db_core::sha256_hex(&commit.0)))
-        .collect();
 
     if to_import.is_empty() {
         println!("{} '{}' is already up to date", "✓".green(), ledger_id);
@@ -622,6 +594,48 @@ pub async fn run_pull(ledger: Option<&str>, no_indexes: bool, dirs: &FlureeDir) 
     // Persist refreshed token if auto-refresh happened.
     context::persist_refreshed_tokens(&client, upstream.remote.as_str(), dirs).await;
     Ok(())
+}
+
+/// The commits a paginated pull imports: the line oldest first, and the
+/// merged-in commits parents before children.
+///
+/// `pages` are in the order they were fetched, newest first. A `lineage`
+/// export holds only new commits. The default export also holds commits at
+/// or below `local_t`, which are dropped.
+fn pull_import_set(
+    pages: &[fluree_db_api::ExportCommitsResponse],
+    local_t: i64,
+) -> CliResult<(
+    Vec<fluree_db_api::Base64Bytes>,
+    Vec<fluree_db_api::Base64Bytes>,
+)> {
+    use fluree_db_core::commit::codec::format::{CommitHeader, HEADER_LEN};
+
+    let lineage = pages.iter().all(|page| page.lineage);
+    let mut to_import = Vec::new();
+    for commit in pages.iter().flat_map(|page| &page.commits) {
+        if commit.0.len() < HEADER_LEN {
+            continue;
+        }
+        let header = CommitHeader::read_from(&commit.0)
+            .map_err(|e| CliError::Config(format!("invalid commit in pull response: {e}")))?;
+        if lineage || header.t > local_t {
+            to_import.push(commit.clone());
+        }
+    }
+    to_import.reverse(); // oldest→newest
+
+    // Older pages first, so parents stay ahead of children. A commit that
+    // merges on two pages brought in arrives twice and is kept once.
+    let mut seen = std::collections::HashSet::new();
+    let merged = pages
+        .iter()
+        .rev()
+        .flat_map(|page| &page.merged_commits)
+        .filter(|commit| seen.insert(fluree_db_core::sha256_hex(&commit.0)))
+        .cloned()
+        .collect();
+    Ok((to_import, merged))
 }
 
 /// The remote head a push plans from, or `None` when the remote has no
@@ -2105,4 +2119,67 @@ async fn run_pull_via_origins(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_api::{Base64Bytes, ExportCommitsResponse};
+    use fluree_db_core::{Commit, ContentId, ContentKind};
+
+    /// Commit bytes at `t`, distinct per `tag`.
+    fn commit(t: i64, tag: &str) -> Base64Bytes {
+        let parent = ContentId::new(ContentKind::Commit, tag.as_bytes());
+        let commit = Commit::new(t, Vec::new()).with_parent(parent);
+        let written = fluree_db_core::commit::codec::write_commit(&commit, false, None).unwrap();
+        Base64Bytes(written.bytes)
+    }
+
+    fn page(
+        commits: Vec<Base64Bytes>,
+        merged_commits: Vec<Base64Bytes>,
+        lineage: bool,
+    ) -> ExportCommitsResponse {
+        ExportCommitsResponse {
+            ledger: "mydb:main".to_string(),
+            head_commit_id: ContentId::new(ContentKind::Commit, b"head"),
+            head_t: 0,
+            count: commits.len(),
+            commits,
+            blobs: Default::default(),
+            missing_blobs: Vec::new(),
+            newest_t: 0,
+            oldest_t: 0,
+            next_cursor_id: None,
+            effective_limit: 100,
+            lineage,
+            merged_commits,
+        }
+    }
+
+    #[test]
+    fn pull_import_set_orders_lineage_pages_oldest_first() {
+        let (c2, c3, c4) = (commit(2, "c2"), commit(3, "c3"), commit(4, "c4"));
+        let (a, b) = (commit(7, "a"), commit(8, "b"));
+        // Fetched newest first. `b` was brought in by merges on both pages.
+        let pages = [
+            page(vec![c4.clone(), c3.clone()], vec![b.clone()], true),
+            page(vec![c2.clone()], vec![a.clone(), b.clone()], true),
+        ];
+
+        let (to_import, merged) = pull_import_set(&pages, 1).unwrap();
+        assert_eq!(to_import, [c2, c3, c4]);
+        // The older page's commits come first, and `b` is kept once.
+        assert_eq!(merged, [a, b]);
+    }
+
+    #[test]
+    fn pull_import_set_drops_known_commits_from_the_default_export() {
+        let (c1, c2, c3) = (commit(1, "c1"), commit(2, "c2"), commit(3, "c3"));
+        let pages = [page(vec![c3.clone(), c2.clone(), c1], Vec::new(), false)];
+
+        let (to_import, merged) = pull_import_set(&pages, 1).unwrap();
+        assert_eq!(to_import, [c2, c3]);
+        assert!(merged.is_empty());
+    }
 }
