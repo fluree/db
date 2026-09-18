@@ -266,8 +266,16 @@ async fn scan_base_index_for_attachment_events(
 
 /// True when `FLUREE_FORCE_ANNOTATION_BOOTSTRAP` asks to run the base-index
 /// bootstrap even though the sticky `had_annotation_arena` bit is set.
-/// EXPERIMENTAL — not a substitute for fixing the bit to track actual
-/// seals/retracts.
+///
+/// The supported form is `ReindexOptions::with_rebuild_annotations`; this
+/// env var predates it and stays for existing operator runbooks.
+///
+/// There is no "fix the bit to track actual seals/retracts" that removes the
+/// need for either. A retracted `f:reifies*` row leaves no trace in the index
+/// — not even an `op=false` row — so no pass can tell a ledger whose arena was
+/// never sealed from one whose arena was sealed and then dropped, and only the
+/// first is safe to rebuild from currently-live bundles. That is why the
+/// caller acknowledges the hazard rather than the code detecting it.
 #[cfg(not(target_arch = "wasm32"))]
 fn force_annotation_bootstrap() -> bool {
     std::env::var("FLUREE_FORCE_ANNOTATION_BOOTSTRAP")
@@ -287,6 +295,7 @@ fn force_annotation_bootstrap() -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn attachment_events_from_state(
     state: &fluree_db_ledger::LedgerState,
+    force_rebuild: bool,
 ) -> Option<AttachmentEventCoverage> {
     let events: Vec<_> = state.novelty.attachments.iter_event_pairs().collect();
     let snapshot = state.snapshot.as_ref();
@@ -303,7 +312,7 @@ pub(crate) async fn attachment_events_from_state(
     if events.is_empty() {
         let bootstrap_eligible = snapshot.has_annotations
             && snapshot.annotation_index.is_none()
-            && (force_annotation_bootstrap() || !snapshot.had_annotation_arena);
+            && (force_rebuild || force_annotation_bootstrap() || !snapshot.had_annotation_arena);
         if bootstrap_eligible {
             if let Some(events) = scan_base_index_for_attachment_events_in(
                 snapshot,

@@ -145,12 +145,58 @@ pub async fn index_ledger(fluree: &Fluree, ledger_id: &str) -> CliResult<IndexOu
 /// With `--remote`, routes to the named remote's `POST /reindex` endpoint.
 /// Without `--remote` but with a local server running, auto-routes to it
 /// via `server.meta.json` (pass `--direct` to bypass).
+/// The `--rebuild-annotations` / `--force` pair from `fluree reindex`.
+///
+/// Carried together because one is meaningless without the other: the
+/// rebuild discards unrecoverable history in one case the code cannot
+/// detect, so the operator acknowledges it rather than being warned after
+/// the fact. `--force` is this CLI's existing confirmation idiom — the same
+/// one `fluree drop` uses, with the same "refuse, do not prompt" behaviour,
+/// because a recovery tool has to work in a script.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RebuildAnnotations {
+    pub rebuild_annotations: bool,
+    pub force: bool,
+}
+
+impl RebuildAnnotations {
+    /// `Ok(true)` when the caller asked for a rebuild and acknowledged it.
+    ///
+    /// The refusal names the condition of *safe* use as well as the hazard:
+    /// a user who knows their arena was never sealed is exactly who this is
+    /// for, and should be able to proceed without guessing.
+    fn resolve(self) -> CliResult<bool> {
+        if self.rebuild_annotations && !self.force {
+            return Err(CliError::Usage(
+                "--rebuild-annotations rebuilds the annotation arena from \
+                 currently-live annotations.\n  \
+                 If an arena was previously sealed and then dropped, its \
+                 retraction history is discarded and cannot be recovered.\n  \
+                 Safe when the arena was never sealed.\n  \
+                 Re-run with --force to proceed."
+                    .into(),
+            ));
+        }
+        Ok(self.rebuild_annotations)
+    }
+}
+
 pub async fn run_reindex(
     ledger: Option<&str>,
     dirs: &FlureeDir,
     remote_flag: Option<&str>,
     direct: bool,
+    rebuild: RebuildAnnotations,
 ) -> CliResult<()> {
+    let rebuild_annotations = rebuild.resolve()?;
+    if rebuild_annotations && remote_flag.is_some() {
+        return Err(CliError::Usage(
+            "--rebuild-annotations is a local-only repair; the remote reindex \
+             API does not carry it. Run it where the ledger's index lives."
+                .into(),
+        ));
+    }
+
     if let Some(remote_name) = remote_flag {
         let alias = context::resolve_ledger(ledger, dirs)?;
         let client = context::build_remote_client(remote_name, dirs).await?;
@@ -198,7 +244,10 @@ pub async fn run_reindex(
             );
 
             let result = fluree
-                .reindex(&ledger_id, ReindexOptions::default())
+                .reindex(
+                    &ledger_id,
+                    ReindexOptions::default().with_rebuild_annotations(rebuild_annotations),
+                )
                 .await?;
 
             println!(

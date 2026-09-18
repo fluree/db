@@ -742,10 +742,24 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             commands::index::run_index(ledger.as_deref(), &fluree_dir).await
         }
 
-        Commands::Reindex { ledger, remote } => {
+        Commands::Reindex {
+            ledger,
+            rebuild_annotations,
+            force,
+            remote,
+        } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
-            commands::index::run_reindex(ledger.as_deref(), &fluree_dir, remote.as_deref(), direct)
-                .await
+            commands::index::run_reindex(
+                ledger.as_deref(),
+                &fluree_dir,
+                remote.as_deref(),
+                direct,
+                commands::index::RebuildAnnotations {
+                    rebuild_annotations,
+                    force,
+                },
+            )
+            .await
         }
 
         Commands::Sweep {

@@ -2594,6 +2594,89 @@ fn insert_then_index_keeps_annotations_readable() {
         .stderr(predicate::str::contains("could not be resolved").not());
 }
 
+/// `--rebuild-annotations` discards unrecoverable history in one case the
+/// code cannot detect, so it refuses rather than warning after the fact —
+/// and refuses rather than prompting, because the people who need it are
+/// recovering a stuck ledger from a script.
+///
+/// The refusal has to name the *condition of safe use*, not only the hazard:
+/// a user who knows their arena was never sealed is the whole population this
+/// flag exists for.
+#[test]
+fn rebuild_annotations_refuses_without_the_confirmation_flag() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "rb"]).assert().success();
+
+    fluree_cmd(&tmp)
+        .args(["reindex", "rb", "--rebuild-annotations"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("retraction history is discarded"))
+        .stderr(predicate::str::contains(
+            "Safe when the arena was never sealed",
+        ))
+        .stderr(predicate::str::contains("--force"));
+}
+
+/// And with the acknowledgement it runs. `--force` is this CLI's existing
+/// confirmation idiom, the same flag `fluree drop` requires.
+#[test]
+fn rebuild_annotations_proceeds_once_acknowledged() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "rb2"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "rb2",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:knows ex:b ~ ex:c1 {| ex:conf 0.5 |} .\n",
+        ])
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["reindex", "rb2", "--rebuild-annotations", "--force"])
+        .assert()
+        .success();
+
+    // The ledger is still readable and the annotation survived.
+    fluree_cmd(&tmp)
+        .args(["export", "rb2", "--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<http://example.org/knows> <http://example.org/b> \
+             ~ <http://example.org/c1>",
+        ));
+}
+
+/// The remote reindex API does not carry the flag, so asking for it against
+/// a remote is refused rather than silently ignored — a repair that reports
+/// success without repairing anything is the worst of the three outcomes.
+#[test]
+fn rebuild_annotations_is_refused_against_a_remote() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+
+    fluree_cmd(&tmp)
+        .args([
+            "reindex",
+            "rb3",
+            "--rebuild-annotations",
+            "--force",
+            "--remote",
+            "origin",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("local-only repair"));
+}
+
 // ============================================================================
 // v1.1 — Config tests
 // ============================================================================

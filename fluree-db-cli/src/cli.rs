@@ -1315,6 +1315,19 @@ pub enum Commands {
         /// Ledger name (defaults to active ledger)
         ledger: Option<String>,
 
+        /// Rebuild the annotation arena from currently-live annotations
+        ///
+        /// Safe when the arena was never sealed — the state a ledger is left
+        /// in by `fluree index` on releases before 4.2. If an arena was
+        /// previously sealed and then dropped, this discards its retraction
+        /// history and it cannot be recovered. Requires --force.
+        #[arg(long)]
+        rebuild_annotations: bool,
+
+        /// Required flag to confirm --rebuild-annotations
+        #[arg(long)]
+        force: bool,
+
         /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]
         remote: Option<String>,
