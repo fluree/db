@@ -209,6 +209,23 @@ pub(crate) fn lower_query<E: IriEncoder>(
     })
 }
 
+/// True for the bind a node-map metadata accessor emits: a one-argument call
+/// to `datatype`, `t`, `op` or `lang` over a variable. See
+/// [`check_bind_targets`] for why these are exempt.
+fn is_metadata_join(expr: &Expression) -> bool {
+    matches!(
+        expr,
+        Expression::Call { func, args }
+            if matches!(
+                func,
+                Function::T
+                    | Function::Op
+                    | Function::Lang { .. }
+                    | Function::Datatype { .. }
+            ) && matches!(args.as_slice(), [Expression::Var(_)])
+    )
+}
+
 /// Reject a `BIND` whose target variable is already bound in the same scope.
 ///
 /// `BindOperator` implements SPARQL BIND with deliberate clobber prevention
@@ -227,11 +244,28 @@ pub(crate) fn lower_query<E: IriEncoder>(
 ///   `["union", [{…"?nm"}], [{…}, ["bind","?nm",…]]]` — a legitimate way to
 ///   give both branches the same output column — still lowers.
 /// - Bodies with their own scope (`Subquery`, `Exists`/`NotExists`, `Minus`,
-///   `Service`) are not descended into. That can only miss a collision, never
-///   invent one.
-/// - Lowering-internal binds (`?__`-prefixed: property-path expansions,
-///   node-map metadata accessors) are exempt, mirroring the Cypher guard's
-///   treatment of `?#__`. A user variable cannot carry that prefix.
+///   `Service`) are not descended into here. For `Subquery` that is only safe
+///   because `lower_subquery` calls this function on its own patterns; an
+///   earlier version of this comment said not descending "can only miss a
+///   collision", which is true of this function and was not true of the
+///   property it was cited for, since nothing else checked a nested select.
+/// - Lowering-internal binds (`?__`-prefixed: property-path expansions) are
+///   exempt, mirroring the Cypher guard's treatment of `?#__`. A user
+///   variable cannot carry that prefix.
+/// - **Node-map metadata binds are exempt, and they are NOT `?__`-prefixed.**
+///   `{"@value": "?v", "@t": "?t"}` lowers to `Bind { ?t, t(?v) }` through
+///   `add_metadata_bind_pattern` (`node_map.rs`), and the variable is the
+///   author's own name. Reusing one across two properties — the natural
+///   spelling of "both asserted in the same transaction" — binds onto an
+///   already-bound `?t` BY DESIGN: that join is the whole point of the idiom,
+///   and it relies on bind-as-constraint. An earlier version of this comment
+///   claimed these were `?__`-prefixed; they are not, and the guard broke the
+///   idiom. Recognised structurally, as a one-argument call to one of the four
+///   metadata functions the node-map emits (`datatype`, `t`, `op`, `lang`)
+///   over a variable. A user writing that same join by hand as
+///   `["bind", "?t", "(t ?v)"]` is exempted too, which is consistent rather
+///   than a hole: it means the same thing, and the result is the documented
+///   join, not a silent wrong answer.
 ///
 /// The identity bind `["bind","?v","?v"]` is exempt, as `v AS v` is on the
 /// Cypher side: it recomputes the value it already holds, so no row is dropped
@@ -249,7 +283,11 @@ fn check_bind_targets(
             Pattern::Bind { var, expr } => {
                 let name = vars.try_name(*var).unwrap_or("");
                 let is_identity = matches!(expr, Expression::Var(v) if v == var);
-                if produced.contains(var) && !is_identity && !name.starts_with("?__") {
+                if produced.contains(var)
+                    && !is_identity
+                    && !name.starts_with("?__")
+                    && !is_metadata_join(expr)
+                {
                     // Same defect either way, but the author wrote one of two
                     // spellings and the message should name the one they used,
                     // mirroring SPARQL's split between V5
@@ -271,6 +309,23 @@ fn check_bind_targets(
                              fresh variable."
                         ))
                     });
+                }
+                produced.insert(*var);
+            }
+            // `["unwind", "?v", expr]` onto a bound `?v` returns the same
+            // unexplained empty result as a bind, and the Cypher twin of this
+            // exact shape (`UNWIND … AS a` over a bound `a`) is rejected, so
+            // the two surfaces should say the same thing about the same
+            // mistake.
+            Pattern::Unwind { var, .. } => {
+                if produced.contains(var) {
+                    let name = vars.try_name(*var).unwrap_or("");
+                    return Err(ParseError::InvalidWhere(format!(
+                        "unwind target {name} is already bound by an earlier pattern — \
+                         unwinding onto a bound variable silently filters to rows where \
+                         an element happens to match, rather than introducing one row per \
+                         element. Unwind into a fresh variable."
+                    )));
                 }
                 produced.insert(*var);
             }
@@ -1469,6 +1524,8 @@ fn lower_subquery<E: IriEncoder>(
         .collect();
     let mut post_binds: Vec<(VarId, Expression)> = Vec::new();
     let mut post_bind_aliases: std::collections::HashSet<VarId> = std::collections::HashSet::new();
+    // Select-expression binds, so the guard below names the spelling written.
+    let mut select_alias_binds: std::collections::HashSet<VarId> = std::collections::HashSet::new();
     for column in columns {
         if let UnresolvedColumn::Computation { expr, alias } = column {
             let (placement, alias_var, lowered_expr) = lower_select_expr_bind(
@@ -1486,6 +1543,7 @@ fn lower_subquery<E: IriEncoder>(
                     post_bind_aliases.insert(alias_var);
                 }
                 SelectExprPlacement::Pre => {
+                    select_alias_binds.insert(alias_var);
                     patterns.push(Pattern::Bind {
                         var: alias_var,
                         expr: lowered_expr,
@@ -1496,6 +1554,20 @@ fn lower_subquery<E: IriEncoder>(
     }
 
     // Build SubqueryPattern with options
+    // fluree/db#1857 JSON-LD twin, one level down. `check_bind_targets` does
+    // not descend into `Subquery`, and this is the only other place these
+    // binds are pushed — so without this call nothing checked a nested
+    // select, and `["query", {… ["bind", "?v", …]}]` with `?v` bound still
+    // returned an unexplained empty result. A subquery body has its own scope,
+    // so the enclosing set is empty: outer variables are joined on its
+    // projection afterwards, not visible inside it.
+    check_bind_targets(
+        &patterns,
+        &std::collections::HashSet::new(),
+        vars,
+        &select_alias_binds,
+    )?;
+
     let mut sq = SubqueryPattern::new(select, patterns);
 
     if let Some(limit) = subquery.options.limit {
