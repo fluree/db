@@ -736,7 +736,7 @@ async fn resolve_untranslated(
     };
     let mut base: Vec<Flake> = Vec::with_capacity(rows.len());
     for f in rows {
-        if fluree_db_core::namespaces::is_any_reifies(&f.p) {
+        if fluree_db_core::namespaces::is_reserved_reifies_predicate(&f.p) {
             ann.probe.note_bundle_sid(f.s.clone());
             continue;
         }
