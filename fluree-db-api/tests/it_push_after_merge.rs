@@ -242,6 +242,39 @@ async fn push_is_rejected_when_a_merged_commit_is_missing() {
     );
 }
 
+#[tokio::test]
+async fn push_is_rejected_when_a_merged_commit_is_unreachable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    merged_history(&fluree).await;
+
+    // A commit from an unrelated ledger. It has no parents, so it passes
+    // the parent check, but nothing in the push merges it.
+    fluree.create_ledger("other").await.unwrap();
+    insert_name(&fluree, "other:main", "mallory", "Mallory").await;
+    let stray = build_bundle(&fluree, "other:main").await.commits.remove(0);
+
+    let mut bundle = build_bundle(&fluree, "mydb:main").await;
+    bundle.merged_commits.push(stray);
+
+    let target = "it/push-merge-stray:main";
+    fluree.create_ledger(target).await.unwrap();
+    let error = fluree
+        .push_commits(
+            target,
+            bundle,
+            &GovernanceOptions::default(),
+            &index_config(),
+        )
+        .await
+        .expect_err("push should be rejected");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("not reachable from any merge"),
+        "unexpected error: {message}"
+    );
+}
+
 /// A target ledger holding main's first two commits, the head a puller has
 /// before the merge. Returns that head.
 async fn target_before_merge(fluree: &support::MemoryFluree, target: &str) -> ContentId {

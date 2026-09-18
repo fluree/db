@@ -449,7 +449,7 @@ The fields of `POST /push/*ledger`, plus:
 
 - `merged_commits`: array of base64-encoded commit v2 blobs, parents before children. These are the commits that merges in `commits` brought in from other branches. The server stores them and does not replay them. Each merge commit already carries their combined changes. Their `t` values come from other branches, so they are not contiguous with `commits`. Their txn blobs go in `blobs` like any other.
 
-The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`.
+The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit. A push that carries any other commit is refused with `422`.
 
 **Why a separate endpoint:**
 

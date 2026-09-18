@@ -371,6 +371,7 @@ impl Fluree {
         // 2.1) Decode the commits the chain's merges brought in, and check
         //      that no parent the bundle names is missing here.
         let merged = decode_merged_commits(&request).map_err(PushError::into_api_error)?;
+        validate_merged_reachable(&decoded, &merged).map_err(PushError::into_api_error)?;
         let content_store = self.branched_content_store(base_state.ledger_id()).await?;
         validate_ancestry_present(content_store.as_ref(), &decoded, &merged)
             .await
@@ -954,6 +955,46 @@ fn decode_merged_commits(
             })
         })
         .collect()
+}
+
+/// Check that every merged commit is reachable from a merge in the chain.
+///
+/// A merged commit is stored without being replayed or validated. One that
+/// no merge references would sit in the ledger's storage unreachable. It
+/// would also survive `drop`, which finds what to delete by walking the
+/// history.
+fn validate_merged_reachable(
+    chain: &[PushCommitDecoded],
+    merged: &[PushCommitDecoded],
+) -> std::result::Result<(), PushError> {
+    let by_digest: HashMap<&str, &PushCommitDecoded> =
+        merged.iter().map(|c| (c.digest_hex.as_str(), c)).collect();
+    // Walk from the chain's merge parents through the merged commits.
+    let mut reached = HashSet::new();
+    let mut stack: Vec<String> = chain
+        .iter()
+        .flat_map(|c| c.commit.parents.iter().skip(1))
+        .map(ContentId::digest_hex)
+        .collect();
+    while let Some(digest) = stack.pop() {
+        let Some(c) = by_digest.get(digest.as_str()) else {
+            continue;
+        };
+        if reached.insert(c.digest_hex.as_str()) {
+            stack.extend(c.commit.parents.iter().map(ContentId::digest_hex));
+        }
+    }
+
+    match merged
+        .iter()
+        .find(|c| !reached.contains(c.digest_hex.as_str()))
+    {
+        Some(c) => Err(PushError::Invalid(format!(
+            "merged commit {} is not reachable from any merge in the push",
+            c.digest_hex
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Check that every parent the bundle references is either in the bundle or
@@ -2388,6 +2429,7 @@ impl Fluree {
         // 4.1) Decode the commits the chain's merges brought in, and check
         //      that no parent the bundle names is missing here.
         let merged = decode_merged_commits(&request).map_err(PushError::into_api_error)?;
+        validate_merged_reachable(&decoded, &merged).map_err(PushError::into_api_error)?;
         let content_store = self.branched_content_store(base_state.ledger_id()).await?;
         validate_ancestry_present(content_store.as_ref(), &decoded, &merged)
             .await
