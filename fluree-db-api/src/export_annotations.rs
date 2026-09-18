@@ -39,6 +39,14 @@ use crate::{ApiError, LedgerState, Result};
 pub struct AnnotationProbe<'a> {
     /// Sealed on-disk arena: authoritative for `t <= its max_t`.
     arena: Option<(&'a AnnotationIndexRoot, &'a Arc<dyn ContentStore>)>,
+    /// One reader for the whole export, built from `arena` once.
+    ///
+    /// The reader memoises the forward branch and every forward leaf it
+    /// touches. It used to be constructed inside `live_reifiers`, which runs
+    /// once per `ColumnBatch`, so those caches were rebuilt and thrown away
+    /// for every batch of the export and each batch re-fetched the same
+    /// branch. The source is chosen once per export, so the reader can be.
+    reader: Option<AnnotationArenaReader<'a, dyn ContentStore>>,
     /// Attachment events committed since the last index build.
     novelty: Option<&'a AttachmentNovelty>,
     /// Bundles recovered by scanning the base index, for a ledger whose arena
@@ -62,6 +70,7 @@ impl<'a> AnnotationProbe<'a> {
     ) -> Self {
         Self {
             arena,
+            reader: arena.map(|(root, store)| AnnotationArenaReader::new(root, store.as_ref())),
             novelty,
             scanned: HashMap::new(),
             as_of_t,
@@ -213,8 +222,11 @@ impl<'a> AnnotationProbe<'a> {
             // Sealed arena, nothing pending: one sorted merge-scan for the
             // whole batch. `current_annotations_batch` is arena-only by
             // contract, which is exactly what an empty overlay makes correct.
-            (Some((root, store)), None) => {
-                let reader = AnnotationArenaReader::new(root, store.as_ref());
+            (Some(_), None) => {
+                let reader = self
+                    .reader
+                    .as_ref()
+                    .expect("reader is built whenever arena is");
                 reader
                     .current_annotations_batch(edges, self.as_of_t)
                     .await
@@ -225,8 +237,11 @@ impl<'a> AnnotationProbe<'a> {
             // read cannot see a novelty *retract* of an indexed attachment, so
             // each edge merges its own event stream instead. Slower, and
             // confined to ledgers with pending annotation novelty.
-            (Some((root, store)), Some(novelty)) => {
-                let reader = AnnotationArenaReader::new(root, store.as_ref());
+            (Some(_), Some(novelty)) => {
+                let reader = self
+                    .reader
+                    .as_ref()
+                    .expect("reader is built whenever arena is");
                 let mut out = Vec::with_capacity(edges.len());
                 for edge in edges {
                     let events = novelty.collect_forward_events(edge);
