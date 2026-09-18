@@ -2721,6 +2721,83 @@ fn the_unresolved_counter_still_fires_when_it_should() {
         ));
 }
 
+/// Every object shape keeps its annotation, including the big-numeric ones.
+///
+/// `xsd:decimal` did not. The seek key `batch_reifiers` builds needs a
+/// datatype `Sid`, and it asked `resolve_datatype_sid(o_type)` — which
+/// returns `None` for the `NUM_BIG_OVERFLOW` arena, because that arena holds
+/// both overflow `xsd:integer` and `xsd:decimal` and the o_type alone cannot
+/// say which. The `else { continue }` then skipped the row before it could
+/// be matched against the arena, so the marker was lost on *every* lookup
+/// path, sealed arena included, and the reifier came out as an orphan.
+///
+/// `resolve_datatype_sid_for_value` exists for exactly that ambiguity —
+/// added for #1329, where the same gap rendered big numerics with an empty
+/// `@type`. This call site had simply not adopted it.
+///
+/// The fixture covers all three shapes that arena serves, not just the
+/// reported one: an explicit `xsd:decimal`, a **bare** Turtle numeric
+/// (which parses as decimal, and is how anyone writes a score), and an
+/// overflow-magnitude `xsd:integer`. A small integer and a ref are controls
+/// that always worked — without them a regression that broke everything
+/// would still satisfy the assertions below.
+#[test]
+fn big_numeric_objects_keep_their_annotations() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let src = tmp.path().join("num-src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.ttl"),
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+         ex:s ex:pRef  ex:bob                     ~ ex:cRef  {| ex:n \"ref\"  |} .\n\
+         ex:s ex:pDec  \"1.5\"^^xsd:decimal         ~ ex:cDec  {| ex:n \"dec\"  |} .\n\
+         ex:s ex:pBare 1.5                        ~ ex:cBare {| ex:n \"bare\" |} .\n\
+         ex:s ex:pBig  \"123456789012345678901234567890\"^^xsd:integer \
+             ~ ex:cBig {| ex:n \"big\" |} .\n\
+         ex:s ex:pInt  \"42\"^^xsd:integer          ~ ex:cInt  {| ex:n \"int\"  |} .\n",
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["create", "num", "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+
+    let out = fluree_cmd(&tmp)
+        .args(["export", "num", "--format", "turtle"])
+        .assert()
+        .success();
+    let out = out.get_output();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.trim().is_empty(), "empty export proves nothing");
+
+    for (pred, reifier) in [
+        ("ex:pRef", "ex:cRef"),   // control: always worked
+        ("ex:pInt", "ex:cInt"),   // control: small integer, not the big arena
+        ("ex:pDec", "ex:cDec"),   // the reported case
+        ("ex:pBare", "ex:cBare"), // a bare numeric is a decimal
+        ("ex:pBig", "ex:cBig"),   // overflow integer shares the same arena
+    ] {
+        let line = stdout
+            .lines()
+            .find(|l| l.contains(pred))
+            .unwrap_or_else(|| panic!("{pred} missing from export:\n{stdout}"));
+        assert!(
+            line.contains(&format!("~ {reifier}")),
+            "{pred} lost its annotation marker: {line}"
+        );
+    }
+
+    // Nothing was dropped, so nothing is reported.
+    fluree_cmd(&tmp)
+        .args(["export", "num", "--format", "turtle"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("could not be resolved").not());
+}
+
 // ============================================================================
 // v1.1 — Config tests
 // ============================================================================
