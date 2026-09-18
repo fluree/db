@@ -1882,7 +1882,7 @@ fn lower_term<E: IriEncoder>(
 /// in subject or predicate positions.
 fn lower_ref_term<E: IriEncoder>(
     term: &UnresolvedTerm,
-    _encoder: &E,
+    encoder: &E,
     vars: &mut VarRegistry,
 ) -> Result<Ref> {
     match term {
@@ -1890,7 +1890,11 @@ fn lower_ref_term<E: IriEncoder>(
             let var_id = vars.get_or_insert(name);
             Ok(Ref::Var(var_id))
         }
-        UnresolvedTerm::Iri(iri) => Ok(Ref::Iri(iri.clone())),
+        // Leaving every constant as `Ref::Iri` for "deferred encoding" kept
+        // JSON-LD joins off the batched probe lanes, which SPARQL reached
+        // through the same rule. Cross-ledger execution re-encodes pattern
+        // SIDs per graph (`reencode_sid`) for every surface alike.
+        UnresolvedTerm::Iri(iri) => Ok(encoder.encode_ref(iri)),
         UnresolvedTerm::Literal(_) => Err(ParseError::InvalidWhere(
             "Literal values are not valid in subject or predicate position".to_string(),
         )),
@@ -2111,10 +2115,23 @@ mod tests {
         let lowered = lower_triple_pattern(&pattern, &encoder, &mut vars).unwrap();
 
         assert_eq!(lowered.s.as_var(), Some(VarId(0)));
-        // Predicate IRI is lowered to Ref::Iri for deferred encoding
-        assert_eq!(lowered.p.as_iri(), Some("http://schema.org/name"));
+        // A registered prefix encodes at lowering, as SPARQL does; operators
+        // that need a statically known predicate test for the SID form.
+        assert_eq!(
+            lowered.p.as_sid().map(|s| (s.namespace_code, &*s.name)),
+            Some((100, "name"))
+        );
         assert!(matches!(lowered.o, Term::Var(VarId(1))));
         assert!(lowered.dtc.is_none());
+
+        // An unregistered prefix stays an IRI for the scan to encode per graph.
+        let foreign = UnresolvedTriplePattern::new(
+            UnresolvedTerm::var("?s"),
+            UnresolvedTerm::iri("http://elsewhere.example/name"),
+            UnresolvedTerm::var("?name"),
+        );
+        let lowered = lower_triple_pattern(&foreign, &encoder, &mut vars).unwrap();
+        assert_eq!(lowered.p.as_iri(), Some("http://elsewhere.example/name"));
     }
 
     #[test]
