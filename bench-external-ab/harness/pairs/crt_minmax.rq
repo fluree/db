@@ -1,0 +1,4 @@
+# crt_minmax — shape-equivalent (no verbatim corpus member). MIN/MAX of a double measure.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT (MIN(?tot) AS ?mn) (MAX(?tot) AS ?mx)
+WHERE { ?o a edw:Order ; edw:orderTotal ?tot . }

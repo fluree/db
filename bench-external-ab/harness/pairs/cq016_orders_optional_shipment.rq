@@ -1,0 +1,6 @@
+# cq016 — verbatim corpus q016_orders_optional_shipment.
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?oid ?st
+WHERE { ?o a edw:Order ; edw:orderId ?oid .
+        OPTIONAL { ?sh edw:order ?o ; edw:shipStatus ?st . } }
+LIMIT 5000
