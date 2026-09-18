@@ -3296,6 +3296,14 @@ where
 /// `epoch != 0`; the base manifest count is the current-state base count only then.
 /// Returns `Ok(None)` to defer (overlay flake failed to translate). Returns the
 /// plain manifest count when there is no novelty for the predicate.
+///
+/// CALLER GATE: `p_id` must be a **persisted** predicate id. Both the touched-leaf
+/// partition and the bounded overlay cursor are range-bounded by it, so a predicate
+/// that exists only in the overlay (uncommitted novelty, or a datalog / OWL2-RL
+/// materialization) is unreachable here by construction — the leaf list is empty and
+/// this returns the base count, 0. Callers must therefore resolve `sid_to_p_id`
+/// **inside** this lane and defer on a miss; hoisting that lookup above the lane
+/// split and reading the miss as "count 0" is fluree/db#1863.
 pub fn count_predicate_overlay_delta(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
