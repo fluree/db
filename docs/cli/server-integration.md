@@ -1054,6 +1054,19 @@ backpressure and other commit-time conditions still apply. With
 `include_validation=false` it reflects only the conflict/strategy
 interaction.
 
+### Response headers
+
+A successful export reports what it left out, so a client is not left inferring
+completeness from a `200`. Each header is present only when its count is
+non-zero, so a clean export carries none of them.
+
+| Header | Meaning |
+|--------|---------|
+| `x-fluree-export-named-graphs-omitted` | User-visible named graphs the ledger holds that this export did not cover — set when a dataset format ran without `all_graphs`. |
+| `x-fluree-export-annotations-unresolved` | Edge annotations that could not be represented and are **not** in the body. Re-request with `raw_reifies` to get them as `f:reifies*` triples. |
+| `x-fluree-export-annotations-out-of-scope` | Reifiers the body names with a `~ <r>` marker whose own properties this export does not contain. The annotation is usable only against a wider export. |
+| `x-fluree-export-rows-skipped` | Rows the writer could not represent (unresolvable predicate id, or a value that decoded to null). |
+
 ### Error responses
 
 | Status | When |
@@ -2037,6 +2050,7 @@ Content-Type: application/json
 {
   "format": "turtle",
   "all_graphs": false,
+  "system_graphs": false,
   "graph": "http://example.org/people",
   "context": { "ex": "http://example.org/" },
   "at": "t:42"
@@ -2046,12 +2060,16 @@ Content-Type: application/json
 | Field | Type | Required | Server default | Description |
 |-------|------|----------|----------------|-------------|
 | `format` | string | No | `"turtle"` | One of: `turtle`/`ttl`, `ntriples`/`nt`, `nquads`/`n-quads`, `trig`, `jsonld`/`json-ld`/`json`. Case-insensitive. |
-| `all_graphs` | bool | No | `false` | Export every named graph as a dataset. Requires `format` ∈ `trig` / `nquads`. Mutually exclusive with `graph`. |
+| `all_graphs` | bool | No | `false` | Export every user-visible named graph as a dataset. Requires `format` ∈ `trig` / `nquads`. Mutually exclusive with `graph`. The ledger's system graphs (`#txn-meta`, `#config`) are excluded. |
+| `system_graphs` | bool | No | `false` | Also emit the system graphs under `all_graphs`. Diagnostic only — the result is named for the source ledger and does not re-import cleanly. |
+| `raw_reifies` | bool | No | `false` | Emit edge annotations as raw `f:reifies*` triples instead of RDF 1.2 annotation syntax. The escape hatch the `x-fluree-export-annotations-unresolved` header points at, and the way to keep pre-4.2 bytes. |
 | `graph` | string | No | — | IRI of a single named graph to export. Mutually exclusive with `all_graphs`. |
 | `context` | object | No | ledger default | Prefix map for Turtle/TriG/JSON-LD output. Either a bare object (`{ "ex": "..." }`) or `{ "@context": {...} }`. Falls back to the ledger's stored default context when absent. |
 | `at` | string | No | latest | Time spec — `t:<N>` (transaction number), `t:latest` or `latest`, `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. Identical to the local `--at` flag. |
 
 An empty body is accepted and treated as all-default (Turtle export at HEAD).
+
+**Breaking change in 4.2.** Response bodies now carry RDF 1.2 annotation syntax for edge annotations — `s p o ~ <r>` in Turtle and TriG, a triple term under `rdf:reifies` in N-Triples and N-Quads, `@annotation` in JSON-LD — where previous versions emitted the underlying `f:reifies*` triples. A consumer that parsed those triples directly will not find them. Set `raw_reifies` to keep the old bytes.
 
 ### Auth
 
@@ -2088,6 +2106,8 @@ stream chunked bodies; clients MUST be prepared to read until EOF.
 2. **Dataset/format coupling.** When `all_graphs == true`, `format` must be
    `trig` or `nquads`; otherwise return `400` with a message that mentions
    the dataset format requirement (the local CLI surfaces the same error).
+   `system_graphs == true` without `all_graphs` is also a `400`: it selects
+   nothing on its own.
 3. **Time spec parsing.** Accept the tagged forms `t:<N>`, `t:latest`,
    `iso:<ISO-8601>`, `recorded:<ISO-8601>` and `commit:<hex-prefix>` (min 6
    characters) — the same grammar a ledger address carries after `@`, minus
@@ -2104,18 +2124,18 @@ stream chunked bodies; clients MUST be prepared to read until EOF.
 4. **Graph IRI resolution.** When `graph` is set, resolve via the ledger's
    graph registry; an unknown IRI is a `400` (or `5xx` if you treat it as
    a config error — the reference returns `400` via `ApiError::Config`).
-5. **Index requirement.** Export reads from the binary index. If the
-   ledger has no index, the reference server surfaces `ApiError::Config`
-   ("no binary index available for export (is the ledger indexed?)"),
-   which the error mapper returns as `400 Bad Request`. Document that
-   shape if you implement equivalently — the CLI surfaces the message
-   verbatim.
+5. **Index requirement.** None. Export reads the binary index where one
+   exists and the novelty overlay for everything committed since, so a
+   never-indexed ledger exports the same triples. Earlier reference
+   servers returned `ApiError::Config` ("no binary index available for
+   export (is the ledger indexed?)") as `400 Bad Request` in that case;
+   that response no longer occurs and a client must not depend on it.
 
 ### Error responses
 
 | Status | When |
 |--------|------|
-| `400` | Unknown format; conflicting `all_graphs` + `graph`; `all_graphs` with non-dataset format; unknown graph IRI; malformed JSON; ledger not indexed. |
+| `400` | Unknown format; conflicting `all_graphs` + `graph`; `all_graphs` with non-dataset format; `system_graphs` without `all_graphs`; unknown graph IRI; malformed JSON. |
 | `401` / `403` | Admin token required and absent/invalid. |
 | `404` | Ledger does not exist. |
 | `5xx` | Storage / nameservice / encoding errors during walk. |

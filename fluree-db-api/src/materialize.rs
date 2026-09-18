@@ -1570,7 +1570,7 @@ where
     // Quick gate uses — so they cost O(classes), never a whole-twin scan.
     let twin_start = std::time::Instant::now();
     let twin_raw = dir.join("twin.nt");
-    spool_twin_ntriples_indexed(ledger, &twin_raw)?;
+    spool_twin_ntriples_indexed(ledger, &twin_raw).await?;
     let mut twin_class_count: BTreeMap<String, u64> =
         classes.iter().map(|c| (c.clone(), 0)).collect();
     for class in &classes {
@@ -1842,7 +1842,7 @@ impl TripleObserver for FileWritingObserver {
 /// committed-but-not-yet-indexed twin triples are read too (e.g. the negative gate's
 /// post-build injected corruption). Per-class counts are NOT collected here — the
 /// caller derives them from bounded COUNT queries.
-fn spool_twin_ntriples_indexed(
+async fn spool_twin_ntriples_indexed(
     ledger: &crate::LedgerState,
     path: &Path,
 ) -> Result<(), MaterializeError> {
@@ -1864,12 +1864,19 @@ fn spool_twin_ntriples_indexed(
         to_t: ledger.t(),
         overlay: Some(overlay),
         dict_novelty: Some(&ledger.dict_novelty),
+        // The twin spool is an internal byte-comparison artifact, not a
+        // published serialization: it must keep emitting whatever the index
+        // holds, one row per line, so the source side it diffs against lines
+        // up. RDF 1.2 annotation rewriting would change the line set.
+        annotations: None,
+        graph_sid: None,
     };
 
     let file = std::fs::File::create(path)
         .map_err(|e| R2rmlError::Materialization(format!("twin spool create: {e}")))?;
     let mut writer = CanonicalizingLineWriter::new(std::io::BufWriter::new(file));
     crate::export::export_graph_ntriples(&binary_store, &config, &mut writer)
+        .await
         .map_err(|e| R2rmlError::Materialization(format!("twin index export: {e}")))?;
     writer.finish()
 }

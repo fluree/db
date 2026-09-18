@@ -39,8 +39,9 @@ use fluree_db_core::{
 };
 use fluree_db_nameservice::{NameServiceLookup, NsRecord};
 use fluree_db_novelty::{
-    generate_commit_flakes, stamp_graph_on_commit_flakes, trace_first_parent_commits_by_id, Commit,
-    Novelty,
+    drop_forged_commit_flakes, generate_commit_flakes, stamp_commit_flakes_dropping_forgeries,
+    stamp_graph_on_commit_flakes, trace_first_parent_commits_by_id,
+    warn_if_forged_commit_flakes_dropped, Commit, Novelty,
 };
 use futures::StreamExt;
 use std::sync::Arc;
@@ -412,11 +413,31 @@ impl LedgerState {
         snapshot.apply_envelope_deltas(&merged_ns_delta, &all_graph_iris)?;
 
         // Stamp commit metadata flakes with txn-meta graph SID now that
-        // namespace_codes are complete.
+        // namespace_codes are complete — and, in the same pass, drop any flake
+        // that arrived from a commit *blob* already claiming commit provenance.
+        //
+        // Genuine commit records are regenerated from the envelope above with
+        // `g: None` and acquire the txn-meta Sid here; user transaction
+        // metadata rides the envelope's separate `txn_meta` field. So a blob
+        // flake that is already stamped and already in the `FLUREE_COMMIT`
+        // namespace is forged by construction. It matters because this replay
+        // routes by graph Sid with no index filter, which is what makes such a
+        // record *live* on a replica that has not indexed yet — precisely
+        // where `resolve_commit_prefix` reads. See #1846.
+        //
+        // Skipping the drop when `encode_iri` yields `None` is not fail-open,
+        // despite the shape: the `reverse_graph` seeding a few lines below is
+        // gated on the *same* expression, so a `None` also means no routing
+        // entry for the txn-meta graph Sid exists. A forged flake then has
+        // nowhere to route and cannot reach `TXN_META_GRAPH_ID` — the thing
+        // the drop protects against is unreachable in exactly the case the
+        // drop is skipped. The two must stay gated together; splitting them
+        // would turn this into a real fail-open.
         let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(ledger_id);
         if let Some(g_sid) = snapshot.encode_iri(&txn_meta_iri) {
-            for (flakes, _) in &mut commit_batches {
-                stamp_graph_on_commit_flakes(flakes, &g_sid);
+            for (flakes, t) in &mut commit_batches {
+                let dropped = stamp_commit_flakes_dropping_forgeries(flakes, &g_sid);
+                warn_if_forged_commit_flakes_dropped(dropped, ledger_id, *t);
             }
         }
 
@@ -927,8 +948,14 @@ impl LedgerState {
             stamp_graph_on_commit_flakes(&mut meta_flakes, &g_sid);
         }
 
-        // Combine data flakes + metadata flakes
+        // Combine data flakes + metadata flakes. The blob's own flakes are
+        // screened first: a flake claiming commit provenance cannot have come
+        // from any legitimate writer (see `load_novelty` above, and #1846).
         let mut all_flakes = commit.flakes;
+        if let Some(g_sid) = self.snapshot.encode_iri(&txn_meta_iri) {
+            let dropped = drop_forged_commit_flakes(&mut all_flakes, &g_sid);
+            warn_if_forged_commit_flakes_dropped(dropped, ledger_id, commit_t);
+        }
         all_flakes.extend(meta_flakes);
 
         // Build reverse_graph for per-graph novelty routing

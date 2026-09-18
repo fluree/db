@@ -189,6 +189,26 @@ pub enum TransactError {
         graph_iri: String,
     },
 
+    /// A bulk RDF import (`fluree create --from`, the server's source-import
+    /// route) carried a `GRAPH <urn:fluree:{ledger}#config> { … }` block.
+    ///
+    /// Distinct from [`TransactError::ReservedGraphTarget`] on purpose. A
+    /// write to `#txn-meta` is a *security* refusal — forged commit records
+    /// steer the commit resolvers. `#config` is a *capability* gap: ordinary
+    /// transactions may write ledger configuration (see `docs/ledger-config/`),
+    /// but the bulk-import index pipeline has no pass that builds g_id 2 from
+    /// data chunks, so an imported config block would be persisted and
+    /// unreadable. The two must not read alike or the reader draws the wrong
+    /// conclusion about which one is a policy and which one is a limitation.
+    #[error(
+        "bulk import cannot populate the ledger config graph <{graph_iri}>; \
+         create the ledger first, then set its configuration with a transaction"
+    )]
+    ConfigGraphImportUnsupported {
+        /// The ledger-scoped config graph IRI the import attempted to fill.
+        graph_iri: String,
+    },
+
     /// A SPARQL/builder graph-management transfer (ADD/COPY/MOVE) named a
     /// source graph that has never been registered — a typo'd or never-written
     /// IRI. Per SPARQL 1.1 Update §3.2, ADD/COPY/MOVE from a nonexistent source

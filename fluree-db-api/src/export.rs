@@ -3,11 +3,14 @@
 //! Writes N-Triples, Turtle, N-Quads, or TriG directly to a `Write` sink,
 //! one leaflet-batch at a time.  Memory usage is O(leaflet_size), not O(dataset).
 
+use crate::export_annotations::AnnotationProbe;
+use fluree_db_binary_index::format::branch::BranchManifest;
 use fluree_db_binary_index::read::types::sort_overlay_ops;
 use fluree_db_binary_index::{
     BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnBatch, ColumnProjection, RunSortOrder,
 };
 use fluree_db_core::dict_novelty::DictNovelty;
+use fluree_db_core::edge::EdgeKey;
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{DecodeKind, Flake, GraphId, OType, OverlayProvider, Sid};
 use fluree_db_query::binary_scan::{
@@ -35,13 +38,53 @@ pub struct ExportConfig<'a> {
     pub overlay: Option<&'a dyn OverlayProvider>,
     /// Dictionary novelty for resolving IDs from committed-but-not-yet-indexed transactions.
     pub dict_novelty: Option<&'a Arc<DictNovelty>>,
+    /// Forward annotation lookup. `None` means this export emits the raw
+    /// `f:reifies*` system facts as ordinary triples (`--raw-reifies`, or a
+    /// ledger that has never carried an annotation) and the writers run
+    /// exactly the loop they ran before RDF 1.2 output existed.
+    pub annotations: Option<&'a AnnotationProbe<'a>>,
+    /// SID of the graph being scanned, as `EdgeKey.g` recorded it. `None` for
+    /// the default graph. Only read when `annotations` is `Some`.
+    pub graph_sid: Option<Sid>,
 }
 
 /// Counters returned after export completes.
+///
+/// The CLI and the HTTP route both surface these. Before they did, an export
+/// that quietly dropped every named graph in the ledger was indistinguishable
+/// from one that had nothing to drop — the complaint in #1847 was precisely
+/// that "nothing in the output suggested anything was missing".
 #[derive(Debug, Default)]
 pub struct ExportStats {
+    /// Base triples written. Annotation markers are not counted: RDF 1.2
+    /// spells the same reifier as a suffix in Turtle and as its own
+    /// `rdf:reifies` statement in N-Triples, so a count that moved with the
+    /// format would say nothing about the data.
     pub triples_written: u64,
+    /// Rows the writers could not represent: an unresolvable predicate id, or
+    /// a value that decoded to `FlakeValue::Null`.
     pub rows_skipped: u64,
+    /// Graphs that contributed at least one triple, counting the default
+    /// graph. Accumulated by the builder, not the per-graph writers.
+    pub graphs_written: u64,
+    /// User-visible named graphs in the ledger's registry that this export did
+    /// not cover, because no graph selector asked for them. System graphs are
+    /// not counted: they are never user data.
+    pub named_graphs_omitted: u64,
+    /// Reifiers named by an annotation marker in the output whose own
+    /// description is not in the output.
+    ///
+    /// `EdgeKey` carries a graph, and a bundle may live in a different graph
+    /// from the edge it reifies, so a `--graph <IRI>` export can legitimately
+    /// emit `~ <r>` while `<r>`'s own triples fall outside the selection. That
+    /// is reported rather than silently dropped — and rather than suppressed,
+    /// which would lose the fact that the edge is annotated at all.
+    pub annotations_out_of_scope: u64,
+    /// Annotation bundles the export dropped without emitting a marker for
+    /// them — the count that means the output is not a faithful
+    /// serialization. See `AnnotationProbe::unresolved_count` for the one case
+    /// that reaches it today.
+    pub annotations_unresolved: u64,
 }
 
 /// Output format for streaming export.
@@ -64,8 +107,31 @@ pub const SYSTEM_GRAPH_TXN_META: GraphId = 1;
 pub const SYSTEM_GRAPH_CONFIG: GraphId = 2;
 
 /// Returns `true` if `g_id` is a system-internal graph.
+///
+/// `#txn-meta` and `#config` carry a ledger's own commit metadata and
+/// configuration under IRIs derived from its name. Exporting them as ordinary
+/// named graphs produces a file that either collides with the target ledger's
+/// reserved graph ids on re-import (#1846) or lands a foreign ledger's commit
+/// history in a user graph, so `--all-graphs` filters them out unless
+/// `system_graphs()` is set.
 pub fn is_system_graph(g_id: GraphId) -> bool {
     g_id == SYSTEM_GRAPH_TXN_META || g_id == SYSTEM_GRAPH_CONFIG
+}
+
+/// The SPOT branch to scan for `g_id`, or an empty one.
+///
+/// A graph with no branch is not a graph with no rows: an un-indexed ledger has
+/// no branch for *any* graph while holding its whole contents in the novelty
+/// overlay, and an indexed ledger has no branch for a graph first written after
+/// the last index build. Returning an empty [`BranchManifest`] rather than
+/// bailing lets [`BinaryCursor`] exhaust its (zero-length) leaf range and fall
+/// through to its overlay-only tail, which emits exactly those rows. Bailing
+/// instead is what made `fluree export` fail on a never-indexed ledger.
+fn spot_branch(store: &Arc<BinaryIndexStore>, g_id: GraphId) -> Arc<BranchManifest> {
+    match store.branch_for_order(g_id, RunSortOrder::Spot) {
+        Some(b) => Arc::clone(b),
+        None => Arc::new(BranchManifest { leaves: Vec::new() }),
+    }
 }
 
 /// Configure a `BinaryCursor` with time-travel bounds and novelty overlay.
@@ -118,7 +184,32 @@ fn surviving_untranslated(flakes: Vec<Flake>) -> Vec<Flake> {
             }
         }
     }
-    latest.into_values().filter(|f| f.op).collect()
+    let mut out: Vec<Flake> = latest.into_values().filter(|f| f.op).collect();
+    // Deterministic order. `HashMap::into_values` yields in the
+    // randomly-seeded hasher's order, so two exports of the same ledger
+    // produced different bytes run to run whenever untranslated rows existed
+    // — and #1574 makes untranslated rows the normal case rather than a
+    // corner. Intra-block predicate order carries no meaning in Turtle, but
+    // diffing two exports, checksumming one, or content-addressing a backup
+    // all require the bytes to be stable.
+    //
+    // The key is the whole of `Flake`'s fact identity — `s, p, o, dt, m` per
+    // its hand-written `Eq` — so it is total over the map's own key and no
+    // two surviving rows can tie into an unspecified order.
+    fn meta_key(f: &Flake) -> (Option<&str>, Option<i32>) {
+        (
+            f.m.as_ref().and_then(|m| m.lang.as_deref()),
+            f.m.as_ref().and_then(|m| m.i),
+        )
+    }
+    out.sort_unstable_by(|a, b| {
+        a.s.cmp(&b.s)
+            .then_with(|| a.p.cmp(&b.p))
+            .then_with(|| a.o.cmp(&b.o))
+            .then_with(|| a.dt.cmp(&b.dt))
+            .then_with(|| meta_key(a).cmp(&meta_key(b)))
+    });
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +268,43 @@ impl<'a> ExportResolver<'a> {
                 ))
             }
         }
+    }
+
+    /// Resolve a subject ID to the `Sid` the write path stored it under.
+    ///
+    /// Mirrors `BinaryGraphView::resolve_subject_sid_uncached`: a novel id
+    /// (above its namespace's watermark) resolves straight from `DictNovelty`
+    /// to `Sid(ns_code, suffix)`, which is the exact value the transaction
+    /// wrote; anything persisted round-trips through the subject dictionary.
+    /// Exactness matters because the resulting `EdgeKey` is a seek key into
+    /// arena leaves sorted by the derived `Ord` — a Sid that differs in any
+    /// position lands on the wrong span and reports "no annotations" rather
+    /// than failing.
+    fn resolve_subject_sid(&self, s_id: u64) -> io::Result<Sid> {
+        if let Some(dn) = self.dict_novelty {
+            if dn.is_initialized() {
+                let sid64 = fluree_db_core::subject_id::SubjectId::from_u64(s_id);
+                if sid64.local_id() > dn.subjects.watermark_for_ns(sid64.ns_code()) {
+                    if let Some((ns_code, suffix)) = dn.subjects.resolve_subject(s_id) {
+                        return Ok(Sid::new(ns_code, suffix));
+                    }
+                }
+            }
+        }
+        let iri = self.resolve_subject_iri(s_id)?;
+        Ok(self
+            .store
+            .find_subject_sid(&iri)?
+            .unwrap_or_else(|| self.store.encode_iri(&iri)))
+    }
+
+    /// Resolve a predicate ID to its `Sid`. The ephemeral map holds the
+    /// original `Sid` for novelty-only predicates, so no re-encoding is needed
+    /// on that branch.
+    fn resolve_predicate_sid(&self, p_id: u32) -> Option<Sid> {
+        self.store
+            .predicate_sid(p_id)
+            .or_else(|| self.ephemeral_preds_reverse.get(&p_id).cloned())
     }
 
     /// Resolve a predicate ID to an IRI string.
@@ -245,6 +373,139 @@ impl<'a> ExportResolver<'a> {
         let sid = self.store.encode_iri(&iri);
         Ok(FlakeValue::Ref(sid))
     }
+}
+
+impl crate::export_annotations::ReifierSubject for ExportResolver<'_> {
+    fn reifier_sid(&self, s_id: u64) -> io::Result<Sid> {
+        self.resolve_subject_sid(s_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RDF 1.2 annotations
+// ---------------------------------------------------------------------------
+
+/// Per-export state for annotation emission: which predicate ids to suppress,
+/// and the bookkeeping behind `ExportStats::annotations_out_of_scope`.
+///
+/// Built once per graph scan; absent entirely when the export is not emitting
+/// annotation syntax, so the common path allocates nothing.
+struct AnnotationContext<'a> {
+    probe: &'a AnnotationProbe<'a>,
+    /// `p_id`s of the seven `f:reifies*` predicates in this store's id space,
+    /// persisted and ephemeral. Hoisted out of the row loop: suppression is
+    /// then a scan of at most fourteen `u32`s, not an IRI comparison.
+    reifies_p_ids: Vec<u32>,
+    graph_sid: Option<Sid>,
+}
+
+impl<'a> AnnotationContext<'a> {
+    fn new(resolver: &ExportResolver<'_>, config: &'a ExportConfig<'a>) -> Option<Self> {
+        let probe = config.annotations?;
+        let mut reifies_p_ids: Vec<u32> = fluree_vocab::reifies_iris::ALL
+            .iter()
+            .filter_map(|iri| resolver.store.find_predicate_id(iri))
+            .collect();
+        // Novelty-only predicates never reach the persisted dictionary; on a
+        // never-indexed ledger *every* `f:reifies*` id is ephemeral.
+        reifies_p_ids.extend(
+            resolver
+                .ephemeral_preds_reverse
+                .iter()
+                .filter(|(_, sid)| fluree_db_core::namespaces::is_reserved_reifies_predicate(sid))
+                .map(|(p_id, _)| *p_id),
+        );
+        Some(Self {
+            probe,
+            reifies_p_ids,
+            graph_sid: config.graph_sid.clone(),
+        })
+    }
+
+    #[inline]
+    fn is_reifies_row(&self, p_id: u32) -> bool {
+        self.reifies_p_ids.contains(&p_id)
+    }
+}
+
+/// Live reifiers for every row of `batch`, row-aligned.
+///
+/// Returns an empty vec when the export is not emitting annotation syntax;
+/// callers treat a missing entry as "no reifiers", so no writer needs a
+/// branch on the mode.
+///
+/// This re-decodes each row's subject, predicate and object to build its
+/// `EdgeKey` — work the row writer then does again. That duplication is
+/// deliberate path separation: it happens only for ledgers that carry
+/// annotations, and it keeps the row writers' existing loop untouched for
+/// every ledger that does not.
+async fn batch_reifiers(
+    resolver: &ExportResolver<'_>,
+    ann: Option<&AnnotationContext<'_>>,
+    batch: &ColumnBatch,
+    g_id: GraphId,
+) -> io::Result<Vec<Vec<Sid>>> {
+    let Some(ann) = ann else {
+        return Ok(Vec::new());
+    };
+    let mut edges: Vec<EdgeKey> = Vec::new();
+    let mut edge_row: Vec<usize> = Vec::new();
+    for row in 0..batch.row_count {
+        let p_id = batch.p_id.get_or(row, 0);
+        if ann.is_reifies_row(p_id) {
+            continue; // the bundle itself is never an annotated edge
+        }
+        let o_type = batch.o_type.get_or(row, 0);
+        let o_key = batch.o_key.get(row);
+        let Some(p) = resolver.resolve_predicate_sid(p_id) else {
+            continue;
+        };
+        let Ok(s) = resolver.resolve_subject_sid(batch.s_id.get(row)) else {
+            continue;
+        };
+        let Ok(o) = resolver.decode_value(o_type, o_key, p_id, g_id) else {
+            continue;
+        };
+        if matches!(o, FlakeValue::Null) {
+            continue;
+        }
+        // `resolve_datatype_sid_for_value`, not `resolve_datatype_sid`. The
+        // `NUM_BIG_OVERFLOW` arena holds both overflow `xsd:integer` and
+        // `xsd:decimal`, so the o_type alone names no datatype and the plain
+        // form returns `None` — which made this `continue` silently skip
+        // building a seek key for those rows, so they could never be matched
+        // against the arena and lost their `~ <r>` marker whatever the
+        // annotation source. The value-aware form exists for exactly this
+        // ambiguity (added for #1329, where the same gap rendered big
+        // numerics with an empty `@type`); this call site had not adopted it.
+        let Some(dt) = resolver.store.resolve_datatype_sid_for_value(o_type, &o) else {
+            continue;
+        };
+        edges.push(EdgeKey {
+            g: ann.graph_sid.clone(),
+            s,
+            p,
+            o,
+            dt,
+            lang: resolver.store.resolve_lang_tag(o_type).map(str::to_owned),
+            // v1 stores `None` for every edge; list-occurrence annotations
+            // are deferred (see `EdgeKey::list_i`).
+            list_i: None,
+        });
+        edge_row.push(row);
+    }
+    let per_edge = ann.probe.live_reifiers(&edges).await?;
+    let mut out = vec![Vec::new(); batch.row_count];
+    for (i, row) in edge_row.into_iter().enumerate() {
+        out[row] = per_edge[i].clone();
+    }
+    Ok(out)
+}
+
+/// Reifiers for one row, or the empty slice.
+#[inline]
+fn row_reifiers(reifiers: &[Vec<Sid>], row: usize) -> &[Sid] {
+    reifiers.get(row).map_or(&[], Vec::as_slice)
 }
 
 // ---------------------------------------------------------------------------
@@ -357,17 +618,13 @@ pub fn write_prefix_declarations<W: Write>(prefixes: &PrefixMap, writer: &mut W)
 ///
 /// Uses subject grouping (`;` between predicates of the same subject)
 /// and prefixed names where possible.
-pub fn export_graph_turtle<W: Write>(
+pub async fn export_graph_turtle<W: Write>(
     store: &Arc<BinaryIndexStore>,
     config: &ExportConfig<'_>,
     prefixes: &PrefixMap,
     writer: &mut W,
 ) -> io::Result<ExportStats> {
-    let branch_ref = match store.branch_for_order(config.g_id, RunSortOrder::Spot) {
-        Some(b) => b,
-        None => return Ok(ExportStats::default()),
-    };
-    let branch = Arc::clone(branch_ref);
+    let branch = spot_branch(store, config.g_id);
 
     let filter = BinaryFilter::default();
     // Full identity projection (incl. OI): when a novelty overlay is attached,
@@ -385,42 +642,137 @@ pub fn export_graph_turtle<W: Write>(
     );
     let (ephemeral_preds, untranslated) = apply_time_travel(&mut cursor, config, store);
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
+    let ann = AnnotationContext::new(&resolver, config);
 
     let mut stats = ExportStats::default();
     let mut prev_subject: Option<String> = None;
 
+    // Untranslated overlay rows are folded into the subject block they belong
+    // to rather than appended after the stream, so a subject never opens twice
+    // (see `UntranslatedBySubject`).
+    let (untranslated, untranslated_reifiers) =
+        resolve_untranslated(ann.as_ref(), untranslated).await?;
+    let mut untranslated = UntranslatedBySubject::new(store, untranslated);
+
     while let Some(batch) = cursor.next_batch()? {
+        let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
         write_turtle_batch(
             &resolver,
+            ann.as_ref(),
+            &reifiers,
+            &untranslated_reifiers,
             &batch,
             config.g_id,
             prefixes,
             &mut prev_subject,
+            &mut untranslated,
             &mut stats,
             writer,
         )?;
     }
 
-    // Close last subject if any
-    if prev_subject.is_some() {
+    // Close last subject if any, folding in its untranslated rows first.
+    if let Some(s_iri) = prev_subject.take() {
+        if let Some(flakes) = untranslated.take(&s_iri) {
+            write_untranslated_turtle_continuations(
+                &resolver,
+                ann.as_ref(),
+                &untranslated_reifiers,
+                &flakes,
+                prefixes,
+                &mut stats,
+                writer,
+            )?;
+        }
         writeln!(writer, " .")?;
     }
 
-    // Emit untranslated overlay flakes as standalone Turtle statements.
-    for flake in &untranslated {
+    // Subjects the base stream never reached get their own blocks.
+    let (remaining, unresolved) = untranslated.into_remaining();
+    for (s_iri, flakes) in &remaining {
+        write_untranslated_turtle_block(
+            &resolver,
+            ann.as_ref(),
+            &untranslated_reifiers,
+            s_iri,
+            flakes,
+            prefixes,
+            &mut stats,
+            writer,
+        )?;
+    }
+    for flake in &unresolved {
         write_raw_flake_turtle(&resolver, flake, prefixes, &mut stats, writer)?;
     }
 
     Ok(stats)
 }
 
+/// Split untranslated overlay rows into the bundle rows annotation syntax
+/// replaces and the base rows that may carry a marker, resolving every
+/// reifier in one probe call.
+///
+/// Untranslated rows never pass through `is_reifies_row` — only the
+/// translated writers call it — so before this they reached the output raw:
+/// a *partial* `f:reifies*` bundle (the rows that did translate were
+/// suppressed) and no `~ <r>` on the edge it described. Round-tripping that
+/// file plants a reserved predicate in the target ledger as ordinary data.
+///
+/// Filtering them alone would have been worse than the leak. The unresolved
+/// counter only moves where the translated path calls `note_bundle_in_scope`,
+/// so a silent filter converts a visible wrong answer into an invisible one.
+/// Suppression and accounting are the same change.
+///
+/// One `live_reifiers` call for the whole untranslated set rather than one
+/// per row: `batch_reifiers` is already a per-row probe on annotated ledgers,
+/// and stacking a second one is the wrong direction for that cost.
+async fn resolve_untranslated(
+    ann: Option<&AnnotationContext<'_>>,
+    rows: Vec<Flake>,
+) -> io::Result<(Vec<Flake>, HashMap<EdgeKey, Vec<Sid>>)> {
+    let Some(ann) = ann else {
+        // `--raw-reifies` and annotation-free ledgers want the rows verbatim.
+        return Ok((rows, HashMap::new()));
+    };
+    let mut base: Vec<Flake> = Vec::with_capacity(rows.len());
+    for f in rows {
+        if fluree_db_core::namespaces::is_reserved_reifies_predicate(&f.p) {
+            ann.probe.note_bundle_sid(f.s.clone());
+            continue;
+        }
+        base.push(f);
+    }
+    let keys: Vec<EdgeKey> = base.iter().map(EdgeKey::from_flake).collect();
+    let live = ann.probe.live_reifiers(&keys).await?;
+    let mut map: HashMap<EdgeKey, Vec<Sid>> = HashMap::new();
+    for (key, reifiers) in keys.into_iter().zip(live) {
+        if !reifiers.is_empty() {
+            map.insert(key, reifiers);
+        }
+    }
+    Ok((base, map))
+}
+
+/// Reifiers for an untranslated row, from the map `resolve_untranslated`
+/// built. Empty when the row is not an annotated edge.
+fn untranslated_reifiers_for<'m>(map: &'m HashMap<EdgeKey, Vec<Sid>>, flake: &Flake) -> &'m [Sid] {
+    map.get(&EdgeKey::from_flake(flake))
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
 /// Write a batch of rows as Turtle, grouping by subject.
+#[allow(clippy::too_many_arguments)]
 fn write_turtle_batch<W: Write>(
     resolver: &ExportResolver,
+    ann: Option<&AnnotationContext<'_>>,
+    reifiers: &[Vec<Sid>],
+    untranslated_reifiers: &HashMap<EdgeKey, Vec<Sid>>,
     batch: &ColumnBatch,
     g_id: GraphId,
     prefixes: &PrefixMap,
     prev_subject: &mut Option<String>,
+    untranslated: &mut UntranslatedBySubject,
     stats: &mut ExportStats,
     writer: &mut W,
 ) -> io::Result<()> {
@@ -429,6 +781,17 @@ fn write_turtle_batch<W: Write>(
         let p_id = batch.p_id.get_or(row, 0);
         let o_type = batch.o_type.get_or(row, 0);
         let o_key = batch.o_key.get(row);
+
+        // The `f:reifies*` bundle is the on-disk encoding of an annotation,
+        // not a triple the ledger was asked to hold. It is replaced by the
+        // `~ <r>` markers emitted below, and re-emitting it too would produce
+        // a file the write path refuses to ingest.
+        if let Some(ann) = ann {
+            if ann.is_reifies_row(p_id) {
+                ann.probe.note_bundle_in_scope(resolver, s_id);
+                continue;
+            }
+        }
 
         let s_iri = resolver.resolve_subject_iri(s_id)?;
         let p_iri = match resolver.resolve_predicate_iri(p_id) {
@@ -450,8 +813,20 @@ fn write_turtle_batch<W: Write>(
             // Continue same subject — semicolon separator
             write!(writer, " ;\n    ")?;
         } else {
-            // New subject — close previous if any
-            if prev_subject.is_some() {
+            // New subject — close previous if any, folding in the untranslated
+            // rows that belong to it so the block is written once.
+            if let Some(prev) = prev_subject.take() {
+                if let Some(flakes) = untranslated.take(&prev) {
+                    write_untranslated_turtle_continuations(
+                        resolver,
+                        ann,
+                        untranslated_reifiers,
+                        &flakes,
+                        prefixes,
+                        stats,
+                        writer,
+                    )?;
+                }
                 writeln!(writer, " .")?;
             }
             // Write subject
@@ -470,6 +845,22 @@ fn write_turtle_batch<W: Write>(
 
         // Write object
         write_turtle_object(writer, &value, resolver.store, o_type, prefixes)?;
+
+        // RDF 1.2 reifier markers: `s p o ~ <r1> ~ <r2>`. The reifiers' own
+        // property blocks are left where the scan puts them, later in the
+        // stream as ordinary subjects — inlining a `{| … |}` body would need
+        // a random seek per reifier, out of scan order, at the exact moment
+        // the base edge is written.
+        if let Some(ann) = ann {
+            for reifier in row_reifiers(reifiers, row) {
+                let Some(iri) = resolver.store.sid_to_iri(reifier) else {
+                    continue;
+                };
+                writer.write_all(b" ~ ")?;
+                write_turtle_iri_or_bnode(writer, &iri, prefixes)?;
+                ann.probe.note_reifier_named(reifier);
+            }
+        }
 
         stats.triples_written += 1;
     }
@@ -552,17 +943,13 @@ fn write_turtle_object<W: Write>(
 /// - Other typed literals → `{"@value": "...", "@type": "..."}`
 /// - Refs → `{"@id": "iri"}`
 /// - Single-cardinality properties are unwrapped (not in `[]`)
-pub fn export_graph_jsonld<W: Write>(
+pub async fn export_graph_jsonld<W: Write>(
     store: &Arc<BinaryIndexStore>,
     config: &ExportConfig<'_>,
     prefixes: &PrefixMap,
     writer: &mut W,
 ) -> io::Result<ExportStats> {
-    let branch_ref = match store.branch_for_order(config.g_id, RunSortOrder::Spot) {
-        Some(b) => b,
-        None => return Ok(ExportStats::default()),
-    };
-    let branch = Arc::clone(branch_ref);
+    let branch = spot_branch(store, config.g_id);
 
     let filter = BinaryFilter::default();
     // Full identity projection (incl. OI): when a novelty overlay is attached,
@@ -580,6 +967,7 @@ pub fn export_graph_jsonld<W: Write>(
     );
     let (ephemeral_preds, untranslated) = apply_time_travel(&mut cursor, config, store);
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
+    let ann = AnnotationContext::new(&resolver, config);
 
     let mut stats = ExportStats::default();
 
@@ -588,13 +976,24 @@ pub fn export_graph_jsonld<W: Write>(
     let mut current_subject: Option<String> = None;
     let mut current_props: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
     let mut first_node = true;
+    let (untranslated, untranslated_reifiers) =
+        resolve_untranslated(ann.as_ref(), untranslated).await?;
+    let mut untranslated = UntranslatedBySubject::new(store, untranslated);
 
     while let Some(batch) = cursor.next_batch()? {
+        let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
         for row in 0..batch.row_count {
             let s_id = batch.s_id.get(row);
             let p_id = batch.p_id.get_or(row, 0);
             let o_type = batch.o_type.get_or(row, 0);
             let o_key = batch.o_key.get(row);
+
+            if let Some(ann) = ann.as_ref() {
+                if ann.is_reifies_row(p_id) {
+                    ann.probe.note_bundle_in_scope(&resolver, s_id);
+                    continue;
+                }
+            }
 
             let s_iri = resolver.resolve_subject_iri(s_id)?;
             let p_iri = match resolver.resolve_predicate_iri(p_id) {
@@ -612,13 +1011,39 @@ pub fn export_graph_jsonld<W: Write>(
 
             // Convert to JSON-LD value
             let jval = flake_to_jsonld(&value, store, o_type, prefixes);
+            // One value per reifier, each carrying `@annotation` — the JSON-LD
+            // shape `parse/edge_annotations.rs` ingests. Repeating the base
+            // value is how the keyword attaches to an edge: two reifiers on
+            // one edge are two annotated occurrences of the same triple, which
+            // re-ingest to one triple and two bundles.
+            let jvals = match ann.as_ref() {
+                Some(ann) => annotated_jsonld_values(
+                    &resolver,
+                    ann,
+                    &jval,
+                    row_reifiers(&reifiers, row),
+                    prefixes,
+                ),
+                None => vec![jval],
+            };
 
             // Check if we've moved to a new subject
             let same_subject = current_subject.as_deref() == Some(&s_iri);
             if !same_subject {
-                // Flush previous subject
-                if let Some(ref subj_iri) = current_subject {
-                    write_jsonld_node(writer, subj_iri, &current_props, prefixes, first_node)?;
+                // Flush previous subject, folding in its untranslated rows.
+                if let Some(subj_iri) = current_subject.take() {
+                    if let Some(flakes) = untranslated.take(&subj_iri) {
+                        merge_untranslated_jsonld(
+                            &resolver,
+                            ann.as_ref(),
+                            &untranslated_reifiers,
+                            &flakes,
+                            prefixes,
+                            &mut current_props,
+                            &mut stats,
+                        );
+                    }
+                    write_jsonld_node(writer, &subj_iri, &current_props, prefixes, first_node)?;
                     first_node = false;
                 }
                 current_subject = Some(s_iri);
@@ -628,57 +1053,103 @@ pub fn export_graph_jsonld<W: Write>(
             // Append value to the right predicate bucket
             let compact_p = compact_iri(&p_iri, prefixes);
             if let Some(entry) = current_props.iter_mut().find(|(k, _)| *k == compact_p) {
-                entry.1.push(jval);
+                entry.1.extend(jvals);
             } else {
-                current_props.push((compact_p, vec![jval]));
+                current_props.push((compact_p, jvals));
             }
 
             stats.triples_written += 1;
         }
     }
 
-    // Flush last subject
-    if let Some(ref subj_iri) = current_subject {
-        write_jsonld_node(writer, subj_iri, &current_props, prefixes, first_node)?;
+    // Flush last subject, folding in its untranslated rows.
+    if let Some(subj_iri) = current_subject.take() {
+        if let Some(flakes) = untranslated.take(&subj_iri) {
+            merge_untranslated_jsonld(
+                &resolver,
+                ann.as_ref(),
+                &untranslated_reifiers,
+                &flakes,
+                prefixes,
+                &mut current_props,
+                &mut stats,
+            );
+        }
+        write_jsonld_node(writer, &subj_iri, &current_props, prefixes, first_node)?;
         first_node = false;
     }
 
-    // Emit untranslated overlay flakes as additional JSON-LD nodes, grouped by
-    // subject (a repeated @id node object is valid JSON-LD; it merges on parse).
-    // (subject IRI, [(predicate, [values])]) — mirrors the cursor accumulator.
-    type JsonLdNode = (String, Vec<(String, Vec<serde_json::Value>)>);
-    let mut raw_nodes: Vec<JsonLdNode> = Vec::new();
-    for flake in &untranslated {
-        let (Some(s_iri), Some(p_iri)) = (store.sid_to_iri(&flake.s), store.sid_to_iri(&flake.p))
-        else {
+    // Subjects the base stream never reached get their own node objects. Rows
+    // whose subject IRI does not resolve cannot be placed and are counted as
+    // skipped, matching every other writer.
+    let (remaining, unresolved) = untranslated.into_remaining();
+    for (subj_iri, flakes) in &remaining {
+        let mut props: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+        merge_untranslated_jsonld(
+            &resolver,
+            ann.as_ref(),
+            &untranslated_reifiers,
+            flakes,
+            prefixes,
+            &mut props,
+            &mut stats,
+        );
+        if props.is_empty() {
+            continue;
+        }
+        write_jsonld_node(writer, subj_iri, &props, prefixes, first_node)?;
+        first_node = false;
+    }
+    stats.rows_skipped += unresolved.len() as u64;
+
+    Ok(stats)
+}
+
+/// Fold a subject's untranslated rows into the property list about to be
+/// written for that subject, so the node object is emitted once.
+///
+/// Mirrors the accumulator in `export_graph_jsonld`: same predicate bucketing,
+/// same compaction. A repeated `@id` node object is legal JSON-LD and merges
+/// on parse, but it is still a shape that depends on index state, which is
+/// what `UntranslatedBySubject` exists to remove.
+fn merge_untranslated_jsonld(
+    resolver: &ExportResolver,
+    ann: Option<&AnnotationContext<'_>>,
+    reifier_map: &HashMap<EdgeKey, Vec<Sid>>,
+    flakes: &[Flake],
+    prefixes: &PrefixMap,
+    props: &mut Vec<(String, Vec<serde_json::Value>)>,
+    stats: &mut ExportStats,
+) {
+    let store = resolver.store;
+    for flake in flakes {
+        let (Some(p_iri), Some(jval)) = (
+            store.sid_to_iri(&flake.p),
+            flake_to_jsonld_raw(flake, store, prefixes),
+        ) else {
             stats.rows_skipped += 1;
             continue;
         };
-        let Some(jval) = flake_to_jsonld_raw(flake, store, prefixes) else {
-            stats.rows_skipped += 1;
-            continue;
+        // Same `@annotation` shape the translated path emits, via the same
+        // helper — an untranslated row is no less annotated.
+        let values = match ann {
+            Some(ann) => annotated_jsonld_values(
+                resolver,
+                ann,
+                &jval,
+                untranslated_reifiers_for(reifier_map, flake),
+                prefixes,
+            ),
+            None => vec![jval],
         };
         let compact_p = compact_iri(&p_iri, prefixes);
-        let node = match raw_nodes.iter_mut().find(|(s, _)| *s == s_iri) {
-            Some(n) => n,
-            None => {
-                raw_nodes.push((s_iri, Vec::new()));
-                raw_nodes.last_mut().unwrap()
-            }
-        };
-        if let Some(entry) = node.1.iter_mut().find(|(k, _)| *k == compact_p) {
-            entry.1.push(jval);
+        if let Some(entry) = props.iter_mut().find(|(k, _)| *k == compact_p) {
+            entry.1.extend(values);
         } else {
-            node.1.push((compact_p, vec![jval]));
+            props.push((compact_p, values));
         }
         stats.triples_written += 1;
     }
-    for (subj_iri, props) in &raw_nodes {
-        write_jsonld_node(writer, subj_iri, props, prefixes, first_node)?;
-        first_node = false;
-    }
-
-    Ok(stats)
 }
 
 /// JSON-LD value for an untranslated overlay flake, deriving the language tag
@@ -748,6 +1219,48 @@ fn flake_to_jsonld_raw(
         // Temporal / other types always encode into V3 ops.
         _ => None,
     }
+}
+
+/// One JSON-LD value per reifier, each carrying an `@annotation` block; the
+/// bare value when the edge has none.
+///
+/// A scalar value (`"ex:name": "Alice"`) has nowhere to hang a keyword, so an
+/// annotated one is promoted to its `{"@value": …}` object form. `{"@id": …}`
+/// objects take the keyword directly.
+fn annotated_jsonld_values(
+    resolver: &ExportResolver,
+    ann: &AnnotationContext<'_>,
+    jval: &serde_json::Value,
+    reifiers: &[Sid],
+    prefixes: &PrefixMap,
+) -> Vec<serde_json::Value> {
+    if reifiers.is_empty() {
+        return vec![jval.clone()];
+    }
+    let mut out = Vec::with_capacity(reifiers.len());
+    for reifier in reifiers {
+        let Some(r_iri) = resolver.store.sid_to_iri(reifier) else {
+            continue;
+        };
+        let mut obj = match jval {
+            serde_json::Value::Object(map) => map.clone(),
+            scalar => {
+                let mut map = serde_json::Map::new();
+                map.insert("@value".to_string(), scalar.clone());
+                map
+            }
+        };
+        obj.insert(
+            "@annotation".to_string(),
+            serde_json::json!({ "@id": compact_iri(&r_iri, prefixes) }),
+        );
+        out.push(serde_json::Value::Object(obj));
+        ann.probe.note_reifier_named(reifier);
+    }
+    if out.is_empty() {
+        out.push(jval.clone());
+    }
+    out
 }
 
 /// Write the JSON-LD document header: `{"@context": {...}, "@graph": [`
@@ -1063,16 +1576,12 @@ fn escape_json_string(s: &str) -> String {
 /// Stream triples/quads from the SPOT index of one graph to `writer`.
 ///
 /// Includes novelty overlay and respects `to_t` for time-travel export.
-pub fn export_graph_ntriples<W: Write>(
+pub async fn export_graph_ntriples<W: Write>(
     store: &Arc<BinaryIndexStore>,
     config: &ExportConfig<'_>,
     writer: &mut W,
 ) -> io::Result<ExportStats> {
-    let branch_ref = match store.branch_for_order(config.g_id, RunSortOrder::Spot) {
-        Some(b) => b,
-        None => return Ok(ExportStats::default()), // no data for this graph
-    };
-    let branch = Arc::clone(branch_ref);
+    let branch = spot_branch(store, config.g_id);
 
     let filter = BinaryFilter::default();
     // Full identity projection (incl. OI): when a novelty overlay is attached,
@@ -1090,6 +1599,9 @@ pub fn export_graph_ntriples<W: Write>(
     );
     let (ephemeral_preds, untranslated) = apply_time_travel(&mut cursor, config, store);
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
+    let ann = AnnotationContext::new(&resolver, config);
+    let (untranslated, untranslated_reifiers) =
+        resolve_untranslated(ann.as_ref(), untranslated).await?;
 
     let mut stats = ExportStats::default();
     let graph_term = config.graph_iri.as_deref().map(|iri| {
@@ -1101,8 +1613,11 @@ pub fn export_graph_ntriples<W: Write>(
     });
 
     while let Some(batch) = cursor.next_batch()? {
+        let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
         write_batch(
             &resolver,
+            ann.as_ref(),
+            &reifiers,
             &batch,
             config.g_id,
             graph_term.as_deref(),
@@ -1114,7 +1629,16 @@ pub fn export_graph_ntriples<W: Write>(
     // Emit overlay flakes that could not be encoded into V3 ops (e.g.
     // novelty-only language tags) directly from their decoded form.
     for flake in &untranslated {
-        write_raw_flake_ntriples(&resolver, flake, graph_term.as_deref(), &mut stats, writer)?;
+        let reifiers = untranslated_reifiers_for(&untranslated_reifiers, flake);
+        write_raw_flake_ntriples(
+            &resolver,
+            ann.as_ref(),
+            reifiers,
+            flake,
+            graph_term.as_deref(),
+            &mut stats,
+            writer,
+        )?;
     }
 
     Ok(stats)
@@ -1124,8 +1648,11 @@ pub fn export_graph_ntriples<W: Write>(
 // Batch → N-Triples / N-Quads
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn write_batch<W: Write>(
     resolver: &ExportResolver,
+    ann: Option<&AnnotationContext<'_>>,
+    reifiers: &[Vec<Sid>],
     batch: &ColumnBatch,
     g_id: GraphId,
     graph_term: Option<&str>,
@@ -1137,6 +1664,13 @@ fn write_batch<W: Write>(
         let p_id = batch.p_id.get_or(row, 0);
         let o_type = batch.o_type.get_or(row, 0);
         let o_key = batch.o_key.get(row);
+
+        if let Some(ann) = ann {
+            if ann.is_reifies_row(p_id) {
+                ann.probe.note_bundle_in_scope(resolver, s_id);
+                continue;
+            }
+        }
 
         // Resolve subject
         let s_iri = resolver.resolve_subject_iri(s_id)?;
@@ -1177,6 +1711,33 @@ fn write_batch<W: Write>(
 
         writer.write_all(b" .\n")?;
         stats.triples_written += 1;
+
+        // N-Triples has no annotation sugar, by design. The standards-correct
+        // spelling is a triple term as the object of `rdf:reifies`, which
+        // Fluree's Turtle and N-Quads readers both accept.
+        if let Some(ann) = ann {
+            for reifier in row_reifiers(reifiers, row) {
+                let Some(r_iri) = resolver.store.sid_to_iri(reifier) else {
+                    continue;
+                };
+                write_iri_or_bnode(writer, &r_iri)?;
+                writer.write_all(b" <")?;
+                write_escaped_iri(writer, fluree_vocab::rdf::REIFIES)?;
+                writer.write_all(b"> <<( ")?;
+                write_iri_or_bnode(writer, &s_iri)?;
+                writer.write_all(b" <")?;
+                write_escaped_iri(writer, &p_iri)?;
+                writer.write_all(b"> ")?;
+                write_object(writer, &value, resolver.store, o_type)?;
+                writer.write_all(b" )>>")?;
+                if let Some(g) = graph_term {
+                    writer.write_all(b" ")?;
+                    writer.write_all(g.as_bytes())?;
+                }
+                writer.write_all(b" .\n")?;
+                ann.probe.note_reifier_named(reifier);
+            }
+        }
     }
     Ok(())
 }
@@ -1490,6 +2051,8 @@ fn write_raw_object<W: Write>(
 /// Emit a single untranslated overlay flake as an N-Triples / N-Quads statement.
 fn write_raw_flake_ntriples<W: Write>(
     resolver: &ExportResolver,
+    ann: Option<&AnnotationContext<'_>>,
+    reifiers: &[Sid],
     flake: &Flake,
     graph_term: Option<&str>,
     stats: &mut ExportStats,
@@ -1519,6 +2082,189 @@ fn write_raw_flake_ntriples<W: Write>(
     }
     writer.write_all(b" .\n")?;
     stats.triples_written += 1;
+
+    // Same spelling the translated path uses: a triple term as the object of
+    // `rdf:reifies`. `body` already holds `s <p> o`, which is exactly the
+    // term, so it is reused rather than re-serialised.
+    if let Some(ann) = ann {
+        for reifier in reifiers {
+            let Some(r_iri) = resolver.store.sid_to_iri(reifier) else {
+                continue;
+            };
+            write_iri_or_bnode(writer, &r_iri)?;
+            writer.write_all(b" <")?;
+            write_escaped_iri(writer, fluree_vocab::rdf::REIFIES)?;
+            writer.write_all(b"> <<( ")?;
+            writer.write_all(&body)?;
+            writer.write_all(b" )>>")?;
+            if let Some(g) = graph_term {
+                writer.write_all(b" ")?;
+                writer.write_all(g.as_bytes())?;
+            }
+            writer.write_all(b" .\n")?;
+            ann.probe.note_reifier_named(reifier);
+        }
+    }
+    Ok(())
+}
+
+/// Overlay rows that missed V3 translation, indexed by the subject they belong
+/// to.
+///
+/// `apply_time_travel` hands the cursor the overlay ops it could encode and
+/// returns the rest; those bypass the cursor's sorted merge entirely, as
+/// `surviving_untranslated`'s own contract says. Emitting them after the stream
+/// stranded each one outside the subject block it belongs to, so a subject
+/// could open twice in the same file.
+///
+/// That was always reachable — any commit after the last index build can
+/// produce an untranslated row — but #1574 made it the normal case rather than
+/// the edge one: a never-indexed ledger has no persisted dictionary to encode
+/// against, so most of the ledger misses translation. Export's output *shape*
+/// would then depend on whether the ledger happened to be indexed, which is
+/// the one property a faithful-round-trip change cannot afford to add.
+///
+/// Keying by subject lets each writer fold a subject's untranslated rows into
+/// that subject's block as it closes, and emit whatever the base stream never
+/// reached as its own blocks afterwards. Memory is unchanged: these flakes were
+/// already held for the whole export as a `Vec`.
+struct UntranslatedBySubject {
+    by_subject: BTreeMap<String, Vec<Flake>>,
+    /// Rows whose subject IRI does not resolve. They cannot be grouped, and
+    /// the per-row writers already count them as skipped; kept separate so
+    /// that stays the writers' decision rather than being silently dropped
+    /// here.
+    unresolved: Vec<Flake>,
+}
+
+impl UntranslatedBySubject {
+    fn new(store: &BinaryIndexStore, flakes: Vec<Flake>) -> Self {
+        let mut by_subject: BTreeMap<String, Vec<Flake>> = BTreeMap::new();
+        let mut unresolved = Vec::new();
+        for flake in flakes {
+            match store.sid_to_iri(&flake.s) {
+                Some(s_iri) => by_subject.entry(s_iri).or_default().push(flake),
+                None => unresolved.push(flake),
+            }
+        }
+        Self {
+            by_subject,
+            unresolved,
+        }
+    }
+
+    /// Rows for `s_iri`, removed so the closing pass cannot emit them twice.
+    fn take(&mut self, s_iri: &str) -> Option<Vec<Flake>> {
+        self.by_subject.remove(s_iri)
+    }
+
+    /// Subjects the base stream never reached, in IRI order for determinism.
+    fn into_remaining(self) -> (Vec<(String, Vec<Flake>)>, Vec<Flake>) {
+        (self.by_subject.into_iter().collect(), self.unresolved)
+    }
+}
+
+/// Write one untranslated row's `predicate object` pair into `out`.
+///
+/// Returns `false` when the value variant is not representable, which is the
+/// caller's cue to count a skipped row and emit nothing.
+fn write_raw_po_turtle(
+    resolver: &ExportResolver,
+    ann: Option<&AnnotationContext<'_>>,
+    reifiers: &[Sid],
+    flake: &Flake,
+    prefixes: &PrefixMap,
+    out: &mut Vec<u8>,
+) -> io::Result<bool> {
+    let Some(p_iri) = resolver.store.sid_to_iri(&flake.p) else {
+        return Ok(false);
+    };
+    if p_iri == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" {
+        out.write_all(b"a")?;
+    } else {
+        write_turtle_iri(out, &p_iri, prefixes)?;
+    }
+    out.write_all(b" ")?;
+    if !write_raw_object(out, resolver.store, flake, Some(prefixes))? {
+        return Ok(false);
+    }
+    // Same `~ <r>` marker the translated path writes, for a row that reached
+    // the output without ever passing through it.
+    if let Some(ann) = ann {
+        for reifier in reifiers {
+            let Some(iri) = resolver.store.sid_to_iri(reifier) else {
+                continue;
+            };
+            out.write_all(b" ~ ")?;
+            write_turtle_iri_or_bnode(out, &iri, prefixes)?;
+            ann.probe.note_reifier_named(reifier);
+        }
+    }
+    Ok(true)
+}
+
+/// Append untranslated rows to the Turtle block that is currently open.
+fn write_untranslated_turtle_continuations<W: Write>(
+    resolver: &ExportResolver,
+    ann: Option<&AnnotationContext<'_>>,
+    reifier_map: &HashMap<EdgeKey, Vec<Sid>>,
+    flakes: &[Flake],
+    prefixes: &PrefixMap,
+    stats: &mut ExportStats,
+    writer: &mut W,
+) -> io::Result<()> {
+    for flake in flakes {
+        let mut body: Vec<u8> = Vec::new();
+        let reifiers = untranslated_reifiers_for(reifier_map, flake);
+        if !write_raw_po_turtle(resolver, ann, reifiers, flake, prefixes, &mut body)? {
+            stats.rows_skipped += 1;
+            continue;
+        }
+        write!(writer, " ;\n    ")?;
+        writer.write_all(&body)?;
+        stats.triples_written += 1;
+    }
+    Ok(())
+}
+
+/// Emit a whole subject block for untranslated rows the base stream never
+/// reached.
+#[allow(clippy::too_many_arguments)]
+fn write_untranslated_turtle_block<W: Write>(
+    resolver: &ExportResolver,
+    ann: Option<&AnnotationContext<'_>>,
+    reifier_map: &HashMap<EdgeKey, Vec<Sid>>,
+    s_iri: &str,
+    flakes: &[Flake],
+    prefixes: &PrefixMap,
+    stats: &mut ExportStats,
+    writer: &mut W,
+) -> io::Result<()> {
+    // Render the rows first: a subject whose every row is unrepresentable must
+    // not leave a dangling subject term behind.
+    let mut bodies: Vec<Vec<u8>> = Vec::new();
+    for flake in flakes {
+        let mut body: Vec<u8> = Vec::new();
+        let reifiers = untranslated_reifiers_for(reifier_map, flake);
+        if write_raw_po_turtle(resolver, ann, reifiers, flake, prefixes, &mut body)? {
+            bodies.push(body);
+        } else {
+            stats.rows_skipped += 1;
+        }
+    }
+    let Some((first, rest)) = bodies.split_first() else {
+        return Ok(());
+    };
+    write_turtle_iri_or_bnode(writer, s_iri, prefixes)?;
+    write!(writer, "\n    ")?;
+    writer.write_all(first)?;
+    stats.triples_written += 1;
+    for body in rest {
+        write!(writer, " ;\n    ")?;
+        writer.write_all(body)?;
+        stats.triples_written += 1;
+    }
+    writeln!(writer, " .")?;
     Ok(())
 }
 
