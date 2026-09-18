@@ -1,10 +1,12 @@
 //! A threshold on an annotation body must reduce scan work.
 //!
 //! `expand_edge_annotation_patterns` wraps the expanded chain in
-//! `Pattern::DefaultGraphSource`, and `collect_inner_join_block` stops at any
-//! non-triple pattern. A `FILTER` written beside the annotation therefore
-//! started a block with no triples in it, `extract_bounds_from_filters` never
-//! saw the body's object variable, and the threshold ran as a `FilterOperator`
+//! `Pattern::DefaultGraphSource`, and `collect_inner_join_block` breaks on that
+//! wrapper — it collects `Filter` alongside `Triple`, `Values` and `Bind`, and
+//! stops only on its `_` arm. A `FILTER` written beside the annotation
+//! therefore started a block with no triples in it,
+//! `extract_bounds_from_filters` returned early on an empty `object_vars`, and
+//! the threshold ran as a `FilterOperator`
 //! *above* the wrapper — after every annotation had been read and
 //! materialized. Filtering by confidence cost exactly what not filtering cost:
 //! on a 60k-edge ledger, `?c > 0.7` (18,317 rows) and `?c > 0.97` (1,148 rows)
@@ -403,22 +405,85 @@ impl Drop for LanePin {
     }
 }
 
-/// Scoped `FLUREE_DISABLE_QUERY_FAST_PATHS`, restored on drop.
-struct DisableFastPaths(Option<String>);
+/// Scoped planner-fast-path disable, restored on drop.
+///
+/// Programmatic rather than `FLUREE_DISABLE_QUERY_FAST_PATHS`, because a scoped
+/// env-var helper is a lie whenever the *reader* caches. `fast_paths_disabled()`
+/// (`operator_tree.rs`) latches its env read in a `OnceLock` on first call, so:
+///
+/// - set the var after any query has run and it does nothing — the assertion
+///   then compares a query against itself and passes vacuously;
+/// - set it before any query has run and it latches `true` for the entire test
+///   binary, which `Drop` cannot undo — `it_join_batched_overlay` is a module of
+///   the same `grp_misc` binary and asserts specific lanes fired.
+///
+/// Which of those two happens is decided by test scheduling. `LanePin` above is
+/// safe with an env var only because `forced_chain_lane()` re-reads per call:
+/// same shape, opposite correctness, decided by the reader rather than the
+/// setter. `set_fast_paths_disabled` is an `AtomicBool`, so it is both effective
+/// and reversible; its own doc comment names this footgun.
+///
+/// The mutex is for the same reason `LanePin` has one: process-wide state in a
+/// parallel binary.
+///
+/// # Residual, and the full remedy if it ever bites
+///
+/// The mutex serialises this helper against *itself*; it cannot stop an
+/// unrelated test in the same binary from observing fast paths off while the
+/// guard is held. That is currently harmless because the switch reaches only
+/// the fused/aggregate detectors (`operator_tree.rs`, `fast_paths_globally_disabled`),
+/// the membership join (`where_plan.rs`) and the range semijoin — and no module
+/// in `grp_misc` asserts any of them. Checked across all 39, not assumed. Note
+/// the switch's own doc: batched joins and cursor selection are explicitly
+/// unaffected, so `it_join_batched_overlay`'s `used_spot_star_walk` assertion
+/// is not in scope for it.
+///
+/// **If a test asserting a fused fast path, membership join or range semijoin
+/// is ever added to `grp_misc`, that is the moment to move this module to its
+/// own `[[test]]` binary** — which is what `it_datetime_component_presence`
+/// does, and why its header says "Own test binary: toggles the process-global
+/// fast-path kill switch."
+struct DisableFastPaths {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
 
 impl DisableFastPaths {
     fn set() -> Self {
-        let prev = std::env::var("FLUREE_DISABLE_QUERY_FAST_PATHS").ok();
-        std::env::set_var("FLUREE_DISABLE_QUERY_FAST_PATHS", "1");
-        Self(prev)
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let guard = LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The env var ORs into `fast_paths_disabled()` and cannot be cleared
+        // programmatically, so with it set the fast-paths-ON phase would run
+        // generically and the differential would pass without comparing
+        // anything. Fail loudly instead.
+        assert!(
+            std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_none(),
+            "FLUREE_DISABLE_QUERY_FAST_PATHS must be unset: it latches \
+             `fast_paths_disabled()` on for the process and makes this \
+             differential vacuous"
+        );
+        assert!(
+            !fluree_db_api::fast_paths_disabled(),
+            "fast paths already disabled on entry: something else in this binary \
+             left the switch on, and this guard's Drop would clear it for them"
+        );
+        fluree_db_api::set_fast_paths_disabled(true);
+        // Value-shaped, not presence-shaped: assert the switch is actually ON
+        // rather than that we called the setter. This is the check whose
+        // absence made the previous env-var version pass without ever
+        // disabling anything.
+        assert!(
+            fluree_db_api::fast_paths_disabled(),
+            "the kill switch must be on inside this guard"
+        );
+        Self { _guard: guard }
     }
 }
 
 impl Drop for DisableFastPaths {
     fn drop(&mut self) {
-        match self.0.take() {
-            Some(v) => std::env::set_var("FLUREE_DISABLE_QUERY_FAST_PATHS", v),
-            None => std::env::remove_var("FLUREE_DISABLE_QUERY_FAST_PATHS"),
-        }
+        fluree_db_api::set_fast_paths_disabled(false);
     }
 }
