@@ -45,7 +45,6 @@ use tower::ServiceExt;
 const OMITTED: &str = "x-fluree-export-named-graphs-omitted";
 const UNRESOLVED: &str = "x-fluree-export-annotations-unresolved";
 const SKIPPED: &str = "x-fluree-export-rows-skipped";
-const OUT_OF_SCOPE: &str = "x-fluree-export-annotations-out-of-scope";
 
 /// An edge annotation written inside a named graph — the shape the three
 /// annotation sources disagree about.
