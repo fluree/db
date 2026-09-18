@@ -118,12 +118,18 @@ impl LlmClient {
             WireApi::Responses => (self.endpoint.route("responses"), self.responses_body(req)),
         };
 
-        let mut last = String::new();
-        let mut recovered = false;
-        for attempt in 0..ATTEMPTS {
-            if attempt > 0 {
-                std::thread::sleep(Duration::from_secs(1 << attempt));
-            }
+        let mut last;
+        // Retries and dialect corrections are counted separately on
+        // purpose. A correction is not a transient failure: it should not
+        // back off, and it should not spend one of the three attempts that
+        // exist to ride out a 429 or a 503. It terminates on its own —
+        // every correction removes or renames a field, and `recover` only
+        // matches a field still in the body — so the cap is a guard against
+        // a future rule that could undo another, not the thing that ends
+        // the loop.
+        let mut spent = 0u32;
+        let mut corrections = 0usize;
+        loop {
             let mut http = self.agent.post(&url);
             if let Some(key) = &self.api_key {
                 http = http.header("Authorization", &format!("Bearer {key}"));
@@ -146,12 +152,12 @@ impl LlmClient {
                     // again, once: it is the only mechanism that survives a
                     // provider's published capability table being wrong,
                     // which is the situation we are actually in.
-                    if status == 400 && !recovered {
+                    if status == 400 && corrections < ADJUSTABLE.len() {
                         if let Some(fixed) = self.recover(&mut body, &text) {
                             tracing::debug!("{url}: retrying with {fixed}");
                             self.recoveries
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            recovered = true;
+                            corrections += 1;
                             continue;
                         }
                     }
@@ -161,6 +167,11 @@ impl LlmClient {
                 }
                 Err(e) => last = e.to_string(),
             }
+            spent += 1;
+            if spent >= ATTEMPTS {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1 << spent));
         }
         Err(DocError::Model(format!("{url}: {last}")))
     }

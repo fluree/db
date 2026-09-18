@@ -4513,18 +4513,37 @@ fn doc_ingest_stores_assertion_mode_from_a_custom_prompt() {
         .stdout(predicate::str::contains("hedged"));
 }
 
-/// A withdrawn field is visible in the run's own output, and the refusal
-/// is not repeated on the next chunk.
+/// Three refusals in a row, resolved in one call, and reported once.
+///
+/// This pins three things at the same time, and each would be invisible
+/// without the others:
+///
+/// 1. **All three fields route through the correction**, not just the
+///    budget — the mechanism is used for the fields that motivated it.
+/// 2. **A correction does not back off.** The gaps between arrivals stay
+///    far under the 2s that is the shortest retry sleep.
+///
+/// It deliberately does **not** claim that a correction avoids spending a
+/// retry: four requests are reachable either way, because the `continue`
+/// skips the budget check. That property needs a transient failure to be
+/// observable at all, and has its own test below.
 #[test]
-fn doc_ingest_withdraws_a_refused_field_and_says_so() {
+fn doc_ingest_takes_three_corrections_in_one_call_without_spending_a_retry() {
     use std::io::{BufRead, BufReader, Read, Write};
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     write_extraction_fixtures(&tmp);
 
+    // An endpoint that refuses every optional field, one 400 at a time,
+    // each in the words a real provider uses.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
-    let seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+    // Request bodies with the instant each arrived. The gaps between them
+    // are what "a correction does not back off" means; whole-process wall
+    // time is not, because it also pays for starting a debug binary from
+    // cold, which is how this assertion first flaked.
+    type Arrivals = std::sync::Arc<std::sync::Mutex<Vec<(std::time::Instant, serde_json::Value)>>>;
+    let seen: Arrivals = Default::default();
     let captured = seen.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -4544,13 +4563,31 @@ fn doc_ingest_withdraws_a_refused_field_and_says_so() {
             let mut body = vec![0u8; len];
             reader.read_exact(&mut body).ok();
             let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-            captured.lock().unwrap().push(parsed.clone());
-            let (status, reply) = if parsed.get("temperature").is_some() {
+            captured
+                .lock()
+                .unwrap()
+                .push((std::time::Instant::now(), parsed.clone()));
+            let refuse = |param: &str, message: &str| {
                 (
                     400,
-                    serde_json::json!({ "error": { "param": "temperature",
-                    "message": "Unsupported value: 'temperature'" } })
-                    .to_string(),
+                    serde_json::json!({ "error": { "param": param, "message": message } })
+                        .to_string(),
+                )
+            };
+            let (status, reply) = if parsed.get("temperature").is_some() {
+                refuse(
+                    "temperature",
+                    "Unsupported value: 'temperature' does not support 0 with this model",
+                )
+            } else if parsed.get("response_format").is_some() {
+                refuse(
+                    "response_format",
+                    "response_format.type: Input should be 'json_schema'",
+                )
+            } else if parsed.get("max_completion_tokens").is_some() {
+                refuse(
+                    "max_completion_tokens",
+                    "Unrecognized request argument supplied: max_completion_tokens",
                 )
             } else {
                 (
@@ -4587,15 +4624,130 @@ fn doc_ingest_withdraws_a_refused_field_and_says_so() {
         .assert()
         .success()
         .stdout(
-            predicate::str::contains("1 call(s) were refused and resent with an adjusted request")
+            predicate::str::contains("3 call(s) were refused and resent with an adjusted request")
                 .count(1),
         );
 
-    let sent = seen.lock().unwrap();
-    assert_eq!(sent.len(), 2, "one refusal, one resend: {sent:?}");
+    let arrivals = seen.lock().unwrap();
+    let sent: Vec<&serde_json::Value> = arrivals.iter().map(|(_, b)| b).collect();
+    assert_eq!(
+        sent.len(),
+        4,
+        "one call, three corrections, one answer: {sent:?}"
+    );
+    // Each refusal withdrew exactly the field it named, and nothing else.
     assert_eq!(sent[0]["temperature"], 0);
+    assert_eq!(sent[0]["response_format"]["type"], "json_object");
+    assert_eq!(sent[0]["max_completion_tokens"], 8000);
     assert!(sent[1].get("temperature").is_none());
     assert_eq!(sent[1]["response_format"]["type"], "json_object");
+    assert!(sent[2].get("response_format").is_none());
+    assert_eq!(sent[2]["max_completion_tokens"], 8000);
+    assert_eq!(sent[3]["max_tokens"], 8000, "renamed, not dropped");
+    assert!(sent[3].get("max_completion_tokens").is_none());
+    // The shortest retry backoff is 2s, so any gap near it means a
+    // correction was treated as a transient failure.
+    let worst = arrivals
+        .windows(2)
+        .map(|w| w[1].0.duration_since(w[0].0))
+        .max()
+        .expect("four requests give three gaps");
+    assert!(
+        worst < std::time::Duration::from_secs(2),
+        "a correction backed off: the longest gap between requests was {worst:?}"
+    );
+}
+
+/// A dialect correction must not spend one of the three attempts that
+/// exist to ride out a transient failure.
+///
+/// Only observable when a transient actually follows a correction, which is
+/// why this is its own test and why it pays real backoff: the endpoint
+/// refuses one field, then fails twice with a 503, then answers. Four
+/// requests and a clean run. If the correction had consumed an attempt the
+/// budget would run out on the second 503 and the chunk would be reported
+/// failed instead.
+#[test]
+fn doc_ingest_keeps_its_full_retry_budget_after_a_dialect_correction() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served = count.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let mut len = 0usize;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; len];
+            reader.read_exact(&mut body).ok();
+            let n = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (status, reply) = match n {
+                // One dialect refusal, then two transients, then the answer.
+                0 => (
+                    400,
+                    serde_json::json!({ "error": { "param": "temperature",
+                        "message": "Unsupported value: 'temperature'" } })
+                    .to_string(),
+                ),
+                1 | 2 => (503, serde_json::json!({ "error": "try again" }).to_string()),
+                _ => (
+                    200,
+                    serde_json::json!({ "choices": [{ "message": {
+                        "role": "assistant",
+                        "content": "{\"entities\":[],\"relations\":[]}" } }] })
+                    .to_string(),
+                ),
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+        }
+    });
+
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+        ])
+        .assert()
+        .success()
+        // The chunk was extracted, not abandoned.
+        .stdout(predicate::str::contains("chunk(s) failed").not())
+        .stdout(predicate::str::contains(
+            "1 call(s) were refused and resent with an adjusted request",
+        ));
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        4,
+        "one correction plus three attempts"
+    );
 }
 
 // --- end: `fluree doc ingest` re-ingest ownership (PR-C / #1864) ------------
