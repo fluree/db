@@ -2628,6 +2628,155 @@ fn an_untranslated_annotation_exports_with_its_marker() {
         .stdout(predicate::str::contains("<http://example.org/src>"));
 }
 
+/// Every object shape keeps its annotation, including the big-numeric ones.
+///
+/// `xsd:decimal` did not. The seek key `batch_reifiers` builds needs a
+/// datatype `Sid`, and it asked `resolve_datatype_sid(o_type)` — which
+/// returns `None` for the `NUM_BIG_OVERFLOW` arena, because that arena holds
+/// both overflow `xsd:integer` and `xsd:decimal` and the o_type alone cannot
+/// say which. The `else { continue }` then skipped the row before it could
+/// be matched against the arena, so the marker was lost on *every* lookup
+/// path, sealed arena included, and the reifier came out as an orphan.
+///
+/// `resolve_datatype_sid_for_value` exists for exactly that ambiguity —
+/// added for #1329, where the same gap rendered big numerics with an empty
+/// `@type`. This call site had simply not adopted it.
+///
+/// The fixture covers all three shapes that arena serves, not just the
+/// reported one: an explicit `xsd:decimal`, a **bare** Turtle numeric
+/// (which parses as decimal, and is how anyone writes a score), and an
+/// overflow-magnitude `xsd:integer`. A small integer and a ref are controls
+/// that always worked — without them a regression that broke everything
+/// would still satisfy the assertions below.
+#[test]
+fn big_numeric_objects_keep_their_annotations() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let src = tmp.path().join("num-src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.ttl"),
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+         ex:s ex:pRef  ex:bob                     ~ ex:cRef  {| ex:n \"ref\"  |} .\n\
+         ex:s ex:pDec  \"1.5\"^^xsd:decimal         ~ ex:cDec  {| ex:n \"dec\"  |} .\n\
+         ex:s ex:pBare 1.5                        ~ ex:cBare {| ex:n \"bare\" |} .\n\
+         ex:s ex:pBig  \"123456789012345678901234567890\"^^xsd:integer \
+             ~ ex:cBig {| ex:n \"big\" |} .\n\
+         ex:s ex:pInt  \"42\"^^xsd:integer          ~ ex:cInt  {| ex:n \"int\"  |} .\n",
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["create", "num", "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+
+    let out = fluree_cmd(&tmp)
+        .args(["export", "num", "--format", "turtle"])
+        .assert()
+        .success();
+    let out = out.get_output();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.trim().is_empty(), "empty export proves nothing");
+
+    for (pred, reifier) in [
+        ("ex:pRef", "ex:cRef"),   // control: always worked
+        ("ex:pInt", "ex:cInt"),   // control: small integer, not the big arena
+        ("ex:pDec", "ex:cDec"),   // the reported case
+        ("ex:pBare", "ex:cBare"), // a bare numeric is a decimal
+        ("ex:pBig", "ex:cBig"),   // overflow integer shares the same arena
+    ] {
+        let line = stdout
+            .lines()
+            .find(|l| l.contains(pred))
+            .unwrap_or_else(|| panic!("{pred} missing from export:\n{stdout}"));
+        assert!(
+            line.contains(&format!("~ {reifier}")),
+            "{pred} lost its annotation marker: {line}"
+        );
+    }
+
+    // Nothing was dropped, so nothing is reported.
+    fluree_cmd(&tmp)
+        .args(["export", "num", "--format", "turtle"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("could not be resolved").not());
+}
+
+/// A point-in-time export shows an annotation that was live at that time,
+/// even though it has since been retracted.
+///
+/// It did not, on the arena-less path. `scan_base_index_for_attachment_events_in`
+/// computed its own upper bound as `t.max(snapshot.t)` — right for a seal
+/// pass, which wants the whole of history, and wrong for a read at a
+/// requested `t`. Raising the bound to HEAD means the range never returns a
+/// bundle retracted after the requested time, and the filter below it can
+/// only *drop* rows, never restore them. The annotation vanished from an
+/// export that should contain it, and because no edge was then known to be
+/// annotated, nothing incremented the unresolved counter either — silent.
+///
+/// The bound is now the caller's: seal callers clamp it themselves, the
+/// export passes the requested time.
+///
+/// Three things the fixture needs, or it passes without exercising the bug:
+/// the ledger must be **indexed past** the requested `t` (otherwise
+/// `snapshot.t` is 0 and the clamp is a no-op), the annotation must be
+/// **retracted after** it (otherwise it is live at HEAD too), and the scan
+/// must be the annotation source (`FLUREE_EXPORT_ANNOTATION_SCAN`), since
+/// that is the path the bound belongs to.
+#[test]
+fn a_point_in_time_export_keeps_an_annotation_retracted_later() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "tt"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "tt",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:knows ex:b ~ ex:c1 {| ex:conf 0.5 |} .\n",
+        ])
+        .assert()
+        .success();
+    // Retract the attachment, keeping the edge (the by-@id form).
+    fluree_cmd(&tmp)
+        .args([
+            "update",
+            "tt",
+            "--format",
+            "json",
+            "-e",
+            r#"{"@context":{"ex":"http://example.org/"},
+                "delete":{"@id":"ex:a","ex:knows":{"@id":"ex:b",
+                          "@annotation":{"@id":"ex:c1"}}}}"#,
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp).args(["index", "tt"]).assert().success();
+
+    // At HEAD the annotation is gone — that is the retract working.
+    fluree_cmd(&tmp)
+        .args(["export", "tt", "--format", "turtle"])
+        .env("FLUREE_EXPORT_ANNOTATION_SCAN", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("~ <http://example.org/c1>").not());
+
+    // At t=1 it was live, so it must be in the output.
+    fluree_cmd(&tmp)
+        .args(["export", "tt", "--format", "turtle", "--at", "1"])
+        .env("FLUREE_EXPORT_ANNOTATION_SCAN", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("~ <http://example.org/c1>"))
+        .stdout(predicate::str::contains("<http://example.org/knows>"));
+}
+
 /// An annotation written inside a named graph exports like any other.
 ///
 /// It did not, until #1882: the seal scan reads bundles out of the base
@@ -2729,29 +2878,26 @@ fn insert_then_index_keeps_annotations_readable() {
         .stderr(predicate::str::contains("could not be resolved").not());
 }
 
-/// `--rebuild-annotations` discards unrecoverable history in one case the
-/// code cannot detect, so it refuses rather than warning after the fact —
-/// and refuses rather than prompting, because the people who need it are
-/// recovering a stuck ledger from a script.
-///
-/// The refusal has to name the *condition of safe use*, not only the hazard:
-/// a user who knows their arena was never sealed is the whole population this
-/// flag exists for.
+/// The remote reindex API does not carry the flag, so asking for it against
+/// a remote is refused rather than silently ignored — a repair that reports
+/// success without repairing anything is the worst of the three outcomes.
 #[test]
-fn rebuild_annotations_refuses_without_the_confirmation_flag() {
+fn rebuild_annotations_is_refused_against_a_remote() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
-    fluree_cmd(&tmp).args(["create", "rb"]).assert().success();
 
     fluree_cmd(&tmp)
-        .args(["reindex", "rb", "--rebuild-annotations"])
+        .args([
+            "reindex",
+            "rb3",
+            "--rebuild-annotations",
+            "--force",
+            "--remote",
+            "origin",
+        ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("retraction history is discarded"))
-        .stderr(predicate::str::contains(
-            "Safe when the arena was never sealed",
-        ))
-        .stderr(predicate::str::contains("--force"));
+        .stderr(predicate::str::contains("local-only repair"));
 }
 
 /// And with the acknowledgement it runs. `--force` is this CLI's existing
@@ -2790,26 +2936,29 @@ fn rebuild_annotations_proceeds_once_acknowledged() {
         ));
 }
 
-/// The remote reindex API does not carry the flag, so asking for it against
-/// a remote is refused rather than silently ignored — a repair that reports
-/// success without repairing anything is the worst of the three outcomes.
+/// `--rebuild-annotations` discards unrecoverable history in one case the
+/// code cannot detect, so it refuses rather than warning after the fact —
+/// and refuses rather than prompting, because the people who need it are
+/// recovering a stuck ledger from a script.
+///
+/// The refusal has to name the *condition of safe use*, not only the hazard:
+/// a user who knows their arena was never sealed is the whole population this
+/// flag exists for.
 #[test]
-fn rebuild_annotations_is_refused_against_a_remote() {
+fn rebuild_annotations_refuses_without_the_confirmation_flag() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "rb"]).assert().success();
 
     fluree_cmd(&tmp)
-        .args([
-            "reindex",
-            "rb3",
-            "--rebuild-annotations",
-            "--force",
-            "--remote",
-            "origin",
-        ])
+        .args(["reindex", "rb", "--rebuild-annotations"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("local-only repair"));
+        .stderr(predicate::str::contains("retraction history is discarded"))
+        .stderr(predicate::str::contains(
+            "Safe when the arena was never sealed",
+        ))
+        .stderr(predicate::str::contains("--force"));
 }
 
 // ============================================================================

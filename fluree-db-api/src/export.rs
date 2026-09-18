@@ -469,7 +469,16 @@ async fn batch_reifiers(
         if matches!(o, FlakeValue::Null) {
             continue;
         }
-        let Some(dt) = resolver.store.resolve_datatype_sid(o_type) else {
+        // `resolve_datatype_sid_for_value`, not `resolve_datatype_sid`. The
+        // `NUM_BIG_OVERFLOW` arena holds both overflow `xsd:integer` and
+        // `xsd:decimal`, so the o_type alone names no datatype and the plain
+        // form returns `None` — which made this `continue` silently skip
+        // building a seek key for those rows, so they could never be matched
+        // against the arena and lost their `~ <r>` marker whatever the
+        // annotation source. The value-aware form exists for exactly this
+        // ambiguity (added for #1329, where the same gap rendered big
+        // numerics with an empty `@type`); this call site had not adopted it.
+        let Some(dt) = resolver.store.resolve_datatype_sid_for_value(o_type, &o) else {
             continue;
         };
         edges.push(EdgeKey {
@@ -727,7 +736,7 @@ async fn resolve_untranslated(
     };
     let mut base: Vec<Flake> = Vec::with_capacity(rows.len());
     for f in rows {
-        if fluree_db_core::namespaces::is_any_reifies(&f.p) {
+        if fluree_db_core::namespaces::is_reserved_reifies_predicate(&f.p) {
             ann.probe.note_bundle_sid(f.s.clone());
             continue;
         }

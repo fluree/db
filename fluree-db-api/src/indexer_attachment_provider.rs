@@ -258,7 +258,9 @@ async fn scan_base_index_for_attachment_events(
     scan_base_index_for_attachment_events_in(
         &view.snapshot,
         view.novelty.as_ref(),
-        view.t,
+        // A seal pass wants every bundle the base carries, so the bound is
+        // raised to whichever of the two is further ahead.
+        view.t.max(view.snapshot.t),
         ledger_id,
     )
     .await
@@ -317,7 +319,8 @@ pub(crate) async fn attachment_events_from_state(
             if let Some(events) = scan_base_index_for_attachment_events_in(
                 snapshot,
                 &*state.novelty,
-                state.t(),
+                // Seal pass: whole history, as above.
+                state.t().max(snapshot.t),
                 &snapshot.ledger_id,
             )
             .await
@@ -346,7 +349,7 @@ pub(crate) async fn attachment_events_from_state(
 pub(crate) async fn scan_base_index_for_attachment_events_in(
     snapshot: &fluree_db_core::LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
-    t: i64,
+    to_t: i64,
     ledger_id: &str,
 ) -> Option<
     Vec<(
@@ -366,7 +369,7 @@ pub(crate) async fn scan_base_index_for_attachment_events_in(
         return None;
     }
     snapshot.range_provider.as_ref()?;
-    tracing::debug!(ledger_id, t, "scan_base_index_for_attachment_events");
+    tracing::debug!(ledger_id, to_t, "scan_base_index_for_attachment_events");
 
     // Annotation flakes may live in the default graph (g_id=0) or
     // any named graph. Always include g_id=0 — `GraphRegistry::iter_entries`
@@ -431,7 +434,15 @@ pub(crate) async fn scan_base_index_for_attachment_events_in(
         })
         .collect();
 
-    let to_t = t.max(snapshot.t);
+    // `to_t` is the caller's, deliberately un-clamped. It used to be
+    // `t.max(snapshot.t)`, which is right for a seal pass — it wants the
+    // whole of history the base carries — and wrong for a point-in-time
+    // read. Raising the bound to HEAD for an `--at` export means a bundle
+    // retracted *after* the requested `t` is no longer returned by the
+    // range at all, and a downstream filter can only drop rows, never
+    // restore them: the annotation disappears from an export that should
+    // contain it, without bumping any counter, because no edge is known to
+    // be annotated. Seal callers pass the clamped value themselves.
 
     let mut events: Vec<(EdgeKey, Sid, i64, bool)> = Vec::new();
     let mut seen: HashSet<(fluree_db_core::GraphId, Sid, i64)> = HashSet::new();

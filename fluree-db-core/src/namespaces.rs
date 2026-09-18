@@ -205,23 +205,6 @@ pub fn is_reifies_graph(sid: &Sid) -> bool {
     sid.namespace_code == FLUREE_DB && sid.name.as_ref() == fluree_db_predicates::REIFIES_GRAPH
 }
 
-/// True for any of the seven reserved `f:reifies*` predicates.
-///
-/// The seven are checked individually elsewhere for their own reasons; this
-/// is for callers that only need "is this row part of an annotation bundle",
-/// so the disjunction lives in one place. A seven-way `||` written twice is
-/// where an eighth predicate gets added to one copy.
-#[inline]
-pub fn is_any_reifies(sid: &Sid) -> bool {
-    is_reifies_graph(sid)
-        || is_reifies_subject(sid)
-        || is_reifies_predicate(sid)
-        || is_reifies_object(sid)
-        || is_reifies_datatype(sid)
-        || is_reifies_lang(sid)
-        || is_reifies_list_index(sid)
-}
-
 /// True for `f:reifiesSubject`.
 #[inline]
 pub fn is_reifies_subject(sid: &Sid) -> bool {

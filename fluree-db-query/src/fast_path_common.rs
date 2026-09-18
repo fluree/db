@@ -2689,14 +2689,46 @@ pub(crate) fn policy_lane_for_predicates(
     verdict
 }
 
-/// [`policy_lane_for_predicate`] for the probe lanes: `Allow` keeps the lane,
-/// anything else declines it (the lanes have no empty result to short-circuit
-/// to; the per-row fallback filters and finds nothing).
-fn probe_lane_policy_clears(ctx: &ExecutionContext<'_>, pred_sid: &Sid) -> bool {
-    matches!(
-        policy_lane_for_predicate(ctx, pred_sid, POLICY_PREDICATE_PROBE_SITE),
+/// Admission shared by every probe lane and by the join's early routing
+/// decision: `Some(plan)` settles the lane without consulting the overlay,
+/// `None` means plan against it.
+///
+/// Order matters. The lanes read raw leaflets in `Clean` mode too and never
+/// run per-leaf policy filtering, and they emit current facts where a
+/// history range needs every event with its `t` and `op` — so both the
+/// history gate and the per-predicate policy gate sit BEFORE the
+/// overlay-free return, which would otherwise admit the lane on a clean
+/// graph.
+pub(crate) fn probe_lane_admission(
+    ctx: &ExecutionContext<'_>,
+    pred_sids: &[&Sid],
+) -> Option<ProbeLanePlan> {
+    if ctx.is_history_range() {
+        return Some(ProbeLanePlan::Decline);
+    }
+    // Every predicate the lane reads must clear; an empty set has nothing to
+    // clear and declines under any non-root policy. `Allow` keeps the lane,
+    // anything else declines it (the lanes have no empty result to
+    // short-circuit to; the per-row fallback filters and finds nothing).
+    if !matches!(
+        policy_lane_for_predicates(ctx, pred_sids, POLICY_PREDICATE_PROBE_SITE),
         PredicateFastPath::Allow
-    )
+    ) {
+        return Some(ProbeLanePlan::Decline);
+    }
+    if ctx.overlay_free_single_graph() {
+        return Some(ProbeLanePlan::Clean);
+    }
+    // Eager-materialization callers (reasoning queries with Sid-space derived
+    // overlays, federated queries) need the per-row path: probes emit
+    // encoded bindings and merge only V3-translated novelty.
+    if ctx.eager_materialization {
+        return Some(ProbeLanePlan::Decline);
+    }
+    if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
+        return Some(ProbeLanePlan::Decline);
+    }
+    None
 }
 
 /// Plan a single-predicate PSOT subject probe under the active overlay.
@@ -2705,23 +2737,8 @@ pub fn subject_probe_lane_plan(
     store: &Arc<BinaryIndexStore>,
     pred_sid: &Sid,
 ) -> Result<ProbeLanePlan> {
-    // BEFORE the overlay-free return: the probe lanes read raw leaflets in
-    // `Clean` mode too, so a policy that can touch this predicate must
-    // decline regardless of novelty state.
-    if !probe_lane_policy_clears(ctx, pred_sid) {
-        return Ok(ProbeLanePlan::Decline);
-    }
-    if ctx.overlay_free_single_graph() {
-        return Ok(ProbeLanePlan::Clean);
-    }
-    // Eager-materialization callers (reasoning queries with Sid-space derived
-    // overlays, federated queries) need the per-row path: probes emit
-    // encoded bindings and merge only V3-translated novelty.
-    if ctx.eager_materialization {
-        return Ok(ProbeLanePlan::Decline);
-    }
-    if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
-        return Ok(ProbeLanePlan::Decline);
+    if let Some(plan) = probe_lane_admission(ctx, &[pred_sid]) {
+        return Ok(plan);
     }
     let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
     else {
@@ -2755,20 +2772,8 @@ pub fn object_probe_lane_plan(
     store: &Arc<BinaryIndexStore>,
     pred_sid: &Sid,
 ) -> Result<ProbeLanePlan> {
-    // See subject_probe_lane_plan: policy declines before the overlay-free
-    // return (raw leaflet reads bypass per-leaf policy filtering in `Clean`
-    // mode too); eager callers keep the per-row path under an overlay.
-    if !probe_lane_policy_clears(ctx, pred_sid) {
-        return Ok(ProbeLanePlan::Decline);
-    }
-    if ctx.overlay_free_single_graph() {
-        return Ok(ProbeLanePlan::Clean);
-    }
-    if ctx.eager_materialization {
-        return Ok(ProbeLanePlan::Decline);
-    }
-    if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
-        return Ok(ProbeLanePlan::Decline);
+    if let Some(plan) = probe_lane_admission(ctx, &[pred_sid]) {
+        return Ok(plan);
     }
     let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
     else {
@@ -2803,24 +2808,8 @@ pub fn star_probe_lane_plan(
     store: &Arc<BinaryIndexStore>,
     pred_sids: &[&Sid],
 ) -> Result<ProbeLanePlan> {
-    // See subject_probe_lane_plan: policy declines before the overlay-free
-    // return (raw leaflet reads bypass per-leaf policy filtering in `Clean`
-    // mode too); eager callers keep the per-row path under an overlay. The
-    // star reads every predicate at once, so the whole set must clear.
-    if !matches!(
-        policy_lane_for_predicates(ctx, pred_sids, POLICY_PREDICATE_PROBE_SITE),
-        PredicateFastPath::Allow
-    ) {
-        return Ok(ProbeLanePlan::Decline);
-    }
-    if ctx.overlay_free_single_graph() {
-        return Ok(ProbeLanePlan::Clean);
-    }
-    if ctx.eager_materialization {
-        return Ok(ProbeLanePlan::Decline);
-    }
-    if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
-        return Ok(ProbeLanePlan::Decline);
+    if let Some(plan) = probe_lane_admission(ctx, pred_sids) {
+        return Ok(plan);
     }
     let mut merged: Vec<fluree_db_binary_index::read::types::OverlayOp> = Vec::new();
     for pred_sid in pred_sids {
@@ -3694,7 +3683,7 @@ fn allow_fast_path(ctx: &ExecutionContext<'_>) -> bool {
 /// unfiltered).
 #[inline]
 fn fast_path_eligible_no_policy(ctx: &ExecutionContext<'_>) -> bool {
-    !ctx.is_multi_ledger() && ctx.from_t.is_none() && !overlay_has_novelty(ctx)
+    !ctx.is_multi_ledger() && !ctx.is_history_range() && !overlay_has_novelty(ctx)
 }
 
 /// True when the overlay can still contribute flakes.
@@ -3756,7 +3745,7 @@ pub fn fast_path_store_policy_cleared<'a>(
 /// at the planner level.
 #[inline]
 pub fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    !ctx.is_multi_ledger() && ctx.from_t.is_none() && ctx.allow_unfiltered()
+    !ctx.is_multi_ledger() && !ctx.is_history_range() && ctx.allow_unfiltered()
 }
 
 /// Verdict for a single-predicate cursor fast path under a view policy, returned
@@ -3796,7 +3785,7 @@ pub fn cursor_fast_path_for_predicate(
     ctx: &ExecutionContext<'_>,
     pred_sid: &Sid,
 ) -> PredicateFastPath {
-    if ctx.is_multi_ledger() || ctx.from_t.is_some() {
+    if ctx.is_multi_ledger() || ctx.is_history_range() {
         return PredicateFastPath::Decline;
     }
     // No policy or root: nothing to filter, run the fast path unfiltered.

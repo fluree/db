@@ -19,6 +19,14 @@
 //!   annotation sources an HTTP client can reach. Its non-zero case needs the
 //!   base-index scan, which requires a process-global env var, so it lives in
 //!   the standalone `export_scan_source` target.
+//! - `x-fluree-export-annotations-out-of-scope` — emitted, and asserted
+//!   absent, but **not asserted non-zero**. The counter is
+//!   `named − in_scope`: a reifier a marker pointed at whose own bundle the
+//!   export never saw. The write path co-locates the two — an annotation's
+//!   `f:reifies*` rows are written into the same graph as the edge they
+//!   describe (`EdgeKey::to_reifies_facts`) — so no selection of graphs can
+//!   include the marker and exclude the bundle. Like the two below, it is a
+//!   corruption-class guard rather than a reachable state.
 //! - `x-fluree-export-rows-skipped` — asserted absent. Every site that
 //!   increments it is a dictionary miss (a subject or predicate id with no
 //!   IRI), which no well-formed request produces; reaching it over the wire
@@ -280,4 +288,54 @@ async fn an_annotated_named_graph_resolves_from_both_reachable_sources() {
             "{stage}: nothing was dropped, so nothing to report; headers: {headers:?}"
         );
     }
+}
+
+/// A targeted single-graph export has omitted nothing.
+///
+/// `omitted_named_graph_count` only zeroed under `all_graphs`, so asking for
+/// one graph by IRI reported every *other* user graph as omitted — a client
+/// acting on that header saw a false positive on every targeted request.
+/// The CLI gates the same warning on `all_graphs || graph.is_some()` and
+/// correctly stays quiet; the two surfaces now agree.
+#[tokio::test]
+async fn a_targeted_single_graph_export_reports_no_omission() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "tgt:main").await;
+    upsert_trig(
+        &app,
+        "tgt:main",
+        "@prefix ex: <http://example.org/> .\n\
+         GRAPH <http://example.org/g1> { ex:a ex:p \"in-g1\" . }\n\
+         GRAPH <http://example.org/g2> { ex:b ex:p \"in-g2\" . }\n\
+         GRAPH <http://example.org/g3> { ex:c ex:p \"in-g3\" . }\n",
+    )
+    .await;
+
+    let (status, headers, body) = export(
+        &app,
+        "tgt:main",
+        json!({ "format": "trig", "graph": "http://example.org/g1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("in-g1"),
+        "the requested graph must be in the body, or the absence below is vacuous: {body}"
+    );
+    assert!(!body.contains("in-g2"), "only the requested graph: {body}");
+    assert_eq!(
+        header(&headers, OMITTED),
+        None,
+        "a targeted export dropped nothing it was asked for; headers: {headers:?}"
+    );
+
+    // The untargeted default-graph-only export still reports, which is the
+    // case the header exists for and the control that keeps this honest.
+    let (_, headers, _) = export(&app, "tgt:main", json!({ "format": "trig" })).await;
+    assert_eq!(
+        header(&headers, OMITTED).as_deref(),
+        Some("3"),
+        "an unasked-for drop must still be reported; headers: {headers:?}"
+    );
 }

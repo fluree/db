@@ -536,7 +536,7 @@ fn overlay_lane_eligible(ctx: &crate::context::ExecutionContext<'_>) -> bool {
         .as_ref()
         .is_some_and(|store| ctx.to_t >= store.max_t())
         && !ctx.is_multi_ledger()
-        && ctx.from_t.is_none()
+        && !ctx.is_history_range()
         && ctx.allow_unfiltered()
         && crate::fast_path_common::overlay_has_novelty(ctx)
 }

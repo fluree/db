@@ -1737,30 +1737,17 @@ impl NestedLoopJoinOperator {
     /// object. Decline cases route to the overlay-correct per-row fallback
     /// BEFORE any accumulation, so a flush never reroutes mid-stream.
     fn compute_batched_overlay_mode(&self, ctx: &ExecutionContext<'_>) -> Result<ProbeLanePlan> {
-        // BEFORE the overlay-free return: the batched lanes read raw leaflets in
-        // `Clean` mode too and never run per-leaf `filter_flakes` policy
-        // filtering, so a policy that can touch the probed predicate must
-        // decline regardless of novelty state. This mirrors the same ordering
-        // in `subject_probe_lane_plan` / `object_probe_lane_plan`; without it
-        // this early `Clean` return would bypass their (correctly gated)
-        // decision.
-        if !ctx.allow_unfiltered() {
-            let clears = self.batched_predicate.as_ref().is_some_and(|pred| {
-                matches!(
-                    crate::fast_path_common::policy_lane_for_predicate(
-                        ctx,
-                        pred,
-                        crate::fast_path_common::POLICY_PREDICATE_PROBE_SITE,
-                    ),
-                    crate::fast_path_common::PredicateFastPath::Allow
-                )
-            });
-            if !clears {
-                return Ok(ProbeLanePlan::Decline);
-            }
-        }
-        if ctx.overlay_free_single_graph() {
-            return Ok(ProbeLanePlan::Clean);
+        // The lane planners' own admission, so an overlay-free graph settles
+        // as `Clean` without needing a store — and its history and policy
+        // gates run before that `Clean` regardless of eligibility. With no
+        // batched predicate there is nothing for a policy to clear, and the
+        // empty set declines under any non-root policy.
+        let preds: &[&Sid] = match self.batched_predicate.as_ref() {
+            Some(pred) => &[pred],
+            None => &[],
+        };
+        if let Some(plan) = crate::fast_path_common::probe_lane_admission(ctx, preds) {
+            return Ok(plan);
         }
         if !(self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
         {
