@@ -368,14 +368,41 @@ pub(crate) async fn scan_base_index_for_attachment_events_in(
     for (id, _) in snapshot.graph_registry.iter_entries() {
         graph_ids.insert(id);
     }
-    let graph_ids: Vec<fluree_db_core::GraphId> = graph_ids.into_iter().collect();
+
+    // Pair each graph with the `Sid` of its IRI, because the rows we are
+    // about to read will not carry one.
+    //
+    // The base-index reader does not put a graph on the flakes it decodes —
+    // the graph rides on the query's `g_id`, not the row, so
+    // `fluree-db-query`'s range decoder builds every `Flake` with `g: None`.
+    // `EdgeKey::from_reifies_facts` cross-checks the `f:reifiesGraph` object
+    // against the bundle's flake-level `g`, treating disagreement as a forged
+    // bundle. A named-graph bundle read from the base index therefore says
+    // "I reify g1" on one axis and "I live in the default graph" on the
+    // other, and is rejected as `GraphMismatch`.
+    //
+    // We know exactly which graph we asked for, so stamp it back on below
+    // before decoding. Doing it here rather than in the decoder keeps the
+    // cost on this scan instead of on every flake of every query, and leaves
+    // the decoder's tamper check intact: a bundle whose `f:reifiesGraph`
+    // names a *different* graph than the one it was read from still fails.
+    let graphs: Vec<(fluree_db_core::GraphId, Option<Sid>)> = graph_ids
+        .into_iter()
+        .map(|id| {
+            let graph_sid = (id != 0)
+                .then(|| snapshot.graph_registry.iri_for_graph_id(id))
+                .flatten()
+                .and_then(|iri| snapshot.encode_iri(iri));
+            (id, graph_sid)
+        })
+        .collect();
 
     let to_t = t.max(snapshot.t);
 
     let mut events: Vec<(EdgeKey, Sid, i64, bool)> = Vec::new();
     let mut seen: HashSet<(fluree_db_core::GraphId, Sid, i64)> = HashSet::new();
 
-    for g_id in graph_ids {
+    for (g_id, graph_sid) in graphs {
         // Collect every `f:reifies*` flake in this graph by walking
         // each reserved predicate in turn (PSOT). We group in
         // memory by annotation SID, which sidesteps a SPOT-scan
@@ -422,11 +449,16 @@ pub(crate) async fn scan_base_index_for_attachment_events_in(
                     return None;
                 }
             };
-            for f in flakes {
+            for mut f in flakes {
                 if !f.op {
                     // Skip retracted f:reifies* events: the seal pass
                     // only cares about currently-live bundles.
                     continue;
+                }
+                // Base-index rows arrive with no graph; overlay rows already
+                // carry the right one. Fill only what the reader omitted.
+                if f.g.is_none() {
+                    f.g = graph_sid.clone();
                 }
                 by_ann.entry((f.s.clone(), f.t)).or_default().push(f);
             }
@@ -445,8 +477,25 @@ pub(crate) async fn scan_base_index_for_attachment_events_in(
             // trustworthy on the arena's `t` axis without a separate
             // f:reifiesSubject lookup. The arena builder applies
             // (t, op) latest-wins across the emitted events.
-            let Ok(edge_key) = EdgeKey::from_reifies_facts(&bundle) else {
-                continue;
+            let edge_key = match EdgeKey::from_reifies_facts(&bundle) {
+                Ok(edge_key) => edge_key,
+                Err(e) => {
+                    // Every variant of this error means "malformed or
+                    // tampered bundle", and dropping it silently is how the
+                    // named-graph defect above stayed invisible. The rows
+                    // stay readable as ordinary RDF; what is lost is the
+                    // edge attachment, so say which annotation and why.
+                    tracing::warn!(
+                        error = %e,
+                        ?g_id,
+                        annotation = %ann_sid,
+                        t = group_t,
+                        "scan_base_index_for_attachment_events: skipping malformed \
+                         annotation bundle; its f:reifies* rows remain readable as \
+                         ordinary RDF but this edge attachment will not be sealed"
+                    );
+                    continue;
+                }
             };
             events.push((edge_key, ann_sid, group_t, /* op = */ true));
         }

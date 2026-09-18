@@ -2493,13 +2493,17 @@ fn export_without_annotations_is_unchanged() {
         .stdout(predicate::str::contains("~").not());
 }
 
-/// An annotation written inside a named graph is not represented in the
-/// output today: the forward lookup export uses is blind to named graphs,
-/// though the rows are in the ledger and SPARQL reads them. Export must say
-/// so — suppressing the `f:reifies*` rows and then emitting no marker is
-/// exactly the silent truncation this work exists to remove.
+/// An annotation written inside a named graph exports like any other.
+///
+/// It did not, until #1882: the seal scan reads bundles out of the base
+/// index, and the base-index reader does not put a graph on the rows it
+/// decodes — the graph rides on the query's `g_id`, not the row. The
+/// decoder cross-checks `f:reifiesGraph` against the flake-level graph and
+/// read the disagreement as a forged bundle, so every named-graph
+/// annotation was dropped on the floor with no marker emitted. This is the
+/// user-facing shape of that fix, and the reason #1859's last gap closed.
 #[test]
-fn export_reports_annotations_it_could_not_resolve() {
+fn a_named_graph_annotation_exports_with_its_marker() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     let src = tmp.path().join("gann-src");
@@ -2521,12 +2525,14 @@ fn export_reports_annotations_it_could_not_resolve() {
         .args(["export", "gann", "--format", "trig", "--all-graphs"])
         .assert()
         .success()
-        .stderr(predicate::str::contains(
-            "1 edge annotations could not be resolved",
-        ))
-        .stderr(predicate::str::contains("--raw-reifies"));
+        // The marker, inline on the edge it annotates.
+        .stdout(predicate::str::contains("ex:p ex:y ~ ex:cG"))
+        // And the reifier's own description, so the annotation is usable.
+        .stdout(predicate::str::contains("ex:src ex:d"))
+        // Nothing was dropped, so nothing is reported.
+        .stderr(predicate::str::contains("could not be resolved").not());
 
-    // And the named remedy works: the bundle comes out verbatim.
+    // `--raw-reifies` still emits the bundle verbatim for pinned consumers.
     fluree_cmd(&tmp)
         .args([
             "export",

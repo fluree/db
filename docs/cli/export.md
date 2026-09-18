@@ -84,14 +84,16 @@ ex:claim1
 
 A ledger that has never carried an annotation pays nothing for any of this: export reads one flag on the snapshot and runs the scan it always ran.
 
-**Known limit.** Annotations written *inside a named graph* are resolved correctly when export reads them from the sealed annotation arena or from the novelty overlay. They are dropped when export falls back to the **base-index scan**, which is blind to them — the fallback taken by a ledger whose index reports annotations but for which no arena was sealed. SPARQL reads them in every case. Export says so rather than dropping them quietly:
+Annotations written *inside a named graph* export like any other. They did not before 4.2: export can resolve annotations from a sealed arena, the novelty overlay, or a base-index scan, and the scan alone dropped them — it reads the bundle correctly, but the base-index reader does not put a graph on the rows it decodes, so the decoder saw the bundle's `f:reifiesGraph` disagree with its flake-level graph and rejected it as forged. All three sources now agree.
+
+When export does suppress an annotation it cannot then represent — a bundle the decoder rejects as malformed — it says so rather than dropping it quietly:
 
 ```
   warning: 1 edge annotations could not be resolved and are NOT in the output;
            re-run with --raw-reifies to emit them as f:reifies* triples
 ```
 
-`FLUREE_EXPORT_ANNOTATION_SCAN=1` forces the base-index scan in place of the sealed annotation arena — how to compare the two sources without rebuilding an index. They agree except on annotations inside a named graph, which the arena resolves and the scan cannot see; forcing the scan on such a ledger produces the warning above.
+`FLUREE_EXPORT_ANNOTATION_SCAN=1` forces the base-index scan in place of the sealed annotation arena. The two sources should agree; this is how to check without rebuilding an index.
 
 ### Prefixes / Context
 
