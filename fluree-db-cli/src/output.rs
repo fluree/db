@@ -1,5 +1,5 @@
 use crate::detect::QueryFormat;
-use crate::error::CliResult;
+use crate::error::{CliError, CliResult};
 use comfy_table::{ContentArrangement, Table};
 use fluree_db_api::format::IriCompactor;
 use fluree_db_api::QueryResult;
@@ -529,14 +529,39 @@ fn format_jsonld_table(json: &serde_json::Value, limit: Option<usize>) -> CliRes
 
     // Collect all keys from all objects for column headers
     let mut columns: Vec<String> = Vec::new();
+    let mut saw_object = false;
     for obj in arr {
         if let Some(map) = obj.as_object() {
+            saw_object = true;
             for key in map.keys() {
                 if !columns.contains(key) {
                     columns.push(key.clone());
                 }
             }
         }
+    }
+
+    // Column discovery only understands JSON objects. Without this guard a
+    // non-object array — notably the array-of-arrays a JSON-LD SELECT returns —
+    // produced an empty header and empty cells: a `++`/`||` table under a
+    // footer truthfully reporting N rows (#1805). Callers reach this renderer
+    // only by passing `OutputFormatKind::Table` for a JSON-LD result, which
+    // `commands::query::json_path_display_format` exists to prevent; say so
+    // rather than rendering a table that silently drops every value.
+    if !saw_object {
+        return Err(CliError::Input(format!(
+            "cannot render this JSON-LD result as a table: expected an array of \
+             objects, found {total_rows} row(s) of {}. SELECT results are \
+             positional arrays and have no column names — use --format json. \
+             (A caller that reached this with a SELECT result skipped \
+             `json_path_display_format`.)",
+            match arr.first() {
+                Some(serde_json::Value::Array(_)) => "arrays",
+                Some(serde_json::Value::String(_)) => "strings",
+                Some(serde_json::Value::Null) => "nulls",
+                _ => "scalars",
+            }
+        )));
     }
 
     let mut table = Table::new();
@@ -584,6 +609,62 @@ mod tests {
     use serde_json::json;
 
     const LEDGER: &str = "cli/table-novelty:main";
+
+    // ---- #1805 secondary: the JSON-LD table renderer's input contract ------
+
+    /// A JSON-LD SELECT result is an array of positional *arrays*, not of
+    /// objects. `format_jsonld_table` discovers columns by `as_object()`, so
+    /// such a result yielded no columns, no header and no cells — a `++`/`||`
+    /// table under a footer that truthfully said "(2 rows)". Callers are meant
+    /// to coerce JSON-LD to `--format json` via
+    /// `commands::query::json_path_display_format`; one remote call site did
+    /// not. Renderer-side this must be a diagnostic, not an empty table.
+    #[test]
+    fn jsonld_table_rejects_select_rows_instead_of_rendering_them_empty() {
+        let select_rows = json!([["ex:e1", "v1"], ["ex:e2", "v2"]]);
+        let err = match format_jsonld_table(&select_rows, None) {
+            Err(e) => e.to_string(),
+            Ok(out) => panic!(
+                "array-of-arrays must not render as a table; got:\n{}",
+                out.text
+            ),
+        };
+        assert!(err.contains("array of"), "got: {err}");
+        assert!(err.contains("--format json"), "must suggest the fix: {err}");
+        assert!(
+            err.contains("json_path_display_format"),
+            "must name the guard the caller skipped: {err}"
+        );
+    }
+
+    /// Non-object scalars are equally unrenderable and must be reported, not
+    /// silently blanked.
+    #[test]
+    fn jsonld_table_rejects_scalar_rows() {
+        assert!(format_jsonld_table(&json!([1, 2, 3]), None).is_err());
+        assert!(format_jsonld_table(&json!(["a", "b"]), None).is_err());
+    }
+
+    /// The guard must not fire on what the renderer is actually for. An empty
+    /// array and a non-array both have their own early returns above it, and an
+    /// object array renders as before even when some rows lack some keys.
+    #[test]
+    fn jsonld_table_still_renders_node_objects() {
+        let out = format_jsonld_table(
+            &json!([{"@id": "ex:e1", "ex:v": "v1"}, {"@id": "ex:e2"}]),
+            None,
+        )
+        .expect("object rows must still render");
+        assert_eq!(out.total_rows, 2);
+        assert!(out.text.contains("ex:e1"), "got: {}", out.text);
+        assert!(out.text.contains("v1"), "got: {}", out.text);
+
+        assert_eq!(
+            format_jsonld_table(&json!([]), None).unwrap().text,
+            "(empty result set)"
+        );
+        assert!(format_jsonld_table(&json!({"a": 1}), None).is_ok());
+    }
 
     /// Base data (indexed) plus a subject that lands only in novelty.
     ///

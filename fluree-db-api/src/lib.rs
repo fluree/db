@@ -150,7 +150,7 @@ pub use commit_transfer::{
 };
 pub use dataset::{
     sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
-    TimeSpec,
+    TimeSpec, ACCEPTED_TIME_SPEC_SPELLINGS,
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result, TargetTally};
 pub use fluree_db_core::ledger_id::format_ledger_id;
