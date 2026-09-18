@@ -24,6 +24,7 @@
 
 pub mod ast;
 pub mod diag;
+pub mod keywords;
 pub mod lex;
 pub mod params;
 pub mod parse;
@@ -35,6 +36,7 @@ pub mod lower;
 
 pub use ast::CypherAst;
 pub use diag::{DiagCode, Diagnostic, ParseOutput, Severity};
+pub use keywords::reserved_keyword_message;
 pub use params::{substitute_params, ParamError, ParamMap};
 pub use parse::parse_cypher;
 pub use span::SourceSpan;

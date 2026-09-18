@@ -435,6 +435,47 @@ impl<'a> CypherLowering<'a> {
         Ok(())
     }
 
+    /// Reject a `WITH … AS v` before a write clause when `v` is already bound
+    /// by a preceding read clause, or already assigned by an earlier item in
+    /// the same `WITH`.
+    ///
+    /// Same defect as the read-path guard in `fluree-db-cypher`
+    /// (`lower/stmt.rs`, `ProjectionState::check_alias`), reached through a
+    /// second, independent lowering: the alias interns to the already-bound
+    /// variable's own VarId, so the projection emits a `Pattern::Bind` onto a
+    /// bound variable and `BindOperator`'s clobber prevention turns it into
+    /// `WHERE v = expr`. On the write path that is strictly worse than a wrong
+    /// answer — every row is dropped, so the Update's WHERE matches nothing and
+    /// the transaction COMMITS, reports no error, and writes nothing.
+    ///
+    /// `self.bound_vars` is still the pre-`WITH` scope here (it is narrowed to
+    /// `horizon` only after the whole projection is lowered), so this is the
+    /// clause-entry snapshot the check needs. The pass-through forms `WITH a`
+    /// and `WITH a AS a` never reach here — they carry the binding forward
+    /// unchanged rather than assigning onto it.
+    fn check_with_alias(
+        &self,
+        alias: &str,
+        horizon: &std::collections::HashSet<String>,
+    ) -> Result<(), LowerCypherError> {
+        if horizon.contains(alias) {
+            return Err(LowerCypherError::rejected(format!(
+                "WITH assigns `{alias}` twice — two projected columns cannot share one output \
+                 name, the second would silently overwrite the first. Give each item a distinct \
+                 name (e.g. `AS {alias}2`)."
+            )));
+        }
+        if self.bound_vars.contains(alias) {
+            return Err(LowerCypherError::rejected(format!(
+                "WITH alias `{alias}` is already bound by an earlier clause — assigning onto it \
+                 would silently drop every row, so the write would commit without error and \
+                 without writing anything. Alias to a name that is not already bound (e.g. \
+                 `AS {alias}_value`)."
+            )));
+        }
+        Ok(())
+    }
+
     /// Lower a `WITH` projection that precedes a write clause. This is the
     /// **horizon subset** that maps cleanly onto the where-pattern stream:
     /// pass-through variables, renames, and computed (non-aggregate) aliases
@@ -479,6 +520,7 @@ impl<'a> CypherLowering<'a> {
                         }
                         // Rename (`WITH a AS b`).
                         Some(a) => {
+                            self.check_with_alias(&a, &horizon)?;
                             binds.push(UnresolvedPattern::Bind {
                                 var: Arc::from(var_name(&a).as_str()),
                                 expr: UnresolvedExpression::var(var_name(&v.name)),
@@ -497,6 +539,7 @@ impl<'a> CypherLowering<'a> {
                              (`<expr> AS name`)",
                         ));
                     };
+                    self.check_with_alias(&a, &horizon)?;
                     let mut aux = Vec::new();
                     let expr = self.lower_filter_expr(other, &mut aux)?;
                     self.where_patterns.append(&mut aux);
@@ -582,7 +625,7 @@ impl<'a> CypherLowering<'a> {
 
         // Labels — `?n rdf:type <label>`.
         for Label { name, .. } in &n.labels {
-            let label_iri = self.resolve_iri(name);
+            let label_iri = self.resolve_label(name)?;
             out.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
                 s: subj.clone(),
                 p: UnresolvedTerm::Iri(Arc::from(rdf::TYPE)),
@@ -979,7 +1022,7 @@ impl<'a> CypherLowering<'a> {
                     let subj = self.var_term(&target.name);
                     let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
                     for label in labels {
-                        let iri = self.resolve_iri(label);
+                        let iri = self.resolve_label(label)?;
                         let label_sid = self.ns.sid_for_iri(&iri);
                         self.insert_templates.push(TripleTemplate::new(
                             subj.clone(),
@@ -1101,7 +1144,7 @@ impl<'a> CypherLowering<'a> {
                     let subj = self.var_term(&target.name);
                     let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
                     for label in labels {
-                        let iri = self.resolve_iri(label);
+                        let iri = self.resolve_label(label)?;
                         let label_sid = self.ns.sid_for_iri(&iri);
                         self.delete_templates.push(TripleTemplate::new(
                             subj.clone(),
@@ -1465,7 +1508,7 @@ impl<'a> CypherLowering<'a> {
     ) -> Result<Vec<UnresolvedPattern>, LowerCypherError> {
         let mut guard = Vec::new();
         for Label { name, .. } in &node.labels {
-            let label_iri = self.resolve_iri(name);
+            let label_iri = self.resolve_label(name)?;
             guard.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
                 s: probe.clone(),
                 p: UnresolvedTerm::Iri(Arc::from(rdf::TYPE)),
@@ -1550,7 +1593,7 @@ impl<'a> CypherLowering<'a> {
                 }
                 let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
                 for label in labels {
-                    let iri = self.resolve_iri(label);
+                    let iri = self.resolve_label(label)?;
                     let sid = self.ns.sid_for_iri(&iri);
                     self.insert_templates.push(TripleTemplate::new(
                         subj.clone(),
@@ -1677,7 +1720,7 @@ impl<'a> CypherLowering<'a> {
         // Labels — emit (n, rdf:type, label_iri).
         let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
         for Label { name, .. } in &n.labels {
-            let iri = self.resolve_iri(name);
+            let iri = self.resolve_label(name)?;
             let label_sid = self.ns.sid_for_iri(&iri);
             self.insert_templates.push(TripleTemplate::new(
                 subj.clone(),
@@ -2003,8 +2046,36 @@ impl<'a> CypherLowering<'a> {
         }
     }
 
+    /// Resolve a node label, rejecting the same reserved names a predicate
+    /// rejects. See `LoweringContext::resolve_label` in `fluree-db-cypher`;
+    /// the write path had the same gap at six sites, and ``SET n:`@type` ``
+    /// was the sharp end — it committed, after which `labels(n)` read back
+    /// `["Person", "@type"]`.
+    fn resolve_label(&self, name: &str) -> Result<String, LowerCypherError> {
+        self.resolve_predicate(name)
+    }
+
+    /// Resolve and reject reserved predicates — Fluree's own `f:reifies*`
+    /// system predicates, and the JSON-LD keywords (`@id`, `@type`, …) that
+    /// are not Cypher properties.
+    ///
+    /// The keyword check matters more here than on the read side: unchecked,
+    /// `CREATE (n {`@id`: "x"})` and `SET n.`@type` = "T"` COMMIT, storing a
+    /// literal predicate spelled `@id` / `@type` while leaving the node's real
+    /// identity and labels untouched. It runs on the *bare* name, before
+    /// `@vocab` expansion. See `fluree_db_cypher::keywords`.
     fn resolve_predicate(&self, name: &str) -> Result<String, LowerCypherError> {
+        if let Some(msg) = fluree_db_cypher::reserved_keyword_message(name) {
+            return Err(LowerCypherError::rejected(msg));
+        }
         let iri = self.resolve_iri(name);
+        // A keyword reached through the context (`{"id": "@id"}`) — see the
+        // read-side twin in `fluree-db-cypher`'s `LoweringContext`.
+        if let Some(msg) = fluree_db_cypher::reserved_keyword_message(&iri) {
+            return Err(LowerCypherError::rejected(format!(
+                "`{name}` resolves through the ledger's context to `{iri}` — {msg}"
+            )));
+        }
         if reifies_iris::ALL.iter().any(|x| *x == iri) {
             return Err(LowerCypherError::ReservedPredicate(iri));
         }

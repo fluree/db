@@ -300,12 +300,18 @@ fn lower_single_branch_inner<E: IriEncoder>(
                 patterns.push(Pattern::Optional(inner));
             }
             ReadClause::With(w) => {
-                let subq = lower_with(ctx, w, std::mem::take(&mut patterns))?;
+                let outer = if narrowed { &[][..] } else { outer_scope };
+                let subq = lower_with(ctx, w, std::mem::take(&mut patterns), outer)?;
                 patterns.push(Pattern::Subquery(subq));
                 narrowed = true;
             }
             ReadClause::Unwind(u) => {
-                patterns.push(lower_unwind(ctx, u)?);
+                // `&patterns` ends before the push; `lower_unwind` needs the
+                // clause-entry scope to decide whether the constant-list
+                // shortcut is sound.
+                let outer = if narrowed { &[][..] } else { outer_scope };
+                let unwound = lower_unwind(ctx, u, &patterns, outer)?;
+                patterns.push(unwound);
             }
             ReadClause::CallSubquery(call) => {
                 // Pipeline clause: outer rows flow INTO the subquery and its
@@ -334,8 +340,12 @@ fn lower_single_branch_inner<E: IriEncoder>(
         }
     }
 
-    let (output, ordering, limit, offset, group_keys, aggregates, post_binds) =
-        lower_return(ctx, &q.return_clause, &mut patterns)?;
+    let (output, ordering, limit, offset, group_keys, aggregates, post_binds) = lower_return(
+        ctx,
+        &q.return_clause,
+        &mut patterns,
+        if narrowed { &[] } else { outer_scope },
+    )?;
 
     // When the projection mixes aggregates with non-aggregate items,
     // the non-aggregates become GROUP BY keys (Cypher's implicit
@@ -367,8 +377,9 @@ fn lower_return<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     r: &ReturnClause,
     patterns: &mut Vec<Pattern>,
+    outer: &[VarId],
 ) -> Result<LoweredReturn> {
-    let mut projection = ProjectionState::new();
+    let mut projection = ProjectionState::new(ctx, "RETURN", patterns, outer, &r.items);
     for item in &r.items {
         projection.add_item(ctx, patterns, item)?;
     }
@@ -446,10 +457,48 @@ struct ProjectionState {
     /// Counter for synthetic per-aggregate output vars lifted out of composite
     /// expressions (`?#__agg_N`).
     agg_name_counter: u32,
+    /// The clause keyword this projection belongs to (`"RETURN"` / `"WITH"`),
+    /// used only to word the alias-collision errors.
+    clause: &'static str,
+    /// Variables already bound when the clause was *entered* — the snapshot the
+    /// alias guard tests against. See [`ProjectionState::check_alias`] for why
+    /// this is a clause-entry snapshot rather than a read of the registry or a
+    /// per-item recomputation.
+    in_scope: std::collections::HashSet<VarId>,
+    /// Output VarIds assigned by an earlier `AS` item in this same clause, so a
+    /// projection that names one output column twice is rejected rather than
+    /// silently emitting one column under two headers.
+    assigned: std::collections::HashSet<VarId>,
 }
 
 impl ProjectionState {
-    fn new() -> Self {
+    /// `items` is read only to decide whether the clause-entry scope snapshot
+    /// is needed at all: a projection with no `AS` item can never collide, so
+    /// the `visible_vars_from_patterns` walk is skipped entirely. Mirrors
+    /// `check_select_aliases` in `fluree-db-sparql`, which returns before its
+    /// in-scope walk for the same reason.
+    fn new<E: IriEncoder>(
+        ctx: &LoweringContext<'_, E>,
+        clause: &'static str,
+        patterns: &[Pattern],
+        outer: &[VarId],
+        items: &[ProjectionItem],
+    ) -> Self {
+        // `outer` is the enclosing scope a `CALL { … }` body imports. It is
+        // not in `patterns` — a CALL body starts with `patterns = []` and the
+        // imported variables are seeded per parent row by `SubqueryOperator`
+        // — so without it an imported name was invisible here, and
+        // `CALL (a) { WITH a.name AS a RETURN a AS z }` clobber-dropped every
+        // row. That is fluree/db#1857's own shape, inside the construct whose
+        // pre-existing guard this change generalises.
+        let in_scope = if items.iter().any(|i| i.alias.is_some()) {
+            visible_vars_from_patterns(ctx, patterns)
+                .into_iter()
+                .chain(outer.iter().copied())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         Self {
             vars: Vec::new(),
             group_keys: Vec::new(),
@@ -459,7 +508,100 @@ impl ProjectionState {
             list_outputs: std::collections::HashSet::new(),
             post_binds: Vec::new(),
             agg_name_counter: 0,
+            clause,
+            in_scope,
+            assigned: std::collections::HashSet::new(),
         }
+    }
+
+    /// Claim an output column name for this clause, rejecting a second item
+    /// that would produce the same one.
+    ///
+    /// Covers bare and unaliased items as well as aliases: `RETURN a, a`,
+    /// `RETURN a AS a, a` and `RETURN a.name, a.name` all emit two headers
+    /// backed by one `VarId`, which any client keying results by column name
+    /// reads as one column. Neo4j rejects all of them ("Multiple result
+    /// columns with the same name are not supported"). The unaliased label
+    /// comes from `projection_label`, which is pure — the synthetic
+    /// `?#__ret_N` fallback is skipped because it is unique by construction
+    /// and asking for it here would double-bump the counter.
+    fn claim_output<E: IriEncoder>(
+        &mut self,
+        ctx: &mut LoweringContext<'_, E>,
+        id: VarId,
+    ) -> Result<()> {
+        if self.assigned.insert(id) {
+            return Ok(());
+        }
+        let clause = self.clause;
+        let name = ctx
+            .vars
+            .try_name(id)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("?v{}", id.0));
+        Err(LowerError::generic(format!(
+            "{clause} produces the output name `{name}` twice — two projected columns cannot \
+             share one name, the second would silently overwrite the first. Give each item a \
+             distinct name (e.g. `AS {name}2`)."
+        )))
+    }
+
+    /// Reject a `RETURN` / `WITH` alias that would assign onto a variable the
+    /// clause already has in scope, or onto one an earlier item in the same
+    /// clause already assigned.
+    ///
+    /// An alias interns through the statement-wide `VarRegistry`, which is a
+    /// name↔id *bijection* (`fluree-db-query/src/var_registry.rs`). So
+    /// `RETURN expr AS v` where `v` is already bound does not mint a new
+    /// column — it emits a `Pattern::Bind` onto the *bound* variable, and
+    /// `BindOperator`'s deliberate clobber prevention
+    /// (`fluree-db-query/src/bind.rs`) then either drops the row (the computed
+    /// value differs from the existing binding) or keeps the old value (the
+    /// computed value is unbound). Either way the projection is silently
+    /// `WHERE v = expr`, projecting `v`. This is the same failure the
+    /// CALL-subquery guard in `lower_call_branch` diagnoses and rejects; it
+    /// was simply never generalized to the top-level projection.
+    ///
+    /// Three details this guard has to get right:
+    ///
+    /// 1. `in_scope` is snapshotted at **clause entry**, not read from the
+    ///    registry. `WITH pair[0] AS x, pair[1] AS y … OPTIONAL MATCH (x)-[…]->(y)`
+    ///    is legal and common: the pattern binds `x`/`y` *after* the alias
+    ///    assigns them. A registry-wide check would reject it.
+    /// 2. The snapshot is taken **once per clause**, not per item — `add_item`
+    ///    pushes its own auxiliary `Optional`/`Bind` patterns into the same
+    ///    list, so a per-item recomputation would see item N-1's own bind as
+    ///    "already in scope".
+    /// 3. The identity projection `v AS v` is exempt from the in-scope arm. It
+    ///    binds `v` to itself, so the computed value always equals the existing
+    ///    one and no row is dropped; `WITH a AS a, b AS b` is the idiomatic way
+    ///    to carry names across a scope boundary.
+    ///
+    /// Synthetic `?#__*` variables cannot false-trigger: an alias is a
+    /// user-written identifier, and `visible_vars_from_patterns` filters the
+    /// synthetic names out of the snapshot anyway.
+    fn check_alias<E: IriEncoder>(
+        &mut self,
+        ctx: &mut LoweringContext<'_, E>,
+        item: &ProjectionItem,
+    ) -> Result<()> {
+        let Some(alias) = &item.alias else {
+            return Ok(());
+        };
+        let alias_id = ctx.intern_var(&alias.name);
+        self.claim_output(ctx, alias_id)?;
+        let clause = self.clause;
+        let is_identity = matches!(&item.expr, Expr::Var(v) if v.name == alias.name);
+        if !is_identity && self.in_scope.contains(&alias_id) {
+            return Err(LowerError::generic(format!(
+                "{clause} alias `{name}` is already bound by an earlier clause — assigning \
+                 onto it would silently drop rows or discard the projected value instead of \
+                 returning it. Alias to a name that is not already bound (e.g. \
+                 `AS {name}_value`).",
+                name = alias.name
+            )));
+        }
+        Ok(())
     }
 
     fn add_item<E: IriEncoder>(
@@ -475,9 +617,20 @@ impl ProjectionState {
             }
             if item.alias.is_none() {
                 let id = ctx.intern_var(&v.name);
+                self.claim_output(ctx, id)?;
                 self.vars.push(id);
                 self.group_keys.push(id);
                 return Ok(());
+            }
+        }
+        // Every remaining path below mints the item's output VarId from the
+        // alias and emits a `Bind` (or an aggregate spec) onto it, so the
+        // collision guard belongs here — once, ahead of all of them.
+        self.check_alias(ctx, item)?;
+        if item.alias.is_none() {
+            if let Some(label) = projection_label(&item.expr) {
+                let id = ctx.intern_var(&label);
+                self.claim_output(ctx, id)?;
             }
         }
         if let Expr::Call(call) = &item.expr {
@@ -1197,8 +1350,9 @@ fn lower_with<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     w: &WithClause,
     mut inner_patterns: Vec<Pattern>,
+    outer: &[VarId],
 ) -> Result<SubqueryPattern> {
-    let mut projection = ProjectionState::new();
+    let mut projection = ProjectionState::new(ctx, "WITH", &inner_patterns, outer, &w.items);
     for item in &w.items {
         projection.add_item(ctx, &mut inner_patterns, item)?;
     }
@@ -1595,12 +1749,50 @@ fn visible_vars_from_patterns<E: IriEncoder>(
 fn lower_unwind<E: IriEncoder>(
     ctx: &mut LoweringContext<'_, E>,
     u: &UnwindClause,
+    scope: &[Pattern],
+    outer: &[VarId],
 ) -> Result<Pattern> {
     let alias = ctx.intern_var(&u.alias.name);
 
     // A constant inline list lowers to `Values` (one row per element). Any
     // other (runtime) expression — `UNWIND nodes(path) AS n`, `UNWIND range(..)`
     // — lowers to a `Pattern::Unwind` that the operator explodes per input row.
+    //
+    // `UNWIND … AS v` introduces a NEW binding, so an alias that is already
+    // bound is the same collision fluree/db#1857 is about, one clause over —
+    // and it was silently dropping every row:
+    //
+    //     MATCH (a)-[r:KNOWS]->(b) UNWIND [1, 2, 3] AS a RETURN a   -> 0 rows
+    //     MATCH (a)-[r:KNOWS]->(b) UNWIND range(1, 3) AS a RETURN a -> 0 rows
+    //     MATCH (a)-[r:KNOWS]->(b) UNWIND labels(a) AS a RETURN a   -> 3 rows
+    //
+    // The boundary is NOT constant-list vs runtime expression, which is the
+    // obvious guess and is wrong — `range(1, 3)` is a runtime expression and
+    // still drops. It is whether the list expression REFERENCES the alias.
+    // `labels(a)` does, so the planner must keep the `Unwind` downstream of
+    // the MATCH, where `UnwindOperator` shadows the column as openCypher
+    // wants. An uncorrelated list can float above the MATCH, where the alias
+    // is not yet in the child schema, so the operator appends a new column
+    // instead of shadowing and the join against the bound value matches
+    // nothing.
+    //
+    // So the one case that works does so by accident of plan ordering, which
+    // is not a property the lowering can promise. Rejecting the whole shape is
+    // one rule rather than a rule about plan shape, and it is what the rest of
+    // this change does with the same collision. No in-repo query uses the
+    // shape. Making it work for real means keeping an uncorrelated `Unwind`
+    // pinned below its MATCH, which is a planner change, not a lowering one.
+    // `outer` covers a name a `CALL { … }` body imports — see
+    // `ProjectionState::new`.
+    if outer.contains(&alias) || visible_vars_from_patterns(ctx, scope).contains(&alias) {
+        return Err(LowerError::generic(format!(
+            "UNWIND alias `{}` is already bound by an earlier clause — UNWIND introduces a \
+             new binding, so assigning onto a bound name silently drops every row. Unwind \
+             into a name that is not already bound (e.g. `AS {}_item`).",
+            u.alias.name, u.alias.name
+        )));
+    }
+
     match &u.expr {
         Expr::List(items, _) if items.iter().all(|i| matches!(i, Expr::Lit(_))) => {
             let mut rows: Vec<Vec<Binding>> = Vec::with_capacity(items.len());

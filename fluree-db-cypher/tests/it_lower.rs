@@ -1451,3 +1451,260 @@ fn regex_match_binds_tighter_than_comparison() {
     let out = parse_cypher(r#"MATCH (n) WHERE (n.name =~ "a+") = true RETURN n"#);
     assert!(!out.has_errors(), "parse errors: {:?}", out.diagnostics);
 }
+
+// ===========================================================================
+// fluree/db#1857 — a RETURN/WITH alias colliding with an already-bound
+// pattern variable is silently `WHERE v = expr`, projecting `v`.
+//
+// An alias interns through the statement-wide `VarRegistry`, a name<->id
+// bijection, so `AS v` on a bound `v` emits `Pattern::Bind` onto a bound
+// variable and `BindOperator`'s clobber prevention either drops the row or
+// keeps the stale value. Lowering now rejects it.
+// ===========================================================================
+
+/// Lower and return the error message, asserting the statement parses.
+fn lower_error(src: &str) -> String {
+    let out = parse_cypher(src);
+    assert!(!out.has_errors(), "parse errors: {:?}", out.diagnostics);
+    let ast = out.ast.expect("ast");
+    let encoder = NoEncoder;
+    let mut vars = VarRegistry::new();
+    match lower_cypher(&ast, &encoder, &mut vars) {
+        Ok(_) => panic!("expected lowering to reject: {src}"),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn issue1857_return_alias_colliding_with_pattern_var_is_rejected() {
+    // The relationship variable, the source node, and a *different* node
+    // variable all take the same path — node-vs-relationship is not the
+    // discriminator, so all three must be rejected.
+    for (src, name) in [
+        ("MATCH (a)-[r:KNOWS]->(b) RETURN r.confidence AS r", "r"),
+        ("MATCH (a)-[r:KNOWS]->(b) RETURN a.name AS a", "a"),
+        ("MATCH (a)-[r:KNOWS]->(b) RETURN a.name AS b", "b"),
+        ("MATCH (a)-[r:KNOWS]->(b) RETURN id(a) AS a", "a"),
+        ("MATCH (a)-[r:KNOWS]->(b) RETURN a AS b", "b"),
+        ("MATCH (a)-[r:KNOWS]->(b) RETURN count(a) AS b", "b"),
+    ] {
+        let msg = lower_error(src);
+        assert!(
+            msg.contains(&format!("`{name}`")) && msg.contains("already bound"),
+            "message must name the colliding variable and say why: {msg} (for {src})"
+        );
+        assert!(
+            !msg.contains("unsupported in v1"),
+            "this is a user error, not a deferred feature: {msg}"
+        );
+    }
+}
+
+#[test]
+fn issue1857_with_alias_colliding_with_pattern_var_is_rejected() {
+    for src in [
+        "MATCH (a)-[r:KNOWS]->(b) WITH a.name AS a RETURN a",
+        "MATCH (a)-[r:KNOWS]->(b) WITH r.confidence AS r RETURN r",
+    ] {
+        let msg = lower_error(src);
+        assert!(
+            msg.starts_with("WITH alias") && msg.contains("already bound"),
+            "WITH must be named as the offending clause: {msg} (for {src})"
+        );
+    }
+    // Carrying `a` forward AND aliasing onto it in the same clause trips the
+    // duplicate-output-name arm first, which is the more precise complaint:
+    // the collision is between two items of this clause, not with the MATCH.
+    let msg = lower_error("MATCH (a)-[r:KNOWS]->(b) WITH a, b.name AS a RETURN a");
+    assert!(
+        msg.starts_with("WITH produces the output name `a` twice"),
+        "expected the duplicate-column complaint: {msg}"
+    );
+}
+
+#[test]
+fn issue1857_duplicate_projection_alias_is_rejected() {
+    // Neither name is a pattern variable; the collision is between the two
+    // projection items themselves, which today emit two columns backed by
+    // one VarId and drop every row.
+    let msg = lower_error("MATCH (a)-[r:KNOWS]->(b) RETURN a.name AS x, b.name AS x");
+    assert!(
+        msg.contains("output name `x` twice"),
+        "message must name the duplicated output column: {msg}"
+    );
+    let msg = lower_error("MATCH (a)-[r:KNOWS]->(b) WITH a.name AS x, b.name AS x RETURN x");
+    assert!(
+        msg.starts_with("WITH produces the output name `x` twice"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn issue1857_identity_alias_is_accepted() {
+    // `v AS v` binds v to itself: the computed value always equals the
+    // existing binding, so no row is dropped and nothing is discarded.
+    // `WITH a AS a, b AS b` is the idiomatic scope carry and must keep working.
+    for src in [
+        "MATCH (a)-[r:KNOWS]->(b) RETURN a AS a",
+        "MATCH (a)-[r:KNOWS]->(b) RETURN r AS r",
+        "MATCH (a)-[r:KNOWS]->(b) WITH a AS a, b AS b RETURN a.name AS n",
+    ] {
+        let out = parse_cypher(src);
+        assert!(!out.has_errors(), "parse errors: {:?}", out.diagnostics);
+        let ast = out.ast.expect("ast");
+        let mut vars = VarRegistry::new();
+        assert!(
+            lower_cypher(&ast, &NoEncoder, &mut vars).is_ok(),
+            "identity projection must still lower: {src}"
+        );
+    }
+}
+
+#[test]
+fn issue1857_alias_matching_a_later_pattern_var_is_accepted() {
+    // The guard keys off the scope as it stood at CLAUSE ENTRY, not the
+    // statement-wide registry. Here `x`/`y` are bound by an OPTIONAL MATCH
+    // that runs AFTER the WITH assigns them — legal, and the shape four
+    // live tests in it_query_cypher.rs depend on. A registry-wide check
+    // would reject it.
+    let src = "MATCH (a)-[r:KNOWS]->(b) \
+               WITH [a, b] AS pair \
+               WITH pair[0] AS x, pair[1] AS y \
+               OPTIONAL MATCH (x)-[k:KNOWS]->(y) \
+               RETURN x, y";
+    let out = parse_cypher(src);
+    assert!(!out.has_errors(), "parse errors: {:?}", out.diagnostics);
+    let ast = out.ast.expect("ast");
+    let mut vars = VarRegistry::new();
+    assert!(
+        lower_cypher(&ast, &NoEncoder, &mut vars).is_ok(),
+        "an alias bound only by a LATER clause must lower"
+    );
+}
+
+#[test]
+fn issue1857_reserved_jsonld_property_key_is_rejected() {
+    // `@id` / `@type` are not Cypher properties. Unchecked they lower as
+    // ordinary predicates: the read is always null and the write stores a
+    // literal predicate spelled `@id`. Every syntactic position that resolves
+    // a property key must reject them, and the message must name the accessor
+    // that does work — discoverability is the whole point of the change.
+    for (src, accessor) in [
+        ("MATCH (a:Person) RETURN a.`@id` AS v", "id(n)"),
+        ("MATCH (a:Person) RETURN a.`@type` AS t", "labels(n)"),
+        ("MATCH (a)-[r:KNOWS]->(b) RETURN r.`@id` AS v", "id(n)"),
+        (
+            r#"MATCH (a:Person {`@id`: "alice"}) RETURN a.name AS n"#,
+            "id(n)",
+        ),
+        ("MATCH (a)-[r:KNOWS {`@id`: \"x\"}]->(b) RETURN a", "id(n)"),
+        ("MATCH (a:Person) RETURN [x IN [a] | x.`@id`] AS v", "id(n)"),
+    ] {
+        let msg = lower_error(src);
+        assert!(
+            msg.contains("reserved JSON-LD keyword") && msg.contains(accessor),
+            "message must name the keyword and the working accessor: {msg} (for {src})"
+        );
+        assert!(
+            !msg.contains("unsupported in v1"),
+            "this is a user error, not a deferred feature: {msg}"
+        );
+    }
+}
+
+#[test]
+fn issue1857_ordinary_property_keys_are_unaffected() {
+    // The reserved set is exact — a property merely *named* like a keyword
+    // without the `@` must still lower.
+    for src in [
+        "MATCH (a:Person) RETURN a.id AS v",
+        "MATCH (a:Person) RETURN a.type AS v",
+        "MATCH (a:Person) RETURN a.value AS v",
+        r#"MATCH (a:Person {id: "alice"}) RETURN a.name AS n"#,
+    ] {
+        let out = parse_cypher(src);
+        assert!(!out.has_errors(), "parse errors: {:?}", out.diagnostics);
+        let ast = out.ast.expect("ast");
+        let mut vars = VarRegistry::new();
+        assert!(
+            lower_cypher(&ast, &NoEncoder, &mut vars).is_ok(),
+            "ordinary property key must still lower: {src}"
+        );
+    }
+}
+
+#[test]
+fn issue1857_reserved_jsonld_key_as_node_label_is_rejected() {
+    // Labels lower to the OBJECT of an `rdf:type` triple, not to a predicate,
+    // so they resolved through `resolve_iri` and routed around the reserved-
+    // name check. `MATCH (n:`@id`)` read as zero rows and `SET n:`@type``
+    // committed a junk class — the same persisted-junk outcome the property
+    // check exists to remove, one position over.
+    for src in [
+        "MATCH (n:`@id`) RETURN n",
+        "MATCH (n:`@type`) RETURN n",
+        "MATCH (n:Person)-[r:KNOWS]->(m:`@id`) RETURN n",
+    ] {
+        let msg = lower_error(src);
+        assert!(
+            msg.contains("reserved JSON-LD keyword"),
+            "label position must reject the keyword: {msg} (for {src})"
+        );
+    }
+    // A label merely spelled like one is untouched.
+    let out = parse_cypher("MATCH (n:Type) RETURN n");
+    let ast = out.ast.expect("ast");
+    let mut vars = VarRegistry::new();
+    assert!(lower_cypher(&ast, &NoEncoder, &mut vars).is_ok());
+}
+
+#[test]
+fn issue1857_unwind_onto_a_bound_var_is_rejected() {
+    // Same collision as the projection alias, one clause over. It silently
+    // dropped every row, and the boundary is not the obvious one: `range(1,3)`
+    // is a runtime expression and still dropped, while `labels(a)` worked —
+    // the difference is whether the list references the alias, which is a
+    // property of plan ordering rather than of the statement.
+    for src in [
+        "MATCH (a)-[r:KNOWS]->(b) UNWIND [1, 2, 3] AS a RETURN a",
+        "MATCH (a)-[r:KNOWS]->(b) UNWIND range(1, 3) AS a RETURN a",
+        "MATCH (a)-[r:KNOWS]->(b) UNWIND labels(a) AS a RETURN a",
+    ] {
+        let msg = lower_error(src);
+        assert!(
+            msg.starts_with("UNWIND alias `a` is already bound"),
+            "UNWIND onto a bound alias must be rejected: {msg} (for {src})"
+        );
+    }
+    // A fresh alias is untouched, and still takes the constant-list shortcut.
+    let q = lower("MATCH (a)-[r:KNOWS]->(b) UNWIND [1, 2, 3] AS fresh RETURN fresh");
+    assert!(
+        q.patterns
+            .iter()
+            .any(|p| matches!(p, Pattern::Values { .. })),
+        "a fresh alias must keep the constant-list shortcut: {:?}",
+        q.patterns
+    );
+}
+
+#[test]
+fn issue1857_duplicate_output_name_from_bare_items_is_rejected() {
+    // `check_alias` only saw aliased items, so a bare or unaliased item could
+    // still produce a second column with the same header.
+    for src in [
+        "MATCH (a)-[r:KNOWS]->(b) RETURN a, a",
+        "MATCH (a)-[r:KNOWS]->(b) RETURN a AS a, a",
+        "MATCH (a)-[r:KNOWS]->(b) RETURN a.name, a.name",
+    ] {
+        let msg = lower_error(src);
+        assert!(
+            msg.contains("twice"),
+            "duplicate output name must be rejected: {msg} (for {src})"
+        );
+    }
+    // Distinct columns over the same variable stay legal.
+    let out = parse_cypher("MATCH (a)-[r:KNOWS]->(b) RETURN a, a.name");
+    let ast = out.ast.expect("ast");
+    let mut vars = VarRegistry::new();
+    assert!(lower_cypher(&ast, &NoEncoder, &mut vars).is_ok());
+}
