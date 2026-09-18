@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_annotation_filter_pushdown.rs"]
+mod it_annotation_filter_pushdown;
 #[path = "it_compile_breakdown.rs"]
 mod it_compile_breakdown;
 #[path = "it_count_distinct_objects.rs"]
