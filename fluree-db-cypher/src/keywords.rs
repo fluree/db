@@ -19,8 +19,11 @@
 //! Shared by the read lowering (`fluree-db-cypher`) and the write lowering
 //! (`fluree-db-transact`), which resolve predicates independently.
 
-/// The message for a reserved JSON-LD keyword used where Cypher expects a
+/// The message for a reserved JSON-LD name used where Cypher expects a
 /// property key, label, or relationship type — `None` for any ordinary name.
+///
+/// The rule is the `@` prefix, not a list: every `@`-prefixed name is
+/// rejected, and the known keywords only get more specific advice.
 ///
 /// Each message names the working accessor where one exists, which is the
 /// whole point: the accessors are documented, but a user reaching for
@@ -49,7 +52,13 @@ pub fn reserved_keyword_message(key: &str) -> Option<String> {
         "@graph" | "@context" | "@list" | "@set" | "@none" | "@reverse" | "@index" | "@nest"
         | "@base" | "@vocab" | "@container" | "@included" | "@prefix" | "@propagate"
         | "@protected" | "@version" => "it describes JSON-LD document structure, not data",
-        _ => return None,
+        // Any other `@` name. The list above carries advice; it is not the
+        // boundary. A list that has to track the JSON-LD spec lets every name
+        // it misses through — `@import` and `@annotation` did, and both
+        // committed a literal predicate — while the safety argument in the
+        // module doc covers the whole prefix: no ordinary Cypher identifier
+        // begins with `@`, so rejecting all of them cannot catch a real name.
+        _ => "names beginning with `@` are reserved by JSON-LD",
     };
     Some(format!(
         "`{key}` is a reserved JSON-LD keyword, not a usable Cypher name (property key, \
@@ -71,10 +80,23 @@ mod tests {
     }
 
     #[test]
+    fn every_at_prefixed_name_is_reserved_not_just_the_listed_ones() {
+        // `@import` and `@annotation` are real JSON-LD 1.1 keywords the list
+        // missed; both committed a literal predicate before the prefix became
+        // the rule. The bare `@` is covered by the same rule.
+        for key in ["@import", "@annotation", "@", "@anything"] {
+            assert!(
+                reserved_keyword_message(key).is_some(),
+                "`{key}` must be reserved"
+            );
+        }
+    }
+
+    #[test]
     fn ordinary_names_pass() {
         // Including names that merely look adjacent — only the exact
         // keyword set is reserved.
-        for key in ["id", "type", "name", "value", "graph", "atid", "id@", "@"] {
+        for key in ["id", "type", "name", "value", "graph", "atid", "id@"] {
             assert!(
                 reserved_keyword_message(key).is_none(),
                 "`{key}` must not be treated as reserved"

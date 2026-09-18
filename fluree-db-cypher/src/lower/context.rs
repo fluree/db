@@ -235,6 +235,16 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             return Err(LowerError::generic(msg));
         }
         let iri = self.resolve_iri(name);
+        // The bare-name check above misses a keyword reached through the
+        // ledger's context: `{"id": "@id"}` is a standard JSON-LD aliasing
+        // idiom, lands in `overrides`, and resolves `id` to `@id`. Checking
+        // the resolved term too closes that, while the bare-name check still
+        // catches `@id` before `@vocab` would turn it into `<vocab>@id`.
+        if let Some(msg) = crate::keywords::reserved_keyword_message(&iri) {
+            return Err(LowerError::generic(format!(
+                "`{name}` resolves through the ledger's context to `{iri}` — {msg}"
+            )));
+        }
         if fluree_vocab::reifies_iris::ALL.iter().any(|x| *x == iri) {
             return Err(LowerError::ReservedPredicate(iri));
         }

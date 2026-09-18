@@ -435,19 +435,6 @@ impl<'a> CypherLowering<'a> {
         Ok(())
     }
 
-    /// Lower a `WITH` projection that precedes a write clause. This is the
-    /// **horizon subset** that maps cleanly onto the where-pattern stream:
-    /// pass-through variables, renames, and computed (non-aggregate) aliases
-    /// (each a `Bind`), plus an optional `WHERE` filter. After the projection
-    /// the in-scope variables are narrowed to the WITH list — exactly Cypher's
-    /// scoping rule — so a later write can only reference projected names (a
-    /// dropped node referenced in a write `MATCH`-style position becomes a fresh
-    /// node, and a dropped target of SET/REMOVE/DELETE is rejected as unbound).
-    ///
-    /// Deferred (clear errors): aggregation (rejected via the computed-projection
-    /// path, since aggregate calls aren't in the filter-expression surface),
-    /// `DISTINCT`, and `ORDER BY` / `SKIP` / `LIMIT` — these need a query-level
-    /// grouping or slice the single-Txn write model doesn't carry.
     /// Reject a `WITH … AS v` before a write clause when `v` is already bound
     /// by a preceding read clause, or already assigned by an earlier item in
     /// the same `WITH`.
@@ -489,6 +476,19 @@ impl<'a> CypherLowering<'a> {
         Ok(())
     }
 
+    /// Lower a `WITH` projection that precedes a write clause. This is the
+    /// **horizon subset** that maps cleanly onto the where-pattern stream:
+    /// pass-through variables, renames, and computed (non-aggregate) aliases
+    /// (each a `Bind`), plus an optional `WHERE` filter. After the projection
+    /// the in-scope variables are narrowed to the WITH list — exactly Cypher's
+    /// scoping rule — so a later write can only reference projected names (a
+    /// dropped node referenced in a write `MATCH`-style position becomes a fresh
+    /// node, and a dropped target of SET/REMOVE/DELETE is rejected as unbound).
+    ///
+    /// Deferred (clear errors): aggregation (rejected via the computed-projection
+    /// path, since aggregate calls aren't in the filter-expression surface),
+    /// `DISTINCT`, and `ORDER BY` / `SKIP` / `LIMIT` — these need a query-level
+    /// grouping or slice the single-Txn write model doesn't carry.
     fn lower_with_clause(&mut self, w: &WithClause) -> Result<(), LowerCypherError> {
         if w.distinct {
             return Err(LowerCypherError::unsupported(
@@ -2069,6 +2069,13 @@ impl<'a> CypherLowering<'a> {
             return Err(LowerCypherError::rejected(msg));
         }
         let iri = self.resolve_iri(name);
+        // A keyword reached through the context (`{"id": "@id"}`) — see the
+        // read-side twin in `fluree-db-cypher`'s `LoweringContext`.
+        if let Some(msg) = fluree_db_cypher::reserved_keyword_message(&iri) {
+            return Err(LowerCypherError::rejected(format!(
+                "`{name}` resolves through the ledger's context to `{iri}` — {msg}"
+            )));
+        }
         if reifies_iris::ALL.iter().any(|x| *x == iri) {
             return Err(LowerCypherError::ReservedPredicate(iri));
         }
