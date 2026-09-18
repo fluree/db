@@ -262,10 +262,23 @@ fn is_metadata_join(expr: &Expression) -> bool {
 ///   claimed these were `?__`-prefixed; they are not, and the guard broke the
 ///   idiom. Recognised structurally, as a one-argument call to one of the four
 ///   metadata functions the node-map emits (`datatype`, `t`, `op`, `lang`)
-///   over a variable. A user writing that same join by hand as
-///   `["bind", "?t", "(t ?v)"]` is exempted too, which is consistent rather
-///   than a hole: it means the same thing, and the result is the documented
-///   join, not a silent wrong answer.
+///   over a variable.
+///
+///   **This is an exemption, and it is not free — stated precisely so it reads
+///   as a decision rather than a hole.** The structural test cannot tell the
+///   node-map's bind from a hand-written one, so it also admits
+///   `["bind", "?t", "(t ?v)"]` (or `datatype` / `op` / `lang`) written by
+///   hand onto an already-bound `?t`. If the author meant that as a *join*, the
+///   result is the documented one. If they meant to **shadow** `?t`, they
+///   silently get constraint semantics instead — rows where the two values
+///   happen to match — which is precisely this guard's defect class, let
+///   through. It is accepted because that case needs a metadata function
+///   hand-written onto a bound variable *with shadowing intent*, which is rare,
+///   while the node-map idiom it protects is documented and common. The
+///   alternative that closes it — carrying provenance from `node_map.rs`
+///   through `UnresolvedQuery` to here — touches every `UnresolvedPattern::Bind`
+///   construction site, and was judged not worth that for a case that is not
+///   otherwise reachable.
 ///
 /// The identity bind `["bind","?v","?v"]` is exempt, as `v AS v` is on the
 /// Cypher side: it recomputes the value it already holds, so no row is dropped
