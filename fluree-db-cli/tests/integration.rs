@@ -2547,6 +2547,53 @@ fn a_named_graph_annotation_exports_with_its_marker() {
         .stdout(predicate::str::contains("reifiesSubject"));
 }
 
+/// `fluree index` must seal the annotation arena on the first pass.
+///
+/// It did not: the attachment-events provider reads from a running
+/// `LedgerManager`, a one-shot CLI process has none, so `index` resolved no
+/// coverage and sealed nothing — while root assembly set the sticky
+/// `had_annotation_arena` bit regardless, permanently blocking the
+/// bootstrap that would have recovered it. `reindex` already had a fallback
+/// for this; `index` now makes the same call (#1882).
+///
+/// What this asserts is that the annotation survives `insert` + `index`
+/// round-trip. It does *not* assert which annotation source answered —
+/// after the named-graph fix above, the arena and the base-index scan
+/// produce identical output, so the remaining difference between sealed and
+/// unsealed is speed, which is measured rather than asserted here.
+#[test]
+fn insert_then_index_keeps_annotations_readable() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "iann"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "iann",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:knows ex:b ~ ex:c1 {| ex:conf 0.5 |} .\n",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp).args(["index", "iann"]).assert().success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "iann", "--format", "turtle"])
+        .assert()
+        .success()
+        // Full IRIs, not CURIEs: an inline `insert -e` does not persist the
+        // `@prefix` the way `create --from` does.
+        .stdout(predicate::str::contains(
+            "<http://example.org/knows> <http://example.org/b> \
+             ~ <http://example.org/c1>",
+        ))
+        .stdout(predicate::str::contains("<http://example.org/conf>"))
+        .stderr(predicate::str::contains("could not be resolved").not());
+}
+
 // ============================================================================
 // v1.1 — Config tests
 // ============================================================================

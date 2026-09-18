@@ -55,9 +55,9 @@ pub async fn index_ledger(fluree: &Fluree, ledger_id: &str) -> CliResult<IndexOu
     // the provider trait, so we have to resolve here. Without this,
     // the indexer takes the defensive-drop path (`annotation_index
     // = None`) and queries fall back to the M2a scan path —
-    // correct but slower. The provider reads from the running
-    // `LedgerManager`, so we cache the ledger first to make sure
-    // its attachment overlay is loaded.
+    // correct but slower. We cache the ledger first so the provider (when
+    // there is one) finds its attachment overlay loaded, and so the
+    // annotation gate below has a snapshot to read.
     //
     // **Sticky-bit gate.** Mirror `admin.rs::reindex`: only resolve
     // for ledgers that have actually observed a `f:reifies*` flake.
@@ -67,15 +67,49 @@ pub async fn index_ledger(fluree: &Fluree, ledger_id: &str) -> CliResult<IndexOu
     // `it_select_star_novelty_retract::expansion_applies_novelty_retractions`).
     // The CLI shared the same code shape pre-gate and was vulnerable
     // to the same regression; keep the two paths symmetric.
-    if let Some(provider) = fluree.attachment_events_provider() {
-        let handle = fluree.ledger_cached(ledger_id).await.map_err(|e| {
-            CliError::Import(format!("indexing failed: failed to load ledger: {e}"))
-        })?;
-        let view = handle.snapshot().await;
-        let ledger_has_annotations =
-            view.snapshot.has_annotations || view.novelty.attachments.has_annotations();
+    // A load failure here is not fatal: the indexer loads the ledger itself,
+    // and the only thing lost is the chance to resolve annotation coverage.
+    // `reindex` treats it the same way. Before this block ran for every
+    // ledger it propagated the error, but it only ran when a provider
+    // existed — which in a one-shot CLI is never — so propagating now would
+    // fail indexing runs that previously never attempted the load.
+    let loaded = match fluree.ledger_cached(ledger_id).await {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                ledger_id,
+                "index: no loadable ledger state; annotation arena will not be \
+                 sealed this pass"
+            );
+            None
+        }
+    };
+    if let Some(handle) = loaded {
+        let ledger_has_annotations = {
+            let view = handle.snapshot().await;
+            view.snapshot.has_annotations || view.novelty.attachments.has_annotations()
+        };
         if ledger_has_annotations {
-            config.attachment_events = provider.attachment_events(ledger_id).await;
+            if let Some(provider) = fluree.attachment_events_provider() {
+                config.attachment_events = provider.attachment_events(ledger_id).await;
+            }
+            // Second chance, the one `reindex` already has — and the reason
+            // it has to sit *outside* the provider branch: the provider
+            // reads from a running `LedgerManager`, and a one-shot CLI
+            // process has none, so `attachment_events_provider()` returns
+            // `None` here and the branch above never runs at all.
+            //
+            // Without this, `fluree index` hands the indexer no coverage and
+            // seals no arena, while root assembly sets the sticky
+            // `had_annotation_arena` bit regardless — which then blocks the
+            // bootstrap that would have recovered it, for the life of the
+            // ledger. That asymmetry is the whole of why `reindex`-first
+            // seals an arena and `index`-first never does. Same call
+            // `reindex` makes, so the two paths now agree. See #1882.
+            if config.attachment_events.is_none() {
+                config.attachment_events = fluree.attachment_coverage_from_state(ledger_id).await;
+            }
         }
     }
 
