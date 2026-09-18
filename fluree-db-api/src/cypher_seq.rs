@@ -769,8 +769,10 @@ impl Fluree {
 
             if rebound.is_empty() && !table.rows.is_empty() {
                 return Err(cypher_err(
-                    "MERGE re-bind matched no rows — the created pattern is not visible to \
-                     the writer (a policy may hide it)",
+                    "MERGE re-bind matched no rows — the pattern this MERGE created or \
+                     matched is not visible when it is read back. A policy that hides the \
+                     node is one cause; so is any read clause whose bindings the MERGE \
+                     itself was supposed to supply.",
                 ));
             }
 
