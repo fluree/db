@@ -4384,10 +4384,11 @@ fn doc_ingest_reports_the_keys_and_items_the_schema_drops() {
 ///
 /// Not `chat_body` in isolation: this is the request as transmitted, so a
 /// regression anywhere between `[doc.llm]` and the socket is caught. The
-/// key set is matched exactly, because the bug class is a field that
-/// should not be there and no presence assertion can see one.
+/// key set is matched exactly, in both directions — a field that should
+/// not be there is invisible to a presence assertion, and a field that
+/// silently stopped being sent is invisible to an absence one.
 #[test]
-fn doc_ingest_wire_body_carries_only_the_fields_every_model_accepts() {
+fn doc_ingest_wire_body_carries_every_field_until_one_is_refused() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     write_extraction_fixtures(&tmp);
@@ -4422,11 +4423,21 @@ fn doc_ingest_wire_body_carries_only_the_fields_every_model_accepts() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        vec!["max_completion_tokens", "messages", "model"],
-        "the transmitted body carries a field no model was asked for: {body}"
+        vec![
+            "max_completion_tokens",
+            "messages",
+            "model",
+            "response_format",
+            "temperature"
+        ],
+        "the transmitted body is not the one this build intends to send: {body}"
     );
     assert_eq!(body["max_completion_tokens"], 8000);
     assert_eq!(body["model"], "stub");
+    // The stub accepted everything, so nothing was withdrawn and the run
+    // says nothing about corrections.
+    assert_eq!(body["temperature"], 0);
+    assert_eq!(body["response_format"]["type"], "json_object");
 }
 
 /// `doc:assertionMode` end to end, from a custom `--system-prompt` to the
@@ -4502,18 +4513,15 @@ fn doc_ingest_stores_assertion_mode_from_a_custom_prompt() {
         .stdout(predicate::str::contains("hedged"));
 }
 
-/// A downgraded request is visible in the run's own output, not only in
-/// `tracing::debug!`. A corpus where every call was silently adjusted must
-/// not read the same as one where none was.
+/// A withdrawn field is visible in the run's own output, and the refusal
+/// is not repeated on the next chunk.
 #[test]
-fn doc_ingest_says_when_the_endpoint_refused_and_the_request_was_resent() {
+fn doc_ingest_withdraws_a_refused_field_and_says_so() {
     use std::io::{BufRead, BufReader, Read, Write};
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     write_extraction_fixtures(&tmp);
 
-    // A server that speaks only the deprecated budget field: it names
-    // `max_completion_tokens` in a 400 and accepts the resend.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let seen: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
@@ -4536,21 +4544,20 @@ fn doc_ingest_says_when_the_endpoint_refused_and_the_request_was_resent() {
             let mut body = vec![0u8; len];
             reader.read_exact(&mut body).ok();
             let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
-            let old_spelling = parsed.get("max_tokens").is_some();
-            captured.lock().unwrap().push(parsed);
-            let (status, reply) = if old_spelling {
+            captured.lock().unwrap().push(parsed.clone());
+            let (status, reply) = if parsed.get("temperature").is_some() {
+                (
+                    400,
+                    serde_json::json!({ "error": { "param": "temperature",
+                    "message": "Unsupported value: 'temperature'" } })
+                    .to_string(),
+                )
+            } else {
                 (
                     200,
                     serde_json::json!({ "choices": [{ "message": {
                     "role": "assistant",
                     "content": "{\"entities\":[],\"relations\":[]}" } }] })
-                    .to_string(),
-                )
-            } else {
-                (
-                    400,
-                    serde_json::json!({ "error": {
-                    "message": "Unrecognized request argument supplied: max_completion_tokens" } })
                     .to_string(),
                 )
             };
@@ -4584,14 +4591,11 @@ fn doc_ingest_says_when_the_endpoint_refused_and_the_request_was_resent() {
                 .count(1),
         );
 
-    // Both requests really happened, and the second carried the spelling
-    // the 400 asked for — so the message is not reporting a phantom.
     let sent = seen.lock().unwrap();
     assert_eq!(sent.len(), 2, "one refusal, one resend: {sent:?}");
-    assert_eq!(sent[0]["max_completion_tokens"], 8000);
-    assert!(sent[0].get("max_tokens").is_none());
-    assert_eq!(sent[1]["max_tokens"], 8000);
-    assert!(sent[1].get("max_completion_tokens").is_none());
+    assert_eq!(sent[0]["temperature"], 0);
+    assert!(sent[1].get("temperature").is_none());
+    assert_eq!(sent[1]["response_format"]["type"], "json_object");
 }
 
 // --- end: `fluree doc ingest` re-ingest ownership (PR-C / #1864) ------------

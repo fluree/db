@@ -30,6 +30,10 @@ pub struct Request<'a> {
     pub parts: Vec<Part<'a>>,
     /// What the gateway should route this as (`doc-parse`, `extraction`).
     pub intent: &'a str,
+    /// Ask a chat endpoint for a JSON object. The prompt must also say so:
+    /// OpenAI refuses the mode otherwise. Dropped automatically for an
+    /// endpoint that refuses the field — see [`LlmClient::recover`].
+    pub json: bool,
     /// Upper bound on the answer, sent as `max_completion_tokens`.
     ///
     /// On a reasoning model this budgets reasoning *and* output, so it can
@@ -48,7 +52,23 @@ pub struct LlmClient {
     ///
     /// Atomic because one client is shared across the chunk workers.
     recoveries: std::sync::atomic::AtomicUsize,
+    /// Fields this endpoint has refused, learned from its own 400s and
+    /// remembered for the rest of the run.
+    ///
+    /// Without this the correction would be per call — and `complete` is
+    /// called once per chunk, so a corpus against an endpoint that refuses
+    /// one field would pay a wasted round trip, a backoff and a retry on
+    /// every chunk of every document. Remembering makes it once per field
+    /// per run.
+    refused: std::sync::Mutex<std::collections::BTreeSet<&'static str>>,
 }
+
+/// The optional fields a chat body carries, each of which some endpoint
+/// refuses. Sent by default and withdrawn on refusal, rather than withheld
+/// by default: withholding is a capability judgement made once, for every
+/// provider, by whoever wrote this list — which is the thing a 400 lets us
+/// avoid.
+const ADJUSTABLE: [&str; 3] = ["temperature", "response_format", "max_completion_tokens"];
 
 impl std::fmt::Debug for LlmClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -73,6 +93,7 @@ impl LlmClient {
             endpoint,
             api_key,
             recoveries: std::sync::atomic::AtomicUsize::new(0),
+            refused: std::sync::Mutex::new(Default::default()),
         }
     }
 
@@ -126,7 +147,7 @@ impl LlmClient {
                     // provider's published capability table being wrong,
                     // which is the situation we are actually in.
                     if status == 400 && !recovered {
-                        if let Some(fixed) = recover(&mut body, &text) {
+                        if let Some(fixed) = self.recover(&mut body, &text) {
                             tracing::debug!("{url}: retrying with {fixed}");
                             self.recoveries
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -161,29 +182,96 @@ impl LlmClient {
             })
             .collect();
         messages.push(serde_json::json!({ "role": "user", "content": content }));
-        // The minimum body that does the job, which is what `responses_body`
-        // below has always sent. Every field beyond it is a field some
-        // current model refuses:
+        // Sent optimistically, withdrawn on refusal. `responses_body` below
+        // omits all three because the Responses API names them differently
+        // or not at all — not because a chat call is better off without
+        // them, which was the reading an earlier draft of this took.
         //
-        // - `temperature: 0` was here for determinism, and 0 is already the
-        //   default on every endpoint that accepts it — while gpt-5 and the
-        //   o-series reject any value but their own and 400 on the field.
-        // - `response_format: {"type":"json_object"}` only guarantees
-        //   syntactic JSON, which the prompt already asks for and
-        //   `parse_extraction` already tolerates fences and prose around.
-        //   Anthropic's OpenAI-compatible route 400s on it today, against
-        //   its own published table saying the field is ignored.
-        //
-        // The output budget stays, under the spelling Chat Completions
-        // takes across its whole range: `max_tokens` is the deprecated one
-        // and is what gpt-5 and the o-series reject. An endpoint too old to
-        // know `max_completion_tokens` says so in a 400, and `recover` puts
-        // the old spelling back for it.
-        serde_json::json!({
+        // - `temperature: 0` is what makes extraction close to greedy, and
+        //   this pipeline is built on repeatability: the extraction cache
+        //   is content-keyed and every document node carries a
+        //   `doc:extractionFingerprint`. It is not a guarantee — there is
+        //   no `seed` here and no provider promises determinism — but the
+        //   OpenAI chat default is 1, so dropping it for everyone would
+        //   make a cold run over one corpus produce a different graph each
+        //   time while the fingerprint claimed otherwise.
+        // - `response_format` genuinely improves reliability where it is
+        //   supported. `clean_json` plus the retry is a weaker fallback,
+        //   not an equivalent.
+        // - `max_completion_tokens` is the spelling Chat Completions takes
+        //   across its current range; `max_tokens` is the deprecated one.
+        let refused = self.refused.lock().expect("refused fields");
+        let mut body = serde_json::json!({
             "model": self.endpoint.model,
             "messages": messages,
-            "max_completion_tokens": req.max_tokens,
-        })
+        });
+        if !refused.contains("temperature") {
+            body["temperature"] = serde_json::json!(0);
+        }
+        if req.json && !refused.contains("response_format") {
+            body["response_format"] = serde_json::json!({ "type": "json_object" });
+        }
+        let budget = if refused.contains("max_completion_tokens") {
+            "max_tokens"
+        } else {
+            "max_completion_tokens"
+        };
+        body[budget] = serde_json::json!(req.max_tokens);
+        body
+    }
+
+    /// Adjust a refused request body from what the refusal said, and
+    /// remember the refusal, returning a description of the change. `None`
+    /// when nothing here matches, which leaves the 400 terminal and
+    /// reported verbatim.
+    ///
+    /// A 400 naming a field is the endpoint describing its own dialect, and
+    /// that is better evidence than any table we could ship: it comes from
+    /// the deployment, at the moment it refuses, and it stays right when a
+    /// vendor's published capability table does not. Anthropic's
+    /// OpenAI-compatibility page documents `response_format` as ignored
+    /// while the deployed route 400s on it, which is exactly that case.
+    ///
+    /// Deliberately a short list of known refusals rather than a general
+    /// solver: an unrecognised 400 stays an error the operator reads, not a
+    /// silent mutation of their request.
+    fn recover(&self, body: &mut serde_json::Value, error: &str) -> Option<&'static str> {
+        let map = body.as_object_mut()?;
+        // Which field the endpoint named. `error.param` is where OpenAI
+        // puts it; the substring is the fallback for everyone else.
+        let param = serde_json::from_str::<serde_json::Value>(error)
+            .ok()
+            .and_then(|v| {
+                v.pointer("/error/param")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        let named = |field: &str| param.as_deref() == Some(field) || error.contains(field);
+
+        // On record, verbatim, from the reports these rules exist for:
+        //   "Unsupported parameter: 'max_tokens' is not supported with this
+        //    model. Use 'max_completion_tokens' instead."
+        //   "response_format.type: Input should be 'json_schema'"
+        // The gpt-5 temperature refusal is *not* on record here — that rule
+        // is inferred from the documented behaviour (only the default is
+        // accepted) and from the shape of the other two. It matches
+        // `error.param` first for that reason.
+        let field = *ADJUSTABLE
+            .iter()
+            .find(|f| map.contains_key(**f) && named(f))?;
+        let value = map.remove(field)?;
+        let description = match field {
+            // A rename, not a withdrawal: the budget still applies, under
+            // the spelling this endpoint knows.
+            "max_completion_tokens" => {
+                map.insert("max_tokens".into(), value);
+                "max_tokens instead of max_completion_tokens"
+            }
+            "temperature" => "no temperature",
+            _ => "no response_format",
+        };
+        self.refused.lock().expect("refused fields").insert(field);
+        Some(description)
     }
 
     fn responses_body(&self, req: &Request<'_>) -> serde_json::Value {
@@ -222,28 +310,6 @@ impl LlmClient {
         }
         body
     }
-}
-
-/// Adjust a refused request body from what the refusal said, returning a
-/// description of the change. `None` when nothing here matches, which
-/// leaves the 400 terminal and reported verbatim.
-///
-/// One rule, because we send one field an endpoint can reasonably refuse.
-/// Deliberately a short list of known refusals rather than a general
-/// solver: a novel 400 from a novel model stays an error the operator
-/// sees, not a silent mutation of their request.
-fn recover(body: &mut serde_json::Value, error: &str) -> Option<&'static str> {
-    // A server that predates `max_completion_tokens` names it. The
-    // deprecated spelling is what gpt-5 and the o-series refuse, so we
-    // cannot lead with it — but we can fall back to it for exactly the
-    // endpoints that ask.
-    let map = body.as_object_mut()?;
-    if map.contains_key("max_completion_tokens") && error.contains("max_completion_tokens") {
-        let budget = map.remove("max_completion_tokens")?;
-        map.insert("max_tokens".into(), budget);
-        return Some("max_tokens instead of max_completion_tokens");
-    }
-    None
 }
 
 fn data_url(mime: &str, bytes: &[u8]) -> String {
@@ -347,6 +413,7 @@ mod tests {
             system: Some("sys"),
             parts: vec![Part::Text("user")],
             intent: "extraction",
+            json: true,
             max_tokens: 8000,
         }
     }
@@ -361,15 +428,12 @@ mod tests {
 
     /// The whole of the chat body, matched exactly.
     ///
-    /// Exact rather than field-by-field on purpose. The bug class is a
-    /// field that should not be on the wire, and every presence assertion
-    /// — `assert_eq!(body["max_completion_tokens"], 8000)` — is equally
-    /// true of a body that also carries `max_tokens` and `temperature`.
-    /// An equality on the whole object cannot be satisfied by a body with
-    /// anything extra in it, and it fails loudly when someone adds a field
-    /// without thinking about which models refuse it.
+    /// Exact rather than field-by-field on purpose, and it cuts both ways
+    /// now: a presence assertion cannot see a field that should not be
+    /// there, and an absence assertion cannot see one that stopped being
+    /// sent. An equality on the whole object fails loudly either way.
     #[test]
-    fn chat_body_sends_nothing_a_current_model_would_refuse() {
+    fn chat_body_sends_every_field_until_the_endpoint_refuses_one() {
         let body = client(WireApi::Chat).chat_body(&extraction_request());
         assert_eq!(
             body,
@@ -379,32 +443,18 @@ mod tests {
                     { "role": "system", "content": "sys" },
                     { "role": "user", "content": [{ "type": "text", "text": "user" }] }
                 ],
+                "temperature": 0,
+                "response_format": { "type": "json_object" },
                 "max_completion_tokens": 8000
             })
         );
     }
 
-    /// The two bodies differ only in what the two APIs actually name.
-    /// `responses_body` was already right; this is the property that says
-    /// `chat_body` has stopped being the odd one out.
+    /// Crop reading shares the builder, so it shares the corrections — a
+    /// gpt-5-class vision model refuses the same fields for the same
+    /// reasons. It asks for no JSON, and that is the one difference.
     #[test]
-    fn neither_wire_shape_sends_temperature_or_response_format() {
-        let req = extraction_request();
-        for body in [
-            client(WireApi::Chat).chat_body(&req),
-            client(WireApi::Responses).responses_body(&req),
-        ] {
-            for field in ["temperature", "response_format", "max_tokens"] {
-                assert!(body.get(field).is_none(), "{field} is on the wire: {body}");
-            }
-        }
-    }
-
-    /// A crop read goes through the same builder, so the same three fields
-    /// are gone from every VLM call. Intended — a gpt-5-class vision model
-    /// refuses them for the same reasons — and therefore pinned.
-    #[test]
-    fn crop_reading_shares_the_aligned_body() {
+    fn crop_reading_shares_the_body_but_asks_for_no_json() {
         let crop = Request {
             system: None,
             parts: vec![
@@ -415,44 +465,122 @@ mod tests {
                 },
             ],
             intent: "doc-parse",
+            json: false,
             max_tokens: 4096,
         };
         let body = client(WireApi::Chat).chat_body(&crop);
         assert_eq!(body["max_completion_tokens"], 4096);
-        for field in ["temperature", "response_format", "max_tokens"] {
-            assert!(body.get(field).is_none(), "{field} is on the wire: {body}");
-        }
+        assert_eq!(body["temperature"], 0);
+        assert!(
+            body.get("response_format").is_none(),
+            "a crop never asked for JSON: {body}"
+        );
         assert!(body["messages"][0]["content"][1]["image_url"]["url"]
             .as_str()
             .unwrap()
             .starts_with("data:image/png;base64,"));
     }
 
-    /// An endpoint too old for `max_completion_tokens` says so in the 400,
-    /// and that is a better source of truth than any table we could ship:
-    /// it is the endpoint itself, at the moment it refuses.
+    /// The Responses route is unaffected either way: it never carried any
+    /// of the three, and nothing here can put them on it.
     #[test]
-    fn a_400_naming_the_budget_field_switches_to_the_old_spelling() {
-        let mut body = client(WireApi::Chat).chat_body(&extraction_request());
-        let refusal = r#"{"error":{"message":"Unrecognized request argument supplied: max_completion_tokens","type":"invalid_request_error"}}"#;
-        assert_eq!(
-            recover(&mut body, refusal),
-            Some("max_tokens instead of max_completion_tokens")
+    fn the_responses_body_carries_none_of_the_adjustable_fields() {
+        let body = client(WireApi::Responses).responses_body(&extraction_request());
+        for field in ADJUSTABLE.iter().chain(["max_tokens"].iter()) {
+            assert!(
+                body.get(field).is_none(),
+                "{field} reached /responses: {body}"
+            );
+        }
+    }
+
+    /// A refusal is learned once and remembered for the rest of the run.
+    ///
+    /// This is the property that decides the design rather than decorates
+    /// it. `complete` runs once per chunk, so without it an endpoint that
+    /// refuses one field costs a wasted round trip, a backoff and one of
+    /// three retries on **every chunk of every document** — about 10k
+    /// wasted calls and over an hour of pure sleep on a 10k-chunk corpus.
+    #[test]
+    fn a_refusal_is_remembered_so_the_next_call_does_not_repeat_it() {
+        let client = client(WireApi::Chat);
+        let refusal = r#"{"error":{"param":"temperature","message":"Unsupported value: 'temperature' does not support 0 with this model. Only the default (1) is supported."}}"#;
+
+        let mut first = client.chat_body(&extraction_request());
+        assert_eq!(first["temperature"], 0, "sent optimistically to begin with");
+        assert_eq!(client.recover(&mut first, refusal), Some("no temperature"));
+        assert!(first.get("temperature").is_none(), "{first}");
+
+        // The next chunk's body, built fresh, has already learned it.
+        let second = client.chat_body(&extraction_request());
+        assert!(
+            second.get("temperature").is_none(),
+            "the refusal was not remembered, so every chunk would pay for it: {second}"
         );
-        assert_eq!(body["max_tokens"], 8000);
-        assert!(body.get("max_completion_tokens").is_none(), "{body}");
+        // And only that field was withdrawn.
+        assert_eq!(second["max_completion_tokens"], 8000);
+        assert_eq!(second["response_format"]["type"], "json_object");
+    }
 
-        // Once only: a second pass finds nothing left to rename, so the
-        // caller cannot loop.
-        assert_eq!(recover(&mut body, refusal), None);
+    /// Each of the three fields, refused in the endpoint's own words.
+    #[test]
+    fn each_adjustable_field_is_withdrawn_when_the_endpoint_names_it() {
+        // Verbatim from the reports these rules exist for.
+        let budget = r#"{"error":{"message":"Unsupported parameter: 'max_completion_tokens' is not supported with this model. Use 'max_tokens' instead."}}"#;
+        let format =
+            r#"{"error":{"message":"response_format.type: Input should be 'json_schema'"}}"#;
+        // Inferred, not on record — hence the `error.param` match first.
+        let temperature = r#"{"error":{"param":"temperature","message":"Unsupported value"}}"#;
 
-        // A refusal about something else is left alone and stays terminal.
-        // A silent mutation of a request the operator did not ask for is
-        // worse than an error they can read.
-        let mut other = client(WireApi::Chat).chat_body(&extraction_request());
-        let unrelated = r#"{"error":{"message":"model `auto` does not exist"}}"#;
-        assert_eq!(recover(&mut other, unrelated), None);
-        assert_eq!(other["max_completion_tokens"], 8000);
+        for (refusal, gone, description) in [
+            (
+                budget,
+                "max_completion_tokens",
+                "max_tokens instead of max_completion_tokens",
+            ),
+            (format, "response_format", "no response_format"),
+            (temperature, "temperature", "no temperature"),
+        ] {
+            let client = client(WireApi::Chat);
+            let mut body = client.chat_body(&extraction_request());
+            assert_eq!(client.recover(&mut body, refusal), Some(description));
+            assert!(body.get(gone).is_none(), "{gone} survived: {body}");
+            if gone == "max_completion_tokens" {
+                // Renamed, not withdrawn: the budget still applies.
+                assert_eq!(body["max_tokens"], 8000);
+            }
+        }
+    }
+
+    /// A refusal naming something we do not adjust stays terminal. A silent
+    /// mutation of a request the operator did not ask for is worse than an
+    /// error they can read.
+    #[test]
+    fn an_unrecognised_refusal_changes_nothing() {
+        let client = client(WireApi::Chat);
+        let mut body = client.chat_body(&extraction_request());
+        let before = body.clone();
+        let unrelated = r#"{"error":{"param":"model","message":"model `auto` does not exist"}}"#;
+        assert_eq!(client.recover(&mut body, unrelated), None);
+        assert_eq!(body, before);
+        assert_eq!(client.recoveries(), 0);
+    }
+
+    /// Correction terminates without needing a counter to stop it: every
+    /// rule removes or renames the field it matched, and `recover` only
+    /// matches a field still in the body. The cap in `complete` guards a
+    /// future rule that could undo another, not this.
+    #[test]
+    fn a_field_is_only_ever_withdrawn_once() {
+        let client = client(WireApi::Chat);
+        let mut body = client.chat_body(&extraction_request());
+        let refusal = r#"{"error":{"message":"Unrecognized request argument supplied: max_completion_tokens"}}"#;
+        assert!(client.recover(&mut body, refusal).is_some());
+        assert_eq!(
+            client.recover(&mut body, refusal),
+            None,
+            "a second pass found something to change, so a caller could loop: {body}"
+        );
     }
 
     #[test]
@@ -467,6 +595,7 @@ mod tests {
                 },
             ],
             intent: "doc-parse",
+            json: false,
             max_tokens: 10,
         };
         let body = client(WireApi::Responses).responses_body(&req);

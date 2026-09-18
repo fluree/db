@@ -145,6 +145,7 @@ impl VlmReader {
                 },
             ],
             intent: "doc-parse",
+            json: false,
             max_tokens: MAX_TOKENS,
         })?;
         if let Some(cache) = &self.cache {
