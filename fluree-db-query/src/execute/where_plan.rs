@@ -3707,7 +3707,6 @@ pub fn build_triple_operators(
             return Ok(Box::new(CyclicBgpOperator::new(
                 cyclic_plan,
                 ctx.required_where_vars,
-                ctx.planning.mode(),
                 fallback,
             )));
         }

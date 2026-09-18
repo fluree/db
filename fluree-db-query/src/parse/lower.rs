@@ -1890,17 +1890,11 @@ fn lower_ref_term<E: IriEncoder>(
             let var_id = vars.get_or_insert(name);
             Ok(Ref::Var(var_id))
         }
-        // Encode the way SPARQL lowering does (`lower_iri_ref`): a SID when
-        // the prefix is registered, else the IRI for the scan to encode per
-        // graph. Operators that need a statically known predicate — the
-        // nested-loop join's batched probe lanes above all — test for the SID
-        // form, so leaving every constant as an IRI silently kept JSON-LD
-        // joins off those lanes. Cross-ledger execution re-encodes pattern
-        // SIDs per graph (`reencode_sid`), exactly as it does for SPARQL.
-        UnresolvedTerm::Iri(iri) => Ok(match encoder.encode_iri_strict(iri) {
-            Some(sid) => Ref::Sid(sid),
-            None => Ref::Iri(iri.clone()),
-        }),
+        // Leaving every constant as `Ref::Iri` for "deferred encoding" kept
+        // JSON-LD joins off the batched probe lanes, which SPARQL reached
+        // through the same rule. Cross-ledger execution re-encodes pattern
+        // SIDs per graph (`reencode_sid`) for every surface alike.
+        UnresolvedTerm::Iri(iri) => Ok(encoder.encode_ref(iri)),
         UnresolvedTerm::Literal(_) => Err(ParseError::InvalidWhere(
             "Literal values are not valid in subject or predicate position".to_string(),
         )),

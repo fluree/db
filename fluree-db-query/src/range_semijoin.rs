@@ -606,7 +606,7 @@ impl RangeSemiJoinOperator {
             return Ok(WalkOutcome::Declined);
         };
         if ctx.is_multi_ledger()
-            || ctx.from_t.is_some()
+            || ctx.is_history_range()
             || !ctx.overlay_free_single_graph()
             || ctx.to_t < store.max_t()
             || !root_or_no_policy(ctx)

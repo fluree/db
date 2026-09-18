@@ -17,7 +17,6 @@ use crate::ir::triple::{Ref, TriplePattern};
 use crate::object_binding::{late_materialized_object_binding, materialized_object_binding};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::plan_node::PlanChild;
-use crate::temporal_mode::TemporalMode;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryGraphView;
@@ -567,7 +566,6 @@ pub(crate) struct CyclicBgpOperator {
     join_mode: CyclicJoinMode,
     schema: Arc<[VarId]>,
     schema_positions: Arc<[usize]>,
-    mode: TemporalMode,
     state: OperatorState,
     fallback: Option<BoxedOperator>,
     ref_relations: Vec<RefRelationIndex>,
@@ -601,7 +599,6 @@ impl CyclicBgpOperator {
     pub(crate) fn new(
         plan: CyclicBgpPlan,
         required_where_vars: Option<&[VarId]>,
-        mode: TemporalMode,
         fallback: BoxedOperator,
     ) -> Self {
         let required: Option<HashSet<VarId>> =
@@ -629,7 +626,6 @@ impl CyclicBgpOperator {
             join_mode,
             schema: Arc::from(schema.into_boxed_slice()),
             schema_positions: Arc::from(schema_positions.into_boxed_slice()),
-            mode,
             state: OperatorState::Created,
             fallback: Some(fallback),
             ref_relations: Vec::new(),
@@ -1102,8 +1098,8 @@ impl CyclicBgpOperator {
     }
 
     fn open_fast_path(&mut self, ctx: &ExecutionContext<'_>) -> Result<bool> {
-        if self.mode.is_history() || !allow_cursor_fast_path(ctx) {
-            self.log_fast_path_bail("runtime-mode-or-context-unsupported", None);
+        if !allow_cursor_fast_path(ctx) {
+            self.log_fast_path_bail("context-unsupported", None);
             return Ok(false);
         }
 
@@ -2645,12 +2641,7 @@ mod tests {
 
     fn operator_for(triples: &[TriplePattern]) -> CyclicBgpOperator {
         let plan = analyze_cyclic_bgp(triples, None).expect("test shape should be cyclic");
-        CyclicBgpOperator::new(
-            plan,
-            None,
-            TemporalMode::Current,
-            Box::new(EmptyOperator::new()),
-        )
+        CyclicBgpOperator::new(plan, None, Box::new(EmptyOperator::new()))
     }
 
     #[test]
