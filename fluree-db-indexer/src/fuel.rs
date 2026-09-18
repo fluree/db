@@ -153,6 +153,10 @@ impl ContentStore for MeteredContentStore {
         self.inner.release(id).await
     }
 
+    async fn release_many(&self, ids: &[ContentId]) -> Vec<(ContentId, fluree_db_core::Error)> {
+        self.inner.release_many(ids).await
+    }
+
     async fn get_range(
         &self,
         id: &ContentId,

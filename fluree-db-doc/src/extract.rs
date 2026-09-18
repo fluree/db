@@ -92,6 +92,67 @@ pub struct LlmRelation {
     #[serde(rename = "objectIsLiteral")]
     pub object_is_literal: bool,
     pub context: Option<String>,
+    /// How the source states the relation, when a custom `--system-prompt`
+    /// asked for it. Carried as the model wrote it and validated in
+    /// [`resolve`] rather than here, so the check still runs on an answer
+    /// served from the cache.
+    ///
+    /// The shipped prompt does not ask for this. `prompt.rs` goes out
+    /// verbatim with Fluree AI's hosted extraction and the provider-side
+    /// prompt cache is keyed on the exact text, so adding a line to it is
+    /// not this crate's call to make — and does not have to be, because
+    /// tolerating the field costs nothing when nobody sends it.
+    #[serde(rename = "assertionMode")]
+    pub assertion_mode: Option<String>,
+}
+
+/// How a source states a relation. Four values, deliberately not a float.
+///
+/// Asking a model "how confident are you" collapses three independent
+/// things — did the text really say this, how hedged was it, how strong is
+/// the relation itself — into one number whose meaning is set by whatever
+/// prompt produced it, and it cannot be revised afterwards. Asking "does
+/// the source assert, hedge, attribute or negate this" is a classification
+/// of text the model is holding, and it is the one axis the pipeline could
+/// not already express: two documents stating `alice knows bob`, one
+/// certain and one hedged, come back otherwise identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertionMode {
+    /// The source states it plainly.
+    Asserted,
+    /// "may", "reportedly", "is thought to".
+    Hedged,
+    /// The source reports someone else saying it.
+    Attributed,
+    /// The source denies it.
+    Negated,
+}
+
+impl AssertionMode {
+    pub const ALL: [&'static str; 4] = ["asserted", "hedged", "attributed", "negated"];
+
+    /// Case-insensitive and whitespace-tolerant, because this arrives from
+    /// a language model. Anything else is `None` and is reported, never
+    /// stored: an unrecognised mode silently absent is the failure this
+    /// whole change exists to stop.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "asserted" => Some(Self::Asserted),
+            "hedged" => Some(Self::Hedged),
+            "attributed" => Some(Self::Attributed),
+            "negated" => Some(Self::Negated),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Asserted => "asserted",
+            Self::Hedged => "hedged",
+            Self::Attributed => "attributed",
+            Self::Negated => "negated",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -100,6 +161,61 @@ pub struct ChunkExtraction {
     pub relations: Vec<LlmRelation>,
     #[serde(skip)]
     pub from_cache: bool,
+    /// Keys the model returned that the schema above does not carry.
+    /// Named rather than counted: `--system-prompt` promises customisation
+    /// the schema does not honour, and "confidence was ignored" is a fix
+    /// where "one key was ignored" is a mystery. Capped, since the names
+    /// come from the model.
+    #[serde(skip)]
+    pub unknown_keys: std::collections::BTreeSet<String>,
+    /// Entities and relations discarded whole because they did not
+    /// deserialize — an item that is not an object, or `"objectIsLiteral":
+    /// "true"` as a string. Strictly worse than an ignored key and, until
+    /// now, equally silent.
+    #[serde(skip)]
+    pub dropped_items: usize,
+}
+
+/// How many distinct unknown key names one chunk keeps. They are model
+/// output, so the set is bounded; three are shown and the rest counted.
+const MAX_UNKNOWN_KEYS: usize = 8;
+
+/// The keys [`LlmEntity`] consumes, in the spelling the prompt asks for.
+const ENTITY_KEYS: [&str; 6] = [
+    "name",
+    "type",
+    "nerLabel",
+    "context",
+    "alternateNames",
+    "attributes",
+];
+
+/// The keys [`LlmRelation`] consumes. The first six are what the shipped
+/// prompt asks for; `assertionMode` is accepted from a custom one.
+const RELATION_KEYS: [&str; 7] = [
+    "subjectName",
+    "predicate",
+    "predicateLabel",
+    "objectName",
+    "objectIsLiteral",
+    "context",
+    "assertionMode",
+];
+
+/// Record the keys on one returned item that nothing downstream reads.
+/// One `as_object` on a value `from_value` is about to clone anyway, then
+/// at most six pointer comparisons.
+fn note_unknown_keys(item: &Value, known: &[&str], out: &mut std::collections::BTreeSet<String>) {
+    let Some(map) = item.as_object() else { return };
+    for key in map.keys() {
+        if known.contains(&key.as_str()) || out.contains(key) {
+            continue;
+        }
+        if out.len() >= MAX_UNKNOWN_KEYS {
+            return;
+        }
+        out.insert(key.clone());
+    }
 }
 
 /// Strip a ```json fence, which models add however firmly they are asked
@@ -118,6 +234,13 @@ pub fn clean_json(content: &str) -> String {
 
 /// Tolerates missing keys and malformed items; fails only on JSON that
 /// does not parse, which the caller retries once.
+///
+/// Tolerance is the right behaviour — one bad item should not lose a
+/// chunk — but it used to be silent in all three directions at once: an
+/// unknown key vanished into serde's default, and an item that failed to
+/// deserialize was dropped whole with no counter. A run that ignored every
+/// field a custom `--system-prompt` asked for was indistinguishable from a
+/// clean one. What is tolerated is now counted, and named where it can be.
 pub fn parse_extraction(text: &str) -> std::result::Result<ChunkExtraction, serde_json::Error> {
     let value: Value = serde_json::from_str(&clean_json(text))?;
     let mut out = ChunkExtraction::default();
@@ -127,8 +250,10 @@ pub fn parse_extraction(text: &str) -> std::result::Result<ChunkExtraction, serd
         .into_iter()
         .flatten()
     {
-        if let Ok(e) = serde_json::from_value::<LlmEntity>(item.clone()) {
-            out.entities.push(e);
+        note_unknown_keys(item, &ENTITY_KEYS, &mut out.unknown_keys);
+        match serde_json::from_value::<LlmEntity>(item.clone()) {
+            Ok(e) => out.entities.push(e),
+            Err(_) => out.dropped_items += 1,
         }
     }
     for item in value
@@ -137,8 +262,10 @@ pub fn parse_extraction(text: &str) -> std::result::Result<ChunkExtraction, serd
         .into_iter()
         .flatten()
     {
-        if let Ok(r) = serde_json::from_value::<LlmRelation>(item.clone()) {
-            out.relations.push(r);
+        note_unknown_keys(item, &RELATION_KEYS, &mut out.unknown_keys);
+        match serde_json::from_value::<LlmRelation>(item.clone()) {
+            Ok(r) => out.relations.push(r),
+            Err(_) => out.dropped_items += 1,
         }
     }
     Ok(out)
@@ -199,6 +326,12 @@ impl Extractor {
 
     pub fn model_name(&self) -> &str {
         self.client.model()
+    }
+
+    /// Extraction calls the endpoint refused once and accepted after the
+    /// request was adjusted. See [`LlmClient::recoveries`].
+    pub fn recoveries(&self) -> usize {
+        self.client.recoveries()
     }
 
     /// Changes when the endpoint model, the ontology, the guidance or
@@ -292,6 +425,17 @@ pub struct ExtractionStats {
     pub relations_repaired: usize,
     pub relations_rejected: usize,
     pub attributes: usize,
+    /// Relations carrying an `assertionMode` outside the four modes.
+    /// Counted rather than stored, so a prompt asking for "probably" finds
+    /// out instead of producing a silently empty column.
+    pub assertion_mode_rejected: usize,
+    /// Distinct keys the model returned that the extraction schema does
+    /// not carry, across the chunks this run actually asked about. Empty
+    /// on a cache hit: the answer was parsed on an earlier run and only
+    /// the parsed struct is stored.
+    pub unknown_keys: std::collections::BTreeSet<String>,
+    /// Entities and relations the parser could not read and dropped whole.
+    pub dropped_items: usize,
 }
 
 /// Everything extraction adds to a document's transaction.
@@ -417,6 +561,13 @@ pub fn resolve(
         let Some(extraction) = input.extraction else {
             continue;
         };
+        // What the parser tolerated, carried up so the run can say so.
+        out.stats.dropped_items += extraction.dropped_items;
+        for key in &extraction.unknown_keys {
+            if out.stats.unknown_keys.len() < MAX_UNKNOWN_KEYS {
+                out.stats.unknown_keys.insert(key.clone());
+            }
+        }
         for e in &extraction.entities {
             let Some(name) = e.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) else {
                 continue;
@@ -615,6 +766,22 @@ pub fn resolve(
                 .filter(|c| !c.is_empty())
             {
                 node[vocab::EXCERPT] = json!(excerpt);
+            }
+            // Beside doc:verdict, which it is shaped after: both are
+            // enums on the review node, neither is a score, and both
+            // describe the claim rather than the edge — an edge two
+            // documents state has no single modality, and this way the
+            // question never arises.
+            if let Some(mode) = rel
+                .assertion_mode
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+            {
+                match AssertionMode::parse(mode) {
+                    Some(m) => node[vocab::ASSERTION_MODE] = json!(m.as_str()),
+                    None => out.stats.assertion_mode_rejected += 1,
+                }
             }
             match &verdict {
                 Verdict::Repaired { note, .. } => {
@@ -887,7 +1054,194 @@ mod tests {
         let x = parse_extraction("```json\n{\"entities\":[{\"name\":\"A\"}]}\n```").unwrap();
         assert_eq!(x.entities[0].name.as_deref(), Some("A"));
         assert!(x.relations.is_empty());
+        assert!(x.unknown_keys.is_empty());
+        assert_eq!(x.dropped_items, 0);
         assert!(parse_extraction("nope").is_err());
+    }
+
+    #[test]
+    fn parse_names_the_keys_it_ignores_and_still_keeps_the_item() {
+        // What a custom --system-prompt asking for a confidence produces.
+        let x = parse_extraction(
+            r#"{"relations":[
+                 {"subjectName":"A","predicate":"p","objectName":"B",
+                  "objectIsLiteral":false,"context":"c",
+                  "confidence":0.99,"modality":"asserted"}],
+               "entities":[{"name":"A","salience":3}]}"#,
+        )
+        .unwrap();
+        // The relation is not lost — tolerance is still the behaviour.
+        assert_eq!(x.relations.len(), 1);
+        assert_eq!(x.entities.len(), 1);
+        assert_eq!(x.dropped_items, 0);
+        assert_eq!(
+            x.unknown_keys
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["confidence", "modality", "salience"]
+        );
+    }
+
+    #[test]
+    fn parse_counts_an_item_it_drops_whole() {
+        // A single type coercion used to lose the entire relation with no
+        // counter and no warning — the worst of the three drop sites.
+        let x = parse_extraction(
+            r#"{"relations":[
+                 {"subjectName":"A","predicate":"p","objectName":"B",
+                  "objectIsLiteral":"true","context":"c"},
+                 {"subjectName":"C","predicate":"p","objectName":"D",
+                  "objectIsLiteral":false,"context":"c"}],
+               "entities":["not an object",{"name":"A"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(x.dropped_items, 2, "one relation and one entity");
+        assert_eq!(x.relations.len(), 1, "the malformed relation is gone");
+        assert_eq!(x.relations[0].subject_name.as_deref(), Some("C"));
+        assert_eq!(x.entities.len(), 1);
+        // A value that is not an object has no keys to report.
+        assert!(x.unknown_keys.is_empty());
+    }
+
+    #[test]
+    fn unknown_key_names_are_capped_but_the_count_is_not_lost() {
+        let keys: String = (0..20)
+            .map(|i| format!(",\"k{i:02}\":1"))
+            .collect::<Vec<_>>()
+            .join("");
+        let x = parse_extraction(&format!(r#"{{"entities":[{{"name":"A"{keys}}}]}}"#)).unwrap();
+        assert_eq!(x.unknown_keys.len(), MAX_UNKNOWN_KEYS);
+        assert_eq!(x.entities.len(), 1);
+    }
+
+    /// The field is accepted, validated and emitted; a value outside the
+    /// four modes is reported rather than stored; and a relation carrying
+    /// none is unchanged, because the shipped prompt does not ask for it.
+    #[test]
+    fn assertion_mode_is_validated_and_emitted_beside_the_verdict() {
+        let text = "Jane Doe joined Acme as CTO.";
+        let c = chunk(text);
+        let relation = |mode: Option<&str>| LlmRelation {
+            subject_name: Some("Jane Doe".into()),
+            predicate: Some("schema:worksFor".into()),
+            predicate_label: Some("works for".into()),
+            object_name: Some("Acme".into()),
+            object_is_literal: true,
+            context: Some("Jane Doe joined Acme as CTO.".into()),
+            assertion_mode: mode.map(str::to_string),
+        };
+        let extraction = ChunkExtraction {
+            entities: vec![LlmEntity {
+                name: Some("Jane Doe".into()),
+                class: Some("schema:Person".into()),
+                context: Some("Jane Doe joined Acme".into()),
+                ..Default::default()
+            }],
+            relations: vec![
+                relation(Some("  Hedged ")),
+                relation(Some("probably")),
+                relation(None),
+            ],
+            ..Default::default()
+        };
+        let inputs = [ChunkInput {
+            chunk: &c,
+            chunk_iri: "urn:d/chunk/0".into(),
+            mentions: &[],
+            extraction: Some(&extraction),
+        }];
+        let m = model();
+        let out = resolve(
+            "urn:d",
+            "urn:t:",
+            &inputs,
+            None,
+            Some(&m),
+            ResolvePolicy::default(),
+        );
+        let modes: Vec<Option<&str>> = out
+            .nodes
+            .iter()
+            .filter(|n| n["@type"] == json!(vocab::RELATION))
+            .map(|n| n[vocab::ASSERTION_MODE].as_str())
+            .collect();
+        assert_eq!(
+            modes,
+            vec![Some("hedged"), None, None],
+            "case and whitespace tolerated, an unknown mode stored as nothing"
+        );
+        assert_eq!(out.stats.assertion_mode_rejected, 1);
+        // It rides beside the verdict on the review node, not on the edge.
+        let hedged = out
+            .nodes
+            .iter()
+            .find(|n| n[vocab::ASSERTION_MODE] == json!("hedged"))
+            .expect("the hedged relation node");
+        assert_eq!(hedged[vocab::VERDICT], json!("valid"));
+        assert!(out
+            .direct
+            .iter()
+            .all(|e| e.get(vocab::ASSERTION_MODE).is_none()));
+    }
+
+    #[test]
+    fn assertion_mode_is_not_an_unknown_key_but_confidence_still_is() {
+        let x = parse_extraction(
+            r#"{"relations":[
+                 {"subjectName":"A","predicate":"p","objectName":"B",
+                  "objectIsLiteral":false,"context":"c",
+                  "assertionMode":"hedged","confidence":0.4}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            x.relations[0].assertion_mode.as_deref(),
+            Some("hedged"),
+            "the schema now carries it"
+        );
+        assert_eq!(
+            x.unknown_keys
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["confidence"],
+            "and a bare confidence float is still declined, and still said so"
+        );
+    }
+
+    #[test]
+    fn resolve_carries_the_parsers_drops_into_the_run_stats() {
+        let text = "Jane Doe joined Acme as CTO.";
+        let c = chunk(text);
+        let extraction = ChunkExtraction {
+            entities: vec![LlmEntity {
+                name: Some("Jane Doe".into()),
+                class: Some("schema:Person".into()),
+                context: Some("Jane Doe joined Acme".into()),
+                ..Default::default()
+            }],
+            relations: Vec::new(),
+            from_cache: false,
+            unknown_keys: ["confidence".to_string()].into_iter().collect(),
+            dropped_items: 2,
+        };
+        let inputs = [ChunkInput {
+            chunk: &c,
+            chunk_iri: "urn:d/chunk/0".into(),
+            mentions: &[],
+            extraction: Some(&extraction),
+        }];
+        let m = model();
+        let out = resolve(
+            "urn:d",
+            "urn:t:",
+            &inputs,
+            None,
+            Some(&m),
+            ResolvePolicy::default(),
+        );
+        assert_eq!(out.stats.dropped_items, 2);
+        assert!(out.stats.unknown_keys.contains("confidence"));
     }
 
     #[test]
@@ -937,8 +1291,10 @@ mod tests {
                 object_name: Some("Acme".into()),
                 object_is_literal: false,
                 context: Some("Jane Doe joined Acme as CTO.".into()),
+                assertion_mode: None,
             }],
             from_cache: false,
+            ..Default::default()
         };
         let inputs = [ChunkInput {
             chunk: &c,
@@ -1074,6 +1430,7 @@ mod tests {
                 },
             ],
             from_cache: false,
+            ..Default::default()
         };
         let inputs = [ChunkInput {
             chunk: &c,

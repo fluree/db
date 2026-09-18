@@ -348,6 +348,24 @@ pub trait StorageWrite: Debug + Send + Sync {
     /// Only returns an error for actual failures (network, permissions, etc).
     async fn delete(&self, address: &str) -> Result<()>;
 
+    /// Delete several objects by address, returning the ones that could not
+    /// be deleted with the error each hit.
+    ///
+    /// An absent object is not a failure, as for [`delete`](Self::delete).
+    /// The default issues one `delete` per address in order; backends with a
+    /// native batch operation override it so a caller releasing thousands of
+    /// artifacts costs a handful of requests rather than one each.
+    async fn delete_many(&self, addresses: &[String]) -> Vec<(String, crate::error::Error)> {
+        let mut failures = Vec::new();
+        for address in addresses {
+            match self.delete(address).await {
+                Ok(()) | Err(crate::error::Error::NotFound(_)) => {}
+                Err(e) => failures.push((address.clone(), e)),
+            }
+        }
+        failures
+    }
+
     /// Make every write this storage reported complete short of the device
     /// durable now.
     ///
@@ -508,6 +526,10 @@ impl StorageWrite for Arc<dyn Storage> {
         self.as_ref().delete(address).await
     }
 
+    async fn delete_many(&self, addresses: &[String]) -> Vec<(String, crate::error::Error)> {
+        self.as_ref().delete_many(addresses).await
+    }
+
     async fn sync(&self) -> Result<()> {
         self.as_ref().sync().await
     }
@@ -630,6 +652,22 @@ pub trait ContentStore: Debug + Send + Sync {
     /// tracking which releases have already succeeded.
     async fn release(&self, id: &ContentId) -> Result<()>;
 
+    /// Release several CIDs, returning the ones that could not be released
+    /// with the error each hit.
+    ///
+    /// Same contract as [`release`](Self::release) per id. The default calls
+    /// `release` once per id; stores over a backend with a batch delete
+    /// override it so the collector's per-pass work is a few requests.
+    async fn release_many(&self, ids: &[ContentId]) -> Vec<(ContentId, crate::error::Error)> {
+        let mut failures = Vec::new();
+        for id in ids {
+            if let Err(e) = self.release(id).await {
+                failures.push((id.clone(), e));
+            }
+        }
+        failures
+    }
+
     /// Retrieve a byte range from an object by CID.
     ///
     /// The range is `[start, end)` in bytes. Returns the bytes within
@@ -700,6 +738,10 @@ impl ContentStore for Arc<dyn ContentStore> {
 
     async fn release(&self, id: &ContentId) -> Result<()> {
         self.as_ref().release(id).await
+    }
+
+    async fn release_many(&self, ids: &[ContentId]) -> Vec<(ContentId, crate::error::Error)> {
+        self.as_ref().release_many(ids).await
     }
 
     async fn get_range(&self, id: &ContentId, range: std::ops::Range<u64>) -> Result<Vec<u8>> {
@@ -915,6 +957,42 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         crate::disk_cache::evict_cached_cid(id);
 
         deleted
+    }
+
+    async fn release_many(&self, ids: &[ContentId]) -> Vec<(ContentId, crate::error::Error)> {
+        // Every candidate address of every id goes into one batch: the
+        // legacy addresses are almost always absent, and an absent object is
+        // free inside a batch where it cost a round trip on its own.
+        let mut addresses = Vec::with_capacity(ids.len() * 2);
+        let mut owner: Vec<usize> = Vec::with_capacity(ids.len() * 2);
+        for (i, id) in ids.iter().enumerate() {
+            for address in candidate_addresses(&self.method, &self.ledger_id, id) {
+                addresses.push(address);
+                owner.push(i);
+            }
+        }
+
+        let failed = self.storage.delete_many(&addresses).await;
+
+        // Deletes before evictions, for the reason `release` gives.
+        #[cfg(feature = "native")]
+        for id in ids {
+            crate::disk_cache::evict_cached_cid(id);
+        }
+
+        // One failure per id, the first address that failed.
+        let mut seen = std::collections::HashSet::new();
+        let mut failures = Vec::new();
+        for (address, error) in failed {
+            let Some(pos) = addresses.iter().position(|a| *a == address) else {
+                continue;
+            };
+            let idx = owner[pos];
+            if seen.insert(idx) {
+                failures.push((ids[idx].clone(), error));
+            }
+        }
+        failures
     }
 
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
@@ -1247,6 +1325,10 @@ impl ContentStore for BranchedContentStore {
 
     async fn release(&self, id: &ContentId) -> Result<()> {
         self.branch_store.release(id).await
+    }
+
+    async fn release_many(&self, ids: &[ContentId]) -> Vec<(ContentId, crate::error::Error)> {
+        self.branch_store.release_many(ids).await
     }
 
     fn resolve_local_path(&self, id: &ContentId) -> Option<std::path::PathBuf> {
@@ -1741,6 +1823,52 @@ mod tests {
             "the legacy-located blob must actually be reclaimed"
         );
         assert!(!store.has(&id).await.unwrap(), "and be unreachable after");
+    }
+
+    /// A batch release covers every candidate address of every id, so a
+    /// blob at its legacy address is reclaimed by the batch path exactly as
+    /// by [`ContentStore::release`], and an id with nothing behind it is
+    /// not a failure.
+    #[tokio::test]
+    async fn release_many_reclaims_every_candidate_address() {
+        let storage = MemoryStorage::new();
+        let canonical_id = ContentId::new(ContentKind::IndexLeaf, b"leaf bytes");
+        let canonical = content_address(
+            storage.storage_method(),
+            ContentKind::IndexLeaf,
+            LEDGER,
+            &canonical_id.digest_hex(),
+        );
+        storage
+            .write_bytes(&canonical, b"leaf bytes")
+            .await
+            .unwrap();
+
+        let legacy_id = ContentId::new(
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"legacy dict",
+        );
+        let legacy = legacy_dict_address(storage.storage_method(), LEDGER, &legacy_id)
+            .expect("dict CIDs have a legacy address");
+        storage.write_bytes(&legacy, b"legacy dict").await.unwrap();
+
+        let absent_id = ContentId::new(ContentKind::IndexLeaf, b"never written");
+
+        let store = content_store_for(storage.clone(), LEDGER);
+        let failures = store
+            .release_many(&[canonical_id.clone(), legacy_id.clone(), absent_id])
+            .await;
+        assert!(failures.is_empty(), "nothing should fail: {failures:?}");
+
+        assert!(!storage.exists(&canonical).await.unwrap());
+        assert!(
+            !storage.exists(&legacy).await.unwrap(),
+            "the legacy-located blob must be reclaimed by the batch path too"
+        );
+        assert!(!store.has(&canonical_id).await.unwrap());
+        assert!(!store.has(&legacy_id).await.unwrap());
     }
 
     /// The current-layout address always leads, so callers that only need the

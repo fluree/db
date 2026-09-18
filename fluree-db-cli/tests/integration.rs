@@ -3839,18 +3839,38 @@ fn doc_search_without_index_explains() {
 /// same JSON, fenced the way models fence it however they are asked not
 /// to. Returns its base URL and the count of requests it served.
 fn stub_llm(answer: serde_json::Value) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-    stub_llm_with_status(answer, 200)
+    let (url, calls, _) = stub_llm_capturing(answer, 200);
+    (url, calls)
 }
 
 fn stub_llm_with_status(
     answer: serde_json::Value,
     status: u16,
 ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let (url, calls, _) = stub_llm_capturing(answer, status);
+    (url, calls)
+}
+
+/// The same stub, keeping every request body it was sent. What the binary
+/// actually puts on the wire is the only thing that answers "does this call
+/// work against that provider", and asserting on it costs no network.
+type CapturedBodies = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+fn stub_llm_capturing(
+    answer: serde_json::Value,
+    status: u16,
+) -> (
+    String,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    CapturedBodies,
+) {
     use std::io::{BufRead, BufReader, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/v1", listener.local_addr().unwrap());
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let served = calls.clone();
+    let bodies: CapturedBodies = Default::default();
+    let captured = bodies.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
@@ -3868,6 +3888,9 @@ fn stub_llm_with_status(
             }
             let mut body = vec![0u8; content_length];
             reader.read_exact(&mut body).ok();
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body) {
+                captured.lock().unwrap().push(v);
+            }
             served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let content = format!("```json\n{answer}\n```");
             let reply = serde_json::json!({
@@ -3882,7 +3905,7 @@ fn stub_llm_with_status(
             );
         }
     });
-    (url, calls)
+    (url, calls, bodies)
 }
 
 fn write_extraction_fixtures(tmp: &TempDir) {
@@ -4148,7 +4171,12 @@ fn doc_ingest_tolerates_a_failed_chunk_and_retries_it_next_run() {
         .stdout(predicate::str::contains(
             "1 ingested, 0 unchanged, 0 failed",
         ))
-        .stdout(predicate::str::contains("1 chunk(s) failed"));
+        .stdout(predicate::str::contains("1 chunk(s) failed"))
+        // The headline is no longer green. `failed` still counts documents
+        // and the exit code is still 0 — both load-bearing for the retry
+        // loop below — but a run where every chunk of every document failed
+        // used to print a green `done:`.
+        .stdout(predicate::str::contains("done with errors:"));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     // Not "unchanged": the chunk is asked about again.
     ingest()
@@ -4157,6 +4185,572 @@ fn doc_ingest_tolerates_a_failed_chunk_and_retries_it_next_run() {
         .stdout(predicate::str::contains("1 chunk(s) not extracted"));
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
+
+// --- begin: `fluree doc ingest` re-ingest ownership (PR-C / #1864) ----------
+// Owned by the doc-pipeline change; keep additions inside this block.
+
+/// Re-ingest retracts what the pipeline wrote and nothing else.
+///
+/// It used to issue `DELETE { ?s ?p ?o }` over every node stamped with the
+/// document plus the document node itself, so a trust weight on the source
+/// or a reviewer's note on a relation was destroyed on the next run — with
+/// the run reporting success and exiting 0.
+///
+/// The assertion is the end-to-end property, deliberately: a write-path
+/// assertion on the generated SPARQL would have passed against the bug.
+#[test]
+fn doc_ingest_reingest_keeps_triples_the_pipeline_did_not_write() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, calls) = stub_llm(serde_json::json!({
+        "entities": [
+            { "name": "Jane Doe", "type": "schema:Person",
+              "context": "Jane Doe joined Acme as Chief Technology Officer" }
+        ],
+        "relations": [
+            { "subjectName": "Jane Doe", "predicate": "schema:worksFor", "objectName": "Acme",
+              "objectIsLiteral": false,
+              "context": "Jane Doe joined Acme as Chief Technology Officer in March." }
+        ]
+    }));
+    let ingest = || {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.env("FLUREE_DOC_LLM_URL", &url)
+            .env("FLUREE_DOC_LLM_MODEL", "stub")
+            .args([
+                "doc",
+                "ingest",
+                "docs",
+                "-l",
+                "memos",
+                "--model",
+                "ont/model.ttl",
+                "--entities",
+                "ont/entities.ttl",
+            ]);
+        cmd
+    };
+    ingest().assert().success();
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // What a user curates out of band: source trust on the document node —
+    // where the design puts it, because it has to be revisable — and a
+    // review note on a relation node the pipeline mints and re-mints.
+    fluree_cmd(&tmp)
+        .args([
+            "update",
+            "memos",
+            "-e",
+            r#"{"@context":{"ex":"https://example.org/","rdfs":"http://www.w3.org/2000/01/rdf-schema#"},
+                "insert":[
+                  {"@id":"urn:fluree:doc:memo.md","ex:trust":0.9},
+                  {"@id":"urn:fluree:doc:memo.md/relation/0",
+                   "ex:reviewedConfidence":1.0,"rdfs:comment":"checked by hand"}]}"#,
+        ])
+        .assert()
+        .success();
+
+    let curated = r"PREFIX ex: <https://example.org/>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        SELECT ?s ?p ?o WHERE {
+          VALUES ?p { ex:trust ex:reviewedConfidence rdfs:comment } ?s ?p ?o }";
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", curated])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(3 rows"));
+
+    // Change the source so the document is re-ingested rather than skipped.
+    let memo = tmp.path().join("docs").join("memo.md");
+    let mut text = std::fs::read_to_string(&memo).unwrap();
+    text.push_str("\nJane Doe also chairs the safety committee.\n");
+    std::fs::write(&memo, text).unwrap();
+    ingest()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 ingested"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    // The property. All three survive: two namespaces the pipeline does not
+    // write, on the two node kinds it owns.
+    fluree_cmd(&tmp)
+        .args(["query", "memos", "-e", curated])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(3 rows"))
+        .stdout(predicate::str::contains("urn:fluree:doc:memo.md"))
+        .stdout(predicate::str::contains("checked by hand"));
+
+    // And the sweep still sweeps: one hash and one chunk, not two of each.
+    // A sweep narrowed until it retracts nothing would pass the assertion
+    // above, so pin the other side too.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "memos",
+            "-e",
+            r"PREFIX doc: <https://ns.flur.ee/doc#>
+               SELECT ?h WHERE { <urn:fluree:doc:memo.md> doc:sha256 ?h }",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(1 rows"));
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "memos",
+            "-e",
+            r"PREFIX doc: <https://ns.flur.ee/doc#>
+               SELECT ?c WHERE { ?c a doc:Chunk ; doc:sourceDocument <urn:fluree:doc:memo.md> }",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(1 rows"));
+}
+
+/// What `parse_extraction` tolerates, it now reports — once per run.
+///
+/// The model returns the two keys a custom `--system-prompt` would have
+/// asked for and one relation whose `objectIsLiteral` is a string. Before
+/// this, the keys vanished into serde's default, the malformed relation was
+/// dropped whole, and the run printed `0 dropped` and exited 0.
+#[test]
+fn doc_ingest_reports_the_keys_and_items_the_schema_drops() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    // Two chunks, so "once per run, not once per chunk" is testable at all.
+    let filler = "Jane Doe reviewed the quarterly plan with the Acme team. "
+        .repeat(40)
+        .to_string();
+    std::fs::write(
+        tmp.path().join("docs").join("memo.md"),
+        format!(
+            "# Staffing memo\n\nJane Doe joined Acme as Chief Technology Officer in March.\n\n\
+             {filler}\n\n## Second section\n\n{filler}\n"
+        ),
+    )
+    .unwrap();
+    let (url, calls) = stub_llm(serde_json::json!({
+        "entities": [
+            { "name": "Jane Doe", "type": "schema:Person",
+              "context": "Jane Doe joined Acme as Chief Technology Officer" }
+        ],
+        "relations": [
+            // Keeps its extra keys; the relation still lands.
+            { "subjectName": "Jane Doe", "predicate": "schema:worksFor", "objectName": "Acme",
+              "objectIsLiteral": false,
+              "context": "Jane Doe joined Acme as Chief Technology Officer in March.",
+              "confidence": 0.99, "modality": "asserted" },
+            // One type coercion; the whole relation is unreadable.
+            { "subjectName": "Jane Doe", "predicate": "schema:worksFor", "objectName": "Acme",
+              "objectIsLiteral": "true", "context": "Jane Doe joined Acme" }
+        ]
+    }));
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains(
+                "2 key(s) the extraction schema does not carry were ignored: \
+                 \"confidence\", \"modality\"",
+            )
+            .count(1),
+        )
+        .stdout(
+            predicate::str::contains("item(s) the extraction schema could not read were dropped")
+                .count(1),
+        );
+    // Two chunks were really asked about, so a once-per-chunk message would
+    // have printed twice and the count(1) above would have caught it.
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// What the shipping binary actually puts on the wire, end to end.
+///
+/// Not `chat_body` in isolation: this is the request as transmitted, so a
+/// regression anywhere between `[doc.llm]` and the socket is caught. The
+/// key set is matched exactly, in both directions — a field that should
+/// not be there is invisible to a presence assertion, and a field that
+/// silently stopped being sent is invisible to an absence one.
+#[test]
+fn doc_ingest_wire_body_carries_every_field_until_one_is_refused() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    let (url, _calls, bodies) =
+        stub_llm_capturing(serde_json::json!({ "entities": [], "relations": [] }), 200);
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+        ])
+        .assert()
+        .success();
+
+    let sent = bodies.lock().unwrap();
+    assert_eq!(sent.len(), 1, "one chunk, one call");
+    let body = &sent[0];
+    let mut keys: Vec<&str> = body
+        .as_object()
+        .expect("a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "max_completion_tokens",
+            "messages",
+            "model",
+            "response_format",
+            "temperature"
+        ],
+        "the transmitted body is not the one this build intends to send: {body}"
+    );
+    assert_eq!(body["max_completion_tokens"], 8000);
+    assert_eq!(body["model"], "stub");
+    // The stub accepted everything, so nothing was withdrawn and the run
+    // says nothing about corrections.
+    assert_eq!(body["temperature"], 0);
+    assert_eq!(body["response_format"]["type"], "json_object");
+}
+
+/// `doc:assertionMode` end to end, from a custom `--system-prompt` to the
+/// ledger. The shipped prompt is untouched — it ships verbatim with hosted
+/// extraction — so the only path today is a caller's own prompt, and that
+/// path has to actually work.
+#[test]
+fn doc_ingest_stores_assertion_mode_from_a_custom_prompt() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+    std::fs::write(
+        tmp.path().join("prompt.txt"),
+        "Extract entities and relations as JSON.\n\
+         For each relation add \"assertionMode\": how the source states it — \
+         \"asserted\", \"hedged\", \"attributed\" or \"negated\".\n\
+         {guidance}## MODEL\n{model}",
+    )
+    .unwrap();
+    let (url, _calls) = stub_llm(serde_json::json!({
+        "entities": [
+            { "name": "Jane Doe", "type": "schema:Person",
+              "context": "Jane Doe joined Acme as Chief Technology Officer" }
+        ],
+        "relations": [
+            { "subjectName": "Jane Doe", "predicate": "schema:worksFor", "objectName": "Acme",
+              "objectIsLiteral": false, "assertionMode": "Hedged",
+              "context": "Jane Doe joined Acme as Chief Technology Officer in March." },
+            { "subjectName": "Jane Doe", "predicate": "schema:jobTitle",
+              "objectName": "Chief Technology Officer", "objectIsLiteral": true,
+              "assertionMode": "probably", "context": "as Chief Technology Officer" }
+        ]
+    }));
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+            "--system-prompt",
+            "prompt.txt",
+        ])
+        .assert()
+        .success()
+        // An out-of-enum value is refused out loud, not dropped quietly.
+        .stdout(predicate::str::contains(
+            "1 relation(s) named an assertionMode outside \
+             asserted / hedged / attributed / negated",
+        ))
+        // And is not reported as an ignored key: the schema carries it.
+        .stdout(predicate::str::contains("assertionMode\"").not());
+
+    // Stored on the review node beside the verdict, normalised, and only
+    // for the relation whose mode was one of the four.
+    fluree_cmd(&tmp)
+        .args([
+            "query",
+            "memos",
+            "-e",
+            r"PREFIX doc: <https://ns.flur.ee/doc#>
+              SELECT ?m ?v WHERE { ?r a doc:Relation ; doc:assertionMode ?m ; doc:verdict ?v }",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("(1 rows"))
+        .stdout(predicate::str::contains("hedged"));
+}
+
+/// Three refusals in a row, resolved in one call, and reported once.
+///
+/// This pins three things at the same time, and each would be invisible
+/// without the others:
+///
+/// 1. **All three fields route through the correction**, not just the
+///    budget — the mechanism is used for the fields that motivated it.
+/// 2. **A correction does not back off.** The gaps between arrivals stay
+///    far under the 2s that is the shortest retry sleep.
+///
+/// It deliberately does **not** claim that a correction avoids spending a
+/// retry: four requests are reachable either way, because the `continue`
+/// skips the budget check. That property needs a transient failure to be
+/// observable at all, and has its own test below.
+#[test]
+fn doc_ingest_takes_three_corrections_in_one_call_without_spending_a_retry() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+
+    // An endpoint that refuses every optional field, one 400 at a time,
+    // each in the words a real provider uses.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    // Request bodies with the instant each arrived. The gaps between them
+    // are what "a correction does not back off" means; whole-process wall
+    // time is not, because it also pays for starting a debug binary from
+    // cold, which is how this assertion first flaked.
+    type Arrivals = std::sync::Arc<std::sync::Mutex<Vec<(std::time::Instant, serde_json::Value)>>>;
+    let seen: Arrivals = Default::default();
+    let captured = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let mut len = 0usize;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; len];
+            reader.read_exact(&mut body).ok();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            captured
+                .lock()
+                .unwrap()
+                .push((std::time::Instant::now(), parsed.clone()));
+            let refuse = |param: &str, message: &str| {
+                (
+                    400,
+                    serde_json::json!({ "error": { "param": param, "message": message } })
+                        .to_string(),
+                )
+            };
+            let (status, reply) = if parsed.get("temperature").is_some() {
+                refuse(
+                    "temperature",
+                    "Unsupported value: 'temperature' does not support 0 with this model",
+                )
+            } else if parsed.get("response_format").is_some() {
+                refuse(
+                    "response_format",
+                    "response_format.type: Input should be 'json_schema'",
+                )
+            } else if parsed.get("max_completion_tokens").is_some() {
+                refuse(
+                    "max_completion_tokens",
+                    "Unrecognized request argument supplied: max_completion_tokens",
+                )
+            } else {
+                (
+                    200,
+                    serde_json::json!({ "choices": [{ "message": {
+                    "role": "assistant",
+                    "content": "{\"entities\":[],\"relations\":[]}" } }] })
+                    .to_string(),
+                )
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+        }
+    });
+
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("3 call(s) were refused and resent with an adjusted request")
+                .count(1),
+        );
+
+    let arrivals = seen.lock().unwrap();
+    let sent: Vec<&serde_json::Value> = arrivals.iter().map(|(_, b)| b).collect();
+    assert_eq!(
+        sent.len(),
+        4,
+        "one call, three corrections, one answer: {sent:?}"
+    );
+    // Each refusal withdrew exactly the field it named, and nothing else.
+    assert_eq!(sent[0]["temperature"], 0);
+    assert_eq!(sent[0]["response_format"]["type"], "json_object");
+    assert_eq!(sent[0]["max_completion_tokens"], 8000);
+    assert!(sent[1].get("temperature").is_none());
+    assert_eq!(sent[1]["response_format"]["type"], "json_object");
+    assert!(sent[2].get("response_format").is_none());
+    assert_eq!(sent[2]["max_completion_tokens"], 8000);
+    assert_eq!(sent[3]["max_tokens"], 8000, "renamed, not dropped");
+    assert!(sent[3].get("max_completion_tokens").is_none());
+    // The shortest retry backoff is 2s, so any gap near it means a
+    // correction was treated as a transient failure.
+    let worst = arrivals
+        .windows(2)
+        .map(|w| w[1].0.duration_since(w[0].0))
+        .max()
+        .expect("four requests give three gaps");
+    assert!(
+        worst < std::time::Duration::from_secs(2),
+        "a correction backed off: the longest gap between requests was {worst:?}"
+    );
+}
+
+/// A dialect correction must not spend one of the three attempts that
+/// exist to ride out a transient failure.
+///
+/// Only observable when a transient actually follows a correction, which is
+/// why this is its own test and why it pays real backoff: the endpoint
+/// refuses one field, then fails twice with a 503, then answers. Four
+/// requests and a clean run. If the correction had consumed an attempt the
+/// budget would run out on the second 503 and the chunk would be reported
+/// failed instead.
+#[test]
+fn doc_ingest_keeps_its_full_retry_budget_after_a_dialect_correction() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    write_extraction_fixtures(&tmp);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served = count.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let mut len = 0usize;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; len];
+            reader.read_exact(&mut body).ok();
+            let n = served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (status, reply) = match n {
+                // One dialect refusal, then two transients, then the answer.
+                0 => (
+                    400,
+                    serde_json::json!({ "error": { "param": "temperature",
+                        "message": "Unsupported value: 'temperature'" } })
+                    .to_string(),
+                ),
+                1 | 2 => (503, serde_json::json!({ "error": "try again" }).to_string()),
+                _ => (
+                    200,
+                    serde_json::json!({ "choices": [{ "message": {
+                        "role": "assistant",
+                        "content": "{\"entities\":[],\"relations\":[]}" } }] })
+                    .to_string(),
+                ),
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+        }
+    });
+
+    fluree_cmd(&tmp)
+        .env("FLUREE_DOC_LLM_URL", &url)
+        .env("FLUREE_DOC_LLM_MODEL", "stub")
+        .args([
+            "doc",
+            "ingest",
+            "docs",
+            "-l",
+            "memos",
+            "--model",
+            "ont/model.ttl",
+            "--entities",
+            "ont/entities.ttl",
+        ])
+        .assert()
+        .success()
+        // The chunk was extracted, not abandoned.
+        .stdout(predicate::str::contains("chunk(s) failed").not())
+        .stdout(predicate::str::contains(
+            "1 call(s) were refused and resent with an adjusted request",
+        ));
+    assert_eq!(
+        count.load(std::sync::atomic::Ordering::SeqCst),
+        4,
+        "one correction plus three attempts"
+    );
+}
+
+// --- end: `fluree doc ingest` re-ingest ownership (PR-C / #1864) ------------
 
 /// A stub OpenAI-compatible `/embeddings` endpoint. Each input string becomes
 /// a 3-dim vector counting two marker words, so similarity is predictable and

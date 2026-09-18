@@ -106,7 +106,7 @@ async fn export_local(
             builder = builder.graph(iri);
         }
         if let Some(at_str) = req.at.as_deref() {
-            builder = builder.as_of(parse_time_spec(at_str));
+            builder = builder.as_of(parse_time_spec(at_str)?);
         }
         if let Some(ctx) = req.context.as_ref() {
             builder = builder.context(ctx);
@@ -146,14 +146,15 @@ fn parse_format(s: &str) -> Result<ExportFormat> {
     }
 }
 
-fn parse_time_spec(at: &str) -> TimeSpec {
-    if let Ok(t) = at.parse::<i64>() {
-        TimeSpec::at_t(t)
-    } else if at.contains('-') && at.contains(':') {
-        TimeSpec::at_time(at.to_string())
-    } else {
-        TimeSpec::at_commit(at.to_string())
-    }
+/// Parse the request's `at` field.
+///
+/// Shares [`TimeSpec::parse_at`] with `fluree query --at` and `fluree export
+/// --at` (#1805). This was a byte-identical copy of the CLI's old heuristic, so
+/// `POST /export {"at": "t:2"}` sent the literal string `t:2` to the commit
+/// prefix resolver exactly as the CLI did.
+fn parse_time_spec(at: &str) -> Result<TimeSpec> {
+    TimeSpec::parse_at(at)
+        .map_err(|e| ServerError::bad_request(format!("invalid 'at' time spec: {e}")))
 }
 
 fn content_type_for(format: ExportFormat) -> &'static str {

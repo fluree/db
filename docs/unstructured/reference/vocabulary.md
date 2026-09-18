@@ -67,6 +67,7 @@ Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally u
 | `rdfs:label` | string | `subject | predicate label | object`. |
 | `doc:excerpt` | string | The text supporting it, as the model quoted it. |
 | `doc:verdict` | string | `valid`, `repaired` or `rejected`. |
+| `doc:assertionMode` | string | `asserted`, `hedged`, `attributed` or `negated`: how the source states it. Present only when a custom `--system-prompt` asked for it. Not a confidence score and not ordered — see [Assertion mode](../concepts/entities-and-relations.md#assertion-mode). |
 | `doc:asserted` | boolean | Whether a direct edge was written for it. |
 | `doc:originalPredicate`, `doc:repairNote` | string | On a repaired relation: what the model wrote, and how it was resolved. |
 | `doc:rejectionReason` | string | On a rejected relation. |

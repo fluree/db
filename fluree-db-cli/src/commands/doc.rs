@@ -174,6 +174,14 @@ struct Totals {
     off_model_dropped: usize,
     extraction_cache_hits: usize,
     chunks_failed: usize,
+    /// Keys the model returned that the extraction schema does not carry,
+    /// named so a `--system-prompt` that asks for one is a fix rather than
+    /// a mystery.
+    unknown_keys: std::collections::BTreeSet<String>,
+    /// Entities and relations the parser could not read and dropped whole.
+    dropped_items: usize,
+    /// Relations whose `assertionMode` was not one of the four modes.
+    assertion_mode_rejected: usize,
 }
 
 const DEFAULT_CONCURRENCY: usize = 4;
@@ -541,7 +549,9 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
             max_chars: args.max_chars,
         },
         cache,
-        vlm,
+        // The reader is shared, not handed over: the run reports at the end
+        // how many of its calls the endpoint refused and had to be resent.
+        vlm: vlm.clone(),
     };
 
     if let Some(out) = &args.out_dir {
@@ -764,6 +774,9 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
                 totals.off_model_dropped += s.off_model_dropped;
                 totals.extraction_cache_hits += x.cache_hits;
                 totals.chunks_failed += x.chunks_failed;
+                totals.dropped_items += s.dropped_items;
+                totals.assertion_mode_rejected += s.assertion_mode_rejected;
+                totals.unknown_keys.extend(s.unknown_keys.iter().cloned());
                 note
             }
             None => String::new(),
@@ -814,7 +827,10 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
     println!();
     println!(
         "{} {} ingested, {} unchanged, {} failed — {} chunks, {} pages, {} crop(s) read, {} parse(s) from cache, {:.1}s{}",
-        if totals.failed == 0 { "done:".green() } else { "done with errors:".yellow() },
+        // A chunk failure is not a document failure — the document landed
+        // and the next run retries just that chunk — but a run where every
+        // chunk of every document failed still printed a green `done:`.
+        if totals.failed == 0 && totals.chunks_failed == 0 { "done:".green() } else { "done with errors:".yellow() },
         totals.ingested,
         totals.skipped,
         totals.failed,
@@ -843,6 +859,52 @@ async fn run_ingest(args: DocIngestArgs, dirs: &FlureeDir) -> CliResult<()> {
             } else {
                 String::new()
             }
+        );
+        // Once per run, not once per chunk: a 10k-chunk corpus returning
+        // the same extra key every time would otherwise print 10k lines.
+        if !totals.unknown_keys.is_empty() {
+            let shown: Vec<String> = totals
+                .unknown_keys
+                .iter()
+                .take(3)
+                .map(|k| format!("\"{k}\""))
+                .collect();
+            let rest = totals.unknown_keys.len().saturating_sub(shown.len());
+            println!(
+                "    {} {} key(s) the extraction schema does not carry were ignored: {}{} — nothing was stored for them",
+                "!".yellow(),
+                totals.unknown_keys.len(),
+                shown.join(", "),
+                if rest > 0 { format!(" and {rest} more") } else { String::new() }
+            );
+        }
+        if totals.dropped_items > 0 {
+            println!(
+                "    {} {} item(s) the extraction schema could not read were dropped whole",
+                "!".yellow(),
+                totals.dropped_items
+            );
+        }
+        if totals.assertion_mode_rejected > 0 {
+            println!(
+                "    {} {} relation(s) named an assertionMode outside {}; nothing was stored for them",
+                "!".yellow(),
+                totals.assertion_mode_rejected,
+                fluree_db_doc::extract::AssertionMode::ALL.join(" / ")
+            );
+        }
+    }
+    // Outside the extraction block on purpose: crop reading uses the same
+    // wire shape, so a run with no `--model` can still have been adjusted.
+    let recoveries = extraction
+        .as_ref()
+        .and_then(|x| x.extractor.as_ref())
+        .map_or(0, |x| x.recoveries())
+        + vlm.as_ref().map_or(0, |v| v.recoveries());
+    if recoveries > 0 {
+        println!(
+            "    {} {recoveries} call(s) were refused and resent with an adjusted request; the endpoint does not take every field this sends",
+            "!".yellow()
         );
     }
     if totals.unescalated > 0 {

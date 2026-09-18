@@ -23,7 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ModelEndpoint {
     /// Base URL of an OpenAI-compatible API, up to and including `/v1`.
     pub url: String,
@@ -50,6 +50,30 @@ pub enum WireApi {
     #[default]
     Chat,
     Responses,
+}
+
+/// Hand-written so the bearer token cannot be printed.
+///
+/// Nothing formats a `ModelEndpoint` today, but a derived `Debug` means one
+/// future `{:?}` in a `tracing` call, an error message or a panic puts a
+/// live API key wherever that goes — and this struct is reachable from
+/// `DocConfig` and `EmbeddingClient`, both of which do derive `Debug`, so a
+/// caller need never name `ModelEndpoint` to leak one. `LlmClient` already
+/// has the hand-written version of this (`llm.rs`); the type holding the
+/// secret is the right place for it.
+impl std::fmt::Debug for ModelEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelEndpoint")
+            .field("url", &self.url)
+            .field("model", &self.model)
+            // Whether a key is configured is useful and safe; a `$NAME`
+            // indirection is not a secret either, but the resolved value
+            // it stands for is, and the two are the same field.
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("dimensions", &self.dimensions)
+            .field("api", &self.api)
+            .finish()
+    }
 }
 
 impl ModelEndpoint {
@@ -206,6 +230,7 @@ pub const GATEWAY_EMBEDDING_MODEL: &str = "text-embedding-3-small";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embed::EmbeddingClient;
 
     #[test]
     fn route_joins_with_single_slash() {
@@ -237,6 +262,54 @@ mod tests {
             api: None,
         };
         assert_eq!(ep.resolved_api_key().as_deref(), Some("sk-test"));
+    }
+
+    /// A literal key, a `$NAME` indirection, and the same endpoint reached
+    /// through the two containers that do derive `Debug`. None of them may
+    /// print the secret.
+    #[test]
+    fn debug_never_prints_a_secret() {
+        std::env::set_var("FLUREE_DOC_SECRET_TEST_KEY", "sk-from-the-environment");
+        for key in ["sk-literal-secret", "$FLUREE_DOC_SECRET_TEST_KEY"] {
+            let ep = ModelEndpoint {
+                url: "https://api.openai.com/v1".into(),
+                model: "gpt-5-mini".into(),
+                api_key: Some(key.into()),
+                dimensions: None,
+                api: None,
+            };
+            assert_eq!(
+                ep.resolved_api_key().as_deref(),
+                Some(if key.starts_with('$') {
+                    "sk-from-the-environment"
+                } else {
+                    key
+                }),
+                "the key must still be usable"
+            );
+            for rendered in [
+                format!("{ep:?}"),
+                format!("{:?}", EmbeddingClient::new(ep.clone()).ok()),
+                format!(
+                    "{:?}",
+                    DocConfig {
+                        llm: Some(ep.clone()),
+                        ..Default::default()
+                    }
+                ),
+            ] {
+                assert!(
+                    !rendered.contains("sk-literal-secret")
+                        && !rendered.contains("sk-from-the-environment")
+                        && !rendered.contains("FLUREE_DOC_SECRET_TEST_KEY"),
+                    "a secret reached a Debug rendering: {rendered}"
+                );
+                assert!(
+                    rendered.contains("<redacted>"),
+                    "the key should still be visibly present-but-hidden: {rendered}"
+                );
+            }
+        }
     }
 
     #[test]
