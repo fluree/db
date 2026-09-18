@@ -2798,6 +2798,78 @@ fn big_numeric_objects_keep_their_annotations() {
         .stderr(predicate::str::contains("could not be resolved").not());
 }
 
+/// A point-in-time export shows an annotation that was live at that time,
+/// even though it has since been retracted.
+///
+/// It did not, on the arena-less path. `scan_base_index_for_attachment_events_in`
+/// computed its own upper bound as `t.max(snapshot.t)` — right for a seal
+/// pass, which wants the whole of history, and wrong for a read at a
+/// requested `t`. Raising the bound to HEAD means the range never returns a
+/// bundle retracted after the requested time, and the filter below it can
+/// only *drop* rows, never restore them. The annotation vanished from an
+/// export that should contain it, and because no edge was then known to be
+/// annotated, nothing incremented the unresolved counter either — silent.
+///
+/// The bound is now the caller's: seal callers clamp it themselves, the
+/// export passes the requested time.
+///
+/// Three things the fixture needs, or it passes without exercising the bug:
+/// the ledger must be **indexed past** the requested `t` (otherwise
+/// `snapshot.t` is 0 and the clamp is a no-op), the annotation must be
+/// **retracted after** it (otherwise it is live at HEAD too), and the scan
+/// must be the annotation source (`FLUREE_EXPORT_ANNOTATION_SCAN`), since
+/// that is the path the bound belongs to.
+#[test]
+fn a_point_in_time_export_keeps_an_annotation_retracted_later() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "tt"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "tt",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:knows ex:b ~ ex:c1 {| ex:conf 0.5 |} .\n",
+        ])
+        .assert()
+        .success();
+    // Retract the attachment, keeping the edge (the by-@id form).
+    fluree_cmd(&tmp)
+        .args([
+            "update",
+            "tt",
+            "--format",
+            "json",
+            "-e",
+            r#"{"@context":{"ex":"http://example.org/"},
+                "delete":{"@id":"ex:a","ex:knows":{"@id":"ex:b",
+                          "@annotation":{"@id":"ex:c1"}}}}"#,
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp).args(["index", "tt"]).assert().success();
+
+    // At HEAD the annotation is gone — that is the retract working.
+    fluree_cmd(&tmp)
+        .args(["export", "tt", "--format", "turtle"])
+        .env("FLUREE_EXPORT_ANNOTATION_SCAN", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("~ <http://example.org/c1>").not());
+
+    // At t=1 it was live, so it must be in the output.
+    fluree_cmd(&tmp)
+        .args(["export", "tt", "--format", "turtle", "--at", "1"])
+        .env("FLUREE_EXPORT_ANNOTATION_SCAN", "1")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("~ <http://example.org/c1>"))
+        .stdout(predicate::str::contains("<http://example.org/knows>"));
+}
+
 // ============================================================================
 // v1.1 — Config tests
 // ============================================================================
