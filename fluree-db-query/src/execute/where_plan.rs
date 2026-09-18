@@ -269,23 +269,48 @@ fn expand_edge_annotation_patterns_inside_graph(patterns: &[Pattern]) -> Vec<Pat
     out
 }
 
-/// Move a `FILTER` into the [`Pattern::DefaultGraphSource`] wrapper that binds
+/// Copy a `FILTER` into the [`Pattern::DefaultGraphSource`] wrapper that binds
 /// every variable it mentions.
 ///
 /// [`expand_edge_annotation_patterns`] wraps each expanded annotation chain in
-/// `DefaultGraphSource`, and [`collect_inner_join_block`] stops at any
-/// non-triple pattern — so a `FILTER` written beside an annotation
-/// (`?s :knows ?o {| :confidence ?c |} FILTER(?c > 0.97)`) starts a block of
-/// its own with no triples in it. [`extract_bounds_from_filters`] needs an
-/// object variable from the *same* block, finds none, and the threshold is
-/// left as a `FilterOperator` above the wrapper: every annotation is read and
-/// materialized before a single row is discarded, so a selective threshold
-/// costs exactly what no threshold costs.
+/// `DefaultGraphSource`. [`collect_inner_join_block`] collects `Values`,
+/// `Triple`, `Bind` **and `Filter`**, breaking only on its `_` arm — and
+/// `DefaultGraphSource` is what hits that arm. So a `FILTER` written beside an
+/// annotation (`?s :knows ?o {| :confidence ?c |} FILTER(?c > 0.97)`) starts a
+/// block of its own whose `triples` vector is empty.
+/// [`extract_bounds_from_filters`] returns early on `object_vars.is_empty()`,
+/// and the threshold is left as a `FilterOperator` above the wrapper: every
+/// annotation is read and materialized before a single row is discarded, so a
+/// selective threshold costs exactly what no threshold costs.
 ///
-/// Moving the filter inside puts it in the chain's *body*, which every
-/// annotation lane plans through the ordinary block builder — so the body scan
-/// picks up the same `ObjectBounds` pushdown an unannotated triple has always
-/// had. Nothing new is taught to the scan layer.
+/// Putting a copy inside puts it in the chain's *body*, which every annotation
+/// lane plans through the ordinary block builder — so the body scan picks up
+/// the same `ObjectBounds` pushdown an unannotated triple has always had.
+/// Nothing new is taught to the scan layer.
+///
+/// # Copy, not move
+///
+/// That `collect_inner_join_block` collects filters is also why this copies
+/// rather than relocates. A filter in the outer list was already feeding
+/// `extract_bounds_from_filters` for any *sibling* triple in its block, so
+/// removing it would trade one pushdown for another rather than add one:
+///
+/// ```text
+/// ?s :knows ?o {| :confidence ?c |}      # the wrapper
+/// ?a :confidence ?c .                    # a plain sibling, bounds from the filter
+/// FILTER(?c > 0.7)
+/// ```
+///
+/// Leaving the original in place keeps the sibling's bound and adds the
+/// wrapper's, and nothing outside the wrapper changes at all — which is also
+/// what makes the soundness argument below a statement about the wrapper only.
+/// The cost is one redundant predicate evaluation per surviving row, on rows
+/// the inner copy has already admitted.
+///
+/// A filter is only duplicated when [`expression_is_duplication_safe`] holds.
+/// `FILTER(?c > RAND())` evaluated twice keeps a different set of rows than the
+/// same filter evaluated once, so a non-deterministic expression is *moved*, as
+/// before — correct, and no worse than the previous behaviour.
 ///
 /// # Why this is sound
 ///
@@ -339,8 +364,10 @@ fn sink_filters_into_annotation_chains(patterns: &mut Vec<Pattern>) {
         })
         .collect();
 
-    // `(filter index, wrapper index)`, in source order.
-    let mut moves: Vec<(usize, usize)> = Vec::new();
+    // `(filter index, wrapper index, duplicate)`, in source order. `duplicate`
+    // is false only for an expression that cannot be evaluated twice, which is
+    // relocated the way this pass originally worked.
+    let mut moves: Vec<(usize, usize, bool)> = Vec::new();
     for (i, p) in patterns.iter().enumerate() {
         let Pattern::Filter(expr) = p else { continue };
         if contains_exists(expr) {
@@ -358,7 +385,7 @@ fn sink_filters_into_annotation_chains(patterns: &mut Vec<Pattern>) {
             b.as_ref()
                 .is_some_and(|bound| vars.iter().all(|v| bound.contains(v)))
         }) {
-            moves.push((i, w));
+            moves.push((i, w, crate::eval::expression_is_duplication_safe(expr)));
         }
     }
     if moves.is_empty() {
@@ -366,15 +393,18 @@ fn sink_filters_into_annotation_chains(patterns: &mut Vec<Pattern>) {
     }
 
     // Append in source order so sibling filters keep their relative order,
-    // then remove the originals back-to-front so earlier indices stay valid.
-    for &(fi, wi) in &moves {
+    // then remove back-to-front — so earlier indices stay valid — only those
+    // originals that could not be safely duplicated.
+    for &(fi, wi, _) in &moves {
         let f = patterns[fi].clone();
         if let Pattern::DefaultGraphSource { patterns: inner } = &mut patterns[wi] {
             inner.push(f);
         }
     }
-    for &(fi, _) in moves.iter().rev() {
-        patterns.remove(fi);
+    for &(fi, _, duplicate) in moves.iter().rev() {
+        if !duplicate {
+            patterns.remove(fi);
+        }
     }
 }
 
@@ -6282,10 +6312,9 @@ mod tests {
     }
 
     #[test]
-    fn sink_moves_annotation_body_filter_inside_the_wrapper() {
+    fn sink_copies_annotation_body_filter_inside_the_wrapper() {
         let patterns = vec![annotated_hop(0, 1, 2, 3), gt(3, 0.97)];
         let expanded = expand_edge_annotation_patterns(&patterns);
-        assert_eq!(expanded.len(), 1, "the FILTER must not remain a sibling");
         let chain = unwrap_default_graph_source(&expanded[0]);
         // base + 3 f:reifies* + body triple + the sunk FILTER
         assert_eq!(chain.len(), 6);
@@ -6293,6 +6322,65 @@ mod tests {
         assert!(
             matches!(chain[5], Pattern::Filter(_)),
             "the FILTER sinks to the end of the chain, where the body is: {chain:?}"
+        );
+        // Copied, not relocated: the original keeps feeding
+        // `extract_bounds_from_filters` for anything else in its block.
+        assert_eq!(expanded.len(), 2);
+        assert_eq!(
+            filter_count(&expanded),
+            1,
+            "the original FILTER is retained"
+        );
+    }
+
+    #[test]
+    fn sink_keeps_the_original_so_a_sibling_triple_keeps_its_bounds() {
+        // The mixed shape: an annotated hop and a plain triple reading the
+        // same variable. Before the copy, sinking removed the FILTER from the
+        // outer block and the plain scan silently lost the `ObjectBounds` it
+        // had before this pass existed — a pushdown traded, not added.
+        let sibling = Pattern::Triple(TriplePattern::new(
+            Ref::Var(VarId(7)),
+            Ref::Sid(Sid::new(100, "confidence")),
+            Term::Var(VarId(3)),
+        ));
+        let patterns = vec![annotated_hop(0, 1, 2, 3), sibling, gt(3, 0.7)];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        assert_eq!(
+            filter_count(unwrap_default_graph_source(&expanded[0])),
+            1,
+            "the wrapper still gets its copy"
+        );
+        assert_eq!(
+            filter_count(&expanded),
+            1,
+            "and the sibling's block keeps the original: {expanded:?}"
+        );
+    }
+
+    #[test]
+    fn sink_moves_rather_than_copies_a_nondeterministic_filter() {
+        // `FILTER(?c > RAND())` evaluated twice keeps a different set of rows
+        // than the same filter evaluated once, so this one is relocated the
+        // way the pass originally worked rather than duplicated.
+        let rand_filter = Pattern::Filter(Expression::call(
+            crate::ir::Function::Gt,
+            vec![
+                Expression::Var(VarId(3)),
+                Expression::call(crate::ir::Function::Rand, vec![]),
+            ],
+        ));
+        let patterns = vec![annotated_hop(0, 1, 2, 3), rand_filter];
+        let expanded = expand_edge_annotation_patterns(&patterns);
+        assert_eq!(
+            filter_count(unwrap_default_graph_source(&expanded[0])),
+            1,
+            "it still sinks — moving is sound, only duplicating is not"
+        );
+        assert_eq!(
+            filter_count(&expanded),
+            0,
+            "and it is NOT left outside as well: {expanded:?}"
         );
     }
 
@@ -6339,9 +6427,16 @@ mod tests {
             gt(6, 0.5),
         ];
         let expanded = expand_edge_annotation_patterns(&patterns);
-        assert_eq!(expanded.len(), 2, "two wrappers, no leftover FILTERs");
-        assert_eq!(filter_count(unwrap_default_graph_source(&expanded[0])), 1);
-        assert_eq!(filter_count(unwrap_default_graph_source(&expanded[1])), 1);
+        let wrappers: Vec<&Pattern> = expanded
+            .iter()
+            .filter(|p| matches!(p, Pattern::DefaultGraphSource { .. }))
+            .collect();
+        assert_eq!(wrappers.len(), 2, "two wrappers");
+        assert_eq!(filter_count(unwrap_default_graph_source(wrappers[0])), 1);
+        assert_eq!(filter_count(unwrap_default_graph_source(wrappers[1])), 1);
+        // Each hop's threshold is copied into its own chain; both originals
+        // stay put, so neither hop's sibling loses a bound.
+        assert_eq!(filter_count(&expanded), 2);
     }
 
     #[test]

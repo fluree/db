@@ -487,6 +487,59 @@ fn function_supported_for_bool_cache(func: &Function) -> bool {
     )
 }
 
+/// Whether evaluating `expr` twice against the same row is guaranteed to give
+/// the same answer.
+///
+/// Sinking a `FILTER` into an annotation wrapper *copies* it rather than moving
+/// it, so the original keeps feeding any sibling triple's `ObjectBounds`
+/// pushdown. Copying only preserves semantics when the expression is a pure
+/// function of its row: `FILTER(?c > RAND())` evaluated twice keeps a different
+/// set of rows than the same filter evaluated once, so that one has to be moved
+/// rather than copied.
+///
+/// This is the same question [`function_supported_for_bool_cache`] answers — a
+/// result that may differ between two calls can be neither cached nor
+/// duplicated — so both read one exclusion list instead of drifting apart. If a
+/// function is added there, duplication safety follows automatically.
+pub(crate) fn expression_is_duplication_safe(expr: &Expression) -> bool {
+    match expr {
+        Expression::Call { func, args } => {
+            function_supported_for_bool_cache(func)
+                && args.iter().all(expression_is_duplication_safe)
+        }
+        Expression::Map(entries) => entries
+            .iter()
+            .all(|(_, v)| expression_is_duplication_safe(v)),
+        Expression::ListComprehension {
+            list, filter, map, ..
+        } => {
+            expression_is_duplication_safe(list)
+                && filter.as_deref().is_none_or(expression_is_duplication_safe)
+                && map.as_deref().is_none_or(expression_is_duplication_safe)
+        }
+        Expression::Reduce {
+            init, list, body, ..
+        } => {
+            expression_is_duplication_safe(init)
+                && expression_is_duplication_safe(list)
+                && expression_is_duplication_safe(body)
+        }
+        Expression::ListPredicate {
+            list, predicate, ..
+        } => expression_is_duplication_safe(list) && expression_is_duplication_safe(predicate),
+        Expression::Member { target, .. } => expression_is_duplication_safe(target),
+        // Resolved per-row against the execution context. The sink already
+        // declines these via `contains_exists`; excluded here too so the
+        // predicate stands on its own rather than relying on a caller's gate.
+        Expression::Exists { .. } | Expression::PatternComprehension { .. } => false,
+        // Already resolved against one execution context; re-evaluating it
+        // elsewhere is not obviously the same question, so decline rather than
+        // reason about which context it was resolved in.
+        Expression::Resolved(_) => false,
+        Expression::Var(_) | Expression::Const(_) => true,
+    }
+}
+
 fn function_returns_bool(func: &Function, all_children_return_bool: bool) -> bool {
     match func {
         Function::Eq
