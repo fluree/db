@@ -395,13 +395,38 @@ pub(crate) async fn scan_base_index_for_attachment_events_in(
     // cost on this scan instead of on every flake of every query, and leaves
     // the decoder's tamper check intact: a bundle whose `f:reifiesGraph`
     // names a *different* graph than the one it was read from still fails.
+    // The subject dictionary, for resolving a graph IRI to the Sid the write
+    // path actually stored. Same downcast `ledger_manager` uses; the provider
+    // is known present because this function returns early without one.
+    let store = snapshot
+        .range_provider
+        .as_ref()
+        .and_then(|rp| {
+            rp.as_any()
+                .downcast_ref::<fluree_db_query::BinaryRangeProvider>()
+        })
+        .map(|rp| rp.store().as_ref());
+
     let graphs: Vec<(fluree_db_core::GraphId, Option<Sid>)> = graph_ids
         .into_iter()
         .map(|id| {
             let graph_sid = (id != 0)
                 .then(|| snapshot.graph_registry.iri_for_graph_id(id))
                 .flatten()
-                .and_then(|iri| snapshot.encode_iri(iri));
+                .and_then(|iri| {
+                    // Prefer the *stored* Sid, the way
+                    // `ExportResolver::resolve_subject_sid` does, and fall
+                    // back to a fresh encode only when the store cannot
+                    // answer. `encode_iri` has no OVERFLOW branch: once the
+                    // namespace table has overflowed, the write path stores a
+                    // graph as `(OVERFLOW, iri)` while `encode_iri` returns
+                    // `(EMPTY, iri)` — same name, different namespace code.
+                    // Stamping the wrong one would have the decoder reject
+                    // the bundle for a second reason, silently.
+                    store
+                        .and_then(|s| s.find_subject_sid(iri).ok().flatten())
+                        .or_else(|| snapshot.encode_iri(iri))
+                });
             (id, graph_sid)
         })
         .collect();
