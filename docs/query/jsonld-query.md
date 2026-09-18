@@ -699,9 +699,26 @@ relying on that, `filter` says it directly and is unchanged:
 ```
 
 The identity form `["bind", "?v", "?v"]` is still accepted, as is a bind
-inside one `union` branch onto a column the sibling branch produces. SPARQL
-has rejected both spellings all along (§10.1 and §19.8); Cypher rejects its
-`AS` equivalent; this closes the last surface that did not.
+inside one `union` branch onto a column the sibling branch produces. The rule
+applies inside nested `["query", …]` subqueries too, and to `unwind`, which
+has the same problem: `["unwind", "?v", …]` onto a bound `?v` silently
+filtered to rows where an element happened to match. Unwind into a fresh
+variable.
+
+**Reusing a metadata variable is not affected, deliberately.** Binding one
+`@t` (or `@type`, `@language`, `@op`) variable across two properties is how
+you ask for "both asserted in the same transaction":
+
+```json
+{"@id": "?s",
+ "schema:name": {"@value": "?name", "@t": "?t"},
+ "schema:age":  {"@value": "?age",  "@t": "?t"}}
+```
+
+That binds onto an already-bound `?t` by design — the join is the point — so
+it keeps working. SPARQL has rejected both `bind` spellings all along (§10.1
+and §19.8); Cypher rejects its `AS` equivalent; this closes the last surface
+that did not.
 
 ### Values Patterns
 

@@ -11293,3 +11293,86 @@ async fn issue1857_unwind_onto_a_bound_var_is_rejected() {
         9,
     );
 }
+
+// ---------------------------------------------------------------------------
+// fluree/db#1857 — review round (bplatz). Each test pins a finding that held.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn issue1857_call_body_alias_onto_imported_var_is_rejected() {
+    // #1857's own shape inside a CALL body. The projection snapshot was
+    // branch-local, and a CALL body starts with no patterns — the imported
+    // `a` is seeded per parent row by SubqueryOperator — so the imported name
+    // was invisible to the guard and `Bind{a, a.name}` clobber-dropped every
+    // row. This is the test that decides whether `Fixes #1857` holds.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-call-body").await;
+    let db = graphdb_from_ledger(&l);
+
+    for q in [
+        r#"MATCH (a:Person) CALL (a) { WITH a.name AS a RETURN a AS z } RETURN z"#,
+        r#"MATCH (a:Person) CALL (a) { UNWIND [1, 2, 3] AS a RETURN a AS z } RETURN z"#,
+    ] {
+        let msg = cypher_query_error(&fluree, &db, q).await;
+        assert!(
+            msg.contains("`a`") && msg.contains("already bound"),
+            "CALL body must reject an alias onto an imported name: {msg} (for {q})"
+        );
+    }
+
+    // Fresh aliases and the identity carry inside a CALL are NOT rejected —
+    // that is what this half pins. It deliberately asserts non-rejection
+    // rather than a row count: the fresh-alias form returns 16 rows (4 x 4),
+    // not 4, on `main` without this change as well, so the count reflects a
+    // pre-existing CALL-correlation behaviour that is out of this PR's scope
+    // and is tracked separately.
+    for q in [
+        r#"MATCH (a:Person) CALL (a) { WITH a.name AS n RETURN n AS z } RETURN z"#,
+        r#"MATCH (a:Person) CALL (a) { WITH a AS a RETURN a.name AS z } RETURN z"#,
+    ] {
+        fluree
+            .query_cypher(&db, q)
+            .await
+            .unwrap_or_else(|e| panic!("must not be rejected: {q}: {e}"));
+    }
+}
+
+#[tokio::test]
+async fn issue1857_unlisted_at_prefixed_names_are_reserved() {
+    // The keyword list was the boundary, so any `@` name it missed got
+    // through — `@import` and `@annotation` committed literal predicates.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-at-prefix").await;
+    let db = graphdb_from_ledger(&l);
+
+    let msg = cypher_query_error(&fluree, &db, r#"MATCH (n:Person) RETURN n.`@import` AS v"#).await;
+    assert!(msg.contains("reserved JSON-LD"), "{msg}");
+
+    for stmt in [
+        r#"MATCH (n:Person {name: "Alice"}) SET n.`@import` = "x""#,
+        r#"MATCH (n:Person {name: "Alice"}) SET n.`@annotation` = "x""#,
+    ] {
+        let err = fluree
+            .transact_cypher(l.clone(), stmt)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("must be rejected, not committed: {stmt}"));
+        assert!(err.to_string().contains("reserved JSON-LD"), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn issue1857_keyword_reached_through_a_context_alias_is_rejected() {
+    // `{"id": "@id"}` is a standard JSON-LD aliasing idiom. It lands in the
+    // Cypher override map and resolves `id` to `@id`, so a check on the bare
+    // name alone let `n.id` read and write the keyword.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-context-alias").await;
+    let db = graphdb_from_ledger(&l).with_default_context(Some(json!({"id": "@id"})));
+
+    let msg = cypher_query_error(&fluree, &db, r#"MATCH (n:Person) RETURN n.id AS v"#).await;
+    assert!(
+        msg.contains("resolves through the ledger's context to `@id`"),
+        "must name both the spelling and what it resolved to: {msg}"
+    );
+}

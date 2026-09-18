@@ -746,13 +746,17 @@ here to stay:
   this shows on ordinary `a / b`.
 - **No implicit per-statement transaction id.** Immutability and time-travel
   (`f:t`, history queries) replace those semantics.
-- **`@id`, `@type` and the other JSON-LD keywords are not Cypher names.** A node
-  variable already *is* the node, so ``n.`@id` `` and ``n.`@type` `` are rejected and
-  the error names the accessor that works — `id(n)` / `elementId(n)` for
-  identity, `labels(n)` for types, `SET n:Label` to add one. The rejection
-  covers every position a bare name can occupy: property keys, inline property
-  maps, annotation property maps, **node labels**, and relationship types, on
-  both the read and write paths. As a property key they were previously read as
+- **`@id`, `@type` and every other `@`-prefixed name are not Cypher names.** A
+  node variable already *is* the node, so ``n.`@id` `` and ``n.`@type` `` are rejected
+  and the error names the accessor that works — `id(n)` / `elementId(n)` for
+  identity, `labels(n)` for types, `SET n:Label` to add one. The rule is the
+  `@` prefix, not a list of keywords, so names JSON-LD adds later are covered
+  too. It covers every position a bare name can occupy: property keys, inline
+  property maps, annotation property maps, **node labels**, and relationship
+  types, on both the read and write paths — and it checks what a name
+  **resolves to** as well as how it is spelled, so a ledger context that
+  aliases an ordinary term to a keyword (`{"id": "@id"}`, a standard JSON-LD
+  idiom) cannot route `n.id` around it. As a property key they were previously read as
   ordinary absent properties (always `null`) and written as a literal predicate
   spelled `@id`; as a label ``MATCH (n:`@id`)`` read as zero rows and
   ``SET n:`@type` `` committed, after which `labels(n)` read back
@@ -788,6 +792,9 @@ case pulls them in; each has a workaround:
   and unaliased ones, so `RETURN a, a` and `RETURN a.name, a.name` are rejected
   alongside `AS x, … AS x`. That matches Neo4j ("Multiple result columns with
   the same name are not supported").
+- **The same collision inside a `CALL { … }` body** is rejected too. A name the
+  body imports — `CALL (a) { WITH a.name AS a … }` — is bound for every parent
+  row, so assigning onto it dropped every row exactly as at the top level.
 - **`UNWIND <list> AS v` where `v` is already bound** is rejected, for the same
   reason: `UNWIND` introduces a new binding, and assigning onto a bound name
   silently dropped every row. One sub-case — a list expression that *references*

@@ -438,3 +438,70 @@ async fn jsonld_grouped_list_keeps_duplicates_without_aggregation() {
     let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
     assert_eq!(rows, json!([["ex:b1", [10, 10, 10]], ["ex:b2", [20, 30]]]));
 }
+
+/// Review round (bplatz) on the JSON-LD guard: the regression it introduced,
+/// and the two scopes it did not see.
+#[tokio::test]
+async fn jsonld_bind_guard_review_round() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "query/grouping-parity-v5review:main").await;
+    let ctx = context_ex_schema();
+
+    // REGRESSION FIX. Reusing one node-map metadata variable across two
+    // properties is the natural spelling of "both asserted in the same
+    // transaction", and it binds onto an already-bound `?t` by design. The
+    // guard's doc claimed these binds were `?__`-prefixed and exempt; they
+    // carry the author's own name, so the guard rejected a working query.
+    let shared_t = json!({
+        "@context": ctx,
+        "select": ["?name", "?t"],
+        "where": [{"@id": "?s",
+                   "schema:name": {"@value": "?name", "@t": "?t"},
+                   "schema:age":  {"@value": "?age",  "@t": "?t"}}]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &shared_t)
+        .await
+        .expect("a shared metadata variable is a join, and must keep working");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(rows.as_array().map(Vec::len), Some(3), "{rows:?}");
+
+    // …while a genuine collision on the same shape of query is still refused,
+    // so the exemption is the metadata join and not a blanket pass.
+    let genuine = json!({
+        "@context": ctx,
+        "select": ["?name"],
+        "where": [{"@id": "?s", "schema:name": "?name", "schema:age": "?age"},
+                  ["bind", "?age", ["expr", ["+", "?age", 1]]]]
+    });
+    support::query_jsonld(&fluree, &ledger, &genuine)
+        .await
+        .expect_err("a user bind onto a bound variable is still rejected");
+
+    // Nested subquery: nothing checked it, so the defect survived one level
+    // down and returned an unexplained empty result.
+    let nested = json!({
+        "@context": ctx,
+        "select": ["?age"],
+        "where": [["query", {"@context": ctx,
+                             "select": ["?age"],
+                             "where": [{"@id": "?s2", "schema:age": "?age"},
+                                       ["bind", "?age", ["expr", ["+", "?age", 1]]]]}]]
+    });
+    let err = support::query_jsonld(&fluree, &ledger, &nested)
+        .await
+        .expect_err("a nested select must be guarded like the top level");
+    assert!(err.to_string().contains("bind target ?age"), "{err}");
+
+    // `unwind` onto a bound variable: the Cypher twin of this exact shape is
+    // rejected in the same PR, so the surfaces should agree.
+    let unwind = json!({
+        "@context": ctx,
+        "select": ["?name", "?age"],
+        "where": [{"@id": "?s", "schema:name": "?name", "schema:age": "?age"},
+                  ["unwind", "?age", ["expr", ["range", 1, 3]]]]
+    });
+    let err = support::query_jsonld(&fluree, &ledger, &unwind)
+        .await
+        .expect_err("unwind onto a bound variable must be rejected");
+    assert!(err.to_string().contains("unwind target ?age"), "{err}");
+}
