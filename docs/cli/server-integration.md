@@ -2063,7 +2063,7 @@ Content-Type: application/json
 | `system_graphs` | bool | No | `false` | Also emit the system graphs under `all_graphs`. Diagnostic only — the result is named for the source ledger and does not re-import cleanly. |
 | `graph` | string | No | — | IRI of a single named graph to export. Mutually exclusive with `all_graphs`. |
 | `context` | object | No | ledger default | Prefix map for Turtle/TriG/JSON-LD output. Either a bare object (`{ "ex": "..." }`) or `{ "@context": {...} }`. Falls back to the ledger's stored default context when absent. |
-| `at` | string | No | latest | Time spec — `t:<N>` (transaction number), `t:latest` or `latest`, `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>` (min 6 chars). A bare transaction number, ISO-8601 timestamp or commit prefix also works; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. Identical to the local `--at` flag. |
+| `at` | string | No | latest | Time spec — `t:<N>` (transaction number), `t:latest` or `latest`, `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. Identical to the local `--at` flag. |
 
 An empty body is accepted and treated as all-default (Turtle export at HEAD).
 

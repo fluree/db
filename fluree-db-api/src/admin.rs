@@ -11,17 +11,27 @@
 
 use crate::{error::ApiError, tx::IndexingMode, Result};
 use fluree_db_core::tracking::{Tracker, TrackingOptions};
+use fluree_db_core::ContentId;
 use fluree_db_core::{
     address_path::{ledger_id_to_path_prefix, shared_prefix_for_path},
     format_ledger_id, DEFAULT_BRANCH,
 };
 use fluree_db_indexer::{
-    clean_garbage, execute_sweep, plan_sweep, rebuild_index_from_commits_with_tracker,
-    BranchIndexHead, CleanGarbageConfig, MaintenanceGuard, SweepPlan, SweepResult,
+    current_sibling_heads, execute_sweep, plan_garbage, plan_sweep,
+    rebuild_index_from_commits_with_tracker, release_garbage_plan, shared_refs_of_branches,
+    siblings_of, BranchIndexHead, CleanGarbageConfig, MaintenanceGuard, SweepPlan, SweepResult,
 };
 use fluree_db_nameservice::{GraphSourceType, NsRecord};
+use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+/// The ledger name a ledger id belongs to, for keying the collector lock.
+fn ledger_name_of(ledger_id: &str) -> String {
+    fluree_db_core::ledger_id::split_ledger_id(ledger_id)
+        .map(|(name, _)| name)
+        .unwrap_or_else(|_| ledger_id.to_string())
+}
 
 // =============================================================================
 // Drop Mode and Status Types
@@ -1199,6 +1209,13 @@ impl crate::Fluree {
 
     /// Cancel indexing, delete storage artifacts, purge nameservice record,
     /// and disconnect from cache. Returns the parent's new child count.
+    ///
+    /// Dictionary blobs live in the ledger-wide `@shared/dicts/` namespace,
+    /// so the branch prefix delete does not reach them. The ones only this
+    /// branch's index chain referenced go last, once the record is gone: a
+    /// sibling's collector pass may already have deferred them to this branch
+    /// (see the module docs on `fluree_db_indexer::gc`), after which nothing
+    /// else names them.
     async fn purge_branch(
         &self,
         ledger_id: &str,
@@ -1210,9 +1227,15 @@ impl crate::Fluree {
             handle.wait_for_idle(ledger_id).await;
         }
 
-        // Branch path: only the per-branch artifacts. `@shared/dicts/` is
-        // never wiped from a branch drop — sibling/parent branches may still
-        // reference them; final cleanup happens in `drop_ledger`.
+        // Read before the branch's roots are deleted: the chain is what says
+        // which blobs it referenced.
+        let own_dicts = self
+            .shared_blobs_of(ledger_id, record, &mut report.warnings)
+            .await;
+
+        // Branch path: only the per-branch artifacts. The rest of
+        // `@shared/dicts/` stays — sibling/parent branches reference it — and
+        // is wiped by `drop_ledger` once every branch is gone.
         let (count, warnings) = self.drop_artifacts(ledger_id, record).await;
         report.artifacts_deleted += count;
         report.warnings.extend(warnings);
@@ -1223,7 +1246,136 @@ impl crate::Fluree {
             mgr.disconnect(ledger_id).await;
         }
 
+        if !own_dicts.is_empty() {
+            // Not concurrently with a sibling's collector pass, which decides
+            // from the same chains this does, and with every surviving
+            // branch's builds held off: what the survivors reference is only
+            // true while none of them can publish. See
+            // `IndexerHandle::open_release_window`.
+            let _quiet = match &self.indexing_mode {
+                IndexingMode::Background(handle) => {
+                    let gc_guard = handle.hold_gc(&ledger_name_of(ledger_id)).await;
+                    match handle.open_release_window(&gc_guard).await {
+                        Some(window) => Some((window, gc_guard)),
+                        None => {
+                            report.warnings.push(
+                                "A branch of the ledger is held for maintenance; the dropped \
+                                 branch's dictionary blobs are left for a sweep"
+                                    .to_string(),
+                            );
+                            return Ok(parent_new_count);
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let unique_dicts = self
+                .unreferenced_by_survivors(ledger_id, own_dicts, &mut report.warnings)
+                .await;
+            let failures = self
+                .content_store(ledger_id)
+                .release_many(&unique_dicts)
+                .await;
+            let released = unique_dicts.len() - failures.len();
+            report.artifacts_deleted += released;
+            for (cid, error) in failures {
+                warn!(ledger_id, %cid, %error, "Failed to release a dropped branch's dictionary blob");
+                report
+                    .warnings
+                    .push(format!("Failed to release dictionary blob {cid}: {error}"));
+            }
+            info!(
+                ledger_id,
+                released, "Released dictionary blobs only the dropped branch referenced"
+            );
+        }
+
         Ok(parent_new_count)
+    }
+
+    /// Dictionary blobs `ledger_id`'s index chain references.
+    ///
+    /// Here and in [`Self::unreferenced_by_survivors`], any failure to read a
+    /// chain or list the branches returns nothing and records a warning:
+    /// releasing on an incomplete picture could take a dictionary a surviving
+    /// branch still reads, whereas leaving the blobs costs disk until a sweep.
+    async fn shared_blobs_of(
+        &self,
+        ledger_id: &str,
+        record: Option<&NsRecord>,
+        warnings: &mut Vec<String>,
+    ) -> HashSet<ContentId> {
+        let Some(head) = record.and_then(|r| r.index_head_id.clone()) else {
+            return HashSet::new();
+        };
+        let backend = self.backend();
+        let own = BranchIndexHead {
+            ledger_id: ledger_id.to_string(),
+            index_head_id: Some(head),
+        };
+        match shared_refs_of_branches(backend, &[own], None).await {
+            Ok(refs) => refs,
+            Err(e) => {
+                warnings.push(format!(
+                    "Could not read the branch's index chain; its dictionary blobs are left for a sweep: {e}"
+                ));
+                HashSet::new()
+            }
+        }
+    }
+
+    /// The blobs in `referenced` that no surviving branch of `ledger_id`'s
+    /// ledger reaches, retracted branches included. Listed and walked now
+    /// rather than earlier: the caller holds the survivors quiet.
+    async fn unreferenced_by_survivors(
+        &self,
+        ledger_id: &str,
+        referenced: HashSet<ContentId>,
+        warnings: &mut Vec<String>,
+    ) -> Vec<ContentId> {
+        let backend = self.backend();
+        let records = match self.nameservice().all_records().await {
+            Ok(records) => records,
+            Err(e) => {
+                warnings.push(format!(
+                    "Could not list branches; the branch's dictionary blobs are left for a sweep: {e}"
+                ));
+                return Vec::new();
+            }
+        };
+        // The listing's branches plus any this process built that the listing
+        // does not show yet (DynamoDB lists through an eventually consistent
+        // index), each head re-read.
+        let mut candidates: Vec<String> = siblings_of(&records, ledger_id)
+            .into_iter()
+            .map(|b| b.ledger_id)
+            .collect();
+        if let IndexingMode::Background(handle) = &self.indexing_mode {
+            candidates.extend(handle.built_branches(&ledger_name_of(ledger_id)));
+        }
+        let survivors = match current_sibling_heads(self.nameservice(), ledger_id, &candidates)
+            .await
+        {
+            Ok(survivors) => survivors,
+            Err(e) => {
+                warnings.push(format!(
+                        "Could not read a sibling branch's record; the branch's dictionary blobs are left for a sweep: {e}"
+                    ));
+                return Vec::new();
+            }
+        };
+        let elsewhere = match shared_refs_of_branches(backend, &survivors, None).await {
+            Ok(refs) => refs,
+            Err(e) => {
+                warnings.push(format!(
+                    "Could not read a sibling branch's index chain; the branch's dictionary blobs are left for a sweep: {e}"
+                ));
+                return Vec::new();
+            }
+        };
+        let mut unique: Vec<ContentId> = referenced.difference(&elsewhere).cloned().collect();
+        unique.sort();
+        unique
     }
 
     /// Recursively drop retracted ancestor branches that have zero children.
@@ -2156,13 +2308,77 @@ impl crate::Fluree {
         } else {
             let gc_store = self.content_store(&ledger_id);
             let gc_root_id = index_result.root_id.clone();
-            let gc_config = CleanGarbageConfig {
-                max_old_indexes: Some(gc_max_old_indexes),
-                min_time_garbage_mins: Some(gc_min_time_mins),
-                ..Default::default()
+            let gc_backend = self.backend().clone();
+            let gc_ledger_id = ledger_id.clone();
+            let gc_nameservice = self.nameservice_mode.as_arc_reader();
+            let gc_handle = match &self.indexing_mode {
+                IndexingMode::Background(handle) => Some(handle.clone()),
+                _ => None,
             };
             tokio::spawn(async move {
-                if let Err(e) = clean_garbage(gc_store.as_ref(), &gc_root_id, gc_config).await {
+                let gc_config = CleanGarbageConfig {
+                    max_old_indexes: Some(gc_max_old_indexes),
+                    min_time_garbage_mins: Some(gc_min_time_mins),
+                    ..Default::default()
+                };
+                let pass = async {
+                    // Serialised with the worker's own passes on this ledger's
+                    // branches where a worker exists, and released with its
+                    // builds held off; see `IndexerHandle::open_release_window`.
+                    let gc_guard = match &gc_handle {
+                        Some(handle) => Some(handle.hold_gc(&ledger_name_of(&gc_ledger_id)).await),
+                        None => None,
+                    };
+                    let Some(plan) =
+                        plan_garbage(gc_store.as_ref(), &gc_root_id, &gc_config).await?
+                    else {
+                        return Ok(());
+                    };
+                    let _window = match (&gc_handle, &gc_guard) {
+                        (Some(handle), Some(guard)) => {
+                            match handle.open_release_window(guard).await {
+                                Some(window) => Some(window),
+                                // Held for maintenance; the periodic pass retries.
+                                None => return Ok(()),
+                            }
+                        }
+                        _ => None,
+                    };
+                    // A reindex is rare enough for a full listing; the
+                    // worker's own passes avoid one. A failed listing
+                    // defers every shared blob.
+                    let siblings = match gc_nameservice.all_records().await {
+                        Ok(records) => {
+                            let mut ids: Vec<String> = siblings_of(&records, &gc_ledger_id)
+                                .into_iter()
+                                .map(|b| b.ledger_id)
+                                .collect();
+                            if let Some(handle) = &gc_handle {
+                                ids.extend(handle.built_branches(&ledger_name_of(&gc_ledger_id)));
+                            }
+                            Some(ids)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "could not list branches for the collector's sibling check; deferring shared blobs"
+                            );
+                            None
+                        }
+                    };
+                    release_garbage_plan(
+                        plan,
+                        &gc_backend,
+                        gc_nameservice.as_ref(),
+                        &gc_ledger_id,
+                        siblings.as_deref(),
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+                };
+                let result: fluree_db_indexer::Result<()> = pass.await;
+                if let Err(e) = result {
                     tracing::warn!(
                         error = %e,
                         root_id = %gc_root_id,

@@ -1757,13 +1757,16 @@ fn parse_literal_value_with_meta(
 
             // Handle @json specially
             if type_iri == "@json" || expanded_type == rdf::JSON {
-                // If @value is already a string, use it directly (avoid double-serialization)
-                // Only serialize if it's an object, array, or other non-string JSON value
+                // Canonicalizing here gives one term per value, regardless
+                // of how the writer serialized it (#1781). A string `@value`
+                // holds an already serialized document, so it is
+                // canonicalized in place when it parses and stored as written
+                // when it does not.
                 let json_string = match val {
-                    Value::String(s) => s.clone(),
-                    _ => serde_json::to_string(val).map_err(|e| {
-                        TransactError::Parse(format!("Failed to serialize @json value: {e}"))
-                    })?,
+                    Value::String(s) => {
+                        fluree_graph_ir::canonicalize_json(s).unwrap_or_else(|_| s.clone())
+                    }
+                    _ => fluree_graph_ir::canonicalize_json_value(val),
                 };
                 let datatype_sid = ns_registry.sid_for_iri(rdf::JSON);
                 return Ok(

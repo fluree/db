@@ -493,7 +493,7 @@ async fn run_local_rdf(
         builder = builder.graph(iri);
     }
     if let Some(at_str) = at {
-        builder = builder.as_of(crate::commands::query::parse_time_spec(at_str));
+        builder = builder.as_of(crate::commands::query::parse_time_spec(at_str)?);
     }
     if let Some(ctx) = resolve_context_override(context_expr, context_file)? {
         builder = builder.context(&ctx);

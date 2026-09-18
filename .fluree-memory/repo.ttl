@@ -997,6 +997,53 @@ mem:fact-01ky55dwckmwazppht36vrn5hk a mem:Fact ;
     mem:createdAt "2026-07-22T14:59:41.587318Z"^^xsd:dateTime ;
     mem:rationale "The cookbook drifted into fully non-runnable syntax because this path had parser tests but no e2e coverage, and the unbound-metadata case fails silently rather than erroring." .
 
+mem:constraint-01m2ndzbe89853esz7dc7apxbv a mem:Constraint ;
+    mem:content "Collector passes for branches of one ledger must never overlap, and a branch drop must take the same per-ledger-name lock (GcLocks / IndexerHandle::hold_gc). Two concurrent passes can each see the other's not-yet-released old root still referencing a dictionary blob, both defer it, and both consume the manifests that named it, orphaning the blob for good. Only in-process passes are serialised; a second-process indexer is the same single-process caveat MaintenanceGuard carries." ;
+    mem:tag "branches" ;
+    mem:tag "concurrency" ;
+    mem:tag "gc" ;
+    mem:tag "indexer" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-api/src/admin.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/orchestrator.rs" ;
+    mem:branch "feat/gc-shared-dict-reclaim" ;
+    mem:createdAt "2026-09-16T15:39:40.872581+00:00"^^xsd:dateTime ;
+    mem:rationale "The sibling check decides from a snapshot of the other branches' chains; two deciders with interleaved snapshots each conclude the other still needs the blob." .
+
+mem:decision-01m2ndz73ex89zq0ftggn4dq2n a mem:Decision ;
+    mem:content "The index collector releases a dictionary blob a manifest names unless another branch of the ledger (retracted included) still reaches it through its own chain (SharedBlobPolicy::Release, computed by gc::siblings). Sibling chains are walked through a flat per-branch store on purpose: a fork's copied head root links into the source namespace, and a branch-aware store would count the source's own history as \"referenced elsewhere\" and never release anything. A blob a sibling still reaches is deferred; the sibling's own manifest names it when it replaces it, so whichever branch drops it last deletes it." ;
+    mem:tag "branches" ;
+    mem:tag "dictionaries" ;
+    mem:tag "gc" ;
+    mem:tag "indexer" ;
+    mem:tag "storage" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-indexer/src/gc/collector.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/gc/mod.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/gc/siblings.rs" ;
+    mem:branch "feat/gc-shared-dict-reclaim" ;
+    mem:createdAt "2026-09-16T15:39:36.430342+00:00"^^xsd:dateTime ;
+    mem:rationale "Before this the collector skipped every dict-blob CID and only a storage sweep reclaimed them; nothing ran sweeps, so each incremental build leaked its rewritten reverse-dict leaves (34 GB under a 225 MB commit log on one deployment)." ;
+    mem:alternatives "Copy dictionaries per branch at fork (huge copies); auto-run the sweep periodically (lists all storage, needs every branch held)" .
+
+mem:fact-01m2ndzh3f0ttxz9zt9g63rs14 a mem:Fact ;
+    mem:content "Index GC runs only where a BackgroundIndexerWorker runs: fluree-db-server, an API client built with with_indexing, or a process that spawns the worker itself (solo does). The CLI's local mode uses without_indexing() plus novelty thresholds, so `fluree index`/`fluree reindex` never collect and a CLI-only user reclaims nothing without `fluree sweep`. The periodic collector pass rides the worker's catch-up tick (catchup_interval, once at start-up too), so it obeys catchup_sweeps_enabled and runs only on the catch-up owner. Releases go out via release_many/delete_many in batches of 1000 with 4 in flight because the S3 backend caps requests process-wide at 32; a pass or sweep at 32-wide single deletes starved every reader." ;
+    mem:tag "cli" ;
+    mem:tag "gc" ;
+    mem:tag "indexer" ;
+    mem:tag "io" ;
+    mem:tag "s3" ;
+    mem:tag "server" ;
+    mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-cli/src/context.rs" ;
+    mem:artifactRef "fluree-db-core/src/storage.rs" ;
+    mem:artifactRef "fluree-db-indexer/src/orchestrator.rs" ;
+    mem:artifactRef "fluree-db-storage-aws/src/s3/mod.rs" ;
+    mem:branch "feat/gc-shared-dict-reclaim" ;
+    mem:createdAt "2026-09-16T15:39:46.671346+00:00"^^xsd:dateTime ;
+    mem:rationale "Answers the recurring \"why did nothing get cleaned up\" question for a given deployment shape before anyone looks for a collector bug." .
+
 mem:constraint-01kxej5vnp087j9mjp31d8yw62 a mem:Constraint ;
     mem:content "A span-capture integration test with an ABSENCE assertion (`!store.has_event(...)`) must be its OWN `[[test]]` bin — never bundled into a shared grp_* group, and never converted to `set_global_default`. A process-global subscriber captures PARALLEL siblings' events (a sibling emitting the same event from a shared code path breaks the absence assertion), and tracing's process-global callsite-interest cache lets a sibling hit the callsite first under the no-op default and cache it \"disabled\" (breaks PRESENCE capture). oauth2.rs's set_global_default pattern is sound only for PRESENCE-only assertions. fluree-db-api convention: it_cyclic_bgp_probe and it_minmax_fast_path_fired are standalone bins for this reason." ;
     mem:tag "flake" ;
@@ -2808,6 +2855,21 @@ mem:fact-01kx0h97eybzh5g0bkaw3dr0f3 a mem:Fact ;
     mem:artifactRef "fluree-db-api/tests/support/mod.rs" ;
     mem:branch "fix/policy-class-with-identity" ;
     mem:createdAt "2026-07-08T09:34:58.014473Z"^^xsd:dateTime .
+
+mem:constraint-01m2mvq8by6dxjs9p0dg1t80pc a mem:Constraint ;
+    mem:content "is_root in policy_builder is true only when both rule sets are empty AND (explicit policy input present ? default_allow == Some(true) : default_allow != Some(false)). Never use effective_default_allow() in the no-input arm: it resolves unset to deny and would fail every ungoverned ledger closed. allow_unfiltered() is exactly !is_root(), so a non-root context with zero rules silently forces every scan onto the policy-filtered fallback and declines all probe lanes." ;
+    mem:tag "default_allow" ;
+    mem:tag "fast-path" ;
+    mem:tag "is_root" ;
+    mem:tag "performance" ;
+    mem:tag "policy" ;
+    mem:scope mem:repo ;
+    mem:severity "must" ;
+    mem:artifactRef "fluree-db-api/src/policy_builder.rs" ;
+    mem:artifactRef "fluree-db-query/src/context.rs" ;
+    mem:branch "fix/policy-empty-ruleset-allow-root" ;
+    mem:createdAt "2026-09-16T10:20:41.214976+00:00"^^xsd:dateTime ;
+    mem:rationale "A console-bound ledger whose model had no f:AccessPolicy rules ran 20-40x slower under an unrestricted-in-effect view; the fail-closed contract from 5593817a0 (zero rules under deny must deny) is preserved by requiring an explicit allow when any input selects policy." .
 
 mem:constraint-01m0xcxydkmh6amzdm8a62q7cc a mem:Constraint ;
     mem:content "Nothing reclaims raw-txn blobs: gc/sweep.rs excludes ContentKind::Txn by design, and after PR #1677 no inline release touches them, so every distinct failed-staging body leaks permanently. A commit-chain-rooted sweep of the `txn/` prefix is UNSAFE as written: the raft queued transactor puts live QueuedRequest envelopes under ContentKind::Txn in the same per-ledger prefix and releases them itself. A future collector needs a candidate list (orphan CIDs recorded at failure time) plus a grace period, not blind enumerate-minus-live." ;

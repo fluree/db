@@ -3041,6 +3041,7 @@ dependencies = [
  "cid",
  "dashmap",
  "fluree-db-credential",
+ "fluree-graph-ir",
  "fluree-vocab",
  "fs2",
  "futures",

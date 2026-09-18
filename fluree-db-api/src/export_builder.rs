@@ -272,7 +272,20 @@ impl<'a> ExportBuilder<'a> {
                 .snapshot
                 .graph_registry
                 .iri_for_graph_id(g_id)
-                .map(|iri| binary_store.encode_iri(iri))
+                .map(|iri| {
+                    // Resolve the way `ExportResolver::resolve_subject_sid`
+                    // does: the stored Sid first, a fresh encode only as a
+                    // fallback. `encode_iri` returns the split form whenever
+                    // the namespace prefix is registered, while storage may
+                    // hold the full-IRI form for that same IRI — and a Sid
+                    // differing in any position lands on the wrong arena span
+                    // and reports "no annotations" rather than failing.
+                    binary_store
+                        .find_subject_sid(iri)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| binary_store.encode_iri(iri))
+                })
         };
 
         let mut total_stats = ExportStats::default();

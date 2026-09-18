@@ -443,6 +443,10 @@ fn rewrite_having_aggregates(
 /// - `"rules": [...]` - query-time datalog rules (enables datalog automatically)
 /// - No key present - no reasoning (reasoning is opt-in)
 ///
+/// These keys are canonical at the **top level** of the query object, and are
+/// also accepted inside `opts` as an alias. The top level wins: when it
+/// carries any of them, `opts` is not consulted at all.
+///
 /// # Example
 ///
 /// ```json
@@ -454,21 +458,76 @@ fn rewrite_having_aggregates(
 /// ```json
 /// { "rules": [...datalog rules...] }
 /// ```
+///
+/// or, equivalently,
+///
+/// ```json
+/// { "opts": { "reasoning": "rdfs" } }
+/// ```
 pub fn parse_reasoning(
     obj: &serde_json::Map<String, JsonValue>,
 ) -> Result<Option<crate::ir::ReasoningModes>> {
-    // Check if reasoning, rules, ontology, or a budget is present. A budget
-    // alone enables no mode, but it must be carried so a ledger-config
-    // default mode runs under it.
-    let has_reasoning = obj.contains_key("reasoning");
-    let has_rules = obj.contains_key("rules");
-    let has_ontology = obj.contains_key("ontology");
-    let has_budget = obj.contains_key("reasoningBudget");
-
-    if !has_reasoning && !has_rules && !has_ontology && !has_budget {
-        return Ok(None);
+    // The top level is canonical. When it carries any reasoning key it is the
+    // sole source, and this costs exactly what it did before the `opts` alias
+    // below existed: four map probes and one clone.
+    //
+    // A budget alone enables no mode, but it must be carried so a
+    // ledger-config default mode runs under it — hence it counts as present.
+    //
+    // PRECEDENCE IS ALL-OR-NOTHING, NOT PER KEY. Any one top-level reasoning
+    // key makes the top level the whole source, so
+    // `{"reasoningBudget": {…}, "opts": {"reasoning": "datalog"}}` runs with no
+    // reasoning at all: the budget is a modifier rather than a mode, but it
+    // still wins the source election and the `opts` mode is dropped in silence.
+    // That is deliberate — a per-key merge would let one request draw modes
+    // from two places at once, which is harder to predict than one source
+    // winning outright — and it is pinned by
+    // `opts_ignored_when_any_top_level_reasoning_key_present`.
+    //
+    // It is, however, the same silently-ignored shape as the defect that
+    // motivated this alias (fluree/db#1863), one level down. Changing it to a
+    // per-key merge is a behavior change with its own compatibility surface,
+    // so it is tracked separately rather than folded in here.
+    if REASONING_KEYS.iter().any(|k| obj.contains_key(*k)) {
+        return reasoning_from(obj);
     }
 
+    // Otherwise accept the same keys from `opts`. Users reasonably guess that
+    // query-level knobs live there, because several genuinely do
+    // (`objectVarParsing`, `includeSystemFacts`, `t`, `maxFuel`, ...), and
+    // until now `{"opts": {"reasoning": "datalog"}}` was silently ignored: no
+    // error, no reasoning, an empty result set (fluree/db#1863).
+    //
+    // Honoring it grants no privilege a top-level key does not already grant —
+    // ledger-config override control is applied downstream to the *parsed*
+    // modes (`config_resolver::merge_reasoning` -> `effective_reasoning`),
+    // where `Force` wins over a query-supplied mode whatever its source.
+    // Rejecting unknown `opts` keys instead is not viable: `opts` is a
+    // deliberately open bag, and the server injects into it (`identity`,
+    // `policy-values`, `policyClass`), so a whitelist would break forward
+    // compatibility with its own writers.
+    let Some(opts) = obj.get("opts").and_then(JsonValue::as_object) else {
+        return Ok(None);
+    };
+    if !REASONING_KEYS.iter().any(|k| opts.contains_key(*k)) {
+        return Ok(None);
+    }
+    let mut merged = obj.clone();
+    for &key in REASONING_KEYS {
+        if let Some(value) = opts.get(key) {
+            merged.insert(key.to_string(), value.clone());
+        }
+    }
+    reasoning_from(&merged)
+}
+
+/// Keys [`crate::ir::ReasoningModes::from_query_json`] consumes. Canonical at
+/// the top level of the query object; also accepted inside `opts`.
+const REASONING_KEYS: &[&str] = &["reasoning", "rules", "ontology", "reasoningBudget"];
+
+fn reasoning_from(
+    obj: &serde_json::Map<String, JsonValue>,
+) -> Result<Option<crate::ir::ReasoningModes>> {
     // Reconstruct the query object for from_query_json
     let query_obj = JsonValue::Object(obj.clone());
     crate::ir::ReasoningModes::from_query_json(&query_obj)
@@ -556,6 +615,79 @@ pub fn parse_include_system_facts(obj: &serde_json::Map<String, JsonValue>) -> b
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn reasoning_of(v: &JsonValue) -> Option<crate::ir::ReasoningModes> {
+        parse_reasoning(v.as_object().unwrap()).unwrap()
+    }
+
+    /// `{"opts": {"reasoning": ...}}` used to be silently ignored: no error,
+    /// no reasoning, an empty result set (fluree/db#1863).
+    #[test]
+    fn reasoning_accepted_inside_opts() {
+        let modes = reasoning_of(&json!({"opts": {"reasoning": "datalog"}}))
+            .expect("opts.reasoning must enable reasoning");
+        assert!(modes.datalog, "expected datalog mode, got {modes:?}");
+    }
+
+    #[test]
+    fn reasoning_top_level_still_wins_over_opts() {
+        let modes = reasoning_of(&json!({
+            "reasoning": "datalog",
+            "opts": {"reasoning": "owl2rl"}
+        }))
+        .expect("top-level reasoning must enable reasoning");
+        assert!(modes.datalog, "top level should win, got {modes:?}");
+        assert!(!modes.owl2rl, "opts must not be consulted, got {modes:?}");
+    }
+
+    /// The top level is the sole source whenever it carries ANY reasoning key,
+    /// so a stray `opts` twin cannot half-apply.
+    #[test]
+    fn opts_ignored_when_any_top_level_reasoning_key_present() {
+        let modes = reasoning_of(&json!({
+            "rules": [],
+            "opts": {"reasoning": "owl2rl"}
+        }))
+        .expect("a top-level rules key is a reasoning key");
+        assert!(!modes.owl2rl, "opts must not be consulted, got {modes:?}");
+    }
+
+    #[test]
+    fn rules_and_ontology_and_budget_also_aliased_in_opts() {
+        let modes = reasoning_of(&json!({
+            "opts": {"rules": [{"where": {}, "insert": {}}]}
+        }))
+        .expect("opts.rules must enable datalog");
+        assert!(modes.datalog, "rules should enable datalog, got {modes:?}");
+
+        let modes = reasoning_of(&json!({
+            "opts": {"reasoning": "owl2rl", "reasoningBudget": {"maxFacts": 42}}
+        }))
+        .expect("opts.reasoningBudget must be carried");
+        assert_eq!(modes.max_facts, Some(42));
+
+        let modes = reasoning_of(&json!({
+            "opts": {"reasoning": "rdfs", "ontology": {"@graph": []}}
+        }))
+        .expect("opts.ontology must be carried");
+        assert!(modes.ontology.is_some(), "ontology dropped: {modes:?}");
+    }
+
+    #[test]
+    fn unrelated_opts_keys_do_not_enable_reasoning() {
+        assert!(reasoning_of(&json!({"opts": {"identity": "did:key:z6Mk"}})).is_none());
+        assert!(reasoning_of(&json!({"opts": {}})).is_none());
+        assert!(reasoning_of(&json!({"opts": null})).is_none());
+        assert!(reasoning_of(&json!({})).is_none());
+    }
+
+    /// A malformed value inside `opts` must surface the same error a
+    /// malformed top-level value does, not be quietly dropped.
+    #[test]
+    fn malformed_reasoning_in_opts_errors() {
+        let v = json!({"opts": {"rules": "not-an-array"}});
+        assert!(parse_reasoning(v.as_object().unwrap()).is_err());
+    }
 
     #[test]
     fn test_parse_limit() {

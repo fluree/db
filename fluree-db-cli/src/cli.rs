@@ -774,7 +774,15 @@ pub enum Commands {
         #[arg(long, conflicts_with_all = ["sparql", "jsonld"])]
         cypher: bool,
 
-        /// Query at a specific point in time (transaction number, commit hash, or ISO-8601 timestamp)
+        /// Query at a specific point in time.
+        ///
+        /// Accepts `t:<N>` (transaction number), `t:latest`/`latest`,
+        /// `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the
+        /// wall-clock time the commit was recorded), and `commit:<prefix>`
+        /// (hex digest, min 6 chars). A bare transaction number, ISO-8601
+        /// timestamp, or commit prefix also works; a bare integer is read as
+        /// a transaction number, so use `commit:<prefix>` to force a prefix
+        /// that is all digits.
         #[arg(long)]
         at: Option<String>,
 
@@ -890,11 +898,17 @@ pub enum Commands {
         #[arg(short = 'l', long)]
         ledger: Option<String>,
 
-        /// Start of time range (transaction number, default: 1)
+        /// Start of time range (default: 1).
+        ///
+        /// Same spellings as `query --at`: `t:<N>`, `t:latest`/`latest`,
+        /// `iso:<ISO-8601>`, `recorded:<ISO-8601>`, `commit:<prefix>`, or a
+        /// bare transaction number / timestamp / commit prefix.
         #[arg(long, default_value = "1")]
         from: String,
 
-        /// End of time range (transaction number or "latest", default: latest)
+        /// End of time range (default: latest).
+        ///
+        /// Same spellings as `--from`.
         #[arg(long, default_value = "latest")]
         to: String,
 
@@ -1086,7 +1100,15 @@ pub enum Commands {
         #[arg(long, value_name = "FILE")]
         context_file: Option<std::path::PathBuf>,
 
-        /// Query at a specific point in time
+        /// Query at a specific point in time.
+        ///
+        /// Accepts `t:<N>` (transaction number), `t:latest`/`latest`,
+        /// `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the
+        /// wall-clock time the commit was recorded), and `commit:<prefix>`
+        /// (hex digest, min 6 chars). A bare transaction number, ISO-8601
+        /// timestamp, or commit prefix also works; a bare integer is read as
+        /// a transaction number, so use `commit:<prefix>` to force a prefix
+        /// that is all digits.
         #[arg(long)]
         at: Option<String>,
 
@@ -1135,7 +1157,9 @@ pub enum Commands {
 
     /// Show the contents of a commit (decoded flakes with resolved IRIs)
     Show {
-        /// Commit identifier: t:<N>, hex-digest prefix (min 6 chars), or full CID
+        /// Commit identifier: `t:<N>` or a bare transaction number,
+        /// `commit:<prefix>` or a bare hex-digest prefix (min 6 chars), or a
+        /// full CID — same forms accepted by `branch create --at`.
         commit: String,
 
         /// Ledger name (defaults to active ledger)
@@ -1701,9 +1725,15 @@ pub enum BranchAction {
 
         /// Commit to branch at (defaults to source branch HEAD).
         ///
-        /// Accepts `t:N` for a transaction number, or a hex digest / full
-        /// CID for prefix resolution. The source branch must be indexed
-        /// for `t:` / prefix resolution (full CIDs work unconditionally).
+        /// Accepts `t:<N>` or a bare transaction number, `commit:<prefix>` or
+        /// a bare hex digest prefix, or a full CID. A bare integer is read as
+        /// a transaction number, so use `commit:<prefix>` to force a prefix
+        /// that is all digits. The source branch must be indexed for `t:` /
+        /// prefix resolution (full CIDs work unconditionally).
+        ///
+        /// Unlike `query --at` this names a *commit*, so it has no `iso:`,
+        /// `recorded:` or `latest` forms; the spellings the two share mean the
+        /// same thing on both.
         #[arg(long)]
         at: Option<String>,
 
@@ -1855,8 +1885,9 @@ pub enum BranchAction {
     ///
     /// Accepts either a list of positional commit references (cherry-pick
     /// style) or `--from`/`--to` to revert a git-style range. Each commit
-    /// reference may be a `t:N` transaction number, a hex digest prefix, or
-    /// a full commit ID — same forms accepted by `branch create --at`.
+    /// reference may be a `t:N` or bare transaction number, a `commit:<prefix>`
+    /// or bare hex digest prefix, or a full commit ID — same forms accepted by
+    /// `branch create --at`.
     Revert {
         /// Commits to revert (positional). May appear once for the
         /// single-commit case or multiple times for cherry-pick. Mutually

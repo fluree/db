@@ -90,6 +90,17 @@ impl<'a> AnnotationProbe<'a> {
         let Ok(sid) = resolver.reifier_sid(s_id) else {
             return;
         };
+        self.note_bundle_sid(sid);
+    }
+
+    /// As [`Self::note_bundle_in_scope`], for callers that already hold the
+    /// reifier's `Sid`.
+    ///
+    /// Untranslated overlay rows carry a fully-decoded subject, so they need
+    /// no resolver round-trip. They still have to be *counted*: suppressing a
+    /// bundle without noting it turns a visible leak into an annotation that
+    /// vanishes with no marker, no bundle and no number.
+    pub(crate) fn note_bundle_sid(&self, sid: Sid) {
         if let Ok(mut in_scope) = self.in_scope.lock() {
             in_scope.insert(sid);
         }
@@ -112,13 +123,30 @@ impl<'a> AnnotationProbe<'a> {
     /// The complement of [`Self::out_of_scope_count`], and the one that means
     /// data loss: the `f:reifies*` rows were dropped from the output because
     /// annotation syntax was going to replace them, and then no marker was
-    /// emitted. Today this is reachable for annotations inside a named graph —
-    /// the PSOT scan that seals the arena, and that this module falls back to,
-    /// returns nothing for a named graph, so neither forward source knows
-    /// about them. The rows are in the ledger and SPARQL reads them; only
-    /// these two lookups are blind. Reporting it is what keeps that gap from
-    /// being a silent truncation, and `--raw-reifies` gets the bundles out
-    /// verbatim in the meantime.
+    /// emitted.
+    ///
+    /// **This counter is a corruption guard, and is not expected to fire in
+    /// normal operation.** That is a deliberate end state, not an oversight,
+    /// so it is worth saying why rather than leaving the next reader to
+    /// wonder whether it is dead code.
+    ///
+    /// It previously fired for annotations inside a named graph, because the
+    /// base-index scan could not key them. That is fixed. Its remaining
+    /// triggers are bundles [`EdgeKey::from_reifies_facts`] refuses to
+    /// decode, and every one of those variants means a tampered or partial
+    /// bundle. The most obvious, `GraphMismatch`, is **unconstructible from
+    /// any legitimate write**: `EdgeKey::to_reifies_facts` emits the
+    /// flake-level graph and the `f:reifiesGraph` object from the same
+    /// `self.g`, so the two views this check compares are written from one
+    /// value and cannot disagree. Every write surface also rejects
+    /// hand-written `f:reifies*`.
+    ///
+    /// So there is deliberately no regression test driving this above zero:
+    /// reaching it means writing a corrupt store, and a guard against
+    /// corruption being unreachable through supported APIs is the guard
+    /// working. What *is* tested is that it stays silent on every path that
+    /// should resolve — which is the assertion that would break if the
+    /// accounting were removed along with the defect.
     pub(crate) fn unresolved_count(&self) -> u64 {
         let (Ok(named), Ok(in_scope)) = (self.named.lock(), self.in_scope.lock()) else {
             return 0;

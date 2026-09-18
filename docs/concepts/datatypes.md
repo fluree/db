@@ -201,6 +201,40 @@ Beyond XSD, Fluree supports RDF-specific datatypes:
 
 **rdf:JSON** stores JSON data as typed literals. This is useful for storing complex structured data that doesn't fit the RDF model.
 
+A JSON literal is stored in canonical form, per [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785). JSON-LD 1.1 requires this. Members are sorted by key, insignificant whitespace is dropped, and numbers are rendered as ECMAScript renders them.
+
+A literal's value is its text. Without canonical form, `{"a":1,"b":2}` and `{"b":2,"a":1}` would be two different facts. A delete, an upsert, or a merge that matched one would miss the other.
+
+Two consequences are worth knowing:
+
+- **A value reads back canonicalized, not as written.** Members come back in key order. A number written as `1.0` reads back as `1`. The JSON is the same. Only its spelling changes.
+- **Integers keep their exact value.** RFC 8785 treats every number as a double, which rounds integers past 2^53. Fluree keeps them exact instead.
+
+`@value` may be a JSON document or a string holding one. Either is canonicalized. A string that is not valid JSON is stored as written.
+
+Ledgers written before canonicalization keep the text their writers produced. Reindexing does not change that: it rebuilds the index from the commits, and the commits hold the original text. Those values stay readable, and new writes are canonical.
+
+Two things follow for a ledger with older values.
+
+- **Naming a value no longer matches it.** A literal in a `where`, a `delete`, or a `FILTER` is canonicalized before it is compared, so it misses a value stored under another spelling. Bind the value with a variable instead.
+- **Re-asserting a value can leave two of them.** An upsert writes the canonical spelling. If its delete names the old text, the delete misses and both spellings end up on the subject. Any duplicates the missing canonicalization already created stay as they are.
+
+Repair a subject by binding the old value and writing it back:
+
+```json
+{
+  "@context": {"ex": "http://example.org/ns/"},
+  "where": {"@id": "ex:config", "ex:items": "?old"},
+  "delete": {"@id": "ex:config", "ex:items": "?old"},
+  "insert": {
+    "@id": "ex:config",
+    "ex:items": {"@value": [{"name": "alpha", "qty": 1}], "@type": "@json"}
+  }
+}
+```
+
+The `where` clause binds every spelling on that property, so this collapses duplicates as well. History keeps the original text; only the current state changes. `fluree validate` finds the properties worth repairing wherever a shape constrains them.
+
 ### Geographic Data
 
 ```json
