@@ -90,6 +90,17 @@ impl<'a> AnnotationProbe<'a> {
         let Ok(sid) = resolver.reifier_sid(s_id) else {
             return;
         };
+        self.note_bundle_sid(sid);
+    }
+
+    /// As [`Self::note_bundle_in_scope`], for callers that already hold the
+    /// reifier's `Sid`.
+    ///
+    /// Untranslated overlay rows carry a fully-decoded subject, so they need
+    /// no resolver round-trip. They still have to be *counted*: suppressing a
+    /// bundle without noting it turns a visible leak into an annotation that
+    /// vanishes with no marker, no bundle and no number.
+    pub(crate) fn note_bundle_sid(&self, sid: Sid) {
         if let Ok(mut in_scope) = self.in_scope.lock() {
             in_scope.insert(sid);
         }

@@ -641,6 +641,8 @@ pub async fn export_graph_turtle<W: Write>(
     // Untranslated overlay rows are folded into the subject block they belong
     // to rather than appended after the stream, so a subject never opens twice
     // (see `UntranslatedBySubject`).
+    let (untranslated, untranslated_reifiers) =
+        resolve_untranslated(ann.as_ref(), untranslated).await?;
     let mut untranslated = UntranslatedBySubject::new(store, untranslated);
 
     while let Some(batch) = cursor.next_batch()? {
@@ -649,6 +651,7 @@ pub async fn export_graph_turtle<W: Write>(
             &resolver,
             ann.as_ref(),
             &reifiers,
+            &untranslated_reifiers,
             &batch,
             config.g_id,
             prefixes,
@@ -663,7 +666,13 @@ pub async fn export_graph_turtle<W: Write>(
     if let Some(s_iri) = prev_subject.take() {
         if let Some(flakes) = untranslated.take(&s_iri) {
             write_untranslated_turtle_continuations(
-                &resolver, &flakes, prefixes, &mut stats, writer,
+                &resolver,
+                ann.as_ref(),
+                &untranslated_reifiers,
+                &flakes,
+                prefixes,
+                &mut stats,
+                writer,
             )?;
         }
         writeln!(writer, " .")?;
@@ -672,7 +681,16 @@ pub async fn export_graph_turtle<W: Write>(
     // Subjects the base stream never reached get their own blocks.
     let (remaining, unresolved) = untranslated.into_remaining();
     for (s_iri, flakes) in &remaining {
-        write_untranslated_turtle_block(&resolver, s_iri, flakes, prefixes, &mut stats, writer)?;
+        write_untranslated_turtle_block(
+            &resolver,
+            ann.as_ref(),
+            &untranslated_reifiers,
+            s_iri,
+            flakes,
+            prefixes,
+            &mut stats,
+            writer,
+        )?;
     }
     for flake in &unresolved {
         write_raw_flake_turtle(&resolver, flake, prefixes, &mut stats, writer)?;
@@ -681,12 +699,66 @@ pub async fn export_graph_turtle<W: Write>(
     Ok(stats)
 }
 
+/// Split untranslated overlay rows into the bundle rows annotation syntax
+/// replaces and the base rows that may carry a marker, resolving every
+/// reifier in one probe call.
+///
+/// Untranslated rows never pass through `is_reifies_row` — only the
+/// translated writers call it — so before this they reached the output raw:
+/// a *partial* `f:reifies*` bundle (the rows that did translate were
+/// suppressed) and no `~ <r>` on the edge it described. Round-tripping that
+/// file plants a reserved predicate in the target ledger as ordinary data.
+///
+/// Filtering them alone would have been worse than the leak. The unresolved
+/// counter only moves where the translated path calls `note_bundle_in_scope`,
+/// so a silent filter converts a visible wrong answer into an invisible one.
+/// Suppression and accounting are the same change.
+///
+/// One `live_reifiers` call for the whole untranslated set rather than one
+/// per row: `batch_reifiers` is already a per-row probe on annotated ledgers,
+/// and stacking a second one is the wrong direction for that cost.
+async fn resolve_untranslated(
+    ann: Option<&AnnotationContext<'_>>,
+    rows: Vec<Flake>,
+) -> io::Result<(Vec<Flake>, HashMap<EdgeKey, Vec<Sid>>)> {
+    let Some(ann) = ann else {
+        // `--raw-reifies` and annotation-free ledgers want the rows verbatim.
+        return Ok((rows, HashMap::new()));
+    };
+    let mut base: Vec<Flake> = Vec::with_capacity(rows.len());
+    for f in rows {
+        if fluree_db_core::namespaces::is_any_reifies(&f.p) {
+            ann.probe.note_bundle_sid(f.s.clone());
+            continue;
+        }
+        base.push(f);
+    }
+    let keys: Vec<EdgeKey> = base.iter().map(EdgeKey::from_flake).collect();
+    let live = ann.probe.live_reifiers(&keys).await?;
+    let mut map: HashMap<EdgeKey, Vec<Sid>> = HashMap::new();
+    for (key, reifiers) in keys.into_iter().zip(live) {
+        if !reifiers.is_empty() {
+            map.insert(key, reifiers);
+        }
+    }
+    Ok((base, map))
+}
+
+/// Reifiers for an untranslated row, from the map `resolve_untranslated`
+/// built. Empty when the row is not an annotated edge.
+fn untranslated_reifiers_for<'m>(map: &'m HashMap<EdgeKey, Vec<Sid>>, flake: &Flake) -> &'m [Sid] {
+    map.get(&EdgeKey::from_flake(flake))
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
 /// Write a batch of rows as Turtle, grouping by subject.
 #[allow(clippy::too_many_arguments)]
 fn write_turtle_batch<W: Write>(
     resolver: &ExportResolver,
     ann: Option<&AnnotationContext<'_>>,
     reifiers: &[Vec<Sid>],
+    untranslated_reifiers: &HashMap<EdgeKey, Vec<Sid>>,
     batch: &ColumnBatch,
     g_id: GraphId,
     prefixes: &PrefixMap,
@@ -737,7 +809,13 @@ fn write_turtle_batch<W: Write>(
             if let Some(prev) = prev_subject.take() {
                 if let Some(flakes) = untranslated.take(&prev) {
                     write_untranslated_turtle_continuations(
-                        resolver, &flakes, prefixes, stats, writer,
+                        resolver,
+                        ann,
+                        untranslated_reifiers,
+                        &flakes,
+                        prefixes,
+                        stats,
+                        writer,
                     )?;
                 }
                 writeln!(writer, " .")?;
@@ -889,6 +967,8 @@ pub async fn export_graph_jsonld<W: Write>(
     let mut current_subject: Option<String> = None;
     let mut current_props: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
     let mut first_node = true;
+    let (untranslated, untranslated_reifiers) =
+        resolve_untranslated(ann.as_ref(), untranslated).await?;
     let mut untranslated = UntranslatedBySubject::new(store, untranslated);
 
     while let Some(batch) = cursor.next_batch()? {
@@ -945,8 +1025,10 @@ pub async fn export_graph_jsonld<W: Write>(
                 if let Some(subj_iri) = current_subject.take() {
                     if let Some(flakes) = untranslated.take(&subj_iri) {
                         merge_untranslated_jsonld(
+                            &resolver,
+                            ann.as_ref(),
+                            &untranslated_reifiers,
                             &flakes,
-                            store,
                             prefixes,
                             &mut current_props,
                             &mut stats,
@@ -974,7 +1056,15 @@ pub async fn export_graph_jsonld<W: Write>(
     // Flush last subject, folding in its untranslated rows.
     if let Some(subj_iri) = current_subject.take() {
         if let Some(flakes) = untranslated.take(&subj_iri) {
-            merge_untranslated_jsonld(&flakes, store, prefixes, &mut current_props, &mut stats);
+            merge_untranslated_jsonld(
+                &resolver,
+                ann.as_ref(),
+                &untranslated_reifiers,
+                &flakes,
+                prefixes,
+                &mut current_props,
+                &mut stats,
+            );
         }
         write_jsonld_node(writer, &subj_iri, &current_props, prefixes, first_node)?;
         first_node = false;
@@ -986,7 +1076,15 @@ pub async fn export_graph_jsonld<W: Write>(
     let (remaining, unresolved) = untranslated.into_remaining();
     for (subj_iri, flakes) in &remaining {
         let mut props: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
-        merge_untranslated_jsonld(flakes, store, prefixes, &mut props, &mut stats);
+        merge_untranslated_jsonld(
+            &resolver,
+            ann.as_ref(),
+            &untranslated_reifiers,
+            flakes,
+            prefixes,
+            &mut props,
+            &mut stats,
+        );
         if props.is_empty() {
             continue;
         }
@@ -1006,12 +1104,15 @@ pub async fn export_graph_jsonld<W: Write>(
 /// on parse, but it is still a shape that depends on index state, which is
 /// what `UntranslatedBySubject` exists to remove.
 fn merge_untranslated_jsonld(
+    resolver: &ExportResolver,
+    ann: Option<&AnnotationContext<'_>>,
+    reifier_map: &HashMap<EdgeKey, Vec<Sid>>,
     flakes: &[Flake],
-    store: &BinaryIndexStore,
     prefixes: &PrefixMap,
     props: &mut Vec<(String, Vec<serde_json::Value>)>,
     stats: &mut ExportStats,
 ) {
+    let store = resolver.store;
     for flake in flakes {
         let (Some(p_iri), Some(jval)) = (
             store.sid_to_iri(&flake.p),
@@ -1020,11 +1121,23 @@ fn merge_untranslated_jsonld(
             stats.rows_skipped += 1;
             continue;
         };
+        // Same `@annotation` shape the translated path emits, via the same
+        // helper — an untranslated row is no less annotated.
+        let values = match ann {
+            Some(ann) => annotated_jsonld_values(
+                resolver,
+                ann,
+                &jval,
+                untranslated_reifiers_for(reifier_map, flake),
+                prefixes,
+            ),
+            None => vec![jval],
+        };
         let compact_p = compact_iri(&p_iri, prefixes);
         if let Some(entry) = props.iter_mut().find(|(k, _)| *k == compact_p) {
-            entry.1.push(jval);
+            entry.1.extend(values);
         } else {
-            props.push((compact_p, vec![jval]));
+            props.push((compact_p, values));
         }
         stats.triples_written += 1;
     }
@@ -1478,6 +1591,8 @@ pub async fn export_graph_ntriples<W: Write>(
     let (ephemeral_preds, untranslated) = apply_time_travel(&mut cursor, config, store);
     let resolver = ExportResolver::new(store, config.dict_novelty, &ephemeral_preds);
     let ann = AnnotationContext::new(&resolver, config);
+    let (untranslated, untranslated_reifiers) =
+        resolve_untranslated(ann.as_ref(), untranslated).await?;
 
     let mut stats = ExportStats::default();
     let graph_term = config.graph_iri.as_deref().map(|iri| {
@@ -1505,7 +1620,16 @@ pub async fn export_graph_ntriples<W: Write>(
     // Emit overlay flakes that could not be encoded into V3 ops (e.g.
     // novelty-only language tags) directly from their decoded form.
     for flake in &untranslated {
-        write_raw_flake_ntriples(&resolver, flake, graph_term.as_deref(), &mut stats, writer)?;
+        let reifiers = untranslated_reifiers_for(&untranslated_reifiers, flake);
+        write_raw_flake_ntriples(
+            &resolver,
+            ann.as_ref(),
+            reifiers,
+            flake,
+            graph_term.as_deref(),
+            &mut stats,
+            writer,
+        )?;
     }
 
     Ok(stats)
@@ -1918,6 +2042,8 @@ fn write_raw_object<W: Write>(
 /// Emit a single untranslated overlay flake as an N-Triples / N-Quads statement.
 fn write_raw_flake_ntriples<W: Write>(
     resolver: &ExportResolver,
+    ann: Option<&AnnotationContext<'_>>,
+    reifiers: &[Sid],
     flake: &Flake,
     graph_term: Option<&str>,
     stats: &mut ExportStats,
@@ -1947,6 +2073,29 @@ fn write_raw_flake_ntriples<W: Write>(
     }
     writer.write_all(b" .\n")?;
     stats.triples_written += 1;
+
+    // Same spelling the translated path uses: a triple term as the object of
+    // `rdf:reifies`. `body` already holds `s <p> o`, which is exactly the
+    // term, so it is reused rather than re-serialised.
+    if let Some(ann) = ann {
+        for reifier in reifiers {
+            let Some(r_iri) = resolver.store.sid_to_iri(reifier) else {
+                continue;
+            };
+            write_iri_or_bnode(writer, &r_iri)?;
+            writer.write_all(b" <")?;
+            write_escaped_iri(writer, fluree_vocab::rdf::REIFIES)?;
+            writer.write_all(b"> <<( ")?;
+            writer.write_all(&body)?;
+            writer.write_all(b" )>>")?;
+            if let Some(g) = graph_term {
+                writer.write_all(b" ")?;
+                writer.write_all(g.as_bytes())?;
+            }
+            writer.write_all(b" .\n")?;
+            ann.probe.note_reifier_named(reifier);
+        }
+    }
     Ok(())
 }
 
@@ -2012,6 +2161,8 @@ impl UntranslatedBySubject {
 /// caller's cue to count a skipped row and emit nothing.
 fn write_raw_po_turtle(
     resolver: &ExportResolver,
+    ann: Option<&AnnotationContext<'_>>,
+    reifiers: &[Sid],
     flake: &Flake,
     prefixes: &PrefixMap,
     out: &mut Vec<u8>,
@@ -2025,12 +2176,29 @@ fn write_raw_po_turtle(
         write_turtle_iri(out, &p_iri, prefixes)?;
     }
     out.write_all(b" ")?;
-    write_raw_object(out, resolver.store, flake, Some(prefixes))
+    if !write_raw_object(out, resolver.store, flake, Some(prefixes))? {
+        return Ok(false);
+    }
+    // Same `~ <r>` marker the translated path writes, for a row that reached
+    // the output without ever passing through it.
+    if let Some(ann) = ann {
+        for reifier in reifiers {
+            let Some(iri) = resolver.store.sid_to_iri(reifier) else {
+                continue;
+            };
+            out.write_all(b" ~ ")?;
+            write_turtle_iri_or_bnode(out, &iri, prefixes)?;
+            ann.probe.note_reifier_named(reifier);
+        }
+    }
+    Ok(true)
 }
 
 /// Append untranslated rows to the Turtle block that is currently open.
 fn write_untranslated_turtle_continuations<W: Write>(
     resolver: &ExportResolver,
+    ann: Option<&AnnotationContext<'_>>,
+    reifier_map: &HashMap<EdgeKey, Vec<Sid>>,
     flakes: &[Flake],
     prefixes: &PrefixMap,
     stats: &mut ExportStats,
@@ -2038,7 +2206,8 @@ fn write_untranslated_turtle_continuations<W: Write>(
 ) -> io::Result<()> {
     for flake in flakes {
         let mut body: Vec<u8> = Vec::new();
-        if !write_raw_po_turtle(resolver, flake, prefixes, &mut body)? {
+        let reifiers = untranslated_reifiers_for(reifier_map, flake);
+        if !write_raw_po_turtle(resolver, ann, reifiers, flake, prefixes, &mut body)? {
             stats.rows_skipped += 1;
             continue;
         }
@@ -2051,8 +2220,11 @@ fn write_untranslated_turtle_continuations<W: Write>(
 
 /// Emit a whole subject block for untranslated rows the base stream never
 /// reached.
+#[allow(clippy::too_many_arguments)]
 fn write_untranslated_turtle_block<W: Write>(
     resolver: &ExportResolver,
+    ann: Option<&AnnotationContext<'_>>,
+    reifier_map: &HashMap<EdgeKey, Vec<Sid>>,
     s_iri: &str,
     flakes: &[Flake],
     prefixes: &PrefixMap,
@@ -2064,7 +2236,8 @@ fn write_untranslated_turtle_block<W: Write>(
     let mut bodies: Vec<Vec<u8>> = Vec::new();
     for flake in flakes {
         let mut body: Vec<u8> = Vec::new();
-        if write_raw_po_turtle(resolver, flake, prefixes, &mut body)? {
+        let reifiers = untranslated_reifiers_for(reifier_map, flake);
+        if write_raw_po_turtle(resolver, ann, reifiers, flake, prefixes, &mut body)? {
             bodies.push(body);
         } else {
             stats.rows_skipped += 1;

@@ -2604,6 +2604,123 @@ fn export_is_byte_stable_across_runs() {
     }
 }
 
+/// An annotation on a row that missed V3 translation exports like any other,
+/// in every format.
+///
+/// It did not. Untranslated overlay rows never pass through
+/// `is_reifies_row` — only the translated writers call it — so the bundle
+/// reached the output raw while the rows that *did* translate were
+/// suppressed: a partial `f:reifies*` bundle, and no marker on the edge it
+/// described. Round-tripping that file plants a reserved predicate in the
+/// target ledger as ordinary user data.
+///
+/// The fixture is a lang-tagged object on a never-indexed ledger, which is
+/// the shape that misses translation without a persisted dictionary — and
+/// #1574 makes never-indexed the normal case rather than a corner. The
+/// PR's earlier annotation tests all used `ex:knows ex:bob`, the one object
+/// shape that translates, which is why they were green.
+#[test]
+fn an_untranslated_annotation_exports_with_its_marker() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "unt"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "unt",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:alice ex:label \"Alice\"@en ~ ex:claimL {| ex:src ex:a |} .\n",
+        ])
+        .assert()
+        .success();
+
+    // Turtle: inline marker.
+    fluree_cmd(&tmp)
+        .args(["export", "unt", "--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"Alice\"@en ~ <http://example.org/claimL>",
+        ))
+        .stdout(predicate::str::contains("reifiesObject").not())
+        .stderr(predicate::str::contains("could not be resolved").not());
+
+    // N-Triples: triple term as the object of rdf:reifies.
+    fluree_cmd(&tmp)
+        .args(["export", "unt", "--format", "ntriples"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<(",
+        ))
+        .stdout(predicate::str::contains("reifiesObject").not());
+
+    // JSON-LD: @annotation on the promoted @value object.
+    fluree_cmd(&tmp)
+        .args(["export", "unt", "--format", "jsonld"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"@annotation\":{\"@id\":\"http://example.org/claimL\"}",
+        ))
+        .stdout(predicate::str::contains("reifiesObject").not());
+
+    // The reifier's own description survives in all three; checked once.
+    fluree_cmd(&tmp)
+        .args(["export", "unt", "--format", "turtle"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<http://example.org/src>"));
+}
+
+/// The counter still fires when an annotation genuinely cannot be resolved.
+///
+/// Paired with the test above on purpose. "No warning" is satisfied by a
+/// counter that has stopped working, so a `MustNotFire` assertion alone
+/// cannot distinguish "nothing was dropped" from "the accounting is dead".
+///
+/// The fixture is an annotation inside a named graph, which the base-index
+/// seal scan cannot key on this branch.
+///
+/// **This canary has a known expiry**, recorded here so the next person does
+/// not mistake its retirement for a regression: the stacked seal fix makes
+/// named-graph annotations resolve, at which point this stops firing and
+/// must be replaced rather than deleted. The replacement wanted is a bundle
+/// the decoder rejects outright — a `GraphMismatch` or a malformed bundle —
+/// which is a corruption state rather than a defect, and which no supported
+/// write surface can produce, since every write path rejects hand-written
+/// `f:reifies*`.
+#[test]
+fn the_unresolved_counter_still_fires_when_it_should() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let src = tmp.path().join("mf-src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.trig"),
+        "@prefix ex: <http://example.org/> .\n\
+         GRAPH <http://example.org/g1> { \
+             ex:x ex:p ex:y ~ ex:cG {| ex:src ex:d |} . }\n",
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["create", "mf", "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "mf", "--format", "trig", "--all-graphs"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "1 edge annotations could not be resolved",
+        ));
+}
+
 // ============================================================================
 // v1.1 — Config tests
 // ============================================================================
