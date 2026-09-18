@@ -44,24 +44,61 @@ pub enum CommitRef {
 impl CommitRef {
     /// Parse a user-supplied commit reference string.
     ///
-    /// - `"t:N"` → [`CommitRef::T`] with transaction number `N`
+    /// - `"t:N"` or a bare integer → [`CommitRef::T`] with transaction number `N`
+    /// - `"commit:<prefix>"` or a bare hex digest prefix → [`CommitRef::Prefix`]
+    ///   (the `fluree:commit:` / `sha256:` prefixed hex forms are handled by the
+    ///   prefix resolver)
     /// - a valid multibase CID (e.g., `"bagaybqabciq..."`) → [`CommitRef::Exact`]
-    /// - anything else → [`CommitRef::Prefix`] (hex digest prefixes, and the
-    ///   `fluree:commit:` / `sha256:` prefixed hex forms, are all handled by
-    ///   the prefix resolver)
     ///
     /// A CID counts only in its canonical spelling — see
     /// [`ContentId::parse_canonical`] for why. A hex digest taken as a CID here
     /// would become [`CommitRef::Exact`] of a commit nobody named, skipping the
-    /// prefix scan entirely.
+    /// prefix scan entirely. A bare integer is checked first, and cannot collide:
+    /// a canonical CID always carries its multibase prefix letter.
+    ///
+    /// The bare integer and `commit:` spellings exist so that every surface
+    /// spelling a *commit* accepts the same strings as one spelling a *point in
+    /// time* ([`crate::TimeSpec::parse_at`]) wherever the two overlap. Before
+    /// #1805 they were exactly inverted: `branch create --at t:2` worked and
+    /// rejected `2`, while `query --at 2` worked and rejected `t:2`.
+    ///
+    /// **A bare integer is a `t`, not a prefix.** `123456` is simultaneously a
+    /// valid `t` and a valid 6-character hex prefix. `commit:123456` forces the
+    /// prefix reading; `t:123456` forces the other.
+    ///
+    /// # Why there is no [`COMMIT_PREFIX_MIN_LEN`] check here
+    ///
+    /// [`TimeSpec::parse_at`](crate::TimeSpec::parse_at) rejects a too-short
+    /// prefix at the boundary and this deliberately does not, which looks like
+    /// an inconsistency. It is not, for two reasons.
+    ///
+    /// The floor is already applied to every [`CommitRef::Prefix`]:
+    /// [`LedgerView::resolve_commit`] routes it through
+    /// [`normalize_commit_ref`], which enforces the same constant with the same
+    /// message. A check here would be a second application on that path, not a
+    /// missing one.
+    ///
+    /// More decisively, it would measure the wrong string. `normalize_commit_ref`
+    /// strips `fluree:commit:` / `sha256:` and decodes canonical CIDs *before*
+    /// measuring; this function does none of that. `sha256:abc` is ten
+    /// characters here and three there, so a parse-time floor would pass a
+    /// string the resolver correctly rejects — a check that looks like it
+    /// happened and did not. The length rule belongs where the stripping does.
     pub fn parse(s: &str) -> Result<Self> {
         if let Some(t_str) = s.strip_prefix("t:") {
             let t: i64 = t_str
                 .parse()
                 .map_err(|_| ApiError::query(format!("invalid t value in commit ref '{s}'")))?;
             Ok(CommitRef::T(t))
+        } else if let Some(prefix) = s.strip_prefix("commit:") {
+            if prefix.is_empty() {
+                return Err(ApiError::query(format!("empty commit prefix in '{s}'")));
+            }
+            Ok(CommitRef::Prefix(prefix.to_string()))
         } else if s.is_empty() {
             Err(ApiError::query("empty commit reference"))
+        } else if let Ok(t) = s.parse::<i64>() {
+            Ok(CommitRef::T(t))
         } else if let Some(cid) = ContentId::parse_canonical(s) {
             Ok(CommitRef::Exact(cid))
         } else {
@@ -218,12 +255,11 @@ impl LedgerView {
 /// hex prefix of six characters or more can collide with it.
 pub(crate) const COMMIT_CID_CONSTANT_HEAD: &str = "bagaybqabciq";
 
-/// The shortest commit hex prefix either resolver will scan for.
-///
-/// Exported because anything that *prints* an abbreviated commit id has to
-/// clear it, or its output cannot be pasted back in. `fluree log`'s
-/// `ABBREV_LEN` is checked against this so the two cannot drift apart.
-pub const COMMIT_PREFIX_MIN_LEN: usize = 6;
+// The shortest commit hex prefix either resolver will scan for. Defined in
+// `fluree-db-core` so the address grammar (`parse_time_travel_spec`) can apply
+// the same floor without depending on this crate; re-exported here, and from
+// the crate root, because this is where callers expect to find it.
+pub use fluree_db_core::ledger_id::COMMIT_PREFIX_MIN_LEN;
 
 /// The hex digest a commit resolver scans for, from any spelling a user types.
 ///
@@ -504,6 +540,82 @@ async fn resolve_t_to_commit_id(
 mod tests {
     use super::*;
     use fluree_db_core::ContentKind;
+
+    /// `--at` used to mean two contradictory things: `branch create --at t:2`
+    /// worked and rejected `2`, while `query --at 2` worked and rejected `t:2`
+    /// (#1805). The two grammars denote different things — a commit versus a
+    /// point in time — so they stay separate, but every spelling they *share*
+    /// must parse the same way on both. These pin the commit half.
+    #[test]
+    fn parse_accepts_a_bare_transaction_number() {
+        assert_eq!(CommitRef::parse("2").unwrap(), CommitRef::T(2));
+        assert_eq!(CommitRef::parse("0").unwrap(), CommitRef::T(0));
+        assert_eq!(
+            CommitRef::parse("2").unwrap(),
+            CommitRef::parse("t:2").unwrap(),
+            "bare and tagged spellings of t=2 must agree"
+        );
+    }
+
+    #[test]
+    fn parse_accepts_the_commit_tag() {
+        assert_eq!(
+            CommitRef::parse("commit:abc123").unwrap(),
+            CommitRef::Prefix("abc123".to_string())
+        );
+        assert_eq!(
+            CommitRef::parse("commit:abc123").unwrap(),
+            CommitRef::parse("abc123").unwrap(),
+            "tagged and bare spellings of a hex prefix must agree"
+        );
+        assert!(CommitRef::parse("commit:").is_err());
+    }
+
+    /// An all-digit string of 6+ characters is both a valid `t` and a valid hex
+    /// prefix; `t` wins, matching what `--at` has always done. `commit:` is the
+    /// escape hatch, and without it the ambiguity would be unresolvable.
+    #[test]
+    fn parse_resolves_the_digits_ambiguity_toward_t() {
+        assert_eq!(CommitRef::parse("123456").unwrap(), CommitRef::T(123_456));
+        assert_eq!(
+            CommitRef::parse("commit:123456").unwrap(),
+            CommitRef::Prefix("123456".to_string())
+        );
+
+        // A bare *negative* integer is a `t` too, where it used to fall through
+        // to `Prefix("-5")`. Strictly a better error path — a negative `t`
+        // fails cleanly downstream and `-5` was never a valid hex prefix, so
+        // nothing that used to resolve stops resolving — but it is a behaviour
+        // change in the same class as the ambiguity above, and it needs the
+        // test more, not less: on the CLI clap consumes `-5` as a flag before
+        // this is reached, so the arm is exercised only through the library and
+        // `routes/ledger.rs`, which the integration suite never walks.
+        assert_eq!(CommitRef::parse("-5").unwrap(), CommitRef::T(-5));
+        assert_eq!(
+            CommitRef::parse("-5").unwrap(),
+            CommitRef::parse("t:-5").unwrap(),
+            "bare and tagged spellings must agree on the sign too"
+        );
+        assert_eq!(
+            CommitRef::parse("commit:-5").unwrap(),
+            CommitRef::Prefix("-5".to_string()),
+            "`commit:` still forces the prefix reading"
+        );
+    }
+
+    /// Accepting a bare integer must not shadow the CID arm. It cannot: a
+    /// canonical CID always carries its multibase prefix letter, so it never
+    /// parses as `i64`.
+    #[test]
+    fn bare_integer_arm_does_not_shadow_a_canonical_cid() {
+        let cid = ContentId::new(ContentKind::Commit, b"digits-arm-probe");
+        let s = cid.to_string();
+        assert!(
+            s.parse::<i64>().is_err(),
+            "a CID must not parse as an integer: {s}"
+        );
+        assert!(matches!(CommitRef::parse(&s).unwrap(), CommitRef::Exact(_)));
+    }
 
     /// `parse` must accept the multibase CID string produced by
     /// `ContentId::Display` and return [`CommitRef::Exact`]. If it falls

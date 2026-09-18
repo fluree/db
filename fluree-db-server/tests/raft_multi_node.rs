@@ -170,7 +170,7 @@ impl TestCluster {
         }
 
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
+            .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(10))
             .build()
             .expect("build reqwest client");
@@ -866,7 +866,7 @@ async fn sse_events_endpoint_emits_runtime_raft_commits() {
     // read-timeout on `cluster.client` would kill an idle stream
     // before we insert.
     let sse_client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
+        .connect_timeout(Duration::from_secs(10))
         .no_gzip()
         .build()
         .expect("build sse client");
@@ -913,8 +913,9 @@ async fn sse_events_endpoint_emits_runtime_raft_commits() {
 
     // Poll the accumulated bytes for the runtime event. Give it a
     // generous budget — raft apply + SSE emit is well under a
-    // second on a quiet machine, but CI can be slow.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // second on a quiet machine, but CI can be slow, and nextest
+    // hard-kills a genuine hang at 360s regardless.
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut saw_runtime_event = false;
     while Instant::now() < deadline {
         let buf = buffer.lock().await;

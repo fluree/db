@@ -63,14 +63,15 @@ pub fn count_rows_operator(
                 PredicateFastPath::Allow => {}
             }
 
-            let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                return Ok(Some(build_count_batch(out_var, 0)?)); // predicate absent => 0
-            };
-
             // Lane 1 — metadata-only predicate row count (instant) when there is
-            // no novelty overlay and the target is the indexed head.
+            // no novelty overlay and the target is the indexed head. Here, and
+            // only here, a predicate missing from the persisted dictionary really
+            // does mean zero rows: with no overlay, nothing else can contribute.
             let overlay_free = !crate::fast_path_common::overlay_has_novelty(ctx);
             if overlay_free && ctx.to_t == store.max_t() {
+                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                    return Ok(Some(build_count_batch(out_var, 0)?)); // predicate absent => 0
+                };
                 let count = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
                 return Ok(Some(build_count_batch(
                     out_var,
@@ -81,7 +82,16 @@ pub fn count_rows_operator(
             // Lane 2 — base metadata count + a novelty delta that rescans only the
             // leaves novelty touches, when the target is at or above the indexed
             // head. Time-travel below the head needs base replay — defer.
+            //
+            // A predicate living only in the overlay (uncommitted novelty, or a
+            // datalog / OWL2-RL materialization) has no persisted `p_id` to
+            // range-bound the delta cursor, so the base count is not the answer —
+            // defer, exactly as the numeric-compare and encoded-filter twins below
+            // do. Reading the miss as 0 here was #1863.
             if ctx.to_t >= store.max_t() {
+                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+                    return Ok(None);
+                };
                 if let Some(count) =
                     count_predicate_overlay_delta(ctx, store, ctx.binary_g_id, pred_sid, p_id)?
                 {

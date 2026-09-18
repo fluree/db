@@ -382,6 +382,100 @@ async fn drop_ledger_hard_clears_every_branch_and_shared() {
     let _new = fluree.create_ledger("multi-drop").await.expect("recreate");
 }
 
+/// Dropping a fork releases the dictionary blobs only the fork's index chain
+/// referenced and keeps every blob the surviving branch still reaches.
+/// Dictionaries are ledger-wide, so the branch prefix delete alone would have
+/// left the fork's own blobs behind for a sweep.
+#[tokio::test]
+async fn drop_branch_releases_dictionary_blobs_only_the_branch_referenced() {
+    use crate::support::build_and_publish_index;
+    use fluree_db_core::ContentStore;
+    use fluree_db_indexer::{shared_refs_of_branches, BranchIndexHead};
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+
+    let main = fluree.create_ledger("fork-dicts").await.unwrap();
+    let seed = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:seed", "ex:val": 1}]
+    });
+    fluree.insert(main, &seed).await.unwrap();
+    build_and_publish_index(&fluree, "fork-dicts:main").await;
+
+    fluree
+        .create_branch("fork-dicts", "dev", None, None)
+        .await
+        .unwrap();
+
+    // New subjects on the fork, then an index build: the fork's reverse
+    // dictionary leaves are rewritten, so its chain references blobs main's
+    // does not.
+    let dev = fluree.ledger("fork-dicts:dev").await.unwrap();
+    let subjects: Vec<_> = (0..50)
+        .map(|i| json!({"@id": format!("ex:dev-{i}"), "ex:val": i}))
+        .collect();
+    let more = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": subjects
+    });
+    fluree.insert(dev, &more).await.unwrap();
+    build_and_publish_index(&fluree, "fork-dicts:dev").await;
+
+    async fn dict_refs(
+        fluree: &fluree_db_api::Fluree,
+        ledger_id: &str,
+    ) -> std::collections::HashSet<fluree_db_core::ContentId> {
+        let head = fluree
+            .nameservice()
+            .lookup(ledger_id)
+            .await
+            .unwrap()
+            .expect("record")
+            .index_head_id;
+        shared_refs_of_branches(
+            fluree.backend(),
+            &[BranchIndexHead {
+                ledger_id: ledger_id.to_string(),
+                index_head_id: head,
+            }],
+            None,
+        )
+        .await
+        .unwrap()
+    }
+    let main_refs = dict_refs(&fluree, "fork-dicts:main").await;
+    let dev_refs = dict_refs(&fluree, "fork-dicts:dev").await;
+    let dev_only: Vec<_> = dev_refs.difference(&main_refs).cloned().collect();
+    assert!(
+        !dev_only.is_empty(),
+        "the fork must reference dictionary blobs of its own for this test to mean anything"
+    );
+    assert!(
+        !main_refs.is_empty(),
+        "the surviving branch must reference dictionary blobs"
+    );
+
+    let report = fluree.drop_branch("fork-dicts", "dev").await.unwrap();
+    assert_eq!(report.status, DropStatus::Dropped);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+    let store = fluree.content_store("fork-dicts:main");
+    for cid in &main_refs {
+        assert!(
+            store.has(cid).await.unwrap(),
+            "surviving branch's dictionary blob {cid} must remain"
+        );
+    }
+    for cid in &dev_only {
+        assert!(
+            !store.has(cid).await.unwrap(),
+            "fork-only dictionary blob {cid} must be released with the fork"
+        );
+    }
+}
+
 /// Test that drop cancels pending indexing before deletion (the flake fix).
 ///
 /// This test exercises the "drop while indexing is pending/in progress" scenario
@@ -595,4 +689,30 @@ async fn drop_ledger_disconnects_from_cache() {
         !cached_after.contains(&ledger_id.to_string()),
         "Ledger should be evicted from cache after drop"
     );
+}
+
+/// The collector and a fork drop, end to end on file storage and the file
+/// nameservice with the worker running: real builds, passes releasing behind
+/// them inside release windows, and nothing a surviving chain references lost.
+#[tokio::test]
+async fn collector_and_fork_drop_keep_every_referenced_dictionary_on_file_storage() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(&path).build().expect("build");
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        crate::support::collecting_indexer_config(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            crate::support::run_collector_and_fork_drop_scenario(&fluree, &handle, "gc-e2e").await;
+        })
+        .await;
 }

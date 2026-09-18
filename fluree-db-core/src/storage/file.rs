@@ -1554,42 +1554,83 @@ impl StorageWrite for FileStorage {
     async fn delete(&self, address: &str) -> Result<()> {
         let (key, path) = self.resolve_key(address)?;
         let storage = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let operation = storage.begin_operation(storage.durability, &key)?;
-            let (_, log) = storage.write_plan(&operation, 0)?;
-            let appended = match &log {
-                // Ordered after the writes it undoes, so replay cannot bring
-                // the file back. Covered by the next flush, which is no weaker
-                // than an unlink that was never followed by a directory flush.
-                Some(log) => {
-                    Some(log.append(Op::Delete { key: &key }, false).map_err(|e| {
-                        crate::error::Error::io(format!("WAL append for {key}: {e}"))
-                    })?)
-                }
-                None => None,
-            };
-            match std::fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                // Idempotent: not found is OK
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => {
-                    if let (Some(log), Some(appended)) = (&log, &appended) {
-                        log.cancel(appended.seq, &key).map_err(|cancel| {
-                            crate::error::Error::io(format!(
-                                "delete {}: {e}; WAL cancel also failed: {cancel}",
-                                path.display()
-                            ))
-                        })?;
-                    }
-                    Err(crate::error::Error::io(format!(
-                        "Failed to delete {}: {e}",
-                        path.display()
-                    )))
+        tokio::task::spawn_blocking(move || storage.delete_key_blocking(&key, &path))
+            .await
+            .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
+    }
+
+    /// One blocking task for the whole batch rather than one per address:
+    /// the per-key work is an unlink, so a batch of thousands is otherwise
+    /// mostly task hand-offs.
+    async fn delete_many(&self, addresses: &[String]) -> Vec<(String, crate::error::Error)> {
+        let mut failures = Vec::new();
+        let mut resolved = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            match self.resolve_key(address) {
+                Ok((key, path)) => resolved.push((address.clone(), key, path)),
+                Err(e) => failures.push((address.clone(), e)),
+            }
+        }
+        let storage = self.clone();
+        match tokio::task::spawn_blocking(move || {
+            let mut failed = Vec::new();
+            for (address, key, path) in resolved {
+                if let Err(e) = storage.delete_key_blocking(&key, &path) {
+                    failed.push((address, e));
                 }
             }
+            failed
         })
         .await
-        .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
+        {
+            Ok(failed) => failures.extend(failed),
+            Err(e) => failures.extend(addresses.iter().map(|address| {
+                (
+                    address.clone(),
+                    crate::error::Error::io(format!("delete join: {e}")),
+                )
+            })),
+        }
+        failures
+    }
+}
+
+impl FileStorage {
+    /// Unlink `path`, recording the delete in the WAL first when one is
+    /// attached. Absence is success. Runs on the caller's thread: it takes
+    /// the root gate and a key stripe, which block.
+    fn delete_key_blocking(&self, key: &str, path: &std::path::Path) -> Result<()> {
+        let operation = self.begin_operation(self.durability, key)?;
+        let (_, log) = self.write_plan(&operation, 0)?;
+        let appended = match &log {
+            // Ordered after the writes it undoes, so replay cannot bring
+            // the file back. Covered by the next flush, which is no weaker
+            // than an unlink that was never followed by a directory flush.
+            Some(log) => Some(
+                log.append(Op::Delete { key }, false)
+                    .map_err(|e| crate::error::Error::io(format!("WAL append for {key}: {e}")))?,
+            ),
+            None => None,
+        };
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            // Idempotent: not found is OK
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                if let (Some(log), Some(appended)) = (&log, &appended) {
+                    log.cancel(appended.seq, key).map_err(|cancel| {
+                        crate::error::Error::io(format!(
+                            "delete {}: {e}; WAL cancel also failed: {cancel}",
+                            path.display()
+                        ))
+                    })?;
+                }
+                Err(crate::error::Error::io(format!(
+                    "Failed to delete {}: {e}",
+                    path.display()
+                )))
+            }
+        }
     }
 }
 
@@ -2082,6 +2123,22 @@ mod tests {
             std::fs::metadata(&path).unwrap().ino(),
             "blob was written in place, not staged and renamed"
         );
+    }
+
+    /// The batch path unlinks every address in one blocking task and treats
+    /// an absent one as already gone, as `delete` does.
+    #[tokio::test]
+    async fn delete_many_unlinks_every_address_and_ignores_absent_ones() {
+        let (_dir, storage) = storage();
+        storage.write_bytes("a.json", b"a").await.unwrap();
+        storage.write_bytes("b.json", b"b").await.unwrap();
+
+        let failures = storage
+            .delete_many(&["a.json".into(), "b.json".into(), "absent.json".into()])
+            .await;
+        assert!(failures.is_empty(), "nothing should fail: {failures:?}");
+        assert!(!storage.exists("a.json").await.unwrap());
+        assert!(!storage.exists("b.json").await.unwrap());
     }
 
     /// The CAS write-back goes through the same staging path, so a reader

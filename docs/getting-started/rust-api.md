@@ -695,7 +695,7 @@ All formats stream directly from the binary SPOT index. Memory usage is O(leafle
 - `.format(ExportFormat)` — output format (default: Turtle)
 - `.all_graphs()` — include all named graphs including system graphs (requires TriG or NQuads)
 - `.graph("iri")` — export a specific named graph by IRI
-- `.as_of(TimeSpec)` — time-travel export (transaction number, ISO-8601 datetime, or commit CID prefix)
+- `.as_of(TimeSpec)` — time-travel export (`AtT`, `AtTime`/`AtRecorded` for the event and recorded time axes, `AtCommit`, or `Latest`; parse a user-supplied string with `TimeSpec::parse_at`)
 - `.context(&json)` — override prefix map (default: ledger's context from nameservice)
 - `.write_to(&mut writer)` — stream to any `Write` sink
 - `.to_stdout()` — convenience for stdout output

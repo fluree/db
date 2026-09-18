@@ -266,3 +266,41 @@ async fn read_tracked_anonymous_reports_no_enforcement() {
         "no policy context was built, so no enforcement is claimed"
     );
 }
+
+/// Allow twin of the deny-all case above. An identity with no applicable
+/// policies under `default-allow: true` can be denied nothing, so the context
+/// is root and the request is unenforced: every row, no enforcement record.
+#[tokio::test]
+async fn read_tracked_zero_policy_identity_under_allow_reports_unenforced() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let _ = seed_people_with_ssn(&fluree, "policy/track-allow:main").await;
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/", "schema": "http://schema.org/"},
+        "from": "policy/track-allow:main",
+        "opts": {
+            "identity": "http://example.org/ns/nobody",
+            "default-allow": true,
+            "meta": {"policy": true}
+        },
+        "select": ["?s", "?name"],
+        "where": {"@id": "?s", "@type": "ex:User", "schema:name": "?name"}
+    });
+
+    let response = fluree
+        .query_connection_tracked(&query)
+        .await
+        .expect("tracked query");
+
+    assert_eq!(
+        response.result.as_array().map(Vec::len),
+        Some(2),
+        "nothing can be denied, so every row returns"
+    );
+    assert_eq!(response.policy, Some(HashMap::new()));
+    assert_eq!(
+        response.policy_enforcement, None,
+        "zero rules under an allow default build a root context, so no enforcement is claimed"
+    );
+}

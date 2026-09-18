@@ -36,7 +36,39 @@ api = "chat"
 
 Environment variables override the file per field: `FLUREE_DOC_{EMBEDDING,LLM,VLM}_{URL,MODEL,API_KEY,DIMENSIONS,API}`.
 
+There are deliberately **no per-endpoint capability settings** — nothing to declare about which JSON mode, token-limit field or temperature a model takes. See [What is sent on the wire, and what gets withdrawn](#what-is-sent-on-the-wire-and-what-gets-withdrawn).
+
 An absent `[doc]` table means unconfigured: the pipeline runs deterministic and offline. A present but malformed one is an error.
+
+### What is sent on the wire, and what gets withdrawn
+
+A generation request carries the model, the messages, a sampling temperature, a JSON-mode request and an output budget:
+
+```json
+{ "model": "gpt-5-mini",
+  "messages": [ … ],
+  "temperature": 0,
+  "response_format": { "type": "json_object" },
+  "max_completion_tokens": 8000 }
+```
+
+Three of those are fields that *some* current model refuses, and they are sent optimistically rather than withheld:
+
+| Field | Why it is sent | Who refuses it |
+|---|---|---|
+| `temperature: 0` | Extraction is transcription, not composition. Near-greedy sampling is what makes a re-run over the same corpus produce the same graph, which the extraction cache and `doc:extractionFingerprint` both assume. | gpt-5 and the o-series accept only their own default. |
+| `response_format` | `json_object` genuinely improves how reliably a model returns parseable JSON. | Anthropic's OpenAI-compatible route, today. |
+| `max_completion_tokens` | The spelling Chat Completions takes across its current range. | Servers predating it, which want `max_tokens`. |
+
+**A refusal is the endpoint describing its own dialect, and it is taken at its word.** When a request comes back 400 naming one of those fields, that field is withdrawn — or, for the budget, renamed to `max_tokens` — and the request is resent immediately. No backoff, and it does not consume one of the three retries that exist for transient failures. **The refusal is then remembered for the rest of the run**, so an endpoint that rejects a field costs one extra round trip in total rather than one per chunk. The run reports how many calls were adjusted.
+
+Only the three fields above are handled this way. Any other 400 is reported to you verbatim rather than silently rewritten.
+
+**None of this is configurable, on purpose.** A per-endpoint capability setting is only right until you repoint `url` at a different server, has to be re-derived by hand whenever the endpoint or model changes, and can only be as accurate as the vendor table someone transcribed it from — which in the Anthropic case above is wrong today: its own compatibility page documents `response_format` as ignored while the deployed route rejects it. Asking the endpoint is more reliable than asking the documentation.
+
+Determinism is worth one caveat: `temperature: 0` makes extraction near-greedy, not reproducible. No `seed` is sent and no provider guarantees identical output. On an endpoint that refuses the field you lose even that, and two cold runs over one corpus can differ while the fingerprint stays the same.
+
+The gateway route (`api = "responses"`) carries none of these fields, and never has.
 
 ## Extraction
 

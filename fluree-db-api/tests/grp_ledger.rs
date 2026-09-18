@@ -11,6 +11,8 @@ mod it_branch_time_travel;
 mod it_drop_ledger;
 #[path = "it_drop_named_graph.rs"]
 mod it_drop_named_graph;
+#[path = "it_json_canonicalization.rs"]
+mod it_json_canonicalization;
 #[path = "it_ledger_info_named_graphs.rs"]
 mod it_ledger_info_named_graphs;
 #[path = "it_ledger_lifecycle.rs"]

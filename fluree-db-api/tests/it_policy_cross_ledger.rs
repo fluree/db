@@ -9,7 +9,9 @@
 #![cfg(feature = "native")]
 
 use crate::support::genesis_ledger;
-use fluree_db_api::{FlureeBuilder, GovernanceOptions};
+use fluree_db_api::{
+    CommitOpts, FlureeBuilder, GovernanceOptions, IndexConfig, ReindexOptions, TxnOpts,
+};
 use serde_json::json;
 
 fn config_graph_iri(ledger_id: &str) -> String {
@@ -491,6 +493,257 @@ async fn empty_cross_ledger_restrictions_fail_closed_under_default_deny() {
         json!([]),
         "configured cross-ledger source with an empty restriction set must \
          fail closed under defaultAllow=false, got {users_jsonld}"
+    );
+}
+
+/// Allow twin of the test above. A configured cross-ledger source whose class
+/// filter selects zero rules under `defaultAllow=true` can deny nothing, so
+/// the context must be root. Non-root here would change no answer — it would
+/// only force every scan onto the policy-filtered fallback, decline every
+/// probe lane, and strip statistics from explain.
+#[tokio::test]
+async fn empty_cross_ledger_restrictions_under_default_allow_are_root() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger-filter/empty-allow/model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let policy_graph_iri = "http://example.org/empty-allow-policies";
+
+    // Custom-typed rule only: the default {f:AccessPolicy} filter selects none.
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{policy_graph_iri}> {{
+                ex:orgDenyUsers
+                    rdf:type    ex:OrgPolicy ;
+                    f:action    f:view ;
+                    f:onClass   ex:User ;
+                    f:allow     false .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M custom-typed policy");
+
+    let data_id = "test/cross-ledger-filter/empty-allow/data:main";
+    let data = genesis_ledger(&fluree, data_id);
+    let r1 = fluree
+        .insert(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice",
+                "@type": "ex:User",
+                "ex:name": "Alice"
+            }),
+        )
+        .await
+        .unwrap();
+    let data = r1.ledger;
+
+    let config_iri = config_graph_iri(data_id);
+    fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow true .
+                <urn:cfg:policy> f:policySource <urn:cfg:policy-ref> .
+                <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:policy-src> .
+                <urn:cfg:policy-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{policy_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D config with cross-ledger source, defaultAllow=true");
+
+    let wrapped = fluree
+        .db_with_policy(data_id, &GovernanceOptions::default())
+        .await
+        .expect("db_with_policy");
+    assert!(
+        wrapped.is_root(),
+        "a configured source that selects zero rules under defaultAllow=true \
+         must build a root (unrestricted) context"
+    );
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "select": "?u",
+        "where": {"@id": "?u", "@type": "ex:User"}
+    });
+    let users = fluree.query(&wrapped, &query).await.expect("query ex:User");
+    let users_jsonld = users.to_jsonld(&wrapped.snapshot).expect("jsonld");
+    assert_eq!(
+        users_jsonld.as_array().map(Vec::len),
+        Some(1),
+        "nothing can be denied, so alice must be returned, got {users_jsonld}"
+    );
+
+    // Root explains carry no policy notice. (This novelty-only ledger has no
+    // statistics at all, which explain reports on its own; that reason is
+    // unrelated to policy.)
+    let explain = fluree.explain(&wrapped, &query).await.expect("explain");
+    let reason = explain["plan"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        !reason.contains("by policy"),
+        "a root context must not mark the explain as policy-scoped: {explain}"
+    );
+}
+
+/// Same configuration over a persisted index: the fast paths must actually
+/// fire. Pinned by routing stamp, not by the answer — every fast path here has
+/// a fallback that computes the same rows, so a silent decline is invisible to
+/// a value assertion.
+#[tokio::test(flavor = "current_thread")]
+async fn empty_cross_ledger_restrictions_under_default_allow_keep_fast_paths() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger-filter/empty-allow-indexed/model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let policy_graph_iri = "http://example.org/empty-allow-indexed-policies";
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{policy_graph_iri}> {{
+                ex:orgDenyUsers
+                    rdf:type    ex:OrgPolicy ;
+                    f:action    f:view ;
+                    f:onClass   ex:User ;
+                    f:allow     false .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M custom-typed policy");
+
+    let data_id = "test/cross-ledger-filter/empty-allow-indexed/data:main";
+    let data = genesis_ledger(&fluree, data_id);
+    let config_iri = config_graph_iri(data_id);
+    let data = fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow true .
+                <urn:cfg:policy> f:policySource <urn:cfg:policy-ref> .
+                <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:policy-src> .
+                <urn:cfg:policy-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{policy_graph_iri}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D config with cross-ledger source, defaultAllow=true")
+        .ledger;
+
+    // Hold off background indexing so the reindex below is the only build.
+    let no_background = IndexConfig {
+        reindex_min_bytes: 1_000_000_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    fluree
+        .insert_with_opts(
+            data,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [
+                    {"@id": "ex:alice", "@type": "ex:User", "ex:name": "Alice"},
+                    {"@id": "ex:bob", "@type": "ex:User", "ex:name": "Bob"}
+                ]
+            }),
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &no_background,
+        )
+        .await
+        .expect("insert users");
+    fluree
+        .reindex(data_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let wrapped = fluree
+        .db_with_policy(data_id, &GovernanceOptions::default())
+        .await
+        .expect("db_with_policy");
+    assert!(
+        wrapped.is_root(),
+        "zero rules under defaultAllow=true is root"
+    );
+    assert!(
+        wrapped.snapshot.stats.is_some(),
+        "the indexed view must carry statistics for the count fold to be planned"
+    );
+
+    let (store, tracing_guard) = crate::support::span_capture::init_test_tracing();
+    let counts = fluree
+        .query(
+            &wrapped,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "select": ["?p", "(as (count ?s) ?n)"],
+                "where": {"@id": "?s", "?p": "?o"},
+                "groupBy": ["?p"]
+            }),
+        )
+        .await
+        .expect("count by predicate");
+    drop(tracing_guard);
+    let counts_jsonld = counts.to_jsonld(&wrapped.snapshot).expect("jsonld");
+    assert!(
+        counts_jsonld
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "count by predicate returned no rows: {counts_jsonld}"
+    );
+
+    let outcomes: Vec<(String, String)> = store
+        .find_events("fast-path outcome")
+        .iter()
+        .filter_map(|e| {
+            Some((
+                e.fields.get("site")?.clone(),
+                e.fields.get("outcome")?.clone(),
+            ))
+        })
+        .collect();
+    assert!(
+        outcomes.iter().any(|(_, outcome)| outcome == "proceed"),
+        "no fast path proceeded under a root context: {outcomes:?}"
+    );
+    assert!(
+        !outcomes
+            .iter()
+            .any(|(_, outcome)| outcome == "fallback:gate_declined"),
+        "a root context must not make any fast path decline at its policy gate: {outcomes:?}"
     );
 }
 
