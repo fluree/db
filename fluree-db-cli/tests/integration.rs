@@ -2541,6 +2541,69 @@ fn export_reports_annotations_it_could_not_resolve() {
         .stdout(predicate::str::contains("reifiesSubject"));
 }
 
+/// Two exports of the same ledger must produce the same bytes.
+///
+/// They did not. Untranslated rows reach the writers through
+/// `surviving_untranslated`, which collapsed fact identities in a `HashMap`
+/// and returned `into_values()` — the randomly-seeded hasher's order, fresh
+/// every process. The triple set was always right; only the order moved.
+///
+/// That is not cosmetic. Intra-block predicate order carries no meaning in
+/// Turtle, but diffing two exports, checksumming one, or content-addressing a
+/// backup all need the bytes to be stable — and #1574 makes untranslated rows
+/// the normal case for a never-indexed ledger rather than a corner.
+///
+/// The fixture is deliberately never indexed and deliberately mixed-shape: a
+/// lang tag and a decimal both miss V3 translation without a persisted
+/// dictionary, which is exactly what lands a row in that map.
+#[test]
+fn export_is_byte_stable_across_runs() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    fluree_cmd(&tmp).args(["create", "det"]).assert().success();
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "det",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:p1 \"one\"@en ; ex:p2 1.5 ; ex:p3 ex:z ; ex:p4 \"four\" .\n\
+             ex:b ex:p1 \"two\"@fr ; ex:p2 2.5 ; ex:p3 ex:y ; ex:p4 \"five\" .\n",
+        ])
+        .assert()
+        .success();
+
+    let first = fluree_cmd(&tmp)
+        .args(["export", "det", "--format", "turtle"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        !first.is_empty(),
+        "an empty export would make every comparison below vacuously true"
+    );
+
+    // Each run is a fresh process, so a fresh hasher seed.
+    for run in 2..=5 {
+        let next = fluree_cmd(&tmp)
+            .args(["export", "det", "--format", "turtle"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&next),
+            "run {run} differed from run 1"
+        );
+    }
+}
+
 // ============================================================================
 // v1.1 — Config tests
 // ============================================================================

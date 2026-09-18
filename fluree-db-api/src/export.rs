@@ -184,7 +184,32 @@ fn surviving_untranslated(flakes: Vec<Flake>) -> Vec<Flake> {
             }
         }
     }
-    latest.into_values().filter(|f| f.op).collect()
+    let mut out: Vec<Flake> = latest.into_values().filter(|f| f.op).collect();
+    // Deterministic order. `HashMap::into_values` yields in the
+    // randomly-seeded hasher's order, so two exports of the same ledger
+    // produced different bytes run to run whenever untranslated rows existed
+    // — and #1574 makes untranslated rows the normal case rather than a
+    // corner. Intra-block predicate order carries no meaning in Turtle, but
+    // diffing two exports, checksumming one, or content-addressing a backup
+    // all require the bytes to be stable.
+    //
+    // The key is the whole of `Flake`'s fact identity — `s, p, o, dt, m` per
+    // its hand-written `Eq` — so it is total over the map's own key and no
+    // two surviving rows can tie into an unspecified order.
+    fn meta_key(f: &Flake) -> (Option<&str>, Option<i32>) {
+        (
+            f.m.as_ref().and_then(|m| m.lang.as_deref()),
+            f.m.as_ref().and_then(|m| m.i),
+        )
+    }
+    out.sort_unstable_by(|a, b| {
+        a.s.cmp(&b.s)
+            .then_with(|| a.p.cmp(&b.p))
+            .then_with(|| a.o.cmp(&b.o))
+            .then_with(|| a.dt.cmp(&b.dt))
+            .then_with(|| meta_key(a).cmp(&meta_key(b)))
+    });
+    out
 }
 
 // ---------------------------------------------------------------------------
