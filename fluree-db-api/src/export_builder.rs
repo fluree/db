@@ -184,7 +184,16 @@ impl<'a> ExportBuilder<'a> {
     /// export it is every other user graph in the registry — the number the
     /// caller needs to say so out loud.
     fn omitted_named_graph_count(&self, registry: &GraphRegistry, target: Option<u16>) -> u64 {
-        if self.all_graphs {
+        // Zero whenever the caller chose which graphs it wanted — either all
+        // of them, or one by IRI. The count answers "your request lost data
+        // you did not ask to drop", so a *targeted* export has nothing to
+        // report: not returning the graphs you did not name is the feature.
+        //
+        // Counting them made the HTTP surface disagree with the CLI, which
+        // gates the same warning on `all_graphs || graph.is_some()`. A client
+        // acting on the header saw a false positive on every single-graph
+        // request.
+        if self.all_graphs || target.is_some() {
             return 0;
         }
         registry

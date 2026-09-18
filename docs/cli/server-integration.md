@@ -1064,6 +1064,7 @@ non-zero, so a clean export carries none of them.
 |--------|---------|
 | `x-fluree-export-named-graphs-omitted` | User-visible named graphs the ledger holds that this export did not cover — set when a dataset format ran without `all_graphs`. |
 | `x-fluree-export-annotations-unresolved` | Edge annotations that could not be represented and are **not** in the body. Re-request with `raw_reifies` to get them as `f:reifies*` triples. |
+| `x-fluree-export-annotations-out-of-scope` | Reifiers the body names with a `~ <r>` marker whose own properties this export does not contain. The annotation is usable only against a wider export. |
 | `x-fluree-export-rows-skipped` | Rows the writer could not represent (unresolvable predicate id, or a value that decoded to null). |
 
 ### Error responses
@@ -2061,11 +2062,14 @@ Content-Type: application/json
 | `format` | string | No | `"turtle"` | One of: `turtle`/`ttl`, `ntriples`/`nt`, `nquads`/`n-quads`, `trig`, `jsonld`/`json-ld`/`json`. Case-insensitive. |
 | `all_graphs` | bool | No | `false` | Export every user-visible named graph as a dataset. Requires `format` ∈ `trig` / `nquads`. Mutually exclusive with `graph`. The ledger's system graphs (`#txn-meta`, `#config`) are excluded. |
 | `system_graphs` | bool | No | `false` | Also emit the system graphs under `all_graphs`. Diagnostic only — the result is named for the source ledger and does not re-import cleanly. |
+| `raw_reifies` | bool | No | `false` | Emit edge annotations as raw `f:reifies*` triples instead of RDF 1.2 annotation syntax. The escape hatch the `x-fluree-export-annotations-unresolved` header points at, and the way to keep pre-4.2 bytes. |
 | `graph` | string | No | — | IRI of a single named graph to export. Mutually exclusive with `all_graphs`. |
 | `context` | object | No | ledger default | Prefix map for Turtle/TriG/JSON-LD output. Either a bare object (`{ "ex": "..." }`) or `{ "@context": {...} }`. Falls back to the ledger's stored default context when absent. |
 | `at` | string | No | latest | Time spec — `t:<N>` (transaction number), `t:latest` or `latest`, `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. Identical to the local `--at` flag. |
 
 An empty body is accepted and treated as all-default (Turtle export at HEAD).
+
+**Breaking change in 4.2.** Response bodies now carry RDF 1.2 annotation syntax for edge annotations — `s p o ~ <r>` in Turtle and TriG, a triple term under `rdf:reifies` in N-Triples and N-Quads, `@annotation` in JSON-LD — where previous versions emitted the underlying `f:reifies*` triples. A consumer that parsed those triples directly will not find them. Set `raw_reifies` to keep the old bytes.
 
 ### Auth
 

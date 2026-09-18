@@ -165,6 +165,18 @@ async fn export_local(
                 stats.annotations_unresolved,
             );
         }
+        if stats.annotations_out_of_scope > 0 {
+            // The fourth omission class, and the one the HTTP surface was
+            // missing while the CLI warned about it: the body carries
+            // `~ <r>` markers whose reifiers' own properties are not in the
+            // export. A clean 200 with no signal is the same "nothing
+            // suggests anything is missing" problem the other three were
+            // given headers to fix.
+            builder = builder.header(
+                "x-fluree-export-annotations-out-of-scope",
+                stats.annotations_out_of_scope,
+            );
+        }
         if stats.rows_skipped > 0 {
             builder = builder.header("x-fluree-export-rows-skipped", stats.rows_skipped);
         }
