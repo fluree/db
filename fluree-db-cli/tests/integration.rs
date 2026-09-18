@@ -2870,6 +2870,101 @@ fn a_point_in_time_export_keeps_an_annotation_retracted_later() {
         .stdout(predicate::str::contains("<http://example.org/knows>"));
 }
 
+/// The per-predicate pre-filter never costs an annotation.
+///
+/// `batch_reifiers` now skips rows whose predicate carries no annotation
+/// before doing the expensive per-row work. That is only safe if the set of
+/// annotated predicates is never narrower than the truth — a skipped row
+/// loses its marker with nothing counted. So this is three arms, one per way
+/// the set could come up short:
+///
+/// 1. **Sealed arena, filter engaged.** Annotations on some predicates, plain
+///    rows on others; every marker must still appear.
+/// 2. **A predicate that exists only in novelty.** Indexed first, then a new
+///    annotated predicate is written — absent from the persisted dictionary,
+///    so it resolves only through the ephemeral map. Treating "absent from
+///    the dictionary" as "does not exist" is exactly the #1863 shape.
+/// 3. **The base-index scan as the annotation source.** There are three
+///    sources, not two; a set built only from novelty and the arena would map
+///    every predicate cleanly, keep the filter on, and drop these silently.
+#[test]
+fn the_annotation_prefilter_never_drops_a_marker() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let src = tmp.path().join("pf-src");
+    std::fs::create_dir_all(&src).unwrap();
+    let mut ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    // Many plain rows on unannotated predicates, so the filter has work to do.
+    for i in 0..50 {
+        ttl.push_str(&format!("ex:s{i} ex:plain \"{i}\" ; ex:other ex:o{i} .\n"));
+    }
+    ttl.push_str("ex:a ex:knows ex:b ~ ex:c1 {| ex:n \"one\" |} .\n");
+    ttl.push_str("ex:a ex:likes ex:b ~ ex:c2 {| ex:n \"two\" |} .\n");
+    std::fs::write(src.join("a.ttl"), ttl).unwrap();
+    fluree_cmd(&tmp)
+        .args(["create", "pf", "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+
+    let markers = |extra_env: Option<(&str, &str)>| -> String {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.args(["export", "pf", "--format", "turtle"]);
+        if let Some((k, v)) = extra_env {
+            cmd.env(k, v);
+        }
+        let out = cmd.assert().success().get_output().stdout.clone();
+        String::from_utf8_lossy(&out).into_owned()
+    };
+
+    // Arm 1 — sealed arena.
+    let arena = markers(None);
+    assert!(
+        arena.contains("ex:plain"),
+        "plain rows must export: {arena}"
+    );
+    for r in ["~ ex:c1", "~ ex:c2"] {
+        assert!(
+            arena.contains(r),
+            "arena: {r} dropped by the pre-filter:\n{arena}"
+        );
+    }
+
+    // Arm 2 — a predicate that exists only in novelty.
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "pf",
+            "--format",
+            "turtle",
+            "-e",
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:brandNewPredicate ex:b ~ ex:c3 {| ex:n \"three\" |} .\n",
+        ])
+        .assert()
+        .success();
+    let novel = markers(None);
+    assert!(
+        novel.contains("~ <http://example.org/c3>") || novel.contains("~ ex:c3"),
+        "novelty-only predicate: marker dropped by the pre-filter:\n{novel}"
+    );
+    for r in ["~ ex:c1", "~ ex:c2"] {
+        assert!(
+            novel.contains(r),
+            "arena marker lost once novelty joined: {r}"
+        );
+    }
+
+    // Arm 3 — the base-index scan as the source.
+    let scanned = markers(Some(("FLUREE_EXPORT_ANNOTATION_SCAN", "1")));
+    for r in ["~ ex:c1", "~ ex:c2"] {
+        assert!(
+            scanned.contains(r),
+            "scan-served: {r} dropped by the pre-filter:\n{scanned}"
+        );
+    }
+}
+
 // ============================================================================
 // v1.1 — Config tests
 // ============================================================================

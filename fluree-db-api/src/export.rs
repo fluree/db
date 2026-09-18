@@ -18,7 +18,7 @@ use fluree_db_query::binary_scan::{
 };
 use fluree_graph_ir::canonical_xsd_double;
 use fluree_vocab::{namespaces, xsd};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -396,6 +396,9 @@ struct AnnotationContext<'a> {
     /// persisted and ephemeral. Hoisted out of the row loop: suppression is
     /// then a scan of at most fourteen `u32`s, not an IRI comparison.
     reifies_p_ids: Vec<u32>,
+    /// Batch `p_id`s of every annotated predicate, or `None` to disable the
+    /// pre-filter. See `batch_reifiers` for why `None` is the safe default.
+    annotated_p_ids: Option<HashSet<u32>>,
     graph_sid: Option<Sid>,
 }
 
@@ -415,9 +418,33 @@ impl<'a> AnnotationContext<'a> {
                 .filter(|(_, sid)| fluree_db_core::namespaces::is_reserved_reifies_predicate(sid))
                 .map(|(p_id, _)| *p_id),
         );
+        // Map each annotated predicate to the `p_id` rows carry. Persisted
+        // predicates resolve through the dictionary; novelty-only ones never
+        // reach it, so they resolve through the ephemeral map instead. Any
+        // predicate neither can place disables the filter outright: treating
+        // "absent from the persisted dictionary" as "does not exist" is the
+        // defect shape this codebase already paid for once (#1863), and here
+        // it would silently drop the row's marker.
+        let annotated_p_ids = probe.annotated_predicates().and_then(|preds| {
+            let ephemeral: HashMap<&Sid, u32> = resolver
+                .ephemeral_preds_reverse
+                .iter()
+                .map(|(p_id, sid)| (sid, *p_id))
+                .collect();
+            preds
+                .iter()
+                .map(|sid| {
+                    resolver
+                        .store
+                        .sid_to_p_id(sid)
+                        .or_else(|| ephemeral.get(sid).copied())
+                })
+                .collect::<Option<HashSet<u32>>>()
+        });
         Some(Self {
             probe,
             reifies_p_ids,
+            annotated_p_ids,
             graph_sid: config.graph_sid.clone(),
         })
     }
@@ -454,6 +481,16 @@ async fn batch_reifiers(
         let p_id = batch.p_id.get_or(row, 0);
         if ann.is_reifies_row(p_id) {
             continue; // the bundle itself is never an annotated edge
+        }
+        // Skip rows whose predicate carries no annotation before the
+        // expensive part — subject resolution, value decode, a lang
+        // allocation and an owned `EdgeKey` — so the cost tracks the
+        // annotations, not the dataset. Only ever *skips*: when the set is
+        // unknown the filter is off and every row is keyed as before.
+        if let Some(ids) = &ann.annotated_p_ids {
+            if !ids.contains(&p_id) {
+                continue;
+            }
         }
         let o_type = batch.o_type.get_or(row, 0);
         let o_key = batch.o_key.get(row);

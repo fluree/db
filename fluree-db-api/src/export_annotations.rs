@@ -52,6 +52,15 @@ pub struct AnnotationProbe<'a> {
     /// Bundles recovered by scanning the base index, for a ledger whose arena
     /// was never sealed. Resolved once at export start; empty otherwise.
     scanned: HashMap<EdgeKey, Vec<Sid>>,
+    /// Every predicate that carries a live annotation, drawn from **the same
+    /// sources `live_reifiers` consults** for this export.
+    ///
+    /// Lets `batch_reifiers` skip rows whose predicate is never annotated
+    /// before doing the expensive per-row work, so the cost tracks the
+    /// annotations rather than the dataset. `None` means "unknown" and turns
+    /// the filter off — it must never be narrower than the truth, because a
+    /// row skipped here loses its marker with nothing counted.
+    annotated_predicates: Option<HashSet<Sid>>,
     as_of_t: i64,
     /// Reifiers named by a `~ <r>` marker somewhere in this export.
     named: Mutex<HashSet<Sid>>,
@@ -73,6 +82,7 @@ impl<'a> AnnotationProbe<'a> {
             reader: arena.map(|(root, store)| AnnotationArenaReader::new(root, store.as_ref())),
             novelty,
             scanned: HashMap::new(),
+            annotated_predicates: None,
             as_of_t,
             named: Mutex::new(HashSet::new()),
             in_scope: Mutex::new(HashSet::new()),
@@ -169,6 +179,62 @@ impl<'a> AnnotationProbe<'a> {
     /// the re-bootstrap), which would have made the refusal a dead end on
     /// ledgers every other reader serves through its own scan fallback.
     pub(crate) async fn for_ledger(ledger: &'a LedgerState, as_of_t: i64) -> Result<Option<Self>> {
+        let Some(mut probe) = Self::choose_source(ledger, as_of_t).await? else {
+            return Ok(None);
+        };
+        probe.annotated_predicates = probe.index_predicates().await;
+        Ok(Some(probe))
+    }
+
+    /// The predicates carrying a live annotation at `as_of_t`, from exactly
+    /// the sources `live_reifiers` would consult — arm for arm, so the set
+    /// can never be narrower than whatever answers the export.
+    ///
+    /// Three sources exist, not two: the novelty overlay, the sealed arena,
+    /// **and** the base-index scan. Building the set from a fixed pair would
+    /// let a scan-served export map every predicate cleanly, keep the filter
+    /// on, and drop annotated rows without trace. `None` on any error, which
+    /// switches the filter off.
+    async fn index_predicates(&self) -> Option<HashSet<Sid>> {
+        let mut preds: HashSet<Sid> = HashSet::new();
+        let add_scanned = |preds: &mut HashSet<Sid>| {
+            preds.extend(self.scanned.keys().map(|e| e.p.clone()));
+        };
+        // Every novelty edge, live or not: a superset is safe, a subset is not.
+        let add_novelty = |preds: &mut HashSet<Sid>, n: &AttachmentNovelty| {
+            preds.extend(n.iter_forward().map(|(e, _)| e.p.clone()));
+        };
+        match (self.arena, self.novelty) {
+            (None, None) => add_scanned(&mut preds),
+            (None, Some(n)) => {
+                add_scanned(&mut preds);
+                add_novelty(&mut preds, n);
+            }
+            (Some(_), maybe_novelty) => {
+                let reader = self.reader.as_ref()?;
+                for entry in reader.forward_leaf_entries().await.ok()? {
+                    for (edge, _) in reader
+                        .live_pairs_in_forward_leaf(&entry.leaf_cid, self.as_of_t)
+                        .await
+                        .ok()?
+                    {
+                        preds.insert(edge.p);
+                    }
+                }
+                if let Some(n) = maybe_novelty {
+                    add_novelty(&mut preds, n);
+                }
+            }
+        }
+        Some(preds)
+    }
+
+    /// See [`Self::annotated_predicates`](field@Self::annotated_predicates).
+    pub(crate) fn annotated_predicates(&self) -> Option<&HashSet<Sid>> {
+        self.annotated_predicates.as_ref()
+    }
+
+    async fn choose_source(ledger: &'a LedgerState, as_of_t: i64) -> Result<Option<Self>> {
         let snapshot = &ledger.snapshot;
         let attachments = &ledger.novelty.attachments;
         let novelty = attachments.has_annotations().then_some(attachments);
