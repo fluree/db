@@ -380,12 +380,11 @@ pub fn coerce_value(value: FlakeValue, datatype_iri: &str) -> CoercionResult<Fla
             )),
         },
 
-        // String → rdf:JSON: validate as JSON
-        (FlakeValue::String(s), dt) if dt == rdf::JSON => {
-            serde_json::from_str::<serde_json::Value>(s)
-                .map(|_| FlakeValue::Json(s.clone()))
-                .map_err(|e| CoercionError::parse_failed(s, "rdf:JSON", Some(&e.to_string())))
-        }
+        // Canonicalizing gives one term per value (#1781). It validates the
+        // string on the way.
+        (FlakeValue::String(s), dt) if dt == rdf::JSON => fluree_graph_ir::canonicalize_json(s)
+            .map(FlakeValue::Json)
+            .map_err(|e| CoercionError::parse_failed(s, "rdf:JSON", Some(&e.to_string()))),
 
         // Already JSON → rdf:JSON
         (FlakeValue::Json(j), dt) if dt == rdf::JSON => Ok(FlakeValue::Json(j.clone())),
@@ -534,9 +533,10 @@ pub fn coerce_string_value(s: &str, datatype_iri: &str) -> CoercionResult<FlakeV
             .map(|d| FlakeValue::YearMonthDuration(Box::new(d)))
             .map_err(|e| CoercionError::parse_failed(s, "xsd:yearMonthDuration", Some(&e))),
 
-        // rdf:JSON (validate as JSON)
-        dt if dt == rdf::JSON => serde_json::from_str::<serde_json::Value>(s)
-            .map(|_| FlakeValue::Json(s.to_string()))
+        // Canonicalizing gives one term per value (#1781). It validates the
+        // string on the way.
+        dt if dt == rdf::JSON => fluree_graph_ir::canonicalize_json(s)
+            .map(FlakeValue::Json)
             .map_err(|e| CoercionError::parse_failed(s, "rdf:JSON", Some(&e.to_string()))),
 
         // f:embeddingVector — parse JSON array lexical form (e.g. "[0.1, 0.2]")

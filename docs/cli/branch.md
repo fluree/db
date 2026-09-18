@@ -26,7 +26,7 @@ fluree branch create <NAME> [OPTIONS]
 |--------|-------------|
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
 | `--from <BRANCH>` | Source branch to create from (defaults to "main") |
-| `--at <COMMIT-REF>` | Commit to branch at (defaults to source branch HEAD). Accepts `t:N` for a transaction number or a hex digest / full CID. |
+| `--at <COMMIT-REF>` | Commit to branch at (defaults to source branch HEAD). Accepts `t:<N>` or a bare transaction number, `commit:<prefix>` or a bare hex digest prefix (min 6 chars), or a full CID. A bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. Unlike `query --at` this names a *commit*, so it has no `iso:`, `recorded:` or `latest` forms; the spellings the two share mean the same thing on both. |
 | `--remote <REMOTE>` | Execute against a remote server |
 
 **Description:**
@@ -51,6 +51,7 @@ fluree branch create feature-x --from dev
 
 # Branch at a historical point on main (transaction number)
 fluree branch create rewind --at t:5
+fluree branch create rewind --at 5          # same commit
 
 # Branch at a historical commit by hex-digest prefix
 fluree branch create rewind --at 3dd028a7
@@ -365,7 +366,7 @@ fluree branch revert <COMMITS>...
 fluree branch revert --from <COMMIT> --to <COMMIT>
 ```
 
-Accepts either positional commit references (cherry-pick style, one or several) or a git-style range. Each commit reference may be a `t:N` transaction number, a hex digest prefix, or a full commit ID — the same forms `branch create --at` accepts.
+Accepts either positional commit references (cherry-pick style, one or several) or a git-style range. Each commit reference may be a `t:<N>` or bare transaction number, a `commit:<prefix>` or bare hex digest prefix, or a full commit ID — the same forms `branch create --at` accepts.
 
 A commit must be on the branch's own history, which is the line of commits reached by following each merge's first parent. When the selected commits have nothing to undo, such as one that only registered a graph, no commit is written: the command reports that nothing was reverted and HEAD stays where it was. The genesis commit, a merge commit, and a commit that reached this branch through a merge are all refused: the first two have no single change to undo, and the third belongs to the branch that authored it, where its own history can say what changed after it. Revert it there and merge again.
 

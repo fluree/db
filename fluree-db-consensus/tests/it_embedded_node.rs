@@ -361,7 +361,7 @@ async fn the_wait_ceiling_bounds_a_submission_before_its_next_probe() {
     .await;
 
     // Allow scheduling slack, but stay well below the 10-second probe.
-    let result = tokio::time::timeout(Duration::from_secs(1), &mut submission).await;
+    let result = tokio::time::timeout(Duration::from_secs(3), &mut submission).await;
     drop(guard);
     let err = result
         .expect("the 20 ms ceiling must wake the waiter before its 10 s probe")

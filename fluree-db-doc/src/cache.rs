@@ -49,8 +49,11 @@ struct ParseMeta {
 }
 
 /// Bumped when the way an extraction is asked changes without the prompt
-/// text changing (v2: system prompt as a system message, not `instructions`).
-const EXTRACTION_CACHE_VERSION: &str = "v2";
+/// text changing (v2: system prompt as a system message, not `instructions`;
+/// v3: `max_completion_tokens` in place of `max_tokens`, and no
+/// `temperature` or `response_format`, so answers given while the wire body
+/// was malformed are not reused).
+const EXTRACTION_CACHE_VERSION: &str = "v3";
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -226,11 +229,43 @@ mod tests {
             }],
             relations: vec![],
             from_cache: false,
+            ..Default::default()
         };
         cache.store_extraction(&key, &x).unwrap();
         let hit = cache.load_extraction(&key).unwrap();
         assert_eq!(hit.entities, x.entities);
         assert_ne!(key, DocCache::extraction_key("m", "sys", "other"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// An answer given while the wire body was wrong must not be served
+    /// back after the transport is fixed. The version is the only thing
+    /// standing between a corpus extracted through a malformed wire body
+    /// and a silent reuse of it — the prompts did not change, so nothing
+    /// else in the key did either.
+    #[test]
+    fn a_version_bump_invalidates_every_stored_answer() {
+        let dir = tempdir();
+        let cache = DocCache::new(&dir);
+        let key = DocCache::extraction_key("m", "sys", "user");
+        cache
+            .store_extraction(&key, &ChunkExtraction::default())
+            .unwrap();
+        assert!(cache.load_extraction(&key).is_some());
+
+        // What the previous version's key was, verbatim, so this fails if
+        // EXTRACTION_CACHE_VERSION is ever reverted or left behind.
+        let mut h = Sha256::new();
+        for part in ["v2", "\0m\0sys\0user"] {
+            h.update(part.as_bytes());
+        }
+        let v2 = hex::encode(h.finalize());
+        assert_ne!(key, v2, "the version is not in the key at all");
+        assert!(
+            cache.load_extraction(&v2).is_none(),
+            "a v2 answer is still reachable"
+        );
+        assert_eq!(EXTRACTION_CACHE_VERSION, "v3");
         fs::remove_dir_all(dir).ok();
     }
 

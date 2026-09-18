@@ -25,6 +25,7 @@ mod fulltext;
 mod geo;
 mod hash;
 mod helpers;
+pub(crate) use helpers::expression_is_duplication_safe;
 mod iter;
 pub(crate) use iter::eval_single_node_predicate;
 mod list;

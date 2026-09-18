@@ -530,11 +530,13 @@ async fn json_objects() {
         .to_jsonld_async(ledger1.as_graph_db_ref(0))
         .await
         .unwrap();
+    // `1.0` reads back as `1`: an rdf:JSON literal is stored in canonical
+    // form, and that renders numbers the way ECMAScript does (#1781).
     assert_eq!(
         normalize_rows(&r_graph),
         normalize_rows(&json!([
-            {"@id": "ex:alice", "@type": "ex:Person", "ex:json": {"json": "data", "is": ["cool", "right?", 1, false, 1.0]}},
-            {"@id": "ex:bob", "@type": "ex:Person", "ex:json": {":edn": "data", ":is": ["cool", "right?", 1, false, 1.0]}}
+            {"@id": "ex:alice", "@type": "ex:Person", "ex:json": {"json": "data", "is": ["cool", "right?", 1, false, 1]}},
+            {"@id": "ex:bob", "@type": "ex:Person", "ex:json": {":edn": "data", ":is": ["cool", "right?", 1, false, 1]}}
         ]))
     );
 
@@ -551,8 +553,8 @@ async fn json_objects() {
     assert_eq!(
         normalize_rows(&r_select),
         normalize_rows(&json!([
-            {":edn": "data", ":is": ["cool", "right?", 1, false, 1.0]},
-            {"json": "data", "is": ["cool", "right?", 1, false, 1.0]}
+            {":edn": "data", ":is": ["cool", "right?", 1, false, 1]},
+            {"json": "data", "is": ["cool", "right?", 1, false, 1]}
         ]))
     );
 }

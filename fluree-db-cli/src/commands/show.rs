@@ -41,24 +41,18 @@ pub async fn run(
         LedgerMode::Local { fluree, alias } => {
             let ledger_id = context::to_ledger_id(&alias);
 
-            let detail = if let Some(t_str) = commit.strip_prefix("t:") {
-                let t: i64 = t_str.parse().map_err(|_| {
-                    CliError::Input(format!("Invalid transaction number: '{t_str}'"))
-                })?;
-                fluree
-                    .graph(&ledger_id)
-                    .commit_t(t)
-                    .execute()
-                    .await
-                    .map_err(CliError::Api)?
-            } else {
-                fluree
-                    .graph(&ledger_id)
-                    .commit_prefix(commit)
-                    .execute()
-                    .await
-                    .map_err(CliError::Api)?
+            // Shared with `branch create --at` and `branch revert` (#1805) —
+            // this used to be a private `t:`-or-prefix hand-roll, so `show 2`
+            // was rejected while `branch create --at t:2` was not.
+            let graph = fluree.graph(&ledger_id);
+            let builder = match fluree_db_api::CommitRef::parse(commit).map_err(CliError::Api)? {
+                fluree_db_api::CommitRef::T(t) => graph.commit_t(t),
+                fluree_db_api::CommitRef::Prefix(prefix) => graph.commit_prefix(&prefix),
+                // `commit_prefix` re-parses a canonical CID into the same
+                // `ContentId` this arm already holds.
+                fluree_db_api::CommitRef::Exact(cid) => graph.commit_prefix(&cid.to_string()),
             };
+            let detail = builder.execute().await.map_err(CliError::Api)?;
 
             let json = serde_json::to_string_pretty(&detail)
                 .map_err(|e| CliError::Input(format!("JSON serialization failed: {e}")))?;

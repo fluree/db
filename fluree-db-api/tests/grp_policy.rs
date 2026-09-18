@@ -5,6 +5,8 @@ mod support;
 mod it_policy_allow;
 #[path = "it_policy_class.rs"]
 mod it_policy_class;
+#[path = "it_policy_class_cache_sequential.rs"]
+mod it_policy_class_cache_sequential;
 #[path = "it_policy_cross_ledger.rs"]
 mod it_policy_cross_ledger;
 #[path = "it_policy_cypher_conditions.rs"]
@@ -21,6 +23,8 @@ mod it_policy_indexed;
 mod it_policy_named_graphs;
 #[path = "it_policy_optional_hashjoin.rs"]
 mod it_policy_optional_hashjoin;
+#[path = "it_policy_predicate_fast_lanes.rs"]
+mod it_policy_predicate_fast_lanes;
 #[path = "it_policy_query_connection.rs"]
 mod it_policy_query_connection;
 #[path = "it_policy_sparql.rs"]

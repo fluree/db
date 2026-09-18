@@ -932,6 +932,85 @@ impl Operator for DefaultGraphSourceOperator {
     fn estimated_rows(&self) -> Option<usize> {
         self.estimated
     }
+
+    /// Without this the rendered physical plan truncates at the wrapper and the
+    /// whole annotated BGP disappears — which is how a threshold that never
+    /// reached the scan stayed invisible behind a plan that looked like one
+    /// operator.
+    fn plan_children(&self) -> Vec<crate::plan_node::PlanChild<'_>> {
+        vec![crate::plan_node::PlanChild::child(self.child.as_ref())]
+    }
+
+    /// Name the chain and the lane its cost model prefers.
+    ///
+    /// The inner subplan is built at `open()` (it needs the snapshot to know
+    /// whether a sealed arena exists), so `describe()` cannot report the lane
+    /// that *ran* — that is EXPLAIN ANALYZE territory, per the `Operator`
+    /// contract. Everything [`Self::chain_lane`] consumes is available here
+    /// though (the child's schema and the planner stats; only the elision
+    /// gates need the context), so the cost model's *preference* is reportable
+    /// and is the single most useful fact about an annotated plan. It is
+    /// labelled as a preference, and `lane-final` says where the real answer
+    /// lives: the `annotation delegate lane` tracing event at DEBUG.
+    ///
+    /// **`lane-preference` is not evidence of the lane that executed, and must
+    /// not be used as one.** It is [`Self::chain_lane`]'s answer, computed
+    /// *before* the runtime gates and — when `FLUREE_ANNOTATION_LANE` is set —
+    /// simply that variable echoed back, so as a check it confirms its own
+    /// input. Execution then runs the arena or enumeration lane only if all
+    /// five of [`Self::annotation_probe_gates_pass`] hold (sealed arena,
+    /// content store, not a history query, **drained overlay**, root-or-no
+    /// policy); any one of them falls through to the hash or generic lane
+    /// with no signal here. A single uncommitted flake fails the overlay
+    /// condition, which is the easiest of the five to trip by accident.
+    ///
+    /// For what actually ran, use the tracing events — `annotation delegate
+    /// gates` prints each condition individually and `annotation delegate
+    /// lane` names the lane. Both need `RUST_LOG=debug` **and** the CLI's
+    /// `-v`; `RUST_LOG` alone emits nothing.
+    fn plan_details(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut m = serde_json::Map::new();
+        let Some(shape) =
+            crate::annotation_edge_probe::recognize_annotation_edge(&self.inner_patterns)
+        else {
+            m.insert("kind".into(), "unrecognized-chain".into());
+            m.insert("patterns".into(), self.inner_patterns.len().into());
+            return m;
+        };
+        m.insert("kind".into(), "edge-annotation".into());
+        m.insert(
+            "base".into(),
+            match &shape.base {
+                Pattern::Triple(tp) => crate::explain::format_pattern(tp).into(),
+                other => format!("{other:?}").into(),
+            },
+        );
+        m.insert("body-patterns".into(), shape.body.len().into());
+        m.insert(
+            "body-filters".into(),
+            shape
+                .body
+                .iter()
+                .filter(|p| matches!(p, Pattern::Filter(_)))
+                .count()
+                .into(),
+        );
+        let child_bound: HashSet<VarId> = self.child.schema().iter().copied().collect();
+        let elided =
+            elide_redundant_chain(&self.inner_patterns, &self.needed_outside, &child_bound);
+        m.insert("chain-elided".into(), elided.is_some().into());
+        let lane = match self.chain_lane(&self.child, elided.is_some()) {
+            ChainLane::Arena => "arena",
+            ChainLane::Enumerate => "enumerate",
+            ChainLane::Chain => "chain",
+        };
+        m.insert("lane-preference".into(), lane.into());
+        m.insert(
+            "lane-final".into(),
+            "decided at open; see the `annotation delegate lane` DEBUG event".into(),
+        );
+        m
+    }
 }
 
 #[cfg(test)]

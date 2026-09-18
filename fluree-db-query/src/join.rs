@@ -1738,9 +1738,15 @@ impl NestedLoopJoinOperator {
     /// BEFORE any accumulation, so a flush never reroutes mid-stream.
     fn compute_batched_overlay_mode(&self, ctx: &ExecutionContext<'_>) -> Result<ProbeLanePlan> {
         // The lane planners' own admission, so an overlay-free graph settles
-        // as `Clean` without needing a store or predicate — and its policy
-        // and history gates run before that `Clean` regardless of eligibility.
-        if let Some(plan) = crate::fast_path_common::probe_lane_admission(ctx) {
+        // as `Clean` without needing a store — and its history and policy
+        // gates run before that `Clean` regardless of eligibility. With no
+        // batched predicate there is nothing for a policy to clear, and the
+        // empty set declines under any non-root policy.
+        let preds: &[&Sid] = match self.batched_predicate.as_ref() {
+            Some(pred) => &[pred],
+            None => &[],
+        };
+        if let Some(plan) = crate::fast_path_common::probe_lane_admission(ctx, preds) {
             return Ok(plan);
         }
         if !(self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
@@ -4304,19 +4310,25 @@ mod tests {
             "overlay-free single graph with no policy should permit the batched Clean lane"
         );
 
-        // Non-root view policy => Decline regardless of overlay-free state, so the
-        // join falls back to the per-row scan path that applies filter_flakes.
-        let wrapper = PolicyWrapper::new(
-            PolicySet::default(),
-            PolicySet::default(),
-            false, // root
-            false, // default_allow
-            HashMap::new(),
-        );
-        let enforcer = Arc::new(QueryPolicyEnforcer::new(Arc::new(PolicyContext::new(
-            wrapper, None,
-        ))));
-        let ctx_policy = ExecutionContext::new(&snapshot, &vars).with_policy_enforcer(enforcer);
+        // Non-root view policy that can touch the probed predicate => Decline
+        // regardless of overlay-free state, so the join falls back to the
+        // per-row scan path that applies filter_flakes. An empty view set under
+        // a deny default hides every flake of the predicate, which the lanes
+        // cannot short-circuit, so it declines too.
+        let policed = |default_allow: bool| {
+            let wrapper = PolicyWrapper::new(
+                PolicySet::default(),
+                PolicySet::default(),
+                false, // root
+                default_allow,
+                HashMap::new(),
+            );
+            Arc::new(QueryPolicyEnforcer::new(Arc::new(PolicyContext::new(
+                wrapper, None,
+            ))))
+        };
+        let ctx_policy =
+            ExecutionContext::new(&snapshot, &vars).with_policy_enforcer(policed(false));
         let join_policy = make_join();
         assert!(
             matches!(
@@ -4325,7 +4337,22 @@ mod tests {
                     .unwrap(),
                 ProbeLanePlan::Decline
             ),
-            "non-root view policy must decline the batched lane (force the filtered per-row fallback)"
+            "a view policy that hides the probed predicate must decline the batched lane"
+        );
+
+        // Non-root view policy that provably cannot touch the probed predicate
+        // (no rule covers it, default allows) => the lane stays on.
+        let ctx_untouched =
+            ExecutionContext::new(&snapshot, &vars).with_policy_enforcer(policed(true));
+        let join_untouched = make_join();
+        assert!(
+            matches!(
+                join_untouched
+                    .compute_batched_overlay_mode(&ctx_untouched)
+                    .unwrap(),
+                ProbeLanePlan::Clean
+            ),
+            "a view policy that cannot touch the probed predicate must keep the batched lane"
         );
     }
 

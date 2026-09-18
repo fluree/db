@@ -270,6 +270,13 @@ where
         self.inner.delete(address).await
     }
 
+    async fn delete_many(
+        &self,
+        addresses: &[String],
+    ) -> Vec<(String, fluree_db_core::error::Error)> {
+        self.inner.delete_many(addresses).await
+    }
+
     async fn sync(&self) -> fluree_db_core::error::Result<()> {
         self.inner.sync().await
     }

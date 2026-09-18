@@ -15,6 +15,7 @@ credential = ["dep:fluree-db-credential"]
 
 [dependencies]
 fluree-vocab = { path = "../fluree-vocab" }
+fluree-graph-ir = { path = "../fluree-graph-ir" }
 futures = { workspace = true }
 async-trait = { workspace = true }
 hashbrown = { workspace = true }

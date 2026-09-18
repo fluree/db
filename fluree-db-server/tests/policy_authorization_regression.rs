@@ -1490,7 +1490,7 @@ async fn explain_uses_final_body_policy_selection_on_both_routes() {
                 result["plan"]["reason"]
                     .as_str()
                     .unwrap_or_default()
-                    .contains("withheld by policy"),
+                    .contains("hidden from this explain by policy"),
                 !allow,
                 "{result}"
             );

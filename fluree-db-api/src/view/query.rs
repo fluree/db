@@ -30,7 +30,11 @@ fn explain_policy_notice(mut result: JsonValue, view: &GraphDb) -> JsonValue {
     if let Some(plan) = result.get_mut("plan").and_then(JsonValue::as_object_mut) {
         plan.insert(
             "reason".into(),
-            JsonValue::String("Statistics withheld by policy; estimates are heuristic".into()),
+            JsonValue::String(
+                "Statistics hidden from this explain by policy; execution still plans \
+                 with them. Estimates shown are heuristic."
+                    .into(),
+            ),
         );
     }
     result
