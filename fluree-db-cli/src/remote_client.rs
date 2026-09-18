@@ -1558,21 +1558,41 @@ impl RemoteLedgerClient {
     // Negotiated upload import (for size-capped servers)
     // ========================================================================
 
+    /// Fetch the server's discovery document, or `None` when it cannot be
+    /// read or parsed.
+    async fn fetch_discovery(&self) -> Option<serde_json::Value> {
+        let disco_url = reqwest::Url::parse(&self.base_url)
+            .and_then(|u| u.join("/.well-known/fluree.json"))
+            .ok()?;
+        let resp = self
+            .add_auth(self.client.get(disco_url))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<serde_json::Value>().await.ok()
+    }
+
+    /// Whether the server takes the commits a push's merges brought in, on
+    /// `POST /push-merges`.
+    ///
+    /// A server that does not advertise it is treated as unable to. That
+    /// includes one whose discovery document cannot be read.
+    pub async fn supports_push_merges(&self) -> bool {
+        self.fetch_discovery()
+            .await
+            .and_then(|doc| doc["push"]["merged_commits"].as_bool())
+            .unwrap_or(false)
+    }
+
     /// Read the server's `.flpack` import capabilities from discovery.
     ///
     /// Best-effort: any failure (old server, no discovery, parse error) yields
     /// the back-compatible default — direct streaming only.
     pub async fn fetch_import_capability(&self) -> ImportCapability {
-        let Ok(disco_url) =
-            reqwest::Url::parse(&self.base_url).and_then(|u| u.join("/.well-known/fluree.json"))
-        else {
-            return ImportCapability::direct_only();
-        };
-        let resp = match self.add_auth(self.client.get(disco_url)).send().await {
-            Ok(r) if r.status().is_success() => r,
-            _ => return ImportCapability::direct_only(),
-        };
-        let Ok(doc) = resp.json::<serde_json::Value>().await else {
+        let Some(doc) = self.fetch_discovery().await else {
             return ImportCapability::direct_only();
         };
         let import = &doc["import"];
@@ -2455,7 +2475,14 @@ impl RemoteLedgerClient {
         ledger: &str,
         request: &fluree_db_api::PushCommitsRequest,
     ) -> Result<PushCommitsResponse, RemoteLedgerError> {
-        let url = self.op_url("push", ledger);
+        // Merged commits go only to `push-merges`. A server predating that
+        // endpoint answers 404 there, where `push` would drop them.
+        let op = if request.merged_commits.is_empty() {
+            "push"
+        } else {
+            "push-merges"
+        };
+        let url = self.op_url(op, ledger);
         let body = serde_json::to_value(request)
             .map_err(|e| RemoteLedgerError::InvalidRequest(e.to_string()))?;
 
@@ -2592,16 +2619,28 @@ impl RemoteLedgerClient {
     /// Uses address-cursor pagination. Pass `cursor: None` for the first page
     /// (starts from head). Each response includes `next_cursor` for the next page,
     /// or `None` when genesis has been reached.
+    ///
+    /// Requests `lineage` mode: the first-parent line as `commits`, and the
+    /// commits its merges brought in as `merged_commits`. The export stops
+    /// above `base`, or runs to genesis when it is `None`. A server predating
+    /// that mode ignores the request and answers with `lineage` unset.
     pub async fn fetch_commits(
         &self,
         ledger: &str,
         cursor: Option<&str>,
+        base: Option<&fluree_db_core::ContentId>,
         limit: usize,
     ) -> Result<ExportCommitsResponse, RemoteLedgerError> {
         let mut url = self.op_url("commits", ledger);
-        url.push_str(&format!("?limit={limit}"));
+        url.push_str(&format!("?limit={limit}&lineage=true"));
         if let Some(c) = cursor {
             url.push_str(&format!("&cursor={}", urlencoding::encode(c)));
+        }
+        if let Some(base) = base {
+            url.push_str(&format!(
+                "&base_id={}",
+                urlencoding::encode(&base.to_string())
+            ));
         }
 
         let resp = self
@@ -2879,6 +2918,16 @@ fn push_idempotency_key(ledger: &str, request: &fluree_db_api::PushCommitsReques
         hasher.update([0u8]);
         hasher.update((v.0.len() as u64).to_be_bytes());
         hasher.update(&v.0);
+    }
+
+    // Hashed only when present, so a push without merges keeps the key it
+    // had before this field existed.
+    if !request.merged_commits.is_empty() {
+        hasher.update(b"merged\0");
+        for commit in &request.merged_commits {
+            hasher.update((commit.0.len() as u64).to_be_bytes());
+            hasher.update(&commit.0);
+        }
     }
 
     format!("sha256:{}", hex::encode(hasher.finalize()))
@@ -3230,6 +3279,152 @@ mod tests {
         assert!(
             recorded.iter().all(|(_, _, chunked)| !chunked),
             "no part may use chunked encoding (S3 presigned PUT rejects it)"
+        );
+    }
+
+    /// Serve one HTTP request with a 200 JSON `body`. Returns the base URL
+    /// and a handle yielding the request line the client sent.
+    async fn serve_once(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let header_end = loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                if n == 0 {
+                    break buf.len();
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let content_length: usize = headers
+                .to_lowercase()
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            headers.lines().next().unwrap_or_default().to_string()
+        });
+        (format!("http://{addr}/v1/fluree"), server)
+    }
+
+    const PUSH_RESPONSE: &str = r#"{"ledger":"mydb:main","accepted":1,
+        "head":{"t":2,"commit_id":"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"},
+        "indexing":{"enabled":false,"needed":false,"novelty_size":0,"index_t":0,"commit_t":2}}"#;
+
+    /// Merged commits go only to `push-merges`. A push without them keeps
+    /// using `push`, which every server accepts.
+    #[tokio::test]
+    async fn push_commits_picks_the_endpoint_by_content() {
+        for (merged_commits, expected) in [
+            (Vec::new(), "POST /v1/fluree/push/mydb:main "),
+            (
+                vec![fluree_db_api::Base64Bytes(b"merged".to_vec())],
+                "POST /v1/fluree/push-merges/mydb:main ",
+            ),
+        ] {
+            let (base_url, server) = serve_once(PUSH_RESPONSE).await;
+            let request = fluree_db_api::PushCommitsRequest {
+                commits: vec![fluree_db_api::Base64Bytes(b"line".to_vec())],
+                merged_commits,
+                ..Default::default()
+            };
+            RemoteLedgerClient::new(&base_url, None)
+                .push_commits("mydb:main", &request)
+                .await
+                .expect("push should succeed");
+            let request_line = server.await.unwrap();
+            assert!(
+                request_line.starts_with(expected),
+                "expected {expected:?}, got {request_line:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn supports_push_merges_reads_discovery() {
+        for (doc, expected) in [
+            (r#"{"version":1,"push":{"merged_commits":true}}"#, true),
+            (r#"{"version":1}"#, false),
+        ] {
+            let (base_url, server) = serve_once(doc).await;
+            assert_eq!(
+                RemoteLedgerClient::new(&base_url, None)
+                    .supports_push_merges()
+                    .await,
+                expected,
+                "discovery document: {doc}"
+            );
+            assert!(server
+                .await
+                .unwrap()
+                .starts_with("GET /.well-known/fluree.json "));
+        }
+    }
+
+    /// Pull asks for the first-parent line, stopping above the local head.
+    #[tokio::test]
+    async fn fetch_commits_requests_the_line_above_the_base() {
+        let page = r#"{"ledger":"mydb:main",
+            "head_commit_id":"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            "head_t":2,"commits":[],"newest_t":0,"oldest_t":0,"next_cursor_id":null,
+            "count":0,"effective_limit":100,"lineage":true}"#;
+        let (base_url, server) = serve_once(page).await;
+        let base: fluree_db_core::ContentId =
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+                .parse()
+                .unwrap();
+        let response = RemoteLedgerClient::new(&base_url, None)
+            .fetch_commits("mydb:main", None, Some(&base), 100)
+            .await
+            .expect("fetch should succeed");
+        assert!(response.lineage);
+
+        let request_line = server.await.unwrap();
+        assert!(request_line.contains("lineage=true"), "{request_line}");
+        assert!(
+            request_line.contains(&format!("base_id={base}")),
+            "{request_line}"
+        );
+    }
+
+    /// Two pushes that differ only in their merged commits must not share
+    /// an idempotency key. A server would replay the first one's response.
+    #[test]
+    fn push_idempotency_key_covers_merged_commits() {
+        let plain = fluree_db_api::PushCommitsRequest {
+            commits: vec![fluree_db_api::Base64Bytes(b"line".to_vec())],
+            ..Default::default()
+        };
+        let with_merges = fluree_db_api::PushCommitsRequest {
+            merged_commits: vec![fluree_db_api::Base64Bytes(b"merged".to_vec())],
+            ..plain.clone()
+        };
+        assert_ne!(
+            push_idempotency_key("mydb:main", &plain),
+            push_idempotency_key("mydb:main", &with_merges)
         );
     }
 

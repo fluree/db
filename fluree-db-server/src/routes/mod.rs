@@ -212,8 +212,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sync", post(transact::sync))
         .route("/upsert/*ledger", post(transact::upsert_ledger_tail))
         .route("/sync/*ledger", post(transact::sync_ledger))
-        // Commit-push endpoint (precomputed commits)
+        // Commit-push endpoints (precomputed commits). The second takes a
+        // push whose commits include a merge; see `routes::push`.
         .route("/push/*ledger", post(push::push_ledger_tail))
+        .route("/push-merges/*ledger", post(push::push_merges_ledger_tail))
         // Nameservice ref endpoints (for remote sync)
         .route(
             "/nameservice/refs/:alias/commit",

@@ -22,7 +22,7 @@ Downloads new commits from the configured upstream and applies them to the local
 1. Queries the remote for its current head (`t` and commit ContentId)
 2. Compares with the local head; exits early if already up to date
 3. Attempts bulk download of missing commits (and by default **index artifacts**) via the **pack protocol** (single streaming request)
-4. Falls back to paginated JSON export if the server does not support pack
+4. Falls back to paginated JSON export if the server does not support pack. The export sends the branch's first-parent line and, separately, the commits its merges brought in. A server too old to export that way can still serve a history without merges.
 5. Stores all commit and transaction blobs to local CAS
 6. When index data is requested and transferred, advances the local index head to match the remote
 7. Advances the local commit head to the remote head

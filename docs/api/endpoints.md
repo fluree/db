@@ -30,6 +30,8 @@ when the API is hosted under `/v1/fluree` or on a separate `data` subdomain).
 
 Implementations MAY also return an `import` block advertising `.flpack` import capabilities (`modes` incl. `multipart-put`, `direct_max_bytes`, multipart hints) so the CLI can negotiate the upload path — see [Negotiated upload import](#negotiated-upload-import-import-upload).
 
+Implementations MAY also return a `push` block. `"push": {"merged_commits": true}` advertises [`POST /push-merges/*ledger`](#post-push-mergesledger). The CLI refuses to push a history containing a merge to a server that does not advertise it.
+
 ### GET {api_base_url}/whoami
 
 Diagnostic endpoint for Bearer tokens. Returns a summary of the principal:
@@ -386,6 +388,14 @@ JSON object:
 - `commits`: array of base64-encoded commit v2 blobs (oldest → newest)
 - `blobs` (optional): map of `{ cid: base64Bytes }` for referenced blobs (currently: `commit.txn` when present). Provided blobs must hash-verify against their CID. A referenced txn blob that is *not* provided is accepted with a warning — the source may itself have a provenance gap (see `missing_blobs` on export), and the commit's flakes do not depend on it.
 - `missing_blobs` (optional): array of CID strings the sender knows it cannot supply. Mirrors `missing_blobs` on the export response, so a sender declares a provenance gap instead of leaving the receiver to infer it from an absent `blobs` key. Undeclared gaps are still accepted today (a sender predating this field cannot declare one) but are logged at `warn` rather than `debug`.
+- `merged_commits`: must be absent or empty on this endpoint. A push that carries merged commits goes to [`POST /push-merges/*ledger`](#post-push-mergesledger). This endpoint refuses one with `400`.
+
+**Chain rules:**
+
+- Each commit's `t` is the prior commit's `t + 1`. The first commit's `t` is the ledger's current `t + 1`.
+- Each commit's first parent is the prior commit. The first commit's first parent is the ledger's current head. A match on a later parent is not enough. The first-parent line is the history the server replays.
+- A commit with no flakes is rejected unless it is a merge commit. A merge records the merge even when its conflict strategy resolved every flake away.
+- Every parent of every commit is either in the push or already stored. For a branch, that includes history from before the fork, which is stored under its source branch.
 
 **Response Body (200 OK):**
 
@@ -419,8 +429,35 @@ When `enabled` is `false` (external indexer mode), the caller should use `needed
 
 **Error Responses:**
 
+- `400 Bad Request`: the body carries `merged_commits`
 - `409 Conflict`: head changed / diverged / first commit `t` did not match next-t
-- `422 Unprocessable Entity`: invalid commit bytes, missing referenced blob, or retraction invariant violation
+- `422 Unprocessable Entity`: invalid commit bytes, a parent that is neither in the push nor stored, or retraction invariant violation
+
+### POST /push-merges/*ledger
+
+Push commits whose history contains a merge. The request, response, headers, and idempotency behavior are those of [`POST /push/*ledger`](#post-pushledger), plus `merged_commits`.
+
+**URL:**
+
+```
+POST /push-merges/<ledger...>
+```
+
+**Request Body:**
+
+The fields of `POST /push/*ledger`, plus:
+
+- `merged_commits`: array of base64-encoded commit v2 blobs, parents before children. These are the commits that merges in `commits` brought in from other branches. The server stores them and does not replay them. Each merge commit already carries their combined changes. Their `t` values come from other branches, so they are not contiguous with `commits`. Their txn blobs go in `blobs` like any other.
+
+The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit. A push that carries any other commit is refused with `422`.
+
+**Why a separate endpoint:**
+
+A server predating this endpoint answers `404`. Given the same body on `POST /push`, that server would accept the push and drop `merged_commits`. It would then store merge commits without their parents. Servers that implement this endpoint advertise it in discovery with `"push": {"merged_commits": true}`.
+
+**Error Responses:**
+
+As for `POST /push/*ledger`, without the `400` for `merged_commits`.
 
 ### GET /show/*ledger
 
@@ -550,6 +587,8 @@ GET /commits/<ledger...>?limit=100&cursor_id=<cid>
 
 - `limit` (optional): Max commits per page (default 100, server clamps to max 500)
 - `cursor_id` (optional): Commit CID cursor for pagination. Omit for first page (starts from head). Use `next_cursor_id` from the previous response for subsequent pages.
+- `lineage` (optional): `true` selects lineage mode, described below. Defaults to `false`.
+- `base_id` (optional, lineage mode only): the client's head. The export stops above it. Omit it to export down to genesis.
 
 **Request Headers:**
 
@@ -580,12 +619,26 @@ Authorization: Bearer <token>   (requires fluree.storage.* claims)
 - `missing_blobs`: Txn CIDs referenced by commits in this page that the server could not read (omitted when empty). The commits are still exported; run `fluree verify` on the source to locate the referencing commit.
 - `next_cursor_id`: CID cursor for the next page; `null` when genesis is reached.
 - `effective_limit`: Actual limit used (after server clamping).
+- `lineage`: `true` in lineage mode. Omitted otherwise.
+- `merged_commits`: in lineage mode, the commits that merges in this page's `commits` brought in, parents before children. Omitted when empty.
+
+**Lineage mode:**
+
+By default, pages walk every parent of every commit. A history containing a merge then interleaves commits from different branches. Such a history cannot be imported.
+
+With `lineage=true`, `commits` holds only the branch's first-parent line. `merged_commits` holds the commits its merges brought in, as in [`POST /push-merges/*ledger`](#post-push-mergesledger). `next_cursor_id` is the next commit on the line. A commit that merges on two pages brought in appears on both pages.
+
+- With `base_id`, the export stops above that commit. `next_cursor_id` is `null` on the page that reaches it.
+- A `base_id` that is not on the branch's first-parent line returns `409`. The histories have diverged.
+
+The mode is opt-in, so a client that does not request it keeps the default format. A server predating it ignores the parameters and returns the default format without `lineage`. That is how a client tells the two apart.
 
 **Responses:**
 
 - `200 OK`: Page of commits returned
 - `401 Unauthorized`: Missing or invalid storage token
 - `404 Not Found`: Storage proxy not enabled, ledger not found, or not authorized for this ledger
+- `409 Conflict`: in lineage mode, `base_id` is not on the branch's first-parent line
 
 **Pagination:**
 
@@ -3543,8 +3596,9 @@ For sync workflows (`clone`/`push`/`pull`), these additional endpoints are neede
 
 | Endpoint | CLI commands | Notes |
 |----------|-------------|-------|
-| `POST /push/{ledger}` | `push` | Required for push |
-| `GET /commits/{ledger}` | `clone`, `pull` | Paginated export fallback |
+| `POST /push/{ledger}` | `push`, `publish` | Required for push |
+| `POST /push-merges/{ledger}` | `push`, `publish` | Required to push a history containing a merge. Advertise it in discovery. |
+| `GET /commits/{ledger}` | `clone`, `pull` | Paginated export fallback. Implement `lineage` mode to serve a history containing a merge. |
 | `POST /pack/{ledger}` | `clone`, `pull` | Preferred bulk transport; CLI falls back to `/commits` on 404/405/501 |
 | `GET /storage/ns/{ledger}` | `clone`, `pull` | Pack preflight (head CID discovery) |
 

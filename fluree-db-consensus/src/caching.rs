@@ -661,6 +661,11 @@ impl<C: Committer> CachingCommitter<C> {
             hasher.update((value.len() as u64).to_le_bytes());
             hasher.update(value);
         }
+        hasher.update((request.merged_commits.len() as u64).to_le_bytes());
+        for commit in &request.merged_commits {
+            hasher.update((commit.len() as u64).to_le_bytes());
+            hasher.update(commit);
+        }
         hash_governance(&mut hasher, &request.governance);
         hasher.finalize().into()
     }
@@ -2777,8 +2782,25 @@ ex:alice ex:name "Alice" ."#;
             ledger_id: "test/committer:main".to_string(),
             commits,
             blobs: std::collections::HashMap::new(),
+            merged_commits: Vec::new(),
             governance: GovernanceOptions::default(),
         }
+    }
+
+    /// Two pushes that differ only in their merged commits must not share a
+    /// body hash. The cache would otherwise return the first push's receipt
+    /// for the second.
+    #[test]
+    fn push_body_hash_covers_merged_commits() {
+        let plain = push_request(Some("k"), vec![b"line".to_vec()]);
+        let with_merges = PushRequest {
+            merged_commits: vec![b"merged".to_vec()],
+            ..push_request(Some("k"), vec![b"line".to_vec()])
+        };
+        assert_ne!(
+            CachingCommitter::<LocalCommitter>::hash_push_body(&plain),
+            CachingCommitter::<LocalCommitter>::hash_push_body(&with_merges),
+        );
     }
 
     #[tokio::test]

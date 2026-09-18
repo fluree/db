@@ -50,6 +50,8 @@ Fallbacks (strongly recommended):
 - `GET {api_base_url}/commits/*ledger` (paginated export of commit + txn blobs)
 - `GET {api_base_url}/storage/objects/:cid?ledger=:ledger-id` (per-object fetch by CID)
 
+The CLI requests the `/commits` export in [lineage mode](../api/endpoints.md#get-commitsledger) (`lineage=true`, with `base_id` set to the local head on pull). Without lineage mode, the fallback cannot transfer a history containing a merge. The CLI detects a server without it because the response does not include `lineage`. It then uses the default format.
+
 ### `fluree track add --mode peer` (local query execution over served blocks)
 
 Peer mode runs the consumer's queries **locally** over index blocks fetched
@@ -120,8 +122,14 @@ Optional:
 ### `fluree push` (commit ingestion)
 
 - `POST {api_base_url}/push/*ledger`
+- `POST {api_base_url}/push-merges/*ledger` (a push whose history contains a merge)
+- `GET /.well-known/fluree.json` with `"push": {"merged_commits": true}`, if you implement `push-merges`
 
 This is not storage-proxy replication; it is a transaction operation and should be authorized like normal transactions.
+
+The CLI pushes the branch's first-parent line as `commits`. When a commit on that line is a merge, the CLI also sends the commits the merge brought in, as `merged_commits`, to `push-merges` instead of `push`. It does so only when discovery advertises `push.merged_commits`. Otherwise it refuses the push before sending anything. See [`POST /push-merges/*ledger`](../api/endpoints.md#post-push-mergesledger) for the rules the server enforces.
+
+`push-merges` is a separate endpoint so that a server without it fails with `404`. The same body on `push` would be accepted by such a server with the merged commits dropped. For that reason `push` must refuse a body carrying `merged_commits`.
 
 The CLI sends an `Idempotency-Key` header derived from the pushed commit bytes so servers can safely replay a successful push result if the client retries after a timeout.
 
@@ -193,14 +201,16 @@ Required endpoints:
 - `POST {api_base_url}/create` (create empty ledger if not exists)
 - `GET {api_base_url}/info/*ledger` (check remote head when ledger exists)
 - `POST {api_base_url}/push/*ledger` (push all commits)
+- `POST {api_base_url}/push-merges/*ledger` and its discovery flag, when the history contains a merge (see [`fluree push`](#fluree-push-commit-ingestion))
 
 **Workflow:**
 
-1. CLI calls `GET /exists?ledger=mydb:main`
-2. If `exists: false`, CLI calls `POST /create` with `{"ledger": "mydb:main"}`
-3. If `exists: true`, CLI calls `GET /info/mydb:main` and rejects if `t > 0` (remote already has data)
-4. CLI walks the full local commit chain (oldest → newest) and sends all commits via `POST /push/mydb:main`
-5. CLI configures upstream tracking locally
+1. CLI plans the push from genesis. If the history contains a merge and discovery does not advertise `push.merged_commits`, it stops here, before touching the remote.
+2. CLI calls `GET /exists?ledger=mydb:main`
+3. If `exists: false`, CLI calls `POST /create` with `{"ledger": "mydb:main"}`
+4. If `exists: true`, CLI calls `GET /info/mydb:main` and rejects if `t > 0` (remote already has data)
+5. CLI sends the first-parent line (oldest → newest) via `POST /push/mydb:main`, or via `POST /push-merges/mydb:main` with the merged-in commits
+6. CLI configures upstream tracking locally
 
 The `--remote-name` flag allows publishing under a different name on the remote (e.g., `fluree publish origin mydb --remote-name production-db`).
 

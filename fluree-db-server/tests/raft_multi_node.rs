@@ -824,6 +824,154 @@ async fn happy_path_follower_forwards_to_leader() {
     }
 }
 
+/// Build, in a local in-memory instance, a main branch that ends in a
+/// general merge of `dev`. Return the push a client would send for it: the
+/// first-parent line plus the commit `dev` made.
+async fn merged_history_push() -> fluree_db_api::PushCommitsRequest {
+    use fluree_db_api::{Base64Bytes, ConflictStrategy, FlureeBuilder};
+    use fluree_db_core::ContentStore;
+
+    let local = FlureeBuilder::memory().build_memory();
+    let insert = |ledger: &'static str, subject: &'static str, name: &'static str| {
+        let local = &local;
+        async move {
+            let state = local.ledger(ledger).await.unwrap();
+            let data = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": format!("ex:{subject}"),
+                "ex:name": name,
+            });
+            local.insert(state, &data).await.unwrap();
+        }
+    };
+    local.create_ledger("mydb").await.unwrap();
+    insert("mydb:main", "alice", "Alice").await;
+    local
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    // Dev's commit keeps its raw transaction, so it references a txn blob
+    // that has to travel with the push.
+    let dev = local.ledger("mydb:dev").await.unwrap();
+    local
+        .transact(
+            dev,
+            fluree_db_api::TxnType::Insert,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": "ex:bob",
+                "ex:name": "Bob",
+            }),
+            fluree_db_api::TxnOpts::default().store_raw_txn(true),
+            fluree_db_api::CommitOpts::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .unwrap();
+    insert("mydb:main", "carol", "Carol").await;
+    let report = local
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(!report.fast_forward);
+
+    let store = local.branched_content_store("mydb:main").await.unwrap();
+    let head = local
+        .ledger("mydb:main")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .unwrap();
+    let plan = fluree_db_core::plan_commit_transfer(store.as_ref(), &head, None)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut request = fluree_db_api::PushCommitsRequest::default();
+    for (cids, out) in [
+        (&plan.lineage, &mut request.commits),
+        (&plan.merged, &mut request.merged_commits),
+    ] {
+        for cid in cids {
+            let bytes = store.get(cid).await.unwrap();
+            let commit = fluree_db_core::commit::codec::read_commit(&bytes).unwrap();
+            if let Some(txn) = &commit.txn {
+                let txn_bytes = store.get(txn).await.unwrap();
+                request
+                    .blobs
+                    .insert(txn.to_string(), Base64Bytes(txn_bytes));
+            }
+            out.push(Base64Bytes(bytes));
+        }
+    }
+    request
+}
+
+/// A push containing a merge, sent to a follower, is forwarded to the
+/// leader and applied through the Raft queue's `PushWithMerges` envelope.
+/// Every node then sees the merged data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn push_with_merges_through_a_follower() {
+    init_test_tracing();
+    let cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+
+    let follower = cluster.pick_follower().await;
+    let ledger = "raft:push-merges";
+    cluster.create_ledger(follower, ledger).await;
+
+    let request = merged_history_push().await;
+    assert_eq!(request.merged_commits.len(), 1, "dev's commit");
+    let resp = cluster
+        .client
+        .post(format!(
+            "{}/v1/fluree/push-merges/{ledger}",
+            cluster.public_url(follower)
+        ))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&request).unwrap())
+        .send()
+        .await
+        .expect("push request");
+    assert!(
+        resp.status().is_success(),
+        "push-merges via follower returned {}: {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+
+    for node in &cluster.nodes {
+        cluster
+            .wait_for_names(
+                node.node_id,
+                ledger,
+                &["Alice", "Bob", "Carol"],
+                DEFAULT_TIMEOUT,
+            )
+            .await;
+    }
+
+    // The worker also writes the merged-in commit's txn blob. Storage is
+    // shared, so any node can read it.
+    use fluree_db_core::ContentStore;
+    let side = fluree_db_core::commit::codec::read_commit(&request.merged_commits[0].0).unwrap();
+    let txn = side.txn.expect("dev's commit has a txn blob");
+    let stored = cluster.nodes[0]
+        ._state
+        .fluree
+        .content_store(ledger)
+        .get(&txn)
+        .await;
+    assert!(
+        stored.is_ok(),
+        "txn blob {txn} of dev's commit is not stored"
+    );
+}
+
 /// Regression test for the event-bus wiring bug fixed in this branch.
 ///
 /// Before the fix, the raft `StateMachineAdapter` emitted

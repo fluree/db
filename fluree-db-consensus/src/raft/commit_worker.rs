@@ -40,8 +40,8 @@ use crate::raft::state_machine::{BodyKind, PoisonReason, QueueEntry, RefKey};
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::{NodeId, TypeConfig};
 use crate::{
-    QueuedMerge, QueuedPush, QueuedRebase, QueuedRequest, QueuedRevert, QueuedTransact,
-    SubmissionError, TransactionBody,
+    QueuedMerge, QueuedPush, QueuedPushWithMerges, QueuedRebase, QueuedRequest, QueuedRevert,
+    QueuedTransact, SubmissionError, TransactionBody,
 };
 use fluree_db_api::{
     ApiError, Base64Bytes, Fluree, PushCommitsRequest, RefreshOpts, StagedMerge, StagedPush,
@@ -343,6 +343,7 @@ impl Worker {
         let StagedOutcome { receipt, install } = match envelope {
             QueuedRequest::Transact(transact) => self.stage_and_persist(*transact).await?,
             QueuedRequest::Push(push) => self.process_push(*push).await?,
+            QueuedRequest::PushWithMerges(push) => self.process_push_with_merges(*push).await?,
             QueuedRequest::Revert(revert) => self.process_revert(revert).await?,
             QueuedRequest::Merge(merge) => self.process_merge(merge).await?,
             QueuedRequest::Rebase(rebase) => self.process_rebase(rebase).await?,
@@ -839,10 +840,27 @@ impl Worker {
     /// finalize through the held write guard so this node's cache
     /// catches up with the head we're about to publish.
     async fn process_push(&self, push: QueuedPush) -> Result<StagedOutcome, WorkerError> {
-        let QueuedPush {
-            commit_cids,
-            blobs,
-            governance,
+        self.process_push_with_merges(QueuedPushWithMerges {
+            push,
+            merged_commit_cids: Vec::new(),
+        })
+        .await
+    }
+
+    /// [`Self::process_push`] for a push that also carries the commits its
+    /// merges brought in.
+    async fn process_push_with_merges(
+        &self,
+        push: QueuedPushWithMerges,
+    ) -> Result<StagedOutcome, WorkerError> {
+        let QueuedPushWithMerges {
+            push:
+                QueuedPush {
+                    commit_cids,
+                    blobs,
+                    governance,
+                },
+            merged_commit_cids,
         } = push;
         let ledger_id = self.ref_key.ledger_id();
         let content_store = self.staging.fluree.content_store(&ledger_id);
@@ -853,19 +871,29 @@ impl Worker {
         // malformed body. Any other error is a transport / backend
         // hiccup; raise as `Transient` so the retry/backoff loop in
         // `process_entry` heals it.
-        let mut commits = Vec::with_capacity(commit_cids.len());
-        for cid in &commit_cids {
-            let bytes = content_store.get(cid).await.map_err(|e| {
-                if matches!(e, fluree_db_core::Error::NotFound(_)) {
-                    stage(PoisonReason::BodyMalformed {
-                        error: format!("push commit {cid} missing from CAS: {e}"),
-                    })
-                } else {
-                    WorkerError::Transient(format!("push commit {cid} CAS read failed: {e}"))
+        let read_commits = |cids: Vec<fluree_db_core::CommitId>| {
+            let content_store = content_store.clone();
+            async move {
+                let mut out = Vec::with_capacity(cids.len());
+                for cid in &cids {
+                    let bytes = content_store.get(cid).await.map_err(|e| {
+                        if matches!(e, fluree_db_core::Error::NotFound(_)) {
+                            stage(PoisonReason::BodyMalformed {
+                                error: format!("push commit {cid} missing from CAS: {e}"),
+                            })
+                        } else {
+                            WorkerError::Transient(format!(
+                                "push commit {cid} CAS read failed: {e}"
+                            ))
+                        }
+                    })?;
+                    out.push(Base64Bytes(bytes));
                 }
-            })?;
-            commits.push(Base64Bytes(bytes));
-        }
+                Ok::<_, WorkerError>(out)
+            }
+        };
+        let commits = read_commits(commit_cids).await?;
+        let merged_commits = read_commits(merged_commit_cids).await?;
         let payload = PushCommitsRequest {
             commits,
             blobs: blobs
@@ -875,6 +903,7 @@ impl Worker {
             // The staged bundle carries every blob it resolved; a gap it
             // could not resolve is not distinguished here yet.
             missing_blobs: Vec::new(),
+            merged_commits,
         };
         let StagedPush {
             accepted,
@@ -1528,7 +1557,7 @@ fn drain_dead_workers(
 fn check_envelope_kind(body_kind: BodyKind, envelope: &QueuedRequest) -> Result<(), WorkerError> {
     let expected = match envelope {
         QueuedRequest::Transact(t) => BodyKind::from(&t.body),
-        QueuedRequest::Push(_) => BodyKind::Pushed,
+        QueuedRequest::Push(_) | QueuedRequest::PushWithMerges(_) => BodyKind::Pushed,
         QueuedRequest::Revert(_) => BodyKind::Revert,
         QueuedRequest::Merge(_) => BodyKind::Merge,
         QueuedRequest::Rebase(_) => BodyKind::Rebase,

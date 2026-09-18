@@ -29,6 +29,14 @@ Unlike `fetch`/`pull`, this is **not** a storage-proxy replication operation. It
 
 If a pushed commit contains **retractions**, the server enforces a strict invariant: each retraction must target a fact that is currently asserted at that point in the push batch. (List retractions require exact list-index metadata match.)
 
+### Pushing a merge
+
+Push sends the branch's first-parent line: the commits the server replays. A merge commit on that line already carries the combined changes of the branch it merged. The commits that branch made still travel with the push. The server stores them without replaying them, so the history stays complete on the remote.
+
+A push containing a merge needs a server that supports it. The CLI checks the server's discovery document first. If the server does not support it, the push is refused before anything is sent. The server then needs upgrading.
+
+The remote head must be on your branch's first-parent line. If it is only reachable through a merge, the histories have diverged. Push then asks you to pull first.
+
 ## Examples
 
 ```bash
@@ -66,6 +74,8 @@ error: no upstream configured for 'mydb:main'
 | No upstream configured | Run `fluree upstream set <ledger> <remote>` first |
 | Push rejected (409) | Remote head changed, histories diverged, or first commit `t` does not match next-t |
 | Push rejected (422) | Invalid commit bytes, missing required referenced blob, or retraction invariant violation |
+| History contains a merge | The remote does not support pushing merges. Upgrade the remote server. |
+| 404 for a push containing a merge | The remote advertises support, but the node that handled the request does not have it. A node may still be on an earlier release. |
 
 ## Workflow
 
