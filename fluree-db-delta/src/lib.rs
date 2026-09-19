@@ -9,9 +9,11 @@
 pub mod bridge;
 pub mod config;
 pub mod error;
+pub mod filter;
 mod store;
 pub mod table;
 
 pub use config::{AzureAuth, DeltaGsConfig, DeltaIoConfig};
 pub use error::{DeltaError, Result};
+pub use filter::{ColumnFilter, FilterOp, FilterValue};
 pub use table::{DeltaBatchStream, DeltaSnapshot, DeltaTable, VersionSelector};

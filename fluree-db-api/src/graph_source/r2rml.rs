@@ -2991,12 +2991,17 @@ impl FlureeR2rmlProvider<'_> {
                 .row_count(&self.session, &mapping, table_name, non_null_cols)
                 .await;
         }
-        // A Delta count would need per-file `numRecords` statistics net of
-        // deletion vectors; decline so the caller counts a scan of the same
-        // pinned version.
         #[cfg(feature = "delta")]
-        if self.delta_source(graph_source_id).await?.is_some() {
-            return Ok(None);
+        if let Some(delta) = self.delta_source(graph_source_id).await? {
+            return delta
+                .row_count(
+                    self.fluree,
+                    &self.session,
+                    table_name,
+                    non_null_cols,
+                    self.source_time(graph_source_id),
+                )
+                .await;
         }
         // Same pinned context as the scan: one Iceberg snapshot per query (the
         // shared `self.session` pin), so a count and a scan cannot disagree.
@@ -3745,7 +3750,8 @@ impl FlureeR2rmlProvider<'_> {
                 .scan(&self.session, &mapping, table_name, projection, filters)
                 .await;
         }
-        // `filters` and `topk` only prune; the operator above re-applies both.
+        // `filters` are applied where the reader can state them exactly and
+        // `topk` is ignored; the operator above enforces both.
         #[cfg(feature = "delta")]
         if let Some(delta) = self.delta_source(graph_source_id).await? {
             return delta
@@ -3754,6 +3760,7 @@ impl FlureeR2rmlProvider<'_> {
                     &self.session,
                     table_name,
                     projection,
+                    filters,
                     self.source_time(graph_source_id),
                 )
                 .await;

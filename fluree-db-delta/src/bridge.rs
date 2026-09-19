@@ -51,6 +51,11 @@ impl BatchBridge {
         })
     }
 
+    /// The Arrow schema batches are expected in.
+    pub fn arrow_schema(&self) -> &Schema {
+        &self.arrow_schema
+    }
+
     pub fn schema(&self) -> &Arc<BatchSchema> {
         &self.schema
     }

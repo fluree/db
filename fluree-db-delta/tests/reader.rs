@@ -8,7 +8,10 @@
 
 use std::path::{Path, PathBuf};
 
-use fluree_db_delta::{DeltaError, DeltaIoConfig, DeltaSnapshot, DeltaTable, VersionSelector};
+use fluree_db_delta::{
+    ColumnFilter, DeltaError, DeltaIoConfig, DeltaSnapshot, DeltaTable, FilterOp, FilterValue,
+    VersionSelector,
+};
 use fluree_db_tabular::{Column, ColumnBatch};
 use futures::StreamExt;
 
@@ -55,7 +58,7 @@ fn cell(column: &Column, row: usize) -> Cell {
 async fn rows(snapshot: &DeltaSnapshot, columns: &[&str]) -> Vec<Vec<Cell>> {
     let projection: Vec<String> = columns.iter().map(ToString::to_string).collect();
     let batches: Vec<ColumnBatch> = snapshot
-        .scan(&projection)
+        .scan(&projection, &[])
         .expect("plan scan")
         .map(|b| b.expect("batch"))
         .collect()
@@ -225,7 +228,7 @@ async fn a_version_whose_data_was_removed_fails_at_scan() {
 
     // The log still replays to v0; its only data file is gone.
     let v0 = table.snapshot(VersionSelector::Version(0)).await.unwrap();
-    let results: Vec<_> = v0.scan(&[]).unwrap().collect().await;
+    let results: Vec<_> = v0.scan(&[], &[]).unwrap().collect().await;
     let err = results
         .into_iter()
         .find_map(Result::err)
@@ -381,7 +384,7 @@ async fn an_absolute_data_path_outside_the_allowlist_is_refused_at_read() {
     )
     .unwrap();
     let snapshot = table.snapshot(VersionSelector::Latest).await.unwrap();
-    let results: Vec<_> = snapshot.scan(&[]).unwrap().collect().await;
+    let results: Vec<_> = snapshot.scan(&[], &[]).unwrap().collect().await;
     let err = results
         .into_iter()
         .find_map(Result::err)
@@ -392,6 +395,497 @@ async fn an_absolute_data_path_outside_the_allowlist_is_refused_at_read() {
 
 /// Building an Azure store is offline (tokens are fetched on first read), so
 /// this pins the configuration contract without an Azure account.
+#[tokio::test]
+async fn a_checkpointed_log_reads_the_same_with_or_without_its_early_commits() {
+    let expected = |through: i64| -> Vec<Vec<Cell>> {
+        (0..=through).map(|i| vec![int(i), int(i * 1000)]).collect()
+    };
+    for name in ["checkpointed", "log_cleaned"] {
+        let table = open(name);
+        let latest = table.snapshot(VersionSelector::Latest).await.unwrap();
+        assert_eq!(latest.version(), 12, "{name}");
+        assert_eq!(
+            rows(&latest, &["id", "amount"]).await,
+            expected(12),
+            "{name}"
+        );
+        // The checkpoint itself, and a commit replayed on top of it.
+        for version in [10, 11] {
+            let pinned = table
+                .snapshot(VersionSelector::Version(version))
+                .await
+                .unwrap();
+            assert_eq!(
+                rows(&pinned, &["id", "amount"]).await,
+                expected(version as i64),
+                "{name} v{version}"
+            );
+        }
+    }
+
+    // Before the checkpoint: replayable only while the commits survive.
+    let v3 = open("checkpointed")
+        .snapshot(VersionSelector::Version(3))
+        .await
+        .unwrap();
+    assert_eq!(rows(&v3, &["id", "amount"]).await, expected(3));
+    let gone = open("log_cleaned")
+        .snapshot(VersionSelector::Version(3))
+        .await;
+    assert!(
+        matches!(gone, Err(DeltaError::VersionNotFound { version: 3, .. })),
+        "{:?}",
+        gone.err()
+    );
+}
+
+#[tokio::test]
+async fn an_instant_before_the_oldest_retained_commit_is_refused_on_a_cleaned_log() {
+    let table = open("log_cleaned");
+    let oldest = table
+        .snapshot(VersionSelector::Version(10))
+        .await
+        .unwrap()
+        .timestamp_ms()
+        .await
+        .unwrap();
+    let at = table
+        .snapshot(VersionSelector::AsOfTimestampMs(oldest))
+        .await
+        .unwrap();
+    assert_eq!(at.version(), 10);
+    let before = table
+        .snapshot(VersionSelector::AsOfTimestampMs(oldest - 1))
+        .await;
+    assert!(
+        matches!(before, Err(DeltaError::NoVersionAtTime { .. })),
+        "{:?}",
+        before.err()
+    );
+}
+
+#[tokio::test]
+async fn every_scalar_type_written_by_spark_arrives_typed() {
+    let snapshot = open("types")
+        .snapshot(VersionSelector::Latest)
+        .await
+        .unwrap();
+    let batches: Vec<ColumnBatch> = snapshot
+        .scan(&[], &[])
+        .unwrap()
+        .map(|b| b.expect("batch"))
+        .collect()
+        .await;
+    assert_eq!(batches.iter().map(|b| b.num_rows).sum::<usize>(), 3);
+    // Spark spread the rows over several files; pick each out by id.
+    let at = |id: i64| {
+        batches
+            .iter()
+            .find_map(|b| {
+                let ids = b.column_by_name("id").expect("id");
+                (0..b.num_rows)
+                    .find(|&r| ids.get_i64(r) == Some(id))
+                    .map(|r| (b, r))
+            })
+            .expect("id present")
+    };
+    let ((b1, one), (b2, two), (b3, nulls)) = (at(1), at(2), at(3));
+    let col1 = |name: &str| b1.column_by_name(name).expect("column");
+    let col2 = |name: &str| b2.column_by_name(name).expect("column");
+
+    assert_eq!(col1("flag").get_bool(one), Some(true));
+    assert_eq!(col2("tiny").get_i32(two), Some(-7));
+    assert_eq!(col1("small").get_i32(one), Some(300));
+    assert_eq!(col2("num").get_i32(two), Some(-70_000));
+    assert_eq!(col2("ratio").get_f64(two), Some(-0.25));
+    assert_eq!(col1("approx").get_f32(one), Some(2.5));
+    assert_eq!(col2("label").get_string(two), Some(""));
+    assert_eq!(col1("blob").get_bytes(one), Some(&[0x00, 0xFF, 0x10][..]));
+    assert_eq!(col2("blob").get_bytes(two), Some(&[][..]));
+    // 2024-02-29 and 1969-12-31 as days from the epoch.
+    assert_eq!(col1("day").get_date(one), Some(19_782));
+    assert_eq!(col2("day").get_date(two), Some(-1));
+    let decimal = |column: &Column, row: usize| match column {
+        Column::Decimal {
+            values,
+            precision,
+            scale,
+        } => (values[row], *precision, *scale),
+        other => panic!("decimal column, got {:?}", other.field_type()),
+    };
+    assert_eq!(decimal(col1("price"), one), (Some(1999), 10, 2));
+    assert_eq!(decimal(col2("price"), two), (Some(-1), 10, 2));
+    assert_eq!(
+        decimal(col1("big"), one),
+        (Some(123_456_789_012_345_678_900_123_456_789), 38, 10)
+    );
+    assert_eq!(decimal(col2("big"), two), (Some(-10_000_000_001), 38, 10));
+    // A zoned instant and a wall-clock one keep their frames apart.
+    let micros = |column: &Column, zoned: bool, row: usize| match (column, zoned) {
+        (Column::TimestampTz(v), true) | (Column::Timestamp(v), false) => v[row],
+        (other, _) => panic!("zoned={zoned}, got {:?}", other.field_type()),
+    };
+    assert_eq!(micros(col1("at"), true, one), Some(1_709_210_096_789_000));
+    assert_eq!(micros(col2("at"), true, two), Some(-500_000));
+    assert_eq!(
+        micros(col1("wall"), false, one),
+        Some(1_709_168_523_000_000)
+    );
+    assert_eq!(micros(col2("wall"), false, two), Some(-1_000_000));
+    for name in snapshot.column_names().iter().filter(|n| *n != "id") {
+        assert!(
+            b3.column_by_name(name).expect("column").is_null(nulls),
+            "{name} of the all-null row"
+        );
+    }
+}
+
+fn filter(column: &str, op: FilterOp, value: FilterValue) -> ColumnFilter {
+    ColumnFilter {
+        column: column.to_string(),
+        op,
+        value,
+    }
+}
+
+/// `partitioned` is six files of four rows: regions east/north/west twice over,
+/// ids 0.., 100.., 200.. then 300.., 400.., 500...
+#[tokio::test]
+async fn filters_skip_files_by_partition_value_and_by_statistics() {
+    let snapshot = open("partitioned")
+        .snapshot(VersionSelector::Latest)
+        .await
+        .unwrap();
+    let files = |filters: Vec<ColumnFilter>| {
+        let snapshot = snapshot.clone();
+        async move { snapshot.file_count(&filters).await.unwrap() }
+    };
+    let str_ = |v: &str| FilterValue::Str(v.to_string());
+
+    assert_eq!(files(vec![]).await, 6);
+    assert_eq!(
+        files(vec![filter("region", FilterOp::Eq, str_("north"))]).await,
+        2
+    );
+    assert_eq!(
+        files(vec![filter("id", FilterOp::GtEq, FilterValue::Int(500))]).await,
+        1
+    );
+    assert_eq!(
+        files(vec![filter("id", FilterOp::Lt, FilterValue::Int(0))]).await,
+        0
+    );
+    // 203 is inside a file's range; 250 is between files.
+    assert_eq!(
+        files(vec![filter("id", FilterOp::Eq, FilterValue::Int(203))]).await,
+        1
+    );
+    assert_eq!(
+        files(vec![filter("id", FilterOp::Eq, FilterValue::Int(250))]).await,
+        0
+    );
+    let members = FilterValue::Set(vec![FilterValue::Int(1), FilterValue::Int(402)]);
+    assert_eq!(files(vec![filter("id", FilterOp::In, members)]).await, 2);
+    assert_eq!(
+        files(vec![
+            filter("region", FilterOp::Eq, str_("west")),
+            filter("amount", FilterOp::Gt, FilterValue::Int(3000)),
+        ])
+        .await,
+        1
+    );
+    // Not expressible against the column: nothing is skipped.
+    assert_eq!(
+        files(vec![filter("id", FilterOp::Eq, str_("203"))]).await,
+        6
+    );
+}
+
+/// Ids a scan of `columns` under `filters` returns, sorted.
+async fn ids(snapshot: &DeltaSnapshot, columns: &[&str], filters: Vec<ColumnFilter>) -> Vec<i64> {
+    let projection: Vec<String> = columns.iter().map(ToString::to_string).collect();
+    let mut out: Vec<i64> = snapshot
+        .scan(&projection, &filters)
+        .unwrap()
+        .map(|b| b.expect("batch"))
+        .collect::<Vec<ColumnBatch>>()
+        .await
+        .iter()
+        .flat_map(|b| {
+            let id = b.column_by_name("id").expect("id");
+            (0..b.num_rows)
+                .map(|r| id.get_i64(r).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+#[tokio::test]
+async fn rows_a_filter_rejects_do_not_leave_the_reader() {
+    let str_ = |v: &str| FilterValue::Str(v.to_string());
+    let sales = open("partitioned")
+        .snapshot(VersionSelector::Latest)
+        .await
+        .unwrap();
+    let all = ["id", "amount", "region"];
+
+    assert_eq!(
+        ids(
+            &sales,
+            &all,
+            vec![filter("id", FilterOp::Eq, FilterValue::Int(203))]
+        )
+        .await,
+        [203]
+    );
+    assert_eq!(
+        ids(
+            &sales,
+            &all,
+            vec![filter("id", FilterOp::NotEq, FilterValue::Int(203))]
+        )
+        .await
+        .len(),
+        23
+    );
+    assert_eq!(
+        ids(
+            &sales,
+            &all,
+            vec![filter("amount", FilterOp::GtEq, FilterValue::Int(5010))]
+        )
+        .await,
+        [501, 502, 503]
+    );
+    assert_eq!(
+        ids(
+            &sales,
+            &all,
+            vec![filter("amount", FilterOp::Lt, FilterValue::Int(20))]
+        )
+        .await,
+        [0, 1]
+    );
+    let members = FilterValue::Set(vec![
+        FilterValue::Int(1),
+        FilterValue::Int(250),
+        FilterValue::Int(402),
+    ]);
+    assert_eq!(
+        ids(&sales, &all, vec![filter("id", FilterOp::In, members)]).await,
+        [1, 402]
+    );
+    // A partition column is filtered like any other, and terms are conjoined.
+    assert_eq!(
+        ids(
+            &sales,
+            &all,
+            vec![
+                filter("region", FilterOp::Eq, str_("north")),
+                filter("id", FilterOp::LtEq, FilterValue::Int(101)),
+            ]
+        )
+        .await,
+        [100, 101]
+    );
+    assert_eq!(
+        ids(
+            &sales,
+            &all,
+            vec![filter("region", FilterOp::Gt, str_("north"))]
+        )
+        .await
+        .len(),
+        8
+    );
+    // The filtered column is not projected: files are skipped, rows are not.
+    assert_eq!(
+        ids(
+            &sales,
+            &["id"],
+            vec![filter("amount", FilterOp::Eq, FilterValue::Int(2030))]
+        )
+        .await,
+        [200, 201, 202, 203]
+    );
+    // A value of another type than the column filters nothing.
+    assert_eq!(
+        ids(&sales, &all, vec![filter("id", FilterOp::Eq, str_("203"))])
+            .await
+            .len(),
+        24
+    );
+
+    // `types`: ids 1 and 2 carry values, id 3 is null in every other column.
+    let types = open("types")
+        .snapshot(VersionSelector::Latest)
+        .await
+        .unwrap();
+    let every: Vec<String> = types.column_names();
+    let every: Vec<&str> = every.iter().map(String::as_str).collect();
+    let pick = |f: ColumnFilter| ids(&types, &every, vec![f]);
+    assert_eq!(
+        pick(filter("flag", FilterOp::Eq, FilterValue::Bool(false))).await,
+        [2]
+    );
+    // A null is no match for `!=` either: the row has no such triple.
+    assert_eq!(
+        pick(filter("flag", FilterOp::NotEq, FilterValue::Bool(false))).await,
+        [1]
+    );
+    assert_eq!(
+        pick(filter("tiny", FilterOp::Lt, FilterValue::Int(0))).await,
+        [2]
+    );
+    assert_eq!(
+        pick(filter("small", FilterOp::Eq, FilterValue::Int(300))).await,
+        [1]
+    );
+    assert_eq!(
+        pick(filter("num", FilterOp::GtEq, FilterValue::Int(-70_000))).await,
+        [1, 2]
+    );
+    assert_eq!(
+        pick(filter("ratio", FilterOp::Gt, FilterValue::Double(1.0))).await,
+        [1]
+    );
+    assert_eq!(pick(filter("label", FilterOp::Eq, str_(""))).await, [2]);
+    assert_eq!(
+        pick(filter("day", FilterOp::Lt, FilterValue::Date(0))).await,
+        [2]
+    );
+    let zoned = |micros| FilterValue::Timestamp { micros, tz: true };
+    let wall = |micros| FilterValue::Timestamp { micros, tz: false };
+    assert_eq!(pick(filter("at", FilterOp::Gt, zoned(0))).await, [1]);
+    assert_eq!(
+        pick(filter("wall", FilterOp::LtEq, wall(-1_000_000))).await,
+        [2]
+    );
+    assert_eq!(
+        pick(filter("id", FilterOp::Eq, FilterValue::Raw("2".into()))).await,
+        [2]
+    );
+
+    // Left to the caller: a frame mismatch, a narrowed float, a zero double
+    // (Arrow orders -0.0 below 0.0), a decimal, a key not in canonical form.
+    for unusable in [
+        filter("at", FilterOp::Gt, wall(0)),
+        filter("wall", FilterOp::Gt, zoned(0)),
+        filter("approx", FilterOp::Gt, FilterValue::Double(0.5)),
+        filter("ratio", FilterOp::Gt, FilterValue::Double(0.0)),
+        filter("price", FilterOp::Gt, FilterValue::Int(1)),
+        filter("id", FilterOp::Eq, FilterValue::Raw("02".into())),
+    ] {
+        let kept = pick(unusable.clone()).await;
+        assert_eq!(kept, [1, 2, 3], "{unusable:?}");
+    }
+}
+
+/// Rewrite every `add` action's statistics in a copied table's log.
+fn rewrite_stats(table: &Path, edit: impl Fn(&mut serde_json::Value)) {
+    for entry in std::fs::read_dir(table.join("_delta_log")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let rewritten: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut action: serde_json::Value = serde_json::from_str(line).unwrap();
+                if let Some(add) = action.get_mut("add") {
+                    edit(add);
+                }
+                action.to_string()
+            })
+            .collect();
+        std::fs::write(&path, rewritten.join("\n") + "\n").unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_log_answers_a_row_count_only_when_it_provably_matches_a_scan() {
+    let latest = |name: &str| {
+        let table = open(name);
+        async move { table.snapshot(VersionSelector::Latest).await.unwrap() }
+    };
+    let cols = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+    let partitioned = latest("partitioned").await;
+    assert_eq!(partitioned.exact_row_count(&[]).await.unwrap(), Some(24));
+    assert_eq!(
+        partitioned
+            .exact_row_count(&cols(&["id", "region"]))
+            .await
+            .unwrap(),
+        Some(24)
+    );
+    assert_eq!(
+        partitioned.exact_row_count(&cols(&["nope"])).await.unwrap(),
+        None
+    );
+
+    // A null in a counted column: the row would not be counted by a scan.
+    let types = latest("types").await;
+    assert_eq!(
+        types.exact_row_count(&cols(&["id"])).await.unwrap(),
+        Some(3)
+    );
+    assert_eq!(
+        types
+            .exact_row_count(&cols(&["id", "label"]))
+            .await
+            .unwrap(),
+        None
+    );
+
+    // Deletion vectors make the recorded counts an over-count.
+    let vectors = latest("deletion_vectors").await;
+    assert_eq!(vectors.exact_row_count(&[]).await.unwrap(), None);
+    assert_eq!(rows(&vectors, &["id"]).await.len(), 4096 - 9);
+
+    // Statistics are optional. Without a null count for a counted column, or
+    // without any statistics, the log proves nothing.
+    allow_roots();
+    let open_copy = |dir: &Path| {
+        DeltaTable::open("copy", dir.to_str().unwrap(), &DeltaIoConfig::default()).unwrap()
+    };
+    let no_null_count = tempfile::tempdir().unwrap();
+    copy_dir_all(&fixtures().join("partitioned"), no_null_count.path());
+    rewrite_stats(no_null_count.path(), |add| {
+        let mut stats: serde_json::Value =
+            serde_json::from_str(add["stats"].as_str().unwrap()).unwrap();
+        stats["nullCount"].as_object_mut().unwrap().remove("amount");
+        add["stats"] = stats.to_string().into();
+    });
+    let snapshot = open_copy(no_null_count.path())
+        .snapshot(VersionSelector::Latest)
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.exact_row_count(&cols(&["id"])).await.unwrap(),
+        Some(24)
+    );
+    assert_eq!(
+        snapshot.exact_row_count(&cols(&["amount"])).await.unwrap(),
+        None
+    );
+
+    let no_stats = tempfile::tempdir().unwrap();
+    copy_dir_all(&fixtures().join("partitioned"), no_stats.path());
+    rewrite_stats(no_stats.path(), |add| {
+        add.as_object_mut().unwrap().remove("stats");
+    });
+    let snapshot = open_copy(no_stats.path())
+        .snapshot(VersionSelector::Latest)
+        .await
+        .unwrap();
+    assert_eq!(snapshot.exact_row_count(&[]).await.unwrap(), None);
+    assert_eq!(rows(&snapshot, &["id"]).await.len(), 24);
+}
+
 #[tokio::test]
 async fn azure_locations_open_with_a_hydrated_service_principal_only() {
     use fluree_db_delta::config::AzureAuth;

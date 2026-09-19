@@ -221,6 +221,12 @@ name = "it_delta_local_fs"
 path = "tests/it_delta_local_fs.rs"
 required-features = ["delta", "native"]
 
+# A Delta source against a native ledger holding the same triples.
+[[test]]
+name = "it_delta_differential"
+path = "tests/it_delta_differential.rs"
+required-features = ["delta", "native"]
+
 [[test]]
 name = "it_sql_graph_source"
 path = "tests/it_sql_graph_source.rs"

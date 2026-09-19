@@ -204,6 +204,39 @@ so a commit landing mid-query cannot split the result across two versions. Two
 tables of one source are each consistent, but are not a cross-table snapshot —
 Delta has no such thing.
 
+## Performance
+
+Only the columns a query's mapped predicates use are decoded, and a table's
+data files are read in parallel — by default one per core, at most 32; set
+`FLUREE_DELTA_SCAN_CONCURRENCY` to change it.
+
+**Filter pushdown.** A comparison the query places on a mapped column — a
+`FILTER` with `=`, `<`, `<=`, `>`, `>=` or `IN`, a `VALUES` block, a constant
+object, or a bound subject whose template names the column — is pushed into
+the scan, where it acts twice. Each data file's partition values and min/max
+statistics are checked first, and a file that cannot hold a matching row is
+never opened. The rows of the files that are opened are then filtered as they
+are decoded, before any RDF term is built for them. File skipping depends on
+how the table is laid out: a filter on a partition column, or on a column the
+writer clusters or sorts by, skips most of the table, while a filter on a
+column whose values are spread across every file skips nothing and is left to
+the row filter.
+
+A comparison is pushed only when its value has the column's own type — an
+integer against an integer column, a string against a string column, a zoned
+`xsd:dateTime` against `timestamp` and an unzoned one against `timestamp_ntz`.
+Decimal and `float` columns, comparisons against a zero `double`, and any
+other expression are evaluated by the query engine over the decoded rows.
+Aggregates that Fluree folds directly over the scan (`COUNT`, `SUM`, `MIN`,
+`MAX`, `AVG`, with or without `GROUP BY`) currently read the whole table and
+apply the query's filter themselves.
+
+**Counts.** `COUNT` of a whole mapped table, with no filter or grouping, is
+answered from the row counts recorded in the transaction log without opening a
+data file — provided every file records one, no file carries a deletion
+vector, and statistics show no null in the columns the count depends on.
+Otherwise the table is scanned.
+
 ## Time travel
 
 An alias with a time specification reads every table of the source at the
@@ -264,11 +297,8 @@ source at two different states in one query is rejected, as for
 
 - **Storage**: S3 (and S3-compatible endpoints), ADLS Gen2, OneLake and the
   local filesystem. Azure sovereign clouds are not addressable.
-- **No pushdown yet**: filters, `LIMIT` and `ORDER BY` are applied by the
-  query engine after rows are read. Column projection is pushed down — only
-  mapped columns are decoded — but partition and file-statistics pruning are
-  not, so a selective query over a large table still reads the whole table.
-- **`COUNT`** scans; there is no metadata-only count.
+- **`ORDER BY … LIMIT`** is not pushed down, and folded aggregates do not push
+  their filter; see [Performance](#performance).
 - **Materialization and tracking** (`fluree materialize`, `fluree track`) are
   not available for Delta sources.
 - **Nested types** cannot be mapped.

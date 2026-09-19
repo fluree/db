@@ -8,11 +8,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use fluree_db_delta::{DeltaError, DeltaGsConfig, DeltaIoConfig, DeltaSnapshot, DeltaTable};
+use fluree_db_delta::{
+    ColumnFilter, DeltaError, DeltaGsConfig, DeltaIoConfig, DeltaSnapshot, DeltaTable, FilterOp,
+    FilterValue,
+};
 use fluree_db_iceberg::config::MappingSource;
 use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType};
 use fluree_db_query::error::{QueryError, Result as QueryResult};
-use fluree_db_query::r2rml::{ColumnBatchStream, SourceTime, TableWatermark};
+use fluree_db_query::r2rml::{
+    ColumnBatchStream, ScanCmpOp, ScanFilter, ScanValue, SourceTime, TableWatermark,
+};
 use futures::StreamExt;
 use tracing::{info, warn};
 
@@ -383,24 +388,44 @@ impl DeltaSource {
         Ok(snapshot)
     }
 
+    /// The pinned version's row count from the log, when it provably equals a
+    /// scan's; see [`DeltaSnapshot::exact_row_count`].
+    pub(crate) async fn row_count(
+        &self,
+        fluree: &crate::Fluree,
+        session: &IcebergCatalogSession,
+        table_name: &str,
+        non_null_cols: &[String],
+        pin: Option<SourceTime>,
+    ) -> QueryResult<Option<u64>> {
+        let snapshot = self.snapshot(fluree, session, table_name, pin).await?;
+        snapshot
+            .exact_row_count(non_null_cols)
+            .await
+            .map_err(|e| self.query_error(table_name, e))
+    }
+
     pub(crate) async fn scan(
         &self,
         fluree: &crate::Fluree,
         session: &IcebergCatalogSession,
         table_name: &str,
         projection: &[String],
+        filters: &[ScanFilter],
         pin: Option<SourceTime>,
     ) -> QueryResult<ColumnBatchStream> {
         let snapshot = self.snapshot(fluree, session, table_name, pin).await?;
+        let filters: Vec<ColumnFilter> = filters.iter().filter_map(column_filter).collect();
         info!(
             graph_source_id = %self.graph_source_id,
             table_name = %table_name,
             version = snapshot.version(),
             projection = ?projection,
+            filters = filters.len(),
             "Starting Delta table scan"
         );
         let stream = snapshot
-            .scan(projection)
+            .scan(projection, &filters)
             .map_err(|e| self.query_error(table_name, e))?;
         let graph_source_id = self.graph_source_id.clone();
         let table = table_name.to_string();
@@ -423,6 +448,43 @@ impl DeltaSource {
     fn query_error(&self, table_name: &str, error: DeltaError) -> QueryError {
         delta_query_error(&self.graph_source_id, table_name, error)
     }
+}
+
+/// A pushed filter in the reader's terms, or `None` for a value it has no
+/// exact form for (decimals). The reader drops any it cannot state against the
+/// column's physical type.
+fn column_filter(filter: &ScanFilter) -> Option<ColumnFilter> {
+    fn value(v: &ScanValue) -> Option<FilterValue> {
+        Some(match v {
+            ScanValue::Bool(b) => FilterValue::Bool(*b),
+            ScanValue::Int(n) => FilterValue::Int(*n),
+            ScanValue::Date(days) => FilterValue::Date(*days),
+            ScanValue::Str(s) => FilterValue::Str(s.clone()),
+            ScanValue::Double(d) => FilterValue::Double(*d),
+            ScanValue::TemplateKey(raw) => FilterValue::Raw(raw.clone()),
+            ScanValue::Timestamp { micros, tz } => FilterValue::Timestamp {
+                micros: *micros,
+                tz: *tz,
+            },
+            ScanValue::Set(members) => {
+                FilterValue::Set(members.iter().map(value).collect::<Option<_>>()?)
+            }
+            ScanValue::Decimal { .. } => return None,
+        })
+    }
+    Some(ColumnFilter {
+        column: filter.column.clone(),
+        op: match filter.op {
+            ScanCmpOp::Eq => FilterOp::Eq,
+            ScanCmpOp::NotEq => FilterOp::NotEq,
+            ScanCmpOp::Lt => FilterOp::Lt,
+            ScanCmpOp::LtEq => FilterOp::LtEq,
+            ScanCmpOp::Gt => FilterOp::Gt,
+            ScanCmpOp::GtEq => FilterOp::GtEq,
+            ScanCmpOp::In => FilterOp::In,
+        },
+        value: value(&filter.value)?,
+    })
 }
 
 /// A Delta version is the format's own state identifier, so `@snapshot:<n>`
