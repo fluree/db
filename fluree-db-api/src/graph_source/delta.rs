@@ -35,6 +35,63 @@ pub struct DeltaCreateConfig {
     pub default_allow: Option<bool>,
 }
 
+/// The flat Azure service-principal fields the CLI and HTTP surfaces accept.
+/// `client_secret_env` names an environment variable read where the tables are
+/// read, so the secret itself is never stored; `client_secret` is a literal.
+#[derive(Debug, Clone, Default)]
+pub struct DeltaAzureFields {
+    pub tenant_id: Option<String>,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub client_secret_env: Option<String>,
+}
+
+impl DeltaAzureFields {
+    /// `None` when no field is set (ambient credentials). A partial set is an
+    /// error: silently falling back to ambient credentials would read with an
+    /// identity the caller did not name.
+    pub fn into_auth(self) -> crate::Result<Option<fluree_db_delta::AzureAuth>> {
+        use fluree_db_iceberg::ConfigValue;
+        let Self {
+            tenant_id,
+            client_id,
+            client_secret,
+            client_secret_env,
+        } = self;
+        if tenant_id.is_none()
+            && client_id.is_none()
+            && client_secret.is_none()
+            && client_secret_env.is_none()
+        {
+            return Ok(None);
+        }
+        let client_secret = match (client_secret, client_secret_env) {
+            (Some(literal), None) => ConfigValue::literal(literal),
+            (None, Some(var)) => ConfigValue::from_env(var),
+            _ => {
+                return Err(crate::ApiError::Config(
+                    "Azure service principal: give exactly one of the client secret and the \
+                     environment variable holding it"
+                        .to_string(),
+                ))
+            }
+        };
+        match (tenant_id, client_id) {
+            (Some(tenant_id), Some(client_id)) => {
+                Ok(Some(fluree_db_delta::AzureAuth::ClientSecret {
+                    tenant_id,
+                    client_id,
+                    client_secret,
+                }))
+            }
+            _ => Err(crate::ApiError::Config(
+                "Azure service principal: tenant id, client id and client secret are all required"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
 impl DeltaCreateConfig {
     /// A source whose tables live under `root`.
     pub fn new(
@@ -141,6 +198,12 @@ impl crate::Fluree {
         let (triples_map_count, table_names, mapping_validated) = registered.summary();
         let gs_config = config.to_gs_config(&registered.address);
 
+        // An unresolvable secret is a registration error, not a table warning.
+        let io = gs_config
+            .io
+            .hydrate(self.secret_resolver())
+            .await
+            .map_err(|e| crate::ApiError::Config(e.to_string()))?;
         let mut table_versions = BTreeMap::new();
         let mut table_warnings = Vec::new();
         for table_name in &table_names {
@@ -156,7 +219,7 @@ impl crate::Fluree {
             columns.dedup();
             let probed = async {
                 let location = gs_config.table_location(table_name)?;
-                let table = DeltaTable::open(table_name, &location, &gs_config.io)?;
+                let table = DeltaTable::open(table_name, &location, &io)?;
                 let snapshot = table
                     .snapshot(fluree_db_delta::VersionSelector::Latest)
                     .await?;
@@ -260,7 +323,13 @@ impl DeltaSource {
             .map_err(|e| self.query_error(table_name, e))?;
         let table = fluree
             .r2rml_cache()
-            .delta_table(table_name, &location, &self.config.io)
+            .delta_table(
+                table_name,
+                &location,
+                &self.config.io,
+                fluree.secret_resolver(),
+            )
+            .await
             .map_err(|e| self.query_error(table_name, e))?;
         let snapshot = table
             .snapshot(version_selector(table_name, pin)?)
@@ -366,4 +435,57 @@ pub(crate) fn policy_config(record: &GraphSourceRecord) -> (Option<String>, Opti
     DeltaGsConfig::from_json(&record.config)
         .ok()
         .map_or((None, None), |c| (c.model, c.default_allow))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_delta::AzureAuth;
+
+    fn fields(
+        tenant: Option<&str>,
+        client: Option<&str>,
+        secret: Option<&str>,
+        secret_env: Option<&str>,
+    ) -> DeltaAzureFields {
+        DeltaAzureFields {
+            tenant_id: tenant.map(str::to_string),
+            client_id: client.map(str::to_string),
+            client_secret: secret.map(str::to_string),
+            client_secret_env: secret_env.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn no_azure_fields_means_ambient_credentials() {
+        assert!(fields(None, None, None, None)
+            .into_auth()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_partial_service_principal_is_an_error_not_ambient_credentials() {
+        for partial in [
+            fields(Some("t"), None, Some("s"), None),
+            fields(None, Some("c"), Some("s"), None),
+            fields(Some("t"), Some("c"), None, None),
+            fields(Some("t"), Some("c"), Some("s"), Some("VAR")),
+            fields(Some("t"), None, None, None),
+        ] {
+            assert!(partial.clone().into_auth().is_err(), "{partial:?}");
+        }
+    }
+
+    #[test]
+    fn a_secret_named_by_environment_variable_is_not_stored() {
+        let auth = fields(Some("t"), Some("c"), None, Some("DELTA_TEST_AZURE_SECRET"))
+            .into_auth()
+            .unwrap()
+            .expect("service principal");
+        let json = serde_json::to_string(&auth).unwrap();
+        assert!(json.contains("DELTA_TEST_AZURE_SECRET"), "{json}");
+        let AzureAuth::ClientSecret { client_secret, .. } = auth;
+        assert!(!client_secret.is_literal());
+    }
 }

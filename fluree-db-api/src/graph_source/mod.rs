@@ -237,7 +237,7 @@ pub use sql::{SqlCheckResult, SqlCreateConfig, SqlCreateResult};
 mod delta;
 
 #[cfg(feature = "delta")]
-pub use delta::{DeltaCreateConfig, DeltaCreateResult};
+pub use delta::{DeltaAzureFields, DeltaCreateConfig, DeltaCreateResult};
 
 // Re-export configuration types
 pub use config::Bm25CreateConfig;

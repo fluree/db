@@ -3235,7 +3235,8 @@ pub struct DeltaMapArgs {
     pub remote: Option<String>,
 
     /// Directory the mapping's table names resolve beneath: s3://bucket/prefix,
-    /// or a local path under FLUREE_ICEBERG_LOCAL_ROOTS
+    /// abfss://container@account.dfs.core.windows.net/path (or the OneLake
+    /// form), or a local path under FLUREE_ICEBERG_LOCAL_ROOTS
     #[arg(long)]
     pub root: Option<String>,
 
@@ -3267,6 +3268,25 @@ pub struct DeltaMapArgs {
     /// Use path-style S3 URLs (MinIO, LocalStack)
     #[arg(long)]
     pub s3_path_style: bool,
+
+    /// Microsoft Entra tenant id of a service principal for abfss:// locations.
+    /// Omit the --azure-* options to use ambient Azure credentials.
+    #[arg(long)]
+    pub azure_tenant_id: Option<String>,
+
+    /// Service principal (application) client id
+    #[arg(long)]
+    pub azure_client_id: Option<String>,
+
+    /// Service principal client secret (stored with the graph source; prefer
+    /// --azure-client-secret-env)
+    #[arg(long, conflicts_with = "azure_client_secret_env")]
+    pub azure_client_secret: Option<String>,
+
+    /// Environment variable holding the client secret, read by the process
+    /// that reads the tables
+    #[arg(long, value_name = "VAR")]
+    pub azure_client_secret_env: Option<String>,
 
     /// Model ledger (name:branch) governing this source: its default graph
     /// supplies the view policies (`fluree model access enable <model> ...`)

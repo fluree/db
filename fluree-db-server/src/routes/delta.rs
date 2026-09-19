@@ -38,6 +38,14 @@ pub struct DeltaMapRequest {
     pub s3_endpoint: Option<String>,
     #[serde(default)]
     pub s3_path_style: bool,
+    /// Microsoft Entra service principal for `abfss://` locations. Omit all
+    /// four to use the server's ambient Azure credentials.
+    pub azure_tenant_id: Option<String>,
+    pub azure_client_id: Option<String>,
+    /// Literal client secret (stored with the graph source)
+    pub azure_client_secret: Option<String>,
+    /// Name of a server environment variable holding the client secret
+    pub azure_client_secret_env: Option<String>,
     /// Model ledger (`name:branch`) whose default graph supplies the source's
     /// view policies and class/property hierarchy.
     pub model: Option<String>,
@@ -99,7 +107,7 @@ async fn delta_map_local(state: Arc<AppState>, request: Request) -> Result<impl 
 
         let result = state
             .fluree
-            .create_delta_graph_source(build_delta_config(req))
+            .create_delta_graph_source(build_delta_config(req).map_err(ServerError::Api)?)
             .await
             .map_err(ServerError::Api)?;
 
@@ -127,8 +135,17 @@ async fn delta_map_local(state: Arc<AppState>, request: Request) -> Result<impl 
     .await
 }
 
-fn build_delta_config(req: DeltaMapRequest) -> fluree_db_api::DeltaCreateConfig {
-    fluree_db_api::DeltaCreateConfig {
+fn build_delta_config(
+    req: DeltaMapRequest,
+) -> fluree_db_api::Result<fluree_db_api::DeltaCreateConfig> {
+    let azure = fluree_db_api::DeltaAzureFields {
+        tenant_id: req.azure_tenant_id,
+        client_id: req.azure_client_id,
+        client_secret: req.azure_client_secret,
+        client_secret_env: req.azure_client_secret_env,
+    }
+    .into_auth()?;
+    Ok(fluree_db_api::DeltaCreateConfig {
         name: req.name,
         branch: req.branch,
         root: req.root,
@@ -137,10 +154,11 @@ fn build_delta_config(req: DeltaMapRequest) -> fluree_db_api::DeltaCreateConfig 
             s3_region: req.s3_region,
             s3_endpoint: req.s3_endpoint,
             s3_path_style: req.s3_path_style,
+            azure,
         },
         mapping: fluree_db_api::R2rmlMappingInput::Content(req.r2rml),
         mapping_media_type: req.r2rml_type,
         model: req.model,
         default_allow: req.default_allow,
-    }
+    })
 }

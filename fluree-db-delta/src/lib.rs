@@ -12,6 +12,6 @@ pub mod error;
 mod store;
 pub mod table;
 
-pub use config::{DeltaGsConfig, DeltaIoConfig};
+pub use config::{AzureAuth, DeltaGsConfig, DeltaIoConfig};
 pub use error::{DeltaError, Result};
 pub use table::{DeltaBatchStream, DeltaSnapshot, DeltaTable, VersionSelector};

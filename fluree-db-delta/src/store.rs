@@ -10,23 +10,54 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use delta_kernel::object_store::{
-    self as object_store, aws::AmazonS3Builder, local::LocalFileSystem, path::Path, CopyOptions,
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    self as object_store, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
+    local::LocalFileSystem, path::Path, CopyOptions, GetOptions, GetResult, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult,
 };
 use futures::stream::{self, BoxStream, StreamExt};
 use url::Url;
 
-use crate::config::DeltaIoConfig;
+use crate::config::{AzureAuth, DeltaIoConfig, LocationKind};
 use crate::error::{DeltaError, Result};
 
 /// Parse a table location into the directory URL Kernel expects (trailing
 /// slash) and open a store for it.
 pub(crate) fn open(location: &str, io: &DeltaIoConfig) -> Result<(Url, Arc<dyn ObjectStore>)> {
-    crate::config::validate_location(location)?;
+    let kind = crate::config::validate_location(location)?;
     let bad = |e: &dyn std::fmt::Display| DeltaError::Config(format!("{location}: {e}"));
 
-    if fluree_db_iceberg::is_local_location(location) {
+    if kind == LocationKind::Azure {
+        let url =
+            Url::parse(&format!("{}/", location.trim_end_matches('/'))).map_err(|e| bad(&e))?;
+        let builder = match &io.azure {
+            None => MicrosoftAzureBuilder::from_env(),
+            // An unresolved secret reference fails here: `io` must be hydrated.
+            Some(AzureAuth::ClientSecret {
+                tenant_id,
+                client_id,
+                client_secret,
+            }) => MicrosoftAzureBuilder::new().with_client_secret_authorization(
+                client_id,
+                client_secret
+                    .resolve()
+                    .map_err(|e| bad(&format!("Azure client secret: {e}")))?,
+                tenant_id,
+            ),
+        };
+        let store = ReadOnlyStore {
+            inner: Arc::new(
+                builder
+                    .with_url(url.as_str())
+                    .build()
+                    .map_err(|e| bad(&e))?,
+            ),
+            local: false,
+        };
+        return Ok((url, Arc::new(store)));
+    }
+
+    if kind == LocationKind::Local {
         let path = fluree_db_iceberg::resolve_local_path(location).map_err(|e| bad(&e))?;
         let url =
             Url::from_directory_path(&path).map_err(|()| bad(&"not an absolute directory path"))?;
