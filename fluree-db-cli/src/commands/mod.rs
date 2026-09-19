@@ -8,6 +8,7 @@ pub mod completions;
 pub mod config_cmd;
 pub mod context_cmd;
 pub mod create;
+pub mod delta;
 pub mod doc;
 pub mod doc_sources;
 pub mod docs;

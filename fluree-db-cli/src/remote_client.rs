@@ -2838,6 +2838,23 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// Map Delta tables as a graph source on the remote server.
+    ///
+    /// Calls `POST {base_url}/delta/map`.
+    pub async fn delta_map(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("delta/map");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
     /// Map an Iceberg table as a graph source on the remote server.
     ///
     /// Calls `POST {base_url}/iceberg/map`.

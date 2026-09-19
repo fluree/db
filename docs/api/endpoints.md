@@ -3115,6 +3115,59 @@ By default the server does not sync on commit, so an index only advances when so
 
 See also the CLI equivalent: [fluree bm25 sync](../cli/bm25.md#fluree-bm25-sync).
 
+### POST {api_base_url}/delta/map
+
+Map Delta Lake tables as an R2RML graph source. Admin-protected — requires the admin Bearer token when an admin token is configured. Available only when the server is built with the `delta` feature. See [Delta Lake tables](../graph-sources/delta.md).
+
+**URL:**
+```
+POST {api_base_url}/delta/map
+```
+
+**Request Body:**
+
+```json
+{
+  "name": "sales",
+  "root": "s3://lake/Tables",
+  "tables": { "orders": "s3://lake/raw/orders_v2" },
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "r2rml_type": "text/turtle",
+  "branch": "main",
+  "s3_region": "us-east-1"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Graph source name (required) |
+| `root` | string | Directory the mapping's table names resolve beneath: `dbo.orders` → `<root>/dbo/orders`. `s3://…`, or a local path under the server's local-root allowlist. Required unless every mapped table has a `tables` entry. |
+| `tables` | object | Explicit table name → table location; wins over `root` |
+| `r2rml` | string | Inline R2RML mapping (required). `rr:tableName` logical tables only. |
+| `r2rml_type` | string | Media type of `r2rml` (`text/turtle`) |
+| `branch` | string | Branch name (default: `main`) |
+| `s3_region`, `s3_endpoint`, `s3_path_style` | string, string, bool | S3 options. `s3_endpoint` is guarded against the link-local/metadata range. Credentials come from the server's ambient AWS chain. |
+| `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
+| `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
+
+**Response:**
+
+```json
+{
+  "graph_source_id": "sales:main",
+  "mapping_source": "bafy…",
+  "triples_map_count": 3,
+  "table_count": 2,
+  "table_names": ["dbo.customers", "orders"],
+  "mapping_validated": true,
+  "table_versions": { "dbo.customers": 12, "orders": 847 }
+}
+```
+
+`table_versions` holds the current Delta version of each mapped table that opened with every column its maps reference. A table that could not be read, or that lacks a mapped column, appears in `table_warnings` instead; the source is registered regardless. `model_warnings` lists policies of the model a virtual source cannot evaluate.
+
+See also the CLI equivalent: [fluree delta map](../cli/delta.md#fluree-delta-map).
+
 ### POST {api_base_url}/sql/map
 
 Map tables behind a SQL endpoint as an R2RML graph source. The endpoint speaks the Trino client protocol (Trino, Starburst, PrestoDB, or a `fluree-sql-bridge` sidecar). Admin-protected — requires the admin Bearer token when an admin token is configured. Available only when the server is built with the `sql` feature (on by default). See [SQL graph sources](../graph-sources/sql.md).

@@ -821,6 +821,42 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             }
         }
 
+        Commands::Delta { action } => {
+            let fluree_dir = config::require_fluree_dir(config_path)?;
+            match action {
+                cli::DeltaAction::Map(args) => {
+                    commands::delta::run_delta_map(*args, &fluree_dir, direct).await
+                }
+                cli::DeltaAction::List { remote } => {
+                    commands::iceberg::run_iceberg_list(&fluree_dir, remote.as_deref(), direct)
+                        .await
+                }
+                cli::DeltaAction::Info { name, remote } => {
+                    commands::iceberg::run_iceberg_info(
+                        &name,
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
+                }
+                cli::DeltaAction::Drop {
+                    name,
+                    force,
+                    remote,
+                } => {
+                    commands::iceberg::run_iceberg_drop(
+                        &name,
+                        force,
+                        &fluree_dir,
+                        remote.as_deref(),
+                        direct,
+                    )
+                    .await
+                }
+            }
+        }
+
         Commands::Iceberg { action } => {
             let fluree_dir = config::require_fluree_dir(config_path)?;
             match action {

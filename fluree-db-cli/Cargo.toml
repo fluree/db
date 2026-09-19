@@ -25,6 +25,8 @@ server = ["dep:fluree-db-server"]
 iceberg = ["fluree-db-api/iceberg"]
 # SQL graph sources (R2RML over a Trino-protocol endpoint)
 sql = ["iceberg", "fluree-db-api/sql", "fluree-db-server?/sql"]
+# Delta Lake graph sources (R2RML over Delta tables)
+delta = ["iceberg", "fluree-db-api/delta", "fluree-db-server?/delta"]
 aws = ["fluree-db-server/aws", "fluree-db-nameservice-sync/aws"]
 # SHACL constraint validation at transaction time
 shacl = ["fluree-db-api/shacl"]
