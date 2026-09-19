@@ -373,6 +373,55 @@ async fn a_filter_skips_files_and_a_bare_count_reads_none() {
         }
     }
 
+    // Folded aggregates push the filter of their fact scan too.
+    let folded = |body: &'static str, var: &'static str| {
+        let fluree = fluree.clone();
+        async move {
+            let sparql = format!(
+                "PREFIX ex: <http://example.org/>\n{}",
+                body.replace("$FROM", "FROM <holed:main>")
+            );
+            fluree
+                .query_from()
+                .sparql(&sparql)
+                .execute_formatted()
+                .await
+                .map(|v| {
+                    v["results"]["bindings"][0][var]["value"]
+                        .as_str()
+                        .map(String::from)
+                })
+                .unwrap_or_else(|e| panic!("{body} opened a file its filter excludes: {e}"))
+        }
+    };
+    assert_eq!(
+        folded(
+            "SELECT (COUNT(?s) AS ?n) $FROM WHERE { ?s ex:region \"east\" }",
+            "n"
+        )
+        .await
+        .as_deref(),
+        Some("8")
+    );
+    assert_eq!(
+        folded(
+            "SELECT (SUM(?id) AS ?t) $FROM WHERE { ?s ex:saleId ?id FILTER(?id < 100) }",
+            "t"
+        )
+        .await
+        .as_deref(),
+        Some("6")
+    );
+    assert_eq!(
+        folded(
+            "SELECT ?r (MAX(?id) AS ?top) $FROM WHERE { ?s ex:region ?r ; ex:saleId ?id FILTER(?r = \"west\") } GROUP BY ?r",
+            "top"
+        )
+        .await
+        .as_deref(),
+        Some("503")
+    );
+
     // The same table without a usable filter does need those files.
     let err = run("SELECT ?s $FROM WHERE { ?s ex:region ?r }")
         .await

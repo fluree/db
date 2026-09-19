@@ -227,9 +227,9 @@ integer against an integer column, a string against a string column, a zoned
 `xsd:dateTime` against `timestamp` and an unzoned one against `timestamp_ntz`.
 Decimal and `float` columns, comparisons against a zero `double`, and any
 other expression are evaluated by the query engine over the decoded rows.
-Aggregates that Fluree folds directly over the scan (`COUNT`, `SUM`, `MIN`,
-`MAX`, `AVG`, with or without `GROUP BY`) currently read the whole table and
-apply the query's filter themselves.
+An aggregate over one table (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, with or
+without `GROUP BY`) pushes its filter the same way. An aggregate that joins
+tables filters the table it aggregates over after reading it.
 
 **Counts.** `COUNT` of a whole mapped table, with no filter or grouping, is
 answered from the row counts recorded in the transaction log without opening a
@@ -297,8 +297,7 @@ source at two different states in one query is rejected, as for
 
 - **Storage**: S3 (and S3-compatible endpoints), ADLS Gen2, OneLake and the
   local filesystem. Azure sovereign clouds are not addressable.
-- **`ORDER BY … LIMIT`** is not pushed down, and folded aggregates do not push
-  their filter; see [Performance](#performance).
+- **`ORDER BY … LIMIT`** is not pushed down; see [Performance](#performance).
 - **Materialization and tracking** (`fluree materialize`, `fluree track`) are
   not available for Delta sources.
 - **Nested types** cannot be mapped.

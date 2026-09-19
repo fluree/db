@@ -735,7 +735,7 @@ fn collect_expr_vars(expr: &Expression, out: &mut HashSet<VarId>) -> bool {
 /// Collect conjunctive `?var <op> const` comparisons that prune safely against
 /// Iceberg column min/max bounds (date/int/bool only). `!=` and non-prunable
 /// literal types are skipped — they stay with the in-engine FILTER.
-fn collect_pushdowns(expr: &Expression, out: &mut Vec<(VarId, ScanCmpOp, ScanValue)>) {
+pub(super) fn collect_pushdowns(expr: &Expression, out: &mut Vec<(VarId, ScanCmpOp, ScanValue)>) {
     let Expression::Call { func, args } = expr else {
         return;
     };

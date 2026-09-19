@@ -1144,6 +1144,12 @@ struct Resolved {
     /// columns. Empty means a constant subject (present on every row → the
     /// shortcut needs no null proof). Consumed only for the bare-COUNT fast path.
     count_non_null_cols: Vec<String>,
+    /// Filters pushed to the FACT scan so a provider can skip files and rows.
+    /// Each restates a condition the fold enforces per row (`filter`,
+    /// `fact_constraints`), so whether the provider applies it is a cost
+    /// matter only. Dim and membership scans push none: keep-min must see
+    /// every row.
+    scan_filters: Vec<crate::r2rml::ScanFilter>,
     /// PR-6 + S2: FK→GKey resolvers for dim-sourced GROUP BY keys, indexed by
     /// `KeySource::Dim.resolver`. EMPTY for a single-table plain-column fold (keys read
     /// straight from the scanned fact batch via `group_cols`). ONE entry for a fact⋈dim
@@ -1821,7 +1827,7 @@ impl Operator for FusedR2rmlAggregateOperator {
                 &resolved.pattern.graph_source_id,
                 &resolved.table_name,
                 &resolved.projection,
-                &[],
+                &resolved.scan_filters,
                 None,
                 as_of_t,
             )
@@ -2403,9 +2409,9 @@ impl FusedR2rmlAggregateOperator {
         // Resolve the fact-side constant-object constraints to per-row
         // scalar-column checks: the folded `star_constraints` AND a standalone
         // `?s pred const` member, which the rewrite leaves as
-        // `predicate_filter`/`object_constant`. The pushed scan filter for the
-        // latter is pruning only — a provider may apply it inexactly or not at
-        // all — so the fold must enforce it like any other constraint. Declines
+        // `predicate_filter`/`object_constant`. Both are also pushed to the scan
+        // (`scan_filters`), but a provider may apply a pushed filter inexactly or
+        // not at all, so the fold must enforce them itself. Declines
         // (`None`) if any constraint's predicate is a RefObjectMap object or is
         // absent — those keep the materialize path (no silent over-count). Empty
         // for an unconstrained COUNT/SUM/AVG/MIN/MAX plan.
@@ -2644,6 +2650,23 @@ impl FusedR2rmlAggregateOperator {
             None => None,
         };
 
+        // This fold takes its FILTER from the query rather than from the
+        // rewrite, so the comparisons the rewrite would have attached to the
+        // pattern are collected here.
+        let scan_filters = {
+            let mut pushing = pattern.clone();
+            if let Some(expr) = &self.filter {
+                let mut comparisons = Vec::new();
+                super::rewrite::collect_pushdowns(expr, &mut comparisons);
+                pushing.scan_filters.extend(
+                    comparisons.into_iter().map(|(var, op, value)| {
+                        crate::ir::adapters::ScanPushdown { var, op, value }
+                    }),
+                );
+            }
+            super::operator::pattern_scan_filters(&pushing, tm)
+        };
+
         projection.sort();
         projection.dedup();
 
@@ -2749,6 +2772,7 @@ impl FusedR2rmlAggregateOperator {
             expr_folds,
             validity_cols,
             count_non_null_cols,
+            scan_filters,
             group_resolvers,
             semi_joins: Vec::new(),
             group_key_plan,
@@ -3916,6 +3940,7 @@ impl FusedR2rmlAggregateOperator {
             validity_cols,
             // The COUNT(*) manifest shortcut is single-table only.
             count_non_null_cols: Vec::new(),
+            scan_filters: Vec::new(),
             // The join path is a single terminal-dim resolver (resolver index 0),
             // matching the `KeySource::Dim { resolver: 0, .. }` plan above.
             group_resolvers: vec![GroupKeyResolver {
