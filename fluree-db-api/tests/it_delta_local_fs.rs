@@ -652,3 +652,55 @@ async fn view_policies_govern_a_delta_source() {
     let reader = json!({ "identity": "http://example.org/users/reader", "default-allow": false });
     assert_eq!(count(&fluree, totals(governed, reader)).await, 5);
 }
+
+/// A version whose log replays but whose data was vacuumed resolves, then fails
+/// at scan with a message that says so — not a raw storage error, and never the
+/// current rows.
+#[tokio::test]
+async fn a_vacuumed_version_is_an_explicit_error() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = fixtures().canonicalize().expect("fixtures dir");
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <http://example.org/mapping#Lost>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "history_loss" ] ;
+            rr:subjectMap [ rr:template "http://example.org/lost/{id}" ] ;
+            rr:predicateObjectMap [ rr:predicate ex:amount ; rr:objectMap [ rr:column "amount" ] ] .
+    "#;
+    let mut config = DeltaCreateConfig::new("delta-lost", root.to_str().unwrap(), mapping);
+    config.mapping_media_type = Some("text/turtle".to_string());
+    fluree
+        .create_delta_graph_source(config)
+        .await
+        .expect("create");
+    let q = |from: &str| {
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": from,
+            "select": ["?a"],
+            "where": {"@id": "?s", "ex:amount": "?a"},
+        })
+    };
+    let latest = fluree
+        .query_from()
+        .jsonld(&q("delta-lost:main"))
+        .execute_formatted()
+        .await
+        .expect("latest reads");
+    assert_eq!(latest.as_array().map(Vec::len), Some(1), "{latest}");
+
+    let err = fluree
+        .query_from()
+        .jsonld(&q("delta-lost:main@snapshot:0"))
+        .execute_formatted()
+        .await
+        .expect_err("v0's only data file is gone")
+        .to_string();
+    assert!(
+        err.contains("version 0 of table 'history_loss' can no longer be read"),
+        "{err}"
+    );
+}

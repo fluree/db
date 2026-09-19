@@ -404,8 +404,19 @@ impl DeltaSource {
             .map_err(|e| self.query_error(table_name, e))?;
         let graph_source_id = self.graph_source_id.clone();
         let table = table_name.to_string();
+        let version = snapshot.version();
         Ok(Box::pin(stream.map(move |batch| {
-            batch.map_err(|e| delta_query_error(&graph_source_id, &table, e))
+            batch.map_err(|e| {
+                // The log replayed, so the version exists; its data does not.
+                if e.is_missing_file() {
+                    return QueryError::InvalidQuery(format!(
+                        "Delta graph source '{graph_source_id}': version {version} of table \
+                         '{table}' can no longer be read — a data file it references has been \
+                         removed from storage (VACUUM or data retention)"
+                    ));
+                }
+                delta_query_error(&graph_source_id, &table, e)
+            })
         })))
     }
 
