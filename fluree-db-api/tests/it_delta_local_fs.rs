@@ -757,3 +757,77 @@ async fn aggregates_apply_constraints_the_scan_does_not() {
         );
     }
 }
+
+/// A mapped boolean column compares equal to a boolean literal. The `flags`
+/// fixture (delta-rs) holds ids 1..6 with shipped = T, T, F, T, null, F.
+#[tokio::test]
+async fn a_mapped_boolean_compares_equal_to_a_boolean_literal() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = fixtures().canonicalize().expect("fixtures dir");
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+        <http://example.org/mapping#Flag>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "flags" ] ;
+            rr:subjectMap [ rr:template "http://example.org/flag/{id}" ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:shipped ;
+                rr:objectMap [ rr:column "shipped" ; rr:datatype xsd:boolean ]
+            ] .
+    "#;
+    let mut config = DeltaCreateConfig::new("delta-flags", root.to_str().unwrap(), mapping);
+    config.mapping_media_type = Some("text/turtle".to_string());
+    fluree
+        .create_delta_graph_source(config)
+        .await
+        .expect("create");
+
+    let ids = |filter: &'static str| {
+        let fluree = fluree.clone();
+        async move {
+            let sparql = format!(
+                "SELECT ?s FROM <delta-flags:main> WHERE {{ \
+                 ?s <http://example.org/shipped> ?b FILTER({filter}) }}"
+            );
+            let v = fluree
+                .query_from()
+                .sparql(&sparql)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+            let mut out: Vec<String> = v["results"]["bindings"]
+                .as_array()
+                .expect("bindings")
+                .iter()
+                .map(|b| {
+                    let iri = b["s"]["value"].as_str().expect("iri");
+                    iri.rsplit('/').next().unwrap().to_string()
+                })
+                .collect();
+            out.sort();
+            out
+        }
+    };
+    assert_eq!(ids("?b = false").await, ["3", "6"]);
+    assert_eq!(ids("?b = true").await, ["1", "2", "4"]);
+    assert_eq!(ids("?b != true").await, ["3", "6"]);
+    assert_eq!(ids("!?b").await, ["3", "6"]);
+
+    // The JSON-LD surface shares the binding, so the same comparison holds.
+    let jsonld = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": "delta-flags:main",
+        "select": ["?s"],
+        "where": [{"@id": "?s", "ex:shipped": "?b"}, ["filter", "(= ?b false)"]],
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&jsonld)
+        .execute_formatted()
+        .await
+        .expect("jsonld filter");
+    assert_eq!(rows.as_array().map(Vec::len), Some(2), "{rows}");
+}
