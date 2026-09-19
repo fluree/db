@@ -441,27 +441,50 @@ async fn a_checkpointed_log_reads_the_same_with_or_without_its_early_commits() {
 
 #[tokio::test]
 async fn an_instant_before_the_oldest_retained_commit_is_refused_on_a_cleaned_log() {
-    let table = open("log_cleaned");
-    let oldest = table
-        .snapshot(VersionSelector::Version(10))
-        .await
-        .unwrap()
-        .timestamp_ms()
-        .await
-        .unwrap();
-    let at = table
-        .snapshot(VersionSelector::AsOfTimestampMs(oldest))
-        .await
-        .unwrap();
-    assert_eq!(at.version(), 10);
-    let before = table
-        .snapshot(VersionSelector::AsOfTimestampMs(oldest - 1))
-        .await;
-    assert!(
-        matches!(before, Err(DeltaError::NoVersionAtTime { .. })),
-        "{:?}",
-        before.err()
-    );
+    // The table has no in-commit timestamps and a checkout does not preserve
+    // mtimes, so stage a copy whose log files carry known ones.
+    allow_roots();
+    let staged = tempfile::tempdir().unwrap();
+    let dir = staged.path().join("log_cleaned");
+    copy_dir_all(&fixtures().join("log_cleaned"), &dir);
+    let base_ms: i64 = 1_700_000_000_000;
+    let stamp = |name: String, ms: i64| {
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms as u64);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("_delta_log").join(name))
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    };
+    for version in 10..13_i64 {
+        stamp(
+            format!("{version:020}.json"),
+            base_ms + (version - 10) * 60_000,
+        );
+    }
+    stamp(format!("{:020}.checkpoint.parquet", 10), base_ms);
+    let table = DeltaTable::open(
+        "log_cleaned",
+        dir.to_str().unwrap(),
+        &DeltaIoConfig::default(),
+    )
+    .unwrap();
+
+    let at = |ms: i64| table.snapshot(VersionSelector::AsOfTimestampMs(ms));
+    assert_eq!(at(base_ms).await.unwrap().version(), 10);
+    assert_eq!(at(base_ms + 60_000).await.unwrap().version(), 11);
+    assert_eq!(at(base_ms + 59_999).await.unwrap().version(), 10);
+    // Versions 0–9 were committed before this, but nothing of them remains.
+    match at(base_ms - 1).await {
+        Err(DeltaError::NoVersionAtTime { oldest_ms, .. }) => {
+            assert_eq!(oldest_ms, Some(base_ms));
+        }
+        other => panic!(
+            "expected NoVersionAtTime, got {:?}",
+            other.map(|s| s.version())
+        ),
+    }
 }
 
 #[tokio::test]
