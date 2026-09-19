@@ -751,12 +751,13 @@ impl Fluree {
                 record.source_type,
                 fluree_db_nameservice::GraphSourceType::Iceberg
                     | fluree_db_nameservice::GraphSourceType::R2rml
+                    | fluree_db_nameservice::GraphSourceType::Delta
             )
         {
             return Err(ApiError::invalid_query(format!(
                 "graph source '{gs_id}' ({}) does not support time-pinned reads; only \
-                 Iceberg-backed graph sources do. Remove the time specification to query \
-                 its current state.",
+                 Iceberg- and Delta-backed graph sources do. Remove the time specification \
+                 to query its current state.",
                 record.source_type.to_type_string()
             )));
         }

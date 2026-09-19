@@ -111,6 +111,13 @@ fn require_iceberg_backed(
              live tables); query it directly instead"
         )));
     }
+    #[cfg(feature = "delta")]
+    if record.source_type == GraphSourceType::Delta {
+        return Err(QueryError::InvalidQuery(format!(
+            "Graph source '{graph_source_id}' is Delta-backed: materialization is not yet \
+             available for Delta graph sources; query it directly instead"
+        )));
+    }
     let _ = (record, graph_source_id);
     Ok(())
 }
@@ -126,6 +133,8 @@ pub(crate) fn mapping_source_of(
         }
         #[cfg(feature = "sql")]
         GraphSourceType::Sql => super::sql::mapping_source(record),
+        #[cfg(feature = "delta")]
+        GraphSourceType::Delta => super::delta::mapping_source(record),
         _ => None,
     }
 }
@@ -143,6 +152,8 @@ pub(crate) fn policy_config_of(
         }
         #[cfg(feature = "sql")]
         GraphSourceType::Sql => super::sql::policy_config(record),
+        #[cfg(feature = "delta")]
+        GraphSourceType::Delta => super::delta::policy_config(record),
         _ => (None, None),
     }
 }
@@ -956,8 +967,6 @@ impl crate::Fluree {
         &self,
         config: R2rmlCreateConfig,
     ) -> Result<R2rmlCreateResult> {
-        use crate::graph_source::config::R2rmlMappingInput;
-
         let graph_source_id = config.graph_source_id();
         info!(graph_source_id = %graph_source_id, "Creating R2RML graph source");
 
@@ -966,46 +975,16 @@ impl crate::Fluree {
             .validate_source_model(config.iceberg.model.as_deref())
             .await?;
 
-        // Resolve mapping: validate and store to CAS if inline content
-        let (mapping_address, triples_map_count, table_names, mapping_validated) = match &config
-            .mapping
-        {
-            R2rmlMappingInput::Content(content) => {
-                // Inline content has no filename to sniff; the shared resolver
-                // defaults a missing media type to Turtle (matching the eventual
-                // CID address, which is also extensionless).
-                let compiled =
-                    Self::compile_r2rml_content(content, config.mapping_media_type.as_deref(), "")?;
-                reject_sql_queries(&compiled)?;
-                let count = compiled.len();
-                let tables = Self::sorted_table_names(&compiled);
-                let gs_id = config.graph_source_id();
-                let cs = self.content_store(&gs_id);
-                let cid = cs
-                    .put(
-                        fluree_db_core::ContentKind::GraphSourceMapping,
-                        content.as_bytes(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        crate::ApiError::Config(format!("Failed to store R2RML mapping: {e}"))
-                    })?;
-                let addr = cid.to_string();
-                info!(graph_source_id = %graph_source_id, mapping_cid = %addr, "R2RML mapping stored to CAS");
-                (addr, count, tables, true)
-            }
-            R2rmlMappingInput::Address(address) => {
-                let (count, tables, validated) = self
-                        .validate_r2rml_mapping_from_address(address, &config)
-                        .await
-                        .map(|(c, t)| (c, t, true))
-                        .unwrap_or_else(|e| {
-                            warn!(graph_source_id = %graph_source_id, error = %e, "Could not validate R2RML mapping from address");
-                            (0, Vec::new(), false)
-                        });
-                (address.clone(), count, tables, validated)
-            }
-        };
+        let registered = self
+            .register_r2rml_mapping(
+                &graph_source_id,
+                &config.mapping,
+                config.mapping_media_type.as_deref(),
+                false,
+            )
+            .await?;
+        let (triples_map_count, table_names, mapping_validated) = registered.summary();
+        let mapping_address = registered.address;
         let table_count = table_names.len();
 
         // Test catalog connection (REST mode only)
@@ -1104,6 +1083,81 @@ impl crate::Fluree {
         Ok(())
     }
 
+    /// Resolve a registration's mapping input to the address the record stores.
+    ///
+    /// Inline content must compile and is written to the source's content
+    /// store. An address is read and compiled when the backend can; one that
+    /// cannot be read registers unvalidated (`compiled: None`) and fails at
+    /// query time instead. `allow_sql_queries` is false for sources that read
+    /// table files and cannot execute `rr:sqlQuery`.
+    pub(crate) async fn register_r2rml_mapping(
+        &self,
+        graph_source_id: &str,
+        input: &crate::graph_source::config::R2rmlMappingInput,
+        media_type: Option<&str>,
+        allow_sql_queries: bool,
+    ) -> Result<RegisteredMapping> {
+        use crate::graph_source::config::R2rmlMappingInput;
+        let check = |compiled: &CompiledR2rmlMapping| {
+            if allow_sql_queries {
+                Ok(())
+            } else {
+                reject_sql_queries(compiled)
+            }
+        };
+        match input {
+            R2rmlMappingInput::Content(content) => {
+                let compiled = Self::compile_r2rml_content(content, media_type, "")?;
+                check(&compiled)?;
+                let cid = self
+                    .content_store(graph_source_id)
+                    .put(
+                        fluree_db_core::ContentKind::GraphSourceMapping,
+                        content.as_bytes(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::ApiError::Config(format!("Failed to store R2RML mapping: {e}"))
+                    })?;
+                Ok(RegisteredMapping {
+                    address: cid.to_string(),
+                    compiled: Some(compiled),
+                })
+            }
+            R2rmlMappingInput::Address(address) => {
+                let storage = self.admin_storage().ok_or_else(|| {
+                    crate::ApiError::Config(
+                        "address-based mappings are not supported on this backend".to_string(),
+                    )
+                })?;
+                let compiled = match storage.read_bytes(address).await {
+                    Ok(bytes) => match String::from_utf8(bytes)
+                        .map_err(|e| crate::ApiError::Config(e.to_string()))
+                        .and_then(|content| {
+                            Self::compile_r2rml_content(&content, media_type, address)
+                        }) {
+                        Ok(compiled) => {
+                            check(&compiled)?;
+                            Some(compiled)
+                        }
+                        Err(e) => {
+                            warn!(graph_source_id = %graph_source_id, error = %e, "Could not validate R2RML mapping from address");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        warn!(graph_source_id = %graph_source_id, error = %e, "Could not read R2RML mapping from address");
+                        None
+                    }
+                };
+                Ok(RegisteredMapping {
+                    address: address.clone(),
+                    compiled,
+                })
+            }
+        }
+    }
+
     /// Compile R2RML content and return the compiled mapping.
     ///
     /// `source` is the mapping's filename, storage address, or content-addressed
@@ -1130,35 +1184,6 @@ impl crate::Fluree {
         }
     }
 
-    /// Validate an R2RML mapping from a pre-existing storage address.
-    ///
-    /// Returns the number of TriplesMap definitions and the sorted list of
-    /// distinct logical table names referenced by the mapping.
-    async fn validate_r2rml_mapping_from_address(
-        &self,
-        address: &str,
-        config: &R2rmlCreateConfig,
-    ) -> Result<(usize, Vec<String>)> {
-        let storage = self.admin_storage().ok_or_else(|| {
-            crate::ApiError::Config(format!(
-                "Cannot load R2RML mapping from address '{address}': address-based reads are not supported on this backend"
-            ))
-        })?;
-        let bytes = storage.read_bytes(address).await.map_err(|e| {
-            crate::ApiError::Config(format!(
-                "Failed to load R2RML mapping from '{address}': {e}"
-            ))
-        })?;
-        let content = String::from_utf8(bytes).map_err(|e| {
-            crate::ApiError::Config(format!("R2RML mapping is not valid UTF-8: {e}"))
-        })?;
-        // `address` may carry an extension (e.g. `.ttl`/`.jsonld`); pass it so the
-        // resolver can infer the format when no explicit media type is set.
-        let compiled =
-            Self::compile_r2rml_content(&content, config.mapping_media_type.as_deref(), address)?;
-        Ok((compiled.len(), Self::sorted_table_names(&compiled)))
-    }
-
     /// Collect the distinct logical table names referenced by a compiled
     /// mapping, sorted for deterministic reporting.
     pub(crate) fn sorted_table_names(compiled: &CompiledR2rmlMapping) -> Vec<String> {
@@ -1169,6 +1194,23 @@ impl crate::Fluree {
             .collect();
         names.sort();
         names
+    }
+}
+
+/// A registration's mapping as stored, and its compiled form when it could be
+/// read (always, for inline content).
+pub(crate) struct RegisteredMapping {
+    pub(crate) address: String,
+    pub(crate) compiled: Option<CompiledR2rmlMapping>,
+}
+
+impl RegisteredMapping {
+    /// `(triples map count, sorted table names, validated)` for a create result.
+    pub(crate) fn summary(&self) -> (usize, Vec<String>, bool) {
+        match &self.compiled {
+            Some(c) => (c.len(), crate::Fluree::sorted_table_names(c), true),
+            None => (0, Vec::new(), false),
+        }
     }
 }
 
@@ -1342,6 +1384,34 @@ impl<'a> FlureeR2rmlProvider<'a> {
         };
         self.session
             .memo_sql_dispatch(graph_source_id, decision.clone());
+        Ok(decision)
+    }
+
+    /// The Delta source behind `graph_source_id`, or `None` for any other
+    /// family. Memoized per query like [`Self::sql_source`]; the memoized source
+    /// also fixes the table versions this query reads.
+    #[cfg(feature = "delta")]
+    async fn delta_source(
+        &self,
+        graph_source_id: &str,
+    ) -> QueryResult<Option<Arc<super::delta::DeltaSource>>> {
+        if let Some(decision) = self.session.delta_dispatch(graph_source_id) {
+            return Ok(decision);
+        }
+        let record = self
+            .fluree
+            .nameservice()
+            .lookup_graph_source(graph_source_id)
+            .await
+            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
+        let decision = match record {
+            Some(r) if r.source_type == GraphSourceType::Delta => {
+                Some(Arc::new(super::delta::DeltaSource::open(&r)?))
+            }
+            _ => None,
+        };
+        self.session
+            .memo_delta_dispatch(graph_source_id, decision.clone());
         Ok(decision)
     }
 
@@ -2909,6 +2979,13 @@ impl FlureeR2rmlProvider<'_> {
                 .row_count(&self.session, &mapping, table_name, non_null_cols)
                 .await;
         }
+        // A Delta count would need per-file `numRecords` statistics net of
+        // deletion vectors; decline so the caller counts a scan of the same
+        // pinned version.
+        #[cfg(feature = "delta")]
+        if self.delta_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
         // Same pinned context as the scan: one Iceberg snapshot per query (the
         // shared `self.session` pin), so a count and a scan cannot disagree.
         // GREP: r2rml-as-of-t — `as_of_t` is a Fluree `t` and is ignored here as in
@@ -3654,6 +3731,19 @@ impl FlureeR2rmlProvider<'_> {
             let mapping = self.compiled_mapping(graph_source_id, None).await?;
             return sql
                 .scan(&self.session, &mapping, table_name, projection, filters)
+                .await;
+        }
+        // `filters` and `topk` only prune; the operator above re-applies both.
+        #[cfg(feature = "delta")]
+        if let Some(delta) = self.delta_source(graph_source_id).await? {
+            return delta
+                .scan(
+                    self.fluree,
+                    &self.session,
+                    table_name,
+                    projection,
+                    self.source_time(graph_source_id),
+                )
                 .await;
         }
         info!(
