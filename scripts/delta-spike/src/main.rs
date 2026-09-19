@@ -232,9 +232,18 @@ fn main() -> Result<()> {
                         Expression::column([expected.key.as_str()]).lt(Expression::literal(0_i64)),
                     ))
                     .build()?;
-                let mut actual = rows(empty, engine.clone(), &version.columns)?;
-                actual.retain(|r| r[&expected.key].as_i64().is_some_and(|n| n < 0));
-                assert_rows(actual, vec![], &expected.key)?;
+                // No residual here: every fixture file carries min/max statistics
+                // for its key, so a predicate no key satisfies must skip every
+                // file. Filtering the output first would pass for any reader.
+                let unpruned = rows(empty, engine.clone(), &version.columns)?;
+                if !unpruned.is_empty() {
+                    return Err(format!(
+                        "{name} v{}: data skipping kept {} rows for an unsatisfiable predicate",
+                        version.version,
+                        unpruned.len()
+                    )
+                    .into());
+                }
                 scans += 2;
                 println!(
                     "{}",
@@ -265,13 +274,18 @@ fn main() -> Result<()> {
                 json!({"table":name,"version":missing.version,"expected_failure":"missing_data"})
             );
         }
-        // A future/nonexistent version must not silently resolve to current.
-        if Snapshot::builder_for(url)
+        // A future/nonexistent version must not silently resolve to current,
+        // and must fail *as* a missing version: a storage or listing failure
+        // would also be an `Err`.
+        match Snapshot::builder_for(url)
             .at_version(current.version() + 1)
             .build(engine.as_ref())
-            .is_ok()
         {
-            return Err("nonexistent version unexpectedly resolved".into());
+            Ok(_) => return Err("nonexistent version unexpectedly resolved".into()),
+            Err(error) if is_missing_version(&error) => {}
+            Err(error) => {
+                return Err(format!("expected a missing-version error, got: {error:?}").into())
+            }
         }
     }
     println!(
@@ -279,6 +293,18 @@ fn main() -> Result<()> {
         json!({"reader":"delta_kernel 0.28.0","snapshots":snapshots,"scans":scans,"status":"passed"})
     );
     Ok(())
+}
+
+/// Kernel 0.28 reports a version past the end of the log as a generic
+/// log-segment mismatch; there is no dedicated variant to match.
+fn is_missing_version(error: &delta_kernel::Error) -> bool {
+    match error {
+        delta_kernel::Error::Generic(message) => {
+            message.contains("not the same as the specified end version")
+        }
+        delta_kernel::Error::Backtraced { source, .. } => is_missing_version(source),
+        _ => false,
+    }
 }
 
 fn is_not_found(error: &(dyn Error + 'static)) -> bool {
