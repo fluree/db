@@ -242,7 +242,7 @@ pub struct GraphDb {
     /// `GRAPH <gs_id> { ... }` so the R2RML provider handles them.
     pub(crate) graph_source_id: Option<Arc<str>>,
     /// The table state a time-specified graph-source view reads
-    /// (`alias@iso:` / `@recorded:` / `@snapshot:`). Pushed into the R2RML
+    /// (`alias@time:` / `@recorded:` / `@snapshot:`). Pushed into the R2RML
     /// provider before execution; `None` reads the source's current state.
     pub(crate) graph_source_time: Option<fluree_db_query::r2rml::SourceTime>,
 }

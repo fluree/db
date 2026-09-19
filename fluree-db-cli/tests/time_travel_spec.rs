@@ -421,8 +421,10 @@ fn help_text_lists_the_accepted_spellings() {
         if expect_time_axes {
             // `branch create --at` names a commit, so it has no timestamp axes.
             assert!(
-                stdout.contains("iso:<ISO-8601>") && stdout.contains("recorded:<ISO-8601>"),
-                "`fluree {}` must document the timestamp axes:\n{stdout}",
+                stdout.contains("time:<ISO-8601>")
+                    && stdout.contains("`iso:` is an alias")
+                    && stdout.contains("recorded:<ISO-8601>"),
+                "`fluree {}` must document the timestamp axes and the iso: alias:\n{stdout}",
                 args.join(" ")
             );
         }

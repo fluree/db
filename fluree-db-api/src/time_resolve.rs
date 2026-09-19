@@ -1,7 +1,7 @@
 //! Index-based time travel resolution
 //!
 //! Replaces commit-chain walking with efficient O(log n) index queries for
-//! resolving `@iso:<datetime>` and `@commit:<prefix>` time travel specifiers.
+//! resolving `@time:<datetime>` and `@commit:<prefix>` time travel specifiers.
 //!
 //! # Background
 //!

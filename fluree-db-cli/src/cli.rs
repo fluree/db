@@ -777,7 +777,7 @@ pub enum Commands {
         /// Query at a specific point in time.
         ///
         /// Accepts `t:<N>` (transaction number), `t:latest`/`latest`,
-        /// `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the
+        /// `time:<ISO-8601>` (commit event time; `iso:` is an alias), `recorded:<ISO-8601>` (the
         /// wall-clock time the commit was recorded), and `commit:<prefix>`
         /// (hex digest, min 6 chars). A bare transaction number, ISO-8601
         /// timestamp, or commit prefix also works; a bare integer is read as
@@ -901,7 +901,7 @@ pub enum Commands {
         /// Start of time range (default: 1).
         ///
         /// Same spellings as `query --at`: `t:<N>`, `t:latest`/`latest`,
-        /// `iso:<ISO-8601>`, `recorded:<ISO-8601>`, `commit:<prefix>`, or a
+        /// `time:<ISO-8601>` (`iso:` is an alias), `recorded:<ISO-8601>`, `commit:<prefix>`, or a
         /// bare transaction number / timestamp / commit prefix.
         #[arg(long, default_value = "1")]
         from: String,
@@ -1103,7 +1103,7 @@ pub enum Commands {
         /// Query at a specific point in time.
         ///
         /// Accepts `t:<N>` (transaction number), `t:latest`/`latest`,
-        /// `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the
+        /// `time:<ISO-8601>` (commit event time; `iso:` is an alias), `recorded:<ISO-8601>` (the
         /// wall-clock time the commit was recorded), and `commit:<prefix>`
         /// (hex digest, min 6 chars). A bare transaction number, ISO-8601
         /// timestamp, or commit prefix also works; a bare integer is read as
@@ -1718,7 +1718,7 @@ pub enum BranchAction {
         /// that is all digits. The source branch must be indexed for `t:` /
         /// prefix resolution (full CIDs work unconditionally).
         ///
-        /// Unlike `query --at` this names a *commit*, so it has no `iso:`,
+        /// Unlike `query --at` this names a *commit*, so it has no `time:`,
         /// `recorded:` or `latest` forms; the spellings the two share mean the
         /// same thing on both.
         #[arg(long)]

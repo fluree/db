@@ -12,7 +12,7 @@ Fluree's native query language that uses JSON-LD syntax. JSON-LD Query provides 
 
 **Key Features:**
 - JSON-based syntax (no string parsing)
-- Full support for time travel (`@t:`, `@iso:`, `@commit:`)
+- Full support for time travel (`@t:`, `@time:`, `@commit:`)
 - Graph source integration
 - Policy enforcement
 - History queries
@@ -134,7 +134,7 @@ ledger:main@t:100
 
 **ISO 8601 Timestamp:**
 ```
-ledger:main@iso:2024-01-15T10:30:00Z
+ledger:main@time:2024-01-15T10:30:00Z
 ```
 
 **Commit ContentId:**

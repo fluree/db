@@ -188,7 +188,7 @@ Fluree-Max-Bytes: 32768
 | `message` | When truncated | Human-readable truncation explanation |
 | `resume` | When truncated, single-FROM only | Ready-to-execute SPARQL with `@t:` pinning and OFFSET |
 
-**Multi-ledger queries:** The `t` field is omitted (each ledger has its own timeline). The `resume` field is also omitted; instead, the `message` instructs the caller to use `@iso:` on each FROM clause for time-pinning.
+**Multi-ledger queries:** The `t` field is omitted (each ledger has its own timeline). The `resume` field is also omitted; instead, the `message` instructs the caller to use `@time:` on each FROM clause for time-pinning.
 
 **Byte budget:** Set via the `Fluree-Max-Bytes` header. When the cumulative serialized size of rows exceeds this limit, the formatter stops adding rows and sets `hasMore: true`. The budget applies to row data only (schema and envelope overhead are excluded from the count).
 
