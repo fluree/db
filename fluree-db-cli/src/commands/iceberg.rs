@@ -763,11 +763,12 @@ fn is_iceberg_family_source_type(st: &fluree_db_nameservice::GraphSourceType) ->
         fluree_db_nameservice::GraphSourceType::Iceberg
             | fluree_db_nameservice::GraphSourceType::R2rml
             | fluree_db_nameservice::GraphSourceType::Sql
+            | fluree_db_nameservice::GraphSourceType::Delta
     )
 }
 
 fn is_iceberg_family_type_str(s: &str) -> bool {
-    matches!(s, "Iceberg" | "R2RML" | "SQL")
+    matches!(s, "Iceberg" | "R2RML" | "SQL" | "Delta")
 }
 
 #[cfg(test)]

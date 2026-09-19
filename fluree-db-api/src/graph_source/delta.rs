@@ -144,15 +144,26 @@ impl crate::Fluree {
         let mut table_versions = BTreeMap::new();
         let mut table_warnings = Vec::new();
         for table_name in &table_names {
+            // Exactly the columns a scan of this table will project.
+            let mut columns: Vec<String> = registered
+                .compiled
+                .iter()
+                .flat_map(|m| m.find_maps_for_table(table_name))
+                .flat_map(|tm| tm.referenced_columns())
+                .map(str::to_string)
+                .collect();
+            columns.sort();
+            columns.dedup();
             let probed = async {
                 let location = gs_config.table_location(table_name)?;
                 let table = DeltaTable::open(table_name, &location, &gs_config.io)?;
                 let snapshot = table
                     .snapshot(fluree_db_delta::VersionSelector::Latest)
                     .await?;
-                // Planning the full projection surfaces a column type the batch
-                // model cannot carry now rather than at the first query.
-                snapshot.batch_schema(&[])?;
+                // Planning surfaces a mapped column the table lacks, or one of
+                // a type the batch model cannot carry, now rather than at the
+                // first query.
+                snapshot.batch_schema(&columns)?;
                 Ok::<_, DeltaError>(snapshot.version())
             }
             .await;

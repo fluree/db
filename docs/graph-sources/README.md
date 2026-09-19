@@ -31,6 +31,13 @@ Relational database mapping:
 - Join optimization
 - Supported databases (PostgreSQL, MySQL, etc.)
 
+### [Delta Lake tables](delta.md)
+
+Delta tables read in place:
+- Deletion vectors, column mapping and partition values applied per the Delta protocol
+- R2RML mappings with `rr:tableName`, tables addressed by path
+- Time travel by Delta version (`@snapshot:`) or commit time (`@time:`)
+
 ### [SQL endpoints](sql.md)
 
 Relational databases and warehouses through a Trino-protocol endpoint:

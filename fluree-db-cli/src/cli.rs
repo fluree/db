@@ -1411,6 +1411,12 @@ pub enum Commands {
         action: SqlAction,
     },
 
+    /// Manage Delta Lake graph sources (R2RML over Delta tables)
+    Delta {
+        #[command(subcommand)]
+        action: DeltaAction,
+    },
+
     /// Materialize a native twin ledger from a virtual (R2RML-over-Iceberg)
     /// graph source: bulk-build every triple, verify it against the source, and
     /// write it as a native ledger or a .flpack pack (DEC-003 Deliverable 1).
@@ -3168,6 +3174,110 @@ pub enum SqlAction {
         #[arg(long)]
         remote: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DeltaAction {
+    /// Map Delta Lake tables as an R2RML graph source
+    ///
+    /// Tables are named by path. Each rr:tableName in the mapping resolves to
+    /// its --table entry, else to a directory under --root with the name's
+    /// dots as separators (dbo.orders -> <root>/dbo/orders).
+    ///
+    /// Query a past table state with `<name>@snapshot:<delta-version>` or
+    /// `<name>@time:<ISO-8601>`.
+    ///
+    /// Examples:
+    ///   fluree delta map sales --root s3://lake/Tables --r2rml mappings/sales.ttl
+    ///   fluree delta map sales --table orders=s3://lake/raw/orders_v2 --r2rml sales.ttl
+    Map(Box<DeltaMapArgs>),
+
+    /// List mapped graph sources (Delta, SQL, Iceberg and R2RML)
+    List {
+        /// List graph sources on a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Show details for a mapped graph source
+    Info {
+        /// Graph source name
+        name: String,
+
+        /// Query a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Drop a mapped graph source
+    Drop {
+        /// Graph source name
+        name: String,
+
+        /// Required flag to confirm deletion
+        #[arg(long)]
+        force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+/// Arguments for mapping Delta tables as a graph source.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaMapArgs {
+    /// Graph source name (e.g., "sales")
+    pub name: String,
+
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    /// Directory the mapping's table names resolve beneath: s3://bucket/prefix,
+    /// or a local path under FLUREE_ICEBERG_LOCAL_ROOTS
+    #[arg(long)]
+    pub root: Option<String>,
+
+    /// Explicit table location (repeatable): --table orders=s3://lake/raw/orders_v2
+    #[arg(long = "table", value_name = "NAME=LOCATION")]
+    pub table: Vec<String>,
+
+    /// R2RML mapping file. Each rr:tableName names a Delta table; rr:sqlQuery
+    /// is not supported.
+    #[arg(long)]
+    pub r2rml: PathBuf,
+
+    /// R2RML mapping media type (e.g., "text/turtle"); inferred from extension if omitted
+    #[arg(long)]
+    pub r2rml_type: Option<String>,
+
+    /// Branch name (defaults to "main")
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// S3 region override
+    #[arg(long)]
+    pub s3_region: Option<String>,
+
+    /// S3 endpoint override (MinIO, LocalStack)
+    #[arg(long)]
+    pub s3_endpoint: Option<String>,
+
+    /// Use path-style S3 URLs (MinIO, LocalStack)
+    #[arg(long)]
+    pub s3_path_style: bool,
+
+    /// Model ledger (name:branch) governing this source: its default graph
+    /// supplies the view policies (`fluree model access enable <model> ...`)
+    /// and the class/property hierarchy they entail over.
+    #[arg(long, value_name = "LEDGER")]
+    pub model: Option<String>,
+
+    /// Fallback for governed requests that match no policy: `true` keeps the
+    /// source readable under authentication without a model (unset: deny).
+    #[arg(long, value_name = "BOOL")]
+    pub default_allow: Option<bool>,
 }
 
 /// Arguments for mapping a SQL endpoint as a graph source.

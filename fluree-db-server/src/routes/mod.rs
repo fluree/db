@@ -5,6 +5,8 @@ pub(crate) mod admin_auth;
 mod bm25;
 mod commits;
 mod context;
+#[cfg(feature = "delta")]
+mod delta;
 mod events;
 mod export;
 #[cfg(feature = "graphql")]
@@ -124,6 +126,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     #[cfg(feature = "sql")]
     let v1_admin_protected_writes = v1_admin_protected_writes.route("/sql/map", post(sql::sql_map));
+    #[cfg(feature = "delta")]
+    let v1_admin_protected_writes =
+        v1_admin_protected_writes.route("/delta/map", post(delta::delta_map));
 
     // Admin auth runs BEFORE leader-forward. Axum runs the
     // last-applied layer outermost, so `require_admin_token`

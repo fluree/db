@@ -769,9 +769,10 @@ fallback to the current or oldest snapshot:
   simply reads as empty.
 
 `@t:` and `@commit:` name Fluree ledger states and are rejected on a graph
-source; `@snapshot:` is rejected on a native ledger. Only Iceberg-backed
-sources can be pinned: a SQL-backed R2RML source, a BM25 or vector index read
-their current state and reject any time specification. Naming one source at
+source; `@snapshot:` is rejected on a native ledger. Only table sources with
+retained history can be pinned — Iceberg and [Delta](delta.md#time-travel): a
+SQL-backed R2RML source, a BM25 or vector index read their current state and
+reject any time specification. Naming one source at
 two different states in one query — two different pins, or one reference
 pinned and another not, across `from` and `fromNamed` — is also rejected,
 because a pin applies to every read of that source in the query.

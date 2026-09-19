@@ -447,3 +447,50 @@ async fn materializing_a_delta_source_is_refused() {
         "{err}"
     );
 }
+
+/// Registration checks each table for the columns its maps project: a column
+/// the table lacks is reported then, and the source still registers.
+#[tokio::test]
+async fn registration_reports_a_mapped_column_the_table_lacks() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = fixtures().canonicalize().expect("fixtures dir");
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <http://example.org/mapping#Store>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "dim_store" ] ;
+            rr:subjectMap [ rr:template "http://example.org/store/{store_id}" ] ;
+            rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] .
+        <http://example.org/mapping#Absent>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "not_there" ] ;
+            rr:subjectMap [ rr:template "http://example.org/absent/{id}" ] .
+    "#;
+    let mut config = DeltaCreateConfig::new("delta-warn", root.to_str().unwrap(), mapping);
+    config.mapping_media_type = Some("text/turtle".to_string());
+    let created = fluree
+        .create_delta_graph_source(config)
+        .await
+        .expect("registers despite warnings");
+    assert!(created.table_versions.is_empty(), "{created:?}");
+    let warnings = created.table_warnings.join("\n");
+    assert!(warnings.contains("no column 'city'"), "{warnings}");
+    assert!(warnings.contains("table 'not_there'"), "{warnings}");
+
+    // A name that cannot be placed at all is an error, not a warning.
+    let mut unplaced = DeltaCreateConfig::new("delta-unplaced", root.to_str().unwrap(), mapping);
+    unplaced.mapping_media_type = Some("text/turtle".to_string());
+    unplaced.root = None;
+    unplaced.tables.insert(
+        "dim_store".to_string(),
+        format!("{}/dim_store", root.display()),
+    );
+    let err = fluree
+        .create_delta_graph_source(unplaced)
+        .await
+        .expect_err("`not_there` has no location")
+        .to_string();
+    assert!(err.contains("'not_there'"), "{err}");
+}

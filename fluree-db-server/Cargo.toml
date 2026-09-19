@@ -40,6 +40,9 @@ oidc = ["fluree-db-credential/oidc", "dep:jsonwebtoken"]
 iceberg = ["fluree-db-api/iceberg"]
 # SQL graph sources (R2RML over a Trino-protocol endpoint)
 sql = ["iceberg", "fluree-db-api/sql"]
+# Delta Lake graph sources (R2RML over Delta tables). Opt-in: links Delta
+# Kernel and `object_store`, including a second reqwest major.
+delta = ["iceberg", "fluree-db-api/delta"]
 # Use mimalloc as the global allocator. Better multicore allocation throughput
 # for the allocation-heavy query/materialization paths (e.g. R2RML/Iceberg
 # scans). Opt-in: enable in release packaging after a soak.
