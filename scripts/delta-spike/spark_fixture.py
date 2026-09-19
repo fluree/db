@@ -93,6 +93,23 @@ def generate(root):
         physical = pq.ParquetFile(mapped / unquote(adds[0]["path"])).schema_arrow.names
         assert "id" not in physical and "amount" not in physical, physical
 
+        # In-commit timestamps make time travel independent of file mtimes,
+        # which a copied or checked-out table does not preserve.
+        timed = root / "in_commit_time"
+        first = [{"id": 1, "amount": 100}]
+        (spark.createDataFrame(first, "id long, amount long").coalesce(1).write.format("delta")
+         .option("delta.enableInCommitTimestamps", "true").save(str(timed)))
+        save("in_commit_time", first)
+        second = first + [{"id": 2, "amount": 30000}]
+        (spark.createDataFrame(second[1:], "id long, amount long").coalesce(1)
+         .write.format("delta").mode("append").save(str(timed)))
+        save("in_commit_time", second)
+        spark.sql(f"DELETE FROM {sql_table('in_commit_time')} WHERE id = 1")
+        save("in_commit_time", second[1:])
+        stamps = [a["commitInfo"]["inCommitTimestamp"] for a in actions(timed) if "commitInfo" in a]
+        assert len(stamps) == 3 and stamps == sorted(set(stamps)), stamps
+        tables["in_commit_time"]["commit_timestamps_ms"] = stamps
+
         loss = root / "history_loss"
         spark.createDataFrame(small, "id long, amount long").coalesce(1).write.format("delta").save(str(loss))
         retired = [a["add"]["path"] for a in actions(loss) if "add" in a]

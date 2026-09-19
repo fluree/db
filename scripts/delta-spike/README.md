@@ -79,14 +79,15 @@ evidence; customer-produced tables are still needed.
 | --- | --- |
 | Kernel 0.28.0 + default engine | Probe selects Arrow/Parquet 58.4; the release also supports Arrow 59. Its `object_store` 0.13.2 dependency brings reqwest 0.12, alongside the engine's reqwest 0.13. Arrow features also enable multiple cloud backends. |
 | Delta-rs Rust 0.32.4 (manifest inspection; Rust API not built here) | Arrow/Parquet 58, `object_store` 0.13.2, and the `buoyant_kernel` 0.22 family. DataFusion 53.1 is optional in the core crate; the Python wheel's contents do not establish production Rust binary size. |
-| Fluree production workspace | Now aligned to Arrow/Parquet 58.4, with unified reqwest 0.13. Kernel's older storage/HTTP dependency still needs resolution before adoption. |
+| Fluree production workspace | Aligned to Arrow/Parquet 58.4, with unified reqwest 0.13. `fluree-db-delta` adopts Kernel 0.28 as published, so a build with the `delta` feature also links reqwest 0.12 through `object_store` 0.13. |
 
-Kernel's logical scan API remains a promising fit for Fluree's existing query
-engine. Arrow/Parquet alignment is complete. Before integrating it, resolve the
-storage/HTTP dependencies: an upstream-compatible change or a custom engine needs evaluation.
-Measure the chosen production configuration after that decision. This standalone
-probe intentionally permits duplicate HTTP versions to expose the issue without
-adding them to the product build.
+Kernel's logical scan API is the production reader (`fluree-db-delta`). Its
+`arrow-58` feature hard-enables `object_store` 0.13 with the AWS, Azure, GCP and
+HTTP backends in the core crate, so neither a custom engine nor a storage
+wrapper removes the second reqwest. Decision: accept the duplicate rather than
+patch or fork `object_store`; it disappears when Kernel and Parquet move to
+`object_store` 0.14. Measure the release artifact with `delta` enabled before
+turning it on by default.
 
 Still required: timestamp selection, expired-log/checkpoint failures, broader
 type/schema evolution, graph-source
@@ -109,7 +110,9 @@ cargo run --locked --manifest-path scripts/delta-spike/Cargo.toml -- \
 ```
 
 The generator checks Spark's reads against independently constructed expected
-rows and inspects the physical files/log actions:
+rows and inspects the physical files/log actions. `fluree-db-delta/tests/fixtures`
+holds a committed copy of these tables (and the basic ones) for the production
+reader's tests:
 
 - `deletion_vectors`: 4,096 rows in two partitioned files, each with five Parquet
   row groups in the tested run. Deleting nine rows must reuse both original
@@ -118,6 +121,10 @@ rows and inspects the physical files/log actions:
 - `column_mapping`: four versions covering physical name mapping, rename,
   drop, and re-add of the original logical name. All versions reuse a single
   Parquet file. Re-added `amount` must be null, never the old column's values.
+- `in_commit_time`: three versions written with `delta.enableInCommitTimestamps`.
+  The manifest records each commit's in-commit timestamp, so timestamp
+  selection can be checked on a copied table whose file modification times
+  no longer mean anything.
 - `history_loss`: retains the current overwritten snapshot but deliberately
   removes one retired synthetic Parquet file created by this invocation. Its
   version-zero scan must fail with a missing-file error. No existing table is
