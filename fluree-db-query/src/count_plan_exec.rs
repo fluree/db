@@ -25,9 +25,9 @@ use crate::fast_path_common::{
     cursor_projection_otype_okey, cursor_projection_sid_only, cursor_projection_sid_otype_okey,
     intersect_many_sorted, leaf_entries_for_predicate, normalize_pred_sid,
     projection_sid_otype_okey, slice_overlay_ops_by_subject, sum_post_object_counts_filtered,
-    CursorSubjectCountStream, FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter,
-    PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectSeek, PsotSubjectWeightedSumIter,
-    SharedOverlayOps,
+    CursorSubjectCountStream, FastPathOperator, GroupStream, InnerMergeHeads, ObjectFilterMode,
+    PostObjectGroupCountIter, PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectSeek,
+    PsotSubjectWeightedSumIter, SharedOverlayOps,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -235,7 +235,7 @@ enum SubjectGroups<'a> {
     Cursor(CursorSubjectCountStream),
 }
 
-impl SubjectGroups<'_> {
+impl GroupStream for SubjectGroups<'_> {
     fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
         match self {
             SubjectGroups::Empty => Ok(None),
@@ -848,30 +848,16 @@ fn merge_count_range(
                 .with_cancellation(cancellation),
         );
     }
-    let mut curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());
-    for it in &mut iters {
-        curr.push(it.next_group()?);
-    }
+    let Some(mut heads) = InnerMergeHeads::prime(&mut iters)? else {
+        return Ok(0);
+    };
     let mut total: u128 = 0;
     loop {
-        if curr.iter().any(std::option::Option::is_none) {
-            break;
+        if heads.aligned() {
+            total = total.saturating_add(heads.count_product());
         }
-        let max_s = curr.iter().filter_map(|c| c.map(|(s, _)| s)).max().unwrap();
-        if curr.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
-            let product: u128 = curr.iter().map(|c| c.unwrap().1 as u128).product();
-            total = total.saturating_add(product);
-            for (i, it) in iters.iter_mut().enumerate() {
-                curr[i] = it.next_group()?;
-            }
-        } else {
-            for (i, it) in iters.iter_mut().enumerate() {
-                if let Some((s_id, _)) = curr[i] {
-                    if s_id < max_s {
-                        curr[i] = it.next_group()?;
-                    }
-                }
-            }
+        if !heads.advance(&mut iters)? {
+            break;
         }
     }
     Ok(total)
@@ -933,23 +919,15 @@ fn merge_optional_count_range(
         });
     }
 
-    let mut req_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(req_iters.len());
-    for it in &mut req_iters {
-        req_cur.push(it.next_group()?);
-    }
+    let Some(mut heads) = InnerMergeHeads::prime(&mut req_iters)? else {
+        return Ok(0);
+    };
     let mut total: u128 = 0;
     loop {
-        if req_cur.iter().any(std::option::Option::is_none) {
-            break;
-        }
-        let max_s = req_cur
-            .iter()
-            .filter_map(|c| c.map(|(s, _)| s))
-            .max()
-            .unwrap();
-        if req_cur.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
+        if heads.aligned() {
+            let max_s = heads.key();
             // Required inner-join product at this subject.
-            let mut product: u128 = req_cur.iter().map(|c| c.unwrap().1 as u128).product();
+            let mut product: u128 = heads.count_product();
             // Multiply each optional group's max(1, Π count) factor (streaming;
             // cursors lazily catch up to max_s).
             for g in &mut opt {
@@ -982,17 +960,9 @@ fn merge_optional_count_range(
                 product = product.saturating_mul(mult);
             }
             total = total.saturating_add(product);
-            for (i, it) in req_iters.iter_mut().enumerate() {
-                req_cur[i] = it.next_group()?;
-            }
-        } else {
-            for (i, it) in req_iters.iter_mut().enumerate() {
-                if let Some((s_id, _)) = req_cur[i] {
-                    if s_id < max_s {
-                        req_cur[i] = it.next_group()?;
-                    }
-                }
-            }
+        }
+        if !heads.advance(&mut req_iters)? {
+            break;
         }
     }
     Ok(total)
@@ -1192,32 +1162,19 @@ fn merge_count_range_overlay(
         streams.push(CursorSubjectCountStream::new(cursor).with_cancellation(cancellation));
     }
 
-    let mut curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(streams.len());
-    for s in &mut streams {
-        curr.push(s.next_group()?);
-    }
+    let Some(mut heads) = InnerMergeHeads::prime(&mut streams)? else {
+        return Ok(0);
+    };
     let mut total: u128 = 0;
     loop {
-        if curr.iter().any(std::option::Option::is_none) {
-            break;
+        if heads.aligned() {
+            let s = heads.key();
+            if s >= lo && s < hi {
+                total = total.saturating_add(heads.count_product());
+            }
         }
-        let max_s = curr.iter().filter_map(|c| c.map(|(s, _)| s)).max().unwrap();
-        if curr.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
-            if max_s >= lo && max_s < hi {
-                let product: u128 = curr.iter().map(|c| c.unwrap().1 as u128).product();
-                total = total.saturating_add(product);
-            }
-            for (i, s) in streams.iter_mut().enumerate() {
-                curr[i] = s.next_group()?;
-            }
-        } else {
-            for (i, s) in streams.iter_mut().enumerate() {
-                if let Some((s_id, _)) = curr[i] {
-                    if s_id < max_s {
-                        curr[i] = s.next_group()?;
-                    }
-                }
-            }
+        if !heads.advance(&mut streams)? {
+            break;
         }
     }
     Ok(total)
@@ -1456,23 +1413,15 @@ fn merge_optional_count_range_overlay(
         opt.push(OptG { streams, cur });
     }
 
-    let mut req_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(req_streams.len());
-    for s in &mut req_streams {
-        req_cur.push(s.next_group()?);
-    }
+    let Some(mut heads) = InnerMergeHeads::prime(&mut req_streams)? else {
+        return Ok(0);
+    };
     let mut total: u128 = 0;
     loop {
-        if req_cur.iter().any(std::option::Option::is_none) {
-            break;
-        }
-        let max_s = req_cur
-            .iter()
-            .filter_map(|c| c.map(|(s, _)| s))
-            .max()
-            .unwrap();
-        if req_cur.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
+        if heads.aligned() {
+            let max_s = heads.key();
             if max_s >= lo && max_s < hi {
-                let mut product: u128 = req_cur.iter().map(|c| c.unwrap().1 as u128).product();
+                let mut product: u128 = heads.count_product();
                 for g in &mut opt {
                     let mut g_prod: u128 = 1;
                     for i in 0..g.streams.len() {
@@ -1501,17 +1450,9 @@ fn merge_optional_count_range_overlay(
                 }
                 total = total.saturating_add(product);
             }
-            for (i, s) in req_streams.iter_mut().enumerate() {
-                req_cur[i] = s.next_group()?;
-            }
-        } else {
-            for (i, s) in req_streams.iter_mut().enumerate() {
-                if let Some((s_id, _)) = req_cur[i] {
-                    if s_id < max_s {
-                        req_cur[i] = s.next_group()?;
-                    }
-                }
-            }
+        }
+        if !heads.advance(&mut req_streams)? {
+            break;
         }
     }
     Ok(total)
@@ -2127,42 +2068,25 @@ fn sum_star_join(
         iters.push(groups);
     }
 
-    let mut curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());
-    for it in &mut iters {
-        curr.push(it.next_group()?);
-    }
+    let Some(mut heads) = InnerMergeHeads::prime(&mut iters)? else {
+        return Ok(Some(0));
+    };
 
     let mut excl_idx: usize = 0;
     let mut incl_idx: usize = 0;
     let mut total: u128 = 0;
 
     loop {
-        if curr.iter().any(std::option::Option::is_none) {
-            break;
-        }
-
-        let max_s = curr.iter().filter_map(|c| c.map(|(s, _)| s)).max().unwrap();
-
-        if curr.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
-            let skip = is_excluded(max_s, exclude_sorted, &mut excl_idx)
-                || !is_included(max_s, include_sorted, &mut incl_idx);
-
+        if heads.aligned() {
+            let s = heads.key();
+            let skip = is_excluded(s, exclude_sorted, &mut excl_idx)
+                || !is_included(s, include_sorted, &mut incl_idx);
             if !skip {
-                let product: u128 = curr.iter().map(|c| c.unwrap().1 as u128).product();
-                total = total.saturating_add(product);
+                total = total.saturating_add(heads.count_product());
             }
-
-            for (i, it) in iters.iter_mut().enumerate() {
-                curr[i] = it.next_group()?;
-            }
-        } else {
-            for (i, it) in iters.iter_mut().enumerate() {
-                if let Some((s_id, _)) = curr[i] {
-                    if s_id < max_s {
-                        curr[i] = it.next_group()?;
-                    }
-                }
-            }
+        }
+        if !heads.advance(&mut iters)? {
+            break;
         }
     }
 
@@ -2458,34 +2382,23 @@ fn sum_optional_join(
         });
     }
 
-    // Prime required cursors.
-    let mut req_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(req_iters.len());
-    for it in &mut req_iters {
-        req_cur.push(it.next_group()?);
-    }
+    let Some(mut heads) = InnerMergeHeads::prime(&mut req_iters)? else {
+        return Ok(Some(0));
+    };
 
     let mut excl_idx: usize = 0;
     let mut incl_idx: usize = 0;
     let mut total: u128 = 0;
 
     loop {
-        if req_cur.iter().any(std::option::Option::is_none) {
-            break;
-        }
-
-        let max_s = req_cur
-            .iter()
-            .filter_map(|c| c.map(|(s, _)| s))
-            .max()
-            .unwrap();
-
-        if req_cur.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
+        if heads.aligned() {
+            let max_s = heads.key();
             let skip = is_excluded(max_s, exclude_sorted, &mut excl_idx)
                 || !is_included(max_s, include_sorted, &mut incl_idx);
 
             if !skip {
                 // Required product at this subject.
-                let mut product: u128 = req_cur.iter().map(|c| c.unwrap().1 as u128).product();
+                let mut product: u128 = heads.count_product();
 
                 // Multiply OPTIONAL group factors for this subject (streaming).
                 for g in &mut opt_groups {
@@ -2543,20 +2456,9 @@ fn sum_optional_join(
                     }
                 }
             }
-
-            // Advance required iterators.
-            for (i, it) in req_iters.iter_mut().enumerate() {
-                req_cur[i] = it.next_group()?;
-            }
-        } else {
-            // Advance smaller required subjects up to the current max.
-            for (i, it) in req_iters.iter_mut().enumerate() {
-                if let Some((s_id, _)) = req_cur[i] {
-                    if s_id < max_s {
-                        req_cur[i] = it.next_group()?;
-                    }
-                }
-            }
+        }
+        if !heads.advance(&mut req_iters)? {
+            break;
         }
     }
 

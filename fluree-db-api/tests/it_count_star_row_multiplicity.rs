@@ -44,6 +44,8 @@ use tempfile::TempDir;
 /// * `ex:Gadget` / `ex:tag`  — 5 pairs over 2 tagged subjects (3 + 2).
 /// * `ex:Gadget` / `ex:code` — 3 pairs over 2 subjects (2 + 1); crossed with
 ///   `ex:tag` it gives 3x2 + 2x1 = 8, which no single-predicate count produces.
+/// * `ex:mark` is on `ex:g1` alone, so an EXISTS/MINUS over it splits the
+///   tag x code cartesian into 6 (g1) and 2 (g2) — neither is a sum of counts.
 /// * `ex:g3` carries the type but no tag and no code, so an OPTIONAL tail has
 ///   a non-matching subject to preserve.
 /// * `ex:Widget` / `ex:name` — 4 pairs over 3 subjects, the issue's second
@@ -51,7 +53,7 @@ use tempfile::TempDir;
 const DATA: &str = r#"
 @prefix ex: <http://example.org/> .
 
-ex:g1 a ex:Gadget ; ex:tag "a" , "b" , "c" ; ex:code "x" , "y" .
+ex:g1 a ex:Gadget ; ex:tag "a" , "b" , "c" ; ex:code "x" , "y" ; ex:mark "m" .
 ex:g2 a ex:Gadget ; ex:tag "d" , "e" ; ex:code "z" .
 ex:g3 a ex:Gadget .
 
@@ -136,6 +138,27 @@ fn cases() -> Vec<Case> {
             name: "rows {?s a Gadget . ?s tag ?o . ?s code ?c}",
             sparql: "SELECT ?s WHERE { ?s a ex:Gadget . ?s ex:tag ?o . ?s ex:code ?c }",
             expected: "rows=8",
+        },
+        // ---- EXISTS / MINUS over the star: the filtered N-way count merge ---
+        // The filter side becomes a subject include/exclude list over the
+        // tag x code merge. g1 (marked): 3 x 2 = 6; g2 (unmarked): 2 x 1 = 2.
+        Case {
+            name: "COUNT(*) {?s tag ?o . ?s code ?c FILTER EXISTS {?s mark ?m}}",
+            sparql: "SELECT (COUNT(*) AS ?n) WHERE \
+                     { ?s ex:tag ?o . ?s ex:code ?c FILTER EXISTS { ?s ex:mark ?m } }",
+            expected: "n=6",
+        },
+        Case {
+            name: "COUNT(*) {?s tag ?o . ?s code ?c MINUS {?s mark ?m}}",
+            sparql: "SELECT (COUNT(*) AS ?n) WHERE \
+                     { ?s ex:tag ?o . ?s ex:code ?c MINUS { ?s ex:mark ?m } }",
+            expected: "n=2",
+        },
+        Case {
+            name: "COUNT(*) {?s tag ?o . ?s code ?c FILTER NOT EXISTS {?s mark ?m}}",
+            sparql: "SELECT (COUNT(*) AS ?n) WHERE \
+                     { ?s ex:tag ?o . ?s ex:code ?c FILTER NOT EXISTS { ?s ex:mark ?m } }",
+            expected: "n=2",
         },
         // ---- OPTIONAL tail folded into the same block -----------------------
         // g1 -> 3, g2 -> 2, g3 -> 1 unmatched row = 6.
