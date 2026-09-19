@@ -530,3 +530,125 @@ async fn graph_source_info_redacts_a_stored_azure_secret() {
     assert!(!info.contains("hunter2-do-not-leak"), "{info}");
     assert!(info.contains("client-visible"), "{info}");
 }
+
+/// View policy on a Delta source: request policies through the shared R2RML
+/// gate, and a registered model ledger supplying rules and default-allow —
+/// the record's `model` / `default_allow` are read by Delta-specific code.
+#[tokio::test]
+async fn view_policies_govern_a_delta_source() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = fixtures().canonicalize().expect("fixtures dir");
+    let context = json!({ "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" });
+
+    // `dim_store` has three stores; `fact_order` six orders with five totals.
+    let names = |from: &str, opts: Value| {
+        let mut q = json!({
+            "@context": context.clone(),
+            "from": from,
+            "select": ["?name"],
+            "where": { "@id": "?s", "ex:storeName": "?name" },
+        });
+        if !opts.is_null() {
+            q["opts"] = opts;
+        }
+        q
+    };
+    let totals = |from: &str, opts: Value| {
+        json!({
+            "@context": context.clone(),
+            "from": from,
+            "opts": opts,
+            "select": ["?total"],
+            "where": { "@id": "?o", "ex:total": "?total" },
+        })
+    };
+    let count = |fluree: &Fluree, q: Value| {
+        let fluree = fluree.clone();
+        async move {
+            fluree
+                .query_from()
+                .jsonld(&q)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{q}: {e}"))
+                .as_array()
+                .map_or(0, Vec::len)
+        }
+    };
+
+    // --- Request policies on an ungoverned source.
+    let mut open = DeltaCreateConfig::new("delta-open", root.to_str().unwrap(), MAPPING);
+    open.mapping_media_type = Some("text/turtle".to_string());
+    fluree
+        .create_delta_graph_source(open)
+        .await
+        .expect("open source");
+    let open = "delta-open:main";
+    let hide_names = json!([{
+        "@id": "ex:hideNames", "@type": "f:AccessPolicy", "f:action": "f:view",
+        "f:onProperty": [{ "@id": "http://example.org/storeName" }], "f:allow": false
+    }]);
+    let deny_names = json!({ "policy": hide_names, "default-allow": true });
+    assert_eq!(count(&fluree, names(open, Value::Null)).await, 3);
+    assert_eq!(count(&fluree, names(open, deny_names.clone())).await, 0);
+    assert_eq!(
+        count(&fluree, totals(open, deny_names)).await,
+        5,
+        "the deny targets one property only"
+    );
+    assert_eq!(
+        count(
+            &fluree,
+            names(open, json!({ "policy": [], "default-allow": false }))
+        )
+        .await,
+        0,
+        "no matching rule and default-allow false"
+    );
+
+    // --- A model ledger: baseline rule hides totals, a reader class grants them.
+    const MODEL: &str = "delta-governance:main";
+    let ledger = fluree.create_ledger(MODEL).await.expect("model ledger");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@graph": [
+                    { "@id": "ex:hideTotals", "@type": "f:AccessPolicy", "f:action": { "@id": "f:view" },
+                      "f:onProperty": [{ "@id": "ex:total" }], "f:allow": false },
+                    { "@id": "ex:readTotals", "@type": "ex:ReaderPolicy", "f:action": { "@id": "f:view" },
+                      "f:onProperty": [{ "@id": "ex:total" }], "f:allow": true },
+                    { "@id": "http://example.org/users/reader", "f:policyClass": { "@id": "ex:ReaderPolicy" } }
+                ]
+            }),
+        )
+        .await
+        .expect("seed model ledger");
+    let mut governed = DeltaCreateConfig::new("delta-governed", root.to_str().unwrap(), MAPPING);
+    governed.mapping_media_type = Some("text/turtle".to_string());
+    governed.model = Some(MODEL.to_string());
+    governed.default_allow = Some(true);
+    fluree
+        .create_delta_graph_source(governed)
+        .await
+        .expect("governed source");
+    let governed = "delta-governed:main";
+
+    // No request options at all: the registered model and default-allow apply.
+    assert_eq!(
+        count(&fluree, names(governed, Value::Null)).await,
+        3,
+        "registered default-allow keeps unrestricted properties readable"
+    );
+    let mut bare_totals = totals(governed, Value::Null);
+    bare_totals.as_object_mut().unwrap().remove("opts");
+    assert_eq!(
+        count(&fluree, bare_totals).await,
+        0,
+        "the model's baseline rule hides totals"
+    );
+    let reader = json!({ "identity": "http://example.org/users/reader", "default-allow": false });
+    assert_eq!(count(&fluree, totals(governed, reader)).await, 5);
+}
