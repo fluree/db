@@ -237,6 +237,18 @@ data file — provided every file records one, no file carries a deletion
 vector, and statistics show no null in the columns the count depends on.
 Otherwise the table is scanned.
 
+**The transaction log.** Every query that does not pin a version checks the
+table's log for new commits, so it always reads the table's current version.
+It does not read the log again from the start: the server remembers the last
+version it read of each table, with that version's list of data files, and
+reads only the commits added since. A repeat query of an unchanged table costs
+one listing of the log directory and one metadata request, and reads nothing; the four most recently used
+pinned versions of a table are remembered the same way. A table that is
+deleted and written again under the same path is noticed and read afresh.
+File lists are held up to a process-wide `FLUREE_DELTA_LOG_CACHE_MB` (default
+256; a table whose list does not fit is planned from its log on every query,
+and `0` turns the memory off).
+
 ## Time travel
 
 An alias with a time specification reads every table of the source at the

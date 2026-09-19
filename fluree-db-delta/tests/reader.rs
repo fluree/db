@@ -393,6 +393,233 @@ async fn an_absolute_data_path_outside_the_allowlist_is_refused_at_read() {
     assert!(chain.contains("PermissionDenied"), "{chain}");
 }
 
+/// A copy of a fixture whose log is cut back to a version, then grown the way
+/// a writer grows it: one commit at a time, a checkpoint with its commit.
+struct Growing {
+    _dir: tempfile::TempDir,
+    log: PathBuf,
+    held: PathBuf,
+    table: DeltaTable,
+}
+
+impl Growing {
+    fn new(fixture: &str, through: u64) -> Self {
+        allow_roots();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(fixture);
+        copy_dir_all(&fixtures().join(fixture), &root);
+        let log = root.join("_delta_log");
+        let held = dir.path().join("held");
+        std::fs::create_dir_all(&held).unwrap();
+        for entry in std::fs::read_dir(&log).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                std::fs::rename(entry.path(), held.join(entry.file_name())).unwrap();
+            }
+        }
+        let table = DeltaTable::open(fixture, root.to_str().unwrap(), &DeltaIoConfig::default())
+            .expect("open table");
+        let growing = Self {
+            _dir: dir,
+            log,
+            held,
+            table,
+        };
+        for version in 0..=through {
+            growing.publish(version);
+        }
+        growing
+    }
+
+    fn publish(&self, version: u64) {
+        let prefix = format!("{version:020}.");
+        let mut checkpointed = false;
+        for entry in std::fs::read_dir(&self.held).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            if name.starts_with(&prefix) {
+                checkpointed |= name.contains("checkpoint");
+                std::fs::rename(self.held.join(&name), self.log.join(&name)).unwrap();
+            }
+        }
+        if checkpointed {
+            std::fs::rename(
+                self.held.join("_last_checkpoint"),
+                self.log.join("_last_checkpoint"),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Remove every log file except the newest commit.
+    fn lose_the_log_below(&self, version: u64) {
+        let tip = format!("{version:020}.json");
+        for entry in std::fs::read_dir(&self.log).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() && entry.file_name() != *tip {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+    }
+
+    async fn latest(&self) -> DeltaSnapshot {
+        self.table.snapshot(VersionSelector::Latest).await.unwrap()
+    }
+}
+
+/// One handle kept across a table's whole life reads each new version from the
+/// commits past the last one. Every step must match the rows the generators
+/// wrote: appends, a rewritten file, a delete, a schema change, deletion
+/// vectors, partitions, and a checkpoint landing mid-way.
+#[tokio::test]
+async fn a_handle_kept_while_a_table_grows_reads_every_new_version() {
+    let orders = Growing::new("fact_order", 0);
+    let cols = ["order_id", "store_id", "amount", "region"];
+    let v0 = vec![
+        vec![int(1), int(1), int(100), s("east")],
+        vec![int(2), int(2), int(200), s("west")],
+        vec![int(3), int(1), Cell::Null, s("east")],
+        vec![int(4), int(3), int(400), Cell::Null],
+    ];
+    let mut v1 = v0.clone();
+    v1.push(vec![int(5), int(2), int(500), s("west")]);
+    v1.push(vec![int(6), int(1), int(600), s("east")]);
+    let mut v2 = v1.clone();
+    v2[1][2] = int(250);
+    let v3: Vec<_> = v2[1..].to_vec();
+    let mut v4 = v3.clone();
+    v4.push(vec![int(7), int(1), int(700), s("east")]);
+    for (version, expected) in [(0, &v0), (1, &v1), (2, &v2), (3, &v3), (4, &v4)] {
+        orders.publish(version);
+        let latest = orders.latest().await;
+        assert_eq!(latest.version(), version);
+        assert_eq!(
+            &rows(&latest, &cols).await,
+            expected,
+            "fact_order v{version}"
+        );
+    }
+
+    let vectors = Growing::new("deletion_vectors", 0);
+    let removed = [0, 1, 1023, 1024, 2047, 2048, 3071, 4094, 4095];
+    assert_eq!(rows(&vectors.latest().await, &["id"]).await.len(), 4096);
+    vectors.publish(1);
+    let latest = vectors.latest().await;
+    assert_eq!(
+        rows(&latest, &["id"]).await,
+        (0..4096)
+            .filter(|i| !removed.contains(i))
+            .map(|i| vec![int(i)])
+            .collect::<Vec<_>>()
+    );
+    // Rows a deletion vector hides make the log's count unusable.
+    assert_eq!(latest.exact_row_count(&[]).await.unwrap(), None);
+
+    let sales = Growing::new("partitioned", 0);
+    for version in 0..6_u64 {
+        sales.publish(version);
+        let latest = sales.latest().await;
+        let expected: Vec<_> = (0..=version as i64)
+            .flat_map(|file| (0..4).map(move |i| vec![int(file * 100 + i)]))
+            .collect();
+        assert_eq!(
+            rows(&latest, &["id"]).await,
+            expected,
+            "partitioned v{version}"
+        );
+        // The grown listing still carries what skipping and counting need.
+        let newest = filter("id", FilterOp::GtEq, FilterValue::Int(version as i64 * 100));
+        assert_eq!(latest.file_count(&[newest]).await.unwrap(), 1);
+        assert_eq!(
+            latest.exact_row_count(&[]).await.unwrap(),
+            Some((version + 1) * 4)
+        );
+    }
+
+    let checkpointed = Growing::new("checkpointed", 8);
+    for version in 8..13_u64 {
+        checkpointed.publish(version);
+        let latest = checkpointed.latest().await;
+        assert_eq!(
+            rows(&latest, &["id", "amount"]).await,
+            (0..=version as i64)
+                .map(|i| vec![int(i), int(i * 1000)])
+                .collect::<Vec<_>>(),
+            "checkpointed v{version}"
+        );
+    }
+}
+
+/// With the log gone but for its newest commit, a replay cannot succeed — so a
+/// read that does succeed was served from what the handle remembers.
+#[tokio::test]
+async fn a_repeat_read_does_not_replay_the_log() {
+    let expected = |through: i64| -> Vec<Vec<Cell>> {
+        (0..=through).map(|i| vec![int(i), int(i * 1000)]).collect()
+    };
+    let growing = Growing::new("checkpointed", 11);
+    let cols = ["id", "amount"];
+    assert_eq!(rows(&growing.latest().await, &cols).await, expected(11));
+    let pinned = |version| growing.table.snapshot(VersionSelector::Version(version));
+    assert_eq!(rows(&pinned(9).await.unwrap(), &cols).await, expected(9));
+
+    growing.lose_the_log_below(11);
+    let fresh = DeltaTable::open(
+        "checkpointed",
+        growing.log.parent().unwrap().to_str().unwrap(),
+        &DeltaIoConfig::default(),
+    )
+    .unwrap();
+    assert!(fresh.snapshot(VersionSelector::Latest).await.is_err());
+
+    let again = growing.latest().await;
+    assert_eq!(again.version(), 11);
+    assert_eq!(rows(&again, &cols).await, expected(11));
+    assert_eq!(rows(&pinned(9).await.unwrap(), &cols).await, expected(9));
+    // A version never asked for still needs the log.
+    assert!(pinned(5).await.is_err());
+
+    // A new commit is read on its own, on top of what is remembered.
+    growing.publish(12);
+    let grown = growing.latest().await;
+    assert_eq!(grown.version(), 12);
+    assert_eq!(rows(&grown, &cols).await, expected(12));
+}
+
+/// A table dropped and rewritten under the same path is a different log; what
+/// was remembered of the old one must not be extended with the new one's commits.
+#[tokio::test]
+async fn a_table_rewritten_in_place_is_read_afresh() {
+    let growing = Growing::new("checkpointed", 3);
+    assert_eq!(rows(&growing.latest().await, &["id"]).await.len(), 4);
+    assert_eq!(
+        growing
+            .table
+            .snapshot(VersionSelector::Version(1))
+            .await
+            .unwrap()
+            .column_names(),
+        ["id", "amount"]
+    );
+
+    // Same path, more versions than were remembered, different rows.
+    let root = growing.log.parent().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    copy_dir_all(&fixtures().join("fact_order"), root);
+
+    let latest = growing.latest().await;
+    assert_eq!(latest.version(), 4);
+    assert_eq!(
+        rows(&latest, &["order_id"]).await,
+        (2..=7).map(|i| vec![int(i)]).collect::<Vec<_>>()
+    );
+    let v1 = growing
+        .table
+        .snapshot(VersionSelector::Version(1))
+        .await
+        .unwrap();
+    assert_eq!(rows(&v1, &["order_id"]).await.len(), 6);
+}
+
 /// Building an Azure store is offline (tokens are fetched on first read), so
 /// this pins the configuration contract without an Azure account.
 #[tokio::test]

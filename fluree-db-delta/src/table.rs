@@ -2,6 +2,11 @@
 //!
 //! Kernel's API is synchronous over a background executor, so every call into
 //! it runs on the blocking pool.
+//!
+//! A table handle remembers the last version it resolved. The next unpinned
+//! read lists the log for commits past it instead of replaying the log, so it
+//! still sees every new commit; a version's file listing is kept with it (see
+//! [`crate::listing`]).
 
 use std::collections::VecDeque;
 use std::num::NonZero;
@@ -29,6 +34,7 @@ use crate::bridge::BatchBridge;
 use crate::config::DeltaIoConfig;
 use crate::error::{DeltaError, Result};
 use crate::filter::{ColumnFilter, RowFilter};
+use crate::listing::Listing;
 
 type Engine = DefaultEngine<TokioMultiThreadExecutor>;
 
@@ -84,13 +90,70 @@ pub enum VersionSelector {
     AsOfTimestampMs(i64),
 }
 
-/// A Delta table and the engine that reads it. Cheap to clone; safe to cache
-/// for the life of the process (it holds no table state).
+/// Pinned versions remembered per table.
+const PINNED_KEPT: usize = 4;
+
+/// A Delta table and the engine that reads it. Cheap to clone; clones share
+/// the remembered versions.
 #[derive(Clone)]
 pub struct DeltaTable {
     name: Arc<str>,
     url: Url,
     engine: Arc<Engine>,
+    known: Arc<Mutex<Known>>,
+    /// Held across a first resolution, so concurrent first queries replay the
+    /// log once between them.
+    cold: Arc<Mutex<()>>,
+}
+
+#[derive(Default)]
+struct Known {
+    latest: Option<Resolved>,
+    /// Most recently used first.
+    pinned: VecDeque<Resolved>,
+}
+
+/// A resolved version and its file listing, shared by every reader of it.
+#[derive(Clone)]
+struct Resolved {
+    snapshot: SnapshotRef,
+    files: Arc<Mutex<Files>>,
+}
+
+enum Files {
+    /// Not listed yet; an earlier version's listing to build on, if any.
+    Unlisted(Option<(u64, Arc<Listing>)>),
+    Listed(Arc<Listing>),
+    /// Too large to keep: every scan plans from the log.
+    Unbounded,
+}
+
+impl Resolved {
+    fn new(snapshot: SnapshotRef, files: Files) -> Self {
+        Self {
+            snapshot,
+            files: Arc::new(Mutex::new(files)),
+        }
+    }
+
+    fn version(&self) -> u64 {
+        self.snapshot.version()
+    }
+
+    /// What a later version of this table starts its listing from.
+    fn successor_files(&self) -> Files {
+        match &*lock(&self.files) {
+            Files::Listed(listing) => Files::Unlisted(Some((self.version(), listing.clone()))),
+            Files::Unlisted(prior) => Files::Unlisted(prior.clone()),
+            Files::Unbounded => Files::Unbounded,
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl std::fmt::Debug for DeltaTable {
@@ -115,6 +178,8 @@ impl DeltaTable {
                     .with_batch_size(BATCH_ROWS)
                     .build(),
             ),
+            known: Arc::default(),
+            cold: Arc::default(),
         })
     }
 
@@ -130,46 +195,149 @@ impl DeltaTable {
     }
 
     fn snapshot_blocking(&self, selector: VersionSelector) -> Result<DeltaSnapshot> {
-        let engine = self.engine.as_ref();
-        let build = |version: Option<u64>| {
-            let builder = Snapshot::builder_for(self.url.clone());
-            match version {
-                Some(v) => builder.at_version(v),
-                None => builder,
-            }
-            .build(engine)
-        };
-        let snapshot = match selector {
-            VersionSelector::Latest => build(None).map_err(|e| self.kernel(e))?,
-            VersionSelector::Version(version) => {
-                let latest = build(None).map_err(|e| self.kernel(e))?;
-                match version.cmp(&latest.version()) {
-                    std::cmp::Ordering::Equal => latest,
-                    std::cmp::Ordering::Greater => return Err(self.version_not_found(version)),
-                    // Older than latest: the log no longer reaching it (cleanup)
-                    // is the expected failure, so report it as the missing pin.
-                    std::cmp::Ordering::Less => build(Some(version)).map_err(|e| {
-                        tracing::debug!(table = %self.name, version, error = %e, "Delta version not reconstructable");
-                        self.version_not_found(version)
-                    })?,
-                }
-            }
+        let latest = self.latest()?;
+        let resolved = match selector {
+            VersionSelector::Latest => latest,
+            VersionSelector::Version(version) => match version.cmp(&latest.version()) {
+                std::cmp::Ordering::Equal => latest,
+                std::cmp::Ordering::Greater => return Err(self.version_not_found(version)),
+                // Older than latest: the log no longer reaching it (cleanup)
+                // is the expected failure, so report it as the missing pin.
+                std::cmp::Ordering::Less => self.pinned(version).map_err(|e| {
+                    tracing::debug!(table = %self.name, version, error = %e, "Delta version not reconstructable");
+                    self.version_not_found(version)
+                })?,
+            },
             VersionSelector::AsOfTimestampMs(ms) => {
-                let latest = build(None).map_err(|e| self.kernel(e))?;
-                let commit =
-                    latest_version_as_of(&latest, engine, ms, HistoryCommitType::Recreatable)
-                        .map_err(|e| self.time_error(ms, e))?;
+                let commit = latest_version_as_of(
+                    &latest.snapshot,
+                    self.engine.as_ref(),
+                    ms,
+                    HistoryCommitType::Recreatable,
+                )
+                .map_err(|e| self.time_error(ms, e))?;
                 if commit.version == latest.version() {
                     latest
                 } else {
-                    build(Some(commit.version)).map_err(|e| self.kernel(e))?
+                    self.pinned(commit.version)?
                 }
             }
         };
         Ok(DeltaSnapshot {
             table: self.clone(),
-            snapshot,
+            snapshot: resolved.snapshot,
+            files: resolved.files,
         })
+    }
+
+    fn replay(&self, version: Option<u64>) -> Result<Resolved> {
+        let builder = Snapshot::builder_for(self.url.clone());
+        let snapshot = match version {
+            Some(v) => builder.at_version(v),
+            None => builder,
+        }
+        .build(self.engine.as_ref())
+        .map_err(|e| self.kernel(e))?;
+        Ok(Resolved::new(snapshot, Files::Unlisted(None)))
+    }
+
+    /// The table's current version, always checked against storage.
+    fn latest(&self) -> Result<Resolved> {
+        if crate::listing::budget() == 0 {
+            return self.replay(None);
+        }
+        let mut known = lock(&self.known).latest.clone();
+        let _cold;
+        if known.is_none() {
+            _cold = lock(&self.cold);
+            known = lock(&self.known).latest.clone();
+        }
+        let resolved = match known {
+            Some(known) => match self.advance(&known) {
+                Some(advanced) => advanced,
+                None => {
+                    // Not the log that was remembered: forget all of it.
+                    *lock(&self.known) = Known::default();
+                    self.replay(None)?
+                }
+            },
+            None => self.replay(None)?,
+        };
+        let mut slot = lock(&self.known);
+        if slot
+            .latest
+            .as_ref()
+            .is_none_or(|held| held.version() <= resolved.version())
+        {
+            slot.latest = Some(resolved.clone());
+        }
+        Ok(resolved)
+    }
+
+    /// `known` brought up to the log's current end by reading only the commits
+    /// past it. `None` when the log is no longer the one `known` was read from
+    /// (a table dropped and rewritten in place) or cannot be extended.
+    fn advance(&self, known: &Resolved) -> Option<Resolved> {
+        let engine = self.engine.as_ref();
+        // Kernel extends a snapshot without re-reading what it already holds,
+        // so check that for it: the commit it ends on must be unchanged.
+        let tip = &known
+            .snapshot
+            .log_segment()
+            .listed
+            .latest_commit_file
+            .as_ref()?
+            .location;
+        let (now, advanced) = std::thread::scope(|scope| {
+            let head = scope.spawn(|| engine.storage_handler().head(&tip.location));
+            let advanced = Snapshot::builder_from(known.snapshot.clone()).build(engine);
+            (head.join(), advanced)
+        });
+        let unchanged = matches!(
+            &now,
+            Ok(Ok(now)) if now.size == tip.size && now.last_modified == tip.last_modified
+        );
+        let snapshot = match advanced {
+            Ok(snapshot) if unchanged => snapshot,
+            Ok(_) => {
+                tracing::debug!(table = %self.name, "Delta log replaced since last read; replaying");
+                return None;
+            }
+            Err(e) => {
+                tracing::debug!(table = %self.name, error = %e, "Delta log not extendable; replaying");
+                return None;
+            }
+        };
+        Some(if snapshot.version() == known.version() {
+            // Possibly a newer checkpoint under the same version: same files.
+            Resolved {
+                snapshot,
+                files: known.files.clone(),
+            }
+        } else {
+            Resolved::new(snapshot, known.successor_files())
+        })
+    }
+
+    /// A version older than latest. A version never changes, so a remembered
+    /// one is served as it was.
+    fn pinned(&self, version: u64) -> Result<Resolved> {
+        let keep = crate::listing::budget() > 0;
+        if keep {
+            let mut known = lock(&self.known);
+            if let Some(at) = known.pinned.iter().position(|r| r.version() == version) {
+                let hit = known.pinned.remove(at).expect("position is in range");
+                known.pinned.push_front(hit.clone());
+                return Ok(hit);
+            }
+        }
+        let resolved = self.replay(Some(version))?;
+        if keep {
+            let mut known = lock(&self.known);
+            known.pinned.push_front(resolved.clone());
+            known.pinned.truncate(PINNED_KEPT);
+        }
+        Ok(resolved)
     }
 
     fn kernel(&self, error: delta_kernel::Error) -> DeltaError {
@@ -213,6 +381,7 @@ impl DeltaTable {
 pub struct DeltaSnapshot {
     table: DeltaTable,
     snapshot: SnapshotRef,
+    files: Arc<Mutex<Files>>,
 }
 
 impl DeltaSnapshot {
@@ -386,15 +555,46 @@ impl DeltaSnapshot {
             .map_err(|e| self.table.kernel(e))
     }
 
+    /// This version's file listing, made on first use. `None` when it is too
+    /// large to keep.
+    fn listing(&self) -> Result<Option<Arc<Listing>>> {
+        let kernel = |e| self.table.kernel(e);
+        let engine = self.table.engine.as_ref();
+        // Held while listing: concurrent scans of one version share one replay.
+        let mut files = lock(&self.files);
+        let prior = match &*files {
+            Files::Listed(listing) => return Ok(Some(listing.clone())),
+            Files::Unbounded => return Ok(None),
+            Files::Unlisted(prior) => prior.clone(),
+        };
+        let everything = self.build_scan(None, None)?;
+        let listed = match prior {
+            Some((version, listing)) => Listing::collect(
+                everything
+                    .scan_metadata_from(engine, version, listing.data(), None)
+                    .map_err(kernel)?,
+            ),
+            None => Listing::collect(everything.scan_metadata(engine).map_err(kernel)?),
+        }
+        .map_err(kernel)?;
+        *files = listed.clone().map_or(Files::Unbounded, Files::Listed);
+        Ok(listed)
+    }
+
     fn files(&self, scan: &Scan) -> Result<Vec<ScanFile>> {
         fn push(files: &mut Vec<ScanFile>, file: ScanFile) {
             files.push(file);
         }
+        let kernel = |e| self.table.kernel(e);
+        let engine = self.table.engine.as_ref();
+        let planned: Box<dyn Iterator<Item = _>> = match self.listing()? {
+            Some(listing) => scan
+                .scan_metadata_from(engine, self.version(), listing.data(), None)
+                .map_err(kernel)?,
+            None => Box::new(scan.scan_metadata(engine).map_err(kernel)?),
+        };
         let mut files = Vec::new();
-        for metadata in scan
-            .scan_metadata(self.table.engine.as_ref())
-            .map_err(|e| self.table.kernel(e))?
-        {
+        for metadata in planned {
             files = metadata
                 .and_then(|m| m.visit_scan_files(files, push))
                 .map_err(|e| self.table.kernel(e))?;

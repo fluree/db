@@ -443,3 +443,89 @@ async fn a_filter_skips_files_and_a_bare_count_reads_none() {
         "{count}"
     );
 }
+
+/// Queries share one handle per table, which remembers the last version it
+/// read. With the older commits removed a log replay cannot succeed, so the
+/// second query's answer shows both halves of the contract: what was read is
+/// not read again, and a commit landing between two queries is still seen.
+#[tokio::test]
+async fn a_commit_between_two_queries_is_seen_without_replaying_the_log() {
+    let lake = tempfile::tempdir().unwrap();
+    let lake_root = lake.path().canonicalize().unwrap();
+    copy_dir_all(
+        &fixtures().join("partitioned"),
+        &lake_root.join("partitioned"),
+    );
+    let log = lake_root.join("partitioned/_delta_log");
+    let held = lake_root.join("held");
+    std::fs::create_dir_all(&held).unwrap();
+    let version_of = |name: &str| name.get(..20).and_then(|v| v.parse::<u64>().ok());
+    for entry in std::fs::read_dir(&log).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        if version_of(&name).is_some_and(|v| v >= 3) {
+            std::fs::rename(entry.path(), held.join(&name)).unwrap();
+        }
+    }
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+        <http://example.org/mapping#Sale> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "partitioned" ] ;
+            rr:subjectMap [ rr:template "http://example.org/sale/{id}" ; rr:class ex:Sale ] ;
+            rr:predicateObjectMap [ rr:predicate ex:saleId ; rr:objectMap [ rr:column "id" ; rr:datatype xsd:integer ] ] .
+    "#;
+    let mut config = DeltaCreateConfig::new("growing", lake_root.to_str().unwrap(), mapping);
+    config.mapping_media_type = Some("text/turtle".to_string());
+    fluree.create_delta_graph_source(config).await.unwrap();
+
+    let ask = |body: &'static str| {
+        let fluree = fluree.clone();
+        async move {
+            let sparql = format!(
+                "PREFIX ex: <http://example.org/>\n{}",
+                body.replace("$FROM", "FROM <growing:main>")
+            );
+            let answer = fluree
+                .query_from()
+                .sparql(&sparql)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{body}: {e}"));
+            let mut values: Vec<i64> = answer["results"]["bindings"]
+                .as_array()
+                .expect("bindings")
+                .iter()
+                .map(|b| b["v"]["value"].as_str().unwrap().parse().unwrap())
+                .collect();
+            values.sort_unstable();
+            values
+        }
+    };
+    const COUNT: &str = "SELECT (COUNT(?s) AS ?v) $FROM WHERE { ?s a ex:Sale }";
+    const NEWEST: &str = "SELECT ?v $FROM WHERE { ?s ex:saleId ?v FILTER(?v >= 200) }";
+
+    assert_eq!(ask(COUNT).await, [12]);
+    assert_eq!(ask(NEWEST).await, [200, 201, 202, 203]);
+
+    for entry in std::fs::read_dir(&log).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        if version_of(&name).is_some_and(|v| v < 2) {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    assert_eq!(ask(COUNT).await, [12]);
+
+    for entry in std::fs::read_dir(&held).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        if version_of(&name) == Some(3) {
+            std::fs::rename(held.join(&name), log.join(&name)).unwrap();
+        }
+    }
+    assert_eq!(ask(COUNT).await, [16]);
+    assert_eq!(ask(NEWEST).await, [200, 201, 202, 203, 300, 301, 302, 303]);
+}

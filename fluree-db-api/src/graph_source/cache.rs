@@ -149,8 +149,9 @@ pub struct R2rmlCache {
     #[cfg(feature = "sql")]
     sql_clients: SyncCache<String, Arc<TrinoClient>>,
     /// Process-wide Delta table handles keyed by location + io options. A
-    /// handle owns an engine with a background I/O thread and holds no table
-    /// state, so queries share it; the TTL bounds a stale store configuration.
+    /// handle owns the table's store and remembers the last version it read,
+    /// which the next query extends rather than replays; the TTL bounds a
+    /// stale store configuration.
     #[cfg(feature = "delta")]
     delta_tables: SyncCache<String, fluree_db_delta::DeltaTable>,
 }

@@ -17,7 +17,9 @@ fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false }
 # major and hard-enables `object_store` 0.13 with its cloud backends, which
 # still use reqwest 0.12; that duplicate goes away when Kernel moves to
 # `object_store` 0.14.
-delta_kernel = { version = "=0.28.0", features = ["arrow-58"] }
+# `internal-api` exposes planning a scan from a kept file listing; the exact
+# version pin is what makes relying on it safe.
+delta_kernel = { version = "=0.28.0", features = ["arrow-58", "internal-api"] }
 delta_kernel_default_engine = { version = "=0.28.0", default-features = false, features = ["arrow-58", "rustls"] }
 
 async-trait.workspace = true
