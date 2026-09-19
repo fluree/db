@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -109,6 +110,61 @@ def generate(root):
         stamps = [a["commitInfo"]["inCommitTimestamp"] for a in actions(timed) if "commitInfo" in a]
         assert len(stamps) == 3 and stamps == sorted(set(stamps)), stamps
         tables["in_commit_time"]["commit_timestamps_ms"] = stamps
+
+        # Thirteen commits cross Spark's checkpoint interval of ten. log_cleaned
+        # is the same table after log retention: only the checkpoint and the
+        # commits after it remain, so versions before it cannot be rebuilt.
+        ckpt = root / "checkpointed"
+        ckpt_rows = []
+        for i in range(13):
+            ckpt_rows.append({"id": i, "amount": i * 1000})
+            (spark.createDataFrame(ckpt_rows[-1:], "id long, amount long").coalesce(1)
+             .write.format("delta").mode("append").save(str(ckpt)))
+            save("checkpointed", ckpt_rows)
+        assert (ckpt / "_delta_log" / f"{10:020}.checkpoint.parquet").is_file()
+        cleaned = root / "log_cleaned"
+        shutil.copytree(ckpt, cleaned)
+        for log in (cleaned / "_delta_log").iterdir():
+            stem = log.name.lstrip(".")[:20]
+            if stem.isdigit() and int(stem) < 10:
+                log.unlink()
+        tables["log_cleaned"] = {"key": "id", "oldest_version": 10, "versions": [
+            v for v in copy.deepcopy(tables["checkpointed"]["versions"]) if v["version"] >= 10]}
+
+        # Every scalar type a mapping can address, written by Spark rather than
+        # assembled as Arrow arrays, with a null in each nullable column.
+        typed = root / "types"
+        spark.sql(f"""CREATE TABLE {sql_table('types')} (
+            id BIGINT, flag BOOLEAN, tiny TINYINT, small SMALLINT, num INT, ratio DOUBLE,
+            approx FLOAT, price DECIMAL(10,2), big DECIMAL(38,10), day DATE, at TIMESTAMP,
+            wall TIMESTAMP_NTZ, label STRING, blob BINARY) USING delta""")
+        spark.conf.set("spark.sql.session.timeZone", "UTC")
+        spark.sql(f"""INSERT INTO {sql_table('types')} VALUES
+            (1, true, 7, 300, 70000, 1.5, 2.5, 19.99, 12345678901234567890.0123456789,
+             DATE'2024-02-29', TIMESTAMP'2024-02-29 12:34:56.789', TIMESTAMP_NTZ'2024-02-29 01:02:03',
+             'alpha', X'00FF10'),
+            (2, false, -7, -300, -70000, -0.25, -8.0, -0.01, -1.0000000001,
+             DATE'1969-12-31', TIMESTAMP'1969-12-31 23:59:59.5', TIMESTAMP_NTZ'1969-12-31 23:59:59',
+             '', X''),
+            (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)""")
+        tables["types"] = {"key": "id", "versions": [{"version": 1, "rows": 3}]}
+
+        # Six files whose id ranges and partition values are disjoint, so a
+        # predicate on either provably excludes whole files.
+        parts = root / "partitioned"
+        part_rows = []
+        for wave in range(2):
+            for r, region in enumerate(["east", "north", "west"]):
+                base = (wave * 3 + r) * 100
+                rows_here = [{"id": base + i, "amount": (base + i) * 10, "region": region}
+                             for i in range(4)]
+                part_rows += rows_here
+                (spark.createDataFrame(rows_here, "id long, amount long, region string").coalesce(1)
+                 .write.format("delta").mode("append").partitionBy("region").save(str(parts)))
+        tables["partitioned"] = {"key": "id", "versions": []}
+        save("partitioned", sorted(part_rows, key=lambda r: r["id"]))
+        live = [a["add"] for a in actions(parts) if "add" in a]
+        assert len(live) == 6 and all("minValues" in a["stats"] for a in live), live
 
         loss = root / "history_loss"
         spark.createDataFrame(small, "id long, amount long").coalesce(1).write.format("delta").save(str(loss))
