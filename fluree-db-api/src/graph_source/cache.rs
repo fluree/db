@@ -148,6 +148,11 @@ pub struct R2rmlCache {
     /// `LIMIT 0` round trip.
     #[cfg(feature = "sql")]
     sql_clients: SyncCache<String, Arc<TrinoClient>>,
+    /// Process-wide Delta table handles keyed by location + io options. A
+    /// handle owns an engine with a background I/O thread and holds no table
+    /// state, so queries share it; the TTL bounds a stale store configuration.
+    #[cfg(feature = "delta")]
+    delta_tables: SyncCache<String, fluree_db_delta::DeltaTable>,
 }
 
 // moka::sync::Cache is Send+Sync but doesn't implement Debug
@@ -202,6 +207,11 @@ impl R2rmlCache {
                 #[cfg(feature = "sql")]
                 sql_clients: SyncCache::builder()
                     .max_capacity(64)
+                    .time_to_live(Duration::from_secs(rest_client_ttl_secs()))
+                    .build(),
+                #[cfg(feature = "delta")]
+                delta_tables: SyncCache::builder()
+                    .max_capacity(256)
                     .time_to_live(Duration::from_secs(rest_client_ttl_secs()))
                     .build(),
             }
@@ -318,6 +328,26 @@ impl R2rmlCache {
     #[cfg(feature = "sql")]
     pub(crate) fn put_sql_client(&self, key: String, client: Arc<TrinoClient>) {
         self.sql_clients.insert(key, client);
+    }
+
+    /// The shared handle for the Delta table at `location`, opened on first use.
+    #[cfg(feature = "delta")]
+    pub(crate) fn delta_table(
+        &self,
+        table_name: &str,
+        location: &str,
+        io: &fluree_db_delta::DeltaIoConfig,
+    ) -> fluree_db_delta::Result<fluree_db_delta::DeltaTable> {
+        let key = format!(
+            "{location}\u{1f}{}",
+            serde_json::to_string(io).unwrap_or_default()
+        );
+        if let Some(table) = self.delta_tables.get(&key) {
+            return Ok(table);
+        }
+        let table = fluree_db_delta::DeltaTable::open(table_name, location, io)?;
+        self.delta_tables.insert(key, table.clone());
+        Ok(table)
     }
 
     /// Get a cross-query `loadTable` response if cached, within TTL, and its

@@ -2940,6 +2940,7 @@ dependencies = [
  "fluree-db-credential",
  "fluree-db-crypto",
  "fluree-db-cypher",
+ "fluree-db-delta",
  "fluree-db-graphql",
  "fluree-db-iceberg",
  "fluree-db-indexer",

@@ -617,7 +617,7 @@ async fn pinned_query_on_a_graph_source_reads_that_snapshot() {
         expect_refused(
             result,
             &format!("bm25 @{suffix}"),
-            "does not support time-pinned reads; only Iceberg-backed graph sources do",
+            "does not support time-pinned reads",
         );
     }
 

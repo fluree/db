@@ -21,6 +21,9 @@ iceberg = ["dep:fluree-db-iceberg", "fluree-db-iceberg/aws"]
 # because the graph-source provider dispatch lives there; the crate itself adds
 # only an HTTP client, no database drivers.
 sql = ["iceberg", "dep:fluree-db-sql"]
+# Delta Lake graph sources (R2RML over Delta tables, read through Delta Kernel).
+# Stacks on `iceberg` for the same reason `sql` does.
+delta = ["iceberg", "dep:fluree-db-delta"]
 # Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers)
 aws-testcontainers = [
   "dep:fluree-db-storage-aws",
@@ -71,6 +74,7 @@ fluree-db-graphql = { path = "../fluree-db-graphql", optional = true }
 fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
 fluree-db-sql = { path = "../fluree-db-sql", optional = true }
+fluree-db-delta = { path = "../fluree-db-delta", optional = true }
 fluree-db-tabular = { path = "../fluree-db-tabular" }
 fluree-db-stats = { path = "../fluree-db-stats", features = ["tabular"] }
 fluree-db-storage-aws = { path = "../fluree-db-storage-aws", optional = true }
@@ -210,6 +214,13 @@ required-features = ["iceberg", "native"]
 
 # End-to-end over a SQL graph source against a fake Trino-protocol endpoint
 # (wiremock), through registration, the R2RML query path and pushdown.
+# Delta graph sources end to end: reads, joins, and time-pinned versions
+# against the fixtures committed in fluree-db-delta.
+[[test]]
+name = "it_delta_local_fs"
+path = "tests/it_delta_local_fs.rs"
+required-features = ["delta", "native"]
+
 [[test]]
 name = "it_sql_graph_source"
 path = "tests/it_sql_graph_source.rs"
