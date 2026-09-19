@@ -194,9 +194,10 @@ fluree query --at recorded:2024-01-15T10:30:00Z 'SELECT * WHERE { ?s ?p ?o }'
 fluree query --at latest 'SELECT * WHERE { ?s ?p ?o }'
 ```
 
-An Iceberg-backed graph source takes `--at snapshot:<id>` (the Iceberg snapshot
-id) or `--at time:<ISO-8601>`; `t:` and `commit:` name ledger states and are
-rejected there. See
+A graph source backed by versioned tables (Iceberg, Delta) takes `--at
+snapshot:<id>` (an Iceberg snapshot id, or a Delta table version) or `--at
+time:<ISO-8601>`; `t:` and `commit:` name ledger states and are rejected there.
+See
 [time travel on graph sources](../concepts/time-travel.md#graph-sources-snapshot).
 
 ```bash
