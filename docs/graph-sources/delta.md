@@ -117,8 +117,23 @@ principal per source, give its tenant id, client id and secret:
 process, so the secret is never stored; `azure_client_secret` is a literal
 that is stored with the graph source. An embedding application can instead
 supply a secret reference, resolved through its `SecretResolver`. Tokens are
-requested for the storage audience and refreshed automatically. The identity
-needs read access to the container, or, on Fabric, to the workspace item.
+requested for the storage audience and refreshed automatically.
+
+What the identity needs:
+
+- **ADLS Gen2**: the *Storage Blob Data Reader* role on the storage account or
+  container. A new role assignment can take a minute or two to take effect; until
+  then reads fail with 403.
+- **OneLake**: a workspace role that includes OneLake data access. *Viewer*
+  does not — a Viewer principal authenticates and is then refused with
+  `403 … not authorized … for workspace`. *Contributor* (or a OneLake data
+  access role granting read on the lakehouse) works. No tenant-wide setting is
+  required for a service principal to read OneLake files.
+
+In a schema-enabled lakehouse tables live under `Tables/<schema>/<table>`, so
+with `<item>/Tables` as the root they are mapped as `rr:tableName "dbo.orders"`;
+in a lakehouse without schemas they are `Tables/<table>` and mapped by bare
+name.
 
 Access control on the tables themselves (OneLake security roles, row- or
 column-level rules defined in Fabric) is enforced by Azure against that
