@@ -3141,12 +3141,14 @@ POST {api_base_url}/delta/map
 | Field | Type | Description |
 |-------|------|-------------|
 | `name` | string | Graph source name (required) |
-| `root` | string | Directory the mapping's table names resolve beneath: `dbo.orders` → `<root>/dbo/orders`. `s3://…`, or a local path under the server's local-root allowlist. Required unless every mapped table has a `tables` entry. |
+| `root` | string | Directory the mapping's table names resolve beneath: `dbo.orders` → `<root>/dbo/orders`. `s3://…`, `abfss://<container>@<account>.dfs.core.windows.net/…`, the OneLake `abfss://` form, or a local path under the server's local-root allowlist. Required unless every mapped table has a `tables` entry. |
 | `tables` | object | Explicit table name → table location; wins over `root` |
 | `r2rml` | string | Inline R2RML mapping (required). `rr:tableName` logical tables only. |
 | `r2rml_type` | string | Media type of `r2rml` (`text/turtle`) |
 | `branch` | string | Branch name (default: `main`) |
-| `s3_region`, `s3_endpoint`, `s3_path_style` | string, string, bool | S3 options. `s3_endpoint` is guarded against the link-local/metadata range. Credentials come from the server's ambient AWS chain. |
+| `s3_region`, `s3_endpoint`, `s3_path_style` | string, string, bool | S3 options. `s3_endpoint` is guarded against the link-local/metadata range. Credentials come from the server's environment or role. |
+| `azure_tenant_id`, `azure_client_id` | string | Microsoft Entra service principal for `abfss://` locations. Omit all Azure fields to use the server's ambient Azure credentials. |
+| `azure_client_secret_env` / `azure_client_secret` | string | The principal's secret: the name of a server environment variable holding it (not stored), or a literal (stored with the graph source). Exactly one, with the two fields above. |
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
 

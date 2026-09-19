@@ -389,3 +389,94 @@ async fn an_absolute_data_path_outside_the_allowlist_is_refused_at_read() {
     let chain = format!("{err:?}");
     assert!(chain.contains("PermissionDenied"), "{chain}");
 }
+
+/// Building an Azure store is offline (tokens are fetched on first read), so
+/// this pins the configuration contract without an Azure account.
+#[tokio::test]
+async fn azure_locations_open_with_a_hydrated_service_principal_only() {
+    use fluree_db_delta::config::AzureAuth;
+    use fluree_db_iceberg::ConfigValue;
+
+    let location = "abfss://lake@acct.dfs.core.windows.net/Tables/orders";
+    let with_secret = |client_secret: ConfigValue| DeltaIoConfig {
+        azure: Some(AzureAuth::ClientSecret {
+            tenant_id: "tenant".to_string(),
+            client_id: "app".to_string(),
+            client_secret,
+        }),
+        ..Default::default()
+    };
+
+    DeltaTable::open(
+        "orders",
+        location,
+        &with_secret(ConfigValue::literal("s3cret")),
+    )
+    .expect("service principal store builds offline");
+
+    // A secret reference must be hydrated first; opening with it unresolved
+    // fails closed rather than falling back to ambient credentials.
+    let by_ref = with_secret(ConfigValue::SecretRef {
+        secret_ref: "vault://delta/azure".to_string(),
+    });
+    let err = DeltaTable::open("orders", location, &by_ref).unwrap_err();
+    assert!(matches!(err, DeltaError::Config(_)), "{err}");
+    let err = by_ref.hydrate(None).await.unwrap_err();
+    assert!(matches!(err, DeltaError::Config(_)), "{err}");
+
+    let err = DeltaTable::open(
+        "orders",
+        "abfss://lake@evil.example.com/Tables/orders",
+        &DeltaIoConfig::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, DeltaError::Config(_)), "{err}");
+}
+
+/// Network check, no account needed: a bogus service principal must get as far
+/// as Microsoft Entra *rejecting the credentials*. That proves the store's HTTP
+/// stack (its own reqwest/rustls, separate from the workspace's) completes a
+/// TLS handshake with this platform's trust roots; a certificate or provider
+/// problem would surface as a transport error instead.
+///
+///   cargo test -p fluree-db-delta --test reader -- --ignored live_
+#[tokio::test]
+#[ignore = "needs outbound HTTPS"]
+async fn live_azure_token_request_reaches_entra() {
+    use fluree_db_delta::config::AzureAuth;
+    use fluree_db_iceberg::ConfigValue;
+
+    let io = DeltaIoConfig {
+        azure: Some(AzureAuth::ClientSecret {
+            tenant_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            client_id: "00000000-0000-0000-0000-000000000000".to_string(),
+            client_secret: ConfigValue::literal("not-a-secret"),
+        }),
+        ..Default::default()
+    };
+    let table = DeltaTable::open(
+        "probe",
+        "abfss://probe@azureopendatastorage.dfs.core.windows.net/none",
+        &io,
+    )
+    .unwrap();
+    let err = format!(
+        "{:?}",
+        table
+            .snapshot(VersionSelector::Latest)
+            .await
+            .err()
+            .expect("bogus credentials cannot read")
+    );
+    println!("{err}");
+    let lowered = err.to_lowercase();
+    assert!(
+        !lowered.contains("certificate") && !lowered.contains("cryptoprovider"),
+        "TLS failure: {err}"
+    );
+    // Entra's answer to an unknown tenant.
+    assert!(
+        err.contains("AADSTS") || lowered.contains("tenant"),
+        "did not reach Entra: {err}"
+    );
+}

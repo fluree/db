@@ -41,11 +41,14 @@ fluree delta map <NAME> --r2rml <PATH> (--root <LOCATION> | --table <NAME=LOCATI
 | `--root <LOCATION>` | Directory the mapping's table names resolve beneath. Each `rr:tableName` becomes a path under it, with dots as separators: `dbo.orders` → `<root>/dbo/orders` |
 | `--table <NAME=LOCATION>` | Explicit location for one table (repeatable). Wins over `--root`; use it for a table outside the root or whose directory does not follow its name |
 
-A location is `s3://bucket/prefix`, or a local path (`file:///…` or absolute)
-under [`FLUREE_ICEBERG_LOCAL_ROOTS`](../graph-sources/iceberg.md#enabling-local-tables).
+A location is `s3://bucket/prefix`,
+`abfss://<container>@<account>.dfs.core.windows.net/<path>` (ADLS Gen2),
+`abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<item>/<path>` (OneLake),
+or a local path (`file:///…` or absolute) under
+[`FLUREE_ICEBERG_LOCAL_ROOTS`](../graph-sources/iceberg.md#enabling-local-tables).
 Give `--root`, one or more `--table`, or both.
 
-**Storage:**
+**S3:**
 
 | Option | Description |
 |--------|-------------|
@@ -53,9 +56,18 @@ Give `--root`, one or more `--table`, or both.
 | `--s3-endpoint <URL>` | S3 endpoint override (MinIO, LocalStack) |
 | `--s3-path-style` | Use path-style S3 URLs |
 
-S3 credentials come from the environment of the process that reads the tables
-(`AWS_ACCESS_KEY_ID`, `AWS_PROFILE`, instance or task roles); none are stored
-on the graph source.
+**Azure:**
+
+| Option | Description |
+|--------|-------------|
+| `--azure-tenant-id <ID>` | Microsoft Entra tenant of a service principal |
+| `--azure-client-id <ID>` | Service principal (application) client id |
+| `--azure-client-secret-env <VAR>` | Environment variable holding the client secret, read by the process that reads the tables. The secret is not stored |
+| `--azure-client-secret <SECRET>` | Literal client secret. Stored with the graph source; prefer the option above |
+
+Give the tenant, the client id and one of the two secret options together, or
+none of them to use ambient credentials. See
+[Credentials](../graph-sources/delta.md#credentials).
 
 **R2RML mapping:**
 
@@ -78,6 +90,13 @@ on the graph source.
 ```bash
 # Every mapped table lives under one root
 fluree delta map sales --root s3://lake/Tables --r2rml mappings/sales.ttl
+
+# OneLake, reading as a service principal whose secret stays in the environment
+fluree delta map fabric-sales \
+  --root abfss://<workspace-id>@onelake.dfs.fabric.microsoft.com/<lakehouse-id>/Tables \
+  --azure-tenant-id "$TENANT" --azure-client-id "$APP_ID" \
+  --azure-client-secret-env FABRIC_CLIENT_SECRET \
+  --r2rml mappings/sales.ttl
 
 # One table lives elsewhere
 fluree delta map sales \

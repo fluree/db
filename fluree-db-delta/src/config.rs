@@ -2,7 +2,10 @@
 
 use std::collections::BTreeMap;
 
+use std::sync::Arc;
+
 use fluree_db_iceberg::config::MappingSource;
+use fluree_db_iceberg::{ConfigValue, SecretResolver};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{DeltaError, Result};
@@ -40,8 +43,10 @@ pub struct DeltaGsConfig {
     pub default_allow: Option<bool>,
 }
 
-/// Object-store options. Credentials come from the ambient provider chain of
-/// the target store; nothing secret is persisted here.
+/// Object-store options. S3 credentials always come from the ambient AWS
+/// chain. Azure credentials come from the ambient chain (`AZURE_*` environment
+/// variables, workload identity, managed identity) unless `azure` names a
+/// service principal.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct DeltaIoConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -51,6 +56,39 @@ pub struct DeltaIoConfig {
     pub s3_endpoint: Option<String>,
     #[serde(default)]
     pub s3_path_style: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure: Option<AzureAuth>,
+}
+
+/// Explicit Azure credentials for ADLS Gen2 and OneLake locations.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AzureAuth {
+    /// Microsoft Entra service principal (OAuth2 client credentials). The
+    /// token is requested for the storage audience and refreshed by the store.
+    ClientSecret {
+        tenant_id: String,
+        client_id: String,
+        /// Prefer an environment or secret reference: a literal is persisted
+        /// with the graph source.
+        client_secret: ConfigValue,
+    },
+}
+
+impl DeltaIoConfig {
+    /// Resolve secret references so [`crate::DeltaTable::open`] can read the
+    /// config synchronously. Key any cache on the config as stored, not on
+    /// this result, or every secret rotation re-keys it.
+    pub async fn hydrate(&self, resolver: Option<&Arc<dyn SecretResolver>>) -> Result<Self> {
+        let mut hydrated = self.clone();
+        if let Some(AzureAuth::ClientSecret { client_secret, .. }) = &mut hydrated.azure {
+            *client_secret = client_secret
+                .hydrate(resolver)
+                .await
+                .map_err(|e| DeltaError::Config(format!("Azure client secret: {e}")))?;
+        }
+        Ok(hydrated)
+    }
 }
 
 impl DeltaGsConfig {
@@ -70,6 +108,18 @@ impl DeltaGsConfig {
         }
         for location in self.root.iter().chain(self.tables.values()) {
             validate_location(location)?;
+        }
+        if let Some(AzureAuth::ClientSecret {
+            tenant_id,
+            client_id,
+            ..
+        }) = &self.io.azure
+        {
+            if tenant_id.trim().is_empty() || client_id.trim().is_empty() {
+                return Err(DeltaError::Config(
+                    "Azure client-secret auth needs a tenant_id and a client_id".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -102,18 +152,51 @@ impl DeltaGsConfig {
     }
 }
 
+/// Which store serves a location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocationKind {
+    Local,
+    S3,
+    Azure,
+}
+
+/// Azure hosts a location may name. Requiring one keeps a stored location from
+/// steering credentials to an arbitrary endpoint.
+const AZURE_HOST_SUFFIXES: [&str; 2] = [".dfs.core.windows.net", ".dfs.fabric.microsoft.com"];
+
 /// Schemes the reader can open. Local locations must also sit under the
 /// operator's `FLUREE_ICEBERG_LOCAL_ROOTS` allowlist, shared with Iceberg.
-pub(crate) fn validate_location(location: &str) -> Result<()> {
+pub(crate) fn validate_location(location: &str) -> Result<LocationKind> {
     if fluree_db_iceberg::is_local_location(location) {
         return fluree_db_iceberg::ensure_local_location_allowed(location)
+            .map(|()| LocationKind::Local)
             .map_err(|e| DeltaError::Config(e.to_string()));
     }
     match location.split_once("://") {
-        Some(("s3" | "s3a", rest)) if !rest.is_empty() => Ok(()),
+        Some(("s3" | "s3a", rest)) if !rest.is_empty() => Ok(LocationKind::S3),
+        // `abfss://<container>@<account>.dfs.core.windows.net/<path>`, or the
+        // OneLake form `abfss://<workspace>@onelake.dfs.fabric.microsoft.com/…`.
+        Some(("abfss", rest)) => {
+            let authority = rest.split('/').next().unwrap_or("");
+            let well_formed = authority.split_once('@').is_some_and(|(container, host)| {
+                !container.is_empty()
+                    && AZURE_HOST_SUFFIXES
+                        .iter()
+                        .any(|suffix| host.len() > suffix.len() && host.ends_with(suffix))
+            });
+            if well_formed {
+                Ok(LocationKind::Azure)
+            } else {
+                Err(DeltaError::Config(format!(
+                    "unsupported Azure location '{location}': expected \
+                     abfss://<container>@<account>.dfs.core.windows.net/<path> or \
+                     abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<item>/<path>"
+                )))
+            }
+        }
         _ => Err(DeltaError::Config(format!(
-            "unsupported Delta table location '{location}': expected s3://, file:// \
-             or an absolute path"
+            "unsupported Delta table location '{location}': expected s3://, abfss://, \
+             file:// or an absolute path"
         ))),
     }
 }
@@ -169,6 +252,55 @@ mod tests {
         for bad in ["http://host/lake", "lake", "s3://"] {
             assert!(rooted(bad).validate().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn azure_locations_must_name_a_storage_host() {
+        for good in [
+            "abfss://lake@acct.dfs.core.windows.net/Tables",
+            "abfss://ws-guid@onelake.dfs.fabric.microsoft.com/item-guid/Tables",
+        ] {
+            assert_eq!(
+                validate_location(good).unwrap(),
+                LocationKind::Azure,
+                "{good}"
+            );
+        }
+        for bad in [
+            // fsspec form: the account would come from the environment.
+            "abfss://lake/Tables",
+            "abfss://lake@evil.example.com/Tables",
+            "abfss://lake@.dfs.core.windows.net/Tables",
+            "abfss://@acct.dfs.core.windows.net/Tables",
+            "abfss://lake@acct.dfs.core.windows.net.evil.example/Tables",
+            // Cleartext.
+            "abfs://lake@acct.dfs.core.windows.net/Tables",
+        ] {
+            assert!(validate_location(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_service_principal_needs_its_identifiers_and_keeps_its_secret_out_of_debug() {
+        let mut config = rooted("abfss://lake@acct.dfs.core.windows.net/Tables");
+        config.io.azure = Some(AzureAuth::ClientSecret {
+            tenant_id: String::new(),
+            client_id: "app".to_string(),
+            client_secret: ConfigValue::literal("hunter2"),
+        });
+        assert!(config.validate().is_err());
+        if let Some(AzureAuth::ClientSecret { tenant_id, .. }) = &mut config.io.azure {
+            *tenant_id = "tenant".to_string();
+        }
+        config.validate().unwrap();
+        assert!(!format!("{config:?}").contains("hunter2"));
+
+        let json = config.to_json().unwrap();
+        let back = DeltaGsConfig::from_json(&json).unwrap();
+        assert!(matches!(
+            back.io.azure,
+            Some(AzureAuth::ClientSecret { ref client_id, .. }) if client_id == "app"
+        ));
     }
 
     #[test]

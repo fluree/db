@@ -330,13 +330,17 @@ impl R2rmlCache {
         self.sql_clients.insert(key, client);
     }
 
-    /// The shared handle for the Delta table at `location`, opened on first use.
+    /// The shared handle for the Delta table at `location`, opened on first
+    /// use. Keyed on `io` as stored, before secrets are resolved, so a rotated
+    /// secret behind a reference does not re-key the cache; the TTL bounds how
+    /// long a handle keeps the old one.
     #[cfg(feature = "delta")]
-    pub(crate) fn delta_table(
+    pub(crate) async fn delta_table(
         &self,
         table_name: &str,
         location: &str,
         io: &fluree_db_delta::DeltaIoConfig,
+        resolver: Option<&Arc<dyn fluree_db_iceberg::SecretResolver>>,
     ) -> fluree_db_delta::Result<fluree_db_delta::DeltaTable> {
         let key = format!(
             "{location}\u{1f}{}",
@@ -345,7 +349,8 @@ impl R2rmlCache {
         if let Some(table) = self.delta_tables.get(&key) {
             return Ok(table);
         }
-        let table = fluree_db_delta::DeltaTable::open(table_name, location, io)?;
+        let hydrated = io.hydrate(resolver).await?;
+        let table = fluree_db_delta::DeltaTable::open(table_name, location, &hydrated)?;
         self.delta_tables.insert(key, table.clone());
         Ok(table)
     }

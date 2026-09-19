@@ -33,10 +33,17 @@ resolves to:
 2. a directory under `root`, with the name's dots as path separators —
    `dbo.orders` → `<root>/dbo/orders`.
 
-Locations are `s3://bucket/prefix`, or local paths under
-[`FLUREE_ICEBERG_LOCAL_ROOTS`](iceberg.md#enabling-local-tables) (the same
-allowlist Iceberg local tables use; a Delta log that names a data file outside
-it is refused at read).
+A location is one of:
+
+| Store | Location |
+|-------|----------|
+| Amazon S3 (and S3-compatible) | `s3://bucket/prefix` |
+| Azure Data Lake Storage Gen2 | `abfss://<container>@<account>.dfs.core.windows.net/<path>` |
+| Microsoft Fabric OneLake | `abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<item>/<path>` — a lakehouse's tables are under `<item>/Tables`, so with that as `root`, `dbo.orders` names `Tables/dbo/orders` |
+| Local filesystem | `file:///…` or an absolute path under [`FLUREE_ICEBERG_LOCAL_ROOTS`](iceberg.md#enabling-local-tables), the allowlist Iceberg local tables use. A Delta log that names a data file outside it is refused at read |
+
+An Azure location must name its storage host in full; other `abfss://` forms
+are refused, so a stored location cannot direct credentials elsewhere.
 
 ### CLI
 
@@ -62,7 +69,8 @@ Content-Type: application/json
 ```
 
 Optional fields: `branch`, `r2rml_type`, `s3_endpoint`, `s3_path_style`,
-`model`, `default_allow`. The response reports the stored mapping, the mapped
+`azure_tenant_id`, `azure_client_id`, `azure_client_secret_env` /
+`azure_client_secret`, `model`, `default_allow`. The response reports the stored mapping, the mapped
 table names, `table_versions` (the current Delta version of each table that
 opened with every column its maps reference) and `table_warnings` (a table that
 could not be read, or a mapped column it lacks; the source is registered
@@ -79,9 +87,43 @@ let created = fluree.create_delta_graph_source(config).await?;
 
 ### Credentials
 
-S3 access uses the ambient AWS credential chain of the process reading the
-tables (environment variables, profile, instance or task role). Nothing secret
+Credentials belong to the process that **reads** the tables — the server, or a
+CLI running locally.
+
+**S3.** `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and
+`AWS_SESSION_TOKEN`) from the environment, a web-identity token, or the
+container / instance role. Shared-config profiles (`AWS_PROFILE`, SSO) are not
+read; export the profile's credentials into the environment instead. Nothing
 is stored on the graph source.
+
+**Azure.** With no Azure options, the ambient chain: the `AZURE_*` environment
+variables (`AZURE_CLIENT_ID` + `AZURE_CLIENT_SECRET` + `AZURE_TENANT_ID`,
+`AZURE_STORAGE_ACCOUNT_KEY`, a SAS token, `AZURE_FEDERATED_TOKEN_FILE` for
+workload identity), else the managed identity of the host. To name a service
+principal per source, give its tenant id, client id and secret:
+
+```json
+{
+  "name": "fabric-sales",
+  "root": "abfss://<workspace-id>@onelake.dfs.fabric.microsoft.com/<lakehouse-id>/Tables",
+  "azure_tenant_id": "…",
+  "azure_client_id": "…",
+  "azure_client_secret_env": "FABRIC_CLIENT_SECRET",
+  "r2rml": "…"
+}
+```
+
+`azure_client_secret_env` names an environment variable of the reading
+process, so the secret is never stored; `azure_client_secret` is a literal
+that is stored with the graph source. An embedding application can instead
+supply a secret reference, resolved through its `SecretResolver`. Tokens are
+requested for the storage audience and refreshed automatically. The identity
+needs read access to the container, or, on Fabric, to the workspace item.
+
+Access control on the tables themselves (OneLake security roles, row- or
+column-level rules defined in Fabric) is enforced by Azure against that
+identity, not re-implemented here; use a model ledger's
+[access policy](iceberg.md#access-policy) to govern what Fluree users see.
 
 ## Mapping
 
@@ -205,7 +247,8 @@ source at two different states in one query is rejected, as for
 
 ## Limitations
 
-- **Storage**: S3 (and S3-compatible endpoints) and the local filesystem.
+- **Storage**: S3 (and S3-compatible endpoints), ADLS Gen2, OneLake and the
+  local filesystem. Azure sovereign clouds are not addressable.
 - **No pushdown yet**: filters, `LIMIT` and `ORDER BY` are applied by the
   query engine after rows are read. Column projection is pushed down — only
   mapped columns are decoded — but partition and file-statistics pruning are

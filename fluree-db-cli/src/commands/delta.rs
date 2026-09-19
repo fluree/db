@@ -84,6 +84,10 @@ fn args_to_json(args: &DeltaMapArgs) -> CliResult<serde_json::Value> {
         ("branch", &args.branch),
         ("s3_region", &args.s3_region),
         ("s3_endpoint", &args.s3_endpoint),
+        ("azure_tenant_id", &args.azure_tenant_id),
+        ("azure_client_id", &args.azure_client_id),
+        ("azure_client_secret", &args.azure_client_secret),
+        ("azure_client_secret_env", &args.azure_client_secret_env),
         ("model", &args.model),
     ] {
         if let Some(v) = value {
@@ -154,6 +158,13 @@ async fn run_delta_map_remote(
 async fn run_delta_map_local(args: DeltaMapArgs, dirs: &FlureeDir) -> CliResult<()> {
     require_location(&args)?;
     let fluree = crate::context::build_fluree(dirs)?;
+    let azure = fluree_db_api::DeltaAzureFields {
+        tenant_id: args.azure_tenant_id.clone(),
+        client_id: args.azure_client_id.clone(),
+        client_secret: args.azure_client_secret.clone(),
+        client_secret_env: args.azure_client_secret_env.clone(),
+    }
+    .into_auth()?;
     let config = fluree_db_api::DeltaCreateConfig {
         name: args.name.clone(),
         branch: args.branch.clone(),
@@ -163,6 +174,7 @@ async fn run_delta_map_local(args: DeltaMapArgs, dirs: &FlureeDir) -> CliResult<
             s3_region: args.s3_region.clone(),
             s3_endpoint: args.s3_endpoint.clone(),
             s3_path_style: args.s3_path_style,
+            azure,
         },
         mapping: fluree_db_api::R2rmlMappingInput::Content(read_mapping(&args)?),
         mapping_media_type: mapping_media_type(&args),
