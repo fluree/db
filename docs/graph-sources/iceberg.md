@@ -724,9 +724,9 @@ whole query. Two selectors apply to Iceberg sources:
 | Selector | Selects |
 | --- | --- |
 | `@snapshot:<id>` | The snapshot with exactly that Iceberg snapshot id (any retained snapshot, including one later rolled back) |
-| `@iso:<timestamp>` | The snapshot that **was the table's current state** at that instant (RFC 3339): the latest snapshot-log entry at or before it, the same rule as Iceberg's own `TIMESTAMP AS OF`. A retained snapshot that was rolled back, or lives only on a branch, is not selected by time. |
+| `@time:<timestamp>` | The snapshot that **was the table's current state** at that instant (RFC 3339): the latest snapshot-log entry at or before it, the same rule as Iceberg's own `TIMESTAMP AS OF`. A retained snapshot that was rolled back, or lives only on a branch, is not selected by time. |
 
-`@recorded:<timestamp>` is accepted as a synonym for `@iso:`: an Iceberg
+`@recorded:<timestamp>` is accepted as a synonym for `@time:`: an Iceberg
 snapshot carries one time, its commit time, and no separate event-time axis —
 the same rule as a ledger that never used caller-supplied event times.
 
@@ -743,13 +743,13 @@ the same rule as a ledger that never used caller-supplied event times.
 
 ```json
 {
-  "from": "warehouse-orders:main@iso:2024-01-01T00:00:00Z",
+  "from": "warehouse-orders:main@time:2024-01-01T00:00:00Z",
   "select": ["?orderId", "?total"],
   "where": [...]
 }
 ```
 
-The same selectors work in SPARQL `FROM <warehouse-orders:main@iso:...>` and in
+The same selectors work in SPARQL `FROM <warehouse-orders:main@time:...>` and in
 the Rust API as `fluree.graph_at(alias, TimeSpec::AtSnapshot(id))` /
 `TimeSpec::AtTime(iso)`. Aggregates, including the manifest-backed `COUNT`
 shortcut, answer from the selected snapshot, so a count and a row scan in one
@@ -762,7 +762,7 @@ fallback to the current or oldest snapshot:
 
 - `@snapshot:` with an id the table no longer has (expired by snapshot
   retention, or never existed) → `snapshot <id> not found for table '...'`.
-- `@iso:` before the oldest retained snapshot → `no snapshot of table '...' at
+- `@time:` before the oldest retained snapshot → `no snapshot of table '...' at
   or before <requested>; the oldest retained snapshot is <time>`.
 - Either selector on a table that has never committed (no snapshots yet) →
   the same errors, saying the table has no snapshots. Unpinned, such a table

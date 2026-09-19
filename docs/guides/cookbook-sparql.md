@@ -29,7 +29,7 @@ WHERE {
 ```
 
 The specifier can be a transaction number (`@t:100`), an ISO datetime
-(`@iso:2024-01-15T10:30:00Z`), a commit id (`@commit:bafy…`), or `@t:latest` for
+(`@time:2024-01-15T10:30:00Z`), a commit id (`@commit:bafy…`), or `@t:latest` for
 the current head. Everything else about the query is unchanged — you're just
 reading an earlier snapshot.
 
@@ -54,7 +54,7 @@ ORDER BY ?t
 
 Each row is one change to Alice's salary over the range. Filter to just the
 retractions with `FILTER(?op = false)`, or bound the window with ISO datetimes
-(`FROM <mydb:main@iso:2024-01-01T00:00:00Z> TO <mydb:main@iso:2024-12-31T23:59:59Z>`).
+(`FROM <mydb:main@time:2024-01-01T00:00:00Z> TO <mydb:main@time:2024-12-31T23:59:59Z>`).
 
 > **Two `<<` forms, different jobs.** The bare `<< s p o >>` above, paired with
 > `f:t` / `f:op`, is Fluree's flake-metadata term. With any other predicate, or
