@@ -6,6 +6,7 @@
 //! every later scan or count in that query reads the same version.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use fluree_db_delta::{DeltaError, DeltaGsConfig, DeltaIoConfig, DeltaSnapshot, DeltaTable};
 use fluree_db_iceberg::config::MappingSource;
@@ -276,8 +277,10 @@ pub(crate) struct DeltaSource {
     graph_source_id: String,
     config: DeltaGsConfig,
     /// Table name → the version this query reads. First resolution wins, so a
-    /// commit landing mid-query cannot split a query across two versions.
-    snapshots: tokio::sync::Mutex<HashMap<String, DeltaSnapshot>>,
+    /// commit landing mid-query cannot split a query across two versions. One
+    /// cell per table: tables resolve concurrently, and concurrent readers of
+    /// one table share a single log replay.
+    snapshots: std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<DeltaSnapshot>>>>,
 }
 
 impl DeltaSource {
@@ -293,7 +296,7 @@ impl DeltaSource {
         Ok(Self {
             graph_source_id: record.graph_source_id.clone(),
             config,
-            snapshots: tokio::sync::Mutex::new(HashMap::new()),
+            snapshots: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -313,10 +316,43 @@ impl DeltaSource {
                 self.graph_source_id
             )));
         }
-        let mut snapshots = self.snapshots.lock().await;
-        if let Some(snapshot) = snapshots.get(table_name) {
-            return Ok(snapshot.clone());
-        }
+        let cell = Arc::clone(
+            self.snapshots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(table_name.to_string())
+                .or_default(),
+        );
+        cell.get_or_try_init(|| self.resolve(fluree, session, table_name, pin))
+            .await
+            .cloned()
+    }
+
+    /// Warm the versions of `table_names` concurrently, so a multi-table query
+    /// does not replay its logs one after another. Failures are left for the
+    /// scan that needs the table to report.
+    pub(crate) async fn prefetch(
+        &self,
+        fluree: &crate::Fluree,
+        session: &IcebergCatalogSession,
+        table_names: &[String],
+        pin: Option<SourceTime>,
+    ) {
+        futures::future::join_all(
+            table_names
+                .iter()
+                .map(|table| self.snapshot(fluree, session, table, pin)),
+        )
+        .await;
+    }
+
+    async fn resolve(
+        &self,
+        fluree: &crate::Fluree,
+        session: &IcebergCatalogSession,
+        table_name: &str,
+        pin: Option<SourceTime>,
+    ) -> QueryResult<DeltaSnapshot> {
         let location = self
             .config
             .table_location(table_name)
@@ -344,7 +380,6 @@ impl DeltaSource {
                 sequence_number: None,
             },
         );
-        snapshots.insert(table_name.to_string(), snapshot.clone());
         Ok(snapshot)
     }
 

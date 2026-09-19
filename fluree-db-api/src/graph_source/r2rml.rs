@@ -2650,6 +2650,18 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
     /// scan re-resolves and surfaces them — so a warm failure degrades to today's
     /// serial GET, never a changed result.
     async fn prefetch_tables(&self, graph_source_id: &str, table_names: &[String]) {
+        #[cfg(feature = "delta")]
+        if let Ok(Some(delta)) = self.delta_source(graph_source_id).await {
+            delta
+                .prefetch(
+                    self.fluree,
+                    &self.session,
+                    table_names,
+                    self.source_time(graph_source_id),
+                )
+                .await;
+            return;
+        }
         // Dedup, preserving first-seen order, AND skip tables already resolved
         // (with unexpired creds) in this query's session pin — re-warming a
         // pinned table would issue a wasted `loadTable` GET. Collect OWNED names:
