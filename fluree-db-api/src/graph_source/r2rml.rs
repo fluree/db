@@ -1198,7 +1198,7 @@ pub struct FlureeR2rmlProvider<'a> {
     /// the lifetime of one query — collapsing the per-scan REST round-trip storm
     /// and pinning a single Iceberg snapshot across the query.
     session: std::sync::Arc<super::catalog_session::IcebergCatalogSession>,
-    /// Per-source table-state pins for this query (`alias@iso:` / `@snapshot:`),
+    /// Per-source table-state pins for this query (`alias@time:` / `@snapshot:`),
     /// consulted by every scan and count of the source. See
     /// [`R2rmlTableProvider::pin_source_time`].
     source_times: std::sync::Mutex<std::collections::HashMap<String, SourceTime>>,

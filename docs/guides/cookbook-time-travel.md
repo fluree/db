@@ -8,7 +8,7 @@ There are two distinct capabilities, and it's worth keeping them straight:
 |---|---|---|
 | Question | "What did the graph look like *at* time T?" | "What *changed* between T1 and T2?" |
 | Result | An ordinary graph, as of one moment | A change log: value + `t` + assert/retract |
-| Syntax | `@t:` / `@iso:` / `@recorded:` / `@commit:` on a ledger reference | `from` **and** `to`, plus per-value metadata bindings |
+| Syntax | `@t:` / `@time:` / `@recorded:` / `@commit:` on a ledger reference | `from` **and** `to`, plus per-value metadata bindings |
 
 Time travel needs nothing special in the query body — you write a normal query and pin the snapshot. History queries need explicit metadata bindings, covered under [History queries](#history-queries) below.
 
@@ -73,7 +73,7 @@ The structured form is equivalent and composes with named-graph selection:
 }
 ```
 
-The suffix forms are `@t:5`, `@t:latest`, `@iso:2025-01-15T00:00:00Z`, `@recorded:2025-01-15T00:00:00Z`, and `@commit:bafyreif...`.
+The suffix forms are `@t:5`, `@t:latest`, `@time:2025-01-15T00:00:00Z`, `@recorded:2025-01-15T00:00:00Z`, and `@commit:bafyreif...`.
 
 ### SPARQL with a time specifier
 
@@ -106,7 +106,7 @@ curl -X POST 'http://localhost:8090/v1/fluree/query' \
 curl -X POST 'http://localhost:8090/v1/fluree/query' \
   -H 'Content-Type: application/json' \
   -d '{
-        "from": "mydb:main@iso:2025-01-15T00:00:00Z",
+        "from": "mydb:main@time:2025-01-15T00:00:00Z",
         "select": ["?s", "?p", "?o"],
         "where": [{"@id": "?s", "?p": "?o"}]
       }'
@@ -328,7 +328,7 @@ The JSON-LD equivalent:
 }
 ```
 
-ISO timestamps work as endpoints too, in either syntax: `FROM <mydb:main@iso:2025-01-01T00:00:00Z>`.
+ISO timestamps work as endpoints too, in either syntax: `FROM <mydb:main@time:2025-01-01T00:00:00Z>`.
 
 ### Count changes per entity (SPARQL)
 
@@ -462,7 +462,7 @@ A tracked ledger has no local commit chain; use `--remote <name>` to query the u
 ## Common questions
 
 **Is time travel expensive?**
-No. Querying a historical state uses the same indexes as querying the current state. The cost is O(log n) for index lookups. `@t:` is cheapest (no resolution); `@iso:` / `@recorded:` cost a binary search over commit timestamps; `@commit:` costs a bounded scan.
+No. Querying a historical state uses the same indexes as querying the current state. The cost is O(log n) for index lookups. `@t:` is cheapest (no resolution); `@time:` / `@recorded:` cost a binary search over commit timestamps; `@commit:` costs a bounded scan.
 
 **Does old data use extra storage?**
 Yes — immutability means retracted values are preserved. Storage grows with the number of changes, not just the current state size. For most workloads this is negligible.

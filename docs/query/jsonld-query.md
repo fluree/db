@@ -236,7 +236,7 @@ Specifies which ledger(s) to query:
 
 ```json
 {
-  "from": "mydb:main@iso:2024-01-15T10:30:00Z"
+  "from": "mydb:main@time:2024-01-15T10:30:00Z"
 }
 ```
 
@@ -1389,7 +1389,7 @@ Query historical data using time specifiers in `from`:
 ```json
 {
   "@context": { "ex": "http://example.org/ns/" },
-  "from": "ledger:main@iso:2024-01-15T10:30:00Z",
+  "from": "ledger:main@time:2024-01-15T10:30:00Z",
   "select": ["?name"],
   "where": [
     { "@id": "?person", "ex:name": "?name" }
@@ -1481,8 +1481,8 @@ Both annotations work uniformly for literal-valued and IRI-valued objects.
 ```json
 {
   "@context": { "ex": "http://example.org/ns/" },
-  "from": "ledger:main@iso:2024-01-01T00:00:00Z",
-  "to": "ledger:main@iso:2024-12-31T23:59:59Z",
+  "from": "ledger:main@time:2024-01-01T00:00:00Z",
+  "to": "ledger:main@time:2024-12-31T23:59:59Z",
   "select": ["?name", "?t", "?op"],
   "where": [
     { "@id": "ex:alice", "ex:name": { "@value": "?name", "@t": "?t", "@op": "?op" } }

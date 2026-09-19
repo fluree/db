@@ -491,7 +491,7 @@ impl Fluree {
 
     /// Load a view at a flexible time specification.
     ///
-    /// Resolves `@t:`, `@iso:`, `@recorded:`, `@commit:`, or `latest` time
+    /// Resolves `@t:`, `@time:`, `@recorded:`, `@commit:`, or `latest` time
     /// specifications.
     pub(crate) async fn load_graph_db_at(
         &self,

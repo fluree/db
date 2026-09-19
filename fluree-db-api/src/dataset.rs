@@ -520,7 +520,7 @@ impl TimeSpec {
     /// |---|---|
     /// | `t:<N>` | transaction number `N` |
     /// | `t:latest` | the ledger's current head |
-    /// | `iso:<timestamp>` | commit *event* time (`db:time`) |
+    /// | `time:<timestamp>` (alias `iso:`) | commit *event* time (`db:time`) |
     /// | `recorded:<timestamp>` | wall-clock time the commit was recorded (`db:receivedAt`) |
     /// | `commit:<prefix>` | commit hex-digest prefix, at least 6 characters |
     ///
@@ -559,7 +559,9 @@ impl TimeSpec {
     /// - `latest` — the untagged spelling of `t:latest`, which `fluree history
     ///   --to` has always taken.
     /// - a bare integer → `AtT`
-    /// - a string containing both `-` and `:` → `AtTime` (an ISO-8601 timestamp)
+    /// - a string containing `-` → `AtTime` (an ISO-8601 timestamp or date; a
+    ///   hex digest never contains one, so a date-only value fails as a bad
+    ///   timestamp rather than as an unknown commit)
     /// - anything else → `AtCommit` (a bare hex-digest prefix)
     ///
     /// **A bare integer is a `t`, not a commit prefix.** `123456` is both a
@@ -588,8 +590,8 @@ impl TimeSpec {
         if let Ok(t) = spec.parse::<i64>() {
             return Ok(TimeSpec::AtT(t));
         }
-        if spec.contains('-') && spec.contains(':') {
-            // Looks like ISO-8601 (e.g. "2024-01-15T10:30:00Z").
+        if spec.contains('-') {
+            // Looks like ISO-8601 (e.g. "2024-01-15T10:30:00Z", or a bare date).
             return Ok(TimeSpec::AtTime(spec.to_string()));
         }
         // The same floor the `commit:` arm applies, so the two spellings of a
@@ -617,9 +619,10 @@ impl TimeSpec {
 /// The spellings [`TimeSpec::parse_at`] accepts, quoted back when a user reaches
 /// for a canonical tag and mis-spells it.
 pub const ACCEPTED_TIME_SPEC_SPELLINGS: &str =
-    "Accepted: t:<N>, t:latest, latest, iso:<ISO-8601>, recorded:<ISO-8601>, \
-     commit:<hex-prefix>, snapshot:<id> (graph sources only), a bare transaction \
-     number, a bare ISO-8601 timestamp, or a bare commit hex-digest prefix";
+    "Accepted: t:<N>, t:latest, latest, time:<ISO-8601> (or its alias iso:), \
+     recorded:<ISO-8601>, commit:<hex-prefix>, snapshot:<id> (graph sources only), \
+     a bare transaction number, a bare ISO-8601 timestamp, or a bare commit \
+     hex-digest prefix";
 
 impl From<LedgerIdTimeSpec> for TimeSpec {
     fn from(spec: LedgerIdTimeSpec) -> Self {
@@ -1119,7 +1122,7 @@ impl GovernanceOptions {
 /// Supports compatible formats:
 /// - `ledger:main@t:42` → identifier="ledger:main", TimeSpec::AtT(42)
 /// - `ledger:main@t:latest` → identifier="ledger:main", TimeSpec::Latest
-/// - `ledger:main@iso:2025-01-01T00:00:00Z` → identifier="ledger:main", TimeSpec::AtTime(...)
+/// - `ledger:main@time:2025-01-01T00:00:00Z` → identifier="ledger:main", TimeSpec::AtTime(...)
 /// - `ledger:main@commit:abc123` → identifier="ledger:main", TimeSpec::AtCommit(...)
 ///
 /// Returns (identifier, Option<TimeSpec>).
@@ -1166,7 +1169,7 @@ fn parse_ledger_id_time_travel(
 /// Parse graph sources from a JSON value
 ///
 /// Accepts:
-/// - String: single graph source (may include @t:/@iso:/@commit: time-travel syntax)
+/// - String: single graph source (may include @t:/@time:/@commit: time-travel syntax)
 /// - Array: multiple graph sources
 /// - Object: single graph source with time spec
 fn parse_graph_sources(
@@ -1247,13 +1250,7 @@ fn parse_named_graph_object(
             }
         } else if let Some(at_val) = entry.get("at") {
             if let Some(at_str) = at_val.as_str() {
-                if let Some(commit_hash) = at_str.strip_prefix("commit:") {
-                    source.time_spec = Some(TimeSpec::AtCommit(commit_hash.to_string()));
-                } else if let Some(recorded) = at_str.strip_prefix("recorded:") {
-                    source.time_spec = Some(TimeSpec::AtRecorded(recorded.to_string()));
-                } else {
-                    source.time_spec = Some(TimeSpec::AtTime(at_str.to_string()));
-                }
+                source.time_spec = Some(parse_object_at(at_str)?);
             }
         }
 
@@ -1268,6 +1265,15 @@ fn parse_named_graph_object(
         sources.push(source);
     }
     Ok(sources)
+}
+
+/// The object form's `"at"` key takes the same grammar as the CLI's `--at` and
+/// the server's `at=`: every tagged spelling plus a bare timestamp, transaction
+/// number, or commit prefix. It used to have its own three-way split that read
+/// anything untagged as a timestamp, so `"at": "time:..."` or `"at": "t:5"`
+/// became an invalid timestamp downstream.
+fn parse_object_at(at_str: &str) -> Result<TimeSpec, DatasetParseError> {
+    TimeSpec::parse_at(at_str).map_err(|e| DatasetParseError::InvalidGraphSource(e.to_string()))
 }
 
 /// Read a source object's graph selector, accepting either spelling.
@@ -1311,7 +1317,7 @@ fn parse_graph_selector_field(
 /// Parse a single graph source from a JSON value
 ///
 /// Accepts:
-/// - String: identifier (may include @t:/@iso:/@commit: time-travel syntax and #txn-meta fragment)
+/// - String: identifier (may include @t:/@time:/@commit: time-travel syntax and #txn-meta fragment)
 /// - Object: Extended graph source object with optional fields:
 ///   - `@id` / `id`: ledger reference (required)
 ///   - `t` / `at`: time specification
@@ -1354,16 +1360,7 @@ fn parse_single_graph_source(
                 }
             } else if let Some(at_val) = obj.get("at") {
                 if let Some(at_str) = at_val.as_str() {
-                    // Determine if it's a commit hash, recorded-axis
-                    // timestamp, or event-time timestamp
-                    if let Some(commit_hash) = at_str.strip_prefix("commit:") {
-                        source.time_spec = Some(TimeSpec::AtCommit(commit_hash.to_string()));
-                    } else if let Some(recorded) = at_str.strip_prefix("recorded:") {
-                        source.time_spec = Some(TimeSpec::AtRecorded(recorded.to_string()));
-                    } else {
-                        // Assume ISO timestamp
-                        source.time_spec = Some(TimeSpec::AtTime(at_str.to_string()));
-                    }
+                    source.time_spec = Some(parse_object_at(at_str)?);
                 }
             }
 
@@ -1604,7 +1601,17 @@ mod time_spec_grammar_tests {
 
     #[test]
     fn parse_rejects_malformed_tagged_specs() {
-        for bad in ["t:", "t:abc", "iso:", "commit:", "commit:abc", "recorded:"] {
+        for bad in [
+            "t:",
+            "t:abc",
+            "time:",
+            "iso:",
+            "commit:",
+            "commit:abc",
+            "recorded:",
+            "snapshot:",
+            "snapshot:abc",
+        ] {
             assert!(
                 TimeSpec::parse(bad).is_err(),
                 "expected {bad:?} to be an error"
@@ -1620,7 +1627,7 @@ mod time_spec_grammar_tests {
     /// here at the unit level so the next such slip fails faster.
     #[test]
     fn error_text_quotes_the_tag_as_the_calling_surface_spells_it() {
-        for tag in ["t:", "iso:", "commit:", "recorded:"] {
+        for tag in ["t:", "time:", "iso:", "commit:", "recorded:", "snapshot:"] {
             assert_eq!(
                 TimeSpec::parse(tag).unwrap_err().to_string(),
                 format!("Missing value after '{tag}'")
@@ -1633,7 +1640,7 @@ mod time_spec_grammar_tests {
 
         let bare = TimeSpec::parse("nope").unwrap_err().to_string();
         assert!(
-            bare.contains("Expected t:, iso:, recorded:, commit:, or snapshot:"),
+            bare.contains("Expected t:, time:, recorded:, commit:, or snapshot:"),
             "got: {bare}"
         );
         assert!(
@@ -1645,7 +1652,7 @@ mod time_spec_grammar_tests {
             .unwrap_err()
             .to_string();
         assert!(
-            addressed.contains("Expected @t:, @iso:, @recorded:, @commit:, or @snapshot:"),
+            addressed.contains("Expected @t:, @time:, @recorded:, @commit:, or @snapshot:"),
             "got: {addressed}"
         );
     }
@@ -1656,6 +1663,10 @@ mod time_spec_grammar_tests {
         // Canonical — every one of these was broken before #1805.
         assert_eq!(TimeSpec::parse_at("t:2").unwrap(), TimeSpec::AtT(2));
         assert_eq!(TimeSpec::parse_at("t:latest").unwrap(), TimeSpec::Latest);
+        assert_eq!(
+            TimeSpec::parse_at("time:2024-01-15T10:30:00Z").unwrap(),
+            TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string())
+        );
         assert_eq!(
             TimeSpec::parse_at("iso:2024-01-15T10:30:00Z").unwrap(),
             TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string())
@@ -1798,9 +1809,11 @@ mod time_spec_grammar_tests {
         for spec in [
             "t:7",
             "t:latest",
+            "time:2024-01-15T10:30:00Z",
             "iso:2024-01-15T10:30:00Z",
             "recorded:2024-01-15T10:30:00Z",
             "commit:abc123def",
+            "snapshot:42",
         ] {
             let (identifier, from_address) =
                 parse_ledger_id_time_travel(&format!("mydb:main@{spec}")).unwrap();
@@ -1991,7 +2004,67 @@ mod tests {
         ));
     }
 
-    // Ledger ID time-travel syntax tests (@t:, @iso:, @commit:)
+    /// The object form's `at` takes the shared `--at` grammar: tagged spellings
+    /// (including the `time:` / `iso:` pair) and the bare forms, in both the
+    /// `from` object and the `fromNamed` entry shapes.
+    #[test]
+    fn object_form_at_takes_the_shared_grammar() {
+        let cases = [
+            (
+                "time:2024-01-15T10:30:00Z",
+                TimeSpec::AtTime("2024-01-15T10:30:00Z".into()),
+            ),
+            (
+                "iso:2024-01-15T10:30:00Z",
+                TimeSpec::AtTime("2024-01-15T10:30:00Z".into()),
+            ),
+            (
+                "2024-01-15T10:30:00Z",
+                TimeSpec::AtTime("2024-01-15T10:30:00Z".into()),
+            ),
+            (
+                "recorded:2024-01-15T10:30:00Z",
+                TimeSpec::AtRecorded("2024-01-15T10:30:00Z".into()),
+            ),
+            ("t:7", TimeSpec::AtT(7)),
+            ("7", TimeSpec::AtT(7)),
+            ("latest", TimeSpec::Latest),
+            ("commit:abc123", TimeSpec::AtCommit("abc123".into())),
+            ("snapshot:42", TimeSpec::AtSnapshot(42)),
+            // A date-only value is a (later-rejected) timestamp, not a commit
+            // prefix: the error then talks about the timestamp the user wrote.
+            ("2024-01-15", TimeSpec::AtTime("2024-01-15".into())),
+        ];
+        for (at, expected) in &cases {
+            let query = json!({
+                "from": {"@id": "ledger:main", "at": at},
+                "fromNamed": [{"@id": "other:main", "at": at, "alias": "o"}],
+                "select": ["?s"],
+                "where": {"@id": "?s"}
+            });
+            let spec = DatasetSpec::from_json(&query).unwrap();
+            assert_eq!(
+                spec.default_graphs[0].time_spec.as_ref(),
+                Some(expected),
+                "from at={at}"
+            );
+            assert_eq!(
+                spec.named_graphs[0].time_spec.as_ref(),
+                Some(expected),
+                "fromNamed at={at}"
+            );
+        }
+        // A malformed tag is a parse error, not a timestamp that fails later.
+        let query = json!({
+            "from": {"@id": "ledger:main", "at": "t:abc"},
+            "select": ["?s"],
+            "where": {"@id": "?s"}
+        });
+        let err = DatasetSpec::from_json(&query).unwrap_err().to_string();
+        assert!(err.contains("Invalid integer for t:"), "{err}");
+    }
+
+    // Ledger ID time-travel syntax tests (@t:, @time:, @commit:)
 
     #[test]
     fn test_parse_ledger_id_at_t() {

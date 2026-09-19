@@ -994,7 +994,7 @@ WHERE {
 
 Time specifiers:
 - `@t:100` - Transaction number
-- `@iso:2024-01-15T10:30:00Z` - ISO 8601 datetime
+- `@time:2024-01-15T10:30:00Z` - ISO 8601 datetime
 - `@commit:bafybeig...` - Commit ContentId
 - `@t:latest` - Current/latest state
 
@@ -1043,8 +1043,8 @@ PREFIX ex: <http://example.org/ns/>
 PREFIX f: <https://ns.flur.ee/db#>
 
 SELECT ?name ?t ?op
-FROM <ledger:main@iso:2024-01-01T00:00:00Z>
-TO <ledger:main@iso:2024-12-31T23:59:59Z>
+FROM <ledger:main@time:2024-01-01T00:00:00Z>
+TO <ledger:main@time:2024-12-31T23:59:59Z>
 WHERE {
   << ex:alice ex:name ?name >> f:t ?t .
   << ex:alice ex:name ?name >> f:op ?op .

@@ -576,7 +576,7 @@ fn sparql_is_history_query(sparql: &str) -> bool {
 /// used in the collision error message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExtractedFrom {
-    /// Bare ledger identifier with any `@t:`/`@iso:`/`@commit:` suffix and
+    /// Bare ledger identifier with any `@t:`/`@time:`/`@commit:` suffix and
     /// `#named-graph` fragment stripped.
     ledger: String,
     /// `Some(location)` if the source entry expressed a temporal pin
@@ -591,7 +591,7 @@ struct ExtractedFrom {
 /// Mirrors the dataset parser surface (`parse_single_graph_source` /
 /// `parse_graph_sources` in `crate::dataset`):
 /// - String → single graph source. The identifier may carry a
-///   `@t:`/`@iso:`/`@commit:` suffix (temporal pin) and an optional
+///   `@t:`/`@time:`/`@commit:` suffix (temporal pin) and an optional
 ///   `#named-graph` fragment.
 /// - Object → single graph source with `@id`/`id` for the identifier and
 ///   optional `t` (integer) or `at` (string: `commit:HASH` or ISO timestamp)
@@ -627,15 +627,12 @@ fn extract_jsonld_from_value(val: &JsonValue, out: &mut Vec<ExtractedFrom>) {
 }
 
 fn extract_jsonld_from_string(s: &str) -> ExtractedFrom {
-    let pin_location = TEMPORAL_MARKERS.iter().find_map(|m| {
-        if s.contains(m) {
-            Some(format!("'from' contains temporal pin: {s}"))
-        } else {
-            None
-        }
-    });
+    // The same tag-driven detection the snapshot rewriter uses, so a pin the
+    // rewriter leaves alone is one the collision check saw.
+    let pin_location =
+        snapshot::string_has_explicit_pin(s).then(|| format!("'from' contains temporal pin: {s}"));
     ExtractedFrom {
-        ledger: strip_temporal_suffix(s).to_string(),
+        ledger: snapshot::bare_ledger_id(s).to_string(),
         pin_location,
     }
 }
@@ -667,22 +664,6 @@ fn extract_jsonld_from_object(obj: &JsonMap<String, JsonValue>) -> Option<Extrac
 
     Some(entry)
 }
-
-/// Strip a `@t:`/`@iso:`/`@commit:` suffix from a ledger identifier so distinct
-/// ledger counting is independent of temporal pins.
-fn strip_temporal_suffix(ledger: &str) -> &str {
-    // Fragment (`#named-graph`) may follow the temporal marker; we strip it
-    // alongside the marker to keep counting on the bare ledger name.
-    let bare = ledger.split('#').next().unwrap_or(ledger);
-    for marker in TEMPORAL_MARKERS {
-        if let Some(idx) = bare.find(marker) {
-            return &bare[..idx];
-        }
-    }
-    bare
-}
-
-const TEMPORAL_MARKERS: &[&str] = &["@t:", "@iso:", "@commit:"];
 
 /// Extract per-IRI ledger identifiers and temporal-pin status from a SPARQL
 /// query's `FROM` / `FROM NAMED` dataset clauses.
@@ -1347,6 +1328,35 @@ mod tests {
         let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
         assert_eq!(distinct.len(), 1);
         assert!(distinct.contains("ledgerA"));
+    }
+
+    /// Every tag of the shared grammar is a pin to the validator — the same
+    /// set the snapshot rewriter honours, so a pin it leaves alone is one the
+    /// collision check saw and the distinct-ledger count stripped.
+    #[test]
+    fn validator_recognises_every_grammar_tag_as_a_pin() {
+        for pinned in [
+            "ledgerA@time:2024-01-01T00:00:00Z",
+            "ledgerA@iso:2024-01-01T00:00:00Z",
+            "ledgerA@recorded:2024-01-01T00:00:00Z",
+            "ledgerA@snapshot:42",
+            "ledgerA@commit:abcdef",
+            "ledgerA@time:2024-01-01T00:00:00Z#txn-meta",
+        ] {
+            let req = envelope_with(
+                &[("a", jsonld(pinned)), ("b", jsonld("ledgerA"))],
+                Some(AsOf::Iso("2024-01-01T00:00:00Z".into())),
+            );
+            let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+            assert!(
+                matches!(err, MultiQueryValidationError::AsOfCollision { .. }),
+                "{pinned}: {err:?}"
+            );
+            let req = envelope_with(&[("a", jsonld(pinned)), ("b", jsonld("ledgerA"))], None);
+            let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
+            assert_eq!(distinct.len(), 1, "{pinned}: {distinct:?}");
+            assert!(distinct.contains("ledgerA"), "{pinned}: {distinct:?}");
+        }
     }
 
     #[test]

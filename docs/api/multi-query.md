@@ -154,7 +154,7 @@ following are all collision errors and reject the envelope with
 - JSON-LD `from: { "@id": "ledger", "t": 42 }`
 - JSON-LD `from: { "@id": "ledger", "at": "commit:abc123" }`
 - JSON-LD body with an inner `t` field
-- SPARQL `FROM <ledger@t:42>` / `FROM <ledger@iso:...>` /
+- SPARQL `FROM <ledger@t:42>` / `FROM <ledger@time:...>` /
   `FROM <ledger@commit:...>`
 
 This rule is intentional: the alternative (silent inner-wins override)
