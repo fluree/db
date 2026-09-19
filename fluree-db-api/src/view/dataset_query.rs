@@ -732,6 +732,10 @@ impl Fluree {
         // producer's path, so the NDJSON `end` record carries the same state.
         tracker.record_policy_enforcement(dataset.policy_enforcement());
 
+        // Time-pinned graph-source views read that table state, never current.
+        crate::graph_source::pin_graph_source_times(dataset.views(), r2rml.table_provider)
+            .map_err(query_error_to_api_error)?;
+
         let primary = dataset
             .primary()
             .ok_or_else(|| ApiError::query("Dataset has no default graphs"))?;
@@ -910,6 +914,8 @@ impl Fluree {
         // See `execute_view_tracked_with_r2rml`: recorded before execution, and
         // aggregated across every graph the dataset can read.
         tracker.record_policy_enforcement(dataset.policy_enforcement());
+
+        crate::graph_source::pin_graph_source_times(dataset.views(), r2rml.table_provider)?;
 
         let primary = dataset.primary().ok_or_else(|| {
             fluree_db_query::QueryError::InvalidQuery("Dataset has no default graphs".into())

@@ -97,6 +97,92 @@
 //! - `effective_t()` = minimum watermark across all source ledgers
 //! - Use `f:resultLedger` binding to disambiguate results in joins
 
+/// Refusal for a `@t:` / `@commit:` pin on a graph source: those name Fluree
+/// ledger states, which a virtual source has none of. The refusal names the
+/// pins a source does honor; a pin must never be silently answered from the
+/// source's current state.
+pub(crate) const GRAPH_SOURCE_LEDGER_TIME_UNSUPPORTED: &str =
+    "Graph sources have no transaction numbers or commit hashes. Pin the source's \
+     table state with @iso:<timestamp>, @recorded:<timestamp>, or @snapshot:<id>, \
+     or remove the time specification to query at latest.";
+
+/// Refusal for `@snapshot:` on a native ledger, which has no table snapshots.
+pub(crate) const SNAPSHOT_SPEC_ON_LEDGER: &str =
+    "@snapshot: selects a graph source's table snapshot; a ledger is addressed \
+     with @t:, @iso:, @recorded:, or @commit:.";
+
+/// The table state a time-specified graph-source alias reads, or `None` for
+/// its current state. `@iso:` and `@recorded:` coincide: a table snapshot has
+/// one time, the writer's commit time, and no separate event axis (the same
+/// rule as a ledger that never used caller-supplied event times).
+pub(crate) fn source_time_for(
+    spec: &crate::TimeSpec,
+) -> crate::Result<Option<fluree_db_query::r2rml::SourceTime>> {
+    use fluree_db_query::r2rml::SourceTime;
+    match spec {
+        crate::TimeSpec::Latest => Ok(None),
+        crate::TimeSpec::AtSnapshot(id) => Ok(Some(SourceTime::SnapshotId(*id))),
+        crate::TimeSpec::AtTime(iso) | crate::TimeSpec::AtRecorded(iso) => {
+            // Snapshot times are whole milliseconds and the selection is
+            // "committed at or before", so sub-millisecond precision floors
+            // (the ledger resolvers ceiling; see `iso_to_target_epoch_ms`).
+            let dt = crate::time_resolve::parse_time_travel_iso(iso)?;
+            Ok(Some(SourceTime::AsOfTimestampMs(dt.timestamp_millis())))
+        }
+        crate::TimeSpec::AtT(_) | crate::TimeSpec::AtCommit(_) => {
+            Err(crate::ApiError::query(GRAPH_SOURCE_LEDGER_TIME_UNSUPPORTED))
+        }
+    }
+}
+
+/// Push every time-specified graph-source view's pin into the query's R2RML
+/// table provider before execution. One call site per execution route, so a
+/// route cannot run a pinned view against the source's current state.
+///
+/// A pin is per source for the whole query, so one source read at two states
+/// — including pinned in one view and unpinned in another — is refused rather
+/// than letting the pin decide for the unpinned view.
+pub(crate) fn pin_graph_source_times<'v>(
+    views: impl IntoIterator<Item = &'v crate::view::GraphDb>,
+    table_provider: &dyn fluree_db_query::r2rml::R2rmlTableProvider,
+) -> fluree_db_query::error::Result<()> {
+    use fluree_db_query::r2rml::SourceTime;
+    let mut times: std::collections::HashMap<&str, Option<SourceTime>> =
+        std::collections::HashMap::new();
+    for view in views {
+        let Some(gs_id) = view.graph_source_id.as_deref() else {
+            continue;
+        };
+        match times.insert(gs_id, view.graph_source_time) {
+            Some(prior) if prior != view.graph_source_time => {
+                return Err(fluree_db_query::QueryError::InvalidQuery(format!(
+                    "graph source '{gs_id}' is read at two different states in one query \
+                     ({}, {}); pin every reference of a source the same way",
+                    describe_source_time(prior),
+                    describe_source_time(view.graph_source_time),
+                )));
+            }
+            _ => {}
+        }
+    }
+    for (gs_id, time) in times {
+        if let Some(time) = time {
+            table_provider.pin_source_time(gs_id, time)?;
+        }
+    }
+    Ok(())
+}
+
+fn describe_source_time(time: Option<fluree_db_query::r2rml::SourceTime>) -> String {
+    match time {
+        None => "latest".to_string(),
+        Some(fluree_db_query::r2rml::SourceTime::SnapshotId(id)) => format!("@snapshot:{id}"),
+        Some(fluree_db_query::r2rml::SourceTime::AsOfTimestampMs(ms)) => {
+            format!("@time:{}", crate::time_resolve::epoch_ms_to_iso(ms))
+        }
+    }
+}
+
 // Internal modules
 mod bm25;
 mod cache;

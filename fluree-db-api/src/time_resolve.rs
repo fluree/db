@@ -25,11 +25,24 @@ use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB};
 use crate::error::{ApiError, Result};
 
 /// Convert epoch milliseconds to an ISO-8601 string for error messages.
-fn epoch_ms_to_iso(epoch_ms: i64) -> String {
+/// Epoch milliseconds as RFC 3339 (`2024-01-15T10:30:00.000Z`) for error text
+/// that names an instant; the one renderer every time-travel error uses.
+pub(crate) fn epoch_ms_to_iso(epoch_ms: i64) -> String {
     Utc.timestamp_millis_opt(epoch_ms)
         .single()
-        .map(|dt| dt.to_rfc3339())
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_else(|| epoch_ms.to_string())
+}
+
+/// Parse the timestamp of a `@time:` / `@recorded:` selector. The one parser
+/// for every surface, so a malformed timestamp is the same (user) error on a
+/// ledger and on a graph source.
+pub(crate) fn parse_time_travel_iso(iso: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(iso).map_err(|e| {
+        ApiError::query(format!(
+            "Invalid ISO-8601 timestamp for time travel: {iso} ({e})"
+        ))
+    })
 }
 
 /// Resolve an ISO-8601 datetime to a transaction number using POST index queries.
@@ -410,17 +423,7 @@ pub(crate) async fn resolve_time_spec(
         crate::TimeSpec::AtT(t) => Ok(*t),
         crate::TimeSpec::Latest => Ok(current_t),
         crate::TimeSpec::AtTime(iso) => {
-            let dt = chrono::DateTime::parse_from_rfc3339(iso).map_err(|e| {
-                ApiError::internal(format!(
-                    "Invalid ISO-8601 timestamp for time travel: {iso} ({e})"
-                ))
-            })?;
-            // `ledger#time` flakes store epoch milliseconds. Ceiling sub-ms precision
-            // to avoid truncation off-by-one.
-            let mut target_epoch_ms = dt.timestamp_millis();
-            if dt.timestamp_subsec_nanos() % 1_000_000 != 0 {
-                target_epoch_ms += 1;
-            }
+            let target_epoch_ms = iso_to_target_epoch_ms(iso)?;
             datetime_to_t(
                 &ledger.snapshot,
                 Some(ledger.novelty.as_ref()),
@@ -448,6 +451,9 @@ pub(crate) async fn resolve_time_spec(
             )
             .await
         }
+        crate::TimeSpec::AtSnapshot(_) => Err(ApiError::query(
+            crate::graph_source::SNAPSHOT_SPEC_ON_LEDGER,
+        )),
     }
 }
 
@@ -455,11 +461,7 @@ pub(crate) async fn resolve_time_spec(
 /// precision to avoid truncation off-by-one (commit-timestamp flakes store
 /// epoch milliseconds).
 pub(crate) fn iso_to_target_epoch_ms(iso: &str) -> Result<i64> {
-    let dt = chrono::DateTime::parse_from_rfc3339(iso).map_err(|e| {
-        ApiError::internal(format!(
-            "Invalid ISO-8601 timestamp for time travel: {iso} ({e})"
-        ))
-    })?;
+    let dt = parse_time_travel_iso(iso)?;
     let mut target_epoch_ms = dt.timestamp_millis();
     if dt.timestamp_subsec_nanos() % 1_000_000 != 0 {
         target_epoch_ms += 1;

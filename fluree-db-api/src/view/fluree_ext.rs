@@ -5,8 +5,6 @@
 use fluree_db_core::VerifiedIdentity;
 use std::sync::Arc;
 
-use chrono::DateTime;
-
 use crate::view::{GraphDb, ReasoningModePrecedence};
 use crate::{config_resolver, time_resolve, ApiError, Fluree, GovernanceOptions, Result, TimeSpec};
 use fluree_db_binary_index::BinaryIndexStore;
@@ -503,61 +501,16 @@ impl Fluree {
         match spec {
             TimeSpec::Latest => self.load_graph_db(ledger_id).await,
             TimeSpec::AtT(t) => self.load_graph_db_at_t(ledger_id, t).await,
-            TimeSpec::AtTime(iso) => {
+            // Every other spec resolves against the ledger's head state through
+            // the one shared resolver. `ledger_cached` runs first, so an alias that
+            // is not a ledger surfaces NotFound and the callers' graph-source
+            // fallback still fires (a `@snapshot:` on a real ledger is refused
+            // by the resolver).
+            spec => {
                 let handle = self.ledger_cached(ledger_id).await?;
                 let snapshot = handle.snapshot().await;
                 let ledger = snapshot.to_ledger_state();
-                let current_t = ledger.t();
-                let dt = DateTime::parse_from_rfc3339(&iso).map_err(|e| {
-                    ApiError::internal(format!(
-                        "Invalid ISO-8601 timestamp for time travel: {iso} ({e})"
-                    ))
-                })?;
-                // `ledger#time` flakes store epoch milliseconds. If the ISO timestamp includes
-                // sub-millisecond precision, `timestamp_millis()` truncates, which can push the
-                // target *slightly before* the intended instant. To avoid off-by-one-ms
-                // resolution (especially around the first commit after genesis), we ceiling
-                // to the next millisecond when sub-ms precision is present.
-                let mut target_epoch_ms = dt.timestamp_millis();
-                if dt.timestamp_subsec_nanos() % 1_000_000 != 0 {
-                    target_epoch_ms += 1;
-                }
-                let resolved_t = time_resolve::datetime_to_t(
-                    &ledger.snapshot,
-                    Some(ledger.novelty.as_ref()),
-                    target_epoch_ms,
-                    current_t,
-                )
-                .await?;
-                self.load_graph_db_at_t(ledger_id, resolved_t).await
-            }
-            TimeSpec::AtRecorded(iso) => {
-                let handle = self.ledger_cached(ledger_id).await?;
-                let snapshot = handle.snapshot().await;
-                let ledger = snapshot.to_ledger_state();
-                let current_t = ledger.t();
-                let target_epoch_ms = time_resolve::iso_to_target_epoch_ms(&iso)?;
-                let resolved_t = time_resolve::recorded_to_t(
-                    &ledger.snapshot,
-                    Some(ledger.novelty.as_ref()),
-                    target_epoch_ms,
-                    current_t,
-                )
-                .await?;
-                self.load_graph_db_at_t(ledger_id, resolved_t).await
-            }
-            TimeSpec::AtCommit(commit_prefix) => {
-                let handle = self.ledger_cached(ledger_id).await?;
-                let snapshot = handle.snapshot().await;
-                let ledger = snapshot.to_ledger_state();
-                let current_t = ledger.t();
-                let resolved_t = time_resolve::commit_to_t(
-                    &ledger.snapshot,
-                    Some(ledger.novelty.as_ref()),
-                    &commit_prefix,
-                    current_t,
-                )
-                .await?;
+                let resolved_t = time_resolve::resolve_time_spec(&ledger, &spec).await?;
                 self.load_graph_db_at_t(ledger_id, resolved_t).await
             }
         }
@@ -754,6 +707,22 @@ impl Fluree {
     }
 
     pub async fn resolve_graph_source(&self, ledger_id: &str) -> Result<Option<GraphDb>> {
+        self.resolve_graph_source_at(ledger_id, &TimeSpec::Latest)
+            .await
+    }
+
+    /// [`Self::resolve_graph_source`] for a time-specified alias. The view
+    /// carries the table state the query reads; the two routes that resolve a
+    /// pinned alias (the `from`-driven dataset builder and the lazy `graph_at()`
+    /// handle) both come through here, so refusals live in one place: `@t:` /
+    /// `@commit:` on any graph source, and any pin on a source that is not an
+    /// Iceberg-backed table (SQL, BM25, vector, geo) — those read their current
+    /// state and would otherwise accept the pin and ignore it.
+    pub(crate) async fn resolve_graph_source_at(
+        &self,
+        ledger_id: &str,
+        spec: &TimeSpec,
+    ) -> Result<Option<GraphDb>> {
         // A graph-source alias may carry a graph fragment (`{ds}#txn-meta`) or an
         // explicit `:branch`. Split the fragment off BEFORE normalizing/looking up:
         // the nameservice registers a graph source under its `name:branch` id, and
@@ -776,6 +745,22 @@ impl Fluree {
             return Ok(None);
         };
 
+        let graph_source_time = crate::graph_source::source_time_for(spec)?;
+        if graph_source_time.is_some()
+            && !matches!(
+                record.source_type,
+                fluree_db_nameservice::GraphSourceType::Iceberg
+                    | fluree_db_nameservice::GraphSourceType::R2rml
+            )
+        {
+            return Err(ApiError::query(format!(
+                "graph source '{gs_id}' ({}) does not support time-pinned reads; only \
+                 Iceberg-backed graph sources do. Remove the time specification to query \
+                 its current state.",
+                record.source_type.to_type_string()
+            )));
+        }
+
         let snapshot = fluree_db_core::LedgerSnapshot::genesis(&gs_id);
         let state =
             fluree_db_ledger::LedgerState::new(snapshot, fluree_db_novelty::Novelty::new(0));
@@ -786,6 +771,7 @@ impl Fluree {
         // empty system graph, for fragments and explicit dataset selectors alike.
         db.resolved_config = Self::graph_source_model_config(&record);
         db.graph_source_id = Some(gs_id.into());
+        db.graph_source_time = graph_source_time;
         Self::select_graph(db, graph_ref).map(Some)
     }
 }
