@@ -4126,6 +4126,88 @@ impl Operator for FastPathOperator {
     }
 }
 
+/// The current group of each branch in an N-way union (min) merge: every key
+/// in any stream, with the sum of its counts across the streams that carry it
+/// (bag semantics). An exhausted branch drops out; the merge ends when all have.
+///
+/// Scalar columns for the reason given on [`InnerMergeHeads`].
+pub(crate) struct UnionMergeHeads {
+    keys: Vec<u64>,
+    counts: Vec<u64>,
+    live: Vec<bool>,
+    key: u64,
+    count_sum: u64,
+}
+
+impl UnionMergeHeads {
+    /// Read each stream's first group.
+    pub(crate) fn prime<S: GroupStream>(streams: &mut [S]) -> Result<Self> {
+        let mut heads = Self {
+            keys: vec![0; streams.len()],
+            counts: vec![0; streams.len()],
+            live: vec![true; streams.len()],
+            key: 0,
+            count_sum: 0,
+        };
+        for (i, stream) in streams.iter_mut().enumerate() {
+            heads.step(i, stream)?;
+        }
+        Ok(heads)
+    }
+
+    /// Take the smallest key across the live streams, consuming its group from
+    /// each stream on it. `false` when every stream is exhausted; otherwise
+    /// [`key`](Self::key) and [`count_sum`](Self::count_sum) describe it.
+    #[inline(always)]
+    pub(crate) fn next<S: GroupStream>(&mut self, streams: &mut [S]) -> Result<bool> {
+        let mut min_key = u64::MAX;
+        let mut any_live = false;
+        for (i, &key) in self.keys.iter().enumerate() {
+            if self.live[i] {
+                any_live = true;
+                min_key = min_key.min(key);
+            }
+        }
+        if !any_live {
+            return Ok(false);
+        }
+        let mut count_sum = 0u64;
+        for (i, stream) in streams.iter_mut().enumerate() {
+            if self.live[i] && self.keys[i] == min_key {
+                count_sum = count_sum.saturating_add(self.counts[i]);
+                self.step(i, stream)?;
+            }
+        }
+        self.key = min_key;
+        self.count_sum = count_sum;
+        Ok(true)
+    }
+
+    /// The key taken by the last [`next`](Self::next).
+    #[inline(always)]
+    pub(crate) fn key(&self) -> u64 {
+        self.key
+    }
+
+    /// Sum of that key's counts across the streams that carried it.
+    #[inline(always)]
+    pub(crate) fn count_sum(&self) -> u64 {
+        self.count_sum
+    }
+
+    #[inline(always)]
+    fn step<S: GroupStream>(&mut self, i: usize, stream: &mut S) -> Result<()> {
+        match stream.next_group()? {
+            Some((key, count)) => {
+                self.keys[i] = key;
+                self.counts[i] = count;
+            }
+            None => self.live[i] = false,
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4180,6 +4262,27 @@ mod tests {
         // A key at 0 and at u64::MAX are ordinary keys, not sentinels.
         let lo_hi: &[(u64, u64)] = &[(0, 2), (u64::MAX, 3)];
         assert_eq!(inner_merge(&[lo_hi, lo_hi]), vec![(0, 4), (u64::MAX, 9)]);
+    }
+
+    #[test]
+    fn union_merge_heads_sums_counts_per_key_until_all_streams_end() {
+        let a: &[(u64, u64)] = &[(1, 2), (3, 3), (9, 1)];
+        let b: &[(u64, u64)] = &[(3, 4), (4, 5), (u64::MAX, 6)];
+        let empty: &[(u64, u64)] = &[];
+        let mut streams = vec![VecGroups::new(a), VecGroups::new(empty), VecGroups::new(b)];
+        let mut heads = UnionMergeHeads::prime(&mut streams).unwrap();
+        let mut out = Vec::new();
+        while heads.next(&mut streams).unwrap() {
+            out.push((heads.key(), heads.count_sum()));
+        }
+        // 3 is in both branches (3 + 4); `a` ends at 9 while `b` runs on, and
+        // u64::MAX is a real key, not the exhaustion marker.
+        assert_eq!(out, vec![(1, 2), (3, 7), (4, 5), (9, 1), (u64::MAX, 6)]);
+        assert!(!heads.next(&mut streams).unwrap());
+
+        let mut none: Vec<VecGroups> = Vec::new();
+        let mut heads = UnionMergeHeads::prime(&mut none).unwrap();
+        assert!(!heads.next(&mut none).unwrap());
     }
 
     #[test]
