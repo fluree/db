@@ -1,0 +1,102 @@
+//! Error type for the Delta reader.
+
+use thiserror::Error;
+
+pub type Result<T> = std::result::Result<T, DeltaError>;
+
+#[derive(Debug, Error)]
+pub enum DeltaError {
+    /// The graph-source configuration is unusable as written.
+    #[error("invalid Delta configuration: {0}")]
+    Config(String),
+
+    /// A pinned version the table's log does not retain (or never had).
+    #[error("Delta table '{table}' has no readable version {version}")]
+    VersionNotFound { table: String, version: u64 },
+
+    /// An instant before the oldest version the log can still reconstruct.
+    #[error("Delta table '{table}' has no version at or before {requested_ms} ms")]
+    NoVersionAtTime {
+        table: String,
+        requested_ms: i64,
+        /// Commit time of the oldest reconstructable version, when known.
+        oldest_ms: Option<i64>,
+    },
+
+    /// A projected column the selected version's schema does not have.
+    #[error("Delta table '{table}' has no column '{column}' at version {version}")]
+    ColumnNotFound {
+        table: String,
+        column: String,
+        version: u64,
+    },
+
+    /// A column type with no `fluree-db-tabular` representation. Raised before
+    /// any rows are read, so an unsupported column never reads as nulls.
+    #[error("unsupported Delta column type: {0}")]
+    UnsupportedType(String),
+
+    /// Kernel's logical batch disagreed with the schema it planned.
+    #[error("Delta batch does not match its planned schema: {0}")]
+    SchemaMismatch(String),
+
+    /// Anything Kernel reports: protocol features it cannot read, log replay
+    /// failures, and data files a historical version references but storage no
+    /// longer holds.
+    #[error("Delta table '{table}': {source}")]
+    Kernel {
+        table: String,
+        #[source]
+        source: Box<delta_kernel::Error>,
+    },
+
+    #[error("Delta reader internal error: {0}")]
+    Internal(String),
+}
+
+impl DeltaError {
+    pub(crate) fn kernel(table: &str, source: delta_kernel::Error) -> Self {
+        Self::Kernel {
+            table: table.to_string(),
+            source: Box::new(source),
+        }
+    }
+
+    /// True when a data or log file the selected version needs is gone from
+    /// storage — the `VACUUM`ed-history case, as opposed to an unsupported
+    /// feature or a transport failure.
+    pub fn is_missing_file(&self) -> bool {
+        match self {
+            Self::Kernel { source, .. } => kernel_is_not_found(source),
+            _ => false,
+        }
+    }
+}
+
+fn kernel_is_not_found(error: &delta_kernel::Error) -> bool {
+    use delta_kernel::Error as K;
+    match error {
+        K::FileNotFound(_) => true,
+        K::IOError(e) => e.kind() == std::io::ErrorKind::NotFound,
+        K::ObjectStore(delta_kernel::object_store::Error::NotFound { .. }) => true,
+        K::Backtraced { source, .. } => kernel_is_not_found(source),
+        other => std::error::Error::source(other).is_some_and(source_is_not_found),
+    }
+}
+
+fn source_is_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(kernel) = error.downcast_ref::<delta_kernel::Error>() {
+        return kernel_is_not_found(kernel);
+    }
+    if let Some(delta_kernel::object_store::Error::NotFound { .. }) =
+        error.downcast_ref::<delta_kernel::object_store::Error>()
+    {
+        return true;
+    }
+    if let Some(io) = error.downcast_ref::<std::io::Error>() {
+        if io.kind() == std::io::ErrorKind::NotFound {
+            return true;
+        }
+    }
+    error.source().is_some_and(source_is_not_found)
+}

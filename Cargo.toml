@@ -29,6 +29,7 @@ members = [
     "fluree-db-storage-aws",
     "fluree-db-storage-ipfs",
     "fluree-db-iceberg",
+    "fluree-db-delta",
     "fluree-db-tabular",
     "fluree-db-r2rml",
     "fluree-db-sql",
