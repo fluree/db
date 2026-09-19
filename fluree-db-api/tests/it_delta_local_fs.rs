@@ -704,3 +704,56 @@ async fn a_vacuumed_version_is_an_explicit_error() {
         "{err}"
     );
 }
+
+/// Scan filters are advisory: a Delta scan returns every row, so each query
+/// shape must apply its own constraints. COUNT over a constant-object pattern
+/// and over a FILTER must agree with the row query.
+#[tokio::test]
+async fn aggregates_apply_constraints_the_scan_does_not() {
+    let (fluree, alias) = source("delta-agg").await;
+    let run = |sparql: String| {
+        let fluree = fluree.clone();
+        async move {
+            let v = fluree
+                .query_from()
+                .sparql(&sparql)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+            v["results"]["bindings"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        }
+    };
+    let ex = "http://example.org/";
+    // fact_order at latest: totals 250, 400, 500, 600, 700 (order 3 has none).
+    let rows = run(format!(
+        "SELECT ?o FROM <{alias}> WHERE {{ ?o <{ex}total> 600 }}"
+    ))
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    for (label, pattern, expected) in [
+        ("constant object", format!("?o <{ex}total> 600"), "1"),
+        (
+            "filter",
+            format!("?o <{ex}total> ?t FILTER(?t >= 500)"),
+            "3",
+        ),
+        (
+            "class + constant",
+            format!("?o a <{ex}Order> ; <{ex}total> 600"),
+            "1",
+        ),
+    ] {
+        let n = run(format!(
+            "SELECT (COUNT(?o) AS ?n) FROM <{alias}> WHERE {{ {pattern} }}"
+        ))
+        .await;
+        assert_eq!(
+            n[0]["n"]["value"].as_str(),
+            Some(expected),
+            "COUNT with {label}: {n:?}"
+        );
+    }
+}

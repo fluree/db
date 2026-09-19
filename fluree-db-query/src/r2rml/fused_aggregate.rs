@@ -2400,11 +2400,16 @@ impl FusedR2rmlAggregateOperator {
             return Ok(None);
         };
 
-        // Resolve the fact-side folded constant-object constraints to per-row
-        // scalar-column checks. Declines (`None`) if any constraint's predicate is a
-        // RefObjectMap object or is absent — those keep the materialize path (no
-        // silent over-count). Empty for an unconstrained COUNT/SUM/AVG/MIN/MAX plan.
-        let Some(fact_constraints) = Self::resolve_star_constraint_checks(&pattern, tm) else {
+        // Resolve the fact-side constant-object constraints to per-row
+        // scalar-column checks: the folded `star_constraints` AND a standalone
+        // `?s pred const` member, which the rewrite leaves as
+        // `predicate_filter`/`object_constant`. The pushed scan filter for the
+        // latter is pruning only — a provider may apply it inexactly or not at
+        // all — so the fold must enforce it like any other constraint. Declines
+        // (`None`) if any constraint's predicate is a RefObjectMap object or is
+        // absent — those keep the materialize path (no silent over-count). Empty
+        // for an unconstrained COUNT/SUM/AVG/MIN/MAX plan.
+        let Some(fact_constraints) = Self::resolve_pattern_constraints(&pattern, tm) else {
             return Ok(None);
         };
 
@@ -3121,8 +3126,9 @@ impl FusedR2rmlAggregateOperator {
         Some(checks)
     }
 
-    /// P3: gather ALL of a semi-join chain pattern's folded constant-object
-    /// constraints — from `star_constraints` AND from a STANDALONE const-object
+    /// Gather ALL of a pattern's constant-object constraints (the single-scan
+    /// fact pattern and every semi-join chain pattern use this) — from
+    /// `star_constraints` AND from a STANDALONE const-object
     /// member (`predicate_filter` + `object_constant`). The distinction is
     /// load-bearing: the rewrite folds a constant object into `star_constraints` only
     /// when the subject ALSO has a var-object member (the group-key branch's terminal,
@@ -3133,7 +3139,7 @@ impl FusedR2rmlAggregateOperator {
     /// membership UNFILTERED and admit every row (a silent SUM over-count). Declines
     /// (`None`) if the standalone constraint's predicate is not a scalar-column
     /// `PredicateObjectMap` — never silently ignored.
-    fn resolve_semijoin_pattern_constraints(
+    fn resolve_pattern_constraints(
         pattern: &R2rmlPattern,
         tm: &TriplesMap,
     ) -> Option<Vec<ResolvedConstraint>> {
@@ -4147,8 +4153,7 @@ impl FusedR2rmlAggregateOperator {
             // standalone by the rewrite, so reading only star_constraints would admit
             // every row (silent over-count). Declines if a constraint can't resolve to
             // a scalar column.
-            let Some(checks) = Self::resolve_semijoin_pattern_constraints(chain[h], chain_tms[h])
-            else {
+            let Some(checks) = Self::resolve_pattern_constraints(chain[h], chain_tms[h]) else {
                 return Ok(None);
             };
             chain_checks.push(checks);
