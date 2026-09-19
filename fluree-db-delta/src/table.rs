@@ -558,6 +558,9 @@ impl DeltaSnapshot {
     /// This version's file listing, made on first use. `None` when it is too
     /// large to keep.
     fn listing(&self) -> Result<Option<Arc<Listing>>> {
+        if crate::listing::budget() == 0 {
+            return Ok(None);
+        }
         let kernel = |e| self.table.kernel(e);
         let engine = self.table.engine.as_ref();
         // Held while listing: concurrent scans of one version share one replay.
