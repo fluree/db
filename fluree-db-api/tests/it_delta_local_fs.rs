@@ -494,3 +494,39 @@ async fn registration_reports_a_mapped_column_the_table_lacks() {
         .to_string();
     assert!(err.contains("'not_there'"), "{err}");
 }
+
+/// A literal service-principal secret is stored with the source; the info view
+/// every client can read must not return it.
+#[tokio::test]
+async fn graph_source_info_redacts_a_stored_azure_secret() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = fixtures().canonicalize().expect("fixtures dir");
+    let mut config = DeltaCreateConfig::new("delta-secret", root.to_str().unwrap(), MAPPING);
+    config.mapping_media_type = Some("text/turtle".to_string());
+    config.io.azure = Some(fluree_db_api::DeltaAzureAuth::ClientSecret {
+        tenant_id: "tenant-visible".to_string(),
+        client_id: "client-visible".to_string(),
+        client_secret: fluree_db_api::DeltaConfigValue::literal("hunter2-do-not-leak"),
+    });
+    fluree
+        .create_delta_graph_source(config)
+        .await
+        .expect("create");
+    let record = fluree
+        .nameservice()
+        .lookup_graph_source("delta-secret:main")
+        .await
+        .expect("lookup")
+        .expect("record");
+    assert!(
+        record.config.contains("hunter2-do-not-leak"),
+        "precondition: the literal is what gets stored"
+    );
+    let info = fluree_db_api::ledger_info::build_graph_source_info(&fluree, &record)
+        .await
+        .expect("info")
+        .to_string();
+    assert!(!info.contains("hunter2-do-not-leak"), "{info}");
+    assert!(info.contains("client-visible"), "{info}");
+}
