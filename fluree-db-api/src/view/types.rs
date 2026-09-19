@@ -241,6 +241,10 @@ pub struct GraphDb {
     /// rather than a real ledger. Query patterns should be auto-wrapped in
     /// `GRAPH <gs_id> { ... }` so the R2RML provider handles them.
     pub(crate) graph_source_id: Option<Arc<str>>,
+    /// The table state a time-specified graph-source view reads
+    /// (`alias@iso:` / `@recorded:` / `@snapshot:`). Pushed into the R2RML
+    /// provider before execution; `None` reads the source's current state.
+    pub(crate) graph_source_time: Option<fluree_db_query::r2rml::SourceTime>,
 }
 
 impl std::fmt::Debug for GraphDb {
@@ -308,6 +312,7 @@ impl GraphDb {
             rules_source_g_id: None,
             cross_ledger_resolved_ts: Arc::new(std::collections::HashMap::new()),
             graph_source_id: None,
+            graph_source_time: None,
         }
     }
 
@@ -551,6 +556,7 @@ impl GraphDb {
             // model config must also drop the virtual-data routing tag.
             if graph_id != fluree_db_core::DEFAULT_GRAPH_ID {
                 self.graph_source_id = None;
+                self.graph_source_time = None;
             }
         }
         self.graph_id = graph_id;

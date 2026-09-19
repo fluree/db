@@ -216,6 +216,7 @@ pub(crate) fn time_spec_to_suffix(spec: &fluree_db_api::TimeSpec) -> String {
         fluree_db_api::TimeSpec::AtTime(iso) => format!("@iso:{iso}"),
         fluree_db_api::TimeSpec::AtRecorded(iso) => format!("@recorded:{iso}"),
         fluree_db_api::TimeSpec::AtCommit(prefix) => format!("@commit:{prefix}"),
+        fluree_db_api::TimeSpec::AtSnapshot(id) => format!("@snapshot:{id}"),
     }
 }
 
@@ -2057,6 +2058,7 @@ mod tests {
             TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string()),
             TimeSpec::AtRecorded("2024-01-15T10:30:00Z".to_string()),
             TimeSpec::AtCommit("abc123def".to_string()),
+            TimeSpec::AtSnapshot(5_648_190_075_564_901_028),
         ];
         for spec in all {
             let suffix = time_spec_to_suffix(&spec);

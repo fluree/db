@@ -480,6 +480,9 @@ pub enum TimeSpec {
     /// Identical to `AtTime` on ledgers that never used caller-supplied
     /// event times.
     AtRecorded(String),
+    /// At a table format's own snapshot id (`@snapshot:<id>`). Resolvable only
+    /// by a graph source backed by a snapshotted table; native ledgers reject it.
+    AtSnapshot(i64),
     /// "latest" keyword - resolves to current ledger t
     Latest,
 }
@@ -615,8 +618,8 @@ impl TimeSpec {
 /// for a canonical tag and mis-spells it.
 pub const ACCEPTED_TIME_SPEC_SPELLINGS: &str =
     "Accepted: t:<N>, t:latest, latest, iso:<ISO-8601>, recorded:<ISO-8601>, \
-     commit:<hex-prefix>, a bare transaction number, a bare ISO-8601 timestamp, \
-     or a bare commit hex-digest prefix";
+     commit:<hex-prefix>, snapshot:<id> (graph sources only), a bare transaction \
+     number, a bare ISO-8601 timestamp, or a bare commit hex-digest prefix";
 
 impl From<LedgerIdTimeSpec> for TimeSpec {
     fn from(spec: LedgerIdTimeSpec) -> Self {
@@ -625,6 +628,7 @@ impl From<LedgerIdTimeSpec> for TimeSpec {
             LedgerIdTimeSpec::AtIso(value) => TimeSpec::AtTime(value),
             LedgerIdTimeSpec::AtCommit(value) => TimeSpec::AtCommit(value),
             LedgerIdTimeSpec::AtRecorded(value) => TimeSpec::AtRecorded(value),
+            LedgerIdTimeSpec::AtSnapshot(id) => TimeSpec::AtSnapshot(id),
         }
     }
 }
@@ -1629,7 +1633,7 @@ mod time_spec_grammar_tests {
 
         let bare = TimeSpec::parse("nope").unwrap_err().to_string();
         assert!(
-            bare.contains("Expected t:, iso:, recorded:, or commit:"),
+            bare.contains("Expected t:, iso:, recorded:, commit:, or snapshot:"),
             "got: {bare}"
         );
         assert!(
@@ -1641,7 +1645,7 @@ mod time_spec_grammar_tests {
             .unwrap_err()
             .to_string();
         assert!(
-            addressed.contains("Expected @t:, @iso:, @recorded:, or @commit:"),
+            addressed.contains("Expected @t:, @iso:, @recorded:, @commit:, or @snapshot:"),
             "got: {addressed}"
         );
     }
