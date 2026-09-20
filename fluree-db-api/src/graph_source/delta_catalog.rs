@@ -330,8 +330,11 @@ impl crate::Fluree {
         let unity = self.hydrate_unity(&req.unity).await?;
         let overrides = keyed_overrides(&unity, &req.tables, &req.per_table_overrides)?;
         // `buffered` keeps the request's order, and with it the mapping's.
-        let tables: Vec<TableDescription> = futures::stream::iter(&req.tables)
-            .map(|name| fluree_db_delta::describe_unity_table(&unity, name))
+        let tables: Vec<TableDescription> = futures::stream::iter(req.tables.clone())
+            .map(|name| {
+                let unity = unity.clone();
+                async move { fluree_db_delta::describe_unity_table(&unity, &name).await }
+            })
             .buffered(DESCRIBE_CONCURRENCY)
             .try_collect()
             .await

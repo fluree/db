@@ -2,6 +2,8 @@
 //! table's columns and declared keys. Nothing here reads a table's files.
 
 use fluree_db_tabular::FieldType;
+use std::sync::Arc;
+
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
@@ -89,12 +91,12 @@ pub struct DeclaredForeignKey {
 /// List what `unity` holds. `unity` must be hydrated.
 pub async fn browse_unity(unity: &UnityConfig, depth: BrowseDepth) -> Result<UnityListing> {
     unity.validate()?;
-    let client = UnityClient::new(unity)?;
+    let client = Arc::new(UnityClient::new(unity)?);
     browse(&client, unity, depth).await
 }
 
 pub(crate) async fn browse(
-    client: &UnityClient,
+    client: &Arc<UnityClient>,
     unity: &UnityConfig,
     depth: BrowseDepth,
 ) -> Result<UnityListing> {
@@ -114,11 +116,20 @@ pub(crate) async fn browse(
     let mut tables = Vec::new();
     if depth == BrowseDepth::Tables {
         // `buffered` keeps the schemas' order.
-        let listed: Vec<Vec<ListedTable>> = futures::stream::iter(&schemas)
+        // Every catalog's system views are left out; they are still listed
+        // when the schema is asked for by name.
+        let wanted: Vec<String> = schemas
+            .iter()
             .map(|full| full.strip_prefix(&format!("{catalog}.")).unwrap_or(full))
-            // Every catalog's system views; still listed when asked for by name.
-            .filter(|schema| futures::future::ready(*schema != SYSTEM_SCHEMA))
-            .map(|schema| client.tables(catalog, schema))
+            .filter(|schema| *schema != SYSTEM_SCHEMA)
+            .map(str::to_string)
+            .collect();
+        // Owned values keep the future `Send`; `buffered` keeps the order.
+        let listed: Vec<Vec<ListedTable>> = futures::stream::iter(wanted)
+            .map(|schema| {
+                let (client, catalog) = (client.clone(), catalog.to_string());
+                async move { client.tables(&catalog, &schema).await }
+            })
             .buffered(LISTING_CONCURRENCY)
             .try_collect()
             .await?;
@@ -166,8 +177,8 @@ mod tests {
     }
 
     /// A plain HTTP client: the production one refuses the loopback mock.
-    fn client(config: &UnityConfig) -> UnityClient {
-        UnityClient::with_http(config, reqwest::Client::new()).unwrap()
+    fn client(config: &UnityConfig) -> Arc<UnityClient> {
+        Arc::new(UnityClient::with_http(config, reqwest::Client::new()).unwrap())
     }
 
     async fn serve(
