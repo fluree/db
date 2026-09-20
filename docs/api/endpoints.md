@@ -3150,6 +3150,11 @@ POST {api_base_url}/delta/map
 | `s3_region`, `s3_endpoint`, `s3_path_style` | string, string, bool | S3 options. `s3_endpoint` is guarded against the link-local/metadata range. Credentials come from the server's environment or role. |
 | `azure_tenant_id`, `azure_client_id` | string | Microsoft Entra service principal for `abfss://` locations. Omit all Azure fields to use the server's ambient Azure credentials. |
 | `azure_client_secret_env` / `azure_client_secret` | string | The principal's secret: the name of a server environment variable holding it (not stored), or a literal (stored with the graph source). Exactly one, with the two fields above. |
+| `unity_uri` | string | Databricks workspace URL. Tables without a `tables` entry are then named in Unity Catalog (`catalog.schema.table`), which places each and issues, and renews, its credentials. Excludes `root`. Guarded against internal hosts |
+| `unity_catalog`, `unity_schema` | string | Complete a mapped table name of fewer than three parts |
+| `oauth2_client_id`, `oauth2_client_secret_env` / `oauth2_client_secret` | string | A Databricks service principal: its application id, and its OAuth secret as the name of a server environment variable (not stored; must be listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`) or a literal (stored) |
+| `auth_bearer_env` / `auth_bearer` | string | A Databricks token in place of a service principal, under the same rule. It does not renew |
+| `oauth2_token_url`, `oauth2_scope` | string | Default to the workspace's own token endpoint and `all-apis` |
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
 

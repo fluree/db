@@ -28,8 +28,9 @@ wrong, which is why a Delta table is not addressed as a folder of files.
 
 ## Registering a source
 
-A Delta source names its tables by **path**. Each `rr:tableName` in the mapping
-resolves to:
+A Delta source names its tables by **path**, or — for Databricks — by their
+name in [Unity Catalog](#unity-catalog). By path, each `rr:tableName` in the
+mapping resolves to:
 
 1. its explicit `tables` entry, if there is one; otherwise
 2. a directory under `root`, with the name's dots as path separators —
@@ -72,7 +73,8 @@ Content-Type: application/json
 
 Optional fields: `branch`, `r2rml_type`, `s3_endpoint`, `s3_path_style`,
 `azure_tenant_id`, `azure_client_id`, `azure_client_secret_env` /
-`azure_client_secret`, `model`, `default_allow`. The response reports the stored mapping, the mapped
+`azure_client_secret`, the [Unity Catalog](#unity-catalog) fields, `model`,
+`default_allow`. The response reports the stored mapping, the mapped
 table names, `table_versions` (the current Delta version of each table that
 opened with every column its maps reference) and `table_warnings` (a table that
 could not be read, or a mapped column it lacks; the source is registered
@@ -145,6 +147,57 @@ Access control on the tables themselves (OneLake security roles, row- or
 column-level rules defined in Fabric) is enforced by Azure against that
 identity, not re-implemented here; use a model ledger's
 [access policy](iceberg.md#access-policy) to govern what Fluree users see.
+
+### Unity Catalog
+
+With a Databricks workspace as `unity_uri` (`--unity-uri`), a table without a
+`tables` entry is named as Databricks names it, `catalog.schema.table`. Unity
+Catalog says where it lives and issues the credentials that read it, so managed
+tables — whose storage path Unity owns — are reachable, and the reading process
+needs no storage credentials of its own.
+
+```json
+{
+  "name": "dbx-sales",
+  "unity_uri": "https://<workspace>.cloud.databricks.com",
+  "unity_catalog": "main",
+  "oauth2_client_id": "<application-id>",
+  "oauth2_client_secret_env": "DATABRICKS_CLIENT_SECRET",
+  "s3_region": "us-east-1",
+  "r2rml": "…"
+}
+```
+
+- **Names.** `unity_catalog` and `unity_schema` complete a shorter name: with
+  the config above, `rr:tableName "sales.orders"` is `main.sales.orders`. A
+  `tables` entry is still read by path with the process's own credentials, so
+  one source can mix the two. `root` and `unity_uri` exclude each other.
+- **Auth.** A service principal (`oauth2_client_id` and its secret), whose
+  token is requested and renewed automatically, or a personal access token
+  (`auth_bearer_env` / `auth_bearer`), which is not. The token URL and scope
+  default to the workspace's own endpoint and `all-apis`. A secret is given as
+  a literal, stored with the source, or as the name of an environment variable
+  of the reading process; a server accepts only names listed in
+  [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](iceberg.md#stored-configuration-format-nameservice).
+- **Credentials.** Unity issues them per table, scoped to that table's path,
+  for an hour. Each table's are kept until a few minutes before they expire
+  and then requested again; concurrent queries share one request. The table's
+  log and footer caches are unaffected by the change of credentials.
+- **Region.** Unity does not name an S3 bucket's region: give `s3_region`, or
+  set `AWS_REGION`.
+- **What is read.** Delta tables with files of their own. A view, a table in
+  another format, and a table the principal cannot see or Unity will not issue
+  credentials for are reported by name — as a `table_warnings` entry at
+  registration and as the error of a query that touches them. A location on
+  the local filesystem is never followed, whatever
+  `FLUREE_ICEBERG_LOCAL_ROOTS` allows.
+- **Freshness of placement.** Where a name points is looked up when its table
+  handle is first opened and again when the handle's cache entry expires; a
+  table dropped and recreated elsewhere is read at its old location until then.
+
+Setting up the workspace side — external data access, the service principal
+and its four privileges — is walked through in
+[Connecting to lakehouse platforms](lakehouse-platforms.md#databricks-tables-through-unity-catalog).
 
 ## Mapping
 
@@ -330,10 +383,9 @@ source at two different states in one query is rejected, as for
 - **Materialization and tracking** (`fluree materialize`, `fluree track`) are
   not available for Delta sources.
 - **Nested types** cannot be mapped.
-- **Catalogs**: tables are addressed by path; there is no catalog discovery.
-  Databricks managed tables can be reached one at a time with credentials
-  Unity Catalog issues; see
-  [Connecting to lakehouse platforms](lakehouse-platforms.md#databricks-managed-tables).
+- **Catalogs**: Unity Catalog places tables that are named in the mapping;
+  catalogs, schemas and tables cannot be browsed, and no mapping is generated
+  from them.
 
 ## Related Documentation
 

@@ -106,8 +106,12 @@ impl UnityConfig {
     fn validate(&self) -> Result<()> {
         fluree_db_iceberg::net::validate_public_url(&self.uri)
             .map_err(|e| DeltaError::Config(format!("Unity Catalog uri: {e}")))?;
-        match self.auth {
-            AuthConfig::Bearer { .. } | AuthConfig::OAuth2ClientCredentials { .. } => Ok(()),
+        match &self.auth {
+            AuthConfig::Bearer { .. } => Ok(()),
+            AuthConfig::OAuth2ClientCredentials { token_url, .. } => {
+                fluree_db_iceberg::net::validate_public_url(token_url)
+                    .map_err(|e| DeltaError::Config(format!("Unity Catalog token URL: {e}")))
+            }
             _ => Err(DeltaError::Config(
                 "Unity Catalog needs a bearer token or OAuth2 client credentials".to_string(),
             )),
@@ -391,6 +395,20 @@ mod tests {
         let mut unauthenticated = unity(None, None);
         unauthenticated.auth = AuthConfig::None;
         assert!(with(unauthenticated).validate().is_err());
+
+        let mut internal_token_url = unity(None, None);
+        internal_token_url.auth = AuthConfig::OAuth2ClientCredentials {
+            token_url: "http://127.0.0.1/token".to_string(),
+            client_id: ConfigValue::literal("app"),
+            client_secret: ConfigValue::literal("s"),
+            scope: None,
+            audience: None,
+        };
+        assert!(with(internal_token_url)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("token URL"));
 
         let mut internal = unity(None, None);
         internal.uri = "http://169.254.169.254".to_string();

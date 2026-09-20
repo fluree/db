@@ -3288,6 +3288,56 @@ pub struct DeltaMapArgs {
     #[arg(long, value_name = "VAR")]
     pub azure_client_secret_env: Option<String>,
 
+    /// Databricks workspace URL. Tables without a --table entry are then named
+    /// in Unity Catalog (catalog.schema.table), which says where each lives
+    /// and issues the credentials that read it. Excludes --root
+    #[arg(long, value_name = "URL", conflicts_with = "root")]
+    pub unity_uri: Option<String>,
+
+    /// Catalog that completes a mapped table name of fewer than three parts
+    #[arg(long, requires = "unity_uri")]
+    pub unity_catalog: Option<String>,
+
+    /// Schema that completes a one-part mapped table name
+    #[arg(long, requires = "unity_uri")]
+    pub unity_schema: Option<String>,
+
+    /// Databricks token for Unity Catalog (stored with the graph source;
+    /// prefer --auth-bearer-env)
+    #[arg(long, requires = "unity_uri", conflicts_with = "auth_bearer_env")]
+    pub auth_bearer: Option<String>,
+
+    /// Environment variable holding the Databricks token, read by the process
+    /// that reads the tables. With --remote, the server must list the variable
+    /// in FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS
+    #[arg(long, value_name = "VAR", requires = "unity_uri")]
+    pub auth_bearer_env: Option<String>,
+
+    /// Application id of a Databricks service principal
+    #[arg(long, requires = "unity_uri")]
+    pub oauth2_client_id: Option<String>,
+
+    /// The service principal's OAuth secret (stored with the graph source;
+    /// prefer --oauth2-client-secret-env)
+    #[arg(
+        long,
+        requires = "unity_uri",
+        conflicts_with = "oauth2_client_secret_env"
+    )]
+    pub oauth2_client_secret: Option<String>,
+
+    /// Environment variable holding the OAuth secret; as --auth-bearer-env
+    #[arg(long, value_name = "VAR", requires = "unity_uri")]
+    pub oauth2_client_secret_env: Option<String>,
+
+    /// OAuth2 token URL (default: the workspace's own, <unity-uri>/oidc/v1/token)
+    #[arg(long, requires = "unity_uri")]
+    pub oauth2_token_url: Option<String>,
+
+    /// OAuth2 scope (default: all-apis)
+    #[arg(long, requires = "unity_uri")]
+    pub oauth2_scope: Option<String>,
+
     /// Model ledger (name:branch) governing this source: its default graph
     /// supplies the view policies (`fluree model access enable <model> ...`)
     /// and the class/property hierarchy they entail over.

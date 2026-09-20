@@ -248,7 +248,7 @@ pub use fluree_db_sql::{
     SqlGsConfig, WireProtocol,
 };
 #[cfg(feature = "delta")]
-pub use graph_source::{DeltaAzureFields, DeltaCreateConfig, DeltaCreateResult};
+pub use graph_source::{DeltaAzureFields, DeltaCreateConfig, DeltaCreateResult, DeltaUnityFields};
 #[cfg(feature = "sql")]
 pub use graph_source::{SqlCheckResult, SqlCreateConfig, SqlCreateResult};
 

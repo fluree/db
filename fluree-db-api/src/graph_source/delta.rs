@@ -101,6 +101,75 @@ impl DeltaAzureFields {
     }
 }
 
+/// The flat Unity Catalog fields the CLI and HTTP surfaces accept. A secret
+/// arrives as the surface resolved it: a literal, or the name of an
+/// environment variable read where the tables are read.
+#[derive(Debug, Clone, Default)]
+pub struct DeltaUnityFields {
+    /// The Databricks workspace URL.
+    pub uri: Option<String>,
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
+    pub bearer: Option<fluree_db_iceberg::ConfigValue>,
+    pub oauth2_client_id: Option<String>,
+    pub oauth2_client_secret: Option<fluree_db_iceberg::ConfigValue>,
+    /// Defaults to the workspace's own token endpoint.
+    pub oauth2_token_url: Option<String>,
+    /// Defaults to `all-apis`.
+    pub oauth2_scope: Option<String>,
+}
+
+impl DeltaUnityFields {
+    /// `None` when no field is set. Catalog fields without a workspace, or a
+    /// workspace without exactly one way to authenticate, are errors.
+    pub fn into_config(self) -> crate::Result<Option<UnityConfig>> {
+        use fluree_db_iceberg::auth::AuthConfig;
+        use fluree_db_iceberg::ConfigValue;
+        let bad = |message: &str| Err(crate::ApiError::Config(format!("Unity Catalog: {message}")));
+        let Some(uri) = self.uri else {
+            let stray = self.catalog.is_some()
+                || self.schema.is_some()
+                || self.bearer.is_some()
+                || self.oauth2_client_id.is_some()
+                || self.oauth2_client_secret.is_some()
+                || self.oauth2_token_url.is_some()
+                || self.oauth2_scope.is_some();
+            return if stray {
+                bad("catalog and auth options need the workspace URL")
+            } else {
+                Ok(None)
+            };
+        };
+        let auth = match (
+            self.bearer,
+            self.oauth2_client_id,
+            self.oauth2_client_secret,
+        ) {
+            (Some(token), None, None) => AuthConfig::Bearer { token },
+            (None, Some(client_id), Some(client_secret)) => AuthConfig::OAuth2ClientCredentials {
+                token_url: self
+                    .oauth2_token_url
+                    .unwrap_or_else(|| format!("{}/oidc/v1/token", uri.trim_end_matches('/'))),
+                client_id: ConfigValue::literal(client_id),
+                client_secret,
+                scope: Some(self.oauth2_scope.unwrap_or_else(|| "all-apis".to_string())),
+                audience: None,
+            },
+            _ => {
+                return bad(
+                    "give a bearer token, or the client id and secret of a service principal",
+                )
+            }
+        };
+        Ok(Some(UnityConfig {
+            uri,
+            auth,
+            catalog: self.catalog,
+            schema: self.schema,
+        }))
+    }
+}
+
 impl DeltaCreateConfig {
     /// A source whose tables live under `root`.
     pub fn new(
@@ -600,6 +669,92 @@ mod tests {
             client_id: client.map(str::to_string),
             client_secret: secret.map(str::to_string),
             client_secret_env: secret_env.map(str::to_string),
+        }
+    }
+
+    fn secret(value: &str) -> Option<fluree_db_iceberg::ConfigValue> {
+        Some(fluree_db_iceberg::ConfigValue::literal(value))
+    }
+
+    #[test]
+    fn a_service_principal_needs_only_its_workspace_id_and_secret() {
+        let unity = DeltaUnityFields {
+            uri: Some("https://workspace.example.com/".to_string()),
+            catalog: Some("main".to_string()),
+            oauth2_client_id: Some("app".to_string()),
+            oauth2_client_secret: Some(fluree_db_iceberg::ConfigValue::from_env("SP_SECRET")),
+            ..Default::default()
+        }
+        .into_config()
+        .unwrap()
+        .unwrap();
+        assert_eq!(unity.catalog.as_deref(), Some("main"));
+        let auth = serde_json::to_value(&unity.auth).unwrap();
+        assert_eq!(auth["type"], "oauth2_client_credentials");
+        assert_eq!(
+            auth["token_url"],
+            "https://workspace.example.com/oidc/v1/token"
+        );
+        assert_eq!(auth["scope"], "all-apis");
+        assert_eq!(auth["client_secret"]["env_var"], "SP_SECRET");
+
+        let overridden = DeltaUnityFields {
+            uri: Some("https://workspace.example.com".to_string()),
+            oauth2_client_id: Some("app".to_string()),
+            oauth2_client_secret: secret("s"),
+            oauth2_token_url: Some("https://login.example.com/token".to_string()),
+            oauth2_scope: Some("sql".to_string()),
+            ..Default::default()
+        }
+        .into_config()
+        .unwrap()
+        .unwrap();
+        let auth = serde_json::to_value(&overridden.auth).unwrap();
+        assert_eq!(auth["token_url"], "https://login.example.com/token");
+        assert_eq!(auth["scope"], "sql");
+    }
+
+    #[test]
+    fn unity_fields_are_all_or_nothing_with_one_way_to_authenticate() {
+        assert!(DeltaUnityFields::default().into_config().unwrap().is_none());
+        let uri = || Some("https://workspace.example.com".to_string());
+
+        let bearer = DeltaUnityFields {
+            uri: uri(),
+            bearer: secret("t"),
+            ..Default::default()
+        };
+        assert!(bearer.clone().into_config().unwrap().is_some());
+
+        for broken in [
+            DeltaUnityFields {
+                uri: uri(),
+                ..Default::default()
+            },
+            DeltaUnityFields {
+                catalog: Some("main".to_string()),
+                ..Default::default()
+            },
+            DeltaUnityFields {
+                bearer: secret("t"),
+                ..Default::default()
+            },
+            DeltaUnityFields {
+                oauth2_client_id: Some("app".to_string()),
+                ..bearer.clone()
+            },
+            DeltaUnityFields {
+                uri: uri(),
+                oauth2_client_id: Some("app".to_string()),
+                ..Default::default()
+            },
+            DeltaUnityFields {
+                uri: uri(),
+                oauth2_client_secret: secret("s"),
+                ..Default::default()
+            },
+        ] {
+            assert!(broken.clone().into_config().is_err(), "{broken:?}");
         }
     }
 

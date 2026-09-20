@@ -24,7 +24,7 @@ commands operate on the same family of mapped sources.
 ### Usage
 
 ```bash
-fluree delta map <NAME> --r2rml <PATH> (--root <LOCATION> | --table <NAME=LOCATION>...) [OPTIONS]
+fluree delta map <NAME> --r2rml <PATH> (--root <LOCATION> | --unity-uri <URL> | --table <NAME=LOCATION>...) [OPTIONS]
 ```
 
 ### Arguments
@@ -70,6 +70,24 @@ Give the tenant, the client id and one of the two secret options together, or
 none of them to use ambient credentials. See
 [Credentials](../graph-sources/delta.md#credentials).
 
+**Unity Catalog (Databricks):**
+
+| Option | Description |
+|--------|-------------|
+| `--unity-uri <URL>` | Databricks workspace URL. Tables without a `--table` entry are then named in Unity Catalog (`catalog.schema.table`), which says where each lives and issues, and renews, the credentials that read it. Excludes `--root` |
+| `--unity-catalog <NAME>` | Completes a mapped table name of fewer than three parts |
+| `--unity-schema <NAME>` | Completes a one-part mapped table name |
+| `--oauth2-client-id <ID>` | Application id of a Databricks service principal |
+| `--oauth2-client-secret-env <VAR>` | Environment variable holding the service principal's OAuth secret, read by the process that reads the tables. The secret is not stored. With `--remote`, the server must list the variable in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) |
+| `--oauth2-client-secret <SECRET>` | Literal OAuth secret. Stored with the graph source; prefer the option above |
+| `--auth-bearer-env <VAR>` / `--auth-bearer <TOKEN>` | A Databricks personal access token in place of a service principal, by variable or literal. It does not renew |
+| `--oauth2-token-url <URL>` | OAuth2 token URL (default: the workspace's own, `<unity-uri>/oidc/v1/token`) |
+| `--oauth2-scope <SCOPE>` | OAuth2 scope (default: `all-apis`) |
+
+Give a service principal's id and secret, or a token. On AWS also give
+`--s3-region`: Unity Catalog does not name the bucket's region. See
+[Unity Catalog](../graph-sources/delta.md#unity-catalog).
+
 **R2RML mapping:**
 
 | Option | Description |
@@ -97,6 +115,13 @@ fluree delta map fabric-sales \
   --root abfss://<workspace-id>@onelake.dfs.fabric.microsoft.com/<lakehouse-id>/Tables \
   --azure-tenant-id "$TENANT" --azure-client-id "$APP_ID" \
   --azure-client-secret-env FABRIC_CLIENT_SECRET \
+  --r2rml mappings/sales.ttl
+
+# Databricks tables by name, read as a service principal
+fluree delta map dbx-sales \
+  --unity-uri https://<workspace>.cloud.databricks.com --unity-catalog main \
+  --oauth2-client-id "$APP_ID" --oauth2-client-secret-env DATABRICKS_CLIENT_SECRET \
+  --s3-region us-east-1 \
   --r2rml mappings/sales.ttl
 
 # One table lives elsewhere

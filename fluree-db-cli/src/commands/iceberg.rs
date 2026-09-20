@@ -673,7 +673,7 @@ async fn run_iceberg_map_local(_args: IcebergMapArgs, _dirs: &FlureeDir) -> CliR
 #[cfg(feature = "iceberg")]
 /// A secret given literally or as the name of an environment variable (clap
 /// refuses both).
-fn secret_value(
+pub(crate) fn secret_value(
     literal: &Option<String>,
     env: &Option<String>,
 ) -> Option<fluree_db_api::IcebergConfigValue> {
