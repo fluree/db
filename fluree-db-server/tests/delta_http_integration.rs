@@ -202,6 +202,43 @@ async fn a_map_request_the_server_cannot_honour_is_refused() {
     .await;
     assert!(status.is_client_error(), "{status}: {text}");
 
+    // Unity Catalog: a workspace URL aimed at an internal host, a token URL
+    // likewise, a secret in a variable the operator did not list, a catalog
+    // beside a root, and a catalog with no way to authenticate.
+    let unity = "https://workspace.example.com";
+    for (name, extra) in [
+        (
+            "unity-ssrf",
+            json!({"unity_uri": "http://169.254.169.254", "auth_bearer": "t"}),
+        ),
+        (
+            "unity-token-ssrf",
+            json!({"unity_uri": unity, "oauth2_client_id": "app", "oauth2_client_secret": "s",
+                   "oauth2_token_url": "http://127.0.0.1/token"}),
+        ),
+        (
+            "unity-env",
+            json!({"unity_uri": unity, "auth_bearer_env": "AWS_SECRET_ACCESS_KEY"}),
+        ),
+        (
+            "unity-root",
+            json!({"unity_uri": unity, "auth_bearer": "t", "root": "s3://bucket/lake"}),
+        ),
+        ("unity-anonymous", json!({"unity_uri": unity})),
+    ] {
+        let mut body = json!({"name": name, "r2rml": MAPPING_TTL});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let (status, text) = map(&state, body).await;
+        assert!(status.is_client_error(), "{name}: {status}: {text}");
+        let (status, text) = amounts(&state, &format!("{name}:main")).await;
+        assert!(
+            !status.is_success(),
+            "{name} was registered: {status}: {text}"
+        );
+    }
+
     // Nothing above left a source behind.
     let (status, text) = amounts(&state, "elsewhere:main").await;
     assert!(!status.is_success(), "{status}: {text}");
