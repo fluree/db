@@ -180,6 +180,9 @@ Iceberg endpoint is `https://<workspace>/api/2.1/unity-catalog/iceberg-rest`).
 A catalog with no `/v1/config` route is addressed with the warehouse name as
 the prefix.
 
+For Databricks — what to enable in Unity Catalog, and the token it needs — see
+[Connecting to lakehouse platforms](lakehouse-platforms.md#databricks-through-the-iceberg-rest-endpoint).
+
 **Direct S3 config:**
 
 ```json

@@ -92,6 +92,10 @@ let created = fluree.create_delta_graph_source(config).await?;
 Credentials belong to the process that **reads** the tables — the server, or a
 CLI running locally.
 
+For creating an identity and granting it access on ADLS Gen2, OneLake or
+Databricks, step by step, see
+[Connecting to lakehouse platforms](lakehouse-platforms.md).
+
 **S3.** `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (and
 `AWS_SESSION_TOKEN`) from the environment, a web-identity token, or the
 container / instance role. Shared-config profiles (`AWS_PROFILE`, SSO) are not
@@ -327,10 +331,14 @@ source at two different states in one query is rejected, as for
   not available for Delta sources.
 - **Nested types** cannot be mapped.
 - **Catalogs**: tables are addressed by path; there is no catalog discovery.
+  Databricks managed tables can be reached one at a time with credentials
+  Unity Catalog issues; see
+  [Connecting to lakehouse platforms](lakehouse-platforms.md#databricks-managed-tables).
 
 ## Related Documentation
 
 - [`fluree delta`](../cli/delta.md)
+- [Connecting to lakehouse platforms](lakehouse-platforms.md) — ADLS Gen2, OneLake and Databricks, step by step
 - [R2RML](r2rml.md)
 - [Iceberg / Parquet](iceberg.md) — access policy, local-table allowlist
 - [Time travel](../concepts/time-travel.md)

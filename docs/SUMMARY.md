@@ -180,6 +180,7 @@
   - [Iceberg / Parquet](graph-sources/iceberg.md)
   - [R2RML](graph-sources/r2rml.md)
   - [Delta Lake tables](graph-sources/delta.md)
+  - [Connecting to lakehouse platforms](graph-sources/lakehouse-platforms.md)
   - [SQL endpoints (Trino / bridge)](graph-sources/sql.md)
   - [BM25 graph source](graph-sources/bm25.md)
 
