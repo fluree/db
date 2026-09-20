@@ -12,6 +12,11 @@ without it can still map and query Delta sources on a server that has it
 | Subcommand | Description |
 |------------|-------------|
 | `map` | Map Delta tables as a graph source |
+| `browse` | List a Unity Catalog's catalogs, schemas or tables |
+| `preview` | Show a Unity Catalog table's columns and declared keys |
+| `verify` | Read a Unity Catalog table with the credentials Unity issues |
+| `generate` | Generate an R2RML mapping from Unity Catalog tables |
+| `validate` | Check a mapping against the tables `map` would read |
 | `list` | List mapped graph sources (Delta, SQL, Iceberg and R2RML) |
 | `info` | Show details for a mapped graph source |
 | `drop` | Drop a mapped graph source |
@@ -149,6 +154,50 @@ yet, or this process may lack the credentials the querying process has — or
 that it lacks a mapped column. The source is registered either way and the
 first query reports the underlying error. A table name that cannot be
 placed (no `--table` entry and no `--root`) is an error.
+
+## fluree delta browse / preview / verify / generate / validate
+
+The read-only commands that lead up to `map` on Unity Catalog. None registers
+anything. See
+[From a catalog to a mapping](../graph-sources/delta.md#from-a-catalog-to-a-mapping).
+
+```bash
+fluree delta browse   [--depth schemas|tables]          <UNITY OPTIONS>
+fluree delta preview  <TABLE>                           <UNITY OPTIONS>
+fluree delta verify   <TABLE> [--s3-region <REGION>]    <UNITY OPTIONS>
+fluree delta generate <TABLE>... --base-namespace <IRI> <UNITY OPTIONS> [-o <FILE>]
+fluree delta validate --r2rml <PATH>                    <the location options of `map`>
+```
+
+`<UNITY OPTIONS>` are `--unity-uri` (required here) and the `--unity-*`,
+`--auth-bearer*` and `--oauth2-*` options of [`map`](#options). A `<TABLE>` of
+fewer than three parts is completed from `--unity-catalog` and
+`--unity-schema`, which also set how far `browse` reaches.
+
+All five take `--remote <NAME>` and `--json`, which prints the endpoint's
+answer as is.
+
+| Command | Options of its own |
+|---------|--------------------|
+| `browse` | `--depth schemas\|tables` (default `tables`): how far a listing of one catalog reaches |
+| `verify` | `--s3-region`, `--s3-endpoint`, `--s3-path-style` |
+| `generate` | `--base-namespace <IRI>` (required): what every generated IRI derives from |
+| | `-o, --output <FILE>`: write the mapping here instead of standard output |
+| | `--subject-key <TABLE=COLUMN[,COLUMN]>` (repeatable): a table's subject columns |
+| | `--class-name <TABLE=NAME>` (repeatable): a table's class |
+| | `--strict-subjects`: give a table no subject unless its key is declared or cannot be null |
+| | `--no-joins`: keep foreign keys as plain values |
+
+`generate` writes the mapping to standard output or `--output`, and what it
+decided — a key it chose, a column it passed over — to standard error.
+`verify` exits non-zero when the table cannot be read, and `validate` when the
+mapping has an error, so a script can gate on either.
+
+```bash
+fluree delta generate main.sales.orders main.sales.customers \
+  --unity-uri https://<workspace>.cloud.databricks.com --auth-bearer-env DATABRICKS_TOKEN \
+  --base-namespace https://example.org/sales# -o sales.ttl
+```
 
 ## Querying a past version
 

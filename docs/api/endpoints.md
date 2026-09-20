@@ -3176,6 +3176,62 @@ POST {api_base_url}/delta/map
 
 See also the CLI equivalent: [fluree delta map](../cli/delta.md#fluree-delta-map).
 
+### POST {api_base_url}/delta/catalog/* and /delta/r2rml/*
+
+Five read-only endpoints that lead up to `delta/map` on Unity Catalog. None registers anything. All are admin-protected, since each carries a catalog credential and calls out, and are available only when the server is built with the `delta` feature. See [From a catalog to a mapping](../graph-sources/delta.md#from-a-catalog-to-a-mapping).
+
+Every body takes the Unity connection fields of `delta/map`: `unity_uri` (required here), `unity_catalog`, `unity_schema`, and either `auth_bearer` / `auth_bearer_env` or `oauth2_client_id` with `oauth2_client_secret` / `oauth2_client_secret_env` (and optionally `oauth2_token_url`, `oauth2_scope`). An `_env` field names a server environment variable listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`. A table name of fewer than three parts is completed from `unity_catalog` and `unity_schema`.
+
+| Endpoint | Further fields | Answer |
+|---|---|---|
+| `POST /delta/catalog/browse` | `depth`: `schemas` or `tables` (default) | `catalogs`, `schemas` (`catalog.schema`), `tables` |
+| `POST /delta/catalog/preview` | `table` | The table's `columns`, `primary_key`, `foreign_keys`, `location`, `access_rule`, `unreadable` |
+| `POST /delta/catalog/verify` | `table`; `s3_region`, `s3_endpoint`, `s3_path_style` | `readable`, and `location`, `version`, `data_file_count` or `error` |
+| `POST /delta/r2rml/generate` | `tables`, `base_namespace`; `per_table_overrides`, `options` | `turtle`, `structured`, `diagnostics`, `tables` |
+| `POST /delta/r2rml/validate` | A `delta/map` body; `name` is optional | `compiled_ok`, `triples_map_count`, `table_names`, `diagnostics` |
+
+**Browse** lists the metastore's catalogs when no `unity_catalog` is given, a catalog's schemas (and, at `depth: "tables"`, their tables) when one is, and a schema's tables when `unity_schema` is given too. A catalog-wide listing leaves out `information_schema`.
+
+```json
+{
+  "catalogs": [],
+  "schemas": ["main.sales"],
+  "tables": [
+    { "full_name": "main.sales.orders", "kind": "MANAGED", "format": "DELTA",
+      "comment": null, "access_rule": null, "unreadable": null },
+    { "full_name": "main.sales.recent", "kind": "VIEW", "format": null,
+      "comment": null, "access_rule": null, "unreadable": "is a VIEW, not a Delta table" }
+  ]
+}
+```
+
+`unreadable` says why this reader cannot read the object at all. `access_rule` is `row filter` (or, in a preview, `column mask`): Unity may issue no credentials for such a table, which `verify` settles.
+
+**Preview** columns carry `name`, `position`, `type_text` (Unity's spelling), `xsd_type` (the datatype a generated mapping gives the column), `mappable` (false for a nested or semi-structured type), `nullable`, `comment` and `masked`.
+
+**Verify** answers `200` with `"readable": false` and the reason in `error` for a table that cannot be read; only a request that cannot be made is an error.
+
+**Generate** request:
+
+```json
+{
+  "unity_uri": "https://<workspace>.cloud.databricks.com",
+  "auth_bearer_env": "DATABRICKS_TOKEN",
+  "tables": ["main.sales.orders", "main.sales.customers"],
+  "base_namespace": "https://example.org/sales#",
+  "per_table_overrides": [
+    { "table": "main.sales.orders", "subject_key": ["order_id", "line"], "class_name": "Purchase" }
+  ],
+  "options": { "emit_fk_joins": true, "subject_strategy": "auto" }
+}
+```
+
+An override's `table` is spelled as in `tables`. `options` are those of `iceberg/r2rml/generate`. `turtle` is the mapping; `structured` is the same mapping as data; each entry of `diagnostics` has a `severity` (`error`, `warning`, `advisory`), a `code`, and the `table`, `column` and `message` it concerns.
+
+**Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
+
+See also the CLI equivalents: [fluree delta browse / preview / verify / generate / validate](../cli/delta.md#fluree-delta-browse--preview--verify--generate--validate).
+
 ### POST {api_base_url}/sql/map
 
 Map tables behind a SQL endpoint as an R2RML graph source. The endpoint speaks the Trino client protocol (Trino, Starburst, PrestoDB, or a `fluree-sql-bridge` sidecar). Admin-protected — requires the admin Bearer token when an admin token is configured. Available only when the server is built with the `sql` feature (on by default). See [SQL graph sources](../graph-sources/sql.md).
