@@ -15,7 +15,7 @@ The option reference is in [Delta Lake tables](delta.md) and
 | Microsoft Fabric lakehouse tables (OneLake) | [Delta source](#microsoft-fabric-onelake), by path | A service principal with a workspace role that includes OneLake data access |
 | Databricks **external** tables (you chose the storage path) | [Delta source](#databricks-external-tables), by path | Your own credentials for that S3 bucket or ADLS container |
 | Databricks **managed** tables (Unity Catalog owns the path) | [Delta source with Unity-issued credentials](#databricks-managed-tables), one table at a time | A Databricks token; Unity Catalog issues short-lived storage credentials |
-| Databricks tables with Iceberg reads (UniForm) or managed Iceberg tables | [Iceberg REST source](#databricks-through-the-iceberg-rest-endpoint) | A Databricks token only; storage credentials are vended per request |
+| Databricks tables with Iceberg reads (UniForm) or managed Iceberg tables | [Iceberg REST source](#databricks-through-the-iceberg-rest-endpoint) | A Databricks service principal (or a personal access token); storage credentials are vended per request |
 | Delta tables on S3 | Delta source, by path — see [Delta Lake tables](delta.md#credentials) | AWS credentials in the environment, or the instance / container role |
 
 Everything Fabric stores in OneLake is a Delta table, whichever Fabric engine
@@ -153,10 +153,15 @@ credentials for one table. It needs, once:
 
 1. **External data access** turned on for the metastore: in the workspace,
    **Catalog → ⚙ → Metastore → External data access**.
-2. The privilege, which neither ownership nor metastore admin implies:
+2. The privileges on the reading principal. `EXTERNAL USE SCHEMA` is implied
+   by nothing — not ownership, not metastore admin — and the ordinary read
+   privileges are needed as well, even for a principal that can already see
+   the table:
    ```sql
-   GRANT EXTERNAL USE SCHEMA ON SCHEMA main.sales TO `reader@example.com`;
+   GRANT USE CATALOG ON CATALOG main TO `reader@example.com`;
+   GRANT USE SCHEMA, SELECT, EXTERNAL USE SCHEMA ON SCHEMA main.sales TO `reader@example.com`;
    ```
+   A service principal is named by its application id in place of the email.
 3. A **personal access token**: user icon → **Settings → Developer → Access
    tokens → Generate new token**. If the dialog asks for scopes, the Unity
    Catalog APIs need `unity-catalog` (or `all-apis`).
@@ -228,6 +233,31 @@ fluree iceberg map dbx-sales \
 stored with the source and does not renew; give it a lifetime to match, and
 re-map when it is rotated.
 
+**For a standing deployment, use a service principal.** Its OAuth token is
+requested by Fluree and renewed as it expires, so nothing has to be rotated by
+hand:
+
+1. In the workspace, **Settings → Identity and access → Service principals →
+   Add service principal**. Note its **Application ID** — that is the client id.
+2. On the service principal's **Secrets** tab, **Generate secret**. The secret
+   is shown once.
+3. Grant it the four privileges listed under
+   [Databricks managed tables](#databricks-managed-tables), naming it by its
+   application id.
+
+```bash
+fluree iceberg map dbx-sales \
+  --catalog-uri https://<workspace>.cloud.databricks.com/api/2.1/unity-catalog/iceberg-rest \
+  --warehouse main \
+  --oauth2-token-url https://<workspace>.cloud.databricks.com/oidc/v1/token \
+  --oauth2-client-id <application-id> \
+  --oauth2-client-secret "$DATABRICKS_CLIENT_SECRET" \
+  --oauth2-scope all-apis \
+  --r2rml mappings/sales.ttl
+```
+
+The client secret is stored with the source.
+
 ## When it does not work
 
 | Message | Cause |
@@ -237,6 +267,7 @@ re-map when it is rotated.
 | `(not readable yet)` when mapping | The mapping process could not open the table — often only because it lacks the credentials the server has. The source is registered; the first query reports the real error |
 | S3 reads fail although `aws` works in the same shell | `AWS_PROFILE` and SSO sessions are not read. Export the profile's keys (`aws configure export-credentials --format env`) |
 | `User does not have EXTERNAL USE SCHEMA on Schema …` | The grant in [Databricks managed tables](#databricks-managed-tables) is missing; it is not implied by ownership |
+| `Catalog … authorized the table but vended no storage credentials` | The principal can see the table but lacks `USE CATALOG`, `USE SCHEMA`, `SELECT` or `EXTERNAL USE SCHEMA`. The Iceberg endpoint answers without credentials rather than with an error; `POST …/temporary-table-credentials` as the same principal names the missing privilege |
 | `Provided access token does not have required scopes: all-apis` | The token was created with narrower scopes than the Iceberg endpoint accepts |
 | `… is not an Iceberg compatible table` | The table is plain Delta; enable UniForm or read it as a Delta source |
 | `AccessDenied … no session policy allows …` on S3 | Unity-issued credentials used on a different table's path |
