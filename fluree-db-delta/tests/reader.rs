@@ -1,6 +1,6 @@
 //! Reader correctness against committed fixtures.
 //!
-//! `dim_store` / `fact_order` are written by delta-rs (`scripts/delta-spike/
+//! `dim_store` / `fact_order` are written by delta-rs (`scripts/delta-fixtures/
 //! fixture.py`); the rest by Delta Spark (`spark_fixture.py`), so deletion
 //! vectors, column mapping and in-commit timestamps come from the reference
 //! writer. Expected rows are restated here from the generators' inputs, never

@@ -4,7 +4,7 @@
 # ///
 """Generate synthetic Delta history and an independently constructed row oracle.
 
-Run: uv run --python 3.12 scripts/delta-spike/fixture.py /tmp/delta-fixture-<run>
+Run: uv run --python 3.12 scripts/delta-fixtures/fixture.py /tmp/delta-fixture-<run>
 The destination must not exist. Nothing is uploaded or vacuumed by this script.
 """
 
@@ -81,6 +81,13 @@ def generate(root):
     ]
     write_deltalake(str(root / "dim_store"), pa.Table.from_pylist(stores))
     save("dim_store", "store_id", stores, ["store_id", "name"])
+
+    # A nullable boolean: the one scalar a mapped FILTER compares by value.
+    flags = [{"id": i + 1, "shipped": shipped}
+             for i, shipped in enumerate([True, True, False, True, None, False])]
+    flag_schema = pa.schema([pa.field("id", pa.int64()), pa.field("shipped", pa.bool_())])
+    write_deltalake(str(root / "flags"), pa.Table.from_pylist(flags, schema=flag_schema))
+    save("flags", "id", flags, flag_schema.names)
 
     schema = pa.schema([
         ("order_id", pa.int64()), ("store_id", pa.int64()),
