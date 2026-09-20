@@ -214,6 +214,7 @@ fn preview_to_emit_schema(table: &TableIdentifier, preview: &TablePreview) -> Em
         name: table.name.clone(),
         columns: preview.schema.columns.iter().map(map_column).collect(),
         identifier_field_ids: preview.schema.identifier_field_ids.clone(),
+        foreign_keys: Vec::new(),
     }
 }
 

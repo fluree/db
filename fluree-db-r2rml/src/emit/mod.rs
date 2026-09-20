@@ -34,7 +34,8 @@ mod tests;
 
 pub use diagnostic::{DiagCode, Diagnostic, Severity};
 pub use input::{
-    EmitColumn, EmitColumnStats, EmitTableSchema, TableKey, TableOverride, TypedBound,
+    DeclaredForeignKey, EmitColumn, EmitColumnStats, EmitTableSchema, TableKey, TableOverride,
+    TypedBound,
 };
 pub use ir::{ColumnMapping, ForeignKey, PrefixDecl, StructuredR2rmlMapping, TableMapping};
 

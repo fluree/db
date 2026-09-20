@@ -74,10 +74,18 @@ pub fn build_mapping(
     }
 
     // -- Phase 2: FK inference against the complete PK index. --
+    // A join's object is its parent's subject, so only a table that has one
+    // can be a declared key's parent.
+    let joinable: HashSet<String> = tables
+        .iter()
+        .zip(&drafts)
+        .filter(|(_, draft)| !draft.subject_template.is_empty())
+        .map(|(table, _)| table.qualified_name())
+        .collect();
     let mut table_mappings = Vec::with_capacity(tables.len());
     for (table, draft) in tables.iter().zip(drafts) {
         let (joins, resolved_fk_cols) = if opts.emit_fk_joins {
-            infer_foreign_keys(table, &draft, &pk_index, opts, &mut diagnostics)
+            infer_foreign_keys(table, &draft, &pk_index, &joinable, opts, &mut diagnostics)
         } else {
             (Vec::new(), HashSet::new())
         };
@@ -279,11 +287,11 @@ fn select_subject_key(
     // -- Name fallback: a `<STEM>_KEY` / `<STEM>_ID` column. --
     let marker_stem = naming::strip_table_marker(table.stem());
     let candidates = [format!("{marker_stem}_KEY"), format!("{marker_stem}_ID")];
-    if let Some(col) = table
-        .columns
-        .iter()
-        .find(|c| candidates.iter().any(|cand| cand == &c.name))
-    {
+    if let Some(col) = table.columns.iter().find(|c| {
+        candidates
+            .iter()
+            .any(|cand| cand.eq_ignore_ascii_case(&c.name))
+    }) {
         // A proven-non-null name key is safe under both strategies (only its
         // uniqueness is unverifiable).
         if col.is_non_null() {
@@ -648,6 +656,7 @@ fn infer_foreign_keys(
     table: &EmitTableSchema,
     draft: &TableDraft,
     pk_index: &[PkEntry],
+    joinable: &HashSet<String>,
     opts: &EmitOptions,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> (Vec<ColumnMapping>, HashSet<String>) {
@@ -657,7 +666,51 @@ fn infer_foreign_keys(
     // whose local collides with an earlier one is disambiguated (not merged).
     let mut emitted_join_locals: HashSet<String> = HashSet::new();
 
+    // Declared keys first: nothing is inferred for a column one covers, joined
+    // or not. Unlike an inferred key, one may sit inside the subject key.
+    let mut declared: HashSet<&str> = HashSet::new();
+    for key in &table.foreign_keys {
+        declared.extend(key.child_columns.iter().map(String::as_str));
+        let unjoined = match (key.child_columns.as_slice(), key.parent_columns.as_slice()) {
+            ([_], [_]) if !joinable.contains(&key.parent_table) => {
+                Some("is not among the mapped tables, or has no subject")
+            }
+            ([child], [_]) if !table.columns.iter().any(|c| &c.name == child && !c.nested) => {
+                Some("is declared on a column this table does not map")
+            }
+            ([_], [_]) => None,
+            _ => Some("spans several columns, which a generated join does not"),
+        };
+        let first = key.child_columns.first().cloned();
+        if let Some(why) = unjoined {
+            diagnostics.push(Diagnostic::new(
+                Severity::Warning,
+                DiagCode::UnresolvedFkCandidate,
+                table.qualified_name(),
+                first,
+                format!(
+                    "declared foreign key ({}) → {} {why}; kept literal, no join emitted",
+                    key.child_columns.join(", "),
+                    key.parent_table
+                ),
+            ));
+            continue;
+        }
+        let (child, parent) = (&key.child_columns[0], &key.parent_columns[0]);
+        let fk = ForeignKey {
+            target_table: key.parent_table.clone(),
+            child_column: child.clone(),
+            parent_column: parent.clone(),
+        };
+        let predicate_iri = join_predicate(child, draft, &mut emitted_join_locals, opts);
+        joins.push(ColumnMapping::join(child.clone(), predicate_iri, fk));
+        resolved.insert(child.clone());
+    }
+
     for col in &table.columns {
+        if declared.contains(col.name.as_str()) {
+            continue;
+        }
         // FK candidacy: non-nested, non-subject-key columns only.
         if col.nested || draft.subject_key_columns.contains(&col.name) {
             continue;
