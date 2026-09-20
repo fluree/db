@@ -192,8 +192,11 @@ needs no storage credentials of its own.
   the local filesystem is never followed, whatever
   `FLUREE_ICEBERG_LOCAL_ROOTS` allows.
 - **Freshness of placement.** Where a name points is looked up when its table
-  handle is first opened and again when the handle's cache entry expires; a
-  table dropped and recreated elsewhere is read at its old location until then.
+  handle is first opened, and again when the handle is rebuilt
+  (`FLUREE_ICEBERG_REST_CLIENT_TTL_SECS`, default 15 minutes); a table dropped
+  and recreated elsewhere is read at its old location until then. With the
+  default, credentials are in practice replaced with the handle; renewal
+  within a handle serves a longer setting and scans that outlast a set.
 
 Setting up the workspace side — external data access, the service principal
 and its four privileges — is walked through in
@@ -317,7 +320,11 @@ pinned versions of a table are remembered the same way. A table that is
 deleted and written again under the same path is noticed and read afresh.
 File lists are held up to a process-wide `FLUREE_DELTA_LOG_CACHE_MB` (default
 256; a table whose list does not fit is planned from its log on every query,
-and `0` turns the memory off).
+and `0` turns the memory off). What is remembered belongs to the table's
+shared handle, which is rebuilt every
+[`FLUREE_ICEBERG_REST_CLIENT_TTL_SECS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning)
+(default 15 minutes) so that a rotated secret takes effect; the first query
+after that reads the log from its last checkpoint again.
 
 ## Time travel
 

@@ -319,6 +319,15 @@ impl<C: Send + Sync + 'static> CredentialProvider for Vending<C> {
                     .read_credentials(&self.table)
                     .await
                     .map_err(refused)?;
+                tracing::info!(
+                    table = %self.table.full_name,
+                    renewed = held.is_some(),
+                    valid_for_s = vended
+                        .expires
+                        .duration_since(SystemTime::now())
+                        .map_or(0, |d| d.as_secs()),
+                    "Unity Catalog issued table credentials"
+                );
                 *held = Some(vended.clone());
                 vended
             }
