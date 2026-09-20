@@ -171,6 +171,15 @@ Note the nesting: the graph source is “Iceberg” (this page), and `catalog.ty
 }
 ```
 
+`warehouse` is the name the catalog knows the warehouse (or catalog) by. It is
+sent to the catalog's `/v1/config` route, and the path prefix that route
+returns is used for every later request, as the Iceberg REST specification
+describes — so the name is enough even where the catalog's routes are laid out
+differently (for example `catalogs/<name>` on Databricks Unity Catalog, whose
+Iceberg endpoint is `https://<workspace>/api/2.1/unity-catalog/iceberg-rest`).
+A catalog with no `/v1/config` route is addressed with the warehouse name as
+the prefix.
+
 **Direct S3 config:**
 
 ```json

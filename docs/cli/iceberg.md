@@ -41,7 +41,7 @@ fluree iceberg map <NAME> [OPTIONS]
 |--------|-------------|
 | `--catalog-uri <URI>` | REST catalog URI (required for rest mode) |
 | `--table <ID>` | Table identifier in `namespace.table` format (required if not specified in R2RML mapping) |
-| `--warehouse <NAME>` | Warehouse identifier |
+| `--warehouse <NAME>` | Warehouse (or catalog) name as the REST catalog knows it; the catalog's own route prefix is looked up from it |
 | `--no-vended-credentials` | Disable vended credentials (enabled by default) |
 
 **Direct S3 mode options:**
