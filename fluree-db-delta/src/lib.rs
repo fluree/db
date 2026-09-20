@@ -7,6 +7,7 @@
 //! [`fluree_db_tabular::ColumnBatch`]es. Tables are never written.
 
 pub mod bridge;
+pub mod catalog;
 pub mod config;
 mod datafile;
 pub mod error;
@@ -17,6 +18,10 @@ mod store;
 pub mod table;
 mod unity;
 
+pub use catalog::{
+    browse_unity, describe_unity_table, BrowseDepth, DeclaredForeignKey, DescribedColumn,
+    ListedTable, TableDescription, UnityListing,
+};
 pub use config::{AzureAuth, DeltaGsConfig, DeltaIoConfig, Placement, UnityConfig};
 pub use datafile::rows_decoded;
 pub use error::{DeltaError, Result};

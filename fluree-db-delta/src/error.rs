@@ -54,6 +54,10 @@ pub enum DeltaError {
     #[error("Unity Catalog, table '{table}': {message}")]
     Catalog { table: String, message: String },
 
+    /// A catalog would not list what it holds.
+    #[error("Unity Catalog, {scope}: {message}")]
+    CatalogListing { scope: String, message: String },
+
     #[error("Delta reader internal error: {0}")]
     Internal(String),
 }

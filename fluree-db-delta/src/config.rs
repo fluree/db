@@ -103,7 +103,7 @@ impl UnityConfig {
         })
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         fluree_db_iceberg::net::validate_public_url(&self.uri)
             .map_err(|e| DeltaError::Config(format!("Unity Catalog uri: {e}")))?;
         match &self.auth {

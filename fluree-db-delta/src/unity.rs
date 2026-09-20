@@ -17,6 +17,7 @@ use fluree_db_iceberg::auth::SendCatalogAuth;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde::Deserialize;
 
+use crate::catalog::{DeclaredForeignKey, DescribedColumn, ListedTable, TableDescription};
 use crate::config::UnityConfig;
 use crate::error::{DeltaError, Result};
 
@@ -49,7 +50,10 @@ pub(crate) struct UnityTable {
 
 #[derive(Deserialize)]
 struct TableRecord {
-    table_id: String,
+    #[serde(default)]
+    table_id: Option<String>,
+    #[serde(default)]
+    full_name: Option<String>,
     #[serde(default)]
     storage_location: Option<String>,
     #[serde(default)]
@@ -57,15 +61,93 @@ struct TableRecord {
     #[serde(default)]
     table_type: Option<String>,
     #[serde(default)]
+    comment: Option<String>,
+    #[serde(default)]
     row_filter: Option<serde_json::Value>,
     #[serde(default)]
     columns: Vec<ColumnRecord>,
+    #[serde(default)]
+    table_constraints: Vec<ConstraintRecord>,
 }
 
 #[derive(Deserialize)]
 struct ColumnRecord {
     #[serde(default)]
+    name: String,
+    #[serde(default)]
+    position: i32,
+    #[serde(default)]
+    type_text: String,
+    /// The column as a Delta schema field.
+    #[serde(default)]
+    type_json: Option<String>,
+    #[serde(default = "yes")]
+    nullable: bool,
+    #[serde(default)]
+    comment: Option<String>,
+    #[serde(default)]
     mask: Option<serde_json::Value>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+struct ConstraintRecord {
+    #[serde(default)]
+    primary_key_constraint: Option<KeyRecord>,
+    #[serde(default)]
+    foreign_key_constraint: Option<KeyRecord>,
+}
+
+#[derive(Deserialize)]
+struct KeyRecord {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    child_columns: Vec<String>,
+    #[serde(default)]
+    parent_table: String,
+    #[serde(default)]
+    parent_columns: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct Page {
+    #[serde(default, alias = "schemas", alias = "tables")]
+    catalogs: Vec<serde_json::Value>,
+    #[serde(default)]
+    next_page_token: Option<String>,
+}
+
+impl TableRecord {
+    fn kind(&self) -> &str {
+        self.table_type.as_deref().unwrap_or("table")
+    }
+
+    /// Why this reader cannot read the object, whatever Unity allows.
+    fn unreadable(&self) -> Option<String> {
+        let kind = self.kind();
+        match self.data_source_format.as_deref() {
+            Some(format) if format.eq_ignore_ascii_case("delta") => None,
+            Some(format) => Some(format!(
+                "is a {kind} in {format} format; only Delta tables are read"
+            )),
+            None => Some(format!("is a {kind}, not a Delta table")),
+        }
+    }
+
+    /// A listing omits columns, so it shows a row filter but never a mask.
+    fn access_rule(&self) -> Option<&'static str> {
+        if self.row_filter.is_some() {
+            Some("row filter")
+        } else if self.columns.iter().any(|c| c.mask.is_some()) {
+            Some("column mask")
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -100,7 +182,7 @@ impl UnityClient {
         Self::with_http(config, http)
     }
 
-    fn with_http(config: &UnityConfig, http: reqwest::Client) -> Result<Self> {
+    pub(crate) fn with_http(config: &UnityConfig, http: reqwest::Client) -> Result<Self> {
         let auth = config
             .auth
             .create_provider_arc()
@@ -115,43 +197,149 @@ impl UnityClient {
     /// Where `full_name` lives. Only a Delta table with files of its own is
     /// placed: a view, or a table in another format, is refused by name.
     pub(crate) async fn table(&self, full_name: &str) -> Result<UnityTable> {
-        let path = format!(
-            "/api/2.1/unity-catalog/tables/{}",
-            utf8_percent_encode(full_name, NAME)
-        );
-        let refuse = |message: String| DeltaError::Catalog {
-            table: full_name.to_string(),
-            message,
-        };
-        let record: TableRecord = serde_json::from_value(self.send(full_name, &path, None).await?)
-            .map_err(|e| refuse(format!("unreadable table record: {e}")))?;
-        let kind = record.table_type.as_deref().unwrap_or("table");
-        match record.data_source_format.as_deref() {
-            Some(format) if format.eq_ignore_ascii_case("delta") => {}
-            Some(format) => {
-                return Err(refuse(format!(
-                    "is a {kind} in {format} format; only Delta tables are read"
-                )))
-            }
-            None => return Err(refuse(format!("is a {kind}, not a Delta table"))),
+        let refuse = |message: String| Subject::Table(full_name).failed(message);
+        let record = self.record(full_name).await?;
+        if let Some(why) = record.unreadable() {
+            return Err(refuse(why));
         }
-        let governed = if record.row_filter.is_some() {
-            Some("row filter")
-        } else if record.columns.iter().any(|c| c.mask.is_some()) {
-            Some("column mask")
-        } else {
-            None
-        };
+        let governed = record.access_rule();
         let location = record
             .storage_location
             .filter(|l| !l.is_empty())
             .ok_or_else(|| refuse("has no storage location".to_string()))?;
         Ok(UnityTable {
             full_name: full_name.to_string(),
-            id: record.table_id,
+            id: record
+                .table_id
+                .ok_or_else(|| refuse("has no table id".to_string()))?,
             location,
             governed,
         })
+    }
+
+    async fn record(&self, full_name: &str) -> Result<TableRecord> {
+        let about = Subject::Table(full_name);
+        let path = format!(
+            "/api/2.1/unity-catalog/tables/{}",
+            utf8_percent_encode(full_name, NAME)
+        );
+        serde_json::from_value(self.send(about, &path, None).await?)
+            .map_err(|e| about.failed(format!("unreadable table record: {e}")))
+    }
+
+    /// The table's columns and declared keys, as Unity records them.
+    pub(crate) async fn describe(&self, full_name: &str) -> Result<TableDescription> {
+        let record = self.record(full_name).await?;
+        let mut primary_key = Vec::new();
+        let mut foreign_keys = Vec::new();
+        for constraint in &record.table_constraints {
+            if let Some(key) = &constraint.primary_key_constraint {
+                primary_key = key.child_columns.clone();
+            }
+            if let Some(key) = &constraint.foreign_key_constraint {
+                foreign_keys.push(DeclaredForeignKey {
+                    name: key.name.clone(),
+                    columns: key.child_columns.clone(),
+                    parent_table: key.parent_table.clone(),
+                    parent_columns: key.parent_columns.clone(),
+                });
+            }
+        }
+        let mut columns: Vec<DescribedColumn> = record
+            .columns
+            .iter()
+            .map(|c| DescribedColumn {
+                name: c.name.clone(),
+                position: c.position,
+                type_text: c.type_text.clone(),
+                field_type: c
+                    .type_json
+                    .as_deref()
+                    .and_then(crate::bridge::field_type_of_json),
+                nullable: c.nullable,
+                comment: c.comment.clone(),
+                masked: c.mask.is_some(),
+            })
+            .collect();
+        columns.sort_by_key(|c| c.position);
+        Ok(TableDescription {
+            full_name: full_name.to_string(),
+            kind: record.kind().to_string(),
+            format: record.data_source_format.clone(),
+            location: record.storage_location.clone().filter(|l| !l.is_empty()),
+            comment: record.comment.clone(),
+            access_rule: record.access_rule().map(str::to_string),
+            unreadable: record.unreadable(),
+            columns,
+            primary_key,
+            foreign_keys,
+        })
+    }
+
+    pub(crate) async fn catalogs(&self) -> Result<Vec<String>> {
+        let rows = self
+            .pages(Subject::Metastore, "/api/2.1/unity-catalog/catalogs?")
+            .await?;
+        Ok(rows.iter().filter_map(|r| text(r, "name")).collect())
+    }
+
+    /// Schemas of `catalog`, as `catalog.schema`.
+    pub(crate) async fn schemas(&self, catalog: &str) -> Result<Vec<String>> {
+        let path = format!(
+            "/api/2.1/unity-catalog/schemas?catalog_name={}&",
+            utf8_percent_encode(catalog, NAME)
+        );
+        let rows = self.pages(Subject::Catalog(catalog), &path).await?;
+        Ok(rows.iter().filter_map(|r| text(r, "full_name")).collect())
+    }
+
+    pub(crate) async fn tables(&self, catalog: &str, schema: &str) -> Result<Vec<ListedTable>> {
+        let scope = format!("{catalog}.{schema}");
+        let about = Subject::Schema(&scope);
+        let path = format!(
+            "/api/2.1/unity-catalog/tables?catalog_name={}&schema_name={}&omit_columns=true&",
+            utf8_percent_encode(catalog, NAME),
+            utf8_percent_encode(schema, NAME)
+        );
+        self.pages(about, &path)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let record: TableRecord = serde_json::from_value(row)
+                    .map_err(|e| about.failed(format!("unreadable table record: {e}")))?;
+                Ok(ListedTable {
+                    full_name: record
+                        .full_name
+                        .clone()
+                        .ok_or_else(|| about.failed("a listed table has no name".to_string()))?,
+                    kind: record.kind().to_string(),
+                    format: record.data_source_format.clone(),
+                    comment: record.comment.clone(),
+                    access_rule: record.access_rule().map(str::to_string),
+                    unreadable: record.unreadable(),
+                })
+            })
+            .collect()
+    }
+
+    /// Every page of a listing. `path` ends ready for another query parameter.
+    async fn pages(&self, about: Subject<'_>, path: &str) -> Result<Vec<serde_json::Value>> {
+        let mut rows = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page_path = match &token {
+                Some(token) => format!("{path}page_token={}", utf8_percent_encode(token, NAME)),
+                None => path.trim_end_matches(['?', '&']).to_string(),
+            };
+            let page: Page = serde_json::from_value(self.send(about, &page_path, None).await?)
+                .map_err(|e| about.failed(format!("unreadable listing: {e}")))?;
+            rows.extend(page.catalogs);
+            match page.next_page_token.filter(|t| !t.is_empty()) {
+                // A token that repeats would never end.
+                Some(next) if token.as_ref() != Some(&next) => token = Some(next),
+                _ => return Ok(rows),
+            }
+        }
     }
 
     async fn read_credentials(&self, table: &UnityTable) -> Result<Vended> {
@@ -162,7 +350,7 @@ impl UnityClient {
         };
         let sent = self
             .send(
-                &table.full_name,
+                Subject::Table(&table.full_name),
                 "/api/2.1/unity-catalog/temporary-table-credentials",
                 Some(&body),
             )
@@ -206,14 +394,11 @@ impl UnityClient {
     /// One authenticated request; a 401 refreshes the catalog token once.
     async fn send(
         &self,
-        table: &str,
+        about: Subject<'_>,
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value> {
-        let failed = |message: String| DeltaError::Catalog {
-            table: table.to_string(),
-            message,
-        };
+        let failed = |message: String| about.failed(message);
         let url = format!("{}{path}", self.base);
         for retried in [false, true] {
             let mut request = match body {
@@ -257,6 +442,36 @@ impl UnityClient {
         }
         unreachable!("the second pass returns")
     }
+}
+
+/// What a request to Unity is about, for the error it may end in.
+#[derive(Clone, Copy)]
+enum Subject<'a> {
+    Metastore,
+    Catalog(&'a str),
+    Schema(&'a str),
+    Table(&'a str),
+}
+
+impl Subject<'_> {
+    fn failed(self, message: String) -> DeltaError {
+        let scope = match self {
+            Self::Table(table) => {
+                return DeltaError::Catalog {
+                    table: table.to_string(),
+                    message,
+                }
+            }
+            Self::Metastore => "its catalogs".to_string(),
+            Self::Catalog(name) => format!("catalog '{name}'"),
+            Self::Schema(name) => format!("schema '{name}'"),
+        };
+        DeltaError::CatalogListing { scope, message }
+    }
+}
+
+fn text(row: &serde_json::Value, key: &str) -> Option<String> {
+    row.get(key)?.as_str().map(str::to_string)
 }
 
 /// `k=v&…` as the decoded pairs the Azure store signs requests with.
