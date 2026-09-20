@@ -6,7 +6,9 @@ queried like any other graph — SPARQL or JSON-LD, joined with ledgers and othe
 graph sources, under the same [access policy](iceberg.md#access-policy) as
 every mapped source. Tables are only ever read.
 
-Delta support is behind the `delta` build feature of the server and CLI.
+The server and CLI include Delta support by default (the `delta` build
+feature). A program embedding `fluree-db-api` enables that crate's `delta`
+feature to get it.
 
 ## What is read
 

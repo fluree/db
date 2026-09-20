@@ -23,7 +23,7 @@ name = "fluree_db_server"
 path = "src/lib.rs"
 
 [features]
-default = ["native", "credential", "iceberg", "sql", "shacl", "bolt", "graphql"]
+default = ["native", "credential", "iceberg", "sql", "delta", "shacl", "bolt", "graphql"]
 native = ["fluree-db-api/native"]
 # AWS S3 storage + DynamoDB nameservice (via connection JSON-LD config)
 aws = ["fluree-db-api/aws"]
@@ -40,8 +40,9 @@ oidc = ["fluree-db-credential/oidc", "dep:jsonwebtoken"]
 iceberg = ["fluree-db-api/iceberg"]
 # SQL graph sources (R2RML over a Trino-protocol endpoint)
 sql = ["iceberg", "fluree-db-api/sql"]
-# Delta Lake graph sources (R2RML over Delta tables). Opt-in: links Delta
-# Kernel and `object_store`, including a second reqwest major.
+# Delta Lake graph sources (R2RML over Delta tables). Links Delta Kernel and
+# `object_store`, including a second reqwest major; builds that do not read
+# Delta tables can drop it with `default-features = false`.
 delta = ["iceberg", "fluree-db-api/delta"]
 # Use mimalloc as the global allocator. Better multicore allocation throughput
 # for the allocation-heavy query/materialization paths (e.g. R2RML/Iceberg

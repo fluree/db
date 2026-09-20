@@ -20,7 +20,7 @@ path = "src/lib.rs"
 # reuses the dist binary) can use S3 storage + DynamoDB nameservice via
 # connection config. Dormant unless configured; ~+2 MB over the AWS SDK that
 # `iceberg` already pulls in.
-default = ["server", "iceberg", "sql", "shacl", "aws", "graphql"]
+default = ["server", "iceberg", "sql", "delta", "shacl", "aws", "graphql"]
 server = ["dep:fluree-db-server"]
 iceberg = ["fluree-db-api/iceberg"]
 # SQL graph sources (R2RML over a Trino-protocol endpoint)

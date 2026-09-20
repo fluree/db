@@ -3,8 +3,9 @@
 Manage Delta Lake graph sources — R2RML mappings over Delta tables read in
 place. See [Delta Lake tables](../graph-sources/delta.md).
 
-Reading Delta tables needs a build with the `delta` feature. A CLI without it
-can still map and query Delta sources on a server that has it (`--remote`).
+Delta support is part of the default build (the `delta` feature). A CLI built
+without it can still map and query Delta sources on a server that has it
+(`--remote`).
 
 ## Subcommands
 
