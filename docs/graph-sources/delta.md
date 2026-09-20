@@ -213,14 +213,20 @@ data files are read in parallel — by default one per core, at most 32; set
 **Filter pushdown.** A comparison the query places on a mapped column — a
 `FILTER` with `=`, `<`, `<=`, `>`, `>=` or `IN`, a `VALUES` block, a constant
 object, or a bound subject whose template names the column — is pushed into
-the scan, where it acts twice. Each data file's partition values and min/max
-statistics are checked first, and a file that cannot hold a matching row is
-never opened. The rows of the files that are opened are then filtered as they
-are decoded, before any RDF term is built for them. File skipping depends on
+the scan, where it acts at three grains. Each data file's partition values and
+min/max statistics are checked first, and a file that cannot hold a matching
+row is never opened. Inside a file that is opened, the Parquet footer's
+row-group statistics and page index are checked the same way, and only the row
+groups and pages that may hold a match are fetched and decoded. The rows that
+are decoded are then filtered before any RDF term is built for them. File skipping depends on
 how the table is laid out: a filter on a partition column, or on a column the
 writer clusters or sorts by, skips most of the table, while a filter on a
 column whose values are spread across every file skips nothing and is left to
-the row filter.
+the row filter. Pruning inside a file compares integers, dates, doubles,
+strings and timestamps stored as 64-bit microseconds; a timestamp a writer
+stored in the legacy 96-bit form carries no usable bounds. A file with a
+deletion vector is decoded whole, because the vector addresses rows by their
+position in the file.
 
 A comparison is pushed only when its value has the column's own type — an
 integer against an integer column, a string against a string column, a zoned
@@ -236,6 +242,11 @@ answered from the row counts recorded in the transaction log without opening a
 data file — provided every file records one, no file carries a deletion
 vector, and statistics show no null in the columns the count depends on.
 Otherwise the table is scanned.
+
+**Footers.** A data file never changes, so its Parquet footer (with its page
+index) is read once and kept — up to `FLUREE_DELTA_FOOTER_CACHE_MB` across all
+tables (default 128, `0` keeps none). A repeat query fetches only the pages it
+needs.
 
 **The transaction log.** Every query that does not pin a version checks the
 table's log for new commits, so it always reads the table's current version.

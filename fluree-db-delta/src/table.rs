@@ -19,15 +19,17 @@ use delta_kernel::engine::arrow_conversion::TryFromKernel;
 use delta_kernel::engine::arrow_data::EngineDataArrowExt;
 use delta_kernel::history_manager::error::{LogHistoryError, NearestTimestamp};
 use delta_kernel::history_manager::{latest_version_as_of, HistoryCommitType};
+use delta_kernel::object_store::ObjectStore;
 use delta_kernel::scan::state::{transform_to_logical, ScanFile};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{StructField, StructType};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{Engine as _, FileMeta, Predicate, PredicateRef, Snapshot};
+use delta_kernel::{Engine as _, EngineData, FileMeta, Predicate, PredicateRef, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
+use delta_kernel_default_engine::executor::TaskExecutor as _;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
 use fluree_db_tabular::{BatchSchema, ColumnBatch};
-use futures::Stream;
+use futures::{Stream, StreamExt as _};
 use url::Url;
 
 use crate::bridge::BatchBridge;
@@ -100,6 +102,8 @@ pub struct DeltaTable {
     name: Arc<str>,
     url: Url,
     engine: Arc<Engine>,
+    store: Arc<dyn ObjectStore>,
+    executor: Arc<TokioMultiThreadExecutor>,
     known: Arc<Mutex<Known>>,
     /// Held across a first resolution, so concurrent first queries replay the
     /// log once between them.
@@ -169,15 +173,18 @@ impl DeltaTable {
     /// `name` labels errors; `location` is the table directory.
     pub fn open(name: &str, location: &str, io: &DeltaIoConfig) -> Result<Self> {
         let (url, store) = crate::store::open(location, io)?;
+        let executor = executor()?;
         Ok(Self {
             name: name.into(),
             url,
             engine: Arc::new(
-                DefaultEngineBuilder::new(store)
-                    .with_task_executor(executor()?)
+                DefaultEngineBuilder::new(store.clone())
+                    .with_task_executor(executor.clone())
                     .with_batch_size(BATCH_ROWS)
                     .build(),
             ),
+            store,
+            executor,
             known: Arc::default(),
             cold: Arc::default(),
         })
@@ -433,6 +440,11 @@ impl DeltaSnapshot {
         let (schema, bridge) = self.plan(projection)?;
         let predicate = crate::filter::to_predicate(&self.snapshot.schema(), filters);
         let rows = RowFilter::new(&self.snapshot.schema(), bridge.arrow_schema(), filters);
+        let terms = crate::filter::file_terms(
+            &self.snapshot.schema(),
+            self.snapshot.table_configuration().column_mapping_mode(),
+            filters,
+        );
         let this = self.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ColumnBatch>>(4);
         tokio::task::spawn_blocking(move || {
@@ -449,7 +461,7 @@ impl DeltaSnapshot {
             let workers = scan_concurrency(files.len());
             let queue = Arc::new(Mutex::new(VecDeque::from(files)));
             let scan = Arc::new(scan);
-            let shape = Arc::new((bridge, rows));
+            let shape = Arc::new((bridge, rows, terms));
             for _ in 0..workers {
                 let (this, scan, shape, queue, tx) = (
                     this.clone(),
@@ -464,7 +476,7 @@ impl DeltaSnapshot {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .pop_front();
                     let Some(file) = next else { break };
-                    match this.read_file(&scan, file, &shape.0, &shape.1, &tx) {
+                    match this.read_file(&scan, file, &shape.0, &shape.1, &shape.2, &tx) {
                         Ok(true) => {}
                         Ok(false) => break, // consumer stopped early
                         Err(e) => {
@@ -612,6 +624,7 @@ impl DeltaSnapshot {
         file: ScanFile,
         bridge: &BatchBridge,
         rows: &RowFilter,
+        terms: &[crate::prune::Term],
         tx: &tokio::sync::mpsc::Sender<Result<ColumnBatch>>,
     ) -> Result<bool> {
         let kernel = |e| self.table.kernel(e);
@@ -629,14 +642,35 @@ impl DeltaSnapshot {
             size: u64::try_from(file.size)
                 .map_err(|_| DeltaError::Internal(format!("data file size {}", file.size)))?,
         };
-        let batches = engine
-            .parquet_handler()
-            .read_parquet_files(&[meta], scan.physical_schema().clone(), None)
-            .map_err(kernel)?;
-        for physical in batches {
+        // A deletion vector addresses rows by position in the whole file, so
+        // such a file is decoded whole.
+        let terms = if deleted.is_some() {
+            Vec::new()
+        } else {
+            terms.to_vec()
+        };
+        let (store, schema) = (self.table.store.clone(), scan.physical_schema().clone());
+        let (decoded, mut batches) = tokio::sync::mpsc::channel(2);
+        self.table.executor.spawn(async move {
+            let mut stream =
+                match crate::datafile::open(store, meta, schema, &terms, BATCH_ROWS).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        let _ = decoded.send(Err(e)).await;
+                        return;
+                    }
+                };
+            while let Some(batch) = stream.next().await {
+                if decoded.send(batch).await.is_err() {
+                    return;
+                }
+            }
+        });
+        while let Some(physical) = batches.blocking_recv() {
+            let physical: Box<dyn EngineData> = physical.map_err(kernel)?;
             let logical = transform_to_logical(
                 engine,
-                physical.map_err(kernel)?,
+                physical,
                 scan.physical_schema(),
                 scan.logical_schema(),
                 file.transform.clone(),

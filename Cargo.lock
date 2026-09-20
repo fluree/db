@@ -3291,6 +3291,7 @@ dependencies = [
  "fluree-db-iceberg",
  "fluree-db-tabular",
  "futures",
+ "lru 0.12.5",
  "serde",
  "serde_json",
  "tempfile",

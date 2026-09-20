@@ -19,7 +19,8 @@ use delta_kernel::arrow::compute::{filter_record_batch, or};
 use delta_kernel::arrow::datatypes::{DataType as ArrowType, Schema as ArrowSchema, TimeUnit};
 use delta_kernel::arrow::error::ArrowError;
 use delta_kernel::expressions::{Expression, Predicate, PredicateRef, Scalar};
-use delta_kernel::schema::{DataType, PrimitiveType, StructType};
+use delta_kernel::schema::{DataType, PrimitiveType, StructField, StructType};
+use delta_kernel::table_features::ColumnMappingMode;
 
 use crate::error::{DeltaError, Result};
 
@@ -76,14 +77,14 @@ pub(crate) fn to_predicate(schema: &StructType, filters: &[ColumnFilter]) -> Opt
     }
 }
 
-/// One filter against `schema`: the column's logical name, the operator, and
-/// its value(s) as scalars of the column's type. `None` when it cannot be
+/// One filter against `schema`: the column, the operator, and its value(s) as
+/// scalars of the column's type. `None` when it cannot be
 /// stated exactly. A set resolves whole or not at all: a dropped member's rows
 /// could otherwise be skipped.
 fn resolve<'a>(
     schema: &'a StructType,
     filter: &ColumnFilter,
-) -> Option<(&'a str, FilterOp, Vec<Scalar>)> {
+) -> Option<(&'a StructField, FilterOp, Vec<Scalar>)> {
     let field = crate::table::resolve_field(schema, &filter.column)?;
     let DataType::Primitive(kind) = field.data_type() else {
         return None;
@@ -101,12 +102,12 @@ fn resolve<'a>(
         (FilterOp::In, _) | (_, FilterValue::Set(_)) => return None,
         (_, value) => vec![scalar(kind, value)?],
     };
-    Some((field.name().as_str(), filter.op, values))
+    Some((field, filter.op, values))
 }
 
 fn one(schema: &StructType, filter: &ColumnFilter) -> Option<Predicate> {
-    let (name, op, values) = resolve(schema, filter)?;
-    let column = || Expression::column([name]);
+    let (field, op, values) = resolve(schema, filter)?;
+    let column = || Expression::column([field.name().as_str()]);
     let mut literals = values.into_iter().map(Expression::literal);
     Some(match op {
         FilterOp::In => Predicate::or_from(literals.map(|l| Predicate::eq(column(), l))),
@@ -117,6 +118,26 @@ fn one(schema: &StructType, filter: &ColumnFilter) -> Option<Predicate> {
         FilterOp::Gt => Predicate::gt(column(), literals.next()?),
         FilterOp::GtEq => Predicate::ge(column(), literals.next()?),
     })
+}
+
+/// The filters against columns as data files name them, for pruning inside a
+/// file (see [`crate::prune`]).
+pub(crate) fn file_terms(
+    schema: &StructType,
+    mapping: ColumnMappingMode,
+    filters: &[ColumnFilter],
+) -> Vec<crate::prune::Term> {
+    filters
+        .iter()
+        .filter_map(|filter| {
+            let (field, op, values) = resolve(schema, filter)?;
+            Some(crate::prune::Term {
+                column: field.physical_name(mapping).to_string(),
+                op,
+                values,
+            })
+        })
+        .collect()
 }
 
 /// The filters as a row-level test over a scan's logical batches. A filter on
@@ -130,8 +151,8 @@ impl RowFilter {
         let terms = filters
             .iter()
             .filter_map(|filter| {
-                let (name, op, values) = resolve(schema, filter)?;
-                Some((batch.index_of(name).ok()?, op, values))
+                let (field, op, values) = resolve(schema, filter)?;
+                Some((batch.index_of(field.name()).ok()?, op, values))
             })
             .collect();
         Self { terms }

@@ -8,13 +8,16 @@
 
 pub mod bridge;
 pub mod config;
+mod datafile;
 pub mod error;
 pub mod filter;
 mod listing;
+mod prune;
 mod store;
 pub mod table;
 
 pub use config::{AzureAuth, DeltaGsConfig, DeltaIoConfig};
+pub use datafile::rows_decoded;
 pub use error::{DeltaError, Result};
 pub use filter::{ColumnFilter, FilterOp, FilterValue};
 pub use table::{DeltaBatchStream, DeltaSnapshot, DeltaTable, VersionSelector};
