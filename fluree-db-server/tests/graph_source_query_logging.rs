@@ -181,7 +181,7 @@ async fn a_graph_source_query_reports_no_missing_ledger_and_a_missing_name_still
     // A name that is neither is still reported, on every one of those routes.
     for (route, request) in requests("nothing:main") {
         let (status, text) = send(&state, request).await;
-        assert!(!status.is_success(), "{route}: {text}");
+        assert_eq!(status, StatusCode::NOT_FOUND, "{route}: {text}");
         let reported = failures.take();
         assert!(
             reported.iter().any(|f| f == "event: ledger not found"),

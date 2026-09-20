@@ -241,3 +241,30 @@ async fn jsonld_missing_ledger_delimited_is_404() {
         "a missing ledger should be 404, got {status}: {text}"
     );
 }
+
+/// With a dataset clause the route returns the ledger loader's own not-found
+/// rather than a converted one; it is a 404 all the same.
+#[tokio::test]
+async fn sparql_with_a_dataset_clause_on_a_missing_ledger_is_404() {
+    let (_tmp, state) = state_with_graph_source().await;
+
+    let resp = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/doesnotexist:main")
+                .header("content-type", "application/sparql-query")
+                .header("accept", "application/sparql-results+json")
+                .body(Body::from(
+                    "SELECT ?s FROM <doesnotexist:main> WHERE { ?s ?p ?o }",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, text) = body_text(resp).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).expect("JSON error body");
+    assert_eq!(body["@type"], "err:db/LedgerNotFound", "{text}");
+}

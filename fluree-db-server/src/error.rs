@@ -157,6 +157,8 @@ impl ServerError {
             // this source) — unlike the 403/507 distinct-status precedents — via
             // the generic `Query(_)` arm in `status_code()`. MUST precede the
             // generic `ApiError::Query(_)` arm below.
+            // The same fact as it leaves the ledger loader, unconverted.
+            ServerError::Api(e) if e.is_not_found() => errors::LEDGER_NOT_FOUND,
             ServerError::Api(ApiError::Query(
                 fluree_db_query::QueryError::R2rmlUnsupportedPattern { .. },
             )) => errors::R2RML_UNSUPPORTED_PATTERN,
@@ -258,7 +260,9 @@ impl ServerError {
                     StatusCode::SERVICE_UNAVAILABLE
                 }
             }
-            ServerError::Api(ApiError::NotFound(_)) => StatusCode::NOT_FOUND,
+            // Every form `ApiError` gives a missing ledger, not only `NotFound`:
+            // the ledger loader's own error is one, and read as a 500 here.
+            ServerError::Api(e) if e.is_not_found() => StatusCode::NOT_FOUND,
 
             // 409 - Conflict
             ServerError::Api(ApiError::LedgerExists(_)) => StatusCode::CONFLICT,
