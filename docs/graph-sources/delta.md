@@ -185,10 +185,11 @@ needs no storage credentials of its own.
   log and footer caches are unaffected by the change of credentials.
 - **Region.** Unity does not name an S3 bucket's region: give `s3_region`, or
   set `AWS_REGION`.
-- **What is read.** Delta tables with files of their own. A view, a table in
-  another format, a table with a **row filter or column mask** (Unity enforces
-  those only in its own compute and issues no credentials for such a table,
-  even to its owner), and a table the principal cannot see are reported by name — as a `table_warnings` entry at
+- **What is read.** Delta tables with files of their own that Unity will issue
+  credentials for. A view, a table in another format, a table the principal
+  cannot see, and a table Unity refuses — today that includes every table with
+  a **row filter or column mask**, which it enforces only in its own compute,
+  whoever asks — are reported by name — as a `table_warnings` entry at
   registration and as the error of a query that touches them. A location on
   the local filesystem is never followed, whatever
   `FLUREE_ICEBERG_LOCAL_ROOTS` allows.

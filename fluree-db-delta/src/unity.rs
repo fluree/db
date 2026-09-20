@@ -42,6 +42,9 @@ pub(crate) struct UnityTable {
     pub(crate) full_name: String,
     pub(crate) id: String,
     pub(crate) location: String,
+    /// The access rule the table carries, if any. It decides nothing here:
+    /// Unity does, when asked for credentials. It explains a refusal.
+    pub(crate) governed: Option<&'static str>,
 }
 
 #[derive(Deserialize)]
@@ -132,21 +135,13 @@ impl UnityClient {
             }
             None => return Err(refuse(format!("is a {kind}, not a Delta table"))),
         }
-        // Unity applies these only in its own compute and issues no
-        // credentials for such a table; say so before it is asked.
-        let filtered = record.row_filter.is_some();
-        let masked = record.columns.iter().any(|c| c.mask.is_some());
-        if filtered || masked {
-            return Err(refuse(format!(
-                "has a {}, which Unity Catalog enforces only in its own compute; it issues no \
-                 credentials to read such a table's files",
-                if filtered {
-                    "row filter"
-                } else {
-                    "column mask"
-                }
-            )));
-        }
+        let governed = if record.row_filter.is_some() {
+            Some("row filter")
+        } else if record.columns.iter().any(|c| c.mask.is_some()) {
+            Some("column mask")
+        } else {
+            None
+        };
         let location = record
             .storage_location
             .filter(|l| !l.is_empty())
@@ -155,6 +150,7 @@ impl UnityClient {
             full_name: full_name.to_string(),
             id: record.table_id,
             location,
+            governed,
         })
     }
 
@@ -164,15 +160,26 @@ impl UnityClient {
             table: table.full_name.clone(),
             message,
         };
-        let issued: TemporaryCredentials = serde_json::from_value(
-            self.send(
+        let sent = self
+            .send(
                 &table.full_name,
                 "/api/2.1/unity-catalog/temporary-table-credentials",
                 Some(&body),
             )
-            .await?,
-        )
-        .map_err(|e| refuse(format!("unreadable credentials: {e}")))?;
+            .await;
+        let answer = match (sent, table.governed) {
+            (Ok(answer), _) => answer,
+            // Unity's own words for this are about cluster modes.
+            (Err(DeltaError::Catalog { message, .. }), Some(rule)) => {
+                return Err(refuse(format!(
+                    "Unity Catalog issued no credentials. The table has a {rule}, which Unity \
+                     enforces only in its own compute. It said: {message}"
+                )))
+            }
+            (Err(e), _) => return Err(e),
+        };
+        let issued: TemporaryCredentials = serde_json::from_value(answer)
+            .map_err(|e| refuse(format!("unreadable credentials: {e}")))?;
         let expires = issued
             .expiration_time
             .map(|ms| UNIX_EPOCH + Duration::from_millis(ms))
@@ -403,6 +410,7 @@ mod tests {
             full_name: "main.sales.orders".to_string(),
             id: "t-1".to_string(),
             location: location.to_string(),
+            governed: None,
         }
     }
 
@@ -506,22 +514,6 @@ mod tests {
                 serde_json::json!({"table_id": "t-1", "data_source_format": "DELTA"}),
                 "no storage location",
             ),
-            (
-                serde_json::json!({
-                    "table_id": "t-1", "data_source_format": "DELTA",
-                    "storage_location": "s3://bucket/t",
-                    "row_filter": {"function_name": "main.sales.only_mine"},
-                }),
-                "has a row filter",
-            ),
-            (
-                serde_json::json!({
-                    "table_id": "t-1", "data_source_format": "DELTA",
-                    "storage_location": "s3://bucket/t",
-                    "columns": [{"name": "id"}, {"name": "ssn", "mask": {"function_name": "f"}}],
-                }),
-                "has a column mask",
-            ),
         ] {
             let server = MockServer::start().await;
             serve_table(&server, record).await;
@@ -533,6 +525,103 @@ mod tests {
             );
             assert!(said.contains(expected), "{said}");
         }
+    }
+
+    /// Whether a table with an access rule can be read is Unity's to decide:
+    /// it is placed like any other, read if Unity issues credentials, and a
+    /// refusal is explained by the rule rather than by Unity's words alone.
+    #[tokio::test]
+    async fn a_table_with_an_access_rule_is_unitys_to_refuse() {
+        for (record, rule) in [
+            (
+                serde_json::json!({"row_filter": {"function_name": "main.sales.only_mine"}}),
+                "row filter",
+            ),
+            (
+                serde_json::json!({"columns": [{"name": "id"},
+                                               {"name": "ssn", "mask": {"function_name": "f"}}]}),
+                "column mask",
+            ),
+        ] {
+            let mut full = serde_json::json!({
+                "table_id": "t-1", "data_source_format": "DELTA",
+                "storage_location": "s3://bucket/t",
+            });
+            full.as_object_mut()
+                .unwrap()
+                .extend(record.as_object().unwrap().clone());
+
+            // Unity refuses, as it does today.
+            let refusing = MockServer::start().await;
+            serve_table(&refusing, full.clone()).await;
+            Mock::given(method("POST"))
+                .and(path(CREDENTIALS))
+                .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "message": "Query on table not supported on assigned clusters.",
+                })))
+                .mount(&refusing)
+                .await;
+            let unity = client(&refusing);
+            let table = unity.table("main.sales.orders").await.unwrap();
+            let said = Vending::aws(unity, table)
+                .get_credential()
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(said.contains(&format!("has a {rule}")), "{said}");
+            assert!(said.contains("assigned clusters"), "{said}");
+
+            // Were Unity to issue credentials, the table would be read.
+            let issuing = MockServer::start().await;
+            serve_table(&issuing, full).await;
+            issue(&issuing, 3600).await;
+            let unity = client(&issuing);
+            let table = unity.table("main.sales.orders").await.unwrap();
+            assert_eq!(
+                Vending::aws(unity, table)
+                    .get_credential()
+                    .await
+                    .unwrap()
+                    .key_id,
+                "KEY1"
+            );
+        }
+    }
+
+    /// The refusal travels up through the object store and Kernel; what the
+    /// reader reports is the catalog's error, not the layers it came through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_met_while_reading_is_reported_as_the_catalogs() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(CREDENTIALS))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "message": "User does not have SELECT on Table 'main.sales.orders'.",
+            })))
+            .mount(&server)
+            .await;
+        let io = DeltaIoConfig {
+            s3_region: Some("us-east-1".to_string()),
+            s3_endpoint: Some(server.uri()),
+            s3_path_style: true,
+            azure: None,
+        };
+        let location = "s3://bucket/tables/t-1";
+        let opened = crate::store::open(
+            location,
+            &io,
+            Credentials::Unity(client(&server), orders(location)),
+        )
+        .unwrap();
+        let table = crate::DeltaTable::over("orders", opened).unwrap();
+
+        let refused = table
+            .snapshot(crate::VersionSelector::Latest)
+            .await
+            .err()
+            .expect("no credentials, no snapshot");
+        let said = message(refused);
+        assert!(said.contains("does not have SELECT"), "{said}");
     }
 
     #[tokio::test]

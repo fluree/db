@@ -198,7 +198,7 @@ impl DeltaTable {
         )
     }
 
-    fn over(name: &str, (url, store): (Url, Arc<dyn ObjectStore>)) -> Result<Self> {
+    pub(crate) fn over(name: &str, (url, store): (Url, Arc<dyn ObjectStore>)) -> Result<Self> {
         let executor = executor()?;
         Ok(Self {
             name: name.into(),
