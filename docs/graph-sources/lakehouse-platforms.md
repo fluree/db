@@ -201,8 +201,8 @@ fluree delta map sales \
   process's own credentials.
 
 Only Delta tables with files of their own are read. A view, a table in another
-format, a table the principal cannot see and a table Unity will not issue
-credentials for are each reported by name — as a warning when the source is
+format, a table with a row filter or column mask, and a table the principal
+cannot see are each reported by name — as a warning when the source is
 mapped, and as the error of any query that touches them.
 
 ### Databricks external tables
@@ -288,6 +288,7 @@ HTTP API), the server's operator lists the variable in
 | `(not readable yet)` when mapping | The mapping process could not open the table — often only because it lacks the credentials the server has. The source is registered; the first query reports the real error |
 | S3 reads fail although `aws` works in the same shell | `AWS_PROFILE` and SSO sessions are not read. Export the profile's keys (`aws configure export-credentials --format env`) |
 | `User does not have EXTERNAL USE SCHEMA on Schema …` (or `USE CATALOG`, `USE SCHEMA`, `SELECT`) | A grant from [step 3](#databricks-tables-through-unity-catalog) is missing; none is implied by ownership or admin rights |
+| `… has a row filter` / `… has a column mask` | Unity Catalog enforces those rules only in its own compute and issues no credentials to read such a table's files, even to its owner. Expose the permitted rows and columns as a separate table, and govern access in Fluree with a model ledger's [access policy](iceberg.md#access-policy) |
 | `… is a VIEW, not a Delta table` / `… in PARQUET format` | Unity Catalog places only Delta tables with files of their own; map the underlying table |
 | `Received redirect` from S3 when a Unity table is first read | The bucket is in another region than `--s3-region` / `AWS_REGION` names |
 | `Catalog … authorized the table but vended no storage credentials` | The principal can see the table but lacks `USE CATALOG`, `USE SCHEMA`, `SELECT` or `EXTERNAL USE SCHEMA`. The Iceberg endpoint answers without credentials rather than with an error; `POST …/temporary-table-credentials` as the same principal names the missing privilege |

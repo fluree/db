@@ -186,8 +186,9 @@ needs no storage credentials of its own.
 - **Region.** Unity does not name an S3 bucket's region: give `s3_region`, or
   set `AWS_REGION`.
 - **What is read.** Delta tables with files of their own. A view, a table in
-  another format, and a table the principal cannot see or Unity will not issue
-  credentials for are reported by name — as a `table_warnings` entry at
+  another format, a table with a **row filter or column mask** (Unity enforces
+  those only in its own compute and issues no credentials for such a table,
+  even to its owner), and a table the principal cannot see are reported by name — as a `table_warnings` entry at
   registration and as the error of a query that touches them. A location on
   the local filesystem is never followed, whatever
   `FLUREE_ICEBERG_LOCAL_ROOTS` allows.

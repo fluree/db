@@ -53,6 +53,16 @@ struct TableRecord {
     data_source_format: Option<String>,
     #[serde(default)]
     table_type: Option<String>,
+    #[serde(default)]
+    row_filter: Option<serde_json::Value>,
+    #[serde(default)]
+    columns: Vec<ColumnRecord>,
+}
+
+#[derive(Deserialize)]
+struct ColumnRecord {
+    #[serde(default)]
+    mask: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +131,21 @@ impl UnityClient {
                 )))
             }
             None => return Err(refuse(format!("is a {kind}, not a Delta table"))),
+        }
+        // Unity applies these only in its own compute and issues no
+        // credentials for such a table; say so before it is asked.
+        let filtered = record.row_filter.is_some();
+        let masked = record.columns.iter().any(|c| c.mask.is_some());
+        if filtered || masked {
+            return Err(refuse(format!(
+                "has a {}, which Unity Catalog enforces only in its own compute; it issues no \
+                 credentials to read such a table's files",
+                if filtered {
+                    "row filter"
+                } else {
+                    "column mask"
+                }
+            )));
         }
         let location = record
             .storage_location
@@ -453,6 +478,7 @@ mod tests {
             serde_json::json!({
                 "table_id": "t-1", "table_type": "MANAGED", "data_source_format": "DELTA",
                 "storage_location": "s3://bucket/tables/t-1",
+                "row_filter": null, "columns": [{"name": "id"}, {"name": "label", "mask": null}],
             }),
         )
         .await;
@@ -479,6 +505,22 @@ mod tests {
             (
                 serde_json::json!({"table_id": "t-1", "data_source_format": "DELTA"}),
                 "no storage location",
+            ),
+            (
+                serde_json::json!({
+                    "table_id": "t-1", "data_source_format": "DELTA",
+                    "storage_location": "s3://bucket/t",
+                    "row_filter": {"function_name": "main.sales.only_mine"},
+                }),
+                "has a row filter",
+            ),
+            (
+                serde_json::json!({
+                    "table_id": "t-1", "data_source_format": "DELTA",
+                    "storage_location": "s3://bucket/t",
+                    "columns": [{"name": "id"}, {"name": "ssn", "mask": {"function_name": "f"}}],
+                }),
+                "has a column mask",
             ),
         ] {
             let server = MockServer::start().await;
