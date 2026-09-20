@@ -3457,9 +3457,16 @@ pub struct IcebergMapArgs {
     #[arg(long, value_name = "BOOL")]
     pub default_allow: Option<bool>,
 
-    /// Bearer token for REST catalog authentication
-    #[arg(long)]
+    /// Bearer token for REST catalog authentication. Stored with the graph
+    /// source; prefer --auth-bearer-env
+    #[arg(long, conflicts_with = "auth_bearer_env")]
     pub auth_bearer: Option<String>,
+
+    /// Environment variable holding the bearer token, read by the process that
+    /// reads the tables. The token is not stored. With --remote, the server
+    /// must list the variable in FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS
+    #[arg(long, value_name = "VAR")]
+    pub auth_bearer_env: Option<String>,
 
     /// OAuth2 token URL for client credentials auth
     #[arg(long)]
@@ -3469,9 +3476,14 @@ pub struct IcebergMapArgs {
     #[arg(long)]
     pub oauth2_client_id: Option<String>,
 
-    /// OAuth2 client secret
-    #[arg(long)]
+    /// OAuth2 client secret. Stored with the graph source; prefer
+    /// --oauth2-client-secret-env
+    #[arg(long, conflicts_with = "oauth2_client_secret_env")]
     pub oauth2_client_secret: Option<String>,
+
+    /// Environment variable holding the OAuth2 client secret; as --auth-bearer-env
+    #[arg(long, value_name = "VAR")]
+    pub oauth2_client_secret_env: Option<String>,
 
     /// OAuth2 scope (e.g. "session:role:ICEBERG_READER" for Snowflake Horizon / Polaris)
     #[arg(long)]

@@ -422,6 +422,9 @@ fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     if let Some(ref v) = args.auth_bearer {
         obj.insert("auth_bearer".into(), v.clone().into());
     }
+    if let Some(ref v) = args.auth_bearer_env {
+        obj.insert("auth_bearer_env".into(), v.clone().into());
+    }
     if let Some(ref v) = args.oauth2_token_url {
         obj.insert("oauth2_token_url".into(), v.clone().into());
     }
@@ -430,6 +433,9 @@ fn args_to_json(args: &IcebergMapArgs) -> CliResult<serde_json::Value> {
     }
     if let Some(ref v) = args.oauth2_client_secret {
         obj.insert("oauth2_client_secret".into(), v.clone().into());
+    }
+    if let Some(ref v) = args.oauth2_client_secret_env {
+        obj.insert("oauth2_client_secret_env".into(), v.clone().into());
     }
     if let Some(ref v) = args.oauth2_scope {
         obj.insert("oauth2_scope".into(), v.clone().into());
@@ -665,6 +671,21 @@ async fn run_iceberg_map_local(_args: IcebergMapArgs, _dirs: &FlureeDir) -> CliR
 // =============================================================================
 
 #[cfg(feature = "iceberg")]
+/// A secret given literally or as the name of an environment variable (clap
+/// refuses both).
+fn secret_value(
+    literal: &Option<String>,
+    env: &Option<String>,
+) -> Option<fluree_db_api::IcebergConfigValue> {
+    use fluree_db_api::IcebergConfigValue as ConfigValue;
+    match (literal, env) {
+        (Some(value), _) => Some(ConfigValue::literal(value)),
+        (None, Some(name)) => Some(ConfigValue::from_env(name)),
+        (None, None) => None,
+    }
+}
+
+#[cfg(feature = "iceberg")]
 fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::IcebergCreateConfig> {
     let mode = args.mode.to_lowercase();
     let mut config = match mode.as_str() {
@@ -709,16 +730,16 @@ fn build_iceberg_config(args: &IcebergMapArgs) -> CliResult<fluree_db_api::Icebe
     if let Some(allow) = args.default_allow {
         config = config.with_default_allow(allow);
     }
-    if let Some(ref token) = args.auth_bearer {
-        config = config.with_auth_bearer(token);
+    if let Some(token) = secret_value(&args.auth_bearer, &args.auth_bearer_env) {
+        config = config.with_auth_bearer_value(token);
     }
     // OAuth2 activates on token_url + client_secret; client_id defaults to "" so
     // Horizon / PAT users can omit it (an empty client_id is what Snowflake
     // Horizon's `session:role:` exchange requires).
-    if let (Some(ref url), Some(ref secret)) = (&args.oauth2_token_url, &args.oauth2_client_secret)
-    {
+    let oauth2_secret = secret_value(&args.oauth2_client_secret, &args.oauth2_client_secret_env);
+    if let (Some(ref url), Some(secret)) = (&args.oauth2_token_url, oauth2_secret) {
         let id = args.oauth2_client_id.as_deref().unwrap_or("");
-        config = config.with_auth_oauth2(url, id, secret);
+        config = config.with_auth_oauth2_secret_value(url, id, secret);
         if let Some(ref scope) = args.oauth2_scope {
             config = config.with_oauth2_scope(scope);
         }
@@ -789,9 +810,11 @@ mod tests {
             model: None,
             default_allow: None,
             auth_bearer: None,
+            auth_bearer_env: None,
             oauth2_token_url: None,
             oauth2_client_id: None,
             oauth2_client_secret: None,
+            oauth2_client_secret_env: None,
             oauth2_scope: None,
             oauth2_audience: None,
             warehouse: None,
@@ -826,6 +849,78 @@ mod tests {
         assert_eq!(body["oauth2_audience"], "polaris");
         // Omitting client_id leaves it out of the remote body entirely.
         assert!(body.get("oauth2_client_id").is_none());
+    }
+
+    #[test]
+    fn a_secret_named_by_variable_reaches_a_remote_server_as_the_name() {
+        let mut args = base_rest_args();
+        args.auth_bearer_env = Some("CATALOG_TOKEN".to_string());
+        args.oauth2_client_secret_env = Some("CATALOG_SECRET".to_string());
+
+        let body = args_to_json(&args).unwrap();
+        assert_eq!(body["auth_bearer_env"], "CATALOG_TOKEN");
+        assert_eq!(body["oauth2_client_secret_env"], "CATALOG_SECRET");
+        assert!(body.get("auth_bearer").is_none());
+        assert!(body.get("oauth2_client_secret").is_none());
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn a_secret_named_by_variable_is_stored_as_the_name() {
+        let mut bearer = base_rest_args();
+        bearer.auth_bearer_env = Some("CATALOG_TOKEN".to_string());
+        let stored = serde_json::to_value(
+            build_iceberg_config(&bearer)
+                .unwrap()
+                .to_iceberg_gs_config(),
+        )
+        .unwrap();
+        assert_eq!(stored["catalog"]["auth"]["type"], "bearer");
+        assert_eq!(
+            stored["catalog"]["auth"]["token"]["env_var"],
+            "CATALOG_TOKEN"
+        );
+
+        let mut oauth2 = base_rest_args();
+        oauth2.oauth2_token_url = Some("https://catalog.example.com/token".to_string());
+        oauth2.oauth2_client_id = Some("app".to_string());
+        oauth2.oauth2_client_secret_env = Some("CATALOG_SECRET".to_string());
+        let stored = serde_json::to_value(
+            build_iceberg_config(&oauth2)
+                .unwrap()
+                .to_iceberg_gs_config(),
+        )
+        .unwrap();
+        let auth = &stored["catalog"]["auth"];
+        assert_eq!(auth["type"], "oauth2_client_credentials");
+        assert_eq!(auth["client_id"], "app");
+        assert_eq!(auth["client_secret"]["env_var"], "CATALOG_SECRET");
+    }
+
+    #[test]
+    fn a_secret_is_given_one_way_or_the_other() {
+        use clap::Parser;
+        let parse = |extra: &[&str]| {
+            let mut argv = vec![
+                "fluree",
+                "iceberg",
+                "map",
+                "gs",
+                "--catalog-uri",
+                "https://c",
+            ];
+            argv.extend_from_slice(extra);
+            crate::cli::Cli::try_parse_from(argv)
+        };
+        assert!(parse(&["--auth-bearer-env", "T"]).is_ok());
+        assert!(parse(&["--auth-bearer", "t", "--auth-bearer-env", "T"]).is_err());
+        assert!(parse(&[
+            "--oauth2-client-secret",
+            "s",
+            "--oauth2-client-secret-env",
+            "S"
+        ])
+        .is_err());
     }
 
     #[cfg(feature = "iceberg")]

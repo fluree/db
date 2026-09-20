@@ -224,14 +224,15 @@ scopes: all-apis`).
 fluree iceberg map dbx-sales \
   --catalog-uri https://<workspace>.cloud.databricks.com/api/2.1/unity-catalog/iceberg-rest \
   --warehouse main \
-  --auth-bearer "$DATABRICKS_TOKEN" \
+  --auth-bearer-env DATABRICKS_TOKEN \
   --r2rml mappings/sales.ttl
 ```
 
 `--warehouse` is the Unity **catalog** name, and the mapping names tables as
-`<schema>.<table>` (`rr:tableName "sales.orders"`). A personal access token is
-stored with the source and does not renew; give it a lifetime to match, and
-re-map when it is rotated.
+`<schema>.<table>` (`rr:tableName "sales.orders"`). `--auth-bearer-env` names
+the environment variable holding the token, read by the process that reads the
+tables, so the token itself is not stored. A personal access token does not
+renew; give it a lifetime to match.
 
 **For a standing deployment, use a service principal.** Its OAuth token is
 requested by Fluree and renewed as it expires, so nothing has to be rotated by
@@ -251,12 +252,16 @@ fluree iceberg map dbx-sales \
   --warehouse main \
   --oauth2-token-url https://<workspace>.cloud.databricks.com/oidc/v1/token \
   --oauth2-client-id <application-id> \
-  --oauth2-client-secret "$DATABRICKS_CLIENT_SECRET" \
+  --oauth2-client-secret-env DATABRICKS_CLIENT_SECRET \
   --oauth2-scope all-apis \
   --r2rml mappings/sales.ttl
 ```
 
-The client secret is stored with the source.
+The secret stays in the environment of the process that reads the tables; only
+the variable's name is stored. When mapping on a server (`--remote`, or the
+HTTP API), the server's operator lists the variable in
+`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS` first; the same holds for
+`--auth-bearer-env`.
 
 ## When it does not work
 

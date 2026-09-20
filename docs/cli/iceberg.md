@@ -61,10 +61,12 @@ fluree iceberg map <NAME> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--auth-bearer <TOKEN>` | Bearer token for REST catalog authentication |
+| `--auth-bearer <TOKEN>` | Bearer token for REST catalog authentication. Stored with the graph source; prefer the option below |
+| `--auth-bearer-env <VAR>` | Environment variable holding the bearer token, read by the process that reads the tables. The token is not stored. With `--remote`, the server must list the variable in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) |
 | `--oauth2-token-url <URL>` | OAuth2 token URL for client credentials auth |
 | `--oauth2-client-id <ID>` | OAuth2 client ID |
-| `--oauth2-client-secret <SECRET>` | OAuth2 client secret |
+| `--oauth2-client-secret <SECRET>` | OAuth2 client secret. Stored with the graph source; prefer the option below |
+| `--oauth2-client-secret-env <VAR>` | Environment variable holding the OAuth2 client secret; as `--auth-bearer-env` |
 
 **S3 overrides:**
 

@@ -250,6 +250,10 @@ pub use graph_source::{DeltaAzureFields, DeltaCreateConfig, DeltaCreateResult};
 #[cfg(feature = "sql")]
 pub use graph_source::{SqlCheckResult, SqlCreateConfig, SqlCreateResult};
 
+/// A graph-source secret: a literal, a secret reference, or the name of an
+/// environment variable of the reading process.
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::ConfigValue as IcebergConfigValue;
 /// Secret-resolution injection point for `ConfigValue::SecretRef` in Iceberg
 /// graph-source auth. The host constructs a [`SecretResolver`] with the tenant
 /// captured and injects it via [`Fluree::with_secret_resolver`]; db stays

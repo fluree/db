@@ -38,12 +38,17 @@ pub struct IcebergMapRequest {
     pub branch: Option<String>,
     /// Bearer token for catalog auth
     pub auth_bearer: Option<String>,
+    /// Environment variable of this server holding the bearer token; see
+    /// [`secret_value`].
+    pub auth_bearer_env: Option<String>,
     /// OAuth2 token URL
     pub oauth2_token_url: Option<String>,
     /// OAuth2 client ID
     pub oauth2_client_id: Option<String>,
     /// OAuth2 client secret
     pub oauth2_client_secret: Option<String>,
+    /// Environment variable of this server holding the OAuth2 client secret.
+    pub oauth2_client_secret_env: Option<String>,
     /// OAuth2 scope (e.g. "session:role:<ROLE>" for Snowflake Horizon / Polaris)
     pub oauth2_scope: Option<String>,
     /// OAuth2 audience
@@ -620,7 +625,52 @@ pub async fn iceberg_tracking_status(State(state): State<Arc<AppState>>) -> Resp
         .into_response()
 }
 
+/// The environment variables a request may name as a secret (comma-separated).
+const SECRET_ENV_ALLOWLIST: &str = "FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS";
+
+fn allowed_secret_env() -> String {
+    std::env::var(SECRET_ENV_ALLOWLIST).unwrap_or_default()
+}
+
+/// One secret, given as a literal or as the name of an environment variable.
+///
+/// The request also chooses where the secret is sent — the catalog or the
+/// token URL — so it may name only a variable the operator has listed.
+/// Anything else would let a caller send this server's environment to a host
+/// of their choosing.
+fn secret_value(
+    field: &str,
+    literal: Option<&str>,
+    env: Option<&str>,
+    allowed: &str,
+) -> Result<Option<fluree_db_api::IcebergConfigValue>> {
+    use fluree_db_api::IcebergConfigValue as ConfigValue;
+    match (literal, env) {
+        (Some(_), Some(_)) => Err(ServerError::bad_request(format!(
+            "give {field} or {field}_env, not both"
+        ))),
+        (Some(value), None) => Ok(Some(ConfigValue::literal(value))),
+        (None, Some(name)) => {
+            if allowed.split(',').any(|listed| listed.trim() == name) {
+                Ok(Some(ConfigValue::from_env(name)))
+            } else {
+                Err(ServerError::bad_request(format!(
+                    "{field}_env names '{name}', which this server does not list in {SECRET_ENV_ALLOWLIST}"
+                )))
+            }
+        }
+        (None, None) => Ok(None),
+    }
+}
+
 fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::IcebergCreateConfig> {
+    build_iceberg_config_allowing(req, &allowed_secret_env())
+}
+
+fn build_iceberg_config_allowing(
+    req: &IcebergMapRequest,
+    allowed_env: &str,
+) -> Result<fluree_db_api::IcebergCreateConfig> {
     let mode = req.mode.to_lowercase();
     let mut config = match mode.as_str() {
         "rest" => {
@@ -657,15 +707,26 @@ fn build_iceberg_config(req: &IcebergMapRequest) -> Result<fluree_db_api::Iceber
     if let Some(ref branch) = req.branch {
         config = config.with_branch(branch);
     }
-    if let Some(ref token) = req.auth_bearer {
-        config = config.with_auth_bearer(token);
+    if let Some(token) = secret_value(
+        "auth_bearer",
+        req.auth_bearer.as_deref(),
+        req.auth_bearer_env.as_deref(),
+        allowed_env,
+    )? {
+        config = config.with_auth_bearer_value(token);
     }
     // OAuth2 activates on oauth2_token_url + oauth2_client_secret; client_id
     // defaults to "" so Horizon / PAT callers can omit it (Snowflake Horizon's
     // `session:role:` token exchange requires an absent/empty client_id).
-    if let (Some(ref url), Some(ref secret)) = (&req.oauth2_token_url, &req.oauth2_client_secret) {
+    let oauth2_secret = secret_value(
+        "oauth2_client_secret",
+        req.oauth2_client_secret.as_deref(),
+        req.oauth2_client_secret_env.as_deref(),
+        allowed_env,
+    )?;
+    if let (Some(ref url), Some(secret)) = (&req.oauth2_token_url, oauth2_secret) {
         let id = req.oauth2_client_id.as_deref().unwrap_or("");
-        config = config.with_auth_oauth2(url, id, secret);
+        config = config.with_auth_oauth2_secret_value(url, id, secret);
         if let Some(ref scope) = req.oauth2_scope {
             config = config.with_oauth2_scope(scope);
         }
@@ -735,12 +796,17 @@ pub struct IcebergConnectionRequest {
     pub table_location: Option<String>,
     /// Bearer token for catalog auth
     pub auth_bearer: Option<String>,
+    /// Environment variable of this server holding the bearer token; see
+    /// [`secret_value`].
+    pub auth_bearer_env: Option<String>,
     /// OAuth2 token URL
     pub oauth2_token_url: Option<String>,
     /// OAuth2 client ID
     pub oauth2_client_id: Option<String>,
     /// OAuth2 client secret
     pub oauth2_client_secret: Option<String>,
+    /// Environment variable of this server holding the OAuth2 client secret.
+    pub oauth2_client_secret_env: Option<String>,
     /// OAuth2 scope (e.g. "session:role:<ROLE>" for Snowflake Horizon / Polaris)
     pub oauth2_scope: Option<String>,
     /// OAuth2 audience
@@ -761,6 +827,13 @@ pub struct IcebergConnectionRequest {
 
 fn build_iceberg_connection(
     req: &IcebergConnectionRequest,
+) -> Result<fluree_db_api::IcebergConnectionConfig> {
+    build_iceberg_connection_allowing(req, &allowed_secret_env())
+}
+
+fn build_iceberg_connection_allowing(
+    req: &IcebergConnectionRequest,
+    allowed_env: &str,
 ) -> Result<fluree_db_api::IcebergConnectionConfig> {
     use fluree_db_api::IcebergConnectionConfig;
 
@@ -786,14 +859,25 @@ fn build_iceberg_connection(
         }
     };
 
-    if let Some(ref token) = req.auth_bearer {
-        conn = conn.with_auth_bearer(token);
+    if let Some(token) = secret_value(
+        "auth_bearer",
+        req.auth_bearer.as_deref(),
+        req.auth_bearer_env.as_deref(),
+        allowed_env,
+    )? {
+        conn = conn.with_auth_bearer_value(token);
     }
     // OAuth2 activates on token_url + client_secret; client_id defaults to ""
     // so Horizon / PAT callers can omit it (mirrors iceberg/map).
-    if let (Some(ref url), Some(ref secret)) = (&req.oauth2_token_url, &req.oauth2_client_secret) {
+    let oauth2_secret = secret_value(
+        "oauth2_client_secret",
+        req.oauth2_client_secret.as_deref(),
+        req.oauth2_client_secret_env.as_deref(),
+        allowed_env,
+    )?;
+    if let (Some(ref url), Some(secret)) = (&req.oauth2_token_url, oauth2_secret) {
         let id = req.oauth2_client_id.as_deref().unwrap_or("");
-        conn = conn.with_auth_oauth2(url, id, secret);
+        conn = conn.with_auth_oauth2_secret_value(url, id, secret);
         if let Some(ref scope) = req.oauth2_scope {
             conn = conn.with_oauth2_scope(scope);
         }
@@ -1294,6 +1378,77 @@ mod tests {
         assert_eq!(auth["client_id"], ""); // defaulted to empty
         assert_eq!(auth["scope"], "session:role:ICEBERG_READER");
         assert_eq!(auth["audience"], "polaris");
+    }
+
+    fn map_request(extra: serde_json::Value) -> IcebergMapRequest {
+        let mut body = serde_json::json!({
+            "name": "gs", "mode": "rest",
+            "catalog_uri": "https://catalog.example.com", "table": "ns.tbl",
+        });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(body).unwrap()
+    }
+
+    fn stored_auth(config: fluree_db_api::IcebergCreateConfig) -> serde_json::Value {
+        serde_json::to_value(config.to_iceberg_gs_config()).unwrap()["catalog"]["auth"].clone()
+    }
+
+    #[test]
+    fn a_listed_variable_is_stored_as_its_name() {
+        let req = map_request(serde_json::json!({"auth_bearer_env": "CATALOG_TOKEN"}));
+        let auth =
+            stored_auth(build_iceberg_config_allowing(&req, "OTHER, CATALOG_TOKEN").unwrap());
+        assert_eq!(auth["type"], "bearer");
+        assert_eq!(auth["token"]["env_var"], "CATALOG_TOKEN");
+
+        let req = map_request(serde_json::json!({
+            "oauth2_token_url": "https://catalog.example.com/token",
+            "oauth2_client_id": "app",
+            "oauth2_client_secret_env": "CATALOG_SECRET",
+        }));
+        let auth = stored_auth(build_iceberg_config_allowing(&req, "CATALOG_SECRET").unwrap());
+        assert_eq!(auth["type"], "oauth2_client_credentials");
+        assert_eq!(auth["client_secret"]["env_var"], "CATALOG_SECRET");
+    }
+
+    #[test]
+    fn a_variable_the_operator_did_not_list_is_refused() {
+        for allowed in ["", "CATALOG_TOKEN_2", "XCATALOG_TOKEN,CATALOG"] {
+            for field in ["auth_bearer_env", "oauth2_client_secret_env"] {
+                let req = map_request(serde_json::json!({
+                    "oauth2_token_url": "https://catalog.example.com/token",
+                    field: "CATALOG_TOKEN",
+                }));
+                let err = build_iceberg_config_allowing(&req, allowed)
+                    .err()
+                    .unwrap_or_else(|| panic!("{field} accepted with allowlist {allowed:?}"));
+                assert!(err.to_string().contains(SECRET_ENV_ALLOWLIST), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_secret_given_both_ways_is_refused() {
+        let req = map_request(serde_json::json!({
+            "auth_bearer": "t", "auth_bearer_env": "CATALOG_TOKEN",
+        }));
+        assert!(build_iceberg_config_allowing(&req, "CATALOG_TOKEN").is_err());
+    }
+
+    #[test]
+    fn browse_and_preview_hold_a_named_variable_to_the_same_list() {
+        let req = |allowed: &str| {
+            let req: IcebergConnectionRequest = serde_json::from_value(serde_json::json!({
+                "mode": "rest", "catalog_uri": "https://catalog.example.com",
+                "auth_bearer_env": "CATALOG_TOKEN",
+            }))
+            .unwrap();
+            build_iceberg_connection_allowing(&req, allowed)
+        };
+        assert!(req("CATALOG_TOKEN").is_ok());
+        assert!(req("").is_err());
     }
 
     #[test]

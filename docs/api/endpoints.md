@@ -2962,8 +2962,9 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 | `r2rml` | string | Inline R2RML mapping (Turtle/JSON-LD). Omit to auto-generate a direct mapping. |
 | `r2rml_type` | string | Media type of `r2rml` (`text/turtle`, `application/ld+json`) |
 | `branch` | string | Branch name (default: `main`) |
-| `auth_bearer` | string | Static bearer token for catalog auth (does not refresh — a Google OAuth token will expire after ~1h) |
-| `oauth2_*` | string | OAuth2 client-credentials flow for the catalog (refreshes) |
+| `auth_bearer` | string | Static bearer token for catalog auth (does not refresh — a Google OAuth token will expire after ~1h). Stored with the graph source |
+| `auth_bearer_env` | string | In place of `auth_bearer`: the name of an environment variable of the server holding the token, so the token is not stored. The name must be listed in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning); any other is refused with 400 |
+| `oauth2_*` | string | OAuth2 client-credentials flow for the catalog (refreshes). `oauth2_client_secret_env` names a server environment variable in place of `oauth2_client_secret`, under the same rule as `auth_bearer_env` |
 | `auth_google_metadata` | bool | Use the GCE/GKE metadata server (Workload Identity) for catalog auth, minting + auto-refreshing tokens — for Google Iceberg REST catalogs (BigLake). Overrides `auth_bearer`. Only works when running on GCP. |
 | `auth_google_scopes` | string | Optional OAuth scopes for `auth_google_metadata` (default `cloud-platform`) |
 | `warehouse` | string | Warehouse identifier |
