@@ -827,6 +827,21 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 cli::DeltaAction::Map(args) => {
                     commands::delta::run_delta_map(*args, &fluree_dir, direct).await
                 }
+                cli::DeltaAction::Browse(args) => {
+                    commands::delta::run_delta_browse(*args, &fluree_dir, direct).await
+                }
+                cli::DeltaAction::Preview(args) => {
+                    commands::delta::run_delta_preview(*args, &fluree_dir, direct).await
+                }
+                cli::DeltaAction::Verify(args) => {
+                    commands::delta::run_delta_verify(*args, &fluree_dir, direct).await
+                }
+                cli::DeltaAction::Generate(args) => {
+                    commands::delta::run_delta_generate(*args, &fluree_dir, direct).await
+                }
+                cli::DeltaAction::Validate(args) => {
+                    commands::delta::run_delta_validate(*args, &fluree_dir, direct).await
+                }
                 cli::DeltaAction::List { remote } => {
                     commands::iceberg::run_iceberg_list(&fluree_dir, remote.as_deref(), direct)
                         .await

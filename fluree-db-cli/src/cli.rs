@@ -3192,6 +3192,38 @@ pub enum DeltaAction {
     ///   fluree delta map sales --table orders=s3://lake/raw/orders_v2 --r2rml sales.ttl
     Map(Box<DeltaMapArgs>),
 
+    /// List what a Unity Catalog holds
+    ///
+    /// With no --unity-catalog, its catalogs; with one, that catalog's schemas
+    /// and tables; with --unity-schema too, that schema's tables. Each table
+    /// shows whether it is a Delta table this reader can read.
+    ///
+    /// Examples:
+    ///   fluree delta browse --unity-uri https://<workspace> --auth-bearer-env DATABRICKS_TOKEN
+    ///   fluree delta browse --unity-uri ... --auth-bearer-env ... --unity-catalog main
+    Browse(Box<DeltaBrowseArgs>),
+
+    /// Show a Unity Catalog table's columns and declared keys
+    Preview(Box<DeltaTableArgs>),
+
+    /// Read a Unity Catalog table with the credentials Unity issues for it
+    Verify(Box<DeltaTableArgs>),
+
+    /// Generate an R2RML mapping from Unity Catalog tables
+    ///
+    /// Declared primary keys become subjects and declared foreign keys joins.
+    /// What had to be decided without one is said on standard error.
+    ///
+    /// Example:
+    ///   fluree delta generate main.sales.orders main.sales.customers \
+    ///     --unity-uri https://<workspace> --auth-bearer-env DATABRICKS_TOKEN \
+    ///     --base-namespace https://example.org/sales# -o sales.ttl
+    Generate(Box<DeltaGenerateArgs>),
+
+    /// Check a mapping against the tables `delta map` would read, registering
+    /// nothing. Takes the options of `delta map`.
+    Validate(Box<DeltaValidateArgs>),
+
     /// List mapped graph sources (Delta, SQL, Iceberg and R2RML)
     List {
         /// List graph sources on a remote server (by remote name, e.g., "origin")
@@ -3224,81 +3256,21 @@ pub enum DeltaAction {
     },
 }
 
-/// Arguments for mapping Delta tables as a graph source.
+/// A Unity Catalog connection.
 #[derive(Debug, Clone, clap::Args)]
-pub struct DeltaMapArgs {
-    /// Graph source name (e.g., "sales")
-    pub name: String,
-
-    /// Execute against a remote server (by remote name, e.g., "origin")
-    #[arg(long)]
-    pub remote: Option<String>,
-
-    /// Directory the mapping's table names resolve beneath: s3://bucket/prefix,
-    /// abfss://container@account.dfs.core.windows.net/path (or the OneLake
-    /// form), or a local path under FLUREE_ICEBERG_LOCAL_ROOTS
-    #[arg(long)]
-    pub root: Option<String>,
-
-    /// Explicit table location (repeatable): --table orders=s3://lake/raw/orders_v2
-    #[arg(long = "table", value_name = "NAME=LOCATION")]
-    pub table: Vec<String>,
-
-    /// R2RML mapping file. Each rr:tableName names a Delta table; rr:sqlQuery
-    /// is not supported.
-    #[arg(long)]
-    pub r2rml: PathBuf,
-
-    /// R2RML mapping media type (e.g., "text/turtle"); inferred from extension if omitted
-    #[arg(long)]
-    pub r2rml_type: Option<String>,
-
-    /// Branch name (defaults to "main")
-    #[arg(long)]
-    pub branch: Option<String>,
-
-    /// S3 region override
-    #[arg(long)]
-    pub s3_region: Option<String>,
-
-    /// S3 endpoint override (MinIO, LocalStack)
-    #[arg(long)]
-    pub s3_endpoint: Option<String>,
-
-    /// Use path-style S3 URLs (MinIO, LocalStack)
-    #[arg(long)]
-    pub s3_path_style: bool,
-
-    /// Microsoft Entra tenant id of a service principal for abfss:// locations.
-    /// Omit the --azure-* options to use ambient Azure credentials.
-    #[arg(long)]
-    pub azure_tenant_id: Option<String>,
-
-    /// Service principal (application) client id
-    #[arg(long)]
-    pub azure_client_id: Option<String>,
-
-    /// Service principal client secret (stored with the graph source; prefer
-    /// --azure-client-secret-env)
-    #[arg(long, conflicts_with = "azure_client_secret_env")]
-    pub azure_client_secret: Option<String>,
-
-    /// Environment variable holding the client secret, read by the process
-    /// that reads the tables
-    #[arg(long, value_name = "VAR")]
-    pub azure_client_secret_env: Option<String>,
-
-    /// Databricks workspace URL. Tables without a --table entry are then named
-    /// in Unity Catalog (catalog.schema.table), which says where each lives
-    /// and issues the credentials that read it. Excludes --root
-    #[arg(long, value_name = "URL", conflicts_with = "root")]
+pub struct DeltaUnityArgs {
+    /// Databricks workspace URL. For `map`, tables without a --table entry are
+    /// then named in Unity Catalog (catalog.schema.table), which says where
+    /// each lives and issues the credentials that read it. Excludes --root
+    #[arg(long, value_name = "URL")]
     pub unity_uri: Option<String>,
 
-    /// Catalog that completes a mapped table name of fewer than three parts
+    /// Catalog that completes a table name of fewer than three parts, and
+    /// that `browse` lists
     #[arg(long, requires = "unity_uri")]
     pub unity_catalog: Option<String>,
 
-    /// Schema that completes a one-part mapped table name
+    /// Schema that completes a one-part table name, and that `browse` lists
     #[arg(long, requires = "unity_uri")]
     pub unity_schema: Option<String>,
 
@@ -3337,6 +3309,88 @@ pub struct DeltaMapArgs {
     /// OAuth2 scope (default: all-apis)
     #[arg(long, requires = "unity_uri")]
     pub oauth2_scope: Option<String>,
+}
+
+/// S3 options for tables read with credentials that name no region.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaS3Args {
+    /// S3 region override
+    #[arg(long)]
+    pub s3_region: Option<String>,
+
+    /// S3 endpoint override (MinIO, LocalStack)
+    #[arg(long)]
+    pub s3_endpoint: Option<String>,
+
+    /// Use path-style S3 URLs (MinIO, LocalStack)
+    #[arg(long)]
+    pub s3_path_style: bool,
+}
+
+/// Where a Delta source's tables are, and the mapping over them.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaSourceArgs {
+    /// Directory the mapping's table names resolve beneath: s3://bucket/prefix,
+    /// abfss://container@account.dfs.core.windows.net/path (or the OneLake
+    /// form), or a local path under FLUREE_ICEBERG_LOCAL_ROOTS
+    #[arg(long, conflicts_with = "unity_uri")]
+    pub root: Option<String>,
+
+    /// Explicit table location (repeatable): --table orders=s3://lake/raw/orders_v2
+    #[arg(long = "table", value_name = "NAME=LOCATION")]
+    pub table: Vec<String>,
+
+    /// R2RML mapping file. Each rr:tableName names a Delta table; rr:sqlQuery
+    /// is not supported.
+    #[arg(long)]
+    pub r2rml: PathBuf,
+
+    /// R2RML mapping media type (e.g., "text/turtle"); inferred from extension if omitted
+    #[arg(long)]
+    pub r2rml_type: Option<String>,
+
+    #[command(flatten)]
+    pub s3: DeltaS3Args,
+
+    /// Microsoft Entra tenant id of a service principal for abfss:// locations.
+    /// Omit the --azure-* options to use ambient Azure credentials.
+    #[arg(long)]
+    pub azure_tenant_id: Option<String>,
+
+    /// Service principal (application) client id
+    #[arg(long)]
+    pub azure_client_id: Option<String>,
+
+    /// Service principal client secret (stored with the graph source; prefer
+    /// --azure-client-secret-env)
+    #[arg(long, conflicts_with = "azure_client_secret_env")]
+    pub azure_client_secret: Option<String>,
+
+    /// Environment variable holding the client secret, read by the process
+    /// that reads the tables
+    #[arg(long, value_name = "VAR")]
+    pub azure_client_secret_env: Option<String>,
+
+    #[command(flatten)]
+    pub unity: DeltaUnityArgs,
+}
+
+/// Arguments for mapping Delta tables as a graph source.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaMapArgs {
+    /// Graph source name (e.g., "sales")
+    pub name: String,
+
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub source: DeltaSourceArgs,
+
+    /// Branch name (defaults to "main")
+    #[arg(long)]
+    pub branch: Option<String>,
 
     /// Model ledger (name:branch) governing this source: its default graph
     /// supplies the view policies (`fluree model access enable <model> ...`)
@@ -3348,6 +3402,111 @@ pub struct DeltaMapArgs {
     /// source readable under authentication without a model (unset: deny).
     #[arg(long, value_name = "BOOL")]
     pub default_allow: Option<bool>,
+}
+
+/// Arguments for checking a mapping against the tables a `delta map` with the
+/// same options would read.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaValidateArgs {
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub source: DeltaSourceArgs,
+
+    /// Print the server's JSON instead of a summary
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DeltaBrowseDepth {
+    Schemas,
+    Tables,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaBrowseArgs {
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub unity: DeltaUnityArgs,
+
+    /// How far a listing of one catalog reaches
+    #[arg(long, value_enum, default_value = "tables")]
+    pub depth: DeltaBrowseDepth,
+
+    /// Print the server's JSON instead of a summary
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaTableArgs {
+    /// Table name, completed from --unity-catalog and --unity-schema
+    pub table: String,
+
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub unity: DeltaUnityArgs,
+
+    #[command(flatten)]
+    pub s3: DeltaS3Args,
+
+    /// Print the server's JSON instead of a summary
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaGenerateArgs {
+    /// Tables to map, in output order; completed from --unity-catalog and
+    /// --unity-schema
+    #[arg(required = true)]
+    pub tables: Vec<String>,
+
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub unity: DeltaUnityArgs,
+
+    /// The IRI every generated class, property and subject derives from
+    #[arg(long, value_name = "IRI")]
+    pub base_namespace: String,
+
+    /// Write the mapping here instead of standard output
+    #[arg(long, short, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Subject columns for a table, in place of its declared or chosen key
+    /// (repeatable): --subject-key orders=order_id,line
+    #[arg(long, value_name = "TABLE=COLUMN[,COLUMN]")]
+    pub subject_key: Vec<String>,
+
+    /// Class name for a table (repeatable): --class-name orders=Purchase
+    #[arg(long, value_name = "TABLE=NAME")]
+    pub class_name: Vec<String>,
+
+    /// Give a table no subject unless it has a declared or provably non-null
+    /// key, instead of always choosing one
+    #[arg(long)]
+    pub strict_subjects: bool,
+
+    /// Keep foreign keys as plain values; emit no joins
+    #[arg(long)]
+    pub no_joins: bool,
+
+    /// Print the server's JSON (mapping, structure and diagnostics)
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for mapping a SQL endpoint as a graph source.
