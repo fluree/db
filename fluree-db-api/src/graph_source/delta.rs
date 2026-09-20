@@ -319,17 +319,7 @@ impl crate::Fluree {
             columns.sort();
             columns.dedup();
             let probed = async {
-                let table = match (gs_config.placement(table_name)?, &unity) {
-                    (Placement::Unity(full_name), Some(unity)) => {
-                        DeltaTable::open_in_unity(table_name, unity, &full_name, &io).await?
-                    }
-                    (Placement::Path(location), _) => DeltaTable::open(table_name, &location, &io)?,
-                    (Placement::Unity(full_name), None) => {
-                        return Err(DeltaError::Config(format!(
-                            "table '{full_name}' is placed in a catalog the source does not have"
-                        )))
-                    }
-                };
+                let table = open_placed(&gs_config, unity.as_ref(), &io, table_name).await?;
                 let snapshot = table
                     .snapshot(fluree_db_delta::VersionSelector::Latest)
                     .await?;
@@ -378,6 +368,25 @@ impl crate::Fluree {
             table_warnings,
             model_warnings,
         })
+    }
+}
+
+/// Open `table_name` where `config` places it. `unity` and `io` are the
+/// config's own, hydrated.
+pub(crate) async fn open_placed(
+    config: &DeltaGsConfig,
+    unity: Option<&UnityConfig>,
+    io: &DeltaIoConfig,
+    table_name: &str,
+) -> Result<DeltaTable, DeltaError> {
+    match (config.placement(table_name)?, unity) {
+        (Placement::Unity(full_name), Some(unity)) => {
+            DeltaTable::open_in_unity(table_name, unity, &full_name, io).await
+        }
+        (Placement::Path(location), _) => DeltaTable::open(table_name, &location, io),
+        (Placement::Unity(full_name), None) => Err(DeltaError::Config(format!(
+            "table '{full_name}' is placed in a catalog the source does not have"
+        ))),
     }
 }
 

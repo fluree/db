@@ -449,6 +449,23 @@ impl DeltaSnapshot {
             .collect()
     }
 
+    /// Every column of this version, in schema order: its name, the type a
+    /// scan yields (`None` for one the batch model cannot carry), and whether
+    /// it may be null.
+    pub fn columns(&self) -> Vec<(String, Option<fluree_db_tabular::FieldType>, bool)> {
+        self.snapshot
+            .schema()
+            .fields()
+            .map(|f| {
+                (
+                    f.name().clone(),
+                    crate::bridge::field_type_of(f),
+                    f.is_nullable(),
+                )
+            })
+            .collect()
+    }
+
     /// The batch schema a scan of `projection` yields (every column when
     /// empty), without reading data. Fails on a column this version lacks or a
     /// type the batch model cannot carry.

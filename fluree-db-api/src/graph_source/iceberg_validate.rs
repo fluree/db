@@ -38,6 +38,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
+use fluree_db_iceberg::FieldType;
 use fluree_db_r2rml::emit::{DiagCode, Diagnostic, Severity};
 use fluree_db_r2rml::loader::R2rmlLoader;
 use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, ObjectMap, TriplesMap};
@@ -92,24 +93,55 @@ fn compile_error_diagnostic(message: &str) -> Diagnostic {
     }
 }
 
+/// A live column, as far as a mapping is checked against it.
+#[derive(Debug, Clone)]
+pub(crate) struct LiveColumn {
+    pub(crate) name: String,
+    /// `None` for a type that cannot be compared (nested, unreadable).
+    pub(crate) field_type: Option<FieldType>,
+    pub(crate) required: bool,
+    pub(crate) null_fraction: Option<f64>,
+}
+
+impl From<&ColumnInfo> for LiveColumn {
+    fn from(ci: &ColumnInfo) -> Self {
+        Self {
+            name: ci.name.clone(),
+            field_type: ci.field_type,
+            required: ci.required,
+            null_fraction: ci.stats.as_ref().and_then(|s| s.null_fraction),
+        }
+    }
+}
+
+/// What differs between the table formats a mapping is checked against.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Wording {
+    /// What a name that matches only ignoring case means for a query.
+    pub(crate) casing: &'static str,
+    /// Introduces the reason a table's schema could not be had.
+    pub(crate) unread: &'static str,
+}
+
+const ICEBERG_WORDING: Wording = Wording {
+    casing: "Iceberg field names are case-sensitive — fix the casing to match.",
+    unread: "catalog preview failed",
+};
+
 /// How a referenced column resolves against a live schema.
 enum ColumnResolution<'a> {
     /// Exact byte-for-byte name match.
-    Exact(&'a ColumnInfo),
+    Exact(&'a LiveColumn),
     /// Matches only case-insensitively (the schema spells it differently).
-    Casing(&'a ColumnInfo),
+    Casing(&'a LiveColumn),
     /// No column matches, even case-insensitively.
     Missing,
 }
 
-fn resolve_column<'a>(schema: &'a TableSchema, name: &str) -> ColumnResolution<'a> {
-    if let Some(ci) = schema.columns.iter().find(|c| c.name == name) {
+fn resolve_column<'a>(schema: &'a [LiveColumn], name: &str) -> ColumnResolution<'a> {
+    if let Some(ci) = schema.iter().find(|c| c.name == name) {
         ColumnResolution::Exact(ci)
-    } else if let Some(ci) = schema
-        .columns
-        .iter()
-        .find(|c| c.name.eq_ignore_ascii_case(name))
-    {
+    } else if let Some(ci) = schema.iter().find(|c| c.name.eq_ignore_ascii_case(name)) {
         ColumnResolution::Casing(ci)
     } else {
         ColumnResolution::Missing
@@ -121,11 +153,12 @@ fn resolve_column<'a>(schema: &'a TableSchema, name: &str) -> ColumnResolution<'
 /// [`ColumnInfo`] (exact or case-corrected) for downstream type / nullability
 /// checks, or `None` when the column does not exist at all.
 fn check_column<'a>(
-    schema: &'a TableSchema,
+    schema: &'a [LiveColumn],
     table: &str,
     name: &str,
+    wording: Wording,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Option<&'a ColumnInfo> {
+) -> Option<&'a LiveColumn> {
     match resolve_column(schema, name) {
         ColumnResolution::Exact(ci) => Some(ci),
         ColumnResolution::Casing(ci) => {
@@ -136,8 +169,8 @@ fn check_column<'a>(
                 Some(name.to_string()),
                 format!(
                     "Column '{name}' does not match the live schema's casing; the schema spells it \
-                     '{}'. Iceberg field names are case-sensitive — fix the casing to match.",
-                    ci.name
+                     '{}'. {}",
+                    ci.name, wording.casing
                 ),
             ));
             Some(ci)
@@ -172,6 +205,23 @@ fn cross_check_mapping(
     schemas: &HashMap<String, TableSchema>,
     load_errors: &HashMap<String, String>,
 ) -> Vec<Diagnostic> {
+    let live = schemas
+        .iter()
+        .map(|(name, schema)| {
+            let columns = schema.columns.iter().map(LiveColumn::from).collect();
+            (name.clone(), columns)
+        })
+        .collect();
+    cross_check_live(compiled, &live, load_errors, ICEBERG_WORDING)
+}
+
+/// [`cross_check_mapping`] over any table format's columns.
+pub(crate) fn cross_check_live(
+    compiled: &CompiledR2rmlMapping,
+    schemas: &HashMap<String, Vec<LiveColumn>>,
+    load_errors: &HashMap<String, String>,
+    wording: Wording,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
     // Deterministic order: iterate TriplesMaps sorted by IRI so diagnostics are stable.
@@ -186,7 +236,7 @@ fn cross_check_mapping(
         let Some(schema) = schemas.get(table) else {
             let detail = load_errors
                 .get(table)
-                .map(|e| format!(" (catalog preview failed: {e})"))
+                .map(|e| format!(" ({}: {e})", wording.unread))
                 .unwrap_or_default();
             diagnostics.push(Diagnostic::new(
                 Severity::Error,
@@ -211,9 +261,9 @@ fn cross_check_mapping(
         if let Some(col) = &tm.subject_map.column {
             referenced.insert(col.as_str());
         }
-        let mut resolved: HashMap<&str, Option<&ColumnInfo>> = HashMap::new();
+        let mut resolved: HashMap<&str, Option<&LiveColumn>> = HashMap::new();
         for &name in &referenced {
-            let ci = check_column(schema, table, name, &mut diagnostics);
+            let ci = check_column(schema, table, name, wording, &mut diagnostics);
             resolved.insert(name, ci);
         }
 
@@ -251,7 +301,7 @@ fn cross_check_mapping(
                 // fired (parent is iterated as its own TriplesMap), so skip here.
                 let parent_ci = match (parent_table, parent_schema) {
                     (Some(pt), Some(ps)) => {
-                        check_column(ps, pt, &jc.parent_column, &mut diagnostics)
+                        check_column(ps, pt, &jc.parent_column, wording, &mut diagnostics)
                     }
                     _ => None,
                 };
@@ -305,7 +355,7 @@ fn cross_check_mapping(
             // `null_fraction` is null_count/value_count over integer counts, so it is
             // exactly 0.0 iff there are no nulls; `<= 0.0` is an exact, clippy-clean
             // "no nulls" test.
-            let null_fraction = ci.stats.as_ref().and_then(|s| s.null_fraction);
+            let null_fraction = ci.null_fraction;
             let null_free = ci.required || matches!(null_fraction, Some(f) if f <= 0.0);
             if !null_free {
                 let detail = match null_fraction {
@@ -335,7 +385,7 @@ fn cross_check_mapping(
 /// Compile the Turtle for validation, or produce the `compiled_ok = false` response
 /// carrying the compile error. Factored out (no `self` / no catalog) so the
 /// compile-failure branch is unit-testable offline.
-fn compile_for_validate(
+pub(crate) fn compile_for_validate(
     turtle: &str,
 ) -> std::result::Result<CompiledR2rmlMapping, ValidateR2rmlResponse> {
     match R2rmlLoader::from_turtle(turtle).and_then(R2rmlLoader::compile) {

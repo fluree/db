@@ -198,7 +198,7 @@ pub(crate) fn source_resolved_config(
 
 /// An Iceberg-backed source scans tables, never queries: refuse a mapping with
 /// `rr:sqlQuery` at registration rather than at first query.
-fn reject_sql_queries(compiled: &CompiledR2rmlMapping) -> Result<()> {
+pub(crate) fn reject_sql_queries(compiled: &CompiledR2rmlMapping) -> Result<()> {
     if compiled.has_sql_queries() {
         return Err(crate::ApiError::Config(
             "rr:sqlQuery logical tables are only supported by SQL graph sources; \

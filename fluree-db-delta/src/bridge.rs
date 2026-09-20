@@ -100,9 +100,13 @@ impl BatchBridge {
 /// The type a scan yields for a column given as a Delta schema field in
 /// JSON; `None` if it is unreadable or the batch model cannot carry it.
 pub(crate) fn field_type_of_json(field: &str) -> Option<FieldType> {
+    field_type_of(&serde_json::from_str(field).ok()?)
+}
+
+/// The type a scan yields for `field`, if the batch model can carry it.
+pub(crate) fn field_type_of(field: &delta_kernel::schema::StructField) -> Option<FieldType> {
     use delta_kernel::engine::arrow_conversion::TryFromKernel;
-    let field: delta_kernel::schema::StructField = serde_json::from_str(field).ok()?;
-    let schema = delta_kernel::schema::StructType::try_new([field]).ok()?;
+    let schema = delta_kernel::schema::StructType::try_new([field.clone()]).ok()?;
     let arrow = Schema::try_from_kernel(&schema).ok()?;
     field_type(arrow.field(0).data_type()).ok()
 }
