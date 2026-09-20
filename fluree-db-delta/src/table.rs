@@ -220,6 +220,11 @@ impl DeltaTable {
         &self.name
     }
 
+    /// The table directory, as opened.
+    pub fn location(&self) -> &str {
+        self.url.as_str().trim_end_matches('/')
+    }
+
     /// Replay the log to the selected version. A selector nothing satisfies is
     /// an error, never a different version.
     pub async fn snapshot(&self, selector: VersionSelector) -> Result<DeltaSnapshot> {

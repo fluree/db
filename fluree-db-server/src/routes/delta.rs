@@ -146,6 +146,7 @@ fn build_delta_config(
     }
     .into_auth()?;
     Ok(fluree_db_api::DeltaCreateConfig {
+        unity: None,
         name: req.name,
         branch: req.branch,
         root: req.root,

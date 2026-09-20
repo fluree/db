@@ -331,27 +331,38 @@ impl R2rmlCache {
         self.sql_clients.insert(key, client);
     }
 
-    /// The shared handle for the Delta table at `location`, opened on first
-    /// use. Keyed on `io` as stored, before secrets are resolved, so a rotated
-    /// secret behind a reference does not re-key the cache; the TTL bounds how
-    /// long a handle keeps the old one.
+    /// The shared handle for the Delta table at `placement`, opened on first
+    /// use. Keyed on the config as stored, before secrets are resolved, so a
+    /// rotated secret behind a reference does not re-key the cache; the TTL
+    /// bounds how long a handle keeps the old one — and, for a table found
+    /// through a catalog, how long one dropped and recreated elsewhere is
+    /// still read where it was.
     #[cfg(feature = "delta")]
     pub(crate) async fn delta_table(
         &self,
         table_name: &str,
-        location: &str,
-        io: &fluree_db_delta::DeltaIoConfig,
+        placement: &fluree_db_delta::Placement,
+        config: &fluree_db_delta::DeltaGsConfig,
         resolver: Option<&Arc<dyn fluree_db_iceberg::SecretResolver>>,
     ) -> fluree_db_delta::Result<fluree_db_delta::DeltaTable> {
-        let key = format!(
-            "{location}\u{1f}{}",
-            serde_json::to_string(io).unwrap_or_default()
-        );
+        use fluree_db_delta::{DeltaTable, Placement};
+        let key = delta_table_key(placement, config);
         if let Some(table) = self.delta_tables.get(&key) {
             return Ok(table);
         }
-        let hydrated = io.hydrate(resolver).await?;
-        let table = fluree_db_delta::DeltaTable::open(table_name, location, &hydrated)?;
+        let io = config.io.hydrate(resolver).await?;
+        let table = match (placement, &config.unity) {
+            (Placement::Path(location), _) => DeltaTable::open(table_name, location, &io)?,
+            (Placement::Unity(full_name), Some(unity)) => {
+                let unity = unity.hydrate(resolver).await?;
+                DeltaTable::open_in_unity(table_name, &unity, full_name, &io).await?
+            }
+            (Placement::Unity(full_name), None) => {
+                return Err(fluree_db_delta::DeltaError::Config(format!(
+                    "table '{full_name}' is placed in a catalog the source does not have"
+                )))
+            }
+        };
         self.delta_tables.insert(key, table.clone());
         Ok(table)
     }
@@ -548,5 +559,88 @@ mod iceberg_tests {
             cache.get_rest_load_table("k").is_none(),
             "clear() drops cross-query entries"
         );
+    }
+}
+
+/// Keyed on the config as stored, never on resolved secrets. Two sources that
+/// name one catalog table with different catalog credentials get a handle
+/// each: the credentials are what reads it.
+#[cfg(feature = "delta")]
+fn delta_table_key(
+    placement: &fluree_db_delta::Placement,
+    config: &fluree_db_delta::DeltaGsConfig,
+) -> String {
+    use fluree_db_delta::Placement;
+    let io = serde_json::to_string(&config.io).unwrap_or_default();
+    match placement {
+        Placement::Path(location) => format!("{location}\u{1f}{io}"),
+        Placement::Unity(full_name) => format!(
+            "{full_name}\u{1f}{}\u{1f}{io}",
+            serde_json::to_string(&config.unity).unwrap_or_default(),
+        ),
+    }
+}
+
+#[cfg(all(test, feature = "delta"))]
+mod delta_key_tests {
+    use super::delta_table_key;
+    use fluree_db_delta::{DeltaGsConfig, Placement, UnityConfig};
+    use fluree_db_iceberg::auth::AuthConfig;
+    use fluree_db_iceberg::ConfigValue;
+
+    fn source(token: ConfigValue) -> DeltaGsConfig {
+        DeltaGsConfig {
+            unity: Some(UnityConfig {
+                uri: "https://workspace.example.com".to_string(),
+                auth: AuthConfig::Bearer { token },
+                catalog: None,
+                schema: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_catalog_tables_handle_belongs_to_the_credentials_that_read_it() {
+        let orders = Placement::Unity("main.sales.orders".to_string());
+        let items = Placement::Unity("main.sales.items".to_string());
+        let alice = source(ConfigValue::literal("alice"));
+        let bob = source(ConfigValue::literal("bob"));
+
+        assert_eq!(
+            delta_table_key(&orders, &alice),
+            delta_table_key(&orders, &alice)
+        );
+        assert_ne!(
+            delta_table_key(&orders, &alice),
+            delta_table_key(&orders, &bob)
+        );
+        assert_ne!(
+            delta_table_key(&orders, &alice),
+            delta_table_key(&items, &alice)
+        );
+
+        let mut elsewhere = alice.clone();
+        elsewhere.unity.as_mut().unwrap().uri = "https://other.example.com".to_string();
+        assert_ne!(
+            delta_table_key(&orders, &alice),
+            delta_table_key(&orders, &elsewhere)
+        );
+
+        // A path and a catalog name spelt alike are different tables.
+        assert_ne!(
+            delta_table_key(&Placement::Path("main.sales.orders".to_string()), &alice),
+            delta_table_key(&orders, &alice)
+        );
+    }
+
+    #[test]
+    fn a_secret_named_by_variable_keys_on_the_name() {
+        let orders = Placement::Unity("main.sales.orders".to_string());
+        let key = delta_table_key(
+            &orders,
+            &source(ConfigValue::from_env("UNITY_TOKEN_KEY_TEST")),
+        );
+        assert!(key.contains("UNITY_TOKEN_KEY_TEST"), "{key}");
     }
 }

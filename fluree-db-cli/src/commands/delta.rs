@@ -166,6 +166,7 @@ async fn run_delta_map_local(args: DeltaMapArgs, dirs: &FlureeDir) -> CliResult<
     }
     .into_auth()?;
     let config = fluree_db_api::DeltaCreateConfig {
+        unity: None,
         name: args.name.clone(),
         branch: args.branch.clone(),
         root: args.root.clone(),

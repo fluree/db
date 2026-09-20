@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use fluree_db_delta::{
     ColumnFilter, DeltaError, DeltaGsConfig, DeltaIoConfig, DeltaSnapshot, DeltaTable, FilterOp,
-    FilterValue,
+    FilterValue, Placement, UnityConfig,
 };
 use fluree_db_iceberg::config::MappingSource;
 use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType};
@@ -33,6 +33,9 @@ pub struct DeltaCreateConfig {
     pub root: Option<String>,
     /// Explicit table name → table location.
     pub tables: BTreeMap<String, String>,
+    /// Unity Catalog, through which every table without a `tables` entry is
+    /// found and read. Excludes `root`.
+    pub unity: Option<UnityConfig>,
     pub io: DeltaIoConfig,
     pub mapping: R2rmlMappingInput,
     pub mapping_media_type: Option<String>,
@@ -110,12 +113,25 @@ impl DeltaCreateConfig {
             branch: None,
             root: Some(root.into()),
             tables: BTreeMap::new(),
+            unity: None,
             io: DeltaIoConfig::default(),
             mapping: R2rmlMappingInput::Content(mapping_content.into()),
             mapping_media_type: None,
             model: None,
             default_allow: None,
         }
+    }
+
+    /// A source whose tables are named in Unity Catalog.
+    pub fn in_unity(
+        name: impl Into<String>,
+        unity: UnityConfig,
+        mapping_content: impl Into<String>,
+    ) -> Self {
+        let mut config = Self::new(name, "", mapping_content);
+        config.root = None;
+        config.unity = Some(unity);
+        config
     }
 
     pub fn effective_branch(&self) -> &str {
@@ -136,6 +152,7 @@ impl DeltaCreateConfig {
         DeltaGsConfig {
             root: self.root.clone(),
             tables: self.tables.clone(),
+            unity: self.unity.clone(),
             io: self.io.clone(),
             mapping: Some(MappingSource {
                 source: mapping_address.to_string(),
@@ -210,6 +227,15 @@ impl crate::Fluree {
             .hydrate(self.secret_resolver())
             .await
             .map_err(|e| crate::ApiError::Config(e.to_string()))?;
+        let unity = match &gs_config.unity {
+            Some(unity) => Some(
+                unity
+                    .hydrate(self.secret_resolver())
+                    .await
+                    .map_err(|e| crate::ApiError::Config(e.to_string()))?,
+            ),
+            None => None,
+        };
         let mut table_versions = BTreeMap::new();
         let mut table_warnings = Vec::new();
         for table_name in &table_names {
@@ -224,8 +250,17 @@ impl crate::Fluree {
             columns.sort();
             columns.dedup();
             let probed = async {
-                let location = gs_config.table_location(table_name)?;
-                let table = DeltaTable::open(table_name, &location, &io)?;
+                let table = match (gs_config.placement(table_name)?, &unity) {
+                    (Placement::Unity(full_name), Some(unity)) => {
+                        DeltaTable::open_in_unity(table_name, unity, &full_name, &io).await?
+                    }
+                    (Placement::Path(location), _) => DeltaTable::open(table_name, &location, &io)?,
+                    (Placement::Unity(full_name), None) => {
+                        return Err(DeltaError::Config(format!(
+                            "table '{full_name}' is placed in a catalog the source does not have"
+                        )))
+                    }
+                };
                 let snapshot = table
                     .snapshot(fluree_db_delta::VersionSelector::Latest)
                     .await?;
@@ -358,16 +393,16 @@ impl DeltaSource {
         table_name: &str,
         pin: Option<SourceTime>,
     ) -> QueryResult<DeltaSnapshot> {
-        let location = self
+        let placement = self
             .config
-            .table_location(table_name)
+            .placement(table_name)
             .map_err(|e| self.query_error(table_name, e))?;
         let table = fluree
             .r2rml_cache()
             .delta_table(
                 table_name,
-                &location,
-                &self.config.io,
+                &placement,
+                &self.config,
                 fluree.secret_resolver(),
             )
             .await
@@ -376,11 +411,15 @@ impl DeltaSource {
             .snapshot(version_selector(table_name, pin)?)
             .await
             .map_err(|e| self.query_error(table_name, e))?;
+        let located = match &placement {
+            Placement::Path(location) => location.as_str(),
+            Placement::Unity(_) => table.location(),
+        };
 
         session.record_snapshot(
             IcebergCatalogSession::snapshot_key(&self.graph_source_id, table_name),
             TableWatermark {
-                metadata_location: format!("{}@v{}", location, snapshot.version()),
+                metadata_location: format!("{}@v{}", located, snapshot.version()),
                 snapshot_id: i64::try_from(snapshot.version()).ok(),
                 sequence_number: None,
             },
@@ -562,6 +601,32 @@ mod tests {
             client_secret: secret.map(str::to_string),
             client_secret_env: secret_env.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn a_unity_source_stores_its_catalog_and_no_root() {
+        let unity = UnityConfig {
+            uri: "https://workspace.example.com".to_string(),
+            auth: fluree_db_iceberg::auth::AuthConfig::Bearer {
+                token: fluree_db_iceberg::ConfigValue::from_env("DATABRICKS_TOKEN"),
+            },
+            catalog: Some("main".to_string()),
+            schema: None,
+        };
+        let mut config = DeltaCreateConfig::in_unity("sales", unity, "");
+        config.validate().unwrap();
+
+        let stored = config.to_gs_config("mapping.ttl");
+        assert!(stored.root.is_none());
+        assert_eq!(
+            stored.placement("sales.orders").unwrap(),
+            Placement::Unity("main.sales.orders".to_string())
+        );
+        let json = stored.to_json().unwrap();
+        assert!(json.contains("\"env_var\":\"DATABRICKS_TOKEN\""), "{json}");
+
+        config.root = Some("s3://lake/Tables".to_string());
+        assert!(config.validate().is_err());
     }
 
     #[test]
