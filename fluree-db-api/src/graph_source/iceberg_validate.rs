@@ -372,7 +372,7 @@ pub(crate) fn cross_check_live(
                     format!(
                         "Subject-key column '{name}' is nullable ({detail}); rows with a NULL value \
                          here produce no subject and are silently dropped. Uniqueness is NOT checked \
-                         here (NDV is deferred to PR-5)."
+                         here."
                     ),
                 ));
             }

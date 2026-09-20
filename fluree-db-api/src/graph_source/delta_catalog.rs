@@ -227,7 +227,11 @@ fn generate_from(
         )));
     }
     let schemas: Vec<EmitTableSchema> = tables.iter().map(emit_schema).collect();
-    let output = emit_r2rml(&schemas, &emit_options(base_namespace, options, overrides));
+    let emit_options = emit::EmitOptions {
+        declared_key_source: "the primary key Unity Catalog declares".to_string(),
+        ..emit_options(base_namespace, options, overrides)
+    };
+    let output = emit_r2rml(&schemas, &emit_options);
     Ok(GenerateDeltaR2rmlResponse {
         turtle: output.turtle,
         structured: output.structured,
@@ -591,6 +595,15 @@ mod tests {
             .find(|c| c.column_name == "total")
             .unwrap();
         assert_eq!(total.datatype.as_deref(), Some("xsd:decimal"));
+        // The notes speak of this catalog, and of the column's own type.
+        let notes: Vec<_> = out.diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(notes
+            .iter()
+            .any(|m| m.contains("from the primary key Unity Catalog declares")));
+        assert!(notes
+            .iter()
+            .any(|m| m.contains("'extras' (variant) is not a flat scalar")));
+        assert!(!notes.iter().any(|m| m.contains("Iceberg")), "{notes:?}");
 
         let compiled = R2rmlLoader::from_turtle(&out.turtle)
             .unwrap()

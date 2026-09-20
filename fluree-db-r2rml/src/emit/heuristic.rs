@@ -165,6 +165,7 @@ fn build_table_draft(
         table,
         table_override.and_then(|o| o.primary_key.as_deref()),
         strategy,
+        &opts.declared_key_source,
         diagnostics,
     );
     let subject_key_columns: HashSet<String> = subject_key.columns.iter().cloned().collect();
@@ -214,8 +215,8 @@ fn build_table_draft(
                 table.qualified_name(),
                 Some(col.name.clone()),
                 format!(
-                    "column '{}' is a nested struct/list/map; R2RML addresses flat columns only",
-                    col.name
+                    "column '{}' ({}) is not a flat scalar; R2RML addresses flat columns only",
+                    col.name, col.iceberg_type
                 ),
             ));
             continue;
@@ -272,6 +273,7 @@ fn select_subject_key(
     table: &EmitTableSchema,
     override_primary_key: Option<&[String]>,
     strategy: SubjectStrategy,
+    declared_key_source: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> SubjectKey {
     // -- Per-table `primary_key` override: replaces identifier_field_ids. --
@@ -281,7 +283,7 @@ fn select_subject_key(
 
     // -- Iceberg identifier_field_ids (nullable identifier handled per strategy). --
     if !table.identifier_field_ids.is_empty() {
-        return select_identifier_subject_key(table, strategy, diagnostics);
+        return select_identifier_subject_key(table, strategy, declared_key_source, diagnostics);
     }
 
     // -- Name fallback: a `<STEM>_KEY` / `<STEM>_ID` column. --
@@ -448,6 +450,7 @@ fn select_override_subject_key(
 fn select_identifier_subject_key(
     table: &EmitTableSchema,
     strategy: SubjectStrategy,
+    source: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> SubjectKey {
     let mut columns = Vec::new();
@@ -463,19 +466,14 @@ fn select_identifier_subject_key(
                     DiagCode::NoSafeSubjectKey,
                     table.qualified_name(),
                     None,
-                    format!("identifier_field_ids references unknown field id {fid}"),
+                    format!("{source} references unknown field id {fid}"),
                 ));
                 return SubjectKey::none();
             }
         };
         if col.is_non_null() {
             // Uniqueness is still unverifiable metadata-only (NDV deferred).
-            push_subject_key_unverified(
-                table,
-                col,
-                "from Iceberg identifier_field_ids",
-                diagnostics,
-            );
+            push_subject_key_unverified(table, col, &format!("from {source}"), diagnostics);
         } else {
             match strategy {
                 SubjectStrategy::Auto => {
@@ -491,11 +489,10 @@ fn select_identifier_subject_key(
                         table.qualified_name(),
                         Some(col.name.clone()),
                         format!(
-                            "subject key '{}' from Iceberg identifier_field_ids is NOT provably \
-                             non-null (a non-conforming writer set identifier_field_ids without \
-                             marking the column `required`); adopted so the table stays browsable, \
-                             but NOT indexed as an FK parent — rows with a NULL key are \
-                             unaddressable",
+                            "subject key '{}' from {source} is NOT provably non-null (the key \
+                             is declared on a column not marked `required`); adopted so the \
+                             table stays browsable, but NOT indexed as an FK parent — rows with \
+                             a NULL key are unaddressable",
                             col.name
                         ),
                     ));
@@ -507,7 +504,7 @@ fn select_identifier_subject_key(
                         table.qualified_name(),
                         Some(col.name.clone()),
                         format!(
-                            "identifier_field_ids column '{}' is nullable (fails required / \
+                            "{source} column '{}' is nullable (fails required / \
                              null_fraction==0); no safe subject key",
                             col.name
                         ),
@@ -617,7 +614,7 @@ fn push_subject_key_unverified(
         table.qualified_name(),
         Some(col.name.clone()),
         format!(
-            "subject key '{}' {origin}; uniqueness is unverifiable metadata-only (NDV deferred)",
+            "subject key '{}' {origin}; uniqueness cannot be verified from metadata alone",
             col.name
         ),
     ));
