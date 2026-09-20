@@ -50,6 +50,10 @@ pub enum DeltaError {
         source: Box<delta_kernel::Error>,
     },
 
+    /// A catalog could not place a table or would not issue credentials for it.
+    #[error("Unity Catalog, table '{table}': {message}")]
+    Catalog { table: String, message: String },
+
     #[error("Delta reader internal error: {0}")]
     Internal(String),
 }

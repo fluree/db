@@ -33,10 +33,12 @@ use futures::{Stream, StreamExt as _};
 use url::Url;
 
 use crate::bridge::BatchBridge;
-use crate::config::DeltaIoConfig;
+use crate::config::{DeltaIoConfig, UnityConfig};
 use crate::error::{DeltaError, Result};
 use crate::filter::{ColumnFilter, RowFilter};
 use crate::listing::Listing;
+use crate::store::Credentials;
+use crate::unity::UnityClient;
 
 type Engine = DefaultEngine<TokioMultiThreadExecutor>;
 
@@ -172,7 +174,31 @@ impl std::fmt::Debug for DeltaTable {
 impl DeltaTable {
     /// `name` labels errors; `location` is the table directory.
     pub fn open(name: &str, location: &str, io: &DeltaIoConfig) -> Result<Self> {
-        let (url, store) = crate::store::open(location, io)?;
+        Self::over(
+            name,
+            crate::store::open(location, io, Credentials::Ambient)?,
+        )
+    }
+
+    /// Open the Unity Catalog table `full_name` (`catalog.schema.table`): Unity
+    /// says where it lives and issues, and reissues, the credentials that read
+    /// it. `unity` must be hydrated.
+    pub async fn open_in_unity(
+        name: &str,
+        unity: &UnityConfig,
+        full_name: &str,
+        io: &DeltaIoConfig,
+    ) -> Result<Self> {
+        let client = Arc::new(UnityClient::new(unity)?);
+        let table = client.table(full_name).await?;
+        let location = table.location.clone();
+        Self::over(
+            name,
+            crate::store::open(&location, io, Credentials::Unity(client, table))?,
+        )
+    }
+
+    fn over(name: &str, (url, store): (Url, Arc<dyn ObjectStore>)) -> Result<Self> {
         let executor = executor()?;
         Ok(Self {
             name: name.into(),

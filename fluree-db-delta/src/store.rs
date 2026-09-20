@@ -20,24 +20,52 @@ use url::Url;
 
 use crate::config::{AzureAuth, DeltaIoConfig, LocationKind};
 use crate::error::{DeltaError, Result};
+use crate::unity::{UnityClient, UnityTable};
+
+/// Whose credentials read a table.
+pub(crate) enum Credentials {
+    /// The process's own, or the service principal `io` names.
+    Ambient,
+    /// Unity Catalog's, issued for this one table.
+    Unity(Arc<UnityClient>, UnityTable),
+}
 
 /// Parse a table location into the directory URL Kernel expects (trailing
 /// slash) and open a store for it.
-pub(crate) fn open(location: &str, io: &DeltaIoConfig) -> Result<(Url, Arc<dyn ObjectStore>)> {
-    let kind = crate::config::validate_location(location)?;
+pub(crate) fn open(
+    location: &str,
+    io: &DeltaIoConfig,
+    credentials: Credentials,
+) -> Result<(Url, Arc<dyn ObjectStore>)> {
     let bad = |e: &dyn std::fmt::Display| DeltaError::Config(format!("{location}: {e}"));
+
+    // A catalog places tables in object storage; one that names this host's
+    // disk is not followed there, whatever the local-root allowlist permits.
+    if matches!(credentials, Credentials::Unity(..))
+        && fluree_db_iceberg::is_local_location(location)
+    {
+        return Err(bad(
+            &"a catalog may not place a table on the local filesystem",
+        ));
+    }
+    let kind = crate::config::validate_location(location)?;
 
     if kind == LocationKind::Azure {
         let url =
             Url::parse(&format!("{}/", location.trim_end_matches('/'))).map_err(|e| bad(&e))?;
-        let builder = match &io.azure {
-            None => MicrosoftAzureBuilder::from_env(),
+        let builder = match (credentials, &io.azure) {
+            (Credentials::Unity(unity, table), _) => MicrosoftAzureBuilder::new()
+                .with_credentials(crate::unity::Vending::azure(unity, table)),
+            (Credentials::Ambient, None) => MicrosoftAzureBuilder::from_env(),
             // An unresolved secret reference fails here: `io` must be hydrated.
-            Some(AzureAuth::ClientSecret {
-                tenant_id,
-                client_id,
-                client_secret,
-            }) => MicrosoftAzureBuilder::new().with_client_secret_authorization(
+            (
+                Credentials::Ambient,
+                Some(AzureAuth::ClientSecret {
+                    tenant_id,
+                    client_id,
+                    client_secret,
+                }),
+            ) => MicrosoftAzureBuilder::new().with_client_secret_authorization(
                 client_id,
                 client_secret
                     .resolve()
@@ -74,6 +102,9 @@ pub(crate) fn open(location: &str, io: &DeltaIoConfig) -> Result<(Url, Arc<dyn O
         .map_or_else(|| location.to_string(), |rest| format!("s3://{rest}"));
     let url = Url::parse(&format!("{}/", normalized.trim_end_matches('/'))).map_err(|e| bad(&e))?;
     let mut builder = AmazonS3Builder::from_env().with_url(url.as_str());
+    if let Credentials::Unity(unity, table) = credentials {
+        builder = builder.with_credentials(crate::unity::Vending::aws(unity, table));
+    }
     if let Some(region) = &io.s3_region {
         builder = builder.with_region(region);
     }

@@ -3292,6 +3292,8 @@ dependencies = [
  "fluree-db-tabular",
  "futures",
  "lru 0.12.5",
+ "percent-encoding",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "tempfile",
@@ -3299,6 +3301,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "wiremock",
 ]
 
 [[package]]

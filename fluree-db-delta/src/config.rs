@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use std::sync::Arc;
 
+use fluree_db_iceberg::auth::AuthConfig;
 use fluree_db_iceberg::config::MappingSource;
 use fluree_db_iceberg::{ConfigValue, SecretResolver};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,12 @@ pub struct DeltaGsConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tables: BTreeMap<String, String>,
 
+    /// Databricks Unity Catalog. Tables without a `tables` entry are named
+    /// (`catalog.schema.table`), and Unity says where each one lives and
+    /// issues the credentials that read it. Excludes `root`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unity: Option<UnityConfig>,
+
     #[serde(default)]
     pub io: DeltaIoConfig,
 
@@ -41,6 +48,80 @@ pub struct DeltaGsConfig {
     /// Default-allow for policy evaluation when the request leaves it unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_allow: Option<bool>,
+}
+
+/// A Unity Catalog workspace and how to authenticate to it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UnityConfig {
+    /// The workspace URL, e.g. `https://<workspace>.cloud.databricks.com`.
+    pub uri: String,
+    /// A bearer token, or OAuth2 client credentials of a service principal.
+    pub auth: AuthConfig,
+    /// Completes a mapped table name of fewer than three parts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+}
+
+impl UnityConfig {
+    /// Resolve secret references; see [`DeltaIoConfig::hydrate`].
+    pub async fn hydrate(&self, resolver: Option<&Arc<dyn SecretResolver>>) -> Result<Self> {
+        let mut hydrated = self.clone();
+        hydrated.auth = self
+            .auth
+            .hydrate(resolver)
+            .await
+            .map_err(|e| DeltaError::Config(format!("Unity Catalog auth: {e}")))?;
+        Ok(hydrated)
+    }
+
+    /// `table_name` as Unity knows it: `catalog.schema.table`.
+    pub fn full_name(&self, table_name: &str) -> Result<String> {
+        let parts: Vec<&str> = table_name.split('.').collect();
+        let unplaceable = |missing: &str| {
+            DeltaError::Config(format!(
+                "table '{table_name}' needs a {missing}: write it as catalog.schema.table \
+                 or give the source a default"
+            ))
+        };
+        if parts.iter().any(|p| p.trim().is_empty()) || parts.len() > 3 {
+            return Err(DeltaError::Config(format!(
+                "table '{table_name}' is not a catalog.schema.table name"
+            )));
+        }
+        let catalog = || {
+            self.catalog
+                .as_deref()
+                .ok_or_else(|| unplaceable("catalog"))
+        };
+        let schema = || self.schema.as_deref().ok_or_else(|| unplaceable("schema"));
+        Ok(match parts.as_slice() {
+            [table] => format!("{}.{}.{table}", catalog()?, schema()?),
+            [schema, table] => format!("{}.{schema}.{table}", catalog()?),
+            _ => table_name.to_string(),
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        fluree_db_iceberg::net::validate_public_url(&self.uri)
+            .map_err(|e| DeltaError::Config(format!("Unity Catalog uri: {e}")))?;
+        match self.auth {
+            AuthConfig::Bearer { .. } | AuthConfig::OAuth2ClientCredentials { .. } => Ok(()),
+            _ => Err(DeltaError::Config(
+                "Unity Catalog needs a bearer token or OAuth2 client credentials".to_string(),
+            )),
+        }
+    }
+}
+
+/// Where a mapped table is found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    /// A table directory, read with the process's own credentials.
+    Path(String),
+    /// A Unity Catalog table, by its three-part name.
+    Unity(String),
 }
 
 /// Object-store options. S3 credentials always come from the ambient AWS
@@ -101,10 +182,22 @@ impl DeltaGsConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.root.is_none() && self.tables.is_empty() {
+        if self.root.is_none() && self.tables.is_empty() && self.unity.is_none() {
             return Err(DeltaError::Config(
-                "a Delta graph source needs a `root` location or explicit `tables`".to_string(),
+                "a Delta graph source needs a `root` location, explicit `tables` or a \
+                 `unity` catalog"
+                    .to_string(),
             ));
+        }
+        if let Some(unity) = &self.unity {
+            if self.root.is_some() {
+                return Err(DeltaError::Config(
+                    "a Delta graph source resolves unlisted tables under `root` or through \
+                     `unity`, not both"
+                        .to_string(),
+                ));
+            }
+            unity.validate()?;
         }
         for location in self.root.iter().chain(self.tables.values()) {
             validate_location(location)?;
@@ -124,7 +217,18 @@ impl DeltaGsConfig {
         Ok(())
     }
 
-    /// Where `table_name` lives.
+    /// Where `table_name` is found: its `tables` entry, else the catalog, else
+    /// beneath `root`.
+    pub fn placement(&self, table_name: &str) -> Result<Placement> {
+        match &self.unity {
+            Some(unity) if !self.tables.contains_key(table_name) => {
+                unity.full_name(table_name).map(Placement::Unity)
+            }
+            _ => self.table_location(table_name).map(Placement::Path),
+        }
+    }
+
+    /// The path of a table that is addressed by path.
     pub fn table_location(&self, table_name: &str) -> Result<String> {
         if let Some(location) = self.tables.get(table_name) {
             return Ok(location.clone());
@@ -210,6 +314,111 @@ mod tests {
             root: Some(root.to_string()),
             ..Default::default()
         }
+    }
+
+    fn unity(catalog: Option<&str>, schema: Option<&str>) -> UnityConfig {
+        UnityConfig {
+            uri: "https://workspace.example.com".to_string(),
+            auth: AuthConfig::Bearer {
+                token: ConfigValue::literal("t"),
+            },
+            catalog: catalog.map(str::to_string),
+            schema: schema.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_short_name_is_completed_from_the_sources_defaults() {
+        let both = unity(Some("main"), Some("sales"));
+        assert_eq!(both.full_name("orders").unwrap(), "main.sales.orders");
+        assert_eq!(both.full_name("hr.people").unwrap(), "main.hr.people");
+        assert_eq!(both.full_name("dev.hr.people").unwrap(), "dev.hr.people");
+
+        let bare = unity(None, None);
+        assert_eq!(bare.full_name("dev.hr.people").unwrap(), "dev.hr.people");
+        for (config, name, missing) in [
+            (&bare, "hr.people", "needs a catalog"),
+            (&unity(Some("main"), None), "people", "needs a schema"),
+            (&unity(None, Some("hr")), "people", "needs a catalog"),
+        ] {
+            let said = config.full_name(name).unwrap_err().to_string();
+            assert!(said.contains(missing), "{said}");
+        }
+        for name in ["", "a..b", "a.b.c.d", ".b.c"] {
+            assert!(both.full_name(name).is_err(), "{name:?} was placed");
+        }
+    }
+
+    #[test]
+    fn a_listed_table_is_read_by_path_and_the_rest_through_unity() {
+        let config = DeltaGsConfig {
+            unity: Some(unity(Some("main"), None)),
+            tables: BTreeMap::from([("raw.events".to_string(), "s3://lake/events".to_string())]),
+            ..Default::default()
+        };
+        config.validate().unwrap();
+        assert_eq!(
+            config.placement("raw.events").unwrap(),
+            Placement::Path("s3://lake/events".to_string())
+        );
+        assert_eq!(
+            config.placement("sales.orders").unwrap(),
+            Placement::Unity("main.sales.orders".to_string())
+        );
+        // Without a catalog, placement is what it always was.
+        assert_eq!(
+            rooted("s3://lake/Tables").placement("dbo.orders").unwrap(),
+            Placement::Path("s3://lake/Tables/dbo/orders".to_string())
+        );
+    }
+
+    #[test]
+    fn a_unity_source_is_checked_as_it_is_stored() {
+        let with = |unity: UnityConfig| DeltaGsConfig {
+            unity: Some(unity),
+            ..Default::default()
+        };
+        with(unity(None, None)).validate().unwrap();
+
+        let mut rooted_too = with(unity(None, None));
+        rooted_too.root = Some("s3://lake/Tables".to_string());
+        assert!(rooted_too
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not both"));
+
+        let mut unauthenticated = unity(None, None);
+        unauthenticated.auth = AuthConfig::None;
+        assert!(with(unauthenticated).validate().is_err());
+
+        let mut internal = unity(None, None);
+        internal.uri = "http://169.254.169.254".to_string();
+        assert!(with(internal)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("SSRF"));
+    }
+
+    #[test]
+    fn a_unity_block_round_trips_without_its_secret_when_named_by_variable() {
+        let mut config = DeltaGsConfig {
+            unity: Some(unity(Some("main"), None)),
+            ..Default::default()
+        };
+        config.unity.as_mut().unwrap().auth = AuthConfig::Bearer {
+            token: ConfigValue::from_env("DATABRICKS_TOKEN"),
+        };
+        let json = config.to_json().unwrap();
+        assert!(json.contains("\"env_var\":\"DATABRICKS_TOKEN\""), "{json}");
+        let back = DeltaGsConfig::from_json(&json).unwrap();
+        assert_eq!(back.unity.unwrap().catalog.as_deref(), Some("main"));
+        // A source stored before catalogs existed still reads.
+        assert!(DeltaGsConfig::from_json(r#"{"root":"s3://lake/Tables"}"#)
+            .unwrap()
+            .unity
+            .is_none());
     }
 
     #[test]
