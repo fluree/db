@@ -279,3 +279,66 @@ async fn ledger_info_resolves_reserved_graphs_by_exact_iri_not_suffix() {
         "another ledger's config IRI must not resolve to this ledger's g_id 2"
     );
 }
+
+// ===========================================================================
+// The #1846 load-side drop must not touch the config graph
+// ===========================================================================
+
+/// Config writes ride the commit blob body — the same place a forged txn-meta
+/// commit record would sit — and must survive the load-side forgery drop.
+///
+/// `stage()` deliberately permits ordinary transactions to write ledger
+/// configuration (see the asymmetry documented at its reserved-graph guard),
+/// so unlike `#txn-meta` these flakes legitimately travel in the flake stream.
+/// The drop is keyed on the conjunction of the txn-meta graph Sid *and* a
+/// `FLUREE_COMMIT`-namespace subject exactly so that config is out of scope. A
+/// generalisation to "drop reserved-graph flakes from commit blobs" would pass
+/// every forgery test and silently delete ledger configuration.
+///
+/// The watermark half matters on its own: `config_write_t` is the fail-safe
+/// invalidation key for the resolved-config cache on `LedgerHandle`. If config
+/// flakes stopped reaching `CONFIG_GRAPH_ID`, the marker would stop advancing
+/// and a stale config could be served from cache — a failure with no visible
+/// error at all.
+#[tokio::test]
+async fn a_config_write_through_stage_survives_and_advances_the_watermark() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let lid = "rg-config-survives:main";
+    let ledger = seed(&fluree, lid).await;
+
+    assert!(
+        ledger.novelty.config_write_t > 0,
+        "a config write through stage() must advance the config watermark; \
+         it is the resolved-config cache's invalidation key"
+    );
+    assert!(
+        ledger
+            .novelty
+            .segment_count(fluree_db_core::CONFIG_GRAPH_ID)
+            > 0,
+        "config flakes must reach CONFIG_GRAPH_ID in the overlay"
+    );
+
+    // …and the content is actually readable back through the config address.
+    let view = fluree
+        .db(&format!("{lid}#config"))
+        .await
+        .expect("the config graph must be addressable");
+    assert_eq!(view.graph_id, fluree_db_core::CONFIG_GRAPH_ID);
+
+    let rows = support::query_sparql(
+        &fluree,
+        &ledger,
+        "PREFIX schema: <http://schema.org/> \
+         SELECT ?o FROM <urn:fluree:rg-config-survives:main#config> \
+         WHERE { ?s schema:name ?o }",
+    )
+    .await
+    .expect("config graph query")
+    .to_jsonld(&ledger.snapshot)
+    .expect("jsonld");
+    assert!(
+        rows.to_string().contains("CONFIG-MARKER"),
+        "the config graph's own content must survive the load-side drop; got {rows}"
+    );
+}

@@ -327,13 +327,7 @@ impl EdgeKey {
             // participate in the bundle's graph anchor — skip them
             // before tracking `bundle_g` so a metadata fact in a
             // different graph doesn't false-trigger `MixedFlakeGraphs`.
-            let is_bundle_flake = is_reifies_graph(&f.p)
-                || is_reifies_subject(&f.p)
-                || is_reifies_predicate(&f.p)
-                || is_reifies_object(&f.p)
-                || is_reifies_datatype(&f.p)
-                || is_reifies_lang(&f.p)
-                || is_reifies_list_index(&f.p);
+            let is_bundle_flake = crate::namespaces::is_reserved_reifies_predicate(&f.p);
             if !is_bundle_flake {
                 continue;
             }

@@ -342,6 +342,61 @@ fn normalize_root_lang_tags(tags: &[String]) -> Vec<String> {
 }
 
 impl BinaryIndexStore {
+    /// A field-complete store with no graphs, dictionaries, or leaves.
+    ///
+    /// Readers that scan through a [`crate::BinaryCursor`] need an
+    /// `Arc<BinaryIndexStore>` even when the snapshot they are reading has no
+    /// index root at all — a ledger that has been committed to but never
+    /// indexed holds every row in the novelty overlay, and the cursor's
+    /// overlay-only tail emits them once its (empty) leaf range is exhausted.
+    /// Handing such a reader this store is what lets it run without a
+    /// structural `Option` at every use site.
+    ///
+    /// The store resolves nothing on its own: callers are expected to supply a
+    /// `DictNovelty` alongside it, and to seed the namespace table with
+    /// [`Self::augment_namespace_codes`] from the snapshot's
+    /// `shared_namespaces()` so ID→IRI resolution can complete.
+    pub fn empty(cache_dir: PathBuf) -> Self {
+        Self {
+            store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            dicts: DictionarySet {
+                predicates: PredicateDict::new(),
+                predicate_reverse: HashMap::new(),
+                graphs_reverse: HashMap::new(),
+                subject_forward_packs: std::collections::BTreeMap::new(),
+                subject_reverse_tree: None,
+                string_forward_packs: ForwardPackReader::empty(),
+                string_reverse_tree: None,
+                subject_count: 0,
+                string_count: 0,
+                namespace_codes: Arc::new(HashMap::new()),
+                namespace_reverse: Arc::new(HashMap::new()),
+                prefix_trie: Arc::new(PrefixTrie::new()),
+                language_tags: LanguageTagDict::new(),
+                dt_sids: Vec::new(),
+            },
+            graph_indexes: HashMap::new(),
+            o_type_table: Vec::new(),
+            o_type_index: HashMap::new(),
+            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+            residency_mode: false,
+            cas: None,
+            disk_cache: crate::read::artifact_cache::DiskArtifactCache::for_dir(&cache_dir),
+            cache_dir,
+            leaflet_cache: None,
+            remote_leaf_metadata: RwLock::new(HashMap::new()),
+            remote_leaf_open_counts: RwLock::new(HashMap::new()),
+            max_t: 0,
+            base_t: 0,
+            language_tags: Vec::new(),
+            lex_sorted_string_ids: false,
+            ns_split_mode: NsSplitMode::default(),
+            ns_split_mode_set: true,
+            p_sid_table: std::sync::OnceLock::new(),
+            decimal_only_proofs: RwLock::new(HashMap::new()),
+        }
+    }
+
     /// Decode FIR6 bytes and load the store.
     pub async fn load_from_root_bytes(
         cs: Arc<dyn ContentStore>,
@@ -3552,7 +3607,6 @@ pub(crate) mod tests {
     use fluree_db_core::o_type::OType;
     use fluree_db_core::subject_id::SubjectId;
     use fluree_db_core::MemoryContentStore;
-    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 
     use crate::dict::builder;
@@ -3658,45 +3712,19 @@ pub(crate) mod tests {
     /// Field-complete store with no graphs, dicts, or leaves. Shared with
     /// `binary_cursor`'s tests, which need an `Arc<BinaryIndexStore>` to build
     /// a cursor but never read through it.
+    ///
+    /// Delegates to the production [`BinaryIndexStore::empty`] and re-attaches
+    /// the CAS handle plus the `max_t` these tests assume, so there is one
+    /// definition of "field-complete and empty" to keep current.
     pub(crate) fn empty_store(cs: Arc<dyn ContentStore>, cache_dir: PathBuf) -> BinaryIndexStore {
-        BinaryIndexStore {
-            store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            dicts: DictionarySet {
-                predicates: PredicateDict::new(),
-                predicate_reverse: HashMap::new(),
-                graphs_reverse: HashMap::new(),
-                subject_forward_packs: BTreeMap::new(),
-                subject_reverse_tree: None,
-                string_forward_packs: crate::dict::pack_reader::ForwardPackReader::empty(),
-                string_reverse_tree: None,
-                subject_count: 0,
-                string_count: 0,
-                namespace_codes: Arc::new(HashMap::new()),
-                namespace_reverse: Arc::new(HashMap::new()),
-                prefix_trie: Arc::new(PrefixTrie::new()),
-                language_tags: LanguageTagDict::new(),
-                dt_sids: Vec::new(),
-            },
-            graph_indexes: HashMap::new(),
-            o_type_table: Vec::new(),
-            o_type_index: HashMap::new(),
-            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
-            residency_mode: cs.miss_register().is_some(),
-            cas: Some(cs),
-            disk_cache: crate::read::artifact_cache::DiskArtifactCache::for_dir(&cache_dir),
-            cache_dir,
-            leaflet_cache: None,
-            remote_leaf_metadata: RwLock::new(HashMap::new()),
-            remote_leaf_open_counts: RwLock::new(HashMap::new()),
-            max_t: 1,
-            base_t: 0,
-            language_tags: Vec::new(),
-            lex_sorted_string_ids: false,
-            ns_split_mode: NsSplitMode::default(),
-            ns_split_mode_set: true,
-            p_sid_table: std::sync::OnceLock::new(),
-            decimal_only_proofs: RwLock::new(HashMap::new()),
+        let mut store = BinaryIndexStore::empty(cache_dir);
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        {
+            store.residency_mode = cs.miss_register().is_some();
         }
+        store.cas = Some(cs);
+        store.max_t = 1;
+        store
     }
 
     fn make_rec(s_id: u64, p_id: u32, o_type: u16, o_key: u64, t: u32) -> RunRecordV2 {
