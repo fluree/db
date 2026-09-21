@@ -982,6 +982,10 @@ pub struct BranchDiff {
     /// The target's commits above the commit where its own line meets the
     /// source's history, oldest first.
     pub target: Vec<ContentId>,
+    /// Every commit reachable from the source's head that the target does
+    /// not hold, parents before children. These are the commits the target
+    /// needs copied into its own storage.
+    pub source_only: Vec<ContentId>,
     /// Whether the target's head is on the source's first-parent line. Only
     /// then can the target adopt the source's head and keep its own `t`
     /// rising.
@@ -1072,12 +1076,45 @@ pub async fn diff_branches<C: ContentStore + ?Sized>(
         .or_else(|| most_recent_shared(&target_line_commits, &source_history))
         .unwrap_or(fork.clone());
 
+    let source_only = missing_from(store, source_head, &mut target_history).await?;
+
     Ok(BranchDiff {
         base,
         source,
         target,
+        source_only,
         fast_forward: fork == *target_head,
     })
+}
+
+/// The commits reachable from `head` that `other` does not hold, parents
+/// before children.
+async fn missing_from<C: ContentStore + ?Sized>(
+    store: &C,
+    head: &ContentId,
+    other: &mut History,
+) -> Result<Vec<ContentId>> {
+    let mut missing = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // Each commit is emitted after the parents pushed above it. The history
+    // is acyclic. A parent already seen has already been emitted.
+    let mut stack = vec![(head.clone(), false)];
+    while let Some((cid, expanded)) = stack.pop() {
+        if expanded {
+            missing.push(cid);
+            continue;
+        }
+        if !seen.insert(cid.clone()) {
+            continue;
+        }
+        let envelope = load_commit_envelope_by_id(store, &cid).await?;
+        if other.holds(store, &cid, envelope.t).await? {
+            continue;
+        }
+        stack.push((cid, true));
+        stack.extend(envelope.parents.into_iter().map(|parent| (parent, false)));
+    }
+    Ok(missing)
 }
 
 /// The line's most recent commit that the other side's history holds, if it
@@ -1149,6 +1186,17 @@ impl History {
 
     fn contains(&self, cid: &ContentId) -> bool {
         self.members.contains(cid) || self.shared.members.contains(cid)
+    }
+
+    /// [`Self::contains`], loading the shared line as deep as `t`. `t` is
+    /// `cid`'s own `t`.
+    async fn holds<C: ContentStore + ?Sized>(
+        &mut self,
+        store: &C,
+        cid: &ContentId,
+        t: i64,
+    ) -> Result<bool> {
+        Ok(self.members.contains(cid) || self.shared.contains(store, cid, t).await?)
     }
 }
 
@@ -1892,6 +1940,32 @@ mod tests {
         assert_eq!(diff.base, main[1]);
         assert_eq!(diff.source, dev);
         assert!(diff.target.is_empty());
+    }
+
+    /// The commits the target must copy: the source's own, plus what its
+    /// merges brought in, and nothing the target already holds.
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn diff_branches_lists_the_commits_the_target_lacks() {
+        let store = MemoryContentStore::new();
+        let main = store_chain(&store, 1, 2, None, 1).await;
+        let dev = store_chain(&store, 2, 1, Some(main[0].clone()), 2).await;
+        let x = store_chain(&store, 2, 2, Some(main[0].clone()), 3).await;
+        let merge = store_merge(&store, 3, vec![dev[0].clone(), x[1].clone()], 2).await;
+
+        let diff = diff_branches(&store, &merge, main.last().unwrap())
+            .await
+            .unwrap();
+        let missing: std::collections::HashSet<&ContentId> = diff.source_only.iter().collect();
+        assert_eq!(
+            missing,
+            [&dev[0], &x[0], &x[1], &merge].into_iter().collect(),
+            "dev's commit, x's commits, and the merge"
+        );
+        let position = |cid: &ContentId| diff.source_only.iter().position(|c| c == cid).unwrap();
+        assert!(position(&x[0]) < position(&x[1]));
+        assert!(position(&x[1]) < position(&merge));
+        assert!(position(&dev[0]) < position(&merge));
     }
 
     /// x is merged into dev, then both branches commit again. The base is the

@@ -1,8 +1,8 @@
 //! Branch merge support.
 //!
 //! Merges a source branch into a target branch. Supports both fast-forward
-//! merges (target HEAD is the common ancestor) and general merges with
-//! conflict resolution strategies.
+//! merges (the target's head is on the source's first-parent line) and
+//! general merges with conflict resolution strategies.
 
 use crate::commit_data::{collect_from_commits, CollectedCommitData, Fold};
 use crate::error::{ApiError, Result};
@@ -11,15 +11,13 @@ use crate::rebase::ConflictStrategy;
 use fluree_db_core::commit::codec::read_commit_envelope;
 use fluree_db_core::content_kind::ContentKind;
 use fluree_db_core::ledger_id::format_ledger_id;
-use fluree_db_core::{
-    collect_dag_cids, collect_first_parent_cids, load_commit_by_id, CommonAncestor,
-};
+use fluree_db_core::{collect_dag_cids, load_commit_by_id, BranchDiff};
 use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefKind, RefValue};
-use fluree_db_novelty::compute_delta_keys;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
 use serde::Serialize;
+use std::collections::HashSet;
 use tracing::Instrument;
 
 /// Output of [`Fluree::prepare_merge`].
@@ -276,24 +274,21 @@ impl crate::Fluree {
         .await?;
 
         let target_head = target_record.commit_head_id.clone();
-        let ancestor = match target_head.as_ref() {
+        // What each branch changed since they last shared a commit, by
+        // commit identity. Branch clocks are not comparable, so nothing here
+        // compares a `t` across branches.
+        let diff = match target_head.as_ref() {
             Some(target_head_id) => Some(
-                fluree_db_core::find_common_ancestor(
-                    &source_store,
-                    &source_head_id,
-                    target_head_id,
-                )
-                .await?,
+                fluree_db_core::diff_branches(&source_store, &source_head_id, target_head_id)
+                    .await?,
             ),
             None => None,
         };
 
-        // Fast-forward check: target HEAD must be the common ancestor.
-        let is_fast_forward = match (&ancestor, target_head.as_ref()) {
-            (Some(a), Some(tid)) => a.commit_id == *tid,
-            (None, None) => true,
-            _ => false,
-        };
+        // Fast-forward only when the target's head is on the source's
+        // first-parent line. The target then adopts a line that continues
+        // its own, so its `t` keeps rising.
+        let is_fast_forward = diff.as_ref().is_none_or(|d| d.fast_forward);
 
         // Snapshot target nameservice state before mutations. The
         // local apply path passes this to `reset_head` to roll back
@@ -313,15 +308,16 @@ impl crate::Fluree {
                 target_id,
                 &source_record,
                 &source_store,
-                ancestor.as_ref(),
+                diff.as_ref(),
                 source_head_id,
                 source_head_t,
                 rollback_snapshot,
                 target_head,
+                target_record.commit_t,
             )
             .await
         } else {
-            let ancestor = ancestor.expect("ancestor must exist when both heads are Some");
+            let diff = diff.expect("a diff exists when both heads are Some");
             self.build_merge_general(
                 source_branch,
                 &resolved_target,
@@ -331,7 +327,7 @@ impl crate::Fluree {
                 &target_record,
                 &source_store,
                 source_head_id,
-                &ancestor,
+                &diff,
                 strategy,
                 rollback_snapshot,
                 target_head,
@@ -501,18 +497,27 @@ impl crate::Fluree {
         target_id: String,
         source_record: &NsRecord,
         source_store: &impl ContentStore,
-        ancestor: Option<&CommonAncestor>,
+        diff: Option<&BranchDiff>,
         source_head_id: ContentId,
         source_head_t: i64,
         rollback_snapshot: NsRecordSnapshot,
         target_head: Option<ContentId>,
+        current_head_t: i64,
     ) -> Result<StagedMerge> {
-        let stop_at_t = ancestor.map(|a| a.t).unwrap_or(0);
+        // A target with no commits of its own takes the source's whole
+        // history. Otherwise it takes what the diff says it lacks.
+        let to_copy = match diff {
+            Some(diff) => diff.source_only.clone(),
+            None => collect_dag_cids(source_store, &source_head_id, 0)
+                .await?
+                .into_iter()
+                .rev()
+                .map(|(_, cid)| cid)
+                .collect(),
+        };
         let commits_copied = self
-            .copy_commit_chain(source_store, &source_head_id, stop_at_t, &target_id)
+            .copy_commits(source_store, &to_copy, &target_id)
             .await?;
-
-        let current_head_t = ancestor.map(|a| a.t).unwrap_or(0);
         Ok(StagedMerge {
             target: resolved_target.to_string(),
             source: source_branch.to_string(),
@@ -548,7 +553,7 @@ impl crate::Fluree {
         target_record: &NsRecord,
         source_store: &BranchedContentStore,
         source_head_id: ContentId,
-        ancestor: &CommonAncestor,
+        diff: &BranchDiff,
         strategy: ConflictStrategy,
         rollback_snapshot: NsRecordSnapshot,
         target_head: Option<ContentId>,
@@ -560,25 +565,18 @@ impl crate::Fluree {
             ));
         }
 
-        let target_head_id = target_record
-            .commit_head_id
-            .as_ref()
-            .expect("target must have head for non-fast-forward merge");
+        // The keys each branch changed since they last shared a commit.
+        let source_delta = changed_keys(source_store, &diff.source).await?;
 
-        // Compute source delta: all (s,p,g) tuples modified on source since ancestor.
-        let source_delta =
-            compute_delta_keys(source_store.clone(), source_head_id.clone(), ancestor.t).await?;
-
-        // Compute target delta. Use the same branch-aware store below when
-        // loading the queryable target state for staging.
+        // Use the same branch-aware store below when loading the queryable
+        // target state for staging.
         let target_store: BranchedContentStore = if target_record.source_branch.is_some() {
             LedgerState::build_branched_store(&self.nameservice_mode, target_record, self.backend())
                 .await?
         } else {
             BranchedContentStore::leaf(self.content_store(&target_id))
         };
-        let target_delta =
-            compute_delta_keys(target_store.clone(), target_head_id.clone(), ancestor.t).await?;
+        let target_delta = changed_keys(&target_store, &diff.target).await?;
 
         // Find conflicts: intersection of source and target delta sets.
         let conflicts: Vec<ConflictKey> =
@@ -610,7 +608,7 @@ impl crate::Fluree {
             flakes: source_flakes,
             namespace_delta,
             graph_delta,
-        } = collect_commit_data(source_store, &source_head_id, ancestor.t).await?;
+        } = collect_commit_data(source_store, &diff.source).await?;
 
         let current_head_t = target_state.t();
 
@@ -648,7 +646,7 @@ impl crate::Fluree {
         // self-contained for DAG walking. This must happen before the merge
         // commit is published.
         let commits_copied = self
-            .copy_commit_chain(source_store, &source_head_id, ancestor.t, &target_id)
+            .copy_commits(source_store, &diff.source_only, &target_id)
             .await?;
 
         // With the lock held the staged base is authoritative — derive
@@ -714,24 +712,21 @@ impl crate::Fluree {
     /// Copy commit blobs (and their referenced txn blobs) from a source
     /// content store into the target's storage namespace.
     ///
-    /// Collects the commit DAG from `head_id` backwards to `stop_at_t`,
-    /// then iterates the resulting CIDs to copy each commit and its txn
-    /// blob into the target namespace.
-    async fn copy_commit_chain(
+    /// `cids` comes parents first, so a failure part way through never
+    /// leaves a commit stored without its parent.
+    async fn copy_commits(
         &self,
         source_store: &impl ContentStore,
-        head_id: &ContentId,
-        stop_at_t: i64,
+        cids: &[ContentId],
         target_ledger_id: &str,
     ) -> Result<usize> {
         let storage = self
             .admin_storage()
             .ok_or_else(|| ApiError::internal("merge requires managed storage backend"))?;
 
-        let dag = collect_dag_cids(source_store, head_id, stop_at_t).await?;
         let mut copied = 0;
 
-        for (_, cid) in &dag {
+        for cid in cids {
             let bytes = source_store.get(cid).await?;
 
             // Parse envelope to extract txn CID reference. The bytes were already
@@ -798,13 +793,29 @@ impl crate::Fluree {
 /// delta key collisions.
 async fn collect_commit_data(
     store: &impl ContentStore,
-    head_id: &ContentId,
-    stop_at_t: i64,
+    cids: &[ContentId],
 ) -> Result<CollectedCommitData> {
-    let dag = collect_first_parent_cids(store, head_id, stop_at_t).await?;
-    let mut commits = Vec::with_capacity(dag.len());
-    for (_, cid) in dag.iter().rev() {
+    let mut commits = Vec::with_capacity(cids.len());
+    for cid in cids {
         commits.push(load_commit_by_id(store, cid).await?);
     }
     Ok(collect_from_commits(commits, Fold::Replay))
+}
+
+/// The (subject, predicate, graph) keys these commits changed.
+async fn changed_keys(
+    store: &impl ContentStore,
+    cids: &[ContentId],
+) -> Result<HashSet<ConflictKey>> {
+    let mut keys = HashSet::new();
+    for cid in cids {
+        let commit = load_commit_by_id(store, cid).await?;
+        keys.extend(
+            commit
+                .flakes
+                .iter()
+                .map(|flake| ConflictKey::new(flake.s.clone(), flake.p.clone(), flake.g.clone())),
+        );
+    }
+    Ok(keys)
 }
