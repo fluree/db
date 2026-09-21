@@ -17,7 +17,9 @@ use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefKind, RefValue};
 use fluree_db_novelty::delta_keys_of;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
+use rustc_hash::FxHashSet;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -516,7 +518,8 @@ impl crate::Fluree {
         current_head_t: i64,
     ) -> Result<StagedMerge> {
         // A target with no commits of its own takes the source's whole
-        // history. Otherwise it takes what the diff says it lacks.
+        // history, newest `t` last. Otherwise it takes what the diff says it
+        // lacks, parents first.
         let to_copy = match diff {
             Some(diff) => diff.source_only.clone(),
             None => collect_dag_cids(source_store, &source_head_id, 0)
@@ -577,8 +580,10 @@ impl crate::Fluree {
             ));
         }
 
-        // The keys each branch changed since they last shared a commit.
-        let source_delta = delta_keys_of(source_store, &diff.source.own).await?;
+        // Fold the source's commits, and collect the keys its own changes
+        // touched, in one pass. The target's keys need their own read.
+        let (source_data, source_delta) =
+            collect_commit_data(source_store, &diff.source.commits, &diff.source.own).await?;
         let target_delta = delta_keys_of(&target_store, &diff.target.own).await?;
 
         // Find conflicts: intersection of source and target delta sets.
@@ -605,13 +610,11 @@ impl crate::Fluree {
             .lock_or_load(&target_id, target_store, target_record.clone())
             .await?;
 
-        // Collect source flakes and metadata: walk source commits from HEAD
-        // to ancestor, gathering flakes, namespace deltas, and graph deltas.
         let CollectedCommitData {
             flakes: source_flakes,
             namespace_delta,
             graph_delta,
-        } = collect_commit_data(source_store, &diff.source.commits).await?;
+        } = source_data;
 
         let current_head_t = target_state.t();
 
@@ -732,8 +735,9 @@ impl crate::Fluree {
     /// Copy commit blobs (and their referenced txn blobs) from a source
     /// content store into the target's storage namespace.
     ///
-    /// `cids` comes parents first, so a failure part way through never
-    /// leaves a commit stored without its parent.
+    /// A `cids` in parents-first order, as [`BranchDiff::source_only`] is,
+    /// leaves no commit stored without its parent if this fails part way
+    /// through.
     async fn copy_commits(
         &self,
         source_store: &impl ContentStore,
@@ -814,10 +818,21 @@ impl crate::Fluree {
 async fn collect_commit_data(
     store: &impl ContentStore,
     cids: &[ContentId],
-) -> Result<CollectedCommitData> {
+    own: &[ContentId],
+) -> Result<(CollectedCommitData, FxHashSet<ConflictKey>)> {
+    let own: HashSet<&ContentId> = own.iter().collect();
     let mut commits = Vec::with_capacity(cids.len());
+    let mut keys = FxHashSet::default();
     for cid in cids {
-        commits.push(load_commit_by_id(store, cid).await?);
+        let commit = load_commit_by_id(store, cid).await?;
+        if own.contains(cid) {
+            keys.extend(
+                commit.flakes.iter().map(|flake| {
+                    ConflictKey::new(flake.s.clone(), flake.p.clone(), flake.g.clone())
+                }),
+            );
+        }
+        commits.push(commit);
     }
-    Ok(collect_from_commits(commits, Fold::Replay))
+    Ok((collect_from_commits(commits, Fold::Replay), keys))
 }

@@ -70,9 +70,9 @@ pub struct MergePreviewOpts {
     /// unbounded. **Does not bound the divergence walk** — see type docs.
     pub max_commits: Option<usize>,
     /// Cap on `conflicts.keys`. `None` is unbounded. **Does not bound the
-    /// `compute_delta_keys` walks** — see type docs.
+    /// delta-key walks** — see type docs.
     pub max_conflict_keys: Option<usize>,
-    /// When `false`, skips the two `compute_delta_keys` walks — the response
+    /// When `false`, skips the two delta-key walks — the response
     /// still contains commit counts but `conflicts` will be empty. The
     /// fastest way to bound preview cost on diverged branches.
     pub include_conflicts: bool,

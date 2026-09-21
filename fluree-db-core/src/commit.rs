@@ -993,8 +993,10 @@ pub struct BranchSide {
 /// [`diff_branches`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BranchDiff {
-    /// The most recent commit on the source's first-parent line that the
-    /// target's history already holds.
+    /// The most recent commit both branches hold. It is taken from the
+    /// source's line when that line has one above the fork, and from the
+    /// target's line otherwise. When each branch has merged the other,
+    /// their two cut points differ and this reports the source's.
     pub base: ContentId,
     /// The source's side of the divergence.
     pub source: BranchSide,
@@ -1042,17 +1044,13 @@ pub async fn diff_branches<C: ContentStore + ?Sized>(
             }
         }
         child_t = Some(envelope.t);
-        let on_target_line = target_line.contains(store, &cid, envelope.t).await?;
-        next = envelope
-            .parents
-            .first()
-            .cloned()
-            .filter(|_| !on_target_line);
-        source_line.push((cid, envelope));
-        if on_target_line {
-            fork = source_line.last().map(|(cid, _)| cid.clone());
+        if target_line.contains(store, &cid, envelope.t).await? {
+            fork = Some(cid.clone());
+            source_line.push((cid, envelope));
             break;
         }
+        next = envelope.parents.first().cloned();
+        source_line.push((cid, envelope));
     }
     let Some(fork) = fork else {
         return Err(Error::invalid_commit(format!(
@@ -1063,14 +1061,25 @@ pub async fn diff_branches<C: ContentStore + ?Sized>(
     // The target's line down to the same fork.
     let mut target_line_commits = Vec::new();
     let mut next = Some(target_head.clone());
+    let mut child_t = None;
     while let Some(cid) = next.take() {
         let envelope = load_commit_envelope_by_id(store, &cid).await?;
-        next = envelope.parents.first().cloned().filter(|_| cid != fork);
-        let reached_fork = cid == fork;
-        target_line_commits.push((cid, envelope));
-        if reached_fork {
+        if let Some(child_t) = child_t {
+            if envelope.t >= child_t {
+                return Err(Error::invalid_commit(format!(
+                    "first-parent chain is not t-decreasing: commit {cid} has t={} \
+                     under a child with t={child_t}",
+                    envelope.t
+                )));
+            }
+        }
+        child_t = Some(envelope.t);
+        if cid == fork {
+            target_line_commits.push((cid, envelope));
             break;
         }
+        next = envelope.parents.first().cloned();
+        target_line_commits.push((cid, envelope));
     }
 
     // Each side's history above the fork. A merge parent leads into the
@@ -1408,7 +1417,9 @@ impl FirstParentLine {
                 break;
             };
             let envelope = load_commit_envelope_by_id(store, &next).await?;
-            self.lowest_t = envelope.t;
+            // A line's `t` decreases toward genesis. Taking the minimum
+            // keeps the loop finite on a chain that does not.
+            self.lowest_t = self.lowest_t.min(envelope.t);
             self.next = envelope.parents.into_iter().next();
             self.members.insert(next);
         }

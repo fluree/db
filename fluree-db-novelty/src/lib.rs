@@ -54,8 +54,8 @@ pub use commit_flakes::{
     generate_commit_flakes, iso_to_epoch_ms_opt, stamp_graph_on_commit_flakes,
 };
 pub use delta::{
-    compute_delta_keys, compute_delta_keys_and_changes, delta_keys_and_changes_of, delta_keys_of,
-    FactKey, NetChangeAccumulator,
+    compute_delta_keys_and_changes, delta_keys_and_changes_of, delta_keys_of, FactKey,
+    NetChangeAccumulator,
 };
 pub use error::{NoveltyError, Result};
 pub use fluree_db_core::commit::codec::envelope::{MAX_GRAPH_DELTA_ENTRIES, MAX_GRAPH_IRI_LENGTH};
