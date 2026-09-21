@@ -5,7 +5,9 @@
 //! can be checked against branch commits to detect overlapping changes.
 
 use crate::{trace_first_parent_commits_by_id, Result};
-use fluree_db_core::{ConflictKey, ContentId, ContentStore, Flake, FlakeValue, Sid};
+use fluree_db_core::{
+    load_commit_by_id, ConflictKey, ContentId, ContentStore, Flake, FlakeValue, Sid,
+};
 use futures::TryStreamExt;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
@@ -115,6 +117,50 @@ impl NetChangeAccumulator {
     pub fn finish(self) -> Vec<Flake> {
         self.map.into_values().collect()
     }
+}
+
+/// [`compute_delta_keys`] for a set of commits named outright, oldest first.
+///
+/// Branch clocks are not comparable, so a range that crosses a merge cannot
+/// be cut by `t`. Callers that compare two branches name the commits instead.
+pub async fn delta_keys_of<C: ContentStore + ?Sized>(
+    store: &C,
+    cids: &[ContentId],
+) -> Result<FxHashSet<ConflictKey>> {
+    Ok(delta_keys_and_changes_of(store, cids, false).await?.0)
+}
+
+/// [`compute_delta_keys_and_changes`] for a set of commits named outright,
+/// oldest first.
+pub async fn delta_keys_and_changes_of<C: ContentStore + ?Sized>(
+    store: &C,
+    cids: &[ContentId],
+    with_changes: bool,
+) -> Result<(FxHashSet<ConflictKey>, Vec<Flake>, HashMap<u16, String>)> {
+    let mut keys = FxHashSet::default();
+    let mut acc = NetChangeAccumulator::default();
+    let mut namespace_delta: HashMap<u16, String> = HashMap::new();
+
+    // Newest first, as the accumulator requires.
+    for cid in cids.iter().rev() {
+        let commit = load_commit_by_id(store, cid).await?;
+        // A colliding namespace code keeps the oldest commit's prefix.
+        for (code, prefix) in commit.namespace_delta {
+            namespace_delta.insert(code, prefix);
+        }
+        for flake in commit.flakes.iter().rev() {
+            keys.insert(ConflictKey::new(
+                flake.s.clone(),
+                flake.p.clone(),
+                flake.g.clone(),
+            ));
+            if with_changes {
+                acc.push_newest_first(flake);
+            }
+        }
+    }
+
+    Ok((keys, acc.finish(), namespace_delta))
 }
 
 /// Like [`compute_delta_keys`], but additionally nets the range's flakes

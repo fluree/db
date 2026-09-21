@@ -15,9 +15,9 @@ use fluree_db_core::{collect_dag_cids, load_commit_by_id, BranchDiff};
 use fluree_db_core::{BranchedContentStore, ConflictKey, ContentId, ContentStore};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefKind, RefValue};
+use fluree_db_novelty::delta_keys_of;
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
 use serde::Serialize;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -576,8 +576,8 @@ impl crate::Fluree {
         }
 
         // The keys each branch changed since they last shared a commit.
-        let source_delta = changed_keys(source_store, &diff.source).await?;
-        let target_delta = changed_keys(&target_store, &diff.target).await?;
+        let source_delta = delta_keys_of(source_store, &diff.source).await?;
+        let target_delta = delta_keys_of(&target_store, &diff.target).await?;
 
         // Find conflicts: intersection of source and target delta sets.
         let conflicts: Vec<ConflictKey> =
@@ -712,7 +712,7 @@ impl crate::Fluree {
 
     /// A branch-aware store for `record`. A branch reads its parent's
     /// namespace on a miss; a root branch has only its own.
-    async fn branch_store(
+    pub(crate) async fn branch_store(
         &self,
         record: &NsRecord,
         ledger_id: &str,
@@ -818,22 +818,4 @@ async fn collect_commit_data(
         commits.push(load_commit_by_id(store, cid).await?);
     }
     Ok(collect_from_commits(commits, Fold::Replay))
-}
-
-/// The (subject, predicate, graph) keys these commits changed.
-async fn changed_keys(
-    store: &impl ContentStore,
-    cids: &[ContentId],
-) -> Result<HashSet<ConflictKey>> {
-    let mut keys = HashSet::new();
-    for cid in cids {
-        let commit = load_commit_by_id(store, cid).await?;
-        keys.extend(
-            commit
-                .flakes
-                .iter()
-                .map(|flake| ConflictKey::new(flake.s.clone(), flake.p.clone(), flake.g.clone())),
-        );
-    }
-    Ok(keys)
 }
