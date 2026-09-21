@@ -751,3 +751,68 @@ async fn rebase_after_merging_the_source_in() {
         ["a", "d2", "d4", "m2", "m3", "m4", "m5", "m6"]
     );
 }
+
+/// Rebasing after a sync, where both sides changed the same fact since.
+///
+/// The conflict is between the branch's own commit and what the source did
+/// after the sync. The sync itself is not part of either side's changes.
+#[tokio::test]
+async fn rebase_after_sync_detects_conflict() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    let rename = |ledger: &'static str, name: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let state = fluree.ledger(ledger).await.unwrap();
+            fluree
+                .update(
+                    state,
+                    &json!({
+                        "@context": {"ex": "http://example.org/ns/"},
+                        "where": {"@id": "ex:alice", "ex:name": "?old"},
+                        "delete": {"@id": "ex:alice", "ex:name": "?old"},
+                        "insert": {"@id": "ex:alice", "ex:name": name}
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let main = fluree.ledger("mydb:main").await.unwrap();
+    fluree
+        .insert(
+            main,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:alice", "ex:name": "Alice"}]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    // dev syncs main in, then both rename the same fact.
+    rename("mydb:main", "from-main").await;
+    fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::default())
+        .await
+        .unwrap();
+    rename("mydb:dev", "from-dev").await;
+    rename("mydb:main", "main-again").await;
+
+    let err = fluree
+        .rebase_branch("mydb", "dev", ConflictStrategy::Abort)
+        .await
+        .expect_err("both sides renamed alice after the sync");
+    assert!(err.to_string().contains("conflict"), "{err}");
+
+    let report = fluree
+        .rebase_branch("mydb", "dev", ConflictStrategy::TakeBranch)
+        .await
+        .unwrap();
+    assert_eq!(report.replayed, 1, "dev's own rename");
+    assert_eq!(query_all_names(&fluree, "mydb:dev").await, ["from-dev"]);
+}
