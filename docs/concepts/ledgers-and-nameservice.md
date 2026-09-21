@@ -100,6 +100,8 @@ The index represents a queryable snapshot of the ledger state. Indexes are creat
 
 The divergence point (common ancestor) between a branch and its source is computed on demand by walking the commit chains rather than being stored. This avoids stale metadata and supports merge scenarios where the relationship between branches changes over time.
 
+Each branch numbers its commits from its own fork point, so a `t` from one branch means nothing on another. The walk compares commits by identity. It follows each branch's line of first parents, and it follows merge parents into the branches they brought in, so a commit a branch merged earlier counts as one the branch already holds.
+
 #### Additional Metadata
 
 - **`default_context_id`**: ContentId of the default JSON-LD @context for the ledger

@@ -860,37 +860,51 @@ return `404` (not `403`) when the bearer cannot read it.
 
 These rules are not negotiable; the CLI and other clients depend on them:
 
-1. **Source resolution.** `source` must be a branch — its nameservice record
-   must have `source_branch != null`. Otherwise respond `400` with a message
-   containing `"no source branch"` so the CLI's error matcher works.
-2. **Target defaulting.** When `target` is omitted, resolve to
-   `source.source_branch`.
-3. **Self-merge.** If `source == resolved_target`, respond `400` with a
+1. **Target defaulting.** When `target` is omitted, resolve to
+   `source.source_branch`. A source whose nameservice record has
+   `source_branch == null` then has no target to resolve: respond `400` with
+   a message containing `"no source branch"` so the CLI's error matcher
+   works. With an explicit `target`, any branch may be the source, `main`
+   included.
+2. **Self-merge.** If `source == resolved_target`, respond `400` with a
    message containing `"itself"`.
-4. **Cross-branch ancestor lookup.** `ancestor` is the most recent common
-   commit between `source` HEAD and `target` HEAD. The walk **must** be able
-   to load commit envelopes from both branches' namespaces — sibling
-   branches off `main` must work. The reference implementation builds a
-   union view that fans out through both `BranchedContentStore` ancestries;
-   equivalents are fine.
-5. **Fast-forward predicate.**
-   `fast_forward = (ancestor.commit_id == target_head)` when both heads
-   exist; `true` when both heads are absent; `false` otherwise.
-6. **Per-side walks.** `ahead.count` is the total number of commits on
-   `source` since `ancestor.t` (uncapped). `ahead.commits` is the same set,
-   capped at `max_commits`, **strictly newest-first by `t`**.
-   `truncated = count > commits.len()`. Same shape for `behind`.
-7. **Conflict computation.** When
+3. **Divergence by commit identity.** Each branch numbers its commits from
+   its own fork point, so `t` values from two branches are not comparable.
+   Compute each side's commits by identity: its line of first parents down
+   to the first commit the other side already holds. A side "holds" a commit
+   when it is on its own line, or when one of its merges brought that commit
+   in. Leave out merge commits whose merged-in history the other side
+   already holds, since such a commit carries only changes that side has.
+
+   `ancestor` is the most recent commit both sides hold. It lies on one
+   side's line, and reached the other through a merge; without such a merge
+   it is the fork point.
+
+   The walk **must** be able to load commit envelopes from both branches'
+   namespaces, so a merge between two branches off `main` works in either
+   direction. The reference implementation builds a union view that fans out
+   through both `BranchedContentStore` ancestries; equivalents are fine.
+4. **Fast-forward predicate.** `fast_forward` is `true` when the target's
+   head is on the source's line of first parents, which means the source
+   continues where the target left off. It is also `true` when both heads
+   are absent, and `false` otherwise. A target head the source holds only
+   through a merge is **not** a fast-forward: adopting the source's head
+   would replace the target's line with one on another clock, and the
+   target's `t` would fall.
+5. **Per-side walks.** `ahead.count` is the total number of commits rule 3
+   gives for `source` (uncapped). `ahead.commits` is the same set, capped at
+   `max_commits`, **newest-first**. `truncated = count > commits.len()`.
+   Same shape for `behind`.
+6. **Conflict computation.** When
    `include_conflicts == true && !fast_forward` and both heads exist:
-   - Walk both deltas: `(s, p, g)` tuples touched on each side since
-     `ancestor.t`.
+   - Take the `(s, p, g)` tuples each side's commits from rule 3 touched.
    - `conflicts.keys` is the intersection.
    - **Sort the intersection before truncating** — `HashSet::intersection`
      order is unspecified, and stable ordering matters for paginated UIs.
      Lexicographic by `(s, p, g)` is fine; what matters is that two
      requests against the same state return the same prefix.
    - `count` is the unbounded intersection size; `truncated = count > cap`.
-8. **Conflict details.** When `include_conflict_details == true`, populate
+7. **Conflict details.** When `include_conflict_details == true`, populate
    `conflicts.details` for the keys returned in `conflicts.keys` after
    truncation. Each detail includes `key`, `source_values`, `target_values`,
    and a `resolution` annotation for the requested `strategy`. The values are
@@ -898,10 +912,10 @@ These rules are not negotiable; the CLI and other clients depend on them:
    not apply the strategy. Use the same
    resolved flake tuple shape as `/show` (`[s, p, o, dt, op]`, optional
    metadata as a 6th item).
-9. **No mutations.** Implementations must not write to the nameservice,
+8. **No mutations.** Implementations must not write to the nameservice,
    advance any HEAD, copy commits between namespaces, or update any cache
    that downstream operations depend on.
-10. **Server-side cap is mandatory.** Even if a client sends
+9. **Server-side cap is mandatory.** Even if a client sends
    `max_commits=10000000`, clamp to a defensive limit. The reference
    server applies two layers: when no query param is present, it falls
    back to the recommended defaults (`500` for commits, `200` for
@@ -918,14 +932,16 @@ These rules are not negotiable; the CLI and other clients depend on them:
    and the per-summary `load_commit_by_id` reads (one full commit blob
    per summary). It does *not* bound the underlying divergence walk:
    `count` on each side reflects the unbounded divergence and is computed
-   by walking every commit envelope between HEAD and the ancestor.
+   by walking every commit envelope down to the commit the other side
+   holds.
    Likewise, conflict computation walks the full per-side delta when
    `include_conflicts=true`. If you need to refuse expensive previews,
    add a separate operational guard before invoking the walk (for
-   example, reject when `target.t - ancestor.t` exceeds some threshold)
+   example, reject when either side is more than some number of commits
+   ahead)
    or document that clients should pass `include_conflicts=false` for a
    cheaper preview.
-11. **Aggregate change set.** When `include_changes == true`, populate
+10. **Aggregate change set.** When `include_changes == true`, populate
    `changes` with the source side's `ancestor..source_head` flakes **netted
    per fact** — full fact identity is `(subject, predicate, object,
    datatype, graph, language tag, list index)`; each touched fact keeps its
@@ -949,8 +965,8 @@ These rules are not negotiable; the CLI and other clients depend on them:
    `include_changes=true` is a `400`. The source-side commit replay is
    shared with the conflict walk when both are requested; each pagination
    page re-pays the replay cost.
-12. **Validation.** When `include_validation == true` (the default) and
-   `!fast_forward`, stage the change set from rule 11, resolved under
+11. **Validation.** When `include_validation == true` (the default) and
+   `!fast_forward`, stage the change set from rule 10, resolved under
    `strategy` against the **uncapped** conflict set, onto the target's
    current state and run the same SHACL validation `POST /merge` runs for
    that strategy. Report `validation: { conforms, report? }`, where
@@ -966,7 +982,7 @@ These rules are not negotiable; the CLI and other clients depend on them:
    rather than "no conflicts were reported"; commit-time conditions such
    as novelty backpressure are outside it. Warn-mode graphs log and count
    as conforming, matching transactions. This is still read-only
-   (rule 9).
+   (rule 8).
 
 ### Response (`200 OK`)
 
@@ -1057,7 +1073,7 @@ current asserted values in the same shape returned by `GET /show/*ledger`;
 `resolution` is a label only. `mergeable` is `false` when the chosen strategy
 would abort (currently `strategy=abort` with one or more conflicts) or, when
 `validation` is present, when the merged state fails the target's SHACL
-shapes (rule 12). With validation on, `mergeable=true` means neither the
+shapes (rule 11). With validation on, `mergeable=true` means neither the
 strategy nor the target's shapes will reject a subsequent `POST /merge`
 with the same strategy. It is not a promise the commit lands: novelty
 backpressure and other commit-time conditions still apply. With
@@ -1079,9 +1095,9 @@ interaction.
 |---------|-------------------|
 | HTTP route + auth | `fluree-db-server/src/routes/ledger.rs::merge_preview` |
 | Orchestration | `fluree-db-api/src/merge_preview.rs::merge_preview_with` |
-| Per-commit summary + DAG walk | `fluree-db-core/src/commit.rs::walk_commit_summaries` |
-| Common ancestor (dual-frontier BFS) | `fluree-db-core/src/commit.rs::find_common_ancestor` |
-| Delta-key computation | `fluree-db-novelty/src/delta.rs::compute_delta_keys` |
+| Per-commit summary | `fluree-db-core/src/commit.rs::commit_to_summary` |
+| Divergence by commit identity | `fluree-db-core/src/commit.rs::diff_branches` |
+| Delta-key computation | `fluree-db-novelty/src/delta.rs::delta_keys_of` |
 
 Validate compatibility by running `fluree branch diff dev --target feature
 --remote your-remote --json` against your server and diffing the response
@@ -1569,9 +1585,11 @@ HEAD, detecting and resolving conflicts according to `strategy`. The branch's
 own `source_branch` (from its nameservice record) is the rebase target — there
 is no `target` field in the request.
 
-- If the branch is already up-to-date with its source (`branch_head == ancestor`),
-  the operation is a fast-forward: the branch's HEAD is advanced to the source
-  HEAD with no replay, and `fast_forward: true` is returned.
+- If the branch has no commits of its own to replay, the operation is a
+  fast-forward: the branch's HEAD is advanced to the source HEAD with no
+  replay, and `fast_forward: true` is returned. A branch that merged its
+  source in earlier still has its own commits, and that merge is not one of
+  them: its changes came from the source.
 - If `strategy == "abort"` and **any** branch commit conflicts with the source
   delta, the rebase aborts up-front with `409 BranchConflict`. No commits are
   written.

@@ -201,7 +201,9 @@ fluree branch rebase <NAME> [OPTIONS]
 
 **Description:**
 
-Replays a branch's unique commits on top of the source branch's current HEAD. This brings the branch up to date with upstream changes. The `main` branch cannot be rebased.
+Replays a branch's unique commits on top of the source branch's current HEAD. This brings the branch up to date with upstream changes, and rewrites the branch's commits to do it. To keep the branch's commits as they are, merge the source into the branch instead. The `main` branch cannot be rebased.
+
+A branch that already merged its source in is rebased on its own commits only. The merge that brought the source in is left out, because its changes came from the source.
 
 If the branch has no unique commits, a fast-forward rebase is performed — the branch point is simply updated to the source's current HEAD.
 
@@ -312,15 +314,19 @@ fluree branch merge <SOURCE> [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `-l, --ledger <LEDGER>` | Ledger name (defaults to active ledger) |
-| `--target <BRANCH>` | Target branch to merge into (defaults to source's parent branch) |
+| `--target <BRANCH>` | Target branch to merge into (defaults to the branch the source was created from) |
 | `--strategy <STRATEGY>` | Conflict resolution strategy (default: `take-both`). Options: `take-both`, `abort`, `take-source`, `take-branch`. |
 | `--remote <REMOTE>` | Execute against a remote server |
 
 **Description:**
 
-Merges a source branch into a target branch. When the target hasn't advanced since the source branched, this is a fast-forward; otherwise `--strategy` controls how conflicting edits are resolved (mirroring `branch rebase`).
+Merges a source branch into a target branch. Any two branches of a ledger can be merged: a branch into the one it came from, a branch into one created from it, or two branches that share an earlier commit. `main` can be the source when `--target` names where to merge it.
 
-When `--target` is omitted, the merge target is inferred from the source branch's parent (the branch it was created from).
+When `--target` is omitted, the target is the branch the source was created from. Only then does the source need to have been created from another branch.
+
+The merge fast-forwards when the target's head is on the source's line of commits, which means the source continues where the target left off. The target then adopts the source's head. Otherwise the merge folds the source's changes into one commit on the target, and `--strategy` controls how conflicting edits are resolved (mirroring `branch rebase`).
+
+Each branch numbers its commits from its own fork point, so the two branches' `t` values cannot be compared. The merge finds what each side changed by commit identity instead. A branch that already merged the other in keeps that merge out of its own changes, because those changes came from the other side to begin with.
 
 After a successful merge, the source branch remains intact and can continue to receive new transactions and be merged again. Only the new commits since the last merge (or branch creation) are copied.
 
@@ -334,6 +340,9 @@ fluree branch merge dev
 
 # Merge feature-x into dev (explicit target)
 fluree branch merge feature-x --target dev
+
+# Bring main's latest into a branch, keeping the branch's history
+fluree branch merge main --target dev
 
 # Merge for a specific ledger
 fluree branch merge dev --ledger mydb
