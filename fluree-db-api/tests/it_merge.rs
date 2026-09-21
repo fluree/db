@@ -1742,3 +1742,35 @@ async fn merge_sibling_branches() {
         ["a", "d2", "f2"]
     );
 }
+
+/// A sync that resolved a conflict must not be undone by merging back.
+///
+/// dev and main rename the same subject. dev merges main in with
+/// `take-source`, so main's value wins on dev. Merging dev back into main
+/// must leave main on its own value.
+#[tokio::test]
+async fn merge_back_keeps_a_resolution_the_sync_made() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:alice", "Alice").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    rename_alice(&fluree, "mydb:dev", "from-dev").await;
+    rename_alice(&fluree, "mydb:main", "from-main").await;
+
+    // Sync main into dev. main is the source, so its value wins.
+    fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::TakeSource)
+        .await
+        .unwrap();
+    assert_eq!(query_all_names(&fluree, "mydb:dev").await, ["from-main"]);
+
+    // Merging dev back must not resurrect dev's old value.
+    fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert_eq!(query_all_names(&fluree, "mydb:main").await, ["from-main"]);
+}

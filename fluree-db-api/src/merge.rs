@@ -576,8 +576,8 @@ impl crate::Fluree {
         }
 
         // The keys each branch changed since they last shared a commit.
-        let source_delta = delta_keys_of(source_store, &diff.source).await?;
-        let target_delta = delta_keys_of(&target_store, &diff.target).await?;
+        let source_delta = delta_keys_of(source_store, &diff.source.own).await?;
+        let target_delta = delta_keys_of(&target_store, &diff.target.own).await?;
 
         // Find conflicts: intersection of source and target delta sets.
         let conflicts: Vec<ConflictKey> =
@@ -609,7 +609,7 @@ impl crate::Fluree {
             flakes: source_flakes,
             namespace_delta,
             graph_delta,
-        } = collect_commit_data(source_store, &diff.source).await?;
+        } = collect_commit_data(source_store, &diff.source.commits).await?;
 
         let current_head_t = target_state.t();
 

@@ -970,6 +970,25 @@ async fn advance_frontier<C: ContentStore>(
 // Branch comparison
 // =============================================================================
 
+/// One branch's side of a divergence. Built by [`diff_branches`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BranchSide {
+    /// Every commit on the branch's line above the point where the other
+    /// side's history takes over, oldest first. Folding these gives the
+    /// branch's state, so this is what a merge applies and what a rebase
+    /// replays.
+    pub commits: Vec<ContentId>,
+    /// The commits among them that carry the branch's own changes. A merge
+    /// whose merged-in history the other side already holds is left out,
+    /// because its changes came from that side. This is what conflict
+    /// detection compares.
+    ///
+    /// Such a merge stays in `commits`. Its flakes are the strategy's
+    /// resolution, not a copy of what it merged, and dropping them would
+    /// undo that resolution.
+    pub own: Vec<ContentId>,
+}
+
 /// What two branches changed since they last shared a commit. Built by
 /// [`diff_branches`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -977,11 +996,10 @@ pub struct BranchDiff {
     /// The most recent commit on the source's first-parent line that the
     /// target's history already holds.
     pub base: ContentId,
-    /// The source's commits above the base, oldest first.
-    pub source: Vec<ContentId>,
-    /// The target's commits above the commit where its own line meets the
-    /// source's history, oldest first.
-    pub target: Vec<ContentId>,
+    /// The source's side of the divergence.
+    pub source: BranchSide,
+    /// The target's side of the divergence.
+    pub target: BranchSide,
     /// Every commit reachable from the source's head that the target does
     /// not hold, parents before children. These are the commits the target
     /// needs copied into its own storage.
@@ -998,10 +1016,6 @@ pub struct BranchDiff {
 /// branch means nothing on the other. This walk never compares them. It
 /// follows first-parent lines, and it follows merge parents into the branches
 /// they brought in.
-///
-/// Both commit lists leave out merge commits whose merged-in history the
-/// other side already holds. Such a commit carries only changes the other
-/// side has, so replaying it would apply them twice.
 ///
 /// Returns an error when the two branches share no commit.
 pub async fn diff_branches<C: ContentStore + ?Sized>(
@@ -1128,20 +1142,21 @@ fn most_recent_shared(line: &[(ContentId, CommitEnvelope)], other: &History) -> 
 }
 
 /// The line's commits above the first one the other side's history holds,
-/// oldest first. Merge commits whose merge parents the other side holds are
-/// left out.
-fn line_above(line: &[(ContentId, CommitEnvelope)], other: &History) -> Vec<ContentId> {
-    let mut commits: Vec<ContentId> = line
-        .iter()
-        .take_while(|(cid, _)| !other.contains(cid))
-        .filter(|(_, envelope)| {
-            let mut merge_parents = envelope.parents.iter().skip(1).peekable();
-            merge_parents.peek().is_none() || !merge_parents.all(|p| other.contains(p))
-        })
-        .map(|(cid, _)| cid.clone())
-        .collect();
+/// oldest first, and which of them carry the branch's own changes.
+fn line_above(line: &[(ContentId, CommitEnvelope)], other: &History) -> BranchSide {
+    let above = line.iter().take_while(|(cid, _)| !other.contains(cid));
+    let mut commits = Vec::new();
+    let mut own = Vec::new();
+    for (cid, envelope) in above {
+        let merged_in = &envelope.parents[1.min(envelope.parents.len())..];
+        if merged_in.is_empty() || !merged_in.iter().all(|p| other.contains(p)) {
+            own.push(cid.clone());
+        }
+        commits.push(cid.clone());
+    }
     commits.reverse();
-    commits
+    own.reverse();
+    BranchSide { commits, own }
 }
 
 /// One branch's history above the fork: its own line, plus every commit its
@@ -1920,8 +1935,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(diff.base, main[0]);
-        assert_eq!(diff.source, dev);
-        assert_eq!(diff.target, main[1..]);
+        assert_eq!(diff.source.commits, dev);
+        assert_eq!(diff.target.commits, main[1..]);
         assert!(!diff.fast_forward);
     }
 
@@ -1938,8 +1953,8 @@ mod tests {
             .unwrap();
         assert!(diff.fast_forward);
         assert_eq!(diff.base, main[1]);
-        assert_eq!(diff.source, dev);
-        assert!(diff.target.is_empty());
+        assert_eq!(diff.source.commits, dev);
+        assert!(diff.target.commits.is_empty());
     }
 
     /// The commits the target must copy: the source's own, plus what its
@@ -1985,11 +2000,16 @@ mod tests {
 
         let diff = diff_branches(&store, &x_after, &dev_after).await.unwrap();
         assert_eq!(diff.base, x[4], "the x commit dev already merged");
-        assert_eq!(diff.source, [x_after]);
+        assert_eq!(diff.source.commits, [x_after]);
         assert_eq!(
-            diff.target,
+            diff.target.commits,
+            [dev[0].clone(), merge.clone(), dev_after.clone()],
+            "dev's line, the merge of x included"
+        );
+        assert_eq!(
+            diff.target.own,
             [dev[0].clone(), dev_after],
-            "dev's own commits, without the merge of x"
+            "dev's own changes, without the merge of x"
         );
         assert!(!diff.fast_forward);
     }
@@ -2010,8 +2030,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(diff.base, main[4], "main's head, which dev merged");
-        assert_eq!(diff.source, [dev[0].clone(), dev_after]);
-        assert!(diff.target.is_empty());
+        assert_eq!(
+            diff.source.commits,
+            [dev[0].clone(), sync.clone(), dev_after.clone()],
+            "dev's line, the sync merge included: it carries the resolution"
+        );
+        assert_eq!(
+            diff.source.own,
+            [dev[0].clone(), dev_after],
+            "dev's own changes, without the sync of main"
+        );
+        assert!(diff.target.commits.is_empty());
         assert!(!diff.fast_forward, "main's head is behind a merge edge");
     }
 

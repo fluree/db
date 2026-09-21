@@ -366,7 +366,7 @@ impl crate::Fluree {
         let source_name_owned = source_name.to_string();
 
         // Fast-forward: the branch has no commits of its own to replay.
-        let is_fast_forward = diff.source.is_empty();
+        let is_fast_forward = diff.source.commits.is_empty();
 
         if is_fast_forward {
             // Copy the source index into the branch namespace
@@ -405,12 +405,15 @@ impl crate::Fluree {
         }
 
         // The keys the source changed since the two sides diverged.
-        let source_delta = delta_keys_of(&source_store, &diff.target).await?;
+        let source_delta = delta_keys_of(&source_store, &diff.target.own).await?;
 
         // Pass 1: read the branch's own commits to collect lightweight
         // summaries (CID, t, conflict keys) without retaining flake payloads
         // in memory.
-        let summaries = scan_branch_commits(&branch_store, &diff.source, &source_delta).await?;
+        // Replay every commit on the branch's line, merges included: a
+        // merge the branch made carries how it resolved that merge.
+        let summaries =
+            scan_branch_commits(&branch_store, &diff.source.commits, &source_delta).await?;
         let total_commits = summaries.len();
 
         // Abort upfront if any commit conflicts — no commits will be written.

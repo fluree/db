@@ -428,21 +428,20 @@ impl crate::Fluree {
         // namespaces, so it runs over a union of the two stores. This is the
         // same call `prepare_merge` makes, so a preview and the merge it
         // previews see the same divergence.
+        let union_store = BranchedContentStore::with_parents(
+            Arc::new(source_store.clone()) as Arc<dyn ContentStore>,
+            vec![target_branched.clone()],
+        );
         let diff = match (&source_head, &target_head) {
-            (Some(s), Some(t)) => {
-                let union_store = BranchedContentStore::with_parents(
-                    Arc::new(source_store.clone()) as Arc<dyn ContentStore>,
-                    vec![target_branched.clone()],
-                );
-                Some(diff_branches(&union_store, s, t).await?)
-            }
+            (Some(s), Some(t)) => Some(diff_branches(&union_store, s, t).await?),
             _ => None,
         };
 
-        // The commit both branches last shared, for the response.
+        // The commit both branches last shared, for the response. It can sit
+        // on either branch's line, so it is read through the union.
         let ancestor = match &diff {
             Some(diff) => Some(AncestorRef {
-                t: load_commit_envelope_by_id(&source_store, &diff.base)
+                t: load_commit_envelope_by_id(&union_store, &diff.base)
                     .await?
                     .t,
                 commit_id: diff.base.clone(),
@@ -463,7 +462,9 @@ impl crate::Fluree {
         // protect against unbounded responses; direct Rust callers can opt in.
         let ahead_fut = async {
             match (&diff, &source_head) {
-                (Some(diff), _) => summarize(&source_store, &diff.source, opts.max_commits).await,
+                (Some(diff), _) => {
+                    summarize(&source_store, &diff.source.commits, opts.max_commits).await
+                }
                 // No target head: every source commit is ahead.
                 (None, Some(head)) => {
                     walk_commit_summaries(&source_store, head, 0, opts.max_commits)
@@ -476,7 +477,9 @@ impl crate::Fluree {
 
         let behind_fut = async {
             match &diff {
-                Some(diff) => summarize(&target_branched, &diff.target, opts.max_commits).await,
+                Some(diff) => {
+                    summarize(&target_branched, &diff.target.commits, opts.max_commits).await
+                }
                 None => Ok((Vec::new(), 0)),
             }
         };
@@ -508,17 +511,28 @@ impl crate::Fluree {
         // already validated when they were authored, so it is skipped.
         let need_validation = opts.include_validation && !fast_forward && diff.is_some();
 
+        // The change set folds every commit on the source's line, because a
+        // merge the source made carries how it resolved that merge. Conflict
+        // keys come from the source's own changes only.
         let source_fut = async {
-            let source_commits = diff.as_ref().map(|diff| diff.source.as_slice());
-            match (source_commits, &source_head) {
-                (Some(commits), _) if need_changes || need_validation => {
-                    let (keys, net, ns_delta) =
-                        delta_keys_and_changes_of(&source_store, commits, true).await?;
-                    Ok::<_, ApiError>((Some(keys), Some(net), Some(ns_delta)))
-                }
-                (Some(commits), _) if need_conflicts => {
-                    let keys = delta_keys_of(&source_store, commits).await?;
-                    Ok((Some(keys), None, None))
+            match (&diff, &source_head) {
+                (Some(diff), _) => {
+                    let (_, net, ns_delta) = if need_changes || need_validation {
+                        delta_keys_and_changes_of(&source_store, &diff.source.commits, true).await?
+                    } else {
+                        Default::default()
+                    };
+                    let keys = if need_conflicts || need_validation {
+                        Some(delta_keys_of(&source_store, &diff.source.own).await?)
+                    } else {
+                        None
+                    };
+                    let has_changes = need_changes || need_validation;
+                    Ok::<_, ApiError>((
+                        keys,
+                        has_changes.then_some(net),
+                        has_changes.then_some(ns_delta),
+                    ))
                 }
                 // No target head: the change set is the source's whole
                 // history.
@@ -537,7 +551,7 @@ impl crate::Fluree {
         let target_fut = async {
             match &diff {
                 Some(diff) if need_conflicts || need_validation => {
-                    let keys = delta_keys_of(&target_branched, &diff.target).await?;
+                    let keys = delta_keys_of(&target_branched, &diff.target.own).await?;
                     Ok::<_, ApiError>(Some(keys))
                 }
                 _ => Ok(None),
