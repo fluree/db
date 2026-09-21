@@ -493,7 +493,7 @@ Each branch is a fully independent `LedgerState` with its own snapshot, novelty 
 
 #### Nameservice Metadata
 
-When a branch is created, the nameservice records the **source branch name** on the new branch's `NsRecord` (e.g., `source_branch: Some("main")`). The divergence point between the branch and its source is computed on demand by walking the commit chains rather than being stored as a static snapshot.
+When a branch is created, the nameservice records the **source branch name** on the new branch's `NsRecord` (e.g., `source_branch: Some("main")`). The divergence point between the branch and its source is computed on demand by walking the commit chains rather than being stored as a static snapshot. That walk compares commits by identity, because two branches number their commits from their own fork points.
 
 This metadata enables the system to reconstruct the `BranchedContentStore` tree when loading a branch. For nested branches, the ancestry chain is walked recursively via `source_branch` lookups.
 

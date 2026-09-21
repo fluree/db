@@ -49,8 +49,9 @@ pub struct StagedMerge {
     pub target_id: String,
     /// Fully-qualified source id (`"<ledger>:<source>"`).
     pub source_id: String,
-    /// `true` when the target's HEAD was the common ancestor — the
-    /// apply step just advances the ref, no new commit body to write.
+    /// `true` when the target's head is on the source's first-parent
+    /// line. The apply step then just advances the ref, with no new commit
+    /// body to write.
     pub fast_forward: bool,
     /// Number of `(s, p, g)` conflicts the strategy resolved.
     /// Always `0` for fast-forward.
@@ -66,8 +67,9 @@ pub struct StagedMerge {
     /// failure. The Raft path ignores it (no publish happens until
     /// `AdvanceRef` applies through consensus).
     pub rollback_snapshot: NsRecordSnapshot,
-    /// Target's head before the merge. `expected_prev` for the CAS /
-    /// `AdvanceRef` proposal.
+    /// Target's head before the merge. The fast-forward path uses it as
+    /// `expected_prev` for the CAS. The general path takes its own
+    /// expected head from the staged base.
     pub current_head_t: i64,
     /// Companion to [`Self::current_head_t`]. `None` if the target
     /// branch was empty (genesis case).

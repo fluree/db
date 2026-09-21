@@ -5,10 +5,10 @@
 //! [`crate::Fluree::merge_branch`] but without mutating any nameservice or
 //! content-store state.
 //!
-//! The heavy lifting (per-commit summaries, DAG walking, common-ancestor
-//! discovery, delta-key computation) lives in `fluree-db-core` and
-//! `fluree-db-novelty`. This module orchestrates them: nameservice lookups,
-//! branched-store construction for source/target, and parallel walks.
+//! The heavy lifting (the branch diff, per-commit summaries, delta-key
+//! computation) lives in `fluree-db-core` and `fluree-db-novelty`. This
+//! module orchestrates them: nameservice lookups, branched-store
+//! construction for source/target, and parallel walks.
 
 use crate::error::{ApiError, Result};
 use crate::format::iri::IriCompactor;
@@ -53,17 +53,17 @@ pub const DEFAULT_MAX_CHANGES: usize = 500;
 /// lists**, not the cost of computing them:
 ///
 /// - The `BranchDelta::count` on each side is the full unbounded divergence,
-///   computed by walking every commit envelope between HEAD and the common
-///   ancestor. A 1M-commit divergence costs 1M envelope reads regardless of
-///   the cap.
+///   computed by walking every commit envelope down to the commit the other
+///   side holds. A 1M-commit divergence costs 1M envelope reads regardless
+///   of the cap.
 /// - The `ConflictSummary::count` is the full intersection size; both
-///   `compute_delta_keys` walks scan every flake on each side since the
-///   ancestor. Pass [`include_conflicts: false`](Self::include_conflicts) to
-///   skip them entirely when only counts are needed.
+///   delta-key walks scan every flake on each side since the divergence.
+///   Pass [`include_conflicts: false`](Self::include_conflicts) to skip them
+///   entirely when only counts are needed.
 ///
 /// To bound the *I/O cost* of the walk itself, callers must pre-check the
-/// divergence (e.g., refuse before invoking when `target.t - ancestor.t`
-/// exceeds some threshold) or use `include_conflicts: false`.
+/// divergence (for example, refuse before invoking when either side is more
+/// than some number of commits ahead) or use `include_conflicts: false`.
 #[derive(Clone, Debug)]
 pub struct MergePreviewOpts {
     /// Per side. `Some(n)` caps the returned list at `n`; `None` is

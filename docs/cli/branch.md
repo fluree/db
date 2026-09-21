@@ -260,7 +260,7 @@ fluree branch diff <SOURCE> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--target <BRANCH>` | Target branch to preview merging into (defaults to source's parent branch) |
+| `--target <BRANCH>` | Target branch to preview merging into (defaults to the branch the source was created from) |
 | `--max-commits <N>` | Cap on per-side commit summaries shown (default: 50; pass 0 for unbounded in local mode) |
 | `--max-conflict-keys <N>` | Cap on conflict keys shown (default: 50; pass 0 for unbounded in local mode) |
 | `--no-conflicts` | Skip conflict computation for a cheaper preview |
@@ -273,7 +273,7 @@ fluree branch diff <SOURCE> [OPTIONS]
 
 **Description:**
 
-`branch diff` reports ahead/behind commits, fast-forward eligibility, and conflicting `(subject, predicate, graph)` keys without mutating state. With `--conflict-details`, the preview also shows the source and target values for the returned conflict keys and annotates what the selected strategy would do.
+`branch diff` reports ahead/behind commits, fast-forward eligibility, and conflicting `(subject, predicate, graph)` keys without mutating state. It previews the same directions `branch merge` supports, so `fluree branch diff main --target dev` works. With `--conflict-details`, the preview also shows the source and target values for the returned conflict keys and annotates what the selected strategy would do.
 
 By default the preview also stages the merge's resolved change set on the target and validates it against the target's SHACL configuration and shapes, through the same code path `branch merge` uses. The `validation:` line reports `conforms` or the violation report the merge would fail with, and `mergeable:` is `yes` only when the strategy applies and the result conforms. A preview that says `mergeable: yes` therefore means neither the strategy nor the target's shapes will reject the merge. Other conditions still apply at commit time, novelty backpressure among them, so a ledger due for indexing can refuse a merge the preview passed. Fast-forward previews carry no validation line: the adopted commits were validated when they were authored. Pass `--no-validate` for a cheaper count-only preview.
 

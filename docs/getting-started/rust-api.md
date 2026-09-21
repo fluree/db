@@ -1097,7 +1097,8 @@ integration test with immediate assertion) each wrap the same primitive differen
 ### Branch Diff (Merge Preview)
 
 `Fluree::merge_preview` returns the rich diff between two branches —
-ahead/behind commit summaries, the common ancestor, conflict keys, and
+ahead/behind commit summaries, the commit both branches last shared,
+conflict keys, and
 fast-forward eligibility — **without mutating any state**. It uses the
 same primitives as `merge_branch` but skips the publish/copy steps,
 making it cheap enough to call on every UI render.
@@ -1200,7 +1201,7 @@ async fn main() -> Result<()> {
 
 For a merge-request "Changes" panel, `include_changes` returns the **net**
 set of facts the merge would apply: the source side's commits since the
-common ancestor folded per fact, each keeping its newest op. A branch with
+two branches diverged, folded per fact, each keeping its newest op. A branch with
 40 commits that ultimately touches 12 facts reviews as 12 facts, and a fact
 the branch created and then deleted shows as the deletion the merge
 applies:
@@ -1271,10 +1272,10 @@ merge itself would pay.
 lists**, not the cost of computing them:
 
 - `BranchDelta::count` on each side reflects the full unbounded
-  divergence — computed by walking every commit envelope between HEAD and
-  the common ancestor — regardless of `max_commits`.
-- When `include_conflicts: true`, both `compute_delta_keys` walks scan
-  the full per-side delta regardless of `max_conflict_keys`.
+  divergence, computed by walking every commit envelope down to the commit
+  the other side holds, regardless of `max_commits`.
+- When `include_conflicts: true`, both delta-key walks scan the full
+  per-side delta regardless of `max_conflict_keys`.
 - When `include_conflict_details: true`, value details are collected only
   for the returned `conflicts.keys` after the `max_conflict_keys` cap is
   applied.
@@ -1313,11 +1314,11 @@ The per-commit summary types and DAG walker are factored into core for
 reuse outside the merge-preview flow (e.g., git-log-style commit history
 viewers, indexer integration). Re-exported from `fluree-db-api`:
 
-- `walk_commit_summaries(store, head, stop_at_t, max) -> Result<(Vec<CommitSummary>, usize)>`
-  — newest-first walk that returns both the (capped) summary list and the
-  unbounded total count.
+- `diff_branches(store, source_head, target_head) -> Result<BranchDiff>`
+  — each side's commits since the two branches diverged, by commit
+  identity, plus the most recent commit both hold and whether the merge
+  fast-forwards.
 - `commit_to_summary(commit) -> CommitSummary` — pure function, no I/O.
-- `find_common_ancestor(store, head_a, head_b)` — dual-frontier BFS.
 
 ### Time Travel Queries
 

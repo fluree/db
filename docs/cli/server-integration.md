@@ -1084,7 +1084,7 @@ interaction.
 
 | Status | When |
 |--------|------|
-| `400` | Source has no parent (e.g., `main`); `source == target`; unknown strategy; unsupported strategy; `include_conflict_details=true` with `include_conflicts=false`; `strategy=abort` with `include_conflicts=false`. Body must include `"no source branch"` or `"itself"` for the first two cases so the CLI's matcher works. |
+| `400` | Source has no parent (e.g., `main`) and `target` is omitted; `source == target`; unknown strategy; unsupported strategy; `include_conflict_details=true` with `include_conflicts=false`; `strategy=abort` with `include_conflicts=false`. Body must include `"no source branch"` or `"itself"` for the first two cases so the CLI's matcher works. |
 | `401` | Bearer required and absent/invalid. |
 | `404` | Ledger or branch does not exist; or the bearer cannot `can_read`. |
 | `5xx` | Storage / nameservice errors. |
@@ -1666,8 +1666,8 @@ Content-Type: application/json
 | Field | Type | Required | Server default | Description |
 |-------|------|----------|----------------|-------------|
 | `ledger` | string | Yes | — | Ledger name without branch suffix. |
-| `source` | string | Yes | — | Branch to merge **from**. Must have at least one commit and a `source_branch`. |
-| `target` | string | No | `source.source_branch` | Branch to merge **into**. Defaults to the source's parent branch. Must not equal `source`. |
+| `source` | string | Yes | — | Branch to merge **from**. Must have at least one commit. It needs a `source_branch` only when `target` is omitted. |
+| `target` | string | No | `source.source_branch` | Branch to merge **into**. Defaults to the branch the source was created from. Any branch may be the target, `main` included, and any branch may be the source when this is given. Must not equal `source`. |
 | `strategy` | string | No | `"take-both"` | One of `take-both`, `abort`, `take-source`, `take-branch`. Parsed by `ConflictStrategy::from_str_name`. |
 
 ### Auth
@@ -1677,14 +1677,20 @@ Admin-protected (same bracket as `/branch`, `/drop-branch`, `/rebase`,
 
 ### Behavior
 
-- Computes the common ancestor between `source` HEAD and `target` HEAD using
-  a `BranchedContentStore` so sibling branches off `main` work.
-- If `target` HEAD == ancestor, performs a **fast-forward merge**: copies the
-  source's unique commit blobs into the target's namespace and advances the
-  target HEAD. No conflict resolution runs. `fast_forward: true` is reported.
-- Otherwise, performs a **general merge**: stages the union of source and
-  target deltas, resolves overlapping `(s, p, g)` keys via `strategy`, and
-  writes a single new commit on the target. `fast_forward: false` is
+- Diffs the two branches by commit identity, reading through both branches'
+  namespaces so a merge in any direction works. See rules 3 and 4 of the
+  [merge preview contract](#merge-preview-contract), which `/merge` and
+  `/merge-preview` share.
+- If the target's HEAD is on the source's line of first parents, performs a
+  **fast-forward merge**: copies the source's commits the target lacks into
+  the target's namespace and advances the target HEAD. No conflict
+  resolution runs. `fast_forward: true` is reported. A target HEAD the
+  source holds only through a merge is not a fast-forward.
+- Otherwise, performs a **general merge**: folds the source's commits since
+  the divergence, resolves keys both sides changed via `strategy`, and
+  writes a single new commit on the target. The fold includes merges the
+  source itself made, because such a commit carries how that merge was
+  resolved. `fast_forward: false` is
   reported. If `strategy == "abort"` and conflicts exist, the merge fails
   with `409 BranchConflict` and the target is rolled back to its
   pre-merge nameservice snapshot.

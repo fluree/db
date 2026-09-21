@@ -268,7 +268,8 @@ async fn merge_fast_forward_multiple_commits() {
 // Error paths
 // =============================================================================
 
-/// Cannot merge a branch that has no branch point (e.g. main itself).
+/// A branch with no branch point (main itself) has no target to infer,
+/// so merging it without an explicit target is refused.
 #[tokio::test]
 async fn merge_main_as_source_refused() {
     let fluree = FlureeBuilder::memory().build_memory();
