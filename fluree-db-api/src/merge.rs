@@ -18,6 +18,7 @@ use fluree_db_nameservice::{CasResult, NsRecord, NsRecordSnapshot, RefKind, RefV
 use fluree_db_transact::{CommitOpts, NamespaceRegistry};
 use serde::Serialize;
 use std::collections::HashSet;
+use std::sync::Arc;
 use tracing::Instrument;
 
 /// Output of [`Fluree::prepare_merge`].
@@ -233,15 +234,17 @@ impl crate::Fluree {
             .await?
             .ok_or_else(|| ApiError::NotFound(source_id.clone()))?;
 
-        // Resolve target: explicit or from source's parent branch.
-        let source_parent = source_record.source_branch.as_deref().ok_or_else(|| {
-            ApiError::InvalidBranch(format!(
-                "Branch {source_branch} has no source branch; \
-                     only branches created from another branch can be merged"
-            ))
-        })?;
-
-        let resolved_target = target_branch.unwrap_or(source_parent).to_string();
+        // Resolve target: explicit, or the branch the source was created
+        // from. Only the second needs the source to have a parent.
+        let resolved_target = match target_branch {
+            Some(target) => target.to_string(),
+            None => source_record.source_branch.clone().ok_or_else(|| {
+                ApiError::InvalidBranch(format!(
+                    "Branch {source_branch} has no source branch; \
+                         name the branch to merge into with an explicit target"
+                ))
+            })?,
+        };
 
         if source_branch == resolved_target {
             return Err(ApiError::InvalidBranch(
@@ -263,25 +266,30 @@ impl crate::Fluree {
         })?;
         let source_head_t = source_record.commit_t;
 
-        // Compute common ancestor to determine fast-forward eligibility.
-        // Build a BranchedContentStore for the source so we can walk both
-        // commit chains through parent namespaces.
-        let source_store = LedgerState::build_branched_store(
-            &self.nameservice_mode,
-            &source_record,
-            self.backend(),
-        )
-        .await?;
+        // Branch-aware stores for both sides, so a walk can cross each
+        // branch's fork point into its parent's namespace.
+        let source_store = self.branch_store(&source_record, &source_id).await?;
+        let target_store = self.branch_store(&target_record, &target_id).await?;
 
         let target_head = target_record.commit_head_id.clone();
         // What each branch changed since they last shared a commit, by
         // commit identity. Branch clocks are not comparable, so nothing here
         // compares a `t` across branches.
+        //
+        // The walk reads commits from both branches, and neither store holds
+        // the other's own commits. A union of the two resolves either head,
+        // whichever direction the merge runs in.
         let diff = match target_head.as_ref() {
-            Some(target_head_id) => Some(
-                fluree_db_core::diff_branches(&source_store, &source_head_id, target_head_id)
-                    .await?,
-            ),
+            Some(target_head_id) => {
+                let union_store = BranchedContentStore::with_parents(
+                    Arc::new(source_store.clone()) as Arc<dyn ContentStore>,
+                    vec![target_store.clone()],
+                );
+                Some(
+                    fluree_db_core::diff_branches(&union_store, &source_head_id, target_head_id)
+                        .await?,
+                )
+            }
             None => None,
         };
 
@@ -326,6 +334,7 @@ impl crate::Fluree {
                 &source_record,
                 &target_record,
                 &source_store,
+                target_store,
                 source_head_id,
                 &diff,
                 strategy,
@@ -552,6 +561,7 @@ impl crate::Fluree {
         source_record: &NsRecord,
         target_record: &NsRecord,
         source_store: &BranchedContentStore,
+        target_store: BranchedContentStore,
         source_head_id: ContentId,
         diff: &BranchDiff,
         strategy: ConflictStrategy,
@@ -567,15 +577,6 @@ impl crate::Fluree {
 
         // The keys each branch changed since they last shared a commit.
         let source_delta = changed_keys(source_store, &diff.source).await?;
-
-        // Use the same branch-aware store below when loading the queryable
-        // target state for staging.
-        let target_store: BranchedContentStore = if target_record.source_branch.is_some() {
-            LedgerState::build_branched_store(&self.nameservice_mode, target_record, self.backend())
-                .await?
-        } else {
-            BranchedContentStore::leaf(self.content_store(&target_id))
-        };
         let target_delta = changed_keys(&target_store, &diff.target).await?;
 
         // Find conflicts: intersection of source and target delta sets.
@@ -707,6 +708,23 @@ impl crate::Fluree {
             }),
             source_index_for_publish,
         })
+    }
+
+    /// A branch-aware store for `record`. A branch reads its parent's
+    /// namespace on a miss; a root branch has only its own.
+    async fn branch_store(
+        &self,
+        record: &NsRecord,
+        ledger_id: &str,
+    ) -> Result<BranchedContentStore> {
+        if record.source_branch.is_some() {
+            Ok(
+                LedgerState::build_branched_store(&self.nameservice_mode, record, self.backend())
+                    .await?,
+            )
+        } else {
+            Ok(BranchedContentStore::leaf(self.content_store(ledger_id)))
+        }
     }
 
     /// Copy commit blobs (and their referenced txn blobs) from a source
