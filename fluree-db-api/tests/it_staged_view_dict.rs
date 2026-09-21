@@ -36,6 +36,8 @@ static TRANSLATE_FAILURES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Staging completions observed — proves the probe layer is the active
 /// subscriber, so an empty failure list is a real observation.
 static STAGING_SEEN: AtomicUsize = AtomicUsize::new(0);
+/// Translations that routed untranslatable flakes to the raw-merge path.
+static RAW_MERGES: AtomicUsize = AtomicUsize::new(0);
 /// The probe is process-global, so tests run one at a time to keep every
 /// captured event attributable to the transaction under test.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -64,6 +66,9 @@ impl<S: tracing::Subscriber> Layer<S> for ProbeLayer {
         event.record(&mut flat);
         if flat.text.contains("transaction staging completed") {
             STAGING_SEEN.fetch_add(1, Ordering::SeqCst);
+        }
+        if flat.text.contains("not V3-translatable") {
+            RAW_MERGES.fetch_add(1, Ordering::SeqCst);
         }
         let translate_failure = flat.text.contains("failed to translate overlay flake")
             || flat.text.contains("failed V3 translation")
@@ -275,6 +280,141 @@ async fn shacl_over_staged_view_still_rejects_violations() {
         ),
         "expected ShaclViolation, got: {err:?}"
     );
+}
+
+fn item_shape() -> Value {
+    json!({
+        "@context": ctx(),
+        "@graph": [
+            {
+                "@id": "ex:ItemShape",
+                "@type": "sh:NodeShape",
+                "sh:targetClass": {"@id": "ex:Item"},
+                "sh:property": {"@id": "ex:ishape_weight"}
+            },
+            {
+                "@id": "ex:ishape_weight",
+                "sh:path": {"@id": "ex:weight"},
+                "sh:minCount": 1,
+                "sh:maxInclusive": {"@value": "10", "@type": "xsd:decimal"}
+            }
+        ]
+    })
+}
+
+/// `n` items whose `xsd:decimal` weights no index has seen, plus one weighing
+/// `outlier` when given.
+fn items(n: usize, outlier: Option<&str>) -> Value {
+    let mut nodes: Vec<Value> = (0..n)
+        .map(|i| {
+            json!({
+                "@id": format!("ex:item{i}"),
+                "@type": "ex:Item",
+                "ex:weight": {"@value": format!("{}.{:03}", i % 10, i), "@type": "xsd:decimal"}
+            })
+        })
+        .collect();
+    if let Some(w) = outlier {
+        nodes.push(json!({
+            "@id": "ex:outlier",
+            "@type": "ex:Item",
+            "ex:weight": {"@value": w, "@type": "xsd:decimal"}
+        }));
+    }
+    json!({"@context": ctx(), "@graph": nodes})
+}
+
+/// An indexed ledger; with `weighted`, one whose index already holds
+/// `ex:weight`, so staged probes on that predicate take the persisted lane
+/// (raw-merge fallback) instead of the overlay-only lane.
+async fn indexed_item_ledger(
+    fluree: &Fluree,
+    ledger_id: &str,
+    weighted: bool,
+) -> fluree_db_api::LedgerState {
+    if !weighted {
+        return indexed_ledger(fluree, ledger_id).await;
+    }
+    let ledger = fluree.create_ledger(ledger_id).await.expect("create");
+    let nodes: Vec<Value> = (0..10)
+        .map(|i| {
+            json!({
+                "@id": format!("ex:indexed{i}"),
+                "ex:weight": {"@value": format!("{i}.5"), "@type": "xsd:decimal"}
+            })
+        })
+        .collect();
+    fluree
+        .insert(ledger, &json!({"@context": ctx(), "@graph": nodes}))
+        .await
+        .expect("seed");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    fluree.ledger(ledger_id).await.expect("load")
+}
+
+/// Decimals new to the transaction are absent from the persisted NumBig
+/// arena, so they cannot translate. Staged probes still have to find each
+/// subject's own values among the transaction's flakes — both when the
+/// predicate is unindexed (overlay-only lane, seeking to the probe's span)
+/// and when it is indexed (every untranslatable flake is merged raw, and the
+/// probe reads only its window of them). A valid batch passes `sh:minCount`,
+/// and the one out-of-range value is caught.
+#[tokio::test]
+async fn shacl_over_staged_view_sees_untranslatable_decimals() {
+    let _serial = serialize().await;
+    install_probe();
+    let (fluree, _dir) = new_fluree().await;
+    let opts = || TxnOpts {
+        shapes: Some(item_shape()),
+        ..TxnOpts::default()
+    };
+
+    for (lane, weighted) in [("overlay-only", false), ("raw-merge", true)] {
+        let valid = format!("staged-view-dict/decimal-valid-{lane}:main");
+        let ledger = indexed_item_ledger(&fluree, &valid, weighted).await;
+        let merges_before = RAW_MERGES.load(Ordering::SeqCst);
+        fluree
+            .insert_with_opts(
+                ledger,
+                &items(50, None),
+                opts(),
+                CommitOpts::default(),
+                &quiet_index_cfg(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{lane}: every item carries an in-range weight: {e:?}"));
+        if weighted {
+            assert!(
+                RAW_MERGES.load(Ordering::SeqCst) > merges_before,
+                "novel decimals did not reach the raw-merge path; the lane is not under test"
+            );
+        }
+
+        let invalid = format!("staged-view-dict/decimal-invalid-{lane}:main");
+        let ledger = indexed_item_ledger(&fluree, &invalid, weighted).await;
+        let err = fluree
+            .insert_with_opts(
+                ledger,
+                &items(50, Some("99.5")),
+                opts(),
+                CommitOpts::default(),
+                &quiet_index_cfg(),
+            )
+            .await
+            .expect_err("a weight above sh:maxInclusive must be rejected");
+        assert!(
+            matches!(
+                err,
+                fluree_db_api::ApiError::Transact(
+                    fluree_db_transact::TransactError::ShaclViolation(_)
+                )
+            ),
+            "{lane}: expected ShaclViolation, got: {err:?}"
+        );
+    }
 }
 
 /// Whole-graph scans after a commit must decode against the committed

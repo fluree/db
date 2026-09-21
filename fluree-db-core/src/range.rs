@@ -364,7 +364,7 @@ fn apply_overlay_only_options(flakes: &mut Vec<Flake>, opts: &RangeOptions) {
 /// OPST bounds stop at the object: `cmp_object` orders by value THEN
 /// datatype, and the predicate compares after both — so with the datatype
 /// unmatched, an `o+p` bound covers exactly the same span as `o` alone.
-fn overlay_eq_bounds(
+pub fn overlay_eq_bounds(
     index: IndexType,
     test: RangeTest,
     match_val: &RangeMatch,
