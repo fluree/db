@@ -697,3 +697,57 @@ async fn rebase_take_branch_keeps_value_both_sides_asserted() {
 
     assert_eq!(query_all_names(&fluree, "mydb:dev").await, vec!["C"]);
 }
+
+/// Rebasing a branch that has already merged its source in.
+///
+/// The branch's own commits sit under a merge commit, and the source's head
+/// arrived through that merge. The branch's commits must still be replayed.
+#[tokio::test]
+async fn rebase_after_merging_the_source_in() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    let insert = |ledger: &'static str, id: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let state = fluree.ledger(ledger).await.unwrap();
+            fluree
+                .insert(
+                    state,
+                    &json!({
+                        "@context": {"ex": "http://example.org/ns/"},
+                        "@graph": [{"@id": format!("ex:{id}"), "ex:name": id}]
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+    };
+    insert("mydb:main", "a").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    insert("mydb:dev", "d2").await;
+    // main runs ahead of dev, so its `t` values cover dev's own.
+    for m in ["m2", "m3", "m4", "m5"] {
+        insert("mydb:main", m).await;
+    }
+
+    // dev merges main in, then commits again.
+    fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::default())
+        .await
+        .unwrap();
+    insert("mydb:dev", "d4").await;
+    insert("mydb:main", "m6").await;
+
+    let report = fluree
+        .rebase_branch("mydb", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(!report.fast_forward, "dev has commits of its own");
+    assert_eq!(
+        query_all_names(&fluree, "mydb:dev").await,
+        ["a", "d2", "d4", "m2", "m3", "m4", "m5", "m6"]
+    );
+}
