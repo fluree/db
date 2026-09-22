@@ -983,3 +983,125 @@ async fn branch_incremental_index_resolves_pre_fork_parent() {
         })
         .await;
 }
+
+/// Branching at a commit that only arrived through a merge is refused.
+///
+/// The branch never replays such a commit: what the merge contributed is
+/// folded into the merge commit. Branching there would replay the merged
+/// branch's own history as this branch's state.
+#[tokio::test]
+async fn create_branch_at_merged_in_commit_fails() {
+    use fluree_db_api::ConflictStrategy;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let insert = |ledger_id: &'static str, id: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let state = fluree.ledger(ledger_id).await.unwrap();
+            fluree
+                .insert(
+                    state,
+                    &json!({
+                        "@context": {"ex": "http://example.org/ns/"},
+                        "@graph": [{"@id": format!("ex:{id}"), "ex:name": id}]
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+    };
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:a", "ex:name": "a"}]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    insert("mydb:dev", "d2").await;
+    let dev_head = fluree
+        .ledger("mydb:dev")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .unwrap();
+    // main advances too, so the merge is not a fast-forward.
+    insert("mydb:main", "m2").await;
+    fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+
+    let err = fluree
+        .create_branch("mydb", "x", Some("main"), Some(CommitRef::Exact(dev_head)))
+        .await
+        .expect_err("dev's commit is not on main's line");
+    assert!(
+        err.to_string().contains("arrived through a merge"),
+        "unexpected error: {err}"
+    );
+
+    // The merge commit itself is on the line, so branching there works.
+    let merge_commit = fluree
+        .ledger("mydb:main")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .unwrap();
+    fluree
+        .create_branch(
+            "mydb",
+            "y",
+            Some("main"),
+            Some(CommitRef::Exact(merge_commit)),
+        )
+        .await
+        .unwrap();
+}
+
+/// A branch's line runs through its fork point into its source's history,
+/// so a pre-fork commit is a valid branch point.
+#[tokio::test]
+async fn create_branch_at_pre_fork_commit_succeeds() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let first = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:a", "ex:name": "a"}]
+            }),
+        )
+        .await
+        .unwrap();
+    let pre_fork = first.receipt.commit_id.clone();
+    fluree
+        .insert(
+            first.ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:b", "ex:name": "b"}]
+            }),
+        )
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    fluree
+        .create_branch("mydb", "x", Some("dev"), Some(CommitRef::Exact(pre_fork)))
+        .await
+        .expect("a commit before the fork is still on dev's line");
+}

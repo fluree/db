@@ -129,6 +129,8 @@ This is not storage-proxy replication; it is a transaction operation and should 
 
 The CLI pushes the branch's first-parent line as `commits`. When a commit on that line is a merge, the CLI also sends the commits the merge brought in, as `merged_commits`, to `push-merges` instead of `push`. It does so only when discovery advertises `push.merged_commits`. Otherwise it refuses the push before sending anything. See [`POST /push-merges/*ledger`](../api/endpoints.md#post-push-mergesledger) for the rules the server enforces.
 
+Merged commits are stored as history and never replayed, so policy and SHACL never run on them. What a merge brings into the branch's state travels in the merge commit, which is validated like any other commit, so a receiver still only takes checked data into its state.
+
 `push-merges` is a separate endpoint so that a server without it fails with `404`. The same body on `push` would be accepted by such a server with the merged commits dropped. For that reason `push` must refuse a body carrying `merged_commits`.
 
 The CLI sends an `Idempotency-Key` header derived from the pushed commit bytes so servers can safely replay a successful push result if the client retries after a timeout.

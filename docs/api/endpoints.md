@@ -451,6 +451,12 @@ The fields of `POST /push/*ledger`, plus:
 
 The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit. A push that carries any other commit is refused with `422`.
 
+**Trust model:**
+
+The chain's own commits are staged under policy and SHACL, as a transaction would be. Merged commits are stored as history and never replayed, so neither check runs on them. What a merge brings into a branch's state travels in the merge commit, which is validated against the state it lands on, so everything the ledger's state holds has been checked.
+
+The merged commits themselves are history. They are readable through views such as `GET /show/*ledger`, which applies the caller's policy to what it returns, and no path that builds a branch's state reads them. `POST /branch` refuses `--at` on a commit that reached the branch through a merge, for the same reason.
+
 **Why a separate endpoint:**
 
 A server predating this endpoint answers `404`. Given the same body on `POST /push`, that server would accept the push and drop `merged_commits`. It would then store merge commits without their parents. Servers that implement this endpoint advertise it in discovery with `"push": {"merged_commits": true}`.

@@ -33,6 +33,8 @@ If a pushed commit contains **retractions**, the server enforces a strict invari
 
 Push sends the branch's first-parent line: the commits the server replays. A merge commit on that line already carries the combined changes of the branch it merged. The commits that branch made still travel with the push. The server stores them without replaying them, so the history stays complete on the remote.
 
+The server stores those commits as history without replaying them. What the merge brings into the branch's state is in the merge commit, which the server validates like any other commit.
+
 A push containing a merge needs a server that supports it. The CLI checks the server's discovery document first. If the server does not support it, the push is refused before anything is sent. The server then needs upgrading.
 
 The remote head must be on your branch's first-parent line. If it is only reachable through a merge, the histories have diverged. Push then asks you to pull first.
