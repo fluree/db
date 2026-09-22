@@ -1085,21 +1085,21 @@ pub async fn diff_branches<C: ContentStore + ?Sized>(
     // Each side's history above the fork. A merge parent leads into the
     // branch it brought in, which is walked until it rejoins shared history.
     let shared = FirstParentLine::new(fork.clone());
-    let mut source_history = History::new(shared.clone(), &source_line);
-    let mut target_history = History::new(shared, &target_line_commits);
-    source_history.expand(store).await?;
-    target_history.expand(store).await?;
+    let mut source_ancestry = Ancestry::above(shared.clone(), &source_line);
+    let mut target_ancestry = Ancestry::above(shared, &target_line_commits);
+    source_ancestry.expand(store).await?;
+    target_ancestry.expand(store).await?;
 
-    let source = line_above(&source_line, &target_history);
-    let target = line_above(&target_line_commits, &source_history);
+    let source = line_above(&source_line, &target_ancestry);
+    let target = line_above(&target_line_commits, &source_ancestry);
     // The most recent commit both sides hold. It sits on one branch's line
     // and arrived on the other through a merge. Without such a merge it is
     // the fork.
-    let base = most_recent_shared(&source_line, &target_history)
-        .or_else(|| most_recent_shared(&target_line_commits, &source_history))
+    let base = most_recent_shared(&source_line, &target_ancestry)
+        .or_else(|| most_recent_shared(&target_line_commits, &source_ancestry))
         .unwrap_or(fork.clone());
 
-    let source_only = missing_from(store, source_head, &mut target_history).await?;
+    let source_only = missing_from(store, source_head, &mut target_ancestry).await?;
 
     Ok(BranchDiff {
         base,
@@ -1115,7 +1115,7 @@ pub async fn diff_branches<C: ContentStore + ?Sized>(
 async fn missing_from<C: ContentStore + ?Sized>(
     store: &C,
     head: &ContentId,
-    other: &mut History,
+    other: &mut Ancestry,
 ) -> Result<Vec<ContentId>> {
     let mut missing = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -1142,7 +1142,7 @@ async fn missing_from<C: ContentStore + ?Sized>(
 
 /// The line's most recent commit that the other side's history holds, if it
 /// is above the fork. The fork itself is the last commit on the line.
-fn most_recent_shared(line: &[(ContentId, CommitEnvelope)], other: &History) -> Option<ContentId> {
+fn most_recent_shared(line: &[(ContentId, CommitEnvelope)], other: &Ancestry) -> Option<ContentId> {
     line.iter()
         .take(line.len().saturating_sub(1))
         .map(|(cid, _)| cid)
@@ -1152,7 +1152,7 @@ fn most_recent_shared(line: &[(ContentId, CommitEnvelope)], other: &History) -> 
 
 /// The line's commits above the first one the other side's history holds,
 /// oldest first, and which of them carry the branch's own changes.
-fn line_above(line: &[(ContentId, CommitEnvelope)], other: &History) -> BranchSide {
+fn line_above(line: &[(ContentId, CommitEnvelope)], other: &Ancestry) -> BranchSide {
     let above = line.iter().take_while(|(cid, _)| !other.contains(cid));
     let mut commits = Vec::new();
     let mut own = Vec::new();
@@ -1166,62 +1166,6 @@ fn line_above(line: &[(ContentId, CommitEnvelope)], other: &History) -> BranchSi
     commits.reverse();
     own.reverse();
     BranchSide { commits, own }
-}
-
-/// One branch's history above the fork: its own line, plus every commit its
-/// merges brought in.
-struct History {
-    /// The shared line at and below the fork. A walk that reaches it has
-    /// left the branch's own history.
-    shared: FirstParentLine,
-    members: std::collections::HashSet<ContentId>,
-    /// Merge parents still to walk.
-    frontier: Vec<ContentId>,
-}
-
-impl History {
-    fn new(shared: FirstParentLine, line: &[(ContentId, CommitEnvelope)]) -> Self {
-        Self {
-            shared,
-            members: line.iter().map(|(cid, _)| cid.clone()).collect(),
-            frontier: line
-                .iter()
-                .flat_map(|(_, envelope)| envelope.parents.iter().skip(1))
-                .cloned()
-                .collect(),
-        }
-    }
-
-    /// Walk every merge parent into the branch it brought in.
-    async fn expand<C: ContentStore + ?Sized>(&mut self, store: &C) -> Result<()> {
-        while let Some(cid) = self.frontier.pop() {
-            if self.members.contains(&cid) {
-                continue;
-            }
-            let envelope = load_commit_envelope_by_id(store, &cid).await?;
-            if self.shared.contains(store, &cid, envelope.t).await? {
-                continue;
-            }
-            self.members.insert(cid);
-            self.frontier.extend(envelope.parents);
-        }
-        Ok(())
-    }
-
-    fn contains(&self, cid: &ContentId) -> bool {
-        self.members.contains(cid) || self.shared.members.contains(cid)
-    }
-
-    /// [`Self::contains`], loading the shared line as deep as `t`. `t` is
-    /// `cid`'s own `t`.
-    async fn holds<C: ContentStore + ?Sized>(
-        &mut self,
-        store: &C,
-        cid: &ContentId,
-        t: i64,
-    ) -> Result<bool> {
-        Ok(self.members.contains(cid) || self.shared.contains(store, cid, t).await?)
-    }
 }
 
 // =============================================================================
@@ -1311,7 +1255,7 @@ pub async fn plan_commit_transfer_page<C: ContentStore + ?Sized>(
     let mut line = FirstParentLine::new(from.clone());
     // What the receiver already holds. The merged-in walk stops at it, so a
     // branch merged twice sends only the commits it gained since.
-    let mut held = Held::new(base.map(|(base_id, _)| base_id));
+    let mut held = Ancestry::reaching(base.map(|(base_id, _)| base_id.clone()));
     let mut next = Some(from.clone());
     let mut child_t = None;
     // The line commit under this page, and whether the page filled first.
@@ -1348,13 +1292,7 @@ pub async fn plan_commit_transfer_page<C: ContentStore + ?Sized>(
         child_t = Some(envelope.t);
         let mut parents = envelope.parents.into_iter();
         let first_parent = parents.next();
-        line.members.insert(cid.clone());
-        // The merged-in walk loads the line lazily, and may already have
-        // loaded past this commit. Only move that cursor down.
-        if envelope.t < line.lowest_t {
-            line.lowest_t = envelope.t;
-            line.next.clone_from(&first_parent);
-        }
+        line.walked(cid.clone(), envelope.t, &first_parent);
         lineage.push(cid);
 
         // What this commit's merges brought in. Each commit is emitted after
@@ -1368,10 +1306,13 @@ pub async fn plan_commit_transfer_page<C: ContentStore + ?Sized>(
                 merged.push(cid);
                 continue;
             }
-            if line.members.contains(&cid) || !seen.insert(cid.clone()) {
+            if !seen.insert(cid.clone()) {
                 continue;
             }
-            if held.contains(store, &cid).await? {
+            // The receiver has it, or this transfer's line carries it. The
+            // receiver is asked first, since that walk never loads the line
+            // of a commit whose `t` comes from another branch.
+            if held.reaches(store, &cid).await? {
                 continue;
             }
             let envelope = load_commit_envelope_by_id(store, &cid).await?;
@@ -1397,29 +1338,56 @@ pub async fn plan_commit_transfer_page<C: ContentStore + ?Sized>(
     }))
 }
 
-/// The commits reachable from a base, through every parent. These are the
-/// commits a receiver at that base already holds.
+/// A set of commits closed under parents: every commit a walk from its roots
+/// reaches, through every parent.
 ///
-/// The walk runs only as far as a query needs. A commit the base reaches is
-/// usually found early, because a merge's commits sit near the branch's head.
-/// A commit it does not reach exhausts the walk, which then answers the rest
-/// of the page from memory.
-struct Held {
+/// The walk runs on demand. [`Ancestry::expand`] runs it to the end, and
+/// [`Ancestry::reaches`] runs it only as far as one answer needs. A commit
+/// the roots reach is usually found early, because a merge's commits sit
+/// near the branch's head. A commit they do not reach exhausts the walk,
+/// which then answers from memory.
+struct Ancestry {
     members: std::collections::HashSet<ContentId>,
+    /// Parents still to walk.
     frontier: Vec<ContentId>,
+    /// A line the walk stops at, and whose commits the ancestry holds. A
+    /// commit on it carries everything behind it. It is empty when nothing
+    /// bounds the walk.
+    stop: FirstParentLine,
 }
 
-impl Held {
-    /// The commits `base` reaches. Nothing is reachable from no base.
-    fn new(base: Option<&ContentId>) -> Self {
+impl Ancestry {
+    /// What a branch's line adds above `stop`: the line itself, plus every
+    /// commit its merges brought in.
+    fn above(stop: FirstParentLine, line: &[(ContentId, CommitEnvelope)]) -> Self {
         Self {
-            members: std::collections::HashSet::new(),
-            frontier: base.into_iter().cloned().collect(),
+            members: line.iter().map(|(cid, _)| cid.clone()).collect(),
+            frontier: line
+                .iter()
+                .flat_map(|(_, envelope)| envelope.parents.iter().skip(1))
+                .cloned()
+                .collect(),
+            stop,
         }
     }
 
-    /// Whether the base reaches commit `cid`.
-    async fn contains<C: ContentStore + ?Sized>(
+    /// Every commit `roots` reach. Nothing bounds this walk but genesis.
+    fn reaching(roots: impl IntoIterator<Item = ContentId>) -> Self {
+        Self {
+            members: std::collections::HashSet::new(),
+            frontier: roots.into_iter().collect(),
+            stop: FirstParentLine::empty(),
+        }
+    }
+
+    /// Run the walk to the end.
+    async fn expand<C: ContentStore + ?Sized>(&mut self, store: &C) -> Result<()> {
+        while self.step(store).await?.is_some() {}
+        Ok(())
+    }
+
+    /// Whether the walk reaches `cid`, running it only that far.
+    async fn reaches<C: ContentStore + ?Sized>(
         &mut self,
         store: &C,
         cid: &ContentId,
@@ -1427,17 +1395,46 @@ impl Held {
         if self.members.contains(cid) {
             return Ok(true);
         }
-        while let Some(next) = self.frontier.pop() {
-            if !self.members.insert(next.clone()) {
-                continue;
-            }
-            let envelope = load_commit_envelope_by_id(store, &next).await?;
-            self.frontier.extend(envelope.parents);
-            if next == *cid {
+        while let Some(reached) = self.step(store).await? {
+            if reached == *cid {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// [`Self::reaches`], answered from the walk already run.
+    fn contains(&self, cid: &ContentId) -> bool {
+        self.members.contains(cid) || self.stop.members.contains(cid)
+    }
+
+    /// Whether the ancestry holds `cid`: the walk reaches it, or it is on
+    /// the line the walk stops at. `t` is `cid`'s own `t`.
+    async fn holds<C: ContentStore + ?Sized>(
+        &mut self,
+        store: &C,
+        cid: &ContentId,
+        t: i64,
+    ) -> Result<bool> {
+        Ok(self.reaches(store, cid).await? || self.stop.contains(store, cid, t).await?)
+    }
+
+    /// Walk one commit of the frontier. Returns the commit it reached, or
+    /// `None` once the frontier is spent.
+    async fn step<C: ContentStore + ?Sized>(&mut self, store: &C) -> Result<Option<ContentId>> {
+        while let Some(cid) = self.frontier.pop() {
+            if self.members.contains(&cid) {
+                continue;
+            }
+            let envelope = load_commit_envelope_by_id(store, &cid).await?;
+            if self.stop.contains(store, &cid, envelope.t).await? {
+                continue;
+            }
+            self.frontier.extend(envelope.parents);
+            self.members.insert(cid.clone());
+            return Ok(Some(cid));
+        }
+        Ok(None)
     }
 }
 
@@ -1458,6 +1455,26 @@ impl FirstParentLine {
         }
     }
 
+    /// A line with no commits. It holds nothing and loads nothing.
+    fn empty() -> Self {
+        Self {
+            members: std::collections::HashSet::new(),
+            next: None,
+            lowest_t: i64::MAX,
+        }
+    }
+
+    /// Record a commit the caller walked, and where the line continues
+    /// below it. The lazy cursor only moves down, because a query may have
+    /// loaded deeper already.
+    fn walked(&mut self, cid: ContentId, t: i64, next: &Option<ContentId>) {
+        if t < self.lowest_t {
+            self.lowest_t = t;
+            self.next.clone_from(next);
+        }
+        self.members.insert(cid);
+    }
+
     /// Whether commit `cid` is on the line. `t` is that commit's `t`.
     async fn contains<C: ContentStore + ?Sized>(
         &mut self,
@@ -1465,8 +1482,12 @@ impl FirstParentLine {
         cid: &ContentId,
         t: i64,
     ) -> Result<bool> {
+        if self.members.contains(cid) {
+            return Ok(true);
+        }
         // The line's `t` decreases toward genesis. Loading can therefore stop
-        // at `t`.
+        // at `t`. A commit from another branch carries another clock, so `t`
+        // can send this walk to genesis.
         while self.lowest_t > t {
             let Some(next) = self.next.take() else {
                 break;
