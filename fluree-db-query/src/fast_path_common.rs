@@ -3182,6 +3182,11 @@ impl InnerMergeHeads {
     /// Read each stream's first group. `None` when a stream is empty, which
     /// makes the intersection empty.
     pub(crate) fn prime<S: GroupStream>(streams: &mut [S]) -> Result<Option<Self>> {
+        // With no streams `aligned` is never true and `advance` never ends.
+        assert!(
+            !streams.is_empty(),
+            "InnerMergeHeads needs at least one stream"
+        );
         let mut heads = Self {
             keys: vec![0; streams.len()],
             counts: vec![0; streams.len()],
@@ -4297,6 +4302,12 @@ mod tests {
         assert!(inner_merge(&[a, disjoint]).is_empty());
         // The match on the short stream's last group is still reported.
         assert_eq!(inner_merge(&[a, short]), vec![(2, 4)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "InnerMergeHeads needs at least one stream")]
+    fn inner_merge_heads_rejects_zero_streams() {
+        inner_merge(&[]);
     }
 
     /// `cursor_fast_path_for_predicate` must: run unfiltered with no policy;

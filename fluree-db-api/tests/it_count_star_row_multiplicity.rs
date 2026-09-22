@@ -248,6 +248,42 @@ fn jsonld_cases() -> Vec<(&'static str, Value, &'static str)> {
             "n=8",
         ),
         (
+            "jsonld COUNT(*) tag x code exists mark",
+            json!({
+                "@context": ctx,
+                "select": ["(as (count *) ?n)"],
+                "where": [
+                    {"@id": "?s", "ex:tag": "?o", "ex:code": "?c"},
+                    ["exists", {"@id": "?s", "ex:mark": "?m"}]
+                ]
+            }),
+            "n=6",
+        ),
+        (
+            "jsonld COUNT(*) tag x code minus mark",
+            json!({
+                "@context": ctx,
+                "select": ["(as (count *) ?n)"],
+                "where": [
+                    {"@id": "?s", "ex:tag": "?o", "ex:code": "?c"},
+                    ["minus", {"@id": "?s", "ex:mark": "?m"}]
+                ]
+            }),
+            "n=2",
+        ),
+        (
+            "jsonld COUNT(*) tag x code not-exists mark",
+            json!({
+                "@context": ctx,
+                "select": ["(as (count *) ?n)"],
+                "where": [
+                    {"@id": "?s", "ex:tag": "?o", "ex:code": "?c"},
+                    ["not-exists", {"@id": "?s", "ex:mark": "?m"}]
+                ]
+            }),
+            "n=2",
+        ),
+        (
             "jsonld COUNT(*) widget/name",
             json!({
                 "@context": ctx,
