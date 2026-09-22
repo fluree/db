@@ -870,6 +870,8 @@ the type (`?s a ?t`), both are kept unless their class sets are equal.
 
 Iceberg supports schema evolution via metadata updates. If a schema change renames/removes columns used by your R2RML mapping, update the mapping accordingly.
 
+A time-pinned read always uses the current mapping. Columns are matched by Iceberg field id, so a column renamed since the pinned snapshot still resolves under its new name, and a column added since reads as absent, as it was at that snapshot.
+
 ## Configuration Options
 
 ### AWS Credentials

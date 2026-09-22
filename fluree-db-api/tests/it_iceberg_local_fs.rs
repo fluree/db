@@ -438,6 +438,49 @@ async fn pinned_query_on_a_graph_source_reads_that_snapshot() {
             .unwrap_or_else(|e| panic!("graph_at({spec:?}): {e}"));
         assert_eq!(rows_of(&rows), Some(3), "graph_at({spec:?}): {rows}");
 
+        // The tracked cores push the pin separately from the plain ones; a
+        // request with tracking headers runs through them.
+        let tracked = fluree
+            .query_from()
+            .jsonld(&from_names)
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap_or_else(|e| panic!("tracked from @{suffix}: {e:?}"));
+        assert_eq!(
+            rows_of(&tracked.result),
+            Some(3),
+            "tracked from @{suffix}: {tracked:?}"
+        );
+        let tracked = fluree
+            .graph_at(alias, spec.clone())
+            .query()
+            .jsonld(&names)
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap_or_else(|e| panic!("tracked graph_at({spec:?}): {e:?}"));
+        assert_eq!(
+            rows_of(&tracked.result),
+            Some(3),
+            "tracked graph_at({spec:?}): {tracked:?}"
+        );
+        // A second (named) view makes it a dataset, which has its own core.
+        let mut dataset_names = from_names.clone();
+        dataset_names["fromNamed"] = serde_json::json!([format!("{alias}@{suffix}")]);
+        let tracked = fluree
+            .query_from()
+            .jsonld(&dataset_names)
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap_or_else(|e| panic!("tracked dataset @{suffix}: {e:?}"));
+        assert_eq!(
+            rows_of(&tracked.result),
+            Some(3),
+            "tracked dataset @{suffix}: {tracked:?}"
+        );
+
         let from = format!("{alias}@{suffix}");
         let rows = fluree
             .query_from()
@@ -480,14 +523,19 @@ async fn pinned_query_on_a_graph_source_reads_that_snapshot() {
     );
 
     // --- Refused pins. Each must be an error on both routes — never the
-    //     current snapshot, never the oldest one.
+    //     current snapshot, never the oldest one — and a 400: the caller asked
+    //     for something the source cannot answer.
     let expect_refused =
         |result: Result<serde_json::Value, ApiError>, route: &str, needle: &str| {
             let err = match result {
                 Ok(rows) => panic!("{route}: pinned query returned {rows} instead of an error"),
-                Err(err) => err.to_string(),
+                Err(err) => err,
             };
-            assert!(err.contains(needle), "{route}: unexpected error: {err}");
+            assert!(
+                err.to_string().contains(needle),
+                "{route}: unexpected error: {err}"
+            );
+            assert_eq!(err.status_code(), 400, "{route}: {err}");
         };
     let refused: Vec<(String, TimeSpec, &str)> = vec![
         // Before the oldest retained snapshot: typed, names the oldest.
@@ -701,6 +749,17 @@ async fn pinned_query_on_a_graph_source_reads_that_snapshot() {
         result,
         "ledger @snapshot",
         "selects a graph source's table snapshot",
+    );
+    on_ledger["from"] = serde_json::Value::String("plain-ledger:main@iso:not-a-time".to_string());
+    let result = fluree
+        .query_from()
+        .jsonld(&on_ledger)
+        .execute_formatted()
+        .await;
+    expect_refused(
+        result,
+        "ledger @iso malformed",
+        "Invalid ISO-8601 timestamp for time travel",
     );
 }
 

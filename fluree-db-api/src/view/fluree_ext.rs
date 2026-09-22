@@ -753,7 +753,7 @@ impl Fluree {
                     | fluree_db_nameservice::GraphSourceType::R2rml
             )
         {
-            return Err(ApiError::query(format!(
+            return Err(ApiError::invalid_query(format!(
                 "graph source '{gs_id}' ({}) does not support time-pinned reads; only \
                  Iceberg-backed graph sources do. Remove the time specification to query \
                  its current state.",

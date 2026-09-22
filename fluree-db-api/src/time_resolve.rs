@@ -39,7 +39,7 @@ pub(crate) fn epoch_ms_to_iso(epoch_ms: i64) -> String {
 /// ledger and on a graph source.
 pub(crate) fn parse_time_travel_iso(iso: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
     chrono::DateTime::parse_from_rfc3339(iso).map_err(|e| {
-        ApiError::query(format!(
+        ApiError::invalid_query(format!(
             "Invalid ISO-8601 timestamp for time travel: {iso} ({e})"
         ))
     })
@@ -451,7 +451,7 @@ pub(crate) async fn resolve_time_spec(
             )
             .await
         }
-        crate::TimeSpec::AtSnapshot(_) => Err(ApiError::query(
+        crate::TimeSpec::AtSnapshot(_) => Err(ApiError::invalid_query(
             crate::graph_source::SNAPSHOT_SPEC_ON_LEDGER,
         )),
     }

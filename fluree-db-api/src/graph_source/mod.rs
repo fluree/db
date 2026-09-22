@@ -129,9 +129,9 @@ pub(crate) fn source_time_for(
             let dt = crate::time_resolve::parse_time_travel_iso(iso)?;
             Ok(Some(SourceTime::AsOfTimestampMs(dt.timestamp_millis())))
         }
-        crate::TimeSpec::AtT(_) | crate::TimeSpec::AtCommit(_) => {
-            Err(crate::ApiError::query(GRAPH_SOURCE_LEDGER_TIME_UNSUPPORTED))
-        }
+        crate::TimeSpec::AtT(_) | crate::TimeSpec::AtCommit(_) => Err(
+            crate::ApiError::invalid_query(GRAPH_SOURCE_LEDGER_TIME_UNSUPPORTED),
+        ),
     }
 }
 
