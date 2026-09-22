@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::ledger_view::CommitRef;
 use crate::{ApiError, Fluree, HistoricalLedgerView, LedgerState, Result};
 use fluree_db_core::ContentStore;
-use fluree_db_core::{collect_dag_cids, load_commit_envelope_by_id, CommitId};
+use fluree_db_core::{collect_first_parent_cids, load_commit_envelope_by_id, CommitId};
 use fluree_db_nameservice::{NameServiceError, NsRecord};
 
 impl Fluree {
@@ -236,7 +236,9 @@ impl Fluree {
             if resolved == source_head {
                 None
             } else {
-                let store = self.content_store(&source_id);
+                // Branch-aware: the line crosses the fork point into the
+                // source's own parent namespace.
+                let store = self.branched_content_store(&source_id).await?;
                 let resolved_t = verify_ancestor(&*store, &source_head, &resolved).await?;
                 Some((resolved, resolved_t))
             }
@@ -417,21 +419,23 @@ impl Fluree {
     }
 }
 
-/// Verify `target` is reachable by walking parents from `source_head`, and
-/// return its `t` value.
+/// Verify `target` is on the source branch's line of commits, and return
+/// its `t` value.
 ///
-/// Used by `create_branch` when a caller specifies a historical commit — we
-/// only allow branching from commits on the source branch's ancestry.
+/// Used by `create_branch` when a caller specifies a historical commit. The
+/// line is the branch's own history: the commits a load, an index build or
+/// a replay of that branch reads. Branching anywhere on it replays commits
+/// the branch already replays.
 ///
-/// "Ancestry" here is the full commit DAG, not the linear first-parent chain:
-/// `collect_dag_cids` walks every parent edge (including merge parents), so
-/// any commit reachable from `source_head` via any sequence of parent edges
-/// is a valid branch point. This is what enables branching at a commit that
-/// originally lived on a side branch that was later merged into the source
-/// — once merged in, those commits are part of the source's ancestry too.
+/// A commit that reached the branch through a merge is not on the line, and
+/// is refused. The branch never replays it: what the merge contributed is
+/// folded into the merge commit, which was validated against the state it
+/// landed on. Branching there would instead replay the merged branch's own
+/// history, which this ledger never checked. `revert` draws the same line.
 ///
-/// Loads only the target commit's envelope (not its flakes) since we just
-/// need `t` for the ancestry walk's stop condition.
+/// Loads envelopes only, and stops as soon as the line passes below
+/// `target`'s `t`. A line's `t` decreases by one per commit, so the target
+/// is out of range from there on.
 async fn verify_ancestor<C: ContentStore + ?Sized>(
     store: &C,
     source_head: &CommitId,
@@ -447,16 +451,16 @@ async fn verify_ancestor<C: ContentStore + ?Sized>(
         return Ok(target_envelope.t);
     }
 
-    // Walk backward from source_head over the full DAG (all parent edges,
-    // including merge parents), stopping once we pass below target's t.
     let stop_at = (target_envelope.t - 1).max(0);
-    let dag = collect_dag_cids(store, source_head, stop_at).await?;
+    let line = collect_first_parent_cids(store, source_head, stop_at).await?;
 
-    if dag.iter().any(|(_, cid)| cid == target) {
+    if line.iter().any(|(_, cid)| cid == target) {
         Ok(target_envelope.t)
     } else {
         Err(ApiError::NotFound(format!(
-            "commit {target} is not an ancestor of source head {source_head}"
+            "commit {target} is not on the line of commits behind {source_head}. \
+             A commit that arrived through a merge cannot be branched at: branch \
+             at the merge commit instead, or at a commit on the branch that made it"
         )))
     }
 }

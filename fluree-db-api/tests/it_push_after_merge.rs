@@ -77,6 +77,15 @@ async fn read_commits(
 /// Build the push bundle a sender would produce for a ledger with no
 /// counterpart on the receiver.
 async fn build_bundle(fluree: &support::MemoryFluree, ledger_id: &str) -> PushCommitsRequest {
+    build_bundle_from(fluree, ledger_id, None).await
+}
+
+/// Build the push bundle a sender would produce for a receiver at `base`.
+async fn build_bundle_from(
+    fluree: &support::MemoryFluree,
+    ledger_id: &str,
+    base: Option<&ContentId>,
+) -> PushCommitsRequest {
     let store = fluree.branched_content_store(ledger_id).await.unwrap();
     let head = fluree
         .ledger(ledger_id)
@@ -85,10 +94,10 @@ async fn build_bundle(fluree: &support::MemoryFluree, ledger_id: &str) -> PushCo
         .head_commit_id
         .clone()
         .expect("ledger has a head");
-    let plan = plan_commit_transfer(store.as_ref(), &head, None)
+    let plan = plan_commit_transfer(store.as_ref(), &head, base)
         .await
         .unwrap()
-        .expect("head is its own base");
+        .expect("base is on the head's line");
 
     let mut blobs = HashMap::new();
     let commits = read_commits(store.as_ref(), &plan.lineage, &mut blobs).await;
@@ -160,6 +169,64 @@ async fn push_carries_the_commits_a_merge_brought_in() {
         .unwrap();
     let dag = collect_dag_cids(store.as_ref(), &head, 0).await.unwrap();
     assert_eq!(dag.len(), 4, "three on the line plus dev's commit");
+}
+
+#[tokio::test]
+async fn push_after_a_second_merge_sends_only_the_new_commits() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    merged_history(&fluree).await;
+
+    let target = "it/push-merge-again:main";
+    fluree.create_ledger(target).await.unwrap();
+    fluree
+        .push_commits(
+            target,
+            build_bundle(&fluree, "mydb:main").await,
+            &GovernanceOptions::default(),
+            &index_config(),
+        )
+        .await
+        .expect("the first push should be accepted");
+    let base = fluree
+        .ledger(target)
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .unwrap();
+
+    // Both branches move on, then dev is merged a second time.
+    insert_name(&fluree, "mydb:dev", "dan", "Dan").await;
+    insert_name(&fluree, "mydb:main", "erin", "Erin").await;
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(!report.fast_forward, "merge should not fast-forward");
+
+    let bundle = build_bundle_from(&fluree, "mydb:main", Some(&base)).await;
+    assert_eq!(bundle.commits.len(), 2, "erin and the second merge");
+    assert_eq!(
+        bundle.merged_commits.len(),
+        1,
+        "only dev's new commit; the receiver holds the one the first merge brought in"
+    );
+
+    let response = fluree
+        .push_commits(
+            target,
+            bundle,
+            &GovernanceOptions::default(),
+            &index_config(),
+        )
+        .await
+        .expect("the second push should be accepted");
+
+    assert_eq!(response.accepted, 2);
+    assert_eq!(
+        names(&fluree, target).await,
+        ["Alice", "Bob", "Carol", "Dan", "Erin"]
+    );
 }
 
 #[tokio::test]

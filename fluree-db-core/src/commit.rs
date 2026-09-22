@@ -1261,10 +1261,9 @@ pub struct CommitTransferPage {
 /// Returns `None` when `base` is not on the first-parent line of `head`. The
 /// receiver cannot fast-forward to `head` in that case.
 ///
-/// `merged` may include commits the receiver already has. The walk stops at
-/// commits on the first-parent line of `head`, which runs through the base.
-/// Commits that the base's own merges brought in are not on that line. They
-/// are sent again.
+/// `merged` holds only commits the receiver lacks. The walk stops at every
+/// commit reachable from the base, so a branch merged twice sends only what
+/// it gained between the two merges.
 pub async fn plan_commit_transfer<C: ContentStore + ?Sized>(
     store: &C,
     head: &ContentId,
@@ -1277,9 +1276,11 @@ pub async fn plan_commit_transfer<C: ContentStore + ?Sized>(
 
 /// Plan one page of the transfer of a branch from `base` to `from`.
 ///
-/// The page holds at most `limit` commits of the line, walking down from
-/// `from`. Its `merged` holds the commits that merges among them brought in.
-/// The next page starts at `next` with the same `base`.
+/// The page holds at most `limit` commits, counting its line and the
+/// commits its merges brought in, walking down from `from`. A page always
+/// holds at least one line commit, so paging always advances, and one merge
+/// can therefore carry the page past `limit`. The next page starts at
+/// `next` with the same `base`.
 ///
 /// Returns `None` under the same condition as [`plan_commit_transfer`]. A
 /// page that ends above the base cannot detect it. The page that reaches the
@@ -1299,17 +1300,28 @@ pub async fn plan_commit_transfer_page<C: ContentStore + ?Sized>(
         None => None,
     };
 
-    // Walk the line down to the base, or until the page is full. Collect
-    // merge parents on the way.
+    // Walk the line down to the base, or until the page is full, taking
+    // what each merge brought in as it goes.
     let mut lineage = Vec::new();
-    let mut merge_parents = Vec::new();
+    let mut merged = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // The line as walked so far, and where it continues. The merged-in walk
+    // stops at it. A commit above `from` cannot be an ancestor of a merge at
+    // or below it.
+    let mut line = FirstParentLine::new(from.clone());
+    // What the receiver already holds. The merged-in walk stops at it, so a
+    // branch merged twice sends only the commits it gained since.
+    let mut held = Held::new(base.map(|(base_id, _)| base_id));
     let mut next = Some(from.clone());
     let mut child_t = None;
     // The line commit under this page, and whether the page filled first.
     let mut below = None;
     let mut full = false;
     while let Some(cid) = next.take() {
-        if lineage.len() == limit {
+        // Both lists count toward the page. One merge can bring in a whole
+        // branch, so counting the line alone would not bound the page. A
+        // page always takes one line commit, so paging always advances.
+        if !lineage.is_empty() && lineage.len() + merged.len() >= limit {
             below = Some(cid);
             full = true;
             break;
@@ -1335,55 +1347,98 @@ pub async fn plan_commit_transfer_page<C: ContentStore + ?Sized>(
         }
         child_t = Some(envelope.t);
         let mut parents = envelope.parents.into_iter();
-        next = parents.next();
-        merge_parents.extend(parents);
+        let first_parent = parents.next();
+        line.members.insert(cid.clone());
+        // The merged-in walk loads the line lazily, and may already have
+        // loaded past this commit. Only move that cursor down.
+        if envelope.t < line.lowest_t {
+            line.lowest_t = envelope.t;
+            line.next.clone_from(&first_parent);
+        }
         lineage.push(cid);
+
+        // What this commit's merges brought in. Each commit is emitted after
+        // the parents pushed above it. The history is acyclic, so a parent
+        // already seen has already been emitted, on this page or an earlier
+        // one in this walk.
+        let mut stack: Vec<(ContentId, bool)> =
+            parents.rev().map(|parent| (parent, false)).collect();
+        while let Some((cid, expanded)) = stack.pop() {
+            if expanded {
+                merged.push(cid);
+                continue;
+            }
+            if line.members.contains(&cid) || !seen.insert(cid.clone()) {
+                continue;
+            }
+            if held.contains(store, &cid).await? {
+                continue;
+            }
+            let envelope = load_commit_envelope_by_id(store, &cid).await?;
+            if line.contains(store, &cid, envelope.t).await? {
+                continue;
+            }
+            stack.push((cid, true));
+            stack.extend(envelope.parents.into_iter().map(|parent| (parent, false)));
+        }
+
+        next = first_parent;
         if next.is_none() && base.is_some() {
             // The line reached genesis without meeting the base.
             return Ok(None);
         }
     }
     lineage.reverse();
-    let next_page = below
-        .clone()
-        .filter(|cid| full && base.is_none_or(|(base_id, _)| cid != base_id));
-
-    // The merged-in walk stops at the first-parent line of `from`. A commit
-    // above `from` cannot be an ancestor of a merge at or below it.
-    let mut line = FirstParentLine {
-        members: lineage.iter().cloned().collect(),
-        next: below,
-        lowest_t: child_t.unwrap_or(i64::MAX),
-    };
-    let mut merged = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    // Each commit is emitted after the parents pushed above it. The history
-    // is acyclic. A parent already seen has already been emitted.
-    let mut stack: Vec<(ContentId, bool)> = merge_parents
-        .into_iter()
-        .rev()
-        .map(|cid| (cid, false))
-        .collect();
-    while let Some((cid, expanded)) = stack.pop() {
-        if expanded {
-            merged.push(cid);
-            continue;
-        }
-        if line.members.contains(&cid) || !seen.insert(cid.clone()) {
-            continue;
-        }
-        let envelope = load_commit_envelope_by_id(store, &cid).await?;
-        if line.contains(store, &cid, envelope.t).await? {
-            continue;
-        }
-        stack.push((cid, true));
-        stack.extend(envelope.parents.into_iter().map(|parent| (parent, false)));
-    }
+    let next_page = below.filter(|cid| full && base.is_none_or(|(base_id, _)| cid != base_id));
 
     Ok(Some(CommitTransferPage {
         plan: CommitTransferPlan { lineage, merged },
         next: next_page,
     }))
+}
+
+/// The commits reachable from a base, through every parent. These are the
+/// commits a receiver at that base already holds.
+///
+/// The walk runs only as far as a query needs. A commit the base reaches is
+/// usually found early, because a merge's commits sit near the branch's head.
+/// A commit it does not reach exhausts the walk, which then answers the rest
+/// of the page from memory.
+struct Held {
+    members: std::collections::HashSet<ContentId>,
+    frontier: Vec<ContentId>,
+}
+
+impl Held {
+    /// The commits `base` reaches. Nothing is reachable from no base.
+    fn new(base: Option<&ContentId>) -> Self {
+        Self {
+            members: std::collections::HashSet::new(),
+            frontier: base.into_iter().cloned().collect(),
+        }
+    }
+
+    /// Whether the base reaches commit `cid`.
+    async fn contains<C: ContentStore + ?Sized>(
+        &mut self,
+        store: &C,
+        cid: &ContentId,
+    ) -> Result<bool> {
+        if self.members.contains(cid) {
+            return Ok(true);
+        }
+        while let Some(next) = self.frontier.pop() {
+            if !self.members.insert(next.clone()) {
+                continue;
+            }
+            let envelope = load_commit_envelope_by_id(store, &next).await?;
+            self.frontier.extend(envelope.parents);
+            if next == *cid {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// A first-parent line. Its members are loaded only as deep as a query needs.
@@ -2200,6 +2255,84 @@ mod tests {
             outcome = page.map(|p| p.plan);
         }
         assert_eq!(outcome, None);
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn plan_commit_transfer_page_counts_merged_commits() {
+        // main:    m1 <- m2 <- m3 <- m4 <- m5
+        // feature:  \- f2 <- f3 <- f4 <- f5 <- f6 -/
+        // The receiver has m2. The merge brings in five commits.
+        let store = MemoryContentStore::new();
+        let main = store_chain(&store, 1, 3, None, 1).await;
+        let feature = store_chain(&store, 2, 5, Some(main[0].clone()), 2).await;
+        let m4 = store_merge(&store, 4, vec![main[2].clone(), feature[4].clone()], 1).await;
+        let m5 = store_chain(&store, 5, 1, Some(m4.clone()), 1).await[0].clone();
+
+        // The page stops at the merge, which alone is over the limit.
+        let page = plan_commit_transfer_page(&store, &m5, Some(&main[1]), 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.plan.lineage, vec![m4.clone(), m5.clone()]);
+        assert_eq!(page.plan.merged, feature);
+        assert_eq!(page.next, Some(main[2].clone()));
+
+        // Paging advances from there.
+        let page = plan_commit_transfer_page(&store, &main[2], Some(&main[1]), 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.plan.lineage, vec![main[2].clone()]);
+        assert!(page.plan.merged.is_empty());
+        assert_eq!(page.next, None);
+
+        // A page holds its line commit whatever the merge brings in.
+        let page = plan_commit_transfer_page(&store, &m4, Some(&main[2]), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.plan.lineage, vec![m4]);
+        assert_eq!(page.plan.merged, feature);
+        assert_eq!(page.next, None);
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn plan_commit_transfer_skips_what_an_earlier_merge_sent() {
+        // main: m1 <- m2 <- m3 <- m4
+        // x:     \- x2 <- x3 -/     \- x4 <- x5 -/
+        // m2 merges x at x3, m4 merges it again at x5.
+        let store = MemoryContentStore::new();
+        let m1 = store_chain(&store, 1, 1, None, 1).await[0].clone();
+        let x = store_chain(&store, 2, 2, Some(m1.clone()), 2).await;
+        let m2 = store_merge(&store, 2, vec![m1, x[1].clone()], 1).await;
+        let m3 = store_chain(&store, 3, 1, Some(m2.clone()), 1).await[0].clone();
+        let x_later = store_chain(&store, 4, 2, Some(x[1].clone()), 2).await;
+        let m4 = store_merge(&store, 4, vec![m3.clone(), x_later[1].clone()], 1).await;
+
+        // The receiver has the first merge, so it has x up to x3.
+        let plan = plan_commit_transfer(&store, &m4, Some(&m2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.lineage, vec![m3.clone(), m4.clone()]);
+        assert_eq!(plan.merged, x_later);
+
+        // Same from a base above the first merge.
+        let plan = plan_commit_transfer(&store, &m4, Some(&m3))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.lineage, vec![m4.clone()]);
+        assert_eq!(plan.merged, x_later);
+
+        // A receiver with nothing gets both merges' commits.
+        let plan = plan_commit_transfer(&store, &m4, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.merged, [x, x_later].concat());
     }
 
     #[cfg(feature = "credential")]

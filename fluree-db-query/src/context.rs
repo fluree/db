@@ -1059,6 +1059,19 @@ impl<'a> ExecutionContext<'a> {
         self.multi_ledger
     }
 
+    /// Whether this is a history-range query over `[from_t, to_t]`.
+    ///
+    /// Equivalent to the plan's `TemporalMode::History`: both are derived
+    /// from the same `history_time_range()` at the dataset layer, and nothing
+    /// else sets `from_t`. Fast paths that read current leaflet state and
+    /// emit one row per fact must decline here — a history range needs every
+    /// assert and retract event in the window with its `t` and `op`, which
+    /// only the scan's history mode produces.
+    #[inline]
+    pub fn is_history_range(&self) -> bool {
+        self.from_t.is_some()
+    }
+
     /// Compute the multi-ledger flag from dataset + active_graph state.
     ///
     /// A dataset wrapper alone is not enough: single-ledger `FROM` queries

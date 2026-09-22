@@ -51,7 +51,9 @@ pub use commit::{
     MAX_TXN_META_ENTRIES,
 };
 pub use commit_flakes::{
-    generate_commit_flakes, iso_to_epoch_ms_opt, stamp_graph_on_commit_flakes,
+    drop_forged_commit_flakes, generate_commit_flakes, iso_to_epoch_ms_opt,
+    stamp_commit_flakes_dropping_forgeries, stamp_graph_on_commit_flakes,
+    warn_if_forged_commit_flakes_dropped,
 };
 pub use delta::{
     compute_delta_keys_and_changes, delta_keys_and_changes_of, delta_keys_of, FactKey,

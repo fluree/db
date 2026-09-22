@@ -34,7 +34,10 @@ use fluree_db_core::{RangeMatch, RangeOptions, RangeTest, Storage};
 use fluree_db_core::{CODEC_FLUREE_COMMIT, CODEC_FLUREE_TXN};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, NsRecordSnapshot, RefKind, RefValue};
-use fluree_db_novelty::{generate_commit_flakes, stamp_graph_on_commit_flakes, Novelty};
+use fluree_db_novelty::{
+    drop_forged_commit_flakes, generate_commit_flakes, stamp_graph_on_commit_flakes,
+    warn_if_forged_commit_flakes_dropped, Novelty,
+};
 use fluree_db_policy::PolicyContext;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -560,11 +563,20 @@ impl Fluree {
             }
 
             // 4.5 Advance evolving novelty with this commit's flakes + derived metadata flakes.
+            //
+            // These commits come from a peer, so the blob's flakes are screened
+            // before they reach novelty: a flake claiming commit provenance
+            // cannot have come from any legitimate writer, since genuine commit
+            // records are derived from the envelope just below and never ride
+            // the flake stream. Without this an ingested ledger serves forged
+            // commit records until it is indexed (#1846).
             let mut all_flakes = c.commit.flakes.clone();
             let mut meta_flakes =
                 generate_commit_flakes(&c.commit, base_state.ledger_id(), c.commit.t);
             let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base_state.ledger_id());
             if let Some(g_sid) = base_state.snapshot.encode_iri(&txn_meta_iri) {
+                let dropped = drop_forged_commit_flakes(&mut all_flakes, &g_sid);
+                warn_if_forged_commit_flakes_dropped(dropped, base_state.ledger_id(), c.commit.t);
                 stamp_graph_on_commit_flakes(&mut meta_flakes, &g_sid);
             }
             all_flakes.extend(meta_flakes);
@@ -1760,8 +1772,8 @@ async fn read_export_commits(
     Ok(out)
 }
 
-/// One page of a `lineage` export: up to `limit` commits of the first-parent
-/// line, plus the commits their merges brought in.
+/// One page of a `lineage` export: commits of the first-parent line, plus the
+/// commits their merges brought in. `limit` counts both.
 async fn export_lineage_page(
     store: &dyn fluree_db_core::ContentStore,
     from: &ContentId,
@@ -2497,10 +2509,19 @@ impl Fluree {
         let all_flakes: Vec<(i64, Vec<Flake>)> = decoded
             .iter()
             .map(|c| {
+                // Pushed commits come from a peer; screen the blob's flakes for
+                // impersonated commit provenance before they reach novelty. See
+                // the note on the clone path above and #1846.
                 let mut flakes = c.commit.flakes.clone();
                 let mut meta_flakes =
                     generate_commit_flakes(&c.commit, base_state.ledger_id(), c.commit.t);
                 if let Some(ref g_sid) = txn_meta_g_sid {
+                    let dropped = drop_forged_commit_flakes(&mut flakes, g_sid);
+                    warn_if_forged_commit_flakes_dropped(
+                        dropped,
+                        base_state.ledger_id(),
+                        c.commit.t,
+                    );
                     stamp_graph_on_commit_flakes(&mut meta_flakes, g_sid);
                 }
                 flakes.extend(meta_flakes);

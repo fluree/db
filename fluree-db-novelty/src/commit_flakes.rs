@@ -41,6 +41,101 @@ pub fn stamp_graph_on_commit_flakes(flakes: &mut [Flake], graph_sid: &Sid) {
     }
 }
 
+/// Is this flake a blob-carried impersonation of commit provenance?
+///
+/// True only for the conjunction of two things that cannot legitimately
+/// co-occur: the flake already carries the ledger's txn-meta graph Sid, *and*
+/// its subject is in the `FLUREE_COMMIT` namespace — i.e. it claims to be a
+/// commit record.
+///
+/// Genuine commit records are never carried in a commit blob. They are
+/// regenerated from the envelope on every load by [`generate_commit_flakes`],
+/// which builds them with `g: None`, and only then acquire the txn-meta Sid
+/// from [`stamp_graph_on_commit_flakes`]. User-supplied transaction metadata
+/// rides the envelope's separate `txn_meta` field, not the flake stream. So a
+/// flake that arrives from the blob *already* stamped and *already* claiming
+/// commit identity is forged by construction.
+///
+/// Deliberately narrower than "any reserved-graph flake in the blob". The
+/// config graph (g_id 2) is the opposite case — ordinary transactions may
+/// write ledger configuration, those flakes legitimately ride the blob body,
+/// and novelty tracks a config watermark off exactly that — so config is never
+/// touched here. It is also narrower than "any txn-meta flake": only a flake
+/// impersonating a commit *record* can steer the commit resolvers, and
+/// restricting to that keeps the check symmetric with the stamp above.
+#[inline]
+fn is_forged_commit_flake(flake: &Flake, txn_meta_graph_sid: &Sid) -> bool {
+    flake.s.namespace_code == FLUREE_COMMIT
+        && flake.g.as_ref().is_some_and(|g| g == txn_meta_graph_sid)
+}
+
+/// Stamp generated commit metadata and drop blob-carried forgeries, in one
+/// pass.
+///
+/// A drop-in replacement for [`stamp_graph_on_commit_flakes`] at sites that
+/// replay a commit's *blob* flakes alongside freshly generated metadata. Both
+/// jobs key off the same `FLUREE_COMMIT` subject test, so doing them together
+/// costs one traversal rather than two — the non-commit flakes that make up
+/// essentially all of a ledger pay a single `u16` comparison, exactly as they
+/// did under the stamp alone.
+///
+/// Order matters: a forgery must be recognised *before* anything is stamped.
+/// At this point generated metadata still has `g: None`, so the two are
+/// distinguishable; afterwards they are not.
+///
+/// Returns the number of forged flakes dropped, for logging.
+pub fn stamp_commit_flakes_dropping_forgeries(
+    flakes: &mut Vec<Flake>,
+    txn_meta_graph_sid: &Sid,
+) -> usize {
+    let mut dropped = 0usize;
+    flakes.retain_mut(|flake| {
+        if flake.s.namespace_code != FLUREE_COMMIT {
+            return true;
+        }
+        match &flake.g {
+            // Generated this load, not yet routed: stamp it.
+            None => {
+                flake.g = Some(txn_meta_graph_sid.clone());
+                true
+            }
+            // Arrived from the blob already claiming commit provenance.
+            Some(g) if g == txn_meta_graph_sid => {
+                dropped += 1;
+                false
+            }
+            // A commit-namespace subject in some other graph is ordinary data.
+            Some(_) => true,
+        }
+    });
+    dropped
+}
+
+/// Drop blob-carried commit-provenance forgeries, without stamping.
+///
+/// For sites that keep a commit's blob flakes in a separate vector from the
+/// metadata they generate, so the stamping pass never sees the blob flakes.
+/// Returns the number dropped.
+pub fn drop_forged_commit_flakes(flakes: &mut Vec<Flake>, txn_meta_graph_sid: &Sid) -> usize {
+    let before = flakes.len();
+    flakes.retain(|flake| !is_forged_commit_flake(flake, txn_meta_graph_sid));
+    before - flakes.len()
+}
+
+/// Emit the one warning a dropped forgery deserves, if any were dropped.
+pub fn warn_if_forged_commit_flakes_dropped(dropped: usize, ledger_id: &str, t: i64) {
+    if dropped > 0 {
+        tracing::warn!(
+            ledger_id,
+            t,
+            dropped,
+            "commit carries flakes impersonating commit provenance in the \
+             txn-meta graph; dropping them. Genuine commit records are derived \
+             from the commit envelope, never carried in the flake stream."
+        );
+    }
+}
+
 /// Parse ISO-8601 timestamp to epoch milliseconds.
 pub fn iso_to_epoch_ms_opt(iso: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(iso)

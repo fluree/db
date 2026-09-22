@@ -256,3 +256,10 @@ path = "tests/telemetry_test.rs"
 [[test]]
 name = "multi_query_tracing_integration"
 path = "tests/multi_query_tracing_integration.rs"
+
+# Standalone for the same reason: it sets `FLUREE_EXPORT_ANNOTATION_SCAN` to
+# select the export's fallback annotation source, and an env var is
+# process-global while the assertions around it are per-test.
+[[test]]
+name = "export_scan_source"
+path = "tests/export_scan_source.rs"

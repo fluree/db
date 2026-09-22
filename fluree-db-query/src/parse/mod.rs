@@ -1792,8 +1792,11 @@ mod tests {
 
         // query.patterns now contains Pattern, not TriplePattern
         if let crate::ir::Pattern::Triple(tp) = &query.patterns[0] {
-            // Predicate IRI is lowered to Ref::Iri for deferred encoding
-            assert_eq!(tp.p.as_iri(), Some("http://example.org/name"));
+            // The registered prefix encodes at lowering, as SPARQL does.
+            assert_eq!(
+                tp.p.as_sid().map(|s| (s.namespace_code, &*s.name)),
+                Some((100, "name"))
+            );
         } else {
             panic!("Expected Pattern::Triple");
         }

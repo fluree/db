@@ -1044,10 +1044,11 @@ pub enum Commands {
         /// or ledger (`.flpack` archive — full ledger including commits and
         /// indexes, importable via `fluree create --from <file>.flpack`).
         ///
-        /// Note: exporting all graphs requires a dataset-capable format
+        /// Defaults to `turtle`, or to `ledger` when `-o` names a `.flpack`
+        /// file. Exporting all graphs requires a dataset-capable format
         /// (`trig` or `nquads`).
-        #[arg(long, default_value = "turtle")]
-        format: String,
+        #[arg(long)]
+        format: Option<String>,
 
         /// Write output to FILE instead of stdout. Required for --format ledger
         /// when stdout is a TTY (the archive is binary).
@@ -1059,17 +1060,35 @@ pub enum Commands {
         #[arg(long)]
         no_indexes: bool,
 
-        /// Export all named graphs (dataset export), including system graphs.
+        /// Export the default graph plus every named graph (dataset export).
         ///
         /// Use `--format trig` or `--format nquads` when this flag is set.
+        /// The ledger's own system graphs (`#txn-meta`, `#config`) are
+        /// excluded; see `--system-graphs`.
         #[arg(long)]
         all_graphs: bool,
+
+        /// Also emit the ledger's system graphs (`#txn-meta`, `#config`)
+        /// under `--all-graphs`. Diagnostic only — the result is named for
+        /// this ledger and does not re-import cleanly anywhere. Use
+        /// `--format ledger` to move a ledger.
+        #[arg(long, requires = "all_graphs")]
+        system_graphs: bool,
 
         /// Export a specific named graph by IRI.
         ///
         /// Mutually exclusive with `--all-graphs`.
         #[arg(long)]
         graph: Option<String>,
+
+        /// Emit edge annotations as raw `f:reifies*` system triples instead of
+        /// RDF 1.2 annotation syntax — the output of every release before 4.2.
+        ///
+        /// For consumers pinned to those bytes. Fluree's own write surfaces
+        /// reject hand-written `f:reifies*` triples, so this output only
+        /// re-imports through `fluree create --from`.
+        #[arg(long)]
+        raw_reifies: bool,
 
         /// JSON-LD context for prefix declarations (overrides ledger default).
         ///

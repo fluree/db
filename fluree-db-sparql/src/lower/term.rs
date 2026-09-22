@@ -77,10 +77,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     // other labels are non-distinguished variables per spec.
                     if label.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
                         let full_iri = format!("_:{label}");
-                        return Ok(match self.encoder.encode_iri_strict(&full_iri) {
-                            Some(sid) => Ref::Sid(sid),
-                            None => Ref::Iri(Arc::from(full_iri)),
-                        });
+                        return Ok(self.encoder.encode_ref(&full_iri));
                     }
                     let var_id = self.vars.get_or_insert(&format!("_:{label}"));
                     Ok(Ref::Var(var_id))
@@ -139,10 +136,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     // (see lower_subject).
                     if label.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
                         let full_iri = format!("_:{label}");
-                        return Ok(match self.encoder.encode_iri_strict(&full_iri) {
-                            Some(sid) => Term::Sid(sid),
-                            None => Term::Iri(Arc::from(full_iri)),
-                        });
+                        return Ok(self.encoder.encode_term(&full_iri));
                     }
                     let var_id = self.vars.get_or_insert(&format!("_:{label}"));
                     Ok(Term::Var(var_id))
@@ -290,20 +284,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
     pub(super) fn lower_iri(&mut self, iri: &Iri) -> Result<Term> {
         let full_iri = self.expand_iri(iri)?;
-        if let Some(sid) = self.encoder.encode_iri_strict(&full_iri) {
-            Ok(Term::Sid(sid))
-        } else {
-            Ok(Term::Iri(Arc::from(full_iri)))
-        }
+        Ok(self.encoder.encode_term(&full_iri))
     }
 
     pub(super) fn lower_iri_ref(&mut self, iri: &Iri) -> Result<Ref> {
         let full_iri = self.expand_iri(iri)?;
-        if let Some(sid) = self.encoder.encode_iri_strict(&full_iri) {
-            Ok(Ref::Sid(sid))
-        } else {
-            Ok(Ref::Iri(Arc::from(full_iri)))
-        }
+        Ok(self.encoder.encode_ref(&full_iri))
     }
 
     fn lower_literal(&self, lit: &Literal) -> Result<Term> {

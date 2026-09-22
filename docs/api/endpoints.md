@@ -451,6 +451,14 @@ The fields of `POST /push/*ledger`, plus:
 
 The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit. A push that carries any other commit is refused with `422`.
 
+A sender leaves out the commits the receiver's head already reaches, so merging the same branch twice sends only what that branch gained in between. The parent rule still holds, because a commit the receiver has means the receiver has everything behind it.
+
+**Trust model:**
+
+The chain's own commits are staged under policy and SHACL, as a transaction would be. Merged commits are stored as history and never replayed, so neither check runs on them. What a merge brings into a branch's state travels in the merge commit, which is validated against the state it lands on, so everything the ledger's state holds has been checked.
+
+The merged commits themselves are history. They are readable through views such as `GET /show/*ledger`, which applies the caller's policy to what it returns, and no path that builds a branch's state reads them. `POST /branch` refuses `--at` on a commit that reached the branch through a merge, for the same reason.
+
 **Why a separate endpoint:**
 
 A server predating this endpoint answers `404`. Given the same body on `POST /push`, that server would accept the push and drop `merged_commits`. It would then store merge commits without their parents. Servers that implement this endpoint advertise it in discovery with `"push": {"merged_commits": true}`.
@@ -585,7 +593,7 @@ GET /commits/<ledger...>?limit=100&cursor_id=<cid>
 
 **Query Parameters:**
 
-- `limit` (optional): Max commits per page (default 100, server clamps to max 500)
+- `limit` (optional): Max commits per page (default 100, server clamps to max 500). In lineage mode it counts `merged_commits` too.
 - `cursor_id` (optional): Commit CID cursor for pagination. Omit for first page (starts from head). Use `next_cursor_id` from the previous response for subsequent pages.
 - `lineage` (optional): `true` selects lineage mode, described below. Defaults to `false`.
 - `base_id` (optional, lineage mode only): the client's head. The export stops above it. Omit it to export down to genesis.
@@ -628,7 +636,9 @@ By default, pages walk every parent of every commit. A history containing a merg
 
 With `lineage=true`, `commits` holds only the branch's first-parent line. `merged_commits` holds the commits its merges brought in, as in [`POST /push-merges/*ledger`](#post-push-mergesledger). `next_cursor_id` is the next commit on the line. A commit that merges on two pages brought in appears on both pages.
 
-- With `base_id`, the export stops above that commit. `next_cursor_id` is `null` on the page that reaches it.
+`limit` counts both lists together, so a merge's commits are bounded too. A page always holds at least one line commit, so paging always advances. One merge can therefore carry a page past `limit`.
+
+- With `base_id`, the export stops above that commit. `next_cursor_id` is `null` on the page that reaches it. `merged_commits` leaves out what `base_id` already reaches, so pulling after a second merge of the same branch carries only what it gained in between.
 - A `base_id` that is not on the branch's first-parent line returns `409`. The histories have diverged.
 
 The mode is opt-in, so a client that does not request it keeps the default format. A server predating it ignores the parameters and returns the default format without `lineage`. That is how a client tells the two apart.

@@ -33,7 +33,7 @@ fluree branch create <NAME> [OPTIONS]
 
 Creates a new branch for a ledger. By default the branch starts at the source branch's current HEAD, and is fully isolated — subsequent transactions on either branch are invisible to the other.
 
-Pass `--at` to branch from a historical commit on the source branch instead of its HEAD. The commit must be reachable from the source HEAD; the new branch starts with no index and replays from genesis on first query. `t:N` and hex-prefix resolution require the source branch to be indexed (full CIDs work unconditionally).
+Pass `--at` to branch from a historical commit on the source branch instead of its HEAD. The commit must be on the source branch's line of commits, which runs through its fork point into the branch it came from. A commit that reached the branch through a merge is refused: the branch never replays it, because what the merge contributed is folded into the merge commit. Branch at the merge commit instead, or on the branch that made the commit. The new branch starts with no index and replays from genesis on first query. `t:N` and hex-prefix resolution require the source branch to be indexed (full CIDs work unconditionally).
 
 Branches can be nested: you can create a branch from any existing branch, not just "main".
 

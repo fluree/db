@@ -553,7 +553,39 @@ mod inner {
         // Only new mappings (introduced by this commit) go into graph_delta.
         let mut graph_delta: HashMap<u16, String> = HashMap::new();
 
+        // Reserved system graphs are refused HERE because bulk import bypasses
+        // staging entirely: #1838's data-write guard lives in `stage()`
+        // (`stage.rs`, `ReservedGraphTarget`) and never sees these blocks. The
+        // parser assumes otherwise -- `parse/trig_meta.rs` notes "a write to the
+        // ledger's full txn-meta IRI is refused in `stage()`" -- which holds for
+        // every write surface except this one.
+        //
+        // Without the guard the flakes are encoded into the commit blob under
+        // the reserved g_id and then dropped by the graph-scoped index builder,
+        // which builds g_id 1 only from the synthetic commit-metadata chunk and
+        // has no pass for g_id 2 at all. The result is durable-but-unreadable
+        // data on an indexed ledger and, worse, *readable* forged commit
+        // provenance on a replica that has not indexed yet (issue #1846).
+        //
+        // The `<#txn-meta>` sentinel spelling is a different thing and stays
+        // supported: `parse_trig_phase1` routes it to `raw_meta`, so legitimate
+        // commit metadata never reaches this loop.
+        let txn_meta_iri = fluree_db_core::graph_registry::txn_meta_graph_iri(ledger_id);
+        let config_iri = fluree_db_core::graph_registry::config_graph_iri(ledger_id);
+
         for block in &phase1.named_graphs {
+            // Refuse by literal IRI, mirroring the staged-write guard's shape.
+            if block.iri == txn_meta_iri {
+                return Err(TransactError::ReservedGraphTarget {
+                    graph_iri: block.iri.clone(),
+                });
+            }
+            if block.iri == config_iri {
+                return Err(TransactError::ConfigGraphImportUnsupported {
+                    graph_iri: block.iri.clone(),
+                });
+            }
+
             // Allocate or reuse g_id for this graph IRI.
             //
             // When spooling (index build) is active, allocate from the shared
@@ -577,6 +609,23 @@ mod inner {
                 graph_delta.insert(id, block.iri.clone());
                 id
             };
+
+            // Second arm, mirroring `stage.rs`: refuse by what the IRI actually
+            // *routes to*, not only by how it is spelled. The shared graph
+            // allocator is pre-seeded with the two reserved IRIs, so this is
+            // belt-and-braces today; it is what keeps the guard correct if the
+            // seeding ever changes. One integer compare per graph block.
+            if g_id < fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID {
+                return Err(if g_id == fluree_db_core::graph_registry::CONFIG_GRAPH_ID {
+                    TransactError::ConfigGraphImportUnsupported {
+                        graph_iri: block.iri.clone(),
+                    }
+                } else {
+                    TransactError::ReservedGraphTarget {
+                        graph_iri: block.iri.clone(),
+                    }
+                });
+            }
 
             // Create a graph Sid (using the graph IRI's namespace + local name)
             let graph_sid = worker_cache.sid_for_iri(&block.iri);
