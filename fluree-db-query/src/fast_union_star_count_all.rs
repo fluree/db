@@ -32,8 +32,8 @@ use crate::fast_path_common::{
     build_count_batch, build_overlay_cursor_for_subject_range, build_psot_cursor_for_predicate,
     cached_overlay_ops, count_predicate_overlay_delta, count_rows_for_predicate_psot, count_to_i64,
     cursor_projection_sid_only, cursor_projection_sid_otype_okey, leaf_entries_for_predicate,
-    normalize_pred_sid, slice_overlay_ops_by_subject, CursorSubjectCountStream,
-    PsotSubjectCountIter, SharedOverlayOps,
+    normalize_pred_sid, slice_overlay_ops_by_subject, CursorSubjectCountStream, GroupStream,
+    InnerMergeHeads, PsotSubjectCountIter, SharedOverlayOps, UnionMergeHeads,
 };
 use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -259,91 +259,91 @@ impl SubjectSelfLoopCountStreamV6 {
     }
 }
 
-// These helpers return once per subject group. Keep their success slots small
-// without changing QueryError's layout for every other query operator. An error
-// allocates only on the exceptional path and is unboxed at the partition boundary.
-type GroupResult = std::result::Result<Option<(u64, u64)>, Box<QueryError>>;
-
-/// A `(subject, count)` group stream in ascending subject order — either the base
-/// metadata iterator (HEAD) or the overlay-merging cursor stream (novelty/time
-/// travel). Lets the union/extra merge helpers serve both lanes.
-trait SubjectCountGroups {
-    fn next_subject_group(&mut self) -> GroupResult;
-}
-impl SubjectCountGroups for PsotSubjectCountIter<'_> {
+impl GroupStream for SubjectSelfLoopCountStreamV6 {
     #[inline]
-    fn next_subject_group(&mut self) -> GroupResult {
-        self.next_group().map_err(Box::new)
-    }
-}
-impl SubjectCountGroups for CursorSubjectCountStream {
-    #[inline]
-    fn next_subject_group(&mut self) -> GroupResult {
-        self.next_group().map_err(Box::new)
+    fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        SubjectSelfLoopCountStreamV6::next_group(self)
     }
 }
 
-/// Min-merge over union-branch iterators: returns `(s_min, Σ counts at s_min)` and
-/// advances the iterators at `s_min`. Bag semantics — a subject under multiple
-/// branches sums their counts.
-fn next_union_group<T: SubjectCountGroups>(
-    iters: &mut [T],
-    cur: &mut [Option<(u64, u64)>],
-) -> GroupResult {
-    if cur.iter().all(std::option::Option::is_none) {
-        return Ok(None);
+/// Subjects present in ALL constraint (extra) streams, each with the product of
+/// its counts; subjects missing from any constraint predicate are skipped.
+struct ExtraMatches {
+    /// `None` once a stream has run out: no further subject can be in all of them.
+    heads: Option<InnerMergeHeads>,
+    key: u64,
+    product: u64,
+}
+
+impl ExtraMatches {
+    fn prime<S: GroupStream>(streams: &mut [S]) -> Result<Self> {
+        Ok(Self {
+            heads: InnerMergeHeads::prime(streams)?,
+            key: 0,
+            product: 0,
+        })
     }
-    let s_min = cur.iter().filter_map(|c| c.map(|(s, _)| s)).min().unwrap();
-    let mut sum: u64 = 0;
-    for (i, it) in iters.iter_mut().enumerate() {
-        if let Some((s, n)) = cur[i] {
-            if s == s_min {
-                sum = sum.saturating_add(n);
-                cur[i] = it.next_subject_group()?;
+
+    /// Take the next subject in every stream into `key` / `product`. `false`
+    /// when there is none.
+    #[inline(always)]
+    fn next<S: GroupStream>(&mut self, streams: &mut [S]) -> Result<bool> {
+        loop {
+            let Some(heads) = self.heads.as_mut() else {
+                return Ok(false);
+            };
+            let aligned = heads.aligned();
+            if aligned {
+                self.key = heads.key();
+                self.product = heads.count_product().min(u64::MAX as u128) as u64;
+            }
+            if !heads.advance(streams)? {
+                self.heads = None;
+            }
+            if aligned {
+                return Ok(true);
             }
         }
     }
-    Ok(Some((s_min, sum)))
 }
 
-/// Max-merge over the constraint (extra) iterators: returns the next subject present
-/// in ALL of them with the product of their counts; subjects missing from any
-/// constraint predicate are skipped.
-fn next_extra_product_group<T: SubjectCountGroups>(
-    iters: &mut [T],
-    cur: &mut [Option<(u64, u64)>],
-) -> GroupResult {
-    loop {
-        if cur.iter().any(std::option::Option::is_none) {
-            return Ok(None);
-        }
-        let target = cur.iter().filter_map(|c| c.map(|(s, _)| s)).max().unwrap();
-        let mut advanced = false;
-        for (i, it) in iters.iter_mut().enumerate() {
-            while let Some((s, _)) = cur[i] {
-                if s < target {
-                    cur[i] = it.next_subject_group()?;
-                    advanced = true;
-                    if cur[i].is_none() {
-                        return Ok(None);
-                    }
-                } else {
-                    break;
+/// `Σ_s (Σ_b count_b(s)) × (Π_e count_e(s))` over subjects in any union branch
+/// AND all extra streams, keeping only subjects `owned` by the caller's range.
+#[inline(always)]
+fn count_union_with_extras<U: GroupStream, E: GroupStream>(
+    union_streams: &mut [U],
+    extra_streams: &mut [E],
+    owned: impl Fn(u64) -> bool,
+) -> Result<u128> {
+    let mut union = UnionMergeHeads::prime(union_streams)?;
+    let mut extra = ExtraMatches::prime(extra_streams)?;
+    let mut total: u128 = 0;
+    let mut more = union.next(union_streams)? && extra.next(extra_streams)?;
+    while more {
+        let (us, es) = (union.key(), extra.key);
+        more = match us.cmp(&es) {
+            std::cmp::Ordering::Less => union.next(union_streams)?,
+            std::cmp::Ordering::Greater => extra.next(extra_streams)?,
+            std::cmp::Ordering::Equal => {
+                if owned(us) {
+                    let rows = (union.count_sum() as u128).saturating_mul(extra.product as u128);
+                    total = total.saturating_add(rows);
                 }
+                union.next(union_streams)? && extra.next(extra_streams)?
             }
-        }
-        if advanced {
-            continue;
-        }
-        let mut prod: u64 = 1;
-        for c in cur.iter() {
-            prod = prod.saturating_mul(c.unwrap().1);
-        }
-        for (i, it) in iters.iter_mut().enumerate() {
-            cur[i] = it.next_subject_group()?;
-        }
-        return Ok(Some((target, prod)));
+        };
     }
+    Ok(total)
+}
+
+/// `Σ_s Σ_b count_b(s)`: the union's row count with no constraint streams.
+fn sum_union<U: GroupStream>(union_streams: &mut [U]) -> Result<u64> {
+    let mut union = UnionMergeHeads::prime(union_streams)?;
+    let mut total: u64 = 0;
+    while union.next(union_streams)? {
+        total = total.saturating_add(union.count_sum());
+    }
+    Ok(total)
 }
 
 /// Per-partition partial for `(UNION of union_pids) ⋈ (AND of extra_pids)` COUNT(*)
@@ -365,10 +365,6 @@ fn merge_union_constraint_count_range(
                 .with_cancellation(cancellation),
         );
     }
-    let mut u_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(u_iters.len());
-    for it in &mut u_iters {
-        u_cur.push(it.next_group()?);
-    }
     let mut e_iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(extra_pids.len());
     for &p in extra_pids {
         e_iters.push(
@@ -376,28 +372,7 @@ fn merge_union_constraint_count_range(
                 .with_cancellation(cancellation),
         );
     }
-    let mut e_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(e_iters.len());
-    for it in &mut e_iters {
-        e_cur.push(it.next_group()?);
-    }
-
-    let mut u = next_union_group(&mut u_iters, &mut u_cur).map_err(|err| *err)?;
-    let mut e = next_extra_product_group(&mut e_iters, &mut e_cur).map_err(|err| *err)?;
-    let mut total: u128 = 0;
-    while let (Some((us, usum)), Some((es, eprod))) = (u, e) {
-        if us < es {
-            u = next_union_group(&mut u_iters, &mut u_cur).map_err(|err| *err)?;
-            continue;
-        }
-        if es < us {
-            e = next_extra_product_group(&mut e_iters, &mut e_cur).map_err(|err| *err)?;
-            continue;
-        }
-        total = total.saturating_add((usum as u128).saturating_mul(eprod as u128));
-        u = next_union_group(&mut u_iters, &mut u_cur).map_err(|err| *err)?;
-        e = next_extra_product_group(&mut e_iters, &mut e_cur).map_err(|err| *err)?;
-    }
-    Ok(total)
+    count_union_with_extras(&mut u_iters, &mut e_iters, |_| true)
 }
 
 /// Parallel partitioned constrained-union count. Resolves predicate ids, picks the
@@ -505,10 +480,6 @@ fn merge_union_constraint_count_range_overlay(
         };
         u_streams.push(s);
     }
-    let mut u_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(u_streams.len());
-    for s in &mut u_streams {
-        u_cur.push(s.next_group()?);
-    }
     let mut e_streams: Vec<CursorSubjectCountStream> = Vec::with_capacity(extra_pids.len());
     for (i, &p) in extra_pids.iter().enumerate() {
         let Some(s) = build(p, &extra_ops[i]) else {
@@ -516,30 +487,7 @@ fn merge_union_constraint_count_range_overlay(
         };
         e_streams.push(s);
     }
-    let mut e_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(e_streams.len());
-    for s in &mut e_streams {
-        e_cur.push(s.next_group()?);
-    }
-
-    let mut u = next_union_group(&mut u_streams, &mut u_cur).map_err(|err| *err)?;
-    let mut e = next_extra_product_group(&mut e_streams, &mut e_cur).map_err(|err| *err)?;
-    let mut total: u128 = 0;
-    while let (Some((us, usum)), Some((es, eprod))) = (u, e) {
-        if us < es {
-            u = next_union_group(&mut u_streams, &mut u_cur).map_err(|err| *err)?;
-            continue;
-        }
-        if es < us {
-            e = next_extra_product_group(&mut e_streams, &mut e_cur).map_err(|err| *err)?;
-            continue;
-        }
-        if us >= lo && us < hi {
-            total = total.saturating_add((usum as u128).saturating_mul(eprod as u128));
-        }
-        u = next_union_group(&mut u_streams, &mut u_cur).map_err(|err| *err)?;
-        e = next_extra_product_group(&mut e_streams, &mut e_cur).map_err(|err| *err)?;
-    }
-    Ok(total)
+    count_union_with_extras(&mut u_streams, &mut e_streams, |s| s >= lo && s < hi)
 }
 
 /// Overlay/time-travel parallel constrained-union count: like
@@ -789,73 +737,12 @@ fn count_union_star(
         return Ok(Some(0));
     }
 
-    // Helper: yield next `(s, sum)` for the UNION block.
-    let mut union_curr_all: Vec<Option<(u64, u64)>> = Vec::new();
-    let mut union_curr_eq: Vec<Option<(u64, u64)>> = Vec::new();
-    match mode {
-        UnionCountMode::AllRows => {
-            for s in &mut union_streams_all {
-                union_curr_all.push(s.next_group()?);
-            }
-        }
-        UnionCountMode::SubjectEqObject => {
-            for s in &mut union_streams_eq {
-                union_curr_eq.push(s.next_group()?);
-            }
-        }
-    }
-
-    let mut next_union = || -> Result<Option<(u64, u64)>> {
-        match mode {
-            UnionCountMode::AllRows => {
-                if union_curr_all.iter().all(std::option::Option::is_none) {
-                    return Ok(None);
-                }
-                let s_min = union_curr_all
-                    .iter()
-                    .filter_map(|c| c.map(|(s, _)| s))
-                    .min()
-                    .unwrap();
-                let mut sum = 0u64;
-                for (i, st) in union_streams_all.iter_mut().enumerate() {
-                    if let Some((s, n)) = union_curr_all[i] {
-                        if s == s_min {
-                            sum = sum.saturating_add(n);
-                            union_curr_all[i] = st.next_group()?;
-                        }
-                    }
-                }
-                Ok(Some((s_min, sum)))
-            }
-            UnionCountMode::SubjectEqObject => {
-                if union_curr_eq.iter().all(std::option::Option::is_none) {
-                    return Ok(None);
-                }
-                let s_min = union_curr_eq
-                    .iter()
-                    .filter_map(|c| c.map(|(s, _)| s))
-                    .min()
-                    .unwrap();
-                let mut sum = 0u64;
-                for (i, st) in union_streams_eq.iter_mut().enumerate() {
-                    if let Some((s, n)) = union_curr_eq[i] {
-                        if s == s_min {
-                            sum = sum.saturating_add(n);
-                            union_curr_eq[i] = st.next_group()?;
-                        }
-                    }
-                }
-                Ok(Some((s_min, sum)))
-            }
-        }
-    };
-
     // If no extra predicates, total is just Σ_s union_sum(s).
     if extra_preds.is_empty() {
-        let mut total: u64 = 0;
-        while let Some((_s, u)) = next_union()? {
-            total = total.saturating_add(u);
-        }
+        let total = match mode {
+            UnionCountMode::AllRows => sum_union(&mut union_streams_all)?,
+            UnionCountMode::SubjectEqObject => sum_union(&mut union_streams_eq)?,
+        };
         return Ok(Some(total));
     }
 
@@ -885,97 +772,98 @@ fn count_union_star(
         extra_streams
             .push(CursorSubjectCountStream::new(cursor).with_cancellation(&ctx.cancellation));
     }
-    let mut extra_curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(extra_streams.len());
-    for s in &mut extra_streams {
-        extra_curr.push(s.next_group()?);
-    }
-
-    // Helper: next `(s, product)` for subjects that have all extra predicates.
-    let mut next_extra_product = || -> Result<Option<(u64, u64)>> {
-        loop {
-            if extra_curr.iter().any(std::option::Option::is_none) {
-                return Ok(None);
-            }
-            let target = extra_curr.iter().map(|c| c.unwrap().0).max().unwrap();
-            let mut any_advanced = false;
-            for (i, st) in extra_streams.iter_mut().enumerate() {
-                while let Some((s_id, _)) = extra_curr[i] {
-                    if s_id < target {
-                        extra_curr[i] = st.next_group()?;
-                        any_advanced = true;
-                        if extra_curr[i].is_none() {
-                            return Ok(None);
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
-            if any_advanced {
-                continue;
-            }
-            let s = target;
-            let mut prod: u64 = 1;
-            for c in &extra_curr {
-                prod = prod.saturating_mul(c.unwrap().1);
-            }
-            for (i, st) in extra_streams.iter_mut().enumerate() {
-                extra_curr[i] = st.next_group()?;
-            }
-            return Ok(Some((s, prod)));
+    // Merge-join union_sum(s) with product_extra(s).
+    let total = match mode {
+        UnionCountMode::AllRows => {
+            count_union_with_extras(&mut union_streams_all, &mut extra_streams, |_| true)?
+        }
+        UnionCountMode::SubjectEqObject => {
+            count_union_with_extras(&mut union_streams_eq, &mut extra_streams, |_| true)?
         }
     };
-
-    // Merge-join union_sum(s) with product_extra(s).
-    let mut u_cur = next_union()?;
-    let mut e_cur = next_extra_product()?;
-    let mut total: u128 = 0;
-    while let (Some((us, u)), Some((es, eprod))) = (u_cur, e_cur) {
-        if us < es {
-            u_cur = next_union()?;
-            continue;
-        }
-        if es < us {
-            e_cur = next_extra_product()?;
-            continue;
-        }
-        let add = (u as u128).saturating_mul(eprod as u128);
-        total = total.saturating_add(add);
-        u_cur = next_union()?;
-        e_cur = next_extra_product()?;
-    }
     Ok(Some(total.min(u64::MAX as u128) as u64))
 }
 
 #[cfg(test)]
-mod group_result_tests {
+mod group_merge_tests {
     use super::*;
     use fluree_db_core::storage::residency::{FetchKind, NeedFetch};
     use fluree_db_core::{ContentId, ContentKind};
+    use std::collections::VecDeque;
 
-    struct MissingGroup(Option<QueryError>);
-    impl SubjectCountGroups for MissingGroup {
-        fn next_subject_group(&mut self) -> GroupResult {
-            Err(Box::new(self.0.take().expect("one failing read")))
+    /// Yields its groups, then fails with a typed residency miss if it has one.
+    struct Groups {
+        groups: VecDeque<(u64, u64)>,
+        miss: Option<QueryError>,
+    }
+
+    impl Groups {
+        fn of(groups: &[(u64, u64)]) -> Self {
+            Self {
+                groups: groups.iter().copied().collect(),
+                miss: None,
+            }
+        }
+    }
+
+    impl GroupStream for Groups {
+        fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+            match self.groups.pop_front() {
+                Some(group) => Ok(Some(group)),
+                None => self.miss.take().map_or(Ok(None), Err),
+            }
         }
     }
 
     #[test]
+    fn union_times_extras_counts_bag_union_against_every_constraint() {
+        // Union (bag): s=1 -> 2, s=3 -> 3+4, s=4 -> 5, s=9 -> 1.
+        let mut union = [
+            Groups::of(&[(1, 2), (3, 3), (9, 1)]),
+            Groups::of(&[(3, 4), (4, 5)]),
+        ];
+        // In both constraints: s=3 -> 2*5, s=9 -> 3*7. s=4 is in one only.
+        let mut extras = [
+            Groups::of(&[(3, 2), (4, 1), (9, 3)]),
+            Groups::of(&[(1, 9), (3, 5), (9, 7), (12, 1)]),
+        ];
+        let total = count_union_with_extras(&mut union, &mut extras, |_| true).unwrap();
+        assert_eq!(total, 7 * 10 + 21);
+
+        // A partition owns only its own subjects: drop s=9.
+        let mut union = [
+            Groups::of(&[(1, 2), (3, 3), (9, 1)]),
+            Groups::of(&[(3, 4), (4, 5)]),
+        ];
+        let mut extras = [
+            Groups::of(&[(3, 2), (4, 1), (9, 3)]),
+            Groups::of(&[(1, 9), (3, 5), (9, 7), (12, 1)]),
+        ];
+        let total = count_union_with_extras(&mut union, &mut extras, |s| s < 9).unwrap();
+        assert_eq!(total, 7 * 10);
+
+        let mut union = [Groups::of(&[(1, 2), (3, 3)]), Groups::of(&[(3, 4)])];
+        assert_eq!(sum_union(&mut union).unwrap(), 9);
+    }
+
+    #[test]
     fn group_errors_preserve_typed_residency_misses() {
-        for union in [true, false] {
+        for failing_union in [true, false] {
             let cid = ContentId::new(ContentKind::IndexLeaf, b"missing group leaf");
             let miss = NeedFetch::new(cid.clone(), FetchKind::IndexLeaf);
             let expected = miss.to_string();
-            let error = QueryError::from_io("group leaf", miss.into_io_error());
-            let mut streams = [MissingGroup(Some(error))];
-            let mut current = [Some((7, 2))];
-            let result = if union {
-                next_union_group(&mut streams, &mut current)
-            } else {
-                next_extra_product_group(&mut streams, &mut current)
+            let failing = Groups {
+                groups: VecDeque::from([(7, 2)]),
+                miss: Some(QueryError::from_io("group leaf", miss.into_io_error())),
             };
-            // This is the same conversion performed at the partition boundary.
-            let err = *result.expect_err("the source must fail");
+            let healthy = Groups::of(&[(7, 3), (8, 1)]);
+            let (mut union, mut extras) = if failing_union {
+                ([failing], [healthy])
+            } else {
+                ([healthy], [failing])
+            };
+            let err = count_union_with_extras(&mut union, &mut extras, |_| true)
+                .expect_err("the source must fail");
             assert_eq!(err.to_string(), expected);
             assert!(!err.can_demote_in_expression());
             assert!(!err.demotes_to_unbound_in_extend());
@@ -987,11 +875,5 @@ mod group_result_tests {
                 other => panic!("lost typed residency miss: {other}"),
             }
         }
-    }
-
-    #[test]
-    #[cfg(target_pointer_width = "64")]
-    fn group_results_keep_successful_returns_small() {
-        assert!(std::mem::size_of::<GroupResult>() <= 32);
     }
 }
