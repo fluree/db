@@ -219,7 +219,7 @@ impl Fluree {
     /// genesis context tagged with the graph source ID.
     ///
     /// For sources with a time spec, a graph source reads the pinned table
-    /// state (`@iso:` / `@recorded:` / `@snapshot:`); `@t:` and `@commit:`
+    /// state (`@time:` / `@recorded:` / `@snapshot:`); `@t:` and `@commit:`
     /// are rejected with a clear error.
     ///
     /// If `graph_selector` is set, it is applied after resolution

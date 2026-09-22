@@ -103,16 +103,16 @@
 /// source's current state.
 pub(crate) const GRAPH_SOURCE_LEDGER_TIME_UNSUPPORTED: &str =
     "Graph sources have no transaction numbers or commit hashes. Pin the source's \
-     table state with @iso:<timestamp>, @recorded:<timestamp>, or @snapshot:<id>, \
+     table state with @time:<timestamp>, @recorded:<timestamp>, or @snapshot:<id>, \
      or remove the time specification to query at latest.";
 
 /// Refusal for `@snapshot:` on a native ledger, which has no table snapshots.
 pub(crate) const SNAPSHOT_SPEC_ON_LEDGER: &str =
     "@snapshot: selects a graph source's table snapshot; a ledger is addressed \
-     with @t:, @iso:, @recorded:, or @commit:.";
+     with @t:, @time:, @recorded:, or @commit:.";
 
 /// The table state a time-specified graph-source alias reads, or `None` for
-/// its current state. `@iso:` and `@recorded:` coincide: a table snapshot has
+/// its current state. `@time:` and `@recorded:` coincide: a table snapshot has
 /// one time, the writer's commit time, and no separate event axis (the same
 /// rule as a ledger that never used caller-supplied event times).
 pub(crate) fn source_time_for(

@@ -145,7 +145,7 @@ where
             apply_range_filter(&mut flakes, test, &match_val);
             // Apply RangeOptions semantics for overlay-only path (object bounds, offset, limits).
             //
-            // This matters for time resolution (`@iso:`), which uses `object_bounds`
+            // This matters for time resolution (`@time:`), which uses `object_bounds`
             // and `flake_limit(1)` to efficiently resolve the first flake after a target.
             apply_overlay_only_options(&mut flakes, &opts);
             Ok(flakes)

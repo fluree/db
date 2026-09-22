@@ -13,12 +13,13 @@ pub const DEFAULT_BRANCH: &str = "main";
 pub enum LedgerIdTimeSpec {
     /// @t:<transaction>
     AtT(i64),
-    /// @iso:<timestamp> — resolves against commit *event time* (`db:time`)
+    /// @time:<timestamp> (alias `@iso:`) — resolves against commit *event
+    /// time* (`db:time`)
     AtIso(String),
     /// @commit:<cid>
     AtCommit(String),
     /// @recorded:<timestamp> — resolves against the wall-clock time commits
-    /// were recorded (`db:receivedAt`, audit axis). Identical to `@iso:` on
+    /// were recorded (`db:receivedAt`, audit axis). Identical to `@time:` on
     /// ledgers that never used caller-supplied event times.
     AtRecorded(String),
     /// @snapshot:<id> — a table format's own snapshot identifier. Only a graph
@@ -89,7 +90,8 @@ pub fn format_ledger_id(name: &str, branch: &str) -> String {
     format!("{name}:{branch}")
 }
 
-/// Parse a ledger ID with optional `@t:`, `@iso:`, `@recorded:`, or `@commit:` time-travel suffix.
+/// Parse a ledger ID with optional `@t:`, `@time:`, `@recorded:`, `@commit:`, or
+/// `@snapshot:` time-travel suffix.
 pub fn parse_ledger_id_with_time(ledger_id: &str) -> Result<ParsedLedgerId, LedgerIdParseError> {
     let (base, time) = split_time_travel_suffix(ledger_id)?;
 
@@ -116,14 +118,16 @@ pub const COMMIT_PREFIX_MIN_LEN: usize = 6;
 /// `fluree_db_api::TimeSpec::parse_at`, which also accepts a bare integer and a
 /// bare ISO-8601 timestamp — can tell "the user reached for a canonical tag and
 /// got it wrong" apart from "the user typed one of the bare forms".
-pub const TIME_TRAVEL_TAGS: [&str; 5] = ["t:", "iso:", "commit:", "recorded:", "snapshot:"];
+pub const TIME_TRAVEL_TAGS: [&str; 6] =
+    ["t:", "time:", "iso:", "commit:", "recorded:", "snapshot:"];
 
 /// Parse a time-travel spec: the part of a ledger address after `@`, or a bare
 /// spec such as a CLI `--at` argument.
 ///
-/// Accepts `t:<N>`, `iso:<timestamp>`, `recorded:<timestamp>`,
+/// Accepts `t:<N>`, `time:<timestamp>`, `recorded:<timestamp>`,
 /// `commit:<prefix>` (at least [`COMMIT_PREFIX_MIN_LEN`] characters) and
-/// `snapshot:<id>`. `t:latest` is deliberately *not*
+/// `snapshot:<id>`. `iso:<timestamp>` is the original spelling of `time:` and
+/// stays accepted as an alias. `t:latest` is deliberately *not*
 /// accepted: [`LedgerIdTimeSpec`] has no "latest" variant because resolving one
 /// needs the ledger's current `t`, which this layer does not have. Callers that
 /// support it (`fluree_db_api::TimeSpec::parse`) take it before delegating here.
@@ -146,10 +150,13 @@ pub fn parse_time_travel_spec(
             LedgerIdParseError::new(format!("Invalid integer for {sigil}t: '{val}'"))
         })?;
         Ok(LedgerIdTimeSpec::AtT(t))
-    } else if let Some(val) = spec.strip_prefix("iso:") {
+    } else if let Some((tag, val)) = ["time:", "iso:"]
+        .into_iter()
+        .find_map(|tag| spec.strip_prefix(tag).map(|val| (tag, val)))
+    {
         if val.is_empty() {
             return Err(LedgerIdParseError::new(format!(
-                "Missing value after '{sigil}iso:'"
+                "Missing value after '{sigil}{tag}'"
             )));
         }
         Ok(LedgerIdTimeSpec::AtIso(val.to_string()))
@@ -184,15 +191,15 @@ pub fn parse_time_travel_spec(
         Ok(LedgerIdTimeSpec::AtSnapshot(id))
     } else {
         Err(LedgerIdParseError::new(format!(
-            "Invalid time travel format: '{spec}'. Expected {sigil}t:, {sigil}iso:, {sigil}recorded:, {sigil}commit:, or {sigil}snapshot: prefix"
+            "Invalid time travel format: '{spec}'. Expected {sigil}t:, {sigil}time:, {sigil}recorded:, {sigil}commit:, or {sigil}snapshot: prefix"
         )))
     }
 }
 
 /// Split a ledger ID string into its base and optional time-travel suffix.
 ///
-/// This does not interpret `:`; it only handles `@t:`, `@iso:`, `@recorded:`,
-/// `@commit:`, and `@snapshot:`.
+/// This does not interpret `:`; it only handles `@t:`, `@time:` (alias `@iso:`),
+/// `@recorded:`, `@commit:`, and `@snapshot:`.
 pub fn split_time_travel_suffix(
     ledger_id: &str,
 ) -> Result<(String, Option<LedgerIdTimeSpec>), LedgerIdParseError> {
@@ -286,6 +293,25 @@ mod tests {
         assert_eq!(parsed.name, "ledger");
         assert_eq!(parsed.branch, DEFAULT_BRANCH);
         assert!(matches!(parsed.time, Some(LedgerIdTimeSpec::AtIso(_))));
+    }
+
+    /// `time:` is the canonical spelling; `iso:` is its alias. Both reach the
+    /// same value, and each reports its own tag when the value is missing.
+    #[test]
+    fn time_and_iso_tags_are_one_spec() {
+        assert_eq!(
+            parse_time_travel_spec("time:2025-01-01T00:00:00Z", "@").unwrap(),
+            parse_time_travel_spec("iso:2025-01-01T00:00:00Z", "@").unwrap(),
+        );
+        assert_eq!(
+            parse_time_travel_spec("time:2025-01-01T00:00:00Z", "@").unwrap(),
+            LedgerIdTimeSpec::AtIso("2025-01-01T00:00:00Z".to_string()),
+        );
+        for tag in ["time:", "iso:"] {
+            let err = parse_time_travel_spec(tag, "@").unwrap_err().to_string();
+            assert_eq!(err, format!("Missing value after '@{tag}'"));
+        }
+        assert!(TIME_TRAVEL_TAGS.contains(&"time:") && TIME_TRAVEL_TAGS.contains(&"iso:"));
     }
 
     #[test]

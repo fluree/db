@@ -270,7 +270,7 @@ curl -X POST http://localhost:8090/v1/fluree/query \
     "@context": {
       "schema": "http://schema.org/"
     },
-    "from": "mydb:main@iso:2024-01-22T10:00:00Z",
+    "from": "mydb:main@time:2024-01-22T10:00:00Z",
     "select": ["?name"],
     "where": [
       { "@id": "?person", "schema:name": "?name" }

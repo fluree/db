@@ -398,9 +398,10 @@ async fn pinned_query_on_a_graph_source_reads_that_snapshot() {
     //     the COUNT agreeing with the scan.
     let honored: Vec<(String, TimeSpec)> = vec![
         (format!("snapshot:{first}"), TimeSpec::AtSnapshot(first)),
+        (format!("time:{between}"), TimeSpec::AtTime(between.clone())),
         (format!("iso:{between}"), TimeSpec::AtTime(between.clone())),
         (
-            format!("iso:{at_first}"),
+            format!("time:{at_first}"),
             TimeSpec::AtTime(at_first.clone()),
         ),
         (
@@ -653,7 +654,7 @@ async fn pinned_query_on_a_graph_source_reads_that_snapshot() {
         ))
         .await
         .expect("create bm25 index");
-    for suffix in [format!("iso:{between}"), "snapshot:1".to_string()] {
+    for suffix in [format!("time:{between}"), "snapshot:1".to_string()] {
         let mut on_bm25 = names.clone();
         on_bm25["from"] = serde_json::Value::String(format!("bm25-pinned:main@{suffix}"));
         let result = fluree

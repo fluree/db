@@ -205,10 +205,15 @@ fn format_count(n: usize) -> String {
     result
 }
 
-/// Render a `TimeSpec` as the `@`-suffix a ledger address carries.
+/// Render a `TimeSpec` as the `@`-suffix a ledger address carries — the form
+/// the CLI puts on the wire to a remote server.
 ///
-/// The exact inverse of [`parse_time_spec`] on the canonical spellings; the
-/// round trip is pinned by `time_spec_suffix_round_trips_through_parse`.
+/// An inverse of [`parse_time_spec`]; the round trip is pinned by
+/// `time_spec_suffix_round_trips_through_parse`. `AtTime` renders as `@iso:`,
+/// not the canonical `@time:`: every server release accepts `@iso:`, while a
+/// server older than the `@time:` alias rejects the address outright, and a
+/// CLI is routinely newer than the server it talks to. Switch once `@time:` is
+/// the floor of supported servers.
 pub(crate) fn time_spec_to_suffix(spec: &fluree_db_api::TimeSpec) -> String {
     match spec {
         fluree_db_api::TimeSpec::Latest => "@t:latest".to_string(),
@@ -2073,6 +2078,16 @@ mod tests {
                 "round trip failed for {spec:?} via {suffix:?}"
             );
         }
+    }
+
+    /// The wire spelling of a timestamp stays `@iso:` (see `time_spec_to_suffix`):
+    /// a newer CLI must keep working against a server that predates `@time:`.
+    #[test]
+    fn timestamp_renders_with_the_universally_accepted_tag() {
+        assert_eq!(
+            time_spec_to_suffix(&TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string())),
+            "@iso:2024-01-15T10:30:00Z"
+        );
     }
 
     /// Both spellings of every shared form must reach the same `TimeSpec`.

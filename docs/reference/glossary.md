@@ -293,7 +293,7 @@ Metadata about a ledger stored in the nameservice, including commit and index Co
 
 A suffix on a ledger reference indicating which point in time to query.
 
-Examples: `@t:100`, `@iso:2024-01-22`, `@commit:bafybeig...`
+Examples: `@t:100`, `@time:2024-01-22`, `@commit:bafybeig...`
 
 ### Point-in-Time Query
 
