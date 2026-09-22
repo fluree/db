@@ -280,6 +280,489 @@ async fn local_table_end_to_end() {
     eprintln!("local iceberg end-to-end: all assertions passed");
 }
 
+/// Time-pinned reads of a graph source. The fixture has two snapshots (3 rows,
+/// then +2), so a pin that were silently dropped would still return all five.
+/// Both public routes are covered — the `from`-driven dataset builder and the
+/// lazy `graph_at()` handle, whose graph-source fallback used to drop the pin —
+/// and a COUNT is checked against its scan so the manifest shortcut cannot
+/// answer from a different snapshot than the rows.
+#[tokio::test]
+async fn pinned_query_on_a_graph_source_reads_that_snapshot() {
+    use fluree_db_api::TimeSpec;
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct("local-people-pinned", &location, PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create local-file graph source");
+    let alias = "local-people-pinned:main";
+
+    // The two snapshots' ids and commit times, straight from the table metadata.
+    let (first, first_ms, current_ms) = {
+        use fluree_db_iceberg::catalog::{SendCatalogClient, TableIdentifier};
+        use fluree_db_iceberg::io::FileIcebergStorage;
+        use fluree_db_iceberg::metadata::TableMetadata;
+        use fluree_db_iceberg::{SendDirectCatalogClient, SendIcebergStorage};
+
+        let storage = std::sync::Arc::new(FileIcebergStorage::new());
+        let client =
+            SendDirectCatalogClient::new(location.clone(), std::sync::Arc::clone(&storage));
+        let resp = client
+            .load_table(&TableIdentifier::new("silver", "people"), false)
+            .await
+            .expect("direct load_table");
+        let bytes = SendIcebergStorage::read(storage.as_ref(), &resp.metadata_location)
+            .await
+            .expect("read metadata json");
+        let meta = TableMetadata::from_json_str(std::str::from_utf8(&bytes).expect("utf8"))
+            .expect("parse metadata");
+        let current = meta.current_snapshot().expect("current snapshot");
+        let first = meta
+            .snapshot(
+                current
+                    .parent_snapshot_id
+                    .expect("two snapshots in fixture"),
+            )
+            .expect("first snapshot");
+        (first.snapshot_id, first.timestamp_ms, current.timestamp_ms)
+    };
+    assert!(
+        first_ms < current_ms,
+        "fixture snapshots are distinct in time"
+    );
+    let iso = |ms: i64| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+            .expect("valid ms")
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    };
+    // An instant strictly between the two commits selects the first snapshot;
+    // the instant of the first commit itself does too (at-or-before).
+    let between = iso(i64::midpoint(first_ms, current_ms));
+    let at_first = iso(first_ms);
+    let before_first = iso(first_ms - 1);
+
+    let names = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?name"],
+        "where": {"@id": "?s", "ex:name": "?name"},
+    });
+    let count = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["(count ?s)"],
+        "where": {"@id": "?s", "ex:name": "?name"},
+    });
+    let rows_of = |v: &serde_json::Value| v.as_array().map(Vec::len);
+    let count_of = |v: &serde_json::Value| v[0][0].as_u64().or_else(|| v[0].as_u64());
+    // SPARQL twins (CLAUDE.md: the two surfaces share an IR but not an entry
+    // point — `FROM <alias@…>` lexes the pin out of an IRI).
+    let sparql_names = |from: &str| {
+        format!("SELECT ?name FROM <{from}> WHERE {{ ?s <http://example.org/name> ?name }}")
+    };
+    let sparql_count = |from: &str| {
+        format!(
+            "SELECT (COUNT(?s) AS ?n) FROM <{from}> WHERE {{ ?s <http://example.org/name> ?name }}"
+        )
+    };
+    let bindings_of = |v: &serde_json::Value| v["results"]["bindings"].as_array().map(Vec::len);
+    let binding_count_of = |v: &serde_json::Value| {
+        v["results"]["bindings"][0]["n"]["value"]
+            .as_str()
+            .map(str::to_string)
+    };
+
+    // Unpinned control: both routes see the current snapshot's five rows.
+    let latest = fluree
+        .graph(alias)
+        .query()
+        .jsonld(&names)
+        .execute_formatted()
+        .await
+        .expect("latest query");
+    assert_eq!(rows_of(&latest), Some(5), "got: {latest}");
+    // ...and advertise no `t`: the genesis view's 0 is not a state a client
+    // could pin the next page to.
+    let raw = fluree
+        .graph(alias)
+        .query()
+        .jsonld(&names)
+        .execute()
+        .await
+        .expect("latest raw query");
+    assert_eq!(raw.t, None, "a virtual source has no t to pin on");
+
+    // --- Honored pins: the first snapshot's three rows, on both routes, with
+    //     the COUNT agreeing with the scan.
+    let honored: Vec<(String, TimeSpec)> = vec![
+        (format!("snapshot:{first}"), TimeSpec::AtSnapshot(first)),
+        (format!("iso:{between}"), TimeSpec::AtTime(between.clone())),
+        (
+            format!("iso:{at_first}"),
+            TimeSpec::AtTime(at_first.clone()),
+        ),
+        (
+            format!("recorded:{between}"),
+            TimeSpec::AtRecorded(between.clone()),
+        ),
+    ];
+    for (suffix, spec) in &honored {
+        let mut from_names = names.clone();
+        from_names["from"] = serde_json::Value::String(format!("{alias}@{suffix}"));
+        let rows = fluree
+            .query_from()
+            .jsonld(&from_names)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("from @{suffix}: {e}"));
+        assert_eq!(rows_of(&rows), Some(3), "from @{suffix}: {rows}");
+
+        let mut from_count = count.clone();
+        from_count["from"] = serde_json::Value::String(format!("{alias}@{suffix}"));
+        let n = fluree
+            .query_from()
+            .jsonld(&from_count)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("count from @{suffix}: {e}"));
+        assert_eq!(count_of(&n), Some(3), "count from @{suffix}: {n}");
+
+        let rows = fluree
+            .graph_at(alias, spec.clone())
+            .query()
+            .jsonld(&names)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("graph_at({spec:?}): {e}"));
+        assert_eq!(rows_of(&rows), Some(3), "graph_at({spec:?}): {rows}");
+
+        // The tracked cores push the pin separately from the plain ones; a
+        // request with tracking headers runs through them.
+        let tracked = fluree
+            .query_from()
+            .jsonld(&from_names)
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap_or_else(|e| panic!("tracked from @{suffix}: {e:?}"));
+        assert_eq!(
+            rows_of(&tracked.result),
+            Some(3),
+            "tracked from @{suffix}: {tracked:?}"
+        );
+        let tracked = fluree
+            .graph_at(alias, spec.clone())
+            .query()
+            .jsonld(&names)
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap_or_else(|e| panic!("tracked graph_at({spec:?}): {e:?}"));
+        assert_eq!(
+            rows_of(&tracked.result),
+            Some(3),
+            "tracked graph_at({spec:?}): {tracked:?}"
+        );
+        // A second (named) view makes it a dataset, which has its own core.
+        let mut dataset_names = from_names.clone();
+        dataset_names["fromNamed"] = serde_json::json!([format!("{alias}@{suffix}")]);
+        let tracked = fluree
+            .query_from()
+            .jsonld(&dataset_names)
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap_or_else(|e| panic!("tracked dataset @{suffix}: {e:?}"));
+        assert_eq!(
+            rows_of(&tracked.result),
+            Some(3),
+            "tracked dataset @{suffix}: {tracked:?}"
+        );
+
+        let from = format!("{alias}@{suffix}");
+        let rows = fluree
+            .query_from()
+            .sparql(&sparql_names(&from))
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("SPARQL FROM <{from}>: {e}"));
+        assert_eq!(bindings_of(&rows), Some(3), "SPARQL FROM <{from}>: {rows}");
+        let n = fluree
+            .query_from()
+            .sparql(&sparql_count(&from))
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("SPARQL count FROM <{from}>: {e}"));
+        assert_eq!(
+            binding_count_of(&n).as_deref(),
+            Some("3"),
+            "SPARQL count FROM <{from}>: {n}"
+        );
+    }
+
+    // The pin applies when the query addresses the source itself in an
+    // explicit GRAPH block (which skips the auto-wrapping the bare form gets).
+    let mut got = Vec::new();
+    for from in [alias.to_string(), format!("{alias}@snapshot:{first}")] {
+        let rows = fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT ?name FROM <{from}> WHERE {{ GRAPH <{alias}> {{ ?s <http://example.org/name> ?name }} }}"
+            ))
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("GRAPH <{alias}> FROM <{from}>: {e}"));
+        got.push(bindings_of(&rows));
+    }
+    assert_eq!(
+        got,
+        [Some(5), Some(3)],
+        "explicit GRAPH block: latest, pinned"
+    );
+
+    // --- Refused pins. Each must be an error on both routes — never the
+    //     current snapshot, never the oldest one — and a 400: the caller asked
+    //     for something the source cannot answer.
+    let expect_refused =
+        |result: Result<serde_json::Value, ApiError>, route: &str, needle: &str| {
+            let err = match result {
+                Ok(rows) => panic!("{route}: pinned query returned {rows} instead of an error"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains(needle),
+                "{route}: unexpected error: {err}"
+            );
+            assert_eq!(err.status_code(), 400, "{route}: {err}");
+        };
+    let refused: Vec<(String, TimeSpec, &str)> = vec![
+        // Before the oldest retained snapshot: typed, names the oldest.
+        (
+            format!("iso:{before_first}"),
+            TimeSpec::AtTime(before_first.clone()),
+            "no snapshot of table 'silver.people' at or before",
+        ),
+        // An id no snapshot has.
+        (
+            "snapshot:999".to_string(),
+            TimeSpec::AtSnapshot(999),
+            "snapshot 999 not found",
+        ),
+        // Ledger-only selectors have no meaning against a table.
+        (
+            "t:1".to_string(),
+            TimeSpec::AtT(1),
+            "Graph sources have no transaction numbers or commit hashes",
+        ),
+        (
+            "commit:abcdef".to_string(),
+            TimeSpec::AtCommit("abcdef".to_string()),
+            "Graph sources have no transaction numbers or commit hashes",
+        ),
+    ];
+    for (suffix, spec, needle) in &refused {
+        let mut from_names = names.clone();
+        from_names["from"] = serde_json::Value::String(format!("{alias}@{suffix}"));
+        let result = fluree
+            .query_from()
+            .jsonld(&from_names)
+            .execute_formatted()
+            .await;
+        expect_refused(result, &format!("from @{suffix}"), needle);
+
+        let mut from_count = count.clone();
+        from_count["from"] = serde_json::Value::String(format!("{alias}@{suffix}"));
+        let result = fluree
+            .query_from()
+            .jsonld(&from_count)
+            .execute_formatted()
+            .await;
+        expect_refused(result, &format!("count from @{suffix}"), needle);
+
+        let result = fluree
+            .graph_at(alias, spec.clone())
+            .query()
+            .jsonld(&names)
+            .execute_formatted()
+            .await;
+        expect_refused(result, &format!("graph_at({spec:?})"), needle);
+
+        let from = format!("{alias}@{suffix}");
+        let result = fluree
+            .query_from()
+            .sparql(&sparql_names(&from))
+            .execute_formatted()
+            .await;
+        expect_refused(result, &format!("SPARQL FROM <{from}>"), needle);
+    }
+
+    // One source pinned to two states in one query is a conflict, not a race.
+    let two_states = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": format!("{alias}@snapshot:{first}"),
+        "fromNamed": [format!("{alias}@iso:{}", iso(current_ms))],
+        "select": ["?name"],
+        "where": {"@id": "?s", "ex:name": "?name"},
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&two_states)
+        .execute_formatted()
+        .await;
+    expect_refused(result, "two pins", "two different states");
+
+    // ...and so is one reference pinned and another unpinned: the pin is per
+    // source for the whole query, so the unpinned view must not silently follow it.
+    let pinned_and_latest = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": [format!("{alias}@snapshot:{first}"), alias],
+        "select": ["?name"],
+        "where": {"@id": "?s", "ex:name": "?name"},
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&pinned_and_latest)
+        .execute_formatted()
+        .await;
+    expect_refused(result, "pinned + latest", "two different states");
+
+    // A graph source that is not an Iceberg-backed table (here a BM25 index)
+    // reads its current state only: a pin on it is refused, not ignored.
+    let ledger = fluree.create_ledger("bm25-src").await.expect("ledger");
+    fluree
+        .insert(
+            ledger,
+            &serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [{"@id": "ex:doc1", "@type": "ex:Doc", "ex:title": "Hello world"}]
+            }),
+        )
+        .await
+        .expect("seed bm25 ledger");
+    fluree
+        .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "bm25-pinned",
+            "bm25-src:main",
+            serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "where": [{"@id": "?x", "@type": "ex:Doc", "ex:title": "?title"}],
+                "select": {"?x": ["@id", "ex:title"]}
+            }),
+        ))
+        .await
+        .expect("create bm25 index");
+    for suffix in [format!("iso:{between}"), "snapshot:1".to_string()] {
+        let mut on_bm25 = names.clone();
+        on_bm25["from"] = serde_json::Value::String(format!("bm25-pinned:main@{suffix}"));
+        let result = fluree
+            .query_from()
+            .jsonld(&on_bm25)
+            .execute_formatted()
+            .await;
+        expect_refused(
+            result,
+            &format!("bm25 @{suffix}"),
+            "does not support time-pinned reads; only Iceberg-backed graph sources do",
+        );
+    }
+
+    // A table with NO snapshots yet (staged as the fixture's pre-first-commit
+    // metadata alone): unpinned reads are empty, and every pin is an error that
+    // says so — there is no oldest snapshot to name, and nothing to fall back to.
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let empty_dir = staging.path().join("people_empty");
+    let empty_meta = empty_dir.join("metadata");
+    std::fs::create_dir_all(&empty_meta).expect("empty table metadata dir");
+    let first_meta = std::fs::read_dir(fixtures_dir().join("silver/people/metadata"))
+        .expect("people metadata dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .min()
+        .expect("a 00000 metadata file");
+    std::fs::copy(
+        &first_meta,
+        empty_meta.join(first_meta.file_name().expect("name")),
+    )
+    .expect("stage the empty-table metadata");
+    let empty_alias = "local-people-empty:main";
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct(
+                "local-people-empty",
+                format!("file://{}", empty_dir.display()),
+                PEOPLE_R2RML,
+            )
+            .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create empty-table graph source");
+    let rows = fluree
+        .graph(empty_alias)
+        .query()
+        .jsonld(&names)
+        .execute_formatted()
+        .await
+        .expect("unpinned read of an empty table");
+    assert_eq!(rows_of(&rows), Some(0), "got: {rows}");
+    for (suffix, spec, needle) in [
+        (
+            format!("iso:{between}"),
+            TimeSpec::AtTime(between.clone()),
+            "the table has no snapshots",
+        ),
+        (
+            format!("snapshot:{first}"),
+            TimeSpec::AtSnapshot(first),
+            "not found for table",
+        ),
+    ] {
+        let mut from_names = names.clone();
+        from_names["from"] = serde_json::Value::String(format!("{empty_alias}@{suffix}"));
+        let result = fluree
+            .query_from()
+            .jsonld(&from_names)
+            .execute_formatted()
+            .await;
+        expect_refused(result, &format!("empty table, from @{suffix}"), needle);
+        let result = fluree
+            .graph_at(empty_alias, spec.clone())
+            .query()
+            .jsonld(&names)
+            .execute_formatted()
+            .await;
+        expect_refused(result, &format!("empty table, graph_at({spec:?})"), needle);
+    }
+
+    // `@snapshot:` on a native ledger is refused; it is not a ledger selector.
+    fluree.create_ledger("plain-ledger").await.expect("ledger");
+    let mut on_ledger = names.clone();
+    on_ledger["from"] = serde_json::Value::String("plain-ledger:main@snapshot:1".to_string());
+    let result = fluree
+        .query_from()
+        .jsonld(&on_ledger)
+        .execute_formatted()
+        .await;
+    expect_refused(
+        result,
+        "ledger @snapshot",
+        "selects a graph source's table snapshot",
+    );
+    on_ledger["from"] = serde_json::Value::String("plain-ledger:main@iso:not-a-time".to_string());
+    let result = fluree
+        .query_from()
+        .jsonld(&on_ledger)
+        .execute_formatted()
+        .await;
+    expect_refused(
+        result,
+        "ledger @iso malformed",
+        "Invalid ISO-8601 timestamp for time travel",
+    );
+}
+
 /// The lake face of the stats kernel: the same table, profiled through the
 /// scan the virtual graph reads, pinned to its current snapshot.
 #[tokio::test]

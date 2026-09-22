@@ -7,7 +7,6 @@
 
 use crate::view::{DataSetDb, GraphDb};
 use crate::{dataset, time_resolve, ApiError, DatasetSpec, Fluree, GovernanceOptions, Result};
-use chrono::DateTime;
 use fluree_db_core::VerifiedIdentity;
 
 macro_rules! build_dataset_view_from_spec {
@@ -25,10 +24,9 @@ macro_rules! build_dataset_view_from_spec {
         // not two distinct default graphs.
         if let Some(range) = spec.history_range() {
             let ledger = $self.ledger(&range.identifier).await?;
-            let latest_t = ledger.t();
 
-            let from_t = resolve_history_endpoint_t(&ledger, &range.from, latest_t).await?;
-            let to_t = resolve_history_endpoint_t(&ledger, &range.to, latest_t).await?;
+            let from_t = time_resolve::resolve_time_spec(&ledger, &range.from).await?;
+            let to_t = time_resolve::resolve_time_spec(&ledger, &range.to).await?;
 
             let view = GraphDb::from_ledger_state(&ledger);
             let view = ($history_transform)(view).await?;
@@ -220,8 +218,9 @@ impl Fluree {
     /// identifier is a graph source (Iceberg/R2RML) and creates a minimal
     /// genesis context tagged with the graph source ID.
     ///
-    /// For sources with a time spec, time travel on graph sources is
-    /// explicitly rejected with a clear error.
+    /// For sources with a time spec, a graph source reads the pinned table
+    /// state (`@iso:` / `@recorded:` / `@snapshot:`); `@t:` and `@commit:`
+    /// are rejected with a clear error.
     ///
     /// If `graph_selector` is set, it is applied after resolution
     /// (the parser rejects the ambiguous case where both fragment and
@@ -252,27 +251,14 @@ impl Fluree {
                 }
             }
             Some(time_spec) => {
-                let ts = convert_time_spec(time_spec)?;
-                match Box::pin(self.db_at(&source.identifier, ts)).await {
+                match Box::pin(self.db_at(&source.identifier, time_spec.clone())).await {
                     Ok(v) => v,
                     Err(ref e) if e.is_not_found() => {
-                        // Check if it's a graph source — reject time travel explicitly
-                        let gs_id = fluree_db_core::normalize_ledger_id(&source.identifier)
-                            .unwrap_or_else(|_| source.identifier.clone());
-
-                        if self
-                            .nameservice()
-                            .lookup_graph_source(&gs_id)
-                            .await
-                            .map_err(|e| ApiError::internal(e.to_string()))?
-                            .is_some()
-                        {
-                            return Err(ApiError::query(
-                                "Time travel is not supported for graph sources. \
-                                 Remove the time specification to query at latest.",
-                            ));
-                        }
-                        return Err(ApiError::NotFound(source.identifier.clone()));
+                        // A graph source reads the pinned table state; the pin
+                        // rides the view to the R2RML provider, or is refused.
+                        Box::pin(self.resolve_graph_source_at(&source.identifier, time_spec))
+                            .await?
+                            .ok_or_else(|| ApiError::NotFound(source.identifier.clone()))?
                     }
                     Err(e) => return Err(e),
                 }
@@ -320,68 +306,6 @@ impl Fluree {
         self.resolve_graph_source(identifier)
             .await?
             .ok_or_else(|| ApiError::NotFound(identifier.to_string()))
-    }
-}
-
-async fn resolve_history_endpoint_t(
-    ledger: &fluree_db_ledger::LedgerState,
-    spec: &dataset::TimeSpec,
-    latest_t: i64,
-) -> Result<i64> {
-    match spec {
-        dataset::TimeSpec::AtT(t) => Ok(*t),
-        dataset::TimeSpec::Latest => Ok(latest_t),
-        dataset::TimeSpec::AtTime(iso) => {
-            let dt = DateTime::parse_from_rfc3339(iso).map_err(|e| {
-                ApiError::internal(format!(
-                    "Invalid ISO-8601 timestamp for time travel: {iso} ({e})"
-                ))
-            })?;
-            // See `Fluree::load_view_at` for rationale: `ledger#time` is epoch-ms and we
-            // ceiling sub-ms ISO inputs to avoid truncation off-by-one.
-            let mut target_epoch_ms = dt.timestamp_millis();
-            if dt.timestamp_subsec_nanos() % 1_000_000 != 0 {
-                target_epoch_ms += 1;
-            }
-
-            time_resolve::datetime_to_t(
-                &ledger.snapshot,
-                Some(ledger.novelty.as_ref()),
-                target_epoch_ms,
-                latest_t,
-            )
-            .await
-        }
-        dataset::TimeSpec::AtRecorded(iso) => {
-            let target_epoch_ms = time_resolve::iso_to_target_epoch_ms(iso)?;
-            time_resolve::recorded_to_t(
-                &ledger.snapshot,
-                Some(ledger.novelty.as_ref()),
-                target_epoch_ms,
-                latest_t,
-            )
-            .await
-        }
-        dataset::TimeSpec::AtCommit(commit_prefix) => {
-            time_resolve::commit_to_t(
-                &ledger.snapshot,
-                Some(ledger.novelty.as_ref()),
-                commit_prefix,
-                latest_t,
-            )
-            .await
-        }
-    }
-}
-
-/// Convert dataset::TimeSpec to crate::TimeSpec
-fn convert_time_spec(ts: &dataset::TimeSpec) -> Result<crate::TimeSpec> {
-    match ts {
-        dataset::TimeSpec::AtT(t) => Ok(crate::TimeSpec::AtT(*t)),
-        dataset::TimeSpec::AtTime(iso) => Ok(crate::TimeSpec::AtTime(iso.clone())),
-        dataset::TimeSpec::AtRecorded(iso) => Ok(crate::TimeSpec::AtRecorded(iso.clone())),
-        dataset::TimeSpec::AtCommit(sha) => Ok(crate::TimeSpec::AtCommit(sha.clone())),
-        dataset::TimeSpec::Latest => Ok(crate::TimeSpec::Latest),
     }
 }
 

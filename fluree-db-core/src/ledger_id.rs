@@ -21,6 +21,10 @@ pub enum LedgerIdTimeSpec {
     /// were recorded (`db:receivedAt`, audit axis). Identical to `@iso:` on
     /// ledgers that never used caller-supplied event times.
     AtRecorded(String),
+    /// @snapshot:<id> — a table format's own snapshot identifier. Only a graph
+    /// source backed by a snapshotted table (Iceberg) can resolve it; a native
+    /// ledger has no such identifier and rejects it.
+    AtSnapshot(i64),
 }
 
 /// Parsed ledger ID parts with optional time-travel spec.
@@ -112,14 +116,14 @@ pub const COMMIT_PREFIX_MIN_LEN: usize = 6;
 /// `fluree_db_api::TimeSpec::parse_at`, which also accepts a bare integer and a
 /// bare ISO-8601 timestamp — can tell "the user reached for a canonical tag and
 /// got it wrong" apart from "the user typed one of the bare forms".
-pub const TIME_TRAVEL_TAGS: [&str; 4] = ["t:", "iso:", "commit:", "recorded:"];
+pub const TIME_TRAVEL_TAGS: [&str; 5] = ["t:", "iso:", "commit:", "recorded:", "snapshot:"];
 
 /// Parse a time-travel spec: the part of a ledger address after `@`, or a bare
 /// spec such as a CLI `--at` argument.
 ///
-/// Accepts `t:<N>`, `iso:<timestamp>`, `recorded:<timestamp>` and
-/// `commit:<prefix>` (at least [`COMMIT_PREFIX_MIN_LEN`] characters). `t:latest` is
-/// deliberately *not*
+/// Accepts `t:<N>`, `iso:<timestamp>`, `recorded:<timestamp>`,
+/// `commit:<prefix>` (at least [`COMMIT_PREFIX_MIN_LEN`] characters) and
+/// `snapshot:<id>`. `t:latest` is deliberately *not*
 /// accepted: [`LedgerIdTimeSpec`] has no "latest" variant because resolving one
 /// needs the ledger's current `t`, which this layer does not have. Callers that
 /// support it (`fluree_db_api::TimeSpec::parse`) take it before delegating here.
@@ -168,16 +172,27 @@ pub fn parse_time_travel_spec(
             )));
         }
         Ok(LedgerIdTimeSpec::AtRecorded(val.to_string()))
+    } else if let Some(val) = spec.strip_prefix("snapshot:") {
+        if val.is_empty() {
+            return Err(LedgerIdParseError::new(format!(
+                "Missing value after '{sigil}snapshot:'"
+            )));
+        }
+        let id: i64 = val.parse().map_err(|_| {
+            LedgerIdParseError::new(format!("Invalid integer for {sigil}snapshot: '{val}'"))
+        })?;
+        Ok(LedgerIdTimeSpec::AtSnapshot(id))
     } else {
         Err(LedgerIdParseError::new(format!(
-            "Invalid time travel format: '{spec}'. Expected {sigil}t:, {sigil}iso:, {sigil}recorded:, or {sigil}commit: prefix"
+            "Invalid time travel format: '{spec}'. Expected {sigil}t:, {sigil}iso:, {sigil}recorded:, {sigil}commit:, or {sigil}snapshot: prefix"
         )))
     }
 }
 
 /// Split a ledger ID string into its base and optional time-travel suffix.
 ///
-/// This does not interpret `:`; it only handles `@t:`, `@iso:`, `@recorded:`, and `@commit:`.
+/// This does not interpret `:`; it only handles `@t:`, `@iso:`, `@recorded:`,
+/// `@commit:`, and `@snapshot:`.
 pub fn split_time_travel_suffix(
     ledger_id: &str,
 ) -> Result<(String, Option<LedgerIdTimeSpec>), LedgerIdParseError> {

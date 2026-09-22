@@ -561,6 +561,12 @@ impl ApiError {
         ApiError::Internal(format!("Query error: {}", msg.into()))
     }
 
+    /// Create an error for a query the caller got wrong: a 400, where
+    /// [`Self::query`] is a 500.
+    pub fn invalid_query(msg: impl Into<String>) -> Self {
+        ApiError::Query(fluree_db_query::QueryError::InvalidQuery(msg.into()))
+    }
+
     /// Create a not-implemented error
     pub fn not_implemented(feature: impl Into<String>) -> Self {
         ApiError::Internal(format!("Not implemented: {}", feature.into()))

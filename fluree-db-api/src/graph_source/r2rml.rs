@@ -25,7 +25,7 @@ use fluree_db_iceberg::{
         ColumnBatch, FileIcebergStorage, IcebergStorageBackend, S3IcebergStorage,
         SendIcebergStorage, SendParquetReader,
     },
-    metadata::{TableMetadata, WindowCap},
+    metadata::{SnapshotSelection, TableMetadata, WindowCap},
     scan::{
         topk::{batch_sort_values, plan_topk_read, TopKBound},
         ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner,
@@ -37,7 +37,7 @@ use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{
     ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanTopK,
-    ScanValue,
+    ScanValue, SourceTime,
 };
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use futures::StreamExt;
@@ -1198,6 +1198,32 @@ pub struct FlureeR2rmlProvider<'a> {
     /// the lifetime of one query — collapsing the per-scan REST round-trip storm
     /// and pinning a single Iceberg snapshot across the query.
     session: std::sync::Arc<super::catalog_session::IcebergCatalogSession>,
+    /// Per-source table-state pins for this query (`alias@iso:` / `@snapshot:`),
+    /// consulted by every scan and count of the source. See
+    /// [`R2rmlTableProvider::pin_source_time`].
+    source_times: std::sync::Mutex<std::collections::HashMap<String, SourceTime>>,
+}
+
+/// The snapshot a query reads for one table, and whether it is the table's
+/// current snapshot — the one the `metadata_location`-keyed caches describe.
+#[derive(Clone, Copy)]
+struct SelectedSnapshot<'m> {
+    snapshot: &'m fluree_db_iceberg::metadata::Snapshot,
+    is_current: bool,
+}
+
+/// Key for the per-snapshot file-list caches. `metadata_location` alone names
+/// the current snapshot's files (the key every pre-existing entry was written
+/// under); a historical snapshot's list is just as immutable and gets its own.
+fn snapshot_cache_key(metadata_location: &str, selected: SelectedSnapshot<'_>) -> String {
+    if selected.is_current {
+        metadata_location.to_string()
+    } else {
+        format!(
+            "{metadata_location}#snapshot={}",
+            selected.snapshot.snapshot_id
+        )
+    }
 }
 
 impl<'a> FlureeR2rmlProvider<'a> {
@@ -1216,7 +1242,78 @@ impl<'a> FlureeR2rmlProvider<'a> {
         Self {
             fluree,
             session: std::sync::Arc::new(super::catalog_session::IcebergCatalogSession::default()),
+            source_times: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Pins are keyed by the normalized `name:branch` id; the R2RML operator
+    /// carries the GRAPH IRI as the user wrote it, which may omit the branch.
+    fn pin_key(graph_source_id: &str) -> String {
+        fluree_db_core::normalize_ledger_id(graph_source_id)
+            .unwrap_or_else(|_| graph_source_id.to_string())
+    }
+
+    /// This query's pin for `graph_source_id`, if any.
+    fn source_time(&self, graph_source_id: &str) -> Option<SourceTime> {
+        self.source_times
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&Self::pin_key(graph_source_id))
+            .copied()
+    }
+
+    /// A pin on a source the SQL lane serves cannot be honored there; refuse
+    /// rather than read the live tables. View construction already refuses a
+    /// pin on a non-Iceberg source, so this only guards the provider itself.
+    #[cfg(feature = "sql")]
+    fn refuse_pin_on_sql_source(&self, graph_source_id: &str) -> QueryResult<()> {
+        match self.source_time(graph_source_id) {
+            Some(_) => Err(QueryError::UnsupportedFeature(format!(
+                "graph source '{graph_source_id}' is SQL-backed and does not support \
+                 time-pinned reads"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// The snapshot this query reads for `table_name`: the source's pin resolved
+    /// against `metadata`, else the current snapshot. Both the scan and the
+    /// COUNT shortcut select through here, so they cannot disagree. A pin that
+    /// no retained snapshot satisfies is an error, never the current snapshot.
+    /// `Ok(None)` is only an unpinned table with no snapshots.
+    fn select_snapshot<'m>(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        metadata: &'m TableMetadata,
+    ) -> QueryResult<Option<SelectedSnapshot<'m>>> {
+        let snapshot = match self.source_time(graph_source_id) {
+            None => metadata.current_snapshot(),
+            Some(SourceTime::SnapshotId(snapshot_id)) => {
+                Some(metadata.snapshot(snapshot_id).ok_or_else(|| {
+                    QueryError::SnapshotNotFound {
+                        table: table_name.to_string(),
+                        snapshot_id,
+                    }
+                })?)
+            }
+            Some(SourceTime::AsOfTimestampMs(ms)) => Some(
+                fluree_db_iceberg::metadata::select_snapshot(
+                    metadata,
+                    &SnapshotSelection::AsOfTime(ms),
+                )
+                .ok_or_else(|| QueryError::NoSnapshotAtTime {
+                    table: table_name.to_string(),
+                    requested: crate::time_resolve::epoch_ms_to_iso(ms),
+                    oldest: fluree_db_iceberg::metadata::earliest_as_of_time_ms(metadata)
+                        .map(crate::time_resolve::epoch_ms_to_iso),
+                })?,
+            ),
+        };
+        Ok(snapshot.map(|snapshot| SelectedSnapshot {
+            snapshot,
+            is_current: Some(snapshot.snapshot_id) == metadata.current_snapshot_id,
+        }))
     }
 
     /// The SQL source behind `graph_source_id`, or `None` when it is
@@ -2459,6 +2556,22 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             .await
     }
 
+    fn pin_source_time(&self, graph_source_id: &str, time: SourceTime) -> QueryResult<()> {
+        let mut pins = self
+            .source_times
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match pins.insert(Self::pin_key(graph_source_id), time) {
+            // One source, one state per query: `from` and `fromNamed` naming the
+            // same source at different times would otherwise race for the pin.
+            Some(prior) if prior != time => Err(QueryError::InvalidQuery(format!(
+                "graph source '{graph_source_id}' is pinned to two different states in one \
+                 query ({prior:?} and {time:?})"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Warm the per-query catalog session pin + cross-query caches for a set of
     /// tables concurrently (PR-8 slice 1). Best-effort and side-effect-only: each
     /// `load_table_context` populates `self.session` + the moka caches, so the
@@ -2641,6 +2754,61 @@ async fn rest_session_storage(
     Ok(built)
 }
 
+/// The lower bound a cached pointer's current snapshot must meet to answer
+/// `pin` (the `min_snapshot_ms` rider of `disk_catalog_cache::pointer_is_usable`).
+fn pin_min_snapshot_ms(pin: Option<SourceTime>) -> Option<i64> {
+    match pin {
+        Some(SourceTime::AsOfTimestampMs(ms)) => Some(ms),
+        Some(SourceTime::SnapshotId(_)) | None => None,
+    }
+}
+
+/// Whether metadata served by a cross-query cache is new enough to answer `pin`.
+/// Such metadata may predate the catalog's current state, so an as-of instant
+/// past its current snapshot, or a snapshot id it does not list, needs a fresh
+/// `loadTable` rather than a `NoSnapshotAtTime`/`SnapshotNotFound` or an older
+/// snapshot read off stale metadata.
+fn cached_metadata_serves_pin(pin: Option<SourceTime>, metadata: &TableMetadata) -> bool {
+    match pin {
+        None => true,
+        Some(SourceTime::SnapshotId(id)) => metadata.snapshot(id).is_some(),
+        Some(SourceTime::AsOfTimestampMs(ms)) => metadata
+            .current_snapshot()
+            .is_some_and(|s| s.timestamp_ms >= ms),
+    }
+}
+
+/// The schema a read of `snapshot` projects through: the snapshot's own schema,
+/// with every field the table still has carrying its current name. Iceberg
+/// reads by field id while the R2RML mapping names columns as they are now, so
+/// a column renamed since the snapshot still resolves, and one added since
+/// reads as absent, which it was. A field dropped since keeps its old name
+/// unless a current field has taken it.
+fn read_schema<'m>(
+    metadata: &'m TableMetadata,
+    snapshot: &fluree_db_iceberg::metadata::Snapshot,
+) -> Option<std::borrow::Cow<'m, fluree_db_iceberg::metadata::Schema>> {
+    use std::borrow::Cow;
+    let pinned = metadata.schema_for_snapshot(snapshot)?;
+    let Some(current) = metadata
+        .current_schema()
+        .filter(|current| current.schema_id != pinned.schema_id)
+    else {
+        return Some(Cow::Borrowed(pinned));
+    };
+    let mut schema = pinned.clone();
+    schema
+        .fields
+        .retain_mut(|field| match current.field(field.id) {
+            Some(now) => {
+                field.name.clone_from(&now.name);
+                true
+            }
+            None => current.field_by_name(&field.name).is_none(),
+        });
+    Some(Cow::Owned(schema))
+}
+
 /// Resolve `loadTable` (the REST catalog GET, honoring the query pin + the
 /// cross-query cache) and build the vended-credential S3 storage — the SAME
 /// session-pin path the eager scan used before the lazy split (PR-8 loadTable-
@@ -2735,6 +2903,7 @@ impl FlureeR2rmlProvider<'_> {
     ) -> QueryResult<Option<u64>> {
         #[cfg(feature = "sql")]
         if let Some(sql) = self.sql_source(graph_source_id).await? {
+            self.refuse_pin_on_sql_source(graph_source_id)?;
             let mapping = self.compiled_mapping(graph_source_id, None).await?;
             return sql
                 .row_count(&self.session, &mapping, table_name, non_null_cols)
@@ -2742,22 +2911,25 @@ impl FlureeR2rmlProvider<'_> {
         }
         // Same pinned context as the scan: one Iceberg snapshot per query (the
         // shared `self.session` pin), so a count and a scan cannot disagree.
-        // GREP: r2rml-as-of-t — `as_of_t` is ignored here exactly as the scan path
-        // ignores it (matching breadcrumb in `scan_table_inner`); if time-travel
-        // semantics ever land on the scan, this method MUST follow, or a COUNT and
-        // a scan in one query could answer from different snapshots.
+        // GREP: r2rml-as-of-t — `as_of_t` is a Fluree `t` and is ignored here as in
+        // `scan_table_inner`; a time pin is resolved by the same `select_snapshot`
+        // the scan uses, so a COUNT and a scan in one query read the same snapshot.
         let (storage, metadata, metadata_location) =
             self.load_table_context(graph_source_id, table_name).await?;
 
         // The count must equal a full scan of THIS snapshot — the one the scan
-        // planner reads from the same pinned metadata. No current snapshot (an
-        // empty table) or no current schema: decline and let the scan handle it (an
-        // empty scan folds to 0; a missing schema surfaces the scan's own error).
-        let (Some(snapshot), Some(schema)) =
-            (metadata.current_snapshot(), metadata.current_schema())
-        else {
+        // planner reads from the same pinned metadata. No snapshot (an empty
+        // table) or no schema: decline and let the scan handle it (an empty scan
+        // folds to 0; a missing schema surfaces the scan's own error).
+        let Some(selected) = self.select_snapshot(graph_source_id, table_name, &metadata)? else {
             return Ok(None);
         };
+        let snapshot = selected.snapshot;
+        let Some(schema) = read_schema(&metadata, snapshot) else {
+            return Ok(None);
+        };
+        let schema = schema.as_ref();
+        let cache_key = snapshot_cache_key(&metadata_location, selected);
 
         // Manifest-only read (never a Parquet/data file): the live data files, and
         // whether the snapshot carries merge-on-read delete manifests.
@@ -2774,7 +2946,7 @@ impl FlureeR2rmlProvider<'_> {
         // wall — no data file is read. Allowlisted in `fluree-bench-virtual::spans`.
         let catalog_cache = self.catalog_disk_cache();
         let (data_files, has_delete_manifests) = if let Some(hit) =
-            catalog_cache.get_count_stats(&metadata_location)
+            catalog_cache.get_count_stats(&cache_key)
         {
             debug!(table_name = %table_name, "COUNT(*) manifest stats disk-cache hit");
             hit
@@ -2792,7 +2964,7 @@ impl FlureeR2rmlProvider<'_> {
                             e,
                         )
                     })?;
-            catalog_cache.put_count_stats(&metadata_location, &data_files, has_delete_manifests);
+            catalog_cache.put_count_stats(&cache_key, &data_files, has_delete_manifests);
             (data_files, has_delete_manifests)
         };
 
@@ -3018,6 +3190,7 @@ impl FlureeR2rmlProvider<'_> {
             &table_id.table,
         );
         let disk = self.catalog_disk_cache();
+        let source_time = self.source_time(graph_source_id);
         if let CatalogConfig::Rest {
             uri,
             warehouse,
@@ -3028,17 +3201,20 @@ impl FlureeR2rmlProvider<'_> {
             // A snapshot pin from an EARLIER touch of this table THIS query wins
             // unconditionally over the disk pointer (correlated re-loads must read
             // ONE snapshot). Only when unpinned do we consult the disk pointer.
-            // `None` = a latest-snapshot read. GREP: r2rml-as-of-t — when Iceberg
-            // snapshot time-travel lands, the requested snapshot's `timestamp_ms`
-            // MUST be threaded here as `min_snapshot_ms` so bounded staleness can
-            // never downgrade a time-travel request (the guard + hermetic already
-            // exist in `disk_catalog_cache::pointer_is_usable`).
-            let candidate = self
-                .session
-                .pinned_metadata_location(&lt_key)
-                .or_else(|| disk.get_metadata_location(&lt_key, None));
+            // GREP: r2rml-as-of-t — a time-pinned query only takes the pointer
+            // when its metadata can answer the pin, so bounded staleness never
+            // downgrades a time-travel request; otherwise it falls through to a
+            // fresh `loadTable`.
+            let session_loc = self.session.pinned_metadata_location(&lt_key);
+            let from_session = session_loc.is_some();
+            let candidate = session_loc
+                .or_else(|| disk.get_metadata_location(&lt_key, pin_min_snapshot_ms(source_time)));
             if let Some(loc) = candidate {
-                if let Some(md) = self.metadata_from_caches(&loc).await {
+                let cached = self
+                    .metadata_from_caches(&loc)
+                    .await
+                    .filter(|md| from_session || cached_metadata_serves_pin(source_time, md));
+                if let Some(md) = cached {
                     // Pin the location BEFORE serving: a later touch whose disk
                     // pointer has since expired (TTL boundary mid-query) then still
                     // resolves THIS snapshot via `pinned_metadata_location` — the
@@ -3210,8 +3386,10 @@ impl FlureeR2rmlProvider<'_> {
                     let pinned = self.session.pinned_metadata_location(&lt_key);
                     // A cross-query hit applies only on the FIRST resolution of
                     // this table in the query. Once pinned, a reload is a creds
-                    // refresh that must keep the pinned snapshot.
-                    let cross_query = if pinned.is_none() {
+                    // refresh that must keep the pinned snapshot. A time-pinned
+                    // query skips it too: the entry carries only a location, so
+                    // whether it is new enough for the pin can't be checked.
+                    let cross_query = if pinned.is_none() && source_time.is_none() {
                         cache.get_rest_load_table(&lt_key)
                     } else {
                         None
@@ -3465,12 +3643,14 @@ impl FlureeR2rmlProvider<'_> {
         topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
-        // GREP: r2rml-as-of-t — time-travel is not implemented for Iceberg scans;
-        // `_as_of_t` is deliberately ignored. If as-of semantics ever land here,
-        // `table_row_count_inner` MUST honor them identically (matching breadcrumb
-        // there): a COUNT and a scan in one query must read the same snapshot.
+        // GREP: r2rml-as-of-t — `_as_of_t` is a Fluree `t`, which names no Iceberg
+        // state; it is ignored. A time-pinned read arrives as this query's
+        // `SourceTime` pin instead, and `select_snapshot` resolves it for BOTH this
+        // scan and `table_row_count_inner`, so a COUNT and a scan in one query
+        // read the same snapshot.
         #[cfg(feature = "sql")]
         if let Some(sql) = self.sql_source(graph_source_id).await? {
+            self.refuse_pin_on_sql_source(graph_source_id)?;
             let mapping = self.compiled_mapping(graph_source_id, None).await?;
             return sql
                 .scan(&self.session, &mapping, table_name, projection, filters)
@@ -3489,6 +3669,10 @@ impl FlureeR2rmlProvider<'_> {
         let (storage, metadata, metadata_location) =
             self.load_table_context(graph_source_id, table_name).await?;
 
+        // The snapshot this query reads: the source's time pin, else current.
+        let selected = self.select_snapshot(graph_source_id, table_name, &metadata)?;
+        let snapshot = selected.map(|s| s.snapshot);
+
         // Capture this table's pinned snapshot into the build watermark (DEC-003).
         // The single caller of `load_table_context` records here (first-writer-wins),
         // avoiding the multiple resolution paths inside it; the ids come straight off
@@ -3501,10 +3685,20 @@ impl FlureeR2rmlProvider<'_> {
             ),
             fluree_db_query::r2rml::TableWatermark {
                 metadata_location: metadata_location.clone(),
-                snapshot_id: metadata.current_snapshot_id,
-                sequence_number: metadata.current_snapshot().map(|s| s.sequence_number),
+                snapshot_id: snapshot.map(|s| s.snapshot_id),
+                sequence_number: snapshot.map(|s| s.sequence_number),
             },
         );
+
+        // A table that has never committed has no files to read.
+        let Some(selected) = selected else {
+            info!("Table has no snapshots - returning empty result");
+            return Ok(empty_batch_stream());
+        };
+        let snapshot = selected.snapshot;
+        // The scan-files caches describe one snapshot's live file set, so a
+        // historical pin gets its own key and warms like the current snapshot.
+        let cache_key = snapshot_cache_key(&metadata_location, selected);
 
         // Shared on-disk cache for data files (one global byte budget, deduped per
         // directory). Threaded into the Parquet readers, which apply a
@@ -3515,9 +3709,11 @@ impl FlureeR2rmlProvider<'_> {
 
         let cache = self.fluree.r2rml_cache();
 
-        let schema = metadata
-            .current_schema()
+        // The schema at the snapshot being read (current for an unpinned read),
+        // under current column names.
+        let schema = read_schema(&metadata, snapshot)
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
+        let schema = schema.as_ref();
 
         info!(
             format_version = metadata.format_version,
@@ -3557,37 +3753,11 @@ impl FlureeR2rmlProvider<'_> {
 
         // Reuse manifest-derived file selections across repeated scans of the
         // same snapshot. Projection still varies per scan, so we rebuild tasks.
-        // The scan-files cache is keyed only by metadata location, so it is
-        // bypassed when a pushdown filter is present (different filter → a
+        // The scan-files cache holds one snapshot's unfiltered file list, so it
+        // is bypassed when a pushdown filter is present (different filter → a
         // different pruned file set).
-        let (tasks, files_selected, files_pruned, estimated_row_count) = if let Some(filter) =
-            &filter_expr
-        {
-            let scan_config = ScanConfig::new()
-                .with_projection(projected_field_ids.clone())
-                .with_filter(filter.clone());
-            let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
-            let plan = planner
-                .plan_scan()
-                .await
-                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
-            (
-                plan.tasks,
-                plan.files_selected,
-                plan.files_pruned,
-                plan.estimated_row_count,
-            )
-        } else if let Some(cached) = cache.get_scan_files(&metadata_location).await {
-            // F-AUD-1 cache-arm guard: an in-memory scan-files HIT rebuilds tasks
-            // without calling the guarded plan_scan, so re-check the delete flag.
-            guard_cached_scan_files(cached.has_delete_manifests, &metadata_location)?;
-            debug!(
-                metadata_location = %metadata_location,
-                cached_files = cached.data_files.len(),
-                "Iceberg scan-files cache hit"
-            );
-
-            let tasks = cached
+        let rebuild_tasks = |files: &CachedScanFiles| {
+            files
                 .data_files
                 .iter()
                 .cloned()
@@ -3599,91 +3769,99 @@ impl FlureeR2rmlProvider<'_> {
                         Arc::clone(&schema_arc),
                     )
                 })
-                .collect::<Vec<_>>();
-
-            (
-                tasks,
-                cached.files_selected,
-                cached.files_pruned,
-                cached.estimated_row_count,
-            )
-        } else if let Some(disk) = self.catalog_disk_cache().get_scan_files(&metadata_location) {
-            // F-AUD-1 cache-arm guard (the cross-process case): a persistent-disk
-            // scan-files entry survives restarts, so a delete-bearing list cached
-            // under the override by an earlier process must be re-checked before it
-            // is served or promoted into the in-memory cache. Pre-guard (v2) entries
-            // are already excluded by the CACHE_FORMAT_VERSION bump; this covers a v3
-            // entry written under the override.
-            guard_cached_scan_files(disk.has_delete_manifests, &metadata_location)?;
-            // PR-8 slice 2: in-memory miss, but the persistent disk catalog
-            // cache has this snapshot's (unfiltered) file list — a warm-catalog
-            // cold process skips the manifest read (`iceberg.scan_plan`). Rebuild
-            // tasks from the file list exactly as the in-memory-hit arm does, and
-            // populate the in-memory cache for the rest of the process.
-            debug!(
-                metadata_location = %metadata_location,
-                cached_files = disk.data_files.len(),
-                "Iceberg scan-files disk-cache hit"
-            );
-            cache
-                .put_scan_files(metadata_location.clone(), Arc::clone(&disk))
-                .await;
-            let tasks = disk
-                .data_files
-                .iter()
-                .cloned()
-                .map(|data_file| {
-                    FileScanTask::for_whole_file_with_schema(
-                        data_file,
-                        projected_field_ids.clone(),
-                        None,
-                        Arc::clone(&schema_arc),
-                    )
-                })
-                .collect::<Vec<_>>();
-            (
-                tasks,
-                disk.files_selected,
-                disk.files_pruned,
-                disk.estimated_row_count,
-            )
-        } else {
-            debug!(metadata_location = %metadata_location, "Iceberg scan-files cache miss");
-
-            // Create scan configuration with projection for the first plan.
-            let scan_config = ScanConfig::new().with_projection(projected_field_ids.clone());
-            let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
-            let plan = planner
-                .plan_scan()
-                .await
-                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
-
-            let cached = Arc::new(CachedScanFiles {
-                data_files: Arc::new(
-                    plan.tasks
-                        .iter()
-                        .map(|task| task.data_file.clone())
-                        .collect(),
-                ),
-                estimated_row_count: plan.estimated_row_count,
-                files_selected: plan.files_selected,
-                files_pruned: plan.files_pruned,
-                has_delete_manifests: plan.has_delete_manifests,
-            });
-            cache
-                .put_scan_files(metadata_location.clone(), Arc::clone(&cached))
-                .await;
-            // Persist to the disk catalog cache (content-addressed, immutable).
-            self.catalog_disk_cache()
-                .put_scan_files(&metadata_location, &cached);
-
-            (
-                plan.tasks,
-                cached.files_selected,
-                cached.files_pruned,
-                cached.estimated_row_count,
-            )
+                .collect::<Vec<_>>()
         };
+        let (tasks, files_selected, files_pruned, estimated_row_count) =
+            if let Some(filter) = &filter_expr {
+                let scan_config = ScanConfig::new()
+                    .with_projection(projected_field_ids.clone())
+                    .with_filter(filter.clone());
+                let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
+                let plan = planner
+                    .plan_scan_for_snapshot(snapshot)
+                    .await
+                    .map_err(|e| storage_query_error("Failed to plan scan", e))?;
+                (
+                    plan.tasks,
+                    plan.files_selected,
+                    plan.files_pruned,
+                    plan.estimated_row_count,
+                )
+            } else if let Some(cached) = cache.get_scan_files(&cache_key).await {
+                // F-AUD-1 cache-arm guard: an in-memory scan-files HIT rebuilds tasks
+                // without calling the guarded plan_scan, so re-check the delete flag.
+                guard_cached_scan_files(cached.has_delete_manifests, &metadata_location)?;
+                debug!(
+                    metadata_location = %metadata_location,
+                    cached_files = cached.data_files.len(),
+                    "Iceberg scan-files cache hit"
+                );
+                (
+                    rebuild_tasks(&cached),
+                    cached.files_selected,
+                    cached.files_pruned,
+                    cached.estimated_row_count,
+                )
+            } else if let Some(disk) = self.catalog_disk_cache().get_scan_files(&cache_key) {
+                // F-AUD-1 cache-arm guard (the cross-process case): a persistent-disk
+                // scan-files entry survives restarts, so a delete-bearing list cached
+                // under the override by an earlier process must be re-checked before it
+                // is served or promoted into the in-memory cache. Pre-guard (v2) entries
+                // are already excluded by the CACHE_FORMAT_VERSION bump; this covers a v3
+                // entry written under the override.
+                guard_cached_scan_files(disk.has_delete_manifests, &metadata_location)?;
+                // PR-8 slice 2: in-memory miss, but the persistent disk catalog
+                // cache has this snapshot's (unfiltered) file list — a warm-catalog
+                // cold process skips the manifest read (`iceberg.scan_plan`). Rebuild
+                // tasks from the file list exactly as the in-memory-hit arm does, and
+                // populate the in-memory cache for the rest of the process.
+                debug!(
+                    metadata_location = %metadata_location,
+                    cached_files = disk.data_files.len(),
+                    "Iceberg scan-files disk-cache hit"
+                );
+                cache.put_scan_files(cache_key, Arc::clone(&disk)).await;
+                (
+                    rebuild_tasks(&disk),
+                    disk.files_selected,
+                    disk.files_pruned,
+                    disk.estimated_row_count,
+                )
+            } else {
+                debug!(metadata_location = %metadata_location, "Iceberg scan-files cache miss");
+
+                // Create scan configuration with projection for the first plan.
+                let scan_config = ScanConfig::new().with_projection(projected_field_ids.clone());
+                let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
+                let plan = planner
+                    .plan_scan_for_snapshot(snapshot)
+                    .await
+                    .map_err(|e| storage_query_error("Failed to plan scan", e))?;
+
+                let cached = Arc::new(CachedScanFiles {
+                    data_files: Arc::new(
+                        plan.tasks
+                            .iter()
+                            .map(|task| task.data_file.clone())
+                            .collect(),
+                    ),
+                    estimated_row_count: plan.estimated_row_count,
+                    files_selected: plan.files_selected,
+                    files_pruned: plan.files_pruned,
+                    has_delete_manifests: plan.has_delete_manifests,
+                });
+                // Persist to the disk catalog cache (content-addressed, immutable).
+                self.catalog_disk_cache()
+                    .put_scan_files(&cache_key, &cached);
+                cache.put_scan_files(cache_key, Arc::clone(&cached)).await;
+
+                (
+                    plan.tasks,
+                    cached.files_selected,
+                    cached.files_pruned,
+                    cached.estimated_row_count,
+                )
+            };
 
         info!(
             files_selected,
@@ -5648,5 +5826,218 @@ mod tests {
             "a builder-configured ceiling must move the budget; a fixed default \
              would mean the env var is still the only route that counts"
         );
+    }
+
+    /// A pinned read resolves the mapping's (current) column names through field
+    /// ids: `name` was renamed `full_name`, `email` was added after snapshot 1,
+    /// and `legacy` was dropped with its name reused by the renamed `old_code`.
+    #[test]
+    fn read_schema_resolves_current_names_by_field_id() {
+        let fields = |fs: &[(i32, &str)]| {
+            fs.iter()
+                .map(|(id, name)| json!({"id": id, "name": name, "required": false, "type": "string"}))
+                .collect::<Vec<_>>()
+        };
+        let metadata = TableMetadata::from_json_str(
+            &json!({
+                "format-version": 2,
+                "location": "s3://b/t",
+                "last-sequence-number": 2,
+                "last-updated-ms": 2000,
+                "last-column-id": 5,
+                "current-schema-id": 1,
+                "schemas": [
+                    {"type": "struct", "schema-id": 0,
+                     "fields": fields(&[(1, "name"), (2, "score"), (3, "legacy"), (4, "old_code")])},
+                    {"type": "struct", "schema-id": 1,
+                     "fields": fields(&[(1, "full_name"), (2, "score"), (4, "legacy"), (5, "email")])},
+                ],
+                "current-snapshot-id": 2,
+                "snapshots": [
+                    {"snapshot-id": 1, "sequence-number": 1, "timestamp-ms": 1000, "schema-id": 0,
+                     "manifest-list": "s3://b/t/snap-1.avro", "summary": {"operation": "append"}},
+                    {"snapshot-id": 2, "parent-snapshot-id": 1, "sequence-number": 2,
+                     "timestamp-ms": 2000, "schema-id": 1,
+                     "manifest-list": "s3://b/t/snap-2.avro", "summary": {"operation": "append"}},
+                ],
+                "snapshot-log": [],
+                "default-spec-id": 0,
+                "partition-specs": [],
+                "last-partition-id": 0,
+                "sort-orders": [],
+                "default-sort-order-id": 0,
+                "properties": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let ids_by_name = |snapshot_id: i64| {
+            let schema = read_schema(&metadata, metadata.snapshot(snapshot_id).unwrap()).unwrap();
+            schema
+                .fields
+                .iter()
+                .map(|f| (f.name.clone(), f.id))
+                .collect::<Vec<_>>()
+        };
+        let named = |pairs: &[(&str, i32)]| {
+            pairs
+                .iter()
+                .map(|(n, id)| (n.to_string(), *id))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            ids_by_name(1),
+            named(&[("full_name", 1), ("score", 2), ("legacy", 4)])
+        );
+        assert_eq!(
+            ids_by_name(2),
+            named(&[("full_name", 1), ("score", 2), ("legacy", 4), ("email", 5)])
+        );
+    }
+
+    /// A time pin must not be answered from REST cross-query caches that predate
+    /// it. Both layers are seeded with metadata whose current snapshot is 1
+    /// (committed at 1000 ms) and the catalog is unreachable, so reaching the
+    /// catalog surfaces as a load error: a pin the cached metadata cannot answer
+    /// has to go there, while an unpinned read and a pin it can answer are
+    /// served from cache.
+    #[tokio::test]
+    async fn time_pinned_rest_read_bypasses_caches_too_stale_for_the_pin() {
+        use crate::graph_source::catalog_session::{CachedLoadTable, IcebergCatalogSession};
+        use fluree_db_iceberg::config::{CatalogConfig, IoConfig, TableConfig};
+
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config = fluree_db_iceberg::IcebergGsConfig {
+            catalog: CatalogConfig::Rest {
+                catalog_type: "rest".to_string(),
+                uri: "http://127.0.0.1:1".to_string(),
+                auth: fluree_db_iceberg::auth::AuthConfig::None,
+                warehouse: None,
+            },
+            table: TableConfig::Identifier("ns.t".to_string()),
+            io: IoConfig::default(),
+            mapping: None,
+            delete: None,
+            order_by: None,
+            model: None,
+            default_allow: None,
+        }
+        .to_json()
+        .unwrap();
+
+        let old_loc = format!("s3://b/t-{nanos}/metadata/00001.metadata.json");
+        let old_metadata = TableMetadata::from_json_str(
+            &json!({
+                "format-version": 2,
+                "location": "s3://b/t",
+                "last-sequence-number": 1,
+                "last-updated-ms": 1000,
+                "last-column-id": 1,
+                "current-schema-id": 0,
+                "schemas": [],
+                "current-snapshot-id": 1,
+                "snapshots": [{
+                    "snapshot-id": 1,
+                    "sequence-number": 1,
+                    "timestamp-ms": 1000,
+                    "manifest-list": "s3://b/t/snap-1.avro",
+                    "summary": {"operation": "append"},
+                }],
+                "snapshot-log": [{"snapshot-id": 1, "timestamp-ms": 1000}],
+                "default-spec-id": 0,
+                "partition-specs": [],
+                "last-partition-id": 0,
+                "sort-orders": [],
+                "default-sort-order-id": 0,
+                "properties": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fluree
+            .r2rml_cache()
+            .put_metadata(old_loc.clone(), Arc::new(old_metadata))
+            .await;
+
+        let mut sources = Vec::new();
+        for layer in ["pointer", "loadtable"] {
+            let name = format!("pin-rider-{layer}-{}-{nanos}", std::process::id());
+            fluree
+                .publisher()
+                .unwrap()
+                .publish_graph_source(&name, "main", GraphSourceType::Iceberg, &config, &[])
+                .await
+                .unwrap();
+            let gs_id = format!("{name}:main");
+            let lt_key = IcebergCatalogSession::load_table_key(&gs_id, "ns", "t");
+            sources.push((layer, gs_id, lt_key));
+        }
+        let (_, pointer_gs, pointer_key) = &sources[0];
+        let (_, loadtable_gs, loadtable_key) = &sources[1];
+        let provider = FlureeR2rmlProvider::new(&fluree);
+        provider
+            .catalog_disk_cache()
+            .put_metadata_location(pointer_key, &old_loc, 1000);
+        fluree.r2rml_cache().put_rest_load_table(
+            loadtable_key.clone(),
+            Arc::new(CachedLoadTable::from_response(&vended_response(
+                &old_loc, true,
+            ))),
+        );
+
+        // One provider per read, as per query: the session pin must not carry.
+        let read = |gs_id: String, pin: Option<SourceTime>| {
+            let fluree = &fluree;
+            async move {
+                let provider = FlureeR2rmlProvider::new(fluree);
+                if let Some(pin) = pin {
+                    provider.pin_source_time(&gs_id, pin).unwrap();
+                }
+                provider
+                    .load_table_context(&gs_id, "ns.t")
+                    .await
+                    .map(|(_, _, loc)| loc)
+                    .map_err(|e| e.to_string())
+            }
+        };
+        let went_to_catalog =
+            |outcome: std::result::Result<String, String>, what: &str| match outcome {
+                Err(e) => assert!(
+                    e.contains("Failed to load table from catalog"),
+                    "{what}: expected a catalog load, got {e}"
+                ),
+                Ok(loc) => panic!("{what}: served {loc} from a cache too stale for the pin"),
+            };
+
+        for (pin, what) in [
+            (
+                SourceTime::AsOfTimestampMs(2500),
+                "pointer, as-of past cached",
+            ),
+            (SourceTime::SnapshotId(2), "pointer, snapshot id not cached"),
+        ] {
+            went_to_catalog(read(pointer_gs.clone(), Some(pin)).await, what);
+        }
+        for pin in [SourceTime::AsOfTimestampMs(500), SourceTime::SnapshotId(1)] {
+            assert_eq!(
+                read(pointer_gs.clone(), Some(pin)).await,
+                Ok(old_loc.clone()),
+                "pointer: {pin:?} is answerable from the cached metadata"
+            );
+        }
+        assert_eq!(read(pointer_gs.clone(), None).await, Ok(old_loc.clone()));
+
+        for pin in [SourceTime::AsOfTimestampMs(500), SourceTime::SnapshotId(1)] {
+            went_to_catalog(
+                read(loadtable_gs.clone(), Some(pin)).await,
+                &format!("loadTable cache, {pin:?}"),
+            );
+        }
+        assert_eq!(read(loadtable_gs.clone(), None).await, Ok(old_loc.clone()));
     }
 }

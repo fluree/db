@@ -216,6 +216,7 @@ pub(crate) fn time_spec_to_suffix(spec: &fluree_db_api::TimeSpec) -> String {
         fluree_db_api::TimeSpec::AtTime(iso) => format!("@iso:{iso}"),
         fluree_db_api::TimeSpec::AtRecorded(iso) => format!("@recorded:{iso}"),
         fluree_db_api::TimeSpec::AtCommit(prefix) => format!("@commit:{prefix}"),
+        fluree_db_api::TimeSpec::AtSnapshot(id) => format!("@snapshot:{id}"),
     }
 }
 
@@ -465,10 +466,11 @@ pub async fn run(
     // (subject to the same restrictions the server enforces for graph sources).
     let mode = match target {
         context::QueryTarget::GraphSource { fluree, alias } => {
-            reject_graph_source_unsupported(at, explain, output_format)?;
+            reject_graph_source_unsupported(explain, output_format)?;
             return run_graph_source_query(
                 &fluree,
                 &alias,
+                at,
                 query_format,
                 &content,
                 output_format,
@@ -1720,21 +1722,14 @@ fn target_endpoint_id(target: &context::QueryTarget) -> String {
     }
 }
 
-/// Reject the flags the server also refuses for graph-source targets: time
-/// travel, explain plans, and the streaming / delimited output formats. A graph
-/// source is queried at its live source state and returns JSON only.
+/// Reject the flags the server also refuses for graph-source targets: explain
+/// plans and the streaming / delimited output formats. `--at` is not among
+/// them: the API decides which selectors a source honors (`snapshot:` and
+/// `time:` on table sources) and refuses the rest with its own error.
 fn reject_graph_source_unsupported(
-    at: Option<&str>,
     explain: bool,
     output_format: OutputFormatKind,
 ) -> CliResult<()> {
-    if at.is_some() {
-        return Err(CliError::Usage(
-            "`--at` (time travel) is not supported for graph source targets; a graph source is \
-             queried at its live source state"
-                .to_string(),
-        ));
-    }
     if explain {
         return Err(CliError::Usage(
             "`--explain` is not supported for graph source targets".to_string(),
@@ -1850,9 +1845,11 @@ fn render_json_path_result(
 /// the R2RML-aware `graph().query()` builder — the same path the server uses for
 /// `POST /query/<graph-source>`. Requires the `iceberg` feature.
 #[cfg(feature = "iceberg")]
+#[allow(clippy::too_many_arguments)]
 async fn run_graph_source_query(
     fluree: &fluree_db_api::Fluree,
     alias: &str,
+    at: Option<&str>,
     query_format: detect::QueryFormat,
     content: &str,
     output_format: OutputFormatKind,
@@ -1860,11 +1857,15 @@ async fn run_graph_source_query(
     limit: Option<usize>,
 ) -> CliResult<()> {
     let fmt = json_path_formatter_config(query_format, output_format, normalize_arrays);
+    let spec = at
+        .map(parse_time_spec)
+        .transpose()?
+        .unwrap_or(fluree_db_api::TimeSpec::Latest);
     let timer = Instant::now();
     let result_json = match query_format {
         detect::QueryFormat::Sparql => {
             fluree
-                .graph(alias)
+                .graph_at(alias, spec)
                 .query()
                 .sparql(content)
                 .format(fmt)
@@ -1874,7 +1875,7 @@ async fn run_graph_source_query(
         detect::QueryFormat::JsonLd => {
             let json: serde_json::Value = serde_json::from_str(content)?;
             fluree
-                .graph(alias)
+                .graph_at(alias, spec)
                 .query()
                 .jsonld(&json)
                 .format(fmt)
@@ -1890,9 +1891,11 @@ async fn run_graph_source_query(
 /// so a graph-source single-target query can't run locally. Resolution still
 /// succeeds (so the message is clear), but execution points the user at the fix.
 #[cfg(not(feature = "iceberg"))]
+#[allow(clippy::too_many_arguments)]
 async fn run_graph_source_query(
     _fluree: &fluree_db_api::Fluree,
     alias: &str,
+    _at: Option<&str>,
     _query_format: detect::QueryFormat,
     _content: &str,
     _output_format: OutputFormatKind,
@@ -2057,6 +2060,7 @@ mod tests {
             TimeSpec::AtTime("2024-01-15T10:30:00Z".to_string()),
             TimeSpec::AtRecorded("2024-01-15T10:30:00Z".to_string()),
             TimeSpec::AtCommit("abc123def".to_string()),
+            TimeSpec::AtSnapshot(5_648_190_075_564_901_028),
         ];
         for spec in all {
             let suffix = time_spec_to_suffix(&spec);
@@ -2295,17 +2299,14 @@ mod tests {
 
     #[test]
     fn graph_source_guardrails_reject_unsupported_flags() {
-        assert!(
-            reject_graph_source_unsupported(Some("3"), false, OutputFormatKind::Table).is_err()
-        );
-        assert!(reject_graph_source_unsupported(None, true, OutputFormatKind::Table).is_err());
-        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Ndjson).is_err());
-        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Csv).is_err());
-        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Tsv).is_err());
+        assert!(reject_graph_source_unsupported(true, OutputFormatKind::Table).is_err());
+        assert!(reject_graph_source_unsupported(false, OutputFormatKind::Ndjson).is_err());
+        assert!(reject_graph_source_unsupported(false, OutputFormatKind::Csv).is_err());
+        assert!(reject_graph_source_unsupported(false, OutputFormatKind::Tsv).is_err());
         // Supported combinations pass.
-        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Json).is_ok());
-        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::Table).is_ok());
-        assert!(reject_graph_source_unsupported(None, false, OutputFormatKind::TypedJson).is_ok());
+        assert!(reject_graph_source_unsupported(false, OutputFormatKind::Json).is_ok());
+        assert!(reject_graph_source_unsupported(false, OutputFormatKind::Table).is_ok());
+        assert!(reject_graph_source_unsupported(false, OutputFormatKind::TypedJson).is_ok());
     }
 
     #[test]

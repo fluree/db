@@ -194,6 +194,15 @@ fluree query --at recorded:2024-01-15T10:30:00Z 'SELECT * WHERE { ?s ?p ?o }'
 fluree query --at latest 'SELECT * WHERE { ?s ?p ?o }'
 ```
 
+An Iceberg-backed graph source takes `--at snapshot:<id>` (the Iceberg snapshot
+id) or `--at iso:<ISO-8601>`; `t:` and `commit:` name ledger states and are
+rejected there. See
+[time travel on graph sources](../concepts/time-travel.md#graph-sources-snapshot).
+
+```bash
+fluree query warehouse-orders --at snapshot:5648190075564901028 'SELECT * WHERE { ?s ?p ?o } LIMIT 10'
+```
+
 Tracked/remote ledgers also support `--at`. The CLI will translate `--at` into the appropriate dataset/time-travel form when forwarding the query to the remote server.
 
 SPARQL note (remote): if your SPARQL already includes `FROM` / `FROM NAMED`, the CLI will **not** rewrite it for `--at`. In that case, encode time travel directly in the `FROM` IRI (e.g., `FROM <myledger:main@t:5>`).

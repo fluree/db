@@ -167,6 +167,17 @@ On a ledger that never used `eventTime`, the two axes are identical and
 signed commit envelope, so a signature attests to the claimed event time and
 the recording time together.
 
+### Graph Sources (`@snapshot:`)
+
+A virtual graph source backed by a snapshotted table (Iceberg) has no
+transaction numbers or commit hashes, so `@t:` and `@commit:` are rejected on
+its alias. It is pinned instead with `@iso:` / `@recorded:` (the latest table
+snapshot committed at or before that instant — a table snapshot has one time,
+so the two coincide) or with the table format's own identifier,
+`@snapshot:<id>`, which is meaningless on a native ledger and rejected there.
+A pin no retained snapshot satisfies is an error, never the current state. See
+[Iceberg time travel](../graph-sources/iceberg.md#time-travel).
+
 ## Temporal Data Model
 
 ### Immutable Facts

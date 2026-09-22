@@ -716,11 +716,23 @@ Combines customer data from Fluree with order data from Iceberg.
 
 ## Time Travel
 
-Query historical Iceberg snapshots:
+A query against a virtual Iceberg source reads the table's **current**
+snapshot unless the alias carries a time specification, in which case every
+table of the source is read at the snapshot that specification selects, for the
+whole query. Two selectors apply to Iceberg sources:
+
+| Selector | Selects |
+| --- | --- |
+| `@snapshot:<id>` | The snapshot with exactly that Iceberg snapshot id (any retained snapshot, including one later rolled back) |
+| `@iso:<timestamp>` | The snapshot that **was the table's current state** at that instant (RFC 3339): the latest snapshot-log entry at or before it, the same rule as Iceberg's own `TIMESTAMP AS OF`. A retained snapshot that was rolled back, or lives only on a branch, is not selected by time. |
+
+`@recorded:<timestamp>` is accepted as a synonym for `@iso:`: an Iceberg
+snapshot carries one time, its commit time, and no separate event-time axis —
+the same rule as a ledger that never used caller-supplied event times.
 
 ```json
 {
-  "from": "warehouse-orders:main@snapshot:12345",
+  "from": "warehouse-orders:main@snapshot:5648190075564901028",
   "select": ["?orderId", "?total"],
   "where": [
     { "@id": "?order", "ex:orderId": "?orderId" },
@@ -729,15 +741,47 @@ Query historical Iceberg snapshots:
 }
 ```
 
-Or by timestamp:
-
 ```json
 {
-  "from": "warehouse-orders:main@timestamp:2024-01-01T00:00:00Z",
+  "from": "warehouse-orders:main@iso:2024-01-01T00:00:00Z",
   "select": ["?orderId", "?total"],
   "where": [...]
 }
 ```
+
+The same selectors work in SPARQL `FROM <warehouse-orders:main@iso:...>` and in
+the Rust API as `fluree.graph_at(alias, TimeSpec::AtSnapshot(id))` /
+`TimeSpec::AtTime(iso)`. Aggregates, including the manifest-backed `COUNT`
+shortcut, answer from the selected snapshot, so a count and a row scan in one
+query never disagree. Columns are resolved against the schema **as of that
+snapshot** (Iceberg reads Parquet by field id); the R2RML mapping applied is
+always the source's current mapping.
+
+A selection that no retained snapshot can satisfy is an **error**, never a
+fallback to the current or oldest snapshot:
+
+- `@snapshot:` with an id the table no longer has (expired by snapshot
+  retention, or never existed) → `snapshot <id> not found for table '...'`.
+- `@iso:` before the oldest retained snapshot → `no snapshot of table '...' at
+  or before <requested>; the oldest retained snapshot is <time>`.
+- Either selector on a table that has never committed (no snapshots yet) →
+  the same errors, saying the table has no snapshots. Unpinned, such a table
+  simply reads as empty.
+
+`@t:` and `@commit:` name Fluree ledger states and are rejected on a graph
+source; `@snapshot:` is rejected on a native ledger. Only Iceberg-backed
+sources can be pinned: a SQL-backed R2RML source, a BM25 or vector index read
+their current state and reject any time specification. Naming one source at
+two different states in one query — two different pins, or one reference
+pinned and another not, across `from` and `fromNamed` — is also rejected,
+because a pin applies to every read of that source in the query.
+
+Retention matters: Iceberg's `expire_snapshots` removes old snapshots, and a
+table whose history has been expired cannot answer for it. For a durable
+point-in-time copy, [materialize a native twin](#materializing-a-native-twin);
+its completion stamp records the exact snapshot each table was read at, and
+`@snapshot:` with that id re-reads the same state from the source while it is
+retained.
 
 ## Aggregations
 
@@ -825,6 +869,8 @@ the type (`?s a ?t`), both are kept unless their class sets are equal.
 ## Schema Evolution
 
 Iceberg supports schema evolution via metadata updates. If a schema change renames/removes columns used by your R2RML mapping, update the mapping accordingly.
+
+A time-pinned read always uses the current mapping. Columns are matched by Iceberg field id, so a column renamed since the pinned snapshot still resolves under its new name, and a column added since reads as absent, as it was at that snapshot.
 
 ## Configuration Options
 
