@@ -407,6 +407,16 @@ async fn run_ledger_archive_remote(
 // RDF formats (turtle, ntriples, nquads, trig, jsonld)
 // =============================================================================
 
+/// `--at` as the export body carries it: parsed first, so a malformed value
+/// fails before the request as it does for `query --at`, then re-rendered in
+/// the wire spelling `query` sends (a timestamp goes as `iso:`, which servers
+/// older than the `time:` alias still accept).
+fn remote_at(at: &str) -> CliResult<String> {
+    let spec = crate::commands::query::parse_time_spec(at)?;
+    let suffix = crate::commands::query::time_spec_to_suffix(&spec);
+    Ok(suffix.trim_start_matches('@').to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_remote_rdf(
     alias: &str,
@@ -437,7 +447,7 @@ async fn run_remote_rdf(
         body["graph"] = serde_json::Value::String(iri.to_string());
     }
     if let Some(at_str) = at {
-        body["at"] = serde_json::Value::String(at_str.to_string());
+        body["at"] = serde_json::Value::String(remote_at(at_str)?);
     }
     if let Some(ctx) = context_override {
         body["context"] = ctx;
@@ -672,5 +682,25 @@ fn resolve_context_override(
             Ok(Some(ctx))
         }
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remote_at;
+
+    #[test]
+    fn remote_at_sends_the_wire_spelling() {
+        assert_eq!(
+            remote_at("time:2024-01-15T10:30:00Z").unwrap(),
+            "iso:2024-01-15T10:30:00Z"
+        );
+        assert_eq!(
+            remote_at("2024-01-15T10:30:00Z").unwrap(),
+            "iso:2024-01-15T10:30:00Z"
+        );
+        assert_eq!(remote_at("5").unwrap(), "t:5");
+        assert_eq!(remote_at("commit:abc123def").unwrap(), "commit:abc123def");
+        assert!(remote_at("t:abc").is_err());
     }
 }
