@@ -227,7 +227,7 @@ fn cached_overlay_translation(
 
     let OverlayTranslateV3Result {
         mut ops,
-        raw,
+        mut raw,
         ephemeral_p_id_to_sid,
         failed: _,
     } = translate_overlay_ops_v3_with_raw(
@@ -245,8 +245,13 @@ fn cached_overlay_translation(
     fluree_db_binary_index::read::types::sort_overlay_ops(&mut ops, order);
     fluree_db_binary_index::read::types::resolve_overlay_ops(&mut ops);
 
+    // `raw_window` binary-searches this set, so an out-of-order overlay would
+    // silently drop matches. Once per cache fill, not per probe.
     let cmp = index.comparator();
-    debug_assert!(raw.is_sorted_by(|a, b| cmp(a, b).is_le()));
+    if !raw.is_sorted_by(|a, b| cmp(a, b).is_le()) {
+        debug_assert!(false, "overlay yielded out of comparator order");
+        raw.sort_by(cmp);
+    }
 
     let entry = Arc::new(CachedRangeTranslation {
         ops: ops.into(),
@@ -679,6 +684,12 @@ fn binary_range_eq_v3(
             )
         }
     };
+    if !untranslated.is_empty() {
+        tracing::trace!(
+            raw_merged = untranslated.len(),
+            "V3 range probe merges raw overlay flakes"
+        );
+    }
 
     if !overlay_ops.is_empty() {
         // Range-bounded cursors get only the ops window intersecting
@@ -1821,6 +1832,123 @@ mod tests {
         };
         assert!(raw_fact_may_match(&weight("b", "2.5", 3, false), &probe));
         assert!(!raw_fact_may_match(&weight("a", "1.25", 2, true), &probe));
+    }
+
+    /// The window is sound only where `FlakeValue`'s ordering calls equal
+    /// what its equality does — a POST probe for `Long(3)` must find a raw
+    /// `BigInt(3)` or `Decimal("3")` between its sentinels. Every index order
+    /// and probe shape here must answer as merging all raw flakes did: resolve
+    /// the whole set, then filter.
+    #[test]
+    fn raw_window_answers_as_the_full_merge_in_every_order() {
+        use fluree_db_core::range::{flake_matches_range_eq, resolve_current_flakes};
+        use fluree_db_core::FlakeMeta;
+
+        fn dec(v: &str) -> FlakeValue {
+            FlakeValue::Decimal(Box::new(v.parse().unwrap()))
+        }
+        let fl = |subj: &str, pred: &str, o: FlakeValue, dt: &str, t: i64, op: bool| {
+            Flake::new(s(subj), s(pred), o, Sid::new(2, dt), t, op, None)
+        };
+        let lang = |subj: &str, v: &str, tag: &str, t: i64, op: bool| {
+            Flake::new(
+                s(subj),
+                s("label"),
+                FlakeValue::String(v.into()),
+                Sid::new(3, "langString"),
+                t,
+                op,
+                Some(FlakeMeta::with_lang(tag)),
+            )
+        };
+        let raw_all = vec![
+            // A retraction written at another scale cancels its assert.
+            fl("a", "weight", dec("2.5"), "decimal", 2, true),
+            fl("a", "weight", dec("2.50"), "decimal", 3, false),
+            // One numeric value across four representations.
+            fl("b", "weight", FlakeValue::Long(3), "long", 2, true),
+            fl(
+                "c",
+                "weight",
+                FlakeValue::BigInt(Box::new(3.into())),
+                "integer",
+                2,
+                true,
+            ),
+            fl("d", "weight", dec("3"), "decimal", 2, true),
+            fl("e", "weight", FlakeValue::Double(3.0), "double", 2, true),
+            fl("a", "score", FlakeValue::Long(7), "long", 2, true),
+            fl("b", "score", dec("7.0"), "decimal", 2, true),
+            fl("e", "knows", FlakeValue::Ref(s("a")), "id", 2, true),
+            lang("c", "x", "en", 2, true),
+            lang("d", "x", "fr", 2, true),
+            lang("d", "x", "fr", 4, false),
+        ];
+        let subjects: Vec<Option<Sid>> = std::iter::once(None)
+            .chain(["a", "b", "c", "d", "e", "zz"].map(|n| Some(s(n))))
+            .collect();
+        let predicates: Vec<Option<Sid>> = std::iter::once(None)
+            .chain(["weight", "score", "knows", "label", "zz"].map(|n| Some(s(n))))
+            .collect();
+        let objects: Vec<Option<FlakeValue>> = vec![
+            None,
+            Some(FlakeValue::Long(3)),
+            Some(FlakeValue::BigInt(Box::new(3.into()))),
+            Some(dec("3.000")),
+            Some(FlakeValue::Double(3.0)),
+            Some(dec("2.5")),
+            Some(FlakeValue::Long(7)),
+            Some(FlakeValue::Ref(s("a"))),
+            Some(FlakeValue::String("x".into())),
+            Some(FlakeValue::Long(4)),
+        ];
+
+        for index in [
+            IndexType::Spot,
+            IndexType::Psot,
+            IndexType::Post,
+            IndexType::Opst,
+        ] {
+            let mut raw = raw_all.clone();
+            raw.sort_by(index.comparator());
+            let mut narrowed = 0;
+            let mut non_empty = 0;
+            for s_ in &subjects {
+                for p_ in &predicates {
+                    for o_ in &objects {
+                        let probe = RangeMatch {
+                            s: s_.clone(),
+                            p: p_.clone(),
+                            o: o_.clone(),
+                            ..RangeMatch::new()
+                        };
+                        let mut full: Vec<Flake> = resolve_current_flakes(raw.clone(), index)
+                            .into_iter()
+                            .filter(|f| flake_matches_range_eq(f, &probe))
+                            .collect();
+                        let window = raw_window(&raw, index, &probe);
+                        narrowed += usize::from(window.len() < raw.len());
+                        let mut windowed: Vec<Flake> = resolve_current_flakes(
+                            window
+                                .iter()
+                                .filter(|f| raw_fact_may_match(f, &probe))
+                                .cloned()
+                                .collect(),
+                            index,
+                        )
+                        .into_iter()
+                        .filter(|f| flake_matches_range_eq(f, &probe))
+                        .collect();
+                        full.sort_by(index.comparator());
+                        windowed.sort_by(index.comparator());
+                        assert_eq!(windowed, full, "{index:?} {probe:?}");
+                        non_empty += usize::from(!full.is_empty());
+                    }
+                }
+            }
+            assert!(narrowed > 0, "{index:?}: no probe narrowed the window");
+            assert!(non_empty > 0, "{index:?}: every answer was empty");
+        }
     }
 
     /// Sorted-vec overlay honoring the `(first, rhs]` contract, counting what

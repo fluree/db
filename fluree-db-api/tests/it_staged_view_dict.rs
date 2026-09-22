@@ -38,6 +38,8 @@ static TRANSLATE_FAILURES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static STAGING_SEEN: AtomicUsize = AtomicUsize::new(0);
 /// Translations that routed untranslatable flakes to the raw-merge path.
 static RAW_MERGES: AtomicUsize = AtomicUsize::new(0);
+/// Largest number of raw flakes any single range probe merged.
+static RAW_PROBE_MAX: AtomicUsize = AtomicUsize::new(0);
 /// The probe is process-global, so tests run one at a time to keep every
 /// captured event attributable to the transaction under test.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -69,6 +71,14 @@ impl<S: tracing::Subscriber> Layer<S> for ProbeLayer {
         }
         if flat.text.contains("not V3-translatable") {
             RAW_MERGES.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(rest) = flat.text.split("raw_merged=").nth(1) {
+            let n: usize = rest
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|d| d.parse().ok())
+                .expect("raw_merged is a count");
+            RAW_PROBE_MAX.fetch_max(n, Ordering::SeqCst);
         }
         let translate_failure = flat.text.contains("failed to translate overlay flake")
             || flat.text.contains("failed V3 translation")
@@ -355,6 +365,12 @@ async fn indexed_item_ledger(
     fluree.ledger(ledger_id).await.expect("load")
 }
 
+/// Raw flakes one staged probe may merge. Each item carries one weight, so a
+/// probe's window holds its own fact (plus room for a cancelling retraction);
+/// merging the whole raw set would put all of the batch's weights on every
+/// probe.
+const PROBE_RAW_BOUND: usize = 4;
+
 /// Decimals new to the transaction are absent from the persisted NumBig
 /// arena, so they cannot translate. Staged probes still have to find each
 /// subject's own values among the transaction's flakes — both when the
@@ -376,6 +392,7 @@ async fn shacl_over_staged_view_sees_untranslatable_decimals() {
         let valid = format!("staged-view-dict/decimal-valid-{lane}:main");
         let ledger = indexed_item_ledger(&fluree, &valid, weighted).await;
         let merges_before = RAW_MERGES.load(Ordering::SeqCst);
+        RAW_PROBE_MAX.store(0, Ordering::SeqCst);
         fluree
             .insert_with_opts(
                 ledger,
@@ -390,6 +407,14 @@ async fn shacl_over_staged_view_sees_untranslatable_decimals() {
             assert!(
                 RAW_MERGES.load(Ordering::SeqCst) > merges_before,
                 "novel decimals did not reach the raw-merge path; the lane is not under test"
+            );
+            // Each probe reads only its own window of the batch's raw flakes.
+            // Merging the whole raw set per probe is correct but quadratic in
+            // batch size, and would put every item's flakes on every probe.
+            let widest = RAW_PROBE_MAX.load(Ordering::SeqCst);
+            assert!(
+                (1..=PROBE_RAW_BOUND).contains(&widest),
+                "a probe merged {widest} raw flakes; expected 1..={PROBE_RAW_BOUND}"
             );
         }
 
