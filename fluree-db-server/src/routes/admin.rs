@@ -330,6 +330,13 @@ pub async fn discovery(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     }
     doc["import"] = import_doc;
 
+    // Advertise that `POST /push-merges` exists. A client refuses to push a
+    // history containing a merge to a server without it, rather than send a
+    // bundle that server would store incompletely.
+    doc["push"] = serde_json::json!({
+        "merged_commits": true,
+    });
+
     // Advertise server-wide serving capabilities so clients can negotiate
     // query-shipping vs peer (block-fetch) mode before authenticating.
     // Per-ledger posture (f:servingDefaults) is advertised on the

@@ -764,6 +764,7 @@ impl Committer for QueuedTransactor {
             ledger_id,
             commits,
             blobs,
+            merged_commits,
             governance,
         } = request;
 
@@ -785,23 +786,34 @@ impl Committer for QueuedTransactor {
         // and record its CID. The envelope carries only the CIDs;
         // the worker reads the bytes back when staging.
         let content_store = self.fluree.content_store(&ledger_id);
-        let mut commit_cids = Vec::with_capacity(commits.len());
-        for commit_bytes in &commits {
-            let cid = content_store
-                .put(ContentKind::Commit, commit_bytes)
-                .await
-                .map_err(|e| SubmissionError::Execution {
-                    status: 500,
-                    message: format!("push commit CAS write failed: {e}"),
-                })?;
-            commit_cids.push(cid);
-        }
+        let upload = |blobs: Vec<Vec<u8>>| {
+            let content_store = content_store.clone();
+            async move {
+                let mut cids = Vec::with_capacity(blobs.len());
+                for bytes in &blobs {
+                    let cid = content_store
+                        .put(ContentKind::Commit, bytes)
+                        .await
+                        .map_err(|e| SubmissionError::Execution {
+                            status: 500,
+                            message: format!("push commit CAS write failed: {e}"),
+                        })?;
+                    cids.push(cid);
+                }
+                Ok::<_, SubmissionError>(cids)
+            }
+        };
+        let commit_cids = upload(commits).await?;
+        let merged_commit_cids = upload(merged_commits).await?;
 
-        let envelope = QueuedRequest::Push(Box::new(QueuedPush {
-            commit_cids,
-            blobs,
-            governance,
-        }));
+        let envelope = QueuedRequest::for_push(
+            QueuedPush {
+                commit_cids,
+                blobs,
+                governance,
+            },
+            merged_commit_cids,
+        );
         let outcome = self
             .enqueue_and_await(
                 ledger_name,

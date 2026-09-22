@@ -370,6 +370,10 @@ pub enum QueuedRequest {
     /// worker decodes via `Fluree::prepare_push`, advances the head
     /// to the chain's final commit.
     Push(Box<QueuedPush>),
+    /// `push` carrying the commits its merges brought in. Handled like
+    /// [`Self::Push`], and separate so that a worker that cannot store
+    /// those commits refuses the entry.
+    PushWithMerges(Box<QueuedPushWithMerges>),
     /// `revert` — selection + conflict strategy. The worker
     /// re-runs `Fluree::prepare_revert` and advances the head to
     /// the resulting inverse commit (or NoOp short-circuits when
@@ -385,6 +389,21 @@ pub enum QueuedRequest {
 }
 
 impl QueuedRequest {
+    /// The envelope for a push.
+    ///
+    /// A push that brought in no merged commits keeps [`Self::Push`]. A
+    /// worker predating [`Self::PushWithMerges`] still applies that one.
+    pub fn for_push(push: QueuedPush, merged_commit_cids: Vec<CommitId>) -> Self {
+        if merged_commit_cids.is_empty() {
+            Self::Push(Box::new(push))
+        } else {
+            Self::PushWithMerges(Box::new(QueuedPushWithMerges {
+                push,
+                merged_commit_cids,
+            }))
+        }
+    }
+
     /// Encode the envelope for content-addressed storage. The leader
     /// writes these bytes to CAS; the resulting `ContentId` becomes
     /// the `request_cid` in `QueueSubmission`.
@@ -434,6 +453,7 @@ impl QueuedRequest {
             // descriptors, branch names), so hashing the full envelope is
             // equivalent to hashing the canonical body.
             QueuedRequest::Push(p) => canonical_json_bytes(p),
+            QueuedRequest::PushWithMerges(p) => canonical_json_bytes(p),
             QueuedRequest::Revert(r) => canonical_json_bytes(r),
             QueuedRequest::Merge(m) => canonical_json_bytes(m),
             QueuedRequest::Rebase(r) => canonical_json_bytes(r),
@@ -486,6 +506,21 @@ pub struct QueuedPush {
     pub commit_cids: Vec<CommitId>,
     pub blobs: HashMap<String, Vec<u8>>,
     pub governance: GovernanceOptions,
+}
+
+/// Push-side envelope payload for a push whose commits include a merge.
+///
+/// A separate variant rather than a field on [`QueuedPush`]. A worker
+/// predating this release would ignore an unknown field and store the
+/// merge commits' parents nowhere. It fails to decode an unknown variant
+/// instead, which is what a rolling upgrade needs: the entry is refused
+/// rather than half applied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedPushWithMerges {
+    pub push: QueuedPush,
+    /// CIDs of the commits the push's merges brought in, parents before
+    /// children.
+    pub merged_commit_cids: Vec<CommitId>,
 }
 
 /// Revert-side envelope payload. Mirrors the fields of
@@ -662,6 +697,9 @@ pub struct PushRequest {
     pub ledger_id: String,
     pub commits: Vec<Vec<u8>>,
     pub blobs: HashMap<String, Vec<u8>>,
+    /// Commit blobs that merges in `commits` brought in, parents before
+    /// children. See [`fluree_db_api::PushCommitsRequest::merged_commits`].
+    pub merged_commits: Vec<Vec<u8>>,
     pub governance: GovernanceOptions,
 }
 
@@ -944,6 +982,52 @@ mod tests {
             canonical_json_bytes(&a).unwrap(),
             canonical_json_bytes(&b).unwrap(),
         );
+    }
+
+    /// A push carrying merged-in commits must not decode as a plain
+    /// push on a worker that predates the variant. That worker would
+    /// store the merge commits without their parents.
+    #[test]
+    fn a_push_with_merges_does_not_decode_as_a_plain_push() {
+        // The variants of `QueuedRequest` as that release knew them.
+        // Payloads are ignored: the variant name is what decides.
+        #[derive(serde::Deserialize)]
+        enum PriorRelease {
+            Transact(serde::de::IgnoredAny),
+            Push(serde::de::IgnoredAny),
+            Revert(serde::de::IgnoredAny),
+            Merge(serde::de::IgnoredAny),
+            Rebase(serde::de::IgnoredAny),
+        }
+
+        use fluree_db_core::{ContentId, ContentKind};
+        let commit_cid = ContentId::new(ContentKind::Commit, b"line");
+        let merged_cid = ContentId::new(ContentKind::Commit, b"merged");
+        let push = QueuedPush {
+            commit_cids: vec![commit_cid.clone()],
+            blobs: HashMap::new(),
+            governance: GovernanceOptions::default(),
+        };
+        let bytes = QueuedRequest::for_push(push.clone(), vec![merged_cid.clone()])
+            .to_bytes()
+            .expect("encode");
+
+        assert!(serde_json::from_slice::<PriorRelease>(&bytes).is_err());
+
+        match QueuedRequest::from_bytes(&bytes).expect("decode") {
+            QueuedRequest::PushWithMerges(decoded) => {
+                assert_eq!(decoded.push.commit_cids, vec![commit_cid]);
+                assert_eq!(decoded.merged_commit_cids, vec![merged_cid]);
+            }
+            other => panic!("expected PushWithMerges, got {other:?}"),
+        }
+
+        // A push without merges keeps the original variant, which that
+        // worker still accepts.
+        let bytes = QueuedRequest::for_push(push, Vec::new())
+            .to_bytes()
+            .expect("encode");
+        assert!(serde_json::from_slice::<PriorRelease>(&bytes).is_ok());
     }
 
     #[test]

@@ -328,6 +328,7 @@ impl Committer for LocalCommitter {
             ledger_id,
             commits,
             blobs,
+            merged_commits,
             governance,
         } = request;
 
@@ -340,6 +341,7 @@ impl Committer for LocalCommitter {
             // The staged bundle carries every blob it resolved; a gap it
             // could not resolve is not distinguished here yet.
             missing_blobs: Vec::new(),
+            merged_commits: merged_commits.into_iter().map(Base64Bytes).collect(),
         };
 
         let response = self

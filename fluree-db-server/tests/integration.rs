@@ -2,7 +2,7 @@ use axum::body::Body;
 use fluree_db_api::{
     ExportCommitsRequest, ExportCommitsResponse, NamespaceRegistry, PushCommitsRequest,
 };
-use fluree_db_core::{ContentId, Flake, FlakeMeta, FlakeValue, Sid};
+use fluree_db_core::{ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid};
 use fluree_db_novelty::Commit;
 use fluree_db_server::config::{AdminAuthMode, DataAuthMode, EventsAuthMode};
 use fluree_db_server::{routes::build_router, AppState, ServerConfig, TelemetryConfig};
@@ -126,6 +126,13 @@ fn json_contains_string(v: &JsonValue, needle: &str) -> bool {
         JsonValue::Array(a) => a.iter().any(|x| json_contains_string(x, needle)),
         JsonValue::Object(o) => o.values().any(|x| json_contains_string(x, needle)),
     }
+}
+
+/// A merge commit at `t`. `parents` is first parent first.
+fn make_merge_commit_bytes(t: i64, parents: Vec<ContentId>, flakes: Vec<Flake>) -> Vec<u8> {
+    let c = Commit::new(t, flakes).with_merge_parents(parents);
+    let res = fluree_db_core::commit::codec::write_commit(&c, true, None).expect("write_commit");
+    res.bytes
 }
 
 fn make_commit_bytes(t: i64, previous: Option<&ContentId>, flakes: Vec<Flake>) -> Vec<u8> {
@@ -756,6 +763,7 @@ async fn push_endpoint_accepts_single_commit_and_advances_head() {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
         missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
     };
 
     let resp = app
@@ -805,6 +813,135 @@ async fn push_endpoint_accepts_single_commit_and_advances_head() {
     );
 }
 
+/// Build a ledger at t=1 and the pieces of a push that merges a side
+/// commit into it: the merge commit's bytes and the side commit's bytes.
+async fn merge_push_fixture(ledger: &str) -> (TempDir, Arc<AppState>, PushCommitsRequest) {
+    merge_push_fixture_on(test_state().await, ledger).await
+}
+
+/// [`merge_push_fixture`] on a server the caller configured.
+async fn merge_push_fixture_on(
+    (tmp, state): (TempDir, Arc<AppState>),
+    ledger: &str,
+) -> (TempDir, Arc<AppState>, PushCommitsRequest) {
+    let app = build_router(state.clone());
+
+    let create_body = serde_json::json!({ "ledger": ledger });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let name = Sid::new(FLUREE_DB, "name");
+    let dt = Sid::new(XSD, xsd_names::STRING);
+    let flake = |subject: &str, value: &str, t: i64| {
+        Flake::new(
+            Sid::new(FLUREE_DB, subject),
+            name.clone(),
+            FlakeValue::String(value.to_string()),
+            dt.clone(),
+            t,
+            true,
+            None,
+        )
+    };
+
+    // t=1 on the branch, which the merge commit descends from.
+    let base = make_commit_bytes(1, None, vec![flake("alice", "Alice", 1)]);
+    let base_cid = ContentId::new(ContentKind::Commit, &base);
+    let push_req = PushCommitsRequest {
+        commits: vec![fluree_db_api::Base64Bytes(base.clone())],
+        blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
+    };
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/push/{ledger}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A side branch forked from t=1, and the merge of it at t=2. The side
+    // commit's own `t` comes from that branch's clock.
+    let side = make_commit_bytes(2, Some(&base_cid), vec![flake("bob", "Bob", 2)]);
+    let side_cid = ContentId::new(ContentKind::Commit, &side);
+    let merge = make_merge_commit_bytes(2, vec![base_cid, side_cid], vec![flake("bob", "Bob", 2)]);
+
+    let request = PushCommitsRequest {
+        commits: vec![fluree_db_api::Base64Bytes(merge)],
+        blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
+        merged_commits: vec![fluree_db_api::Base64Bytes(side)],
+    };
+    (tmp, state, request)
+}
+
+#[tokio::test]
+async fn push_merges_endpoint_accepts_a_merge_and_its_commits() {
+    let ledger = "push-merge:main";
+    let (_tmp, state, push_req) = merge_push_fixture(ledger).await;
+
+    let resp = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/push-merges/{ledger}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json.pointer("/head/t").and_then(serde_json::Value::as_i64),
+        Some(2)
+    );
+}
+
+#[tokio::test]
+async fn push_endpoint_refuses_merged_commits() {
+    let ledger = "push-merge-wrong-route:main";
+    let (_tmp, state, push_req) = merge_push_fixture(ledger).await;
+
+    let resp = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/push/{ledger}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        json.to_string().contains("push-merges"),
+        "the error should name the endpoint that takes them: {json}"
+    );
+}
+
 #[tokio::test]
 async fn push_rejects_first_commit_t_mismatch_with_409() {
     let (_tmp, state) = test_state().await;
@@ -835,6 +972,7 @@ async fn push_rejects_first_commit_t_mismatch_with_409() {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
         missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
     };
 
     let resp = app
@@ -882,6 +1020,7 @@ async fn push_rejects_retraction_without_existing_assertion_with_422() {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
         missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
     };
 
     let resp = app
@@ -941,6 +1080,7 @@ async fn push_rejects_list_retraction_missing_meta_with_422() {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
         missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
     };
     let resp = app
         .clone()
@@ -970,6 +1110,7 @@ async fn push_rejects_list_retraction_missing_meta_with_422() {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
         missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
     };
     let resp = app
         .oneshot(
@@ -1677,6 +1818,7 @@ async fn sparql_update_templates_support_graph_iri_blocks() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -1784,6 +1926,7 @@ async fn sparql_update_with_clause_scopes_default_templates_and_where() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -1888,6 +2031,7 @@ async fn sparql_update_using_clause_scopes_where_default_graph() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2011,6 +2155,7 @@ async fn sparql_update_multiple_using_clauses_merge_default_graph_for_where() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2121,6 +2266,7 @@ async fn sparql_update_using_named_clause_restricts_where_named_graphs() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2176,6 +2322,7 @@ async fn sparql_update_using_named_clause_restricts_where_named_graphs() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2290,6 +2437,7 @@ async fn sparql_update_multiple_using_named_clauses_allow_multiple_named_graphs_
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2941,6 +3089,15 @@ async fn get_discovery(state: Arc<AppState>) -> (StatusCode, JsonValue) {
 }
 
 #[tokio::test]
+async fn discovery_advertises_pushing_merged_commits() {
+    let (_tmp, state) = test_state().await;
+    let (status, json) = get_discovery(state).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["push"]["merged_commits"], true);
+}
+
+#[tokio::test]
 async fn discovery_no_auth_omits_auth_block() {
     let (_tmp, state) = test_state().await; // all auth modes None
     let (status, json) = get_discovery(state).await;
@@ -3122,6 +3279,7 @@ async fn create_and_push_commits(
             commits: vec![fluree_db_api::Base64Bytes(bytes)],
             blobs: std::collections::HashMap::new(),
             missing_blobs: Vec::new(),
+            merged_commits: Vec::new(),
         };
 
         let resp = app
@@ -3265,6 +3423,7 @@ async fn commits_endpoint_cursor_stability() {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
         missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
     };
     let resp = app
         .clone()
@@ -3288,6 +3447,79 @@ async fn commits_endpoint_cursor_stability() {
     assert_eq!(page2.newest_t, 2, "cursor should resume at t=2");
     assert_eq!(page2.oldest_t, 1, "should reach genesis");
     assert!(page2.next_cursor_id.is_none(), "genesis reached");
+}
+
+/// Lineage mode over HTTP: the query parameters reach the export, and the
+/// response carries the line and the merged-in commits separately.
+#[tokio::test]
+async fn commits_endpoint_exports_the_line_in_lineage_mode() {
+    let ledger = "export-lineage:main";
+    let (_tmp, state, push_req) =
+        merge_push_fixture_on(test_state_with_storage_proxy().await, ledger).await;
+    let app = build_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/push-merges/{ledger}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let token = storage_auth::storage_all_token();
+    let export = |query: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/v1/fluree/commits/{ledger}?{query}"))
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            json_body(resp).await
+        }
+    };
+
+    // Down to genesis: the base commit and the merge, plus the side commit.
+    let (status, json) = export("lineage=true".to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let page: ExportCommitsResponse = serde_json::from_value(json).unwrap();
+    assert!(page.lineage);
+    assert_eq!(page.commits.len(), 2);
+    assert_eq!(page.merged_commits.len(), 1);
+    assert_eq!(page.next_cursor_id, None);
+
+    // Above the base: only the merge, plus the side commit.
+    let base_cid = ContentId::new(ContentKind::Commit, &page.commits[1].0);
+    let (status, json) = export(format!("lineage=true&base_id={base_cid}")).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let page: ExportCommitsResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(page.commits.len(), 1);
+    assert_eq!(page.newest_t, 2);
+    assert_eq!(page.merged_commits.len(), 1);
+
+    // A base off the line: the side commit.
+    let side_cid = ContentId::new(ContentKind::Commit, &page.merged_commits[0].0);
+    let (status, _json) = export(format!("lineage=true&base_id={side_cid}")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Without the flag, the default format: no `lineage`, no split.
+    let (status, json) = export("limit=10".to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(json.get("lineage").is_none(), "{json}");
+    assert!(json.get("merged_commits").is_none(), "{json}");
 }
 
 #[tokio::test]

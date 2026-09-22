@@ -23,6 +23,8 @@ mod it_merge;
 mod it_merge_preview;
 #[path = "it_profile_ledger.rs"]
 mod it_profile_ledger;
+#[path = "it_push_after_merge.rs"]
+mod it_push_after_merge;
 #[path = "it_read_your_writes.rs"]
 mod it_read_your_writes;
 #[path = "it_rebase.rs"]
