@@ -1772,8 +1772,8 @@ async fn read_export_commits(
     Ok(out)
 }
 
-/// One page of a `lineage` export: up to `limit` commits of the first-parent
-/// line, plus the commits their merges brought in.
+/// One page of a `lineage` export: commits of the first-parent line, plus the
+/// commits their merges brought in. `limit` counts both.
 async fn export_lineage_page(
     store: &dyn fluree_db_core::ContentStore,
     from: &ContentId,

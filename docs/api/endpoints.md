@@ -591,7 +591,7 @@ GET /commits/<ledger...>?limit=100&cursor_id=<cid>
 
 **Query Parameters:**
 
-- `limit` (optional): Max commits per page (default 100, server clamps to max 500)
+- `limit` (optional): Max commits per page (default 100, server clamps to max 500). In lineage mode it counts `merged_commits` too.
 - `cursor_id` (optional): Commit CID cursor for pagination. Omit for first page (starts from head). Use `next_cursor_id` from the previous response for subsequent pages.
 - `lineage` (optional): `true` selects lineage mode, described below. Defaults to `false`.
 - `base_id` (optional, lineage mode only): the client's head. The export stops above it. Omit it to export down to genesis.
@@ -633,6 +633,8 @@ Authorization: Bearer <token>   (requires fluree.storage.* claims)
 By default, pages walk every parent of every commit. A history containing a merge then interleaves commits from different branches. Such a history cannot be imported.
 
 With `lineage=true`, `commits` holds only the branch's first-parent line. `merged_commits` holds the commits its merges brought in, as in [`POST /push-merges/*ledger`](#post-push-mergesledger). `next_cursor_id` is the next commit on the line. A commit that merges on two pages brought in appears on both pages.
+
+`limit` counts both lists together, so a merge's commits are bounded too. A page always holds at least one line commit, so paging always advances. One merge can therefore carry a page past `limit`.
 
 - With `base_id`, the export stops above that commit. `next_cursor_id` is `null` on the page that reaches it.
 - A `base_id` that is not on the branch's first-parent line returns `409`. The histories have diverged.
