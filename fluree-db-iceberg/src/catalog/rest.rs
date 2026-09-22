@@ -271,27 +271,31 @@ impl RestCatalogClient {
         if let Some(prefix) = lock_prefixes().get(&key) {
             return Ok(prefix.clone());
         }
-        let prefix = match self.configured_prefix().await? {
+        let under_v1 = |prefix: Option<String>| match prefix {
             Some(prefix) => format!("/v1/{}", prefix.trim_matches('/')),
             None => "/v1".to_string(),
         };
-        lock_prefixes().insert(key, prefix.clone());
-        Ok(prefix)
+        match self.configured_prefix().await {
+            Ok(named) => {
+                let prefix = under_v1(named);
+                lock_prefixes().insert(key, prefix.clone());
+                Ok(prefix)
+            }
+            // A catalog without that route is read the way it was before this
+            // lookup existed: the warehouse name is the prefix. Not cached, so
+            // a transient 404 (a gateway mid-deploy) does not pin it.
+            Err(IcebergError::TableNotFound(_)) => Ok(under_v1(self.config.warehouse.clone())),
+            Err(e) => Err(e),
+        }
     }
 
-    /// `overrides.prefix`, else `defaults.prefix`, from `/v1/config`. A catalog
-    /// without that route is read the way it was before this lookup existed:
-    /// the warehouse name is the prefix.
+    /// `overrides.prefix`, else `defaults.prefix`, from `/v1/config`.
     async fn configured_prefix(&self) -> Result<Option<String>> {
         let path = match &self.config.warehouse {
             Some(warehouse) => format!("/v1/config?warehouse={}", urlencoding::encode(warehouse)),
             None => "/v1/config".to_string(),
         };
-        let config = match self.get(&path, &[]).await {
-            Ok(config) => config,
-            Err(IcebergError::TableNotFound(_)) => return Ok(self.config.warehouse.clone()),
-            Err(e) => return Err(e),
-        };
+        let config = self.get(&path, &[]).await?;
         let named = |section: &str| {
             config
                 .get(section)
@@ -712,6 +716,43 @@ mod tests {
             .filter(|r| r.url.path() == "/v1/config")
             .count();
         assert_eq!(configs, 1, "two clients, one catalog");
+    }
+
+    #[tokio::test]
+    async fn a_missing_config_route_is_asked_again_not_cached() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(404))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        serve_config(&server, serde_json::json!({"overrides": {"prefix": "p"}})).await;
+        serve_table(&server, "/v1/lake/namespaces/db/tables/events").await;
+        serve_table(&server, "/v1/p/namespaces/db/tables/events").await;
+
+        // The first client falls back to the warehouse; the next one asks
+        // again and gets the prefix the catalog names.
+        for _ in 0..2 {
+            loads(&warehouse_client(&server.uri(), Some("lake")), "db")
+                .await
+                .unwrap();
+        }
+        let tables: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .filter(|p| p.ends_with("/tables/events"))
+            .collect();
+        assert_eq!(
+            tables,
+            [
+                "/v1/lake/namespaces/db/tables/events",
+                "/v1/p/namespaces/db/tables/events"
+            ]
+        );
     }
 
     #[test]
