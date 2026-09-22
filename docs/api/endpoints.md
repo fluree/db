@@ -451,6 +451,8 @@ The fields of `POST /push/*ledger`, plus:
 
 The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit. A push that carries any other commit is refused with `422`.
 
+A sender leaves out the commits the receiver's head already reaches, so merging the same branch twice sends only what that branch gained in between. The parent rule still holds, because a commit the receiver has means the receiver has everything behind it.
+
 **Trust model:**
 
 The chain's own commits are staged under policy and SHACL, as a transaction would be. Merged commits are stored as history and never replayed, so neither check runs on them. What a merge brings into a branch's state travels in the merge commit, which is validated against the state it lands on, so everything the ledger's state holds has been checked.
@@ -636,7 +638,7 @@ With `lineage=true`, `commits` holds only the branch's first-parent line. `merge
 
 `limit` counts both lists together, so a merge's commits are bounded too. A page always holds at least one line commit, so paging always advances. One merge can therefore carry a page past `limit`.
 
-- With `base_id`, the export stops above that commit. `next_cursor_id` is `null` on the page that reaches it.
+- With `base_id`, the export stops above that commit. `next_cursor_id` is `null` on the page that reaches it. `merged_commits` leaves out what `base_id` already reaches, so pulling after a second merge of the same branch carries only what it gained in between.
 - A `base_id` that is not on the branch's first-parent line returns `409`. The histories have diverged.
 
 The mode is opt-in, so a client that does not request it keeps the default format. A server predating it ignores the parameters and returns the default format without `lineage`. That is how a client tells the two apart.
