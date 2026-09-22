@@ -213,11 +213,30 @@ async fn time_travel_invalid_format_errors() {
         "where": [{"@id":"?s"}]
     });
 
-    let err = fluree.query_connection(&q).await.unwrap_err().to_string();
+    let err = fluree.query_connection(&q).await.unwrap_err();
     assert!(
-        err.contains("Invalid time travel format"),
+        err.to_string().contains("Invalid time travel format"),
         "expected invalid time travel error, got: {err}"
     );
+    assert_eq!(
+        err.status_code(),
+        400,
+        "a malformed pin is the caller's error"
+    );
+
+    let err = fluree
+        .query_from()
+        .sparql(&format!(
+            "SELECT ?s FROM <{ledger_id}@invalid:format> WHERE {{ ?s ?p ?o }}"
+        ))
+        .execute_formatted()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Invalid time travel format"),
+        "expected invalid time travel error from SPARQL FROM, got: {err}"
+    );
+    assert_eq!(err.status_code(), 400, "SPARQL FROM: {err}");
 
     // sanity: ledger still usable
     assert_eq!(
@@ -240,6 +259,7 @@ async fn time_travel_missing_value_errors() {
 
     for (spec, expect) in [
         ("@t:", "Missing value after '@t:'"),
+        ("@time:", "Missing value after '@time:'"),
         ("@iso:", "Missing value after '@iso:'"),
         ("@commit:", "Missing value after '@commit:'"),
     ] {
@@ -249,8 +269,12 @@ async fn time_travel_missing_value_errors() {
             "select": ["?s"],
             "where": [{"@id":"?s"}]
         });
-        let err = fluree.query_connection(&q).await.unwrap_err().to_string();
-        assert!(err.contains(expect), "expected '{expect}', got: {err}");
+        let err = fluree.query_connection(&q).await.unwrap_err();
+        assert!(
+            err.to_string().contains(expect),
+            "expected '{expect}', got: {err}"
+        );
+        assert_eq!(err.status_code(), 400, "{spec}: {err}");
     }
 }
 
