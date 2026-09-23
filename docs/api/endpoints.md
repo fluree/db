@@ -3186,7 +3186,7 @@ Every body takes the Unity connection fields of `delta/map`: `unity_uri` (requir
 |---|---|---|
 | `POST /delta/catalog/browse` | `depth`: `schemas` or `tables` (default) | `catalogs`, `schemas` (`catalog.schema`), `tables` |
 | `POST /delta/catalog/preview` | `table` | The table's `columns`, `primary_key`, `foreign_keys`, `location`, `access_rule`, `unreadable` |
-| `POST /delta/catalog/verify` | `table`; `s3_region`, `s3_endpoint`, `s3_path_style` | `readable`, and `location`, `version`, `data_file_count` or `error` |
+| `POST /delta/catalog/verify` | `table`; `s3_region`, `s3_endpoint`, `s3_path_style` | `readable`, and `location`, `version`, `data_file_count`, `probed_data_file` or `error` |
 | `POST /delta/r2rml/generate` | `tables`, `base_namespace`; `per_table_overrides`, `options` | `turtle`, `structured`, `diagnostics`, `tables` |
 | `POST /delta/r2rml/validate` | A `delta/map` body; `name` is optional | `compiled_ok`, `triples_map_count`, `table_names`, `diagnostics` |
 

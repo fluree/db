@@ -647,6 +647,9 @@ pub async fn run_delta_verify(
         println!("  Location:   {}", text(&access, "location"));
         println!("  Version:    {}", access["version"]);
         println!("  Data files: {}", access["data_file_count"]);
+        if let Some(probed) = access["probed_data_file"].as_str() {
+            println!("  Read check: {probed}");
+        }
     } else {
         println!("{} is not readable", text(&access, "full_name"));
         println!("  {}", text(&access, "error"));

@@ -558,6 +558,44 @@ impl DeltaSnapshot {
         })))
     }
 
+    /// Stat the first data file this version reads: the proof the store lets a
+    /// scan's reads through, which reading the log alone is not (a table's
+    /// files can sit outside the prefix its credentials cover). `None` for a
+    /// version with no files.
+    pub async fn probe_data_file(&self) -> Result<Option<String>> {
+        use delta_kernel::object_store::ObjectStoreExt as _;
+        let this = self.clone();
+        let first = blocking(move || {
+            let scan = this.build_scan(None, None)?;
+            let root = this.snapshot.table_root().clone();
+            this.files(&scan)?
+                .into_iter()
+                .next()
+                .map(|file| {
+                    root.join(&file.path).map_err(|e| {
+                        DeltaError::Internal(format!("data file path '{}': {e}", file.path))
+                    })
+                })
+                .transpose()
+        })
+        .await?;
+        let Some(url) = first else {
+            return Ok(None);
+        };
+        let path = delta_kernel::object_store::path::Path::from_url_path(url.path())
+            .map_err(|e| DeltaError::Internal(format!("data file path '{url}': {e}")))?;
+        // On the Delta runtime, where the scan's own reads run.
+        let (store, table) = (self.table.store.clone(), self.table.name.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.table.executor.spawn(async move {
+            let _ = tx.send(store.head(&path).await);
+        });
+        rx.await
+            .map_err(|_| DeltaError::Internal("Delta data file probe did not finish".to_string()))?
+            .map_err(|e| DeltaError::kernel(&table, delta_kernel::Error::ObjectStore(e)))?;
+        Ok(Some(url.to_string()))
+    }
+
     /// How many data files a scan with `filters` reads.
     pub async fn file_count(&self, filters: &[ColumnFilter]) -> Result<usize> {
         let this = self.clone();

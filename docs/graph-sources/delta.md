@@ -214,7 +214,7 @@ connection fields as `delta map`.
 |---|---|---|---|
 | Browse | `fluree delta browse` | `POST /delta/catalog/browse` | Lists catalogs, a catalog's schemas and tables, or a schema's tables |
 | Preview | `fluree delta preview <table>` | `POST /delta/catalog/preview` | A table's columns, their mapped datatypes, and its declared keys |
-| Verify | `fluree delta verify <table>` | `POST /delta/catalog/verify` | Reads the table's log with the credentials Unity issues for it |
+| Verify | `fluree delta verify <table>` | `POST /delta/catalog/verify` | Reads the table's log, and stats its first data file, with the credentials Unity issues for it |
 | Generate | `fluree delta generate <table>…` | `POST /delta/r2rml/generate` | Writes an R2RML mapping from Unity's record of the tables |
 | Validate | `fluree delta validate --r2rml <file>` | `POST /delta/r2rml/validate` | Checks a mapping against the tables it names |
 

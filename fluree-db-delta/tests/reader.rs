@@ -1313,3 +1313,46 @@ async fn an_unsupported_reader_protocol_is_refused_not_read() {
         );
     }
 }
+
+/// Listing a version reads only its log; the probe reaches a data file, so a
+/// table whose files are gone (or out of its credentials' reach) is caught.
+#[tokio::test]
+async fn the_data_file_probe_reaches_a_file_the_log_alone_does_not() {
+    let snapshot = open("dim_store")
+        .snapshot(VersionSelector::Latest)
+        .await
+        .unwrap();
+    let probed = snapshot
+        .probe_data_file()
+        .await
+        .unwrap()
+        .expect("dim_store has data files");
+    assert!(probed.ends_with(".parquet"), "{probed}");
+
+    allow_roots();
+    let staged = tempfile::tempdir().unwrap();
+    let dir = staged.path().join("dim_store");
+    copy_dir_all(&fixtures().join("dim_store"), &dir);
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "parquet") {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let table = DeltaTable::open(
+        "dim_store",
+        dir.to_str().unwrap(),
+        &DeltaIoConfig::default(),
+    )
+    .unwrap();
+    let snapshot = table.snapshot(VersionSelector::Latest).await.unwrap();
+    assert!(
+        snapshot.file_count(&[]).await.unwrap() > 0,
+        "the log still lists them"
+    );
+    let err = snapshot
+        .probe_data_file()
+        .await
+        .expect_err("no file to reach");
+    assert!(err.is_missing_file(), "{err:?}");
+}
