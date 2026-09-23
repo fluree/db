@@ -267,6 +267,11 @@ required-features = ["otel"]
 name = "multi_query_tracing_integration"
 path = "tests/multi_query_tracing_integration.rs"
 
+# Standalone for the same reason as `telemetry_test`: it asserts on captured events.
+[[test]]
+name = "graph_source_query_logging"
+path = "tests/graph_source_query_logging.rs"
+
 # Standalone for the same reason: it sets `FLUREE_EXPORT_ANNOTATION_SCAN` to
 # select the export's fallback annotation source, and an env var is
 # process-global while the assertions around it are per-test.

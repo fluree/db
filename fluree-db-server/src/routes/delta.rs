@@ -46,6 +46,24 @@ pub struct DeltaMapRequest {
     pub azure_client_secret: Option<String>,
     /// Name of a server environment variable holding the client secret
     pub azure_client_secret_env: Option<String>,
+    /// Databricks workspace URL. Tables without a `tables` entry are then
+    /// named in Unity Catalog, which places them and issues their credentials.
+    pub unity_uri: Option<String>,
+    /// Complete a mapped table name of fewer than three parts
+    pub unity_catalog: Option<String>,
+    pub unity_schema: Option<String>,
+    /// Catalog auth, as for `iceberg/map`: a bearer token, or the client id and
+    /// secret of a service principal. An `_env` field names a server
+    /// environment variable listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`.
+    pub auth_bearer: Option<String>,
+    pub auth_bearer_env: Option<String>,
+    pub oauth2_client_id: Option<String>,
+    pub oauth2_client_secret: Option<String>,
+    pub oauth2_client_secret_env: Option<String>,
+    /// Defaults to the workspace's token endpoint
+    pub oauth2_token_url: Option<String>,
+    /// Defaults to `all-apis`
+    pub oauth2_scope: Option<String>,
     /// Model ledger (`name:branch`) whose default graph supplies the source's
     /// view policies and class/property hierarchy.
     pub model: Option<String>,
@@ -102,12 +120,16 @@ async fn delta_map_local(state: Arc<AppState>, request: Request) -> Result<impl 
     async move {
         tracing::info!(status = "start", name = %req.name, "delta map requested");
 
-        // The endpoint override reaches an outbound HTTP client.
-        super::iceberg_ssrf::guard_connection_urls(None, None, req.s3_endpoint.as_deref())?;
+        // Each of these reaches an outbound HTTP client.
+        super::iceberg_ssrf::guard_connection_urls(
+            req.unity_uri.as_deref(),
+            req.oauth2_token_url.as_deref(),
+            req.s3_endpoint.as_deref(),
+        )?;
 
         let result = state
             .fluree
-            .create_delta_graph_source(build_delta_config(req).map_err(ServerError::Api)?)
+            .create_delta_graph_source(build_delta_config(req)?)
             .await
             .map_err(ServerError::Api)?;
 
@@ -135,17 +157,47 @@ async fn delta_map_local(state: Arc<AppState>, request: Request) -> Result<impl 
     .await
 }
 
-fn build_delta_config(
+fn build_delta_config(req: DeltaMapRequest) -> Result<fluree_db_api::DeltaCreateConfig> {
+    build_delta_config_allowing(req, &super::iceberg::allowed_secret_env())
+}
+
+fn build_delta_config_allowing(
     req: DeltaMapRequest,
-) -> fluree_db_api::Result<fluree_db_api::DeltaCreateConfig> {
+    allowed_env: &str,
+) -> Result<fluree_db_api::DeltaCreateConfig> {
+    use super::iceberg::secret_value;
+    let unity = fluree_db_api::DeltaUnityFields {
+        uri: req.unity_uri,
+        catalog: req.unity_catalog,
+        schema: req.unity_schema,
+        bearer: secret_value(
+            "auth_bearer",
+            req.auth_bearer.as_deref(),
+            req.auth_bearer_env.as_deref(),
+            allowed_env,
+        )?,
+        oauth2_client_id: req.oauth2_client_id,
+        oauth2_client_secret: secret_value(
+            "oauth2_client_secret",
+            req.oauth2_client_secret.as_deref(),
+            req.oauth2_client_secret_env.as_deref(),
+            allowed_env,
+        )?,
+        oauth2_token_url: req.oauth2_token_url,
+        oauth2_scope: req.oauth2_scope,
+    }
+    .into_config()
+    .map_err(ServerError::Api)?;
     let azure = fluree_db_api::DeltaAzureFields {
         tenant_id: req.azure_tenant_id,
         client_id: req.azure_client_id,
         client_secret: req.azure_client_secret,
         client_secret_env: req.azure_client_secret_env,
     }
-    .into_auth()?;
+    .into_auth()
+    .map_err(ServerError::Api)?;
     Ok(fluree_db_api::DeltaCreateConfig {
+        unity,
         name: req.name,
         branch: req.branch,
         root: req.root,
@@ -161,4 +213,71 @@ fn build_delta_config(
         model: req.model,
         default_allow: req.default_allow,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(extra: serde_json::Value) -> DeltaMapRequest {
+        let mut body = serde_json::json!({"name": "sales", "r2rml": ""});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(body).unwrap()
+    }
+
+    fn stored(config: &fluree_db_api::DeltaCreateConfig) -> serde_json::Value {
+        serde_json::to_value(config.to_gs_config("m.ttl")).unwrap()
+    }
+
+    #[test]
+    fn a_unity_request_stores_its_catalog_and_a_listed_variables_name() {
+        let req = request(serde_json::json!({
+            "unity_uri": "https://workspace.example.com",
+            "unity_catalog": "main",
+            "oauth2_client_id": "app",
+            "oauth2_client_secret_env": "SP_SECRET",
+        }));
+        let config = build_delta_config_allowing(req, "SP_SECRET").unwrap();
+        config.validate().unwrap();
+        let unity = &stored(&config)["unity"];
+        assert_eq!(unity["uri"], "https://workspace.example.com");
+        assert_eq!(unity["catalog"], "main");
+        assert_eq!(unity["auth"]["client_secret"]["env_var"], "SP_SECRET");
+        assert_eq!(
+            unity["auth"]["token_url"],
+            "https://workspace.example.com/oidc/v1/token"
+        );
+    }
+
+    #[test]
+    fn a_unity_secret_may_name_only_a_listed_variable() {
+        for field in ["auth_bearer_env", "oauth2_client_secret_env"] {
+            let req = request(serde_json::json!({
+                "unity_uri": "https://workspace.example.com",
+                "oauth2_client_id": "app",
+                field: "AWS_SECRET_ACCESS_KEY",
+            }));
+            let err = build_delta_config_allowing(req, "SP_SECRET")
+                .err()
+                .unwrap_or_else(|| panic!("{field} accepted"));
+            assert!(
+                err.to_string()
+                    .contains(super::super::iceberg::SECRET_ENV_ALLOWLIST),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_by_path_is_built_as_before() {
+        let config = build_delta_config_allowing(
+            request(serde_json::json!({"root": "s3://lake/Tables"})),
+            "",
+        )
+        .unwrap();
+        assert!(config.unity.is_none());
+        assert!(stored(&config).get("unity").is_none());
+    }
 }

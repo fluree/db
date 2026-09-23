@@ -50,12 +50,24 @@ pub enum DeltaError {
         source: Box<delta_kernel::Error>,
     },
 
+    /// A catalog could not place a table or would not issue credentials for it.
+    /// `denied` when the catalog answered 401/403: this principal may not read it.
+    #[error("Unity Catalog, table '{table}': {message}")]
+    Catalog {
+        table: String,
+        message: String,
+        denied: bool,
+    },
+
     #[error("Delta reader internal error: {0}")]
     Internal(String),
 }
 
 impl DeltaError {
     pub(crate) fn kernel(table: &str, source: delta_kernel::Error) -> Self {
+        if let Some(refusal) = catalog_refusal(&source) {
+            return refusal;
+        }
         Self::Kernel {
             table: table.to_string(),
             source: Box::new(source),
@@ -122,6 +134,34 @@ fn source_is_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
         }
     }
     error.source().is_some_and(source_is_not_found)
+}
+
+/// A catalog's refusal reaches Kernel through the object store that asked it
+/// for credentials, and says more than the layers it came through. Kernel
+/// holds the store's error without naming it as its source, so it is matched.
+fn catalog_refusal(error: &delta_kernel::Error) -> Option<DeltaError> {
+    let store = match error {
+        delta_kernel::Error::Backtraced { source, .. } => return catalog_refusal(source),
+        delta_kernel::Error::ObjectStore(store) => store,
+        _ => return None,
+    };
+    let mut cause = std::error::Error::source(store);
+    while let Some(error) = cause {
+        if let Some(DeltaError::Catalog {
+            table,
+            message,
+            denied,
+        }) = error.downcast_ref::<DeltaError>()
+        {
+            return Some(DeltaError::Catalog {
+                table: table.clone(),
+                message: message.clone(),
+                denied: *denied,
+            });
+        }
+        cause = error.source();
+    }
+    None
 }
 
 #[cfg(test)]

@@ -13,8 +13,8 @@ The option reference is in [Delta Lake tables](delta.md) and
 |---|---|---|
 | Delta tables in your own ADLS Gen2 account | [Delta source](#azure-data-lake-storage-gen2), by path | A service principal, managed identity, account key or SAS with read access to the container |
 | Microsoft Fabric lakehouse tables (OneLake) | [Delta source](#microsoft-fabric-onelake), by path | A service principal with a workspace role that includes OneLake data access |
-| Databricks **external** tables (you chose the storage path) | [Delta source](#databricks-external-tables), by path | Your own credentials for that S3 bucket or ADLS container |
-| Databricks **managed** tables (Unity Catalog owns the path) | [Delta source with Unity-issued credentials](#databricks-managed-tables), one table at a time | A Databricks token; Unity Catalog issues short-lived storage credentials |
+| Databricks Delta tables, **managed or external**, by name (Databricks on AWS or Azure) | [Delta source through Unity Catalog](#databricks-tables-through-unity-catalog) | A Databricks service principal (or token); Unity Catalog issues and renews the storage credentials |
+| Databricks **external** tables, by path, without Unity Catalog | [Delta source](#databricks-external-tables), by path | Your own credentials for that S3 bucket or ADLS container |
 | Databricks tables with Iceberg reads (UniForm) or managed Iceberg tables | [Iceberg REST source](#databricks-through-the-iceberg-rest-endpoint) | A Databricks service principal (or a personal access token); storage credentials are vended per request |
 | Delta tables on S3 | Delta source, by path — see [Delta Lake tables](delta.md#credentials) | AWS credentials in the environment, or the instance / container role |
 
@@ -133,9 +133,86 @@ rest of such a table can.
 
 What differs is how Fluree gets to the files.
 
+### Databricks tables through Unity Catalog
+
+Name the tables as Databricks does — `catalog.schema.table` — and let Unity
+Catalog say where each one lives and issue the credentials that read it. This
+reaches **managed** tables, whose storage path Unity owns, as well as external
+ones, and needs no storage credentials on the Fluree side at all.
+
+Unity issues credentials per table, scoped to that table's path and valid for
+an hour. Fluree holds a set per table and asks for the next one a few minutes
+before the current one expires, so a source may span any number of tables and
+run indefinitely.
+
+**1. Turn on external data access** for the metastore, once: in the workspace,
+**Catalog → ⚙ → Metastore → External data access**.
+
+**2. Create the identity Fluree reads as.** A service principal, whose OAuth
+token Fluree requests and renews by itself:
+
+- **Settings → Identity and access → Service principals → Add service
+  principal.** Note its **Application ID** — that is the client id.
+- On its **Secrets** tab, **Generate secret**. The secret is shown once.
+
+A personal access token also works (user icon → **Settings → Developer →
+Access tokens → Generate new token**; if the dialog asks for scopes,
+`unity-catalog` covers this route). It does not renew: give it a lifetime to
+match, and re-map when it is rotated.
+
+**3. Grant it the privileges.** `EXTERNAL USE SCHEMA` is implied by nothing —
+not ownership, not metastore admin — and the ordinary read privileges are
+needed as well, even for a principal that can already see the table:
+
+```sql
+GRANT USE CATALOG ON CATALOG main TO `<application-id>`;
+GRANT USE SCHEMA, SELECT, EXTERNAL USE SCHEMA ON SCHEMA main.sales TO `<application-id>`;
+```
+
+A user is named by email in place of the application id.
+
+**4. Map the source.**
+
+```bash
+export DATABRICKS_CLIENT_SECRET='<secret from step 2>'
+
+fluree delta map sales \
+  --unity-uri https://<workspace>.cloud.databricks.com \
+  --unity-catalog main \
+  --oauth2-client-id <application-id> \
+  --oauth2-client-secret-env DATABRICKS_CLIENT_SECRET \
+  --s3-region us-east-1 \
+  --r2rml mappings/sales.ttl
+```
+
+- The mapping names tables as `rr:tableName "main.sales.orders"`.
+  `--unity-catalog` (and `--unity-schema`) complete shorter names, so with the
+  command above `"sales.orders"` is enough.
+- The secret stays in the environment of the process that reads the tables;
+  only the variable's name is stored. When mapping on a server (`--remote`, or
+  the HTTP API), its operator lists the variable in
+  `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS` first. With a token, give
+  `--auth-bearer-env DATABRICKS_TOKEN` in place of the two `--oauth2-` options.
+- On AWS, give the bucket's region with `--s3-region` (or `AWS_REGION`): Unity
+  does not say which it is. On Azure Databricks the workspace URL is
+  `https://adb-….azuredatabricks.net` and no region is needed.
+- A table that lives outside Unity can sit in the same source:
+  `--table raw.events=s3://lake/raw/events` is read by path, with the
+  process's own credentials.
+
+Only Delta tables with files of their own are read. A view, a table in another
+format, a table with a row filter or column mask, and a table the principal
+cannot see are each reported by name — as a warning when the source is
+mapped, and as the error of any query that touches them.
+
+Databricks on Google Cloud is not covered yet: Unity Catalog places its tables
+on Google Cloud Storage (`gs://…`), which the Delta reader does not read, and
+mapping such a table reports exactly that.
+
 ### Databricks external tables
 
-An external table lives at a path you chose, in storage you control. Find it:
+An external table lives at a path you chose, in storage you control, so it can
+also be read without Unity Catalog. Find the path:
 
 ```sql
 DESCRIBE DETAIL main.sales.orders;   -- the `location` column
@@ -144,55 +221,6 @@ DESCRIBE DETAIL main.sales.orders;   -- the `location` column
 Map that location as a Delta source, with your own credentials for the bucket
 or container — the [ADLS steps above](#azure-data-lake-storage-gen2), or AWS
 credentials for S3. Unity Catalog is not involved in the read.
-
-### Databricks managed tables
-
-A managed table's files are in storage Unity Catalog owns, under an opaque path
-(`…/tables/<table-id>`). Unity Catalog can issue short-lived, read-only
-credentials for one table. It needs, once:
-
-1. **External data access** turned on for the metastore: in the workspace,
-   **Catalog → ⚙ → Metastore → External data access**.
-2. The privileges on the reading principal. `EXTERNAL USE SCHEMA` is implied
-   by nothing — not ownership, not metastore admin — and the ordinary read
-   privileges are needed as well, even for a principal that can already see
-   the table:
-   ```sql
-   GRANT USE CATALOG ON CATALOG main TO `reader@example.com`;
-   GRANT USE SCHEMA, SELECT, EXTERNAL USE SCHEMA ON SCHEMA main.sales TO `reader@example.com`;
-   ```
-   A service principal is named by its application id in place of the email.
-3. A **personal access token**: user icon → **Settings → Developer → Access
-   tokens → Generate new token**. If the dialog asks for scopes, the Unity
-   Catalog APIs need `unity-catalog` (or `all-apis`).
-
-Then ask for the table's location and credentials:
-
-```bash
-H=https://<workspace>.cloud.databricks.com     # or https://adb-….azuredatabricks.net
-
-curl -s -H "Authorization: Bearer $DATABRICKS_TOKEN" \
-  $H/api/2.1/unity-catalog/tables/main.sales.orders
-# → "table_id", "storage_location"
-
-curl -s -X POST -H "Authorization: Bearer $DATABRICKS_TOKEN" \
-  -H 'Content-Type: application/json' \
-  $H/api/2.1/unity-catalog/temporary-table-credentials \
-  -d '{"table_id": "<table_id>", "operation": "READ"}'
-# AWS   → "aws_temp_credentials": access_key_id, secret_access_key, session_token
-# Azure → "azure_user_delegation_sas": sas_token
-```
-
-On AWS, export the three values as `AWS_ACCESS_KEY_ID`,
-`AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` and map
-`--table orders=<storage_location>`.
-
-Two limits make this a route for exploration rather than a standing
-deployment: the credentials cover **that one table's path** (another table's
-path is refused), and they **expire in about an hour**. Fluree takes one set of
-ambient credentials per process and does not renew these, so a multi-table or
-long-running source over managed tables is better served by external tables, or
-by the Iceberg endpoint below where the tables allow it.
 
 ### Databricks through the Iceberg REST endpoint
 
@@ -215,8 +243,8 @@ Only two kinds of table are visible there:
 
 Any other table answers `… is not an Iceberg compatible table`.
 
-The prerequisites are those of the previous section — external data access,
-`EXTERNAL USE SCHEMA` — and a token with the **`all-apis`** scope: the Iceberg
+The prerequisites are those of the previous section — external data access
+and the four privileges — and a token with the **`all-apis`** scope: the Iceberg
 endpoint refuses narrower ones (`Provided access token does not have required
 scopes: all-apis`).
 
@@ -234,17 +262,9 @@ the environment variable holding the token, read by the process that reads the
 tables, so the token itself is not stored. A personal access token does not
 renew; give it a lifetime to match.
 
-**For a standing deployment, use a service principal.** Its OAuth token is
-requested by Fluree and renewed as it expires, so nothing has to be rotated by
-hand:
-
-1. In the workspace, **Settings → Identity and access → Service principals →
-   Add service principal**. Note its **Application ID** — that is the client id.
-2. On the service principal's **Secrets** tab, **Generate secret**. The secret
-   is shown once.
-3. Grant it the four privileges listed under
-   [Databricks managed tables](#databricks-managed-tables), naming it by its
-   application id.
+**For a standing deployment, use the service principal** from
+[the section above](#databricks-tables-through-unity-catalog), with the same
+four privileges; its OAuth token is requested and renewed by Fluree:
 
 ```bash
 fluree iceberg map dbx-sales \
@@ -271,11 +291,14 @@ HTTP API), the server's operator lists the variable in
 | `403 … not authorized … for workspace` from OneLake | The principal is a workspace *Viewer*; it needs *Contributor* or a OneLake data access role |
 | `(not readable yet)` when mapping | The mapping process could not open the table — often only because it lacks the credentials the server has. The source is registered; the first query reports the real error |
 | S3 reads fail although `aws` works in the same shell | `AWS_PROFILE` and SSO sessions are not read. Export the profile's keys (`aws configure export-credentials --format env`) |
-| `User does not have EXTERNAL USE SCHEMA on Schema …` | The grant in [Databricks managed tables](#databricks-managed-tables) is missing; it is not implied by ownership |
+| `User does not have EXTERNAL USE SCHEMA on Schema …` (or `USE CATALOG`, `USE SCHEMA`, `SELECT`) | A grant from [step 3](#databricks-tables-through-unity-catalog) is missing; none is implied by ownership or admin rights |
+| `Unity Catalog issued no credentials. The table has a row filter …` (or `column mask`) | Whether such a table can be read is Unity Catalog's decision, and today it refuses: it enforces those rules only in its own compute and issues no credentials to read such a table's files, even to its owner. Expose the permitted rows and columns as a separate table, and govern access in Fluree with a model ledger's [access policy](iceberg.md#access-policy) |
+| `… is a VIEW, not a Delta table` / `… in PARQUET format` | Unity Catalog places only Delta tables with files of their own; map the underlying table |
+| `Unity Catalog placed this table on Google Cloud Storage …` | The workspace is Databricks on Google Cloud, which the Delta reader does not support yet |
+| `Received redirect` from S3 when a Unity table is first read | The bucket is in another region than `--s3-region` / `AWS_REGION` names |
 | `Catalog … authorized the table but vended no storage credentials` | The principal can see the table but lacks `USE CATALOG`, `USE SCHEMA`, `SELECT` or `EXTERNAL USE SCHEMA`. The Iceberg endpoint answers without credentials rather than with an error; `POST …/temporary-table-credentials` as the same principal names the missing privilege |
 | `Provided access token does not have required scopes: all-apis` | The token was created with narrower scopes than the Iceberg endpoint accepts |
 | `… is not an Iceberg compatible table` | The table is plain Delta; enable UniForm or read it as a Delta source |
-| `AccessDenied … no session policy allows …` on S3 | Unity-issued credentials used on a different table's path |
 | `unsupported Delta column type: Struct([… metadata … value …])` | The mapping names a `VARIANT` column; leave it out of the mapping |
 | `relative IRI '#Map' has no base` | The R2RML file uses a relative subject; add `@base` or write the IRI in full |
 

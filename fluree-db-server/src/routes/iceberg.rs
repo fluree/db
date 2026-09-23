@@ -626,9 +626,9 @@ pub async fn iceberg_tracking_status(State(state): State<Arc<AppState>>) -> Resp
 }
 
 /// The environment variables a request may name as a secret (comma-separated).
-const SECRET_ENV_ALLOWLIST: &str = "FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS";
+pub(crate) const SECRET_ENV_ALLOWLIST: &str = "FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS";
 
-fn allowed_secret_env() -> String {
+pub(crate) fn allowed_secret_env() -> String {
     std::env::var(SECRET_ENV_ALLOWLIST).unwrap_or_default()
 }
 
@@ -638,7 +638,7 @@ fn allowed_secret_env() -> String {
 /// token URL — so it may name only a variable the operator has listed.
 /// Anything else would let a caller send this server's environment to a host
 /// of their choosing.
-fn secret_value(
+pub(crate) fn secret_value(
     field: &str,
     literal: Option<&str>,
     env: Option<&str>,

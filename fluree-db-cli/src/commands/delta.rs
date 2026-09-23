@@ -61,9 +61,9 @@ fn table_pairs(args: &DeltaMapArgs) -> CliResult<BTreeMap<String, String>> {
 }
 
 fn require_location(args: &DeltaMapArgs) -> CliResult<()> {
-    if args.root.is_none() && args.table.is_empty() {
+    if args.root.is_none() && args.table.is_empty() && args.unity_uri.is_none() {
         return Err(CliError::Usage(
-            "give --root and/or one or more --table NAME=LOCATION".to_string(),
+            "give --root, --unity-uri, and/or one or more --table NAME=LOCATION".to_string(),
         ));
     }
     Ok(())
@@ -89,6 +89,16 @@ fn args_to_json(args: &DeltaMapArgs) -> CliResult<serde_json::Value> {
         ("azure_client_secret", &args.azure_client_secret),
         ("azure_client_secret_env", &args.azure_client_secret_env),
         ("model", &args.model),
+        ("unity_uri", &args.unity_uri),
+        ("unity_catalog", &args.unity_catalog),
+        ("unity_schema", &args.unity_schema),
+        ("auth_bearer", &args.auth_bearer),
+        ("auth_bearer_env", &args.auth_bearer_env),
+        ("oauth2_client_id", &args.oauth2_client_id),
+        ("oauth2_client_secret", &args.oauth2_client_secret),
+        ("oauth2_client_secret_env", &args.oauth2_client_secret_env),
+        ("oauth2_token_url", &args.oauth2_token_url),
+        ("oauth2_scope", &args.oauth2_scope),
     ] {
         if let Some(v) = value {
             obj.insert(key.into(), v.clone().into());
@@ -165,7 +175,20 @@ async fn run_delta_map_local(args: DeltaMapArgs, dirs: &FlureeDir) -> CliResult<
         client_secret_env: args.azure_client_secret_env.clone(),
     }
     .into_auth()?;
+    let secret = super::iceberg::secret_value;
+    let unity = fluree_db_api::DeltaUnityFields {
+        uri: args.unity_uri.clone(),
+        catalog: args.unity_catalog.clone(),
+        schema: args.unity_schema.clone(),
+        bearer: secret(&args.auth_bearer, &args.auth_bearer_env),
+        oauth2_client_id: args.oauth2_client_id.clone(),
+        oauth2_client_secret: secret(&args.oauth2_client_secret, &args.oauth2_client_secret_env),
+        oauth2_token_url: args.oauth2_token_url.clone(),
+        oauth2_scope: args.oauth2_scope.clone(),
+    }
+    .into_config()?;
     let config = fluree_db_api::DeltaCreateConfig {
+        unity,
         name: args.name.clone(),
         branch: args.branch.clone(),
         root: args.root.clone(),
@@ -228,5 +251,74 @@ fn print_created(
     }
     for w in table_warnings {
         println!("  Warning:     {w}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn map_args(extra: &[&str]) -> Result<DeltaMapArgs, clap::Error> {
+        let mapping = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        let mut argv = vec!["fluree", "delta", "map", "sales", "--r2rml", mapping];
+        argv.extend_from_slice(extra);
+        match crate::cli::Cli::try_parse_from(argv)?.command {
+            crate::cli::Commands::Delta {
+                action: crate::cli::DeltaAction::Map(args),
+            } => Ok(*args),
+            _ => unreachable!("parsed as delta map"),
+        }
+    }
+
+    #[test]
+    fn unity_options_reach_a_remote_server_under_the_routes_field_names() {
+        let args = map_args(&[
+            "--unity-uri",
+            "https://workspace.example.com",
+            "--unity-catalog",
+            "main",
+            "--oauth2-client-id",
+            "app",
+            "--oauth2-client-secret-env",
+            "SP_SECRET",
+        ])
+        .unwrap();
+        let body = args_to_json(&args).unwrap();
+        assert_eq!(body["unity_uri"], "https://workspace.example.com");
+        assert_eq!(body["unity_catalog"], "main");
+        assert_eq!(body["oauth2_client_id"], "app");
+        assert_eq!(body["oauth2_client_secret_env"], "SP_SECRET");
+        assert!(body.get("root").is_none());
+    }
+
+    #[test]
+    fn unity_excludes_root_and_its_options_need_it() {
+        let unity = ["--unity-uri", "https://workspace.example.com"];
+        assert!(map_args(&[unity[0], unity[1], "--auth-bearer-env", "T"]).is_ok());
+        assert!(map_args(&[unity[0], unity[1], "--root", "s3://lake/Tables"]).is_err());
+        // With --root present clap waives `requires`; the API's all-or-nothing
+        // check on the Unity fields is what refuses that combination.
+        assert!(map_args(&["--table", "t=s3://lake/t", "--unity-catalog", "main"]).is_err());
+        assert!(map_args(&["--table", "t=s3://lake/t", "--auth-bearer-env", "T"]).is_err());
+        assert!(map_args(&[
+            unity[0],
+            unity[1],
+            "--auth-bearer",
+            "t",
+            "--auth-bearer-env",
+            "T"
+        ])
+        .is_err());
+        // A table by path may sit beside the catalog.
+        assert!(map_args(&[
+            unity[0],
+            unity[1],
+            "--auth-bearer-env",
+            "T",
+            "--table",
+            "raw=s3://lake/raw"
+        ])
+        .is_ok());
     }
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use fluree_db_delta::{
     ColumnFilter, DeltaError, DeltaGsConfig, DeltaIoConfig, DeltaSnapshot, DeltaTable, FilterOp,
-    FilterValue,
+    FilterValue, Placement, UnityConfig,
 };
 use fluree_db_iceberg::config::MappingSource;
 use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType};
@@ -33,6 +33,9 @@ pub struct DeltaCreateConfig {
     pub root: Option<String>,
     /// Explicit table name → table location.
     pub tables: BTreeMap<String, String>,
+    /// Unity Catalog, through which every table without a `tables` entry is
+    /// found and read. Excludes `root`.
+    pub unity: Option<UnityConfig>,
     pub io: DeltaIoConfig,
     pub mapping: R2rmlMappingInput,
     pub mapping_media_type: Option<String>,
@@ -98,6 +101,75 @@ impl DeltaAzureFields {
     }
 }
 
+/// The flat Unity Catalog fields the CLI and HTTP surfaces accept. A secret
+/// arrives as the surface resolved it: a literal, or the name of an
+/// environment variable read where the tables are read.
+#[derive(Debug, Clone, Default)]
+pub struct DeltaUnityFields {
+    /// The Databricks workspace URL.
+    pub uri: Option<String>,
+    pub catalog: Option<String>,
+    pub schema: Option<String>,
+    pub bearer: Option<fluree_db_iceberg::ConfigValue>,
+    pub oauth2_client_id: Option<String>,
+    pub oauth2_client_secret: Option<fluree_db_iceberg::ConfigValue>,
+    /// Defaults to the workspace's own token endpoint.
+    pub oauth2_token_url: Option<String>,
+    /// Defaults to `all-apis`.
+    pub oauth2_scope: Option<String>,
+}
+
+impl DeltaUnityFields {
+    /// `None` when no field is set. Catalog fields without a workspace, or a
+    /// workspace without exactly one way to authenticate, are errors.
+    pub fn into_config(self) -> crate::Result<Option<UnityConfig>> {
+        use fluree_db_iceberg::auth::AuthConfig;
+        use fluree_db_iceberg::ConfigValue;
+        let bad = |message: &str| Err(crate::ApiError::Config(format!("Unity Catalog: {message}")));
+        let Some(uri) = self.uri else {
+            let stray = self.catalog.is_some()
+                || self.schema.is_some()
+                || self.bearer.is_some()
+                || self.oauth2_client_id.is_some()
+                || self.oauth2_client_secret.is_some()
+                || self.oauth2_token_url.is_some()
+                || self.oauth2_scope.is_some();
+            return if stray {
+                bad("catalog and auth options need the workspace URL")
+            } else {
+                Ok(None)
+            };
+        };
+        let auth = match (
+            self.bearer,
+            self.oauth2_client_id,
+            self.oauth2_client_secret,
+        ) {
+            (Some(token), None, None) => AuthConfig::Bearer { token },
+            (None, Some(client_id), Some(client_secret)) => AuthConfig::OAuth2ClientCredentials {
+                token_url: self
+                    .oauth2_token_url
+                    .unwrap_or_else(|| format!("{}/oidc/v1/token", uri.trim_end_matches('/'))),
+                client_id: ConfigValue::literal(client_id),
+                client_secret,
+                scope: Some(self.oauth2_scope.unwrap_or_else(|| "all-apis".to_string())),
+                audience: None,
+            },
+            _ => {
+                return bad(
+                    "give a bearer token, or the client id and secret of a service principal",
+                )
+            }
+        };
+        Ok(Some(UnityConfig {
+            uri,
+            auth,
+            catalog: self.catalog,
+            schema: self.schema,
+        }))
+    }
+}
+
 impl DeltaCreateConfig {
     /// A source whose tables live under `root`.
     pub fn new(
@@ -110,12 +182,25 @@ impl DeltaCreateConfig {
             branch: None,
             root: Some(root.into()),
             tables: BTreeMap::new(),
+            unity: None,
             io: DeltaIoConfig::default(),
             mapping: R2rmlMappingInput::Content(mapping_content.into()),
             mapping_media_type: None,
             model: None,
             default_allow: None,
         }
+    }
+
+    /// A source whose tables are named in Unity Catalog.
+    pub fn in_unity(
+        name: impl Into<String>,
+        unity: UnityConfig,
+        mapping_content: impl Into<String>,
+    ) -> Self {
+        let mut config = Self::new(name, "", mapping_content);
+        config.root = None;
+        config.unity = Some(unity);
+        config
     }
 
     pub fn effective_branch(&self) -> &str {
@@ -136,6 +221,7 @@ impl DeltaCreateConfig {
         DeltaGsConfig {
             root: self.root.clone(),
             tables: self.tables.clone(),
+            unity: self.unity.clone(),
             io: self.io.clone(),
             mapping: Some(MappingSource {
                 source: mapping_address.to_string(),
@@ -210,6 +296,15 @@ impl crate::Fluree {
             .hydrate(self.secret_resolver())
             .await
             .map_err(|e| crate::ApiError::Config(e.to_string()))?;
+        let unity = match &gs_config.unity {
+            Some(unity) => Some(
+                unity
+                    .hydrate(self.secret_resolver())
+                    .await
+                    .map_err(|e| crate::ApiError::Config(e.to_string()))?,
+            ),
+            None => None,
+        };
         let mut table_versions = BTreeMap::new();
         let mut table_warnings = Vec::new();
         for table_name in &table_names {
@@ -224,8 +319,17 @@ impl crate::Fluree {
             columns.sort();
             columns.dedup();
             let probed = async {
-                let location = gs_config.table_location(table_name)?;
-                let table = DeltaTable::open(table_name, &location, &io)?;
+                let table = match (gs_config.placement(table_name)?, &unity) {
+                    (Placement::Unity(full_name), Some(unity)) => {
+                        DeltaTable::open_in_unity(table_name, unity, &full_name, &io).await?
+                    }
+                    (Placement::Path(location), _) => DeltaTable::open(table_name, &location, &io)?,
+                    (Placement::Unity(full_name), None) => {
+                        return Err(DeltaError::Config(format!(
+                            "table '{full_name}' is placed in a catalog the source does not have"
+                        )))
+                    }
+                };
                 let snapshot = table
                     .snapshot(fluree_db_delta::VersionSelector::Latest)
                     .await?;
@@ -358,16 +462,16 @@ impl DeltaSource {
         table_name: &str,
         pin: Option<SourceTime>,
     ) -> QueryResult<DeltaSnapshot> {
-        let location = self
+        let placement = self
             .config
-            .table_location(table_name)
+            .placement(table_name)
             .map_err(|e| self.query_error(table_name, e))?;
         let table = fluree
             .r2rml_cache()
             .delta_table(
                 table_name,
-                &location,
-                &self.config.io,
+                &placement,
+                &self.config,
                 fluree.secret_resolver(),
             )
             .await
@@ -376,11 +480,15 @@ impl DeltaSource {
             .snapshot(version_selector(table_name, pin)?)
             .await
             .map_err(|e| self.query_error(table_name, e))?;
+        let located = match &placement {
+            Placement::Path(location) => location.as_str(),
+            Placement::Unity(_) => table.location(),
+        };
 
         session.record_snapshot(
             IcebergCatalogSession::snapshot_key(&self.graph_source_id, table_name),
             TableWatermark {
-                metadata_location: format!("{}@v{}", location, snapshot.version()),
+                metadata_location: format!("{}@v{}", located, snapshot.version()),
                 snapshot_id: i64::try_from(snapshot.version()).ok(),
                 sequence_number: None,
             },
@@ -526,6 +634,11 @@ fn delta_query_error(graph_source_id: &str, table_name: &str, error: DeltaError)
         DeltaError::ColumnNotFound { .. } => {
             QueryError::InvalidQuery(format!("Delta graph source '{graph_source_id}': {error}"))
         }
+        DeltaError::Catalog {
+            table,
+            message,
+            denied: true,
+        } => QueryError::CatalogAccessDenied { table, message },
         other => QueryError::Internal(format!(
             "Delta graph source '{graph_source_id}', table '{table_name}': {other}"
         )),
@@ -550,6 +663,27 @@ mod tests {
     use super::*;
     use fluree_db_delta::AzureAuth;
 
+    /// A catalog's 401/403 reaches the client as a typed 403, not as an
+    /// invalid query; any other catalog failure keeps its old mapping.
+    #[test]
+    fn a_catalog_refusal_is_a_typed_403() {
+        let refusal = |denied| DeltaError::Catalog {
+            table: "main.sales.orders".to_string(),
+            message: "User does not have SELECT on Table 'main.sales.orders'. (403 Forbidden)"
+                .to_string(),
+            denied,
+        };
+        let denied = delta_query_error("orders:main", "orders", refusal(true));
+        assert!(
+            matches!(&denied, QueryError::CatalogAccessDenied { table, .. } if table == "main.sales.orders"),
+            "{denied:?}"
+        );
+        assert_eq!(crate::ApiError::Query(denied).status_code(), 403);
+
+        let outage = delta_query_error("orders:main", "orders", refusal(false));
+        assert!(matches!(outage, QueryError::Internal(_)), "{outage:?}");
+    }
+
     fn fields(
         tenant: Option<&str>,
         client: Option<&str>,
@@ -562,6 +696,118 @@ mod tests {
             client_secret: secret.map(str::to_string),
             client_secret_env: secret_env.map(str::to_string),
         }
+    }
+
+    fn secret(value: &str) -> Option<fluree_db_iceberg::ConfigValue> {
+        Some(fluree_db_iceberg::ConfigValue::literal(value))
+    }
+
+    #[test]
+    fn a_service_principal_needs_only_its_workspace_id_and_secret() {
+        let unity = DeltaUnityFields {
+            uri: Some("https://workspace.example.com/".to_string()),
+            catalog: Some("main".to_string()),
+            oauth2_client_id: Some("app".to_string()),
+            oauth2_client_secret: Some(fluree_db_iceberg::ConfigValue::from_env("SP_SECRET")),
+            ..Default::default()
+        }
+        .into_config()
+        .unwrap()
+        .unwrap();
+        assert_eq!(unity.catalog.as_deref(), Some("main"));
+        let auth = serde_json::to_value(&unity.auth).unwrap();
+        assert_eq!(auth["type"], "oauth2_client_credentials");
+        assert_eq!(
+            auth["token_url"],
+            "https://workspace.example.com/oidc/v1/token"
+        );
+        assert_eq!(auth["scope"], "all-apis");
+        assert_eq!(auth["client_secret"]["env_var"], "SP_SECRET");
+
+        let overridden = DeltaUnityFields {
+            uri: Some("https://workspace.example.com".to_string()),
+            oauth2_client_id: Some("app".to_string()),
+            oauth2_client_secret: secret("s"),
+            oauth2_token_url: Some("https://login.example.com/token".to_string()),
+            oauth2_scope: Some("sql".to_string()),
+            ..Default::default()
+        }
+        .into_config()
+        .unwrap()
+        .unwrap();
+        let auth = serde_json::to_value(&overridden.auth).unwrap();
+        assert_eq!(auth["token_url"], "https://login.example.com/token");
+        assert_eq!(auth["scope"], "sql");
+    }
+
+    #[test]
+    fn unity_fields_are_all_or_nothing_with_one_way_to_authenticate() {
+        assert!(DeltaUnityFields::default().into_config().unwrap().is_none());
+        let uri = || Some("https://workspace.example.com".to_string());
+
+        let bearer = DeltaUnityFields {
+            uri: uri(),
+            bearer: secret("t"),
+            ..Default::default()
+        };
+        assert!(bearer.clone().into_config().unwrap().is_some());
+
+        for broken in [
+            DeltaUnityFields {
+                uri: uri(),
+                ..Default::default()
+            },
+            DeltaUnityFields {
+                catalog: Some("main".to_string()),
+                ..Default::default()
+            },
+            DeltaUnityFields {
+                bearer: secret("t"),
+                ..Default::default()
+            },
+            DeltaUnityFields {
+                oauth2_client_id: Some("app".to_string()),
+                ..bearer.clone()
+            },
+            DeltaUnityFields {
+                uri: uri(),
+                oauth2_client_id: Some("app".to_string()),
+                ..Default::default()
+            },
+            DeltaUnityFields {
+                uri: uri(),
+                oauth2_client_secret: secret("s"),
+                ..Default::default()
+            },
+        ] {
+            assert!(broken.clone().into_config().is_err(), "{broken:?}");
+        }
+    }
+
+    #[test]
+    fn a_unity_source_stores_its_catalog_and_no_root() {
+        let unity = UnityConfig {
+            uri: "https://workspace.example.com".to_string(),
+            auth: fluree_db_iceberg::auth::AuthConfig::Bearer {
+                token: fluree_db_iceberg::ConfigValue::from_env("DATABRICKS_TOKEN"),
+            },
+            catalog: Some("main".to_string()),
+            schema: None,
+        };
+        let mut config = DeltaCreateConfig::in_unity("sales", unity, "");
+        config.validate().unwrap();
+
+        let stored = config.to_gs_config("mapping.ttl");
+        assert!(stored.root.is_none());
+        assert_eq!(
+            stored.placement("sales.orders").unwrap(),
+            Placement::Unity("main.sales.orders".to_string())
+        );
+        let json = stored.to_json().unwrap();
+        assert!(json.contains("\"env_var\":\"DATABRICKS_TOKEN\""), "{json}");
+
+        config.root = Some("s3://lake/Tables".to_string());
+        assert!(config.validate().is_err());
     }
 
     #[test]

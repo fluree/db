@@ -2083,7 +2083,7 @@ async fn execute_query(
     // The alias may name a graph source (Iceberg/R2RML, BM25, …) rather than a
     // ledger; those resolve through the connection/dataset path, which queries
     // them via their source engine instead of loading a ledger (#1369).
-    let ledger = match load_ledger_for_query(state, ledger_id, &span).await {
+    let ledger = match load_ledger_or_missing(state, ledger_id, &span).await {
         Ok(l) => l,
         Err(e) => {
             // Non-not-found errors (real load failures) propagate unchanged.
@@ -2105,6 +2105,7 @@ async fn execute_query(
                 }
                 return execute_dataset_query(state, ledger_id, query_json, &span).await;
             }
+            report_missing_ledger(&span, &e);
             return Err(ServerError::Api(ApiError::NotFound(ledger_id.to_string())));
         }
     };
@@ -2855,11 +2856,12 @@ async fn execute_sparql_ledger(
             // already supports graph sources via `load_view_from_source`). A
             // genuinely-missing ledger still propagates its not-found.
             if !state.config.is_proxy_storage_mode() {
-                if let Err(e) = load_ledger_for_query(state, ledger_id, &span).await {
+                if let Err(e) = load_ledger_or_missing(state, ledger_id, &span).await {
                     let is_not_found = matches!(&e, ServerError::Api(api) if api.is_not_found());
                     if !(is_not_found
                         && state.fluree.resolve_graph_source(ledger_id).await?.is_some())
                     {
+                        report_missing_ledger(&span, &e);
                         return Err(e);
                     }
                 }
@@ -3077,7 +3079,7 @@ async fn execute_sparql_ledger(
         // target path (`graph().query()` auto-enables R2RML), which queries it via
         // its source engine (#1369). Mirrors the JSON-LD `execute_query` ->
         // `execute_dataset_query` fallback. Graph sources support JSON output only.
-        let ledger = match load_ledger_for_query(state, ledger_id, &span).await {
+        let ledger = match load_ledger_or_missing(state, ledger_id, &span).await {
             Ok(ledger) => ledger,
             Err(e) => {
                 // Non-not-found errors (real load failures) keep the LedgerLoad tag.
@@ -3121,6 +3123,7 @@ async fn execute_sparql_ledger(
                     )
                         .into_response());
                 }
+                report_missing_ledger(&span, &e);
                 return Err(ServerError::Api(ApiError::NotFound(ledger_id.to_string())));
             }
         };
@@ -3629,14 +3632,41 @@ pub(crate) async fn load_ledger_for_query(
     ledger_id: &str,
     span: &tracing::Span,
 ) -> Result<LedgerState> {
+    load_ledger_or_missing(state, ledger_id, span)
+        .await
+        .inspect_err(|e| report_missing_ledger(span, e))
+}
+
+/// Marks the request failed for want of a ledger. Does nothing for any other
+/// error.
+pub(crate) fn report_missing_ledger(span: &tracing::Span, error: &ServerError) {
+    if let ServerError::Api(e) = error {
+        if e.is_not_found() {
+            set_span_error_code(span, "error:NotFound");
+            tracing::error!(error = %e, "ledger not found");
+        }
+    }
+}
+
+/// [`load_ledger_for_query`] for a caller that, finding no such ledger, goes
+/// on to try the name as a graph source. A clean not-found is returned
+/// unreported; the caller reports it with [`report_missing_ledger`] only if
+/// the name turns out to be nothing at all.
+pub(crate) async fn load_ledger_or_missing(
+    state: &AppState,
+    ledger_id: &str,
+    span: &tracing::Span,
+) -> Result<LedgerState> {
     let fluree = &state.fluree;
 
     maybe_refresh_ledger_for_query(state, ledger_id).await;
 
     // Get cached handle (loads if not cached)
     let handle = fluree.ledger_cached(ledger_id).await.map_err(|e| {
-        set_span_error_code(span, "error:NotFound");
-        tracing::error!(error = %e, "ledger not found");
+        if !e.is_not_found() {
+            set_span_error_code(span, "error:NotFound");
+            tracing::error!(error = %e, "ledger not found");
+        }
         ServerError::Api(e)
     })?;
 

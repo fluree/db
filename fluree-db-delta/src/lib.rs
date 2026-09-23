@@ -15,8 +15,9 @@ mod listing;
 mod prune;
 mod store;
 pub mod table;
+mod unity;
 
-pub use config::{AzureAuth, DeltaGsConfig, DeltaIoConfig};
+pub use config::{AzureAuth, DeltaGsConfig, DeltaIoConfig, Placement, UnityConfig};
 pub use datafile::rows_decoded;
 pub use error::{DeltaError, Result};
 pub use filter::{ColumnFilter, FilterOp, FilterValue};

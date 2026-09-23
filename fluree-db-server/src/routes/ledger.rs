@@ -717,9 +717,9 @@ pub async fn info(
 
         // Non-proxy mode: load ledger and return comprehensive info.
         // If ledger is not found, fall back to graph source lookup.
-        let ledger_state = match super::query::load_ledger_for_query(&state, alias, &span).await {
+        let ledger_state = match super::query::load_ledger_or_missing(&state, alias, &span).await {
             Ok(ls) => ls,
-            Err(ServerError::Api(ref e)) if e.is_not_found() => {
+            Err(ref missing @ ServerError::Api(ref e)) if e.is_not_found() => {
                 // Try graph source lookup. A virtual (R2RML/Iceberg) dataset is
                 // routed through the SHARED api builder so its `/info` returns
                 // real classes/properties/counts (metadata-only) with NO secrets.
@@ -731,7 +731,7 @@ pub async fn info(
                     tracing::info!(status = "success", "graph source info retrieved");
                     return Ok(Json(info).into_response());
                 }
-                set_span_error_code(&span, "error:NotFound");
+                super::query::report_missing_ledger(&span, missing);
                 return Err(ServerError::Api(ApiError::NotFound(alias.to_string())));
             }
             Err(e) => return Err(e),

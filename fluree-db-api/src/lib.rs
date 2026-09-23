@@ -237,7 +237,9 @@ pub use graph_source::{
 };
 
 #[cfg(feature = "delta")]
-pub use fluree_db_delta::{AzureAuth as DeltaAzureAuth, DeltaIoConfig};
+pub use fluree_db_delta::{
+    AzureAuth as DeltaAzureAuth, DeltaIoConfig, UnityConfig as DeltaUnityConfig,
+};
 #[cfg(feature = "delta")]
 pub use fluree_db_iceberg::ConfigValue as DeltaConfigValue;
 #[cfg(feature = "sql")]
@@ -246,7 +248,7 @@ pub use fluree_db_sql::{
     SqlGsConfig, WireProtocol,
 };
 #[cfg(feature = "delta")]
-pub use graph_source::{DeltaAzureFields, DeltaCreateConfig, DeltaCreateResult};
+pub use graph_source::{DeltaAzureFields, DeltaCreateConfig, DeltaCreateResult, DeltaUnityFields};
 #[cfg(feature = "sql")]
 pub use graph_source::{SqlCheckResult, SqlCreateConfig, SqlCreateResult};
 
