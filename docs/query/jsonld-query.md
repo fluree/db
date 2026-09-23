@@ -680,6 +680,46 @@ Compute values and bind to variables:
 }
 ```
 
+The target must be a **fresh** variable. Binding onto a name that is already
+bound is rejected, in both spellings — the `bind` pattern above and the
+scalar select expression `(as <expr> ?v)`, which desugars to the same bind:
+
+```json
+["bind", "?age", "(+ ?age 1)"]          // rejected
+{"select": ["(as (+ ?age 1) ?age)"]}    // rejected
+```
+
+**Migration.** These were previously accepted and behaved as a *filter* on the
+existing binding rather than a re-bind: a conflicting expression silently
+returned zero rows and a consistent one returned all of them. If you were
+relying on that, `filter` says it directly and is unchanged:
+
+```json
+["filter", "(= ?age (+ ?age 0))"]
+```
+
+The identity form `["bind", "?v", "?v"]` is still accepted, as is a bind
+inside one `union` branch onto a column the sibling branch produces. The rule
+applies inside nested `["query", …]` subqueries too, and to `unwind`, which
+has the same problem: `["unwind", "?v", …]` onto a bound `?v` silently
+filtered to rows where an element happened to match. Unwind into a fresh
+variable.
+
+**Reusing a metadata variable is not affected, deliberately.** Binding one
+`@t` (or `@type`, `@language`, `@op`) variable across two properties is how
+you ask for "both asserted in the same transaction":
+
+```json
+{"@id": "?s",
+ "schema:name": {"@value": "?name", "@t": "?t"},
+ "schema:age":  {"@value": "?age",  "@t": "?t"}}
+```
+
+That binds onto an already-bound `?t` by design — the join is the point — so
+it keeps working. SPARQL has rejected both `bind` spellings all along (§10.1
+and §19.8); Cypher rejects its `AS` equivalent; this closes the last surface
+that did not.
+
 ### Values Patterns
 
 Provide initial bindings:

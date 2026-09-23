@@ -746,6 +746,21 @@ here to stay:
   this shows on ordinary `a / b`.
 - **No implicit per-statement transaction id.** Immutability and time-travel
   (`f:t`, history queries) replace those semantics.
+- **`@id`, `@type` and every other `@`-prefixed name are not Cypher names.** A
+  node variable already *is* the node, so ``n.`@id` `` and ``n.`@type` `` are rejected
+  and the error names the accessor that works — `id(n)` / `elementId(n)` for
+  identity, `labels(n)` for types, `SET n:Label` to add one. The rule is the
+  `@` prefix, not a list of keywords, so names JSON-LD adds later are covered
+  too. It covers every position a bare name can occupy: property keys, inline
+  property maps, annotation property maps, **node labels**, and relationship
+  types, on both the read and write paths — and it checks what a name
+  **resolves to** as well as how it is spelled, so a ledger context that
+  aliases an ordinary term to a keyword (`{"id": "@id"}`, a standard JSON-LD
+  idiom) cannot route `n.id` around it. As a property key they were previously read as
+  ordinary absent properties (always `null`) and written as a literal predicate
+  spelled `@id`; as a label ``MATCH (n:`@id`)`` read as zero rows and
+  ``SET n:`@type` `` committed, after which `labels(n)` read back
+  `["Person", "@type"]`.
 
 **Deferred (fringe / on request)** — rejected with a clear error until a use
 case pulls them in; each has a workaround:
@@ -757,6 +772,38 @@ case pulls them in; each has a workaround:
   `x.date.month`) and mixing `.*` with named selectors in a map projection.
 - `ORDER BY` over a list/map value, and `neo4j://` cluster routing (use
   `bolt://` direct).
+- **Re-projecting a bound name.** `RETURN expr AS v` / `WITH expr AS v` where
+  `v` is already bound by an earlier clause is rejected; alias to a fresh name.
+  Neo4j accepts `WITH n.name AS n` as a projection into a new scope, so this is
+  the one place Fluree is stricter than openCypher rather than more lenient.
+  The reason is the promise at the top of this section: variable names are a
+  bijection onto the shared IR's variable ids, so the alias resolved to the
+  bound variable and the projection became a silent equality filter — zero rows
+  on a read, and a successful transaction that wrote nothing on a write. An
+  error beats that. Re-projection is deferred rather than impossible: it needs
+  a column-label channel — which probably does not have to reach the shared IR,
+  since the result type is api-side and a Cypher-only field already precedents
+  it — plus a name-to-variable rebinding layer, because `ORDER BY` resolves
+  projection aliases by surface expression and would otherwise sort by the
+  original binding. Tracked in #1870. The identity projection `RETURN v AS v`
+  stays legal, as does aliasing a name that a *later* clause binds
+  (`WITH pair[0] AS x … OPTIONAL MATCH (x)…`).
+  Two projection items may not share one output name either — including bare
+  and unaliased ones, so `RETURN a, a` and `RETURN a.name, a.name` are rejected
+  alongside `AS x, … AS x`. That matches Neo4j ("Multiple result columns with
+  the same name are not supported").
+- **The same collision inside a `CALL { … }` body** is rejected too. A name the
+  body imports — `CALL (a) { WITH a.name AS a … }` — is bound for every parent
+  row, so assigning onto it dropped every row exactly as at the top level.
+- **`UNWIND <list> AS v` where `v` is already bound** is rejected, for the same
+  reason: `UNWIND` introduces a new binding, and assigning onto a bound name
+  silently dropped every row. One sub-case — a list expression that *references*
+  the alias, such as `UNWIND labels(a) AS a` — happened to work, because
+  referencing `a` forces the operator to stay below the `MATCH` where it shadows
+  correctly; an uncorrelated list floats above it and the collision drops the
+  rows instead. That is a property of plan ordering rather than of the
+  statement, so both forms are rejected rather than one being blessed. Unwind
+  into a fresh name.
 
 Everything else — the full clause/pattern/expression surface, the write path,
 procedures, and Bolt driver support — works; when in doubt, try it and read the

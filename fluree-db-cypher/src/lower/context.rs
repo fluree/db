@@ -221,13 +221,46 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         }
     }
 
-    /// Resolve and reject reserved-system predicates.
+    /// Resolve and reject reserved predicates — Fluree's own `f:reifies*`
+    /// system predicates, and the JSON-LD keywords (`@id`, `@type`, …) that
+    /// are not Cypher properties.
+    ///
+    /// The keyword check runs on the *bare* name, before `@vocab` expansion:
+    /// with a vocab set, `@id` would otherwise resolve to `<vocab>@id` and
+    /// lower as an ordinary predicate. Reading it yields `null` and writing it
+    /// stores a literal predicate spelled `@id` — see
+    /// [`crate::keywords`] for why rejecting is safe.
     pub fn resolve_predicate(&self, name: &str) -> Result<String> {
+        if let Some(msg) = crate::keywords::reserved_keyword_message(name) {
+            return Err(LowerError::generic(msg));
+        }
         let iri = self.resolve_iri(name);
+        // The bare-name check above misses a keyword reached through the
+        // ledger's context: `{"id": "@id"}` is a standard JSON-LD aliasing
+        // idiom, lands in `overrides`, and resolves `id` to `@id`. Checking
+        // the resolved term too closes that, while the bare-name check still
+        // catches `@id` before `@vocab` would turn it into `<vocab>@id`.
+        if let Some(msg) = crate::keywords::reserved_keyword_message(&iri) {
+            return Err(LowerError::generic(format!(
+                "`{name}` resolves through the ledger's context to `{iri}` — {msg}"
+            )));
+        }
         if fluree_vocab::reifies_iris::ALL.iter().any(|x| *x == iri) {
             return Err(LowerError::ReservedPredicate(iri));
         }
         Ok(iri)
+    }
+
+    /// Resolve a node label, rejecting the same reserved names a predicate
+    /// rejects.
+    ///
+    /// A label lowers to the OBJECT of an `rdf:type` triple rather than to a
+    /// predicate, so the label sites reached `resolve_iri` directly and routed
+    /// around the reserved-name check: ``MATCH (n:`@id`)`` read as zero rows
+    /// and ``SET n:`@type` `` committed a junk class. Delegating keeps one
+    /// choke point per crate instead of a second copy of the check.
+    pub fn resolve_label(&self, name: &str) -> Result<String> {
+        self.resolve_predicate(name)
     }
 
     /// rdf:type IRI.

@@ -186,21 +186,36 @@ async fn sparql_bind_fresh_variable_still_works() {
     assert_eq!(rows, json!([["Alice", 51], ["Brian", 51], ["Cam", 35]]));
 }
 
-/// JSON-LD surface (reviewed divergence): the analytical `bind` on an
-/// already-bound variable is ACCEPTED by the Fluree-owned syntax — no
-/// validation error — and behaves as a join/constraint on the existing
-/// binding rather than a rebind: a conflicting expression yields zero
-/// rows, a consistent one keeps them. Pinned so the SPARQL-side V5
-/// rejection does not silently change JSON-LD behavior — any tightening
-/// here needs its own decision.
+/// JSON-LD surface, V5/V6 analogue: a `bind` — or a scalar select alias,
+/// which desugars to one — onto an already-bound variable is REJECTED.
+///
+/// This replaces a pin that recorded the opposite. That pin's comment said
+/// "any tightening here needs its own decision", which read as a product
+/// decision reserving the behaviour; the archaeology says otherwise. The
+/// comment came from `e1f1380eb6`, whose body describes the two JSON-LD pins
+/// as "deliberately NOT changed by this PR" — PR scope, not intent — and
+/// describes this one as "empirically behaving" as a join/constraint, i.e.
+/// observed rather than designed. The behaviour underneath it is
+/// `BindOperator`'s clobber prevention, whose every line arrived wholesale in
+/// `5985d0f011` "fluree v4 baseline" and was never proposed or argued. No
+/// issue, design doc or review comment discusses it, and a repo-wide scan
+/// found no query relying on it outside this test. So the deferral was
+/// procedural, and this lands it.
+///
+/// Both spellings are covered, because they fail identically and only one of
+/// them is the real analogue of the Cypher bug (#1857) this follows from:
+/// `(as <expr> ?v)` is the alias/projection form, `["bind", "?v", …]` the
+/// WHERE-clause form. `filter` remains the way to express the constraint
+/// reading this used to back into.
 #[tokio::test]
-async fn jsonld_bind_on_bound_variable_accepted_as_constraint() {
+async fn jsonld_bind_on_bound_variable_rejected() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_people(&fluree, "query/grouping-parity-v5jsonld:main").await;
     let ctx = context_ex_schema();
 
-    // Conflicting rebind (?age = ?age + 1 never holds): accepted, 0 rows.
-    let conflicting = json!({
+    // WHERE-clause bind onto a bound variable — the V5 analogue. Previously
+    // accepted and silently 0 rows (the conflicting `?age = ?age + 1` case).
+    let where_bind = json!({
         "@context": ctx,
         "select": ["?name", "?age"],
         "where": [
@@ -208,24 +223,63 @@ async fn jsonld_bind_on_bound_variable_accepted_as_constraint() {
             ["bind", "?age", ["expr", ["+", "?age", 1]]]
         ]
     });
-    let result = support::query_jsonld(&fluree, &ledger, &conflicting)
+    let err = support::query_jsonld(&fluree, &ledger, &where_bind)
         .await
-        .expect("JSON-LD bind on a bound variable is accepted (divergence)");
-    let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
-    assert_eq!(rows.as_array().map(Vec::len), Some(0), "{rows:?}");
+        .expect_err("bind onto a bound variable must be rejected");
+    assert!(
+        err.to_string()
+            .contains("bind target ?age is already bound"),
+        "unexpected error: {err}"
+    );
 
-    // Consistent rebind (?age = ?age + 0 always holds): all rows survive.
-    let consistent = json!({
+    // Select alias onto a bound variable — the V6 analogue, and the shape that
+    // actually mirrors Cypher's `RETURN expr AS v`. Previously accepted and
+    // silently 0 rows, even in the consistent case.
+    let select_alias = json!({
+        "@context": ctx,
+        "select": ["?name", "(as (+ ?age 0) ?age)"],
+        "where": [{"@id": "?s", "schema:name": "?name", "schema:age": "?age"}]
+    });
+    let err = support::query_jsonld(&fluree, &ledger, &select_alias)
+        .await
+        .expect_err("select alias onto a bound variable must be rejected");
+    assert!(
+        err.to_string()
+            .contains("select alias ?age is already bound"),
+        "the message must name the select spelling, not the where one: {err}"
+    );
+
+    // The consistent case is gone too, deliberately: it only "worked" because
+    // `?age + 0` happened to equal `?age`, which is the filter semantics the
+    // old pin recorded rather than a projection. `filter` is the replacement
+    // and still expresses it.
+    let replacement = json!({
         "@context": ctx,
         "select": ["?name", "?age"],
         "where": [
             {"@id": "?s", "schema:name": "?name", "schema:age": "?age"},
-            ["bind", "?age", ["expr", ["+", "?age", 0]]]
+            ["filter", "(= ?age (+ ?age 0))"]
         ]
     });
-    let result = support::query_jsonld(&fluree, &ledger, &consistent)
+    let result = support::query_jsonld(&fluree, &ledger, &replacement)
         .await
-        .expect("JSON-LD bind on a bound variable is accepted (divergence)");
+        .expect("filter is the supported spelling for the constraint reading");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(rows.as_array().map(Vec::len), Some(3), "{rows:?}");
+
+    // Binding to a FRESH variable is untouched — the guard rejects collisions,
+    // not computation.
+    let fresh = json!({
+        "@context": ctx,
+        "select": ["?name", "?next"],
+        "where": [
+            {"@id": "?s", "schema:name": "?name", "schema:age": "?age"},
+            ["bind", "?next", ["expr", ["+", "?age", 1]]]
+        ]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &fresh)
+        .await
+        .expect("bind to a fresh variable still works");
     let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
     assert_eq!(rows.as_array().map(Vec::len), Some(3), "{rows:?}");
 }
@@ -383,4 +437,71 @@ async fn jsonld_grouped_list_keeps_duplicates_without_aggregation() {
         .expect("query");
     let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
     assert_eq!(rows, json!([["ex:b1", [10, 10, 10]], ["ex:b2", [20, 30]]]));
+}
+
+/// Review round (bplatz) on the JSON-LD guard: the regression it introduced,
+/// and the two scopes it did not see.
+#[tokio::test]
+async fn jsonld_bind_guard_review_round() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_people(&fluree, "query/grouping-parity-v5review:main").await;
+    let ctx = context_ex_schema();
+
+    // REGRESSION FIX. Reusing one node-map metadata variable across two
+    // properties is the natural spelling of "both asserted in the same
+    // transaction", and it binds onto an already-bound `?t` by design. The
+    // guard's doc claimed these binds were `?__`-prefixed and exempt; they
+    // carry the author's own name, so the guard rejected a working query.
+    let shared_t = json!({
+        "@context": ctx,
+        "select": ["?name", "?t"],
+        "where": [{"@id": "?s",
+                   "schema:name": {"@value": "?name", "@t": "?t"},
+                   "schema:age":  {"@value": "?age",  "@t": "?t"}}]
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &shared_t)
+        .await
+        .expect("a shared metadata variable is a join, and must keep working");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    assert_eq!(rows.as_array().map(Vec::len), Some(3), "{rows:?}");
+
+    // …while a genuine collision on the same shape of query is still refused,
+    // so the exemption is the metadata join and not a blanket pass.
+    let genuine = json!({
+        "@context": ctx,
+        "select": ["?name"],
+        "where": [{"@id": "?s", "schema:name": "?name", "schema:age": "?age"},
+                  ["bind", "?age", ["expr", ["+", "?age", 1]]]]
+    });
+    support::query_jsonld(&fluree, &ledger, &genuine)
+        .await
+        .expect_err("a user bind onto a bound variable is still rejected");
+
+    // Nested subquery: nothing checked it, so the defect survived one level
+    // down and returned an unexplained empty result.
+    let nested = json!({
+        "@context": ctx,
+        "select": ["?age"],
+        "where": [["query", {"@context": ctx,
+                             "select": ["?age"],
+                             "where": [{"@id": "?s2", "schema:age": "?age"},
+                                       ["bind", "?age", ["expr", ["+", "?age", 1]]]]}]]
+    });
+    let err = support::query_jsonld(&fluree, &ledger, &nested)
+        .await
+        .expect_err("a nested select must be guarded like the top level");
+    assert!(err.to_string().contains("bind target ?age"), "{err}");
+
+    // `unwind` onto a bound variable: the Cypher twin of this exact shape is
+    // rejected in the same PR, so the surfaces should agree.
+    let unwind = json!({
+        "@context": ctx,
+        "select": ["?name", "?age"],
+        "where": [{"@id": "?s", "schema:name": "?name", "schema:age": "?age"},
+                  ["unwind", "?age", ["expr", ["range", 1, 3]]]]
+    });
+    let err = support::query_jsonld(&fluree, &ledger, &unwind)
+        .await
+        .expect_err("unwind onto a bound variable must be rejected");
+    assert!(err.to_string().contains("unwind target ?age"), "{err}");
 }
