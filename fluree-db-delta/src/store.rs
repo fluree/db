@@ -48,6 +48,14 @@ pub(crate) fn open(
             &"a catalog may not place a table on the local filesystem",
         ));
     }
+    // Databricks on Google Cloud places tables here; say so rather than list
+    // the schemes a path source may use, which the catalog did not choose.
+    if matches!(credentials, Credentials::Unity(..)) && location.starts_with("gs://") {
+        return Err(bad(
+            &"Unity Catalog placed this table on Google Cloud Storage, which the Delta \
+              reader does not read yet (Databricks on AWS and Azure is supported)",
+        ));
+    }
     let kind = crate::config::validate_location(location)?;
 
     if kind == LocationKind::Azure {
