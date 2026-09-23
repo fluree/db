@@ -230,6 +230,12 @@ impl UnityClient {
     /// The table's columns and declared keys, as Unity records them.
     pub(crate) async fn describe(&self, full_name: &str) -> Result<TableDescription> {
         let record = self.record(full_name).await?;
+        // Unity's spelling, not the request's: declared keys name their parent
+        // tables that way, so the tables must be known by it to join.
+        let described_as = record
+            .full_name
+            .clone()
+            .unwrap_or_else(|| full_name.to_string());
         let mut primary_key = Vec::new();
         let mut foreign_keys = Vec::new();
         for constraint in &record.table_constraints {
@@ -263,7 +269,7 @@ impl UnityClient {
             .collect();
         columns.sort_by_key(|c| c.position);
         Ok(TableDescription {
-            full_name: full_name.to_string(),
+            full_name: described_as,
             kind: record.kind().to_string(),
             format: record.data_source_format.clone(),
             location: record.storage_location.clone().filter(|l| !l.is_empty()),
@@ -283,14 +289,27 @@ impl UnityClient {
         Ok(rows.iter().filter_map(|r| text(r, "name")).collect())
     }
 
-    /// Schemas of `catalog`, as `catalog.schema`.
-    pub(crate) async fn schemas(&self, catalog: &str) -> Result<Vec<String>> {
+    /// Schemas of `catalog`, spelled as Unity spells them. Unity folds names to
+    /// lowercase and matches them without regard to case, so a catalog asked
+    /// for as `Main` is `main` in every row.
+    pub(crate) async fn schemas(&self, catalog: &str) -> Result<Vec<ListedSchema>> {
         let path = format!(
             "/api/2.1/unity-catalog/schemas?catalog_name={}&",
             utf8_percent_encode(catalog, NAME)
         );
         let rows = self.pages(Subject::Catalog(catalog), &path).await?;
-        Ok(rows.iter().filter_map(|r| text(r, "full_name")).collect())
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let full_name = text(row, "full_name")?;
+                let (in_catalog, in_schema) = full_name.split_once('.')?;
+                Some(ListedSchema {
+                    catalog: text(row, "catalog_name").unwrap_or_else(|| in_catalog.to_string()),
+                    name: text(row, "name").unwrap_or_else(|| in_schema.to_string()),
+                    full_name,
+                })
+            })
+            .collect())
     }
 
     pub(crate) async fn tables(&self, catalog: &str, schema: &str) -> Result<Vec<ListedTable>> {
@@ -495,6 +514,14 @@ impl Subject<'_> {
 
 fn text(row: &serde_json::Value, key: &str) -> Option<String> {
     row.get(key)?.as_str().map(str::to_string)
+}
+
+/// A schema as Unity names it.
+pub(crate) struct ListedSchema {
+    /// `catalog.schema`
+    pub(crate) full_name: String,
+    pub(crate) catalog: String,
+    pub(crate) name: String,
 }
 
 /// `k=v&…` as the decoded pairs the Azure store signs requests with.
@@ -894,6 +921,18 @@ mod tests {
         };
         assert!(err.contains("Google Cloud Storage"), "{err}");
         assert!(!err.contains("file://"), "{err}");
+        // The table's refusal, not the config's: it reads as unreadable, not
+        // as a malformed request.
+        let refused = crate::store::open(
+            location,
+            &DeltaIoConfig::default(),
+            Credentials::Unity(client(&server), orders(location)),
+        )
+        .expect_err("refused");
+        assert!(
+            matches!(refused, DeltaError::Catalog { denied: false, .. }),
+            "{refused:?}"
+        );
     }
 
     /// Only Unity's 401/403 is an access refusal; an outage is not.

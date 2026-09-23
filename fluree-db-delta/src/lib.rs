@@ -19,8 +19,8 @@ pub mod table;
 mod unity;
 
 pub use catalog::{
-    browse_unity, describe_unity_table, BrowseDepth, DeclaredForeignKey, DescribedColumn,
-    ListedTable, TableDescription, UnityListing,
+    browse_unity, describe_unity_table, describe_unity_tables, BrowseDepth, DeclaredForeignKey,
+    DescribedColumn, ListedTable, TableDescription, UnityListing,
 };
 pub use config::{AzureAuth, DeltaGsConfig, DeltaIoConfig, Placement, UnityConfig};
 pub use datafile::rows_decoded;

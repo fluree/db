@@ -13,7 +13,6 @@ use fluree_db_r2rml::emit::{
     self, emit_r2rml, naming::xsd_datatype, DiagCode, Diagnostic, EmitColumn, EmitColumnStats,
     EmitTableSchema, Severity, StructuredR2rmlMapping, TableKey, TableOverride,
 };
-use futures::{StreamExt, TryStreamExt};
 use serde::Serialize;
 
 use super::delta::{open_placed, DeltaCreateConfig};
@@ -23,9 +22,6 @@ use super::iceberg_validate::{
 };
 use super::R2rmlMappingInput;
 use crate::Result;
-
-/// Tables described at once for one generated mapping.
-const DESCRIBE_CONCURRENCY: usize = 8;
 
 const DELTA_WORDING: Wording = Wording {
     casing: "The Delta reader resolves names ignoring case, so queries work; match the schema's \
@@ -112,6 +108,9 @@ pub struct DeltaTableAccess {
     /// The table's current version, read from its log.
     pub version: Option<u64>,
     pub data_file_count: Option<usize>,
+    /// The data file whose read the store let through; absent when there is
+    /// none, or when the table could not be read.
+    pub probed_data_file: Option<String>,
     /// Why not, in the catalog's or the store's own words.
     pub error: Option<String>,
 }
@@ -191,22 +190,26 @@ fn emit_schema(table: &TableDescription) -> EmitTableSchema {
 }
 
 /// Overrides, given by table name as the request spells it, under the key the
-/// emitter knows each table by.
+/// emitter knows each table by: the name Unity described it as, which may be
+/// spelled differently. `described` is `requested`, in order.
 fn keyed_overrides(
-    unity: &UnityConfig,
-    tables: &[String],
+    requested: &[String],
+    described: &[TableDescription],
     overrides: &HashMap<String, TableOverride>,
 ) -> Result<HashMap<TableKey, TableOverride>> {
     overrides
         .iter()
         .map(|(name, table_override)| {
-            if !tables.contains(name) {
+            let Some(table) = requested
+                .iter()
+                .position(|r| r == name)
+                .and_then(|at| described.get(at))
+            else {
                 return Err(crate::ApiError::config(format!(
                     "an override names '{name}', which is not among the tables"
                 )));
-            }
-            let full_name = unity.full_name(name).map_err(config_error)?;
-            Ok((table_key(&full_name), table_override.clone()))
+            };
+            Ok((table_key(&table.full_name), table_override.clone()))
         })
         .collect()
 }
@@ -273,9 +276,10 @@ impl crate::Fluree {
             .map_err(config_error)
     }
 
-    /// Read `table`'s log with the credentials Unity issues for it: the same
-    /// steps a query's first touch of the table takes. A table that cannot be
-    /// read is a report, not an error; a request that cannot be made is.
+    /// Read `table`'s log with the credentials Unity issues for it, and stat
+    /// its first data file: the same steps a query's first touch of the table
+    /// takes. A table that cannot be read is a report, not an error; a request
+    /// that cannot be made is.
     pub async fn verify_delta_unity_table(
         &self,
         unity: &UnityConfig,
@@ -295,16 +299,23 @@ impl crate::Fluree {
                     .await?;
             let snapshot = table.snapshot(VersionSelector::Latest).await?;
             let files = snapshot.file_count(&[]).await?;
-            Ok::<_, DeltaError>((table.location().to_string(), snapshot.version(), files))
+            let probed = snapshot.probe_data_file().await?;
+            Ok::<_, DeltaError>((
+                table.location().to_string(),
+                snapshot.version(),
+                files,
+                probed,
+            ))
         }
         .await;
         Ok(match read {
-            Ok((location, version, files)) => DeltaTableAccess {
+            Ok((location, version, files, probed)) => DeltaTableAccess {
                 full_name,
                 readable: true,
                 location: Some(location),
                 version: Some(version),
                 data_file_count: Some(files),
+                probed_data_file: probed,
                 error: None,
             },
             Err(DeltaError::Config(e)) => return Err(crate::ApiError::Config(e)),
@@ -314,6 +325,7 @@ impl crate::Fluree {
                 location: None,
                 version: None,
                 data_file_count: None,
+                probed_data_file: None,
                 error: Some(e.to_string()),
             },
         })
@@ -332,17 +344,11 @@ impl crate::Fluree {
             ));
         }
         let unity = self.hydrate_unity(&req.unity).await?;
-        let overrides = keyed_overrides(&unity, &req.tables, &req.per_table_overrides)?;
-        // `buffered` keeps the request's order, and with it the mapping's.
-        let tables: Vec<TableDescription> = futures::stream::iter(req.tables.clone())
-            .map(|name| {
-                let unity = unity.clone();
-                async move { fluree_db_delta::describe_unity_table(&unity, &name).await }
-            })
-            .buffered(DESCRIBE_CONCURRENCY)
-            .try_collect()
+        // In the request's order, and with it the mapping's.
+        let tables = fluree_db_delta::describe_unity_tables(&unity, &req.tables)
             .await
             .map_err(config_error)?;
+        let overrides = keyed_overrides(&req.tables, &tables, &req.per_table_overrides)?;
         generate_from(&tables, &req.base_namespace, &req.options, overrides)
     }
 
@@ -664,24 +670,31 @@ mod tests {
 
     #[test]
     fn an_override_is_given_by_the_tables_name_as_requested() {
-        let unity = UnityConfig {
-            uri: "https://workspace.example.com".to_string(),
-            auth: fluree_db_iceberg::auth::AuthConfig::Bearer {
-                token: fluree_db_iceberg::ConfigValue::literal("t"),
-            },
-            catalog: Some("main".to_string()),
-            schema: Some("sales".to_string()),
+        // Unity describes a table under its own (lowercase) spelling; an
+        // override spelled as requested still reaches it.
+        let requested = vec![
+            "MAIN.SALES.ORDERS".to_string(),
+            "main.sales.customers".to_string(),
+        ];
+        let by_name = |name: &str| {
+            sales()
+                .into_iter()
+                .find(|t| t.full_name == name)
+                .expect("a sales table")
         };
-        let tables = vec!["orders".to_string(), "main.sales.customers".to_string()];
+        let described = vec![
+            by_name("main.sales.orders"),
+            by_name("main.sales.customers"),
+        ];
         let class = |name: &str| TableOverride {
             class_name: Some(name.to_string()),
             ..Default::default()
         };
         let given = HashMap::from([
-            ("orders".to_string(), class("Purchase")),
+            ("MAIN.SALES.ORDERS".to_string(), class("Purchase")),
             ("main.sales.customers".to_string(), class("Buyer")),
         ]);
-        let keyed = keyed_overrides(&unity, &tables, &given).unwrap();
+        let keyed = keyed_overrides(&requested, &described, &given).unwrap();
         let out = generate_from(&sales(), BASE, &GenerateOptions::default(), keyed).unwrap();
         let classes: Vec<_> = out
             .structured
@@ -692,7 +705,7 @@ mod tests {
         assert_eq!(classes, [format!("{BASE}Purchase"), format!("{BASE}Buyer")]);
 
         let stray = HashMap::from([("returns".to_string(), class("Return"))]);
-        let error = keyed_overrides(&unity, &tables, &stray)
+        let error = keyed_overrides(&requested, &described, &stray)
             .unwrap_err()
             .to_string();
         assert!(error.contains("'returns'"), "{error}");

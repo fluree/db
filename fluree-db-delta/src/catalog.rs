@@ -115,19 +115,18 @@ pub(crate) async fn browse(
     let schemas = client.schemas(catalog).await?;
     let mut tables = Vec::new();
     if depth == BrowseDepth::Tables {
-        // `buffered` keeps the schemas' order.
         // Every catalog's system views are left out; they are still listed
-        // when the schema is asked for by name.
-        let wanted: Vec<String> = schemas
+        // when the schema is asked for by name. Each schema is asked for as
+        // Unity spells it, which may not be as the config does.
+        let wanted: Vec<(String, String)> = schemas
             .iter()
-            .map(|full| full.strip_prefix(&format!("{catalog}.")).unwrap_or(full))
-            .filter(|schema| *schema != SYSTEM_SCHEMA)
-            .map(str::to_string)
+            .filter(|schema| !schema.name.eq_ignore_ascii_case(SYSTEM_SCHEMA))
+            .map(|schema| (schema.catalog.clone(), schema.name.clone()))
             .collect();
         // Owned values keep the future `Send`; `buffered` keeps the order.
         let listed: Vec<Vec<ListedTable>> = futures::stream::iter(wanted)
-            .map(|schema| {
-                let (client, catalog) = (client.clone(), catalog.to_string());
+            .map(|(catalog, schema)| {
+                let client = client.clone();
                 async move { client.tables(&catalog, &schema).await }
             })
             .buffered(LISTING_CONCURRENCY)
@@ -137,9 +136,40 @@ pub(crate) async fn browse(
     }
     Ok(UnityListing {
         catalogs: Vec::new(),
-        schemas,
+        schemas: schemas.into_iter().map(|s| s.full_name).collect(),
         tables,
     })
+}
+
+/// Describe each of `table_names`, in order, over one client: one token
+/// exchange for the lot rather than one per table. `unity` must be hydrated.
+pub async fn describe_unity_tables(
+    unity: &UnityConfig,
+    table_names: &[String],
+) -> Result<Vec<TableDescription>> {
+    unity.validate()?;
+    let client = Arc::new(UnityClient::new(unity)?);
+    describe_all(&client, unity, table_names).await
+}
+
+pub(crate) async fn describe_all(
+    client: &Arc<UnityClient>,
+    unity: &UnityConfig,
+    table_names: &[String],
+) -> Result<Vec<TableDescription>> {
+    let full_names = table_names
+        .iter()
+        .map(|name| unity.full_name(name))
+        .collect::<Result<Vec<_>>>()?;
+    // Owned values keep the future `Send`; `buffered` keeps the order.
+    futures::stream::iter(full_names)
+        .map(|full_name| {
+            let client = client.clone();
+            async move { client.describe(&full_name).await }
+        })
+        .buffered(LISTING_CONCURRENCY)
+        .try_collect()
+        .await
 }
 
 /// Describe `table_name`, completed from the config's defaults like a mapped
@@ -245,6 +275,57 @@ mod tests {
             )
             .await;
         }
+    }
+
+    /// Unity folds names to lowercase and matches them without regard to case.
+    /// A catalog asked for with capitals is listed under Unity's spelling, and
+    /// a table described that way is known by Unity's name.
+    #[tokio::test]
+    async fn names_are_unitys_spelling_not_the_requests() {
+        let server = MockServer::start().await;
+        serve(
+            &server,
+            "schemas",
+            &[("catalog_name", "Main")],
+            serde_json::json!({"schemas": [
+                {"full_name": "main.sales", "catalog_name": "main", "name": "sales"},
+                {"full_name": "main.information_schema", "catalog_name": "main",
+                 "name": "information_schema"},
+            ]}),
+        )
+        .await;
+        serve(
+            &server,
+            "tables",
+            &[
+                ("catalog_name", "main"),
+                ("schema_name", "sales"),
+                ("omit_columns", "true"),
+            ],
+            serde_json::json!({"tables": [delta("main.sales.orders")]}),
+        )
+        .await;
+        let catalog = config(&server, Some("Main"), None);
+        let listing = browse(&client(&catalog), &catalog, BrowseDepth::Tables)
+            .await
+            .expect("each schema is asked for as Unity names it");
+        assert_eq!(names(&listing.tables), ["main.sales.orders"]);
+
+        serve(
+            &server,
+            "tables/MAIN.SALES.ORDERS",
+            &[],
+            serde_json::json!({
+                "full_name": "main.sales.orders", "table_type": "MANAGED",
+                "data_source_format": "DELTA", "storage_location": "s3://bucket/orders",
+            }),
+        )
+        .await;
+        let unity = config(&server, None, None);
+        let described = describe_all(&client(&unity), &unity, &["MAIN.SALES.ORDERS".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(described[0].full_name, "main.sales.orders");
     }
 
     #[tokio::test]
