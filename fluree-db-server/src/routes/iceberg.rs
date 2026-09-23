@@ -1080,7 +1080,8 @@ pub struct IcebergVerifyRequest {
 /// Verify that the connection's resolved credentials can READ a table's storage
 /// (the onboarding "Test" probe). Read-only: creates no graph source, writes
 /// nothing; it goes through the engine's own credential + storage path and proves
-/// both the `metadata/` and `data/` S3 prefixes are readable.
+/// both the `metadata/` and `data/` S3 prefixes are readable. A table that cannot
+/// be read answers `200` with `readable: false` and the reason in `error`.
 ///
 /// POST /v1/fluree/iceberg/catalog/verify
 pub async fn iceberg_catalog_verify(
@@ -1126,6 +1127,7 @@ async fn iceberg_catalog_verify_local(
         tracing::info!(
             status = "success",
             table = %req.table,
+            readable = report.readable,
             credential_source = report.credential_source,
             data_files_listed = report.data_files_listed,
             data_probe_skipped = report.data_probe_skipped,

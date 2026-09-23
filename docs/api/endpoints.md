@@ -2998,6 +2998,30 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 
 See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
+### POST {api_base_url}/iceberg/catalog/verify
+
+Checks that a REST-catalog connection's credentials can read a table's storage, through the same credential decision and storage path a query uses. It lists the current snapshot's manifests (the `metadata/` prefix) and stats its first data file (the `data/` prefix), without reading data. It is read-only and admin-protected.
+
+The body takes the `iceberg/map` connection fields and a `table` (`"NAMESPACE.NAME"`, in the catalog's casing).
+
+A table that cannot be read answers `200` with `"readable": false` and the reason in `error`: the catalog would not load it, vended no credentials, or storage refused a read. This is the same contract as Delta's `POST /delta/catalog/verify`. Only a request that cannot be made is an error: Direct catalog mode, an unusable connection, or a catalog that returns no inline table metadata.
+
+```json
+{
+  "readable": true,
+  "error": null,
+  "credential_source": "vended",
+  "metadata_location": "s3://bucket/warehouse/orders/metadata/00003.metadata.json",
+  "data_files_listed": 4,
+  "probed_data_file": "s3://bucket/warehouse/orders/data/part-0.parquet",
+  "probed_data_file_bytes": 2048,
+  "data_probe_skipped": false,
+  "skip_reason": null
+}
+```
+
+`credential_source`, `metadata_location` and `data_files_listed` are `null` when the probe failed before learning them. `data_probe_skipped` is `true`, with `skip_reason`, for a table with no data files.
+
 ### POST {api_base_url}/bm25/create
 
 Create a BM25 full-text search index over a ledger. Admin-protected — requires the admin Bearer token when an admin token is configured. Runs the index build synchronously and returns when the snapshot is committed; for a large corpus it may run for some time, so configure your HTTP client timeout accordingly. In peer mode, the request is forwarded to the transaction server.
