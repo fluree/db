@@ -122,6 +122,7 @@ impl UnityClient {
         let refuse = |message: String| DeltaError::Catalog {
             table: full_name.to_string(),
             message,
+            denied: false,
         };
         let record: TableRecord = serde_json::from_value(self.send(full_name, &path, None).await?)
             .map_err(|e| refuse(format!("unreadable table record: {e}")))?;
@@ -159,6 +160,7 @@ impl UnityClient {
         let refuse = |message: String| DeltaError::Catalog {
             table: table.full_name.clone(),
             message,
+            denied: false,
         };
         let sent = self
             .send(
@@ -170,11 +172,20 @@ impl UnityClient {
         let answer = match (sent, table.governed) {
             (Ok(answer), _) => answer,
             // Unity's own words for this are about cluster modes.
-            (Err(DeltaError::Catalog { message, .. }), Some(rule)) => {
-                return Err(refuse(format!(
-                    "Unity Catalog issued no credentials. The table has a {rule}, which Unity \
-                     enforces only in its own compute. It said: {message}"
-                )))
+            (
+                Err(DeltaError::Catalog {
+                    message, denied, ..
+                }),
+                Some(rule),
+            ) => {
+                return Err(DeltaError::Catalog {
+                    table: table.full_name.clone(),
+                    message: format!(
+                        "Unity Catalog issued no credentials. The table has a {rule}, which \
+                         Unity enforces only in its own compute. It said: {message}"
+                    ),
+                    denied,
+                })
             }
             (Err(e), _) => return Err(e),
         };
@@ -213,6 +224,7 @@ impl UnityClient {
         let failed = |message: String| DeltaError::Catalog {
             table: table.to_string(),
             message,
+            denied: false,
         };
         let url = format!("{}{path}", self.base);
         for retried in [false, true] {
@@ -253,7 +265,14 @@ impl UnityClient {
                 .ok()
                 .and_then(|v| v.get("message")?.as_str().map(str::to_string))
                 .unwrap_or(text);
-            return Err(failed(format!("{said} ({status})")));
+            return Err(DeltaError::Catalog {
+                table: table.to_string(),
+                message: format!("{said} ({status})"),
+                denied: matches!(
+                    status,
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+                ),
+            });
         }
         unreachable!("the second pass returns")
     }
@@ -345,24 +364,35 @@ impl<C: Send + Sync + 'static> CredentialProvider for Vending<C> {
         let mut held = self.held.lock().await;
         let vended = match held.as_ref().filter(|v| v.usable()) {
             Some(vended) => vended.clone(),
-            None => {
-                let vended = self
-                    .unity
-                    .read_credentials(&self.table)
-                    .await
-                    .map_err(refused)?;
-                tracing::info!(
-                    table = %self.table.full_name,
-                    renewed = held.is_some(),
-                    valid_for_s = vended
-                        .expires
-                        .duration_since(SystemTime::now())
-                        .map_or(0, |d| d.as_secs()),
-                    "Unity Catalog issued table credentials"
-                );
-                *held = Some(vended.clone());
-                vended
-            }
+            None => match self.unity.read_credentials(&self.table).await {
+                Ok(vended) => {
+                    tracing::info!(
+                        table = %self.table.full_name,
+                        renewed = held.is_some(),
+                        valid_for_s = vended
+                            .expires
+                            .duration_since(SystemTime::now())
+                            .map_or(0, |d| d.as_secs()),
+                        "Unity Catalog issued table credentials"
+                    );
+                    *held = Some(vended.clone());
+                    vended
+                }
+                // Renewal starts inside the refresh margin, so a set that
+                // failed to renew may still be valid: read on with it rather
+                // than fail a request Unity's blip had nothing to do with.
+                Err(e) => match held.as_ref().filter(|v| SystemTime::now() < v.expires) {
+                    Some(still_valid) => {
+                        tracing::warn!(
+                            table = %self.table.full_name,
+                            error = %e,
+                            "Unity Catalog did not renew table credentials; reading on with the held set"
+                        );
+                        still_valid.clone()
+                    }
+                    None => return Err(refused(e)),
+                },
+            },
         };
         (self.pick)(&vended.secret).ok_or_else(|| {
             refused(DeltaError::Catalog {
@@ -371,6 +401,7 @@ impl<C: Send + Sync + 'static> CredentialProvider for Vending<C> {
                     "credentials are not for the store at {}",
                     self.table.location
                 ),
+                denied: false,
             })
         })
     }
@@ -470,7 +501,7 @@ mod tests {
 
     fn message(error: DeltaError) -> String {
         match error {
-            DeltaError::Catalog { table, message } => {
+            DeltaError::Catalog { table, message, .. } => {
                 assert_eq!(table, "main.sales.orders");
                 message
             }
@@ -620,8 +651,50 @@ mod tests {
             .await
             .err()
             .expect("no credentials, no snapshot");
+        assert!(
+            matches!(refused, DeltaError::Catalog { denied: true, .. }),
+            "a 403 is an access refusal: {refused:?}"
+        );
         let said = message(refused);
         assert!(said.contains("does not have SELECT"), "{said}");
+    }
+
+    /// Databricks on Google Cloud places tables on `gs://`; the refusal says
+    /// that, not which schemes a path source takes.
+    #[tokio::test]
+    async fn a_table_unity_places_on_google_cloud_storage_is_refused_by_name() {
+        let server = MockServer::start().await;
+        let location = "gs://bucket/tables/t-1";
+        let err = match crate::store::open(
+            location,
+            &DeltaIoConfig::default(),
+            Credentials::Unity(client(&server), orders(location)),
+        ) {
+            Ok(_) => panic!("a gs:// placement is not read"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("Google Cloud Storage"), "{err}");
+        assert!(!err.contains("file://"), "{err}");
+    }
+
+    /// Only Unity's 401/403 is an access refusal; an outage is not.
+    #[tokio::test]
+    async fn an_unavailable_catalog_is_not_an_access_refusal() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(CREDENTIALS))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&server)
+            .await;
+        let failed = client(&server)
+            .read_credentials(&orders("s3://bucket/t"))
+            .await
+            .err()
+            .expect("a 503 issues nothing");
+        assert!(
+            matches!(failed, DeltaError::Catalog { denied: false, .. }),
+            "{failed:?}"
+        );
     }
 
     #[tokio::test]
@@ -711,6 +784,35 @@ mod tests {
         assert_eq!(second.key_id, "KEY2");
         assert_eq!(second.token.as_deref(), Some("SESSION2"));
         assert_eq!(issued.load(Ordering::SeqCst), 2);
+    }
+
+    /// Inside the refresh margin a renewal that fails leaves the held set in
+    /// use, since it has not expired; only with nothing valid held is it fatal.
+    #[tokio::test]
+    async fn a_failed_renewal_reads_on_with_credentials_still_valid() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(CREDENTIALS))
+            .respond_with(Issuer {
+                issued: Arc::new(AtomicUsize::new(0)),
+                lifetime_s: REFRESH_MARGIN.as_secs() - 60,
+            })
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(CREDENTIALS))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&server)
+            .await;
+        let vending = Vending::aws(client(&server), orders("s3://bucket/t"));
+        assert_eq!(vending.get_credential().await.unwrap().key_id, "KEY1");
+        // Inside the margin: the renewal is asked for, fails, and KEY1 stands.
+        assert_eq!(vending.get_credential().await.unwrap().key_id, "KEY1");
+
+        // Nothing held: the same failure is the request's.
+        let fresh = Vending::aws(client(&server), orders("s3://bucket/t"));
+        assert!(fresh.get_credential().await.is_err());
     }
 
     #[tokio::test]
