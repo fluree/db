@@ -150,6 +150,9 @@ impl ServerError {
                     ..
                 }),
             ) => errors::CATALOG_CREDENTIALS_NOT_VENDED,
+            ServerError::Api(ApiError::Query(
+                fluree_db_query::QueryError::CatalogAccessDenied { .. },
+            )) => errors::CATALOG_ACCESS_DENIED,
 
             // Virtual-dataset (R2RML) unsupported-pattern refusal: a distinct
             // `@type` so Solo's browse UI can gate on the condition instead of
@@ -308,7 +311,8 @@ impl ServerError {
                 | ApiError::CatalogCredentialsNotVended { .. }
                 | ApiError::Query(
                     fluree_db_query::QueryError::StorageAccessDenied { .. }
-                    | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. },
+                    | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. }
+                    | fluree_db_query::QueryError::CatalogAccessDenied { .. },
                 ),
             ) => StatusCode::FORBIDDEN,
 
@@ -631,6 +635,18 @@ mod tests {
             assert_eq!(se.status_code(), StatusCode::FORBIDDEN);
             assert_eq!(se.error_type(), errors::STORAGE_ACCESS_DENIED);
         }
+    }
+
+    #[test]
+    fn a_catalog_access_refusal_is_403_with_its_own_type() {
+        let se = ServerError::Api(ApiError::Query(
+            fluree_db_query::QueryError::CatalogAccessDenied {
+                table: "main.sales.orders".into(),
+                message: "User does not have SELECT (403 Forbidden)".into(),
+            },
+        ));
+        assert_eq!(se.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(se.error_type(), errors::CATALOG_ACCESS_DENIED);
     }
 
     #[test]

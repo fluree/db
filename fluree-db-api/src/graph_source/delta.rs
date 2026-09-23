@@ -634,6 +634,11 @@ fn delta_query_error(graph_source_id: &str, table_name: &str, error: DeltaError)
         DeltaError::ColumnNotFound { .. } => {
             QueryError::InvalidQuery(format!("Delta graph source '{graph_source_id}': {error}"))
         }
+        DeltaError::Catalog {
+            table,
+            message,
+            denied: true,
+        } => QueryError::CatalogAccessDenied { table, message },
         other => QueryError::Internal(format!(
             "Delta graph source '{graph_source_id}', table '{table_name}': {other}"
         )),
@@ -657,6 +662,27 @@ pub(crate) fn policy_config(record: &GraphSourceRecord) -> (Option<String>, Opti
 mod tests {
     use super::*;
     use fluree_db_delta::AzureAuth;
+
+    /// A catalog's 401/403 reaches the client as a typed 403, not as an
+    /// invalid query; any other catalog failure keeps its old mapping.
+    #[test]
+    fn a_catalog_refusal_is_a_typed_403() {
+        let refusal = |denied| DeltaError::Catalog {
+            table: "main.sales.orders".to_string(),
+            message: "User does not have SELECT on Table 'main.sales.orders'. (403 Forbidden)"
+                .to_string(),
+            denied,
+        };
+        let denied = delta_query_error("orders:main", "orders", refusal(true));
+        assert!(
+            matches!(&denied, QueryError::CatalogAccessDenied { table, .. } if table == "main.sales.orders"),
+            "{denied:?}"
+        );
+        assert_eq!(crate::ApiError::Query(denied).status_code(), 403);
+
+        let outage = delta_query_error("orders:main", "orders", refusal(false));
+        assert!(matches!(outage, QueryError::Internal(_)), "{outage:?}");
+    }
 
     fn fields(
         tenant: Option<&str>,

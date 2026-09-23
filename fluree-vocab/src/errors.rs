@@ -172,6 +172,13 @@ pub const STORAGE_ACCESS_DENIED: &str = "err:storage/AccessDenied";
 /// downgrading to ambient (process-default) AWS credentials.
 pub const CATALOG_CREDENTIALS_NOT_VENDED: &str = "err:catalog/CredentialsNotVended";
 
+/// A catalog refused access to a table (HTTP 401/403 from the catalog), e.g. a
+/// Unity Catalog principal lacking `SELECT` or `EXTERNAL USE SCHEMA`.
+///
+/// Distinct from [`STORAGE_ACCESS_DENIED`] (the object store refused a read)
+/// and from the policy-layer [`ACCESS_DENIED`].
+pub const CATALOG_ACCESS_DENIED: &str = "err:catalog/AccessDenied";
+
 /// Connection error
 pub const CONNECTION: &str = "err:storage/ConnectionError";
 

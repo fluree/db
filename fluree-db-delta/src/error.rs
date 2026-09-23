@@ -51,8 +51,13 @@ pub enum DeltaError {
     },
 
     /// A catalog could not place a table or would not issue credentials for it.
+    /// `denied` when the catalog answered 401/403: this principal may not read it.
     #[error("Unity Catalog, table '{table}': {message}")]
-    Catalog { table: String, message: String },
+    Catalog {
+        table: String,
+        message: String,
+        denied: bool,
+    },
 
     #[error("Delta reader internal error: {0}")]
     Internal(String),
@@ -142,10 +147,16 @@ fn catalog_refusal(error: &delta_kernel::Error) -> Option<DeltaError> {
     };
     let mut cause = std::error::Error::source(store);
     while let Some(error) = cause {
-        if let Some(DeltaError::Catalog { table, message }) = error.downcast_ref::<DeltaError>() {
+        if let Some(DeltaError::Catalog {
+            table,
+            message,
+            denied,
+        }) = error.downcast_ref::<DeltaError>()
+        {
             return Some(DeltaError::Catalog {
                 table: table.clone(),
                 message: message.clone(),
+                denied: *denied,
             });
         }
         cause = error.source();

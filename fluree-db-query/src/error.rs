@@ -176,6 +176,16 @@ pub enum QueryError {
         catalog_uri: String,
     },
 
+    /// The catalog refused this principal access to the table (its 401/403),
+    /// in the catalog's own words.
+    #[error("Catalog denied access to table '{table}': {message}")]
+    CatalogAccessDenied {
+        /// The table as the catalog names it.
+        table: String,
+        /// The catalog's refusal.
+        message: String,
+    },
+
     /// Internal error (should not happen in normal operation)
     #[error("Internal error: {0}")]
     Internal(String),
