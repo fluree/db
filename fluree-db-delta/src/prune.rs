@@ -82,7 +82,10 @@ fn leaf(file: &ParquetMetaData, name: &str) -> Option<usize> {
 
 fn group_may_match(group: &RowGroupMetaData, leaf: usize, term: &Term) -> bool {
     let chunk = group.column(leaf);
-    let Some(stats) = chunk.statistics() else {
+    // Writers before PARQUET-686 (parquet-mr < 1.10) put string bounds in the
+    // deprecated fields in signed byte order, which are not bounds under the
+    // unsigned order compared here.
+    let Some(stats) = chunk.statistics().filter(|s| !s.is_min_max_deprecated()) else {
         return true;
     };
     let descriptor = chunk.column_descr();
@@ -414,5 +417,58 @@ mod tests {
     fn a_column_the_file_lacks_rules_nothing_out() {
         let file = file(EnabledStatistics::Page);
         assert!(plan(&file, &[term("absent", FilterOp::Eq, Scalar::Long(1))]).is_none());
+    }
+
+    /// One row group of `label` in {"apple", "banana", "émile"}, its chunk
+    /// statistics replaced by the given bounds.
+    fn labels_with_bounds(min: &str, max: &str, deprecated: bool) -> ParquetMetaData {
+        use delta_kernel::arrow::array::StringArray;
+        use delta_kernel::parquet::data_type::ByteArray;
+
+        let batch = RecordBatch::try_from_iter([(
+            "label",
+            Arc::new(StringArray::from(vec!["apple", "banana", "émile"])) as ArrayRef,
+        )])
+        .unwrap();
+        let properties = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer =
+            ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let file = ParquetMetaDataReader::new()
+            .parse_and_finish(&bytes::Bytes::from(bytes))
+            .unwrap();
+
+        let stats = Statistics::byte_array(
+            Some(ByteArray::from(min)),
+            Some(ByteArray::from(max)),
+            None,
+            Some(0),
+            deprecated,
+        );
+        let mut group = file.row_group(0).clone().into_builder();
+        let column = group.take_columns().remove(0);
+        let column = column.into_builder().set_statistics(stats).build().unwrap();
+        let group = group.set_column_metadata(vec![column]).build().unwrap();
+        file.into_builder().set_row_groups(vec![group]).build()
+    }
+
+    /// A pre-PARQUET-686 writer ordered "émile" before "banana" (signed bytes),
+    /// so its bounds exclude "apple", which the row group holds.
+    #[test]
+    fn deprecated_signed_order_string_bounds_rule_nothing_out() {
+        let apple = [term("label", FilterOp::Eq, Scalar::String("apple".into()))];
+        let legacy = labels_with_bounds("émile", "banana", true);
+        assert!(plan(&legacy, &apple).is_none());
+
+        // The same bounds, not marked deprecated, would be trusted.
+        let trusted = labels_with_bounds("émile", "banana", false);
+        assert_eq!(
+            plan(&trusted, &apple).expect("a plan").row_groups,
+            [] as [usize; 0]
+        );
     }
 }

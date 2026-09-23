@@ -78,6 +78,29 @@ impl DeltaError {
             _ => false,
         }
     }
+
+    /// Whether a failure to replay an older version means the log no longer
+    /// reaches it, rather than that storage could not be read (a 403, a 503,
+    /// an expired credential) or that the version needs a feature Kernel does
+    /// not implement. Kernel reports the log-cleaned case as a plain message,
+    /// so this rules the other causes out instead of matching it.
+    pub(crate) fn is_unreachable_version(&self) -> bool {
+        match self {
+            Self::Kernel { source, .. } => !kernel_is_access_or_unsupported(source),
+            _ => false,
+        }
+    }
+}
+
+fn kernel_is_access_or_unsupported(error: &delta_kernel::Error) -> bool {
+    use delta_kernel::Error as K;
+    match error {
+        K::Backtraced { source, .. } => kernel_is_access_or_unsupported(source),
+        K::Unsupported(_) | K::Reqwest(_) => true,
+        K::ObjectStore(e) => !matches!(e, delta_kernel::object_store::Error::NotFound { .. }),
+        K::IOError(e) => e.kind() != std::io::ErrorKind::NotFound,
+        _ => false,
+    }
 }
 
 fn kernel_is_not_found(error: &delta_kernel::Error) -> bool {
@@ -128,4 +151,49 @@ fn catalog_refusal(error: &delta_kernel::Error) -> Option<DeltaError> {
         cause = error.source();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn replay_failure(source: delta_kernel::Error) -> DeltaError {
+        DeltaError::kernel("t", source)
+    }
+
+    #[test]
+    fn only_a_log_that_cannot_reach_the_version_is_a_missing_version() {
+        use delta_kernel::object_store::Error as Store;
+        use delta_kernel::Error as K;
+
+        let unreachable = [
+            K::Generic("No files in log segment".to_string()),
+            K::FileNotFound("_delta_log/00000000000000000001.json".to_string()),
+            K::ObjectStore(Store::NotFound {
+                path: "_delta_log/00000000000000000001.json".to_string(),
+                source: "gone".into(),
+            }),
+        ];
+        for source in unreachable {
+            let error = replay_failure(source);
+            assert!(error.is_unreachable_version(), "{error}");
+        }
+
+        let not_a_retention_problem = [
+            K::ObjectStore(Store::Generic {
+                store: "MicrosoftAzure",
+                source: "503 Service Unavailable".into(),
+            }),
+            K::ObjectStore(Store::Unauthenticated {
+                path: "_delta_log/00000000000000000001.json".to_string(),
+                source: "token expired".into(),
+            }),
+            K::IOError(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            K::Unsupported("Feature 'x' is not supported".to_string()),
+        ];
+        for source in not_a_retention_problem {
+            let error = replay_failure(source);
+            assert!(!error.is_unreachable_version(), "{error}");
+        }
+    }
 }

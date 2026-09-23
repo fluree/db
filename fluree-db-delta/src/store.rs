@@ -109,6 +109,9 @@ pub(crate) fn open(
         builder = builder.with_region(region);
     }
     if let Some(endpoint) = &io.s3_endpoint {
+        // Checked where the client is built, not only at the HTTP route: a
+        // record can also arrive through the Rust API, the CLI or replication.
+        fluree_db_iceberg::net::validate_s3_endpoint(endpoint).map_err(|e| bad(&e))?;
         builder = builder
             .with_endpoint(endpoint)
             .with_allow_http(endpoint.starts_with("http://"));
@@ -233,5 +236,38 @@ impl ObjectStore for ReadOnlyStore {
         _options: CopyOptions,
     ) -> object_store::Result<()> {
         Err(read_only(to))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_endpoint(endpoint: &str) -> DeltaIoConfig {
+        DeltaIoConfig {
+            s3_region: Some("us-east-1".to_string()),
+            s3_endpoint: Some(endpoint.to_string()),
+            ..DeltaIoConfig::default()
+        }
+    }
+
+    #[test]
+    fn an_s3_endpoint_in_the_metadata_range_is_refused() {
+        let err = match open(
+            "s3://bucket/table",
+            &with_endpoint("http://169.254.169.254"),
+            Credentials::Ambient,
+        ) {
+            Ok(_) => panic!("a metadata-range endpoint must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("SSRF guard"), "unexpected error: {err}");
+        // MinIO / LocalStack on loopback stay allowed.
+        assert!(open(
+            "s3://bucket/table",
+            &with_endpoint("http://127.0.0.1:4566"),
+            Credentials::Ambient,
+        )
+        .is_ok());
     }
 }

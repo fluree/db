@@ -3129,6 +3129,133 @@ impl CursorSubjectCountStream {
     }
 }
 
+/// An ascending `(key, count)` group stream, as merged by [`InnerMergeHeads`].
+pub(crate) trait GroupStream {
+    fn next_group(&mut self) -> Result<Option<(u64, u64)>>;
+}
+
+impl GroupStream for PsotSubjectCountIter<'_> {
+    #[inline]
+    fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        PsotSubjectCountIter::next_group(self)
+    }
+}
+
+impl GroupStream for CursorSubjectCountStream {
+    #[inline]
+    fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+        CursorSubjectCountStream::next_group(self)
+    }
+}
+
+/// The current group of every stream in an N-way inner (intersection) merge.
+///
+/// Heads are `u64` columns, not a `Vec<Option<(u64, u64)>>`: moving the option
+/// whole out of `next_group`'s `Result` compiles to a 16-byte store through an
+/// unaligned stack temporary, which straddles a cache line on some worker-thread
+/// stack alignments and cost ~50% on a 127M-row merge. The scalar stores here
+/// are 8-byte aligned and cannot.
+///
+/// Everything is `#[inline(always)]`: the merge is a few instructions per key
+/// between `next_group` calls, and an out-of-line step cost 8% on a star whose
+/// subjects mostly match.
+///
+/// ```ignore
+/// let Some(mut heads) = InnerMergeHeads::prime(&mut streams)? else { return Ok(0) };
+/// loop {
+///     if heads.aligned() {
+///         total += heads.count_product();      // every stream is on heads.key()
+///     }
+///     if !heads.advance(&mut streams)? { break; }
+/// }
+/// ```
+pub(crate) struct InnerMergeHeads {
+    keys: Vec<u64>,
+    counts: Vec<u64>,
+    /// Largest head key, as of the last [`aligned`](Self::aligned).
+    max_key: u64,
+    /// Whether every head was on `max_key`, as of the last `aligned`.
+    all_on_max: bool,
+}
+
+impl InnerMergeHeads {
+    /// Read each stream's first group. `None` when a stream is empty, which
+    /// makes the intersection empty.
+    pub(crate) fn prime<S: GroupStream>(streams: &mut [S]) -> Result<Option<Self>> {
+        // With no streams `aligned` is never true and `advance` never ends.
+        assert!(
+            !streams.is_empty(),
+            "InnerMergeHeads needs at least one stream"
+        );
+        let mut heads = Self {
+            keys: vec![0; streams.len()],
+            counts: vec![0; streams.len()],
+            max_key: 0,
+            all_on_max: false,
+        };
+        for (i, stream) in streams.iter_mut().enumerate() {
+            if !heads.advance_one(i, stream)? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(heads))
+    }
+
+    /// Compare the heads: `true` when every stream is on the same key. Call
+    /// once per step, before [`advance`](Self::advance), which acts on the
+    /// comparison made here.
+    #[inline(always)]
+    pub(crate) fn aligned(&mut self) -> bool {
+        let mut min_key = u64::MAX;
+        let mut max_key = 0;
+        for &key in &self.keys {
+            min_key = min_key.min(key);
+            max_key = max_key.max(key);
+        }
+        self.max_key = max_key;
+        self.all_on_max = min_key == max_key;
+        self.all_on_max
+    }
+
+    /// The key every head is on. Meaningful only when the last
+    /// [`aligned`](Self::aligned) returned `true`.
+    #[inline(always)]
+    pub(crate) fn key(&self) -> u64 {
+        self.max_key
+    }
+
+    /// Product of the heads' counts: the join's row count at [`key`](Self::key).
+    #[inline(always)]
+    pub(crate) fn count_product(&self) -> u128 {
+        self.counts.iter().map(|&n| n as u128).product()
+    }
+
+    /// Step the merge: past the shared key when the heads were aligned,
+    /// otherwise each lagging stream one group toward the largest key.
+    /// `false` when a stream runs out, which ends the intersection.
+    #[inline(always)]
+    pub(crate) fn advance<S: GroupStream>(&mut self, streams: &mut [S]) -> Result<bool> {
+        for (i, stream) in streams.iter_mut().enumerate() {
+            if (self.all_on_max || self.keys[i] < self.max_key) && !self.advance_one(i, stream)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    #[inline(always)]
+    fn advance_one<S: GroupStream>(&mut self, i: usize, stream: &mut S) -> Result<bool> {
+        match stream.next_group()? {
+            Some((key, count)) => {
+                self.keys[i] = key;
+                self.counts[i] = count;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+}
+
 /// Count rows of `p_id` (scanned in `order`) for which `per_row(s_id, o_type, o_key)`
 /// returns `Some(true)`, reading through an overlay-folding cursor so the count
 /// includes novelty asserts, excludes retracts, and honors `to_t`.
@@ -4004,11 +4131,184 @@ impl Operator for FastPathOperator {
     }
 }
 
+/// The current group of each branch in an N-way union (min) merge: every key
+/// in any stream, with the sum of its counts across the streams that carry it
+/// (bag semantics). An exhausted branch drops out; the merge ends when all have.
+///
+/// Scalar columns for the reason given on [`InnerMergeHeads`].
+pub(crate) struct UnionMergeHeads {
+    keys: Vec<u64>,
+    counts: Vec<u64>,
+    live: Vec<bool>,
+    key: u64,
+    count_sum: u64,
+}
+
+impl UnionMergeHeads {
+    /// Read each stream's first group.
+    pub(crate) fn prime<S: GroupStream>(streams: &mut [S]) -> Result<Self> {
+        let mut heads = Self {
+            keys: vec![0; streams.len()],
+            counts: vec![0; streams.len()],
+            live: vec![true; streams.len()],
+            key: 0,
+            count_sum: 0,
+        };
+        for (i, stream) in streams.iter_mut().enumerate() {
+            heads.step(i, stream)?;
+        }
+        Ok(heads)
+    }
+
+    /// Take the smallest key across the live streams, consuming its group from
+    /// each stream on it. `false` when every stream is exhausted; otherwise
+    /// [`key`](Self::key) and [`count_sum`](Self::count_sum) describe it.
+    #[inline(always)]
+    pub(crate) fn next<S: GroupStream>(&mut self, streams: &mut [S]) -> Result<bool> {
+        let mut min_key = u64::MAX;
+        let mut any_live = false;
+        for (i, &key) in self.keys.iter().enumerate() {
+            if self.live[i] {
+                any_live = true;
+                min_key = min_key.min(key);
+            }
+        }
+        if !any_live {
+            return Ok(false);
+        }
+        let mut count_sum = 0u64;
+        for (i, stream) in streams.iter_mut().enumerate() {
+            if self.live[i] && self.keys[i] == min_key {
+                count_sum = count_sum.saturating_add(self.counts[i]);
+                self.step(i, stream)?;
+            }
+        }
+        self.key = min_key;
+        self.count_sum = count_sum;
+        Ok(true)
+    }
+
+    /// The key taken by the last [`next`](Self::next).
+    #[inline(always)]
+    pub(crate) fn key(&self) -> u64 {
+        self.key
+    }
+
+    /// Sum of that key's counts across the streams that carried it.
+    #[inline(always)]
+    pub(crate) fn count_sum(&self) -> u64 {
+        self.count_sum
+    }
+
+    #[inline(always)]
+    fn step<S: GroupStream>(&mut self, i: usize, stream: &mut S) -> Result<()> {
+        match stream.next_group()? {
+            Some((key, count)) => {
+                self.keys[i] = key;
+                self.counts[i] = count;
+            }
+            None => self.live[i] = false,
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fluree_db_core::comparator::IndexType;
     use fluree_db_core::Flake;
+
+    /// A `GroupStream` over a fixed ascending list.
+    struct VecGroups(VecDeque<(u64, u64)>);
+
+    impl VecGroups {
+        fn new(groups: &[(u64, u64)]) -> Self {
+            Self(groups.iter().copied().collect())
+        }
+    }
+
+    impl GroupStream for VecGroups {
+        fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
+            Ok(self.0.pop_front())
+        }
+    }
+
+    /// `(key, Π count)` for every key present in all streams, via the helper.
+    fn inner_merge(streams: &[&[(u64, u64)]]) -> Vec<(u64, u128)> {
+        let mut streams: Vec<VecGroups> = streams.iter().map(|g| VecGroups::new(g)).collect();
+        let Some(mut heads) = InnerMergeHeads::prime(&mut streams).unwrap() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        loop {
+            if heads.aligned() {
+                out.push((heads.key(), heads.count_product()));
+            }
+            if !heads.advance(&mut streams).unwrap() {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn inner_merge_heads_intersects_and_multiplies_counts() {
+        // Counts differ per stream, so a sum, a single column, or a dropped
+        // stream cannot produce these products.
+        let a: &[(u64, u64)] = &[(1, 2), (3, 3), (4, 1), (7, 5), (9, 2)];
+        let b: &[(u64, u64)] = &[(2, 9), (3, 4), (7, 2), (8, 1), (9, 3), (12, 1)];
+        let c: &[(u64, u64)] = &[(3, 2), (5, 1), (7, 7), (9, 1)];
+
+        assert_eq!(inner_merge(&[a, b]), vec![(3, 12), (7, 10), (9, 6)]);
+        assert_eq!(inner_merge(&[a, b, c]), vec![(3, 24), (7, 70), (9, 6)]);
+        // One stream: every group is a match.
+        assert_eq!(inner_merge(&[c]), vec![(3, 2), (5, 1), (7, 7), (9, 1)]);
+        // A key at 0 and at u64::MAX are ordinary keys, not sentinels.
+        let lo_hi: &[(u64, u64)] = &[(0, 2), (u64::MAX, 3)];
+        assert_eq!(inner_merge(&[lo_hi, lo_hi]), vec![(0, 4), (u64::MAX, 9)]);
+    }
+
+    #[test]
+    fn union_merge_heads_sums_counts_per_key_until_all_streams_end() {
+        let a: &[(u64, u64)] = &[(1, 2), (3, 3), (9, 1)];
+        let b: &[(u64, u64)] = &[(3, 4), (4, 5), (u64::MAX, 6)];
+        let empty: &[(u64, u64)] = &[];
+        let mut streams = vec![VecGroups::new(a), VecGroups::new(empty), VecGroups::new(b)];
+        let mut heads = UnionMergeHeads::prime(&mut streams).unwrap();
+        let mut out = Vec::new();
+        while heads.next(&mut streams).unwrap() {
+            out.push((heads.key(), heads.count_sum()));
+        }
+        // 3 is in both branches (3 + 4); `a` ends at 9 while `b` runs on, and
+        // u64::MAX is a real key, not the exhaustion marker.
+        assert_eq!(out, vec![(1, 2), (3, 7), (4, 5), (9, 1), (u64::MAX, 6)]);
+        assert!(!heads.next(&mut streams).unwrap());
+
+        let mut none: Vec<VecGroups> = Vec::new();
+        let mut heads = UnionMergeHeads::prime(&mut none).unwrap();
+        assert!(!heads.next(&mut none).unwrap());
+    }
+
+    #[test]
+    fn inner_merge_heads_ends_when_any_stream_runs_out() {
+        let a: &[(u64, u64)] = &[(1, 1), (2, 1), (3, 1)];
+        let empty: &[(u64, u64)] = &[];
+        let disjoint: &[(u64, u64)] = &[(10, 1), (11, 1)];
+        let short: &[(u64, u64)] = &[(2, 4)];
+
+        assert!(inner_merge(&[a, empty]).is_empty());
+        assert!(inner_merge(&[empty, a]).is_empty());
+        assert!(inner_merge(&[a, disjoint]).is_empty());
+        // The match on the short stream's last group is still reported.
+        assert_eq!(inner_merge(&[a, short]), vec![(2, 4)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "InnerMergeHeads needs at least one stream")]
+    fn inner_merge_heads_rejects_zero_streams() {
+        inner_merge(&[]);
+    }
 
     /// `cursor_fast_path_for_predicate` must: run unfiltered with no policy;
     /// decline for a covered predicate under a non-root policy; keep the fast
