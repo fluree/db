@@ -2998,6 +2998,120 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 
 See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
+### POST {api_base_url}/iceberg/catalog/verify
+
+Checks that a REST-catalog connection's credentials can read a table's storage, through the same credential decision and storage path a query uses. It lists the current snapshot's manifests (the `metadata/` prefix) and stats its first data file (the `data/` prefix), without reading data. It is read-only and admin-protected.
+
+The body takes the `iceberg/map` connection fields and a `table` (`"NAMESPACE.NAME"`, in the catalog's casing). The answer is a [verify response](#verify-response).
+
+### Verify response
+
+`POST /iceberg/catalog/verify` and [`POST /delta/catalog/verify`](#post-api_base_urldeltacatalog-and-deltar2rml) answer with the same contract, and with the same field names wherever a field means the same thing. A client can decide pass or fail, and show the data-file check, the same way for either source.
+
+#### Status
+
+| Outcome | Status | Body |
+|---|---|---|
+| The table can be read | `200` | `"readable": true` |
+| The table cannot be read | `200` | `"readable": false`, the reason in `error` |
+| The request cannot be made | `400` | An error: `@type` `err:api/BadRequest` for a body that is not valid JSON or lacks a required field, or `err:system/ConfigError` for an unusable connection (a connection URL the server refuses, an unresolvable secret; for Iceberg, also Direct catalog mode or a catalog that returns no inline table metadata) |
+| The admin token is missing or invalid | `401` | An error |
+
+"Cannot be read" covers every reason that belongs to the table rather than to the request:
+- the catalog would not load or place it, or refused this principal;
+- it vended no credentials while the source requires them;
+- storage refused, or no longer holds, a metadata or data file;
+- (Delta only) the catalog placed it where the reader does not read, such as Google Cloud Storage.
+
+None of these is an HTTP error status; in particular a table-level refusal is never a `403`. The `error` text is the catalog's or the store's own wording, meant to be shown to a person, not parsed.
+
+#### Fields
+
+| Field | Type | Null when | Sources | Meaning |
+|---|---|---|---|---|
+| `readable` | boolean | never | both | Whether a query could read the table |
+| `error` | string | `readable` is `true` | both | Why the table cannot be read |
+| `data_file_count` | integer | the table could not be read | both | Data files in the table's current version (Iceberg: its current snapshot) |
+| `probed_data_file` | string | no file was probed | both | The data file whose read storage let through |
+| `probed_data_file_bytes` | integer | no file was probed | both | That file's size in bytes |
+| `data_probe_skipped` | boolean | never | both | `true` when the table has no data file to probe; `false` when one was probed, or the table could not be read |
+| `skip_reason` | string | `data_probe_skipped` is `false` | both | Why no data file was probed |
+| `full_name` | string | never | Delta | The table's Unity Catalog name (`catalog.schema.table`) |
+| `location` | string | the table could not be read | Delta | Where Unity Catalog places the table |
+| `version` | integer | the table could not be read | Delta | The table's current Delta version |
+| `credential_source` | string | the probe failed before deciding | Iceberg | `"vended"` (issued by the catalog) or `"ambient"` (the server's own credentials) |
+| `metadata_location` | string | the catalog would not load the table | Iceberg | The table's current metadata file |
+
+A field of the other source type is absent, not `null`.
+
+#### Examples
+
+A readable Iceberg table:
+
+```json
+{
+  "readable": true,
+  "error": null,
+  "credential_source": "vended",
+  "metadata_location": "s3://bucket/warehouse/orders/metadata/00003.metadata.json",
+  "data_file_count": 4,
+  "probed_data_file": "s3://bucket/warehouse/orders/data/part-0.parquet",
+  "probed_data_file_bytes": 2048,
+  "data_probe_skipped": false,
+  "skip_reason": null
+}
+```
+
+An Iceberg table whose storage refused the probe:
+
+```json
+{
+  "readable": false,
+  "error": "Storage access denied for s3://bucket/warehouse/orders/data/part-0.parquet (region us-east-1): AccessDenied",
+  "credential_source": "vended",
+  "metadata_location": "s3://bucket/warehouse/orders/metadata/00003.metadata.json",
+  "data_file_count": null,
+  "probed_data_file": null,
+  "probed_data_file_bytes": null,
+  "data_probe_skipped": false,
+  "skip_reason": null
+}
+```
+
+A readable Delta table:
+
+```json
+{
+  "full_name": "main.sales.orders",
+  "readable": true,
+  "location": "s3://bucket/unity/tables/7f3c…",
+  "version": 42,
+  "data_file_count": 12,
+  "probed_data_file": "s3://bucket/unity/tables/7f3c…/part-00000-….snappy.parquet",
+  "probed_data_file_bytes": 1048576,
+  "data_probe_skipped": false,
+  "skip_reason": null,
+  "error": null
+}
+```
+
+A Delta table Unity Catalog will not let this principal read:
+
+```json
+{
+  "full_name": "main.sales.orders",
+  "readable": false,
+  "location": null,
+  "version": null,
+  "data_file_count": null,
+  "probed_data_file": null,
+  "probed_data_file_bytes": null,
+  "data_probe_skipped": false,
+  "skip_reason": null,
+  "error": "Unity Catalog, table 'main.sales.orders': User does not have SELECT on Table 'main.sales.orders'. (403 Forbidden)"
+}
+```
+
 ### POST {api_base_url}/bm25/create
 
 Create a BM25 full-text search index over a ledger. Admin-protected — requires the admin Bearer token when an admin token is configured. Runs the index build synchronously and returns when the snapshot is committed; for a large corpus it may run for some time, so configure your HTTP client timeout accordingly. In peer mode, the request is forwarded to the transaction server.
@@ -3175,6 +3289,62 @@ POST {api_base_url}/delta/map
 `table_versions` holds the current Delta version of each mapped table that opened with every column its maps reference. A table that could not be read, or that lacks a mapped column, appears in `table_warnings` instead; the source is registered regardless. `model_warnings` lists policies of the model a virtual source cannot evaluate.
 
 See also the CLI equivalent: [fluree delta map](../cli/delta.md#fluree-delta-map).
+
+### POST {api_base_url}/delta/catalog/* and /delta/r2rml/*
+
+Five read-only endpoints that lead up to `delta/map` on Unity Catalog. None registers anything. All are admin-protected, since each carries a catalog credential and calls out, and are available only when the server is built with the `delta` feature. See [From a catalog to a mapping](../graph-sources/delta.md#from-a-catalog-to-a-mapping).
+
+Every body takes the Unity connection fields of `delta/map`: `unity_uri` (required here), `unity_catalog`, `unity_schema`, and either `auth_bearer` / `auth_bearer_env` or `oauth2_client_id` with `oauth2_client_secret` / `oauth2_client_secret_env` (and optionally `oauth2_token_url`, `oauth2_scope`). An `_env` field names a server environment variable listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`. A table name of fewer than three parts is completed from `unity_catalog` and `unity_schema`.
+
+| Endpoint | Further fields | Answer |
+|---|---|---|
+| `POST /delta/catalog/browse` | `depth`: `schemas` or `tables` (default) | `catalogs`, `schemas` (`catalog.schema`), `tables` |
+| `POST /delta/catalog/preview` | `table` | The table's `columns`, `primary_key`, `foreign_keys`, `location`, `access_rule`, `unreadable` |
+| `POST /delta/catalog/verify` | `table`; `s3_region`, `s3_endpoint`, `s3_path_style` | A [verify response](#verify-response) |
+| `POST /delta/r2rml/generate` | `tables`, `base_namespace`; `per_table_overrides`, `options` | `turtle`, `structured`, `diagnostics`, `tables` |
+| `POST /delta/r2rml/validate` | A `delta/map` body; `name` is optional | `compiled_ok`, `triples_map_count`, `table_names`, `diagnostics` |
+
+**Browse** lists the metastore's catalogs when no `unity_catalog` is given, a catalog's schemas (and, at `depth: "tables"`, their tables) when one is, and a schema's tables when `unity_schema` is given too. A catalog-wide listing leaves out `information_schema`.
+
+```json
+{
+  "catalogs": [],
+  "schemas": ["main.sales"],
+  "tables": [
+    { "full_name": "main.sales.orders", "kind": "MANAGED", "format": "DELTA",
+      "comment": null, "access_rule": null, "unreadable": null },
+    { "full_name": "main.sales.recent", "kind": "VIEW", "format": null,
+      "comment": null, "access_rule": null, "unreadable": "is a VIEW, not a Delta table" }
+  ]
+}
+```
+
+`unreadable` says why this reader cannot read the object at all. `access_rule` is `row filter` (or, in a preview, `column mask`): Unity may issue no credentials for such a table, which `verify` settles.
+
+**Preview** columns carry `name`, `position`, `type_text` (Unity's spelling), `xsd_type` (the datatype a generated mapping gives the column), `mappable` (false for a nested or semi-structured type), `nullable`, `comment` and `masked`.
+
+**Verify** answers with a [verify response](#verify-response), the same contract and field names as Iceberg's: a table that cannot be read is `200` with `"readable": false` and the reason in `error`; only a request that cannot be made is an error.
+
+**Generate** request:
+
+```json
+{
+  "unity_uri": "https://<workspace>.cloud.databricks.com",
+  "auth_bearer_env": "DATABRICKS_TOKEN",
+  "tables": ["main.sales.orders", "main.sales.customers"],
+  "base_namespace": "https://example.org/sales#",
+  "per_table_overrides": [
+    { "table": "main.sales.orders", "subject_key": ["order_id", "line"], "class_name": "Purchase" }
+  ],
+  "options": { "emit_fk_joins": true, "subject_strategy": "auto" }
+}
+```
+
+An override's `table` is spelled as in `tables`. `options` are those of `iceberg/r2rml/generate`. `turtle` is the mapping; `structured` is the same mapping as data; each entry of `diagnostics` has a `severity` (`error`, `warning`, `advisory`), a `code`, and the `table`, `column` and `message` it concerns.
+
+**Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
+
+See also the CLI equivalents: [fluree delta browse / preview / verify / generate / validate](../cli/delta.md#fluree-delta-browse--preview--verify--generate--validate).
 
 ### POST {api_base_url}/sql/map
 

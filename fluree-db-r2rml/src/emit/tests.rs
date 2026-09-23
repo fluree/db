@@ -13,7 +13,9 @@ use fluree_db_tabular::FieldType;
 
 use crate::emit::diagnostic::DiagCode;
 use crate::emit::fixtures::enterprise_dw_tables;
-use crate::emit::input::{EmitColumn, EmitColumnStats, EmitTableSchema, TypedBound};
+use crate::emit::input::{
+    DeclaredForeignKey, EmitColumn, EmitColumnStats, EmitTableSchema, TypedBound,
+};
 use crate::emit::{emit_r2rml, EmitOptions, EmitOutput, SubjectStrategy, TableKey, TableOverride};
 
 // =============================================================================
@@ -112,6 +114,7 @@ fn tbl(name: &str, identifier_field_ids: Vec<i32>, columns: Vec<EmitColumn>) -> 
         name: name.to_string(),
         columns,
         identifier_field_ids,
+        foreign_keys: Vec::new(),
     }
 }
 
@@ -1776,6 +1779,7 @@ fn adversarial_names_escape_and_do_not_inject_predicate_object_maps() {
         namespace: "DW".to_string(),
         name: "DIM_WIDGET".to_string(),
         identifier_field_ids: vec![1],
+        foreign_keys: Vec::new(),
         columns: vec![
             ik(1, "WIDGET_KEY", 1, 100, true),
             EmitColumn {
@@ -1902,4 +1906,222 @@ fn bytes_datatype_is_hexbinary_coupled_to_materializer_output() {
         }
         other => panic!("expected literal, got {other:?}"),
     }
+}
+
+// =============================================================================
+// Catalogs that fold names to lowercase, and keys a catalog declares
+// =============================================================================
+
+fn declared(child: &[&str], parent_table: &str, parent: &[&str]) -> DeclaredForeignKey {
+    let owned = |names: &[&str]| names.iter().map(|n| (*n).to_string()).collect();
+    DeclaredForeignKey {
+        child_columns: owned(child),
+        parent_table: parent_table.to_string(),
+        parent_columns: owned(parent),
+    }
+}
+
+fn subject_ends(out: &EmitOutput, table: &str, tail: &str) {
+    let tm = out
+        .structured
+        .table_mappings
+        .iter()
+        .find(|tm| tm.table_name == table)
+        .unwrap();
+    assert!(
+        tm.subject_template.ends_with(&format!("/{tail}")),
+        "{}",
+        tm.subject_template
+    );
+}
+
+#[test]
+fn lowercase_names_follow_the_same_conventions_as_uppercase() {
+    let tables = vec![
+        tbl("dim_store", vec![], vec![ik(1, "store_id", 1, 9, true)]),
+        tbl(
+            "fact_sale",
+            vec![],
+            vec![
+                ik(1, "sale_key", 1, 99, true),
+                ik(2, "store_id", 1, 9, false),
+                sc(3, "region_id", FieldType::String),
+            ],
+        ),
+    ];
+    let out = emit_r2rml(&tables, &EmitOptions::default());
+
+    // `<stem>_id` / `<stem>_key` is the name fallback once the marker is gone.
+    subject_ends(&out, "DW.dim_store", "store/{store_id}");
+    subject_ends(&out, "DW.fact_sale", "sale/{sale_key}");
+    // The join's predicate loses its key suffix.
+    let join = out.structured.table_mappings[1]
+        .columns
+        .iter()
+        .find(|c| c.foreign_key.is_some())
+        .unwrap();
+    assert!(
+        join.predicate_iri.ends_with("#store"),
+        "{}",
+        join.predicate_iri
+    );
+    // A key-named column of a non-key type is still called out.
+    assert!(diag_cols(&out, DiagCode::NonKeyTypeSkipped)
+        .contains(&("DW.fact_sale".to_string(), "region_id".to_string())));
+}
+
+#[test]
+fn a_prefix_or_suffix_is_not_matched_across_a_character_boundary() {
+    use crate::emit::naming::{strip_prefix_ignore_case, strip_suffix_ignore_case};
+    assert_eq!(strip_suffix_ignore_case("étage_id", "_ID"), Some("étage"));
+    assert_eq!(strip_suffix_ignore_case("é", "_ID"), None);
+    // The cut would land inside `é`.
+    assert_eq!(strip_suffix_ignore_case("éab", "_ID"), None);
+    assert_eq!(strip_prefix_ignore_case("abcé", "DIM_"), None);
+    assert_eq!(strip_prefix_ignore_case("dim_é", "DIM_"), Some("é"));
+    assert_eq!(strip_prefix_ignore_case("éé", "DIM_"), None);
+}
+
+#[test]
+fn a_declared_key_joins_where_names_alone_would_not() {
+    let mut orders = tbl(
+        "orders",
+        vec![1],
+        vec![
+            ik(1, "order_id", 1, 99, true),
+            sc(2, "buyer", FieldType::String),
+        ],
+    );
+    orders.foreign_keys = vec![declared(&["buyer"], "DW.customers", &["code"])];
+    let customers = tbl("customers", vec![1], vec![sc(1, "code", FieldType::String)]);
+    let mut customers = customers;
+    customers.columns[0].required = true;
+
+    let out = emit_r2rml(&[orders, customers], &EmitOptions::default());
+    let edge = |a: &str, b: &str, c: &str, d: &str| {
+        (a.to_string(), b.to_string(), c.to_string(), d.to_string())
+    };
+    assert_eq!(
+        resolved_fks(&out),
+        BTreeSet::from([edge("DW.orders", "buyer", "DW.customers", "code")])
+    );
+    assert!(out.turtle.contains("rr:parentTriplesMap"));
+}
+
+#[test]
+fn a_declared_key_outranks_the_parent_its_name_suggests() {
+    let mut visits = tbl(
+        "visits",
+        vec![1],
+        vec![
+            ik(1, "visit_id", 1, 99, true),
+            ik(2, "store_id", 1, 9, false),
+        ],
+    );
+    visits.foreign_keys = vec![declared(&["store_id"], "DW.outlets", &["outlet_id"])];
+    let tables = [
+        visits,
+        tbl("store", vec![1], vec![ik(1, "store_id", 1, 9, true)]),
+        tbl("outlets", vec![1], vec![ik(1, "outlet_id", 1, 9, true)]),
+    ];
+    let out = emit_r2rml(&tables, &EmitOptions::default());
+    let targets: Vec<_> = resolved_fks(&out)
+        .into_iter()
+        .map(|(_, _, t, p)| (t, p))
+        .collect();
+    assert_eq!(
+        targets,
+        [("DW.outlets".to_string(), "outlet_id".to_string())]
+    );
+}
+
+#[test]
+fn a_declared_key_inside_the_subject_key_is_still_joined() {
+    let mut lines = tbl(
+        "lines",
+        vec![1, 2],
+        vec![ik(1, "order_id", 1, 99, true), ik(2, "line", 1, 9, true)],
+    );
+    lines.foreign_keys = vec![declared(&["order_id"], "DW.orders", &["order_id"])];
+    let orders = tbl("orders", vec![1], vec![ik(1, "order_id", 1, 99, true)]);
+
+    let inferred_only = {
+        let mut lines = lines.clone();
+        lines.foreign_keys.clear();
+        emit_r2rml(&[lines, orders.clone()], &EmitOptions::default())
+    };
+    assert!(resolved_fks(&inferred_only).is_empty());
+
+    let out = emit_r2rml(&[lines, orders], &EmitOptions::default());
+    assert_eq!(resolved_fks(&out).len(), 1);
+    subject_ends(&out, "DW.lines", "lines/{order_id}/{line}");
+}
+
+#[test]
+fn a_declared_key_that_cannot_be_joined_stays_literal_and_says_why() {
+    let store = tbl("store", vec![1], vec![ik(1, "store_id", 1, 9, true)]);
+    let cases = [
+        (
+            declared(&["store_id"], "DW.elsewhere", &["id"]),
+            "not among the mapped tables",
+        ),
+        (
+            declared(&["store_id", "day"], "DW.store", &["store_id", "day"]),
+            "several columns",
+        ),
+        (
+            declared(&["missing"], "DW.store", &["store_id"]),
+            "does not map",
+        ),
+    ];
+    for (key, why) in cases {
+        let mut visits = tbl(
+            "visits",
+            vec![1],
+            vec![
+                ik(1, "visit_id", 1, 99, true),
+                ik(2, "store_id", 1, 9, false),
+                ik(3, "day", 1, 9, false),
+            ],
+        );
+        let covered = key.child_columns.contains(&"store_id".to_string());
+        visits.foreign_keys = vec![key];
+        let out = emit_r2rml(&[visits, store.clone()], &EmitOptions::default());
+
+        let said: Vec<_> = out
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == DiagCode::UnresolvedFkCandidate && d.message.contains("declared"))
+            .collect();
+        assert_eq!(said.len(), 1, "{why}");
+        assert!(said[0].message.contains(why), "{}", said[0].message);
+        // A column a declared key covers gets no inferred join either.
+        assert_eq!(resolved_fks(&out).is_empty(), covered, "{why}");
+        let literal = out.structured.table_mappings[0]
+            .columns
+            .iter()
+            .any(|c| c.column_name == "store_id" && c.foreign_key.is_none());
+        assert!(literal, "{why}");
+    }
+}
+
+#[test]
+fn a_parent_without_a_subject_is_not_joined_to() {
+    let mut visits = tbl(
+        "visits",
+        vec![1],
+        vec![
+            ik(1, "visit_id", 1, 99, true),
+            ik(2, "store_id", 1, 9, false),
+        ],
+    );
+    visits.foreign_keys = vec![declared(&["store_id"], "DW.store", &["store_id"])];
+    // Strict strategy and a nullable key: no subject.
+    let store = tbl("store", vec![], vec![ik(1, "store_id", 1, 9, false)]);
+    let out = emit_r2rml(&[visits, store], &strict_opts());
+    assert!(resolved_fks(&out).is_empty());
+    assert!(out
+        .diagnostics
+        .iter()
+        .any(|d| d.message.contains("declared") && d.message.contains("has no subject")));
 }

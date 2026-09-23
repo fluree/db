@@ -237,7 +237,16 @@ pub use sql::{SqlCheckResult, SqlCreateConfig, SqlCreateResult};
 mod delta;
 
 #[cfg(feature = "delta")]
+mod delta_catalog;
+
+#[cfg(feature = "delta")]
 pub use delta::{DeltaAzureFields, DeltaCreateConfig, DeltaCreateResult, DeltaUnityFields};
+
+#[cfg(feature = "delta")]
+pub use delta_catalog::{
+    DeltaColumnInfo, DeltaTableAccess, DeltaTablePreview, GenerateDeltaR2rmlRequest,
+    GenerateDeltaR2rmlResponse,
+};
 
 // Re-export configuration types
 pub use config::Bm25CreateConfig;

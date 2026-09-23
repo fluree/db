@@ -204,6 +204,64 @@ Setting up the workspace side — external data access, the service principal
 and its four privileges — is walked through in
 [Connecting to lakehouse platforms](lakehouse-platforms.md#databricks-tables-through-unity-catalog).
 
+### From a catalog to a mapping
+
+Five read-only operations lead up to `delta map` on Unity Catalog. None
+registers anything. Each is a CLI command and an HTTP endpoint taking the same
+connection fields as `delta map`.
+
+| Step | CLI | HTTP | What it does |
+|---|---|---|---|
+| Browse | `fluree delta browse` | `POST /delta/catalog/browse` | Lists catalogs, a catalog's schemas and tables, or a schema's tables |
+| Preview | `fluree delta preview <table>` | `POST /delta/catalog/preview` | A table's columns, their mapped datatypes, and its declared keys |
+| Verify | `fluree delta verify <table>` | `POST /delta/catalog/verify` | Reads the table's log, and stats its first data file, with the credentials Unity issues for it |
+| Generate | `fluree delta generate <table>…` | `POST /delta/r2rml/generate` | Writes an R2RML mapping from Unity's record of the tables |
+| Validate | `fluree delta validate --r2rml <file>` | `POST /delta/r2rml/validate` | Checks a mapping against the tables it names |
+
+```bash
+export DATABRICKS_TOKEN=…
+unity=(--unity-uri https://<workspace>.cloud.databricks.com --auth-bearer-env DATABRICKS_TOKEN)
+
+fluree delta browse   "${unity[@]}" --unity-catalog main
+fluree delta preview  main.sales.orders "${unity[@]}"
+fluree delta verify   main.sales.orders "${unity[@]}" --s3-region us-east-1
+fluree delta generate main.sales.orders main.sales.customers "${unity[@]}" \
+    --base-namespace https://example.org/sales# -o sales.ttl
+fluree delta validate --r2rml sales.ttl "${unity[@]}" --s3-region us-east-1
+fluree delta map sales --r2rml sales.ttl "${unity[@]}" --s3-region us-east-1
+```
+
+- **Browse** reaches as far as `unity_catalog` and `unity_schema` do. Each
+  table carries Unity's type and format. One this reader cannot read — a view,
+  a table in another format — says so, and a table with a row filter is
+  marked, since Unity may issue no credentials for it. A catalog-wide listing
+  leaves out `information_schema`; name it as the schema to list it.
+- **Preview** reads only Unity's record of the table, none of its files. A
+  column whose type a mapping cannot address (nested, `variant`) is shown as
+  such; a column mask is shown on its column.
+- **Verify** takes the steps a query's first touch of the table takes: place
+  it, obtain credentials, read its log. It reports the table's location,
+  current version and data file count, or the catalog's or the store's reason.
+  The CLI exits non-zero when the table cannot be read.
+- **Generate** names each table `catalog.schema.table`, so the mapping
+  registers with no catalog or schema defaults. A primary key declared in
+  Unity becomes the subject; a declared single-column foreign key becomes an
+  `rr:parentTriplesMap` join to its parent, when the parent is among the
+  tables. Where no key is declared the generator chooses one — by the
+  `<table>_id` / `<table>_key` naming convention, else from the columns that
+  cannot be null — and says what it chose and why. Every such decision, and
+  every column it passed over, is a diagnostic: on standard error from the CLI,
+  in `diagnostics` from the endpoint. `--subject-key table=col[,col]` and
+  `--class-name table=Name` (`per_table_overrides`) settle a table's key and
+  class by hand. Unity does not enforce the keys it records, so a generated
+  subject is as unique as the declared key really is.
+- **Validate** takes the options of `delta map` — so it serves sources by path
+  as well — and reads each mapped table's own log. It reports a table that
+  cannot be read, a column the table lacks, a column spelled in another case,
+  a join between columns of different types, a subject column that may be
+  null, and a mapped column of a type the reader cannot carry, which would
+  fail every query on its table. The CLI exits non-zero on an error.
+
 ## Mapping
 
 The mapping is ordinary [R2RML](r2rml.md) with `rr:tableName` logical tables.
@@ -392,9 +450,11 @@ source at two different states in one query is rejected, as for
 - **Materialization and tracking** (`fluree materialize`, `fluree track`) are
   not available for Delta sources.
 - **Nested types** cannot be mapped.
-- **Catalogs**: Unity Catalog places tables that are named in the mapping;
-  catalogs, schemas and tables cannot be browsed, and no mapping is generated
-  from them.
+- **Catalogs**: Unity Catalog is the catalog that is browsed and generated
+  from. Tables addressed by path have no catalog to list; a mapping over them
+  can still be [validated](#from-a-catalog-to-a-mapping).
+- **Generated mappings** join on declared single-column foreign keys. A
+  foreign key over several columns is reported and left as plain values.
 
 ## Related Documentation
 

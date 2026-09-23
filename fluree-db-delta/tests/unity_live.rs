@@ -51,3 +51,53 @@ async fn tables_are_read_by_name_with_credentials_unity_issues() {
         assert_eq!(rows, expected.parse::<usize>().unwrap(), "{name}");
     }
 }
+
+/// `UNITY_CATALOG` and `UNITY_SCHEMA` scope the listing; `UNITY_DESCRIBE` names
+/// tables to describe, comma-separated.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a Databricks workspace"]
+async fn a_catalog_is_listed_and_its_tables_described() {
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
+    let unity = UnityConfig {
+        uri: var("UNITY_URI"),
+        auth: AuthConfig::Bearer {
+            token: ConfigValue::literal(var("UNITY_TOKEN")),
+        },
+        catalog: std::env::var("UNITY_CATALOG").ok(),
+        schema: std::env::var("UNITY_SCHEMA").ok(),
+    };
+    let listing = fluree_db_delta::browse_unity(&unity, fluree_db_delta::BrowseDepth::Tables)
+        .await
+        .unwrap();
+    println!(
+        "catalogs: {:?}\nschemas: {:?}",
+        listing.catalogs, listing.schemas
+    );
+    for t in &listing.tables {
+        println!(
+            "  {} [{} {:?}] rule={:?} unreadable={:?}",
+            t.full_name, t.kind, t.format, t.access_rule, t.unreadable
+        );
+    }
+    for name in std::env::var("UNITY_DESCRIBE")
+        .unwrap_or_default()
+        .split(',')
+    {
+        if name.is_empty() {
+            continue;
+        }
+        let table = fluree_db_delta::describe_unity_table(&unity, name)
+            .await
+            .unwrap();
+        println!(
+            "{} pk={:?} fks={:?} rule={:?}",
+            table.full_name, table.primary_key, table.foreign_keys, table.access_rule
+        );
+        for c in &table.columns {
+            println!(
+                "  {} {} -> {:?} nullable={} masked={} {:?}",
+                c.name, c.type_text, c.field_type, c.nullable, c.masked, c.comment
+            );
+        }
+    }
+}

@@ -39,22 +39,30 @@ pub(crate) fn open(
 ) -> Result<(Url, Arc<dyn ObjectStore>)> {
     let bad = |e: &dyn std::fmt::Display| DeltaError::Config(format!("{location}: {e}"));
 
-    // A catalog places tables in object storage; one that names this host's
-    // disk is not followed there, whatever the local-root allowlist permits.
-    if matches!(credentials, Credentials::Unity(..))
-        && fluree_db_iceberg::is_local_location(location)
-    {
-        return Err(bad(
-            &"a catalog may not place a table on the local filesystem",
-        ));
-    }
-    // Databricks on Google Cloud places tables here; say so rather than list
-    // the schemes a path source may use, which the catalog did not choose.
-    if matches!(credentials, Credentials::Unity(..)) && location.starts_with("gs://") {
-        return Err(bad(
-            &"Unity Catalog placed this table on Google Cloud Storage, which the Delta \
-              reader does not read yet (Databricks on AWS and Azure is supported)",
-        ));
+    // Where a catalog placed the table is the catalog's doing, not the
+    // config's: refusing it is about that one table, like a view or a table
+    // with an access rule, not a registration error.
+    if let Credentials::Unity(_, table) = &credentials {
+        let refuse = |message: &str| DeltaError::Catalog {
+            table: table.full_name.clone(),
+            message: format!("placed at {location}: {message}"),
+            denied: false,
+        };
+        // One that names this host's disk is not followed there, whatever the
+        // local-root allowlist permits.
+        if fluree_db_iceberg::is_local_location(location) {
+            return Err(refuse(
+                "a catalog may not place a table on the local filesystem",
+            ));
+        }
+        // Databricks on Google Cloud places tables here; say so rather than
+        // list the schemes a path source may use.
+        if location.starts_with("gs://") {
+            return Err(refuse(
+                "Unity Catalog placed this table on Google Cloud Storage, which the Delta \
+                 reader does not read yet (Databricks on AWS and Azure is supported)",
+            ));
+        }
     }
     let kind = crate::config::validate_location(location)?;
 

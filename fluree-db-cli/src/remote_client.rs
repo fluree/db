@@ -2855,6 +2855,24 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// One of the read-only Delta endpoints: `catalog/browse`, `r2rml/generate`, ….
+    ///
+    /// Calls `POST {base_url}/delta/{route}`.
+    pub async fn delta_read(
+        &self,
+        route: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root(&format!("delta/{route}"));
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
     /// Map an Iceberg table as a graph source on the remote server.
     ///
     /// Calls `POST {base_url}/iceberg/map`.

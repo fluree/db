@@ -1037,21 +1037,33 @@ impl crate::Fluree {
 
 /// The result of a storage-access verification probe.
 ///
+/// A table that cannot be read is a report (`readable: false`, the reason in
+/// `error`), not an error: the same contract as a Delta source's verify. Only a
+/// request that cannot be made (Direct mode, an unusable connection) errors.
+///
 /// This shape goes over HTTP verbatim (solo's onboarding wizard renders it), so
 /// the field names are pinned.
 #[derive(Debug, Serialize)]
 pub struct StorageAccessReport {
+    /// Whether a query could read the table: the catalog authorized it and its
+    /// storage let both prefixes through.
+    pub readable: bool,
+    /// Why not, in the catalog's or the store's own words; `None` when readable.
+    pub error: Option<String>,
     /// Which credential source the probe used: `"vended"` (catalog-delegated) or
     /// `"ambient"` (the process AWS credential chain). This is the SAME decision
     /// the scan/preview paths make (see [`decide_credential_source`]), so a green
-    /// probe proves a query authenticates to storage the same way.
-    pub credential_source: &'static str,
+    /// probe proves a query authenticates to storage the same way. `None` when
+    /// the probe failed before the decision was made.
+    pub credential_source: Option<&'static str>,
     /// The table's current metadata-JSON location
-    /// (`…/metadata/*.metadata.json`), from the catalog `loadTable` response.
-    pub metadata_location: String,
+    /// (`…/metadata/*.metadata.json`), from the catalog `loadTable` response;
+    /// `None` when the catalog would not load the table.
+    pub metadata_location: Option<String>,
     /// Number of data files listed in the current snapshot's manifests. Listing
     /// them proves the `metadata/` prefix (manifest-list + manifests) is readable.
-    pub data_files_listed: usize,
+    /// `None` when they could not be listed.
+    pub data_file_count: Option<usize>,
     /// The single data file the probe stat-checked (`HeadObject`) to prove the
     /// `data/` prefix is readable; `None` when the data probe was skipped.
     pub probed_data_file: Option<String>,
@@ -1140,18 +1152,59 @@ async fn probe_storage_access<S: SendIcebergStorage + ?Sized>(
                 )
             })?;
 
-    let data_files_listed = data_files.len();
+    let data_file_count = data_files.len();
     let probe = probe_data_files(storage, &data_files, table_qualified).await?;
 
     Ok(StorageAccessReport {
-        credential_source,
-        metadata_location,
-        data_files_listed,
+        readable: true,
+        error: None,
+        credential_source: Some(credential_source),
+        metadata_location: Some(metadata_location),
+        data_file_count: Some(data_file_count),
         probed_data_file: probe.probed_data_file,
         probed_data_file_bytes: probe.probed_data_file_bytes,
         data_probe_skipped: probe.data_probe_skipped,
         skip_reason: probe.skip_reason,
     })
+}
+
+impl StorageAccessReport {
+    /// A table the probe could not read, and as much as it learned first.
+    fn unreadable(
+        error: String,
+        credential_source: Option<&'static str>,
+        metadata_location: Option<String>,
+    ) -> Self {
+        Self {
+            readable: false,
+            error: Some(error),
+            credential_source,
+            metadata_location,
+            data_file_count: None,
+            probed_data_file: None,
+            probed_data_file_bytes: None,
+            data_probe_skipped: false,
+            skip_reason: None,
+        }
+    }
+}
+
+/// Whether a failure to build the table's storage is the table's (a report) or
+/// the request's (an error). The catalog vending nothing, or storage refusing,
+/// is about this table; anything else means the request could not be made.
+fn storage_failure(
+    error: crate::ApiError,
+    metadata_location: String,
+) -> Result<StorageAccessReport> {
+    match error {
+        crate::ApiError::CatalogCredentialsNotVended { .. }
+        | crate::ApiError::StorageAccessDenied { .. } => Ok(StorageAccessReport::unreadable(
+            error.to_string(),
+            None,
+            Some(metadata_location),
+        )),
+        other => Err(other),
+    }
 }
 
 /// Split a `"NAMESPACE.NAME"` table string into a catalog [`TableIdentifier`].
@@ -1187,21 +1240,29 @@ pub async fn verify_storage_access(
     let table_id = parse_qualified_table(table);
     let catalog_table = table_id.to_catalog();
 
-    let load = SendCatalogClient::load_table(&catalog, &catalog_table, conn.io.vended_credentials)
-        .await
-        .map_err(|e| {
-            crate::ApiError::config(format!(
-                "Failed to load table {}: {e}",
-                table_id.qualified()
-            ))
-        })?;
+    let load =
+        match SendCatalogClient::load_table(&catalog, &catalog_table, conn.io.vended_credentials)
+            .await
+        {
+            Ok(load) => load,
+            Err(e) => {
+                return Ok(StorageAccessReport::unreadable(
+                    format!("Failed to load table {}: {e}", table_id.qualified()),
+                    None,
+                    None,
+                ))
+            }
+        };
 
     // Build storage through the SAME credential decision the scan path uses. §2
     // fail-closed fires HERE: a REST source that requires vended credentials but
     // whose catalog vended none is refused (ApiError::CatalogCredentialsNotVended)
     // rather than silently probing with ambient credentials — which is exactly the
     // "validated on a different credential path than queries use" bug this guards.
-    let storage = build_preview_storage(&conn, load.credentials.as_ref()).await?;
+    let storage = match build_preview_storage(&conn, load.credentials.as_ref()).await {
+        Ok(storage) => storage,
+        Err(e) => return storage_failure(e, load.metadata_location),
+    };
     let credential_source = if load.credentials.is_some() {
         "vended"
     } else {
@@ -1221,20 +1282,29 @@ pub async fn verify_storage_access(
     // there is nothing to probe — report a skip rather than erroring (the catalog
     // authorization and the credential decision were still exercised above).
     match metadata.current_snapshot() {
-        Some(snapshot) => {
-            probe_storage_access(
-                &storage,
-                snapshot,
-                credential_source,
-                load.metadata_location,
-                &table_id.qualified(),
-            )
-            .await
-        }
-        None => Ok(StorageAccessReport {
+        Some(snapshot) => Ok(probe_storage_access(
+            &storage,
+            snapshot,
             credential_source,
-            metadata_location: load.metadata_location,
-            data_files_listed: 0,
+            load.metadata_location.clone(),
+            &table_id.qualified(),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            // Manifests or a data file the credentials cannot reach, or that
+            // are gone: the table's, whatever the store said.
+            StorageAccessReport::unreadable(
+                e.to_string(),
+                Some(credential_source),
+                Some(load.metadata_location),
+            )
+        })),
+        None => Ok(StorageAccessReport {
+            readable: true,
+            error: None,
+            credential_source: Some(credential_source),
+            metadata_location: Some(load.metadata_location),
+            data_file_count: Some(0),
             probed_data_file: None,
             probed_data_file_bytes: None,
             data_probe_skipped: true,
@@ -1800,9 +1870,13 @@ mod tests {
     fn storage_access_report_serde_shape() {
         // The solo wizard reads these exact keys — pin the field set + names.
         let report = StorageAccessReport {
-            credential_source: "vended",
-            metadata_location: "s3://bucket/warehouse/t/metadata/v3.metadata.json".to_string(),
-            data_files_listed: 4,
+            readable: true,
+            error: None,
+            credential_source: Some("vended"),
+            metadata_location: Some(
+                "s3://bucket/warehouse/t/metadata/v3.metadata.json".to_string(),
+            ),
+            data_file_count: Some(4),
             probed_data_file: Some("s3://bucket/warehouse/t/data/part-0.parquet".to_string()),
             probed_data_file_bytes: Some(2048),
             data_probe_skipped: false,
@@ -1814,7 +1888,7 @@ mod tests {
             v["metadata_location"],
             "s3://bucket/warehouse/t/metadata/v3.metadata.json"
         );
-        assert_eq!(v["data_files_listed"], 4);
+        assert_eq!(v["data_file_count"], 4);
         assert_eq!(
             v["probed_data_file"],
             "s3://bucket/warehouse/t/data/part-0.parquet"
@@ -1822,11 +1896,43 @@ mod tests {
         assert_eq!(v["probed_data_file_bytes"], 2048);
         assert_eq!(v["data_probe_skipped"], false);
         assert!(v["skip_reason"].is_null());
+        assert_eq!(v["readable"], true);
+        assert!(v["error"].is_null());
         assert_eq!(
             v.as_object().unwrap().len(),
-            7,
+            9,
             "report field set is pinned: {v}"
         );
+    }
+
+    /// The table's own failures are a report, `readable: false` with the
+    /// reason; a request that cannot be made stays an error.
+    #[test]
+    fn a_table_that_cannot_be_read_is_a_report_not_an_error() {
+        let location = "s3://bucket/warehouse/t/metadata/v3.metadata.json";
+        for failure in [
+            crate::ApiError::CatalogCredentialsNotVended {
+                catalog_uri: "https://catalog.example/v1".to_string(),
+            },
+            crate::ApiError::StorageAccessDenied {
+                bucket: "bucket".to_string(),
+                key: "warehouse/t/metadata/snap-1.avro".to_string(),
+                region: None,
+                message: "AccessDenied".to_string(),
+            },
+        ] {
+            let said = failure.to_string();
+            let report = storage_failure(failure, location.to_string())
+                .expect("the table's failure is a report");
+            assert!(!report.readable);
+            assert_eq!(report.error.as_deref(), Some(said.as_str()));
+            assert_eq!(report.metadata_location.as_deref(), Some(location));
+            let v = serde_json::to_value(&report).unwrap();
+            assert_eq!(v["readable"], false, "{v}");
+        }
+
+        let unusable = crate::ApiError::config("s3_endpoint is not a URL");
+        assert!(storage_failure(unusable, location.to_string()).is_err());
     }
 
     #[tokio::test]

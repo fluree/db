@@ -59,6 +59,10 @@ pub enum DeltaError {
         denied: bool,
     },
 
+    /// A catalog would not list what it holds.
+    #[error("Unity Catalog, {scope}: {message}")]
+    CatalogListing { scope: String, message: String },
+
     #[error("Delta reader internal error: {0}")]
     Internal(String),
 }

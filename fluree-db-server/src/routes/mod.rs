@@ -190,6 +190,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/iceberg/r2rml/validate",
             post(iceberg::iceberg_r2rml_validate),
         );
+    // The same for a Delta source on Unity Catalog.
+    #[cfg(feature = "delta")]
+    let v1_admin_protected_reads = v1_admin_protected_reads
+        .route("/delta/catalog/browse", post(delta::delta_catalog_browse))
+        .route("/delta/catalog/preview", post(delta::delta_catalog_preview))
+        .route("/delta/catalog/verify", post(delta::delta_catalog_verify))
+        .route("/delta/r2rml/generate", post(delta::delta_r2rml_generate))
+        .route("/delta/r2rml/validate", post(delta::delta_r2rml_validate));
     // Materialization tracking-worker status — reads this node's worker state.
     #[cfg(feature = "iceberg")]
     let v1_admin_protected_reads =

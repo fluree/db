@@ -243,3 +243,187 @@ async fn a_map_request_the_server_cannot_honour_is_refused() {
     let (status, text) = amounts(&state, "elsewhere:main").await;
     assert!(!status.is_success(), "{status}: {text}");
 }
+
+async fn post(state: &Arc<AppState>, route: &str, body: Value) -> (StatusCode, Value) {
+    let (status, text) = send(
+        state,
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v1/fluree/delta/{route}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await;
+    (
+        status,
+        serde_json::from_str(&text).unwrap_or(Value::String(text)),
+    )
+}
+
+fn codes(response: &Value) -> Vec<(&str, Option<&str>)> {
+    let mut found: Vec<_> = response["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .map(|d| (d["code"].as_str().unwrap(), d["column"].as_str()))
+        .collect();
+    found.sort_unstable();
+    found
+}
+
+#[tokio::test]
+async fn a_mapping_is_validated_against_its_tables_and_nothing_is_registered() {
+    let (_tmp, state) = server().await;
+
+    let (status, sound) = post(
+        &state,
+        "r2rml/validate",
+        json!({"root": fixtures(), "r2rml": MAPPING_TTL}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sound}");
+    assert_eq!(sound["compiled_ok"], true);
+    assert_eq!(sound["triples_map_count"], 1);
+    assert_eq!(sound["table_names"], json!(["in_commit_time"]));
+    // `id` and `amount` may be null in the fixture, which is said of the key.
+    assert_eq!(codes(&sound), [("noSafeSubjectKey", Some("id"))]);
+    // Asked here, while a source registered from this mapping would answer.
+    let (status, text) = amounts(&state, "validate:main").await;
+    assert!(!status.is_success(), "validate registered a source: {text}");
+
+    let flawed = MAPPING_TTL
+        .replace(r#"rr:column "amount""#, r#"rr:column "Amount""#)
+        .replace("item/{id}", "item/{id}/{nope}");
+    let (status, found) = post(
+        &state,
+        "r2rml/validate",
+        json!({"name": "probe", "root": fixtures(), "r2rml": flawed}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    assert_eq!(
+        codes(&found),
+        [
+            ("casingMismatch", Some("Amount")),
+            ("columnNotFound", Some("nope")),
+            ("noSafeSubjectKey", Some("id")),
+        ]
+    );
+
+    let absent = MAPPING_TTL.replace("in_commit_time", "no_such_table");
+    let (status, found) = post(
+        &state,
+        "r2rml/validate",
+        json!({"root": fixtures(), "r2rml": absent}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    assert_eq!(codes(&found), [("tableNotFound", None)]);
+
+    let (status, broken) = post(
+        &state,
+        "r2rml/validate",
+        json!({"root": fixtures(), "r2rml": "not turtle"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{broken}");
+    assert_eq!(broken["compiled_ok"], false);
+}
+
+#[tokio::test]
+async fn a_catalog_request_the_server_cannot_honour_is_refused() {
+    let (_tmp, state) = server().await;
+    let unity = "https://workspace.example.com";
+    let routes = [
+        ("catalog/browse", json!({})),
+        ("catalog/preview", json!({"table": "main.sales.orders"})),
+        ("catalog/verify", json!({"table": "main.sales.orders"})),
+        (
+            "r2rml/generate",
+            json!({"tables": ["main.sales.orders"], "base_namespace": "https://example.org/"}),
+        ),
+    ];
+    let refused = [
+        ("no catalog", json!({"auth_bearer": "t"})),
+        (
+            "internal host",
+            json!({"unity_uri": "http://169.254.169.254", "auth_bearer": "t"}),
+        ),
+        (
+            "internal token host",
+            json!({"unity_uri": unity, "oauth2_client_id": "app", "oauth2_client_secret": "s",
+                   "oauth2_token_url": "http://127.0.0.1/token"}),
+        ),
+        (
+            "unlisted variable",
+            json!({"unity_uri": unity, "auth_bearer_env": "AWS_SECRET_ACCESS_KEY"}),
+        ),
+        ("no way to authenticate", json!({"unity_uri": unity})),
+    ];
+    for (route, base) in &routes {
+        for (case, connection) in &refused {
+            let mut body = base.clone();
+            body.as_object_mut()
+                .unwrap()
+                .extend(connection.as_object().unwrap().clone());
+            let (status, text) = post(&state, route, body).await;
+            assert!(
+                status.is_client_error(),
+                "{route}, {case}: {status}: {text}"
+            );
+        }
+    }
+
+    // An S3 endpoint is only verify's and validate's to aim.
+    let (status, text) = post(
+        &state,
+        "catalog/verify",
+        json!({"unity_uri": unity, "auth_bearer": "t", "table": "main.sales.orders",
+               "s3_endpoint": "http://169.254.169.254/"}),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status}: {text}");
+    let (status, text) = post(
+        &state,
+        "r2rml/validate",
+        json!({"root": "s3://bucket/lake", "r2rml": MAPPING_TTL,
+               "s3_endpoint": "http://169.254.169.254/"}),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status}: {text}");
+
+    let (status, text) = post(
+        &state,
+        "r2rml/generate",
+        json!({"unity_uri": unity, "auth_bearer": "t", "tables": [],
+               "base_namespace": "https://example.org/"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+}
+
+#[tokio::test]
+async fn the_catalog_endpoints_are_the_administrators() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        admin_auth_mode: fluree_db_server::config::AdminAuthMode::Required,
+        admin_auth_insecure_accept_any_issuer: true,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    for route in [
+        "catalog/browse",
+        "catalog/preview",
+        "catalog/verify",
+        "r2rml/generate",
+        "r2rml/validate",
+    ] {
+        let (status, text) = post(&state, route, json!({})).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{route}: {text}");
+    }
+}

@@ -171,11 +171,32 @@ GRANT USE SCHEMA, SELECT, EXTERNAL USE SCHEMA ON SCHEMA main.sales TO `<applicat
 
 A user is named by email in place of the application id.
 
-**4. Map the source.**
+**4. Find the tables and generate a mapping.** This step is optional: a
+mapping written by hand works the same.
 
 ```bash
 export DATABRICKS_CLIENT_SECRET='<secret from step 2>'
+unity=(--unity-uri https://<workspace>.cloud.databricks.com
+       --oauth2-client-id <application-id>
+       --oauth2-client-secret-env DATABRICKS_CLIENT_SECRET)
 
+fluree delta browse "${unity[@]}" --unity-catalog main
+fluree delta verify main.sales.orders "${unity[@]}" --s3-region us-east-1
+fluree delta generate main.sales.orders main.sales.customers "${unity[@]}" \
+  --base-namespace https://example.org/sales# -o mappings/sales.ttl
+```
+
+`browse` shows what the principal can see, and marks what cannot be read.
+`verify` proves the grants of step 3 on one table: it fails with Unity's own
+reason when a privilege is missing. `generate` writes a mapping whose subjects
+and joins follow the primary and foreign keys declared in Unity, and says on
+standard error what it had to decide where none is declared. Review the file,
+then check it with `fluree delta validate`. The steps are described in
+[From a catalog to a mapping](delta.md#from-a-catalog-to-a-mapping).
+
+**5. Map the source.**
+
+```bash
 fluree delta map sales \
   --unity-uri https://<workspace>.cloud.databricks.com \
   --unity-catalog main \

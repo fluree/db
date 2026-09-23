@@ -214,6 +214,7 @@ fn preview_to_emit_schema(table: &TableIdentifier, preview: &TablePreview) -> Em
         name: table.name.clone(),
         columns: preview.schema.columns.iter().map(map_column).collect(),
         identifier_field_ids: preview.schema.identifier_field_ids.clone(),
+        foreign_keys: Vec::new(),
     }
 }
 
@@ -233,14 +234,23 @@ fn build_emit_options(req: &GenerateR2rmlRequest) -> EmitOptions {
             )
         })
         .collect();
+    emit_options(&req.base_namespace, &req.options, per_table_overrides)
+}
 
+/// The emitter's options for a base namespace, the caller's knobs and its
+/// per-table overrides; the remaining IRI bases are [`EmitOptions::new`]'s.
+pub(crate) fn emit_options(
+    base_namespace: &str,
+    options: &GenerateOptions,
+    per_table_overrides: HashMap<TableKey, TableOverride>,
+) -> EmitOptions {
     EmitOptions {
-        xsd_long_as_integer: req.options.xsd_long_as_integer,
-        emit_fk_joins: req.options.emit_fk_joins,
-        keep_fk_keys_as_literals: req.options.keep_fk_keys_as_literals,
-        subject_strategy: req.options.subject_strategy,
+        xsd_long_as_integer: options.xsd_long_as_integer,
+        emit_fk_joins: options.emit_fk_joins,
+        keep_fk_keys_as_literals: options.keep_fk_keys_as_literals,
+        subject_strategy: options.subject_strategy,
         per_table_overrides,
-        ..EmitOptions::new(&req.base_namespace)
+        ..EmitOptions::new(base_namespace)
     }
 }
 
@@ -269,7 +279,7 @@ fn emit_from_previews(
 /// characters. The emitter escapes it into the Turtle `@prefix` header, but a
 /// value carrying a newline / control char is rejected here for a clean `400`
 /// (defense in depth against Turtle header injection).
-fn validate_base_namespace(base: &str) -> Result<()> {
+pub(crate) fn validate_base_namespace(base: &str) -> Result<()> {
     if base.is_empty() {
         return Err(crate::ApiError::config("base_namespace must not be empty"));
     }
