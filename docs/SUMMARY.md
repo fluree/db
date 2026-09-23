@@ -50,6 +50,7 @@
   - [mcp](cli/mcp.md)
   - [docs](cli/docs.md)
   - [iceberg](cli/iceberg.md)
+  - [delta](cli/delta.md)
   - [sql](cli/sql.md)
   - [bm25](cli/bm25.md)
   - [doc](cli/doc.md)
@@ -178,6 +179,8 @@
   - [Overview](graph-sources/overview.md)
   - [Iceberg / Parquet](graph-sources/iceberg.md)
   - [R2RML](graph-sources/r2rml.md)
+  - [Delta Lake tables](graph-sources/delta.md)
+  - [Connecting to lakehouse platforms](graph-sources/lakehouse-platforms.md)
   - [SQL endpoints (Trino / bridge)](graph-sources/sql.md)
   - [BM25 graph source](graph-sources/bm25.md)
 

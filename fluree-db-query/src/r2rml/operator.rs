@@ -671,91 +671,7 @@ impl R2rmlScanOperator {
     }
 
     fn build_scan_filters(&self, triples_map: &TriplesMap) -> Vec<crate::r2rml::ScanFilter> {
-        let mut out = Vec::new();
-        for pd in &self.pattern.scan_filters {
-            let pred_iri = if Some(pd.var) == self.pattern.object_var {
-                self.pattern.predicate_filter.as_deref()
-            } else {
-                self.pattern
-                    .star_bindings
-                    .iter()
-                    .find(|(_, v)| *v == pd.var)
-                    .map(|(p, _)| p.as_str())
-            };
-            let Some(pred_iri) = pred_iri else { continue };
-
-            // The predicate's values come from EVERY matching object map, so a
-            // file-level prune is only sound when the predicate maps to exactly
-            // one scalar object map backed by exactly one column. Otherwise a row
-            // could match via a column we didn't prune on — skip the pushdown and
-            // let the in-engine FILTER handle it.
-            let mut matching = triples_map
-                .predicate_object_maps
-                .iter()
-                .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
-            let (Some(pom), None) = (matching.next(), matching.next()) else {
-                continue;
-            };
-            let Some(col) = value_pushdown_column(&pom.object_map) else {
-                continue;
-            };
-            out.push(crate::r2rml::ScanFilter {
-                column: col.to_string(),
-                op: pd.op,
-                value: pd.value.clone(),
-            });
-        }
-
-        // A scalar constant-object equality pushes as a scan filter too
-        // (optimization; the operator enforces correctness). IRI constants are
-        // operator-enforced only — a FK-key pushdown needs template reversal.
-        if let (Some(crate::r2rml::ObjectConstant::Scalar(value)), Some(pred_iri)) = (
-            &self.pattern.object_constant,
-            self.pattern.predicate_filter.as_deref(),
-        ) {
-            push_scalar_eq_filter(&mut out, triples_map, pred_iri, value);
-        }
-
-        // W4-1 PRIMARY: a scalar constant-object member of a same-subject star
-        // (`?ol ex:orderLineKey "1"; ?ol ex:order ?ord`) lands in `star_constraints`,
-        // not the base `object_constant`, so without this it was enforced ONLY
-        // residually — the whole FACT was read and filtered post-scan (the round-3b
-        // point-lookup fanned into a full 120 M-row scan). Push each scalar star
-        // constraint as a scan filter under the same soundness gate, so a constant
-        // key equality prunes the scan even alongside other predicates. IRI/decimal/
-        // double constraints stay operator-enforced only (not pushable here).
-        for (pred_iri, constant) in &self.pattern.star_constraints {
-            if let crate::r2rml::ObjectConstant::Scalar(value) = constant {
-                push_scalar_eq_filter(&mut out, triples_map, pred_iri, value);
-            }
-        }
-
-        // Bound-subject key pushdown: reverse the subject template against the
-        // constant IRI to recover each key column's raw value, and push it as an
-        // equality so Iceberg can prune to the matching rows. Emitted
-        // unconditionally, like the object-constant filters above; whether it is
-        // *applied* is governed by the same reader-level pushdown kill-switch
-        // (`FLUREE_ICEBERG_PREDICATE_PUSHDOWN`). Only unambiguously-reversible
-        // template shapes yield filters (see `reverse_subject_template`); the
-        // physical type is resolved later against the Iceberg schema, and
-        // unsupported types are skipped. The operator still enforces the subject
-        // equality, so a skipped or partial push is a perf choice, never a
-        // correctness one.
-        if let (Some(subject_iri), Some(template)) = (
-            self.pattern.subject_constant.as_deref(),
-            triples_map.subject_map.template.as_deref(),
-        ) {
-            if let Some(keys) = reverse_subject_template(template, subject_iri) {
-                for (column, raw) in keys {
-                    out.push(crate::r2rml::ScanFilter {
-                        column,
-                        op: crate::r2rml::ScanCmpOp::Eq,
-                        value: crate::r2rml::ScanValue::TemplateKey(raw),
-                    });
-                }
-            }
-        }
-        out
+        pattern_scan_filters(&self.pattern, triples_map)
     }
 
     /// Materialize one window of a TriplesMap's produced column batches into
@@ -1899,11 +1815,11 @@ impl LiteralEncoder {
                         .get(dt_iri.as_ref())
                         .cloned()
                         .unwrap_or_else(|| self.xsd_string.clone());
-                    // Coerce numeric and temporal XSD literals from string to
-                    // the typed FlakeValue: arithmetic reads the value, and
-                    // `=` is a type error between a string-backed literal and
-                    // a dateTime (ordering coerces, equality does not). Other
-                    // datatypes keep their string form.
+                    // Coerce numeric, temporal and boolean XSD literals from
+                    // string to the typed FlakeValue: arithmetic reads the
+                    // value, and `=` does not match a string-backed literal
+                    // against a dateTime or a boolean (ordering coerces,
+                    // equality does not). Other datatypes keep their string form.
                     let val = match fluree_db_core::coerce_value(
                         FlakeValue::String(value.clone()),
                         dt_iri.as_ref(),
@@ -1915,7 +1831,8 @@ impl LiteralEncoder {
                             | FlakeValue::Decimal(_)
                             | FlakeValue::DateTime(_)
                             | FlakeValue::Date(_)
-                            | FlakeValue::Time(_)),
+                            | FlakeValue::Time(_)
+                            | FlakeValue::Boolean(_)),
                         ) => c,
                         _ => FlakeValue::String(value.clone()),
                     };
@@ -2042,6 +1959,101 @@ fn coerce_scalar_for_pushdown(
         // never wrapped in a `Scalar` object constant — decline to coerce it.
         ScanValue::Set(_) => None,
     }
+}
+
+/// The scan filters `pattern` pushes to a scan of `triples_map`'s table: its
+/// FILTER comparisons, scalar constant objects, and a bound subject's template
+/// keys. Every one restates a condition the pattern's consumer enforces, so a
+/// provider may apply them exactly, partly, or not at all.
+pub(crate) fn pattern_scan_filters(
+    pattern: &R2rmlPattern,
+    triples_map: &TriplesMap,
+) -> Vec<crate::r2rml::ScanFilter> {
+    let mut out = Vec::new();
+    for pd in &pattern.scan_filters {
+        let pred_iri = if Some(pd.var) == pattern.object_var {
+            pattern.predicate_filter.as_deref()
+        } else {
+            pattern
+                .star_bindings
+                .iter()
+                .find(|(_, v)| *v == pd.var)
+                .map(|(p, _)| p.as_str())
+        };
+        let Some(pred_iri) = pred_iri else { continue };
+
+        // The predicate's values come from EVERY matching object map, so a
+        // file-level prune is only sound when the predicate maps to exactly
+        // one scalar object map backed by exactly one column. Otherwise a row
+        // could match via a column we didn't prune on — skip the pushdown and
+        // let the in-engine FILTER handle it.
+        let mut matching = triples_map
+            .predicate_object_maps
+            .iter()
+            .filter(|p| p.predicate_map.as_constant() == Some(pred_iri));
+        let (Some(pom), None) = (matching.next(), matching.next()) else {
+            continue;
+        };
+        let Some(col) = value_pushdown_column(&pom.object_map) else {
+            continue;
+        };
+        out.push(crate::r2rml::ScanFilter {
+            column: col.to_string(),
+            op: pd.op,
+            value: pd.value.clone(),
+        });
+    }
+
+    // A scalar constant-object equality pushes as a scan filter too
+    // (optimization; the operator enforces correctness). IRI constants are
+    // operator-enforced only — a FK-key pushdown needs template reversal.
+    if let (Some(crate::r2rml::ObjectConstant::Scalar(value)), Some(pred_iri)) = (
+        &pattern.object_constant,
+        pattern.predicate_filter.as_deref(),
+    ) {
+        push_scalar_eq_filter(&mut out, triples_map, pred_iri, value);
+    }
+
+    // W4-1 PRIMARY: a scalar constant-object member of a same-subject star
+    // (`?ol ex:orderLineKey "1"; ?ol ex:order ?ord`) lands in `star_constraints`,
+    // not the base `object_constant`, so without this it was enforced ONLY
+    // residually — the whole FACT was read and filtered post-scan (the round-3b
+    // point-lookup fanned into a full 120 M-row scan). Push each scalar star
+    // constraint as a scan filter under the same soundness gate, so a constant
+    // key equality prunes the scan even alongside other predicates. IRI/decimal/
+    // double constraints stay operator-enforced only (not pushable here).
+    for (pred_iri, constant) in &pattern.star_constraints {
+        if let crate::r2rml::ObjectConstant::Scalar(value) = constant {
+            push_scalar_eq_filter(&mut out, triples_map, pred_iri, value);
+        }
+    }
+
+    // Bound-subject key pushdown: reverse the subject template against the
+    // constant IRI to recover each key column's raw value, and push it as an
+    // equality so Iceberg can prune to the matching rows. Emitted
+    // unconditionally, like the object-constant filters above; whether it is
+    // *applied* is governed by the same reader-level pushdown kill-switch
+    // (`FLUREE_ICEBERG_PREDICATE_PUSHDOWN`). Only unambiguously-reversible
+    // template shapes yield filters (see `reverse_subject_template`); the
+    // physical type is resolved later against the Iceberg schema, and
+    // unsupported types are skipped. The operator still enforces the subject
+    // equality, so a skipped or partial push is a perf choice, never a
+    // correctness one.
+    if let (Some(subject_iri), Some(template)) = (
+        pattern.subject_constant.as_deref(),
+        triples_map.subject_map.template.as_deref(),
+    ) {
+        if let Some(keys) = reverse_subject_template(template, subject_iri) {
+            for (column, raw) in keys {
+                out.push(crate::r2rml::ScanFilter {
+                    column,
+                    op: crate::r2rml::ScanCmpOp::Eq,
+                    value: crate::r2rml::ScanValue::TemplateKey(raw),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Push an `Eq` scan filter for a scalar constant-object equality on `pred_iri`,

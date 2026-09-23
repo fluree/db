@@ -766,10 +766,14 @@ impl Fluree {
     /// `query_connection`'s opts→policy behaviour for JSON-LD: when the opts
     /// carry any policy input the dataset is built with policy
     /// (`build_dataset_view_with_policy`), otherwise it is the plain view.
+    ///
+    /// `r2rml` carries the graph-source providers; without them a graph source
+    /// named in `FROM` scans nothing.
     pub(crate) async fn query_connection_sparql_with_opts_options(
         &self,
         sparql: &str,
         qc_opts: &GovernanceOptions,
+        r2rml: Option<crate::R2rmlProviders<'_>>,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
         let ast = parse_and_validate_sparql(sparql)?;
@@ -782,8 +786,22 @@ impl Fluree {
         }
 
         let dataset = self.build_dataset_for_connection(&spec, qc_opts).await?;
-        self.query_dataset_with_options(&dataset, sparql, options)
-            .await
+        match r2rml {
+            Some(r2rml) => {
+                self.query_dataset_with_r2rml_options(
+                    &dataset,
+                    sparql,
+                    r2rml.provider,
+                    r2rml.table_provider,
+                    options,
+                )
+                .await
+            }
+            None => {
+                self.query_dataset_with_options(&dataset, sparql, options)
+                    .await
+            }
+        }
     }
 
     pub(crate) async fn query_connection_sparql_with_policy_and_r2rml_options(
@@ -1003,6 +1021,7 @@ impl Fluree {
         qc_opts: &GovernanceOptions,
         format_config: Option<FormatterConfig>,
         tracking_override: Option<TrackingOptions>,
+        r2rml: Option<crate::R2rmlProviders<'_>>,
         options: QueryExecutionOptions,
     ) -> std::result::Result<crate::query::TrackedQueryResponse, crate::query::TrackedErrorResponse>
     {
@@ -1030,14 +1049,29 @@ impl Fluree {
             .build_dataset_for_connection_tracked(&spec, qc_opts)
             .await?;
 
-        self.query_dataset_tracked_with_options(
-            &dataset,
-            sparql,
-            format_config,
-            tracking_override,
-            options,
-        )
-        .await
+        match r2rml {
+            Some(r2rml) => {
+                self.query_dataset_tracked_with_r2rml_options(
+                    &dataset,
+                    sparql,
+                    format_config,
+                    tracking_override,
+                    r2rml,
+                    options,
+                )
+                .await
+            }
+            None => {
+                self.query_dataset_tracked_with_options(
+                    &dataset,
+                    sparql,
+                    format_config,
+                    tracking_override,
+                    options,
+                )
+                .await
+            }
+        }
     }
 
     pub(crate) async fn query_connection_sparql_tracked_with_policy_and_r2rml_options(

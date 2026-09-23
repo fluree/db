@@ -2962,8 +2962,9 @@ POST http://localhost:8090/v1/fluree/iceberg/map
 | `r2rml` | string | Inline R2RML mapping (Turtle/JSON-LD). Omit to auto-generate a direct mapping. |
 | `r2rml_type` | string | Media type of `r2rml` (`text/turtle`, `application/ld+json`) |
 | `branch` | string | Branch name (default: `main`) |
-| `auth_bearer` | string | Static bearer token for catalog auth (does not refresh — a Google OAuth token will expire after ~1h) |
-| `oauth2_*` | string | OAuth2 client-credentials flow for the catalog (refreshes) |
+| `auth_bearer` | string | Static bearer token for catalog auth (does not refresh — a Google OAuth token will expire after ~1h). Stored with the graph source |
+| `auth_bearer_env` | string | In place of `auth_bearer`: the name of an environment variable of the server holding the token, so the token is not stored. The name must be listed in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning); any other is refused with 400 |
+| `oauth2_*` | string | OAuth2 client-credentials flow for the catalog (refreshes). `oauth2_client_secret_env` names a server environment variable in place of `oauth2_client_secret`, under the same rule as `auth_bearer_env` |
 | `auth_google_metadata` | bool | Use the GCE/GKE metadata server (Workload Identity) for catalog auth, minting + auto-refreshing tokens — for Google Iceberg REST catalogs (BigLake). Overrides `auth_bearer`. Only works when running on GCP. |
 | `auth_google_scopes` | string | Optional OAuth scopes for `auth_google_metadata` (default `cloud-platform`) |
 | `warehouse` | string | Warehouse identifier |
@@ -3114,6 +3115,61 @@ Two errors that are the caller's fault currently come back as `500` with `"@type
 By default the server does not sync on commit, so an index only advances when something calls this endpoint — run it from a maintenance job, using `fluree bm25 list --stale` to enumerate the indexes whose source has moved past their watermark. Starting the server with `--bm25-auto-sync` (env `FLUREE_BM25_AUTO_SYNC`, or `indexing.bm25_auto_sync` in the config file) instead keeps every index current automatically, syncing each one when its source ledger commits.
 
 See also the CLI equivalent: [fluree bm25 sync](../cli/bm25.md#fluree-bm25-sync).
+
+### POST {api_base_url}/delta/map
+
+Map Delta Lake tables as an R2RML graph source. Admin-protected — requires the admin Bearer token when an admin token is configured. Available only when the server is built with the `delta` feature. See [Delta Lake tables](../graph-sources/delta.md).
+
+**URL:**
+```
+POST {api_base_url}/delta/map
+```
+
+**Request Body:**
+
+```json
+{
+  "name": "sales",
+  "root": "s3://lake/Tables",
+  "tables": { "orders": "s3://lake/raw/orders_v2" },
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "r2rml_type": "text/turtle",
+  "branch": "main",
+  "s3_region": "us-east-1"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Graph source name (required) |
+| `root` | string | Directory the mapping's table names resolve beneath: `dbo.orders` → `<root>/dbo/orders`. `s3://…`, `abfss://<container>@<account>.dfs.core.windows.net/…`, the OneLake `abfss://` form, or a local path under the server's local-root allowlist. Required unless every mapped table has a `tables` entry. |
+| `tables` | object | Explicit table name → table location; wins over `root` |
+| `r2rml` | string | Inline R2RML mapping (required). `rr:tableName` logical tables only. |
+| `r2rml_type` | string | Media type of `r2rml` (`text/turtle`) |
+| `branch` | string | Branch name (default: `main`) |
+| `s3_region`, `s3_endpoint`, `s3_path_style` | string, string, bool | S3 options. `s3_endpoint` is guarded against the link-local/metadata range. Credentials come from the server's environment or role. |
+| `azure_tenant_id`, `azure_client_id` | string | Microsoft Entra service principal for `abfss://` locations. Omit all Azure fields to use the server's ambient Azure credentials. |
+| `azure_client_secret_env` / `azure_client_secret` | string | The principal's secret: the name of a server environment variable holding it (not stored), or a literal (stored with the graph source). Exactly one, with the two fields above. |
+| `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
+| `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
+
+**Response:**
+
+```json
+{
+  "graph_source_id": "sales:main",
+  "mapping_source": "bafy…",
+  "triples_map_count": 3,
+  "table_count": 2,
+  "table_names": ["dbo.customers", "orders"],
+  "mapping_validated": true,
+  "table_versions": { "dbo.customers": 12, "orders": 847 }
+}
+```
+
+`table_versions` holds the current Delta version of each mapped table that opened with every column its maps reference. A table that could not be read, or that lacks a mapped column, appears in `table_warnings` instead; the source is registered regardless. `model_warnings` lists policies of the model a virtual source cannot evaluate.
+
+See also the CLI equivalent: [fluree delta map](../cli/delta.md#fluree-delta-map).
 
 ### POST {api_base_url}/sql/map
 

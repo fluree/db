@@ -1,5 +1,8 @@
 #[path = "cypher_http_integration.rs"]
 mod cypher_http_integration;
+#[cfg(feature = "delta")]
+#[path = "delta_http_integration.rs"]
+mod delta_http_integration;
 #[path = "graph_source_format_gating.rs"]
 mod graph_source_format_gating;
 #[path = "ledger_route_config_defaults.rs"]

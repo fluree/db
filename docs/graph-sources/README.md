@@ -31,6 +31,20 @@ Relational database mapping:
 - Join optimization
 - Supported databases (PostgreSQL, MySQL, etc.)
 
+### [Delta Lake tables](delta.md)
+
+Delta tables read in place:
+- Deletion vectors, column mapping and partition values applied per the Delta protocol
+- R2RML mappings with `rr:tableName`, tables addressed by path
+- Time travel by Delta version (`@snapshot:`) or commit time (`@time:`)
+
+### [Connecting to lakehouse platforms](lakehouse-platforms.md)
+
+Step-by-step setup for tables that live in a platform:
+- ADLS Gen2 and Microsoft Fabric OneLake: finding a table's location, creating a service principal, the role it needs
+- Databricks: external tables, Unity Catalog's temporary credentials, the Iceberg REST endpoint
+- What the common errors mean
+
 ### [SQL endpoints](sql.md)
 
 Relational databases and warehouses through a Trino-protocol endpoint:

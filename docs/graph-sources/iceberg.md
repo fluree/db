@@ -171,6 +171,31 @@ Note the nesting: the graph source is “Iceberg” (this page), and `catalog.ty
 }
 ```
 
+`warehouse` is the name the catalog knows the warehouse (or catalog) by. It is
+sent to the catalog's `/v1/config` route, and the path prefix that route
+returns is used for every later request, as the Iceberg REST specification
+describes — so the name is enough even where the catalog's routes are laid out
+differently (for example `catalogs/<name>` on Databricks Unity Catalog, whose
+Iceberg endpoint is `https://<workspace>/api/2.1/unity-catalog/iceberg-rest`).
+A catalog with no `/v1/config` route is addressed with the warehouse name as
+the prefix.
+
+**Keeping the secret out of the stored config.** `auth_bearer` and
+`oauth2_client_secret` are stored with the graph source as given. To store only
+a name, give `auth_bearer_env` / `oauth2_client_secret_env`
+(`--auth-bearer-env` / `--oauth2-client-secret-env`): the variable is read from
+the environment of the process that reads the tables, each time a token is
+needed, and the stored config holds `{ "env_var": "<name>" }`. A local CLI
+may name any variable. A **server** accepts only names its operator has listed
+in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS` (comma-separated): the request also
+chooses the catalog and token URLs the secret is sent to, so an unlisted name
+would let a caller send the server's environment to a host of their choosing.
+An embedding application can use a secret reference resolved through its
+`SecretResolver` instead.
+
+For Databricks — what to enable in Unity Catalog, and the token it needs — see
+[Connecting to lakehouse platforms](lakehouse-platforms.md#databricks-through-the-iceberg-rest-endpoint).
+
 **Direct S3 config:**
 
 ```json
@@ -769,9 +794,10 @@ fallback to the current or oldest snapshot:
   simply reads as empty.
 
 `@t:` and `@commit:` name Fluree ledger states and are rejected on a graph
-source; `@snapshot:` is rejected on a native ledger. Only Iceberg-backed
-sources can be pinned: a SQL-backed R2RML source, a BM25 or vector index read
-their current state and reject any time specification. Naming one source at
+source; `@snapshot:` is rejected on a native ledger. Only table sources with
+retained history can be pinned — Iceberg and [Delta](delta.md#time-travel): a
+SQL-backed R2RML source, a BM25 or vector index read their current state and
+reject any time specification. Naming one source at
 two different states in one query — two different pins, or one reference
 pinned and another not, across `from` and `fromNamed` — is also rejected,
 because a pin applies to every read of that source in the query.

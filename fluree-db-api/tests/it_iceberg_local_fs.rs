@@ -286,6 +286,61 @@ async fn local_table_end_to_end() {
 /// lazy `graph_at()` handle, whose graph-source fallback used to drop the pin —
 /// and a COUNT is checked against its scan so the manifest shortcut cannot
 /// answer from a different snapshot than the rows.
+/// A SPARQL connection query carrying governance options — what every server
+/// SPARQL request is, even with no policy headers — reads a graph source named
+/// in `FROM`. That branch once ran without the graph-source providers and
+/// answered with no rows and no error.
+#[tokio::test]
+async fn a_sparql_connection_query_with_governance_options_reads_a_graph_source() {
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct("governed-people", &location, PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create local-file graph source");
+
+    let sparql = "SELECT ?name FROM <governed-people:main> \
+                  WHERE { ?s <http://example.org/name> ?name }";
+    let ask = || {
+        fluree
+            .query_from()
+            .sparql(sparql)
+            .connection_opts(fluree_db_api::GovernanceOptions::default())
+    };
+
+    let result = ask().execute().await.expect("execute");
+    assert_eq!(result.row_count(), 5, "execute");
+
+    let formatted = ask().execute_formatted().await.expect("execute_formatted");
+    assert_eq!(
+        formatted["results"]["bindings"].as_array().map(Vec::len),
+        Some(5),
+        "execute_formatted: {formatted}"
+    );
+
+    let text = ask()
+        .execute_formatted_string()
+        .await
+        .expect("execute_formatted_string");
+    assert_eq!(text.matches("\"name\"").count(), 1 + 5, "{text}");
+
+    let tracked = ask()
+        .execute_tracked()
+        .await
+        .unwrap_or_else(|e| panic!("execute_tracked: {}", e.error));
+    assert_eq!(
+        tracked.result["results"]["bindings"]
+            .as_array()
+            .map(Vec::len),
+        Some(5),
+        "execute_tracked: {}",
+        tracked.result
+    );
+}
+
 #[tokio::test]
 async fn pinned_query_on_a_graph_source_reads_that_snapshot() {
     use fluree_db_api::TimeSpec;
@@ -665,7 +720,7 @@ async fn pinned_query_on_a_graph_source_reads_that_snapshot() {
         expect_refused(
             result,
             &format!("bm25 @{suffix}"),
-            "does not support time-pinned reads; only Iceberg-backed graph sources do",
+            "does not support time-pinned reads",
         );
     }
 

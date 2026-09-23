@@ -1,0 +1,41 @@
+[package]
+name = "fluree-db-delta"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Delta Lake table reader for Fluree DB graph sources (Delta Kernel)"
+
+[dependencies]
+fluree-db-tabular = { path = "../fluree-db-tabular" }
+# `MappingSource` / `ConfigValue` are shared with the Iceberg and SQL graph
+# sources. The base crate (no `aws` feature) is HTTP + serde only.
+fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false }
+
+# Kernel owns log replay, protocol checks, column mapping, partition values and
+# deletion vectors. Its `arrow-58` feature selects the workspace's Arrow/Parquet
+# major and hard-enables `object_store` 0.13 with its cloud backends, which
+# still use reqwest 0.12; that duplicate goes away when Kernel moves to
+# `object_store` 0.14.
+# `internal-api` exposes planning a scan from a kept file listing; the exact
+# version pin is what makes relying on it safe.
+delta_kernel = { version = "=0.28.0", features = ["arrow-58", "internal-api"] }
+delta_kernel_default_engine = { version = "=0.28.0", default-features = false, features = ["arrow-58", "rustls"] }
+
+async-trait.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+futures.workspace = true
+lru.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+url = "2"
+
+[dev-dependencies]
+tempfile = "3.19"
+tokio = { workspace = true, features = ["full"] }
+
+[lints]
+workspace = true
