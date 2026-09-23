@@ -111,6 +111,12 @@ pub struct DeltaTableAccess {
     /// The data file whose read the store let through; absent when there is
     /// none, or when the table could not be read.
     pub probed_data_file: Option<String>,
+    /// That file's size in bytes.
+    pub probed_data_file_bytes: Option<u64>,
+    /// `true` when the table has no data file to stat, with the reason in
+    /// `skip_reason`. Same fields as an Iceberg source's verify.
+    pub data_probe_skipped: bool,
+    pub skip_reason: Option<String>,
     /// Why not, in the catalog's or the store's own words.
     pub error: Option<String>,
 }
@@ -315,7 +321,12 @@ impl crate::Fluree {
                 location: Some(location),
                 version: Some(version),
                 data_file_count: Some(files),
-                probed_data_file: probed,
+                data_probe_skipped: probed.is_none(),
+                skip_reason: probed.is_none().then(|| {
+                    "the table's current version lists no data files; none was probed".to_string()
+                }),
+                probed_data_file_bytes: probed.as_ref().map(|(_, bytes)| *bytes),
+                probed_data_file: probed.map(|(file, _)| file),
                 error: None,
             },
             Err(DeltaError::Config(e)) => return Err(crate::ApiError::Config(e)),
@@ -326,6 +337,9 @@ impl crate::Fluree {
                 version: None,
                 data_file_count: None,
                 probed_data_file: None,
+                probed_data_file_bytes: None,
+                data_probe_skipped: false,
+                skip_reason: None,
                 error: Some(e.to_string()),
             },
         })

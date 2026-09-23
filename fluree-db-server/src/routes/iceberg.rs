@@ -1129,7 +1129,7 @@ async fn iceberg_catalog_verify_local(
             table = %req.table,
             readable = report.readable,
             credential_source = report.credential_source,
-            data_files_listed = report.data_files_listed,
+            data_file_count = report.data_file_count,
             data_probe_skipped = report.data_probe_skipped,
             "iceberg storage access verified"
         );

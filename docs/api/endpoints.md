@@ -3012,7 +3012,7 @@ A table that cannot be read answers `200` with `"readable": false` and the reaso
   "error": null,
   "credential_source": "vended",
   "metadata_location": "s3://bucket/warehouse/orders/metadata/00003.metadata.json",
-  "data_files_listed": 4,
+  "data_file_count": 4,
   "probed_data_file": "s3://bucket/warehouse/orders/data/part-0.parquet",
   "probed_data_file_bytes": 2048,
   "data_probe_skipped": false,
@@ -3020,7 +3020,7 @@ A table that cannot be read answers `200` with `"readable": false` and the reaso
 }
 ```
 
-`credential_source`, `metadata_location` and `data_files_listed` are `null` when the probe failed before learning them. `data_probe_skipped` is `true`, with `skip_reason`, for a table with no data files.
+`credential_source`, `metadata_location` and `data_file_count` are `null` when the probe failed before learning them. `data_probe_skipped` is `true`, with `skip_reason`, for a table with no data files.
 
 ### POST {api_base_url}/bm25/create
 
@@ -3210,7 +3210,7 @@ Every body takes the Unity connection fields of `delta/map`: `unity_uri` (requir
 |---|---|---|
 | `POST /delta/catalog/browse` | `depth`: `schemas` or `tables` (default) | `catalogs`, `schemas` (`catalog.schema`), `tables` |
 | `POST /delta/catalog/preview` | `table` | The table's `columns`, `primary_key`, `foreign_keys`, `location`, `access_rule`, `unreadable` |
-| `POST /delta/catalog/verify` | `table`; `s3_region`, `s3_endpoint`, `s3_path_style` | `readable`, and `location`, `version`, `data_file_count`, `probed_data_file` or `error` |
+| `POST /delta/catalog/verify` | `table`; `s3_region`, `s3_endpoint`, `s3_path_style` | `readable`, and `location`, `version`, `data_file_count`, `probed_data_file`, `probed_data_file_bytes`, `data_probe_skipped`, `skip_reason`, or `error` |
 | `POST /delta/r2rml/generate` | `tables`, `base_namespace`; `per_table_overrides`, `options` | `turtle`, `structured`, `diagnostics`, `tables` |
 | `POST /delta/r2rml/validate` | A `delta/map` body; `name` is optional | `compiled_ok`, `triples_map_count`, `table_names`, `diagnostics` |
 
@@ -3233,7 +3233,7 @@ Every body takes the Unity connection fields of `delta/map`: `unity_uri` (requir
 
 **Preview** columns carry `name`, `position`, `type_text` (Unity's spelling), `xsd_type` (the datatype a generated mapping gives the column), `mappable` (false for a nested or semi-structured type), `nullable`, `comment` and `masked`.
 
-**Verify** answers `200` with `"readable": false` and the reason in `error` for a table that cannot be read; only a request that cannot be made is an error.
+**Verify** answers `200` with `"readable": false` and the reason in `error` for a table that cannot be read; only a request that cannot be made is an error. Its fields share names with [Iceberg's verify](#post-api_base_urlicebergcatalogverify): `readable`, `error`, `data_file_count`, `probed_data_file`, `probed_data_file_bytes`, `data_probe_skipped`, `skip_reason`.
 
 **Generate** request:
 

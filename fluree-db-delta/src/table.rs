@@ -558,11 +558,11 @@ impl DeltaSnapshot {
         })))
     }
 
-    /// Stat the first data file this version reads: the proof the store lets a
-    /// scan's reads through, which reading the log alone is not (a table's
-    /// files can sit outside the prefix its credentials cover). `None` for a
-    /// version with no files.
-    pub async fn probe_data_file(&self) -> Result<Option<String>> {
+    /// Stat the first data file this version reads, as its URL and size: the
+    /// proof the store lets a scan's reads through, which reading the log alone
+    /// is not (a table's files can sit outside the prefix its credentials
+    /// cover). `None` for a version with no files.
+    pub async fn probe_data_file(&self) -> Result<Option<(String, u64)>> {
         use delta_kernel::object_store::ObjectStoreExt as _;
         let this = self.clone();
         let first = blocking(move || {
@@ -590,10 +590,11 @@ impl DeltaSnapshot {
         self.table.executor.spawn(async move {
             let _ = tx.send(store.head(&path).await);
         });
-        rx.await
+        let meta = rx
+            .await
             .map_err(|_| DeltaError::Internal("Delta data file probe did not finish".to_string()))?
             .map_err(|e| DeltaError::kernel(&table, delta_kernel::Error::ObjectStore(e)))?;
-        Ok(Some(url.to_string()))
+        Ok(Some((url.to_string(), meta.size)))
     }
 
     /// How many data files a scan with `filters` reads.

@@ -1063,7 +1063,7 @@ pub struct StorageAccessReport {
     /// Number of data files listed in the current snapshot's manifests. Listing
     /// them proves the `metadata/` prefix (manifest-list + manifests) is readable.
     /// `None` when they could not be listed.
-    pub data_files_listed: Option<usize>,
+    pub data_file_count: Option<usize>,
     /// The single data file the probe stat-checked (`HeadObject`) to prove the
     /// `data/` prefix is readable; `None` when the data probe was skipped.
     pub probed_data_file: Option<String>,
@@ -1152,7 +1152,7 @@ async fn probe_storage_access<S: SendIcebergStorage + ?Sized>(
                 )
             })?;
 
-    let data_files_listed = data_files.len();
+    let data_file_count = data_files.len();
     let probe = probe_data_files(storage, &data_files, table_qualified).await?;
 
     Ok(StorageAccessReport {
@@ -1160,7 +1160,7 @@ async fn probe_storage_access<S: SendIcebergStorage + ?Sized>(
         error: None,
         credential_source: Some(credential_source),
         metadata_location: Some(metadata_location),
-        data_files_listed: Some(data_files_listed),
+        data_file_count: Some(data_file_count),
         probed_data_file: probe.probed_data_file,
         probed_data_file_bytes: probe.probed_data_file_bytes,
         data_probe_skipped: probe.data_probe_skipped,
@@ -1180,7 +1180,7 @@ impl StorageAccessReport {
             error: Some(error),
             credential_source,
             metadata_location,
-            data_files_listed: None,
+            data_file_count: None,
             probed_data_file: None,
             probed_data_file_bytes: None,
             data_probe_skipped: false,
@@ -1304,7 +1304,7 @@ pub async fn verify_storage_access(
             error: None,
             credential_source: Some(credential_source),
             metadata_location: Some(load.metadata_location),
-            data_files_listed: Some(0),
+            data_file_count: Some(0),
             probed_data_file: None,
             probed_data_file_bytes: None,
             data_probe_skipped: true,
@@ -1876,7 +1876,7 @@ mod tests {
             metadata_location: Some(
                 "s3://bucket/warehouse/t/metadata/v3.metadata.json".to_string(),
             ),
-            data_files_listed: Some(4),
+            data_file_count: Some(4),
             probed_data_file: Some("s3://bucket/warehouse/t/data/part-0.parquet".to_string()),
             probed_data_file_bytes: Some(2048),
             data_probe_skipped: false,
@@ -1888,7 +1888,7 @@ mod tests {
             v["metadata_location"],
             "s3://bucket/warehouse/t/metadata/v3.metadata.json"
         );
-        assert_eq!(v["data_files_listed"], 4);
+        assert_eq!(v["data_file_count"], 4);
         assert_eq!(
             v["probed_data_file"],
             "s3://bucket/warehouse/t/data/part-0.parquet"

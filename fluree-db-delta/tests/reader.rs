@@ -1322,12 +1322,18 @@ async fn the_data_file_probe_reaches_a_file_the_log_alone_does_not() {
         .snapshot(VersionSelector::Latest)
         .await
         .unwrap();
-    let probed = snapshot
+    let (probed, bytes) = snapshot
         .probe_data_file()
         .await
         .unwrap()
         .expect("dim_store has data files");
     assert!(probed.ends_with(".parquet"), "{probed}");
+    let on_disk = std::fs::read_dir(fixtures().join("dim_store"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "parquet"))
+        .unwrap();
+    assert_eq!(bytes, std::fs::metadata(on_disk).unwrap().len());
 
     allow_roots();
     let staged = tempfile::tempdir().unwrap();
