@@ -3002,9 +3002,51 @@ See also the CLI wrapper: [fluree iceberg map](../cli/iceberg.md).
 
 Checks that a REST-catalog connection's credentials can read a table's storage, through the same credential decision and storage path a query uses. It lists the current snapshot's manifests (the `metadata/` prefix) and stats its first data file (the `data/` prefix), without reading data. It is read-only and admin-protected.
 
-The body takes the `iceberg/map` connection fields and a `table` (`"NAMESPACE.NAME"`, in the catalog's casing).
+The body takes the `iceberg/map` connection fields and a `table` (`"NAMESPACE.NAME"`, in the catalog's casing). The answer is a [verify response](#verify-response).
 
-A table that cannot be read answers `200` with `"readable": false` and the reason in `error`: the catalog would not load it, vended no credentials, or storage refused a read. This is the same contract as Delta's `POST /delta/catalog/verify`. Only a request that cannot be made is an error: Direct catalog mode, an unusable connection, or a catalog that returns no inline table metadata.
+### Verify response
+
+`POST /iceberg/catalog/verify` and [`POST /delta/catalog/verify`](#post-api_base_urldeltacatalog-and-deltar2rml) answer with the same contract, and with the same field names wherever a field means the same thing. A client can decide pass or fail, and show the data-file check, the same way for either source.
+
+#### Status
+
+| Outcome | Status | Body |
+|---|---|---|
+| The table can be read | `200` | `"readable": true` |
+| The table cannot be read | `200` | `"readable": false`, the reason in `error` |
+| The request cannot be made | `400` | An error: `@type` `err:api/BadRequest` for a body that is not valid JSON or lacks a required field, or `err:system/ConfigError` for an unusable connection (a connection URL the server refuses, an unresolvable secret; for Iceberg, also Direct catalog mode or a catalog that returns no inline table metadata) |
+| The admin token is missing or invalid | `401` | An error |
+
+"Cannot be read" covers every reason that belongs to the table rather than to the request:
+- the catalog would not load or place it, or refused this principal;
+- it vended no credentials while the source requires them;
+- storage refused, or no longer holds, a metadata or data file;
+- (Delta only) the catalog placed it where the reader does not read, such as Google Cloud Storage.
+
+None of these is an HTTP error status; in particular a table-level refusal is never a `403`. The `error` text is the catalog's or the store's own wording, meant to be shown to a person, not parsed.
+
+#### Fields
+
+| Field | Type | Null when | Sources | Meaning |
+|---|---|---|---|---|
+| `readable` | boolean | never | both | Whether a query could read the table |
+| `error` | string | `readable` is `true` | both | Why the table cannot be read |
+| `data_file_count` | integer | the table could not be read | both | Data files in the table's current version (Iceberg: its current snapshot) |
+| `probed_data_file` | string | no file was probed | both | The data file whose read storage let through |
+| `probed_data_file_bytes` | integer | no file was probed | both | That file's size in bytes |
+| `data_probe_skipped` | boolean | never | both | `true` when the table has no data file to probe; `false` when one was probed, or the table could not be read |
+| `skip_reason` | string | `data_probe_skipped` is `false` | both | Why no data file was probed |
+| `full_name` | string | never | Delta | The table's Unity Catalog name (`catalog.schema.table`) |
+| `location` | string | the table could not be read | Delta | Where Unity Catalog places the table |
+| `version` | integer | the table could not be read | Delta | The table's current Delta version |
+| `credential_source` | string | the probe failed before deciding | Iceberg | `"vended"` (issued by the catalog) or `"ambient"` (the server's own credentials) |
+| `metadata_location` | string | the catalog would not load the table | Iceberg | The table's current metadata file |
+
+A field of the other source type is absent, not `null`.
+
+#### Examples
+
+A readable Iceberg table:
 
 ```json
 {
@@ -3020,7 +3062,55 @@ A table that cannot be read answers `200` with `"readable": false` and the reaso
 }
 ```
 
-`credential_source`, `metadata_location` and `data_file_count` are `null` when the probe failed before learning them. `data_probe_skipped` is `true`, with `skip_reason`, for a table with no data files.
+An Iceberg table whose storage refused the probe:
+
+```json
+{
+  "readable": false,
+  "error": "Storage access denied for s3://bucket/warehouse/orders/data/part-0.parquet (region us-east-1): AccessDenied",
+  "credential_source": "vended",
+  "metadata_location": "s3://bucket/warehouse/orders/metadata/00003.metadata.json",
+  "data_file_count": null,
+  "probed_data_file": null,
+  "probed_data_file_bytes": null,
+  "data_probe_skipped": false,
+  "skip_reason": null
+}
+```
+
+A readable Delta table:
+
+```json
+{
+  "full_name": "main.sales.orders",
+  "readable": true,
+  "location": "s3://bucket/unity/tables/7f3c…",
+  "version": 42,
+  "data_file_count": 12,
+  "probed_data_file": "s3://bucket/unity/tables/7f3c…/part-00000-….snappy.parquet",
+  "probed_data_file_bytes": 1048576,
+  "data_probe_skipped": false,
+  "skip_reason": null,
+  "error": null
+}
+```
+
+A Delta table Unity Catalog will not let this principal read:
+
+```json
+{
+  "full_name": "main.sales.orders",
+  "readable": false,
+  "location": null,
+  "version": null,
+  "data_file_count": null,
+  "probed_data_file": null,
+  "probed_data_file_bytes": null,
+  "data_probe_skipped": false,
+  "skip_reason": null,
+  "error": "Unity Catalog, table 'main.sales.orders': User does not have SELECT on Table 'main.sales.orders'. (403 Forbidden)"
+}
+```
 
 ### POST {api_base_url}/bm25/create
 
@@ -3210,7 +3300,7 @@ Every body takes the Unity connection fields of `delta/map`: `unity_uri` (requir
 |---|---|---|
 | `POST /delta/catalog/browse` | `depth`: `schemas` or `tables` (default) | `catalogs`, `schemas` (`catalog.schema`), `tables` |
 | `POST /delta/catalog/preview` | `table` | The table's `columns`, `primary_key`, `foreign_keys`, `location`, `access_rule`, `unreadable` |
-| `POST /delta/catalog/verify` | `table`; `s3_region`, `s3_endpoint`, `s3_path_style` | `readable`, and `location`, `version`, `data_file_count`, `probed_data_file`, `probed_data_file_bytes`, `data_probe_skipped`, `skip_reason`, or `error` |
+| `POST /delta/catalog/verify` | `table`; `s3_region`, `s3_endpoint`, `s3_path_style` | A [verify response](#verify-response) |
 | `POST /delta/r2rml/generate` | `tables`, `base_namespace`; `per_table_overrides`, `options` | `turtle`, `structured`, `diagnostics`, `tables` |
 | `POST /delta/r2rml/validate` | A `delta/map` body; `name` is optional | `compiled_ok`, `triples_map_count`, `table_names`, `diagnostics` |
 
@@ -3233,7 +3323,7 @@ Every body takes the Unity connection fields of `delta/map`: `unity_uri` (requir
 
 **Preview** columns carry `name`, `position`, `type_text` (Unity's spelling), `xsd_type` (the datatype a generated mapping gives the column), `mappable` (false for a nested or semi-structured type), `nullable`, `comment` and `masked`.
 
-**Verify** answers `200` with `"readable": false` and the reason in `error` for a table that cannot be read; only a request that cannot be made is an error. Its fields share names with [Iceberg's verify](#post-api_base_urlicebergcatalogverify): `readable`, `error`, `data_file_count`, `probed_data_file`, `probed_data_file_bytes`, `data_probe_skipped`, `skip_reason`.
+**Verify** answers with a [verify response](#verify-response), the same contract and field names as Iceberg's: a table that cannot be read is `200` with `"readable": false` and the reason in `error`; only a request that cannot be made is an error.
 
 **Generate** request:
 
