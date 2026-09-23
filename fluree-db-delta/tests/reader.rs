@@ -1224,3 +1224,92 @@ async fn live_azure_token_request_reaches_entra() {
         "did not reach Entra: {err}"
     );
 }
+
+/// A scan waiting on its consumer must not hold the caller's blocking threads:
+/// the caller's own file I/O runs there, and a consumer waiting on that I/O
+/// would never pull.
+#[test]
+fn an_unconsumed_scan_leaves_the_callers_blocking_pool_free() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let snapshot = open("partitioned")
+            .snapshot(VersionSelector::Latest)
+            .await
+            .expect("snapshot");
+        let stream = snapshot.scan(&[], &[]).expect("scan");
+        // Nothing pulls, so the workers fill the channel and wait.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let unrelated = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            tokio::task::spawn_blocking(|| 1),
+        )
+        .await;
+        drop(stream);
+        assert!(
+            matches!(unrelated, Ok(Ok(1))),
+            "the scan held the caller's blocking pool: {unrelated:?}"
+        );
+    });
+}
+
+/// `flags` staged with its protocol replaced by `protocol`.
+fn with_protocol(protocol: serde_json::Value) -> (tempfile::TempDir, DeltaTable) {
+    allow_roots();
+    let staged = tempfile::tempdir().unwrap();
+    let dir = staged.path().join("flags");
+    copy_dir_all(&fixtures().join("flags"), &dir);
+    let log = dir.join("_delta_log/00000000000000000000.json");
+    let rewritten: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut action: serde_json::Value = serde_json::from_str(line).unwrap();
+            if action.get("protocol").is_some() {
+                action["protocol"] = protocol.clone();
+            }
+            action.to_string()
+        })
+        .collect();
+    std::fs::write(&log, rewritten.join("\n")).unwrap();
+    let table = DeltaTable::open("flags", dir.to_str().unwrap(), &DeltaIoConfig::default())
+        .expect("open table");
+    (staged, table)
+}
+
+/// A table needing a reader feature Kernel does not implement is refused,
+/// never read partially: by `batch_schema`, which registration probes with,
+/// and by a scan. Kernel does the refusing, so this pins it across upgrades.
+#[tokio::test]
+async fn an_unsupported_reader_protocol_is_refused_not_read() {
+    for protocol in [
+        serde_json::json!({
+            "minReaderVersion": 3,
+            "minWriterVersion": 7,
+            "readerFeatures": ["flureeUnknownFeature"],
+            "writerFeatures": ["flureeUnknownFeature"],
+        }),
+        serde_json::json!({"minReaderVersion": 4, "minWriterVersion": 2}),
+    ] {
+        let (_staged, table) = with_protocol(protocol.clone());
+        let snapshot = table
+            .snapshot(VersionSelector::Latest)
+            .await
+            .expect("the log itself replays");
+        let err = snapshot
+            .batch_schema(&[])
+            .err()
+            .unwrap_or_else(|| panic!("{protocol}: batch_schema must refuse"));
+        assert!(err.to_string().contains("nsupported"), "{protocol}: {err}");
+
+        let results: Vec<_> = snapshot.scan(&[], &[]).unwrap().collect().await;
+        assert!(
+            matches!(results.as_slice(), [Err(_)]),
+            "{protocol}: a scan must fail before any rows: {results:?}"
+        );
+    }
+}

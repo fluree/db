@@ -649,7 +649,8 @@ impl ApiError {
             | ApiError::CatalogCredentialsNotVended { .. }
             | ApiError::Query(
                 fluree_db_query::QueryError::StorageAccessDenied { .. }
-                | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. },
+                | fluree_db_query::QueryError::CatalogCredentialsNotVended { .. }
+                | fluree_db_query::QueryError::CatalogAccessDenied { .. },
             ) => 403,
             // A malformed ledger config graph is the operator's to fix, and no
             // change to the request can clear it.

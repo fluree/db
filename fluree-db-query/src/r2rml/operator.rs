@@ -1961,14 +1961,6 @@ fn coerce_scalar_for_pushdown(
     }
 }
 
-/// Push an `Eq` scan filter for a scalar constant-object equality on `pred_iri`,
-/// applying the [`coerce_scalar_for_pushdown`] soundness gate. Shared by the base
-/// `object_constant` (single-predicate `?s pred const`) and the `star_constraints`
-/// (a constant-object member of a same-subject star, e.g. `?ol …key "1"; ?ol ?p ?o`)
-/// so both classes of constant key-equality prune the scan identically. A file-level
-/// prune is only sound when the predicate maps to EXACTLY ONE scalar object map
-/// backed by one column (else a row could match via an unpruned column); otherwise
-/// no filter is pushed and the operator's residual check remains the authority.
 /// The scan filters `pattern` pushes to a scan of `triples_map`'s table: its
 /// FILTER comparisons, scalar constant objects, and a bound subject's template
 /// keys. Every one restates a condition the pattern's consumer enforces, so a
@@ -2064,6 +2056,14 @@ pub(crate) fn pattern_scan_filters(
     out
 }
 
+/// Push an `Eq` scan filter for a scalar constant-object equality on `pred_iri`,
+/// applying the [`coerce_scalar_for_pushdown`] soundness gate. Shared by the base
+/// `object_constant` (single-predicate `?s pred const`) and the `star_constraints`
+/// (a constant-object member of a same-subject star, e.g. `?ol …key "1"; ?ol ?p ?o`)
+/// so both classes of constant key-equality prune the scan identically. A file-level
+/// prune is only sound when the predicate maps to EXACTLY ONE scalar object map
+/// backed by one column (else a row could match via an unpruned column); otherwise
+/// no filter is pushed and the operator's residual check remains the authority.
 fn push_scalar_eq_filter(
     out: &mut Vec<crate::r2rml::ScanFilter>,
     triples_map: &TriplesMap,

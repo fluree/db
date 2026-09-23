@@ -151,7 +151,9 @@ impl Resolved {
         match &*lock(&self.files) {
             Files::Listed(listing) => Files::Unlisted(Some((self.version(), listing.clone()))),
             Files::Unlisted(prior) => Files::Unlisted(prior.clone()),
-            Files::Unbounded => Files::Unbounded,
+            // The budget is shared across tables: a later version tries again,
+            // since room may have freed up.
+            Files::Unbounded => Files::Unlisted(None),
         }
     }
 }
@@ -240,8 +242,12 @@ impl DeltaTable {
                 std::cmp::Ordering::Equal => latest,
                 std::cmp::Ordering::Greater => return Err(self.version_not_found(version)),
                 // Older than latest: the log no longer reaching it (cleanup)
-                // is the expected failure, so report it as the missing pin.
+                // is the expected failure, so report it as the missing pin;
+                // a storage or feature failure is reported as itself.
                 std::cmp::Ordering::Less => self.pinned(version).map_err(|e| {
+                    if !e.is_unreachable_version() {
+                        return e;
+                    }
                     tracing::debug!(table = %self.name, version, error = %e, "Delta version not reconstructable");
                     self.version_not_found(version)
                 })?,
@@ -467,10 +473,12 @@ impl DeltaSnapshot {
     }
 
     /// The batch schema a scan of `projection` yields (every column when
-    /// empty), without reading data. Fails on a column this version lacks or a
-    /// type the batch model cannot carry.
+    /// empty), without reading data. Fails on a column this version lacks, a
+    /// type the batch model cannot carry, or a reader feature Kernel does not
+    /// implement, which it refuses only once a scan is built.
     pub fn batch_schema(&self, projection: &[String]) -> Result<Arc<BatchSchema>> {
-        let (_, bridge) = self.plan(projection)?;
+        let (schema, bridge) = self.plan(projection)?;
+        self.build_scan(Some(schema), None)?;
         Ok(bridge.schema().clone())
     }
 
@@ -495,6 +503,11 @@ impl DeltaSnapshot {
         );
         let this = self.clone();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ColumnBatch>>(4);
+        // The planner and the workers it spawns wait on storage and on the
+        // consumer for the whole scan, so they run on the Delta runtime's
+        // blocking pool: on the caller's, they hold threads that its own
+        // file I/O needs, and a consumer waiting on that I/O never pulls.
+        let _delta_runtime = self.table.executor.enter();
         tokio::task::spawn_blocking(move || {
             let planned = this
                 .build_scan(Some(schema), predicate)

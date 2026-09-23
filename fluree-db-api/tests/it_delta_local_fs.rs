@@ -831,3 +831,75 @@ async fn a_mapped_boolean_compares_equal_to_a_boolean_literal() {
         .expect("jsonld filter");
     assert_eq!(rows.as_array().map(Vec::len), Some(2), "{rows}");
 }
+
+/// A table that needs a reader feature Kernel does not implement is flagged
+/// when it is mapped, not first discovered by a query, and never read.
+#[tokio::test]
+async fn registration_warns_of_an_unsupported_reader_protocol() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let staged =
+        tempfile::TempDir::new_in(fixtures()).expect("staging dir under the fixtures root");
+    let table = staged.path().join("flags");
+    std::fs::create_dir_all(table.join("_delta_log")).unwrap();
+    for entry in std::fs::read_dir(fixtures().join("flags")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), table.join(entry.file_name())).unwrap();
+        }
+    }
+    let log = "_delta_log/00000000000000000000.json";
+    let rewritten: Vec<String> = std::fs::read_to_string(fixtures().join("flags").join(log))
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut action: Value = serde_json::from_str(line).unwrap();
+            if action.get("protocol").is_some() {
+                action["protocol"] = json!({
+                    "minReaderVersion": 3,
+                    "minWriterVersion": 7,
+                    "readerFeatures": ["flureeUnknownFeature"],
+                    "writerFeatures": ["flureeUnknownFeature"],
+                });
+            }
+            action.to_string()
+        })
+        .collect();
+    std::fs::write(table.join(log), rewritten.join("\n")).unwrap();
+
+    let mapping = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <http://example.org/mapping#Flag>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "flags" ] ;
+            rr:subjectMap [ rr:template "http://example.org/flag/{id}" ] ;
+            rr:predicateObjectMap [ rr:predicate ex:shipped ; rr:objectMap [ rr:column "shipped" ] ] .
+    "#;
+    let root = staged.path().canonicalize().unwrap();
+    let mut config = DeltaCreateConfig::new("delta-unsupported", root.to_str().unwrap(), mapping);
+    config.mapping_media_type = Some("text/turtle".to_string());
+    let created = fluree
+        .create_delta_graph_source(config)
+        .await
+        .expect("registers despite warnings");
+    assert!(created.table_versions.is_empty(), "{created:?}");
+    let warnings = created.table_warnings.join("\n");
+    assert!(
+        warnings.contains("table 'flags'") && warnings.contains("flureeUnknownFeature"),
+        "{warnings}"
+    );
+
+    let err = fluree
+        .query_from()
+        .jsonld(&json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "delta-unsupported:main",
+            "select": ["?s"],
+            "where": {"@id": "?s", "ex:shipped": "?v"},
+        }))
+        .execute_formatted()
+        .await
+        .expect_err("an unsupported table is never read");
+    assert!(err.to_string().contains("flureeUnknownFeature"), "{err}");
+}

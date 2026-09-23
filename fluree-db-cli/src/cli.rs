@@ -3180,9 +3180,13 @@ pub enum SqlAction {
 pub enum DeltaAction {
     /// Map Delta Lake tables as an R2RML graph source
     ///
-    /// Tables are named by path. Each rr:tableName in the mapping resolves to
-    /// its --table entry, else to a directory under --root with the name's
-    /// dots as separators (dbo.orders -> <root>/dbo/orders).
+    /// Tables are named by path, or by their Unity Catalog name. By path, each
+    /// rr:tableName in the mapping resolves to its --table entry, else to a
+    /// directory under --root with the name's dots as separators
+    /// (dbo.orders -> <root>/dbo/orders). With --unity-uri, each rr:tableName is
+    /// a Unity Catalog name (catalog.schema.table, or shorter with
+    /// --unity-catalog / --unity-schema): Unity places the table and issues the
+    /// credentials that read it.
     ///
     /// Query a past table state with `<name>@snapshot:<delta-version>` or
     /// `<name>@time:<ISO-8601>`.
@@ -3190,6 +3194,10 @@ pub enum DeltaAction {
     /// Examples:
     ///   fluree delta map sales --root s3://lake/Tables --r2rml mappings/sales.ttl
     ///   fluree delta map sales --table orders=s3://lake/raw/orders_v2 --r2rml sales.ttl
+    ///   fluree delta map sales --r2rml mappings/sales.ttl \
+    ///     --unity-uri https://<workspace>.cloud.databricks.com --unity-catalog main \
+    ///     --oauth2-client-id <application-id> \
+    ///     --oauth2-client-secret-env DATABRICKS_CLIENT_SECRET --s3-region us-east-1
     Map(Box<DeltaMapArgs>),
 
     /// List what a Unity Catalog holds

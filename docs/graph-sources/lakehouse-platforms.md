@@ -13,7 +13,7 @@ The option reference is in [Delta Lake tables](delta.md) and
 |---|---|---|
 | Delta tables in your own ADLS Gen2 account | [Delta source](#azure-data-lake-storage-gen2), by path | A service principal, managed identity, account key or SAS with read access to the container |
 | Microsoft Fabric lakehouse tables (OneLake) | [Delta source](#microsoft-fabric-onelake), by path | A service principal with a workspace role that includes OneLake data access |
-| Databricks Delta tables, **managed or external**, by name | [Delta source through Unity Catalog](#databricks-tables-through-unity-catalog) | A Databricks service principal (or token); Unity Catalog issues and renews the storage credentials |
+| Databricks Delta tables, **managed or external**, by name (Databricks on AWS or Azure) | [Delta source through Unity Catalog](#databricks-tables-through-unity-catalog) | A Databricks service principal (or token); Unity Catalog issues and renews the storage credentials |
 | Databricks **external** tables, by path, without Unity Catalog | [Delta source](#databricks-external-tables), by path | Your own credentials for that S3 bucket or ADLS container |
 | Databricks tables with Iceberg reads (UniForm) or managed Iceberg tables | [Iceberg REST source](#databricks-through-the-iceberg-rest-endpoint) | A Databricks service principal (or a personal access token); storage credentials are vended per request |
 | Delta tables on S3 | Delta source, by path — see [Delta Lake tables](delta.md#credentials) | AWS credentials in the environment, or the instance / container role |
@@ -226,6 +226,10 @@ format, a table with a row filter or column mask, and a table the principal
 cannot see are each reported by name — as a warning when the source is
 mapped, and as the error of any query that touches them.
 
+Databricks on Google Cloud is not covered yet: Unity Catalog places its tables
+on Google Cloud Storage (`gs://…`), which the Delta reader does not read, and
+mapping such a table reports exactly that.
+
 ### Databricks external tables
 
 An external table lives at a path you chose, in storage you control, so it can
@@ -311,6 +315,7 @@ HTTP API), the server's operator lists the variable in
 | `User does not have EXTERNAL USE SCHEMA on Schema …` (or `USE CATALOG`, `USE SCHEMA`, `SELECT`) | A grant from [step 3](#databricks-tables-through-unity-catalog) is missing; none is implied by ownership or admin rights |
 | `Unity Catalog issued no credentials. The table has a row filter …` (or `column mask`) | Whether such a table can be read is Unity Catalog's decision, and today it refuses: it enforces those rules only in its own compute and issues no credentials to read such a table's files, even to its owner. Expose the permitted rows and columns as a separate table, and govern access in Fluree with a model ledger's [access policy](iceberg.md#access-policy) |
 | `… is a VIEW, not a Delta table` / `… in PARQUET format` | Unity Catalog places only Delta tables with files of their own; map the underlying table |
+| `Unity Catalog placed this table on Google Cloud Storage …` | The workspace is Databricks on Google Cloud, which the Delta reader does not support yet |
 | `Received redirect` from S3 when a Unity table is first read | The bucket is in another region than `--s3-region` / `AWS_REGION` names |
 | `Catalog … authorized the table but vended no storage credentials` | The principal can see the table but lacks `USE CATALOG`, `USE SCHEMA`, `SELECT` or `EXTERNAL USE SCHEMA`. The Iceberg endpoint answers without credentials rather than with an error; `POST …/temporary-table-credentials` as the same principal names the missing privilege |
 | `Provided access token does not have required scopes: all-apis` | The token was created with narrower scopes than the Iceberg endpoint accepts |
